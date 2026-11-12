@@ -1,5 +1,9 @@
 // @ref LLP 1149 D1.1, D2, D6.1. All branch selectors are flat per primitive.
 
+// A device may replace this line to compile the fragment stage for one primitive
+// class: with constant selectors the driver drops every other branch.
+const SPECIALIZED = false; const KIND_BRUSH = 0u; const FLAGS = 0u;
+
 struct Viewport { size: vec2<f32>, pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> viewport: Viewport;
 @group(0) @binding(1) var glyph_atlas: texture_2d<f32>;
@@ -106,6 +110,19 @@ fn rounded_distance(p: vec2<f32>, rect: vec4<f32>, r: vec4<f32>) -> f32 {
 }
 
 fn shape_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, pixel: vec2<f32>) -> f32 {
+    // Most of a large shape is off every corner arc and deep inside, where the
+    // evaluation below clamps to exactly one. `q` is the distance it computes
+    // there. The distance is 1-Lipschitz, so the width is at most pixel.x +
+    // pixel.y or its floor; four times the saturating depth, 0.02 clear of the
+    // arcs for its two offset samples and coordinates under 2^15 leave f32
+    // rounding no way to change that.
+    let lo = rect.xy;
+    let hi = lo + rect.zw;
+    let q = abs(p - (lo + hi) * 0.5) - rect.zw * 0.5;
+    let arc = max(max(radii.x, radii.y), max(radii.z, radii.w));
+    let reach = max(max(abs(lo.x), abs(lo.y)), max(abs(hi.x), abs(hi.y)));
+    if max(q.x, q.y) <= -2.0 * max(pixel.x + pixel.y, 0.00001) && min(q.x, q.y) <= -(arc + 0.02)
+        && reach < 32768.0 { return 1.0; }
     let distance = rounded_distance(p, rect, radii);
     let normal = vec2<f32>(rounded_distance(p + vec2<f32>(0.01, 0.0), rect, radii),
                           rounded_distance(p + vec2<f32>(0.0, 0.01), rect, radii)) - vec2<f32>(distance);
@@ -179,10 +196,16 @@ fn stop_ramp(t: f32, row: i32) -> vec4<f32> {
     return vec4<f32>(c.rgb * c.a, c.a);
 }
 
-fn brush(v: Vertex, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
-    let kind = v.data.x & 65535u;
-    let flags = v.data.y;
-    switch v.data.x >> 16u {
+// Kind/brush and flags. The gradient ramp row is always read per instance.
+fn selectors(v: Vertex) -> vec2<u32> {
+    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, FLAGS); }
+    return v.data;
+}
+
+fn brush(v: Vertex, data: vec2<u32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+    let kind = data.x & 65535u;
+    let flags = data.y;
+    switch data.x >> 16u {
         case 1u: {
             var t = 0.0;
             switch (flags >> 9u) & 3u {
@@ -216,34 +239,34 @@ fn brush(v: Vertex, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
             }
             if (flags & 8u) != 0u { t = fract(t); }
             if (flags & 268435456u) != 0u { t = 1.0 - abs(fract(t * 0.5) * 2.0 - 1.0); }
-            if (flags & 4u) != 0u { return stop_ramp(t, i32((flags >> 16u) & 1023u)); }
+            if (flags & 4u) != 0u { return stop_ramp(t, i32((v.data.y >> 16u) & 1023u)); }
             let size = vec2<f32>(textureDimensions(ramp));
             let uv = vec2<f32>((0.5 + clamp(t, 0.0, 1.0) * (size.x - 1.0)) / size.x,
-                               (f32((flags >> 16u) & 1023u) + 0.5) / size.y);
+                               (f32((v.data.y >> 16u) & 1023u) + 0.5) / size.y);
             return textureSample(ramp, filtering, uv);
         }
         case 2u, 3u: {
             var uv = mapped(v.local, v.rect, v.uv);
             // Coverage uses uv for its path mask; its image occupies the full slot.
             if kind == 4u { uv = (v.local - v.rect.xy) / v.rect.zw; }
-            if (v.data.x >> 16u) == 3u {
+            if (data.x >> 16u) == 3u {
                 uv = (v.local - v.param.xy) / max(v.param.zw, vec2<f32>(0.00001));
             }
             if (flags & 1073741824u) != 0u {
                 uv = v.position.xy / vec2<f32>(textureDimensions(picture));
             }
             var c = textureSample(picture, filtering, uv);
-            if (v.data.x >> 16u) == 3u {
+            if (data.x >> 16u) == 3u {
                 c = textureSampleGrad(picture, filtering, uv, dx / v.param.zw, dy / v.param.zw);
             }
             if (flags & 16u) != 0u {
                 let size = vec2<i32>(textureDimensions(picture));
                 var at = clamp(vec2<i32>(uv * vec2<f32>(size)), vec2<i32>(0), size - vec2<i32>(1));
-                if (v.data.x >> 16u) == 3u { at = vec2<i32>(floor(fract(uv) * vec2<f32>(size))); }
+                if (data.x >> 16u) == 3u { at = vec2<i32>(floor(fract(uv) * vec2<f32>(size))); }
                 c = textureLoad(picture, at, 0);
             }
             if (flags & 1u) != 0u { c = v.color * c.a; }
-            if (v.data.x >> 16u) == 3u { c *= v.color.a; }
+            if (data.x >> 16u) == 3u { c *= v.color.a; }
             return c;
         }
         default: { return v.color; }
@@ -354,17 +377,23 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     let pixel = fwidth(v.local);
     let dx = dpdx(v.local);
     let dy = dpdy(v.local);
-    let kind = v.data.x & 65535u;
-    let flags = v.data.y;
+    let data = selectors(v);
+    let kind = data.x & 65535u;
+    let flags = data.y;
     var alpha = 1.0;
-    var color = brush(v, dx, dy);
+    var color = brush(v, data, dx, dy);
+    var clip1 = 1.0;
+    if (flags & 128u) != 0u {
+        clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
+    }
     switch kind {
         case 0u: { alpha = shape_coverage(v.local, v.rect, v.radii, pixel); }
         case 1u: {
             alpha = max(0.0, shape_coverage(v.local, v.rect, v.radii, pixel) - shape_coverage(v.local, v.uv, v.param, pixel));
         }
         case 2u: {
-            alpha = shadow(v.local, v.uv, v.radii, v.param.x, pixel);
+            // Where the border box below clips an outer shadow to nothing, skip its integral.
+            if (flags & 128u) == 0u || clip1 < 1.0 { alpha = shadow(v.local, v.uv, v.radii, v.param.x, pixel); }
         }
         case 3u: {
             let uv = mapped(v.local, v.rect, v.uv);
@@ -392,10 +421,8 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
         alpha *= shape_coverage(v.position.xy, v.clip0, unpack_radii(v.clip_radii.xy), vec2<f32>(1.0));
     }
     if (flags & 128u) != 0u {
-        var clip = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
         // Shadow's second slot is its border box, excluded for an outer shadow.
-        if kind == 2u { clip = 1.0 - clip; }
-        alpha *= clip;
+        alpha *= select(clip1, 1.0 - clip1, kind == 2u);
     }
     if (flags & 256u) != 0u {
         alpha *= textureSample(clip_atlas, filtering, mapped(v.position.xy, v.mask_rect, v.mask_uv)).r

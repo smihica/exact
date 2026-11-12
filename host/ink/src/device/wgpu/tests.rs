@@ -26,6 +26,12 @@ fn near(actual: [u8; 4], expected: [u8; 4], tolerance: u8) {
     );
 }
 
+// A drifted line would leave every class on the portable program, slow but correct.
+#[test]
+fn the_shader_has_the_line_a_class_replaces() {
+    assert_eq!(SHADER.matches(GENERIC).count(), 1);
+}
+
 #[test]
 fn rounded_rectangles_ring_and_gaussian_shadow_at_two_times_scale() {
     let Some(mut device) = open() else {
