@@ -27,6 +27,9 @@ mod crop;
 mod decode_tests;
 #[path = "image/jpeg.rs"]
 mod jpeg_decode;
+#[cfg(target_os = "linux")]
+#[path = "image/kiosk_camera.rs"]
+mod kiosk_camera;
 #[path = "image/package.rs"]
 mod package;
 pub use package::Ask as PackageAsk;
@@ -230,6 +233,8 @@ pub struct Images {
     pub(crate) box_index: Option<(u64, u64, std::collections::HashMap<ViewId, usize>)>,
     /// Pictures of a package's scheme, which no file holds (`package.rs`).
     package: package::Pictures,
+    #[cfg(target_os = "linux")]
+    camera: kiosk_camera::Camera,
     /// The screen in device pixels, as the presenter last said: a picture
     /// that fills it is downloaded first.
     pub(crate) screen: (f32, f32),
@@ -265,6 +270,8 @@ impl Images {
             order: None,
             box_index: None,
             package: package::Pictures::default(),
+            #[cfg(target_os = "linux")]
+            camera: kiosk_camera::Camera::new(),
             screen: (0., 0.),
         }
     }
@@ -537,6 +544,12 @@ impl Images {
         for id in gone {
             self.remove(id);
         }
+        #[cfg(target_os = "linux")]
+        self.camera.request(
+            self.views
+                .values()
+                .any(|v| v.source == kiosk_camera::SOURCE && v.visible),
+        );
         reports.extend(self.poll());
         reports
     }
@@ -585,8 +598,14 @@ impl Images {
             self.backend.finish_pictures(text);
         }
         let mut reports = Vec::new();
+        #[cfg(target_os = "linux")]
+        reports.extend(self.poll_camera());
         let scale = self.scale;
         for (id, view) in &mut self.views {
+            #[cfg(target_os = "linux")]
+            if self.camera.enabled && view.source == kiosk_camera::SOURCE {
+                continue;
+            }
             // (An `error` ends its source assignment: nothing more is asked.)
             if self.boot_visible_only && !view.visible
                 || view.source.is_empty()
@@ -877,6 +896,49 @@ impl Images {
             .collect();
         reports
     }
+    #[cfg(target_os = "linux")]
+    fn poll_camera(&mut self) -> Vec<Report> {
+        let output = self.camera.poll(&self.backend);
+        let Some(output) = output else {
+            return Vec::new();
+        };
+        let mut reports = Vec::new();
+        match output {
+            Ok(pixels) => {
+                let natural = (pixels.width(), pixels.height());
+                let bytes = pixels.data().len() as u64;
+                let Ok(reservation) = self.backend.session.reserve_allocation(bytes) else {
+                    return reports;
+                };
+                let Ok(charge) = reservation.commit(bytes) else {
+                    return reports;
+                };
+                let bitmap = Arc::new(Bitmap::decoded(pixels, natural, charge));
+                for (id, view) in &mut self.views {
+                    if view.source == kiosk_camera::SOURCE && view.visible {
+                        self.bitmaps.insert(*id, bitmap.clone());
+                        view.displayed_source = view.source.clone();
+                        self.load_events.extend(view.settle(*id, None));
+                        reports.push((*id, Some((natural.0 as f32, natural.1 as f32))));
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Camera: {error}");
+                for (id, view) in &mut self.views {
+                    if view.source == kiosk_camera::SOURCE {
+                        self.bitmaps.remove(id);
+                        // A stream can fail after its first successful image load.
+                        view.settled = false;
+                        self.load_events
+                            .extend(view.settle(*id, Some(error.clone())));
+                        reports.push((*id, None));
+                    }
+                }
+            }
+        }
+        reports
+    }
     /// Which assignment of its source view `id` shows ([`LoadEvent`]).
     pub(crate) fn assignment(&self, id: ViewId) -> Option<u64> {
         self.views.get(&id).map(|view| view.assignment)
@@ -886,6 +948,10 @@ impl Images {
         // A package's picture is answered through the host's turn, not the
         // workers: nothing here to wait on.
         self.views.values().any(|v| {
+            #[cfg(target_os = "linux")]
+            if self.camera.enabled && v.source == kiosk_camera::SOURCE {
+                return false;
+            }
             (!self.boot_visible_only || v.visible && !v.errored && v.symbol_size.is_none())
                 && !v.source.is_empty()
                 && !self.package.serves(&v.source)
@@ -1029,6 +1095,8 @@ impl Images {
     }
     /// Retire this generation. Old worker/backing ownership remains charged.
     pub fn reset(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.camera.request(false);
         self.backend.retire(self.generation);
         self.views.clear();
         self.package = std::mem::take(&mut self.package).reset();

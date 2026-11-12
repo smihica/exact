@@ -346,7 +346,7 @@ impl Backend {
         let mut input = self.wake_read.lock().unwrap();
         while input.read(&mut bytes).is_ok_and(|n| n > 0) {}
     }
-    fn notify(&self) {
+    pub(super) fn notify(&self) {
         *self.revision.lock().unwrap() += 1;
         self.changed.notify_all();
         let _ = self.wake_write.lock().unwrap().write(&[1]);
