@@ -392,8 +392,10 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             alpha = max(0.0, shape_coverage(v.local, v.rect, v.radii, pixel) - shape_coverage(v.local, v.uv, v.param, pixel));
         }
         case 2u: {
-            // Where the border box below clips an outer shadow to nothing, skip its integral.
-            if (flags & 128u) == 0u || clip1 < 1.0 { alpha = shadow(v.local, v.uv, v.radii, v.param.x, pixel); }
+            // A cached shadow already carries coverage in its image alpha.
+            if (data.x >> 16u) != 2u && ((flags & 128u) == 0u || clip1 < 1.0) {
+                alpha = shadow(v.local, v.uv, v.radii, v.param.x, pixel);
+            }
         }
         case 3u: {
             let uv = mapped(v.local, v.rect, v.uv);

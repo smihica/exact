@@ -25,6 +25,7 @@ mod images;
 #[cfg(all(test, not(windows)))]
 mod ordered_tests;
 mod rows;
+mod shadows;
 mod svg;
 #[cfg(test)]
 mod tests;
@@ -55,6 +56,7 @@ pub struct Ink {
     last_ms: (f64, f64),
     statistics: StatisticsReader,
     rows: rows::Rows,
+    shadows: shadows::Shadows,
 }
 
 impl Ink {
@@ -98,6 +100,9 @@ impl Ink {
             last_ms: (0., 0.),
             statistics: StatisticsReader::default(),
             rows: rows::Rows::default(),
+            shadows: shadows::Shadows::new(
+                std::env::var("KIOSK_SHADOW_CACHE").as_deref() == Ok("1"),
+            ),
         }
     }
 
@@ -563,7 +568,9 @@ impl Backend for Ink {
         {
             return false;
         }
-        let result = self.emit(i, Bindings::default());
+        let result = self
+            .cached_shadow(i, reach)
+            .and_then(|(i, b)| self.emit(i, b));
         self.accept(result);
         true
     }
