@@ -33,6 +33,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 use tiny_skia::Pixmap;
 
+mod kiosk;
 mod pointer;
 #[cfg(test)]
 mod tests;
@@ -57,6 +58,7 @@ pub struct Display {
     flips: FlipState,
     width: u32,
     height: u32,
+    portrait: bool,
 }
 
 impl Display {
@@ -115,12 +117,17 @@ impl Display {
             flips: FlipState::default(),
             width,
             height,
+            portrait: std::env::var("KIOSK_PORTRAIT").as_deref() == Ok("1"),
         })
     }
 
     /// The mode's size, pixels.
     pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
+        if self.portrait {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
     }
 
     /// The mode's refresh rate, Hz.
@@ -157,7 +164,11 @@ impl Display {
             let pitch = db.pitch() as usize;
             {
                 let mut map = card.map_dumb_buffer(db).map_err(|e| format!("map: {e}"))?;
-                copy_xrgb(pixels, map.as_mut(), pitch, self.width, self.height);
+                if self.portrait {
+                    kiosk::copy_portrait(pixels, map.as_mut(), pitch, self.width, self.height);
+                } else {
+                    copy_xrgb(pixels, map.as_mut(), pitch, self.width, self.height);
+                }
             }
             if first {
                 card.set_crtc(
@@ -413,6 +424,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         },
         wall()
     );
+    let timings = std::env::var("KIOSK_TIMING").as_deref() == Ok("1");
     loop {
         if measured {
             // A replaced host's flip and samples are the old runner's.
@@ -422,6 +434,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             }
         }
         if p.dirty() && !display.pending() {
+            let start = Instant::now();
             let Some(frame) = p.display_frame() else {
                 eprintln!("exact: display/presenter submission ownership mismatch");
                 return 1;
@@ -429,7 +442,14 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             if measured {
                 frames.submitted(wall(), p.host().runner().seq(), p.hosts);
             }
+            let render_ms = start.elapsed().as_secs_f64() * 1000.0;
             let submitted = display.submit(frame);
+            if timings {
+                eprintln!(
+                    "kiosk: render_readback={render_ms:.2}ms copy_submit={:.2}ms",
+                    start.elapsed().as_secs_f64() * 1000.0 - render_ms
+                );
+            }
             if !marks.done() {
                 marks.submitted(first_pixel.is_none());
             }
@@ -569,6 +589,12 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             p.check_update();
         }
         let mut events = input.read(wall());
+        if display.portrait {
+            events
+                .iter_mut()
+                .for_each(|event| *event = kiosk::input(*event));
+        }
+        // VNC already uses the logical portrait viewport; only evdev is rotated.
         if let Some(v) = vnc.as_mut() {
             events.extend(v.take_events());
         }
