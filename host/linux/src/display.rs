@@ -425,6 +425,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         wall()
     );
     let timings = std::env::var("KIOSK_TIMING").as_deref() == Ok("1");
+    let mut fps = (std::env::var("KIOSK_FPS").as_deref() == Ok("1")).then(kiosk::Fps::default);
     loop {
         if measured {
             // A replaced host's flip and samples are the old runner's.
@@ -435,6 +436,9 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         }
         if p.dirty() && !display.pending() {
             let start = Instant::now();
+            if let Some(fps) = &mut fps {
+                p.brush.fps = fps.frame(start).or(p.brush.fps);
+            }
             let Some(frame) = p.display_frame() else {
                 eprintln!("exact: display/presenter submission ownership mismatch");
                 return 1;

@@ -40,6 +40,7 @@ mod dialog_shadow;
 pub(crate) use dialog_shadow::DialogShadow;
 pub mod gradient;
 mod grouped;
+mod kiosk;
 mod overlay;
 pub(crate) mod scrollbar;
 pub use gradient::GradientPaint;
@@ -498,11 +499,13 @@ pub struct Scene<'a> {
 }
 
 mod frame;
-pub use backend::{Backend, FrameTarget, WindowLayer};
+pub use backend::{Backend, FrameTarget, WindowLayer, POINTER};
 pub use frame::Frame;
 
 /// The painter: the walk over one backend.
 pub struct Painter {
+    /// KIOSK: frames a second to show in the corner (`KIOSK_FPS=1`).
+    pub(crate) fps: Option<u32>,
     pub(crate) split: Option<crate::presenter::split::Split>,
     pub(crate) window_canvas: Option<ViewId>,
     pub(crate) direct_canvases: std::collections::BTreeSet<ViewId>,
@@ -629,6 +632,7 @@ impl Painter {
     /// A painter over a backend.
     pub fn new(text: Shared, scale: f32, backend: Box<dyn Backend>) -> Painter {
         Painter {
+            fps: None,
             split: None,
             window_canvas: None,
             direct_canvases: Default::default(),
@@ -849,7 +853,10 @@ impl Painter {
         self.viewport = viewport;
         self.backend.page(page_color(self.dark));
         let partial = if let Some(previous) = self.damage.pixels.as_ref().filter(|_| {
-            !self.damage.next.is_empty() && self.top_surface.is_none() && !self.scrollbars.enabled
+            !self.damage.next.is_empty()
+                && self.top_surface.is_none()
+                && !self.scrollbars.enabled
+                && self.fps.is_none()
         }) {
             self.backend.begin_damage(
                 viewport.0,
@@ -904,6 +911,7 @@ impl Painter {
         if let Some((px, py)) = scene.pointer {
             self.backend.pointer(px, py);
         }
+        self.paint_fps(viewport);
         self.boxes_hint = walk.boxes.len();
         #[cfg(target_os = "macos")]
         drop(_trace);
@@ -1449,17 +1457,6 @@ fn intersect(a: Rect4, b: Rect4) -> Rect4 {
     let y1 = (a.1 + a.3).min(b.1 + b.3);
     (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
-
-/// The pointer arrow's outline, at the origin, in points.
-pub const POINTER: [(f32, f32); 7] = [
-    (0.0, 0.0),
-    (0.0, 16.0),
-    (4.0, 12.5),
-    (7.0, 19.0),
-    (9.5, 18.0),
-    (6.5, 11.5),
-    (11.5, 11.5),
-];
 
 #[cfg(test)]
 mod inline_image_tests;
