@@ -4,6 +4,9 @@ This fork evaluates Exact on a Raspberry Pi 4 touchscreen kiosk. It carries
 experimental Linux display, input and camera changes alongside Ink performance
 work. The starting revision is `fe4632ed1800ce58f3bcfa880e95f834395d77d9`.
 
+The [kiosk change memo](memo/kiosk-upstream.md) maps each experiment to its code,
+assesses its value to upstream, and records the measurements and open questions.
+
 ## Branches and review
 
 - `main` follows `expo/exact:main` and contains no kiosk changes.
@@ -20,17 +23,7 @@ work. The starting revision is `fe4632ed1800ce58f3bcfa880e95f834395d77d9`.
   camera captures out of this public repository and its commit history.
   Upstream feedback is shared through separately reviewed issues.
 
-## Implemented paths
-
-| Area | Scope |
-| --- | --- |
-| GPU limits | Use the selected adapter's limits for wgpu Ink and Linux Vello. |
-| Ink shaders | Specialize wgpu primitive/brush/flag classes on every platform; retain `EXACT_INK_GENERIC` for comparisons. |
-| Direct presentation | Vulkan display surface, GPU portrait rotation, and Pi render/display-device matching in vendored wgpu-hal. |
-| Touch | Hide the cursor for BTN_TOUCH input; KMS vertical drag, fling, catch and rubber-band overscroll. |
-| Dialog | Optional fixed black 72% comparison scrim follows the dialog's transition; it replaces the authored/platform scrim. |
-| Camera | Explicitly enabled `rpicam-vid` preview through the Linux image path; latest frame only. |
-| Shadows | Reuse a blurred-alpha texture for fixed geometry, with optional outer-band drawing. |
+## Runtime switches
 
 Build the consuming app with the Linux host's `scanout` feature for direct
 presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
@@ -38,6 +31,8 @@ presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
 `KIOSK_PORTRAIT=1` maps a landscape panel to a portrait UI and rotates absolute
 touch coordinates with it. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
+Setting `EXACT_INK_GENERIC` to any value disables shader specialization for
+comparisons.
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
