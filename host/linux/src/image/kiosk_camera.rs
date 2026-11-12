@@ -7,6 +7,47 @@ use std::sync::{
 use std::thread::JoinHandle;
 use tiny_skia::Pixmap;
 
+// KIOSK: analysis consumers share the preview stream instead of opening the device twice.
+/// One unrotated, tightly packed luminance plane from the kiosk capture.
+#[derive(Clone)]
+pub struct LumaFrame {
+    /// Plane width in pixels.
+    pub width: usize,
+    /// Plane height in pixels.
+    pub height: usize,
+    /// Row-major luminance samples, one byte per pixel.
+    pub pixels: Arc<[u8]>,
+}
+
+type Reader = std::sync::mpsc::SyncSender<LumaFrame>;
+static READERS: Mutex<Vec<Reader>> = Mutex::new(Vec::new());
+
+/// Subscribe to the fixed kiosk camera's unrotated luminance frames.
+/// The one-frame mailbox drops frames while the consumer is busy. Dropping the
+/// receiver unsubscribes on the next frame; it never starts or owns the camera.
+pub fn frames() -> std::sync::mpsc::Receiver<LumaFrame> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    READERS.lock().unwrap().push(sender);
+    receiver
+}
+
+fn publish(readers: &mut Vec<Reader>, pixels: &[u8], width: usize, height: usize) {
+    if readers.is_empty() {
+        return;
+    }
+    let frame = LumaFrame {
+        width,
+        height,
+        pixels: pixels.into(),
+    };
+    readers.retain(|reader| {
+        !matches!(
+            reader.try_send(frame.clone()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_))
+        )
+    });
+}
+
 pub(super) const SOURCE: &str = "kiosk-camera:preview";
 const WIDTH: usize = 640;
 const HEIGHT: usize = 480;
@@ -182,6 +223,12 @@ fn capture(
                 Err(error) => return Err(error.to_string()),
             }
             if used == bytes.len() {
+                publish(
+                    &mut READERS.lock().unwrap(),
+                    &bytes[..WIDTH * HEIGHT],
+                    WIDTH,
+                    HEIGHT,
+                );
                 let started = Instant::now();
                 let frame = portrait_frame(&bytes, WIDTH, HEIGHT);
                 conversion += started.elapsed();
@@ -235,6 +282,23 @@ fn portrait_frame(bytes: &[u8], width: usize, height: usize) -> Pixmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kiosk_camera_reader_is_bounded_and_unsubscribes() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut readers = vec![tx];
+        publish(&mut readers, &[1, 2], 2, 1);
+        publish(&mut readers, &[3, 4], 2, 1);
+        let frame = rx.try_recv().unwrap();
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(&*frame.pixels, &[1, 2]);
+        assert!(rx.try_recv().is_err());
+        publish(&mut readers, &[5, 6], 2, 1);
+        assert_eq!(&*rx.try_recv().unwrap().pixels, &[5, 6]);
+        drop(rx);
+        publish(&mut readers, &[7, 8], 2, 1);
+        assert!(readers.is_empty());
+    }
+
     #[test]
     fn kiosk_camera_neutral_chroma_and_clockwise_rotation() {
         let image = portrait_frame(&[0, 255, 64, 128, 128, 128], 2, 2);
