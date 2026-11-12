@@ -1,5 +1,8 @@
 # Agent instructions
 
+On this fork, read [KIOSK.md](KIOSK.md) for the kiosk branch and review workflow.
+Pull requests target `smihica/exact:kiosk`; do not open pull requests against `expo/exact`.
+
 **Building an app with Exact rather than working on it?** This checkout is the version to use:
 Exact has no releases, tags or npm package, and an app uses the checkout by path. Make it with
 `bun scripts/exact.mjs new <path>`. A website (pages served to a browser) reads only
