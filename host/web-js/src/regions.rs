@@ -83,9 +83,9 @@ impl Em<'_> {
     }
 
     /// The declaration of arm `arm`'s own slots, as `name` (the enclosing
-    /// instances' slots spread in), each a signal started from its
-    /// initializer in `scope`, which then reads them through `name`; empty
-    /// when it owns none. `carry`, the dev loop's for a tab panel's arm: an
+    /// instances' slots spread in), initialized in declaration order so a
+    /// later slot can read an earlier one through `name`; empty when it
+    /// owns none. `carry`, the dev loop's for a tab panel's arm: an
     /// expression naming the panel, by which each is carried across a reload.
     fn owned(
         &mut self,
@@ -95,7 +95,14 @@ impl Em<'_> {
         carry: Option<&str>,
     ) -> Result<String, String> {
         let plan = self.plan;
-        let mut own = Vec::new();
+        if self.answers.slots(arm).is_empty() {
+            return Ok(String::new());
+        }
+        let mut decl = match &scope.rows {
+            Some(outer) => format!("const {name}={{...{outer}}};"),
+            None => format!("const {name}={{}};"),
+        };
+        scope.rows = Some(name.to_string());
         for &k in self.answers.slots(arm) {
             scope.row_slots.insert(k);
             let slot = &plan.slots[k];
@@ -107,23 +114,16 @@ impl Em<'_> {
             if let Some(panel) = carry {
                 let quoted = serde_json::to_string(plan.str(slot.name)).unwrap();
                 let declared = type_json(plan, slot.ty);
-                own.push(format!(
-                    "{k}:$devSig({quoted}+\"@\"+{panel},{init},{ty},{declared})"
-                ));
+                let _ = write!(
+                    decl,
+                    "{name}[{k}]=$devSig({quoted}+\"@\"+{panel},{init},{ty},{declared});"
+                );
                 continue;
             }
             let sig = self.uses.rt("sig");
-            let name = string_name(plan, slot);
-            own.push(format!("{k}:{sig}({init},{ty}{name})"));
+            let slot_name = string_name(plan, slot);
+            let _ = write!(decl, "{name}[{k}]={sig}({init},{ty}{slot_name});");
         }
-        if own.is_empty() {
-            return Ok(String::new());
-        }
-        let decl = match &scope.rows {
-            Some(outer) => format!("const {name}={{...{outer},{}}};", own.join(",")),
-            None => format!("const {name}={{{}}};", own.join(",")),
-        };
-        scope.rows = Some(name.to_string());
         Ok(decl)
     }
 

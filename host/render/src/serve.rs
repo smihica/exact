@@ -15,7 +15,7 @@
 
 use crate::encode::{self, Accepts, Variants};
 use crate::files::{asset_shaped, named_build, percent_decode, static_file, AUTH_CALLBACK};
-use crate::{page, render_as, Ids, Rendered};
+use crate::{page, render_with, Ids, Projection, Rendered};
 use exact_plan::{Plan, RenderPolicy};
 use exact_runner::DataSource;
 use exact_web::document::{canonical_location, route_at, Site};
@@ -109,6 +109,7 @@ struct Shared {
     /// What of the viewport the plan reads (LLP 1048.006).
     reads: crate::viewport::Reads,
     pages: Mutex<VecDeque<CachedPage>>,
+    best: Arc<crate::best::Compressor>,
     variants: Variants,
     generations: Option<crate::generations::Generations>,
     /// The entry's `modulepreload`s, for a 103 ([`crate::stream::hint`]).
@@ -221,6 +222,7 @@ impl Server {
                 page_headers,
                 reads,
                 pages: Mutex::new(VecDeque::new()),
+                best: Arc::default(),
                 variants,
                 generations,
                 hints,
@@ -458,13 +460,25 @@ impl Response {
             _ => "",
         };
         let mut out = format!("HTTP/1.1 {} {reason}\r\n", self.status);
+        let page = self
+            .headers
+            .iter()
+            .any(|(name, value)| *name == "Content-Type" && value.starts_with("text/html"));
         // A 304 carries what updates the copy the client holds (RFC 9110
         // §15.4.5), nothing of the representation's own: its CSP, surrogate
-        // keys and length are the stored response's already.
+        // keys and length are the stored response's already. Its `Vary` is
+        // every one its 200 sends, a page's viewport `Vary` among them.
         if self.status == 304 {
             for (name, value) in &self.headers {
                 if matches!(*name, "ETag" | "Cache-Control" | "Vary" | "Expires" | "Age") {
                     let _ = write!(out, "{name}: {value}\r\n");
+                }
+            }
+            if page {
+                for line in page_headers.split_inclusive("\r\n") {
+                    if line.starts_with("Vary:") {
+                        out.push_str(line);
+                    }
                 }
             }
             let _ = write!(out, "Connection: {connection}\r\n\r\n");
@@ -478,10 +492,6 @@ impl Response {
         // A page's policy. On a script's response a CSP would govern only a
         // worker made from it, and a module worker evaluates the module text
         // it verified against the receipt (LLP 1027.002 D2).
-        let page = self
-            .headers
-            .iter()
-            .any(|(name, value)| *name == "Content-Type" && value.starts_with("text/html"));
         if page {
             let _ = write!(out, "Content-Security-Policy: {csp}\r\n");
             // A page's own code never reaches a device the app was not
@@ -953,7 +963,7 @@ fn render_kept<D: DataSource + 'static>(
         accepts: request.accepts,
         cdn: request.cdn,
         dictionary: None,
-        navigate: request.navigate,
+        navigate: request.navigate && request.if_none_match.is_none(),
         keep: request.keep,
         hints: request.hints,
     };
@@ -978,10 +988,7 @@ fn render_kept<D: DataSource + 'static>(
         // This response goes out compressed as it is sent; later hits get the
         // best, made here once, off every request's path.
         let best = Arc::new(OnceLock::new());
-        let (made, body) = (Arc::clone(&best), response.body.clone());
-        let _ = std::thread::Builder::new()
-            .name("exact-render-best".into())
-            .spawn(move || made.set(encode::Best::of(&body)));
+        shared.best.make(&best, response.body.clone());
         let dictionary = wanted.and_then(|wanted| {
             (wanted == hash).then(|| response.body.clone()).or_else(|| {
                 pages
@@ -1216,12 +1223,13 @@ fn document<D: DataSource + 'static>(
     // runner's instance tree and sent as it is written (LLP 1048.004).
     let mut streamed_body = false;
     let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut projection = Projection::Auto;
         if let Some((out, head, at)) = flush.as_mut() {
             let mut send = |bytes: &[u8]| out.send(bytes);
             let late = |activate: exact_plan::ActivatePolicy| {
                 !preload && crate::page::activate_js(activate) != "interaction"
             };
-            if let Some((rendered, body)) = crate::direct::render_js(
+            if let Some(page) = crate::direct::render_js(
                 &shared.plan,
                 &data,
                 viewport,
@@ -1235,19 +1243,22 @@ fn document<D: DataSource + 'static>(
                 &mut send,
             )? {
                 streamed_body = true;
-                return Ok((rendered, head.clone() + &body));
+                return Ok((page.rendered, head.clone() + &page.body));
             }
+            // The direct writer requires a kernel; do not settle without one again.
+            projection = Projection::Kernel;
         }
         // A JavaScript page drops the document's view ids (page::for_runtime).
         let ids = if shared.js { Ids::Any } else { Ids::Runtime };
-        render_as(
+        render_with(
             &shared.plan,
-            data,
+            &data,
             viewport,
             location,
             &site,
             serve.deadline,
             ids,
+            projection,
         )
         .and_then(|rendered| {
             let html = match &flush {

@@ -34,6 +34,8 @@ pub struct DocNode {
     pub style: Rc<StyleProps>,
     /// Its props.
     pub props: PropList,
+    /// Whether its plan site has host-known state looks (LLP 1121 D8).
+    pub has_looks: bool,
     /// Whether it is a root.
     pub is_root: bool,
     /// The plan node it realizes; `None` for a virtualized list's spacer or
@@ -105,6 +107,7 @@ impl DocTree {
             node_type: node.node_type,
             style: &node.style,
             props: &node.props,
+            has_looks: node.has_looks,
             is_root: node.is_root,
             inline_run,
             symbol_color: self.symbol_color(node),
@@ -328,6 +331,11 @@ impl Build<'_> {
             children,
             style,
             props,
+            has_looks: self
+                .plan
+                .looks
+                .binary_search_by_key(&n.node.0, |look| look.node.0)
+                .is_ok(),
             is_root: parent.is_none(),
             site: Some(n.node),
         });
@@ -363,6 +371,7 @@ impl Build<'_> {
                 children: roots.map(roots_of).unwrap_or_default(),
                 style: Rc::new(style),
                 props,
+                has_looks: false,
                 is_root: false,
                 site: None,
             });

@@ -35,11 +35,11 @@ fn split(run: &Run, find: &dyn Fn(&str) -> Option<String>, out: &mut Vec<Run>) {
             break;
         };
         let number_at = start + prefix.len();
-        let number = number(&text[number_at..]);
-        let Some(path) = (if number.is_empty() {
+        let written = number(&text[number_at..]);
+        let Some((number, path)) = (if written.is_empty() {
             None
         } else {
-            find(&number)
+            longest(&written, find)
         }) else {
             at = number_at.max(at + 1);
             continue;
@@ -88,22 +88,34 @@ fn next_reference(text: &str, from: usize) -> Option<(usize, &'static str)> {
     best
 }
 
-/// The digits (and one dotted part) a reference's number is made of.
+/// The digits and every dotted part a reference's number is made of: the
+/// corpus numbers documents three and four levels deep (`1012.001.000`). A
+/// dot not followed by a digit (a sentence's) is not taken.
 fn number(text: &str) -> String {
-    let major: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if major.is_empty() {
-        return major;
+    let mut out: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if out.is_empty() {
+        return out;
     }
-    let rest = &text[major.len()..];
-    match rest.strip_prefix('.') {
-        Some(after) => {
-            let minor: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if minor.is_empty() {
-                major
-            } else {
-                format!("{major}.{minor}")
-            }
+    let mut rest = &text[out.len()..];
+    while let Some(after) = rest.strip_prefix('.') {
+        let part: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if part.is_empty() {
+            break;
         }
-        None => major,
+        out.push('.');
+        out.push_str(&part);
+        rest = &after[part.len()..];
+    }
+    out
+}
+
+/// The longest prefix of `number`, by dotted parts, that names a document.
+fn longest(number: &str, find: &dyn Fn(&str) -> Option<String>) -> Option<(String, String)> {
+    let mut candidate = number;
+    loop {
+        if let Some(path) = find(candidate) {
+            return Some((candidate.to_string(), path));
+        }
+        candidate = &candidate[..candidate.rfind('.')?];
     }
 }

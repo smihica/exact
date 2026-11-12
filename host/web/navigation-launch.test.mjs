@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
-import { historyURL, launchLocation } from './navigation.js';
+import { historyURL } from './navigation/routes.js';
+import { launchLocation } from './navigation/environment.js';
 
 // A drive's launch facts (scripts/agent-launch.mjs) are the carrier's, not the app's: none reaches the launch
 // route, and every History entry keeps them, so a reload relaunches with them. `formatLocale` (#952) among them.
@@ -30,6 +31,15 @@ test('a History entry keeps the userinfo of a page opened with one', () => {
   Object.defineProperty(globalThis, 'location', { configurable: true, value: { origin: 'http://127.0.0.1:9', href: 'http://user:pass@127.0.0.1:9/' } });
   try {
     expect(historyURL('/item/7?q=a#moves')).toBe('http://user:pass@127.0.0.1:9/item/7?q=a#moves');
+  } finally { if (saved) Object.defineProperty(globalThis, 'location', saved); else delete globalThis.location; }
+});
+
+test('a History entry is made under a location with no origin, as the render server gives', () => {
+  // The JavaScript render server's placeholder location has an `href` and an empty `origin` (host/web-js/render.mjs).
+  const saved = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { configurable: true, value: { origin: '', href: 'http://render.invalid/' } });
+  try {
+    expect(historyURL('/item/7?q=a#moves')).toBe('http://render.invalid/item/7?q=a#moves');
   } finally { if (saved) Object.defineProperty(globalThis, 'location', saved); else delete globalThis.location; }
 });
 

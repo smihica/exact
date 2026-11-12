@@ -27,7 +27,11 @@ pub struct Directories {
 }
 
 enum Pending {
+    /// An answer's continuation, under the token its child handed out.
     Child(u64),
+    /// A kept reply's delivery continuation, under its child's token. The
+    /// runner holds it as module work, outside what `forgotten` names.
+    Delivery(u64),
     #[cfg(not(target_arch = "wasm32"))]
     Storage(Vec<u8>, String),
 }
@@ -43,6 +47,8 @@ pub struct Storage<D> {
     next: u64,
     pending: BTreeMap<u64, Pending>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(not(target_arch = "wasm32"))]
+    storage_changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A scripted drive (`EXACT_AGENT=1`): storage is the scratch store it
     /// names, else none.
     agent: bool,
@@ -64,6 +70,8 @@ impl<D> Storage<D> {
             next: 0,
             pending: BTreeMap::new(),
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_changed: Default::default(),
             agent: std::env::var("EXACT_AGENT").as_deref() == Ok("1"),
             logs: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -77,6 +85,16 @@ impl<D: Default> Default for Storage<D> {
     }
 }
 impl<D: DataSource> Storage<D> {
+    /// Keeps `pending` under a new token of this executor's.
+    fn token(&mut self, pending: Pending) -> Result<u64, DataError> {
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| unavailable("storage token space exhausted"))?;
+        self.pending.insert(self.next, pending);
+        Ok(self.next)
+    }
+
     fn step(
         &mut self,
         store: &mut Store,
@@ -127,23 +145,13 @@ impl<D: DataSource> Storage<D> {
                         .grants
                         .clone()
                         .unwrap_or_else(|| self.grants().into());
-                    self.next = self
-                        .next
-                        .checked_add(1)
-                        .ok_or_else(|| unavailable("storage token space exhausted"))?;
-                    self.pending
-                        .insert(self.next, Pending::Storage(payload.clone(), scope));
-                    *request = exact_runner::Request::continuation(self.next);
+                    let token = self.token(Pending::Storage(payload.clone(), scope))?;
+                    *request = exact_runner::Request::continuation(token);
                     return Ok(answer);
                 }
             }
-            if let Some(token) = request.continuation {
-                self.next = self
-                    .next
-                    .checked_add(1)
-                    .ok_or_else(|| unavailable("storage token space exhausted"))?;
-                self.pending.insert(self.next, Pending::Child(token));
-                request.continuation = Some(self.next);
+            if let Some(child) = request.continuation {
+                request.continuation = Some(self.token(Pending::Child(child))?);
             }
         }
         Ok(answer)
@@ -152,7 +160,7 @@ impl<D: DataSource> Storage<D> {
 fn unavailable(s: impl Into<String>) -> DataError {
     DataError::Unavailable(s.into())
 }
-impl<D: DataSource> DataSource for Storage<D> {
+impl<D: DataSource> exact_runner::DataSourceWrapper for Storage<D> {
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -161,7 +169,17 @@ impl<D: DataSource> DataSource for Storage<D> {
         self.source.prepare_snapshot(module, deadline)
     }
     fn take_storage_changed(&mut self) -> bool {
-        self.source.take_storage_changed()
+        let changed = self.source.take_storage_changed();
+        #[cfg(not(target_arch = "wasm32"))]
+        let changed = self
+            .storage_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            || changed;
+        changed
+    }
+
+    fn note_storage_changed(&mut self) {
+        self.source.note_storage_changed();
     }
 
     fn set_document_owner(&mut self, owner: u64) {
@@ -239,6 +257,16 @@ impl<D: DataSource> DataSource for Storage<D> {
     fn canvas_surfaces(&self) -> Vec<(String, usize)> {
         self.source.canvas_surfaces()
     }
+    fn draw_2d(
+        &mut self,
+        surface: &str,
+        args: &[Value],
+        ctx: &exact_runner::exact_canvas::Context2d,
+        frame: &exact_runner::exact_canvas::Frame,
+    ) -> Result<bool, exact_runner::exact_canvas::DrawError> {
+        self.source.draw_2d(surface, args, ctx, frame)
+    }
+
     fn draw(
         &mut self,
         request: &exact_runner::DrawRequest<'_>,
@@ -250,7 +278,15 @@ impl<D: DataSource> DataSource for Storage<D> {
         self.source.canvases_retired(retired)
     }
     fn host_continuation(&self, token: u64) -> bool {
-        self.source.host_continuation(token)
+        if token == exact_runner::BACKGROUND {
+            return self.source.host_continuation(token);
+        }
+        match self.pending.get(&token) {
+            Some(Pending::Child(child) | Pending::Delivery(child)) => {
+                self.source.host_continuation(*child)
+            }
+            _ => false,
+        }
     }
 
     fn configure_secrets(
@@ -319,7 +355,7 @@ impl<D: DataSource> DataSource for Storage<D> {
     /// Continuation tokens are this source's own: each goes back to its
     /// child's where the child handed one out (a storage request's never
     /// did, and one already dispatched can't be told any more), and an entry
-    /// the runner no longer has in flight is let go.
+    /// the runner no longer has in flight is let go, apart from a delivery's.
     fn forgotten(&mut self, store: &exact_runner::Store, in_flight: &[InFlight<'_>]) {
         let view: Vec<InFlight<'_>> = in_flight
             .iter()
@@ -334,7 +370,8 @@ impl<D: DataSource> DataSource for Storage<D> {
             })
             .collect();
         let tokens: HashSet<u64> = in_flight.iter().filter_map(|f| f.continuation).collect();
-        self.pending.retain(|outer, _| tokens.contains(outer));
+        self.pending
+            .retain(|outer, p| matches!(p, Pending::Delivery(_)) || tokens.contains(outer));
         self.source.forgotten(store, &view);
     }
 
@@ -344,7 +381,7 @@ impl<D: DataSource> DataSource for Storage<D> {
             return self.source.dispatch(token, store);
         }
         match self.pending.get(&token) {
-            Some(Pending::Child(child)) => {
+            Some(Pending::Child(child) | Pending::Delivery(child)) => {
                 let child = *child;
                 let dispatch = self.source.dispatch(child, store);
                 if !matches!(dispatch, Dispatch::Held) {
@@ -353,7 +390,7 @@ impl<D: DataSource> DataSource for Storage<D> {
                 dispatch
             }
             #[cfg(not(target_arch = "wasm32"))]
-            Some(Pending::Storage(..)) => match self.continuation(token) {
+            Some(Pending::Storage(..)) => match DataSource::continuation(self, token) {
                 Some(work) => Dispatch::Run(exact_runner::Work::Now(work)),
                 None => Dispatch::Missing,
             },
@@ -367,7 +404,7 @@ impl<D: DataSource> DataSource for Storage<D> {
             let outer = self
                 .pending
                 .iter()
-                .find(|(_, p)| matches!(p, Pending::Child(c) if *c == child))
+                .find(|(_, p)| matches!(p, Pending::Child(c) | Pending::Delivery(c) if *c == child))
                 .map(|(outer, _)| *outer);
             let Some(outer) = outer else {
                 continue;
@@ -381,7 +418,8 @@ impl<D: DataSource> DataSource for Storage<D> {
     }
 
     fn discard(&mut self, token: u64) {
-        if let Some(Pending::Child(child)) = self.pending.remove(&token) {
+        if let Some(Pending::Child(child) | Pending::Delivery(child)) = self.pending.remove(&token)
+        {
             self.source.discard(child);
         }
     }
@@ -403,8 +441,9 @@ impl<D: DataSource> DataSource for Storage<D> {
     }
 
     // Work that outlives its answer (LLP 1146 D2): its tokens are the
-    // source's own, which the runner keeps beside its tickets, so nothing is
-    // remapped.
+    // source's own, which the runner keeps beside its tickets, so they are
+    // not remapped. A delivery's continuation is dispatched like any other,
+    // so it goes out under one of this executor's.
     fn keeps_sent(&self, fetch: u64) -> bool {
         self.source.keeps_sent(fetch)
     }
@@ -424,7 +463,13 @@ impl<D: DataSource> DataSource for Storage<D> {
         token: u64,
         outcome: Outcome,
     ) -> Result<Option<exact_runner::Request>, DataError> {
-        self.source.module_delivery(store, token, outcome)
+        let Some(mut request) = self.source.module_delivery(store, token, outcome)? else {
+            return Ok(None);
+        };
+        if let Some(child) = request.continuation {
+            request.continuation = Some(self.token(Pending::Delivery(child))?);
+        }
+        Ok(Some(request))
     }
 
     // The kept request's token is the source's own, as above; the
@@ -436,9 +481,7 @@ impl<D: DataSource> DataSource for Storage<D> {
     ) -> Option<(u64, exact_runner::Request)> {
         let (token, mut request) = self.source.timer_before_reply(store, in_flight)?;
         let child = request.continuation?;
-        self.next = self.next.checked_add(1)?;
-        self.pending.insert(self.next, Pending::Child(child));
-        request.continuation = Some(self.next);
+        request.continuation = Some(self.token(Pending::Child(child)).ok()?);
         Some((token, request))
     }
 
@@ -470,12 +513,14 @@ impl<D: DataSource> DataSource for Storage<D> {
             return self.source.continuation(token);
         }
         match self.pending.remove(&token)? {
-            Pending::Child(token) => self.source.continuation(token),
+            Pending::Child(token) | Pending::Delivery(token) => self.source.continuation(token),
             #[cfg(not(target_arch = "wasm32"))]
             Pending::Storage(payload, grants) => {
                 let paths = self.directories.clone();
                 let owner = self.document_owner;
                 let alive = self.alive.clone();
+                let storage_changed = self.storage_changed.clone();
+                let app_grants = self.source.grants().to_owned();
                 let refused =
                     paths.is_none() && self.agent && !native::independent_storage(&payload);
                 if refused && !self.told_agent {
@@ -495,7 +540,14 @@ impl<D: DataSource> DataSource for Storage<D> {
                     if refused {
                         return native::agent_refusal();
                     }
-                    native::run(paths.as_ref(), &grants, &payload, owner)
+                    native::run(
+                        paths.as_ref(),
+                        &grants,
+                        &app_grants,
+                        &payload,
+                        owner,
+                        &storage_changed,
+                    )
                 }))
             }
         }

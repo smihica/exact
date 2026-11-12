@@ -42,7 +42,8 @@ fn main() {
             contract::rust_entry(
                 "typetour_data::Tour",
                 "typetour_data::Tour",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

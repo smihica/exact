@@ -227,7 +227,7 @@ extension Agent {
     static func ownControls(in window: UIWindow) -> CGRect? {
         var union: CGRect? = nil, pending: [UIView] = [window]
         while let v = pending.popLast() {
-            guard !v.isHidden, v.alpha > 0.01 else { continue }
+            guard !v.isHidden, v.alpha > 0.01, (v as? NodeView)?.drawnBySurface != true else { continue }
             #if os(iOS)
             let moves = v is UISegmentedControl || v is UISwitch || v is UISlider || v is UIStepper || v is UITabBar
             #else

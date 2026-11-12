@@ -180,7 +180,7 @@ extension NodeView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         if let box = clipBox?.layer {
-            let clipRadius = p.oneRadius && !p.shaped && !p.partialCorners ? p.radius : 0
+            let clipRadius = p.oneRadius && !p.shaped && !p.partialCorners && !clipsOneAxis ? p.radius : 0
             if box.cornerRadius != clipRadius { box.cornerRadius = clipRadius }
             if clipRadius > 0, box.maskedCorners != p.corners { box.maskedCorners = p.corners }
             if box.cornerCurve != p.curve { box.cornerCurve = p.curve }
@@ -266,7 +266,7 @@ extension NodeView {
     private func applyClipOnly() {
         guard let l = clipBox?.layer ?? layer else { return }
         let radii = cornerSizes(in: bounds)
-        let clips = clipsToBounds || clipBox != nil
+        let clips = (clipsToBounds || clipBox != nil) && !clipsOneAxis
         let first = radii[0]
         let circular = radii.allSatisfy { abs($0.width - $0.height) < 0.01 && abs($0.width - first.width) < 0.01 }
             && first.width <= min(bounds.width, bounds.height) / 2

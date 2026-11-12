@@ -2,6 +2,52 @@
 
 use super::*;
 
+/// Keep the iterator temporaries out of `inline_use`'s recursive frame.
+#[inline(never)]
+fn value_names(c: &Component) -> BTreeSet<String> {
+    c.states
+        .iter()
+        .chain(&c.derives)
+        .map(|b| b.name.clone())
+        .chain(
+            c.resources
+                .iter()
+                .filter(|r| super::reads_device(r))
+                .map(|r| r.name.clone()),
+        )
+        .chain(
+            c.props
+                .iter()
+                .chain(&c.injects)
+                .filter(|p| !p.ty.as_ref().is_some_and(is_action))
+                .map(|p| p.name.clone()),
+        )
+        .collect()
+}
+
+/// Refuse a use of `name`, which `ctx.path` holds at `at`: out of line, so
+/// `inline_use`'s frame, which recursion repeats, stays small.
+#[cold]
+#[inline(never)]
+fn refuse_recursion(ctx: &mut Ctx<'_>, name: &str, at: usize, span: crate::Span) {
+    let via = match &ctx.path[at + 1..] {
+        [] => String::new(),
+        names => format!(
+            " (through {})",
+            names
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    ctx.refuse(
+        "syntax-inline-depth",
+        format!("component `{name}` uses itself{via}: a component cannot recurse (LLP 1017.002); draw a tree's levels as rows of a `for` over its flattened list"),
+        span,
+    );
+}
+
 #[inline(never)]
 pub(super) fn inline_use(
     node: &Node,
@@ -30,6 +76,12 @@ pub(super) fn inline_use(
         ctx.refuse("syntax-unknown-component", message, *span);
         return Ok(Vec::new());
     };
+    // A use of a component already being inlined above it never ends; with
+    // two such uses, expansion doubled for 32 levels before the depth bound.
+    if let Some(at) = ctx.path.iter().position(|c| c == name) {
+        refuse_recursion(ctx, name, at, *span);
+        return Ok(Vec::new());
+    }
     // Renaming walks the child's authored tree while the caller's inline
     // frames remain live. Refuse an over-deep expansion before that walk.
     if exceeds_site_budget(&c.view, ctx.file, ctx.discarded_slots, ctx.site_depth) {
@@ -138,18 +190,7 @@ pub(super) fn inline_use(
             Expr::Ident(super::hoisted(&c.name, &r.name), *span),
         );
     }
-    let value_names = c
-        .states
-        .iter()
-        .chain(&c.derives)
-        .map(|b| b.name.clone())
-        .chain(
-            c.resources
-                .iter()
-                .filter(|r| super::reads_device(r))
-                .map(|r| r.name.clone()),
-        )
-        .collect();
+    let value_names = value_names(c);
     // Closure-convert child props/injects into hidden action
     // parameters. A handler evaluates these curried arguments
     // at its exact node site, so intervening `if`/`match`
@@ -159,12 +200,7 @@ pub(super) fn inline_use(
         .props
         .iter()
         .chain(&c.injects)
-        .filter(|prop| {
-            !matches!(
-                prop.ty.as_ref(),
-                Some(TypeExpr::Named(name, _)) if name == "action"
-            )
-        })
+        .filter(|prop| !prop.ty.as_ref().is_some_and(is_action))
         .enumerate()
         .map(|(i, prop)| {
             let hidden = format!("@capture:{n}:{i}");
@@ -195,8 +231,6 @@ pub(super) fn inline_use(
             continue;
         };
         let (target, curried) = match value {
-            // A prop the use lacks, already refused.
-            Expr::Ident(target, _) if target == "?" => continue,
             Expr::Ident(target, _) => (target.clone(), Vec::new()),
             Expr::Call(target, curried, _) => (target.clone(), curried.clone()),
             other => {
@@ -205,7 +239,9 @@ pub(super) fn inline_use(
                                 format!("`{}` is called by an action, so it must name an action, as `{}=act` or `{}=act(args)` does", prop.name, prop.name, prop.name),
                                 other.span(),
                             );
-                continue;
+                // Keep the call marked; an unknown command here would only
+                // repeat this binding's refusal in the child's body.
+                ("?".into(), Vec::new())
             }
         };
         let binding = args
@@ -353,6 +389,7 @@ pub(super) fn inline_use(
             provides: ctx.provides.clone(),
             outer: ctx.fill.clone(),
             instance: ctx.instance,
+            path: ctx.path.clone(),
         })
     });
     // Rename only the view: declarations were lifted above.
@@ -367,7 +404,9 @@ pub(super) fn inline_use(
             .push((b.name.clone(), subst_expr(&b.expr, &mut child)));
     }
     ctx.depth += 1;
+    ctx.path.push(name.clone());
     let body = inline_nodes(&renamed, &mut child, ctx);
+    ctx.path.pop();
     ctx.depth -= 1;
     ctx.provides.truncate(outer_provides);
     ctx.fill = outer_fill;

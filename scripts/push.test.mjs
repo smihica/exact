@@ -1,41 +1,45 @@
-import { validateChannel, sha256, blobPath } from './origin.mjs';
-import {expect, test} from 'bun:test';
+import { validateChannel, channelOrigin, sha256, blobPath } from './origin.mjs';
+import {expect, mock, test} from 'bun:test';
 import * as fs from 'node:fs';
 import {tmpdir, homedir} from 'node:os';
 import {resolve, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {classifyArtifacts} from './app.mjs';
+import {spawnSync as realSpawnSync} from 'node:child_process';
+import {channelOf} from './deploy.mjs';
+import {filesystem, filesystemRead} from './filesystem.mjs';
 
 // The publisher's functions with boundary doubles, for an app at a fresh
 // root whose cohort's binary has prelude runtime 4 and whose baked module
 // needs `runtime` (its receipt's). Bun's native subprocess import bypasses
 // module mocks; explicit bindings also isolate deployment tests.
-function harness(classify=()=>({bundle:true}), runtime=4) {
+function harness(classify=()=>({bundle:true}), runtime=4, {bake, cohortRuntime=4, grants=''}={}) {
   const root=fs.mkdtempSync(resolve(tmpdir(),'exact-push-profile-'));
-  const app={id:'fixture',name:'fixture',dir:root,target:root,manifest:{deploy:{signing:{keys:{test:'public'}}}}};
-  const compat={id:'a'.repeat(32),target:'fixture',inputs:{app:'fixture',platform:'linux',store:{L:'A'},rustMode:'native',grantCeiling:'',keys:{test:'public'},typescriptRuntime:4}};
+  const app={id:'fixture',name:'fixture',dir:root,target:root,manifest:{app:{origin:root},deploy:{signing:{keys:{test:'public'}}}}};
+  const compat={id:'a'.repeat(32),target:'fixture',inputs:{app:'fixture',platform:'linux',store:{L:'A'},rustMode:'native',grantCeiling:grants,keys:{test:'public'},typescriptRuntime:cohortRuntime}};
   const graph={artifacts:[{name:'app.plan',requires:{sources:{}},sha256:'plan'}]};
   const cohort={version:1,compat,binary:'binary',sources:{}};
   const build={trust:'production',compat,graph};
-  const calls=[], published=[];
+  const calls=[], published=[], destinations=[], rows=[];
   const sealed=(name,env)=>{
     calls.push(name);
     expect(env?.EXACT_GAME_PROOF_PROFILE,`${name} shipping profile`).toBe('release');
     expect(env?.EXACT_UPDATE_TRUST,`${name} production trust`).toBe('production');
   };
   const bindings={
-    ...Object.fromEntries(['existsSync','readFileSync','writeFileSync','mkdtempSync','rmSync','watch','readdirSync'].map(name=>[name,fs[name]])),
-    validateChannel,resolve,relative,homedir,ROOT:fileURLToPath(new URL('..',import.meta.url)),
+    ...Object.fromEntries(['existsSync','readFileSync','writeFileSync','mkdtempSync','rmSync','watch'].map(name=>[name,fs[name]])),
+    filesystem, filesystemRead,
+    channelOf,validateChannel,resolve,relative,homedir,ROOT:fileURLToPath(new URL('..',import.meta.url)),
     process:{env:{EXACT_GAME_PROOF_PROFILE:'gpu-dev',EXACT_UPDATE_TRUST:'development'}},
     console:{log(){}},Refusal:Error,refuse(message){throw Error(message)},
     loadSigner:()=>({keyId:'test'}),resolveApp:()=>app,readBuilds:()=>[build],
     cohortReceipt:()=>cohort,classifyArtifacts:classify,
-    openOrigin:()=>({writable:true,list:async()=>[],describe:()=>root}),
-    channelOrigin:()=>root,sha256:()=> 'digest',blobPath:x=>x,streamPath:()=> 'stream',
+    openOrigin:mock(spec=>({writable:true,list:async path=>{destinations.push({origin:spec,path});return []},describe:()=>spec})),
+    channelOrigin,sha256:()=> 'digest',blobPath:x=>x,streamPath:()=> 'stream',
     defaultRelease:()=> 'r-fixture',inspectHead(){throw Error('unexpected head')},
     requireReleasePins(){}, // the release pins' gate (game/inputs.mjs), not what this seals
-    async publishStream({build}){
-      expect(build.trust).toBe('production');calls.push('publish');published.push(build);
+    async publishStream({build,row}){
+      expect(build.trust).toBe('production');calls.push('publish');published.push(build);rows.push(row);
       return {action:'current',platform:'linux',compatibilityId:compat.id};
     },
     RustBaker:class {constructor(app,env){sealed('resident',env)}close(){calls.push('close')}},
@@ -45,6 +49,8 @@ function harness(classify=()=>({bundle:true}), runtime=4) {
       if(tool==='git')return {status:0,stdout:'b'.repeat(40)};
       const name=tool==='cargo'?'tools':args[0]==='graph'?'graph':'typescript';
       sealed(name,opts.env);
+      // `bake` runs the real one (its receipt's runtime is the bake's own).
+      if(name==='typescript'&&bake)return realSpawnSync(bake,args,{...opts,env:{...process.env,...opts.env}});
       if(name==='typescript'){
         const out=args[args.indexOf('--out')+1];fs.mkdirSync(out,{recursive:true});
         fs.writeFileSync(resolve(out,'app.plan'),'plan');
@@ -59,8 +65,38 @@ function harness(classify=()=>({bundle:true}), runtime=4) {
   const functions=source.slice(source.indexOf('function parseArgs('),source.indexOf('\nif (process.argv[1]'))
     .replace('export async function pusher','async function pusher');
   const pusher=new Function(...Object.keys(bindings),functions+'\nreturn pusher;')(...Object.values(bindings));
-  return {root,calls,published,bindings,pusher};
+  return {root,app,calls,published,destinations,rows,bindings,pusher};
 }
+
+test.each([
+  { name: 'the only channel', deploy: { channels: { dogfood: 'dogfood-origin' } }, expected: 'dogfood', origin: 'dogfood-origin' },
+  { name: 'the only channel before app.origin', deploy: { channels: { dogfood: 'dogfood-origin' } }, fallback: true, expected: 'dogfood', origin: 'dogfood-origin' },
+  { name: 'deploy.channel before the only channel', deploy: { channel: 'beta', channels: { dogfood: 'dogfood-origin' } }, fallback: true, expected: 'beta' },
+  { name: '--channel before deploy.channel', deploy: { channel: 'beta', channels: { dogfood: 'dogfood-origin' } }, channel: 'dogfood', expected: 'dogfood', origin: 'dogfood-origin' },
+  { name: 'prod with no channels', deploy: {}, fallback: true, expected: 'prod' },
+  { name: 'prod with several channels', deploy: { channels: { dogfood: 'dogfood-origin', beta: 'beta-origin' } }, fallback: true, expected: 'prod' },
+])('push uses $name for stream discovery and publication', async ({ deploy, channel, fallback, expected, origin }) => {
+  const { root, app, destinations, rows, pusher } = harness();
+  try {
+    if (!fallback) delete app.manifest.app.origin;
+    Object.assign(app.manifest.deploy, deploy);
+    expect(await pusher({ _: [root], channel, keys: root })).toBe(0);
+    expect(destinations).toEqual([{ origin: origin ?? root, path: `.exact/${expected}` }]);
+    expect(rows.map(row => row.channel)).toEqual([expected]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each([
+  { name: 'prod', channels: {} },
+  { name: 'the only channel', channels: { dogfood: 'dogfood-origin' } },
+])('push rejects an empty deploy.channel before falling back to $name', async ({ channels }) => {
+  const { root, app, bindings, pusher } = harness();
+  try {
+    Object.assign(app.manifest.deploy, { channel: '', channels });
+    await expect(pusher({ _: [root], keys: root })).rejects.toThrow('the channel "" cannot name a directory under .exact/');
+    expect(bindings.openOrigin).not.toHaveBeenCalled();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('push seals every Rust, TypeScript and graph bake against an inherited proof profile', async () => {
   const {root,calls,published,bindings,pusher}=harness();
@@ -96,6 +132,33 @@ test('push refuses a TypeScript module that needs a newer prelude than the cohor
   } finally {fs.rmSync(root,{recursive:true,force:true})}
 });
 
+// The real bake and classifier: a module that may open a database needs
+// runtime 10, as its transaction's options may ask to check foreign keys and an
+// older prelude would drop them (bake/src/compat.rs). Here they are data, a
+// migration parsed from JSON, and a cohort on runtime 9 is refused.
+test('push refuses a SQLite module whose transaction options are data to a cohort on runtime 9', async () => {
+  const ROOT=fileURLToPath(new URL('..',import.meta.url));
+  // The bake the lane built (docs/testing.md: a test runs a built binary, it
+  // builds none), in Cargo's target directory, the lane's own if it set one.
+  const bake=resolve(ROOT,process.env.CARGO_TARGET_DIR||'target','debug/exact-js-bake');
+  if(!fs.existsSync(bake))throw new Error('build the bake first: cargo build -p exact-js-bake');
+  const grants='sqlite.open app:/data/a.db';
+  const {root,calls,pusher}=harness(classifyArtifacts,undefined,{bake,cohortRuntime:9,grants});
+  try {
+    fs.writeFileSync(resolve(root,'app.json'),JSON.stringify({name:'fixture',app:{id:'fixture',name:'fixture'}}));
+    fs.writeFileSync(resolve(root,'app.contract'),'component App\n  state count = 0\n  resource message = message(count) as shape string\n  view\n    text message\n');
+    fs.writeFileSync(resolve(root,'app.ts'),`import type { Sources, Answer } from './app.contract.d.ts';
+export const appId = 'fixture';
+export const grants = '${grants}';
+const migration = JSON.parse('{"commands": [], "options": {"foreign\\\\u004beys": "check"}}');
+const sources: Sources = { message: ([count], _store, storage) => storage.sqlite.open('app:/data/a.db').then(db => db.transaction(migration.commands, migration.options)).then(() => String(count), () => String(count)) };
+export const answer: Answer = (source, args, store, storage) => sources[source](args, store, storage);
+`);
+    await expect(pusher({_:[root],origin:root,keys:root})).rejects.toThrow(/typescriptRuntime \(requires a prelude of runtime 10 or later; this cohort's is 9\).*It needs a new binary/);
+    expect(calls).not.toContain('publish');
+  } finally {fs.rmSync(root,{recursive:true,force:true})}
+}, 120000);
+
 test('push refuses incomplete values and reserved channels before publishing', () => {
   const source = fs.readFileSync(new URL('./push.mjs', import.meta.url), 'utf8');
   const parse = new Function('refuse', 'USAGE', source.slice(source.indexOf('function parseArgs('), source.indexOf('\nconst seconds')) + ';return parseArgs;')((message) => { throw Error(message); }, 'usage');
@@ -115,15 +178,43 @@ test('push inventories current app files and carries only head-owned artifacts',
   try {
     fs.mkdirSync(resolve(root, 'assets'));
     fs.writeFileSync(resolve(root, 'assets/new.png'), 'new');
+    fs.mkdirSync(resolve(root, 'deck/nested'), { recursive: true });
+    fs.writeFileSync(resolve(root, 'deck/nested/.config'), 'config');
+    for (const folder of ['assets', 'deck', 'deck/nested']) fs.writeFileSync(resolve(root, folder, '.DS_Store'), 'Bud1');
     const shader = Buffer.from('shader');
     const source = fs.readFileSync(new URL('./push.mjs', import.meta.url), 'utf8');
     const fn = source.slice(source.indexOf('async function carriedAssets('), source.indexOf('\nfunction gitHead('));
-    const carried = new Function('existsSync', 'readdirSync', 'readFileSync', 'resolve', 'sha256', 'blobPath', 'refuse', fn + ';return carriedAssets;')(fs.existsSync, fs.readdirSync, fs.readFileSync, resolve, sha256, blobPath, (message) => { throw Error(message); });
+    const carried = new Function('filesystem', 'filesystemRead', 'resolve', 'sha256', 'blobPath', 'refuse', fn + ';return carriedAssets;')(filesystem, filesystemRead, resolve, sha256, blobPath, (message) => { throw Error(message); });
     const asked = [];
     const assets = await carried({ get: async (path) => { asked.push(path); return shader; } }, { dir: root }, { assets: [
       { name: 'assets/deleted.png', sha256: 'deleted' }, { name: 'shaders/x.wgsl', sha256: sha256(shader) },
     ] });
-    expect(assets.map(a => a.name)).toEqual(['assets/new.png', 'shaders/x.wgsl']);
+    expect(assets.map(a => a.name)).toEqual(['assets/new.png', 'deck/nested/.config', 'shaders/x.wgsl']);
+    expect(assets.map(a => a.bytes.toString())).toEqual(['new', 'config', 'shader']);
+    expect(assets.every(a => a.sha256 === sha256(a.bytes))).toBe(true);
     expect(asked).toEqual([blobPath(sha256(shader))]);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test.each([
+  { name: 'an asset tree', count: 4, mib: 100 },
+  { name: 'one asset', count: 1, mib: 400 },
+])('push reads $name larger than one filesystem reply', async ({ count, mib }) => {
+  const root = fs.mkdtempSync(resolve(import.meta.dir, '../target/push-large-assets-'));
+  try {
+    fs.mkdirSync(resolve(root, 'assets'));
+    // The base64 payload exceeds the synchronous helper's 512 MiB reply limit.
+    const bytes = Buffer.alloc(mib * 1024 * 1024, 97), digest = sha256(bytes);
+    const names = Array.from({ length: count }, (_, i) => `assets/${i}.bin`);
+    for (const name of names) fs.writeFileSync(resolve(root, name), bytes);
+    const source = fs.readFileSync(new URL('./push.mjs', import.meta.url), 'utf8');
+    const fn = source.slice(source.indexOf('async function carriedAssets('), source.indexOf('\nfunction gitHead('));
+    const carried = new Function('filesystem', 'filesystemRead', 'resolve', 'sha256', 'blobPath', 'refuse', fn + ';return carriedAssets;')(filesystem, filesystemRead, resolve, sha256, blobPath, (message) => { throw Error(message); });
+    const assets = await carried({}, { dir: root }, {});
+    expect(assets.map(asset => asset.name)).toEqual(names);
+    for (const asset of assets) {
+      expect(asset.bytes.length).toBe(bytes.length);
+      expect(asset.sha256).toBe(digest);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 60000);

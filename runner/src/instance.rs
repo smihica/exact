@@ -81,12 +81,13 @@ type CreateList = fn(
     ViewId,
     &[Frame],
 ) -> Result<Option<Box<collection::Collection>>, InstanceError>;
-/// A list's data update, given whether it follows its end and its
+/// A list's data update, given its end-follow policy, scroll behavior and
 /// `keep-mounted` value.
 type UpdateList = fn(
     &mut collection::Collection,
     &mut Update<'_>,
     &[Frame],
+    bool,
     bool,
     Option<&Value>,
 ) -> Result<(), InstanceError>;
@@ -1014,7 +1015,6 @@ impl NodeInst {
             if u.discard {
                 if binding.kind == BindingKind::Style
                     && !fresh
-                    && !matches!(value, Value::Option(None))
                     && exact_kernel::StyleId::from_bit(binding.id as u32)
                         .is_some_and(|style| exact_kernel::StyleMask::TEXT.has(style))
                 {
@@ -1244,6 +1244,10 @@ impl NodeInst {
         let keep = self
             .collection()
             .and_then(|_| self.bound_prop(plan, u.sites, exact_kernel::PropId::KeepMounted));
+        let smooth = self.collection().is_some()
+            && self
+                .bound_style(plan, u.sites, exact_kernel::StyleId::ScrollBehavior)
+                .is_some_and(|value| value.as_str() == Some("smooth"));
         if let Some(collection) = self.collection_mut() {
             collection.around = theme::Around {
                 retheme: false,
@@ -1254,6 +1258,7 @@ impl NodeInst {
                 u,
                 frames,
                 follow,
+                smooth,
                 keep.as_ref(),
             )?;
         } else if update_all(u, &mut self.children, frames)? {
@@ -1333,7 +1338,17 @@ impl Tree {
             self.emit_roots(u);
         }
         self.open_tabs(u)?;
-        if self.has_collections && (u.text_styled || u.ops.iter().any(|op| matches!(op, Op::SetStyle { id, patch } if *id <= last_existing_view && patch.mask.intersects(exact_kernel::StyleMask::TEXT)))) {
+        if self.has_collections
+            && (u.text_styled
+                || u.ops.iter().any(|op| {
+                    let (id, mask) = match op {
+                        Op::SetStyle { id, patch } => (id, &patch.mask),
+                        Op::ClearStyle { id, mask, .. } => (id, mask),
+                        _ => return false,
+                    };
+                    *id <= last_existing_view && mask.intersects(exact_kernel::StyleMask::TEXT)
+                }))
+        {
             if let Some(lists) = u.env.lists {
                 (lists.typography)(&mut self.children, u, &[])?;
             }

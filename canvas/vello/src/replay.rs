@@ -229,6 +229,39 @@ impl Replayer {
         }
     }
 
+    /// `clip()`: the region becomes its intersection with `path`. A path
+    /// already in force leaves it unchanged, and a rectangle over the
+    /// rectangle this save level opened last replaces that one with their
+    /// intersection. A draw that clips every frame without `save` so keeps
+    /// one layer, where it would add one a frame (`begin` pushes every open
+    /// clip again).
+    fn clip(&mut self, scene: &mut Scene, path: BezPath, fill: Fill) {
+        if self.open.iter().any(|(p, f)| *p == path && *f == fill) {
+            return;
+        }
+        let last = if self.state.clips > 0 {
+            self.open.last()
+        } else {
+            None
+        };
+        let folded = match (last, rect_of(&path)) {
+            (Some((last, _)), Some(r)) => rect_of(last).map(|l| l.intersect(r)),
+            _ => None,
+        };
+        if let Some(r) = folded {
+            scene.pop_layer();
+            self.open.pop();
+            self.state.clips -= 1;
+            let path = r.to_path(0.1);
+            scene.push_clip_layer(Fill::NonZero, self.base(), &path);
+            self.open.push((path, Fill::NonZero));
+        } else {
+            scene.push_clip_layer(fill, self.base(), &path);
+            self.open.push((path, fill));
+        }
+        self.state.clips += 1;
+    }
+
     /// Whether a `fillRect` (or `clearRect`) of `r` now covers every pixel
     /// (`Canvas2DRecord.swift` `covers`).
     fn covers(&self, r: Rect, clear: bool) -> bool {
@@ -407,11 +440,7 @@ impl Replayer {
                 } else {
                     std::mem::take(&mut self.scratch)
                 };
-                frame
-                    .scene
-                    .push_clip_layer(rule(r.at(0)), self.base(), &path);
-                self.open.push((path, rule(r.at(0))));
-                self.state.clips += 1;
+                self.clip(&mut frame.scene, path, rule(r.at(0)));
             }
             Op::FillRect => {
                 let rc = rect();
@@ -471,7 +500,8 @@ impl Replayer {
                 if r.op == Op::FillText {
                     let style = self.state.fill.clone();
                     self.paint(frame, host, Geom::Fill(&outline, Fill::NonZero, t), &style);
-                } else if let Some(stroke) = self.stroke_style() {
+                } else {
+                    let stroke = self.stroke_style();
                     let style = self.state.stroke.clone();
                     self.paint(frame, host, Geom::Stroke(&outline, stroke, t), &style);
                 }
@@ -483,9 +513,7 @@ impl Replayer {
 
     /// Stroke `user` (user space) with the stroke style under base ∘ author.
     fn stroke_user(&mut self, frame: &mut Frame, host: &mut dyn Host, user: &BezPath) {
-        let Some(stroke) = self.stroke_style() else {
-            return;
-        };
+        let stroke = self.stroke_style();
         let t = self.device();
         let style = self.state.stroke.clone();
         self.paint(frame, host, Geom::Stroke(user, stroke, t), &style);
@@ -595,21 +623,17 @@ impl Replayer {
         );
     }
 
-    /// The stroke with the state's line style; none when the dash list is
-    /// all zeros (nothing is drawn).
-    pub fn stroke_style(&self) -> Option<vello::kurbo::Stroke> {
+    /// The stroke with the state's line style; an all-zero dash list is solid.
+    pub fn stroke_style(&self) -> vello::kurbo::Stroke {
         let s = &self.state;
         let mut stroke = vello::kurbo::Stroke::new(s.width)
             .with_caps(s.cap)
             .with_join(s.join)
             .with_miter_limit(s.miter);
-        if !s.dash.is_empty() {
-            if s.dash.iter().all(|v| *v == 0.0) {
-                return None;
-            }
+        if s.dash.iter().any(|v| *v != 0.0) {
             stroke = stroke.with_dashes(s.dash_offset, s.dash.iter().copied());
         }
-        Some(stroke)
+        stroke
     }
 }
 
@@ -628,6 +652,41 @@ fn ensure_start(p: &mut BezPath, at: (f64, f64)) {
     if p.elements().is_empty() {
         p.move_to(at);
     }
+}
+
+/// The axis-aligned rectangle `p` encloses, when it is one closed subpath
+/// of four corners (a trailing `moveTo`, as `rect()` leaves, draws nothing).
+fn rect_of(p: &BezPath) -> Option<Rect> {
+    use vello::kurbo::{PathEl, Point};
+    let mut pts: Vec<Point> = Vec::with_capacity(5);
+    let mut closed = false;
+    for el in p.elements() {
+        match (*el, closed) {
+            (PathEl::MoveTo(a), false) if pts.is_empty() => pts.push(a),
+            (PathEl::LineTo(a), false) if (1..5).contains(&pts.len()) => pts.push(a),
+            (PathEl::ClosePath, false) => closed = true,
+            (PathEl::MoveTo(_), true) => {}
+            _ => return None,
+        }
+    }
+    if pts.len() == 5 && pts[4] == pts[0] {
+        pts.pop();
+    }
+    if !closed || pts.len() != 4 {
+        return None;
+    }
+    // Edges alternately horizontal and vertical, none of zero length.
+    let across = |i: usize| {
+        let (a, b) = (pts[i], pts[(i + 1) % 4]);
+        a.y == b.y && a.x != b.x
+    };
+    let down = |i: usize| {
+        let (a, b) = (pts[i], pts[(i + 1) % 4]);
+        a.x == b.x && a.y != b.y
+    };
+    let rect = (across(0) && down(1) && across(2) && down(3))
+        || (down(0) && across(1) && down(2) && across(3));
+    rect.then(|| Rect::from_points(pts[0], pts[2]))
 }
 
 fn close(p: &mut BezPath) {

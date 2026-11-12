@@ -365,6 +365,58 @@ fn the_last_row_clamps_to_the_end_and_a_missing_key_is_refused() {
 }
 
 #[test]
+fn refused_keys_are_preserved_in_state_json() {
+    let source = r#"component App
+  state files = ["a.txt", "b.txt"]
+  action setFiles(next: string[])
+    files = next
+  action open(path: string)
+    scrollIntoView("files", path)
+  view
+    list id="files" virtualized=true height=100 estimated-item-height=20
+      for f in files key=f
+        text f height=20
+"#;
+    let mut r = Runner::boot(
+        contract::compile(source).unwrap(),
+        Data,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    for key in [
+        r"C:\notes\c.txt",
+        "first\nsecond",
+        "say \"hi\"",
+        "\t\r\0\u{8}\u{c}\u{1f}é🦀",
+        "c.txt",
+    ] {
+        for duplicate in [false, true] {
+            let files = if duplicate {
+                vec![Value::str(key), Value::str(key)]
+            } else {
+                vec![Value::str("a.txt"), Value::str("b.txt")]
+            };
+            r.act("setFiles", vec![Value::list(files)]).unwrap();
+            r.act("open", vec![Value::str(key)]).unwrap();
+            let state: serde_json::Value = serde_json::from_str(&state(&r)).unwrap();
+            let requests: serde_json::Value = serde_json::from_str(&r.into_view_json()).unwrap();
+            assert_eq!(state["scrollIntoView"], requests);
+            let reason = if duplicate {
+                format!("the list holds s:{key} more than once")
+            } else {
+                format!("no row keyed s:{key} in the list")
+            };
+            assert_eq!(
+                requests.as_array().unwrap().last().unwrap(),
+                &serde_json::json!({"list": "files", "status": format!("refused: {reason}")})
+            );
+        }
+    }
+}
+
+#[test]
 fn a_reader_who_scrolls_cancels_the_request() {
     let mut r = boot();
     let feed = list(&r, false).unwrap().view;

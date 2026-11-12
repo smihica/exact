@@ -281,11 +281,7 @@ fn scheme_colour(a: &Attr, rows: &[StyleId]) -> Result<(), LowerError> {
     let colour = rows.iter().any(|row| {
         matches!(
             row.codec(),
-            StyleCodec::ColorValue
-                | StyleCodec::KeywordColor
-                | StyleCodec::Rgba8
-                | StyleCodec::Color2
-                | StyleCodec::Paint
+            StyleCodec::ColorValue | StyleCodec::KeywordColor | StyleCodec::Paint
         )
     });
     let Expr::Ternary(cond, yes, no, span) = &a.value else {
@@ -552,7 +548,7 @@ fn style_value(
                         exact_motion::ParseError::UnknownProperty(property) => {
                             crate::motion::layout_property_refusal(&property, supported).unwrap_or_else(|| format!("`{property}` is not a supported transition property: transitions animate {supported}"))
                         }
-                        other => format!("invalid transition components ({other:?}); supported properties: {supported}"),
+                        other => format!("invalid transition components: {other}; supported properties: {supported}"),
                     };
                     return err(
                         "lower-attr-value",
@@ -760,7 +756,9 @@ fn style_value(
                                 a.name,
                                 literal_text(value),
                                 a.name,
-                                named(&e, &v).map_or_else(|| describe(&e), String::from),
+                                crate::svg::animation_reason(&e, value)
+                                    .or_else(|| named(&e, &v).map(String::from))
+                                    .unwrap_or_else(|| describe(&e)),
                                 hint.unwrap_or_default()
                             ),
                             span,
@@ -1209,7 +1207,7 @@ pub(crate) fn check_prop_value(
     if !ok && prop == PropId::Datetime {
         return err(
             "lower-time-instant",
-            "`datetime` is an instant in epoch milliseconds; parse a string with `date(…)`",
+            crate::live_time::INSTANT_REFUSAL,
             span,
         );
     }
@@ -1290,6 +1288,7 @@ pub(crate) fn check_glass_group(tag: &tags::Tag, attrs: &[Attr]) -> Result<(), L
 pub(crate) fn flex_component(value: &Expr, index: usize) -> Result<Expr, LowerError> {
     let mut out = value.clone();
     match &mut out {
+        Expr::None(_) => {}
         Expr::Ternary(_, yes, no, _) => {
             **yes = flex_component(yes, index)?;
             **no = flex_component(no, index)?;
@@ -1304,7 +1303,11 @@ pub(crate) fn flex_component(value: &Expr, index: usize) -> Result<Expr, LowerEr
             let (grow, shrink, basis) = match text.trim() {
                 word if word.eq_ignore_ascii_case("none") => (0.0, 0.0, "auto"),
                 word if word.eq_ignore_ascii_case("auto") => (1.0, 1.0, "auto"),
-                word if word.eq_ignore_ascii_case("initial") => (0.0, 1.0, "auto"),
+                word if word.eq_ignore_ascii_case("initial")
+                    || word.eq_ignore_ascii_case("unset") =>
+                {
+                    (0.0, 1.0, "auto")
+                }
                 text => {
                     let mut depth = 0;
                     let words: Vec<_> = text
@@ -1389,13 +1392,18 @@ pub(crate) fn flex_longhands(value: &Expr) -> Option<(f64, f64, String)> {
 /// Whether a `flex` bounds its box on the main axis by itself: a positive
 /// grow (it takes the container's free space), or a definite length basis,
 /// zero included (`flex="0 0 0px"` is an empty scrollport, as `height=0`
-/// is). `none`, `initial`, `"0"` (grow 0 over a `0%` basis) and a zero grow
-/// over `auto`, content or a zero percentage are not (Grok's batch 2
-/// reviews). A computed value is left to the bake's lint.
+/// is). `none`, `initial`, `unset`, `"0"` (grow 0 over a `0%` basis) and
+/// zero grow over `auto`, content or a zero percentage are not. A computed
+/// value is left to the bake's lint.
 pub(crate) fn flex_bounds(value: &Expr) -> bool {
     let Some((grow, _, basis)) = flex_longhands(value) else {
         return true;
     };
+    grow > 0.0 || flex_basis_bounds(&basis)
+}
+/// Whether a literal flex basis is a definite length: not `auto`, a content
+/// keyword or a zero percentage.
+pub(crate) fn flex_basis_bounds(basis: &str) -> bool {
     let basis = basis.trim();
     let intrinsic = matches!(
         basis,
@@ -1404,47 +1412,7 @@ pub(crate) fn flex_bounds(value: &Expr) -> bool {
     let zero_percent = basis
         .strip_suffix('%')
         .is_some_and(|n| n.trim().parse::<f64>().is_ok_and(|n| n == 0.0));
-    grow > 0.0 || !(intrinsic || zero_percent)
-}
-/// A shrinking flex item with a zero minimum fits a bounded flex column.
-/// Its shrink is the `flex-shrink` longhand's, or else the `flex`
-/// shorthand's (`flex="none"` does not shrink).
-pub(crate) fn shrinking_scroll(attrs: &[Attr], bounded_column: bool) -> bool {
-    let shrink = attrs
-        .iter()
-        .rev()
-        .find(|a| a.name == "flex-shrink")
-        .map(|a| numeric_literal(&a.value))
-        .or_else(|| {
-            let flex = attrs.iter().rev().find(|a| a.name == "flex")?;
-            Some(flex_longhands(&flex.value).map(|(_, shrink, _)| shrink))
-        });
-    bounded_column
-        && attrs
-            .iter()
-            .any(|a| a.name == "min-height" && numeric_literal(&a.value) == Some(0.0))
-        && shrink.is_none_or(|n| n.is_none_or(|n| n > 0.0))
-}
-pub(crate) fn bounded_column(tag: &str, attrs: &[Attr], inherited: bool) -> bool {
-    let word = |name: &str| {
-        attrs
-            .iter()
-            .rev()
-            .find(|a| a.name == name)
-            .and_then(|a| match &a.value {
-                Expr::Str(s, _) => Some(s.as_str()),
-                _ => None,
-            })
-    };
-    let column = word("display").map_or(tag == "column" || tag == "button", |v| v == "flex")
-        && word("flex-direction").map_or(tag == "column" || tag == "button", |v| {
-            v.starts_with("column")
-        });
-    column
-        && (attrs.iter().any(|a| {
-            matches!(a.name.as_str(), "height" | "max-height")
-                && !matches!(&a.value, Expr::Str(s, _) if s == "auto")
-        }) || shrinking_scroll(attrs, inherited))
+    !(intrinsic || zero_percent)
 }
 /// Why a multi-column or break value is refused (LLP 1093 §1), if it is.
 fn multicol_value(rows: &[StyleId], v: &str) -> Option<&'static str> {

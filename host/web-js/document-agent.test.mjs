@@ -9,7 +9,7 @@ test('navigation waits for unknown status capability', async () => {
   const { pageServer } = await import('./render.mjs');
   const page = pageServer('/unused', { begin: async () => ({
     policy: 'request', head: '<!doctype html>',
-    finish: async () => ({ html: 'Missing', rest: 'Missing', status: 404, policy: 'request', failed: [], location: '/missing' }),
+    finish: async () => ({ html: 'Missing', rest: 'Missing', status: 404, policy: 'request', failed: [], refused: [], location: '/missing' }),
   }) }, () => {});
   const response = await page('/missing', name => name === 'sec-fetch-dest' ? 'document' : undefined);
   expect(response.status).toBe(404);

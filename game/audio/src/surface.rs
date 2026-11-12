@@ -325,6 +325,7 @@ mod test_device {
             true
         }
         fn set(&mut self, _: u64, _: f32, _: f32) {}
+        fn set_pitch(&mut self, _: u64, _: f32) {}
         fn stop(&mut self, _: u64) {}
     }
     #[test]

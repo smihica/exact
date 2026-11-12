@@ -25,6 +25,22 @@ const sources: Sources = {
         await backgroundFetch({ id: String(id), requests: [request({ url: at('/file'), saveTo: `app:/data/saved/${id}.txt` })], downloadTotal: 1_000_000 });
       } else if (kind === 'missing') {
         await backgroundFetch({ id: String(id), requests: [request({ url: at('/missing') })] });
+      } else if (kind === 'folder') {
+        // A `saveTo` that is a folder is refused, the folder kept.
+        await storage.fs.mkdir(`app:/data/${id}`).catch((e: { code?: string }) => { if (e?.code !== 'EEXIST') throw e; });
+        await storage.fs.atomicWriteFile(`app:/data/${id}/keep.txt`, text('kept'));
+        await backgroundFetch({ id: String(id), requests: [request({ url: at('/file'), saveTo: `app:/data/${id}` })] });
+      } else if (kind === 'appear') {
+        // A folder made at `saveTo` while the body is on its way is kept, the body not placed.
+        await backgroundFetch({ id: String(id), requests: [request({ url: at('/file?wait=1'), saveTo: `app:/data/${id}` })] });
+        await storage.fs.mkdir(`app:/data/${id}`);
+        await storage.fs.atomicWriteFile(`app:/data/${id}/keep.txt`, text('kept'));
+      } else if (kind === 'replace') {
+        await storage.fs.mkdir('app:/data/saved').catch((e: { code?: string }) => { if (e?.code !== 'EEXIST') throw e; });
+        await storage.fs.atomicWriteFile(`app:/data/saved/${id}.txt`, text('old'));
+        await backgroundFetch({ id: String(id), requests: [request({ url: at('/file'), saveTo: `app:/data/saved/${id}.txt` })] });
+      } else if (kind === 'userinfo') {
+        await backgroundFetch({ id: String(id), requests: [request({ url: at('/file').replace('://', '://alice:secret@') })] });
       } else if (kind === 'hold') {
         await backgroundFetch({ id: String(id), requests: [request({ url: at('/file?hold=1') })] });
       } else {
@@ -45,7 +61,8 @@ const sources: Sources = {
     const first = r.records[0];
     let body = '';
     if (first?.path) body = new TextDecoder().decode(await storage.fs.readFile(first.path));
-    const q = new URLSearchParams({ id: String(id), heard: String(heard), result: r.result, reason: r.failureReason, status: String(first?.status ?? 0), body, path: first?.path ?? '', url: first?.url ?? '', lost: String(first?.bodyLost ?? false), uploaded: String(r.uploaded), uploadTotal: String(r.uploadTotal), downloaded: String(r.downloaded) });
+    const kept = await storage.fs.readFile(`app:/data/${id}/keep.txt`).then(() => 'kept', () => 'none');
+    const q = new URLSearchParams({ kept, id: String(id), heard: String(heard), result: r.result, reason: r.failureReason, status: String(first?.status ?? 0), body, path: first?.path ?? '', url: first?.url ?? '', lost: String(first?.bodyLost ?? false), uploaded: String(r.uploaded), uploadTotal: String(r.uploadTotal), downloaded: String(r.downloaded) });
     await fetch(`${origin}/heard?${q}`).catch(() => null);
     await retireBackgroundFetch({ id: String(id) });
     return { text: `${id} ${heard} ${r.result} ${r.failureReason} ${first?.status ?? 0} ${body}` };

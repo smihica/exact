@@ -54,6 +54,7 @@ struct App {
 }
 impl App {
     fn open(root: &Root) -> Self {
+        ibex2_sqlite::link();
         let existed = root.0.exists();
         let mut data = Storage::new(Calendar::default());
         data.configure_storage(

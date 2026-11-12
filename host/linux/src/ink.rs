@@ -598,6 +598,10 @@ impl Backend for Ink {
     fn surface_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4) {
         self.canvas(&pixels, dst, &[], Transform::identity());
     }
+    fn supports_island_image(&self) -> bool {
+        true
+    }
+
     fn island_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4, ts: Transform, mode: u8) {
         self.observe_transform(ts);
         let result = self.blended_image(&pixels, dst, ts, mode);

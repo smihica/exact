@@ -29,6 +29,7 @@ fn main() {
         "geofence_fixture_data::Fences",
         "geofence_fixture_data::Fences",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

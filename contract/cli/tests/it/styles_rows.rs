@@ -16,6 +16,128 @@ impl DataSource for NoData {
 }
 
 #[test]
+fn scroll_padding_and_svg_radii_refuse_negative_literals() {
+    let mut admitted = Vec::new();
+    for (parent, tag, row) in [
+        ("column", "column", "scroll-padding-top"),
+        ("column", "column", "scroll-padding-right"),
+        ("column", "column", "scroll-padding-bottom"),
+        ("column", "column", "scroll-padding-left"),
+        ("column", "column", "scroll-padding"),
+        ("svg", "circle", "r"),
+        ("svg", "rect", "rx"),
+        ("svg", "rect", "ry"),
+    ] {
+        for value in [
+            "\"-10px\"",
+            "\"-5%\"",
+            "-10",
+            "\"-1rem\"",
+            "\"-1em\"",
+            "\"-1vh\"",
+            "\"-1cm\"",
+        ] {
+            let source =
+                format!("component App\n  view\n    {parent}\n      {tag} {row}={value}\n");
+            match contract::compile(&source) {
+                Ok(_) => admitted.push(format!("{tag} {row}={value}")),
+                Err(error) => {
+                    let error = error.to_string();
+                    assert!(error.contains("lower-attr-value"), "{source}: {error}");
+                    assert!(error.contains("nonnegative"), "{source}: {error}");
+                }
+            }
+        }
+        for value in ["0", "10", "\"5%\"", "\"1rem\"", "\"calc(-10px)\""] {
+            let source =
+                format!("component App\n  view\n    {parent}\n      {tag} {row}={value}\n");
+            contract::compile(&source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "negative literals compiled: {admitted:#?}"
+    );
+}
+
+fn check_cleared_flex(attrs: &str, conditional: bool) {
+    use exact_kernel::{Dimension, Offer};
+    let src = format!(
+        r#"style Grow
+  flex="2 3 40px"
+style Plain
+  color="red"
+component App
+  state on = false
+  action flip
+    on = not on
+  view
+    row width=300
+      box testId="item" {attrs}
+        text "aaa bbb ccc ddd"
+"#
+    );
+    let plan = contract::bake(contract::compile(&src).unwrap(), NoData).unwrap();
+    let mut r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    for on in [false, true, false] {
+        let root = r.kernel().roots()[0];
+        r.kernel_mut()
+            .compute_layout(root, Offer::definite(300.0, 200.0))
+            .unwrap();
+        let k = r.kernel();
+        let item = k.node_by_key(k.find_by_test_id("item")[0]).unwrap();
+        let s = &item.style;
+        let (longhands, width) = if conditional && on {
+            ((2.0, 3.0, Dimension::Points(40.0)), 300.0)
+        } else {
+            ((0.0, 1.0, Dimension::Auto), 144.0)
+        };
+        assert_eq!(
+            (s.flex_grow, s.flex_shrink, s.flex_basis.clone()),
+            longhands,
+            "{attrs}, on={on}, width={}",
+            item.frame.width
+        );
+        assert!(
+            (item.frame.width - width).abs() < 0.01,
+            "{attrs}, on={on}: expected {width}, got {}",
+            item.frame.width
+        );
+        r.act("flip", vec![]).unwrap();
+    }
+}
+
+#[test]
+fn absent_flex_restores_initial_longhands_and_intrinsic_width() {
+    for (attrs, conditional) in [
+        ("class=Plain", false),
+        ("class=(on ? Grow : Plain)", true),
+        ("flex=(on ? \"2 3 40px\" : none)", true),
+    ] {
+        check_cleared_flex(attrs, conditional);
+    }
+}
+
+#[test]
+fn unset_flex_restores_initial_longhands_and_intrinsic_width() {
+    for (attrs, conditional) in [
+        ("flex=\"initial\"", false),
+        ("flex=\"unset\"", false),
+        ("flex=\" UnSeT \"", false),
+        ("flex=(on ? \"2 3 40px\" : \"unset\")", true),
+    ] {
+        check_cleared_flex(attrs, conditional);
+    }
+}
+
+#[test]
 fn explicit_clear_intent_differs_from_a_missing_class_row() {
     use exact_kernel::StyleId::TextColor;
     for parent in ["", "color=\"#123456\""] {
@@ -488,4 +610,84 @@ fn calculated_grid_tracks_lower_in_attributes_and_styles() {
         message.contains("calc()") && message.contains("min()"),
         "{message}"
     );
+}
+
+/// `class=(on ? A : B)` is `class=A` while `on` and `class=B` otherwise:
+/// the side that does not write a row leaves it as the node has it
+/// without the class (the tag's fixed `flex-direction`, `display`, an
+/// `hr`'s border), and a
+/// row the chosen style writes under another name (a shorthand beside a
+/// longhand) keeps its value. Compared on the rows set (not who wrote
+/// them) and on the layout.
+#[test]
+fn a_class_choice_is_the_class_it_chooses() {
+    use exact_kernel::Offer;
+    for (tag, a, b) in [
+        ("column", "flex-direction=\"row\"", "gap=0"),
+        ("row", "display=\"none\"", "opacity=1"),
+        ("view", "padding=10", "padding-top=4"),
+        ("view", "margin=10", "margin-top=4"),
+        (
+            "view",
+            "position=\"relative\"\n  inset=10",
+            "position=\"relative\"\n  top=4",
+        ),
+        ("column", "gap=10", "row-gap=4"),
+        ("view", "border=\"2px solid red\"", "border-color=\"blue\""),
+        ("view", "border-radius=10", "border-top-left-radius=4"),
+        ("view", "overflow=\"hidden\"", "overflow-y=\"scroll\""),
+        ("view", "flex=\"2 3 40px\"", "flex-grow=5"),
+        // An `hr` fixes its top border and colour, a metric among them.
+        ("hr", "border-width=2\n  color=\"red\"", "opacity=1"),
+    ] {
+        let node = |id: &str, class: &str| {
+            match tag {
+            "hr" => format!("      hr testId=\"{id}\" class={class}\n"),
+            _ => format!("      {tag} testId=\"{id}\" class={class}\n        view width=50 height=20\n        view width=50 height=20\n"),
+        }
+        };
+        let src = format!(
+            "style A\n  {a}\nstyle B\n  {b}\ncomponent App\n  state on = true\n  action flip\n    on = not on\n  view\n    row width=400 height=800 testId=\"root\"\n{}{}{}{}",
+            node("a", "A"),
+            node("b", "B"),
+            node("ab", "(on ? A : B)"),
+            node("ba", "(on ? B : A)"),
+        );
+        let plan = contract::bake(contract::compile(&src).unwrap(), NoData).unwrap();
+        let mut r = Runner::boot(
+            plan,
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        for on in [true, false] {
+            let k = r.kernel_mut();
+            let root = k.node_by_key(k.find_by_test_id("root")[0]).unwrap().id;
+            k.compute_layout(root, Offer::definite(400.0, 800.0))
+                .unwrap();
+            let k = r.kernel();
+            let seen = |id: &str| {
+                let n = k.node_by_key(k.find_by_test_id(id)[0]).unwrap();
+                let mut style = n.style.clone();
+                style.written = Default::default();
+                let at = |c: exact_kernel::NodeRef| (c.frame.x - n.frame.x, c.frame.y - n.frame.y);
+                let children: Vec<_> = n.child_nodes().map(at).collect();
+                (style, (n.frame.width, n.frame.height), children)
+            };
+            let (yes, no) = if on { ("a", "b") } else { ("b", "a") };
+            assert_eq!(
+                seen("ab"),
+                seen(yes),
+                "{tag} A: {a}; B: {b}; on={on}: (on ? A : B)"
+            );
+            assert_eq!(
+                seen("ba"),
+                seen(no),
+                "{tag} A: {a}; B: {b}; on={on}: (on ? B : A)"
+            );
+            r.act("flip", vec![]).unwrap();
+        }
+    }
 }

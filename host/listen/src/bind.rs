@@ -273,19 +273,24 @@ pub fn publish(path: &Path, takeover: bool, over: bool) -> Result<Bound, Failure
     })
 }
 
-/// Remove `path` while it is still the file `ours`, under the lock.
-pub fn unpublish(path: &Path, ours: Identity) {
+/// Stop tracking a socket this listener no longer holds, without touching its path.
+pub(crate) fn forget(path: &Path, ours: Identity) {
     PUBLISHED
         .lock()
         .unwrap()
         .retain(|(p, i)| !(p == path && *i == ours));
+}
+
+/// Remove `path` while it is still the file `ours`, under the lock.
+pub fn unpublish(path: &Path, ours: Identity) {
+    forget(path, ours);
     let Ok(_lock) = Lock::take(path) else { return };
     if identity(path) == Some(ours) {
         let _ = fs::remove_file(path);
     }
 }
 
-/// The files this process has published and not removed: removed at its
+/// The published sockets this process still holds: removed at its
 /// exit too, so a host that exits without closing its sessions (a drive's
 /// end, `exit()`) leaves no socket behind (D4). A crash still leaves a stale
 /// one, which the next listener replaces.
@@ -316,6 +321,86 @@ mod tests {
         let dir = base.join(format!("exact-listen-bind-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn registered(path: &Path) -> Vec<Identity> {
+        PUBLISHED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(p, i)| (p == path).then_some(*i))
+            .collect()
+    }
+
+    // Ownership transitions run synchronously here, without a poll loop or wake pipe.
+    fn listening(path: &Path) -> crate::Loop {
+        let signal = std::sync::Arc::new(crate::hold::Signal::new(|| {}));
+        let (hold, _) = crate::hold::enter(path, false, signal.clone());
+        crate::Loop {
+            config: crate::Config {
+                address: format!("unix:{}", path.display()),
+                path: path.to_path_buf(),
+                takeover: false,
+                first_line: None,
+                max_line: 64,
+                max_connections: 4,
+            },
+            sink: Box::new(|_| crate::Taken::Queued),
+            shared: std::sync::Arc::new(crate::Shared {
+                out: Default::default(),
+                signal,
+                wake: -1,
+            }),
+            wake: -1,
+            bound: Some(publish(path, false, false).unwrap()),
+            ever_bound: true,
+            hold: Some(hold),
+            watch: None,
+            conns: Default::default(),
+            next: 1,
+            stopped: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "async lane: binds real unix sockets"]
+    fn displaced_sockets_leave_the_exit_registry() {
+        for external in [false, true] {
+            let d = dir(if external { "replace" } else { "displace" });
+            let path = d.join("a.sock");
+            let mut first = listening(&path);
+            let second = publish(&path, true, false).unwrap();
+            if external {
+                first.look();
+            } else {
+                first.displace();
+            }
+            assert_eq!(registered(&path), vec![second.identity]);
+            first.teardown();
+            assert_eq!(identity(&path), Some(second.identity));
+            assert!(UnixStream::connect(&path).is_ok());
+            unpublish(&path, second.identity);
+            assert!(registered(&path).is_empty());
+            fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "async lane: binds real unix sockets"]
+    fn missing_sockets_leave_the_exit_registry() {
+        let d = dir("missing");
+        let path = d.join("a.sock");
+        let mut listener = listening(&path);
+        fs::remove_file(&path).unwrap();
+        listener.look();
+        let rebound = listener.bound.as_ref().unwrap().identity;
+        assert_eq!(registered(&path), vec![rebound]);
+        assert_eq!(identity(&path), Some(rebound));
+        assert!(UnixStream::connect(&path).is_ok());
+        listener.teardown();
+        assert!(registered(&path).is_empty());
+        assert!(!path.exists());
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

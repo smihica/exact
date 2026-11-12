@@ -213,9 +213,9 @@ final class TextSelectionMacTests: XCTestCase {
         XCTAssertEqual(p.selection.selectedText(), "world")
     }
 
-    private func mouse(_ type: NSEvent.EventType, _ point: NSPoint, clicks: Int = 1, flags: NSEvent.ModifierFlags = []) -> NSEvent {
+    private func mouse(_ type: NSEvent.EventType, _ point: NSPoint, clicks: Int = 1, flags: NSEvent.ModifierFlags = [], in window: NSWindow? = nil) -> NSEvent {
         NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
-                           windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: clicks, pressure: type == .leftMouseUp ? 0 : 1)!
+                           windowNumber: (window ?? self.window).windowNumber, context: nil, eventNumber: 1, clickCount: clicks, pressure: type == .leftMouseUp ? 0 : 1)!
     }
     /// A point of a character of a one-line paragraph, in the window: a
     /// tenth into the glyph, where its own leading caret is the nearest.
@@ -226,9 +226,9 @@ final class TextSelectionMacTests: XCTestCase {
     /// A press on a character of `node`, dragged to another when asked, and released.
     private func press(_ node: NodeView, _ index: Int, to: Int? = nil, in other: NodeView? = nil, clicks: Int = 1, flags: NSEvent.ModifierFlags = []) throws {
         let down = try at(node, index), up = try to.map { try at(other ?? node, $0) } ?? down
-        node.mouseDown(with: mouse(.leftMouseDown, down, clicks: clicks, flags: flags))
-        if to != nil { node.mouseDragged(with: mouse(.leftMouseDragged, up, clicks: clicks, flags: flags)) }
-        node.mouseUp(with: mouse(.leftMouseUp, up, clicks: clicks, flags: flags))
+        node.mouseDown(with: mouse(.leftMouseDown, down, clicks: clicks, flags: flags, in: node.window))
+        if to != nil { node.mouseDragged(with: mouse(.leftMouseDragged, up, clicks: clicks, flags: flags, in: node.window)) }
+        node.mouseUp(with: mouse(.leftMouseUp, up, clicks: clicks, flags: flags, in: node.window))
     }
     /// An arrow key down, as AppKit sends it: 123 to 126 are left, right, down and up.
     private func arrow(_ code: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent {
@@ -530,6 +530,186 @@ final class TextSelectionMacTests: XCTestCase {
         XCTAssertEqual(copied, "vcode 1 body\n\nvcode 2 body\n\n" + ("vcode 3 body" as NSString).substring(to: painted.length))
         p.selection.selectAll()
         XCTAssertEqual(p.selection.selectedText(), (1...5).map { "vcode \($0) body" }.joined(separator: "\n\n"), "⌘A in a list")
+    }
+
+    func testSelectAllFollowsTheReadersListOrPage() throws {
+        try selectAllFollowsTheReadersListOrPage(inSheet: false)
+    }
+
+    func testSelectAllFollowsTheReadersListOrPageInASheet() throws {
+        try selectAllFollowsTheReadersListOrPage(inSheet: true)
+    }
+
+    func testSelectAllUsesTheReceivingWindowsResponder() throws {
+        try selectAllFollowsTheReadersListOrPage(inSheet: false, inPopover: true)
+    }
+
+    private func selectAllFollowsTheReadersListOrPage(inSheet: Bool, inPopover: Bool = false) throws {
+        _ = NSApplication.shared
+        let container = inSheet ? "dialog id=\"reader\" display=\"flex\" flex-direction=\"column\""
+            : inPopover ? "column id=\"reader\" popover=\"manual\"" : "column"
+        let source = """
+        component App
+          view
+            column
+              \(inPopover ? "text \"Main window prose.\" id=\"outside\"" : "")
+              \(inPopover ? "button id=\"open\" popovertarget=\"reader\"" : "")
+              \(inPopover ? "  text \"Open\"" : "")
+              \(container) gap=8
+                article
+                  text "Release notes"
+                  text "Long prose the person is reading." id="prose"
+                list virtualized=true height=140 width=360 estimated-item-height=28
+                  for n in [\((1...40).map(String.init).joined(separator: ", "))] key=n
+                    text `comment ${n} body` id=`comment-${n}` height=28
+                text "Between the lists."
+                list virtualized=true height=140 width=360 estimated-item-height=28
+                  for n in [\((1...40).map(String.init).joined(separator: ", "))] key=n
+                    text `reply ${n} body` id=`reply-${n}` height=28
+              \(inPopover ? "column id=\"footer\" popover=\"manual\"" : "")
+              \(inPopover ? "  text \"Window end.\"" : "")
+        """
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try source.write(to: dir.appendingPathComponent("app.contract"), atomically: true, encoding: .utf8)
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_CONTRACT"]))
+        compiler.arguments = ["build", dir.appendingPathComponent("app.contract").path, "-o", dir.appendingPathComponent("app.plan").path]
+        try compiler.run(); compiler.waitUntilExit()
+        XCTAssertEqual(compiler.terminationStatus, 0)
+        let session = ExactApp.shared.makeSession(label: "select-all-scope")
+        self.session = session
+        XCTAssertNil(session.boot(plan: try Data(contentsOf: dir.appendingPathComponent("app.plan")), size: CGSize(width: 400, height: 500)).error)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = ExactView(session: session)
+        let p = session.presenter
+        p.dialogs.painted = false
+        p.menus.painted = true
+        var popoverWindow: NSWindow?
+        defer { popoverWindow?.close() }
+        defer { p.menus.reset(); p.dialogs.reset() }
+        if inSheet { p.dialogCommand("showModal", "reader") }
+        if inPopover {
+            p.menus.action("showPopover", ["reader", "open"])
+            let entry = try XCTUnwrap(p.menus.entries.first)
+            let native = NativePopover(host: p.menus, node: entry.popover, home: entry.frame)
+            // Ordinary windows keep independent responders without requiring
+            // an active desktop for a key NSPopover.
+            let other = NSWindow(contentRect: entry.frame, styleMask: [.titled], backing: .buffered, defer: false)
+            other.isReleasedWhenClosed = false
+            other.contentView = native.content
+            native.content.addSubview(entry.popover)
+            entry.native = native
+            popoverWindow = other
+        }
+        let front = try XCTUnwrap(inPopover ? p.menus.windowed.first?.window : p.frontWindow)
+        XCTAssertEqual(front is SheetWindow, inSheet)
+        func text(_ value: String) -> NodeView? { p.views.values.first { $0.isParagraph && $0.props["text"] == value } }
+        waitFor("both lists' rows") {
+            front.contentView?.layoutSubtreeIfNeeded()
+            return text("comment 2 body") != nil && text("reply 2 body") != nil
+        }
+        XCTAssertNil(text("reply 40 body"), "copy must include rows that have not mounted")
+        func command(_ character: String, in target: NSWindow? = nil) throws {
+            let target = target ?? front
+            let event = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: target.windowNumber, context: nil,
+                characters: character, charactersIgnoringModifiers: character, isARepeat: false, keyCode: character == "a" ? 0 : 8))
+            XCTAssertTrue(target.performKeyEquivalent(with: event))
+        }
+        if inPopover {
+            let reply = try XCTUnwrap(text("reply 2 body"))
+            let outside = try XCTUnwrap(text("Main window prose."))
+            XCTAssertTrue(front !== window)
+            XCTAssertTrue(reply.window === front)
+            XCTAssertTrue(outside.window === window)
+            for clickAgain in [false, true] {
+                for path in ["key equivalent", "key down", "menu action", "container action"] {
+                    try press(outside, 1)
+                    try press(reply, 1)
+                    XCTAssertTrue(front.firstResponder === reply)
+                    try command("a"); try command("c")
+                    XCTAssertEqual(NSPasteboard.general.string(forType: .string), (1...40).map { "reply \($0) body" }.joined(separator: "\n\n"))
+                    // Returning through the title bar keeps this window's responder.
+                    if clickAgain { try press(outside, 1) }
+                    XCTAssertTrue(window.firstResponder === outside)
+                    XCTAssertTrue(front.firstResponder === reply)
+                    XCTAssertTrue(p.focusResponder === reply, "the fallback lookup still sees the other window")
+                    switch path {
+                    case "key equivalent": try command("a", in: window)
+                    case "key down":
+                        outside.keyDown(with: try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                            characters: "a", charactersIgnoringModifiers: "a", isARepeat: false, keyCode: 0)))
+                    case "menu action": XCTAssertTrue(outside.tryToPerform(#selector(NSText.selectAll(_:)), with: nil))
+                    default: try XCTUnwrap(window.contentView as? ExactView).selectAll(nil)
+                    }
+                    try command("c", in: window)
+                    XCTAssertEqual(NSPasteboard.general.string(forType: .string), outside.paragraphText, path)
+                    XCTAssertEqual(p.selection.range(outside), NSRange(location: 0, length: (outside.paragraphText as NSString).length), path)
+                    XCTAssertNil(p.selection.range(reply), path)
+                    XCTAssertNil(p.selection.range(try XCTUnwrap(text("comment 2 body"))), path)
+                }
+            }
+            // This window's endpoints now straddle the other window's text in document order.
+            p.menus.action("showPopover", ["footer", "open"])
+            XCTAssertTrue(try XCTUnwrap(text("Window end.")).window === window)
+            p.selection.selectAll(in: window)
+            p.selection.copy()
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), "Main window prose.\n\nWindow end.")
+            XCTAssertNil(p.selection.range(reply))
+            return
+        }
+        p.selection.selectAll()
+        XCTAssertTrue(p.selection.selectedText().contains("Release notes"), "two lists provide no default list scope")
+        for prefix in ["reply", "comment"] {
+            let node = try XCTUnwrap(text("\(prefix) 2 body"))
+            try press(node, 1)
+            XCTAssertTrue(front.firstResponder === node)
+            for _ in 0..<2 {
+                try command("a"); try command("c")
+                XCTAssertEqual(NSPasteboard.general.string(forType: .string), (1...40).map { "\(prefix) \($0) body" }.joined(separator: "\n\n"))
+                XCTAssertEqual(p.selection.range(node), NSRange(location: 0, length: (node.paragraphText as NSString).length))
+                XCTAssertNil(p.selection.range(try XCTUnwrap(text(prefix == "reply" ? "comment 2 body" : "reply 2 body"))))
+                XCTAssertNil(p.selection.range(try XCTUnwrap(text("Release notes"))))
+            }
+        }
+        // Focus can move without another press, including within a sheet.
+        for prefix in ["reply", "comment"] {
+            let node = try XCTUnwrap(text("\(prefix) 2 body"))
+            p.focusElement(["\(prefix)-2"])
+            XCTAssertTrue(front.firstResponder === node)
+            try command("a"); try command("c")
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), (1...40).map { "\(prefix) \($0) body" }.joined(separator: "\n\n"))
+        }
+        p.focusElement(["prose"])
+        XCTAssertTrue(front.firstResponder === text("Long prose the person is reading."))
+        try command("a"); try command("c")
+        XCTAssertTrue(try XCTUnwrap(NSPasteboard.general.string(forType: .string)).contains("Long prose the person is reading."))
+        for value in ["Long prose the person is reading.", "Between the lists."] {
+            let node = try XCTUnwrap(text(value))
+            try press(node, 1)
+            for _ in 0..<2 {
+                try command("a"); try command("c")
+                XCTAssertEqual(p.selection.range(node), NSRange(location: 0, length: (value as NSString).length))
+                XCTAssertTrue(try XCTUnwrap(NSPasteboard.general.string(forType: .string)).contains(value))
+            }
+        }
+        let reply = try XCTUnwrap(text("reply 2 body"))
+        let replies = try XCTUnwrap(p.views.values.first { $0.kind == "list" && reply.isDescendant(of: $0) })
+        p.apply(wireBatch([["op": "style", "id": replies.id, "style": ["display": "none"]]]))
+        let prose = try XCTUnwrap(text("Long prose the person is reading."))
+        try press(prose, 1)
+        try command("a"); try command("c")
+        XCTAssertTrue(try XCTUnwrap(NSPasteboard.general.string(forType: .string)).contains(prose.paragraphText), "a sole list cannot take selection from prose")
+
+        // A fresh selection has neither a focused paragraph nor a last press.
+        front.makeFirstResponder(nil)
+        let unplaced = TextSelection(p)
+        unplaced.selectAll()
+        XCTAssertEqual(unplaced.selectedText(), (1...40).map { "comment \($0) body" }.joined(separator: "\n\n"))
     }
 
     /// A double click selects a word by the text system's boundaries, as an

@@ -744,7 +744,39 @@ fn native_below(
         .ok_or(denied.clone())?;
     let failed = |e: std::io::Error| HostError::Failed(format!("{}: {e}", path.display()));
     let line_path = line_native(line).ok_or(denied)?;
-    let (root, at, mut parts) = reach(&line_path, &written(grants, directories)).map_err(failed)?;
+    let (root, at, mut parts) = reach(&line_path, &written(grants, directories)).map_err(|e| {
+        let Some(NamesAFile(file, as_spelt)) =
+            e.get_ref().and_then(|e| e.downcast_ref::<NamesAFile>())
+        else {
+            return failed(e);
+        };
+        // Spelt as a grant line spells a target, quoted where it must be.
+        let spelt = |path: &Path| {
+            let path = path.to_string_lossy();
+            PathPrefix::new(&path).map_or(path.to_string(), |p| p.to_string())
+        };
+        // The line without its last name reaches the directory holding the
+        // file and admits paths spelt as the line is, unless that name is a
+        // link to the file, which no walk follows below a line; then the
+        // directory the file is in, and the file is named as reached.
+        let (names, directory) = match (as_spelt, line.components()[1..].split_last()) {
+            (true, Some((_, above))) => ("names a file".into(), format!("/{}", above.join("/"))),
+            _ => (
+                format!("reaches a file, `{}`", spelt(file)),
+                file.parent()
+                    .unwrap_or(Path::new("/"))
+                    .to_string_lossy()
+                    .into(),
+            ),
+        };
+        let directory = spelt(Path::new(&directory));
+        HostError::Failed(format!(
+            "denied: {}: the line `{capability} {line}` {names}, and a native grant line names a \
+             directory, not a file; replace that line with `{capability} {directory}` and use \
+             the file under it",
+            path.display(),
+        ))
+    })?;
     parts.extend(
         target.components()[line.components().len()..]
             .iter()
@@ -822,6 +854,9 @@ fn reach(
     };
     let root = || super::app_fs::open_directory(Path::new("/"));
     let (mut dir, mut at, mut todo, mut links) = (root()?, PathBuf::from("/"), named(line), 0);
+    // Whether the line's own last name was a link, so what is walked now
+    // is where it points.
+    let mut past_last = false;
     loop {
         let meta = dir.metadata()?;
         if stops.contains(&(meta.dev(), meta.ino())) {
@@ -856,7 +891,22 @@ fn reach(
         };
         // A link: go on from where it points, as the kernel would, unless
         // this user can have made it.
-        let target = super::app_fs::link_at(&dir, &part).map_err(|_| error)?;
+        let target = match super::app_fs::link_at(&dir, &part) {
+            Ok(target) => target,
+            // The line's last name is a file, which a native line cannot
+            // name (exact2 LLP 1133.007 §9): only the refusal's words differ.
+            Err(_)
+                if todo.is_empty()
+                    && error.raw_os_error() == Some(libc::ENOTDIR)
+                    && is_file_at(&dir, &part) =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    NamesAFile(at.join(&part), !past_last),
+                ));
+            }
+            Err(_) => return Err(error),
+        };
         if made_by_this_user(&dir, &part)? {
             let link = at.join(&part);
             return Err(std::io::Error::new(
@@ -872,6 +922,7 @@ fn reach(
         if links > 40 {
             return Err(std::io::Error::from_raw_os_error(libc::ELOOP));
         }
+        past_last |= todo.is_empty();
         if target.as_bytes().first() == Some(&b'/') {
             (dir, at) = (root()?, PathBuf::from("/"));
         }
@@ -879,6 +930,46 @@ fn reach(
             todo.push_front(part);
         }
     }
+}
+
+/// The regular file a grant line's last name reached (`reach`), and whether
+/// that name is the file itself rather than a link to it.
+#[cfg(unix)]
+#[derive(Debug)]
+struct NamesAFile(PathBuf, bool);
+
+#[cfg(unix)]
+impl std::fmt::Display for NamesAFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is a file, not a directory", self.0.display())
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for NamesAFile {}
+
+/// Whether `name` in `dir` is a regular file, read from the entry itself
+/// (`fstatat` with `AT_SYMLINK_NOFOLLOW`), so nothing is followed.
+#[cfg(unix)]
+fn is_file_at(dir: &std::fs::File, name: &std::ffi::OsStr) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor, the terminated name and the buffer are live
+    // throughout fstatat, which fills `stat` when it returns 0.
+    let got = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    // SAFETY: fstatat returned 0, so it filled `stat`.
+    got == 0 && unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
 /// Whether the link `name` in `dir` is one this process's user can have made

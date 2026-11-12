@@ -43,7 +43,8 @@ fn main() {
             contract::rust_entry(
                 "carousel_data::Cards",
                 "carousel_data::Cards",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

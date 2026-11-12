@@ -208,7 +208,7 @@ fn load(file: &Path) -> Option<Store> {
         .write(true)
         .open(file.with_extension("lock"))
         .ok()?;
-    lock.try_lock().ok()?;
+    crate::try_lock(&lock).ok()?;
     let read: Value = match std::fs::read(file) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .ok()

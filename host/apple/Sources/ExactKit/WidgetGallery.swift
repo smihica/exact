@@ -541,9 +541,7 @@ enum WidgetGallery {
                     result["refresh"] = preview.refresh; result["refreshReason"] = preview.refreshReason
                 case "screenshot":
                     guard let path = request["path"] as? String else { throw HeadlessSession.Failure(description: "screenshot needs a path") }
-                    let renderer = ImageRenderer(content: WidgetPreviewView(preview: preview))
-                    renderer.scale = variant.scale; renderer.proposedSize = ProposedViewSize(variant.displaySize)
-                    guard let image = renderer.cgImage,
+                    guard let image = GalleryCapture.image(WidgetPreviewView(preview: preview), width: variant.displaySize.width, height: variant.displaySize.height, scale: variant.scale),
                           let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
                         throw HeadlessSession.Failure(description: "could not render widget screenshot")
                     }

@@ -16,7 +16,7 @@ public enum ExactNumerals {
 final class NumeralHost: NumeralCapability {
     private static var slot = 0
 
-    func show(_ node: NodeView, attributed: NSAttributedString, box: CGRect, align: Int, mode: String) {
+    func show(_ node: NodeView, attributed: NSAttributedString, box: CGRect, baseline: CGFloat?, align: Int, mode: String) {
         let roll: NumeralRoll
         if let existing = objc_getAssociatedObject(node, &Self.slot) as? NumeralRoll {
             roll = existing
@@ -26,7 +26,7 @@ final class NumeralHost: NumeralCapability {
             node.addSubview(roll.view)
         }
         roll.view.frame = box
-        roll.show(attributed, align: align, mode: mode)
+        roll.show(attributed, baseline: baseline, align: align, mode: mode)
     }
 
     func hide(_ node: NodeView) {
@@ -38,11 +38,14 @@ final class NumeralHost: NumeralCapability {
 
 /// One paragraph's rolling text: what SwiftUI shows, and the last number it
 /// showed, which says which way the next one rolls.
-private final class NumeralModel: ObservableObject {
+final class NumeralModel: ObservableObject {
     @Published var text = AttributedString()
     @Published var down = false
     @Published var version = 0
-    @Published var alignment: Alignment = .leading
+    @Published var alignment: HorizontalAlignment = .leading
+    /// Where the line's baseline is, down from the view's top; nil: the
+    /// line is centred down the view.
+    @Published var baseline: CGFloat?
     var plain = ""
 }
 
@@ -57,16 +60,20 @@ private struct NumeralBody: View {
             // Apple's smooth spring, without bounce; none under Reduce Motion,
             // where the number changes in place.
             .animation(UIAccessibility.isReduceMotionEnabled ? nil : .spring(duration: 0.4, bounce: 0), value: model.version)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: model.alignment)
+            // The baseline where Exact laid the line out, as the backgrounds under it are.
+            .alignmentGuide(.top) { $0[.firstTextBaseline] - (model.baseline ?? 0) }
+            .frame(maxWidth: .infinity, maxHeight: .infinity,
+                   alignment: Alignment(horizontal: model.alignment, vertical: model.baseline == nil ? .center : .top))
             // The node is the accessibility element; it reads the value once.
             .accessibilityHidden(true)
     }
 }
 
-private final class NumeralRoll {
+final class NumeralRoll {
     let model = NumeralModel()
     let view: UIView
     private let host: UIHostingController<NumeralBody>
+    private var lastAttributed: NSAttributedString?
 
     init() {
         host = UIHostingController(rootView: NumeralBody(model: model))
@@ -76,15 +83,19 @@ private final class NumeralRoll {
         view.isUserInteractionEnabled = false
     }
 
-    func show(_ attributed: NSAttributedString, align: Int, mode: String) {
+    func show(_ attributed: NSAttributedString, baseline: CGFloat? = nil, align: Int, mode: String) {
         model.alignment = align == 1 ? .center : align == 2 ? .trailing : .leading
+        if model.baseline != baseline { model.baseline = baseline }
+        guard lastAttributed?.isEqual(to: attributed) != true else { return }
+        lastAttributed = NSAttributedString(attributedString: attributed)
         let plain = attributed.string
+        model.text = (try? AttributedString(attributed, including: \.uiKit)) ?? AttributedString(plain)
+        // A style change repaints without starting another numeric transition.
         guard plain != model.plain || model.version == 0 else { return }
         // `numeric-countdown` always rolls down; `numeric` rolls the way the
         // number moved, as SwiftUI's own callers say.
         model.down = mode == "numeric-countdown" || leadingNumber(plain) < leadingNumber(model.plain)
         model.plain = plain
-        model.text = (try? AttributedString(attributed, including: \.uiKit)) ?? AttributedString(plain)
         model.version += 1
     }
 }

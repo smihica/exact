@@ -1,3 +1,6 @@
+# Every checkout is LF, whatever core.autocrlf says: build scripts edit and compare source text, and
+# fixtures, plans and vendored crates are hashed by their bytes. Git still detects binary files itself.
+* text=auto eol=lf
 # These inputs have receipt-bound byte identities; preserve their exact newlines.
 js/windows-intl.patch -text
 js/windows-intl-case.inc -text
@@ -6,3 +9,11 @@ js/windows-intl-number.inc -text
 js/windows-intl-probe.js -text
 js/windows-intl-probe.cc -text
 js/windows-intl.json -text
+# Copies kept with their upstream's CRLF bytes.
+apps/variable-type/assets/LICENSE-RobotoFlex.txt -text
+game/games/garden/assets/fonts/LICENSE-Sniglet.txt -text
+host/apple/tests/fonts/Inter-LICENSE -text
+host/linux/tests/fonts/Inter-LICENSE -text
+host/linux/tests/fonts/RobotoFlex-LICENSE -text
+host/windows/reference/packages.lock.json -text
+vendor/wgpu-hal/src/vulkan/descriptor.rs -text

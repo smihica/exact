@@ -1,6 +1,7 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // Test symbol updates with a minimal DOM, then verify their computed styles in Chrome.
 import { afterAll, test, expect } from 'bun:test';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
@@ -123,7 +124,7 @@ test('symbol axes follow the current projected title and root font without anoth
     if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
     const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(Bun.file(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
   } });
   let browser, stage = 'launch';
   const report = (kind, value) => console.log('symbol diagnostic', JSON.stringify({ stage, kind, value }));
@@ -214,7 +215,7 @@ test('a symbol under a bound colour follows whether it has a value', async () =>
     if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
     const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(Bun.file(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
   } });
   let browser;
   try {
@@ -263,7 +264,7 @@ test('a symbol on a button follows its title across a colour scheme change', asy
     if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
     const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(Bun.file(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
   } });
   let browser;
   try {
@@ -323,7 +324,7 @@ test('a symbol under a mode boundary follows its implied row and its binding', a
     if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
     const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(Bun.file(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
   } });
   let browser;
   try {

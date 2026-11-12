@@ -66,23 +66,55 @@ extension TextEngine {
     /// San Francisco's `wght` at each named weight.
     private static let systemStops: [CGFloat] = namedWeights.map { wght(PlatformFont.systemFont(ofSize: 17, weight: $0))?.value ?? 400 }
 
+    /// One variation axis of a face: its tag, range and default.
+    package struct Axis: Equatable {
+        package let tag: UInt32, min: CGFloat, initial: CGFloat, max: CGFloat
+    }
+
+    /// A face's variation axes, read from its `fvar` table
+    /// (https://learn.microsoft.com/typography/opentype/spec/fvar), each value
+    /// cut to four decimals as Core Text reports it (Skia's 0.47999 is its
+    /// 0.4799). Core Text builds every axis's localized name to answer
+    /// `CTFontCopyVariationAxes`: for the control font and the nine system
+    /// weights that was 13 ms of a 21 ms boot on an iPhone 17 Pro Max. A face
+    /// whose table is missing, or is not a version 1 table laid out as the
+    /// specification says, is asked Core Text.
+    package static func axes(_ font: PlatformFont) -> [Axis] {
+        guard let table = CTFontCopyTable(font as CTFont, CTFontTableTag(kCTFontTableFvar), []).map({ [UInt8]($0 as Data) }),
+              table.count >= 16 else { return namedAxes(font) }
+        func u16(_ at: Int) -> Int { Int(table[at]) << 8 | Int(table[at + 1]) }
+        func u32(_ at: Int) -> UInt32 { UInt32(u16(at)) << 16 | UInt32(u16(at + 2)) }
+        func fixed(_ at: Int) -> CGFloat { (CGFloat(Int32(bitPattern: u32(at))) / 65536 * 10000).rounded(.towardZero) / 10000 }
+        let first = u16(4), count = u16(8), size = u16(10)
+        guard u16(0) == 1, size >= 20, first >= 16, first + count * size <= table.count else { return namedAxes(font) }
+        return (0..<count).map { i in
+            let at = first + i * size
+            return Axis(tag: u32(at), min: fixed(at + 4), initial: fixed(at + 8), max: fixed(at + 12))
+        }
+    }
+
+    /// The same from `CTFontCopyVariationAxes`.
+    package static func namedAxes(_ font: PlatformFont) -> [Axis] {
+        (CTFontCopyVariationAxes(font as CTFont) as? [[CFString: Any]] ?? []).compactMap { axis in
+            guard let tag = (axis[kCTFontVariationAxisIdentifierKey] as? NSNumber)?.uint32Value,
+                  let low = (axis[kCTFontVariationAxisMinimumValueKey] as? NSNumber)?.doubleValue,
+                  let high = (axis[kCTFontVariationAxisMaximumValueKey] as? NSNumber)?.doubleValue,
+                  let initial = (axis[kCTFontVariationAxisDefaultValueKey] as? NSNumber)?.doubleValue else { return nil }
+            return Axis(tag: tag, min: CGFloat(low), initial: CGFloat(initial), max: CGFloat(high))
+        }
+    }
+
     /// Every axis of a face at its value, its default where the instance sets none.
     private static func variation(_ font: PlatformFont) -> [NSNumber: CGFloat] {
-        var axes: [NSNumber: CGFloat] = [:]
-        for axis in CTFontCopyVariationAxes(font as CTFont) as? [[CFString: Any]] ?? [] {
-            if let tag = axis[kCTFontVariationAxisIdentifierKey] as? NSNumber,
-               let initial = (axis[kCTFontVariationAxisDefaultValueKey] as? NSNumber)?.doubleValue { axes[tag] = CGFloat(initial) }
-        }
-        for (tag, value) in CTFontCopyVariation(font as CTFont) as? [NSNumber: NSNumber] ?? [:] { axes[tag] = CGFloat(value.doubleValue) }
-        return axes
+        var values: [NSNumber: CGFloat] = [:]
+        for axis in axes(font) { values[axis.tag as NSNumber] = axis.initial }
+        for (tag, value) in CTFontCopyVariation(font as CTFont) as? [NSNumber: NSNumber] ?? [:] { values[tag] = CGFloat(value.doubleValue) }
+        return values
     }
 
     /// A face's `wght` (its axis default where the instance sets none) and
     /// the axis's range; nil without the axis. Kept per font object, which is
-    /// immutable: Core Text builds every axis's localized name to answer
-    /// `CTFontCopyVariationAxes`, and measuring controls asked it for the
-    /// same face on every commit (44% of the owner thread's work while a list
-    /// filled rows on the Mac).
+    /// immutable: measuring controls asks for the same face on every commit.
     private static func wght(_ font: PlatformFont) -> (value: CGFloat, min: CGFloat, max: CGFloat)? {
         wghtLock.lock()
         let kept = wghtKept.object(forKey: font)
@@ -103,12 +135,8 @@ extension TextEngine {
     private static let wghtLock = NSLock()
     private static func readWght(_ font: PlatformFont) -> (value: CGFloat, min: CGFloat, max: CGFloat)? {
         let tag = wghtTag.uint32Value
-        guard let axis = (CTFontCopyVariationAxes(font as CTFont) as? [[CFString: Any]])?
-            .first(where: { ($0[kCTFontVariationAxisIdentifierKey] as? NSNumber)?.uint32Value == tag }),
-              let low = (axis[kCTFontVariationAxisMinimumValueKey] as? NSNumber)?.doubleValue,
-              let high = (axis[kCTFontVariationAxisMaximumValueKey] as? NSNumber)?.doubleValue,
-              let initial = (axis[kCTFontVariationAxisDefaultValueKey] as? NSNumber)?.doubleValue else { return nil }
+        guard let axis = axes(font).first(where: { $0.tag == tag }) else { return nil }
         let set = (CTFontCopyVariation(font as CTFont) as? [NSNumber: NSNumber])?[wghtTag]?.doubleValue
-        return (CGFloat(set ?? initial), CGFloat(low), CGFloat(high))
+        return (set.map { CGFloat($0) } ?? axis.initial, axis.min, axis.max)
     }
 }

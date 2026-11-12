@@ -2,6 +2,42 @@ use super::*;
 use crate::{BodyKind, Physics};
 use exact_game::{Game, Input, Paranoid, Sim, Vec3, World};
 
+#[test]
+fn signed_zero_pose_edits_preserve_static_collider_continuation() {
+    for x in [0.0, -0.0] {
+        let mut w = World::new(60, 0);
+        crate::register(&mut w);
+        let fixed = w.spawn((Transform::at(x, 0.0, 0.0), Collider::default()));
+        w.spawn((
+            Transform::at(100.0, 0.0, 0.0),
+            Body {
+                velocity: Vec3::X,
+                gravity: 0.0,
+                ..Body::default()
+            },
+        ));
+        crate::step(&mut w);
+        // Cache the static collider's verified rebuild before editing its pose.
+        let _ = w.save();
+        {
+            let p = w.resource::<Physics>();
+            assert_eq!(p.executor.0.borrow_mut().live().elidable.len(), 1);
+        }
+        w.get_mut::<Transform>(fixed).unwrap().position.x = -x;
+        crate::step(&mut w);
+        let mut restored = World::new(60, 0);
+        crate::register(&mut restored);
+        restored.load(&w.save()).unwrap();
+        assert_eq!(restored.hash(), w.hash());
+        for world in [&mut w, &mut restored] {
+            world.get_mut::<Collider>(fixed).unwrap().friction = 0.75;
+            crate::step(world);
+        }
+        assert_eq!(restored.hash(), w.hash());
+        assert_eq!(restored.save(), w.save());
+    }
+}
+
 // EXPHYS v2's final BroadPhaseBvh serde field is the pending bool. Decode a
 // re-encoded value after changing just that field: a v1 omission negative control.
 fn pending(p: &Physics) -> bool {

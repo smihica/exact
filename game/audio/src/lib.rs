@@ -130,6 +130,12 @@ pub trait Output {
         pitch: f32,
     ) -> bool;
     fn set(&mut self, id: u64, gain_l: f32, gain_r: f32);
+    /// Ease a live voice toward this playback rate without restarting it.
+    fn set_pitch(&mut self, id: u64, pitch: f32);
+    /// Whether this output generation exhausted its PCM; false if not tracked.
+    fn finished(&self, _id: u64) -> bool {
+        false
+    }
     fn stop(&mut self, id: u64);
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -149,6 +155,10 @@ pub enum Call {
         left: f32,
         right: f32,
     },
+    Pitch {
+        id: u64,
+        pitch: f32,
+    },
     Stop {
         id: u64,
     },
@@ -164,6 +174,7 @@ impl Output for NullOutput {
         false
     }
     fn set(&mut self, _: u64, _: f32, _: f32) {}
+    fn set_pitch(&mut self, _: u64, _: f32) {}
     fn stop(&mut self, _: u64) {}
 }
 /// Explicit test recorder; never used by agent sessions.
@@ -210,6 +221,9 @@ impl Output for RecordingOutput {
     }
     fn set(&mut self, id: u64, left: f32, right: f32) {
         self.calls.push(Call::Set { id, left, right });
+    }
+    fn set_pitch(&mut self, id: u64, pitch: f32) {
+        self.calls.push(Call::Pitch { id, pitch });
     }
     fn stop(&mut self, id: u64) {
         self.calls.push(Call::Stop { id });
@@ -261,7 +275,8 @@ enum Key {
 }
 struct Active {
     output_id: u64,
-    signature: (u64, u64, u32),
+    signature: (u64, u64),
+    pitch: f32,
     pcm: Pcm,
 }
 struct Wanted {
@@ -274,6 +289,7 @@ struct Wanted {
     pitch: f32,
     /// Seconds into the sound at `began`.
     start: f32,
+    progress: f64,
     /// Frames into the sound now.
     offset: usize,
     /// The source's frames per second: the Player's for synths, the asset's for samples.
@@ -292,6 +308,7 @@ pub struct Player<O: Output> {
     revisions: Vec<u64>,
     pcm: Vec<Pcm>,
     active: BTreeMap<Key, Active>,
+    completed: BTreeMap<Key, (u64, u64)>,
     refused_sources: std::collections::BTreeSet<(exact_game::Entity, String)>,
     next_id: u64,
     transport: Option<Transport>,
@@ -307,6 +324,7 @@ impl<O: Output> Player<O> {
             revisions: Vec::new(),
             pcm: Vec::new(),
             active: BTreeMap::new(),
+            completed: BTreeMap::new(),
             refused_sources: Default::default(),
             next_id: 0,
             transport: None,
@@ -320,6 +338,7 @@ impl<O: Output> Player<O> {
             self.output.stop(active.output_id);
         }
         self.active.clear();
+        self.completed.clear();
     }
     /// Stable priority: loops first, then louder (max stereo gain), then newer
     /// start boundary, then larger stable identity. Stops precede all starts.
@@ -407,6 +426,7 @@ impl<O: Output> Player<O> {
                             1.0
                         },
                         start: v.offset,
+                        progress: v.playback_ticks(tick),
                         offset: 0,
                         rate: 0,
                         frames: 0,
@@ -438,6 +458,7 @@ impl<O: Output> Player<O> {
                             looping: true,
                             pitch: 1.0,
                             start: 0.0,
+                            progress: tick as f64,
                             offset: 0,
                             rate: 0,
                             frames: 0,
@@ -447,6 +468,21 @@ impl<O: Output> Player<O> {
                 }
             }
         }
+        self.active.retain(|key, active| {
+            if self.output.finished(active.output_id) {
+                self.completed.insert(key.clone(), active.signature);
+                self.output.stop(active.output_id);
+                false
+            } else {
+                true
+            }
+        });
+        self.completed.retain(|key, signature| {
+            wanted
+                .iter()
+                .any(|w| &w.key == key && (w.definition.revision(), w.began) == *signature)
+        });
+        wanted.retain(|w| !self.completed.contains_key(&w.key));
         let rate = self.rate;
         wanted.retain_mut(|w| {
             if w.gains.0.max(w.gains.1) <= 0.0 {
@@ -470,9 +506,7 @@ impl<O: Output> Player<O> {
             if w.frames == 0 {
                 return false;
             }
-            let elapsed = ((world.tick() - w.began) as f64 * w.rate as f64 * w.pitch as f64
-                / world.hz() as f64)
-                .floor()
+            let elapsed = (w.progress * w.rate as f64 / world.hz() as f64).floor()
                 + (w.start as f64 * w.rate as f64).floor();
             w.offset = if w.looping {
                 (elapsed % w.frames as f64) as usize
@@ -480,6 +514,10 @@ impl<O: Output> Player<O> {
                 elapsed as usize
             };
             w.offset < w.frames
+                || self
+                    .active
+                    .get(&w.key)
+                    .is_some_and(|a| a.signature == (w.definition.revision(), w.began))
         });
         wanted.sort_unstable_by(|a, b| {
             b.looping
@@ -494,7 +532,7 @@ impl<O: Output> Player<O> {
                 .then_with(|| b.key.cmp(&a.key))
         });
         let capacity = self.output.capacity();
-        let signature = |w: &Wanted| (w.definition.revision(), w.began, w.pitch.to_bits());
+        let signature = |w: &Wanted| (w.definition.revision(), w.began);
         // Plan priority winners with the byte bound too, so a small fallback
         // retains its identity across frames. Actual allocation below also counts
         // PCM still waiting for acknowledgement, which can temporarily refuse one.
@@ -590,10 +628,15 @@ impl<O: Output> Player<O> {
                     entry.insert(Active {
                         output_id: id,
                         signature: signature(w),
+                        pitch: w.pitch,
                         pcm,
                     })
                 }
             };
+            if active.pitch != w.pitch {
+                self.output.set_pitch(active.output_id, w.pitch);
+                active.pitch = w.pitch;
+            }
             accepted += 1;
             self.output.set(active.output_id, w.gains.0, w.gains.1);
         }

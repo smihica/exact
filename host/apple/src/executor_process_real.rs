@@ -537,9 +537,16 @@ pub(super) fn exec(
             Ok(Input::Child(_, Seen::Out(err, bytes))) => {
                 child.taken();
                 let into = if err { &mut stderr } else { &mut stdout };
-                into.extend_from_slice(&bytes);
+                // One byte past `maxBuffer` is kept, which says which pipe
+                // overflowed; nothing past it is held.
+                let room = (spec.max_buffer + 1).saturating_sub(into.len());
+                into.extend_from_slice(&bytes[..bytes.len().min(room)]);
                 if into.len() > spec.max_buffer && !overflow {
+                    // As Node's execFile does, the output ends before the
+                    // signal: a child that outlives it is read no further.
                     overflow = true;
+                    child.close_pipes();
+                    eof = [true, true];
                     child.signal(&spec.kill_signal);
                     escalate = Some(clock.now() + 5000.0);
                 }

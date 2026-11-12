@@ -215,3 +215,143 @@ fn keyframes_that_name_different_axes_are_refused() {
         assert!(Keyframes::parse(bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn a_refusal_states_the_rule_in_words() {
+    let longhand = |name: &str, value: &str| {
+        Animation::default()
+            .set_longhand(name, value)
+            .unwrap_err()
+            .to_string()
+    };
+    for (message, says) in [
+        (
+            longhand("animation-duration", "1"),
+            "`1` is not a time: a time is a number with `s` or `ms`",
+        ),
+        (
+            longhand("animation-iteration-count", "-1"),
+            "a number 0 or more, or `infinite`",
+        ),
+        (
+            longhand("animation-direction", "bogus"),
+            "normal, reverse, alternate or alternate-reverse",
+        ),
+        (
+            longhand("animation-timing-function", "-exact-spring()"),
+            "a spring is a transition's timing function",
+        ),
+        // The longhand takes no time: `1s` is refused as an easing alone.
+        (
+            longhand("animation-timing-function", "1s"),
+            "`1s` is not an easing: linear, ease,",
+        ),
+        (
+            Animations::parse("a 1s steps(0)").unwrap_err().to_string(),
+            "`steps()` takes at least one step",
+        ),
+        (
+            Keyframes::parse("from{opacity:x}").unwrap_err().to_string(),
+            "`x` is not a value `opacity` takes",
+        ),
+    ] {
+        assert!(message.contains(says), "{message}");
+        assert!(!message.contains("neither a time"), "{message}");
+    }
+}
+
+/// Each refusal says which limit broke, for the shorthand and a keyframes
+/// body alike.
+#[test]
+fn a_shape_refusal_says_which_limit_broke() {
+    for (text, says) in [
+        (
+            "breathe 1s 2s 3s",
+            "has a third time: an animation takes a duration, then a delay",
+        ),
+        (
+            "spin 1s other",
+            "has a second name, `other`, beside `spin`: an animation has one",
+        ),
+        (
+            "a 1s ease linear",
+            "gives an easing twice, `linear` the second time",
+        ),
+        (
+            "a 1s forwards none",
+            "gives a fill mode twice, `none` the second time",
+        ),
+        ("a 1s @", "`@` in `a 1s @` is no part of an animation"),
+        (
+            "a 1s inherit",
+            "a name, which is an identifier other than `initial`",
+        ),
+        (
+            "spin default",
+            "`default` in `spin default` is no part of an animation",
+        ),
+        ("breathe 1.2.3s", "`1.2.3s` is not a time"),
+        ("-1s breathe", "a duration is 0 or more"),
+        ("breathe 1e999s", "an animation's duration is finite"),
+        ("breathe 1s 1e999s", "an animation's delay is finite"),
+        (
+            "a 1s,",
+            "has an empty entry: each comma separates two animations",
+        ),
+        (
+            "a 1s cubic-bezier(1, 2)",
+            "`cubic-bezier()` takes four numbers",
+        ),
+    ] {
+        let message = Animations::parse(text).unwrap_err().to_string();
+        assert!(message.contains(says), "{text}: {message}");
+    }
+    for (text, says) in [
+        (
+            "120%{opacity:1}",
+            "`120%` is not a keyframe selector: `from`, `to` or a percentage",
+        ),
+        (
+            "from{opacity 1}",
+            "`opacity 1` in a keyframe is not `property: value`",
+        ),
+        (
+            "from{height:3px}",
+            "`height` is not a property keyframes animate",
+        ),
+        ("from opacity:1", "has no `{`"),
+        ("from{opacity:1", "has no closing `}`"),
+        (
+            "from{opacity:1e999}",
+            "an animation's keyframe value is finite",
+        ),
+        (
+            "from{font-variation-settings:normal}",
+            "`normal` names no axes",
+        ),
+        (
+            "from{font-variation-settings:wght}",
+            "`wght` is not a value `font-variation-settings` takes",
+        ),
+    ] {
+        let message = Keyframes::parse(text).unwrap_err().to_string();
+        assert!(message.contains(says), "{text}: {message}");
+        assert!(!message.contains("transition"), "{text}: {message}");
+    }
+}
+
+/// Limits a keyframes list breaks by count: too many keyframes, too many axes.
+#[test]
+fn a_count_refusal_names_its_own_limit() {
+    let many: String = (0..33).map(|i| format!("{i}%{{opacity:1}}")).collect();
+    let message = Keyframes::parse(&many).unwrap_err().to_string();
+    assert_eq!(message, "keyframes hold at most 32 keyframes");
+    let nine: Vec<String> = (0..9).map(|i| format!("\"ax{i:02}\" 1")).collect();
+    let message = Keyframes::parse(&format!(
+        "from{{font-variation-settings:{}}}",
+        nine.join(", ")
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(message.contains("names more than 8 axes"), "{message}");
+}

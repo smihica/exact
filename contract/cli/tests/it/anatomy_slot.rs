@@ -82,6 +82,21 @@ fn a_library_slot_placed_once_and_shown_compiles() {
 }
 
 #[test]
+fn visibility_on_the_slot_chain_must_show_the_fill() {
+    use contract_lower::anatomy::slot::denied;
+
+    for value in ["hidden", "collapse", " HiDdEn ", " CoLlApSe "] {
+        assert!(
+            denied("visibility", value).is_some_and(|reason| reason.contains("hides it")),
+            "{value}"
+        );
+    }
+    for value in ["visible", "inherit", "initial", "unset", "revert"] {
+        assert!(denied("visibility", value).is_none(), "{value}");
+    }
+}
+
+#[test]
 fn the_slot_is_placed_once_unconditionally_never_forwarded() {
     let id = "lower-anatomy-slot-placement";
     for (name, body, said) in [
@@ -119,6 +134,8 @@ fn no_node_of_the_chain_hides_the_fill() {
     for (name, row) in [
         ("display", "display=\"none\""),
         ("visibility", "visibility=\"hidden\""),
+        ("visibility-collapse", "visibility=\"collapse\""),
+        ("visibility-collapse-case", "visibility=\" CoLlApSe \""),
         ("opacity", "opacity=0"),
         ("width", "width=\"0px\""),
         ("height", "height=0"),

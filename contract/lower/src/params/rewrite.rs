@@ -115,13 +115,15 @@ fn source(tag: &str, name: &str) -> bool {
 /// Each `param.<name>` whole word of `text` outside quotes, not after `#`,
 /// and (`glued`) not touching a template hole at its start or end, with its
 /// byte range and name; and the quote `text` leaves open, starting in
-/// `quote` (a template's earlier text's).
+/// `quote` (a template's earlier text's). Only dotted names matching the
+/// internal token form are included, so authored internal tokens are refused
+/// without treating ordinary dotted text as a param reference.
 fn found(
     text: &str,
     glued: (bool, bool),
     mut quote: Option<char>,
 ) -> (Vec<(usize, usize, String)>, Option<char>) {
-    let ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+    let ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
     let bytes: Vec<(usize, char)> = text.char_indices().collect();
     let mut out = Vec::new();
     let mut k = 0;
@@ -148,13 +150,22 @@ fn found(
             let tail = &text[i + PREFIX.len()..];
             let len = tail.find(|c: char| !ident(c)).unwrap_or(tail.len());
             let end = i + PREFIX.len() + len;
-            let whole = before.is_none_or(|c| !ident(c) && c != '.' && c != '#')
+            let name = &tail[..len];
+            let internal = name.split_once('.').is_some_and(|(file, rest)| {
+                file.len() == 9
+                    && file.starts_with('f')
+                    && file[1..].bytes().all(|b| b.is_ascii_hexdigit())
+                    && rest.split_once('.').is_some_and(|(component, param)| {
+                        !component.is_empty() && !param.is_empty() && !param.contains('.')
+                    })
+            });
+            let whole = before.is_none_or(|c| !ident(c) && c != '#')
                 && len > 0
-                && !tail[len..].starts_with('.')
+                && (!name.contains('.') || internal)
                 && !(glued.0 && i == 0)
                 && !(glued.1 && end == text.len());
             if whole {
-                out.push((i, end, tail[..len].to_string()));
+                out.push((i, end, name.to_string()));
             }
             while k < bytes.len() && bytes[k].0 < end {
                 k += 1;
@@ -855,6 +866,20 @@ mod tests {
             ),
             ["fill"]
         );
+        assert_eq!(
+            names("param.f123abcde.App.ink", (false, false)),
+            ["f123abcde.App.ink"]
+        );
+        for dotted in [
+            "https://param.example.com/icon.png",
+            "param.f123abcd.App.ink",
+            "param.f123abcdg.App.ink",
+            "param.f123abcde.App",
+            "param.f123abcde..ink",
+            "param.f123abcde.App.ink.extra",
+        ] {
+            assert!(names(dotted, (false, false)).is_empty(), "{dotted}");
+        }
         assert!(names("\"param.fill\", system-ui", (false, false)).is_empty());
         assert!(names("url(#param.fill)", (false, false)).is_empty());
         assert!(names("param.fill", (true, false)).is_empty());

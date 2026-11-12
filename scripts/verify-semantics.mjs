@@ -16,11 +16,15 @@ export function contractVerify(app, json) {
   // Its own process group, so that stopping it stops the tester `cargo run` starts under it too.
   const child = spawn('cargo', ['run', '-q', '-p', 'contract', '--', 'verify', resolve(app.dir, 'app.contract')], { cwd: ROOT, detached: true, stdio: ['ignore', 'pipe', json ? 'inherit' : 'pipe'] });
   const pass = signal => { try { process.kill(-child.pid, signal); } catch { /* It has exited. */ } }, signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-  for (const signal of signals) process.on(signal, pass);
+  // A listener takes the place of a signal's default, ending the process: after stopping the child, verify ends with
+  // the signal's code (as `whenEnded` does), unless another listener (`whenEnded` itself) is there to end it.
+  const codes = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  const ended = signal => { pass(signal); if (process.listenerCount(signal) === 1) process.exit(codes[signal]); };
+  for (const signal of signals) process.on(signal, ended);
   child.stdout.on('data', data => { output += data; });
   child.stderr?.on('data', data => { errors += data; });
   const done = new Promise(resolveResult => {
-    const finish = exit => { for (const signal of signals) process.off(signal, pass); resolveResult({ exit, output, errors }); };
+    const finish = exit => { for (const signal of signals) process.off(signal, ended); resolveResult({ exit, output, errors }); };
     child.on('error', e => { errors += e.message; finish(1); });
     child.on('exit', exit => finish(exit ?? 1));
   });

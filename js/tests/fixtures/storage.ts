@@ -1,7 +1,7 @@
 import type { Storage } from "../../../vendor/ibex/crates/ibex2/src/bindings/storage";
 type Store = { get(name:string):string|null; set(name:string,value:string):void; forget(name:string):void };
 const appId = "dev.exact.storage-test";
-const grants = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
+const grants = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\nfs.read bundle:/Resources/shipped\n";
 
 // Work queued behind whatever the module started last, the way an app serializes its
 // database operations. The second answer's storage calls run in a later microtask.
@@ -305,6 +305,16 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     try { return {text:String.fromCharCode(...new Uint8Array(await storage.fs.readFile(path)))}; }
     catch (_) { return {text:"empty"}; }
   }
+  // A file the app ships, under `bundle:` (LLP 1133.007 D6).
+  if (op === "bundle-read") {
+    try { return {text: String.fromCharCode(...new Uint8Array(await storage.fs.readFile("bundle:/Resources/shipped/hello.txt")))}; }
+    catch (e:any) { return {text: e.name + " " + e.code}; }
+  }
+  // A host with no `bundle:` directory (LLP 1133.007 D6).
+  if (op === "absent-namespace") {
+    try { await storage.fs.readFile("bundle:/Info.plist"); return {text: "ok"}; }
+    catch (e:any) { return {text: e.name + " " + e.kind + " " + e.code}; }
+  }
   // Refusals carry a stable code beside their message (kanban F28).
   if (op === "codes") {
     const data = storage.fs.directories.data, out: string[] = [];
@@ -480,6 +490,37 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
     }
     return {text: out.join("\n")};
   }
+  // `exactIdleTimeout` (LLP 1016.000 D11): what `fetch` refuses itself.
+  if (op === "idle-refusals") {
+    const socket = "wss://example.test/feed", exactStream = () => ({text: ""}), out: string[] = [];
+    const inits: [string, any][] = [
+      [socket, { exactStream, exactIdleTimeout: 0 }],
+      [socket, { exactStream, exactIdleTimeout: 3600001 }],
+      [socket, { exactStream, exactIdleTimeout: 1.5 }],
+      [socket, { exactIdleTimeout: 60000 }],
+      ["https://example.test/events", { exactStream, exactIdleTimeout: 60000 }],
+      ["https://example.test/poll", { exactStream, exactIdleTimeout: 60000, exactLongPoll: { cursor: "since", from: "seq" } }],
+      ["https://example.test/upload", { method: "POST", body: "x", exactStream, exactUploadProgress: true, exactIdleTimeout: 60000 }],
+    ];
+    for (const [to, init] of inits) {
+      try { await fetch(to, init); out.push("sent"); } catch (e:any) { out.push(e.name + ": " + e.message); }
+    }
+    return {text: out.join("\n")};
+  }
+  // A stream option the host refuses: marked at bake as storage's refusal is, and plain in an answer.
+  if (op === "stream-option-refused") {
+    try { await fetch("wss://example.test/feed", { exactStream: () => ({text: ""}), exactTimeout: 60000 }); }
+    catch (e:any) { return {text: e.name + ":" + e.kind + ":" + e.code + ":" + e.message}; }
+    return {text: "sent"};
+  }
+  if (op === "stream-option-uncaught") return fetch("wss://example.test/feed", { exactStream: () => ({text: ""}), exactTimeout: 60000 });
+  if (op === "own-uncaught") throw new TypeError("the source's own");
+  // The source's own error, and an option of a fetch that is no stream, are never marked.
+  if (op === "own-error") {
+    try { await fetch("https://example.test/a", { exactTimeout: 0 }); }
+    catch (e:any) { return {text: e.name + ":" + e.kind + ":" + e.code + ":" + e.message}; }
+    return {text: "sent"};
+  }
   if (op === "write-slow") {
     await storage.fs.writeFile(storage.fs.directories.data + "/slow.jpg", bytes(value));
     return {text: "wrote " + value};
@@ -583,6 +624,133 @@ async function work(_source:string, args:unknown[], store:Store, storage:Storage
         try { await run(); said.push("allowed"); } catch(e:any) { said.push(e.message); }
       }
       return {text:said.join("\n")};
+    }
+    // A migration's rebuild of a table other rows reference, as Drizzle
+    // writes it, in a `foreignKeys: "check"` batch (docs/reference.md).
+    if (op === "sql-migration") {
+      const said: string[] = [];
+      // SQLite names one mismatched child; which one differs between versions.
+      const said_ = (e:any) => e.message.includes('foreign key check failed, the batch is rolled back: foreign key mismatch - "') && e.message.includes('referencing "fk_t"') ? "mismatch"
+        : e.message.includes("foreign key check failed") ? e.message.slice(e.message.indexOf("foreign key check failed"))
+        : e.message.includes("not authorized: PRAGMA foreign_keys: ") && e.message.includes('foreignKeys: "check"') ? "refused"
+        : e.message.includes("FOREIGN KEY constraint failed") ? "enforced"
+        : e.message.includes("statement 2 of 2 (INSERT INTO missing VALUES (1)): ") ? "failed"
+        : e.message.includes("no such table: main.fk_lone") ? "unwritable" : e.message;
+      const run = async (sql: string[], options?: {foreignKeys: "check"}) => {
+        try { await db.transaction(sql.map(sql => ({sql})), options); said.push("ok"); } catch (e:any) { said.push(said_(e)); }
+      };
+      const children = async () => {
+        const of = (t:string) => `(SELECT group_concat(id || ':' || ifnull(p, 'null')) FROM ${t})`;
+        said.push((await db.query(`SELECT ${of("fk_plain")}, ${of("fk_gone")}, ${of("fk_nulled")}, ${of("fk_strict")}`)).rows[0].map(String).join(","));
+      };
+      await db.transaction(["DROP TABLE IF EXISTS fk_gc", "DROP TABLE IF EXISTS fk_gp", "DROP TABLE IF EXISTS fk_bp", "DROP TABLE IF EXISTS fk_orphaned", "DROP TABLE IF EXISTS fk_lone", "DROP TABLE IF EXISTS fk_plain", "DROP TABLE IF EXISTS fk_gone", "DROP TABLE IF EXISTS fk_nulled", "DROP TABLE IF EXISTS fk_strict", "DROP TABLE IF EXISTS fk_t",
+        "CREATE TABLE fk_t(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE fk_plain(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_t(id))",
+        "CREATE TABLE fk_gone(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_t(id) ON DELETE CASCADE)",
+        "CREATE TABLE fk_nulled(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_t(id) ON DELETE SET NULL)",
+        "CREATE TABLE fk_strict(id INTEGER PRIMARY KEY, p INTEGER NOT NULL REFERENCES fk_t(id) ON DELETE SET NULL)",
+        "INSERT INTO fk_t VALUES (1, 'a'), (2, 'b')", "INSERT INTO fk_plain VALUES (10, 1)", "INSERT INTO fk_gone VALUES (20, 1)",
+        "INSERT INTO fk_nulled VALUES (30, 1)", "INSERT INTO fk_strict VALUES (40, 2)"].map(sql => ({sql})));
+      const drizzle = (where: string) => ["PRAGMA foreign_keys=OFF",
+        "CREATE TABLE `__new_fk_t` (\n\t`id` integer PRIMARY KEY,\n\t`name` text,\n\t`extra` text\n)",
+        "INSERT INTO `__new_fk_t`(\"id\", \"name\") SELECT \"id\", \"name\" FROM `fk_t`" + where,
+        "DROP TABLE `fk_t`", "ALTER TABLE `__new_fk_t` RENAME TO `fk_t`", "PRAGMA foreign_keys=ON"];
+      const orphan = () => run(["INSERT INTO fk_plain VALUES (99, 99)"]);
+      await run(drizzle(""), {foreignKeys: "check"});
+      await children();
+      await orphan();
+      await run(drizzle(" WHERE id = 2"), {foreignKeys: "check"});
+      await children();
+      await orphan();
+      await run(drizzle(""));
+      // A failing statement; a parent made again without a key its children
+      // can name; a parent no row names, dropped for good: the check passes,
+      // and its child table refuses every write.
+      await run(["PRAGMA foreign_keys=OFF", "INSERT INTO missing VALUES (1)"], {foreignKeys: "check"});
+      await orphan();
+      await run(["CREATE TABLE __m(id INTEGER, name TEXT)", "INSERT INTO __m SELECT id, name FROM fk_t", "DROP TABLE fk_t", "ALTER TABLE __m RENAME TO fk_t"], {foreignKeys: "check"});
+      await orphan();
+      await run(["CREATE TABLE fk_lone(id INTEGER PRIMARY KEY)", "CREATE TABLE fk_orphaned(p INTEGER REFERENCES fk_lone(id))"]);
+      await run(["DROP TABLE fk_lone"], {foreignKeys: "check"});
+      try { await db.execute("INSERT INTO fk_orphaned VALUES (NULL)"); said.push("written"); } catch (e:any) { said.push(said_(e)); }
+      // Temporary tables are checked too.
+      await run(["CREATE TEMP TABLE fk_tp(id INTEGER PRIMARY KEY)", "CREATE TEMP TABLE fk_tc(pid INTEGER REFERENCES fk_tp(id))", "INSERT INTO fk_tc VALUES (1)"], {foreignKeys: "check"});
+      // More orphans than a query may return: three named, the rest counted.
+      const long = "fk_" + "x".repeat(1000), row = (id:number) => `${long} row ${id} (references fk_bp)`;
+      try {
+        await db.transaction(["CREATE TABLE fk_bp(id INTEGER PRIMARY KEY)", `CREATE TABLE ${long}(pid INTEGER REFERENCES fk_bp(id))`,
+          `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100001) INSERT INTO ${long} SELECT x FROM n`].map(sql => ({sql})), {foreignKeys: "check"});
+        said.push("ok");
+      } catch (e:any) {
+        said.push(e.message.endsWith(`foreign key check failed, the batch is rolled back: 100001 foreign-key violations: ${row(1)}, ${row(2)}, ${row(3)}, and 99998 more`) ? "counted" : e.message);
+      }
+      // Absent options, however spelt, enforce; anything but foreignKeys: "check" is
+      // refused as a storage error whose code is never read from its words.
+      for (const options of [null, undefined, {}]) await run(["INSERT INTO fk_plain VALUES (99, 99)"], options as any);
+      for (const options of [{busy: true}, {foreignKey: "check"}, "check", {foreignKeys: "off"}]) {
+        try { await db.transaction([{sql: "INSERT INTO fk_plain VALUES (99, 99)"}], options as any); said.push("ok"); }
+        catch (e:any) { said.push(`${e.name}/${e.kind}/${e.code}/${e.message}`); }
+      }
+      // The rows a failed check names: a rowid past 2^53 beside a small one, a
+      // WITHOUT ROWID table's row, names ordered by code point, and tables whose
+      // names are busy words (the code stays failed).
+      const named = async (sql: string[]) => {
+        try { await db.transaction(sql.map(sql => ({sql})), {foreignKeys: "check"}); said.push("ok"); }
+        catch (e:any) { said.push(`${e.code}/${e.message.slice(e.message.indexOf("foreign key check failed"))}`); }
+      };
+      await named(["CREATE TABLE fk_big(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES fk_t(id))", "INSERT INTO fk_big VALUES (1, 99), (9007199254740993, 99)"]);
+      await named(["CREATE TABLE fk_wr(k INTEGER PRIMARY KEY, pid INTEGER REFERENCES fk_t(id)) WITHOUT ROWID", "INSERT INTO fk_wr VALUES (1, 99)"]);
+      await named(["fk_\u{E000}1", "fk_\u{E000}2", "fk_\u{E000}3", "fk_\u{1F600}"].flatMap(t => [`CREATE TABLE "${t}"(pid INTEGER REFERENCES fk_t(id))`, `INSERT INTO "${t}" VALUES (99)`]));
+      await named(["busy", "database is locked"].flatMap(t => [`CREATE TABLE "${t}"(pid INTEGER REFERENCES fk_t(id))`, `INSERT INTO "${t}" VALUES (99)`]));
+      // One row with two broken references is two violations.
+      await named(["CREATE TABLE fk_q(id INTEGER PRIMARY KEY)", "CREATE TABLE fk_two(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_t(id), q INTEGER REFERENCES fk_q(id))", "INSERT INTO fk_two VALUES (1, 99, 99)"]);
+      // `foreignKeys` read as every host reads it: a class's getter and an
+      // inherited property take the mode (the cascading child keeps its row,
+      // with no PRAGMA lines in the batch); a function is refused alike.
+      class MigrationOptions { get foreignKeys(): "check" { return "check"; } }
+      for (const options of [new MigrationOptions(), Object.create({foreignKeys: "check"})]) {
+        await db.transaction(["DROP TABLE IF EXISTS fk_gc", "DROP TABLE IF EXISTS fk_gp", "CREATE TABLE fk_gp(id INTEGER PRIMARY KEY)",
+          "CREATE TABLE fk_gc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_gp(id) ON DELETE CASCADE)", "INSERT INTO fk_gp VALUES (1)", "INSERT INTO fk_gc VALUES (5, 1)"].map(sql => ({sql})));
+        await db.transaction(["CREATE TABLE __new_gp(id INTEGER PRIMARY KEY, extra TEXT)", "INSERT INTO __new_gp(id) SELECT id FROM fk_gp", "DROP TABLE fk_gp", "ALTER TABLE __new_gp RENAME TO fk_gp"].map(sql => ({sql})), options);
+        said.push((await db.query("SELECT COUNT(*) FROM fk_gc")).rows[0][0] === 1n ? "kept" : "lost");
+      }
+      // Read at the call, not when the queue reaches it: with a call in
+      // flight, a change to the options or the batch after the call runs nothing.
+      for (const change of ["options", "batch"]) {
+        await db.transaction(["DROP TABLE IF EXISTS fk_gc", "DROP TABLE IF EXISTS fk_gp", "CREATE TABLE fk_gp(id INTEGER PRIMARY KEY)",
+          "CREATE TABLE fk_gc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_gp(id) ON DELETE CASCADE)", "INSERT INTO fk_gp VALUES (1)", "INSERT INTO fk_gc VALUES (5, 1)"].map(sql => ({sql})));
+        const options: any = {foreignKeys: "check"};
+        const batch = ["CREATE TABLE __new_gp(id INTEGER PRIMARY KEY, extra TEXT)", "INSERT INTO __new_gp(id) SELECT id FROM fk_gp", "DROP TABLE fk_gp", "ALTER TABLE __new_gp RENAME TO fk_gp"].map(sql => ({sql}));
+        const inflight = db.query("SELECT 1");
+        const done = db.transaction(batch, options);
+        if (change === "options") options.foreignKeys = undefined;
+        else { batch.push({sql: "DELETE FROM fk_gc"}); batch[0].sql = "SELECT nothing"; }
+        await inflight;
+        const ran = await done.then(() => true, () => false);
+        said.push(ran && (await db.query("SELECT COUNT(*) FROM fk_gc")).rows[0][0] === 1n ? "kept" : "lost");
+      }
+      // Each entry's params are read once; options are keys, whatever their
+      // names (`__proto__` from JSON, `constructor`), and a record with no
+      // prototype is options like any other.
+      let asked = 0;
+      await db.transaction(["DROP TABLE IF EXISTS fk_n", "CREATE TABLE fk_n(v)"].map(sql => ({sql})));
+      await db.transaction([{sql: "INSERT INTO fk_n VALUES (?)", get params() { return [++asked]; }} as any]);
+      said.push(`${asked}/${(await db.query("SELECT v FROM fk_n")).rows.map(r => String(r[0])).join(",")}`);
+      for (const options of [JSON.parse('{"__proto__": true}'), {constructor: 1}]) {
+        try { await db.transaction([{sql: "INSERT INTO fk_plain VALUES (99, 99)"}], options); said.push("ok"); }
+        catch (e:any) { said.push(`${e.code}/${e.message}`); }
+      }
+      const bare = Object.create(null);
+      bare.foreignKeys = "check";
+      await db.transaction(["DROP TABLE IF EXISTS fk_gc", "DROP TABLE IF EXISTS fk_gp", "CREATE TABLE fk_gp(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE fk_gc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fk_gp(id) ON DELETE CASCADE)", "INSERT INTO fk_gp VALUES (1)", "INSERT INTO fk_gc VALUES (5, 1)"].map(sql => ({sql})));
+      await db.transaction(["CREATE TABLE __new_gp(id INTEGER PRIMARY KEY, extra TEXT)", "INSERT INTO __new_gp(id) SELECT id FROM fk_gp", "DROP TABLE fk_gp", "ALTER TABLE __new_gp RENAME TO fk_gp"].map(sql => ({sql})), bare);
+      said.push((await db.query("SELECT COUNT(*) FROM fk_gc")).rows[0][0] === 1n ? "kept" : "lost");
+      for (const options of [{foreignKeys: () => "check"}, {other: () => 1}, () => 1]) {
+        try { await db.transaction([{sql: "INSERT INTO fk_plain VALUES (99, 99)"}], options as any); said.push("ok"); }
+        catch (e:any) { said.push(`${e.code}/${e.message}`); }
+      }
+      return {text: said.join("|")};
     }
     if (op === "sql-refusals") {
       const kinds=[];

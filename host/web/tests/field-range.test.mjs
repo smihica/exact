@@ -1,6 +1,7 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -224,6 +225,33 @@ check('replacement select tasks read the final value and reset directional range
     }
   }
 }), 60000);
+
+check('the agent picker accepts image and PDF types and delivers their MIME types', () => inChrome(async evaluate => {
+  const cases = [
+    ['logo.svg', 'image/svg+xml'], ['scan.BMP', 'image/bmp'], ['icon.ico', 'image/vnd.microsoft.icon'],
+    ['photo.png', 'image/png'], ['report.PDF', 'application/pdf'],
+  ].flatMap(([name, mime]) => (mime.startsWith('image/') ? ['image/*', mime] : [mime]).map(accept => ({ name, mime, accept })));
+  const results = await evaluate(`(async () => {
+    const { holds, answer } = await import('./files.js');
+    rt.clock.agent = true;
+    const root = document.getElementById('exact-root'), results = [];
+    for (const { name, accept } of ${JSON.stringify(cases)}) {
+      const field = document.createElement('input');
+      field.type = 'file'; field.id = 'one'; field.accept = accept; root.append(field);
+      let picked = [];
+      fileHook(field, 'change', files => { picked = files; });
+      rt.Hosts.showPicker('one');
+      const { ticket } = holds().find(h => h.device.capability === 'pick');
+      const refused = await answer({ op: 'type', ticket, text: '/a/notes.txt' });
+      const kept = holds().some(h => h.ticket === ticket);
+      const result = await answer({ op: 'type', ticket, text: '/a/' + name, files: [{ name, bytes: btoa('fixture') }] });
+      results.push({ refused: !!refused.error, kept, error: result.error ?? null, files: picked.map(f => [f[1], f[2]]) });
+      field.remove(); holds();
+    }
+    return results;
+  })()`);
+  expect(results).toEqual(cases.map(({ name, mime }) => ({ refused: true, kept: true, error: null, files: [[name, mime]] })));
+}));
 
 check('file picker change supplies the complete InputEvent record', () => inChrome(async evaluate => {
   expect(await evaluate(`(() => {

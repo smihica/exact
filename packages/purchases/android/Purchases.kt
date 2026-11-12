@@ -70,6 +70,18 @@ class PurchasesModule(context: ExtensionContext) : ExactExtension(context) {
 
     private fun say(line: String) = context.log("purchases: $line")
 
+    // Above `init`, whose `connect()` hands it to the builder: Kotlin runs initialisers and `init` blocks in the order
+    // they are declared, so one declared below is still null there and `build()` throws.
+    private val updated = PurchasesUpdatedListener { result, purchases ->
+        val answer = flowReply
+        flowReply = null
+        if (answer != null) {
+            val bought = purchases?.firstOrNull { flowItem in it.products }
+            answer(if (result.responseCode == BillingClient.BillingResponseCode.OK && bought != null) details(bought) else failure(result))
+        }
+        changed()
+    }
+
     init {
         sessions.add(this)
         if (!context.agent && client == null) connect()
@@ -166,16 +178,6 @@ class PurchasesModule(context: ExtensionContext) : ExactExtension(context) {
     }
 
     // MARK: Play Billing (stage 2)
-
-    private val updated = PurchasesUpdatedListener { result, purchases ->
-        val answer = flowReply
-        flowReply = null
-        if (answer != null) {
-            val bought = purchases?.firstOrNull { flowItem in it.products }
-            answer(if (result.responseCode == BillingClient.BillingResponseCode.OK && bought != null) details(bought) else failure(result))
-        }
-        changed()
-    }
 
     private fun connect() {
         val b = BillingClient.newBuilder(context.application).setListener(updated)

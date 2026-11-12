@@ -175,30 +175,50 @@ struct SnapshotLiveText: View {
 /// determinate bar; else the activity indicator. A ring where the platform
 /// draws one: in the circular accessory family, or a `progress` the author
 /// rounded into a circle (`border-radius: 50%`, or at least half its box),
-/// as SwiftUI's circular capacity gauge draws the value.
+/// as SwiftUI's circular capacity gauge draws the value. A bar draws in the
+/// tint, which an `accent-color` sets (`SnapshotNodeView`), as UIKit's
+/// progress view does; the indicator in its own `color`, else the tint
+/// (`docs/contract-grammar.md`, "Progress").
 @available(iOS 17.0, macOS 14.0, watchOS 10.0, visionOS 26.0, *)
 struct SnapshotProgressView: View {
     let node: HeadlessSession.Node
     let environment: SnapshotEnvironment
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.snapshotTint) private var around
+
+    /// A bar's and a ring's own tint: a share of the tint in effect where its
+    /// accent is one (`Highlight`), as the iOS host's bar takes it
+    /// (`accentShare`), else its accent; none for `AccentColor` itself, which
+    /// is the tint in effect. The ring, unaccented, takes the box's colour.
+    private func barTint(ring: Bool = false) -> Color? {
+        let style = SnapshotStyle(node)
+        return SnapshotTint.given(style.color("accent_color") ?? (ring ? style.color("text_color") : nil), around: around, dark: scheme == .dark)
+    }
+    /// The indicator's own `color`, where it wrote one, else its accent.
+    private var indicatorTint: Color? {
+        let style = SnapshotStyle(node)
+        return SnapshotTint.given(style.wrote("text_color") ? style.color("text_color") : style.color("accent_color"), around: around, dark: scheme == .dark)
+    }
 
     var body: some View {
         Group {
             if let interval = SnapshotLive.interval(node), let date = environment.frozenDate {
                 let fraction = min(1, max(0, date.timeIntervalSince(interval.lowerBound) / max(0.001, interval.upperBound.timeIntervalSince(interval.lowerBound))))
                 let shown = (node.props["timeFormat"] ?? node.props["format"]) == "countdown" ? 1 - fraction : fraction
-                if circular { gauge(shown, total: 1) } else { ProgressView(value: shown) }
+                if circular { gauge(shown, total: 1) } else { ProgressView(value: shown).modifier(OwnTint(color: barTint())) }
             } else if let interval = SnapshotLive.interval(node) {
                 if circular {
                     ProgressView(timerInterval: interval, countsDown: (node.props["timeFormat"] ?? node.props["format"]) == "countdown") { EmptyView() } currentValueLabel: { EmptyView() }
                         .progressViewStyle(.circular)
+                        .modifier(OwnTint(color: barTint(ring: true)))
                 } else {
                     ProgressView(timerInterval: interval, countsDown: (node.props["timeFormat"] ?? node.props["format"]) == "countdown") { EmptyView() } currentValueLabel: { EmptyView() }
+                        .modifier(OwnTint(color: barTint()))
                 }
             } else if let value = Double(node.props["value"] ?? "") {
-                if circular { gauge(min(value, total), total: total) } else { ProgressView(value: min(value, total), total: total) }
+                if circular { gauge(min(value, total), total: total) } else { ProgressView(value: min(value, total), total: total).modifier(OwnTint(color: barTint())) }
             } else {
-                ProgressView()
+                ProgressView().modifier(OwnTint(color: indicatorTint))
             }
         }
         .frame(width: node.contentBox.width, height: node.contentBox.height)
@@ -211,9 +231,9 @@ struct SnapshotProgressView: View {
         #if os(iOS) || os(watchOS)
         Gauge(value: value, in: 0...total) { EmptyView() }
             .gaugeStyle(.accessoryCircularCapacity)
-            .tint(SnapshotColor.color(SnapshotStyle(node).color("accent_color") ?? SnapshotStyle(node).color("text_color"), dark: scheme == .dark))
+            .modifier(OwnTint(color: barTint(ring: true)))
         #else
-        ProgressView(value: value, total: total).progressViewStyle(.circular)
+        ProgressView(value: value, total: total).progressViewStyle(.circular).modifier(OwnTint(color: barTint(ring: true)))
         #endif
     }
 

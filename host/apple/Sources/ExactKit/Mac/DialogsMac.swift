@@ -327,6 +327,21 @@ final class DialogHost {
     /// Dismissal belongs to the sheet's modal segment; its title-row Back belongs to the pushed route.
     func dismissalOwner(of dialog: NodeView) -> NodeView { entry(ofRoute: dialog)?.routeBase ?? dialog }
 
+    /// AppKit tests charactersIgnoringModifiers for Command-period before
+    /// dispatching to an Escape button. Keep Command's layout there too.
+    func appKitEvent(_ event: NSEvent) -> NSEvent {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+              let characters = event.characters, characters != event.charactersIgnoringModifiers,
+              characters == "." || event.charactersIgnoringModifiers == ".",
+              let window = event.window,
+              window === active?.window || window === presenter?.alerts.sheet else { return event }
+        return NSEvent.keyEvent(with: event.type, location: event.locationInWindow,
+            modifierFlags: event.modifierFlags, timestamp: event.timestamp, windowNumber: event.windowNumber,
+            context: nil, characters: characters, charactersIgnoringModifiers: characters,
+            isARepeat: event.isARepeat, keyCode: event.keyCode) ?? event
+    }
+
     /// Shared by real key delivery and the agent's direct NSWindow delivery.
     func key(_ event: NSEvent) -> Bool {
         guard let dialog = active, event.window === dialog.window else { return false }
@@ -334,7 +349,7 @@ final class DialogHost {
         // Composition owns Escape and Tab until the input method commits it.
         if (dialog.window?.firstResponder as? NSTextInputClient)?.hasMarkedText() == true { return false }
         // Escape, and Command-period, which AppKit gives a sheet's Cancel too.
-        let period = event.type == .keyDown && event.keyCode == 47
+        let period = event.type == .keyDown && event.characters == "."
             && event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
         if event.keyCode == 53 || period {
             if event.type == .keyDown, !event.isARepeat, dismissalOwner(of: dialog).props["closedby"] != "none" { dismiss(dialog) }

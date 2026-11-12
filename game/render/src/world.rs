@@ -36,6 +36,19 @@ pub(crate) trait Writes {
     fn assets_revision(&self) -> u64 {
         0
     }
+    /// Whether a delivered texture is resident and can draw.
+    fn texture_ready(&self, _: &str) -> bool {
+        false
+    }
+    /// `material` with the textures `names` gives replacing its own (by
+    /// `MaterialData` slot order), once all of them can draw.
+    fn material_variant(
+        &mut self,
+        _: crate::MaterialId,
+        _: &[Option<String>; 5],
+    ) -> Option<crate::MaterialId> {
+        None
+    }
     fn instances(&mut self, _: &[crate::DrawInstance]) -> Result<(), RenderError> {
         Ok(())
     }
@@ -133,6 +146,20 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
     }
     fn assets_revision(&self) -> u64 {
         self.models.revision
+    }
+    fn texture_ready(&self, name: &str) -> bool {
+        ASSETS && self.models.textures.get(name).is_some_and(|t| t.active)
+    }
+    fn material_variant(
+        &mut self,
+        material: crate::MaterialId,
+        names: &[Option<String>; 5],
+    ) -> Option<crate::MaterialId> {
+        if ASSETS {
+            self.textured_variant(material, names)
+        } else {
+            None
+        }
     }
     fn opacity(&mut self, values: &[(u32, f32)]) {
         if self.lights.set_opacity(&self.device, &self.queue, values) {
@@ -576,6 +603,11 @@ impl Feed {
     ) -> Result<(), RenderError> {
         self.feed_to(world, renderer)
     }
+    /// The models this feed last drew, a model kept in place of one in flight
+    /// included; the surface passes them to `Sim::hold_assets`.
+    pub fn drawn_assets(&self) -> &std::collections::BTreeSet<String> {
+        self.assets.held()
+    }
     /// Each primitive shape's mesh, named, for the look frame's draw listing.
     pub(crate) fn shape_names(&self) -> Vec<(MeshId, String)> {
         (self.shapes.iter())
@@ -687,6 +719,10 @@ impl Feed {
         } else {
             None
         };
+        // A texture an instance waited for arrived: its look changes.
+        if !batches && self.assets.arrived(r) {
+            batches = true;
+        }
         // Present rewrites looks every tick: patch changed content in place.
         if !batches && looks_changed && !self.assets.patch_looks(w, r)? {
             batches = true;

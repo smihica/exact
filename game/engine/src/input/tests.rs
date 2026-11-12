@@ -146,6 +146,32 @@ fn malformed_saved_press_origins_are_refused_before_live_state_changes() {
 }
 
 #[test]
+fn a_save_with_two_pointer_contacts_of_one_id_is_refused_atomically() {
+    use crate::{Game, Sim, World};
+    struct Empty;
+    impl Game for Empty {
+        const ID: &'static str = "pointer-ids";
+        type Args = ();
+        fn setup(_: &mut World, _: &()) {}
+        fn tick(_: &mut World, _: &Input, _: &()) {}
+    }
+    let mut live = Sim::<Empty>::new(()).unwrap();
+    let before = live.save().unwrap();
+    let mut source = Sim::<Empty>::new(()).unwrap();
+    source
+        .input
+        .apply(pointer_event(1, PointerPhase::Down, 20., 0), 0);
+    let twin = source.input.contacts[0].clone();
+    source.input.contacts.push(twin);
+    let malformed = source.save().unwrap();
+    assert!(live
+        .restore(&malformed)
+        .unwrap_err()
+        .to_string()
+        .contains("unique ids"));
+    assert_eq!(live.save().unwrap(), before);
+}
+#[test]
 fn restore_rejects_unknown_saved_control_atomically() {
     use crate::{Clock, Game, Sim, World};
     struct Old;
@@ -697,4 +723,10 @@ fn queued_ui_contact_continues_identically_in_a_fresh_simulation() {
         }
         assert_eq!(sim.save().unwrap(), restored.save().unwrap());
     }
+}
+#[test]
+#[should_panic(expected = "an action needs a name")]
+fn an_unnamed_action_is_refused_at_declaration() {
+    // A control of no name would be indistinguishable from a raw pointer contact.
+    let _ = Actions::new().button("", &[]);
 }

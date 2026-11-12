@@ -791,6 +791,40 @@ fn a_pages_source_re_asked_without_end_meets_the_deadline() {
     assert!(listed.unwrap_err().contains("deadline"));
 }
 
+/// LLP 1048.000 D3: the wasm shell with `host.web.head` written before its
+/// root, as `host/web/build.mjs` writes it. A script's text that spells the
+/// root, a viewport meta or one of the build's preloads is the app's: an
+/// idle page and an interaction page are composed around it, keeping it once.
+#[test]
+fn a_wasm_page_keeps_head_script_text_that_spells_the_shells_places() {
+    let shell =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/index.html"))
+            .unwrap();
+    let entries = concat!(
+        "<script>const t = '<div id=\"exact-root\"></div><meta name=\"viewport\" content=\"x\">';</script>\n",
+        "<script>const p = '<link rel=\"modulepreload\" href=\"./navigation.js\"><link rel=\"preload\" href=\"./app.wasm\">",
+        "<link rel=\"preload\" href=\"./glue.js\">';</script>\n",
+    );
+    // And one after the root, which spells only its opening tag.
+    let after = "<script>const a = '<div id=\"exact-root\"';</script>\n";
+    let root = "<div id=\"exact-root\"></div>\n";
+    let shell = shell.replacen(root, &format!("{entries}{root}{after}"), 1);
+    for activate in [
+        exact_plan::ActivatePolicy::Inferred,
+        exact_plan::ActivatePolicy::Interaction,
+    ] {
+        let mut r = at(Post::Soon, Duration::from_secs(5));
+        r.activate = activate;
+        // A head with a sheet of its own, as a font or an animation gives it.
+        r.head.push_str("<style>@keyframes spin{}</style>");
+        let html = exact_render::page(&shell, &r).unwrap();
+        assert_eq!(html.matches(entries).count(), 1, "{html}");
+        assert_eq!(html.matches(after).count(), 1, "{html}");
+        let document = format!("<div id=\"exact-root\">{}</div>", r.document.root);
+        assert!(html.find(entries) < html.find(&document), "{html}");
+    }
+}
+
 #[test]
 fn rendered_document_sets_html_language_and_direction() {
     let mut rendered = at(Post::Soon, Duration::from_secs(5));

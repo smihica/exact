@@ -1,6 +1,11 @@
 // The date a session tells its runner (LLP 1027.000.000): at boot, before
-// the first settle, and whenever the zone's offset or the drive's clock moves.
-import Foundation
+// the first settle, and whenever the date, the zone's offset or the drive's
+// clock moves.
+#if canImport(UIKit)
+import UIKit
+#else
+import AppKit
+#endif
 import ExactCore
 
 extension ExactSession {
@@ -10,6 +15,7 @@ extension ExactSession {
             tellAgentOffset()
         } else {
             toldOffset = nil
+            toldEpoch = nil
             offsetHeld = nil
             followOffset()
         }
@@ -17,27 +23,51 @@ extension ExactSession {
         tellPreferences()
         tellPage()
     }
-    /// The machine zone's offset, told when it moved. `offsetHeld` is the
-    /// zone it was read in and when to read it again: until then, in that
-    /// zone, a frame's check reads no calendar.
+    /// The machine's date at the clock's zero and its zone's offset, told
+    /// when either moved: the offset, or the date by a second or more (the
+    /// runner's own threshold). The date moves when the clock is set, and
+    /// through a sleep, since the session's clock (`CACurrentMediaTime`,
+    /// `mach_absolute_time`) stops while the system sleeps and the date does
+    /// not. Runs before each advance and frame; `dateChanged` runs it on a
+    /// system notice.
     func followOffset() {
-        guard launchPlace.epoch == nil else { return }
-        let zone = TimeZone.autoupdatingCurrent, wall = Date()
-        if let held = offsetHeld, held.zone == zone.identifier, wall < held.until { return }
+        guard let date = dateMoved() else { return }
+        apply(runtime.setTime(epochAtZero: date.epoch, utcOffset: date.offset))
+    }
+    /// `followOffset`'s date, nil when neither moved. `offsetHeld` is the
+    /// zone the offset was read in and when to read it again: until then, in
+    /// that zone, a frame's check reads no calendar.
+    private func dateMoved() -> (epoch: Double, offset: Double)? {
+        guard launchPlace.epoch == nil else { return nil }
+        let zone = TimeZone.autoupdatingCurrent, wall = Self.machineDate()
+        let epoch = wall.timeIntervalSince1970 * 1000 - now()
+        let moved = toldEpoch.map { abs(epoch - $0) >= 1000 } ?? true
+        if !moved, let held = offsetHeld, held.zone == zone.identifier, wall < held.until { return nil }
         // An hour at most: a zone's rules can move its offset at a time that
         // is no daylight-saving transition.
         let hour = wall.addingTimeInterval(3600)
         offsetHeld = (zone.identifier, min(zone.nextDaylightSavingTimeTransition(after: wall) ?? hour, hour))
-        let date = dateNow()
-        guard date.offset != toldOffset else { return }
-        toldOffset = date.offset
-        apply(runtime.setTime(epochAtZero: date.epoch, utcOffset: date.offset))
+        let offset = Double(zone.secondsFromGMT(for: wall)) / 60
+        guard moved || offset != toldOffset else { return nil }
+        (toldEpoch, toldOffset) = (epoch, offset)
+        return (epoch, offset)
     }
+    /// A system notice that the date or the zone may have moved, for an app
+    /// with no timer or frame to check it: told as a notice, as
+    /// `formatLocaleChanged` tells the Region.
+    func dateChanged() {
+        guard booted, state != .destroyed, let date = dateMoved() else { return }
+        let tell: (Runtime) -> Batch = { $0.setTime(epochAtZero: date.epoch, utcOffset: date.offset) }
+        if dataPreparing, !Owner.shared.isServingMain { tellSoon([tell]) } else { apply(tell(runtime)) }
+    }
+    /// The machine's date. A test sets it ahead to stand for a sleep, through
+    /// which the session's clock (`CACurrentMediaTime`) stops and the date runs.
+    nonisolated(unsafe) static var machineDate: () -> Date = Date.init
     /// The date at the clock's zero and the zone's offset now: the drive's
     /// under the agent (at the virtual instant), the machine's otherwise.
     func dateNow() -> (epoch: Double, offset: Double) {
         guard let epoch = launchPlace.epoch else {
-            return (Date().timeIntervalSince1970 * 1000 - now(), Double(TimeZone.autoupdatingCurrent.secondsFromGMT()) / 60)
+            return (Self.machineDate().timeIntervalSince1970 * 1000 - now(), Double(TimeZone.autoupdatingCurrent.secondsFromGMT()) / 60)
         }
         let zone = TimeZone(identifier: launchPlace.timeZone) ?? TimeZone(secondsFromGMT: 0)!
         return (epoch, Double(zone.secondsFromGMT(for: Date(timeIntervalSince1970: (epoch + now()) / 1000))) / 60)
@@ -62,13 +92,38 @@ extension ExactSession {
         runtime.setLaunchPlace(locale: launchPlace.locale, timeZone: launchPlace.timeZone, seed: launchPlace.seed, formatLocale: launchPlace.formatLocale)
         runtime.liveClock(clock == nil)
     }
-    /// The Region or the hour cycle the user forces changed (Foundation
-    /// posts `NSLocale.currentLocaleDidChangeNotification` for either):
-    /// `formatLocale` is read again and told, as a notice. The agent's is the drive's.
-    func observeFormatLocale() -> NSObjectProtocol {
-        NotificationCenter.default.addObserver(forName: NSLocale.currentLocaleDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+    /// The notices that the place or the date changed, each with the center
+    /// that posts it, which is the one to remove it from.
+    ///
+    /// The Region or the hour cycle the user forces: Foundation posts
+    /// `NSLocale.currentLocaleDidChangeNotification` for either, and
+    /// `formatLocale` is read again and told. The agent's is the drive's.
+    ///
+    /// The date and the zone (LLP 1027.000.000 D2): Foundation's
+    /// `NSSystemClockDidChange`, "posted whenever the system clock is
+    /// changed", and `NSSystemTimeZoneDidChange`. A sleep, after which the
+    /// session's clock is behind the date: on macOS AppKit's
+    /// `NSWorkspace.didWakeNotification`, which "the workspace posts when the
+    /// device wakes from sleep" on its own `notificationCenter` only; on iOS
+    /// an app is in the background while the device sleeps and becomes active
+    /// again after (`UIApplication.didBecomeActiveNotification`), and UIKit's
+    /// `significantTimeChangeNotification` adds midnight, a carrier time
+    /// update and a daylight-saving change. (Apple Developer Documentation.)
+    func observePlace() -> [(NotificationCenter, NSObjectProtocol)] {
+        let center = NotificationCenter.default
+        var observers = [(center, center.addObserver(forName: NSLocale.currentLocaleDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.formatLocaleChanged()
+        })]
+        var dated: [(NotificationCenter, Notification.Name)] = [(center, .NSSystemClockDidChange), (center, .NSSystemTimeZoneDidChange)]
+        #if canImport(UIKit)
+        dated += [(center, UIApplication.didBecomeActiveNotification), (center, UIApplication.significantTimeChangeNotification)]
+        #else
+        dated.append((NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification))
+        #endif
+        for (posting, name) in dated {
+            observers.append((posting, posting.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.dateChanged() }))
         }
+        return observers
     }
     func formatLocaleChanged() {
         guard launchPlace.epoch == nil, state != .destroyed else { return }

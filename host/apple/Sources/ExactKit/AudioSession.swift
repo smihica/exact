@@ -5,8 +5,8 @@
 // starts its engine with no category and a capture's claim composes nothing.
 //
 // The app holds `.ambient`, `.playback`, or `.playback` with `.mixWithOthers`
-// (`playback-mix`). With no holder it returns to `.ambient`. Before a GPU
-// module makes a surface, an unclaimed session takes `.ambient` without
+// (`playback-mix`). With no holder or claim it returns to `.ambient`. Before
+// a GPU module makes a surface, an unclaimed session takes `.ambient` without
 // activation, so an output opened before its `exact:audio` request mixes.
 //
 // A capture (a microphone, LLP 1133.009) claims the session: while any claim
@@ -34,9 +34,9 @@
 // for a video call), set before the action is fulfilled, and never
 // activated here: the system activates a call's session
 // (`provider(_:didActivate:)`), and an app that activates first blocks the
-// phone session. While a call claim is held no other path sets the category
-// or activates: a capture joins in the call's configuration, and the app's
-// own sound plays in it. The claim lasts while any call does; when the last
+// phone session. While a call claim is held no other path changes the
+// category or activation: captures and the app's own sound use the call's
+// configuration. The claim lasts while any call does; when the last
 // ends, the app's category comes back at the deactivation that follows, or
 // at once, without activating, when the session is already inactive.
 #if os(iOS) || os(tvOS)
@@ -143,9 +143,10 @@ package enum AudioSession {
     /// playback app goes back to `.ambient`, which mixes with other apps'
     /// audio, as Bluesky's player does on re-mute. A muted player keeps
     /// running, so the session itself is given up (telling other apps they
-    /// may resume) only once no player is left. A capture's category stays.
+    /// may resume) only once no player is left. A capture's category stays;
+    /// a call keeps its category and activation.
     package static func release(_ holder: ObjectIdentifier) {
-        guard holders.remove(holder) != nil, holders.isEmpty, captures.isEmpty else { return }
+        guard holders.remove(holder) != nil, holders.isEmpty, captures.isEmpty, !inCall else { return }
         // A boundary at which nothing may run: speech takes its configuration, or gives it up.
         if !speeches.isEmpty || spoken != nil { return composeSpeech() }
         guard configuration.category != .ambient else { return }
@@ -161,7 +162,7 @@ package enum AudioSession {
     /// A media player exists, muted or not.
     package static func playerCame(_ player: ObjectIdentifier) { players.insert(player) }
     /// A media player is gone; with no player and no holder left, a
-    /// playback app's session is given up.
+    /// playback app's session is given up unless a claim keeps it.
     package static func playerWent(_ player: ObjectIdentifier) {
         guard players.remove(player) != nil else { return }
         if !speeches.isEmpty || spoken != nil { return composeSpeech() }
@@ -389,7 +390,8 @@ package enum AudioSession {
     }
 
     private static func giveUpIfIdle() {
-        guard holders.isEmpty, players.isEmpty, captures.isEmpty, speeches.isEmpty, configuration.category != .ambient else { return }
+        guard holders.isEmpty, players.isEmpty, captures.isEmpty, speeches.isEmpty,
+              !inCall, configuration.category != .ambient else { return }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 

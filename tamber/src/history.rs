@@ -16,13 +16,15 @@ use std::collections::{HashMap, HashSet};
 pub enum What {
     /// A token's default (`when` empty) or one `when` line.
     Token,
+    /// A value in the design's `params` block, or one of its `when` lines.
+    Param,
     /// A dial's value.
     Dial,
     /// An axis's values, as `a | b`, and `under scheme=dark` after two
     /// spaces when it has it.
     Axis,
     /// Anything else declared: a token's or dial's kind, range or metadata,
-    /// the design's name, its exports. Read, never reverted.
+    /// the design's name, its exports, icons or components. Read, never reverted.
     Other,
 }
 
@@ -31,6 +33,7 @@ impl What {
     pub fn name(self) -> &'static str {
         match self {
             What::Token => "token",
+            What::Param => "param",
             What::Dial => "dial",
             What::Axis => "axis",
             What::Other => "other",
@@ -38,13 +41,13 @@ impl What {
     }
 }
 
-/// One edit between two versions: a branch of a token, a dial, an axis, or
+/// One edit between two versions: a branch of a token or param, a dial, an axis, or
 /// another declaration, with its text before and after (`None`: absent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     /// What it is to.
     pub what: What,
-    /// The token, dial or axis; for [`What::Other`], what changed
+    /// The token, param, dial or axis; for [`What::Other`], what changed
     /// (`surface.card meta`, `exports`).
     pub name: String,
     /// The `when` line's conditions; none is the default.
@@ -57,7 +60,7 @@ pub struct Edit {
 
 /// The edits from `old` to `new`; a version that is `None` (the file did not
 /// exist) declares nothing. In the newer version's order, then what it
-/// removed. A version that declares a name twice, or a token's `when` twice,
+/// removed. A version that declares a name twice, or a token's or param's `when` twice,
 /// has no one reading by name: refused, naming it.
 pub fn edits(old: Option<&Design>, new: Option<&Design>) -> Result<Vec<Edit>, String> {
     let empty = Design::default();
@@ -114,26 +117,31 @@ pub fn edits(old: Option<&Design>, new: Option<&Design>) -> Result<Vec<Edit>, St
             );
         }
     }
-    for (token, x, y) in union(&a.tokens, &b.tokens, |t| &t.name.value) {
-        for when in branches(x, y) {
-            let (before, after) = (branch(x, &when), branch(y, &when));
-            if before != after {
-                out.push(Edit {
-                    what: What::Token,
-                    name: token.to_string(),
-                    when,
-                    before,
-                    after,
-                });
+    for (what, before, after) in [
+        (What::Token, &a.tokens, &b.tokens),
+        (What::Param, &a.params, &b.params),
+    ] {
+        for (name, x, y) in union(before, after, |t| &t.name.value) {
+            for when in branches(x, y) {
+                let (before, after) = (branch(x, &when), branch(y, &when));
+                if before != after {
+                    out.push(Edit {
+                        what,
+                        name: name.to_string(),
+                        when,
+                        before,
+                        after,
+                    });
+                }
             }
-        }
-        if let (Some(x), Some(y)) = (x, y) {
-            other(
-                &mut out,
-                format!("{token} declaration"),
-                Some(token_shape(x)),
-                Some(token_shape(y)),
-            );
+            if let (Some(x), Some(y)) = (x, y) {
+                other(
+                    &mut out,
+                    format!("{name} declaration"),
+                    Some(token_shape(x)),
+                    Some(token_shape(y)),
+                );
+            }
         }
     }
     let exports = |d: &Design| {
@@ -149,6 +157,14 @@ pub fn edits(old: Option<&Design>, new: Option<&Design>) -> Result<Vec<Edit>, St
     for (icon, x, y) in union(&a.icons, &b.icons, |t| &t.name.value) {
         let value = |t: &crate::Token| t.value.value.trim().to_string();
         other(&mut out, format!("icon {icon}"), x.map(value), y.map(value));
+    }
+    for (name, x, y) in union(&a.components, &b.components, |c| &c.name.value) {
+        other(
+            &mut out,
+            format!("component {name}"),
+            x.map(component_text),
+            y.map(component_text),
+        );
     }
     Ok(out)
 }
@@ -166,10 +182,11 @@ fn ambiguous(d: &Design) -> Option<String> {
     twice(d.axes.iter().map(|x| &x.name.value).collect(), "axis")
         .or_else(|| twice(d.dials.iter().map(|x| &x.name.value).collect(), "dial"))
         .or_else(|| twice(d.tokens.iter().map(|x| &x.name.value).collect(), "token"))
+        .or_else(|| twice(d.params.iter().map(|x| &x.name.value).collect(), "param"))
         .or_else(|| twice(d.icons.iter().map(|x| &x.name.value).collect(), "icon"))
         .or_else(|| {
             // A `when` naming an axis twice reads as no set of conditions.
-            d.tokens.iter().find_map(|t| {
+            d.tokens.iter().chain(&d.params).find_map(|t| {
                 let twice = t.whens.iter().find(|w| {
                     let mut axes = HashSet::new();
                     !w.conds.iter().all(|(a, _)| axes.insert(a))
@@ -178,13 +195,19 @@ fn ambiguous(d: &Design) -> Option<String> {
             })
         })
         .or_else(|| {
-            d.tokens.iter().find_map(|t| {
-                let mut seen = HashSet::new();
-                t.whens
-                    .iter()
-                    .any(|w| !seen.insert(conds_key(&w.conds)))
-                    .then(|| format!("gives the token `{}` one `when` twice", t.name.value))
-            })
+            [(&d.tokens, "token"), (&d.params, "param")]
+                .into_iter()
+                .find_map(|(entries, what)| {
+                    entries.iter().find_map(|t| {
+                        let mut seen = HashSet::new();
+                        t.whens
+                            .iter()
+                            .any(|w| !seen.insert(conds_key(&w.conds)))
+                            .then(|| {
+                                format!("gives the {what} `{}` one `when` twice", t.name.value)
+                            })
+                    })
+                })
         })
 }
 
@@ -214,8 +237,9 @@ pub struct Revert {
 /// The inverse of the commit that took a file from `old` to `new`, on `now`,
 /// the file as it is. Each edit is put back where `now` still has the
 /// commit's `after`; one `now` has as `before` already is left; anything
-/// else conflicts, as does an edit no operation can invert (a dial or an
-/// axis added or removed, a kind or metadata changed).
+/// else conflicts, as does an edit no operation can invert (a dial added or
+/// removed, an axis added, a kind, metadata, param spelling or component
+/// declaration changed).
 pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
     let mut out = Revert::default();
     let (mut first, mut middle, mut last) = (Vec::new(), Vec::new(), Vec::new());
@@ -244,12 +268,30 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
     // bound's sweep).
     let new_axes = ByName::new(&new.axes, |x| &x.name.value);
     let new_tokens = ByName::new(&new.tokens, |x| &x.name.value);
+    let new_params = ByName::new(&new.params, |x| &x.name.value);
     let now_axes = ByName::new(&now.axes, |x| &x.name.value);
     let now_dials = ByName::new(&now.dials, |x| &x.name.value);
     let now_tokens = ByName::new(&now.tokens, |x| &x.name.value);
+    let now_params = ByName::new(&now.params, |x| &x.name.value);
     let old_axes = ByName::new(&old.axes, |x| &x.name.value);
     let old_dials = ByName::new(&old.dials, |x| &x.name.value);
     let old_tokens = ByName::new(&old.tokens, |x| &x.name.value);
+    let old_params = ByName::new(&old.params, |x| &x.name.value);
+    // The server resolves short and full names to the same line (LLP 1121
+    // stage 7 B). An inverse must not set it by one name then unset the other.
+    let param_names: HashSet<&str> = old
+        .params
+        .iter()
+        .chain(&new.params)
+        .chain(&now.params)
+        .map(|p| p.name.value.as_str())
+        .collect();
+    let respelled: HashSet<&str> = param_names
+        .iter()
+        .filter_map(|name| name.rsplit_once('#').map(|(_, short)| (*name, short)))
+        .filter(|(_, short)| param_names.contains(short))
+        .flat_map(|(full, short)| [full, short])
+        .collect();
     let old_at: HashMap<&str, usize> = old
         .tokens
         .iter()
@@ -270,7 +312,7 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
             What::Other => conflict(
                 &mut out,
                 None,
-                "no operation changes a kind, a range, metadata, the design's name or its exports",
+                "no operation changes a kind, a range, metadata, the design's name, exports, icons or component declarations",
             ),
             What::Dial => {
                 let current = now_dials
@@ -390,17 +432,43 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
                     _ => conflict(&mut out, current.map(axis_text), "changed since"),
                 }
             }
-            What::Token => {
-                let (x, y) = (old_tokens.get(&edit.name), new_tokens.get(&edit.name));
-                let current = now_tokens.get(&edit.name);
+            What::Token | What::Param => {
+                let param = edit.what == What::Param;
+                let (old, new, now) = if param {
+                    (&old_params, &new_params, &now_params)
+                } else {
+                    (&old_tokens, &new_tokens, &now_tokens)
+                };
+                let (x, y) = (old.get(&edit.name), new.get(&edit.name));
+                let current = now.get(&edit.name);
+                let what = edit.what.name();
+                if param && respelled.contains(edit.name.as_str()) {
+                    conflict(
+                        &mut out,
+                        branch(current, &edit.when),
+                        "the param's spelling differs between short and full names; no operation restores it",
+                    );
+                    continue;
+                }
                 match (x, y) {
-                    // The commit removed the token: it comes back whole, once
-                    // (its `when` lines are this one op's).
+                    // Tokens come back whole. Params need a result per branch
+                    // so a partial selection also keeps its conflicts.
                     (Some(x), None) => {
-                        if !edit.when.is_empty() {
+                        if !param && !edit.when.is_empty() {
                             continue;
                         }
                         match current {
+                            None if param && !x.meta.is_empty() => conflict(
+                                &mut out,
+                                None,
+                                "no operation restores a param's metadata",
+                            ),
+                            None if param => middle.push(Op::SetParam {
+                                name: edit.name.clone(),
+                                value: edit.before.clone().unwrap(),
+                                when: edit.when.clone(),
+                                respell: None,
+                            }),
                             None => first.push(Op::AddToken {
                                 name: x.name.value.clone(),
                                 kind: x.kind.clone(),
@@ -423,7 +491,7 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
                             Some(c) => conflict(
                                 &mut out,
                                 branch(Some(c), &edit.when),
-                                "a token by that name is there again, with other values",
+                                &format!("a {what} by that name is there again, with other values"),
                             ),
                         }
                     }
@@ -435,6 +503,11 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
                         }
                         match current {
                             None => out.already.push(edit.clone()),
+                            Some(c) if param && same_token(c, y) => middle.push(Op::UnsetParam {
+                                name: edit.name.clone(),
+                                when: Vec::new(),
+                                respell: None,
+                            }),
                             Some(c) if same_token(c, y) => last.push(Op::RemoveToken {
                                 name: edit.name.clone(),
                             }),
@@ -445,7 +518,7 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
                     }
                     _ => {
                         let Some(c) = current else {
-                            conflict(&mut out, None, "the token has been removed since");
+                            conflict(&mut out, None, &format!("the {what} has been removed since"));
                             continue;
                         };
                         let now_value = branch(Some(c), &edit.when);
@@ -455,6 +528,17 @@ pub fn revert(old: &Design, new: &Design, now: &Design) -> Revert {
                             conflict(&mut out, now_value, "changed since");
                         } else {
                             middle.push(match &edit.before {
+                                Some(v) if param => Op::SetParam {
+                                    name: edit.name.clone(),
+                                    when: edit.when.clone(),
+                                    value: v.clone(),
+                                    respell: None,
+                                },
+                                None if param => Op::UnsetParam {
+                                    name: edit.name.clone(),
+                                    when: edit.when.clone(),
+                                    respell: None,
+                                },
                                 Some(v) => Op::SetToken {
                                     name: edit.name.clone(),
                                     when: edit.when.clone(),
@@ -569,6 +653,25 @@ fn axis_text(a: &Axis) -> String {
     }
 }
 
+fn component_text(c: &crate::component::Component) -> String {
+    let mut out = format!("component {}\n  params", c.name.value);
+    for p in &c.params {
+        out.push_str(&format!(
+            "\n    {}: {} = {}",
+            p.name.value,
+            p.kind,
+            p.value.value.trim()
+        ));
+        if let Some((lo, hi)) = &p.range {
+            out.push_str(&format!("  in {lo}..{hi}"));
+        }
+        for (k, v) in &p.meta {
+            out.push_str(&format!("  {}", meta_word(k, v)));
+        }
+    }
+    out
+}
+
 /// What a dial declares besides its value.
 fn dial_shape(d: &Dial) -> String {
     let mut s = d.kind.name().to_string();
@@ -599,6 +702,194 @@ mod tests {
 
     fn d(src: &str) -> Design {
         parse(src).unwrap()
+    }
+
+    #[test]
+    fn history_reads_param_values_and_reverts_them() {
+        let v1 = format!("{V1}\nparams\n  PostButton.radius = 8px\n    when dark-style=dim: 4px\n");
+        let v2 = v1.replace("8px", "20px").replace("4px", "12px");
+        let all = edits(Some(&d(&v1)), Some(&d(&v2))).unwrap();
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[0].what.name(), "param");
+        assert_eq!(all[0].name, "PostButton.radius");
+        assert_eq!(all[0].before.as_deref(), Some("8px"));
+        assert_eq!(all[0].after.as_deref(), Some("20px"));
+        assert_eq!(all[1].when, vec![("dark-style".into(), "dim".into())]);
+        assert_eq!(all[1].before.as_deref(), Some("4px"));
+        assert_eq!(all[1].after.as_deref(), Some("12px"));
+        let r = revert(&d(&v1), &d(&v2), &d(&v2));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        let back = apply_all(&v2, &r.ops, &Vocab::default()).unwrap().text;
+        assert_eq!(back, v1);
+    }
+
+    #[test]
+    fn param_reverts_restore_and_remove_whole_entries_and_when_lines() {
+        let name = "post.contract#PostButton.radius";
+        let base = V1.replace("  under scheme=dark", "");
+        let v1 = format!("{base}\nparams\n  {name} = 8px\n");
+        let v2 = format!("{v1}    when dark-style=dim: 4px\n");
+        let params = crate::params::Params {
+            list: vec![crate::params::Param {
+                full: name.into(),
+                token: "param.fabc.PostButton.radius".into(),
+                kind: "length".into(),
+                default: "0px".into(),
+                from_design: false,
+            }],
+            components: vec!["post.contract#PostButton".into()],
+            ..Default::default()
+        };
+        for (old, new) in [(base.as_str(), v2.as_str()), (v1.as_str(), v2.as_str())] {
+            for (old, new) in [(old, new), (new, old)] {
+                let r = revert(&d(old), &d(new), &d(new));
+                assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+                assert!(!r.ops.is_empty());
+                let back = crate::apply_all_with(new, &r.ops, &Vocab::default(), &params)
+                    .unwrap()
+                    .text;
+                assert_eq!(back, old);
+                let already = revert(&d(old), &d(new), &d(old));
+                assert!(already.ops.is_empty() && already.conflicts.is_empty());
+                assert!(!already.already.is_empty());
+            }
+        }
+        // Restoring a param may also restore its token and an axis value;
+        // removing it must happen before those dependencies go.
+        let with = v2
+            .replace("  edge = #101010", "  radius = 8px\n  edge = #101010")
+            .replace("black | dim", "black | dim | navy")
+            .replace("radius = 8px\n    when", "radius = radius\n    when")
+            .replace("when dark-style=dim: 4px", "when dark-style=navy: 4px");
+        for (old, new) in [
+            (base.as_str(), with.as_str()),
+            (with.as_str(), base.as_str()),
+        ] {
+            let r = revert(&d(old), &d(new), &d(new));
+            assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+            let back = crate::apply_all_with(new, &r.ops, &Vocab::default(), &params)
+                .unwrap()
+                .text;
+            assert_eq!(back, old);
+        }
+    }
+
+    #[test]
+    fn param_reverts_keep_later_edits_and_refuse_conflicts() {
+        let v1 = format!("{V1}\nparams\n  PostButton.radius = 8px\n    when dark-style=dim: 4px\n");
+        let v2 = v1.replace("8px", "20px");
+        let later = v2.replace("4px", "6px");
+        let r = revert(&d(&v1), &d(&v2), &d(&later));
+        assert!(r.conflicts.is_empty());
+        let back = apply_all(&later, &r.ops, &Vocab::default()).unwrap().text;
+        assert_eq!(back, v1.replace("4px", "6px"));
+        for (old, new, now, conflicts) in [
+            (v1.as_str(), v2.as_str(), v2.replace("20px", "30px"), 1),
+            (v1.as_str(), v2.as_str(), V1.to_string(), 1),
+            (V1, v2.as_str(), later.clone(), 1),
+            (v1.as_str(), V1, later, 2),
+        ] {
+            let r = revert(&d(old), &d(new), &d(&now));
+            assert!(r.ops.is_empty());
+            assert_eq!(r.conflicts.len(), conflicts, "{r:?}");
+            for c in &r.conflicts {
+                assert_eq!(c.edit.what, What::Param);
+                assert_eq!(c.edit.name, "PostButton.radius");
+            }
+            assert!(r.conflicts[0].edit.when.is_empty());
+            if conflicts == 2 {
+                assert_eq!(
+                    r.conflicts[1].edit.when,
+                    [("dark-style".into(), "dim".into())]
+                );
+                assert_eq!(r.conflicts[1].now.as_deref(), Some("6px"));
+            }
+        }
+        let duplicate = v1.replace("params\n", "params\n  PostButton.radius = 12px\n");
+        let when_twice = format!("{v1}    when dark-style=dim: 6px\n");
+        let axis_twice = v1.replace("dark-style=dim:", "dark-style=dim dark-style=black:");
+        for bad in [duplicate, when_twice, axis_twice] {
+            assert!(edits(Some(&d(&bad)), Some(&d(&v1))).is_err());
+            assert!(edits(Some(&d(&v1)), Some(&d(&bad))).is_err());
+            let r = revert(&d(&v1), &d(&v2), &d(&bad));
+            assert!(r.ops.is_empty());
+            assert!(r.conflicts[0].why.contains("twice"));
+        }
+    }
+
+    #[test]
+    fn param_reverts_refuse_short_and_full_spellings_across_versions() {
+        let short = format!("{V1}\nparams\n  PostButton.radius = 8px\n");
+        let full = short.replace("PostButton.radius", "post.contract#PostButton.radius");
+        for (a, b) in [(&short, &full), (&full, &short)] {
+            let changed = b.replace("8px", "20px");
+            let r = revert(&d(a), &d(&changed), &d(&changed));
+            assert!(r.ops.is_empty());
+            assert_eq!(r.conflicts.len(), 2);
+            assert!(r.conflicts.iter().all(|c| c.why.contains("spelling")));
+            // The spelling may also change after the commit being reverted.
+            let r = revert(&d(b), &d(&changed), &d(&a.replace("8px", "20px")));
+            assert!(r.ops.is_empty());
+            assert_eq!(r.conflicts.len(), 1);
+            assert!(r.conflicts[0].why.contains("spelling"));
+        }
+        // Fully qualified names with different owners are distinct params.
+        let both = format!("{full}  other.contract#PostButton.radius = 12px\n");
+        let changed = both.replace("8px", "20px");
+        let r = revert(&d(&both), &d(&changed), &d(&changed));
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.ops.len(), 1);
+        assert_eq!(
+            apply_all(&changed, &r.ops, &Vocab::default()).unwrap().text,
+            both
+        );
+    }
+
+    #[test]
+    fn history_reports_component_changes_and_refuses_their_revert() {
+        let v1 = format!("{V1}\ncomponent MapCard\n  params\n    radius: length = 8px  in 0px..32px  control=slider\n");
+        let v2 = v1.replace("8px", "20px");
+        let all = edits(Some(&d(&v1)), Some(&d(&v2))).unwrap();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].what, What::Other);
+        assert_eq!(all[0].name, "component MapCard");
+        let r = revert(&d(&v1), &d(&v2), &d(&v2));
+        assert!(r.ops.is_empty());
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].edit, all[0]);
+        assert!(r.conflicts[0].why.contains("component"));
+        assert!(all[0]
+            .before
+            .as_ref()
+            .unwrap()
+            .contains("radius: length = 8px"));
+        assert!(all[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .contains("radius: length = 20px"));
+        for changed in [
+            V1.to_string(),
+            v1.replace("length = 8px", "number = 8"),
+            v1.replace("0px..32px", "0px..64px"),
+            v1.replace("control=slider", "control=slider  label=\"Corner radius\""),
+            format!("{v1}    inset: length = 4px\n"),
+        ] {
+            for (old, new) in [(&v1, &changed), (&changed, &v1)] {
+                let all = edits(Some(&d(old)), Some(&d(new))).unwrap();
+                assert_eq!(all.len(), 1, "{all:?}");
+                assert_eq!(all[0].name, "component MapCard");
+                let r = revert(&d(old), &d(new), &d(new));
+                assert_eq!(r.conflicts.len(), 1);
+                assert_eq!(r.conflicts[0].edit, all[0]);
+            }
+        }
+        let formatted = v1
+            .replace("component MapCard", "// map\ncomponent MapCard")
+            .replace(" = 8px", " =   8px");
+        assert!(edits(Some(&d(&v1)), Some(&d(&formatted)))
+            .unwrap()
+            .is_empty());
     }
 
     /// An icon is no operation's to write: its change is reported (D10).

@@ -7,8 +7,10 @@
 //! an answer is never `complete`, so an empty day may be one the person did
 //! not share (D2, D5).
 
-use crate::dates::{self, DAY_MS};
+use crate::dates::{self, local_day};
+use crate::empty_store_answer as failed;
 use crate::modules::health;
+use chrono_tz::Tz;
 use exact_plan::Value;
 use exact_runner::{Answer, Outcome};
 use std::collections::BTreeMap;
@@ -21,7 +23,7 @@ const PAGE: f64 = 50.0;
 pub(crate) struct Walk {
     start: f64,
     end: f64,
-    offset: f64,
+    zone: Tz,
     workouts: Vec<health::HealthWorkout>,
 }
 
@@ -33,19 +35,13 @@ fn key(source: &str, args: &[Value]) -> String {
 }
 
 /// `ActivityDays`: each day with a value, and what the answer saw, `since`
-/// also as its local date at `offset`.
-fn days(
-    error: &str,
-    days: Vec<(i32, f64)>,
-    since: Option<f64>,
-    offset: f64,
-    complete: bool,
-) -> Value {
+/// also as its local date in `zone`.
+fn days(error: &str, days: Vec<(i32, f64)>, since: Option<f64>, zone: Tz, complete: bool) -> Value {
     let days = (days.into_iter())
         .map(|(day, steps)| Value::record(vec![Value::Number(day.into()), Value::Number(steps)]))
         .collect();
     let from = since.map_or_else(String::new, |ms| {
-        let (_, month, day) = dates::civil(local_day(ms, offset));
+        let (_, month, day) = dates::civil(local_day(ms, zone));
         format!("{day} {}", dates::MONTH_NAMES[month as usize - 1])
     });
     Value::record(vec![
@@ -66,18 +62,6 @@ fn agenda(error: &str, workouts: Vec<Value>, complete: bool) -> Value {
     ])
 }
 
-fn failed(source: &str, code: &str) -> Value {
-    match source {
-        "calendarActivityDays" => days(code, Vec::new(), None, 0.0, false),
-        _ => agenda(code, Vec::new(), false),
-    }
-}
-
-/// What the build and a first frame show: nothing read yet.
-pub(crate) fn unread(source: &str) -> Value {
-    failed(source, "unread")
-}
-
 fn page(walk: &Walk, after: Option<String>) -> Result<Answer, String> {
     let options = health::HealthWorkoutsOptions {
         start: walk.start,
@@ -91,28 +75,29 @@ fn page(walk: &Walk, after: Option<String>) -> Result<Answer, String> {
         .map_err(|e| e.code)
 }
 
-/// `calendarActivityDays(month, show, offset)` and
-/// `calendarActivityAgenda(start, show, offset)`: nothing while `show` is
-/// false; else the first request.
+/// `calendarActivityDays(month, show, zone)` and
+/// `calendarActivityAgenda(day, show, zone)`, `zone` an IANA name: nothing
+/// while `show` is false; else the first request, for the days from local
+/// midnight to local midnight.
 pub(crate) fn answer(walks: &mut Walks, source: &str, args: &[Value]) -> Answer {
     if !matches!(args.get(1), Some(Value::Bool(true))) {
         walks.remove(&key(source, args));
-        return Answer::Now(unread(source));
+        return Answer::Now(failed(source, "unread"));
     }
-    let number = |i: usize| args.get(i).and_then(Value::as_number).unwrap_or(0.0);
-    let offset = number(2);
+    let number = |i: usize| args.get(i).and_then(Value::as_number).unwrap_or(0.0) as i32;
+    let zone = zone(args);
     if source == "calendarActivityDays" {
-        // The six weeks the month shows, from local midnight, one bucket a day.
-        let month = number(0) as i32;
+        // The six weeks the month shows, one bucket a day: Health's day
+        // intervals are calendar days in the device's zone.
+        let month = number(0);
         let first = dates::month_first(month);
         let from = first - dates::weekday(first) as i32;
         let last = dates::month_first(month + 1) - 1;
         let to = last + 6 - dates::weekday(last) as i32;
-        let shift = offset * 60_000.0;
         let options = health::HealthStatisticsOptions {
             r#type: Some("steps".into()),
-            start: from as f64 * DAY_MS - shift,
-            end: (to + 1) as f64 * DAY_MS - shift,
+            start: dates::midnight(from, zone),
+            end: dates::midnight(to + 1, zone),
             interval: "P1D".into(),
             ..Default::default()
         };
@@ -121,9 +106,9 @@ pub(crate) fn answer(walks: &mut Walks, source: &str, args: &[Value]) -> Answer 
             .unwrap_or_else(|e| Answer::Now(failed(source, &e.code)));
     }
     let walk = Walk {
-        start: number(0),
-        end: number(0) + DAY_MS,
-        offset,
+        start: dates::midnight(number(0), zone),
+        end: dates::midnight(number(0) + 1, zone),
+        zone,
         ..Default::default()
     };
     let first = page(&walk, None);
@@ -133,14 +118,14 @@ pub(crate) fn answer(walks: &mut Walks, source: &str, args: &[Value]) -> Answer 
 
 /// A reply: the answer, or the next page's request.
 pub(crate) fn parse(walks: &mut Walks, source: &str, args: &[Value], outcome: Outcome) -> Answer {
-    let offset = args.get(2).and_then(Value::as_number).unwrap_or(0.0);
     if source == "calendarActivityDays" {
+        let zone = zone(args);
         return Answer::Now(match health::health_statistics_reply(&outcome) {
             Ok(stats) => {
                 let seen = (stats.buckets.iter())
-                    .filter_map(|b| Some((local_day(b.start, offset), b.value?)))
+                    .filter_map(|b| Some((local_day(b.start, zone), b.value?)))
                     .collect();
-                days("", seen, stats.since, offset, stats.complete)
+                days("", seen, stats.since, zone, stats.complete)
             }
             Err(e) => failed(source, &e.code),
         });
@@ -167,18 +152,15 @@ pub(crate) fn parse(walks: &mut Walks, source: &str, args: &[Value], outcome: Ou
     Answer::Now(agenda("", rows(&walk), reply.complete))
 }
 
-/// The local day an instant falls on, at the reader's offset.
-fn local_day(ms: f64, offset: f64) -> i32 {
-    ((ms + offset * 60_000.0) / DAY_MS).floor() as i32
+/// The reader's zone, the third argument.
+fn zone(args: &[Value]) -> Tz {
+    dates::zone(args.get(2).and_then(Value::as_str).unwrap_or(""))
 }
 
 /// The day's workouts as the agenda shows them: the activity, the time and
 /// the distance.
 fn rows(walk: &Walk) -> Vec<Value> {
-    let minute = |ms: f64| {
-        let local = ms + walk.offset * 60_000.0;
-        ((local - (local / DAY_MS).floor() * DAY_MS) / 60_000.0) as u16
-    };
+    let minute = |ms: f64| dates::local_minute(ms, walk.zone);
     (walk.workouts.iter())
         .map(|w| {
             let title = match w.activity.as_str() {
@@ -210,6 +192,7 @@ fn rows(walk: &Walk) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dates::DAY_MS;
     use exact_runner::Response;
     use serde_json::{json, Value as Json};
 
@@ -241,11 +224,7 @@ mod tests {
     #[test]
     fn the_month_asks_daily_steps_and_leaves_out_the_days_with_none() {
         let mut walks = Walks::new();
-        let args = [
-            Value::Number(OCTOBER),
-            Value::Bool(true),
-            Value::Number(0.0),
-        ];
+        let args = [Value::Number(OCTOBER), Value::Bool(true), Value::str("UTC")];
         let body = asked(&answer(&mut walks, "calendarActivityDays", &args));
         assert_eq!(body["source"], "healthStatistics");
         assert_eq!(body["args"]["type"], "steps");
@@ -276,7 +255,11 @@ mod tests {
     #[test]
     fn the_day_walks_the_workout_pages() {
         let mut walks = Walks::new();
-        let args = [Value::Number(SEP_16), Value::Bool(true), Value::Number(0.0)];
+        let args = [
+            Value::Number(SEP_16 / DAY_MS),
+            Value::Bool(true),
+            Value::str("UTC"),
+        ];
         let body = asked(&answer(&mut walks, "calendarActivityAgenda", &args));
         assert_eq!(body["source"], "healthWorkouts");
         assert_eq!(body["args"]["end"], SEP_16 + DAY_MS);
@@ -319,23 +302,49 @@ mod tests {
     fn off_reads_nothing_and_an_error_answers_its_code() {
         let mut walks = Walks::new();
         let off = [
-            Value::Number(SEP_16),
+            Value::Number(SEP_16 / DAY_MS),
             Value::Bool(false),
-            Value::Number(0.0),
+            Value::str("UTC"),
         ];
         assert_eq!(
             record(answer(&mut walks, "calendarActivityAgenda", &off))[0],
             Value::str("unread")
         );
-        let args = [
-            Value::Number(OCTOBER),
-            Value::Bool(true),
-            Value::Number(0.0),
-        ];
+        let args = [Value::Number(OCTOBER), Value::Bool(true), Value::str("UTC")];
         answer(&mut walks, "calendarActivityDays", &args);
         let refused =
             reply(json!({"error": "NotAllowedError", "message": "requestHealthAuthorization"}));
         let f = record(parse(&mut walks, "calendarActivityDays", &args, refused));
         assert_eq!(f[0], Value::str("NotAllowedError"));
+    }
+
+    /// July read in Los Angeles, whose offset is then -7 hours whatever the
+    /// offset on the day it is read.
+    #[test]
+    fn a_summer_month_reads_at_the_summer_offset() {
+        let mut walks = Walks::new();
+        let la = Value::str("America/Los_Angeles");
+        let july = Value::Number((2026 * 12 + 6) as f64);
+        let args = [july, Value::Bool(true), la.clone()];
+        let body = asked(&answer(&mut walks, "calendarActivityDays", &args));
+        // From local midnight on Sunday 28 June.
+        assert_eq!(body["args"]["start"], 1_782_630_000_000.0);
+
+        let jul_4 = 20_638.0;
+        let args = [Value::Number(jul_4), Value::Bool(true), la];
+        let body = asked(&answer(&mut walks, "calendarActivityAgenda", &args));
+        let midnight = jul_4 * DAY_MS + 7.0 * 3_600_000.0;
+        assert_eq!(body["args"]["start"], midnight);
+        let run = json!({"id": "w1", "activity": "running", "start": midnight + 9.0 * 3_600_000.0,
+            "end": midnight + 10.0 * 3_600_000.0, "duration": 3600});
+        let page = reply(json!({"workouts": [run], "complete": false}));
+        let f = record(parse(&mut walks, "calendarActivityAgenda", &args, page));
+        let Value::List(rows) = &f[1] else {
+            panic!("rows")
+        };
+        let Value::Record(row) = &rows[0] else {
+            panic!("a row")
+        };
+        assert_eq!(row[2], Value::str("9:00 AM – 10:00 AM"));
     }
 }

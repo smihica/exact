@@ -9,7 +9,8 @@
 // it, when its size, scale or appearance changes, and after an image or
 // text raster under it publishes pixels; after any other batch it only
 // follows the box. An animation under a filtered box is sampled instead of
-// lowered (`svg_lower::eligibility`).
+// lowered (`svg_lower::eligibility`, and `svg_lower::resample` when the
+// filter comes after the animation).
 //
 // The main thread draws the subtree; the chain runs on a queue of its own,
 // whose Core Image render waits for the GPU, and the old picture shows

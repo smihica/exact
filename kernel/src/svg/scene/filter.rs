@@ -10,7 +10,9 @@
 //! `filter` makes the element not render, as Chrome does.
 
 use super::{cascade, Resolver, Viewport};
-use crate::generated::{ColorInterpolationFilters, NodeType, PropId, StyleId, StyleMask};
+use crate::generated::{
+    ColorInterpolationFilters, ColorScheme, NodeType, PropId, StyleId, StyleMask, StyleProps,
+};
 use crate::kernel::NodeRef;
 use crate::style::Dimension;
 use crate::svg::filter::{
@@ -323,11 +325,12 @@ impl Resolver<'_, '_> {
     pub(super) fn filter(
         &mut self,
         node: &NodeRef<'_>,
+        style: &StyleProps,
         bbox: Option<Rect>,
         stroke: f32,
         vp: Viewport,
     ) -> Option<Filter> {
-        let list = &node.style.filter;
+        let list = &style.filter;
         if list.0.is_empty() {
             return None;
         }
@@ -372,8 +375,8 @@ impl Resolver<'_, '_> {
                     &mut chain,
                     f,
                     visual,
-                    node.style.text_color.resolve(false),
-                    false,
+                    style.text_color.resolve(self.appearance(style)),
+                    self.appearance(style),
                 );
                 if !self.budget.primitives(&chain.primitives[before..]) {
                     return Some(nothing);
@@ -412,10 +415,20 @@ impl Resolver<'_, '_> {
         let coord = |d, default, obb, basis| vp.coord(d, default, if obb { 1.0 } else { basis });
         let row = |n: &NodeRef<'_>, s: StyleId, d: Dimension| n.style.mask.has(s).then_some(d);
         let raw = (
-            coord(row(f, StyleId::X, f.style.x), -0.1, obb, vp.width),
-            coord(row(f, StyleId::Y, f.style.y), -0.1, obb, vp.height),
-            coord(row(f, StyleId::Width, f.style.width), 1.2, obb, vp.width),
-            coord(row(f, StyleId::Height, f.style.height), 1.2, obb, vp.height),
+            coord(row(f, StyleId::X, f.style.x.clone()), -0.1, obb, vp.width),
+            coord(row(f, StyleId::Y, f.style.y.clone()), -0.1, obb, vp.height),
+            coord(
+                row(f, StyleId::Width, f.style.width.clone()),
+                1.2,
+                obb,
+                vp.width,
+            ),
+            coord(
+                row(f, StyleId::Height, f.style.height.clone()),
+                1.2,
+                obb,
+                vp.height,
+            ),
         );
         let region = match (obb, bx) {
             (true, Some(b)) => (
@@ -439,8 +452,7 @@ impl Resolver<'_, '_> {
             (true, Some(b)) => (b.2, b.3),
             _ => (1.0, 1.0),
         };
-        let inherited = f.arena.computed_rows(f.slot, StyleMask::INHERITED);
-        let fstyle = cascade(f, &inherited);
+        let fstyle = f.arena.computed_rows(f.slot, StyleMask::INHERITED);
         let base = chain.primitives.len() as u16;
         let source = chain.source();
         let mut names: Vec<(&str, u16)> = Vec::new();
@@ -720,11 +732,11 @@ impl Resolver<'_, '_> {
                         }
                     })
                 };
-                let x = len(StyleId::X, p.style.x, vp.width, b.0, b.2).unwrap_or(region.0);
-                let y = len(StyleId::Y, p.style.y, vp.height, b.1, b.3).unwrap_or(region.1);
-                let w = len(StyleId::Width, p.style.width, vp.width, 0.0, b.2)
+                let x = len(StyleId::X, p.style.x.clone(), vp.width, b.0, b.2).unwrap_or(region.0);
+                let y = len(StyleId::Y, p.style.y.clone(), vp.height, b.1, b.3).unwrap_or(region.1);
+                let w = len(StyleId::Width, p.style.width.clone(), vp.width, 0.0, b.2)
                     .unwrap_or(region.0 + region.2 - x);
-                let h = len(StyleId::Height, p.style.height, vp.height, 0.0, b.3)
+                let h = len(StyleId::Height, p.style.height.clone(), vp.height, 0.0, b.3)
                     .unwrap_or(region.1 + region.3 - y);
                 let x0 = x.max(region.0);
                 let y0 = y.max(region.1);
@@ -750,11 +762,20 @@ impl Resolver<'_, '_> {
         Some(region)
     }
 
+    fn appearance(&self, style: &StyleProps) -> bool {
+        match style.color_scheme {
+            ColorScheme::Light => false,
+            ColorScheme::Dark => true,
+            ColorScheme::Normal => self.dark,
+        }
+    }
+
     /// `flood-color` with `flood-opacity`, straight sRGB.
     fn flood(&self, style: &crate::generated::StyleProps) -> [f32; 4] {
+        let dark = self.appearance(style);
         let c = match &style.rare.flood_color {
-            Paint::CurrentColor => style.text_color.resolve(false),
-            Paint::Color(c) => c.resolve(false),
+            Paint::CurrentColor => style.text_color.resolve(dark),
+            Paint::Color(c) => c.resolve(dark),
             _ => crate::style::Color(0x0000_00ff),
         };
         rgba(c, style.rare.flood_opacity)
@@ -762,9 +783,10 @@ impl Resolver<'_, '_> {
 
     /// `lighting-color`, straight sRGB.
     fn lighting_color(&self, style: &crate::generated::StyleProps) -> [f32; 3] {
+        let dark = self.appearance(style);
         let c = match &style.rare.lighting_color {
-            Paint::CurrentColor => style.text_color.resolve(false),
-            Paint::Color(c) => c.resolve(false),
+            Paint::CurrentColor => style.text_color.resolve(dark),
+            Paint::Color(c) => c.resolve(dark),
             _ => crate::style::Color(0xffff_ffff),
         };
         let v = rgba(c, 1.0);

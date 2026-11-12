@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { checker } from '../../camera/test/fixture.mjs';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 const here = import.meta.dir, pkg = resolve(here, '..'), root = resolve(pkg, '../..');
 const run = (cmd, args, cwd, env = process.env) => {
@@ -23,7 +24,7 @@ const { check, failed } = checker();
 
 const dir = mkdtempSync(join(tmpdir(), 'exact-payments-')), name = 'paymentsfixture', app = join(dir, name);
 try {
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'android'], root);
   for (const f of ['app.contract', 'app.ts']) cpSync(join(here, 'fixture', f), join(app, f));
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -32,17 +33,10 @@ try {
   manifest.dependencies = { ...manifest.dependencies, '@exact/payments': `file:${pkg}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
-  // `exact new` writes no Canvas library: Weatherlight's, by path into this checkout.
-  const template = resolve(root, 'apps/weatherlight/android'), crate = resolve(app, 'android');
-  mkdirSync(resolve(crate, 'src'), { recursive: true });
-  writeFileSync(resolve(crate, 'Cargo.toml'), readFileSync(resolve(template, 'Cargo.toml'), 'utf8')
-    .replace('name = "weatherlight-android"', `name = "${name}-android"`).replaceAll('"../../../', `"${root}/`));
-  writeFileSync(resolve(crate, 'build.rs'), readFileSync(resolve(template, 'build.rs'), 'utf8').replace('"bake Weatherlight"', '"bake the fixture"'));
-  writeFileSync(resolve(crate, 'src/lib.rs'), readFileSync(resolve(template, 'src/lib.rs'), 'utf8'));
-  const workspace = resolve(app, 'Cargo.toml');
-  writeFileSync(workspace, readFileSync(workspace, 'utf8').replace('members = ["apple", "linux", "web"]', 'members = ["android", "apple", "linux", "web"]'));
-  run('bun', ['exact.mjs', 'lock'], app);
-  const env = { ...process.env, EXACT_APP_DIR: app, EXACT2: root, HERMES_LEAN_SYS_OFFLINE: '1' };
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
+  const env = { ...process.env, EXACT_APP_DIR: app, EXACT: root, HERMES_LEAN_SYS_OFFLINE: '1' };
   // A new app's Maven graph has no lock yet: this build writes it in the scratch app (camera's suite checks the refusal).
   const built = spawnSync('bun', [resolve(root, 'scripts/agent-android.mjs'), 'build', name, '--apk', '--write-locks'], { cwd: root, env, encoding: 'utf8', maxBuffer: 1 << 28 });
   check('android', 'the fixture builds as an APK, its Kotlin compiled against play-services-wallet', built.status === 0, (built.stdout + built.stderr).slice(-3000));

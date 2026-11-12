@@ -1,8 +1,10 @@
-// fragment.js, the web's scroll to a fragment (LLP 1153 D5), over stand-in elements: a scroll by the person counted from
-// the navigation cancels it though the module arms later; a hold while pictures load ends at the app's own scroll, a
+// fragment.js, the web's scroll to a fragment (LLP 1153 D5), over stand-in elements and real browser scrollers.
+// A scroll by the person since navigation cancels it though the module arms later; a hold while pictures load ends at the app's own scroll, a
 // newer navigation, or an entry that no longer shows the fragment; a fragment is all after the first `#`; and Back
 // puts back the scrollers above the route as well as those in it, again after the browser's own scroll to the id.
 import { test, expect, afterAll } from 'bun:test';
+import { hostFixtureFile } from './tests/glue-fixture.mjs';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 class El {
   constructor(attrs = {}, parent = null) {
@@ -90,3 +92,106 @@ test('Back puts back the scrollers above the route, as those in it', () => {
   frame(); frame();
   expect(port.scrollTop).toBe(120);
 });
+
+async function inBrowser(run) {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/fragment.js' || path === '/navigation.js') {
+      return new Response(hostFixtureFile(new URL(`.${path}`, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
+    }
+    return new Response('<!doctype html><main id="root"></main>', { headers: { 'content-type': 'text/html' } });
+  } });
+  let browser;
+  try {
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(server.url.href);
+    await run(page);
+  } finally { await browser?.close(); server.stop(true); }
+}
+
+for (const mode of ['without fragments', 'scroll events', 'fragment snapshots']) {
+  test(`removed routes can be collected after ${mode}`, () => inBrowser(async page => {
+    expect(await page.evaluate(async mode => {
+      const fragment = mode === 'without fragments' ? null : await import('./fragment.js');
+      const root = document.getElementById('root');
+      history.replaceState({ exact: 1, id: 1, url: '/item#moves' }, '');
+      window.removedRoutes = [];
+      for (let i = 0; i < 40; i++) {
+        const route = document.createElement('section'), port = document.createElement('div');
+        route.setAttribute('navigationKey', '1');
+        port.style.cssText = 'height:100px;overflow:auto';
+        port.innerHTML = '<div style="height:20px">Row</div>'.repeat(200);
+        route.append(port); root.append(route);
+        if (mode === 'fragment snapshots') {
+          history.replaceState({ exact: i + 2, id: 1, url: '/item#moves' }, '');
+          fragment.arm(root, { top: 1, fragment: 'moves', pushed: true }, { personScrolls: 0 });
+        } else {
+          await new Promise(resolve => {
+            port.addEventListener('scroll', () => resolve(), { once: true });
+            port.scrollTop = 100;
+          });
+        }
+        window.removedRoutes.push(new WeakRef(route));
+        route.remove();
+      }
+      return window.removedRoutes.length;
+    }, mode)).toBe(40);
+    const cdp = await page.context().newCDPSession(page);
+    for (let i = 0; i < 3; i++) await cdp.send('HeapProfiler.collectGarbage');
+    expect(await page.evaluate(() => window.removedRoutes.filter(ref => ref.deref()).length)).toBe(0);
+    if (mode !== 'without fragments') await page.evaluate(async () => {
+      const fragment = await import('./fragment.js'), root = document.getElementById('root');
+      root.innerHTML = '<section navigationKey="1"></section>';
+      history.replaceState({ exact: 1, id: 1, url: '/item#moves' }, '');
+      fragment.arm(root, { top: 1, fragment: 'moves', traversal: true }, { personScrolls: 0 });
+      fragment.scroll(root, 1, 'moves', () => {});
+    });
+  }), 30_000);
+}
+
+test('an ordinary history push discards the scroll places of the forward entries it replaces', () => inBrowser(async page => {
+  expect(await page.evaluate(async () => {
+    const fragment = await import('./fragment.js'), { navigation } = await import('./navigation.js');
+    const root = document.getElementById('root');
+    root.innerHTML = '<div style="height:100px;overflow:auto"><section navigationKey="1" style="height:4000px"></section></div>';
+    const port = root.firstElementChild;
+    const apply = (url, top = 1) => navigation.apply({ top, url, removed: [] });
+    navigation.connect(root, url => apply(url), () => {});
+    const move = top => new Promise(resolve => {
+      port.addEventListener('scroll', () => resolve(), { once: true });
+      port.scrollTop = top;
+    });
+    apply('/item');
+    apply('/item#old'); await move(100);
+    apply('/item#later'); await move(200);
+    await navigation.travel(null, -2);
+    const back = history.state.exact;
+    await move(300);
+    apply('/other', 2);
+    port.firstElementChild.setAttribute('navigationKey', '2');
+    fragment.arm(root, { top: 2, fragment: '', traversal: true }, navigation);
+    fragment.scroll(root, 2, '', () => {});
+    return [back, history.state.exact, port.scrollTop];
+  })).toEqual([0, 1, 300]);
+}), 30_000);
+
+test('traversal restores the latest scroll event on both axes while the route is retained', () => inBrowser(async page => {
+  expect(await page.evaluate(async () => {
+    const fragment = await import('./fragment.js'), root = document.getElementById('root');
+    root.innerHTML = '<section navigationKey="1" style="height:100px;width:100px;overflow:auto"><div style="height:4000px;width:4000px"></div></section>';
+    const port = root.firstElementChild;
+    const move = (top, left) => new Promise(resolve => {
+      port.addEventListener('scroll', () => resolve(), { once: true });
+      port.scrollTo({ top, left, behavior: 'instant' });
+    });
+    history.replaceState({ exact: 1, id: 1, url: '/item#moves' }, '');
+    await move(100, 50); await move(200, 80);
+    history.replaceState({ exact: 2, id: 1, url: '/item#other' }, '');
+    await move(500, 160);
+    history.replaceState({ exact: 1, id: 1, url: '/item#moves' }, '');
+    fragment.arm(root, { top: 1, fragment: 'moves', traversal: true }, { personScrolls: 0 });
+    fragment.scroll(root, 1, 'moves', () => {});
+    return [port.scrollTop, port.scrollLeft];
+  })).toEqual([200, 80]);
+}), 30_000);

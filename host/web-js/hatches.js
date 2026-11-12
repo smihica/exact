@@ -567,10 +567,12 @@ export function ht(e) {
 function scopesOf(m) {
   if (!["app", "appEnded", "window", "windowEnded"].some(n => typeof m[n] === "function") || typeof document === "undefined") return;
   const media = q => typeof matchMedia === "function" && matchMedia(q).matches;
+  const fixed = () => { const s = document.querySelector?.('meta[name="color-scheme"]')?.content; return s === "light" || s === "dark" ? s : null; };
   const QUERIES = ["(prefers-color-scheme: dark)", "(prefers-contrast: more)", "(prefers-contrast: less)", "(prefers-contrast: custom)", "(prefers-reduced-motion: reduce)", "(prefers-reduced-transparency: reduce)"];
   const facts = () => ({
     visibilityState: document.visibilityState ?? "visible", onLine: globalThis.navigator?.onLine !== false,
-    prefersColorScheme: globalThis.exact?.systemScheme ?? (media(QUERIES[0]) ? "dark" : "light"), // a dev pin's is the system's (LLP 1122 D4)
+    // A dev pin's is the system's (LLP 1122 D4), else the manifest's fixed `userInterfaceStyle` (the shell's meta, look.mjs).
+    prefersColorScheme: globalThis.exact?.systemScheme ?? fixed() ?? (media(QUERIES[0]) ? "dark" : "light"),
     prefersContrast: media(QUERIES[1]) ? "more" : media(QUERIES[2]) ? "less" : media(QUERIES[3]) ? "custom" : "no-preference",
     prefersReducedMotion: media(QUERIES[4]), prefersReducedTransparency: media(QUERIES[5]),
   });

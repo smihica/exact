@@ -263,6 +263,7 @@ pub(crate) fn bind(
             value,
             slices,
             kind: t.kind,
+            span: sink.span(origin, at.line, at.col),
         });
     }
     // A motion token is written into its rows here (D3): by name.

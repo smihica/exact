@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "shared_elements_data::Shared",
             "shared_elements_data::Shared",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

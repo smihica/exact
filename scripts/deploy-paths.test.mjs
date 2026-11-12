@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, sep, toNamespacedPath } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { assertCapturedContractSources, contractCompiler, installedContractPackage, namesNative, nativePlatforms, sourcePathspec, unrelocatableContractDependency } from './deploy.mjs';
+import { assertCapturedContractSources, classify, contractCompiler, disposeSnapshot, installedContractPackage, materializeSnapshot, namesNative, nativePlatforms, snapshotOf, sourcePathspec, unrelocatableContractDependency } from './deploy.mjs';
 import * as asyncLane from './async.mjs';
 import { pinned } from './test-workspace.mjs';
 const {changedPaths, failures, owners, retainSkippedFailures} = asyncLane;
@@ -23,6 +23,41 @@ test('a deploy ships the native platforms the manifest names, and a manifest nam
   expect(nativePlatforms({ deploy: { store: { web: '0' }, binaries: { macos: true } } })).toEqual(['macos']);
   for (const manifest of [{ host: { ios: {} } }, { host: { android: {} } }, { deploy: { binaries: { macos: true } } }]) expect(namesNative(manifest)).toBe(true);
   expect(() => nativePlatforms({ deploy: { store: { tvos: '0' } } })).toThrow(/names the platform tvos under deploy/);
+});
+
+test('an explicit deploy platform omits unsupported targets before classification', async () => {
+  const manifest = JSON.parse(readFileSync(new URL('../apps/shelf/app.json', import.meta.url), 'utf8'));
+  expect(() => nativePlatforms(manifest)).toThrow(/names the platform windows under deploy/);
+  expect(() => nativePlatforms(manifest, [])).toThrow(/names the platform windows under deploy/);
+  expect(() => nativePlatforms(manifest, ['ios', 'windows'])).toThrow(/names the platform windows under deploy/);
+  const opts = { platform: ['ios'] }, platforms = nativePlatforms(manifest, opts.platform);
+  expect(platforms).toEqual(['ios']);
+  expect(nativePlatforms(manifest, ['linux', 'ios', 'ios'])).toEqual(['ios', 'linux']);
+  expect(nativePlatforms(manifest, ['web'])).toEqual([]);
+  const iosAndWindows = { host: manifest.host, deploy: { store: { ios: '0', windows: '0' } } };
+  expect(nativePlatforms(iosAndWindows, ['macos'])).toEqual([]);
+  expect(nativePlatforms({ deploy: { binaries: { ios: true, windows: true } } }, ['ios'])).toEqual(['ios']);
+  expect(nativePlatforms({ host: manifest.host }, ['ios'])).toEqual(['ios']);
+
+  const id = '1'.repeat(64);
+  const table = await classify({ app: { id: manifest.id, displayName: manifest.name, manifest }, opts,
+    origin: { kind: 'fixture', describe: () => 'fixture' }, channel: 'prod', release: 'fixture',
+    snapshot: { commit: 'fixture', dirty: false, changes: [] },
+    compat: { ios: { id, inputs: { platform: 'ios', store: { L: manifest.deploy.store.ios } } } },
+    platforms, wantOrigin: false });
+  expect(table.dryRun).toBe(true);
+  expect(table.rows).toEqual([{ kind: 'binary', platform: 'ios', compatibilityId: id, action: 'binary',
+    reason: 'store.L=0: links no update store; deliver changes in the platform binary' }]);
+});
+
+test('deploy refuses unsupported requested platforms before capturing or building', () => {
+  for (const selection of [['windows'], ['ios', 'windows'], ['tvos']]) {
+    const result = spawnSync(process.execPath, [resolve(import.meta.dir, 'deploy.mjs'), 'shelf',
+      ...selection.flatMap((platform) => ['--platform', platform])], { encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`--platform ${selection.at(-1)}: one of web, ios, macos, linux`);
+  }
 });
 
 // LLP 1153 D3: a deploy's snapshot takes the app's ignored files as source, but not a web build in `dist` nor what it
@@ -137,7 +172,7 @@ test('async runs a check only for the suites selected, its Rust tests built as a
   for (const name of ['conform', 'conform-firefox', 'conform-webkit']) expect(step(name)[2].slice(0, 3)).toEqual(['host/web-js/conform.mjs', 'caltrain', '--synthetic']);
   expect(step('glue')[2].at(-1)).toContain('./host/web/a.test.mjs');
   for (const name of ['prepare', 'ios']) expect(step(name)).toBeDefined();
-  for (const name of ['ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test']) expect(step(name)).toBeUndefined();
+  for (const name of ['ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test', 'parity-svg', 'parity-motion']) expect(step(name)).toBeUndefined();
   expect(asyncLane.covers('test', selection)).toEqual(['cargo:exact-linux']);
   expect(asyncLane.covers('conform-webkit', selection)).toEqual(['conform:caltrain']);
   expect(asyncLane.covers('ios', selection)).toBe(null);
@@ -151,9 +186,11 @@ test('async runs a check only for the suites selected, its Rust tests built as a
   expect(ranTwo.failures).toEqual(['ios: ExactKitTests.CTests testC failed', 'ios: exit 65 (see log)']);
   const full = asyncLane.checks('new', 'old', {lane:[], glue:['./x.test.mjs']});
   expect(full.find(([n]) => n === 'test')[2]).toEqual(expect.arrayContaining(['cargo', 'test', '--workspace']));
-  for (const name of ['ios', 'ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test', 'conform']) expect(full.some(([n]) => n === name)).toBe(true);
+  for (const name of ['ios', 'ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test', 'conform', 'parity-svg', 'parity-motion']) expect(full.some(([n]) => n === name)).toBe(true);
+  // A parity leg builds its gallery's Linux host, then drives the smoke on a fresh web build
+  expect(full.find(([n]) => n === 'parity-svg').slice(1)).toEqual(['sh', ['-c', 'cargo build --profile host-dev -p svg-gallery-linux && EXACT_PARITY_REBUILD=1 bun scripts/smoke.mjs svg --hosts linux']]);
   // What a selection can leave out is what a full run has and an empty selection has not.
-  expect([...asyncLane.gated()].sort()).toEqual(['conform', 'conform-firefox', 'conform-webkit', 'game', 'game-assets-scaffold', 'game-lock', 'game-pins', 'game-recipes', 'game-scaffold', 'game-vocab', 'glue', 'ios', 'ios-touch', 'lane', 'prepare', 'test', 'tvos', 'watchos', 'web-ax-test', 'web-build-test']);
+  expect([...asyncLane.gated()].sort()).toEqual(['conform', 'conform-firefox', 'conform-webkit', 'game', 'game-assets-scaffold', 'game-lock', 'game-pins', 'game-recipes', 'game-scaffold', 'game-vocab', 'glue', 'ios', 'ios-touch', 'lane', 'parity-motion', 'parity-svg', 'prepare', 'test', 'tvos', 'watchos', 'web-ax-test', 'web-build-test']);
 });
 
 test('async compiles tvOS per commit with no simulator, and tier 2 installs it', () => {
@@ -250,16 +287,63 @@ afterAll(() => {
   rmSync(fixture, { recursive: true, force: true });
 });
 
-function compilerRoot() {
+function compilerRoot(source = 'fn main() {}\n') {
   const root = mkdtempSync(join(fixture, 'compiler-'));
   mkdirSync(join(root, 'src'));
   writeFileSync(join(root, 'Cargo.toml'), '[package]\nname="contract"\nversion="0.1.0"\nedition="2021"\n');
-  writeFileSync(join(root, 'src/main.rs'), 'fn main() {}\n');
+  writeFileSync(join(root, 'src/main.rs'), source);
   pinned(root);
   const lock = spawnSync('cargo', ['generate-lockfile', '--offline'], {cwd:root, encoding:'utf8'});
   expect(lock.status).toBe(0);
   return root;
 }
+
+test('a deploy snapshot omits the Exact corpus link and still validates application links', () => {
+  const root = mkdtempSync(join(fixture, 'snapshot-'));
+  const exact = join(root, 'exact'), corpus = join(root, 'corpus'), external = join(root, 'app');
+  const compiler = contractCompiler(compilerRoot('fn main() { print!(r#"{{"packages":[],"sources":[],"consulted":[],"errors":[]}}"#); }\n'));
+  const git = (repo, ...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  };
+  const write = (name, text) => {
+    const path = join(root, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  write('corpus/design.md', 'private design corpus');
+  write('exact/.gitignore', '/llp\n');
+  write('exact/apps/test/app.contract', 'app Test\n');
+  write('exact/apps/test/assets/llp/input.txt', 'app source');
+  write('app/app.contract', 'app External\n');
+  write('app/llp/input.txt', 'external app source');
+  for (const repo of [exact, external]) {
+    git(repo, 'init', '-q');
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm', 'fixture');
+  }
+  symlinkSync(corpus, join(exact, 'llp'), 'dir');
+  expect(git(exact, 'check-ignore', 'llp').trim()).toBe('llp');
+  for (const dir of [join(exact, 'apps/test'), external]) {
+    const app = { name: 'test', dir, workspace: dir === external ? external : exact, manifest: {} };
+    const snapshot = snapshotOf(app, { compiler }, exact);
+    try {
+      expect(snapshot.dirty).toBe(false);
+      const captured = materializeSnapshot(snapshot, join(root, 'run'), app);
+      expect(readdirSync(captured.exactRoot)).not.toContain('llp');
+      const input = dir === external ? 'llp/input.txt' : 'assets/llp/input.txt';
+      expect(readFileSync(join(captured.app.dir, input), 'utf8')).toBe(dir === external ? 'external app source' : 'app source');
+    } finally { disposeSnapshot(snapshot); }
+  }
+  rmSync(join(external, 'llp'), { recursive: true });
+  writeFileSync(join(external, '.gitignore'), '/llp\n');
+  git(external, 'add', '-A');
+  git(external, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm', 'ignore app link');
+  symlinkSync(corpus, join(external, 'llp'), 'dir');
+  const app = { name: 'test', dir: external, workspace: external, manifest: {} };
+  expect(() => snapshotOf(app, { compiler, dirty: true }, exact)).toThrow(/symlink llp.*escapes the captured source repositories/);
+}, 30000);
 
 test('Contract discovery builds in the selected private Cargo target', () => {
   const root = compilerRoot(), target = mkdtempSync(join(fixture, 'cargo-target-'));

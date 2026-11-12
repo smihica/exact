@@ -7,7 +7,7 @@
 //! a checkbox is Chrome's rounded square, a radio its circle and a switch a
 //! pill with a thumb, filled with `accent-color`, else the platform's accent
 //! where the host reported one ([`accents`]). `appearance: none` draws
-//! nothing here: the author's box is the whole look (D6).
+//! no native chrome; a select or date field keeps its value in the author's box (D6).
 
 use super::material::Icon;
 use super::{look, neutral, rgba, Backend, Rect4, Shape};
@@ -99,9 +99,28 @@ pub(crate) fn choice<'a>(
         .map(|(c, _)| c.as_str())
 }
 
-/// What a date control shows: its [`choice`], else the bound value. Under
-/// the neutral look that is HTML's value, its placeholder form when empty;
-/// else the device's writing of it (`dates.rs`), nothing when empty.
+/// A range's thumb's diameter in a box `w` by `h`: the neutral look's mark,
+/// else 16 px. The painter and the pointer both read it and
+/// [`range_mirrored`], so the thumb lands under a press.
+pub(crate) fn range_thumb(node: &NodeRef<'_>, w: f32, h: f32) -> f32 {
+    let d = match look::neutral() {
+        true => look::px(metric::MARK_SIZE, neutral::em(node)),
+        false => 16.0,
+    };
+    d.min(h).min(w)
+}
+
+/// Whether a range's minimum is at the right. A horizontal range runs from
+/// its inline start, so under `direction: rtl` it is, as a browser draws it
+/// and Android's `SeekBar` (`mirrorForRtl`) does.
+pub(crate) fn range_mirrored(node: &NodeRef<'_>) -> bool {
+    node.computed_row(exact_kernel::StyleId::Direction, |s| s.direction)
+        == exact_kernel::Direction::Rtl
+}
+
+/// What a date control shows: its [`choice`], else the bound value. Native
+/// neutral fields show HTML's format hint when empty; bare fields leave
+/// room for their placeholder. Else the device formats the value (`dates.rs`).
 pub(super) fn date_text(
     node: &NodeRef<'_>,
     chosen: Option<&(String, String)>,
@@ -109,6 +128,9 @@ pub(super) fn date_text(
 ) -> String {
     let value = choice(node, chosen).unwrap_or_else(|| node.props.str(PropId::Value).unwrap_or(""));
     let kind = node.props.str(PropId::Type).unwrap_or("date");
+    if value.is_empty() && node.style.appearance == Appearance::None {
+        return String::new();
+    }
     if !look::neutral() {
         let shown = dates.and_then(|d| d.show(kind, value));
         return shown.unwrap_or_else(|| value.to_string());
@@ -201,8 +223,10 @@ pub struct MenuPaint {
     pub row: f32,
     /// Each option's label and whether it is disabled.
     pub rows: Vec<(String, bool)>,
-    /// The chosen row.
+    /// The highlighted row: the one the keys moved to, else the chosen.
     pub chosen: Option<usize>,
+    /// How far the rows are scrolled, in points.
+    pub offset: f32,
     /// The select's inherited text style, which the rows are set in.
     pub style: exact_kernel::StyleProps,
     /// The select's accent, where it sets one.
@@ -236,41 +260,69 @@ impl super::Painter {
     /// A closed select, or a field that shows a value (LLP 1069.001 D7):
     /// the neutral look's field with the text, and a caret when it opens a
     /// menu; else Material's filled field with its trailing icon.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn field_control(
         &mut self,
+        walk: &super::Walk<'_, '_>,
         node: &NodeRef<'_>,
         content: Rect4,
+        outer: &Shape,
         focused: bool,
         ts: Transform,
         text: &str,
         chevron: bool,
     ) {
-        if node.style.appearance == Appearance::None {
-            return;
-        }
+        let bare = node.style.appearance == Appearance::None;
         let dark = self.dark;
-        if look::neutral() {
+        if bare || look::neutral() {
             // Focus changes without a tree commit, so a row cannot keep this ring.
             self.row_refuse();
-            // The look's field: its ground and line, the text a field's
-            // padding in, on the middle line, and a select's caret.
-            let shape = neutral::field(self.backend.as_mut(), node, content, ts, dark);
+            // No appearance keeps the value and authored ink, without the field's inset or caret.
+            let shape = if bare {
+                *outer
+            } else {
+                neutral::field(self.backend.as_mut(), node, content, ts, dark)
+            };
             let style = node.computed_style(StyleMask::INHERITED);
-            let spec = super::text_spec(&style, text);
+            let placeholder = bare && text.is_empty();
+            let shown = if placeholder {
+                node.props.str(PropId::Placeholder).unwrap_or("")
+            } else {
+                text
+            };
+            let spec = super::text_spec(&style, shown);
             let paragraph = self.text.borrow_mut().paragraph(&spec, None);
             let (x, y, w, h) = content;
             let em = neutral::em(node);
-            let inset =
-                look::px(metric::CONTROL_LINE, em) + look::px(metric::FIELD_PADDING_INLINE, em);
+            let inset = if bare {
+                0.0
+            } else {
+                look::px(metric::CONTROL_LINE, em) + look::px(metric::FIELD_PADDING_INLINE, em)
+            };
             let rtl = style.direction == exact_kernel::Direction::Rtl;
-            let ox = if rtl {
+            let ox = if bare {
+                x + crate::text::field::line_left(
+                    style.text_align,
+                    style.direction,
+                    w,
+                    paragraph.width,
+                )
+            } else if rtl {
                 x + w - inset - paragraph.width
             } else {
                 x + inset
             };
             let oy = y + ((h - paragraph.height) / 2.0).max(0.0);
             let palette = [crate::text::RunPaint {
-                color: neutral::field_ink(node, dark),
+                color: if placeholder {
+                    authored_placeholder(node.style, dark)
+                        .unwrap_or_else(|| look::role("-exact-placeholder", dark))
+                } else if bare {
+                    super::presented_color(walk, node, dark)
+                        .unwrap_or_else(|| rgba(node.text_color().resolve(dark)))
+                } else {
+                    neutral::field_ink(node, dark)
+                },
                 source: node.id,
             }];
             self.backend.push_clip(&Shape::rect(content), ts);
@@ -282,10 +334,15 @@ impl super::Painter {
                 ts,
             );
             self.backend.pop_clip();
-            if chevron {
+            if chevron && !bare {
                 neutral::caret(self.backend.as_mut(), node, content, ts, dark);
             }
-            if focused && !self.unringed(node) && node.props.bool(PropId::Disabled) != Some(true) {
+            let unringed = if bare {
+                ringless(node)
+            } else {
+                self.unringed(node)
+            };
+            if focused && !unringed && node.props.bool(PropId::Disabled) != Some(true) {
                 self.field_ring(&shape, ring(node, dark), ts);
             }
             return;
@@ -327,14 +384,15 @@ impl super::Painter {
         } else {
             0.0
         };
+        let (x, y, w, h) = content;
+        let (d, mirrored) = (range_thumb(node, w, h), range_mirrored(node));
+        let along = if mirrored { 1.0 - t } else { t };
         if look::neutral() {
-            neutral::range(self.backend.as_mut(), node, content, ts, dark, t);
+            neutral::range(self.backend.as_mut(), node, content, ts, dark, d, along);
             return;
         }
-        let (x, y, w, h) = content;
-        let d = 16f32.min(h).min(w);
         let cy = y + h / 2.0;
-        let tx = x + (w - d) * t;
+        let tx = x + (w - d) * along;
         let track =
             |from: f32, to: f32| Shape::new((from, cy - 2.0, (to - from).max(0.0), 4.0), [2.0; 4]);
         let rest = if dark {
@@ -344,8 +402,12 @@ impl super::Painter {
         };
         self.backend.fill(&track(x, x + w), alpha(rest), ts);
         let (accent, _) = accents(accent(node, dark), dark);
-        self.backend
-            .fill(&track(x, tx + d / 2.0), alpha(accent), ts);
+        // The fill runs from the minimum to the thumb.
+        let filled = match mirrored {
+            true => track(tx + d / 2.0, x + w),
+            false => track(x, tx + d / 2.0),
+        };
+        self.backend.fill(&filled, alpha(accent), ts);
         let thumb = Shape::new((tx, cy - d / 2.0, d, d), [d / 2.0; 4]);
         self.backend.fill(&thumb, alpha(accent), ts);
     }
@@ -375,9 +437,13 @@ impl super::Painter {
         };
         self.backend.fill(&panel.inset(1.0), bg, ts);
         let (accent, on_accent) = accents(menu.accent, dark);
-        let (x, y, w, _) = menu.rect;
+        let (x, y, w, h) = menu.rect;
+        self.backend.push_clip(&panel, ts);
         for (i, (label, disabled)) in menu.rows.iter().enumerate() {
-            let top = y + MENU_PAD + i as f32 * menu.row;
+            let top = y + MENU_PAD + i as f32 * menu.row - menu.offset;
+            if top + menu.row < y || top > y + h {
+                continue;
+            }
             let chosen = menu.chosen == Some(i);
             if chosen {
                 let row = Shape::new((x + 4.0, top, w - 8.0, menu.row), [4.0; 4]);
@@ -404,6 +470,7 @@ impl super::Painter {
             self.backend
                 .text(&mut engine, &paragraph, &palette, (x + 12.0, oy), ts);
         }
+        self.backend.pop_clip();
         self.dark = previous;
     }
 }

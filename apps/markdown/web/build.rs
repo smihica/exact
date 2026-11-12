@@ -34,6 +34,7 @@ fn main() {
         "exact_data_host::Storage<markdown_data::Markdown>",
         "exact_data_host::Storage::new(markdown_data::Markdown::new())",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

@@ -79,4 +79,4 @@ component Fixture
       button press=unplace testId="unplace"
         text "Unplace"
       if placed
-        exact-camera srcObject=track testId="viewfinder" width=320 height=240 display=(shown ? "block" : "none")
+        exact-camera srcObject=track object-fit="cover" testId="viewfinder" width=320 height=240 display=(shown ? "block" : "none")

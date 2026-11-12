@@ -360,6 +360,23 @@ fn relative_font_rows_start_at_platform_and_other_em_rows_use_authored_font() {
         k.node(2).unwrap().style.padding_top,
         Dimension::Points(40.0)
     );
+    k.apply(0, 0, &[prop(2, PropId::SemanticTag, "textarea")])
+        .unwrap();
+    assert_eq!(number(&k, 2, StyleId::FontSize), 44.0);
+    assert_eq!(
+        k.node(2).unwrap().style.padding_top,
+        Dimension::Points(44.0)
+    );
+    k.apply(
+        0,
+        0,
+        &[Op::ClearProp {
+            id: 2,
+            prop: PropId::SemanticTag,
+        }],
+    )
+    .unwrap();
+    assert_eq!(number(&k, 2, StyleId::FontSize), 40.0);
 }
 
 #[test]

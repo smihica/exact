@@ -47,8 +47,8 @@ fn property_program(
     let path = canonical.as_path();
     let src = crate::read_source(path)?;
     let root = path.parent().unwrap_or_else(|| Path::new("."));
-    let (file, _) = crate::sources::load(path, &src, root)?;
-    let expanded = contract_syntax::expand(&file).map_err(CompileError::from)?;
+    let (file, sources) = crate::sources::load(path, &src, root)?;
+    let expanded = contract_syntax::expand(&file).map_err(|e| sources.resolve(e.into()))?;
     Ok((file, expanded))
 }
 

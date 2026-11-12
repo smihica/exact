@@ -10,6 +10,175 @@ import XCTest
 /// and never a browser's `mm/dd/yyyy`. It still takes the tap that opens it.
 /// UIKit, so a simulator runs it: bun host/apple/build.mjs --test --ios
 final class DatesIOSTests: XCTestCase {
+    func testAFocusHandlerDisablingOrMakingThePickerInertLeavesItEmpty() throws {
+        for prop in ["disabled", "inert"] {
+            let p = Presenter()
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+            defer { window.isHidden = true; p.onFocus = nil; p.onControlValue = nil }
+            p.viewport.frame = window.bounds
+            window.addSubview(p.viewport)
+            window.makeKeyAndVisible()
+            p.apply(wireBatch([
+                ["op": "create", "id": 1, "kind": "view"],
+                ["op": "create", "id": 2, "kind": "control",
+                 "props": ["type": "date", "value": "", "min": "2026-11-12", "max": "2026-11-12"],
+                 "handlers": ["focus", "input", "change"], "style": [:]],
+                ["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]],
+                ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 400, "h": 400],
+                ["op": "frame", "id": 2, "x": 20, "y": 20, "w": 300, "h": 34],
+            ]))
+            let owner = try XCTUnwrap(p.views[2])
+            let picker = try XCTUnwrap(p.controls.controls[2] as? BoundDatePicker)
+            let changed = prop == "inert" ? 1 : 2
+            var focused: [UInt32] = [], values: [String] = []
+            p.onFocus = { id in
+                focused.append(id)
+                p.apply(wireBatch([["op": "props", "id": changed, "set": [prop: "true"]]]))
+            }
+            p.onControlValue = { id, value, input, change in
+                XCTAssertTrue(input && change)
+                values.append(value)
+                p.apply(wireBatch([["op": "props", "id": id, "set": ["value": value]]]))
+            }
+            picker.sendActions(for: .editingDidBegin)
+            XCTAssertEqual(focused, [2])
+            XCTAssertTrue(p.views[2] === owner && p.controls.controls[2] === picker)
+            XCTAssertEqual(picker.isEnabled, prop != "disabled")
+            XCTAssertEqual(owner.inert, prop == "inert")
+            XCTAssertEqual(values, [], "a focus handler setting \(prop) prevents acceptance")
+            XCTAssertTrue(picker.empty)
+            XCTAssertEqual(owner.props["value"], "")
+            p.onFocus = nil
+            p.apply(wireBatch([["op": "props", "id": changed, "clear": [prop]]]))
+            picker.sendActions(for: .editingDidBegin)
+            XCTAssertEqual(values, ["2026-11-12"], "the enabled picker accepts its value when reopened")
+            XCTAssertFalse(picker.empty)
+            XCTAssertEqual(owner.props["value"], "2026-11-12")
+        }
+    }
+
+    func testAFocusHandlerGivingThePickerTheAuthorsLookLeavesItEmpty() throws {
+        let p = Presenter()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        defer { window.isHidden = true; p.onFocus = nil; p.onControlValue = nil }
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view"],
+            ["op": "create", "id": 2, "kind": "control",
+             "props": ["type": "date", "value": "", "min": "2026-11-12", "max": "2026-11-12"],
+             "handlers": ["focus", "input", "change"], "style": [:]],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 400, "h": 400],
+            ["op": "frame", "id": 2, "x": 20, "y": 20, "w": 300, "h": 34],
+        ]))
+        let picker = try XCTUnwrap(p.controls.controls[2] as? BoundDatePicker)
+        XCTAssertNotNil(picker.window)
+        var values: [String] = []
+        // `appearance: none` takes the picker out of the window and keeps it as the node's control.
+        p.onFocus = { _ in p.apply(wireBatch([["op": "style", "id": 2, "style": ["appearance": "none"]]])) }
+        p.onControlValue = { _, value, _, _ in values.append(value) }
+        picker.sendActions(for: .editingDidBegin)
+        XCTAssertTrue(p.controls.controls[2] === picker)
+        XCTAssertNil(picker.window)
+        XCTAssertEqual(values, [], "a picker the focus handler took off screen accepts nothing")
+        XCTAssertTrue(picker.empty)
+    }
+
+    func testAFocusHandlerReplacingThePickerDoesNotAcceptTheDetachedPickersValue() throws {
+        let p = Presenter()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        defer { window.isHidden = true; p.onFocus = nil; p.onControlValue = nil }
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "control",
+             "props": ["type": "date", "value": "", "min": "2026-11-12", "max": "2026-11-12"],
+             "handlers": ["focus", "input", "change"], "style": [:]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 20, "y": 20, "w": 300, "h": 34],
+        ]))
+        let owner = try XCTUnwrap(p.views[1])
+        let picker = try XCTUnwrap(p.controls.controls[1] as? BoundDatePicker)
+        var focused: [UInt32] = [], values: [String] = []
+        p.onFocus = { id in
+            focused.append(id)
+            p.apply(wireBatch([["op": "props", "id": id,
+                               "set": ["type": "time", "min": "09:30", "max": "09:30"]]]))
+        }
+        p.onControlValue = { id, value, input, change in
+            XCTAssertTrue(input && change)
+            values.append(value)
+            p.apply(wireBatch([["op": "props", "id": id, "set": ["value": value]]]))
+        }
+        picker.sendActions(for: .editingDidBegin)
+        XCTAssertEqual(focused, [1])
+        XCTAssertTrue(p.views[1] === owner)
+        let replacement = try XCTUnwrap(p.controls.controls[1] as? BoundDatePicker)
+        XCTAssertFalse(replacement === picker)
+        XCTAssertNil(picker.superview)
+        XCTAssertEqual(values, [], "opening the detached picker cannot report a value for its replacement")
+        XCTAssertTrue(replacement.empty)
+        XCTAssertEqual(owner.props["value"], "")
+        p.onFocus = nil
+        replacement.sendActions(for: .editingDidBegin)
+        XCTAssertEqual(values, ["09:30"], "the replacement accepts its own bounds when it opens")
+        XCTAssertFalse(replacement.empty)
+        XCTAssertEqual(owner.props["value"], "09:30")
+    }
+
+    func testOpeningAnEmptyPickerAcceptsItsInitialValueAndCanRepeatAfterClearing() throws {
+        let p = Presenter()
+        // A picker accepts a value only on screen, as a tap requires.
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        defer { window.isHidden = true; p.onControlValue = nil }
+        p.viewport.frame = window.bounds
+        window.addSubview(p.viewport)
+        window.makeKeyAndVisible()
+        p.apply(wireBatch([
+            ["op": "create", "id": 9, "kind": "view"], ["op": "roots", "ids": [9]],
+            ["op": "frame", "id": 9, "x": 0, "y": 0, "w": 400, "h": 400],
+        ]))
+        for (i, kind) in ["date", "time", "datetime-local"].enumerated() {
+            let id = i + 1
+            let value = kind == "date" ? "2026-11-12" : kind == "time" ? "14:30" : "2026-11-12T14:30"
+            p.apply(wireBatch([
+                ["op": "create", "id": id, "kind": "control",
+                 "props": ["type": kind, "value": "", "min": value, "max": value], "handlers": ["input", "change"], "style": [:]],
+                ["op": "children", "id": 9, "ids": Array(1...id)],
+                ["op": "frame", "id": id, "x": 20, "y": 20 + 40 * i, "w": 300, "h": 34],
+            ]))
+            let picker = try XCTUnwrap(p.controls.controls[UInt32(id)] as? BoundDatePicker)
+            XCTAssertNotNil(picker.window)
+            var values: [String] = []
+            p.onControlValue = { _, value, input, change in
+                XCTAssertTrue(input && change)
+                values.append(value)
+            }
+            for _ in 0..<2 {
+                XCTAssertTrue(picker.empty)
+                picker.sendActions(for: .editingDidBegin)
+                XCTAssertEqual(values, [value])
+                XCTAssertEqual(DateValue.shown(kind, picker), value)
+                XCTAssertFalse(picker.empty)
+                picker.sendActions(for: .editingDidBegin)
+                XCTAssertEqual(values, [value], "opening a filled picker sends no change")
+                p.apply(wireBatch([["op": "props", "id": id, "set": ["value": value]]]))
+                p.apply(wireBatch([["op": "props", "id": id, "set": ["value": ""]]]))
+                values.removeAll()
+            }
+            p.apply(wireBatch([["op": "props", "id": id, "clear": ["min", "max"]]]))
+            let before = DateValue.format(kind, DateValue.initial(kind))
+            picker.sendActions(for: .editingDidBegin)
+            let after = DateValue.format(kind, DateValue.initial(kind))
+            XCTAssertEqual(values.count, 1)
+            XCTAssertTrue([before, after].contains(try XCTUnwrap(values.first)), "a cleared picker starts at now, not its previous value")
+            XCTAssertEqual(DateValue.shown(kind, picker), values.first)
+        }
+    }
+
     func testEmptyDateValuesReachTheElementsVoiceOverActuallyReads() throws {
         guard Presenter.axRuntimeLoaded else { throw missing("accessibility", "UIKit's accessibility runtime is not loaded") }
         let p = Presenter()

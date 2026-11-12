@@ -2,6 +2,7 @@
 // source's parse says it read (`store`), its value falls outside the resource's shape, and the refused commit takes
 // back the mark the parse made; a store write outside a commit must still ask the resource again.
 import { test, expect } from 'bun:test';
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { existsSync } from 'node:fs';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
@@ -12,7 +13,7 @@ test("a parse's store read stands when its answer is refused", async () => {
     if (path.endsWith('/names.js')) return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (path === '/') return new Response('<div id="exact-root"></div>', { headers: { 'content-type': 'text/html' } });
     const local = new URL('../..' + path, import.meta.url), file = existsSync(local) ? local : new URL('../web/' + path.split('/').pop(), import.meta.url);
-    return new Response(Bun.file(file));
+    return new Response(hostFixtureFile(file), { headers: { 'content-type': 'text/javascript' } });
   } });
   const browser = await suiteBrowser(), page = await browser.newPage();
   try {

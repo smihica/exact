@@ -3,7 +3,7 @@
   "class" : "hdr",
   "file" : "gainmap-huge.jpg",
   "id" : "F17",
-  "note" : "ISO 21496-1 gain map, headroom 4; SDR base shown on an SDR display; HDR (stage 3) linear values as the patches say; 4096² so a 16-bit HDR plan exceeds the 32 MiB ceiling",
+  "note" : "ISO 21496-1 gain map, headroom 4; SDR base shown on an SDR display; HDR (stage 3) linear values as the patches say; 4096² so a 16-bit HDR plan exceeds the 192 MiB viewport ceiling",
   "patches" : [
     {
       "h" : 4096,

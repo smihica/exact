@@ -125,10 +125,10 @@ class GeolocationModule(context: ExtensionContext) : ExactExtension(context) {
 
     /** The platform's dialog for [asked], then [done]. A rejection with no rationale owed afterwards is permanent. */
     private fun ask(done: () -> Unit) {
-        context.requestPermissions(asked) {
+        context.requestPermissions(asked) { answered ->
             val activity = context.activity
             val rejected = !has(FINE) && !has(COARSE)
-            if (rejected && activity != null && asked.none { activity.shouldShowRequestPermissionRationale(it) }) {
+            if (asked.all { it in answered } && rejected && activity != null && asked.none { activity.shouldShowRequestPermissionRationale(it) }) {
                 history.edit().putBoolean("permanent", true).apply()
             }
             context.changed("geolocation.geolocationStatus")

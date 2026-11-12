@@ -14,6 +14,65 @@ const fail = message => { throw Object.assign(new Error(message), { kind: 'Unava
 const allowedPragmas = new Set(['user_version', 'application_id', 'table_info', 'table_xinfo',
   'index_list', 'index_info', 'foreign_key_list', 'foreign_key_check', 'integrity_check', 'quick_check']);
 
+const foreignKeysCheck = 'to rebuild a table other rows reference, run the batch as transaction(statements, { foreignKeys: "check" })';
+
+// Strings by code point, as Rust orders them (UTF-16 code units order a
+// character past U+FFFF before U+E000–U+FFFF).
+function byCodePoint(a, b) {
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    const x = a.codePointAt(i), y = b.codePointAt(j);
+    if (x !== y) return x < y ? -1 : 1;
+    i += x > 0xffff ? 2 : 1; j += y > 0xffff ? 2 : 1;
+  }
+  return i < a.length ? 1 : j < b.length ? -1 : 0;
+}
+
+// `PRAGMA foreign_key_check` before a `foreignKeys: 'check'` batch commits,
+// over `main` and `temp` (unqualified, it reads only `main`; nothing else can
+// be attached), in the native provider's words and order. Rows are stepped
+// through and counted; only the three to name are kept. A rowid is a BigInt,
+// or null for a WITHOUT ROWID table.
+function checkForeignKeys(sqlite, session) {
+  const { capi: c } = sqlite, failed = 'foreign key check failed, the batch is rolled back';
+  const order = (a, b) => byCodePoint(a[0], b[0])
+    || (a[1] === b[1] ? 0 : a[1] === null ? -1 : b[1] === null ? 1 : a[1] < b[1] ? -1 : 1)
+    || byCodePoint(a[2], b[2]);
+  let count = 0, named = [];
+  for (const schema of ['main', 'temp']) {
+    let statement;
+    try {
+      statement = session.db.prepare(`PRAGMA ${schema}.foreign_key_check`);
+      while (statement.step()) {
+        count++;
+        const p = statement.pointer;
+        const row = [statement.get(0), c.sqlite3_column_type(p, 1) === c.SQLITE_NULL ? null : BigInt(c.sqlite3_column_int64(p, 1)), statement.get(2)];
+        if (named.length === 3 && order(row, named[2]) >= 0) continue;
+        named = [...named, row].sort(order).slice(0, 3);
+      }
+    } catch (error) {
+      if (!(error instanceof sqlite.SQLite3Error)) throw error;
+      fail(`${failed}: ${c.sqlite3_errmsg(session.db.pointer)}`);
+    } finally { statement?.finalize(); }
+  }
+  if (!count) return;
+  const said = named.map(([table, id, parent]) => id === null
+    ? `a ${table} row (references ${parent})` : `${table} row ${id} (references ${parent})`);
+  const more = count > 3 ? `, and ${count - 3} more` : '';
+  fail(count === 1 ? `${failed}: 1 foreign-key violation: ${said[0]}`
+    : `${failed}: ${count} foreign-key violations: ${said.join(', ')}${more}`);
+}
+
+// Foreign key enforcement, set or (`-1`) read.
+function enforcement(sqlite, session, value) {
+  const { wasm: w, capi: c } = sqlite, scope = w.scopedAllocPush();
+  try {
+    const out = w.scopedAlloc(4);
+    session.db.checkRc(c.sqlite3_db_config(session.db.pointer, c.SQLITE_DBCONFIG_ENABLE_FKEY, value, out));
+    return w.peek32(out) === 1;
+  } finally { w.scopedAllocPop(scope); }
+}
+
 function configure(sqlite, session) {
   const { capi: c } = sqlite, db = session.db;
   db.checkRc(c.sqlite3_db_config(db.pointer, c.SQLITE_DBCONFIG_DEFENSIVE, 1, 0));
@@ -36,6 +95,12 @@ function configure(sqlite, session) {
     if (denied.has(action)) return refuse(denied.get(action));
     if (action === c.SQLITE_TRANSACTION && !session.internal) return refuse(`BEGIN, COMMIT and ROLLBACK: ${together}`);
     if (action === c.SQLITE_FUNCTION && String(second).toLowerCase() === 'load_extension') return refuse('load_extension: extensions are not loaded');
+    // A `foreignKeys: 'check'` batch's own PRAGMA foreign_keys lines (a
+    // migrator writes them around a rebuild) are no-ops; elsewhere refused.
+    if (action === c.SQLITE_PRAGMA && String(first).toLowerCase() === 'foreign_keys') {
+      return session.checking ? c.SQLITE_IGNORE
+        : refuse(`PRAGMA ${first}: the host sets the connection's options; app SQL may run only PRAGMA ${[...allowedPragmas].join(', ')}; ${foreignKeysCheck}`);
+    }
     if (action === c.SQLITE_PRAGMA && !allowedPragmas.has(String(first).toLowerCase())
       && !(session.serializing && first === 'page_count')) {
       return refuse(`PRAGMA ${first}: the host sets the connection's options; app SQL may run only PRAGMA ${[...allowedPragmas].join(', ')}`);
@@ -197,22 +262,40 @@ async function dispatch(owner, { appId, op, args }) {
     return statement;
   }
   if (op === 'transaction') {
-    const commands = rest[0];
+    const [commands, check] = rest;
     if (!Array.isArray(commands) || commands.length > 10000) fail('transaction exceeds 10000 commands or is not an array');
-    internal(session, 'BEGIN IMMEDIATE');
+    if (typeof check !== 'boolean') fail('invalid SQLite foreign key mode');
+    // SQLite ignores a change to enforcement inside a transaction, so it goes
+    // off before BEGIN (https://sqlite.org/lang_altertable.html#otheralter).
+    if (check) enforcement(sqlite, session, 0);
     let results;
     try {
-      results = commands.map((command, i) => {
-        try { return run(sqlite, session, command.sql, command.params ?? [], false); }
-        catch (error) {
-          const points = Array.from(String(command.sql).trim()); // 200 code points, as the native provider counts
-          const shown = points.length > 200 ? `${points.slice(0, 200).join('')}…` : points.join('');
-          error.message = `statement ${i + 1} of ${commands.length} (${shown}): ${error.message}`;
-          throw error;
-        }
-      });
-      internal(session, 'COMMIT');
-    } catch (error) { internal(session, 'ROLLBACK'); throw error; }
+      internal(session, 'BEGIN IMMEDIATE');
+      try {
+        session.checking = check;
+        results = commands.map((command, i) => {
+          try { return run(sqlite, session, command.sql, command.params ?? [], false); }
+          catch (error) {
+            const points = Array.from(String(command.sql).trim()); // 200 code points, as the native provider counts
+            const shown = points.length > 200 ? `${points.slice(0, 200).join('')}…` : points.join('');
+            error.message = `statement ${i + 1} of ${commands.length} (${shown}): ${error.message}`;
+            throw error;
+          }
+        });
+        session.checking = false;
+        if (check) checkForeignKeys(sqlite, session);
+        internal(session, 'COMMIT');
+      } catch (error) { internal(session, 'ROLLBACK'); throw error; }
+    } finally {
+      session.checking = false;
+      // Nothing else reaches this database until enforcement is back: the
+      // owner's queue runs one operation at a time, and none awaits before
+      // here. One that cannot have it back is closed.
+      if (check && !enforcement(sqlite, session, 1)) {
+        await close(databases, id);
+        fail('foreign keys could not be turned back on, so the database is closed');
+      }
+    }
     await persist(sqlite, databases, id, session);
     return results;
   }

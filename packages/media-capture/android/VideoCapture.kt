@@ -183,9 +183,11 @@ internal class VideoTracks(private val context: ExtensionContext, private val ne
     fun foreground(shown: Boolean) {
         if (!context.agent) CameraCapture.foreground(shown)
         for (t in tracks.values) {
-            if (t.readyState != "live" || !t.leased) continue
+            if (t.readyState != "live" || (!shown && !t.leased)) continue
             t.platformMute = if (shown) overlay else "background"
-            settle(t)
+            // A recreated viewfinder can subscribe before the foreground request reaches this extension.
+            if (shown && !t.leased && t.enabled && "app" in t.consumers.values) lease(t, "app")
+            if (t.leased) settle(t)
         }
     }
 

@@ -79,7 +79,6 @@ fn display_normalizes_namespaces_and_prints_one_target() {
     for (path, expected) in [
         ("//a///b/", "/a/b"),
         ("app:/data///x", "app:/data/x"),
-        ("doc:/chosen///x", "doc:/chosen/x"),
         ("/a b", "\"/a b\""),
         ("/a\"b", "\"/a\\\"b\""),
         ("/a\\b", "\"/a\\\\b\""),

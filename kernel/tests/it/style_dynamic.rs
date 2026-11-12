@@ -6,6 +6,97 @@ use exact_kernel::{
 };
 
 #[test]
+fn scroll_padding_and_svg_radii_refuse_negative_literals_atomically() {
+    for id in [
+        StyleId::ScrollPaddingTop,
+        StyleId::ScrollPaddingRight,
+        StyleId::ScrollPaddingBottom,
+        StyleId::ScrollPaddingLeft,
+        StyleId::R,
+        StyleId::Rx,
+        StyleId::Ry,
+    ] {
+        let mut style = StyleProps::default();
+        for (value, expected) in [
+            (StyleValue::Number(0.0), Dimension::Points(0.0)),
+            (StyleValue::Number(10.0), Dimension::Points(10.0)),
+            (StyleValue::Text("10px".into()), Dimension::Points(10.0)),
+            (StyleValue::Percent(5.0), Dimension::Percent(5.0)),
+            (StyleValue::Text("5%".into()), Dimension::Percent(5.0)),
+            (StyleValue::Text("1rem".into()), Dimension::Points(16.0)),
+            (StyleValue::Text("1em".into()), Dimension::Points(16.0)),
+        ] {
+            style.set_dynamic(id, &value).unwrap();
+            assert_eq!(
+                style.get(id),
+                RowValue::Dimension(expected),
+                "{id:?}: {value:?}"
+            );
+        }
+        let before = style.clone();
+        for value in [
+            StyleValue::Text("-10px".into()),
+            StyleValue::Text("-5%".into()),
+            StyleValue::Number(-10.0),
+            StyleValue::Percent(-5.0),
+            StyleValue::Text("-1rem".into()),
+            StyleValue::Text("-1em".into()),
+            StyleValue::Text("-1vh".into()),
+            StyleValue::Text("-1cm".into()),
+        ] {
+            let result = style.set_dynamic(id, &value);
+            assert!(
+                matches!(result, Err(StyleValueError::WrongKind { style, expected })
+                    if style == id && expected.contains("nonnegative")),
+                "{id:?}: {value:?}: {result:?}"
+            );
+            assert_eq!(style, before, "{id:?}: {value:?}");
+        }
+    }
+}
+
+#[test]
+fn scroll_margins_refuse_percentages_without_changing_the_length() {
+    for id in [
+        StyleId::ScrollMarginTop,
+        StyleId::ScrollMarginRight,
+        StyleId::ScrollMarginBottom,
+        StyleId::ScrollMarginLeft,
+    ] {
+        let mut style = StyleProps::default();
+        for (value, points) in [
+            (StyleValue::Number(10.0), 10.0),
+            (StyleValue::Text("-4px".into()), -4.0),
+            (StyleValue::Text("calc(10px + 4px)".into()), 14.0),
+        ] {
+            style.set_dynamic(id, &value).unwrap();
+            assert_eq!(
+                style.get(id),
+                RowValue::Dimension(Dimension::Points(points))
+            );
+        }
+        let before = style.clone();
+        for value in [
+            StyleValue::Percent(10.0),
+            StyleValue::Text("10%".into()),
+            StyleValue::Text("calc(10% + 4px)".into()),
+            StyleValue::Text("calc(0% + 4px)".into()),
+            StyleValue::Text("min(10%, 4px)".into()),
+            StyleValue::Text("max(10%, 4px)".into()),
+            StyleValue::Text("clamp(0px, 10%, 4px)".into()),
+        ] {
+            let result = style.set_dynamic(id, &value);
+            assert!(
+                matches!(result, Err(StyleValueError::WrongKind { style, expected })
+                    if style == id && expected.contains("CSS takes no percentage")),
+                "{id:?}: {value:?}: {result:?}"
+            );
+            assert_eq!(style, before, "{id:?}: {value:?}");
+        }
+    }
+}
+
+#[test]
 fn borrowed_css_parses_like_owned_css_and_retains_no_source_borrow() {
     for (id, css, valid) in [
         (StyleId::TextColor, "#abcdef80", true),

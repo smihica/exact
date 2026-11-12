@@ -155,15 +155,17 @@ pub(super) fn switch(
 }
 
 /// A range: a thin track in the control's line across the box, and a round
-/// thumb in the accent, ringed in the field's ground, at `fraction` of the
-/// way. Nothing marks the part before the thumb, as on the page.
+/// thumb `d` across in the accent, ringed in the field's ground, `along`
+/// the track from its left. Nothing marks the part before the thumb, as on
+/// the page.
 pub(super) fn range(
     backend: &mut dyn Backend,
     node: &NodeRef<'_>,
     content: Rect4,
     ts: Transform,
     dark: bool,
-    fraction: f32,
+    d: f32,
+    along: f32,
 ) {
     let em = em(node);
     let (x, y, w, h) = content;
@@ -175,8 +177,6 @@ pub(super) fn range(
     let cy = y + h / 2.0;
     let track = Shape::new((x, cy - t / 2.0, w, t), [t / 2.0; 4]);
     backend.fill(&track, look::line(dark), ts);
-    let d = look::px(metric::MARK_SIZE, em).min(h).min(w);
-    let along = if rtl(node) { 1.0 - fraction } else { fraction };
     let thumb = Shape::new((x + (w - d) * along, cy - d / 2.0, d, d), [d / 2.0; 4]);
     let (accent, _) = look::accents(super::control::accent(node, dark), dark);
     backend.fill(
@@ -393,8 +393,13 @@ impl super::Painter {
         );
         let pad = look::px(metric::MENU_PADDING, em);
         let inset = look::px(metric::MENU_ROW_PADDING_INLINE, em);
+        let h = menu.rect.3;
+        self.backend.push_clip(&panel, ts);
         for (i, (label, disabled)) in menu.rows.iter().enumerate() {
-            let top = y + super::control::MENU_PAD + i as f32 * menu.row;
+            let top = y + super::control::MENU_PAD + i as f32 * menu.row - menu.offset;
+            if top + menu.row < y || top > y + h {
+                continue;
+            }
             if menu.chosen == Some(i) {
                 let row = Shape::new(
                     (x + pad, top, w - 2.0 * pad, menu.row),
@@ -423,6 +428,7 @@ impl super::Painter {
                 ts,
             );
         }
+        self.backend.pop_clip();
     }
 
     /// A file field: the outline button, and beside it the words for no

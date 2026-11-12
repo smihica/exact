@@ -152,7 +152,20 @@ impl<D: DataSource> Host<D> {
         true
     }
 
+    /// What an inline run's own `opacity` shows now: the engine's sample
+    /// while it moves, else its row. Its paragraph paints it (CSS Color 3
+    /// §3.2: `opacity` applies to every element), as a view's layer would.
+    pub(super) fn run_opacity(&self, key: exact_kernel::NodeKey) -> f64 {
+        let Some(node) = self.runner.kernel().node_by_key(key) else {
+            return 1.0;
+        };
+        self.engine
+            .sampled_value(motion_node(key), Property::Opacity)
+            .map_or(f64::from(node.style.opacity), |v| v.x)
+    }
+
     pub(super) fn stage_native_paragraphs(
+        &self,
         nodes: &[crate::content_region::CandidateNativeNode],
         batch: &mut Batch,
     ) {
@@ -168,11 +181,11 @@ impl<D: DataSource> Host<D> {
                 .children
                 .iter()
                 .rev()
-                .map(|id| (*id, owner, active))
+                .map(|id| (*id, owner, active, 1.0))
                 .collect();
             let mut runs = String::from("[");
             let mut first = true;
-            while let Some((id, parent, active)) = stack.pop() {
+            while let Some((id, parent, active, above)) = stack.pop() {
                 let Some(node) = by_id.get(&id) else {
                     continue;
                 };
@@ -180,6 +193,7 @@ impl<D: DataSource> Host<D> {
                     continue;
                 }
                 let paints = active && node.mirror.props.contains_key("text");
+                let opacity = above * self.run_opacity(node.header.key);
                 if !first {
                     runs.push(',');
                 }
@@ -192,13 +206,14 @@ impl<D: DataSource> Host<D> {
                     &node.mirror.style,
                     &node.header.handlers,
                     paints,
+                    opacity,
                 );
                 stack.extend(
                     node.mirror
                         .children
                         .iter()
                         .rev()
-                        .map(|child| (*child, id, active && !paints)),
+                        .map(|child| (*child, id, active && !paints, opacity)),
                 );
             }
             runs.push(']');
@@ -220,11 +235,11 @@ impl<D: DataSource> Host<D> {
                 .children()
                 .into_iter()
                 .rev()
-                .map(|id| (id, active))
+                .map(|id| (id, active, 1.0))
                 .collect();
             let mut runs = String::from("[");
             let mut first = true;
-            while let Some((id, active)) = stack.pop() {
+            while let Some((id, active, above)) = stack.pop() {
                 let Some(run) = kernel.node(id) else {
                     continue;
                 };
@@ -243,7 +258,7 @@ impl<D: DataSource> Host<D> {
                             exact_kernel::StyleId::Visibility,
                         ))
                         .visibility
-                        == exact_kernel::Visibility::Hidden
+                        != exact_kernel::Visibility::Visible
                     {
                         props.insert("inlineBoxHidden", "true".into());
                     }
@@ -276,6 +291,13 @@ impl<D: DataSource> Host<D> {
                     .filter_map(handler_name)
                     .collect();
                 let paints = active && (inline.is_some() || run.props.str(PropId::Text).is_some());
+                let own = self.run_opacity(run.key);
+                if own == 1.0 {
+                    self.paint.opacities.remove(&id);
+                } else {
+                    self.paint.opacities.insert(id, own);
+                }
+                let opacity = above * own;
                 if !first {
                     runs.push(',');
                 }
@@ -288,12 +310,13 @@ impl<D: DataSource> Host<D> {
                     &style,
                     &handlers,
                     paints,
+                    opacity,
                 );
                 stack.extend(
                     run.children()
                         .into_iter()
                         .rev()
-                        .map(|child| (child, active && !paints)),
+                        .map(|child| (child, active && !paints, opacity)),
                 );
             }
             runs.push(']');

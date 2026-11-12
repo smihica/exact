@@ -229,7 +229,7 @@ fn entry(
         .map(|(name, _)| name.clone())
         .unwrap_or_default();
     Some(Entry {
-        depth: if number.contains('.') { 1 } else { 0 },
+        depth: number.matches('.').count() as u32,
         title: title(body).unwrap_or_else(|| file.clone()),
         status: status(body),
         number,

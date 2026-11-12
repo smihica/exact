@@ -1,7 +1,7 @@
 //! @ref LLP 1039 D3 / LLP 1030 D7 — host facts must not enter kept storage.
 use exact_kernel::{Kernel, NodeType};
 use exact_plan::{asm::Asm, builder::PlanBuilder, TypeKind, Value};
-use exact_runner::{DataError, DataSource, Runner, Viewport};
+use exact_runner::{DataError, DataSource, Runner, RunnerError, Viewport};
 
 #[derive(Default)]
 struct Deferred {
@@ -111,6 +111,58 @@ fn runner_facts_never_write_kept_answers() {
             .collect::<Vec<_>>(),
         ["exact.kept.value"]
     );
+}
+
+#[test]
+fn refused_delivery_facts_are_restored_and_can_be_retried() {
+    let plan = contract::compile(
+        r#"shape Delivery
+  seq: number
+component App
+  state limit = 5
+  resource delivery = exactDelivery() as shape Delivery
+  derive spare = 1 / (limit - delivery.seq)
+  action allow
+    limit = 6
+  view
+    text `${spare}`
+"#,
+    )
+    .unwrap();
+    let mut runner = Runner::boot(
+        plan,
+        Deferred::default(),
+        Kernel::with_monospace(),
+        Viewport::default(),
+        "/",
+    )
+    .unwrap();
+    let previous = runner.delivery().clone();
+    let mut delivery = previous.clone();
+    delivery.seq = 5;
+    for _ in 0..2 {
+        assert!(matches!(
+            runner.set_delivery(delivery.clone()),
+            Err(RunnerError::NonFiniteValue { name }) if name == "spare"
+        ));
+        assert_eq!(runner.delivery(), &previous);
+        assert_eq!(
+            runner.resource("delivery"),
+            Some(&Value::record(vec![Value::Number(0.)]))
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&exact_runner::agent::state(&runner)).unwrap();
+        assert_eq!(state["delivery"]["seq"], 0);
+    }
+    assert!(runner.set_delivery(previous).unwrap().is_none());
+    runner.act("allow", vec![]).unwrap();
+    assert!(runner.set_delivery(delivery.clone()).unwrap().is_some());
+    assert_eq!(runner.delivery(), &delivery);
+    assert_eq!(
+        runner.resource("delivery"),
+        Some(&Value::record(vec![Value::Number(5.)]))
+    );
+    assert!(runner.set_delivery(delivery).unwrap().is_none());
 }
 
 #[test]
@@ -306,4 +358,57 @@ fn deferred_mutations_are_counted_when_the_source_activates() {
         1,
         "activation does not resend a settled write"
     );
+}
+
+#[test]
+fn refused_host_facts_restore_the_fact_and_retry_the_same_update() {
+    let mut r = Runner::boot(
+        contract::compile(
+            r#"shape Delivery
+  seq: number
+shape Acts
+  frequentPushesEnabled: bool
+  linked: bool
+component App
+  resource delivery = exactDelivery() as shape Delivery
+  resource acts = exactActivities() as shape Acts
+  derive spare = 1 / (5 - delivery.seq) + 1 / (acts.frequentPushesEnabled ? 0 : 1)
+  view
+    text spare.toString()
+"#,
+        )
+        .unwrap(),
+        Deferred::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let original = r.delivery().clone();
+    let mut next = original.clone();
+    next.seq = 5;
+    for _ in 0..2 {
+        assert!(r.set_delivery(next.clone()).is_err());
+        assert_eq!(r.delivery(), &original);
+        assert_eq!(
+            r.resource("delivery"),
+            Some(&Value::record(vec![Value::Number(0.)]))
+        );
+    }
+    for _ in 0..2 {
+        assert!(r
+            .set_activities(r#"{"frequentPushesEnabled":true}"#)
+            .is_err());
+        assert_eq!(
+            r.resource("acts"),
+            Some(&Value::record(vec![Value::Bool(false), Value::Bool(false)]))
+        );
+    }
+    assert!(r
+        .set_activities(r#"{"activities":[],"frequentPushesEnabled":false}"#)
+        .unwrap()
+        .is_none());
+    next.seq = 4;
+    assert!(r.set_delivery(next.clone()).unwrap().is_some());
+    assert!(r.set_delivery(next).unwrap().is_none());
 }

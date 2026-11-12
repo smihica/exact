@@ -40,7 +40,6 @@ fn colour(plan: Plan, id: &str, row: StyleId) -> ColorValue {
     let key = r.kernel().find_by_test_id(id)[0];
     match r.kernel().node_by_key(key).unwrap().computed(row) {
         RowValue::ColorValue(c) => c,
-        RowValue::Color(c) => ColorValue::Fixed(c),
         other => panic!("{id}: {other:?}"),
     }
 }
@@ -458,7 +457,6 @@ pub(super) fn row(r: &Runner<NoData>, id: &str, style: StyleId) -> ColorValue {
     let key = r.kernel().find_by_test_id(id)[0];
     match r.kernel().node_by_key(key).unwrap().computed(style) {
         RowValue::ColorValue(c) => c,
-        RowValue::Color(c) => ColorValue::Fixed(c),
         other => panic!("{id}: {other:?}"),
     }
 }
@@ -1130,13 +1128,24 @@ fn wide_mark_cost() {
 }
 
 /// LLP 1121 stage 4, commit 3: a plan's structure leaves the design's values
-/// out, so a value-only edit has the same structure; a role override's
-/// value, a token's slices and a view changed do not.
+/// out, including a role override's. Changing the slice count or view changes
+/// the structure.
 #[test]
 fn a_value_only_edit_keeps_the_plans_structure() {
     let view = "component App\n  view\n    column background-color=\"page\"\n      text \"a\" color=\"ink\"\n";
     let structure = |name: &str, design: &str, view: &str| {
-        let path = app(name, &[("app.tamber", design), ("app.contract", view)]);
+        let path = app(
+            name,
+            &[
+                ("app.tamber", design),
+                ("app.contract", view),
+                // The app pass interns these words after the design values.
+                (
+                    "app.json",
+                    r#"{"name":"T","app":{"id":"com.exact.t","name":"T"},"hatches":["badge","none"]}"#,
+                ),
+            ],
+        );
         contract::compile_path(&path).unwrap().structure()
     };
     let design = format!("{MODES}  Canvas = #fafafa\n");
@@ -1163,6 +1172,15 @@ fn a_value_only_edit_keeps_the_plans_structure() {
     assert_eq!(
         structure("structure-together", &together, &view_edge),
         base_edge
+    );
+    // A value shared with a manifest word changes the retained pool's order.
+    let shadow = format!("{design}  shadow.card: box-shadow = none\n");
+    let view_shadow = view.replace("column ", "column box-shadow=\"shadow.card\" ");
+    let base_shadow = structure("structure-shadow-none", &shadow, &view_shadow);
+    let raised = shadow.replace("box-shadow = none", "box-shadow = 0 1px 2px #000");
+    assert_eq!(
+        structure("structure-shadow-raised", &raised, &view_shadow),
+        base_shadow
     );
     // Code that pushes a value's text keeps that string: the literal and the
     // token changed together is no value-only edit.

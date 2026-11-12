@@ -43,7 +43,7 @@ export function scriptFlags(root) {
     ['serve', parsed(read('host/web/serve.mjs'))],
     ['agent', agent], ['test', agent], ['verify', parsed(read('scripts/verify.mjs'))],
     ['ios', apple], ['mac', apple],
-    ['linux', parsed(read('scripts/build-linux.mjs'))], ['android', parsed(read('scripts/agent-android.mjs'))],
+    ['linux', parsed(read('scripts/build-linux.mjs'))], ['android', parsed(read('scripts/agent-android.mjs'))], ['windows', parsed(read('host/windows/build.mjs'))],
     ['feedback', parsed(read('scripts/feedback.mjs'))],
     ['hatch', parsed(between('export function hatch(', '\nexport function pattern('))],
     ['add', parsed(between('export function add(', '\n/** `exact hatch'))],

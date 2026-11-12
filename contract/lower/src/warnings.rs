@@ -70,7 +70,7 @@ pub(crate) fn with_text_styles(checked: &Checked<'_>, lowered: &TextStyles) -> V
     routeless_header::check(checked, &mut out);
     // Track the navigation root (the outermost `navigationKey`) and its `navigationBack`.
     crate::menu_rows::notes(&root.view, &mut out);
-    crate::symbols::tints(&root.view, &checked.file.styles, lowered, &mut out);
+    crate::symbols::tints(&root.view, checked.file, lowered, &mut out);
     let mut stack: Vec<(&Node, bool, Option<&str>)> =
         root.view.iter().rev().map(|n| (n, false, None)).collect();
     let (mut seen, mut platform) = (BTreeSet::new(), Vec::new());
@@ -193,6 +193,7 @@ pub(crate) fn with_text_styles(checked: &Checked<'_>, lowered: &TextStyles) -> V
     crate::warning_rank::keep_first(&mut out);
     out.extend(platform);
     crate::control_roles::unreachable(&root.view, &checked.file.styles, &mut out);
+    crate::style_hosts::undrawn(&root.view, &checked.file.styles, &mut out);
     one_scheme(
         root,
         &checked.file.styles,
@@ -204,7 +205,7 @@ pub(crate) fn with_text_styles(checked: &Checked<'_>, lowered: &TextStyles) -> V
         },
         &mut out,
     );
-    out
+    crate::theme::shown_errors(out) // a param by the name its author wrote
 }
 
 /// What the one-scheme warning knows of the app's tokens (LLP 1121 D3).
@@ -668,9 +669,9 @@ const EPOCH: Kinds = 16;
 const ALL: [Kinds; 5] = [TIME, SPAN, CONST, UNSEEN, EPOCH];
 
 /// One kind with another, under `op`: a time with the origin added is the
-/// wall-clock time; a time less a time or an unseen anchor is a span, less
-/// a constant, a span or the origin still a time; otherwise what either is,
-/// a constant only when both are.
+/// wall-clock time, with a span added a later time; a time less a time or
+/// an unseen anchor is a span, less a constant, a span or the origin still
+/// a time; otherwise what either is, a constant only when both are.
 fn pair(op: BinOp, x: Kinds, y: Kinds) -> Kinds {
     let join = if x == y || y == CONST {
         x
@@ -681,6 +682,7 @@ fn pair(op: BinOp, x: Kinds, y: Kinds) -> Kinds {
     };
     match op {
         BinOp::Add if x | y == TIME | EPOCH => UNSEEN,
+        BinOp::Add if x | y == TIME | SPAN => TIME,
         BinOp::Sub if x == TIME => match y {
             TIME | UNSEEN => SPAN,
             _ => TIME,

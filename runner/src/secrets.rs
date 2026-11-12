@@ -6,7 +6,9 @@ use std::sync::Arc;
 pub trait SharedSecrets: Send + Sync {
     /// Start acquiring one name without blocking an executor or module owner.
     /// Wake the host when `take` can return. Before granting a lease, fence
-    /// older queued writes so they cannot overwrite its eventual write.
+    /// older queued writes so they cannot overwrite its eventual write. The
+    /// name needs a `secret.keep` grant, as the store's do: Apple's store
+    /// refuses any other's read and write with `denied: secret.keep`.
     fn acquire(&self, name: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Box<dyn SecretWait>;
 }
 

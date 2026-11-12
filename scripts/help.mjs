@@ -12,6 +12,7 @@
 // adds its other flags and `bodyAll`'s lines (the ports, the rarer forms).
 //
 //   bun scripts/help.mjs [<verb>] [all]      a verb's help (all: every flag and the ports), or the index
+import { writeSync } from 'node:fs';
 
 /** A flag's spec is its name, then its argument if it takes one (`--port <n>`); one row may hold
  * several, joined by " · ". */
@@ -56,8 +57,10 @@ const NATIVE_PORTS = 'iOS simulator: a Unix socket; --device: a free TCP port; m
 const APPLE = ['--painted-benchmark', '--watchos', '--watch-sim <udid>', '--ios', '--tvos', '--device', '--run', '--no-install', '--prebuild', '--release', '--host', '--embed', '--bundle', '--distribution', '--unsigned', '--test', '--only <Class,…>',
   '--archive <out.ipa>', '--sim <udid|name>', '--phone <udid|name>', '--url <url>', '--optimize <speed|size>', '--link <plan>', '--widget-gallery'];
 const appleRest = (documented) => APPLE.filter((spec) => !documented.some(([row]) => specs(row).some((d) => name(d) === name(spec))));
-const OPTIMIZE = ['--optimize speed|size', 'the Rust archive\'s (default speed, or app.json host.ios|macos.optimize)'];
+const OPTIMIZE = ['--optimize speed|size', 'production Rust and ExactKit; default size on iOS/tvOS and embeds, speed on Mac; a game keeps speed and refuses size; app.json host.ios|macos.optimize overrides the default'];
 const PREBUILD = ['--prebuild', 'start the build apart from this shell and return; its log: .exact/<ios|macos>-build.log'];
+/** A build verb's `--json` (`reportBuilt`), with what else its object names and the flags it refuses. */
+const jsonBuilt = (more = '', refuses = '') => ['--json', `one JSON object on stdout, its last line: the artifact's path, target, trust${more} (a failure: code, error); the build's own output on stderr${refuses}`];
 const RELEASE = ['--release', 'the build that ships, as EXACT_UPDATE_TRUST=production: it ignores EXACT_AGENT and EXACT_MODULES, so drive the development build; a first is minutes: --prebuild --release early, then --release waits for it and takes seconds; an iOS agent drive installs over it, saying how to put it back'];
 
 export const HELP = {
@@ -107,10 +110,11 @@ export const HELP = {
   },
   'web-build': {
     line: 'build the web app once (the page test web and agent web drive)',
-    usage: 'bun exact.mjs web-build [--out <dir>] [--render rust|js|none]',
+    usage: 'bun exact.mjs web-build [--out <dir>] [--render rust|js|none] [--json]',
     flags: [
       ['--out <dir>', 'a release build there (inside the app: dist), as deploy publishes, and how a static host serves it'],
       ['--render rust|js|none', 'pre-rendered pages: rust (the app\'s <app>-render entry; the default where it has one), js (Bun; the default otherwise), none'],
+      jsonBuilt(),
     ],
     internal: ['--js', '--wasm', '--bake'],
     body: `Builds the JS target (a game: wasm) into the app's target/web-dist; about a second when
@@ -231,17 +235,19 @@ Ports    none to choose: test's and agent's (headless Chrome over a pipe; a simu
   },
   ios: {
     line: 'build for an iOS simulator and install it (--run launches it)',
-    usage: 'bun exact.mjs ios [--run|--prebuild] [--release] [--sim <udid|name>] [--device [--phone <udid|name>]] [--url <url>]',
+    usage: 'bun exact.mjs ios [--run|--prebuild|--no-install] [--json] [--release] [--sim <udid|name>] [--device [--phone <udid|name>]] [--url <url>] [--optimize speed|size]',
     common: ['ios [--run] [--sim <name>]    build for a simulator; --run launches it'],
     flags: [
       ['--run', 'also launch it (in Simulator.app, or on the phone); returns once launched'],
+      ['--no-install', 'build and sign the simulator .app, and install it on no simulator'],
+      jsonBuilt(', signing (an identity\'s SHA-1, or ad-hoc), installed ({name, udid}, unless --no-install, --unsigned or --archive)', '; not with --run, --prebuild or --test'),
       PREBUILD,
       RELEASE,
       ['--sim <udid|name>', 'which simulator (else EXACT_SIM, a booted iPhone, or the newest Pro)'],
-      ['--device', 'a connected iPhone, signed with a development profile on this Mac'],
+      ['--device', 'an iPhone, signed with an installed development profile and identity; DEVELOPMENT_TEAM restricts their team; EXACT_PROFILE/EXACT_IDENTITY override'],
       ['--phone <udid|name>', 'which phone, with --device'],
       ['--archive <out.ipa>', 'with --device: an .ipa to distribute (EXACT_IDENTITY, EXACT_PROFILE), no phone; production trust, so with an update store EXACT_UPDATE_RECEIPT or EXACT_UPDATE_GENESIS=1'],
-      ['--unsigned', 'with --archive: ad-hoc signed, for a service that re-signs it'],
+      ['--unsigned', 'with --device: ad-hoc signed .app, no phone, profile, identity or install; no --run; --archive writes an .ipa for re-signing'],
       ['--tvos', 'an Apple TV simulator instead (with --device, an Apple TV)'],
       ['--url <url>', 'connect the client to that dev server (web\'s URL) for live reload'],
       OPTIMIZE,
@@ -278,9 +284,10 @@ Ports    none. Runs to completion.`,
   },
   mac: {
     line: 'build the macOS app (--run launches it here)',
-    usage: 'bun exact.mjs mac [--run|--prebuild] [--release] [--bundle] [--url <url>] [--optimize speed|size]',
+    usage: 'bun exact.mjs mac [--run|--prebuild] [--json] [--release] [--bundle] [--url <url>] [--optimize speed|size]',
     flags: [
       ['--run', 'assemble the .app and launch it when built, in the foreground (its log here) until it quits'],
+      jsonBuilt(', signing (an identity\'s SHA-1, or ad-hoc)', '; not with --run, --prebuild or --test'),
       PREBUILD,
       RELEASE,
       ['--bundle', 'assemble the .app bundle (the macOS default)'],
@@ -295,8 +302,8 @@ Ports    none. Runs to completion; with --run, until the app quits (^C ends it).
   },
   linux: {
     line: 'build the Linux host (test and agent linux drive it headless)',
-    usage: 'bun exact.mjs linux',
-    flags: [],
+    usage: 'bun exact.mjs linux [--json]',
+    flags: [jsonBuilt()],
     body: `A development build (cargo profile host-dev); prints the binary's path. It runs headless
 anywhere, macOS included, with no display.
 Ports    none. Runs to completion.`,
@@ -304,10 +311,11 @@ Ports    none. Runs to completion.`,
   },
   android: {
     line: 'build the APK and install it (test, agent and verify android drive it)',
-    usage: 'bun exact.mjs android [--run] [--headless]',
+    usage: 'bun exact.mjs android [--run] [--headless] [--json]',
     flags: [
       ['--run', 'launch it once installed'],
       ['--headless', 'build the Linux host for Android instead (agent android --headless runs it under adb shell)'],
+      jsonBuilt(', installed (the device\'s serial, or null with none ready)', '; printed after the install; not with --run'),
     ],
     // `--apk --install` are the verb's own; --release builds the release profile, for measuring; --write-locks writes
     // the Gradle lock and verification files of an app whose modules name Maven libraries.
@@ -339,7 +347,9 @@ artifacts under game/target only. Ports none. Runs to completion.`,
     usage: 'bun exact.mjs contract <subcommand> …      (paths from where you run it)',
     common: ['contract build <file> --json · contract vocab <name>…    diagnostics · any tag, property, colour role or recipe (no name: the card)'],
     flags: [],
-    body: `  build <file.contract> [-o <file.plan>] [--json] [--map]   --json: [] or each diagnostic with its range;
+    body: `  build <file.contract> [--stdin] [-o <file.plan>] [--json] [--errors-only] [--map (requires -o)] [--entry <kind> (requires -o; no --map or --stdin)]
+                                          --json: [] or each diagnostic with its range; --errors-only: omit warnings
+                                          --entry: the named widget's plan, from app.json beside the input
                                           app.contract: app.ts type-checked too, as every host's build does
   types <file.contract> [-o <app.d.ts>]   the types app.ts imports (build app.contract, test, web refresh them)
   vocab [--json] [--all] [<name> …]       no name: the card, what an app writes, in one read (--all: every
@@ -347,8 +357,11 @@ artifacts under game/target only. Ports none. Runs to completion.`,
                                           turn, a recipe whole, a pattern's summary; exit 1 if one is unknown
   fmt [--check | --stdout] <file.contract> · fmt --uses <file.contract>
   symbols <file.contract> [--name <name>] · sources <file.contract>
+  build … --stdin · symbols … --stdin     the file's text is stdin's (an editor's unsaved buffer), read as
+                                          if saved at <file.contract>; app.ts is not type-checked against it
   test <file.test.contract>               the compiled tests, as JSON (bun exact.mjs test runs them)
-  verify <file.contract> [--types] [--prove <Module>] · rust <file.contract> [-o <shapes.rs>]
+  verify <file.contract> [--runner-only] [--js] [--walks N] [--steps M] [--walk-seed N] [--confirm N] [--types] [--prove <Module>]
+  rust <file.contract> [-o <shapes.rs>]
   lean <file.contract> [--components] [--name <ident>] [-o <file.lean>]
   tamber check <app> | eval <app> [--mode <axis>=<value>] | ir <app> [-o <tamber.json>] | fmt <app> [--check]   (a flag before or after <app>)
                                           the app's design (LLP 1121): checked, its tokens in one mode, its IR
@@ -383,7 +396,7 @@ Ports    none. Runs to completion.`,
   },
   tamber: {
     line: 'the app\'s design (app.tamber): checked, its tokens in one mode, its IR',
-    usage: 'bun exact.mjs tamber check <app> | eval <app> [--mode <axis>=<value>] | ir <app> [-o <tamber.json>] | fmt <app> [--check] | gen ts|rust|swift <app> [-o <dir>] | serve <app> [--port <n>] [--lan] [--remote <host:port>] [--trust-tunnel <port>] [--allow-host <name>] [--allow-plugin-origin] [--relay <host> --relay-account <label> …] [--pair-ttl <duration>] | pair <url> --scope read|propose|write [--name <name>] | op <url> <request JSON>|subscribe | import css <stylesheet> [--app <app>] | import shadcn|tailwind|dtcg|pen|astryx <source> <url> [--app <app>] [--prefix <p>] | tool [<app>] [--via <dev url>] [--no-open]   (<app>: its directory, app.contract or a .tamber file; a flag before or after it)',
+    usage: 'bun exact.mjs tamber check <app> | eval <app> [--mode <axis>=<value>] | ir <app> [-o <tamber.json>] | fmt <app> [--check] | gen ts|rust|swift|kotlin <app> [-o <dir>] | serve <app> [--port <n>] [--lan] [--remote <host:port>] [--trust-tunnel <port>] [--allow-host <name>] [--allow-plugin-origin] [--relay <host> --relay-account <label> …] [--pair-ttl <duration>] | pair <url> --scope read|propose|write [--name <name>] | op <url> <request JSON>|subscribe | import css <stylesheet> [--app <app>] | import shadcn|tailwind|dtcg|pen|astryx <source> <url> [--app <app>] [--prefix <p>] | tool [<app>] [--via <dev url>] [--no-open]   (<app>: its directory, app.contract or a .tamber file; a flag before or after it)',
     flags: [
       ['--mode <axis>=<value>[,…]', 'eval: the mode to print the tokens in; the rest at their defaults'],
       ['-o <file>', 'ir: write the IR (tamber.json, generated, never committed) there; gen: the directory (else the app\'s .exact/tamber/)'],
@@ -408,9 +421,9 @@ undo and a change stream, with a token only this machine's loopback can have. ge
 bindings from the IR, generated and never committed (LLP 1121 D12): ts, tamber.ts (a
 ColorToken union, each token's CSS per mode) and tamber.css; rust, tamber.rs, a
 Token<Color> constant a token (SURFACE_CARD), which session.tamber().get resolves; swift,
-tamber.swift, ExactTamberToken.surfaceCard for a native view's ExactTamber(view). op takes
-that token and sends one request, or prints the change stream (subscribe). import css
-writes a stylesheet's :root custom properties into the design, between markers a later
+tamber.swift, ExactTamberToken.surfaceCard; kotlin, TamberTokens.kt for Android native views.
+op takes the server's token and sends one request, or prints the change stream (subscribe).
+import css writes :root custom properties into the design, between markers a later
 import of it rewrites, naming each it refuses (LLP 1153 D6). import <kind> holds another
 system's theme on the server as proposals: the tokens as one, each role override apart.
 tool is the design tool (LLP 1122), built if stale, served by the design server at
@@ -423,13 +436,14 @@ completion.`,
   },
   add: {
     line: 'a standard module (geolocation): its dependency in package.json, installed',
-    usage: 'exact add <module> <app>',
+    usage: 'bun exact.mjs add <module> [<app>]',
     flags: [],
-    body: `<module> is one of exact2's (geolocation, or @exact/geolocation): a path into this checkout,
-so it compiles against the SDK the app uses. Then name what you use, and its grant line:
-docs/recipes/permissions.md.
+    body: `In an app, omit <app>; from the checkout, name it. <module> is one of exact2's
+(geolocation, or @exact/geolocation): a path into this checkout,
+so it compiles against the SDK the app uses. Then name what you use; when the module
+has grants, add their line: docs/recipes/permissions.md.
 Ports    none. Runs to completion.`,
-    example: 'bun <exact2>/scripts/exact.mjs add geolocation .',
+    example: 'bun exact.mjs add @exact/in-app-browser',
   },
   hatch: {
     line: 'an access hatch: a stub per target the app builds, and its app.json entry',
@@ -453,7 +467,7 @@ Ports    none. Runs to completion.`,
     ],
     internal: ['--update'],
     body: `Also rewrites AGENTS.md's generated block and adds the use lines the app's files lack;
-app.json commands and your files are kept. EXACT2=<path> names another exact2 checkout.
+app.json commands and your files are kept. EXACT=<path> names another Exact checkout.
 An app that authored no Cargo workspace has none to rewrite: its native workspace is
 generated under .exact/ by the verb that builds it.
 Ports    none. Runs to completion.`,
@@ -506,8 +520,8 @@ Ports    none; send makes one HTTPS request. Runs to completion.`,
   },
   windows: {
     line: 'build for Windows into dist-windows/ (--run opens it)',
-    usage: 'bun exact.mjs windows [--run] [--release] [--out <dir>]',
-    flags: [['--run', 'open it when built: here, until it quits; from SSH, on the signed-in desktop, returning once its window is up'], ['--release', 'the release profile (default gpu-dev)'], ['--out <dir>', 'package into <dir> instead of dist-windows/, e.g. beside a copy still running']],
+    usage: 'bun exact.mjs windows [--run] [--release] [--out <dir>] [--json]',
+    flags: [['--run', 'open it when built: here, until it quits; from SSH, on the signed-in desktop, returning once its window is up'], ['--release', 'the release profile (default gpu-dev)'], ['--out <dir>', 'package into <dir> instead of dist-windows/, e.g. beside a copy still running'], jsonBuilt('', '; not with --run')],
     body: 'Needs Windows and the MSVC Rust target; test windows and agent windows build first when the build is stale, and\ndrive it headless. A build closes the copy the last --run opened from the same directory.\nPorts    none. Runs to completion; with --run here, until the app quits.',
     example: 'bun exact.mjs windows --run',
   },
@@ -578,7 +592,7 @@ export function indexText({ verbs = Object.keys(HELP).filter((v) => !['new', 'ad
   const line = (verb) => HELP[verb]?.line ?? (own[verb] ? `app.json commands: ${own[verb].join(' ')}` : '');
   const forms = verbs.flatMap((verb) => HELP[verb]?.common ?? []);
   return [
-    'bun exact.mjs <verb> [arguments]    in the app directory (EXACT2=<path> selects the SDK)',
+    'bun exact.mjs <verb> [arguments]    in the app directory (EXACT=<path> selects the SDK)',
     ...names.map((verb) => `  ${verb.padEnd(width)}  ${line(verb)}`),
     ...forms.map((form) => `  ${form}`),
     'bun exact.mjs <verb> --help: flags and example; bun exact.mjs <verb> --help all: every flag and port.',
@@ -602,6 +616,16 @@ const documented = (verb) => [...HELP[verb].flags, ...(HELP[verb].more ?? [])];
 /** Every flag a verb's script takes, documented or not, by name: whether it takes a value. */
 export const knownFlags = (verb) => new Map([...documented(verb).flatMap(([row]) => specs(row)), ...(HELP[verb].internal ?? [])].map((spec) => [name(spec), takesValue(spec)]));
 
+/** Why an Apple device build cannot use these signing and packaging options, or null. */
+export function appleBuildRefusal(args, env = process.env) {
+  const unsigned = args.includes('--unsigned'), archive = args.includes('--archive');
+  if (unsigned && args.includes('--watchos')) return '--unsigned takes no --watchos: a watch build is the simulator companion, which no one re-signs';
+  if (unsigned && !args.includes('--device')) return '--unsigned needs --device: it builds an ad-hoc signed device bundle';
+  if (unsigned && args.includes('--run')) return '--unsigned takes no --run: an ad-hoc signed device bundle cannot launch on a stock device; use a development profile and identity';
+  if (archive && (!args.includes('--device') || args.includes('--run') || args.includes('--host') || !unsigned && (!env.EXACT_IDENTITY || !env.EXACT_PROFILE))) return '--archive needs --device and EXACT_IDENTITY and EXACT_PROFILE (or --unsigned), and takes neither --run nor --host';
+  return null;
+}
+
 /** A dispatched script's first call. `--help`/`-h` prints `verb`'s help and exits 0; a flag the
  * verb's script does not take is refused with the ones it does, exit 2. With `parsed`, `argv` is
  * what the script's own parser left, so every flag still in it is unknown (agent.mjs). */
@@ -618,6 +642,15 @@ export function guardFlags(verb, argv, { parsed = false, say = console.log, fail
   const takes = documented(verb).flatMap(([row]) => specs(row).map(name)).join(', ');
   fail(`${verb}: unknown flag ${unknown.join(', ')}. ${takes ? `It takes ${takes} (--help says what each takes and does).` : 'It takes no flags.'}`);
   return exit(2);
+}
+
+/** A build verb's result under `--json` (`jsonBuilt`): one object, the artifact's `path`, `target` and `trust`, and what
+ * else its verb names. An app's exact.mjs runs the build with its stdout on stderr and prints the object it reads from
+ * the descriptor EXACT_JSON_FD names (app-cli.mjs `jsonBuild`); a build run alone writes it to stdout. */
+export function reportBuilt(result) {
+  const line = `${JSON.stringify(result)}\n`, fd = Number(process.env.EXACT_JSON_FD);
+  if (fd > 2) writeSync(fd, line);
+  else process.stdout.write(line);
 }
 
 if (import.meta.main) { const args = process.argv.slice(2); process.exit(printHelp(args.find((a) => a !== 'all') ?? '', { all: args.includes('all') })); }

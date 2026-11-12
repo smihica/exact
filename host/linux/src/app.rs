@@ -32,7 +32,8 @@
 //!   instead of the manifest's (dev apparatus: a drive against a static
 //!   directory; the baked keys still bind). `EXACT_UPDATE_DIR=<dir>` — the
 //!   store's directory instead of `$XDG_DATA_HOME/exact/<app id>/update`;
-//!   under `EXACT_AGENT=1` a fresh temporary one (`update.rs`).
+//!   under `EXACT_AGENT=1` a fresh temporary one (`store_dir` in
+//!   `update/src/client.rs`).
 //!
 //! With neither `EXACT_PLAN` nor `EXACT_DEV_PLAN`, the boot is the update
 //! store's selection (LLP 1026 D9): the selected entry's plan, else the
@@ -116,7 +117,7 @@ pub struct Config {
     pub dev_said: Option<String>,
     /// The KMS device.
     pub card: String,
-    /// Serve the screen over VNC at this address (`1` is `0.0.0.0:5900`).
+    /// Serve the screen over VNC at this address (`1` is `127.0.0.1:5900`).
     pub vnc: Option<String>,
     /// The archive's `compat.json` (LLP 1030 D3a) as the binary carries it:
     /// what the `delivery` resource and `state.delivery` answer from.

@@ -16,14 +16,7 @@ pub fn bake_data_declaration<D: contract::DataSource + Default>(
     require_declaration(app_dir);
     let wrapped = format!("exact_data_host::Storage<{data_type}>");
     let constructor = format!("exact_data_host::Storage::new({data_type}::default())");
-    bake_source(
-        platform,
-        app_dir,
-        D::default(),
-        &wrapped,
-        &constructor,
-        true,
-    );
+    bake_source(platform, app_dir, D::default(), &wrapped, &constructor);
 }
 
 fn require_declaration(app_dir: &str) {
@@ -42,7 +35,7 @@ fn require_declaration(app_dir: &str) {
 /// Bake the app named by the generated shell, with no JS or Rust module.
 /// `apple` selects macOS or iOS from Cargo's target OS.
 pub fn bake(platform: &str, app_dir: &str) {
-    bake_source(platform, app_dir, (), "()", "Default::default()", false);
+    bake_source(platform, app_dir, (), "()", "Default::default()");
 }
 
 fn bake_source<D: contract::DataSource>(
@@ -51,7 +44,6 @@ fn bake_source<D: contract::DataSource>(
     data: D,
     data_type: &str,
     constructor: &str,
-    has_data: bool,
 ) {
     let platform = if platform == "apple" {
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
@@ -121,7 +113,7 @@ fn bake_source<D: contract::DataSource>(
         contract::native::android_reach(&app, &baked, &out)
             .unwrap_or_else(|e| panic!("android reach: {e}"));
     }
-    let entry = contract::rust_entry(data_type, constructor, "off").unwrap();
+    let entry = contract::rust_entry(data_type, constructor, "off", &compat.inputs).unwrap();
     let linked = if platform == "web" {
         contract::web_linked(&baked, &compat.inputs)
     } else {
@@ -143,14 +135,12 @@ fn bake_source<D: contract::DataSource>(
     let linux = format!(
         "fn main() {{ std::process::exit(exact_linux::run_composed::<AppData>(PLAN, COMPAT, {composed})); }}"
     );
-    let linux_empty = linux.replace("<AppData>", "<()>");
     let host = match platform {
         "web" => "exact_web::host!(AppData, PLAN, COMPAT, app_data);",
         "macos" | "ios" => {
             "exact_apple::host!(AppData, PLAN, COMPAT, None, std::ptr::null(), app_data);"
         }
-        "linux" if has_data => &linux,
-        "linux" => &linux_empty,
+        "linux" => &linux,
         // canvas_jni! embeds OUT_DIR's plan and compat itself.
         "android" => "exact_linux::canvas_jni!(crate::AppData);",
         "windows" => &windows,

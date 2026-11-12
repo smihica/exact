@@ -162,14 +162,14 @@ enum ExactExtensions {
         return a
     }
 
-    /// An `app:/` path's file in the session's directories.
+    /// An `app:/` path in the session's directories, including a destination
+    /// the package will create, reached through no symbolic link.
     static func file(_ path: String, _ module: ExactModuleContext) -> URL? {
         guard path.hasPrefix("app:/") else { return nil }
         let parts = path.dropFirst(5).split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count >= 2, parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
         let roots = ["data": module.data, "cache": module.cache, "tmp": module.temporary]
         guard let root = roots[parts[0]] else { return nil }
-        return parts.dropFirst().reduce(root) { $0.appendingPathComponent($1) }
+        return AppFileWalk.destination(root, Array(parts.dropFirst()))
     }
 
     /// A request of the runner's; `false` for one that names no extension.
@@ -425,6 +425,11 @@ extension ExactExtensions {
                 box["package"] = name
                 NotificationCenter.default.post(name: Notification.Name("exact.regions"), object: box)
                 return box["reply"]
+            },
+            push: ExactPushRegistration {
+                let box = NSMutableDictionary(dictionary: ["op": "read"])
+                NotificationCenter.default.post(name: Notification.Name("exact.push"), object: box)
+                return box["reply"] as? [String: Any]
             },
             expireWake: { [weak module] id in module?.expireWake(name, id: id) },
             state: { [weak module] fields in

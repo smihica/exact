@@ -70,10 +70,12 @@ structure Same (e₁ e₂ : Env) : Prop where
   now : e₁.now = e₂.now
   resources : e₁.prog.resources = e₂.prog.resources
   resVals : e₁.resources = e₂.resources
+  /-- `current` reads which are idle. -/
+  idle : e₁.idle = e₂.idle
 
 theorem Same.symm {e₁ e₂ : Env} (h : Same e₁ e₂) : Same e₂ e₁ :=
   ⟨h.fns.symm, h.shapes.symm, h.routes.symm, h.strings.symm, h.now.symm, h.resources.symm,
-    h.resVals.symm⟩
+    h.resVals.symm, h.idle.symm⟩
 
 theorem Same.shape {e₁ e₂ : Env} (h : Same e₁ e₂) (s : String) : e₁.shape s = e₂.shape s := by
   simp [Env.shape, h.shapes]
@@ -113,6 +115,9 @@ theorem xferE {e₁ e₂ : Env} (hs : Same e₁ e₂) {inFn ls e v}
   | .failedOther hfd hr => .failedOther (hs.fns ▸ hfd) (hs.resources ▸ hr)
   | .failureSettled hfd hr hv => .failureSettled (hs.fns ▸ hfd) (hs.resources ▸ hr) (hs.resVals ▸ hv)
   | .failureOther hfd hr => .failureOther (hs.fns ▸ hfd) (hs.resources ▸ hr)
+  | .currentSettled hfd hr hv => by
+    rw [hs.idle]; exact .currentSettled (hs.fns ▸ hfd) (hs.resources ▸ hr) (hs.resVals ▸ hv)
+  | .currentOther hfd hr => .currentOther (hs.fns ▸ hfd) (hs.resources ▸ hr)
   | .stdlib hfd ha hv => .stdlib (hs.fns ▸ hfd) (xferL hs ha hf) (hs.stdlib_eq _ _ ▸ hv)
   | .record hd h => .record (hs.shape _ ▸ hd) (xferR hs h hf)
   | .recordBase hb hd h => .recordBase (xferE hs hb hf) (hs.shape _ ▸ hd) (xferR hs h hf)
@@ -354,6 +359,8 @@ theorem wkE {env : Env} {inFn L L' e v} (h : EvalR env inFn L e v) (hs : Small e
   | .failedOther hfd hr => .failedOther hfd hr
   | .failureSettled hfd hr hv => .failureSettled hfd hr hv
   | .failureOther hfd hr => .failureOther hfd hr
+  | .currentSettled hfd hr hv => .currentSettled hfd hr hv
+  | .currentOther hfd hr => .currentOther hfd hr
   | .stdlib hfd hargs hv => by
     simp only [Small] at hs
     exact .stdlib hfd (wkL hargs hs (ha.sub fun y hy => by simp [freeNames]; exact .inr hy)) hv
@@ -670,13 +677,14 @@ def callHeadsFields : List (String × Expr) → List String
 end
 
 mutual
-/-- The fragment substitution is proved for: no `pending`/`failed`/`failure` or
-`sortBy`, every
+/-- The fragment substitution is proved for: no `pending`/`failed`/`failure`/
+`current` or `sortBy`, every
 callback of at most two parameters, and no binder named like a call its
 scope makes. -/
 def Plain : Expr → Bool
   | .call n args =>
-    n != "pending" && n != "failed" && n != "failure" && n != "sortBy" && PlainList args
+    n != "pending" && n != "failed" && n != "failure" && n != "current" && n != "sortBy" &&
+      PlainList args
   | .arrow ps b =>
     decide (ps.length ≤ 2) && ps.all (fun p => !(callHeads b).contains p) && Plain b
   | .matchOpt s x a b => Plain s && !(callHeads a).contains x && Plain a && Plain b
@@ -996,7 +1004,7 @@ theorem sfE {e₁ e₂ : Env} (hs : Same e₁ e₂) {inFn ls e v} (h : EvalR e�
           (fun y hy => hA y (by simp [fv, fvList] at hy ⊢; grind)) x i)
         hpb hhb)
   | .pendingSettled .. | .pendingOther .. | .failedSettled .. | .failedOther ..
-  | .failureSettled .. | .failureOther .. | .sortBy .. => by
+  | .failureSettled .. | .failureOther .. | .currentSettled .. | .currentOther .. | .sortBy .. => by
     simp [Plain] at hp
   | .stdlib hfd ha hv => by
     rename_i name _ _

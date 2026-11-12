@@ -78,3 +78,17 @@ pub(crate) fn answer(r: &ResourceDecl, read: &Ty) -> Ty {
         (_, t) => t.clone(),
     }
 }
+
+/// A resource's `when` (LLP 1161.002 D1): a `bool` over what its arguments
+/// may read.
+pub(crate) fn gate(r: &ResourceDecl, scope: &Scope, shapes: &Shapes) -> Result<(), TypeError> {
+    let Some(gate) = &r.gate else { return Ok(()) };
+    match infer(gate, scope, shapes)? {
+        Ty::Bool => Ok(()),
+        t => Err(TypeError {
+            id: "type-when-not-bool",
+            message: format!("`{}`'s `when` is a `bool`, given `{t}`", r.name),
+            span: gate.span(),
+        }),
+    }
+}

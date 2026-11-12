@@ -133,7 +133,8 @@ package final class Shadow {
         // its own transform, about its centre, to fill it.
         let rootBounds = CGRect(x: 0, y: 0, width: w, height: h)
         if root.bounds != rootBounds { root.bounds = rootBounds; root.position = CGPoint(x: CGFloat(w) / 2, y: CGFloat(h) / 2) }
-        let top = mirror(view.layer, opaque: true)
+        // A filtered box shows as its picture (`BoxFilter`), a placed canvas child's too.
+        let top = mirror((view as? NodeView)?.filterPicture ?? view.layer, opaque: true)
         let centre = CGPoint(x: CGFloat(w) / 2, y: CGFloat(h) / 2)
         if top.position != centre { top.position = centre }
         // Scaled to the texture and mirrored vertically: the flipped root
@@ -214,14 +215,17 @@ package final class Shadow {
         copy(shown, to: shadow)
         if let node = layer.delegate as? NodeView { node.setPaintPosition(node.paintZPosition) }
         else { rank(layer, shown.zPosition) }
-        // An SVG part's mask (a gradient under its shape) comes along.
-        if let mask = layer.mask {
+        // An SVG part's mask (a gradient under its shape) comes along; a
+        // placed child's own, not the empty one that hides it on screen.
+        if let mask = layer.boxMask {
             let m = mirror(mask)
             if shadow.mask !== m { shadow.mask = m }
         } else if shadow.mask != nil {
             shadow.mask = nil
         }
         if opaque { if shadow.opacity != 1 { shadow.opacity = 1 }; if shadow.isHidden { shadow.isHidden = false } }
+        // A placed child under the captured root is its surface's to draw.
+        else if (layer as? NodeLayer)?.drawnElsewhere == true, !shadow.isHidden { shadow.isHidden = true }
         let view = layer.delegate as? UIView
         var children: [CALayer] = []
         if let node = view as? NodeView, node.kind == "canvas" {

@@ -1,4 +1,4 @@
-import { viewParent, viewChildren } from './navigation.js';
+import { viewParent, viewChildren } from './navigation/lists.js';
 // Issue #110: an aria-keyshortcuts chord whose key types no Latin character
 // (Korean 2-Set's ㅠ on KeyB, Russian, Greek) is its physical key's (`code`),
 // as web apps match; a Latin character is the key wherever it is (AZERTY,

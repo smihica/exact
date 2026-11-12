@@ -208,7 +208,8 @@ extension WebArm {
            scheme == "http" || scheme == "https" || scheme == "data" || scheme == "about" || scheme == "blob" {
             return nil
         }
-        let path = source.split(separator: "?", maxSplits: 1)[0].split(separator: "#", maxSplits: 1)[0]
+        let path = source.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0]
+            .split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
         let relative = path.drop(while: { $0 == "/" })
         let base = WebArm.assetBase
         let root = base.resolvingSymlinksInPath().standardizedFileURL.path

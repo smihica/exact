@@ -5,10 +5,12 @@ import { createServer } from 'node:http';
 import { cpSync, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Cdp, open } from '../../../scripts/agent.mjs';
-import { chromium } from '../../../scripts/agent-launch.mjs';
+import { chromium, quitBrowser } from '../../../scripts/agent-launch.mjs';
 import { serveStatic, serveBuildTree, readWebRequest } from '../serve.mjs';
 import { publishRoot } from '../../../scripts/deploy.mjs';
 import { DirectoryOrigin, appDocumentPath, sha256 } from '../../../scripts/origin.mjs';
+import { bundleHostModule } from '../../web-js/glue.mjs';
+const navigationModule = await bundleHostModule(process.cwd(), 'navigation.js');
 const dir = process.env.EXACT_ROUTER_TEST, dist = resolve(dir, 'dist');
 // `EXACT_ROUTER_TARGET=js` (host/web/tests/it/navigation.rs): the JS target
 // (LLP 1071), each plan a JS build (the Caltrain carrier; the plans read no
@@ -24,13 +26,13 @@ const jsBuild = (plan, out) => {
     const page = readFileSync(`${out}/${name}`, 'utf8');
     writeFileSync(`${out}/${name}`, page.replace('<script type="module" src="./app.js"></script>', `<script>(${jsFixture})()</script><script type="module" src="./app.js"></script>`));
   }
-  cpSync('host/web/navigation.js', out + '/navigation.js'); // the host-seam cases import it
+  writeFileSync(out + '/navigation.js', navigationModule); // the host-seam cases import it
   // A bare plan has no bake to copy `manifest.json` from; the link-file case needs a file there.
   writeFileSync(out + '/manifest.json', '{}\n');
 };
 if (js) jsBuild('app.plan', dist);
 else cpSync(process.env.EXACT_ROUTER_DIST, dist, { recursive: true });
-if (!js) for (const name of ['glue.js', 'navigation.js', 'motion-glue.js', 'collection-glue.js']) cpSync('host/web/' + name, dist + '/' + name);
+if (!js) for (const name of ['motion-glue.js', 'collection-glue.js']) cpSync('host/web/' + name, dist + '/' + name);
 const bytes = [...readFileSync(dir + '/app.plan')];
 if (!js) {
   const plan = Buffer.from(bytes), envelope = JSON.parse(readFileSync(dist + '/exact.json', 'utf8'));
@@ -818,8 +820,9 @@ try {
 
 } finally {
   if (process.env.EXACT_ROUTER_EVIDENCE) { mkdirSync(process.env.EXACT_ROUTER_EVIDENCE, { recursive: true }); writeFileSync(process.env.EXACT_ROUTER_EVIDENCE + '/browser.json', JSON.stringify({ rows, failures, consoleLines }, null, 2)); }
-  process.kill(-child.pid, 'SIGKILL'); await exited;
-  server.close(); server.closeAllConnections();
+  try { await quitBrowser(child, cdp, exited); }
+  finally { server.close(); server.closeAllConnections(); }
+  rmSync(dir + '/chrome', { recursive: true, force: true });
 }
 assert.deepEqual(failures, []);
 console.log(`router browser${js ? ' (the JS target)' : ''}: all session-history and serving cases passed${js ? `; ${skipped.length} not the JS target's: ${skipped.map(s => s.name).join('; ')}` : ''}`);

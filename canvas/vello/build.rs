@@ -21,6 +21,8 @@ use std::process::Command;
 use vello_shaders::compile::ShaderInfo;
 use vello_shaders::BindType;
 
+mod metal;
+
 /// The kernels the module creates pipelines for, by `vello_shaders` name.
 const VELLO: &[&str] = &[
     "pathtag_reduce",
@@ -49,6 +51,7 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=metal.rs");
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rustc-check-cfg=cfg(exact_no_metal_toolchain)");
     let target = std::env::var("TARGET").unwrap();
@@ -61,39 +64,31 @@ fn main() {
     // dyld refuses ("mis-aligned LINKEDIT string pool"), so host/apple/
     // build.mjs builds this crate with strip off.
     println!("cargo:rustc-cdylib-link-arg=-Wl,-x");
+    let Some((sdk, min)) = metal::sdk(&target) else {
+        println!(
+            "cargo:warning=exact-canvas-vello: no Metal SDK for {target}; the module is a stub"
+        );
+        stub(&out);
+        return;
+    };
     // Without Xcode's Metal toolchain the module is a stub whose `ecg_abi`
     // answers 0, so the host draws with Core Graphics; host/apple/build.mjs
     // checks for the toolchain and says how to install it before it embeds
     // a module. This keeps `cargo build --workspace` working on a Mac
     // without it.
     if !Command::new("xcrun")
-        .args(["-sdk", "macosx", "-f", "metal"])
+        .args(["-sdk", sdk, "-f", "metal"])
         .output()
         .is_ok_and(|o| o.status.success())
         || !Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "--version"])
+            .args(["-sdk", sdk, "metal", "--version"])
             .output()
             .is_ok_and(|o| o.status.success())
     {
         println!("cargo:warning=exact-canvas-vello: no Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`); the module is a stub");
-        println!("cargo:rustc-cfg=exact_no_metal_toolchain");
-        std::fs::write(out.join("kernels.bin"), []).unwrap();
-        std::fs::write(
-            out.join("kernels.rs"),
-            "pub static KERNELS: &[Kernel] = &[];\n",
-        )
-        .unwrap();
+        stub(&out);
         return;
     }
-    let sdk = if target.ends_with("apple-ios-sim") {
-        Some(("iphonesimulator", "-mios-simulator-version-min=17.0"))
-    } else if target.ends_with("apple-ios") {
-        Some(("iphoneos", "-mios-version-min=17.0"))
-    } else if target.ends_with("apple-darwin") {
-        Some(("macosx", "-mmacosx-version-min=14.0"))
-    } else {
-        None
-    };
 
     // vello's shader directory, copied so the fine stage can be patched.
     let dir = out.join("shader");
@@ -155,12 +150,7 @@ fn main() {
             .iter()
             .map(|(name, _, _, _, path)| {
                 let out = &out;
-                s.spawn(move || match sdk {
-                    Some((sdk, min)) => {
-                        metallib(sdk, min, path, &out.join(format!("{name}.metallib")))
-                    }
-                    None => Vec::new(),
-                })
+                s.spawn(move || metallib(sdk, min, path, &out.join(format!("{name}.metallib"))))
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -188,6 +178,16 @@ fn main() {
     writeln!(index, "];").unwrap();
     std::fs::write(out.join("kernels.bin"), &blob).unwrap();
     std::fs::write(out.join("kernels.rs"), index).unwrap();
+}
+
+fn stub(out: &Path) {
+    println!("cargo:rustc-cfg=exact_no_metal_toolchain");
+    std::fs::write(out.join("kernels.bin"), []).unwrap();
+    std::fs::write(
+        out.join("kernels.rs"),
+        "pub static KERNELS: &[Kernel] = &[];\n",
+    )
+    .unwrap();
 }
 
 /// The fine stage, patched: each pixel starts from `backdrop` (the canvas's

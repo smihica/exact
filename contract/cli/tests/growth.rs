@@ -63,8 +63,8 @@ fn cpu() -> Duration {
     Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }
 
-/// One build as `contract build` makes it (mapped, warnings collected): its
-/// CPU time, and its plan's bytes.
+/// The mapped compilation with its warnings, excluding the CLI's separate
+/// advice passes: its CPU time and its plan's bytes.
 fn timed(path: &Path) -> (Duration, Vec<u8>) {
     let start = cpu();
     let (compiled, _warnings) = contract::compile_path_all_warned(path, true);
@@ -105,5 +105,181 @@ fn four_times_the_uses_compile_in_about_four_times_as_long() {
         ratio <= 4.6,
         "{uses} uses took {small:?} and {} took {large:?}: {ratio:.1}x for 4x the uses",
         uses * 4
+    );
+}
+
+// The CLI runs clock advice outside the compilation timed above.
+fn clock_advice_growth(declarations: usize, source: impl Fn(usize) -> String) {
+    let small_file = contract_syntax::parse(&source(declarations)).unwrap();
+    let large_file = contract_syntax::parse(&source(declarations * 4)).unwrap();
+    let (mut small, mut large) = (Duration::MAX, Duration::MAX);
+    for _ in 0..3 {
+        for (file, best) in [(&small_file, &mut small), (&large_file, &mut large)] {
+            let start = cpu();
+            let warnings = contract_analyze::resource_clock_warnings(file);
+            *best = (*best).min(cpu() - start);
+            assert!(warnings.is_empty(), "{warnings:?}");
+        }
+    }
+    let ratio = large.as_secs_f64() / small.as_secs_f64();
+    eprintln!(
+        "clock advice: {declarations} declarations {small:?}, {} {large:?}: {ratio:.1}x",
+        declarations * 4
+    );
+    // Leave room for ordered-map lookups, but reject quadratic growth.
+    assert!(
+        ratio <= 6.0,
+        "clock advice grew {ratio:.1}x for 4x the declarations"
+    );
+}
+
+#[test]
+fn resource_clock_advice_grows_with_functions() {
+    clock_advice_growth(50, |count| {
+        let mut source = String::new();
+        for i in 0..count {
+            source.push_str(&format!("fn f{i}(x: number): number = x + {i}\n"));
+        }
+        source.push_str("component App\n  state s = 0\n  view\n    text `${s}`\n");
+        source
+    });
+}
+
+#[test]
+fn resource_clock_advice_grows_with_derives() {
+    clock_advice_growth(300, |count| {
+        let mut source = String::from("component App\n  state s = 0\n");
+        for i in 0..count {
+            source.push_str(&format!("  derive d{i} = s + {i}\n"));
+        }
+        source.push_str("  view\n    text `${s}`\n");
+        source
+    });
+}
+
+#[test]
+fn imported_names_grow_with_the_scope() {
+    let dir = std::env::temp_dir().join(format!("contract-import-growth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut paths = Vec::new();
+    for count in [500, 2000] {
+        let shapes = (0..count)
+            .map(|i| format!("shape S{i}\n  id: string\n"))
+            .collect::<String>();
+        let names = (0..count).map(|i| format!("S{i}")).collect::<Vec<_>>();
+        std::fs::write(dir.join(format!("shapes{count}.contract")), shapes).unwrap();
+        let path = dir.join(format!("app{count}.contract"));
+        std::fs::write(&path, format!(
+            "use {} from \"./shapes{count}.contract\"\ncomponent App\n  state s: option<S0> = none\n  view\n    text \"imports\"\n",
+            names.join(", ")
+        )).unwrap();
+        paths.push(path);
+    }
+    scope_growth(&dir, &paths);
+}
+
+fn scope_growth(dir: &Path, paths: &[std::path::PathBuf]) {
+    let mut best = [Duration::MAX; 2];
+    for _ in 0..3 {
+        for (i, path) in paths.iter().enumerate() {
+            best[i] = best[i].min(timed(path).0);
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    let ratio = best[1].as_secs_f64() / best[0].as_secs_f64();
+    eprintln!("scopes: {best:?}, {ratio:.2}x");
+    assert!(
+        ratio < 7.0,
+        "4x the declarations took {ratio:.2}x the CPU time"
+    );
+}
+
+#[test]
+fn file_scopes_share_the_programs_names() {
+    let dir = std::env::temp_dir().join(format!("contract-files-growth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut paths = Vec::new();
+    for count in [10, 40] {
+        let mut source = String::new();
+        for i in 0..count {
+            source.push_str(&format!("use S{i}_0 from \"./s{i}.contract\"\n"));
+            let shapes = (0..50)
+                .map(|j| format!("shape S{i}_{j}\n  id: string\n"))
+                .collect::<String>();
+            std::fs::write(dir.join(format!("s{i}.contract")), shapes).unwrap();
+        }
+        source.push_str(
+            "component App\n  state s: option<S0_0> = none\n  view\n    text \"files\"\n",
+        );
+        let path = dir.join(format!("app{count}.contract"));
+        std::fs::write(&path, source).unwrap();
+        paths.push(path);
+    }
+    scope_growth(&dir, &paths);
+}
+
+#[test]
+fn action_injects_grow_with_the_channels_they_reach() {
+    let dir = std::env::temp_dir().join(format!("contract-inject-growth-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut paths = Vec::new();
+    for count in [200, 800] {
+        let mut source = String::from("component Root\n  state n = 0\n");
+        for i in 0..count {
+            source.push_str(&format!("  action a{i}\n    n = n + {i}\n"));
+        }
+        source.push_str("  provide\n");
+        for i in 0..count {
+            source.push_str(&format!("    a{i}\n"));
+        }
+        source.push_str("  view\n    column\n");
+        for i in 0..count / 10 {
+            source.push_str(&format!("      Child{i}()\n"));
+        }
+        for i in 0..count / 10 {
+            source.push_str(&format!("component Child{i}\n  inject\n"));
+            for j in 0..40 {
+                source.push_str(&format!("    a{}: action\n", (i * 7 + j) % count));
+            }
+            source.push_str(&format!(
+                "  view\n    button press=a{}\n      text \"child\"\n",
+                i * 7 % count
+            ));
+        }
+        let path = dir.join(format!("app{count}.contract"));
+        std::fs::write(&path, source).unwrap();
+        paths.push(path);
+    }
+    scope_growth(&dir, &paths);
+}
+
+#[test]
+fn parsing_providers_grows_with_the_section() {
+    let source = |count| {
+        let mut source = String::from("component App\n  state n = 0\n  provide\n");
+        for i in 0..count {
+            source.push_str(&format!("    p{i} = n\n"));
+        }
+        source.push_str("  view\n    text \"providers\"\n");
+        source
+    };
+    let sources = [source(1000), source(4000)];
+    let mut best = [Duration::MAX; 2];
+    for _ in 0..3 {
+        for (i, source) in sources.iter().enumerate() {
+            let start = cpu();
+            let file = contract_syntax::parse(source).unwrap();
+            best[i] = best[i].min(cpu() - start);
+            assert_eq!(
+                file.components[0].provides.len(),
+                if i == 0 { 1000 } else { 4000 }
+            );
+        }
+    }
+    let ratio = best[1].as_secs_f64() / best[0].as_secs_f64();
+    eprintln!("provide parsing: {best:?}, {ratio:.2}x");
+    assert!(
+        ratio < 7.0,
+        "4x the providers took {ratio:.2}x the CPU time"
     );
 }

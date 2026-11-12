@@ -197,11 +197,10 @@ fn horizontal_container_padding_and_measured_row_spacing_still_compile() {
     }
 }
 
-/// The `flex` shorthand's text is a bound as its longhands are (Grok's batch
-/// 2 reviews): a positive grow, or a definite length basis (zero included);
-/// `none`, `initial`, `"0"` and a zero grow over `auto` or `0%` are not, on a virtualized
-/// list and on a `scroll` alike. A scroller's shrink comes from the
-/// shorthand too, so `flex="none"` does not shrink under a bounded column.
+/// A literal `flex` bounds a list or scroll through positive grow or a
+/// definite basis, including zero. `none`, `initial`, `unset`, `"0"` and
+/// zero grow over `auto` or `0%` do not. The shorthand sets shrink too:
+/// `flex="none"` does not shrink under a bounded column.
 #[test]
 fn the_flex_shorthand_text_bounds_as_its_longhands_do() {
     let scroll = |parent: &str, attrs: &str| {
@@ -209,7 +208,15 @@ fn the_flex_shorthand_text_bounds_as_its_longhands_do() {
             "component App\n  view\n    {parent}\n      scroll {attrs}\n        box height=1000\n"
         )
     };
-    for flex in ["none", "0", "initial", "0 1 auto", "0 0 0%", "0 0 content"] {
+    for flex in [
+        "none",
+        "0",
+        "initial",
+        "unset",
+        "0 1 auto",
+        "0 0 0%",
+        "0 0 content",
+    ] {
         let e =
             contract::compile(&source(&format!("virtualized=true flex=\"{flex}\""))).unwrap_err();
         assert_eq!(e.id, "lower-collection-unbounded", "{flex}: {e}");
@@ -273,4 +280,84 @@ fn scroll_padding_applies_to_any_scroller_and_takes_lengths() {
     contract::compile(
         "component App\n  view\n    scroll height=200 scroll-padding-top=92\n      box height=1000 scroll-margin=\"8 12 16 20\"\n",
     ).unwrap();
+}
+
+#[test]
+fn scroll_margins_take_signed_lengths_and_refuse_percentages() {
+    for name in [
+        "scroll-margin",
+        "scroll-margin-top",
+        "scroll-margin-right",
+        "scroll-margin-bottom",
+        "scroll-margin-left",
+    ] {
+        let source = |value| format!("component App\n  view\n    text \"a\" {name}={value}\n");
+        for value in ["10", "\"-4px\"", "\"calc(10px + 4px)\""] {
+            contract::compile(&source(value)).unwrap();
+        }
+        for value in ["\"10%\"", "\"calc(10% + 4px)\"", "\"min(10%, 4px)\""] {
+            let result = contract::compile(&source(value));
+            assert!(result.is_err(), "{name}={value} compiled");
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("CSS takes no percentage"),
+                "{name}={value}: {error}"
+            );
+        }
+    }
+}
+
+/// A `scroll` that a flex row, a grid, its insets, its flex longhands or an
+/// aspect ratio bound compiles, and the bake's measure finds it bounded; one
+/// that a stacking parent leaves to its content is refused.
+#[test]
+fn a_scroll_bounded_by_its_parent_or_its_own_longhands_compiles() {
+    let app = |parent: &str, scroll: &str| {
+        format!("component App\n  view\n    {parent}\n      scroll {scroll}\n        view height=2000\n")
+    };
+    for (parent, scroll) in [
+        ("view display=\"flex\" height=300", "width=200"),
+        (
+            "view display=\"flex\" flex-direction=\"row-reverse\" height=300",
+            "",
+        ),
+        (
+            "view display=\"grid\" grid-template-columns=\"200px 1fr\" height=300",
+            "",
+        ),
+        (
+            "view position=\"relative\" height=300",
+            "position=\"absolute\" inset=0",
+        ),
+        (
+            "view position=\"relative\" height=300",
+            "position=\"absolute\" top=0 bottom=0 width=200",
+        ),
+        ("column height=300", "flex-grow=1 flex-basis=0"),
+        ("column height=300", "flex-basis=100"),
+        ("column height=300", "width=100 aspect-ratio=\"1\""),
+        ("column height=300", ""),
+        ("column max-height=300", "flex-shrink=1"),
+        ("column", "flex=\"none\" flex-basis=100"),
+    ] {
+        let plan = contract::compile(&app(parent, scroll))
+            .unwrap_or_else(|e| panic!("{parent} / {scroll}: {e}"));
+        contract::bake(plan, Rows).unwrap_or_else(|e| panic!("{parent} / {scroll}: {e:?}"));
+    }
+    for (parent, scroll) in [
+        ("view height=300", ""),
+        ("view display=\"flex\" flex-direction=\"column\"", ""),
+        ("column", "flex-grow=0 flex-basis=\"auto\""),
+        ("column height=300", "flex-shrink=0"),
+        ("column height=300", "min-height=100"),
+        ("column", "flex=1 flex-grow=0 flex-basis=\"0%\""),
+        (
+            "view position=\"relative\" height=300",
+            "position=\"absolute\" top=0",
+        ),
+        ("column", "aspect-ratio=\"1\""),
+    ] {
+        let e = contract::compile(&app(parent, scroll)).unwrap_err();
+        assert_eq!(e.id, "lower-scroll-unbounded", "{parent} / {scroll}: {e}");
+    }
 }

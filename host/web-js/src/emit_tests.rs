@@ -851,8 +851,9 @@ component App
 
 component Editor
   state draft = ""
+  state label = draft + "!"
   view
-    text draft
+    text label
 "#;
     let plan = contract::compile(source).unwrap();
     let js = crate::emit::emit(&plan, false, false).unwrap().js;

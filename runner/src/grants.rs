@@ -124,6 +124,33 @@ pub fn admitting<'a>(spec: &'a str, scope: Option<&'a str>, url: &str) -> Option
     })
 }
 
+/// `url` as a refusal may name it, and whether it has a user name or
+/// password: without its userinfo, query or fragment, any of which may
+/// carry a credential. Tabs and newlines are removed first, as the URL
+/// Standard's parser removes them; the authority runs from after the
+/// scheme's `:` and any slashes or backslashes to the next `/`, and its
+/// userinfo is what precedes its last `@`
+/// (<https://url.spec.whatwg.org/#authority-state>). That reads as userinfo
+/// all the parser does, and more where a backslash ends a special URL's
+/// authority before an `@`.
+pub fn redacted(url: &str) -> (String, bool) {
+    let url: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return (url.to_owned(), false);
+    };
+    let authority = rest.trim_start_matches(['/', '\\']);
+    let slashes = &rest[..rest.len() - authority.len()];
+    let end = authority.find('/').unwrap_or(authority.len());
+    match authority[..end].rfind('@') {
+        Some(at) => (format!("{scheme}:{slashes}{}", &authority[at + 1..]), true),
+        None => (url.to_owned(), false),
+    }
+}
+
 /// The line that admits a stream `request` under its scope, as
 /// [`admitting`] for a URL; for a child process, the first `process.spawn`
 /// line that names its program (LLP 1133.007 D2's `state.streams`).
@@ -386,6 +413,57 @@ pub fn normalized_json(spec: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::normalized_json;
+
+    #[test]
+    fn a_redacted_url_has_no_userinfo_query_or_fragment() {
+        for (url, shown, userinfo) in [
+            (
+                "https://example.com/f?token=t#x",
+                "https://example.com/f",
+                false,
+            ),
+            (
+                "https://example.com/@alice",
+                "https://example.com/@alice",
+                false,
+            ),
+            (
+                "https://alice:secret@example.com/f?x",
+                "https://example.com/f",
+                true,
+            ),
+            ("https://alice@example.com", "https://example.com", true),
+            (
+                "https://a@b:secret@example.com/f",
+                "https://example.com/f",
+                true,
+            ),
+            (
+                "HTTPS://alice:secret@example.com",
+                "HTTPS://example.com",
+                true,
+            ),
+            (
+                "https:alice:secret@example.com/f",
+                "https:example.com/f",
+                true,
+            ),
+            (
+                "https:\\\\alice:secret@example.com/",
+                "https:\\\\example.com/",
+                true,
+            ),
+            (
+                "https://al\tice:sec\nret@example.com/",
+                "https://example.com/",
+                true,
+            ),
+            ("https://example.com\\@evil.com/", "https://evil.com/", true),
+            ("example.com/f", "example.com/f", false),
+        ] {
+            assert_eq!(super::redacted(url), (shown.to_owned(), userinfo), "{url}");
+        }
+    }
 
     #[test]
     fn quoted_targets_keep_source_spelling_beside_decoded_namespaces() {

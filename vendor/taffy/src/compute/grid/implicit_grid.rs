@@ -6,7 +6,7 @@ use crate::{CheapCloneStr, GridItemStyle};
 use core::cmp::{max, min};
 
 use super::types::TrackCounts;
-use super::{OriginZeroLine, MAX_OZ_LINE, MIN_OZ_LINE};
+use super::{LineLimit, OriginZeroLine};
 
 /// Estimate the number of rows and columns in the grid
 /// This is used as a performance optimisation to pre-size vectors and reduce allocations. It also forms a necessary step
@@ -19,12 +19,13 @@ use super::{OriginZeroLine, MAX_OZ_LINE, MIN_OZ_LINE};
 pub(crate) fn compute_grid_size_estimate<'a, S: GridItemStyle + 'a>(
     explicit_col_count: u16,
     explicit_row_count: u16,
+    limit: LineLimit,
     child_styles_iter: impl Iterator<Item = S>,
 ) -> (TrackCounts, TrackCounts) {
     // Iterate over children, producing an estimate of the min and max grid lines (in origin-zero coordinates where)
     // along with the span of each item
     let (col_min, col_max, col_max_span, row_min, row_max, row_max_span) =
-        get_known_child_positions(child_styles_iter, explicit_col_count, explicit_row_count);
+        get_known_child_positions(child_styles_iter, explicit_col_count, explicit_row_count, limit);
 
     // Compute *track* count estimates for each axis from:
     //   - The explicit track counts
@@ -65,6 +66,7 @@ fn get_known_child_positions<'a, S: GridItemStyle + 'a>(
     children_iter: impl Iterator<Item = S>,
     explicit_col_count: u16,
     explicit_row_count: u16,
+    limit: LineLimit,
 ) -> (OriginZeroLine, OriginZeroLine, u16, OriginZeroLine, OriginZeroLine, u16) {
     let (mut col_min, mut col_max, mut col_max_span) = (OriginZeroLine(0), OriginZeroLine(0), 0);
     let (mut row_min, mut row_max, mut row_max_span) = (OriginZeroLine(0), OriginZeroLine(0), 0);
@@ -75,9 +77,9 @@ fn get_known_child_positions<'a, S: GridItemStyle + 'a>(
         // Note: that the children reference the lines in between (and around) the tracks not tracks themselves,
         // and thus we must subtract 1 to get an accurate estimate of the number of tracks
         let (child_col_min, child_col_max, child_col_span) =
-            child_min_line_max_line_span::<S::CustomIdent>(col_line, explicit_col_count);
+            child_min_line_max_line_span::<S::CustomIdent>(col_line, explicit_col_count, limit);
         let (child_row_min, child_row_max, child_row_span) =
-            child_min_line_max_line_span::<S::CustomIdent>(row_line, explicit_row_count);
+            child_min_line_max_line_span::<S::CustomIdent>(row_line, explicit_row_count, limit);
 
         col_min = min(col_min, child_col_min);
         col_max = max(col_max, child_col_max);
@@ -98,6 +100,7 @@ fn get_known_child_positions<'a, S: GridItemStyle + 'a>(
 fn child_min_line_max_line_span<S: CheapCloneStr>(
     line: Line<GridPlacement<S>>,
     explicit_track_count: u16,
+    limit: LineLimit,
 ) -> (OriginZeroLine, OriginZeroLine, u16) {
     use GenericGridPlacement::*;
 
@@ -109,7 +112,7 @@ fn child_min_line_max_line_span<S: CheapCloneStr>(
 
     // Convert line into origin-zero coordinates before attempting to analyze
     // We ignore named lines here as they are accounted for separately
-    let oz_line = line.into_origin_zero_ignoring_named(explicit_track_count);
+    let oz_line = line.into_origin_zero_ignoring_named(explicit_track_count, limit);
 
     let min = match (oz_line.start, oz_line.end) {
         // Both tracks specified
@@ -169,8 +172,8 @@ fn child_min_line_max_line_span<S: CheapCloneStr>(
     // Clamp the min and max lines into the limited grid so that the estimated implicit track counts
     // stay within the maximum track limit (https://www.w3.org/TR/css-grid-1/#overlarge-grids).
     // This matches the clamping of the actual item placements performed during placement.
-    let clamped_min = OriginZeroLine(min.0.max(MIN_OZ_LINE));
-    let clamped_max = OriginZeroLine(max.0.min(MAX_OZ_LINE));
+    let clamped_min = OriginZeroLine(min.0.max(limit.min));
+    let clamped_max = OriginZeroLine(max.0.min(limit.max));
 
     (clamped_min, clamped_max, span)
 }
@@ -181,13 +184,14 @@ mod tests {
     mod test_child_min_max_line {
         type S = String;
         use super::super::child_min_line_max_line_span;
-        use super::super::OriginZeroLine;
+        use super::super::{LineLimit, OriginZeroLine};
         use crate::geometry::Line;
         use crate::style_helpers::*;
 
         #[test]
         fn child_min_max_line_auto() {
-            let (min_col, max_col, span) = child_min_line_max_line_span::<S>(Line { start: line(5), end: span(6) }, 6);
+            let (min_col, max_col, span) =
+                child_min_line_max_line_span::<S>(Line { start: line(5), end: span(6) }, 6, LineLimit::DEFAULT);
             assert_eq!(min_col, OriginZeroLine(4));
             assert_eq!(max_col, OriginZeroLine(10));
             assert_eq!(span, 1);
@@ -195,7 +199,8 @@ mod tests {
 
         #[test]
         fn child_min_max_line_negative_track() {
-            let (min_col, max_col, span) = child_min_line_max_line_span::<S>(Line { start: line(-5), end: span(3) }, 6);
+            let (min_col, max_col, span) =
+                child_min_line_max_line_span::<S>(Line { start: line(-5), end: span(3) }, 6, LineLimit::DEFAULT);
             assert_eq!(min_col, OriginZeroLine(2));
             assert_eq!(max_col, OriginZeroLine(5));
             assert_eq!(span, 1);
@@ -205,6 +210,7 @@ mod tests {
     mod test_initial_grid_sizing {
         use super::super::compute_grid_size_estimate;
         use crate::compute::grid::util::test_helpers::*;
+        use crate::compute::grid::LineLimit;
         use crate::style_helpers::*;
 
         #[test]
@@ -215,8 +221,12 @@ mod tests {
                 (line(1), span(2), line(2), auto()).into_grid_child(),
                 (line(-4), auto(), line(-2), auto()).into_grid_child(),
             ];
-            let (inline, block) =
-                compute_grid_size_estimate(explicit_col_count, explicit_row_count, child_styles.iter());
+            let (inline, block) = compute_grid_size_estimate(
+                explicit_col_count,
+                explicit_row_count,
+                LineLimit::DEFAULT,
+                child_styles.iter(),
+            );
             assert_eq!(inline.negative_implicit, 0);
             assert_eq!(inline.explicit, explicit_col_count);
             assert_eq!(inline.positive_implicit, 0);
@@ -233,8 +243,12 @@ mod tests {
                 (line(-6), span(2), line(-8), auto()).into_grid_child(),
                 (line(4), auto(), line(3), auto()).into_grid_child(),
             ];
-            let (inline, block) =
-                compute_grid_size_estimate(explicit_col_count, explicit_row_count, child_styles.iter());
+            let (inline, block) = compute_grid_size_estimate(
+                explicit_col_count,
+                explicit_row_count,
+                LineLimit::DEFAULT,
+                child_styles.iter(),
+            );
             assert_eq!(inline.negative_implicit, 1);
             assert_eq!(inline.explicit, explicit_col_count);
             assert_eq!(inline.positive_implicit, 0);

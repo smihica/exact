@@ -144,22 +144,9 @@ impl Reach {
     /// private ranges and local names without loopback, since the substitute
     /// reads no interface. `host` is as a URL serializes it.
     pub fn static_risk(host: &str) -> bool {
-        if exact_grants::is_local_network(host, false) {
-            return true;
-        }
-        // Grant admission excludes cloud metadata; that exclusion does not
-        // turn its link-local address into a destination without prompt risk.
-        let host = host
-            .strip_prefix('[')
-            .and_then(|h| h.strip_suffix(']'))
-            .unwrap_or(host);
-        host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-            let v4 = match ip {
-                std::net::IpAddr::V4(ip) => Some(ip),
-                std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped(),
-            };
-            v4 == Some(std::net::Ipv4Addr::new(169, 254, 169, 254))
-        })
+        // Grant admission excludes cloud metadata; that does not turn its
+        // link-local or unique-local address into one without prompt risk.
+        exact_grants::is_local_network(host, false) || exact_grants::is_cloud_metadata(host)
     }
 }
 
@@ -203,6 +190,7 @@ mod tests {
             "169.254.169.254",
             "[::ffff:169.254.169.254]",
             "[::ffff:a9fe:a9fe]",
+            "[fd00:ec2::254]",
         ] {
             assert_eq!(
                 Reach {

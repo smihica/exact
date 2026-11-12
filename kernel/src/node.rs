@@ -18,6 +18,8 @@ pub struct NodeFacts<'a> {
     pub style: &'a StyleProps,
     /// Props.
     pub props: &'a PropList,
+    /// Whether the node has host-known state looks (LLP 1121 D8).
+    pub has_looks: bool,
     /// Whether the node is a root.
     pub is_root: bool,
     /// A `Text` inside a `Text`: an inline run of its paragraph.
@@ -42,6 +44,7 @@ impl<'a> NodeRef<'a> {
             node_type: self.node_type,
             style: self.style,
             props: self.props,
+            has_looks: !self.looks().is_empty(),
             is_root: self.is_root,
             inline_run: self.is_inline_run(),
             symbol_color: self.symbol_color_said(),

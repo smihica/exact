@@ -72,7 +72,7 @@ extension ControlHost {
 /// F23): the field's own text is clear, and it draws its author's
 /// `placeholder` in the placeholder colour or, with none, no words at all
 /// (LLP 1115.000 D13.1; it had drawn Chrome's `mm/dd/yyyy`). Editing an
-/// empty one starts at now, and only a change commits it.
+/// empty one starts at now; typing, an arrow or Return accepts that value.
 final class DateCellMac: NSDatePickerCell {
     override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
         if attribute == .enabled, (controlView as? NSControl)?.ariaUnavailableFromNode == true { return false }
@@ -89,10 +89,25 @@ final class DateField: NSDatePicker {
     weak var owner: NodeView?
     override var acceptsFirstResponder: Bool { owner?.acceptsNativeValueFocus(self) == true }
     override var canBecomeKeyView: Bool { acceptsFirstResponder && owner?.tabbable == true }
+    private var sentAction = false
+    override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+        sentAction = true
+        return super.sendAction(action, to: target)
+    }
     override func keyDown(with event: NSEvent) {
         guard acceptsFirstResponder else { return }
         if owner?.nativeValueTab(event, control: self) == true { return }
+        let wasEmpty = empty
+        sentAction = false
         super.keyDown(with: event)
+        // AppKit sends no action when a key accepts the value already shown.
+        // An action that clears the field must not cause a second report.
+        guard wasEmpty, empty, !sentAction,
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return }
+        let chars = event.characters ?? ""
+        if chars.rangeOfCharacter(from: .decimalDigits) != nil || ["\r", "\u{3}", "\u{F700}", "\u{F701}", "\u{F702}", "\u{F703}"].contains(chars) {
+            _ = sendAction(action, to: target)
+        }
     }
     /// The author's `placeholder`, "" when there is none.
     var placeholder = "" { didSet { if placeholder != oldValue, empty { needsDisplay = true } } }
@@ -110,10 +125,7 @@ final class DateField: NSDatePicker {
     override func becomeFirstResponder() -> Bool {
         guard acceptsFirstResponder, super.becomeFirstResponder() else { return false }
         if empty {
-            // Now, as the picker reads its values: the wall clock's fields at UTC.
-            let local = DateFormatter()
-            local.dateFormat = "yyyy-MM-dd'T'HH:mm"
-            dateValue = DateValue.parse("datetime-local", local.string(from: Date())) ?? dateValue
+            dateValue = DateValue.initial(owner?.props["type"] ?? "date", minimum: minDate, maximum: maxDate)
         }
         refresh()
         owner?.focusEntered()

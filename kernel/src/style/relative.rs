@@ -8,8 +8,10 @@
 //! host's painter, the live web host's CSS text) reads pixels as before; only
 //! the web's JS target, which keeps no kernel at run time, writes the units
 //! for the browser to resolve (`exact_web::css::css_text_relative`). The
-//! kernel resolves every such row at the end of each commit
-//! ([`crate::txn`]): `rem` against the root font size the host sets
+//! kernel resolves relative rows at the end of a commit only when their
+//! inputs change: style, ancestry, inherited or control font, root font size,
+//! or display scale. Parents resolve before children ([`crate::txn`]).
+//! `rem` resolves against the root font size the host sets
 //! ([`crate::Kernel::set_root_font_size`]), `em` against the element's own
 //! computed `font-size` — and, for `font-size` itself, against the parent's,
 //! as CSS says. `px` never scales. A text style is the platform's size for it
@@ -308,6 +310,13 @@ fn nonnegative(id: StyleId) -> bool {
             | HitSlopRight
             | HitSlopBottom
             | HitSlopLeft
+            | ScrollPaddingTop
+            | ScrollPaddingRight
+            | ScrollPaddingBottom
+            | ScrollPaddingLeft
+            | R
+            | Rx
+            | Ry
     )
 }
 

@@ -551,15 +551,19 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
     /// (LLP 1123 D2): an authored `aria-hidden` and `inert` above it (WAI-ARIA
     /// tree exclusion, HTML inert subtrees), set on the view the navigation
     /// is mounted in, apart from the hiding a presentation over it gives its
-    /// navigation; and a `color-scheme`, the presented controller's
-    /// appearance, which UIKit carries to its sheet and everything in it.
-    /// After every batch, a transition running or not.
+    /// navigation; and a `color-scheme`, the route's own or else the nearest
+    /// above it: the appearance of the presented controller, which UIKit
+    /// carries to everything in it, and of its presentation controller,
+    /// whose chrome (a partial detent's glass, the grabber) UIKit draws
+    /// outside the controller's view, from the window's appearance unless
+    /// told. After every batch, a transition running or
+    /// not, and as a presentation is made.
     func inheritFromAncestors() {
         for layer in layers where layer.controller.isViewLoaded { inherit(layer) }
     }
 
     private func inherit(_ layer: Presentation) {
-        var hidden = false, inert = false, scheme = UIUserInterfaceStyle.unspecified
+        var hidden = false, inert = false, scheme = layer.route.colorScheme
         var at = presenter.eventParent(of: layer.route)
         while let view = at {
             if let node = view as? NodeView {
@@ -581,6 +585,11 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         if layer.controller.overrideUserInterfaceStyle != scheme {
             layer.controller.overrideUserInterfaceStyle = scheme
             layer.controller.updateTraitsIfNeeded()
+        }
+        if let sheet = layer.controller.presentationController {
+            let said = sheet.traitOverrides.contains(UITraitUserInterfaceStyle.self)
+            if scheme == .unspecified { if said { sheet.traitOverrides.remove(UITraitUserInterfaceStyle.self) } }
+            else if !said || sheet.traitOverrides.userInterfaceStyle != scheme { sheet.traitOverrides.userInterfaceStyle = scheme }
         }
     }
 
@@ -688,6 +697,9 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         layers.append(layer)
         controller.isModalInPresentation = refusesDismissal(of: route)
         controller.loadViewIfNeeded()
+        // What it inherits, from its first frame: a sheet a deferred sync
+        // presents (the second of two, after the first is up) waits for the next batch otherwise.
+        inherit(layer)
         controller.addChild(navigation)
         presenter.collections.watchContacts(in: controller.mount)
         controller.mount.addSubview(navigation.view)

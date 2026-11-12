@@ -1,31 +1,41 @@
 // A production page that admits nothing gets the empty set's answers in place of the grant parser (LLP 1047.002 D3,
 // host/web-js/build.mjs `emptyGrantAdmission`): the stub answers as the parser does for the empty set, exports what the
-// parser's section exports, and a grant, a development build or a module brings the parser back.
+// admission module exports, and a grant, a development build or a module brings the parser back.
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { webCompiler } from './module.mjs';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 const root = resolve(import.meta.dir, '../..');
-const exportsOf = (text) => [...text.matchAll(/^export (?:function|const) (\w+)/gm)].map((m) => m[1]).sort();
 // The parser's Rust whitespace class, the driver's fault table, a fetch option's refusal and the asset path's pattern:
-// text only the section, faults.js, ts-fetch.js's request paths and admission.js's asset check carry.
+// text only admission, faults.js, ts-fetch.js's request paths and admission.js's asset check carry.
 const PARSER = 'u1680', FAULTS = '__exactFaults', REQUESTS = 'exactLongPoll asks again', ASSETS = '\\/assets\\/';
 
-test('a production page with no grants, module or page module admits nothing without the parser', async () => {
+test.each([false, true])('a production page with no grants, module or page module admits nothing without the parser (fetch: %s)', async usesFetch => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
   mkdirSync(resolve(root, 'target'), { recursive: true });
   const dir = mkdtempSync(resolve(root, 'target/web-js-empty-admission-'));
+  let browser, server;
   try {
+    mkdirSync(resolve(dir, 'assets'));
+    writeFileSync(resolve(dir, 'assets/a.txt'), 'asset loaded');
     const app = (grants) => {
       writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Empty admission', id: 'test.empty-admission', app: { id: 'test.empty-admission', name: 'Empty admission' } }));
-      writeFileSync(resolve(dir, 'app.contract'), 'shape Greeting\n  text: string\ncomponent App\n  resource greeting = greeting() as shape Greeting\n  view\n    text greeting.text\n');
-      writeFileSync(resolve(dir, 'app.ts'), `export const grants = ${JSON.stringify(grants)};\nexport const answer = () => ({ text: 'hi' }) as never;\n`);
+      writeFileSync(resolve(dir, 'app.contract'), 'shape Greeting\n  text: string\ncomponent App\n  resource greeting = greeting() as shape Greeting\n  view\n    text greeting.text testId="greeting"\n');
+      writeFileSync(resolve(dir, 'app.ts'), `import type { Answer } from './app.contract.d.ts';
+export const grants = ${JSON.stringify(grants)};
+export const answer: Answer = ${usesFetch ? `async () => {
+  const asset = await (await fetch('/assets/a.txt')).text();
+  try { await fetch('http://127.0.0.1:1/ungranted'); return { text: 'unexpected access' }; }
+  catch (error) { return { text: asset + ': ' + String(error) }; }
+}` : "() => ({ text: 'hi' })"};
+`);
     };
     const build = (out, args) => {
-      const result = spawnSync(process.execPath, ['host/web-js/build.mjs', 'empty-admission', '--out', out, '--render', 'none', ...args], { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8' });
+      const result = spawnSync(process.execPath, ['host/web-js/build.mjs', 'empty-admission', '--out', out, '--render', usesFetch ? 'js' : 'none', ...args], { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8' });
       expect(result.status, result.stdout + result.stderr).toBe(0);
       return { admission: readFileSync(resolve(out, '.gen/grant-admission.js'), 'utf8'), entry: readFileSync(resolve(out, 'app.js'), 'utf8'), module: () => import(pathToFileURL(resolve(out, '.gen/grant-admission.js')).href) };
     };
@@ -42,9 +52,9 @@ test('a production page with no grants, module or page module admits nothing wit
     expect(development.admission).toContain('function validateGrantSet');
     expect(development.entry).toContain(PARSER);
     expect(development.entry).toContain(REQUESTS);
-    expect(exportsOf(production.admission)).toEqual(exportsOf(development.admission));
     // Parity for the empty set: the stub and the parser answer the same calls the same way.
     const stub = await production.module(), parser = await development.module();
+    expect(Object.keys(stub).sort()).toEqual(Object.keys(parser).sort());
     const empty = parser.createGrantSet(JSON.parse(production.admission.match(/\.\.\.(\{.*?\}), entries:/)[1]));
     expect(parser.grantError(empty)).toBeNull();
     for (const [name, args] of [
@@ -60,7 +70,22 @@ test('a production page with no grants, module or page module admits nothing wit
     expect(granted.entry).toContain(PARSER);
     expect(granted.entry).toContain(REQUESTS);
     expect(existsSync(resolve(dir, 'granted/.gen/ts-fetch-refused.js'))).toBe(false);
+    if (!usesFetch) return;
+    let ungranted = 0;
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
+      const path = new URL(req.url).pathname;
+      return new Response(Bun.file(resolve(dir, 'production', path === '/' ? 'index.html' : path.slice(1))));
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.route('**/ungranted', route => { ungranted++; return route.abort(); });
+    await page.goto(server.url.href);
+    await page.waitForFunction(() => document.querySelector('[data-testid=greeting]')?.textContent.includes('asset loaded'));
+    expect(await page.getByTestId('greeting').textContent()).toBe("asset loaded: FetchError: outside the app's grants (net.fetch)");
+    expect(ungranted).toBe(0);
   } finally {
+    await browser?.close();
+    server?.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
 }, 120000);

@@ -746,6 +746,13 @@ pub fn nonnegative_row(style: crate::StyleId) -> bool {
             | HitSlopRight
             | HitSlopBottom
             | HitSlopLeft
+            | ScrollPaddingTop
+            | ScrollPaddingRight
+            | ScrollPaddingBottom
+            | ScrollPaddingLeft
+            | R
+            | Rx
+            | Ry
     )
 }
 

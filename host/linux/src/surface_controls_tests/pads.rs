@@ -2,6 +2,57 @@
 use super::*;
 
 #[test]
+fn the_reader_takes_pad_events_only_while_a_canvas_receives_them() {
+    let (mut p, path) = fixture();
+    p.serve_requests();
+    let told = |p: &mut Presenter<()>| {
+        p.tell_shell();
+        let words = p.take_requests().unwrap_or_default();
+        let (mut at, mut pads) = (0, Vec::new());
+        while at < words.len() {
+            if words[at] == 14 {
+                assert_eq!(words[at + 2], 1);
+                pads.push(words[at + 3]);
+            }
+            at += 3 + words[at + 2] as usize;
+        }
+        pads
+    };
+    assert_eq!(told(&mut p), [1], "no focus uses the first input canvas");
+    assert!(told(&mut p).is_empty());
+    for name in ["editor", "a-jump", "remove", "b"] {
+        let view = find(&p, name);
+        p.set_focus(Some(view), 0.);
+        let takes = i32::from(matches!(name, "a-jump" | "b"));
+        assert_eq!(told(&mut p), [takes], "{name}");
+        assert!(told(&mut p).is_empty());
+    }
+    p.reader_replaced(Box::new(crate::raster::Raster::new()));
+    assert_eq!(
+        told(&mut p),
+        [1],
+        "a new reader is told the current routing"
+    );
+    p.set_focus(Some(find(&p, "editor")), 0.);
+    assert_eq!(told(&mut p), [0], "losing canvas focus releases navigation");
+    p.set_focus(None, 0.);
+    assert_eq!(told(&mut p), [1]);
+    for canvas in p.surfaces.canvases.values_mut() {
+        canvas.id = 98;
+    }
+    assert_eq!(told(&mut p), [0], "paint-only canvases take no pad input");
+    let canvases = std::mem::take(&mut p.surfaces.canvases);
+    p.reader_replaced(Box::new(crate::raster::Raster::new()));
+    assert_eq!(
+        told(&mut p),
+        [0],
+        "an app without a canvas keeps navigation"
+    );
+    p.surfaces.canvases = canvases;
+    done(p, path);
+}
+
+#[test]
 fn controller_polling_needs_an_input_canvas_but_survives_editor_focus() {
     let (mut p, path) = fixture();
     assert!(p.has_gamepad_input());

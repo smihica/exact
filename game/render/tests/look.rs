@@ -753,6 +753,8 @@ fn every_part_of_an_entity_draws_the_same_level() {
 struct SoftArgs {
     soft: f32,
     gap: f32,
+    orthographic: bool,
+    offset: f32,
 }
 struct Soft<const SINGLE: bool = false>;
 impl<const SINGLE: bool> Game for Soft<SINGLE> {
@@ -770,22 +772,29 @@ impl<const SINGLE: bool> Game for Soft<SINGLE> {
             bloom: None,
             ..Default::default()
         });
-        w.spawn((Transform::at(0., 0., 5.), Camera::default()));
+        w.spawn((
+            Transform::at(0., 0., 5.),
+            if args.orthographic {
+                Camera::orthographic(256.)
+            } else {
+                Camera::default()
+            },
+        ));
         // A black wall whose face is at z = 0.
         w.spawn((
-            Transform::at(0., 0., -2.),
+            Transform::at(args.offset, 0., -2.),
             Mesh::cube(4.),
             Material::rgb(0., 0., 0.),
         ));
         let e = w.spawn((
-            Transform::at(0., 0., args.gap),
+            Transform::at(args.offset, 0., args.gap),
             Emitter {
                 rate: 0.,
                 lifetime: 10.,
                 speed: 0.,
                 spread: 0.,
                 gravity: Vec3::ZERO,
-                size: [1., 1.],
+                size: if args.orthographic { [8.; 2] } else { [1.; 2] },
                 color: [[1.; 4], [1.; 4]],
                 additive: false,
                 ..Default::default()
@@ -807,15 +816,31 @@ impl<const SINGLE: bool> Game for Soft<SINGLE> {
 
 #[test]
 fn soft_particles_fade_where_they_meet_the_scene() {
-    soft_particle_pixels::<false>();
-    soft_particle_pixels::<true>();
+    soft_particle_pixels::<false>(false, 0.);
+    soft_particle_pixels::<true>(false, 0.);
 }
-fn soft_particle_pixels<const SINGLE: bool>() {
+#[test]
+fn orthographic_soft_particles_measure_the_gap_along_parallel_rays() {
+    for offset in [0., 96.] {
+        soft_particle_pixels::<false>(true, offset);
+        soft_particle_pixels::<true>(true, offset);
+    }
+}
+fn soft_particle_pixels<const SINGLE: bool>(orthographic: bool, offset: f32) {
     let Some(gpu) = gpu() else { return };
-    let centre = |soft: f64, gap: f64| {
+    let centre = |soft, gap| {
         let mut s = WorldSurface::<Soft<SINGLE>, ModelExecutor, true>::default();
-        s.bind(&[Value::Number(soft), Value::Number(gap)], None)
-            .unwrap();
+        s.bind(
+            &SoftArgs {
+                soft,
+                gap,
+                orthographic,
+                offset,
+            }
+            .values(),
+            None,
+        )
+        .unwrap();
         s.device_ready(exact_gpu::wgpu::Features::empty());
         s.prepare_assets(
             &gpu.device,
@@ -829,7 +854,12 @@ fn soft_particle_pixels<const SINGLE: bool>() {
         };
         let (pixels, _) = fixture::render(&gpu, &mut s, &frame).unwrap();
         assert!(s.error().is_none(), "{:?}", s.error());
-        pixels.at(64, 64)[0]
+        let x = if orthographic {
+            64 + (offset / 2.) as u32
+        } else {
+            64
+        };
+        pixels.at(x, 64)[0]
     };
     let hard = centre(0., 0.1);
     let touching = centre(1., 0.1);

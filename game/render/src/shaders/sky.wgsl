@@ -47,11 +47,11 @@ fn view_ray(ndc: vec2<f32>) -> vec3<f32> {
     let direction = view_ray(input.ndc);
     var color = sky_radiance(direction);
     // Linear fog leaves the sky as it is, but for the part of a ray under water;
-    // with water an orthographic ray starts on its own point of the near plane.
+    // an orthographic ray starts on its own point of the near plane.
     let water = frame.water.y > 0.0;
     if (frame.toon.y <= frame.toon.x && frame.fog_color_density.w > 0.0) || water {
         var origin = frame.camera_alpha.xyz;
-        if water && frame.toon.w > 0.5 {
+        if frame.toon.w > 0.5 {
             let near = frame.inverse_view_proj * vec4(input.ndc, 0.0, 1.0);
             origin = near.xyz / near.w;
         }

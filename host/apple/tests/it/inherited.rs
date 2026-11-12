@@ -784,6 +784,66 @@ fn a_reloaded_plan_resolves_line_height_kinds_against_the_new_receiving_font() {
 }
 
 #[test]
+fn inline_image_labels_follow_their_own_computed_visibility() {
+    let plan = contract::compile(
+        r#"component App
+  state visibility = "visible"
+  action hide
+    visibility = "hidden"
+  action collapse
+    visibility = "collapse"
+  action show
+    visibility = "visible"
+  view
+    column
+      button "Hide" testId="hide" press=hide
+      button "Collapse" testId="collapse" press=collapse
+      button "Show" testId="show" press=show
+      text testId="paragraph" visibility=visibility
+        image "symbol:star" aria-label="Inherited" testId="inherited" width=16 height=16
+        image "symbol:star" aria-label="Shown" testId="shown" width=16 height=16 visibility="visible"
+      text testId="own"
+        image "symbol:star" aria-label="Own" testId="image" width=16 height=16 visibility=visibility
+"#,
+    )
+    .unwrap();
+    let (mut host, first) = Host::boot(
+        &plan.encode(),
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        400.0,
+        800.0,
+    )
+    .unwrap();
+    let check = |batch: &str, hidden: bool| {
+        let batch: serde_json::Value = serde_json::from_str(batch).unwrap();
+        let runs: Vec<_> = batch["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|op| op["op"] == "paragraph")
+            .flat_map(|op| op["runs"].as_array().unwrap())
+            .collect();
+        for name in ["inherited", "shown", "image"] {
+            let run = runs
+                .iter()
+                .find(|run| run["props"]["testId"] == name)
+                .unwrap();
+            assert_eq!(
+                run["props"]["inlineBoxHidden"] == "true",
+                hidden && name != "shown",
+                "{name}: {batch}"
+            );
+        }
+    };
+    check(&first, false);
+    for (action, hidden) in [("hide", true), ("collapse", true), ("show", false)] {
+        let batch = host.dispatch(view(&host, action), Event::Press);
+        check(&batch, hidden);
+    }
+}
+
+#[test]
 fn paragraph_batches_preserve_inline_identity_and_replace_the_complete_run_table() {
     let plan = contract::compile(r##"component Inline
   state changed = false

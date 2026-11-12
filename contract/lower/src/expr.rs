@@ -312,6 +312,17 @@ pub(crate) fn compile(
                 if name == "failed" { return Ok(Ty::Bool); }
                 return Ok(Ty::Option(Box::new(Ty::Record("Failure".into()))));
             }
+            if name == "current" {
+                // Typed already: one name, a resource (LLP 1161.001 D2).
+                let [Expr::Ident(target, _)] = args.as_slice() else {
+                    return err("lower-current", "`current(x)` names one resource", *span);
+                };
+                let Some((Ref::Resource(i), _)) = scope.lookup(target) else {
+                    return err("lower-current", format!("`{target}` is not a resource"), *span);
+                };
+                asm.current_resource(l.resources[i as usize]);
+                return Ok(Ty::Bool);
+            }
             if name == "pending" {
                 // Typed already: one name, a resource or a mutation.
                 let Some(Expr::Ident(target, _)) = args.first() else {

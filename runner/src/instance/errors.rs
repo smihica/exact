@@ -16,9 +16,6 @@ pub enum InstanceError {
     KeyKind {
         region: RegionsId,
     },
-    DuplicateKey {
-        region: RegionsId,
-    },
     NonFiniteValue {
         name: String,
     },

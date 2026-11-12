@@ -44,7 +44,8 @@ fn main() {
             contract::rust_entry(
                 "tamber_host_data::TamberHost",
                 "tamber_host_data::TamberHost",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

@@ -143,7 +143,12 @@
     {"url": "/?q=%zz%2", "name": "q", "expected": "%zz%2"},
     {"url": "/?q=%EF%BB%BFhello", "name": "q", "expected": "﻿hello"},
     {"url": "/?q=a=b=c", "name": "q", "expected": "a=b=c"},
-    {"url": "/?a=1&%61=2", "name": "a", "expected": "1"}
+    {"url": "/?a=1&%61=2", "name": "a", "expected": "1"},
+    {"url": "/login?next=/home?tab=1", "name": "next", "expected": "/home?tab=1"},
+    {"url": "/search?q=why?&page=2", "name": "q", "expected": "why?"},
+    {"url": "/search?q=why?&page=2", "name": "page", "expected": "2"},
+    {"url": "/?q=why??#ignored?", "name": "q", "expected": "why??"},
+    {"url": "/", "name": "q", "expected": ""}
   ],
   "matches": [
     {"table": "interview", "location": "/", "expected": {"name": "home", "params": {"person": "", "post": "", "question": ""}}},

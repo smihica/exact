@@ -34,18 +34,29 @@ Do not track the same live state in two places.
 Optional: `Severity`, `Related`, `Marker`. Optional all-or-none triage block:
 `Impact`, `Urgency`, `Ease`, `Confidence`, `Score reviewed`, `Score rationale`.
 
-**`Status` is exactly `Open` or exactly `Closed`.** The value is the whole rest of the
-line, so `Closed (fixed upstream)` is a *different status*, not a qualified one. Put the
+**`Status` is exactly `Open` or exactly `Closed`.** The value includes the rest of the
+line and any continuation lines, so `Closed (fixed upstream)` is a different status. Put the
 qualifier in `Resolution`. This is the single most common way the format breaks, and the
 checker moves your words to the right field rather than rejecting them.
+Text spanning several lines moves to a body note with its line breaks and indentation
+preserved; a closed issue still needs a one-line `Resolution`.
+`Status` belongs in the header, before the first body heading. A quoted `Status`
+in the body is left untouched, including when the header's `Status` is missing.
+`--fix` leaves an unrecognized token such as `Open-ended` for the author to correct.
 
 ## Commands
 
 ```sh
 bun scripts/issue.mjs new "<one-line title>" --systems "<a, b>"
 bun scripts/issue.mjs close issues/<file>.md --resolution "fixed by <sha>"
+bun scripts/issue.mjs check issues/<file>.md
 bun scripts/issue.mjs check --fix
 ```
+
+With paths, `check` reads each named issue even before it is staged. Relative paths
+(including `./issues/…`) and absolute paths must name files under this repository's
+`issues/` or `issues/closed/`; `issues/README.md` is excluded. Invalid or unreadable
+paths exit 2, malformed issues exit 1. Without paths, it checks tracked issues.
 
 **Do not close an issue with a bare `git mv`.** The closed path requires `Status: Closed`
 and a non-empty `Resolution:`, and a bare move is the most common way the format check

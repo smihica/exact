@@ -15,6 +15,7 @@ task: a shared board that updates live from a hosted backend's subscriptions, wr
 - A task's interval is a literal, so a backoff of 1, 2, 4, 8, 16 s is a one-second task that counts. It works and reads oddly.
 - On macOS a second drive against the real backend painted nothing while every mutation replied ok. About 25 minutes, with frames logged, to see why: the driver seeds a native host's `crypto.getRandomValues` (seed 1 unless `--seed` says another), the module draws its session id from it, and Convex answers a request id it has seen from a session with the first answer. A new `--seed` each launch fixes the drive. Nothing in `state` or the journal says the randomness is seeded; a line at launch would have.
 - `clock +20000 real` was the way to watch a pushed change and a reconnect arrive; it took a `--help all` to find.
+- The quiet-socket watch ran only while `live.status == "ready"`, so a socket that opened and carried nothing was never opened again. A reviewer found it, not a test: no test holds a server silent. It now runs for an open and an opening socket too, as one tick a minute.
 
 ### Lean in
 
@@ -36,3 +37,5 @@ task: a shared board that updates live from a hosted backend's subscriptions, wr
 - 2026-11-10: `bun exact.mjs verify` is clean on the web against `server.ts` (4 tests; light and dark at two widths; the largest text size).
 - 2026-11-10: the Mac app (`bun exact.mjs mac`) against the same backend, with a new `--seed`: the board arrives, a stroke lands in both queries, a write from outside shows with nothing polled. `bun exact.mjs test macos` passes its 4 tests against `server.ts`.
 - 2026-11-10: on an iOS simulator, `bun exact.mjs verify ios` is clean against `server.ts`. The real backend was not driven from the simulator.
+- 2026-11-10: on the web against `server.ts`, `agent web "clock +130000"` with the clock jumped past two ticks and no frame between them: `logs` shows the stream let go and the socket opened again, and the board is `ready`. The 4 tests pass.
+- 2026-11-11: the watch task and `live.beat` are gone: the module asks its socket with `exactIdleTimeout` and the host ends a silent one. The Mac app against a peer that accepts the socket and never sends: `agent macos 'clock until state live.status == "closed" within 90000'` met after 60,011 ms of real time with the driver's clock at 0, `live.error` "nothing arrived for 60000 ms", and the peer saw the close at 60.0 s. The 4 tests pass on the web.

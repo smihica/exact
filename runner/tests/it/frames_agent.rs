@@ -139,7 +139,7 @@ fn a_blocks_root_is_answered_in_its_block() {
         ..Default::default()
     };
     half.mask.set(StyleId::Width);
-    let mut ops: Vec<Op> = (2..=5)
+    let mut ops: Vec<Op> = (2..=6)
         .map(|id| Op::CreateView {
             id,
             node_type: NodeType::View,
@@ -151,6 +151,7 @@ fn a_blocks_root_is_answered_in_its_block() {
         (3, sized(100., 50.)),
         (4, sized(80., 40.)),
         (5, half),
+        (6, sized(20., 10.)),
     ] {
         ops.push(Op::SetStyle {
             id,
@@ -165,7 +166,7 @@ fn a_blocks_root_is_answered_in_its_block() {
         },
         Op::SetChildren {
             id: 3,
-            children: vec![4, 5],
+            children: vec![4, 5, 6],
         },
         Op::SetChildren {
             id: 1,
@@ -185,7 +186,25 @@ fn a_blocks_root_is_answered_in_its_block() {
         .unwrap();
     let json = agent::handle(&runner, r#"{"op":"frames"}"#);
     assert!(
-        json.contains(r#"[3,1,0,50,100,50,0],[4,3,0,0,80,40,0],[5,3,0,0,300,0,0]]"#),
+        json.contains(
+            r#"[3,1,0,50,100,50,0],[4,3,0,0,80,40,0],[5,3,0,0,300,0,0],[6,3,0,0,20,10,0]]"#
+        ),
         "the sheet and the popover each at its block's origin, not 50 above it: {json}"
     );
+    for (id, y, w, h, absolute_y) in [
+        (1, 0, 600, 400, 0),
+        (3, 50, 100, 50, 50),
+        (4, 0, 80, 40, 0),
+        (5, 0, 300, 0, 0),
+        (6, 0, 20, 10, 50),
+    ] {
+        let reply = agent::handle(&runner, &format!(r#"{{"op":"node","id":{id}}}"#));
+        let node: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            node["frame"],
+            serde_json::json!({"x": 0, "y": y, "w": w, "h": h}),
+            "node #{id}: {reply}"
+        );
+        assert_eq!(node["absolute"]["y"], absolute_y, "node #{id}: {reply}");
+    }
 }

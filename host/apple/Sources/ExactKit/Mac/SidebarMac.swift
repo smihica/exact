@@ -52,6 +52,8 @@ final class SidebarHost {
     var wanted: Bool { shown != nil }
     /// The window's owner hears when `wanted` changes, after the batch.
     var onWanted: (() -> Void)?
+    /// The window keeps its composition across a reset until the new tree is read.
+    private var lastWanted = false
     /// The owner's split view, while it holds this session's view.
     private(set) weak var controller: ExactSidebarController?
     /// The authored tablist the sidebar stands for, hidden while it does.
@@ -118,10 +120,13 @@ final class SidebarHost {
         guard !syncing else { return }
         syncing = true
         defer { syncing = false }
-        let was = wanted, stood = projected, inBar = controller?.view.window.map(inToolbar(of:))
+        let stood = projected, inBar = controller?.view.window.map(inToolbar(of:))
         read(batch)
         present()
-        if wanted != was { presenter.afterBatch { [weak self] in self?.onWanted?() } }
+        if wanted != lastWanted {
+            lastWanted = wanted
+            presenter.afterBatch { [weak self] in self?.onWanted?() }
+        }
         // With no batch to run them, the passes that read the projection.
         if batch == nil, stood !== projected || inBar != controller?.view.window.map(inToolbar(of:)) {
             presenter.afterBatch { [weak presenter] in

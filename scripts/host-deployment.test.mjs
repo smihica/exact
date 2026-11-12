@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { HOST_MACOS, withHostDeployment } from './filesystem.mjs';
-import { cargoEnvironment } from './app.mjs';
+import { buildBake, cargoEnvironment, developmentBuildEnv, resolveApp } from './app.mjs';
 import { bakeTool } from './linked-plan.mjs';
 import { warmGameEnvironment } from '../host/web-js/module.mjs';
 import { spawnSync } from 'node:child_process';
@@ -113,6 +113,30 @@ test.skipIf(process.platform !== 'darwin')('Apple deployment hashing preserves t
     }
   } finally { fixture.dispose(); }
 }, 120_000);
+
+// An inherited SDKROOT (a shell's, or Xcode's) never reaches an Apple Cargo call. rustc and cc-rs ask xcrun for each
+// target's SDK; one in the environment reaches the build scripts' C and C++ compiles for the Mac too, and a simulator
+// SDK there fails `-Werror` on -Wincompatible-sysroot (aws-lc-sys under an app's data crate, #162). This runs the iOS
+// bake as host/apple/build.mjs does, with a `cargo` first on PATH that records the environment of the compile.
+test.skipIf(process.platform !== 'darwin')('the iOS bake\'s Cargo process gets no SDKROOT, though the build inherits one', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'exact-bake-sdkroot-'));
+  const recorded = resolve(directory, 'env.json'), real = Bun.which('cargo');
+  const before = { PATH: process.env.PATH, SDKROOT: process.env.SDKROOT };
+  try {
+    // The compile records and fails; any other call (metadata, the failure's diagnosis) is Cargo's own.
+    writeFileSync(resolve(directory, 'cargo'), `#!/bin/sh\ncase "$1" in rustc|build) exec ${JSON.stringify(process.execPath)} -e 'require("fs").writeFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.env)); process.exit(1)';; esac\nexec ${JSON.stringify(real)} "$@"\n`, { mode: 0o755 });
+    process.env.PATH = `${directory}:${process.env.PATH}`;
+    process.env.SDKROOT = spawnSync('xcrun', ['--sdk', 'iphonesimulator', '--show-sdk-path'], { encoding: 'utf8' }).stdout.trim();
+    const target = process.arch === 'arm64' ? 'aarch64-apple-ios-sim' : 'x86_64-apple-ios';
+    expect(() => buildBake(resolveApp('hello'), 'ios', target, { env: { ...developmentBuildEnv(), IPHONEOS_DEPLOYMENT_TARGET: '17.0' } })).toThrow();
+    const env = JSON.parse(readFileSync(recorded, 'utf8'));
+    expect(env.IPHONEOS_DEPLOYMENT_TARGET).toBe('17.0');
+    expect(env.SDKROOT).toBeUndefined();
+  } finally {
+    for (const [key, value] of Object.entries(before)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 300_000);
 
 function appleFixture() {
   const directory = mkdtempSync(resolve(tmpdir(), 'exact-apple-deployment-'));

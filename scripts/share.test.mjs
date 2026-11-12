@@ -53,3 +53,12 @@ test('the branch and source come from git', () => {
     expect(branchOf(dir)).toBe(head.slice(0, branchOf(dir).length));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+// A tester's build with an update store needs a verification key; without one the bake refused it minutes in.
+test('a share of an app with an update store and no keys is refused before it builds, naming what to add', async () => {
+  const { unsignedStore } = await import('./share.mjs');
+  expect(unsignedStore({})).toContain('"deploy": { "store": { "ios": "0" } }');
+  expect(unsignedStore({ deploy: { store: { ios: '0' } } })).toBeNull();
+  expect(unsignedStore({ deploy: { signing: { keys: { k1: 'pub' } } } })).toBeNull();
+  expect(unsignedStore({ deploy: { signing: { keys: {} } } })).not.toBeNull();
+});

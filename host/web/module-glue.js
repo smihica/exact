@@ -2,7 +2,7 @@
 // LLP 1027.000 D3. Trusted app code, NOT a security sandbox. No page or
 // guest builtin is patched. Loaded only after the page's first pixel.
 import { bindAnswerStorage, createStorage, finishLetGo } from './storage.js';
-import { agentSeed, agentStream, keyStore, storageKey } from './storage-environment.js';
+import { agentSeed, agentStream, keyStore, refuseCodeFromStrings, storageKey } from './storage-environment.js';
 import { admitsNetwork, grantError, sameGrantDeclaration, scopedGrantSet } from './grant-admission.js';
 import { faultMatches } from './faults.js';
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -178,6 +178,7 @@ export async function prepare(payload, admitted, id = nextId++) {
     for (const key of ['XMLHttpRequest', 'WebSocket', 'EventSource']) {
       Object.defineProperty(win, key, { value: function () { throw new Error(`${key} is unavailable in data sources`); }, configurable: false });
     }
+    refuseCodeFromStrings(win);
     // A LAN dev page has no `crypto.subtle`: the realm's SHA-256 digest is
     // the dev protocol's, as module integrity's is (LLP 1069.005 D1).
     if (!win.crypto.subtle && globalThis.exact.moduleDigest) win.__exact_digest = bytes => globalThis.exact.moduleDigest(bytes);

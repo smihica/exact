@@ -279,6 +279,67 @@ fn a_stale_time_asks_again() {
     );
 }
 
+#[test]
+fn a_stale_time_follows_the_date_told_again() {
+    let (_app, mut r, calls) = boot("stale-date", "ios", &["purchases"]);
+    let mut parked = Vec::new();
+    pump(&mut r, &mut parked);
+    let reads = || called(&calls, "source", "listPurchases").len();
+    let first = reads();
+    assert!(first >= 1, "{}", logs(&r));
+
+    r.set_time(1_790_000_030_000.0, 60.0).unwrap();
+    r.advance(29_999.0).unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first, "not before its time: {}", logs(&r));
+    r.advance(30_000.0).unwrap();
+    assert!(r.polls_asking());
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first + 1, "{}", logs(&r));
+    assert!(!r.polls_asking());
+    r.advance(61_000.0).unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first + 1, "asked once: {}", logs(&r));
+}
+
+#[test]
+fn a_stale_time_reschedules_the_live_clock_when_the_date_changes() {
+    let (_app, mut r, calls) = boot("stale-live-date", "ios", &["purchases"]);
+    let time = std::rc::Rc::new(std::cell::Cell::new(0.0));
+    let sample = time.clone();
+    r.set_live_clock(Some(Box::new(move || sample.get())));
+    let mut parked = Vec::new();
+    pump(&mut r, &mut parked);
+    let reads = || called(&calls, "source", "listPurchases").len();
+    let first = reads();
+    assert!(first >= 1, "{}", logs(&r));
+    assert_eq!(r.timer_due_ms(), Some(60_000.0));
+
+    r.set_time(1_790_000_000_000.0, 60.0).unwrap();
+    assert_eq!(r.timer_due_ms(), Some(60_000.0), "only the offset changed");
+    r.set_time(1_789_999_970_000.0, 60.0).unwrap();
+    assert_eq!(r.timer_due_ms(), Some(90_000.0));
+    time.set(60_000.0);
+    r.advance(time.get()).unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first, "not before its time: {}", logs(&r));
+
+    r.set_time(1_790_000_010_000.0, 60.0).unwrap();
+    assert_eq!(r.timer_due_ms(), Some(50_000.0), "already overdue");
+    r.advance(time.get()).unwrap();
+    assert!(r.polls_asking());
+    assert_eq!(r.timer_due_ms(), None, "the ask is in flight");
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first + 1, "{}", logs(&r));
+    assert_eq!(r.timer_due_ms(), None, "the reply's time is already past");
+    r.set_time(1_789_999_970_000.0, 60.0).unwrap();
+    assert_eq!(r.timer_due_ms(), None, "the completed ask stays completed");
+    time.set(90_000.0);
+    r.advance(time.get()).unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(reads(), first + 1, "asked once: {}", logs(&r));
+}
+
 /// A target with no store: the status reads its default, the list is
 /// empty, and a purchase fails `NotSupportedError` before any sheet (D20).
 #[test]

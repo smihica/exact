@@ -156,6 +156,67 @@ fn its_face_is_its_children_read_live() {
 }
 
 #[test]
+fn a_grouped_button_made_native_by_a_class_can_match_its_face() {
+    let source = r#"style Native
+  appearance="auto"
+component App
+  state name: option<string> = none
+  action go
+    name = some("Ready")
+  view
+    column width=402 height=874
+      list appearance="auto" flex=1
+        section
+          button class=Native press=go testId="button"
+            match name
+              case some(n)
+                text n
+              case none
+                text "None"
+"#;
+    let nested = source.replace(
+        "            match name\n              case some(n)\n                text n\n              case none\n                text \"None\"",
+        r#"            if true
+              match name
+                case some(n)
+                  if true
+                    text n
+                  else
+                    text "Some"
+                case none
+                  if true
+                    text "None"
+                  else
+                    text "Missing"
+            else
+              text "Other""#,
+    );
+    for source in [source, nested.as_str()] {
+        let mut r = boot(source);
+        let button = view_of(&r, "button");
+        assert_eq!(
+            r.kernel().node(button).unwrap().node_type,
+            NodeType::Control
+        );
+        assert_eq!(
+            r.kernel().press_face(button).unwrap().title.as_deref(),
+            Some("None")
+        );
+        r.dispatch(button, Event::Press).unwrap();
+        assert_eq!(
+            r.kernel().press_face(button).unwrap().title.as_deref(),
+            Some("Ready")
+        );
+        for text in ["text n", "text \"None\""] {
+            let invalid = source.replace(text, &format!("{text} flex-grow=1"));
+            let error = contract::compile(&invalid).unwrap_err();
+            assert_eq!(error.id, "lower-button-style-attr", "{error}");
+            assert!(error.message.contains("`flex-grow`"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn the_switch_is_a_literal_after_classes() {
     // A class carries it, and `buttonStyle` with it.
     let r = boot(&format!(

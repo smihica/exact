@@ -81,6 +81,26 @@ pub struct Batch {
 
 pub use exact_runner::agent::quote;
 
+/// A reply whose batch must receive presenter work before it is wrapped.
+pub struct WrappedBatch {
+    pub(crate) batch: String,
+    fields: String,
+}
+
+impl WrappedBatch {
+    pub(crate) fn new(fields: impl Into<String>, batch: String) -> Self {
+        Self {
+            batch,
+            fields: fields.into(),
+        }
+    }
+
+    /// Serialize the reply with its batch under `batch`.
+    pub fn finish(self) -> String {
+        format!("{{{},\"batch\":{}}}", self.fields, self.batch)
+    }
+}
+
 fn string_map(pairs: &[(&str, String)], out: &mut String) {
     out.push('{');
     for (i, (k, v)) in pairs.iter().enumerate() {
@@ -184,6 +204,9 @@ impl Batch {
     }
 
     /// Encode a textual descendant without allocating a native view operation.
+    /// `opacity` is its presented opacity times its enclosing runs': a run
+    /// has no layer, so its paragraph multiplies it into the run's paint.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn inline_run(
         out: &mut String,
         id: u32,
@@ -192,6 +215,7 @@ impl Batch {
         style: &str,
         handlers: &[&str],
         paints: bool,
+        opacity: f64,
     ) {
         let _ = write!(
             out,
@@ -206,6 +230,10 @@ impl Batch {
         );
         let _ = write!(out, ",\"style\":{style},\"handlers\":");
         string_list(handlers, out);
+        if opacity != 1.0 {
+            // The row is an `f32`: its shortest form, `0.3`, not `0.30000001…`.
+            let _ = write!(out, ",\"opacity\":{}", opacity as f32);
+        }
         out.push('}');
     }
 
@@ -586,7 +614,10 @@ impl Batch {
             return;
         }
         let at = "{\"ops\":[".len();
-        debug_assert!(finished.starts_with("{\"ops\":["));
+        assert!(
+            finished.starts_with("{\"ops\":["),
+            "expected an unwrapped batch"
+        );
         let mut text = self.ops.join(",");
         if finished.as_bytes().get(at) != Some(&b']') {
             text.push(',');

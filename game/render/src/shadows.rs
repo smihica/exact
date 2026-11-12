@@ -22,14 +22,20 @@ pub(crate) struct Cascades {
 }
 
 impl Cascades {
-    pub fn new(frame: &FrameInput<'_>, settings: Shadows) -> Self {
+    /// The camera's view depth that shadows cover, `(near, far)`: none when
+    /// the shadow distance is at or before the camera's near plane, so
+    /// nothing the camera sees is within it and the frame has no sun shadow.
+    pub fn reach(frame: &FrameInput<'_>, settings: Shadows) -> Option<(f32, f32)> {
         let inverse = frame.proj.inverse();
         let near = -inverse.project_point3(Vec3::ZERO).z;
         let far = (-inverse.project_point3(Vec3::Z).z).min(settings.distance);
-        assert!(
-            near > 0.0 && far > near,
-            "shadow distance must exceed camera near"
-        );
+        (near > 0.0 && far > near).then_some((near, far))
+    }
+
+    pub fn new(frame: &FrameInput<'_>, settings: Shadows) -> Self {
+        let (near, far) =
+            Self::reach(frame, settings).expect("shadow distance must exceed camera near");
+        let inverse = frame.proj.inverse();
         let count = settings.cascades.clamp(1, 3);
         let resolution = settings.resolution.clamp(128, 4096);
         let mut result = Self {

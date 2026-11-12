@@ -149,6 +149,10 @@ enum Command {
         left: f32,
         right: f32,
     },
+    Pitch {
+        id: u64,
+        pitch: f32,
+    },
     Stop(u64),
 }
 #[derive(Clone, Copy)]
@@ -158,25 +162,29 @@ struct Packet {
 }
 use exact_game::{asset::SOUND_BYTE_BUDGET, audio::PCM_BYTE_BUDGET};
 
-/// Main-thread ownership and retry queue. The realtime side only returns a
-/// processed sequence watermark; it never touches an Arc or allocates.
+/// Main-thread ownership and retry queue. The realtime side returns processed
+/// sequences and completed generations; it never touches an Arc or allocates.
 struct Pending {
     byte_budget: usize,
     commands: Producer<Packet>,
     acknowledgements: Consumer<u64>,
     controls: VecDeque<Packet>,
     sets: BTreeMap<u64, (f32, f32)>,
+    pitches: BTreeMap<u64, f32>,
     retained: BTreeMap<usize, (crate::Pcm, u64)>,
     live: BTreeMap<u64, usize>,
     sent: BTreeMap<u64, usize>,
     stopping: BTreeMap<u64, u64>,
     sequence: u64,
     acknowledged: u64,
+    finished: Consumer<(u64, u64)>,
+    starts: BTreeMap<u64, u64>,
 }
 impl Pending {
     fn new() -> (Self, Mixer) {
         let (commands, consumer) = channel();
         let (acknowledgements, returns) = channel();
+        let (finished, completions) = channel();
         (
             Self {
                 // Synthesized PCM and resident sounds, each under its own budget.
@@ -185,17 +193,21 @@ impl Pending {
                 acknowledgements: returns,
                 controls: VecDeque::new(),
                 sets: BTreeMap::new(),
+                pitches: BTreeMap::new(),
                 retained: BTreeMap::new(),
                 live: BTreeMap::new(),
                 sent: BTreeMap::new(),
                 stopping: BTreeMap::new(),
                 sequence: 0,
                 acknowledged: 0,
+                finished: completions,
+                starts: BTreeMap::new(),
             },
             Mixer {
                 commands: consumer,
                 acknowledgements,
                 pending_ack: None,
+                finished,
                 voices: [None; 32],
                 rate: 48000.0,
             },
@@ -260,8 +272,12 @@ impl Pending {
         self.live.insert(id, pcm.address());
         true
     }
+    fn finished(&self, id: u64) -> bool {
+        !self.live.contains_key(&id) && !self.sent.contains_key(&id)
+    }
     fn stop(&mut self, id: u64) {
         self.sets.remove(&id);
+        self.pitches.remove(&id);
         let Some(ptr) = self.live.remove(&id) else {
             return;
         };
@@ -289,13 +305,34 @@ impl Pending {
             self.sets.insert(id, (left, right));
         }
     }
+    fn set_pitch(&mut self, id: u64, pitch: f32) {
+        if self.live.contains_key(&id) {
+            self.pitches.insert(id, pitch);
+        }
+    }
     fn flush(&mut self) {
+        while let Some((id, sequence)) = self.finished.pop() {
+            if self.starts.get(&id) == Some(&sequence) {
+                self.sent.remove(&id);
+                self.starts.remove(&id);
+                if !self.controls.iter().any(
+                    |p| matches!(p.command, Command::Start { id: pending, .. } if pending == id),
+                ) {
+                    self.live.remove(&id);
+                    self.sets.remove(&id);
+                    self.pitches.remove(&id);
+                }
+            }
+        }
         while let Some(ack) = self.acknowledgements.pop() {
             self.acknowledged = ack;
         }
         self.stopping.retain(|id, sequence| {
             if *sequence <= self.acknowledged {
-                self.sent.remove(id);
+                if self.starts.get(id).is_some_and(|start| *start <= *sequence) {
+                    self.sent.remove(id);
+                    self.starts.remove(id);
+                }
                 false
             } else {
                 true
@@ -332,6 +369,7 @@ impl Pending {
             match packet.command {
                 Command::Start { id, pcm, .. } => {
                     self.sent.insert(id, pcm.address());
+                    self.starts.insert(id, packet.sequence);
                     self.retained.get_mut(&pcm.address()).unwrap().1 = packet.sequence;
                 }
                 Command::Stop(id) => {
@@ -340,7 +378,7 @@ impl Pending {
                         self.retained.get_mut(&ptr).unwrap().1 = packet.sequence;
                     }
                 }
-                Command::Set { .. } => unreachable!(),
+                Command::Set { .. } | Command::Pitch { .. } => unreachable!(),
             }
             self.controls.remove(index);
         }
@@ -359,14 +397,33 @@ impl Pending {
             self.sequence += 1;
             self.sets.remove(&id);
         }
+        while let Some((&id, &pitch)) = self
+            .pitches
+            .iter()
+            .find(|(id, _)| self.sent.contains_key(id) && !self.stopping.contains_key(id))
+        {
+            let packet = Packet {
+                sequence: self.sequence + 1,
+                command: Command::Pitch { id, pitch },
+            };
+            if self.commands.push(packet).is_err() {
+                return;
+            }
+            self.sequence += 1;
+            self.pitches.remove(&id);
+        }
     }
 }
 #[derive(Clone, Copy)]
 struct Voice {
     id: u64,
+    sequence: u64,
     pcm: Samples,
     position: f64,
     step: f64,
+    source_rate: u32,
+    target_step: f64,
+    pitch_ramp: u32,
     looping: bool,
     left: f32,
     right: f32,
@@ -378,6 +435,7 @@ struct Mixer {
     commands: Consumer<Packet>,
     acknowledgements: Producer<u64>,
     pending_ack: Option<u64>,
+    finished: Producer<(u64, u64)>,
     voices: [Option<Voice>; 32],
     rate: f64,
 }
@@ -409,9 +467,13 @@ impl Mixer {
                     let slot = self.voices.iter().position(Option::is_none).unwrap();
                     self.voices[slot] = Some(Voice {
                         id,
+                        sequence: cmd.sequence,
                         pcm,
                         position: offset as f64,
                         step: rate as f64 * pitch as f64 / self.rate,
+                        source_rate: rate,
+                        target_step: rate as f64 * pitch as f64 / self.rate,
+                        pitch_ramp: 0,
                         looping,
                         left: 0.0,
                         right: 0.0,
@@ -425,6 +487,15 @@ impl Mixer {
                         v.target_left = crate::audio::gain(left);
                         v.target_right = crate::audio::gain(right);
                         v.ramp = (self.rate * 0.01).max(1.0) as u32;
+                    }
+                }
+                Command::Pitch { id, pitch } => {
+                    for v in self.voices.iter_mut().flatten().filter(|v| v.id == id) {
+                        let target = v.source_rate as f64 * pitch as f64 / self.rate;
+                        if target != v.target_step {
+                            v.target_step = target;
+                            v.pitch_ramp = (self.rate * 0.01).max(1.0) as u32;
+                        }
                     }
                 }
                 Command::Stop(id) => {
@@ -472,7 +543,9 @@ impl Mixer {
                 if v.looping {
                     v.position %= len as f64;
                 } else {
-                    *slot = None;
+                    if self.finished.push((v.id, v.sequence)).is_ok() {
+                        *slot = None;
+                    }
                     continue;
                 }
             }
@@ -485,7 +558,7 @@ impl Mixer {
                 i
             };
             // SAFETY: both frames are below len, and the output retains the
-            // immutable allocation until its stop command has been acknowledged.
+            // allocation until a stop acknowledgement or generation completion.
             let ((al, ar), (bl, br)) = unsafe { (v.pcm.frame(i), v.pcm.frame(j)) };
             // Linear interpolation resamples the source rate to the device rate.
             let t = (v.position - i as f64) as f32;
@@ -498,8 +571,15 @@ impl Mixer {
             }
             left += sl * v.left;
             right += sr * v.right;
+            if v.pitch_ramp > 0 {
+                v.step += (v.target_step - v.step) / v.pitch_ramp as f64;
+                v.pitch_ramp -= 1;
+            }
             v.position += v.step;
-            if !v.looping && v.position >= len as f64 {
+            if !v.looping
+                && v.position >= len as f64
+                && self.finished.push((v.id, v.sequence)).is_ok()
+            {
                 *slot = None;
             }
         }
@@ -817,6 +897,12 @@ mod device {
         }
         fn set(&mut self, id: u64, left: f32, right: f32) {
             self.pending.set(id, left, right);
+        }
+        fn set_pitch(&mut self, id: u64, pitch: f32) {
+            self.pending.set_pitch(id, pitch);
+        }
+        fn finished(&self, id: u64) -> bool {
+            self.pending.finished(id)
         }
         fn stop(&mut self, id: u64) {
             self.pending.stop(id);

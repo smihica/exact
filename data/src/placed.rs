@@ -57,6 +57,7 @@ enum Job {
         token: u64,
         outcome: Outcome,
         snapshot: Vec<(String, Vec<u8>)>,
+        clock: f64,
         reply: Reply,
     },
 }
@@ -487,9 +488,11 @@ impl<D: DataSource + 'static> Placed<D> {
                             token,
                             outcome,
                             snapshot,
+                            clock,
                             reply,
                         } => {
                             let mut local = Store::new(&grants, snapshot);
+                            local.set_clock_ms(clock);
                             let result = match &mut source {
                                 Ok(source) => source
                                     .module_landed(&mut local, token, outcome)
@@ -636,7 +639,7 @@ fn turn<D: DataSource>(
     }
 }
 
-impl<D: DataSource + 'static> DataSource for Placed<D> {
+impl<D: DataSource + 'static> exact_runner::DataSourceWrapper for Placed<D> {
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -658,6 +661,15 @@ impl<D: DataSource + 'static> DataSource for Placed<D> {
             .as_mut()
             .is_some_and(DataSource::take_storage_changed)
             || owner
+    }
+
+    fn note_storage_changed(&mut self) {
+        if self.owner.is_some() {
+            self.storage_changed
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else if let Some(inner) = &mut self.inner {
+            inner.note_storage_changed();
+        }
     }
 
     fn set_document_owner(&mut self, owner: u64) {
@@ -735,6 +747,19 @@ impl<D: DataSource + 'static> DataSource for Placed<D> {
 
     /// A worker-placed module does not draw yet (LLP 1056 stage 1; QUEUE):
     /// its canvases report the error through `state`.
+    fn draw_2d(
+        &mut self,
+        surface: &str,
+        args: &[Value],
+        ctx: &exact_runner::exact_canvas::Context2d,
+        frame: &exact_runner::exact_canvas::Frame,
+    ) -> Result<bool, exact_runner::exact_canvas::DrawError> {
+        match (&self.owner, self.inner.as_mut()) {
+            (None, Some(inner)) => inner.draw_2d(surface, args, ctx, frame),
+            _ => Err("a worker-placed module does not draw Canvas 2D yet".into()),
+        }
+    }
+
     fn draw(
         &mut self,
         request: &exact_runner::DrawRequest<'_>,
@@ -1059,7 +1084,7 @@ impl<D: DataSource + 'static> DataSource for Placed<D> {
             .collect();
         let mut out: Vec<_> = ready
             .into_iter()
-            .map(|token| (token, self.dispatch(token, store)))
+            .map(|token| (token, DataSource::dispatch(self, token, store)))
             .collect();
         let Some(inner) = self.inner.as_mut() else {
             return out;
@@ -1223,10 +1248,23 @@ impl<D: DataSource + 'static> DataSource for Placed<D> {
             token: child,
             outcome,
             snapshot: envelope::snapshot(store, &self.grants),
+            clock: store.clock_ms(),
             reply,
         });
         drop(unsent);
         Ok(Some(Request::continuation(continuation)))
+    }
+
+    fn module_landed(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<(), DataError> {
+        if self.owner.is_some() {
+            return Err(unavailable("a worker reply needs module_delivery"));
+        }
+        self.here()?.module_landed(store, token, outcome)
     }
 
     fn background_state(&self) -> Option<exact_runner::BackgroundState> {

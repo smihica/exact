@@ -382,6 +382,9 @@ fn relative(dir: &Path, to: &Path) -> Option<String> {
 /// and the new ones after the last `use` line, else after the comments
 /// that open the file.
 pub(crate) fn apply(src: &str, lines: &[UseLine]) -> String {
+    let (bom, src) = src
+        .strip_prefix('\u{feff}')
+        .map_or(("", src), |rest| ("\u{feff}", rest));
     let mut out: Vec<String> = src.lines().map(str::to_owned).collect();
     for l in lines {
         let Some(n) = l.line.map(|n| n as usize) else {
@@ -416,7 +419,7 @@ pub(crate) fn apply(src: &str, lines: &[UseLine]) -> String {
             out.insert(at + k, text);
         }
     }
-    let mut text = out.join("\n");
+    let mut text = format!("{bom}{}", out.join("\n"));
     if src.ends_with('\n') {
         text.push('\n');
     }
@@ -634,6 +637,35 @@ mod tests {
         assert_eq!(
             out,
             "// A note.\n// More.\nuse D from \"./d.contract\"\ncomponent App\n"
+        );
+    }
+
+    #[test]
+    fn use_edits_preserve_a_leading_byte_order_mark() {
+        let added = UseLine {
+            line: None,
+            text: "use Card from \"./ui.contract\"".into(),
+        };
+        for prefix in ["", "// note\n", "use Icon from \"./icons.contract\"\n"] {
+            let src = format!("\u{feff}{prefix}component App\n  view\n    Card()\n");
+            assert_eq!(
+                apply(&src, std::slice::from_ref(&added)),
+                format!(
+                    "\u{feff}{prefix}{}\ncomponent App\n  view\n    Card()\n",
+                    added.text
+                )
+            );
+        }
+        let src = "\u{feff}use Card from \"./ui.contract\" // note\ncomponent App\n";
+        assert_eq!(
+            apply(
+                src,
+                &[UseLine {
+                    line: Some(1),
+                    text: "use Card, Icon from \"./ui.contract\"".into(),
+                }]
+            ),
+            "\u{feff}use Card, Icon from \"./ui.contract\" // note\ncomponent App\n"
         );
     }
 }

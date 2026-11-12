@@ -24,18 +24,68 @@ pub enum ParseError {
     Empty,
     /// A property name outside `all` and the supported [`Property`] names.
     UnknownProperty(String),
-    /// A time without `s`/`ms`, or not a number.
+    /// A time without `s`/`ms`, or not a number; in a transition, a bare
+    /// number.
     BadTime(String),
-    /// An easing name or function this parser does not know.
+    /// A transition's part that is neither a time nor an easing this parser
+    /// knows (an animation's easing refuses with [`ParseError::BadValue`]).
     BadEasing(String),
-    /// A declaration with too many or too few parts.
+    /// A declaration that breaks the shorthand's shape (a third time, a part
+    /// given twice, too many parts, a keyframes body out of form): the
+    /// sentence that says which.
     BadShape(String),
+    /// A known easing function given arguments it does not take.
+    BadArguments {
+        /// The function as written.
+        text: String,
+        /// Its name, from [`EASING_FUNCTIONS`].
+        function: &'static str,
+    },
     /// Parsed, but the evaluator refuses it.
     Invalid(TransitionError),
-    /// A keyframe value outside its property's grammar (LLP 1055 D6).
+    /// A value outside its property's grammar (LLP 1055 D6): the sentence
+    /// that says which value and what the property takes.
     BadValue(String),
     /// Parsed, but the animation sampler refuses it (LLP 1055 D5).
     InvalidAnimation(crate::animation::AnimationError),
+    /// `-exact-spring()` where an animation's easing goes.
+    SpringInAnimation(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Empty => f.write_str("the value is empty"),
+            ParseError::UnknownProperty(p) => {
+                write!(f, "`{p}` is not a property a transition animates")
+            }
+            ParseError::BadTime(s) => write!(
+                f,
+                "`{s}` is not a time: a time is a number with `s` or `ms` (`0.3s`, `300ms`)"
+            ),
+            ParseError::BadEasing(s) => write!(
+                f,
+                "`{s}` is neither a time (a number with `s` or `ms`) nor an easing: linear, ease, ease-in, ease-out, ease-in-out, step-start, step-end, cubic-bezier(), steps(), linear() or -exact-spring()"
+            ),
+            ParseError::BadShape(s) => f.write_str(s),
+            ParseError::BadArguments { text, function } => {
+                let takes = match *function {
+                    "cubic-bezier" => "four numbers: x1, y1, x2, y2",
+                    "steps" => "a whole number of steps from 1 to 65535, then optionally a position: jump-start, jump-end, jump-none, jump-both, start or end",
+                    "linear" => "stops separated by commas, each a number and up to two percentages",
+                    _ => "no numbers, or three: stiffness, damping and mass",
+                };
+                write!(f, "`{text}`: `{function}()` takes {takes}")
+            }
+            ParseError::Invalid(e) => e.fmt(f),
+            ParseError::BadValue(s) => f.write_str(s),
+            ParseError::InvalidAnimation(e) => e.fmt(f),
+            ParseError::SpringInAnimation(s) => write!(
+                f,
+                "`{s}`: a spring is a transition's timing function, not an animation's"
+            ),
+        }
+    }
 }
 
 impl Transitions {
@@ -51,8 +101,14 @@ impl Transitions {
                 .into_iter()
                 .filter(|p| !p.is_empty())
                 .collect();
-            if parts.is_empty() || parts.len() > 4 {
-                return Err(ParseError::BadShape(decl.trim().to_string()));
+            let decl = decl.trim();
+            if parts.is_empty() {
+                return Err(ParseError::BadShape(format!(
+                    "`{text}` has an empty entry: each comma separates two transitions"
+                )));
+            }
+            if parts.len() > 4 {
+                return Err(ParseError::BadShape(format!("`{decl}` has more than four parts: a transition is a property, a duration, an easing and a delay")));
             }
             let mut property = None;
             let mut duration = 0.0;
@@ -64,19 +120,29 @@ impl Transitions {
                     match times {
                         0 => duration = t,
                         1 => delay = t,
-                        _ => return Err(ParseError::BadShape(decl.trim().to_string())),
+                        _ => return Err(ParseError::BadShape(format!("`{decl}` has a third time: a transition takes a duration, then a delay"))),
                     }
                     times += 1;
+                } else if time_like(part) {
+                    return Err(ParseError::BadTime((*part).to_string()));
+                } else if css_number(part) {
+                    // A number is never a property or an easing here: a time
+                    // written without its unit.
+                    return Err(ParseError::BadTime((*part).to_string()));
                 } else if let Some(named) = TransitionProperty::from_name(part) {
                     if property.is_some() {
-                        return Err(ParseError::BadShape(decl.trim().to_string()));
+                        return Err(ParseError::BadShape(format!("`{decl}` names two properties: a transition names one (`all` for every one)")));
                     }
                     property = Some(named);
                 } else {
                     match easing(part) {
                         Ok(value) if timing.is_none() => timing = Some(value),
-                        Ok(_) => return Err(ParseError::BadShape(decl.trim().to_string())),
-                        Err(_) if property.is_none() => {
+                        Ok(_) => {
+                            return Err(ParseError::BadShape(format!(
+                                "`{decl}` has two easings: a transition takes one"
+                            )))
+                        }
+                        Err(ParseError::BadEasing(_)) if property.is_none() => {
                             return Err(ParseError::UnknownProperty((*part).to_string()))
                         }
                         Err(error) => return Err(error),
@@ -96,6 +162,32 @@ impl Transitions {
         ts.validate().map_err(ParseError::Invalid)?;
         Ok(ts)
     }
+}
+
+/// Whether `s` is in CSS's number syntax, `[+-]?(\d+|\d*\.\d+)(e[+-]?\d+)?`
+/// (CSS Syntax 3 §4.3.12): Rust reads `inf` and `nan` as numbers too.
+fn css_number(s: &str) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (mantissa, exponent) = unsigned.split_once(['e', 'E']).unwrap_or((unsigned, "0"));
+    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    let number = match mantissa.split_once('.') {
+        Some((int, frac)) => (int.is_empty() || digits(int)) && digits(frac),
+        None => digits(mantissa),
+    };
+    number && digits(exponent)
+}
+
+/// Whether `s` is written as a time, a number then `s` or `ms`, even one
+/// [`time`] refuses (`1.2.3s`): an identifier that ends in `s` is not.
+pub(crate) fn time_like(s: &str) -> bool {
+    let stem = s
+        .strip_suffix("ms")
+        .or_else(|| s.strip_suffix('s'))
+        .unwrap_or_default();
+    let unsigned = stem.strip_prefix(['+', '-']).unwrap_or(stem);
+    let unsigned = unsigned.strip_prefix('.').unwrap_or(unsigned);
+    unsigned.starts_with(|c: char| c.is_ascii_digit())
 }
 
 pub(crate) fn time(s: &str) -> Result<f64, ParseError> {
@@ -141,11 +233,19 @@ pub(crate) fn easing(s: &str) -> Result<TimingFunction, ParseError> {
             if !EASING_FUNCTIONS.iter().any(|(n, _)| *n == name) {
                 return Err(ParseError::BadEasing(s.to_string()));
             }
+            let function = EASING_FUNCTIONS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or("", |(n, _)| *n);
+            let bad = || ParseError::BadArguments {
+                text: s.to_string(),
+                function,
+            };
             match name {
                 "cubic-bezier" => {
-                    let n = numbers(&args, s)?;
+                    let n = numbers(&args).ok_or_else(bad)?;
                     if n.len() != 4 {
-                        return Err(ParseError::BadEasing(s.to_string()));
+                        return Err(bad());
                     }
                     Easing::CubicBezier {
                         x1: n[0],
@@ -158,19 +258,19 @@ pub(crate) fn easing(s: &str) -> Result<TimingFunction, ParseError> {
                     let count = args
                         .first()
                         .and_then(|a| a.trim().parse::<u16>().ok())
-                        .ok_or_else(|| ParseError::BadEasing(s.to_string()))?;
+                        .ok_or_else(bad)?;
                     let position = match args.get(1).map(|a| a.trim()) {
                         None | Some("jump-end") | Some("end") => StepPosition::JumpEnd,
                         Some("jump-start") | Some("start") => StepPosition::JumpStart,
                         Some("jump-none") => StepPosition::JumpNone,
                         Some("jump-both") => StepPosition::JumpBoth,
-                        Some(_) => return Err(ParseError::BadEasing(s.to_string())),
+                        Some(_) => return Err(bad()),
                     };
                     Easing::Steps { count, position }
                 }
-                "linear" => Easing::PiecewiseLinear(linear_stops(&args, s)?),
+                "linear" => Easing::PiecewiseLinear(linear_stops(&args).ok_or_else(bad)?),
                 "-exact-spring" => {
-                    let n = numbers(&args, s)?;
+                    let n = numbers(&args).ok_or_else(bad)?;
                     let config = match n.len() {
                         0 => SpringConfig::default(),
                         3 => SpringConfig {
@@ -178,7 +278,7 @@ pub(crate) fn easing(s: &str) -> Result<TimingFunction, ParseError> {
                             damping: n[1],
                             mass: n[2],
                         },
-                        _ => return Err(ParseError::BadEasing(s.to_string())),
+                        _ => return Err(bad()),
                     };
                     return Ok(TimingFunction::Spring(config));
                 }
@@ -188,15 +288,15 @@ pub(crate) fn easing(s: &str) -> Result<TimingFunction, ParseError> {
     }))
 }
 
-fn linear_stops(args: &[String], whole: &str) -> Result<Vec<LinearStop>, ParseError> {
-    let bad = || ParseError::BadEasing(whole.to_string());
+/// `linear()`'s stops, `None` when an argument is not one.
+fn linear_stops(args: &[String]) -> Option<Vec<LinearStop>> {
     let mut stops: Vec<(Option<f64>, f64)> = Vec::new();
     for arg in args {
         let fields: Vec<&str> = arg.split_whitespace().collect();
         if fields.is_empty() || fields.len() > 3 {
-            return Err(bad());
+            return None;
         }
-        let output = exact_num::parse_f64(fields[0]).map_err(|_| bad())?;
+        let output = exact_num::parse_f64(fields[0]).ok()?;
         if fields.len() == 1 {
             stops.push((None, output));
             continue;
@@ -205,13 +305,12 @@ fn linear_stops(args: &[String], whole: &str) -> Result<Vec<LinearStop>, ParseEr
             let input = field
                 .strip_suffix('%')
                 .and_then(|value| exact_num::parse_f64(value).ok())
-                .map(|value| value / 100.0)
-                .ok_or_else(&bad)?;
+                .map(|value| value / 100.0)?;
             stops.push((Some(input), output));
         }
     }
     if stops.is_empty() {
-        return Err(bad());
+        return None;
     }
 
     // CSS Easing 2's fixup: default the endpoints, clamp authored positions
@@ -252,13 +351,15 @@ fn linear_stops(args: &[String], whole: &str) -> Result<Vec<LinearStop>, ParseEr
         }
         start = end;
     }
-    Ok(stops
-        .into_iter()
-        .map(|(input, output)| LinearStop {
-            input: input.unwrap(),
-            output,
-        })
-        .collect())
+    Some(
+        stops
+            .into_iter()
+            .map(|(input, output)| LinearStop {
+                input: input.unwrap(),
+                output,
+            })
+            .collect(),
+    )
 }
 
 fn call(s: &str) -> Option<(&str, Vec<String>)> {
@@ -279,11 +380,9 @@ fn call(s: &str) -> Option<(&str, Vec<String>)> {
     Some((name, args))
 }
 
-fn numbers(args: &[String], whole: &str) -> Result<Vec<f64>, ParseError> {
+fn numbers(args: &[String]) -> Option<Vec<f64>> {
     args.iter()
-        .map(|a| {
-            exact_num::parse_f64(a.trim()).map_err(|_| ParseError::BadEasing(whole.to_string()))
-        })
+        .map(|a| exact_num::parse_f64(a.trim()).ok())
         .collect()
 }
 
@@ -355,8 +454,12 @@ mod tests {
         );
         assert_eq!(
             Transitions::parse("opacity 1"),
-            Err(ParseError::BadEasing("1".into())),
-            "a unitless number is neither a time nor an easing"
+            Err(ParseError::BadTime("1".into())),
+            "a unitless number is a time without its unit"
+        );
+        assert_eq!(
+            Transitions::parse("0.3 opacity"),
+            Err(ParseError::BadTime("0.3".into()))
         );
         assert_eq!(
             Transitions::parse("opacity 1s bounce"),
@@ -415,5 +518,98 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0.0, 0.0), (0.2, 0.0), (0.8, 1.0), (1.0, 1.0)]
         );
+    }
+
+    #[test]
+    fn a_refusal_states_the_rule_in_words() {
+        for (text, says) in [
+            (
+                "opacity 0.3",
+                "`0.3` is not a time: a time is a number with `s` or `ms`",
+            ),
+            (
+                "opacity 1s bounce",
+                "`bounce` is neither a time (a number with `s` or `ms`) nor an easing: linear,",
+            ),
+            ("opacity -1s", "a duration is 0 or more"),
+            (
+                "opacity 1s ease linear",
+                "has two easings: a transition takes one",
+            ),
+            (
+                "opacity 0.3s 0.1s 0.2s",
+                "has a third time: a transition takes a duration, then a delay",
+            ),
+            ("opacity scale 1s", "names two properties"),
+            (
+                "opacity 1s, ",
+                "has an empty entry: each comma separates two transitions",
+            ),
+            (
+                "opacity 1s ease 0s opacity linear",
+                "has more than four parts",
+            ),
+            (
+                "opacity cubic-bezier(0.4, 0, 0.2)",
+                "`cubic-bezier()` takes four numbers: x1, y1, x2, y2",
+            ),
+            (
+                "opacity 1s steps(1.5)",
+                "`steps()` takes a whole number of steps",
+            ),
+            (
+                "opacity 1s steps(4, jump-sideways)",
+                "then optionally a position: jump-start,",
+            ),
+            ("opacity 1s linear(x)", "`linear()` takes stops"),
+            (
+                "opacity -exact-spring(1, 2)",
+                "`-exact-spring()` takes no numbers, or three",
+            ),
+            (
+                "cubic-bezier(1) opacity",
+                "`cubic-bezier()` takes four numbers",
+            ),
+            // A word Rust reads as a number is no CSS number: no unit is missing.
+            ("opacity inf", "`inf` is neither a time"),
+            ("opacity NaN", "`NaN` is neither a time"),
+            (
+                "opacity .5",
+                "`.5` is not a time: a time is a number with `s` or `ms`",
+            ),
+            ("opacity 1e2", "`1e2` is not a time"),
+            ("opacity 1.2.3s", "`1.2.3s` is not a time"),
+            ("opacity 1e999s", "a transition's duration is finite"),
+            ("opacity 0s 1e999s", "a transition's delay is finite"),
+            (
+                "opacity -exact-spring() 0.2s",
+                "write no time, or `0s` and then the delay",
+            ),
+            (
+                "opacity -exact-spring(1e999, 1, 1)",
+                "a spring's stiffness is finite",
+            ),
+            (
+                "opacity -exact-spring(100, 1e200, 1)",
+                "use a larger mass, or a smaller stiffness or damping",
+            ),
+            ("opacity 1s steps(0)", "`steps()` takes at least one step"),
+            (
+                "opacity 1s cubic-bezier(2, 0, 0.2, 1)",
+                "control point's x is from 0 to 1",
+            ),
+            (
+                "opacity 1s -exact-spring(1, 2, 3)",
+                "write no time, or `0s` and then the delay",
+            ),
+            ("opacity -exact-spring(0, 2, 3)", "stiffness is above 0"),
+            (
+                "width 1s",
+                "`width` is not a property a transition animates",
+            ),
+        ] {
+            let message = Transitions::parse(text).unwrap_err().to_string();
+            assert!(message.contains(says), "{text}: {message}");
+        }
     }
 }

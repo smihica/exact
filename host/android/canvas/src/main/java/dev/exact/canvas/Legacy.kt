@@ -59,10 +59,13 @@ object Legacy {
     }
 
     /** Dark icons in the bars over a light page, before `WindowInsetsController` (API 30). */
-    internal fun lightBars(window: Window, light: Boolean) {
+    internal fun lightBars(window: Window, statusLight: Boolean, navigationLight: Boolean) {
         val v = window.decorView
-        val bits = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-        v.systemUiVisibility = if (light) v.systemUiVisibility or bits else v.systemUiVisibility and bits.inv()
+        val status = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        val navigation = View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        val mask = status or navigation
+        v.systemUiVisibility = (v.systemUiVisibility and mask.inv()) or
+            (if (statusLight) status else 0) or (if (navigationLight) navigation else 0)
     }
 
     /** [ExactActivity]'s four insets from what API 29 has (`WindowInsets.Type` is API 30), read from the root's

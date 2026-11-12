@@ -40,7 +40,7 @@ fn main() {
         contract::linux_entry(
             "map_demo_data::Map",
             "map_demo_data::Map",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

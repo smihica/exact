@@ -5,7 +5,8 @@ mock.module('./rt.js', () => ({
   inflight: { n: 0 }, Hosts: {}, OnHooks: {}, viewId: () => 1, Views: new Map(), data: {}, painted: () => Promise.resolve(),
 }));
 mock.module('./pointer.js', () => ({ record: () => {} }));
-const { inertAncestor, liveById } = await import('../web/navigation.js');
+const { inertAncestor } = await import('../web/navigation/layers.js');
+const { liveById } = await import('../web/navigation/routes.js');
 mock.module('./navigation.js', () => ({ inertAncestor, liveById, reportPlace: () => '' }));
 // The real admission over the grant set the Rust parser writes for
 // `fs.read "app:/data/a b"` (runner/src/grants.rs `normalized_json`, pinned

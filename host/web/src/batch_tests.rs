@@ -505,6 +505,22 @@ fn a_long_poll_on_other_work_is_refused_before_dispatch() {
     }
 }
 
+/// LLP 1016.000 D11: this host's sockets carry no idle timeout, so a
+/// request that has one is refused, by name, rather than opened without it.
+#[test]
+fn an_idle_timeout_is_refused_by_name_on_the_wasm_host() {
+    let exact_runner::Answer::Later(request) =
+        exact_runner::Answer::stream(Request::get("wss://example.test/feed"))
+    else {
+        unreachable!()
+    };
+    assert_eq!(crate::batch::request_refusal(&request), None);
+    assert_eq!(
+        crate::batch::request_refusal(&request.idle_timeout(60_000)),
+        Some("an idle timeout is unavailable on the web's wasm host")
+    );
+}
+
 /// LLP 1016.000 D10 on the web page: an upload's op says so (the page sends
 /// it with XMLHttpRequest, http-body.js `upload`), and the batch refuses, in
 /// the words of the native hosts, an upload they refuse.

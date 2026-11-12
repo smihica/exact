@@ -2,7 +2,7 @@
 // menu item, a login item's settings, a global shortcut and a request for
 // attention. `desktop.mjs` makes it an app and drives it.
 use loginItemStatus, registerLoginItem, unregisterLoginItem, openLoginItemSettings, LoginItemStatus from "@exact/login-item"
-use globalShortcut, checkGlobalShortcut, GlobalShortcut, GlobalShortcutCheck from "@exact/global-shortcuts"
+use globalShortcut, checkGlobalShortcut, globalshortcut, GlobalShortcut, GlobalShortcutCheck from "@exact/global-shortcuts"
 use requestAttention from "@exact/dock"
 
 component App

@@ -193,7 +193,7 @@ extension BatchReader {
 
     package mutating func inline() throws -> InlineText {
         var id: UInt32?, parent: UInt32?, props: [String: String] = [:]
-        var style = InlineStyle(), handlers: Set<String> = [], paints = false
+        var style = InlineStyle(), handlers: Set<String> = [], paints = false, opacity = 1.0
         try object { r, key in
             switch key {
             case "id": id = try r.id()
@@ -205,23 +205,20 @@ extension BatchReader {
                 case "style": style = try r.inlineStyle()
                 case "handlers": handlers = Set(try r.array { try $0.string() })
                 case "paint": paints = try r.bool()
+                case "opacity": opacity = try r.number()
                 default: try r.skip()
                 }
             }
         }
         guard let id, let parent else { throw Invalid.wire }
-        return InlineText(id: id, parent: parent, props: props, style: style, handlers: handlers, paints: paints)
+        return InlineText(id: id, parent: parent, props: props, style: style, handlers: handlers, paints: paints, opacity: opacity)
     }
     package mutating func inlineStyle() throws -> InlineStyle {
         var style = InlineStyle(), height: BatchValue?
         try object { r, key in
             switch key {
-            case "font_size", "font_weight", "font_family", "font_style", "font_stretch", "font_variation_settings", "letter_spacing", "text_color", "text_decoration_line", "background_color", "font_variant_numeric", "font_variant_ligatures", "font_feature_settings",
-                 "text_shadow", "text_stroke_width", "text_stroke_color", "visibility", "user_select", "outline_style",
-                 "border_radius_top_left", "border_radius_top_right", "border_radius_bottom_right", "border_radius_bottom_left":
-                try style.set(key, r.value(), colorChannels: r.colorChannels)
             case "line_height": height = try r.value()
-            default: try r.skip()
+            default: try style.set(key, r.value(), colorChannels: r.colorChannels)
             }
         }
         try style.height(height)
@@ -281,7 +278,8 @@ package struct BatchFields {
         for (key, value) in rows where key != "line_height" { try style.set(key, value, colorChannels: colorChannels) }
         try style.height(rows["line_height"])
         return InlineText(id: id, parent: parent, props: try strings("props"), style: style,
-                          handlers: Set(try array("handlers", Self.string)), paints: try bool("paint") ?? false)
+                          handlers: Set(try array("handlers", Self.string)), paints: try bool("paint") ?? false,
+                          opacity: try number("opacity") ?? 1)
     }
     package func op(colorChannels: ((BatchValue, Bool) -> [Double]?)? = nil) throws -> BatchOp {
         guard let name = try string("op") else { throw BatchReader.Invalid.wire }
@@ -326,7 +324,7 @@ extension InlineStyle {
         case "font_variant_numeric": run.numeric = Int(try BatchFields.number(value)) & 0xff
         case "font_variant_ligatures": run.ligatures = Int(try BatchFields.number(value)) & 0xff
         case "font_feature_settings": run.features = FontFeature.of(value)
-        case "visibility": run.hidden = try BatchFields.string(value) == "hidden"
+        case "visibility": run.hidden = try BatchFields.string(value) != "visible"
         case "user_select": selectsAll = try BatchFields.string(value) == "all"
         case "outline_style": outlineNone = try BatchFields.string(value) == "none"
         case "text_decoration_line": run.decoration = try BatchFields.string(value)

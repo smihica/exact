@@ -1,10 +1,10 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // A popover opened at the press (LLP 1021 D2): its author reads the click's `clientX`/`clientY` and writes them as
 // its `left`/`top`, as a page without Electron's `Menu.popup({x, y})` does. In the neutral look its invoker no longer
 // places it (neutral.css's `position-area` gives way), and where the point leaves too little room it opens the
 // other way from it, as a context menu at the pointer does (navigation.js `insetAt`), from where the insets are as
 // they change. One with no inset still opens at its invoker, and one with an authored `position-area` is placed by it. Chrome is the oracle; the page's stylesheet is a default build's (look.mjs).
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 

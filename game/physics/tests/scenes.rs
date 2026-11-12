@@ -421,6 +421,78 @@ fn sensors_filter_events_and_journal() {
 }
 
 #[test]
+fn a_touch_within_one_step_keeps_event_and_journal_order() {
+    for moving_sensor in [false, true] {
+        let mut w = World::new(60, 0);
+        physics::register(&mut w);
+        let gate = w.spawn_named(
+            "gate",
+            (
+                Transform::default(),
+                physics::Announce,
+                Collider {
+                    sensor: true,
+                    shape: Shape::Box {
+                        half: Vec3::new(0.01, 1.0, 1.0),
+                    },
+                    ..Collider::default()
+                },
+            ),
+        );
+        let ball = w.spawn_named(
+            "ball",
+            (
+                Transform::at(-1.0, 0.0, 0.0),
+                Body {
+                    velocity: Vec3::X * 6.0,
+                    gravity: 0.0,
+                    ..Body::default()
+                },
+                Collider {
+                    shape: Shape::Sphere { radius: 0.03 },
+                    ..Collider::default()
+                },
+            ),
+        );
+        let mover = if moving_sensor {
+            gate
+        } else {
+            w.spawn((Transform::at(500.0, 0.0, 0.0), Collider::default()))
+        };
+        w.insert(
+            mover,
+            Body {
+                kind: BodyKind::Kinematic,
+                ..Body::default()
+            },
+        );
+        for _ in 0..10 {
+            physics::step(&mut w);
+            assert!(physics::events(&w).is_empty());
+        }
+        w.get_mut::<Transform>(mover).unwrap().position.z += 2.0;
+        physics::step(&mut w);
+        let events: Vec<_> = physics::events(&w)
+            .iter()
+            .map(|e| (e.a, e.b, e.began))
+            .collect();
+        assert_eq!(events, [(gate, ball, true), (gate, ball, false)]);
+        let journal = w.journal();
+        let lines: Vec<_> = journal
+            .iter()
+            .filter(|e| e.line.ends_with("gate × ball"))
+            .map(|e| e.line.as_str())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(" touch gate × ball"), "{lines:?}");
+        assert!(lines[1].ends_with(" untouch gate × ball"), "{lines:?}");
+        drop(journal);
+        physics::step(&mut w);
+        assert!(physics::events(&w).is_empty());
+    }
+}
+
+#[test]
 fn removed_colliders_keep_their_event_identity_across_restore() {
     let mut w = World::new(60, 0);
     physics::register(&mut w);

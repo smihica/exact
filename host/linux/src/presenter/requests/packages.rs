@@ -8,7 +8,7 @@
 //! other's handler.
 
 use super::Inbox;
-use crate::package::{Context, Entry, Json, Package, Reply};
+use crate::package::{Context, Entry, Json, Package, Reply, Slot};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -21,6 +21,8 @@ pub(in crate::presenter) struct Packages {
     agent: Vec<&'static str>,
     now: Rc<Cell<f64>>,
     lines: Rc<RefCell<Vec<String>>>,
+    /// The runner's native slot, which every instance announces into.
+    native: Slot,
 }
 
 /// The extension a body names.
@@ -48,6 +50,11 @@ impl Packages {
         (self.table.iter().map(|e| e.extension)).partition(|e| !self.agent.contains(e))
     }
 
+    /// The instances announce into `native` from now on.
+    pub(super) fn slot(&self, native: exact_runner::Native) {
+        *self.native.lock().unwrap_or_else(|e| e.into_inner()) = native;
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.table.is_empty()
     }
@@ -72,7 +79,6 @@ impl Packages {
         body: &[u8],
         reply: exact_runner::Reply,
         now: f64,
-        native: &exact_runner::Native,
         inbox: &Inbox,
         wake: &std::sync::Arc<dyn Fn() + Send + Sync>,
     ) {
@@ -81,7 +87,7 @@ impl Packages {
             return Reply::new(reply).error("NotSupportedError", Some("not a module call"));
         };
         let extension = request["extension"].as_str().unwrap_or_default();
-        let Some(at) = self.instance(extension, native) else {
+        let Some(at) = self.instance(extension) else {
             return Reply::new(reply).error("NotSupportedError", None);
         };
         let (_, package, context) = &mut self.made[at];
@@ -149,7 +155,7 @@ impl Packages {
 
     /// The index of `extension`'s instance in this session, made now if
     /// none is.
-    fn instance(&mut self, extension: &str, native: &exact_runner::Native) -> Option<usize> {
+    fn instance(&mut self, extension: &str) -> Option<usize> {
         if let Some(at) = self.made.iter().position(|(e, ..)| *e == extension) {
             return Some(at);
         }
@@ -159,7 +165,7 @@ impl Packages {
         let context = Context::new(
             entry.extension,
             self.agent.contains(&entry.extension),
-            native.clone(),
+            self.native.clone(),
             self.now.clone(),
             self.lines.clone(),
         );

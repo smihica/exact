@@ -166,10 +166,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         self.quads.order::<ASSETS>(&self.device, &self.queue);
         // Soft particles read the opaque depth: the translucent pass splits from
         // the opaque one (not under a scene copy, whose continuation draws them
-        // hard). Depth stays retained once they have drawn, so toggling them
-        // never recreates the targets (and drops bloom and SSAO).
+        // hard).
         let soft = self.quads.soft_drawn() && !needs.contains(crate::Needs::SCENE_COPY);
-        self.soft_retained |= soft;
         // A look frame counts its particle draws, which read the scene's depth
         // in a translucent pass of their own, as soft particles do
         // (quad_coverage.rs), on the path the live frame takes: into the HDR
@@ -179,6 +177,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         let counting = particles && !needs.contains(crate::Needs::SCENE_COPY);
         let direct = self.direct_frame::<H>(frame, soft);
         let shafts = crate::water::shafts(frame, self.water_effects);
+        // Keep depth retained after an effect reads it: toggling the effect or
+        // crossing water must not replace the attachments, bloom and SSAO.
+        self.effects_retained |= soft || shafts;
         // A direct frame leaves the HDR attachments as they are, unused.
         let scene_copy = if direct {
             self.prepare_direct(target.texture().size(), counting);
@@ -187,7 +188,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             self.prepare_targets(
                 size,
                 needs,
-                frame.ambient_occlusion.is_some() || self.soft_retained || counting || shafts,
+                frame.ambient_occlusion.is_some() || self.effects_retained || counting,
             )
         };
         self.water.prepare(
@@ -673,6 +674,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             .sun
             .filter(|sun| sun.illuminance != 0.0)
             .and_then(|s| s.shadows)
+            // A shadow distance at or before the near plane shadows nothing
+            // the camera sees: no cascades, and their maps are released.
+            .filter(|s| Cascades::reach(frame, *s).is_some())
             .map(|s| Cascades::new(frame, s));
         if let Some(c) = &cascades {
             if self.shadows.as_ref().is_none_or(|s| {
@@ -745,11 +749,6 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     hide: e.hide,
                 })
                 .collect();
-        }
-        if self.levels.changed {
-            if let Some(skinning) = &mut self.models.skinning {
-                skinning.activate(&self.queue, &self.levels.hidden);
-            }
         }
     }
 

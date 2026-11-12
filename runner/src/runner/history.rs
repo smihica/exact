@@ -29,14 +29,29 @@ fn selected(r: &Router) -> &[Entry] {
 }
 
 /// Update `ahead`, nearest last, for a commit from `before` to `after`.
-pub(super) fn step(before: Option<&Router>, after: &Router, ahead: &mut Vec<String>) {
+pub(super) fn step(
+    before: Option<&Router>,
+    after: &Router,
+    ahead: &mut Vec<String>,
+    forward: bool,
+) {
     let Some(before) = before.filter(|b| b.tab == after.tab) else {
         ahead.clear();
         return;
     };
     let (old, new) = (selected(before), selected(after));
     let same = |a: &[Entry], b: &[Entry]| a.iter().map(|e| e.id).eq(b.iter().map(|e| e.id));
-    if new.len() < old.len() && same(&old[..new.len()], new) {
+    if forward
+        && new.last().is_some_and(|top| {
+            ahead
+                .last()
+                .is_some_and(|next| *next == top.url || *next == location(top))
+        })
+    {
+        // `go` may pop to an earlier visit at this location. Forward still
+        // consumes the entry it took and puts none of those popped visits ahead.
+        ahead.pop();
+    } else if new.len() < old.len() && same(&old[..new.len()], new) {
         // Back, by one visit or several: the nearest is the one beneath the
         // old top's chain, so it goes last.
         ahead.extend(old[new.len()..].iter().rev().map(location));
@@ -87,14 +102,14 @@ mod tests {
         let mut ahead = Vec::new();
         let three = router("home", &[(0, "/"), (1, "/a"), (2, "/b")]);
         let one = router("home", &[(0, "/")]);
-        step(Some(&three), &one, &mut ahead);
+        step(Some(&three), &one, &mut ahead, false);
         assert_eq!(ahead, ["/b", "/a"], "two steps back: /a is the nearest");
         // Forward is a new visit at the nearest location.
         let forward = router("home", &[(0, "/"), (3, "/a")]);
-        step(Some(&one), &forward, &mut ahead);
+        step(Some(&one), &forward, &mut ahead, false);
         assert_eq!(ahead, ["/b"]);
         // A commit that leaves the stack's visits as they were keeps them.
-        step(Some(&forward), &forward, &mut ahead);
+        step(Some(&forward), &forward, &mut ahead, false);
         assert_eq!(ahead, ["/b"]);
     }
 
@@ -111,18 +126,18 @@ mod tests {
             router("settings", &[(0, "/settings")]),
         ] {
             let mut ahead = Vec::new();
-            step(Some(&two), &one, &mut ahead);
+            step(Some(&two), &one, &mut ahead, false);
             assert_eq!(ahead, ["/a"]);
-            step(Some(&one), &after, &mut ahead);
+            step(Some(&one), &after, &mut ahead, false);
             assert!(ahead.is_empty(), "{after:?}");
         }
         // A `replace` keeps the visit's id: what is ahead stays.
         let mut ahead = Vec::new();
-        step(Some(&two), &one, &mut ahead);
-        step(Some(&one), &router("home", &[(0, "/c")]), &mut ahead);
+        step(Some(&two), &one, &mut ahead, false);
+        step(Some(&one), &router("home", &[(0, "/c")]), &mut ahead, false);
         assert_eq!(ahead, ["/a"]);
         let mut ahead = vec!["/a".to_string()];
-        step(None, &one, &mut ahead);
+        step(None, &one, &mut ahead, false);
         assert!(ahead.is_empty(), "a launch has nothing ahead");
     }
 
@@ -132,9 +147,42 @@ mod tests {
         let mut two = router("home", &[(0, "/"), (1, "/a")]);
         two.tabs[0].stack[1].fragment = "part".into();
         let one = router("home", &[(0, "/")]);
-        step(Some(&two), &one, &mut ahead);
+        step(Some(&two), &one, &mut ahead, false);
         assert_eq!(ahead, ["/a#part"]);
-        step(Some(&one), &two, &mut ahead);
+        step(Some(&one), &two, &mut ahead, false);
+        assert!(ahead.is_empty());
+    }
+
+    #[test]
+    fn forward_that_pops_takes_only_the_nearest_location() {
+        let before = router("home", &[(0, "/"), (1, "/a"), (2, "/b")]);
+        let after = router("home", &[(0, "/"), (1, "/a")]);
+        let mut ahead = vec!["/c".into(), "/a".into()];
+        step(Some(&before), &after, &mut ahead, true);
+        assert_eq!(ahead, ["/c"]);
+
+        // Back to the same visit has the same router values, but adds /b ahead.
+        let mut ahead = vec!["/c".into(), "/a".into()];
+        step(Some(&before), &after, &mut ahead, false);
+        assert_eq!(ahead, ["/c", "/a", "/b"]);
+
+        // A refused Forward keeps its destination; a redirect follows its own change.
+        let mut ahead = vec!["/c".into(), "/a".into()];
+        step(Some(&before), &before, &mut ahead, true);
+        assert_eq!(ahead, ["/c", "/a"]);
+        let redirect = router("home", &[(0, "/"), (3, "/other")]);
+        step(Some(&before), &redirect, &mut ahead, true);
+        assert!(ahead.is_empty());
+    }
+
+    #[test]
+    fn forward_to_an_earlier_visit_preserves_its_fragment_when_none_was_requested() {
+        let mut before = router("home", &[(0, "/"), (1, "/a"), (2, "/b")]);
+        before.tabs[0].stack[1].fragment = "kept".into();
+        let mut after = before.clone();
+        after.tabs[0].stack.pop();
+        let mut ahead = vec!["/a".into()];
+        step(Some(&before), &after, &mut ahead, true);
         assert!(ahead.is_empty());
     }
 }

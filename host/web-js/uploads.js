@@ -13,6 +13,11 @@ export const INTERRUPTED = ['the upload was cut off before its reply; it is not 
 const ANSWERS_KEPT = 32;
 const ALREADY_SENT = [`already sent: the upload went out at these arguments, and of a resource's uploads only the newest ${ANSWERS_KEPT} keep their answers; give new arguments to send it again`, 'error', 'already-sent'];
 const identity = (r, a) => (r.context ? a.slice(0, a.length - r.context) : a);
+const streamLocked = Object.getOwnPropertyDescriptor(ReadableStream.prototype, 'locked').get;
+export function refuseStreamBody(body) {
+  try { streamLocked.call(body); } catch { return; }
+  throw new TypeError('fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first');
+}
 
 /** The uploads of `r` whose ticket was let go once that commit stood (rt.js `closeLetGo` closes it): each is cut off
  * if it reached the network, and forgotten if it never did. */
@@ -71,6 +76,7 @@ export const ledger = {
 export function requestKey({ input, init, redirect }) {
   if (init?.exactUploadProgress !== true) return undefined;
   const request = typeof Request === 'function' && input instanceof Request ? input : null, body = init.body;
+  refuseStreamBody(body);
   const bytes = body == null ? null : body instanceof ArrayBuffer ? new Uint8Array(body) : ArrayBuffer.isView(body) ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength) : new TextEncoder().encode(String(body));
   let hash = 0x811c9dc5;
   for (const b of bytes ?? []) hash = Math.imul(hash ^ b, 16777619) >>> 0;

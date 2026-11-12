@@ -77,6 +77,60 @@ fn a_checkbox_is_a_control_with_a_role() {
     assert_eq!(checked(&r, "muted"), (Some(false), Some(false)));
 }
 
+#[test]
+fn view_binders_preserve_positional_words() {
+    let mut compiled = Vec::new();
+    let mut errors = Vec::new();
+    for (tag, word, attrs, prop, expected) in [
+        (
+            "input",
+            "switch",
+            "type=\"checkbox\" checked=true",
+            PropId::AccessibilityRole,
+            exact_kernel::PropValue::Str("switch".into()),
+        ),
+        (
+            "input",
+            "multiple",
+            "type=\"file\"",
+            PropId::Multiple,
+            exact_kernel::PropValue::Bool(true),
+        ),
+        (
+            "scroll",
+            "document",
+            "height=10",
+            PropId::ScrollDocument,
+            exact_kernel::PropValue::Bool(true),
+        ),
+    ] {
+        for prefix in ["", "component App\n  view\n    Child()\n"] {
+            let source = format!(
+                "{prefix}component Child\n  state {word} = 0\n  view\n    column\n      for {word} in [\"a\"] key={word}\n        {tag} {word} {attrs} testId={word}\n        text {word} testId=\"value\"\n"
+            );
+            match contract::compile(&source) {
+                Ok(plan) => compiled.push((plan, prop, expected.clone())),
+                Err(error) => errors.push(format!("{word} ({prefix:?}): {error}")),
+            }
+        }
+    }
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    for (plan, prop, expected) in compiled {
+        let r = Runner::boot(
+            plan,
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        let node = r.kernel().node(view_of(&r, "a")).unwrap();
+        assert_eq!(node.props.get(prop), Some(&expected));
+        let value = r.kernel().node(view_of(&r, "value")).unwrap();
+        assert_eq!(value.props.str(PropId::Text), Some("a"));
+    }
+}
+
 /// LLP 1115.000 D10.1: a checkbox, a radio and a range have no margin of
 /// their own on any host (Chrome's UA sheet gives them `3px 3px 3px 4px`,
 /// `3px 3px 0 5px` and `2px`, which lowering wrote into every plan). The
@@ -728,6 +782,105 @@ fn a_date_carries_htmls_value_format_within_min_and_max() {
     assert!(r.dispatch(at, Event::Change(true.into())).is_err());
 }
 
+#[test]
+fn date_and_time_bounds_compare_values_across_precisions() {
+    let mut failures = Vec::new();
+    for (kind, min, max, accepted, refused) in [
+        (
+            "time",
+            "09:00:00",
+            "17:00",
+            vec!["09:00", "09:00:00.000", "17:00:00", "17:00:00.0", ""],
+            vec!["08:59", "08:59:59.999", "17:00:00.001", "17:01"],
+        ),
+        (
+            "datetime-local",
+            "2026-01-01T09:00:00",
+            "2026-12-31T17:00",
+            vec!["2026-01-01T09:00", "2026-12-31T17:00:00", ""],
+            vec!["2026-01-01T08:59", "2026-12-31T17:00:00.001"],
+        ),
+        (
+            "time",
+            "09:00:00.1",
+            "09:00:00.12",
+            vec!["09:00:00.10", "09:00:00.100", "09:00:00.120"],
+            vec!["09:00:00.099", "09:00:00.121"],
+        ),
+        (
+            "time",
+            "22:00",
+            "06:00:00",
+            vec!["23:00", "05:00", "22:00:00", "06:00", "00:00", ""],
+            vec!["12:00", "06:00:00.001", "21:59:59.999"],
+        ),
+        (
+            "time",
+            "09:00:00",
+            "09:00",
+            vec!["09:00", "09:00:00", "09:00:00.000", ""],
+            vec!["08:59:59.999", "09:00:00.001", "12:00"],
+        ),
+        (
+            "date",
+            "9999-12-31",
+            "10000-01-02",
+            vec!["9999-12-31", "10000-01-01", "10000-01-02"],
+            vec!["9999-12-30", "10000-01-03"],
+        ),
+        (
+            "datetime-local",
+            "2026-12-31T22:00",
+            "2026-01-01T06:00",
+            vec![""],
+            vec!["2026-12-31T23:00", "2026-01-01T05:00"],
+        ),
+        (
+            "time",
+            "invalid",
+            "17:00",
+            vec!["00:00", "17:00:00", ""],
+            vec!["17:00:00.001"],
+        ),
+        (
+            "time",
+            "09:00:00",
+            "",
+            vec!["09:00", "23:59", ""],
+            vec!["08:59:59.999"],
+        ),
+    ] {
+        let mut r = boot(&format!(
+            "component App\n  state chosen = \"\"\n  action set(value: string)\n    chosen = value\n  view\n    input type=\"{kind}\" value=chosen min=\"{min}\" max=\"{max}\" input=set change=set testId=\"control\"\n"
+        ));
+        let view = view_of(&r, "control");
+        for event in [Event::Input, Event::Change] {
+            for text in &accepted {
+                if let Err(error) = r.dispatch(view, event((*text).into())) {
+                    failures.push(format!("{kind} {min}..{max} refused {text:?}: {error:?}"));
+                    continue;
+                }
+                assert_eq!(
+                    r.kernel().node(view).unwrap().props.str(PropId::Value),
+                    Some(*text)
+                );
+            }
+            for text in &refused {
+                let previous = r.kernel().node(view).unwrap().props.clone();
+                let result = r.dispatch(view, event((*text).into()));
+                if !matches!(result, Err(RunnerError::InvalidValue { .. })) {
+                    failures.push(format!("{kind} {min}..{max} allowed {text:?}: {result:?}"));
+                }
+                assert_eq!(
+                    r.kernel().node(view).unwrap().props.str(PropId::Value),
+                    previous.str(PropId::Value)
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// `spellcheck` and `autocorrect` are HTML's enumerated attributes whose IDL
 /// attributes are bools: a bool is written as their words, a string as
 /// itself (shop diary F7: `spellcheck=false` was refused as no string).
@@ -1004,7 +1157,10 @@ fn a_range_and_a_determinate_progress_are_full_width_by_an_implied_row() {
     let row = |r: &Runner<NoData>, id: &str| {
         let style = r.kernel().node(view_of(r, id)).unwrap().style;
         (
-            style.mask.has(StyleId::Width).then_some(style.width),
+            style
+                .mask
+                .has(StyleId::Width)
+                .then_some(style.width.clone()),
             style.written.has(StyleId::Width),
         )
     };

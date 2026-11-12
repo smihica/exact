@@ -1,10 +1,10 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // Press feedback in a real browser: the shell's CSS and the input glue,
 // driven by CDP mouse and key events. A declared press (LLP 1061 D3) goes by
 // UIKit's rule, not `:active`'s: only the innermost pressable shows it, only
 // while the pointer is inside its box, including under reduced motion. A
 // pressable that declares none dims by the same rule (LLP 1115.000 D6).
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { decodePng } from '../../../scripts/png.mjs';

@@ -2,7 +2,7 @@
 // document, not a missing file (bsky5, b32: `/profile/jay.bsky.team` 404'd
 // on the dev server); a request that is no navigation (an asset's fetch)
 // still finds nothing, and a file that exists is still that file.
-import {afterAll, afterEach, beforeAll, describe, test, expect, spyOn} from 'bun:test';
+import {afterAll, afterEach, beforeAll, describe, test, expect, spyOn, mock} from 'bun:test';
 import {mkdirSync, mkdtempSync, rmSync, readFileSync, renameSync, writeFileSync, symlinkSync} from 'node:fs';
 import {createServer} from 'node:net';
 import {createServer as httpServer} from 'node:http';
@@ -174,6 +174,16 @@ test('the shared pattern matcher retains the route corpus semantics without notf
     const matched = index < 0 ? null : {name: routes[index].name, params};
     expect(matched, location).toEqual(expected?.name === 'notfound' ? null : expected);
   }
+});
+
+test('the JS query reader agrees with the shared route corpus', async () => {
+  // The build copies navigation.js from host/web and generates names.js.
+  mock.module('../web-js/navigation.js', () => import('./navigation.js'));
+  mock.module('../web-js/names.js', () => ({sourceTypes: {}}));
+  const {x_searchParam} = await import('../web-js/router.js');
+  const {search} = JSON.parse(readFileSync(new URL('../../route/tests/corpus.json', import.meta.url), 'utf8'));
+  const values = search.map(({url, name}) => x_searchParam([0, '', url, '', [], ''], name));
+  expect(values).toEqual(search.map(({expected}) => expected));
 });
 
 afterEach(() => stopAll());

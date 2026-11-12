@@ -88,6 +88,8 @@ export function createStorageRequests(appId, admitted) {
         const {fs,sqlite}=services.get(scopeKey); let value;
         if (op==='sqlite' || op==='sqlite.transaction') {
           if (!Array.isArray(args.commands) || args.commands.length>10000) throw new Error('invalid SQLite commands');
+          // As data/host/src/native.rs refuses it: a request has no foreignKeys mode.
+          if (Object.hasOwn(args,'foreignKeys')) throw new Error('storage: a Rust source\'s SQLite request has no foreignKeys mode; run the migration from app.ts with transaction(statements, { foreignKeys: "check" })');
           const commands=args.commands.map(c=>{
             if (!c || !['execute','query'].includes(c.kind) || typeof c.sql!=='string' || !Array.isArray(c.params)) throw new Error('invalid SQLite command');
             return {...c,params:c.params.map(sqlValue)};

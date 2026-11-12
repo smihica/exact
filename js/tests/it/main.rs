@@ -3,6 +3,7 @@
 
 mod abort;
 mod admission;
+mod arguments;
 mod background;
 mod body_from;
 mod body_to;
@@ -23,15 +24,18 @@ mod mapper;
 mod native_later;
 mod native_storage;
 mod no_store;
+mod nul;
 mod outlive;
 mod overlay;
 mod overrun;
+mod parallel;
 mod pinned_engines;
 mod presence;
 mod process;
 mod pure;
 mod render;
 mod secrets;
+mod shim;
 mod snapshot;
 mod socket;
 mod storage;
@@ -42,6 +46,7 @@ mod upload;
 mod walk;
 mod watch;
 mod windows_lean;
+mod wrappers;
 
 /// What a host runs for `dispatch`: its work, or for a re-ask
 /// (`Dispatch::Again`, LLP 1041 §8.4) the empty success a host settles it

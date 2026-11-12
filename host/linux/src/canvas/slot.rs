@@ -126,6 +126,80 @@ mod tests {
         Arc::new(Bitmap::new(Pixmap::new(10, 10).unwrap(), (10, 10), charge))
     }
 
+    #[test]
+    fn image_tint_changes_both_image_drawings() {
+        let image = picture();
+        for ts in [Transform::identity(), Transform::from_rotate(30.0)] {
+            let record = |tint| {
+                let mut r = Recorder::new();
+                r.image(&image, (0., 0., 10., 10.), &[], ts, tint);
+                r.ops
+            };
+            assert_ne!(record(None), record(Some([255, 0, 0, 255])));
+            assert_ne!(record(None), record(Some([0; 4])));
+            let ops = record(Some([255, 0, 0, 128]));
+            let mut at = 0;
+            let mut tint = None;
+            while at < ops.len() {
+                if ops[at] == super::super::picture::IMAGE_TINT {
+                    tint = Some(ops[at + 1]);
+                    assert!(matches!(ops[at + 2], IMAGE | IMAGE_RRECT));
+                }
+                at = super::super::stream::end(&ops, at).unwrap();
+            }
+            assert_eq!(tint, Some(0x80ff0000));
+        }
+    }
+
+    #[test]
+    fn tint_updates_a_kept_picture_slot_without_redefining_its_bitmap() {
+        let bitmap = picture();
+        let mut r = Recorder::new();
+        let ts = Transform::identity();
+        let dst = (0., 0., 10., 10.);
+        r.begin(100., 100., 1.);
+        r.row_begin(1, (0., 0.), None);
+        r.slot_begin(9);
+        r.image(&bitmap, dst, &[], ts, None);
+        r.slot_end();
+        r.row_end(dst);
+        let plain = set(&r.ops).unwrap().to_vec();
+        r.begin(100., 100., 1.);
+        assert!(r.slot_again(1, 9));
+        r.image(&bitmap, dst, &[], ts, Some([255, 0, 0, 255]));
+        r.slot_end();
+        let tinted = set(&r.ops).unwrap();
+        assert_ne!(plain, tinted);
+        let mut at = 0;
+        let mut codes = Vec::new();
+        while at < tinted.len() {
+            codes.push(tinted[at]);
+            at = super::super::stream::end(tinted, at).unwrap();
+        }
+        assert_eq!(
+            codes,
+            [MATRIX, super::super::picture::IMAGE_TINT, IMAGE_RRECT]
+        );
+        assert!(r.kept.contains_key(&1));
+    }
+
+    #[test]
+    fn a_culled_tinted_image_leaves_no_tint_for_the_next_picture() {
+        let bitmap = picture();
+        let mut r = Recorder::new();
+        let ts = Transform::identity();
+        let dst = (0., 0., 10., 10.);
+        r.push_clip(&Shape::rect((20., 20., 10., 10.)), ts);
+        r.image(&bitmap, dst, &[], ts, Some([255, 0, 0, 255]));
+        r.pop_clip();
+        r.image(&bitmap, dst, &[], ts, None);
+        let mut at = 0;
+        while at < r.ops.len() {
+            assert_ne!(r.ops[at], super::super::picture::IMAGE_TINT);
+            at = super::super::stream::end(&r.ops, at).unwrap();
+        }
+    }
+
     /// A row as the walk records one: a background, then a picture's slot
     /// inside a rounded card's clip, the picture in it when it has arrived.
     fn row(r: &mut Recorder, id: u32, previous: Option<u32>, image: Option<&Arc<Bitmap>>) -> u32 {

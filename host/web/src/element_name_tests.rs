@@ -64,6 +64,7 @@ fn page_reset_and_lowered_css_leave_native_control_sizing_to_chrome() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         };
         let css = host_css_of(&facts, None, String::new(), tag);
         assert!(!css.contains("width:"), "{tag}: {css}");

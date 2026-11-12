@@ -31,7 +31,7 @@ use crate::{Dimension, FlexDirection, FlexWrap, Kernel, Overflow};
 pub struct Column {
     /// Left edge.
     pub x: f32,
-    /// Top edge: the container's content top.
+    /// Top edge: the container's content top, moved by `align-content`.
     pub y: f32,
     /// The used column width.
     pub width: f32,
@@ -197,8 +197,11 @@ pub(crate) fn taffy_multicol(arena: &NodeArena, slot: u32) -> Option<taffy::Mult
     let cut = arena.frag.multicol.get(&slot);
     Some(taffy::Multicol {
         count: (s.column_count != 0).then_some(s.column_count),
+        // "Used values will be clamped to a minimum of 1px" (CSS Multi-column
+        // Layout 1 §3.1): a width of zero beside a zero gap made the count
+        // u32::MAX, and the cut ran that many times.
         width: match s.rare.column_width.resolve(arena.env()) {
-            Dimension::Points(w) => Some(w.max(0.0)),
+            Dimension::Points(w) => Some(w.max(1.0)),
             _ => None,
         },
         // Across, in whole columns under a terminal's space rule.
@@ -232,10 +235,10 @@ fn decorated(s: &StyleProps) -> bool {
     };
     let borders = s.border_widths().into_iter().any(|w| w > 0.0);
     let radius = [
-        s.border_radius_top_left,
-        s.border_radius_top_right,
-        s.border_radius_bottom_right,
-        s.border_radius_bottom_left,
+        s.border_radius_top_left.clone(),
+        s.border_radius_top_right.clone(),
+        s.border_radius_bottom_right.clone(),
+        s.border_radius_bottom_left.clone(),
     ]
     .iter()
     .any(|r| !matches!(r, Dimension::Points(p) if *p == 0.0));
@@ -256,7 +259,8 @@ pub(crate) fn kind(arena: &NodeArena, slot: u32) -> Kind {
     let floor = |d: Dimension| {
         !matches!(d, Dimension::Auto) && !matches!(d, Dimension::Points(v) if v <= 0.0)
     };
-    let sized = sized(s.height) || floor(s.min_height) || sized(s.max_height);
+    let sized =
+        sized(s.height.clone()) || floor(s.min_height.clone()) || sized(s.max_height.clone());
     match arena.node_type(slot) {
         NodeType::Text if sized => Kind::Monolithic(Some(FragmentRefusal::Height)),
         NodeType::Text

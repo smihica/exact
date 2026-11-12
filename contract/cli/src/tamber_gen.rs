@@ -1,4 +1,4 @@
-//! `contract tamber gen ts | rust <app> [-o <dir>]` — every language's
+//! `contract tamber gen ts|rust|swift|kotlin <app> [-o <dir>]` — every language's
 //! generated names over the one table (LLP 1121 D12): from the design's IR,
 //! never committed. They go in the app's `.exact/tamber/` (gitignored, as
 //! all of `.exact/` is) unless `-o` names a directory.
@@ -579,7 +579,7 @@ pub fn run(args: &[String]) -> ExitCode {
             // Its params and its packages' tokens laid in, as the build lays them.
             let checked = exact_tamber::parse(&src).and_then(|design| {
                 exact_tamber::check_design(
-                    contract::tamber_params::laid(&design, &params),
+                    contract::tamber_params::laid(&design, &params, None),
                     &contract_lower::tamber_vocab(),
                 )
             });

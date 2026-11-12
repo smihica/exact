@@ -1,61 +1,9 @@
 use super::*;
 
-#[test]
-fn mixed_storage_waits_for_both_images_without_activating_sources() {
-    use std::{cell::Cell, rc::Rc};
-    struct Preparing {
-        ready: Rc<Cell<bool>>,
-        polls: Rc<Cell<usize>>,
-    }
-    impl DataSource for Preparing {
-        fn app_id(&self) -> &str {
-            "test.preload"
-        }
-        fn preload(&self) -> Result<bool, DataError> {
-            self.polls.set(self.polls.get() + 1);
-            Ok(self.ready.get())
-        }
-        fn query(
-            &mut self,
-            _: &str,
-            _: &[exact_plan::Value],
-        ) -> Result<exact_plan::Value, DataError> {
-            panic!("image preparation must not run app queries")
-        }
-        fn activate(&mut self) -> Result<(), DataError> {
-            panic!("image preparation must not activate app instances")
-        }
-    }
-    let first = Rc::new(Cell::new(false));
-    let second = Rc::new(Cell::new(false));
-    let polls = Rc::new(Cell::new(0));
-    let source = Storage::new(
-        exact_data::Mixed::new(
-            Preparing {
-                ready: first.clone(),
-                polls: polls.clone(),
-            },
-            Preparing {
-                ready: second.clone(),
-                polls: polls.clone(),
-            },
-            &["first"],
-            &["second"],
-        )
-        .unwrap(),
-    );
-    assert!(!source.preload().unwrap());
-    assert_eq!(
-        polls.get(),
-        2,
-        "both images start even while the first is pending"
-    );
-    first.set(true);
-    assert!(!source.preload().unwrap());
-    second.set(true);
-    assert!(source.preload().unwrap());
-    assert!(!source.ready(), "preloading does not activate storage");
-}
+mod composition;
+mod delivery;
+mod storage_changed;
+
 use exact_data::storage;
 use exact_runner::{FailureKind, Request};
 use serde_json::{json, Value as Json};
@@ -66,6 +14,7 @@ const GRANTS: &str = "fs.read app:/data\nfs.write app:/data\nsqlite.open app:/da
 struct Paths(PathBuf);
 impl Paths {
     fn new() -> Self {
+        ibex2_sqlite::link();
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -102,11 +51,13 @@ impl Drop for Paths {
 struct Fixture {
     request: Request,
     grants: &'static str,
+    changed: bool,
 }
 impl Fixture {
     fn new() -> Self {
         Self {
             grants: GRANTS,
+            changed: false,
             request: storage::request(
                 "fs.writeFile",
                 json!({"path":"app:/data/note","text":"hello"}),
@@ -120,6 +71,9 @@ impl DataSource for Fixture {
     }
     fn grants(&self) -> &str {
         self.grants
+    }
+    fn take_storage_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
     }
     fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
         Ok(Value::Number(7.))
@@ -203,6 +157,7 @@ fn activation_defers_io_to_the_owned_job_and_parse_returns_its_result() {
     assert!(!paths.0.exists());
     let job = take(&mut host);
     assert!(!paths.0.exists(), "creating a job must not execute it");
+    assert!(!host.take_storage_changed());
     let outcome = std::thread::spawn(job).join().unwrap();
     assert_eq!(std::fs::read(paths.0.join("data/note")).unwrap(), b"hello");
     assert_eq!(
@@ -210,6 +165,8 @@ fn activation_defers_io_to_the_owned_job_and_parse_returns_its_result() {
             .unwrap(),
         Answer::Now(Value::str("null"))
     );
+    assert!(host.take_storage_changed());
+    assert!(!host.take_storage_changed());
     let stat = run(
         &mut host,
         storage::request("fs.stat", json!({"path":"app:/data/note"})),
@@ -218,6 +175,7 @@ fn activation_defers_io_to_the_owned_job_and_parse_returns_its_result() {
     assert_eq!(stat["size"], 5);
     assert_eq!(stat["isFile"], true);
     assert_eq!(stat["isDirectory"], false);
+    assert!(!host.take_storage_changed());
 }
 
 #[test]
@@ -233,6 +191,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         request("fs.mkdir", json!({"path":"app:/data/files"})),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     run(
         &mut host,
         request(
@@ -241,6 +200,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         ),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     run(
         &mut host,
         request(
@@ -249,6 +209,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         ),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     assert_eq!(
         run(
             &mut host,
@@ -257,6 +218,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         .unwrap(),
         json!({"base64":"b25lAP8="})
     );
+    assert!(!host.take_storage_changed());
     run(
         &mut host,
         request(
@@ -265,6 +227,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         ),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     let stat = run(
         &mut host,
         request("fs.stat", json!({"path":"app:/data/files/source"})),
@@ -282,6 +245,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
     denied_copy.grants = Some("fs.read app:/data".into());
     assert!(run(&mut host, denied_copy).is_err());
     assert!(!paths.0.join("data/files/denied").exists());
+    assert!(!host.take_storage_changed());
 
     run(
         &mut host,
@@ -291,6 +255,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         ),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     run(
         &mut host,
         request(
@@ -299,6 +264,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
         ),
     )
     .unwrap();
+    assert!(host.take_storage_changed());
     assert_eq!(
         run(
             &mut host,
@@ -313,8 +279,10 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
     )
     .unwrap();
     assert!(real.as_str().unwrap().ends_with("/data/files/moved"));
+    assert!(!host.take_storage_changed());
     for path in ["app:/data/files/source", "app:/data/files/moved"] {
         run(&mut host, request("fs.rm", json!({"path":path}))).unwrap();
+        assert!(host.take_storage_changed());
     }
     assert_eq!(
         run(
@@ -330,6 +298,7 @@ fn filesystem_lifecycle_preserves_results_and_two_path_authority() {
     denied_sql.grants = Some("fs.read app:/data\nfs.write app:/data".into());
     assert!(run(&mut host, denied_sql).is_err());
     assert!(!paths.0.join("data/test.db").exists());
+    assert!(!host.take_storage_changed());
 }
 
 #[test]
@@ -370,27 +339,6 @@ fn replacement_retains_directories_but_validation_stays_disposable() {
 }
 
 #[test]
-fn source_scope_refuses_writes_and_cannot_expand_the_app_ceiling() {
-    let paths = Paths::new();
-    let mut host = Storage::new(Fixture::new());
-    paths.configure(&mut host);
-    host.activate().unwrap();
-    host.source.request.grants = Some("fs.write app:/elsewhere".into());
-    assert!(host
-        .answer(&mut Store::default(), "operation", &[])
-        .is_err());
-    assert!(!paths.0.exists());
-    for scope in ["", "fs.read app:/data"] {
-        let mut request = Fixture::new().request;
-        request.grants = Some(scope.into());
-        assert!(run(&mut host, request).is_err());
-        assert!(!paths.0.join("data/note").exists());
-    }
-    run(&mut host, Fixture::new().request).unwrap();
-    assert_eq!(std::fs::read(paths.0.join("data/note")).unwrap(), b"hello");
-}
-
-#[test]
 fn sqlite_preserves_int64_and_blobs_shares_backing_data_and_rolls_back_transactions() {
     let paths = Paths::new();
     let mut host = Storage::new(Fixture::new());
@@ -413,6 +361,18 @@ fn sqlite_preserves_int64_and_blobs_shares_backing_data_and_rolls_back_transacti
         inserted[2]["rows"],
         json!([[{"integer":"9007199254740993"},{"bytes":[0,128,255]},"from portable"]])
     );
+    // A request has no foreignKeys mode: naming one is refused, never run enforced.
+    let got = run(
+        &mut host,
+        storage::request(
+            "sqlite.transaction",
+            json!({"path":"app:/data/test.db","foreignKeys":"check","commands":[
+                {"kind":"execute","sql":"INSERT INTO items VALUES(3,NULL,'refused')","params":[]}
+            ]}),
+        ),
+    )
+    .unwrap_err();
+    assert!(got.contains("has no foreignKeys mode"), "{got}");
     assert!(sql(&mut host,"sqlite.transaction",json!([
         {"kind":"execute","sql":"INSERT INTO items VALUES(2,NULL,'must rollback')","params":[]},
         {"kind":"execute","sql":"INSERT INTO items VALUES(9007199254740993,NULL,'duplicate')","params":[]}
@@ -497,8 +457,10 @@ fn invalid_utf8_is_never_repaired_into_an_effectful_request() {
     assert!(storage::response(super::native::run(
         host.directories.as_ref(),
         GRANTS,
+        GRANTS,
         payload,
         0,
+        &Default::default(),
     ))
     .is_err());
     assert!(
@@ -603,10 +565,13 @@ fn a_document_path_reads_and_writes_the_chosen_file_under_its_grant() {
     std::fs::write(folder.join("a.md"), "# A").unwrap();
     let doc =
         exact_data::documents::open_route(folder.join("a.md").to_str().unwrap(), 9001).unwrap();
+    let changed = std::sync::atomic::AtomicBool::new(false);
     let run = |grants: &str, op: &str, args: serde_json::Value| {
         let payload =
             serde_json::to_vec(&serde_json::json!({"version":1,"op":op,"args":args})).unwrap();
-        storage::response(super::native::run(None, grants, &payload, 9001))
+        storage::response(super::native::run(
+            None, grants, grants, &payload, 9001, &changed,
+        ))
     };
     let read = run(
         "fs.read doc:/",
@@ -641,8 +606,10 @@ fn a_document_path_reads_and_writes_the_chosen_file_under_its_grant() {
     let write = serde_json::json!({"path": doc, "text": "# B"});
     let refused = run("fs.read doc:/", "fs.atomicWriteFile", write.clone());
     assert_eq!(refused.unwrap_err(), "denied: fs.write");
+    assert!(!changed.swap(false, Ordering::AcqRel));
     run("fs.read doc:/\nfs.write doc:/", "fs.atomicWriteFile", write).unwrap();
     assert_eq!(std::fs::read_to_string(folder.join("a.md")).unwrap(), "# B");
+    assert!(!changed.swap(false, Ordering::AcqRel));
     let escape = format!("{folder_doc}/../secret");
     assert!(run(
         "fs.read doc:/",
@@ -670,6 +637,7 @@ fn a_chosen_file_is_copied_into_an_app_file_under_both_grants() {
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("a.png"), "picture").unwrap();
     let doc = exact_data::documents::mint(&folder.join("a.png"), 9007).unwrap();
+    let changed = std::sync::atomic::AtomicBool::new(false);
     let copy = |grants: &str, to: &str| {
         let args = serde_json::json!({"path": doc, "destination": to});
         let payload =
@@ -682,8 +650,10 @@ fn a_chosen_file_is_copied_into_an_app_file_under_both_grants() {
         storage::response(super::native::run(
             Some(&paths.directories()),
             grants,
+            grants,
             &payload,
             9007,
+            &changed,
         ))
     };
     let both = "fs.read doc:/\nfs.write app:/data";
@@ -692,6 +662,13 @@ fn a_chosen_file_is_copied_into_an_app_file_under_both_grants() {
         std::fs::read_to_string(paths.0.join("data/a.png")).unwrap(),
         "picture"
     );
+    assert!(!changed.swap(false, Ordering::AcqRel));
+    copy(
+        "fs.read doc:/\nfs.read app:/data\nfs.write app:/data",
+        "app:/data/readable.png",
+    )
+    .unwrap();
+    assert!(changed.swap(false, Ordering::AcqRel));
     for grants in ["fs.read doc:/\nfs.write app:/cache", "fs.write app:/data"] {
         let refused = copy(grants, "app:/data/b.png").unwrap_err();
         assert!(refused.starts_with("denied: "), "{grants}: {refused}");
@@ -719,8 +696,10 @@ fn a_write_that_expects_what_it_read_is_refused_once_the_file_changed() {
         storage::response(super::native::run(
             None,
             "fs.read doc:/\nfs.write doc:/",
+            "fs.read doc:/\nfs.write doc:/",
             &payload,
             9004,
+            &Default::default(),
         ))
     };
     let read = run("fs.stat", serde_json::json!({"path": doc})).unwrap();
@@ -761,7 +740,14 @@ fn the_kept_list_reads_and_forgets_under_doc_keep() {
     let run = |grants: &str, op: &str, args: serde_json::Value| {
         let payload =
             serde_json::to_vec(&serde_json::json!({"version":1,"op":op,"args":args})).unwrap();
-        storage::response(super::native::run(None, grants, &payload, 9005))
+        storage::response(super::native::run(
+            None,
+            grants,
+            grants,
+            &payload,
+            9005,
+            &Default::default(),
+        ))
     };
     let keeps = "fs.read doc:/\nfs.write doc:/\ndoc.keep";
     let listed = run(keeps, "fs.recentDocuments", serde_json::json!({})).unwrap();
@@ -814,7 +800,14 @@ fn a_kept_file_renamed_between_launches_reads_through_its_kept_path() {
         let payload =
             serde_json::to_vec(&serde_json::json!({"version":1,"op":op,"args":{"path": path}}))
                 .unwrap();
-        storage::response(super::native::run(None, "fs.read doc:/", &payload, 9006))
+        storage::response(super::native::run(
+            None,
+            "fs.read doc:/",
+            "fs.read doc:/",
+            &payload,
+            9006,
+            &Default::default(),
+        ))
     };
     let read = run("fs.readFile", &doc).unwrap();
     assert_eq!(read["base64"], exact_runner::agent::base64(b"kept"));
@@ -959,6 +952,7 @@ fn queued_document_work_uses_its_sessions_owner() {
     let mut owner = Storage::new(Fixture {
         grants: "fs.read doc:/",
         request: request.clone(),
+        ..Fixture::new()
     });
     owner.set_document_owner(9010);
     owner.activate().unwrap();
@@ -966,6 +960,7 @@ fn queued_document_work_uses_its_sessions_owner() {
     let mut other = Storage::new(Fixture {
         grants: "fs.read doc:/",
         request: request.clone(),
+        ..Fixture::new()
     });
     other.set_document_owner(9011);
     other.activate().unwrap();
@@ -1033,8 +1028,10 @@ fn filesystem_results_stop_at_the_encoded_response_limit() {
         super::native::run(
             None,
             "fs.read doc:/",
+            "fs.read doc:/",
             &serde_json::to_vec(&json!({"version":1,"op":"fs.readFile","args":{"path":document}})).unwrap(),
             9020,
+            &Default::default(),
         ),
         Outcome::Failed {
             kind: FailureKind::Unsupported,
@@ -1194,10 +1191,12 @@ fn compress_image_answers_a_rust_source_as_typescripts() {
             json!({"path":"app:/data/in/photo.jpg","destination":to,"maxDimension":dimension,"maxBytes":bytes}),
         )
     };
+    assert!(host.take_storage_changed());
     let result = run(
         &mut host,
         compress("app:/data/out.jpg", json!(32), json!(2_000_000)),
     );
+    assert_eq!(host.take_storage_changed(), result.is_ok());
     if cfg!(target_vendor = "apple") {
         let size = std::fs::metadata(paths.0.join("data/out.jpg"))
             .unwrap()
@@ -1253,6 +1252,7 @@ fn compress_image_answers_a_rust_source_as_typescripts() {
         assert!(err.starts_with(expected), "{err}");
     }
     assert!(!paths.0.join("data/x.jpg").exists());
+    assert!(!host.take_storage_changed());
 }
 
 /// A Rust source's `fs.transformImage` (LLP 1133.019 D17): the record is
@@ -1281,10 +1281,12 @@ fn transform_image_answers_a_rust_source_as_typescripts() {
             .extend(options.as_object().unwrap().clone());
         storage::request("fs.transformImage", args)
     };
+    assert!(host.take_storage_changed());
     let result = run(
         &mut host,
         transform("app:/data/turned", json!({"rotate":90,"metadata":"none"})),
     );
+    assert_eq!(host.take_storage_changed(), result.is_ok());
     let cropped = run(
         &mut host,
         storage::request(
@@ -1293,6 +1295,7 @@ fn transform_image_answers_a_rust_source_as_typescripts() {
                 "crop":{"x":0,"y":0,"width":24,"height":64}}),
         ),
     );
+    assert_eq!(host.take_storage_changed(), cropped.is_ok());
     if cfg!(target_vendor = "apple") {
         let size = std::fs::metadata(paths.0.join("data/turned.jpg"))
             .unwrap()
@@ -1459,8 +1462,10 @@ fn image_cancellation_orders_publication_and_the_consumer_reads_only_success() {
     let outcome = super::native::run(
         Some(&roots),
         GRANTS,
+        GRANTS,
         br#"{"version":1,"op":"fs.readFile","args":{"path":"app:/data/out.jpg"}}"#,
         0,
+        &Default::default(),
     );
     let Outcome::Storage(bytes) = outcome else {
         panic!("the committed output is consumable")

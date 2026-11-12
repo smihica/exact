@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { open, jsonLines, MalformedOperation, main, webFrame } from './agent.mjs';
 import { chromium, launchFacts, noteDefaultStore } from './agent-launch.mjs';
-import { need } from './coverage.mjs';
+import { need, notApplicable } from './coverage.mjs';
 import { typeCommand } from './agent-keys.mjs';
 import { render, stateOp } from './agent-inspect.mjs';
 
@@ -130,6 +130,20 @@ test('malformed input is labelled before delivery; a state refusal is not', asyn
   // `state thread --json` printed the capped summary again, the flag unread; `--full` is the step's own.
   await assert.rejects(() => main(['web', 'state thread --json'], { open: async () => ({ close() {} }) }),
     e => e.malformed === true && e.message.endsWith('state: --json is a flag of the drive, not of the step: write it before the steps, as `web --json "state thread"`'));
+});
+
+test('a move the carrier refuses partway keeps the contact where its delivered samples left it', async () => {
+  const carrier = { host: 'web', browser: 'chrome', launchFacts: launchFacts({}), reset() {}, async ask() { return {}; },
+    async input() { return reply; } };
+  let reply = { error: 'surface refused pointer', at: [10, 30] };
+  const s = await open({ reuse: carrier });
+  s.landed = async r => r;
+  s.contact = { x: 10, y: 50 };
+  assert.equal((await s.pointer('move', { dx: 0, dy: -40, ms: 200 })).error, 'surface refused pointer');
+  assert.deepEqual(s.contact, { x: 10, y: 30 });
+  reply = { error: 'surface refused pointer' };
+  assert.equal((await s.pointer('move', { dx: 0, dy: -40 })).error, 'surface refused pointer');
+  assert.deepEqual(s.contact, { x: 10, y: 30 });
 });
 
 test('accepted pointer, wheel, media and zero-time forms still reach the carrier', async () => {
@@ -595,8 +609,11 @@ test('a native named store is kept unless the drive resets it, under its lock; a
     let env = null, lock = null;
     const injected = { open: async (o) => { env = o.env; return { state: async () => ({}), close: async () => {} }; }, driveServer: async () => null,
       exclusiveNativeStore: async (key, launch) => { lock = key; return launch(); }, resolveDevice: () => 'a device' };
-    assert.equal(await main(['ios', '--reset-storage', 'state'], injected), 0);
-    assert.deepEqual([lock?.storage, env?.EXACT_AGENT_STORAGE_FRESH], ['default', '1']);
+    for (const host of ['ios', 'macos', 'linux', 'android', 'windows']) {
+      lock = env = null;
+      assert.equal(await main([host, '--reset-storage', 'state'], injected), 0);
+      assert.deepEqual([lock?.storage, env?.EXACT_AGENT_STORAGE_FRESH], ['default', '1'], host);
+    }
     await assert.rejects(main(['web', '--reset-storage', 'state'], injected), /need --storage <name>/);
   } finally { [console.log, console.error] = quiet; }
 });
@@ -832,6 +849,36 @@ test('a native store is one drive\'s at a time: a second is refused until the fi
     await (await exclusiveNativeStore(key, async () => ({ close: async () => {} }), root)).close();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+notApplicable(process.platform === 'win32' ? 'POSIX executable permissions' : null)('a native launch failure returns its error and releases the store for another drive', () => {
+  const root = mkdtempSync(resolve(import.meta.dir, '.native-launch-'));
+  try {
+    writeFileSync(resolve(root, 'not-executable'), '#!/bin/sh\necho hi\n', { mode: 0o644 });
+    // A subprocess bounds a regression that hangs during cleanup, even after the ready deadline.
+    const ran = spawnSync(process.execPath, ['--eval', `
+      import assert from 'node:assert/strict';
+      import { resolve } from 'node:path';
+      import { openStdio } from './scripts/agent-stdio.mjs';
+      import { exclusiveNativeStore } from './scripts/agent-launch.mjs';
+      const root = process.argv[1];
+      for (const host of ['linux', 'windows']) {
+        const key = { host, device: 'machine', appId: 'native-launch-test', storage: 'default' };
+        for (const bin of [resolve(root, 'not-executable'), root]) {
+          process.env[host === 'linux' ? 'EXACT_LINUX_BIN' : 'EXACT_WINDOWS_BIN'] = bin;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await assert.rejects(
+              exclusiveNativeStore(key, () => openStdio({ host, app: 'hello' }), root),
+              /launch failed: EACCES:/,
+            );
+          }
+        }
+      }
+    `, root], { cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL',
+      env: { ...process.env, EXACT_APP_DIR: '', EXACT_PROOF_PRODUCTS: '' } });
+    assert.equal(ran.error, undefined, ran.stderr);
+    assert.equal(ran.status, 0, ran.stderr);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 15000);
 
 test('compare on a capture: nodes where the window has them, its safe area not scored, a scaled viewport refused, its notes said', async () => {
   const { compareOp } = await import('./agent-compare.mjs');

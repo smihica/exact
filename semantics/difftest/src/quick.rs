@@ -7,11 +7,11 @@
 //! `runner/`, `plan/` or `semantics/` there is nothing to run. Otherwise
 //! the corpus programs relevant to them (a changed corpus file itself; the
 //! corpus directories a changed file's name points at; the whole corpus
-//! when none does), a small random sweep and the lowering check on a few
-//! generated programs, both seeded by the base. Lean's observations are
-//! reused from earlier runs when the case and the semantics are unchanged
-//! (`leanrun::CACHE`), so a warm run spends its time on the runner's half
-//! and on what changed.
+//! when any name points nowhere), a small random sweep and the lowering
+//! check on a few generated programs, both seeded by the base. Lean's
+//! observations are reused from earlier runs when the case and the semantics
+//! are unchanged (`leanrun::CACHE`), so a warm run spends its time on the
+//! runner's half and on what changed.
 
 use crate::{check, corpus, gen, leanrun, lowering, script::Case, seed_of, Outcome, Verdict};
 use std::path::{Path, PathBuf};
@@ -21,13 +21,15 @@ use std::time::Instant;
 /// The trees whose changes the semantics can see.
 const WATCHED: [&str; 4] = ["contract/", "runner/", "plan/", "semantics/"];
 
-/// Words in a changed file's path, and the corpus directories they point at.
+/// Words in a changed file's name, and the corpus directories they point at.
+/// `stdlib` stays unmatched because its functions span the whole corpus.
 const AREAS: &[(&[&str], &[&str])] = &[
     (&["route", "router"], &["routes"]),
     (
         &["row", "each", "keyed", "list", "collection"],
         &["rows", "lists"],
     ),
+    (&["each"], &["resources"]),
     (&["timer", "task", "clock"], &["timers"]),
     (
         &["resource", "source", "oracle", "settle"],
@@ -35,6 +37,7 @@ const AREAS: &[(&[&str], &[&str])] = &[
     ),
     (&["mutation", "send"], &["mutations"]),
     (&["number", "float", "format"], &["numbers"]),
+    (&["format"], &["format"]),
     (&["text", "string", "str"], &["text"]),
     (
         &["view", "render", "instance", "node", "element"],
@@ -42,7 +45,7 @@ const AREAS: &[(&[&str], &[&str])] = &[
     ),
     (&["action", "stmt", "exec", "transaction"], &["actions"]),
     (&["derive"], &["derives"]),
-    (&["fn", "call", "stdlib"], &["fns"]),
+    (&["fn", "call"], &["fns"]),
     (&["option", "match"], &["options"]),
     (&["record", "shape"], &["records"]),
     (&["component", "expand", "use"], &["components"]),
@@ -306,5 +309,54 @@ fn reproduce(name: &str) -> String {
             Some(seed) => format!("random --seed {seed} --count 1"),
             None => "corpus".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn selected_corpus_files(changed: &str) -> Vec<PathBuf> {
+        let semantics = leanrun::project();
+        let root = semantics.parent().unwrap();
+        let selected = corpus_files(root, &semantics, &[&changed.to_string()]).unwrap();
+        let mut files = Vec::new();
+        for path in selected {
+            crate::collect(&path, &mut files).unwrap();
+        }
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    #[test]
+    fn stdlib_changes_select_the_whole_corpus() {
+        let mut expected = Vec::new();
+        crate::collect(&leanrun::project().join("corpus"), &mut expected).unwrap();
+        expected.sort();
+        assert_eq!(selected_corpus_files("runner/src/stdlib.rs"), expected);
+    }
+
+    #[test]
+    fn format_changes_select_formatting_cases() {
+        let mut expected = Vec::new();
+        crate::collect(&leanrun::project().join("corpus/format"), &mut expected).unwrap();
+        assert!(!expected.is_empty());
+        for changed in ["runner/src/format.rs", "semantics/Contract/Format.lean"] {
+            let selected = selected_corpus_files(changed);
+            for file in &expected {
+                assert!(
+                    selected.contains(file),
+                    "{changed} omitted {}",
+                    file.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_changes_select_resource_cases() {
+        let file = leanrun::project().join("corpus/resources/each.contract");
+        assert!(selected_corpus_files("runner/src/runner/each.rs").contains(&file));
     }
 }

@@ -1,6 +1,54 @@
 use contract_syntax::migrate::migrate;
 
 #[test]
+fn press_migration_keeps_continued_attributes_on_the_element() {
+    for (name, value) in [
+        ("color", "\"#111\""),
+        ("padding", "8"),
+        ("padding", "(true ?\n            8 : 12)"),
+    ] {
+        let base = format!("{name}={value}");
+        let paint = "-exact-press-background-color=\"#eee\"";
+        for rows in [
+            format!("{base}\n          {paint}"),
+            format!("{paint}\n          {base}"),
+        ] {
+            let before = format!(
+                r##"component App
+  state n = 0
+  action up()
+    n = n + 1
+  view
+    column
+      row press=up
+          {rows}
+        text "Go"
+"##
+            );
+            let after = migrate(&before).unwrap();
+            let file = contract_syntax::parse(&after).unwrap();
+            let contract_syntax::Node::Element { children, .. } = &file.components[0].view[0]
+            else {
+                panic!("{after}");
+            };
+            let contract_syntax::Node::Element {
+                attrs, children, ..
+            } = &children[0]
+            else {
+                panic!("{after}");
+            };
+            assert_eq!(
+                attrs.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                ["press", name, ":active background-color"],
+                "{after}"
+            );
+            assert_eq!(children.len(), 1, "{after}");
+            assert_eq!(migrate(&after).unwrap(), after);
+        }
+    }
+}
+
+#[test]
 fn press_paints_move_into_one_active_block_without_rewriting_literals() {
     let before = r##"// -exact-press-color is mentioned here.
 style Card
@@ -27,10 +75,10 @@ component App
   state on = false
   view
     column  testId="paint"
+       // Keep this comment.
       :active
         background-color=(on ? "#111111" : none)
         color="#222222"
-       // Keep this comment.
       text "-exact-press-color is text"
 "##
     );

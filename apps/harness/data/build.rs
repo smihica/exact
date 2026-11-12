@@ -12,7 +12,7 @@ fn main() {
     let source = format!("{shapes}\ncomponent Seam\n  view\n    text \"\"\n");
     let plan = contract::compile(&source)
         .unwrap_or_else(|e| panic!("../shapes.contract does not compile: {e}"));
-    let rust = contract::rust(&plan).expect("contract rust");
+    let rust = contract::rust(&plan, &Default::default()).expect("contract rust");
     let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("shapes.rs");
     std::fs::write(out, rust).expect("write shapes.rs");
 }

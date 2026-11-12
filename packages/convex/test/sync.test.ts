@@ -51,7 +51,7 @@ test('a query asked before the socket opens goes in the first query set, and its
   sync.frame(transition(version(0, 0, T0), version(1, 0, T1), [updated(0, [])])); // recorded
   await first.wait;
   expect(first.read()).toEqual({ ok: true, value: [] });
-  expect([sync.status, sync.rev, sync.beat]).toEqual(['ready', 1, 1]);
+  expect([sync.status, sync.rev]).toEqual(['ready', 1]);
   // Asked again at the new rev, it answers now.
   expect(sync.ask(1, 'messages:list', { channel: 'general' }).read()).toEqual({ ok: true, value: [] });
 });
@@ -189,7 +189,7 @@ test('a chunked Transition is applied once whole', () => {
   const whole = transition(version(0, 0, T0), version(1, 0, T1), [updated(0, [HELLO])]);
   const chunk = (partNumber: number, text: string) => JSON.stringify({ type: 'TransitionChunk', chunk: text, partNumber, totalParts: 2, transitionId: 't1' });
   sync.frame(chunk(0, whole.slice(0, 40)));
-  expect([sync.rev, sync.beat]).toEqual([0, 1]);
+  expect(sync.rev).toBe(0);
   sync.frame(chunk(1, whole.slice(40)));
   expect(first.read()).toEqual({ ok: true, value: [HELLO] });
   expect(sync.rev).toBe(1);
@@ -206,6 +206,16 @@ test('a frame out of place is a protocol error; one the protocol lacks is fatal'
 });
 
 // What `index.d.ts` declares is what `index.ts` implements, as the type checker sees the two (`types.ts`).
+test('a socket that ended failed stays failed through the close that follows', () => {
+  const { sync } = opened();
+  sync.closed('Convex sent a frame this client cannot follow', true);
+  sync.closed('the socket closed (1000)');
+  expect([sync.status, sync.error]).toEqual(['failed', 'Convex sent a frame this client cannot follow']);
+  // A new connection starts over.
+  sync.connecting('s2');
+  expect(sync.status).toBe('connecting');
+});
+
 test('the declared API is the one implemented', () => {
   const checked = Bun.spawnSync([`${import.meta.dir}/../../../node_modules/.bin/tsc`, '--noEmit', '--strict', '--allowImportingTsExtensions', '--module', 'preserve', 'test/types.ts'], { cwd: `${import.meta.dir}/..` });
   expect(checked.exitCode, `${checked.stdout}${checked.stderr}`).toBe(0);

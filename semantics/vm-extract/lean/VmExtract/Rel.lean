@@ -26,6 +26,7 @@ def opName : Op → String
   | .LoadIndex => "LoadIndex" | .Map => "Map" | .Filter => "Filter"
   | .FailureResource => "FailureResource"
   | .FailedMutation => "FailedMutation" | .FailureMutation => "FailureMutation"
+  | .CurrentResource => "CurrentResource"
 
 /-- A Rust trap and the model's for the same failure (the pc and operands
 the Rust trap carries are not the model's). A roster refusal is

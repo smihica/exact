@@ -10,26 +10,16 @@
 // usage: bun packages/health/test/android.mjs [--emulator]
 //   (an NDK of clang 18 or newer in ANDROID_NDK_HOME, and a JDK 17 or newer in JAVA_HOME)
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { checker, makeFixture, pkg, root, run, texts } from './fixture.mjs';
+import { checker, makeFixture, pkg, root, texts } from './fixture.mjs';
 
 const { app } = makeFixture(), name = basename(app);
-// `exact new` writes no Canvas library: Weatherlight's, by path into this checkout.
-const template = resolve(root, 'apps/weatherlight/android'), crate = resolve(app, 'android');
-mkdirSync(resolve(crate, 'src'), { recursive: true });
-writeFileSync(resolve(crate, 'Cargo.toml'), readFileSync(resolve(template, 'Cargo.toml'), 'utf8')
-  .replace('name = "weatherlight-android"', `name = "${name}-android"`).replaceAll('"../../../', `"${root}/`));
-writeFileSync(resolve(crate, 'build.rs'), readFileSync(resolve(template, 'build.rs'), 'utf8').replace('"bake Weatherlight"', '"bake the fixture"'));
-writeFileSync(resolve(crate, 'src/lib.rs'), readFileSync(resolve(template, 'src/lib.rs'), 'utf8'));
-const workspace = resolve(app, 'Cargo.toml');
-writeFileSync(workspace, readFileSync(workspace, 'utf8').replace('members = ["apple", "linux", "web"]', 'members = ["android", "apple", "linux", "web"]'));
-run('bun', ['exact.mjs', 'lock'], app);
 
 const { check, failed } = checker();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
-const env = { ...process.env, EXACT_APP_DIR: app, EXACT2: root, HERMES_LEAN_SYS_OFFLINE: '1' };
+const env = { ...process.env, EXACT_APP_DIR: app, EXACT: root, HERMES_LEAN_SYS_OFFLINE: '1' };
 const out = resolve(root, 'host/android/app/build', name);
 try {
   const built = spawnSync('bun', [resolve(root, 'scripts/agent-android.mjs'), 'build', name, '--apk', '--write-locks'], { cwd: root, env, encoding: 'utf8', maxBuffer: 1 << 28 });

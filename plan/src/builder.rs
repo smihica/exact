@@ -36,10 +36,27 @@ pub struct PlanBuilder {
     /// shared body is indistinguishable from a copy to every reader.
     bodies: HashMap<Vec<u8>, Code, BuildHasherDefault<BodyHasher>>,
     /// The design's values (`theme` rows' and slices'), interned at
-    /// [`finish`](Self::finish) after every other string: a value-only edit
-    /// then moves no other string's id, so the plan's structure
-    /// ([`Plan::structure`]) stays (LLP 1121 stage 4).
+    /// [`finish`](Self::finish) after bytecode strings, so a value-only edit
+    /// keeps bytecode string ids stable. [`Plan::structure`] sorts the retained
+    /// strings and remaps their references, including strings the app pass
+    /// adds later (LLP 1121 stage 4).
     values: Vec<(ValueAt, String)>,
+    /// Equal type rows in insertion order, including a resumed plan's duplicates.
+    types_by: HashMap<TypeKey, Vec<TypesId>, BuildHasherDefault<BodyHasher>>,
+    types_indexed: usize,
+}
+
+/// A `types` row's structure: what makes two rows equal.
+type TypeKey = (TypeKind, Option<TypesId>, u32, u32, StrId);
+
+fn type_key(row: &TypesRow) -> TypeKey {
+    (
+        row.kind,
+        row.elem,
+        row.fields.start,
+        row.fields.len,
+        row.name,
+    )
 }
 
 /// Where a design value interned at finish goes.
@@ -89,6 +106,8 @@ impl PlanBuilder {
             interned: HashMap::default(),
             bodies: HashMap::with_capacity_and_hasher(256, Default::default()),
             values: Vec::new(),
+            types_by: HashMap::default(),
+            types_indexed: 0,
         };
         // These eight distinct stack ids are part of the plan vocabulary.
         // A host may resolve several of them to one installed face; their
@@ -121,6 +140,8 @@ impl PlanBuilder {
             interned,
             bodies: HashMap::default(),
             values: Vec::new(),
+            types_by: HashMap::default(),
+            types_indexed: 0,
         }
     }
 
@@ -230,7 +251,9 @@ impl PlanBuilder {
         let string = self.primitive(TypeKind::String);
         let fields: Vec<_> = values.iter().map(|v| (v.as_str(), string)).collect();
         let id = self.record("enum", &fields);
+        let before = type_key(&self.plan.types[id.0 as usize]);
         self.plan.types[id.0 as usize].kind = TypeKind::String;
+        self.retyped(id, before);
         id
     }
 
@@ -278,11 +301,39 @@ impl PlanBuilder {
     fn push_type(&mut self, row: TypesRow) -> TypesId {
         // Structural interning keeps equal types equal by id, which is what
         // `Record` opcodes and `conforms` compare against.
-        if let Some(i) = self.plan.types.iter().position(|t| *t == row) {
-            return TypesId(i as u32);
+        self.index_types();
+        if let Some(rows) = self.types_by.get(&type_key(&row)) {
+            return rows[0];
         }
         self.plan.types.push(row);
+        self.index_types();
         TypesId(self.plan.types.len() as u32 - 1)
+    }
+
+    /// Index the `types` rows not indexed yet, each under its structure.
+    fn index_types(&mut self) {
+        for i in self.types_indexed..self.plan.types.len() {
+            let key = type_key(&self.plan.types[i]);
+            self.types_by
+                .entry(key)
+                .or_default()
+                .push(TypesId(i as u32));
+        }
+        self.types_indexed = self.plan.types.len();
+    }
+
+    /// An enum changes kind after insertion; keep the earliest equal row first.
+    fn retyped(&mut self, id: TypesId, before: TypeKey) {
+        if let Some(rows) = self.types_by.get_mut(&before) {
+            rows.retain(|row| *row != id);
+            if rows.is_empty() {
+                self.types_by.remove(&before);
+            }
+        }
+        let after = type_key(&self.plan.types[id.0 as usize]);
+        let rows = self.types_by.entry(after).or_default();
+        let at = rows.partition_point(|row| row.0 < id.0);
+        rows.insert(at, id);
     }
 
     /// A declared font family and its faces (LLP 1019 D1–D2).
@@ -564,6 +615,8 @@ impl PlanBuilder {
             placeholder: None,
             placeholder_value: self.no_data(),
             each: ArgsRange { start: 0, len: 0 },
+            transient: false,
+            gate: ArgsRange { start: 0, len: 0 },
         });
         ResourcesId(self.plan.resources.len() as u32 - 1)
     }
@@ -578,7 +631,7 @@ impl PlanBuilder {
             ty,
             refreshes: MutationRefreshesRange { start: 0, len: 0 },
             then: None,
-            queue: false,
+            mode: MutationMode::Newest,
         });
         MutationsId(self.plan.mutations.len() as u32 - 1)
     }
@@ -588,9 +641,10 @@ impl PlanBuilder {
         self.plan.mutations[mutation.0 as usize].then = Some(action);
     }
 
-    /// `mutation … queue` (LLP 1092 D1): its sends wait their turn.
-    pub fn set_mutation_queue(&mut self, mutation: MutationsId) {
-        self.plan.mutations[mutation.0 as usize].queue = true;
+    /// `mutation … queue` (LLP 1092 D1), whose sends wait their turn, or
+    /// `mutation … parallel` (LLP 1161.000 D1), whose sends run together.
+    pub fn set_mutation_mode(&mut self, mutation: MutationsId, mode: MutationMode) {
+        self.plan.mutations[mutation.0 as usize].mode = mode;
     }
 
     /// The resources a send to `mutation` refreshes (LLP 1054.000.000 D1),
@@ -633,7 +687,7 @@ impl PlanBuilder {
     pub fn module(
         &mut self,
         source: SourcesId,
-        extension: &str,
+        interface: (&str, &str),
         declared: &str,
         send: bool,
         live: bool,
@@ -643,7 +697,8 @@ impl PlanBuilder {
     ) {
         let row = ModulesRow {
             source,
-            extension: self.str(extension),
+            extension: self.str(interface.0),
+            package: self.str(interface.1),
             declared: self.str(declared),
             send,
             live,
@@ -658,7 +713,7 @@ impl PlanBuilder {
     /// runs with its arguments.
     pub fn module_event(
         &mut self,
-        extension: &str,
+        interface: (&str, &str),
         declared: &str,
         action: ActionsId,
         raised: &str,
@@ -666,7 +721,8 @@ impl PlanBuilder {
         budget: u32,
     ) {
         let row = ModuleEventsRow {
-            extension: self.str(extension),
+            extension: self.str(interface.0),
+            package: self.str(interface.1),
             declared: self.str(declared),
             action,
             raised: self.str(raised),
@@ -1025,6 +1081,18 @@ impl PlanBuilder {
     /// D4): its compiled value is the empty-store placeholder.
     pub fn set_resource_reader(&mut self, id: ResourcesId, reader: bool) {
         self.plan.resources[id.0 as usize].reader = reader;
+    }
+
+    /// Mark a resource whose answer is never kept across launches (LLP
+    /// 1156.005 D4).
+    pub fn set_resource_transient(&mut self, id: ResourcesId) {
+        self.plan.resources[id.0 as usize].transient = true;
+    }
+
+    /// A resource's `when` (LLP 1161.002 D1): the condition under which it is asked.
+    pub fn set_resource_gate(&mut self, id: ResourcesId, gate: Code) {
+        let range = self.args(&[gate]);
+        self.plan.resources[id.0 as usize].gate = range;
     }
 
     /// Replace an action's body.

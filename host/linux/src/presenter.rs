@@ -65,19 +65,23 @@ mod group;
 mod hatch;
 mod history;
 pub mod ime;
+mod number;
 mod painter;
 mod pan_release;
 mod picker;
 mod pointer;
 mod pump;
 mod radio;
+mod range;
 mod range_frame;
 #[cfg(test)]
 mod save_tests;
+mod select;
 mod svg_hit;
+mod tabs;
 #[cfg(windows)]
 mod windows_field;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) use display_frame::SubmittedFrame;
 #[path = "content_region/presenter.rs"]
 mod content_region;
@@ -115,6 +119,7 @@ use scroll_end::Completion;
 #[cfg(all(test, not(windows)))]
 mod scroll_end_tests;
 mod shortcuts;
+mod status_bar;
 #[cfg(target_os = "android")]
 pub(crate) mod still;
 mod swipe;
@@ -177,7 +182,8 @@ pub struct Presenter<D: DataSource> {
     pub(crate) surfaces: crate::surfaces::Surfaces,
     module: Option<crate::delivery::Module>,
     painted: bool,
-    activation_failed: bool,
+    /// Why the data module did not activate ([`Presenter::activation_error`]).
+    activation_failed: Option<String>,
     dev: Option<crate::fetch::Poller>,
     pending_dev: Option<crate::fetch::Generation>,
     pending_update: bool,
@@ -213,6 +219,8 @@ pub struct Presenter<D: DataSource> {
     pub(crate) fields: BTreeMap<ViewId, field::FieldMark>,
     field_history: history::Histories,
     field_drag: Option<field_pointer::Drag>,
+    /// A contact that went down on a range (`range.rs`).
+    range_drag: Option<range::Drag>,
     ime: Option<ime::Composition>,
     ime_epoch: u64,
     field_reveal: bool,
@@ -233,8 +241,11 @@ pub struct Presenter<D: DataSource> {
     /// its bound value last changed, beside that bound value
     /// (`paint::control::choice`, `field_text`).
     pub(crate) chosen: BTreeMap<ViewId, (String, String)>,
-    /// The select whose menu is open (LLP 1069.001 D7).
+    /// The select whose menu is open (LLP 1069.001 D7), the row its keys
+    /// moved to, and how far it is scrolled (`select.rs`).
     pub(crate) menu: Option<ViewId>,
+    menu_row: Option<usize>,
+    menu_scroll: f32,
     autofocus_processed: std::collections::BTreeSet<ViewId>,
     /// What the focus's following of the route keeps (`arrive.rs`).
     route_focus: arrive::State,
@@ -260,6 +271,7 @@ pub struct Presenter<D: DataSource> {
     pub(crate) control_bindings: BTreeMap<(u32, u32), crate::surfaces::ControlBinding>,
     pub(crate) control_contact: Option<(ViewId, f32, f32)>,
     boxes: Vec<PaintedBox>,
+    boxes_page: (f32, f32),
     /// Bumped whenever `boxes` is replaced.
     boxes_serial: u64,
     /// The fields `rangeFrame` reads, as painted beside `boxes`.
@@ -305,7 +317,7 @@ pub struct Presenter<D: DataSource> {
     pub painter: PainterInfo,
     /// The executor for a request that leaves the process (LLP 1016 D2).
     executor: crate::executor::Executor,
-    /// Requests held at dispatch, released after a later commit (LLP 1027.002 D3).
+    /// Requests held at dispatch until a commit or source wake releases them (LLP 1027.002 D3).
     parked: BTreeMap<u64, exact_runner::RequestOut>,
     refusal_turn: bool,
     collection: collection::State,
@@ -515,6 +527,7 @@ impl<D: DataSource> Presenter<D> {
             fields: BTreeMap::new(),
             field_history: Default::default(),
             field_drag: None,
+            range_drag: None,
             ime: None,
             ime_epoch: 0,
             field_reveal: false,
@@ -527,6 +540,8 @@ impl<D: DataSource> Presenter<D> {
             controls: BTreeMap::new(),
             chosen: BTreeMap::new(),
             menu: None,
+            menu_row: None,
+            menu_scroll: 0.0,
             autofocus_processed: Default::default(),
             route_focus: Default::default(),
             pointer: None,
@@ -541,6 +556,7 @@ impl<D: DataSource> Presenter<D> {
             pads: Default::default(),
             control_bindings: BTreeMap::new(),
             boxes: Vec::new(),
+            boxes_page: (0., 0.),
             boxes_serial: 0,
             ranges: Default::default(),
             dirty: true,
@@ -570,7 +586,7 @@ impl<D: DataSource> Presenter<D> {
             surfaces: Default::default(),
             module: None,
             painted: false,
-            activation_failed: false,
+            activation_failed: None,
             dev: None,
             pending_dev: None,
             pending_update: false,
@@ -671,20 +687,20 @@ impl<D: DataSource> Presenter<D> {
             .commit_shaders(shaders)
             .map_err(HostError::Asset)?;
         self.host = host;
-        self.replaced();
-        if self.display.new_session() {
-            self.painted = false;
-        }
-        self.activation_failed = false;
-        self.module = module;
-        self.text = candidate_text.clone();
-        self.brush.text = candidate_text;
         // The old executor lets go of everything, then says which uploads had
         // begun to go out; the rest never left (LLP 1016.000 D10).
         self.executor.forget(|_| false);
         let started = self.executor.let_go_started(|_| false);
         self.executor = self.host.executor();
         self.host.runner_mut().uploads_started(&started);
+        self.replaced();
+        if self.display.new_session() {
+            self.painted = false;
+        }
+        self.activation_failed = None;
+        self.module = module;
+        self.text = candidate_text.clone();
+        self.brush.text = candidate_text;
         self.parked.clear();
         self.scroll.clear();
         self.collection = collection::State::default();
@@ -837,7 +853,7 @@ impl<D: DataSource> Presenter<D> {
         self.hatches.stale = true;
         // A continuation is dispatched here, on this thread, after the
         // commit that handed it out (LLP 1027.002 D3); one a source holds
-        // is parked and released after a later commit.
+        // is parked until a later commit or source wake releases it.
         // An app's aborted fetches first (any method), then what the runner let go.
         self.executor
             .cancel(&self.host.runner_mut().take_explicit_aborts());
@@ -889,11 +905,7 @@ impl<D: DataSource> Presenter<D> {
             };
             self.run_dispatch(r, dispatch);
         }
-        for (token, dispatch) in self.host.release_work() {
-            if let Some(r) = self.parked.remove(&token) {
-                self.run_dispatch(r, dispatch);
-            }
-        }
+        self.release_held_work();
         // An abort made in this batch's turns is answered at the next pump: wake it.
         if self.host.runner_mut().collected_aborts() {
             self.executor.notify();
@@ -1186,6 +1198,7 @@ impl<D: DataSource> Presenter<D> {
             s.push('}');
         }
         s.push(']');
+        self.status_bar_layout(&mut s);
         if let Some(id) = node {
             let detail = self.host.agent(&format!(
                 "{{\"op\":\"node\",\"id\":{id},\"plan\":{include_plan}}}"
@@ -1326,28 +1339,6 @@ impl<D: DataSource> Presenter<D> {
             })
     }
 
-    /// The agent's wheel: over the node's center.
-    pub fn wheel(&mut self, id: ViewId, dx: f32, dy: f32) -> Result<String, String> {
-        if !dx.is_finite() || !dy.is_finite() {
-            return Err("wheel needs finite deltas".into());
-        }
-        if !self.alert_allows(id) || self.host.route_visibility(id).1 {
-            return Err(format!("view {id} is hidden or inert"));
-        }
-        let b = self
-            .box_of(id)
-            .ok_or_else(|| format!("no view {id} on screen"))?;
-        let (x, y) = (b.rect.0 + b.rect.2 / 2.0, b.rect.1 + b.rect.3 / 2.0);
-        self.wheel_at(x, y, dx, dy);
-        Ok(format!(
-            "{{\"tapped\":{id},\"wheel\":[{},{}],\"at\":[{},{}]}}",
-            num(dx as f64),
-            num(dy as f64),
-            num(r2(x)),
-            num(r2(y))
-        ))
-    }
-
     /// The agent's `tap <list> into <key>` (LLP 1070.000 §5): the runner's
     /// request, committed, then every report it asks for.
     pub fn into_view(
@@ -1384,29 +1375,35 @@ impl<D: DataSource> Presenter<D> {
         self.host.runner().has_pending()
     }
 
-    /// Another host took over: it is measured as the last was, and counted.
+    /// Another host took over, with its executor: it is measured as the
+    /// last was, given what the last was given, and counted.
     pub(crate) fn replaced(&mut self) {
         self.read_ranges();
         self.scroll_end = Default::default();
         self.give_clock();
+        self.modules_replaced();
         // A new kernel may have the same epoch.
         self.brush.paint_epoch = None;
         // A new runner reuses view ids and node keys: an unbound control's
         // own state, a choice or typed text (LLP 1069.001 D4), an edit to
-        // commit, a caret, an open menu, a hover or a held pointer is not
-        // its tree's, as Apple's reset and the web's rebuilt page have it.
+        // commit, a caret, an open menu, a hover, a held pointer or a GPU
+        // surface is not its tree's, as Apple's reset and the web's rebuilt
+        // page have it.
         self.chosen.clear();
         self.controls.clear();
         self.edited = None;
         self.fields.clear();
         self.field_drag = None;
+        self.range_drag = None;
         self.field_history = Default::default();
         self.ime = None;
         self.window_focus = None;
-        self.menu = None;
+        self.close_menu();
         self.hovered.clear();
         self.pointer_held = None;
         self.pointer_path.clear();
+        self.surfaces.replaced(&mut self.host);
+        self.control_bindings.clear();
         self.hatch_reset();
         self.top_replaced();
         self.holds_changed();

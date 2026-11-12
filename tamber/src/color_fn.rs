@@ -4,7 +4,7 @@
 
 use crate::css::Item;
 use crate::fold::{color_item, fail, per_side, FoldError, Folded, Half, Named, Names};
-use exact_color::{HueMethod, Interpolation, MixSpace, Parsed, Space, Wide};
+use exact_color::{hue_arc, Interpolation, MixSpace, Parsed, Space, Wide};
 
 /// A typed calc value (CSS Values 4 §10.9): a number, an angle in degrees,
 /// or a percentage not yet resolved.
@@ -285,10 +285,14 @@ fn space_of(mix: MixSpace) -> Space {
 
 /// A colour in `space`'s components; in its own space, as it is.
 fn components(w: Wide, space: MixSpace) -> [f64; 3] {
-    if space_of(space) == w.space && !matches!(space, MixSpace::Hsl | MixSpace::Hwb) {
+    if in_own_space(w, space) {
         return w.c;
     }
     space.from_linear_srgb(w.linear_srgb())
+}
+
+fn in_own_space(w: Wide, space: MixSpace) -> bool {
+    space_of(space) == w.space && !matches!(space, MixSpace::Hsl | MixSpace::Hwb)
 }
 
 /// Components in `space` as a colour, hsl and hwb as sRGB. A relative
@@ -691,12 +695,14 @@ fn normalise(given: &[Option<f64>]) -> (Vec<f64>, f64) {
 }
 
 /// A colour at one end of an interpolation in a space: its components, its
-/// alpha, and whether its hue is powerless (an achromatic colour's).
+/// alpha, whether its hue is powerless (an achromatic colour's), and whether
+/// its components are as written rather than converted.
 #[derive(Clone, Copy)]
 struct End {
     c: [f64; 3],
     alpha: f64,
     gray: bool,
+    written: bool,
 }
 
 fn polar(space: MixSpace) -> Option<usize> {
@@ -721,6 +727,7 @@ fn end(w: Wide, space: MixSpace) -> End {
         c,
         alpha: w.alpha,
         gray,
+        written: in_own_space(w, space),
     }
 }
 
@@ -736,18 +743,8 @@ fn step(mut a: End, mut b: End, t: f64, how: Interpolation) -> End {
             (false, true) => b.c[hue] = a.c[hue],
             _ => {}
         }
-        let (h1, h2) = (a.c[hue], b.c[hue]);
-        let d = h2 - h1;
-        b.c[hue] = match how.hue {
-            HueMethod::Shorter if d > 180.0 => h2 - 360.0,
-            HueMethod::Shorter if d < -180.0 => h2 + 360.0,
-            HueMethod::Longer if d > 0.0 && d < 180.0 => h2 - 360.0,
-            // As `exact_color::mix` takes the bound, so a transition agrees.
-            HueMethod::Longer if (-180.0..=0.0).contains(&d) => h2 + 360.0,
-            HueMethod::Increasing if d < 0.0 => h2 + 360.0,
-            HueMethod::Decreasing if d > 0.0 => h2 - 360.0,
-            _ => h2,
-        };
+        // As `exact_color::mix` goes round, so a transition agrees.
+        b.c[hue] = hue_arc(a.c[hue], b.c[hue], how.hue, a.written && b.written);
     }
     let alpha = a.alpha + (b.alpha - a.alpha) * t;
     let c = std::array::from_fn(|i| {
@@ -766,5 +763,7 @@ fn step(mut a: End, mut b: End, t: f64, how: Interpolation) -> End {
         c,
         alpha,
         gray: a.gray && b.gray,
+        // A converted end's rounding carries into the mix.
+        written: a.written && b.written,
     }
 }

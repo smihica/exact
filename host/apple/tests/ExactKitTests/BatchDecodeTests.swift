@@ -92,6 +92,20 @@ final class BatchDecodeTests: XCTestCase {
     }
     private func compare(_ text: String) throws -> Batch { try compare(Data(text.utf8)) }
 
+    func testInlineVisibilityInEitherOperationFieldOrder() throws {
+        for (style, hidden) in [("{}", false), (#"{"visibility":"visible"}"#, false),
+                                (#"{"visibility":"hidden"}"#, true), (#"{"visibility":"collapse"}"#, true)] {
+            let run = #"{"id":2,"parent":1,"paint":true,"props":{"text":"Run"},"style":\#(style)}"#
+            for op in [#"{"op":"paragraph","id":1,"runs":[\#(run)]}"#,
+                       #"{"id":1,"runs":[\#(run)],"op":"paragraph"}"#] {
+                let batch = Batch.decode(Data(#"{"ops":[\#(op)]}"#.utf8))
+                XCTAssertNil(batch.error)
+                let decoded = try XCTUnwrap(batch.ops.first?.runs.first)
+                XCTAssertEqual(decoded.hidden, hidden, style)
+            }
+        }
+    }
+
     func testEveryOperationAndAdapterPayload() throws {
         let rows = [
             #"{"op":"create","id":4294967295,"kind":"text","props":{"text":"α 👩‍🚀 é\n\"\\\u0001"},"style":{"opacity":0.5,"text_color":[[1,2,3,4],[5,6,7,8]],"future":{"b":true,"n":null}},"handlers":["press","press","change"]}"#,

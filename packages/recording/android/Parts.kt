@@ -121,7 +121,8 @@ internal fun recoverParts(app: Context, log: (String) -> Unit) {
         val file = File(path)
         val part = File("$path.part")
         try {
-            if (part.isFile && mux(part, file)) log("recording: recovered $path")
+            // A part the app's own code made a link reads nothing through it.
+            if (dev.exact.canvas.Files.regular(part) && mux(part, file)) log("recording: recovered $path")
         } catch (e: Exception) {
             log("recording: $path did not recover: $e")
         }

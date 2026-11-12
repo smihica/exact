@@ -169,7 +169,7 @@ extension TextEngine {
     /// Paint a paragraph into a y-down context (a flipped NSView's, a
     /// UIView's): one CTLineDraw per line, on device-pixel baselines
     /// (`paintedBaseline`), flush by alignment.
-    static func draw(_ p: Paragraph, spec: Spec, in bounds: CGRect, context ctx: CGContext, dirty: CGRect? = nil) {
+    static func draw(_ p: Paragraph, spec: Spec, in bounds: CGRect, context ctx: CGContext, dirty: CGRect? = nil, pass: TextLinePaint.Pass = .all) {
         // Font smoothing is graphics state (LLP 1019 D12).
         ctx.saveGState()
         defer { ctx.restoreGState() }
@@ -177,17 +177,18 @@ extension TextEngine {
         // CSS `text-shadow`: under every glyph of the paragraph at once, so
         // one line's shadow never covers another's text (LLP 1077 D3). Core
         // Graphics' blur is CSS's radius; its offset is base space, y up.
-        if let s = spec.shadow {
+        let shadow = pass.paintsGlyphs ? spec.shadow : nil
+        if let s = shadow {
             ctx.saveGState()
             ctx.setShadow(offset: CGSize(width: s[0], height: -s[1]), blur: s[2], color: TextEngine.shadowColor(s))
             ctx.beginTransparencyLayer(auxiliaryInfo: nil)
         }
-        defer { if spec.shadow != nil { ctx.endTransparencyLayer(); ctx.restoreGState() } }
+        defer { if shadow != nil { ctx.endTransparencyLayer(); ctx.restoreGState() } }
         func paint(_ index: Int) {
             let line = spec.ellipsis ? p.ellipsized(index, spec: spec, width: bounds.width) : p.lines[index]
             let baseline = p.baselines[index]
             let x = p.origin(index, align: spec.align, width: bounds.width)
-            TextLinePaint.draw(line, at: CGPoint(x: bounds.minX + x, y: Self.paintedLine(baseline, top: bounds.minY, scale: deviceScale(ctx), lineScale: p.lineScale)), in: ctx)
+            TextLinePaint.draw(line, at: CGPoint(x: bounds.minX + x, y: Self.paintedLine(baseline, top: bounds.minY, scale: deviceScale(ctx), lineScale: p.lineScale)), in: ctx, pass: pass)
         }
         if let dirty {
             p.inkBounds().forEachLine(from: dirty.minY - bounds.minY,
@@ -271,6 +272,7 @@ enum TextLinePaint {
             ctx.setFillColor(fill.color)
             if let path = fill.path { ctx.addPath(path); ctx.fillPath() } else { ctx.fill(fill.rect) }
         }
+        guard pass.paintsGlyphs else { ctx.restoreGState(); return }
         // The text matrix is not graphics state; put the caller's back.
         let matrix = ctx.textMatrix
         ctx.translateBy(x: origin.x, y: origin.y)

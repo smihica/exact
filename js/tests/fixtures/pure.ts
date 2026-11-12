@@ -2,7 +2,7 @@
 // Contract signature small; the separate transfer corpus also uses Bun's JSON.
 // What an object says of itself never steers a copy (review r4a 5, 9, 10):
 // its own `constructor`, getters and tags, a key named `__proto__`, holes.
-import { streams } from './pure-streams.ts';
+import { streams, streamBody, streamBodyBrands, streamUpload } from './pure-streams.ts';
 function steered() {
   const proto=structuredClone(JSON.parse('{"__proto__":{"admin":true},"ok":1}'));
   const bytes=new Uint8Array([1,2]);
@@ -21,7 +21,152 @@ function steered() {
     map:[...structuredClone(map)], re:[structuredClone(re).flags,structuredClone(re).source],
     holes:[holes.length,0 in holes,1 in holes,2 in holes,visits]};
 }
+function shadowIntrinsics(): string {
+  const check = (run: () => unknown) => {
+    try { return run(); } catch (error) { return String(error); }
+  };
+  return JSON.stringify([
+    check(() => {
+      class MyError extends Error {
+        constructor(message: string) { super(message); this.name = 'MyError'; }
+      }
+      const error = new MyError('x');
+      return [error.name, error.message, error instanceof MyError];
+    }),
+    check(() => {
+      const money = {};
+      money.toString = () => '$2.50';
+      money.toString = () => '$3.50';
+      const d = Object.getOwnPropertyDescriptor(money, 'toString')!;
+      return [String(money), d.writable, d.enumerable, d.configurable];
+    }),
+    check(() => {
+      function Point(this: any, n: number) { this.n = n; }
+      Point.prototype.toString = function () { return `Point(${this.n})`; };
+      return String(new (Point as any)(3));
+    }),
+    check(() => {
+      const refused = Object.create(Error.prototype);
+      refused.name = 'Refused';
+      return refused.name;
+    }),
+    check(() => {
+      const seen: Record<string, boolean> = {};
+      for (const word of ['a', 'constructor', 'valueOf']) seen[word] = true;
+      return Object.keys(seen);
+    }),
+    check(() => {
+      const list = [];
+      list[Symbol.iterator] = function* () { yield 7; };
+      return [...list];
+    }),
+  ]);
+}
+
+function lockedIntrinsics(): string {
+  'use strict';
+  const refuses = (run: () => void) => {
+    try { run(); return false; } catch (error) { return error instanceof TypeError; }
+  };
+  return JSON.stringify([
+    [Object.prototype, 'toString'],
+    [Error.prototype, 'name'],
+    [Array.prototype, Symbol.iterator],
+    [Function.prototype, 'call'],
+  ].map(([object, key]) => {
+    const obj = object as any, k = key as PropertyKey, value = obj[k];
+    const d = Object.getOwnPropertyDescriptor(obj, k)!;
+    const receiver = Object.create(obj);
+    Object.defineProperty(receiver, k, { value: 'own', writable: false });
+    let getterCalled = false;
+    const accessor = Object.create(obj);
+    Object.defineProperty(accessor, k, { get() { getterCalled = true; return 'own'; } });
+    return [
+      typeof d.get === 'function', typeof d.set === 'function',
+      Object.isFrozen(obj), Object.isFrozen(d.get), Object.isFrozen(d.set), Object.isFrozen(value),
+      d.get!.prototype === undefined, d.set!.prototype === undefined,
+      refuses(() => { d.get!.prototype.slot = 1; }),
+      refuses(() => { d.set!.prototype.slot = 1; }),
+      refuses(() => { obj[k] = 'changed'; }),
+      refuses(() => { Object.defineProperty(obj, k, { value: 'changed' }); }),
+      refuses(() => { delete obj[k]; }),
+      refuses(() => { d.set!.call(receiver, 'changed'); }),
+      refuses(() => { d.set!.call(accessor, 'changed'); }),
+      refuses(() => { d.set!.call(Object.preventExtensions(Object.create(obj)), 'changed'); }),
+      obj[k] === value, receiver[k] === 'own', !getterCalled,
+    ];
+  }));
+}
+
 export function exercise(source: string): string {
+  if (source === 'lockedIntrinsics') return lockedIntrinsics();
+  if (source === 'shadowIntrinsics') return shadowIntrinsics();
+  if (source === 'streamBody') return streamBody() as unknown as string;
+  if (source === 'streamBodyBrands') return streamBodyBrands() as unknown as string;
+  if (source === 'streamUpload') return streamUpload() as unknown as string;
+  if (source === 'consoleAbortListeners') {
+    const controller = new AbortController();
+    controller.signal.onabort = () => { throw new Error('boom'); };
+    controller.signal.addEventListener('abort', () => { throw new RangeError('listener'); });
+    controller.signal.addEventListener('abort', () => { console.log('later listener'); });
+    controller.abort();
+    return 'reached the return';
+  }
+  if (source === 'consoleTrailingNewline') {
+    console.log('done\n');
+    return 'reached the return';
+  }
+  if (source === 'consoleTrailingCarriageReturn') {
+    console.log('100%\r');
+    return 'reached the return';
+  }
+  if (source === 'consoleLineEndings') {
+    for (const entry of ['done\n', '100%\r', 'next', '', '\n', 'a\r\nb\n', 'x\0é😀\n', 'end\n\n']) {
+      console.log(entry);
+    }
+    return 'reached the return';
+  }
+  if (source === 'consoleErrors') {
+    const error = new TypeError('boom');
+    console.error(error);
+    console.error('load failed', error);
+    return error.stack!;
+  }
+  if (source === 'consoleCycle') {
+    const row: any = { id: 1, children: [] };
+    row.children.push({ parent: row });
+    console.log('row', row);
+    console.log('after');
+    return 'reached the return';
+  }
+  if (source === 'consoleBigInt') {
+    console.info('bigint', 1n, { n: 1n });
+    return 'reached the return';
+  }
+  if (source === 'consoleFallback') {
+    const error = new RangeError('no stack');
+    Object.defineProperty(error, 'stack', { get() { throw new Error('stack getter'); } });
+    console.warn(error);
+    console.debug({
+      toJSON() { throw new Error('Javascript execution has timed out.'); },
+      toString() { return 'fallback'; },
+    });
+    console.log({
+      toJSON() { throw new Error('JSON hook'); },
+      toString() { throw new Error('string hook'); },
+    }, 'after');
+    console.info(null, undefined, true, 42, Symbol('label'), { ok: true });
+    return 'reached the return';
+  }
+  if (source === 'consoleEmpty' || source === 'consoleEmptyBatch') {
+    console.log('');
+    if (source === 'consoleEmptyBatch') {
+      console.log('middle');
+      console.log('');
+      console.log();
+    }
+    return 'reached the return';
+  }
   const encoder = new TextEncoder();
   if(source==='text') {
     const labels=['UTF-8',' utf8 ','unicode-1-1-utf-8','unicode11utf8','unicode20utf8','x-unicode20utf8'].map(s=>new TextDecoder(s).encoding);
@@ -108,8 +253,7 @@ export function exercise(source: string): string {
     const nextOnce={[Symbol.iterator]:()=>({get next(){nexts++;return ()=>({done:n++>0,value:signal});}})};
     let gets=0;
     const valueOnce={[Symbol.iterator]:()=>{let k=0;return {next:()=>k++?{done:true}:{done:false,get value(){gets++;return signal;}}};}};
-    // An iterator method and a `next` with a `call` of their own, which a conversion must not use (defined, as data
-    // code's prototypes are frozen)
+    // An iterator method and a `next` with a `call` of their own, which a conversion must not use.
     const ownCall={[Symbol.iterator]:()=>({next:Object.defineProperty(()=>({done:true}),'call',{value:()=>({done:false,value:{}})})})};
     const methodCall={[Symbol.iterator]:Object.defineProperty(function*(){yield signal;},'call',{value:()=>1})};
     return JSON.stringify([said(()=>AbortSignal.any(once as unknown as AbortSignal[])),reads,said(()=>AbortSignal.any(lateThrow())),said(()=>AbortSignal.any(badStep as unknown as AbortSignal[])),
@@ -269,8 +413,8 @@ export function exercise(source: string): string {
     changing.maximumFractionDigits=3;
     kept.push((1.23456).toLocaleString('en-US',changing),(1.23456).toLocaleString(['de-DE'],changing),(1.23456).toLocaleString('de-DE',changing),(1234.5).toLocaleString('en-US'));
     out['en-US toLocaleString kept']=kept;
-    // A DateTimeFormat made with the same locales and options shares one
-    // engine formatter, each `new` an object of its own; a Date's
+    // A DateTimeFormat with an explicit timeZone and the same locales and
+    // options shares an engine formatter, each `new` an object of its own; a Date's
     // toLocale…String adds its default fields when the options name none.
     const days=[Date.UTC(2026,0,5,9,30,15),Date.UTC(2025,11,31,23,5,0),Date.UTC(2024,1,29,12,0,0)].map(t=>new Date(t));
     const utc={timeZone:'UTC'} as const, short:Intl.DateTimeFormatOptions={month:'short',day:'numeric',year:'numeric',timeZone:'UTC'};

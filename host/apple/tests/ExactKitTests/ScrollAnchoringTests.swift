@@ -105,6 +105,66 @@ final class ScrollAnchoringTests: XCTestCase {
         XCTAssertEqual(ScrollAnchoring.adjusted(top: 20, before: 100, after: 0, minimum: 0, maximum: 300), 0)
     }
 
+    func testABatchFromClosingWorkKeepsTheReadersPosition() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        #endif
+        for (followEnd, initialTop, authoredTop) in [(false, 200.0, false), (true, 200.0, false),
+                                                    (true, 448.0, false), (true, 200.0, true)] {
+            let p = Presenter()
+            p.viewport.frame = CGRect(x: 0, y: 0, width: 400, height: 400)
+            func rows(header: Double, extra: Double = 0) -> [[String: Any]] {
+                var ops: [[String: Any]] = [
+                    ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 300, "h": header],
+                ]
+                for i in 0..<20 {
+                    ops.append(["op": "frame", "id": 10 + i, "x": 0, "y": header + Double(i * 30), "w": 300, "h": 30])
+                }
+                ops.append(["op": "content", "id": 1, "w": 300, "h": header + 600 + extra])
+                return ops
+            }
+            var ops: [[String: Any]] = [
+                ["op": "create", "id": 1, "kind": "view", "props": followEnd ? ["scrollFollowEnd": "true"] : [:],
+                 "style": ["overflow_y": "scroll"]],
+                ["op": "create", "id": 2, "kind": "view", "props": ["id": "header"]],
+            ]
+            for i in 0..<20 {
+                ops.append(["op": "create", "id": 10 + i, "kind": "view", "props": ["id": "row-\(i)"]])
+            }
+            ops += [
+                ["op": "children", "id": 1, "ids": [2] + Array(10..<30)], ["op": "roots", "ids": [1]],
+                ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 300, "h": 200],
+            ]
+            p.apply(wireBatch(ops + rows(header: 48)))
+            #if os(iOS) || os(tvOS)
+            let scroll = try XCTUnwrap(p.views[1]?.scrollView)
+            scroll.contentOffset.y = initialTop
+            func top() -> CGFloat { scroll.contentOffset.y }
+            #else
+            let clip = try XCTUnwrap(p.views[1]?.scroll?.contentView)
+            clip.scroll(to: CGPoint(x: 0, y: initialTop))
+            func top() -> CGFloat { clip.bounds.minY }
+            #endif
+            var nested = 0
+            // Covers and route blocks can synchronously apply a batch from this queue.
+            p.onViewportFit = {
+                p.afterBatch {
+                    nested += 1
+                    let restored = authoredTop ? 100.0 : initialTop == 448 ? 400.0 : 152.0
+                    XCTAssertEqual(top(), restored, accuracy: 0.5, "closing work sees the restored or authored offset")
+                    p.apply(wireBatch(rows(header: 0, extra: 60)))
+                }
+            }
+            defer { p.onViewportFit = nil }
+            var props = ["viewportFit": "cover"]
+            if authoredTop { props["scrollTop"] = "100" }
+            p.apply(wireBatch([["op": "props", "id": 1, "set": props]] + rows(header: 0)))
+            XCTAssertEqual(nested, 1)
+            let expected = authoredTop ? 100.0 : initialTop == 448 ? 460.0 : 152.0
+            XCTAssertEqual(top(), expected, accuracy: 0.5, "followEnd=\(followEnd), initialTop=\(initialTop), authoredTop=\(authoredTop)")
+        }
+    }
+
     func testOnlyLayoutPropertiesSuppress() {
         var changes = ScrollAnchoring.Changes()
         changes.note(1, from: ["background_color": "#fff"], to: ["background_color": "#000"], popover: false)

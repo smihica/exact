@@ -29,6 +29,7 @@ fn main() {
         "theme_fixture_data::Fixture",
         "theme_fixture_data::Fixture",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

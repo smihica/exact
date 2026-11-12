@@ -293,6 +293,68 @@ fn the_reader_is_told_each_field_its_box_and_its_keyboard() {
 }
 
 #[test]
+fn a_hosted_fields_face_belongs_to_its_plan() {
+    let (_shell, _hosting) = shell();
+    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/fixtures/fonts");
+    let plan = |file: &str| {
+        let source = format!(
+            r#"font "Field"
+  400 = "assets/{file}"
+component App
+  view
+    column width=320 height=200
+      input testId="f" font-family="Field"
+"#
+        );
+        contract::compile_path_source(&assets.join("field-font.contract"), &source)
+            .unwrap()
+            .encode()
+    };
+    let boot_plan = |plan: &[u8]| {
+        let (mut p, error) = Presenter::boot_with(
+            plan,
+            (),
+            (320., 480.),
+            1.,
+            assets.clone(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        settle(&mut p);
+        p
+    };
+    let file = |name: &str| {
+        format!(
+            "{}#0",
+            assets
+                .join("assets")
+                .join(name)
+                .canonicalize()
+                .unwrap()
+                .display()
+        )
+    };
+    let first = plan("DejaVuSans.ttf");
+    let second = plan("DejaVuSans-Bold.ttf");
+    let mut original = boot_plan(&first);
+    assert_eq!(told(&mut original)[0].strings[2], file("DejaVuSans.ttf"));
+    let mut reloaded = boot_plan(&first);
+    assert_eq!(
+        reloaded.reload_module(&second, (), None, false).unwrap(),
+        None
+    );
+    settle(&mut reloaded);
+    assert_eq!(
+        told(&mut reloaded)[0].strings[2],
+        file("DejaVuSans-Bold.ttf")
+    );
+    let mut fresh = boot_plan(&second);
+    assert_eq!(told(&mut fresh)[0].strings[2], file("DejaVuSans-Bold.ttf"));
+    assert_eq!(told(&mut original)[0].strings[2], file("DejaVuSans.ttf"));
+}
+
+#[test]
 fn a_hosted_fields_text_is_the_shells_to_draw() {
     let (_shell, _hosting) = shell();
     let mut p = boot(FORM);

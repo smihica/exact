@@ -24,9 +24,9 @@ pub enum FilterFn {
     Brightness(f32),
     /// `contrast()`.
     Contrast(f32),
-    /// `drop-shadow(<length>{2,3} <color>?)`: dx, dy, blur (px), colour
-    /// (`currentcolor` when none is given), which may be a reference (LLP
-    /// 1095 D1).
+    /// `drop-shadow([ <color>? && <length>{2,3} ])`: dx, dy, blur (px),
+    /// colour (`None` for an omitted colour or `currentcolor`), which may
+    /// be a reference (LLP 1095 D1).
     DropShadow(f32, f32, f32, Option<crate::style::ColorValue>),
     /// `grayscale()`.
     Grayscale(f32),
@@ -149,10 +149,13 @@ impl FilterList {
                         match px(word) {
                             Some(v) if lengths.len() < 3 => lengths.push(v),
                             _ if color.is_none() => {
-                                color =
+                                color = Some(if word.eq_ignore_ascii_case("currentcolor") {
+                                    None
+                                } else {
                                     Some(crate::style::ColorValue::parse_light_dark(word).or_else(
                                         || crate::style::Color::parse(word).map(Into::into),
                                     )?)
+                                })
                             }
                             _ => return None,
                         }
@@ -164,7 +167,7 @@ impl FilterList {
                         lengths[0],
                         lengths[1],
                         lengths.get(2).copied().unwrap_or(0.0),
-                        color,
+                        color.flatten(),
                     )
                 }
                 _ => return None,

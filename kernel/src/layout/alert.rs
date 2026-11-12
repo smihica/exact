@@ -128,9 +128,7 @@ impl LayoutTree {
             (false, None) => None,
         };
         if arena.node_type(slot).lays_out_children() {
-            let children = order::laid_out(arena, slot, &self.taffy, owner, prefix, |child| {
-                arena.taffy(child)
-            });
+            let children = order::laid_out(arena, slot, prefix, |child| arena.taffy(child));
             self.set_children(owner, &children);
         }
         self.mark_dirty(owner);

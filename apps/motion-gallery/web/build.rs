@@ -30,6 +30,7 @@ fn main() {
         "motion_gallery_data::Gallery",
         "motion_gallery_data::Gallery",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

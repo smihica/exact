@@ -2,6 +2,8 @@
 //! which it cannot run (LLP 1027.002 §5 step 0).
 use contract::DataSource;
 use exact_js::Module;
+use exact_plan::Value;
+use exact_runner::{Answer, DataError, InFlight, Outcome, Overlaid, Store, Target, Write};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -84,52 +86,78 @@ pub(crate) struct Seeded<'a> {
     pub(crate) seed: &'a Seed,
 }
 
-impl DataSource for Seeded<'_> {
-    fn query(
-        &mut self,
-        source: &str,
-        args: &[exact_plan::Value],
-    ) -> Result<exact_plan::Value, exact_runner::DataError> {
+impl Seeded<'_> {
+    fn seeds(&self, source: &str) -> bool {
+        self.seed.values.contains_key(source)
+    }
+}
+
+impl exact_runner::DataSourceWrapper for Seeded<'_> {
+    fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError> {
         match self.seed.values.get(source) {
             Some(Ok(value)) => Ok(value.clone()),
-            Some(Err(message)) => Err(exact_runner::DataError::Unavailable(message.clone())),
+            Some(Err(message)) => Err(DataError::Unavailable(message.clone())),
             None => self.module.query(source, args),
         }
     }
     fn answer(
         &mut self,
-        store: &mut exact_runner::Store,
+        store: &mut Store,
         source: &str,
-        args: &[exact_plan::Value],
-    ) -> Result<exact_runner::Answer, exact_runner::DataError> {
-        if self.seed.values.contains_key(source) {
-            return self.query(source, args).map(exact_runner::Answer::Now);
+        args: &[Value],
+    ) -> Result<Answer, DataError> {
+        if self.seeds(source) {
+            return DataSource::query(self, source, args).map(Answer::Now);
         }
         self.module.answer(store, source, args)
     }
     fn answer_for(
         &mut self,
-        target: exact_runner::Target,
-        store: &mut exact_runner::Store,
+        target: Target,
+        store: &mut Store,
         source: &str,
-        args: &[exact_plan::Value],
-    ) -> Result<exact_runner::Answer, exact_runner::DataError> {
-        if self.seed.values.contains_key(source) {
-            return self.query(source, args).map(exact_runner::Answer::Now);
+        args: &[Value],
+    ) -> Result<Answer, DataError> {
+        if self.seeds(source) {
+            return DataSource::query(self, source, args).map(Answer::Now);
         }
         self.module.answer_for(target, store, source, args)
     }
     fn overlay(
         &mut self,
         source: &str,
-        args: &[exact_plan::Value],
-        answer: &exact_plan::Value,
-        writes: &[exact_runner::Write<'_>],
-    ) -> Result<Option<exact_runner::Overlaid>, exact_runner::DataError> {
-        if self.seed.values.contains_key(source) {
+        args: &[Value],
+        answer: &Value,
+        writes: &[Write<'_>],
+    ) -> Result<Option<Overlaid>, DataError> {
+        if self.seeds(source) {
             return Ok(None);
         }
         self.module.overlay(source, args, answer, writes)
+    }
+    fn adopt(&mut self, source: &str, args: &[Value], value: &Value) {
+        if !self.seeds(source) {
+            self.module.adopt(source, args, value);
+        }
+    }
+    fn parse(
+        &mut self,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        self.module.parse(store, source, args, outcome)
+    }
+    fn parse_for(
+        &mut self,
+        target: Target,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        self.module.parse_for(target, store, source, args, outcome)
     }
     fn app_id(&self) -> &str {
         self.module.app_id()
@@ -148,5 +176,156 @@ impl DataSource for Seeded<'_> {
     }
     fn canvas_surfaces(&self) -> Vec<(String, usize)> {
         self.module.canvas_surfaces()
+    }
+    fn prepare_snapshot(
+        &mut self,
+        module: Option<exact_runner::SnapshotModule<'_>>,
+        deadline: std::time::Instant,
+    ) -> Result<(), DataError> {
+        self.module.prepare_snapshot(module, deadline)
+    }
+    fn take_storage_changed(&mut self) -> bool {
+        self.module.take_storage_changed()
+    }
+    fn note_storage_changed(&mut self) {
+        self.module.note_storage_changed()
+    }
+    fn set_document_owner(&mut self, owner: u64) {
+        self.module.set_document_owner(owner)
+    }
+    fn configure_storage(
+        &mut self,
+        data: std::path::PathBuf,
+        cache: std::path::PathBuf,
+        temporary: std::path::PathBuf,
+    ) -> Result<(), DataError> {
+        self.module.configure_storage(data, cache, temporary)
+    }
+    fn configure_secrets(
+        &mut self,
+        secrets: std::sync::Arc<dyn exact_runner::SharedSecrets>,
+    ) -> Result<(), DataError> {
+        self.module.configure_secrets(secrets)
+    }
+    fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
+        self.module.continuation(token)
+    }
+    fn host_continuation(&self, token: u64) -> bool {
+        self.module.host_continuation(token)
+    }
+    fn placement(&self) -> exact_runner::Placement {
+        self.module.placement()
+    }
+    fn dispatch(&mut self, token: u64, store: &Store) -> exact_runner::Dispatch {
+        self.module.dispatch(token, store)
+    }
+    fn release(&mut self, store: &Store) -> Vec<(u64, exact_runner::Dispatch)> {
+        self.module.release(store)
+    }
+    fn discard(&mut self, token: u64) {
+        self.module.discard(token)
+    }
+    fn keeps_sent(&self, fetch: u64) -> bool {
+        self.module.keeps_sent(fetch)
+    }
+    fn module_delivery(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<Option<exact_runner::Request>, DataError> {
+        self.module.module_delivery(store, token, outcome)
+    }
+    fn background(&mut self, store: &Store) -> Option<exact_runner::Request> {
+        self.module.background(store)
+    }
+    fn background_landed(
+        &mut self,
+        store: &Store,
+        outcome: Outcome,
+    ) -> Result<Option<exact_runner::Request>, DataError> {
+        self.module.background_landed(store, outcome)
+    }
+    fn keep_sent(
+        &mut self,
+        store: &Store,
+        let_go: &[InFlight<'_>],
+        refused: bool,
+    ) -> Vec<Option<u64>> {
+        self.module.keep_sent(store, let_go, refused)
+    }
+    fn timer_before_reply(
+        &mut self,
+        store: &Store,
+        in_flight: InFlight<'_>,
+    ) -> Option<(u64, exact_runner::Request)> {
+        self.module.timer_before_reply(store, in_flight)
+    }
+    fn module_landed(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<(), DataError> {
+        self.module.module_landed(store, token, outcome)
+    }
+    fn background_state(&self) -> Option<exact_runner::BackgroundState> {
+        self.module.background_state()
+    }
+    fn take_logs(&mut self) -> Vec<String> {
+        self.module.take_logs()
+    }
+    fn take_aborted(&mut self) -> Vec<u64> {
+        self.module.take_aborted()
+    }
+    fn abort_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.module.abort_wake(wake)
+    }
+    fn activate(&mut self) -> Result<(), DataError> {
+        self.module.activate()
+    }
+    fn activate_for_validation(&mut self) -> Result<(), DataError> {
+        self.module.activate_for_validation()
+    }
+    fn preload(&self) -> Result<bool, DataError> {
+        self.module.preload()
+    }
+    fn when_preloaded(&self, wake: Box<dyn FnOnce() + Send>) {
+        self.module.when_preloaded(wake)
+    }
+    fn replacement(&self, plan: &[u8], receipt: &str, module: Vec<u8>) -> Result<Self, DataError> {
+        let module = self.module.replacement(plan, receipt, module)?;
+        Ok(Seeded {
+            module,
+            seed: self.seed,
+        })
+    }
+    fn forgotten(&mut self, store: &Store, in_flight: &[InFlight<'_>]) {
+        self.module.forgotten(store, in_flight)
+    }
+    fn interrupt(&self) -> Option<exact_runner::Interrupt> {
+        self.module.interrupt()
+    }
+    fn native(&self) -> Option<exact_runner::Native> {
+        self.module.native()
+    }
+    fn draw_2d(
+        &mut self,
+        surface: &str,
+        args: &[Value],
+        ctx: &exact_runner::exact_canvas::Context2d,
+        frame: &exact_runner::exact_canvas::Frame,
+    ) -> Result<bool, exact_runner::exact_canvas::DrawError> {
+        self.module.draw_2d(surface, args, ctx, frame)
+    }
+    fn draw(
+        &mut self,
+        request: &exact_runner::DrawRequest<'_>,
+        ctx: &exact_runner::exact_canvas::Context2d,
+    ) -> exact_runner::Drawn {
+        self.module.draw(request, ctx)
+    }
+    fn canvases_retired(&mut self, retired: &[(u64, u32)]) {
+        self.module.canvases_retired(retired)
     }
 }

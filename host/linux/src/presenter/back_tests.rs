@@ -264,6 +264,65 @@ fn the_mouses_back_and_forward_buttons_step_history_at_their_release() {
 }
 
 #[test]
+fn forward_to_a_location_beneath_the_top_consumes_history() {
+    let app = r#"routes nav
+  home "/"
+    thread "/t/:thread"
+component App
+  action open(url: string)
+    nav = push(nav, url)
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=`${top(nav).id}` ROOT width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}` position="absolute" inset=0
+          text e.url
+          button press=open("/t/a") testId=`a${e.id}`
+            text "Thread a"
+          button press=open("/t/b") testId=`b${e.id}`
+            text "Thread b"
+"#;
+    for root in ["navigate=follow", ""] {
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan(&app.replace("ROOT", root)),
+            (),
+            (400., 800.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        for letter in ["a", "b", "a"] {
+            let router = p.host().runner().carry().router.unwrap().1;
+            let top = exact_route::top(&router).unwrap().id;
+            let button = id(&p, &format!("{letter}{top}")).unwrap();
+            p.dispatch_press(button, 0., false);
+        }
+        let router = p.host().runner().carry().router.unwrap().1;
+        let original = exact_route::stack(&router).to_vec();
+        assert_eq!(
+            original.iter().map(|e| e.url.as_str()).collect::<Vec<_>>(),
+            ["/", "/t/a", "/t/b", "/t/a"]
+        );
+        p.pointer_aux(8, true, 300., 700., 1.);
+        p.pointer_aux(8, false, 300., 700., 2.);
+        assert_eq!(p.host().runner().location_ahead().as_deref(), Some("/t/a"));
+        p.pointer_aux(16, true, 300., 700., 3.);
+        p.pointer_aux(16, false, 300., 700., 4.);
+        let after = p.host().runner().carry().router.unwrap().1;
+        assert_eq!(exact_route::stack(&after), &original[..2], "{root:?}");
+        assert_eq!(p.host().runner().location_ahead(), None, "{root:?}");
+        p.pointer_aux(16, true, 300., 700., 5.);
+        p.pointer_aux(16, false, 300., 700., 6.);
+        device_key(&mut p, ALT, "ArrowRight");
+        device_key(&mut p, &[], "BrowserForward");
+        assert_eq!(p.host().runner().carry().router.unwrap().1, after);
+    }
+}
+
+#[test]
 fn back_is_its_keys_default_action_after_the_authors() {
     // In a text field Alt+Left goes back; the caret's keys are the bare arrows.
     let mut p = boot("navigate=follow", "input value=\"abc\" testId=\"field\"");

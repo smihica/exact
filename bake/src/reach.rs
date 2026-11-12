@@ -196,9 +196,9 @@ pub(crate) fn derive(
             usage.insert((*key).into(), json!(purposes[grant.purpose]));
         }
         // The platform's signing entitlements: macOS's hardened-runtime ones,
-        // iOS's capability ones (LLP 1069.008.000 D2; push's `aps-environment`
-        // joins when LLP 1069 §5 #9 lands). `auth.*`'s associated domains are
-        // `reach.auth` (below).
+        // iOS's capability ones (LLP 1069.008.000 D2; push's `aps-environment`,
+        // LLP 1133.004 §9 P2). `auth.*`'s associated domains are `reach.auth`
+        // (below).
         match platform {
             "macos" => entitlements.extend(grant.device.hardened),
             "ios" => {
@@ -781,6 +781,10 @@ fn family_enforcement(line: &str) -> &'static str {
 }
 
 #[cfg(test)]
+#[path = "reach_grant_lines_tests.rs"]
+mod grant_lines_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1016,6 +1020,21 @@ mod tests {
         assert!(
             !parsed(&dir.0, Some(lan), None, false).is_err_and(|e| e.contains("grant-development"))
         );
+    }
+
+    #[test]
+    fn push_signs_aps_environment_on_ios_alone() {
+        // LLP 1133.004 §9 P2: nothing on the Mac, and tvOS drops it.
+        let dir = app(&[("en", r#"{"n": "Says when a build ends."}"#)]);
+        let derive_for = |platform: &str| {
+            let mut c = compat("device.notifications n\ndevice.push");
+            derive(&dir.0, platform, None, &mut c).unwrap();
+            c.reach
+        };
+        let ios = derive_for("ios");
+        assert_eq!(ios["entitlements"], json!(["aps-environment"]));
+        assert_eq!(ios["tvOmits"], json!(["aps-environment"]));
+        assert_eq!(derive_for("macos")["entitlements"], json!([]));
     }
 
     #[test]

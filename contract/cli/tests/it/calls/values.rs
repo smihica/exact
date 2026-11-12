@@ -10,6 +10,59 @@ const STATE: &str = "state pick = 7";
 const DEVICE: &str = "resource pick = exactViewport() as shape Viewport";
 
 #[test]
+fn value_props_and_injects_named_like_an_app_fn_leave_calls_intact() {
+    let prop = "fn pick(n: number): number = n + 1\nfn other(n: number): number = n + 100\ncomponent App\n  state other = 7\n  view\n    Seg(pick=other)\ncomponent Seg\n  props\n    pick: number\n  view\n    text `${pick(1)} ${pick}` testId=\"result\"\n";
+    let inject = prop
+        .replace(
+            "  view\n    Seg(pick=other)",
+            "  provide\n    pick = other\n  view\n    Seg()",
+        )
+        .replace("  props\n", "  inject\n");
+    for source in [prop, &inject] {
+        assert_eq!(text_of(&boot(source), "result"), "2 7");
+    }
+}
+
+#[test]
+fn value_props_and_injects_leave_stdlib_call_heads_intact() {
+    let prop = "component App\n  state max = 3\n  view\n    column\n      Child(min=max)\ncomponent Child\n  props\n    min: number\n  view\n    text `${min(4, 9)} ${min}` testId=\"result\"\n";
+    let inject = prop
+        .replace(
+            "  view\n    column\n      Child(min=max)",
+            "  provide\n    min = max\n  view\n    Child()",
+        )
+        .replace("  props\n", "  inject\n");
+    for source in [prop.to_string(), prop.replace("min=max", "min=3"), inject] {
+        assert_eq!(text_of(&boot(&source), "result"), "4 3");
+    }
+}
+
+#[test]
+fn value_props_and_injects_preserve_calls_in_declarations_fills_and_actions() {
+    let prop = include_str!("../../../../../semantics/corpus/components/value-prop-fn.contract");
+    let inject = prop
+        .replace(
+            "  action change()",
+            "  provide\n    min = lo\n    max = hi\n    value = v\n    pick = other\n  action change()",
+        )
+        .replace("Child(min=lo, max=hi, value=v, pick=other)", "Child()")
+        .replace("component Child\n  props", "component Child\n  inject");
+    for source in [prop, &inject] {
+        let mut r = boot(source);
+        assert_eq!(text_of(&r, "fill"), "4 0 10 7");
+        assert_eq!(text_of(&r, "values"), "5 6 0");
+        assert_eq!(text_of(&r, "passed"), "6 6");
+        press(&mut r, "up");
+        assert_eq!(text_of(&r, "values"), "5 6 14");
+        press(&mut r, "change");
+        assert_eq!(text_of(&r, "values"), "5 10 14");
+        assert_eq!(text_of(&r, "passed"), "10 10");
+        press(&mut r, "relay");
+        assert_eq!(text_of(&r, "values"), "5 10 18");
+    }
+}
+
+#[test]
 fn lean_components_preserve_child_device_resources() {
     let src = include_str!("../../../../../semantics/corpus/components/device-facts.contract");
     let emitted = contract::lean::lean_components(src, "facts").unwrap();

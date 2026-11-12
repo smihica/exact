@@ -1,5 +1,7 @@
 import {cdpBrowser} from '../scripts/agent-launch.mjs';
-import {runFocusCommands} from '../host/web/navigation.js';
+import { runFocusCommands } from '../host/web/navigation/focus.js';
+import { hostFixtureFile } from '../host/web/tests/glue-fixture.mjs';
+import { parseSync } from 'rolldown/utils';
 import {captureWorld, diffWorlds, formatWorldDiff} from './proof.mjs';
 import {spawnSync} from 'node:child_process';
 import {checkSteadyResidency} from './render/tests/residency.mjs';
@@ -398,17 +400,18 @@ test('steady residency skips no-device worlds and asserts only device-backed wor
 });
 
 test('explicit focus in a commit precedes autofocus and its authored side effects', () => {
-  const source=readFileSync(resolve(import.meta.dir,'../host/web/glue.js'),'utf8');
-  // The commit's tail: explicit focus commands, then autofocus (6dbf594b moved autofocus into navigation.js).
-  const start=source.indexOf('  for (const command of focusCommands)'), end=source.indexOf('  positionContexts(); presence.live?.after');
-  expect(start).toBeGreaterThan(-1); expect(end).toBeGreaterThan(start);
+  const source=readFileSync(resolve(import.meta.dir,'../host/web/wasm/commit.js'),'utf8');
+  const statements=parseSync('commit.js',source).program.body.find(node=>node.type==='FunctionDeclaration' && node.id.name==='apply').body.body;
+  const start=statements.find(node=>node.type==='ForOfStatement' && node.right.name==='focusCommands')?.start;
+  const end=statements.find(node=>node.type==='ExpressionStatement' && node.expression.callee?.name==='positionContexts')?.start;
+  expect(start).toBeDefined(); expect(end).toBeGreaterThan(start);
   const code=runFocusCommands.toString()+';\n'+source.slice(start,end);
   const calls=[], explicit={id:'chosen',isConnected:true,matches:()=>false,getClientRects:()=>[{}],focus:()=>{calls.push('explicit');document.activeElement=explicit;}};
   const document={activeElement:null};
-  // `inputHandlers` (the tail's route-arrival call, optional there) has no
+  // `host.inputHandlers` (the tail's route-arrival call, optional there) has no
   // part in the order under test, so it stands in as absent.
-  new Function('focusAutofocus','focusCommands','inputReady','root','inertAncestor','getComputedStyle','log','document','inputHandlers','popoverCommand',code)(
-    ()=>{if(!document.activeElement) calls.push('autofocus side effect');},[{name:'focus',args:['chosen']}],true,{querySelectorAll:()=>[explicit]},()=>false,()=>({visibility:'visible'}),()=>{},document,undefined,()=>{});
+  new Function('focusAutofocus','focusCommands','host','root','inertAncestor','getComputedStyle','log','document','popoverCommand',code)(
+    ()=>{if(!document.activeElement) calls.push('autofocus side effect');},[{name:'focus',args:['chosen']}],{inputReady:true},{querySelectorAll:()=>[explicit]},()=>false,()=>({visibility:'visible'}),()=>{},document,()=>{});
   expect(calls).toEqual(['explicit']);
 });
 
@@ -1002,7 +1005,7 @@ test('E10 browser buttons retain UA keyboard focus and hover feedback', async ()
   const server=Bun.serve({port:0,fetch(request) {
     const path=new URL(request.url).pathname;
     if(path==='/') return new Response(readFileSync(resolve(root,'index.html'),'utf8').replace('<script type="module" src="./glue.js"></script>','').replace('<div id="exact-root"></div>','<div id="exact-root"><div id="canvas" data-gpu-input tabindex="-1"><button id="pause" style="background:#202731;color:white;padding:12px">Pause</button></div></div>'),{headers:{'content-type':'text/html'}});
-    if(path.endsWith('.js')) return new Response(Bun.file(resolve(root,path.slice(1))),{headers:{'content-type':'text/javascript'}});
+    if(path.endsWith('.js')) return new Response(hostFixtureFile(resolve(root,path.slice(1))),{headers:{'content-type':'text/javascript'}});
     return new Response('',{status:404});
   }});
   const suite=await cdpBrowser(),{cdp}=suite;

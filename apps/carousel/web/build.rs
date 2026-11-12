@@ -29,6 +29,7 @@ fn main() {
         "carousel_data::Cards",
         "carousel_data::Cards",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

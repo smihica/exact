@@ -397,3 +397,12 @@ fn a_phone_with_no_bars_has_no_margin() {
     assert_eq!(env["safe-area-inset-top"], 0);
     assert_eq!(env["safe-area-inset-left"], 0);
 }
+
+#[test]
+fn status_bar_style_reaches_chrome_independently_of_the_scheme() {
+    let mut p = boot(&page("status-bar-style=\"light-content\""));
+    let layout: serde_json::Value = serde_json::from_str(&p.layout_json(None, false)).unwrap();
+    assert_eq!(layout["statusBar"]["style"], "light-content");
+    assert!(p.chrome().status_light_icons);
+    assert!(!p.chrome().dark);
+}

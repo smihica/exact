@@ -123,7 +123,7 @@ fn streamed<D: DataSource + 'static, F: Fn() -> D>(
     };
     let mut sent = Vec::new();
     let mut send = |bytes: &[u8]| sent.extend_from_slice(bytes);
-    let Some((_, body)) = crate::direct::render_js(
+    let Some(page) = crate::direct::render_js(
         plan,
         data,
         viewport,
@@ -139,13 +139,25 @@ fn streamed<D: DataSource + 'static, F: Fn() -> D>(
     else {
         return Ok(None);
     };
-    if sent != body.as_bytes() {
+    // The boot document is never cached or adopted (LLP 1048.005 D5, D6).
+    let after_boot = page.boot.as_ref().map(|boot| {
+        crate::page::body_after_boot_js(
+            shell,
+            &js,
+            &page.rendered,
+            late(page.rendered.activate),
+            false,
+            Some(boot),
+        )
+    });
+    let start = page.boot.as_ref().map_or(0, |boot| boot.sent);
+    if sent.get(start..) != Some(after_boot.as_deref().unwrap_or(&page.body).as_bytes()) {
         return Ok(Some("the streamed runs are not the page".into()));
     }
     let expected = body_js(shell, &js, kernel, late(kernel.activate), false);
     let (a, b) = (
         without_clock(&without_digest(&expected)),
-        without_clock(&without_digest(&body)),
+        without_clock(&without_digest(&page.body)),
     );
     Ok(first_difference(&a, &b)
         .map(|at| format!("streamed page at byte {at}: {}", around(&a, &b, at))))

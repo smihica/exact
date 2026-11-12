@@ -153,9 +153,8 @@
   // other `get…()` lists (docs/reference.md).
   if (global.Intl && typeof global.Intl.Locale !== 'function') (function () {
     // CLDR's tables are built at the first getWeekInfo(), not at boot: splitting
-    // them is about 90 KB of heap, half of it garbage, in every runtime. Built
-    // after hardening, they have no prototype: a property bootstrap planted on
-    // Object.prototype is frozen by then and would refuse a write of its name.
+    // them is about 90 KB of heap, half of it garbage, in every runtime. They
+    // have no prototype so a locale lookup cannot see bootstrap's properties.
     var week;
     function weekData() {
       if (week) return week;

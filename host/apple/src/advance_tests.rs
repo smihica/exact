@@ -109,6 +109,82 @@ fn sent(host: &Host<NoData>) -> usize {
     items.len()
 }
 
+const FORWARD: &str = r#"routes nav
+  home "/"
+    thread "/t/:thread"
+component App
+  state n = 0
+  state shown = true
+  task due mount
+    after(100, tick)
+  action tick
+    TIMER
+  action open
+    nav = push(nav, "/t/a")
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=`${top(nav).id}` ROOT testId="root"
+      if shown
+        column testId="target"
+          button testId="open" press=open
+            text "Open"
+"#;
+
+#[test]
+fn forward_survives_a_timer_refusal_and_reports_it() {
+    for root in ["navigate=follow", ""] {
+        let mut host = boot(&FORWARD.replace("ROOT", root).replace("TIMER", "n = 1 / 0"));
+        press(&mut host, "open", 0.0);
+        let top = exact_route::top(&host.runner.carry().router.unwrap().1)
+            .unwrap()
+            .id;
+        host.host_back(top, 0.0);
+        let kernel = host.runner.kernel();
+        let root = kernel
+            .node_by_key(kernel.find_by_test_id("root")[0])
+            .unwrap()
+            .id;
+        let batch = host.host_forward(root, 200.0);
+        assert!(batch.contains("\"error\":\"NonFiniteValue"), "{batch}");
+        assert_eq!(host.runner.location_ahead(), None, "{batch}");
+        assert_eq!(
+            exact_route::top(&host.runner.carry().router.unwrap().1)
+                .unwrap()
+                .url,
+            "/t/a"
+        );
+        assert_eq!(host.runner.slot("n"), Some(&Value::Number(0.0)));
+    }
+}
+
+#[test]
+fn forward_refuses_a_target_removed_by_a_due_timer() {
+    for root in ["navigate=follow", ""] {
+        let mut host = boot(
+            &FORWARD
+                .replace("ROOT", root)
+                .replace("TIMER", "shown = false"),
+        );
+        press(&mut host, "open", 0.0);
+        let top = exact_route::top(&host.runner.carry().router.unwrap().1)
+            .unwrap()
+            .id;
+        host.host_back(top, 0.0);
+        let kernel = host.runner.kernel();
+        let root = kernel
+            .node_by_key(kernel.find_by_test_id("target")[0])
+            .unwrap()
+            .id;
+        let before = host.runner.carry().router.unwrap().1;
+        let batch = host.host_forward(root, 200.0);
+        assert!(host.runner.kernel().node(root).is_none());
+        assert!(batch.contains("UnknownView"), "{batch}");
+        assert_eq!(host.runner.carry().router.unwrap().1, before);
+        assert_eq!(host.runner.location_ahead().as_deref(), Some("/t/a"));
+    }
+}
+
 #[test]
 fn an_answer_nothing_shows_skips_layout_and_one_shown_lays_out() {
     let mut host = boot(MIDI);

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { classify } from '../gpu-tier.js';
-import { pageReporter } from '../navigation.js';
+import { pageReporter } from '../navigation/environment.js';
 
 // LLP 1139.003 D2: the web's table is gpu/src/tier.rs `classify`'s, case for case.
 test('the web classifies adapters as the native table does', () => {

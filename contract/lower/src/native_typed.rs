@@ -67,6 +67,15 @@ pub(crate) fn declared(tag: &str) -> Option<DeclaredView> {
     DECLARED.with(|d| d.borrow().get(tag).cloned())
 }
 
+/// Whether the package view `tag` declares a prop named `name`.
+pub(crate) fn declares_prop(tag: &str, name: &str) -> bool {
+    DECLARED.with(|d| {
+        d.borrow()
+            .get(tag)
+            .is_some_and(|v| v.props.contains_key(name))
+    })
+}
+
 /// Whether string literal `value` is one of the cases enum declaration `decl` (or its option) names: a literal
 /// infers to `string`, which no `enum<…>` admits otherwise.
 pub(crate) fn names_case(decl: &str, value: &str) -> bool {

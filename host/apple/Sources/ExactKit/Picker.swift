@@ -55,13 +55,32 @@ enum AppFiles {
         learn(object)
         return object["roots"] as? [String: String] ?? [:]
     }
-    /// The file an `app:/data|cache|tmp/…` path names; nil for `..` or a root.
+    /// Where an `app:/data|cache|tmp/…` path names, for a file the host
+    /// writes there; nil for `..` or a root. A file the app names is read
+    /// through `open` or `file`, never through this.
     static func url(_ path: String) -> URL? {
+        guard let at = place(path) else { return nil }
+        return at.names.reduce(at.root) { $0.appendingPathComponent($1) }
+    }
+    /// The regular file `path` names, opened through no symbolic link
+    /// (`AppFileWalk`), as `readFile` and a share open it; nil for any other.
+    static func open(_ path: String) -> FileHandle? {
+        guard let at = place(path) else { return nil }
+        return AppFileWalk.open(at.root, at.names)
+    }
+    /// The URL of the file `open` finds, for a reader that takes a URL (a
+    /// player, picture in picture); nil where `open` refuses.
+    static func file(_ path: String) -> URL? {
+        guard let at = place(path), let handle = AppFileWalk.open(at.root, at.names) else { return nil }
+        try? handle.close()
+        return at.names.reduce(at.root) { $0.appendingPathComponent($1) }
+    }
+    private static func place(_ path: String) -> (root: URL, names: [String])? {
         guard path.hasPrefix("app:/") else { return nil }
         let parts = path.dropFirst(5).split(separator: "/", omittingEmptySubsequences: false).map(String.init)
         guard parts.count >= 2, !parts.dropFirst().contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { return nil }
         lock.lock(); let root = roots[parts[0]]; lock.unlock()
-        return parts.dropFirst().reduce(root) { $0?.appendingPathComponent($1) }
+        return root.map { ($0, Array(parts.dropFirst())) }
     }
 }
 

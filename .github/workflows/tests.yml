@@ -17,7 +17,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -58,28 +57,39 @@ jobs:
           # A run with a failing test still leaves what it compiled for the next one.
           cache-on-failure: true
 
+      - name: Bun dependencies
+        run: bun install --frozen-lockfile
+
       - name: Hermes bundle
         # Ordinary builds are offline (.cargo/config.toml); the installer fetches and
         # verifies Ibex's pinned, attested release bundle once.
         run: cargo run --manifest-path vendor/ibex/crates/hermes-lean-sys-installer/Cargo.toml -- --target x86_64-unknown-linux-gnu
 
-      - name: Bun dependencies
-        run: bun install --frozen-lockfile
-
       - name: Cargo dependencies
-        # The script tests check the web crates offline, so the registry must
-        # already hold every crate.
         run: cargo fetch --locked
 
       - name: test
+        env:
+          CARGO_TERM_COLOR: always
         run: cargo test --tests --no-fail-fast
 
       - uses: browser-actions/setup-chrome@v1
         id: chrome
         if: ${{ !cancelled() }}
 
+      - name: SDK
+        # What the script tests build with (README): the web nightly with
+        # rust-src, wasm-bindgen and Binaryen. It runs after the Cargo tests,
+        # whose build leaves this runner no room for them. With CHROME set it
+        # downloads no Playwright Chromium.
+        if: ${{ !cancelled() }}
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/exact.mjs setup
+
       - name: script tests
         # Runs after a failing Cargo test too: each reports its own failures.
+        # Cargo writes no colour here: tests read its output.
         if: ${{ !cancelled() }}
         env:
           CHROME: ${{ steps.chrome.outputs.chrome-path }}
@@ -109,4 +119,6 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: test
+        env:
+          CARGO_TERM_COLOR: always
         run: cargo test --tests --no-fail-fast

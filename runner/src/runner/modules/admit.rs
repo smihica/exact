@@ -273,7 +273,7 @@ impl<D: DataSource> Runner<D> {
             _ => o.id,
         };
         if owner != 0 && owner != by {
-            let send = matches!(target, Target::Mutation(_));
+            let send = target.mutation().is_some();
             self.extensions.origins.let_go.push((owner, send));
         }
     }
@@ -586,6 +586,20 @@ impl<D: DataSource> Runner<D> {
         (o.tickets).retain(|t, _| pending.iter().any(|p| p.ticket == *t));
         (o.ticket_causes).retain(|t, _| pending.iter().any(|p| p.ticket == *t));
         (o.ids).retain(|t, _| pending.iter().any(|p| p.ticket == *t));
+    }
+
+    /// Resource row `i` is a new member's (`each.rs`): nothing an earlier
+    /// member asked through it stands: its asks' origins, the arguments a
+    /// child's start refused, its last poll answer.
+    pub(in crate::runner) fn forget_resource_row(&mut self, i: usize) {
+        let o = &mut self.extensions.origins;
+        o.asked.remove(&i);
+        o.asked_causes.remove(&i);
+        o.deferred.remove(&i);
+        for within in self.extensions.within.values_mut() {
+            within.remove(&i);
+        }
+        self.forget_refused_row(i);
     }
 
     /// What answers `row` now (module doc).
@@ -991,7 +1005,6 @@ impl<D: DataSource> Runner<D> {
         }
         // An option's records name URLs and app files (`"admit"`, LLP
         // 1133.017 D3): each admitted as a fetch's URL or a path option is.
-        // A refusal names the URL without its query or fragment.
         for (option, fields) in sub["admits"].as_object().into_iter().flatten() {
             let records: Vec<&Json> = match &args[option] {
                 Json::Array(list) => list.iter().collect(),
@@ -1006,19 +1019,15 @@ impl<D: DataSource> Runner<D> {
                         continue;
                     };
                     let grants = self.data.grants();
-                    let (ok, shown) = if capability == "net.fetch" {
-                        let web = given.starts_with("https://") || given.starts_with("http://");
-                        let ok = web && crate::grants::admitting(grants, None, given).is_some();
-                        (ok, given.split(['?', '#']).next().unwrap_or_default())
-                    } else {
-                        let ok = crate::save_file::plain_app_path(given)
-                            && crate::save_file::covered(grants, capability, given);
-                        (ok, given)
-                    };
-                    if !ok {
-                        return Err(format!(
-                            "grant-missing ({option}[{i}].{field}={shown} needs {capability})"
-                        ));
+                    let at = format!("{option}[{i}].{field}");
+                    if capability == "net.fetch" {
+                        if let Some(why) = fetch_refusal(grants, &at, given) {
+                            return Err(why);
+                        }
+                    } else if !crate::save_file::plain_app_path(given)
+                        || !crate::save_file::covered(grants, capability, given)
+                    {
+                        return Err(format!("grant-missing ({at}={given} needs {capability})"));
                     }
                 }
             }
@@ -1082,6 +1091,23 @@ impl<D: DataSource> Runner<D> {
     }
 }
 
+/// Why a record's URL at `at` is refused under `grants`, naming it without
+/// its userinfo, query or fragment: it has a user name or password, which a
+/// browser's `Request` refuses too
+/// (<https://fetch.spec.whatwg.org/#dom-request>), or no `net.fetch` line
+/// admits it.
+fn fetch_refusal(grants: &str, at: &str, given: &str) -> Option<String> {
+    let (shown, userinfo) = crate::grants::redacted(given);
+    if userinfo {
+        return Some(format!(
+            "userinfo ({at}={shown} has a user name or password)"
+        ));
+    }
+    let web = given.starts_with("https://") || given.starts_with("http://");
+    let ok = web && crate::grants::admitting(grants, None, given).is_some();
+    (!ok).then(|| format!("grant-missing ({at}={shown} needs net.fetch)"))
+}
+
 /// Every origin, least privileged first.
 pub(in crate::runner) const ORIGINS: [CallOrigin; 4] = [
     CallOrigin::Device,
@@ -1122,5 +1148,35 @@ pub(in crate::runner) fn overlay(value: &mut Json, over: &Json) {
             }
         }
         (value, over) => *value = over.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_refusal;
+
+    #[test]
+    fn a_record_url_with_a_password_is_refused_without_showing_it() {
+        let grants = "net.fetch https://example.com";
+        let at = "requests[0].url";
+        assert_eq!(
+            fetch_refusal(grants, at, "https://example.com/f?token=t"),
+            None
+        );
+        for url in [
+            "https://alice:secret@example.com/f",
+            "http://alice:secret@other.example/f?token=t",
+            "https:alice:secret@example.com/f",
+        ] {
+            let why = fetch_refusal(grants, at, url).unwrap_or_default();
+            assert!(
+                why.starts_with("userinfo (") && !why.contains("alice") && !why.contains("secret"),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            fetch_refusal(grants, at, "https://other.example/f?token=t#x").as_deref(),
+            Some("grant-missing (requests[0].url=https://other.example/f needs net.fetch)")
+        );
     }
 }

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "surface_controls_tests/escape.rs"]
+mod escape;
 #[path = "surface_controls_tests/logs.rs"]
 mod logs;
 #[path = "surface_controls_tests/pads.rs"]

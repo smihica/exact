@@ -131,6 +131,110 @@ fn a_provided_value_may_be_state_and_follows_it() {
 }
 
 #[test]
+fn view_binders_preserve_class_names() {
+    let component = r##"style Card
+  color="#ff0000"
+style Other
+  color="#0000ff"
+component Child
+  state Card = false
+  view
+    column
+      for Card in [true, false] key=Card.toString()
+        text Card.toString() class=Card testId=`direct-${Card}`
+        text Card.toString() class=(Card ? Card : Other) testId=`yes-${Card}`
+        text Card.toString() class=(Card ? Other : Card) testId=`no-${Card}`
+"##;
+    for prefix in ["", "component App\n  view\n    Child()\n"] {
+        let r = Runner::boot(
+            contract::compile(&format!("{prefix}{component}")).unwrap(),
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        for (id, hex, text) in [
+            ("direct-true", "#ff0000", "true"),
+            ("direct-false", "#ff0000", "false"),
+            ("yes-true", "#ff0000", "true"),
+            ("yes-false", "#0000ff", "false"),
+            ("no-true", "#0000ff", "true"),
+            ("no-false", "#ff0000", "false"),
+        ] {
+            let k = r.kernel();
+            let node = k.node_by_key(k.find_by_test_id(id)[0]).unwrap();
+            assert_eq!(node.style.text_color, Color::parse_hex(hex).unwrap().into());
+            assert_eq!(node.props.str(exact_kernel::PropId::Text), Some(text));
+        }
+    }
+}
+
+#[test]
+fn view_binders_do_not_capture_provided_values() {
+    let source = r#"component Provider
+  state item = "root"
+  state index = 9
+  state items = ["a", "b"]
+  state option = some("bound")
+  provide
+    current = item
+    number = index
+  action change
+    item = "next"
+    index = 10
+  view
+    column
+      Row(id="outside")
+      for item, index in items key=item
+        Row(id=`${item}-${index}`)
+      match option
+        case some(item)
+          Row(id=item)
+        case none
+          Row(id="none")
+      button "Change" press=change testId="change"
+component Row
+  props
+    id: string
+  inject
+    current: string
+    number: number
+  view
+    text `${current}:${number}` testId=`row-${id}`
+"#;
+    for prefix in ["", "component App\n  view\n    Provider()\n"] {
+        let mut r = Runner::boot(
+            contract::compile(&format!("{prefix}{source}")).unwrap(),
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        for expected in ["root:9", "next:10"] {
+            let texts = ["row-outside", "row-a-0", "row-b-1", "row-bound"].map(|id| {
+                let k = r.kernel();
+                let key = k.find_by_test_id(id)[0];
+                k.node_by_key(key)
+                    .unwrap()
+                    .props
+                    .iter()
+                    .find_map(|(p, v)| match v {
+                        PropValue::Str(s) if p.name() == "text" => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .unwrap()
+            });
+            assert_eq!(texts, [expected; 4], "{prefix}");
+            let key = r.kernel().find_by_test_id("change")[0];
+            let id = r.kernel().node_by_key(key).unwrap().id;
+            r.dispatch(id, exact_runner::Event::Press).unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_misspelled_or_mistyped_prop_is_refused_where_it_is_written() {
     let source = |args: &str| {
         format!("shape Todo\n  title: string\ncomponent App\n  resource todo = todo() as shape Todo\n  state count = 0\n  action pick\n    count = 1\n  view\n    Row({args})\ncomponent Row\n  props\n    todo: Todo\n    onPick: action\n  view\n    button press=onPick\n      text todo.title\n")
@@ -228,16 +332,43 @@ fn a_view_when_and_a_state_as_name_the_contract_form() {
 }
 
 #[test]
-fn position_fixed_says_how_to_pin_a_box() {
-    let src =
-        "component App\n  view\n    column\n      text \"toast\" position=\"fixed\" bottom=0\n";
-    let error = contract::compile(src).unwrap_err();
-    assert!(
-        error
-            .message
-            .ends_with("; `fixed` is not a row (LLP 1001): pin a box to the viewport with `absolute`, directly inside a viewport-sized root that does not scroll (its content scrolls in a `scroll` beside it)"),
-        "{error}"
-    );
+fn invalid_position_literals_name_the_value_and_the_fix() {
+    for position in ["fixed", "fixd"] {
+        let mut expected = format!(
+            "`position=\"{position}\"` is not a valid `position`: expected one of \"relative\", \"absolute\", \"static\", \"sticky\""
+        );
+        if position == "fixed" {
+            expected.push_str("; `fixed` is not a row (LLP 1001): pin a box to the viewport with `absolute`, directly inside a viewport-sized root that does not scroll (its content scrolls in a `scroll` beside it)");
+        }
+        for (tag, attrs) in [
+            ("text \"toast\"", "bottom=0"),
+            ("column", "top=0"),
+            ("column", "top=0 opacity=0.5"),
+            ("column", "top=0 transition=\"opacity 200ms\""),
+            ("column", "top=0 overflow=\"hidden\""),
+            ("column", "top=0 translate=\"1px 0\""),
+            ("scroll", "top=0 height=100"),
+        ] {
+            let src = format!(
+                "component App\n  view\n    column\n      {tag} position=\"{position}\" {attrs}\n"
+            );
+            let error = contract::compile(&src).unwrap_err();
+            assert_eq!(error.id, "lower-attr-value", "{src}: {error}");
+            assert_eq!(error.message, expected, "{src}: {error}");
+        }
+    }
+}
+
+#[test]
+fn clearing_position_on_a_clipping_box_is_refused() {
+    for position in ["", "unset", " UNSET "] {
+        let src =
+            format!("component App\n  view\n    box position=\"{position}\" overflow=\"hidden\"\n");
+        let error = contract::compile(&src).unwrap_err();
+        assert_eq!(error.id, "lower-attr-value", "{src}: {error}");
+        assert!(error.message.contains("containing block"), "{src}: {error}");
+        contract::compile(&src.replace(" overflow=\"hidden\"", "")).unwrap();
+    }
 }
 
 #[test]
@@ -246,7 +377,7 @@ fn a_mutation_clause_out_of_order_names_the_order() {
     let error = contract::compile(src).unwrap_err();
     assert_eq!(error.id, "syntax-expected-newline", "{error}");
     assert!(
-        error.message.starts_with("`queue` is out of place: a mutation's clauses go `as shape T`, then `queue`, then `refreshes a, b`, then `then action`"),
+        error.message.starts_with("`queue` is out of place: a mutation's clauses go `as shape T`, then `queue` or `parallel`, then `refreshes a, b`, then `then action`"),
         "{error}"
     );
 }

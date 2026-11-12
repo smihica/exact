@@ -1,0 +1,68 @@
+// A resource's `when` (LLP 1161.002): closed, it asks nothing and keeps its
+// value, which is not current; a refresh while closed asks nothing; opened,
+// it is asked again at the same arguments or at new ones. Closed before its
+// first answer it holds its type's zero. A gate may read a derive and
+// another resource's value.
+shape Hit
+  title: string
+  score: number
+
+component App
+  state open = false
+  state q = "a"
+  resource hits = search(q) when open as shape Hit[]
+  resource top = best(q) when open and q.length >= 2 as shape Hit
+  resource count = tally(q) when open as shape number
+  derive wanted = open and q != ""
+  resource more = extra(q) when wanted and count >= 0 as shape option<string>
+  derive fresh = current(hits)
+  derive topFresh = current(top)
+  derive moreFresh = current(more)
+  action show
+    open = true
+  action hide
+    open = false
+  action setQ(v: string)
+    q = v
+  action again
+    refresh hits
+    refresh count
+  view
+    column
+      text `${hits.length} ${fresh}` testId="hits"
+      text `${top.title} ${top.score} ${topFresh}` testId="top"
+      text `${count} ${current(count)}` testId="count"
+      text `${moreFresh}` testId="more"
+      input value=q change=setQ testId="q"
+      button "show" press=show testId="show"
+      button "hide" press=hide testId="hide"
+      button "again" press=again testId="again"
+
+test "close, refresh while idle, wake"
+  expect state fresh == false
+  expect state topFresh == false
+  expect text "top" == " 0 false"
+  tap "again"
+  expect state fresh == false
+  tap "show"
+  expect state fresh == true
+  expect state moreFresh == true
+  tap "hide"
+  expect state fresh == false
+  expect state moreFresh == false
+  tap "again"
+  expect state fresh == false
+  tap "show"
+  expect state fresh == true
+
+test "wake with new arguments"
+  tap "show"
+  tap "hide"
+  type "q" "bc"
+  expect state topFresh == false
+  tap "show"
+  expect state topFresh == true
+  type "q" "b"
+  expect state topFresh == false
+  type "q" "bcd"
+  expect state topFresh == true

@@ -641,7 +641,7 @@ impl<D: DataSource> Host<D> {
             &|v| !runner.handlers_of(v).is_empty(),
         );
         svg_lower::hand_over_paths(runner.kernel(), &mut host.engine, host.svg.box_motion);
-        for view in svg_lower::glass_sampling(host.runner.kernel(), &mut host.engine) {
+        for view in svg_lower::resample(runner.kernel(), &mut host.engine, host.svg.box_motion) {
             host.svg.element(host.runner.kernel(), view);
         }
         host.boot_paint(&order);
@@ -966,7 +966,16 @@ impl<D: DataSource> Host<D> {
         self.own_navigation(now_ms, |runner| runner.host_go(location))
     }
 
-    fn own_navigation(
+    /// Native Forward through the root's handler or the runner's own `go`.
+    pub fn host_forward(&mut self, root: ViewId, now_ms: f64) -> String {
+        self.now_ms = now_ms.max(self.now_ms);
+        let a = self.runner.host_forward_at(root, self.now_ms);
+        self.commit(&a.receipts, a.error.map(|e| format!("{e:?}")))
+    }
+
+    /// Advance the clock to `now_ms` and run `navigate` on the runner, as one
+    /// batch.
+    pub(crate) fn own_navigation(
         &mut self,
         now_ms: f64,
         navigate: impl FnOnce(&mut Runner<D>) -> Result<Option<CommitReceipt>, RunnerError>,
@@ -1257,6 +1266,7 @@ impl<D: DataSource> Host<D> {
                 if let Some(id) = self.keys.remove(key) {
                     self.ranks.remove(&id);
                     self.paint.runs.remove(&id);
+                    self.paint.opacities.remove(&id);
                     if let Some((owner, _)) = self.inline_runs.remove(&id) {
                         self.dirty_paragraphs.insert(owner);
                     } else if self.svg.destroyed(id) {
@@ -1334,7 +1344,8 @@ impl<D: DataSource> Host<D> {
                     self.svg.element(runner.kernel(), view);
                 }
             }
-            for view in svg_lower::glass_sampling(self.runner.kernel(), &mut self.engine) {
+            for view in svg_lower::resample(runner.kernel(), &mut self.engine, self.svg.box_motion)
+            {
                 self.svg.element(self.runner.kernel(), view);
             }
             self.play_exits(&mut batch);

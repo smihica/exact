@@ -3,7 +3,7 @@
 import { test, expect } from 'bun:test';
 import { PREFERENCES, mediaHeard, preferGroups, preferWeb } from './agent-prefer.mjs';
 import { MalformedOperation } from './agent-keys.mjs';
-import { pageReporter } from '../host/web/navigation.js';
+import { pageReporter } from '../host/web/navigation/environment.js';
 
 test('a near spelling of a fact is that fact', () => {
   for (const name of ['prefers-color-scheme', 'color-scheme', 'colorScheme', 'prefersColorScheme', 'Color_Scheme']) {

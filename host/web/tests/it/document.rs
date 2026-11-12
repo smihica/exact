@@ -362,6 +362,62 @@ component App
 }
 
 #[test]
+fn select_options_use_their_value_or_label_in_the_document() {
+    let doc = document(
+        r#"
+component App
+  state pick = "b"
+  view
+    column
+      select value=pick
+        option "a" testId="plain-a"
+        option "b" testId="plain-b"
+      select value=pick
+        option "b" value="a" testId="valued-a"
+        option "B" value="b" testId="valued-b"
+      select value="b c"
+        option "a" testId="space-a"
+        option testId="space-b"
+          text "  b\t"
+          text " c\n "
+      select value=""
+        option "a" testId="empty-a"
+        option "B" value="" testId="empty-b"
+      select
+        option "a" testId="default-a"
+        option "b" testId="default-b"
+      select value="b"
+        option "First" value="b" testId="duplicate-a"
+        option "b" testId="duplicate-b"
+      select value="b c"
+        option "a" testId="nbsp-a"
+        option "b c" testId="nbsp-b"
+"#,
+    );
+    for (id, selected) in [
+        ("plain-a", false),
+        ("plain-b", true),
+        ("valued-a", false),
+        ("valued-b", true),
+        ("space-a", false),
+        ("space-b", true),
+        ("empty-a", false),
+        ("empty-b", true),
+        ("default-a", false),
+        ("default-b", false),
+        ("duplicate-a", true),
+        ("duplicate-b", false),
+        ("nbsp-a", false),
+        ("nbsp-b", true),
+    ] {
+        let at = doc.find(&format!("data-testid=\"{id}\"")).unwrap();
+        let start = doc[..at].rfind('<').unwrap();
+        let tag = &doc[start..at + doc[at..].find('>').unwrap()];
+        assert_eq!(tag.contains(" selected"), selected, "{tag}");
+    }
+}
+
+#[test]
 fn markdown_is_spans_and_navigable_links() {
     let src = r#"
 component App
@@ -377,7 +433,13 @@ component App
         doc.contains("<span style=\"font-weight:700;\">b</span>"),
         "{doc}"
     );
-    assert!(doc.contains("<a href=\"https://e.dev/\">safe</a>"), "{doc}");
+    // It leaves the app, so it opens in a new browsing context, as natively.
+    assert!(
+        doc.contains(
+            "<a href=\"https://e.dev/\" target=\"_blank\" rel=\"external noopener\">safe</a>"
+        ),
+        "{doc}"
+    );
     assert!(doc.contains("<span>unsafe</span>"), "{doc}");
     assert!(!doc.contains("javascript"), "{doc}");
     assert!(doc.contains("<br>"), "{doc}");
@@ -976,4 +1038,46 @@ fn bare_text_styles_fill_unsaid_rows_in_the_js_document() {
     );
     assert!(js.contains("font-weight:700"), "{js}");
     assert!(js.contains("line-height:40px"), "{js}");
+}
+
+/// A `progress` with a `value` is HTML's `<progress value max>`: the page keeps
+/// the value, or a determinate bar is written indeterminate (LLP 1116 D8).
+#[test]
+fn a_progress_prerenders_with_its_value() {
+    let html = document(
+        "component App\n  view\n    column\n      progress value=0.4 testId=\"p1\"\n      progress value=3 max=8 testId=\"p2\"\n",
+    );
+    let tag = |id: &str| {
+        let at = html
+            .find(&format!("data-testid=\"{id}\""))
+            .unwrap_or_else(|| panic!("{id} in {html}"));
+        let start = html[..at].rfind('<').unwrap();
+        html[start..start + html[start..].find('>').unwrap()].to_string()
+    };
+    assert!(tag("p1").contains(r#"value="0.4""#), "{}", tag("p1"));
+    assert!(
+        tag("p2").contains(r#"value="3""#) && tag("p2").contains(r#"max="8""#),
+        "{}",
+        tag("p2")
+    );
+}
+
+/// A Markdown link that leaves the app opens as a link node to the same URL
+/// does: in a new browsing context, as natively (renderMarkup's rule).
+#[test]
+fn a_markdown_link_that_leaves_the_app_prerenders_with_its_target() {
+    let html = document(
+        "component App\n  view\n    column\n      text \"see [site](https://example.com/a) and [here](/b)\" markup=\"markdown\" testId=\"md\"\n",
+    );
+    assert!(
+        html.contains(r#"href="https://example.com/a""#)
+            && html.contains(r#"rel="external noopener""#)
+            && html.contains(r#"target="_blank""#),
+        "{html}"
+    );
+    let inside = &html[html.find(r#"href="/b""#).expect("the app's own link")..];
+    assert!(
+        !inside[..inside.find('>').unwrap()].contains("target"),
+        "{html}"
+    );
 }

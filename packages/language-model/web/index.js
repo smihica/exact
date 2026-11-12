@@ -92,7 +92,7 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
   /** Evict the oldest whole turns until `extra` more fits (D6); false when even then it does not. */
   function fit(s, extra) {
     const had = s.turns.length;
-    while (counted(s) + extra > windowOf(s) && s.turns.length) { s.turns.shift(); s.overflowed = true; s.stale = true; }
+    while (counted(s) + extra > windowOf(s) && s.turns.length) { s.turns.shift(); s.overflowed = true; invalidate(s); }
     if (s.turns.length < had) say(`${s.id}: evicted ${had - s.turns.length} turns, overflowed, ${counted(s)} of ${windowOf(s)} tokens`);
     return counted(s) + extra <= windowOf(s);
   }
@@ -127,15 +127,30 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
   const createdInfo = s => ({ id: s.id, contextUsage: usage(s), contextWindow: windowOf(s), tools: s.tools.map(t => t.name), overflowed: s.overflowed });
   const lookup = id => sessions.get(id) ?? null;
 
+  function invalidate(s) {
+    s.stale = true;
+    s.creating = null;
+  }
   /** The browser's session for `s`, built from the transcript when it has none or the transcript changed under it. */
   async function platform(s) {
     if (s.platform && !s.stale) return s.platform;
+    if (s.creating) return s.creating;
     s.platform?.destroy?.();
-    s.platform = await Browser.create({ ...s.options, initialPrompts: messagesOf(s) });
-    s.stale = false;
-    s.platform.addEventListener?.('contextoverflow', () => { s.overflowed = true; });
-    if (s.platform.contextWindow ?? s.platform.inputQuota) s.window = s.platform.contextWindow ?? s.platform.inputQuota;
-    return s.platform;
+    s.platform = null;
+    const creating = Browser.create({ ...s.options, initialPrompts: messagesOf(s) }).then(made => {
+      // An abort can admit another prompt while this create is pending.
+      if (lookup(s.id) !== s || s.creating !== creating) {
+        made.destroy?.();
+        throw new DOMException('The session changed while its browser session was being created', 'AbortError');
+      }
+      s.platform = made;
+      s.stale = false;
+      made.addEventListener?.('contextoverflow', () => { s.overflowed = true; });
+      if (made.contextWindow ?? made.inputQuota) s.window = made.contextWindow ?? made.inputQuota;
+      return made;
+    }).finally(() => { if (s.creating === creating) s.creating = null; });
+    s.creating = creating;
+    return creating;
   }
 
   function makeSession(args, platformSession = null) {
@@ -143,7 +158,7 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
     const tools = (args.tools ?? []).map(t => ({ name: t.name, description: t.description, inputSchema: typeof t.inputSchema === 'string' ? JSON.parse(t.inputSchema) : t.inputSchema }));
     const s = {
       id: `session-${++serial}`, system, turns, tools, toolCost: tools.length ? schemaCost(tools) : 0, overflowed: false,
-      window: WINDOW, queue: [], responding: null, ended: [], count: 0, platform: platformSession, stale: false,
+      window: WINDOW, queue: [], responding: null, ended: [], count: 0, platform: platformSession, stale: false, creating: null,
       options: { expectedInputs: args.expectedInputs, expectedOutputs: tools.length ? [...(args.expectedOutputs ?? [{ type: 'text' }]), { type: 'tool-call' }] : args.expectedOutputs },
     };
     if (platformSession && (platformSession.contextWindow ?? platformSession.inputQuota)) s.window = platformSession.contextWindow ?? platformSession.inputQuota;
@@ -181,6 +196,8 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
     // One still waiting its turn never reached the session: nothing of it is committed.
     if (begun) r.turn.reply = r.text;
     else s.queue = s.queue.filter(q => q.r !== r);
+    // The browser keeps no cancelled reply: the next prompt rebuilds from the transcript (D6).
+    if (begun && state === 'aborted') invalidate(s);
     r.contextUsage = usage(s);
     r.controller?.abort();
     if (begun) s.responding = null;
@@ -200,7 +217,10 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
   /** `work(at)` once the session is free; `r`, the response it begins, holds the session until it ends. */
   function queued(s, work, r = null) {
     return new Promise(resolve => {
-      s.queue.push({ r, go: at => { if (r?.state === 'generating') s.responding = r; else if (r) return resolve(); resolve(work(at)); } });
+      s.queue.push({
+        r, cancel: () => resolve({ error: 'AbortError' }),
+        go: at => { if (r?.state === 'generating') s.responding = r; else if (r) return resolve(); resolve(work(at)); },
+      });
       nextIn(s, now());
     });
   }
@@ -313,7 +333,13 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
     if (r.state !== 'generating') return;
     const s = r.session;
     let session;
-    try { session = await platform(s); } catch (e) { s.turns.push(r.turn); end(r, 'failed', errorOf(e)); return; }
+    try { session = await platform(s); } catch (e) {
+      if (r.state === 'generating') { s.turns.push(r.turn); end(r, 'failed', errorOf(e)); }
+      return;
+    }
+    // A response that ended during an await before admission has freed the session for its next call; admitting its
+    // input would take the session back with no end left to free it. Each await before `admitInput` is checked.
+    if (r.state !== 'generating') return;
     r.controller = new AbortController();
     const options = { signal: r.controller.signal };
     if (r.schema) Object.assign(options, { responseConstraint: r.schema, omitResponseConstraintInput: r.omit });
@@ -322,7 +348,7 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
     let extra;
     const measure = session.measureContextUsage ?? session.measureInputUsage;
     if (measure) try { extra = await measure.call(session, input, options); } catch {}
-    if (!admitInput(r, extra)) return;
+    if (r.state !== 'generating' || !admitInput(r, extra)) return;
     try {
       if (r.overflowed) session = await platform(s);
       for (;;) {
@@ -331,15 +357,18 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
         const stream = session.promptStreaming(input, options), calls = [];
         r.text = '';
         for await (const piece of stream) {
+          if (r.state !== 'generating') return;
           if (typeof piece === 'string') r.text += piece;
           else calls.push(...toolCallsIn(piece));
         }
+        if (r.state !== 'generating') return;
         if (!calls.length) break;
         // The open loop: each call through the runtime, answered as `tool-response` messages, then prompted again.
         r.state = 'calling-tool';
         announce(RESPONSE);
         const answers = [];
         for (const call of calls) {
+          if (r.state !== 'calling-tool') return;
           if (r.calls.length >= TOOL_LIMIT) { end(r, 'failed', { error: 'OperationError', reason: 'tool-limit' }); return; }
           const full = JSON.stringify(call.arguments ?? {}), a = cut(full);
           const c = { id: call.callID ?? `${r.id}.call-${r.calls.length + 1}`, name: call.name, arguments: a.text, fullArguments: full, state: 'running', result: null, truncated: a.truncated };
@@ -360,8 +389,7 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
       if (r.state !== 'generating' && r.state !== 'calling-tool') return;
       const failure = errorOf(e);
       if (failure.error === 'QuotaExceededError') s.overflowed = r.overflowed = true;
-      // The browser keeps no cancelled reply: the next prompt rebuilds from the transcript (D6).
-      s.stale = true;
+      invalidate(s);
       end(r, failure.error === 'AbortError' ? 'aborted' : 'failed', failure.error === 'AbortError' ? null : failure);
     }
   }
@@ -464,7 +492,9 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
         const turn = { input, calls: [], reply: null };
         if (!fit(s, cost(input))) return { error: 'QuotaExceededError' };
         s.turns.push(turn);
-        if (s.platform && !s.stale) try { await s.platform.append([{ role: 'user', content: input }]); } catch { s.stale = true; }
+        if (s.platform && !s.stale) {
+          try { await s.platform.append([{ role: 'user', content: input }]); } catch { invalidate(s); }
+        } else invalidate(s);
         announce(SESSION);
         return sessionInfo(s);
       });
@@ -489,7 +519,10 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
       const s = lookup(session);
       if (!s) return { error: 'InvalidStateError' };
       return queued(s, () => {
-        const c = { ...s, id: `session-${++serial}`, turns: s.turns.map(t => ({ ...t, calls: [...t.calls] })), queue: [], responding: null, ended: [], count: 0, platform: null, stale: true };
+        const c = {
+          ...s, id: `session-${++serial}`, turns: s.turns.map(t => ({ ...t, calls: [...t.calls] })),
+          queue: [], responding: null, ended: [], count: 0, platform: null, stale: true, creating: null,
+        };
         sessions.set(c.id, c);
         say(`${c.id}: cloned from ${s.id}`);
         return createdInfo(c);
@@ -559,10 +592,11 @@ export function implementation({ changed, agent, now, foreground, log, invoke })
 
   function createdOr(s) { return isError(s) ? s : createdInfo(s); }
   function drop(s, why) {
-    for (const r of responses.values()) if (r.session === s) { abort(r, why); responses.delete(r.id); }
-    s.queue = [];
-    s.platform?.destroy?.();
     sessions.delete(s.id);
+    // Aborting the active response advances the queue.
+    for (const q of s.queue.splice(0)) q.cancel();
+    for (const r of responses.values()) if (r.session === s) { abort(r, why); responses.delete(r.id); }
+    s.platform?.destroy?.();
     say(`${s.id}: ${why}`);
     announce(SESSION);
   }

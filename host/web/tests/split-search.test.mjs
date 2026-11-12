@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The navigation split's list search (navigation.js `pushingList`, `splitOf`): found from the route's lists rather
 // than by walking every element of the route on every projection. Held, in Chrome, to answer exactly what the walk
 // answered: the walk is kept here as the reference, and both run over seeded random routes (lists sideways by class,
@@ -8,7 +9,6 @@
 // scheme, a sheet swapped, the route replaced, a push and a pop, the retained list emptied); and in the scope the walk
 // had (`children`: the light DOM, slotted elements included, not a shadow root's or a frame's).
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

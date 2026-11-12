@@ -293,6 +293,142 @@ fn content_equal_without_ownership_never_adopts_authored_output() {
         .contains("authored"));
     fs::remove_dir_all(app).unwrap();
 }
+
+fn interrupt_bake(update: bool) -> std::path::PathBuf {
+    let app = temp();
+    let source = app.join("art/strip.png");
+    if update {
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([20, 40, 60, 255]))
+            .save(&source)
+            .unwrap();
+        exact_game_bake::bake_art(&app).unwrap();
+    }
+    image::RgbaImage::from_pixel(3, 3, image::Rgba([80, 100, 120, 255]))
+        .save(&source)
+        .unwrap();
+    let expected = exact_game_bake::art(&app).unwrap();
+    fs::create_dir_all(app.join("assets")).unwrap();
+    // Fail the second atomic write after validation and the first output's rename.
+    let blocked = app.join(format!("assets/.strip.bc.tex.{}.tmp", std::process::id()));
+    fs::create_dir(&blocked).unwrap();
+    let before = fs::read(app.join("assets/strip.bc.tex")).ok();
+    let error = exact_game_bake::bake_art(&app).unwrap_err();
+    assert!(error.contains(&blocked.display().to_string()), "{error}");
+    assert_eq!(
+        fs::read(app.join("assets/strip.astc.tex")).unwrap(),
+        expected["strip.astc.tex"]
+    );
+    assert_eq!(fs::read(app.join("assets/strip.bc.tex")).ok(), before);
+    fs::remove_dir(blocked).unwrap();
+    app
+}
+
+fn finish_bake(app: &std::path::Path) {
+    let expected = exact_game_bake::art(app).unwrap();
+    exact_game_bake::bake_art(app).unwrap();
+    let manifest: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&fs::read(app.join(".baked-assets.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in expected {
+        assert_eq!(fs::read(app.join("assets").join(name)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn interrupted_first_bake_resumes_its_outputs() {
+    let app = interrupt_bake(false);
+    finish_bake(&app);
+    fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn interrupted_update_resumes_its_outputs() {
+    let app = interrupt_bake(true);
+    finish_bake(&app);
+    fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn interrupted_bake_accepts_a_further_art_edit() {
+    let app = interrupt_bake(true);
+    image::RgbaImage::from_pixel(3, 3, image::Rgba([140, 160, 180, 255]))
+        .save(app.join("art/strip.png"))
+        .unwrap();
+    finish_bake(&app);
+    fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn interrupted_bake_prunes_outputs_when_art_is_removed() {
+    let app = interrupt_bake(true);
+    fs::remove_dir_all(app.join("art")).unwrap();
+    exact_game_bake::bake_art(&app).unwrap();
+    assert!(!app.join(".baked-assets.json").exists());
+    for name in ["strip.tex", "strip.bc.tex", "strip.astc.tex"] {
+        assert!(!app.join("assets").join(name).exists());
+    }
+    fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn interrupted_bake_still_refuses_authored_replacements() {
+    let app = interrupt_bake(true);
+    let manifest = fs::read(app.join(".baked-assets.json")).unwrap();
+    fs::write(app.join("assets/strip.astc.tex"), b"authored replacement").unwrap();
+    let error = exact_game_bake::bake_art(&app).unwrap_err();
+    assert!(
+        error.contains("strip.astc.tex") && error.contains("authored"),
+        "{error}"
+    );
+    assert_eq!(fs::read(app.join(".baked-assets.json")).unwrap(), manifest);
+    assert_eq!(
+        fs::read(app.join("assets/strip.astc.tex")).unwrap(),
+        b"authored replacement"
+    );
+    fs::remove_dir_all(app).unwrap();
+}
+
+#[test]
+fn concurrent_cli_bakes_share_output_ownership() {
+    let app = temp();
+    for red in [20, 80] {
+        image::RgbaImage::from_pixel(1023, 1023, image::Rgba([red, 40, 60, 255]))
+            .save(app.join("art/strip.png"))
+            .unwrap();
+        let start = std::sync::Barrier::new(4);
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        std::process::Command::new(env!("CARGO_BIN_EXE_exact-game-bake"))
+                            .arg("--art")
+                            .arg(&app)
+                            .output()
+                            .unwrap()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for output in results {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        finish_bake(&app);
+    }
+    fs::remove_dir_all(app).unwrap();
+}
+
 #[test]
 fn obsolete_manifest_refuses_before_changing_outputs() {
     let app = temp();

@@ -42,8 +42,7 @@ impl RegionInst {
                 } else {
                     match u.eval(row.subject, frames)? {
                         Value::Bool(true) => Some(0),
-                        Value::Bool(false) if row.arms.len > 1 => Some(1),
-                        Value::Bool(false) => None,
+                        Value::Bool(false) => Some(1),
                         _ => {
                             return Err(InstanceError::SubjectKind {
                                 region: self.region,
@@ -74,10 +73,7 @@ impl RegionInst {
                                 ..Default::default()
                             },
                         ),
-                        Value::Option(None) => (
-                            if row.arms.len > 1 { Some(1) } else { None },
-                            ArmFrame::default(),
-                        ),
+                        Value::Option(None) => (Some(1), ArmFrame::default()),
                         _ => {
                             return Err(InstanceError::SubjectKind {
                                 region: self.region,

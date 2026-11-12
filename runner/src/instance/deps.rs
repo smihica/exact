@@ -475,6 +475,18 @@ impl Deps {
                 bits.set(layout.pending_resource(i));
             }
         }
+        // `current(x)` reads the pending input too (LLP 1161.001): its flag
+        // can turn without the value or the pending flag moving.
+        for (i, (old, new)) in seen
+            .current_resources
+            .iter()
+            .zip(env.current_resources)
+            .enumerate()
+        {
+            if old != new {
+                bits.set(layout.pending_resource(i));
+            }
+        }
         for (i, (old, new)) in seen
             .pending_mutations
             .iter()
@@ -521,7 +533,7 @@ fn scan(plan: &Plan, layout: Layout, code: Code) -> Reads {
             }
             Opcode::LoadDerive => reads.bits.set(layout.derive(index)),
             Opcode::LoadResource => reads.bits.set(layout.resource(index)),
-            Opcode::PendingResource => {
+            Opcode::PendingResource | Opcode::CurrentResource => {
                 // Known only once the resource settled, like its value.
                 reads.bits.set(layout.resource(index));
                 reads.bits.set(layout.pending_resource(index));
@@ -575,6 +587,7 @@ pub struct Seen {
     derives: Vec<Option<Value>>,
     resources: Vec<Option<Held>>,
     pending_resources: Vec<bool>,
+    current_resources: Vec<bool>,
     pending_mutations: Vec<bool>,
     failed_mutations: Vec<Option<crate::failure::Failure>>,
     failed_resources: Vec<Option<crate::failure::Failure>>,
@@ -598,6 +611,7 @@ impl Seen {
             derives: env.derives.to_vec(),
             resources: env.resources.to_vec(),
             pending_resources: env.pending_resources.to_vec(),
+            current_resources: env.current_resources.to_vec(),
             pending_mutations: env.pending_mutations.to_vec(),
             failed_mutations: env.failed_mutations.to_vec(),
             failed_resources: crate::failure::states(env.failed_resources, env.failed_why),

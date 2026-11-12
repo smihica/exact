@@ -31,7 +31,9 @@ extension NodeView {
     ///    or `tree` role;
     /// 5. else it is content and selectable, as a plain list's rows are (a
     ///    transcript): a row that is pressable is a control by 2.
-    /// ⌘A selects what this admits. The web host keeps the browser's own.
+    /// On the Mac, ⌘A selects what this admits in the current virtualized
+    /// list, including unmounted rows, or the window's mounted paragraphs
+    /// when the reader is outside a list. The web keeps the browser's own.
     var textSelectable: Bool {
         var document = false, chrome = false
         var current: AncestorView? = self

@@ -47,5 +47,8 @@
     }
   },
   "artifacts": [],
-  "class": "PurchasesModule"
+  "class": "PurchasesModule",
+  "plistKeys": {
+    "SKIncludeConsumableInAppPurchaseHistory": true
+  }
 }

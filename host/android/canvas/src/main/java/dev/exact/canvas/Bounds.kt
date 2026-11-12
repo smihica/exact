@@ -59,6 +59,7 @@ internal class Bounds {
                     values[2] = f(b, i + 5); values[5] = f(b, i + 6); values[6] = 0f; values[7] = 0f; values[8] = 1f
                     m.setValues(values); i += 7
                 }
+                48 -> { for (k in 0 until 9) values[k] = f(b, i + 1 + k); m.setValues(values); i += 10 }
                 2 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 14 }
                 3 -> { val e = path(b, i + 3, local); if (local.left <= local.right) add(out, local.left, local.top, local.right, local.bottom); i = e }
                 4 -> {
@@ -71,6 +72,13 @@ internal class Bounds {
                     val c = RectF(r); clips.lastOrNull()?.let { if (!c.intersect(it)) c.setEmpty() }
                     clips.add(c); i = e
                 }
+                45 -> {
+                    // Keeping the parent's bounds is conservative for a union of paths.
+                    clips.add(clips.lastOrNull()?.let { RectF(it) })
+                    i += 2 + b.get(i + 1)
+                }
+                46 -> { clips.add(clips.lastOrNull()?.let { RectF(it) }); i += 1 }
+                47 -> i += 2
                 6 -> { if (clips.isNotEmpty()) clips.removeAt(clips.size - 1); i += 1 }
                 7 -> { clips.add(clips.lastOrNull()?.let { RectF(it) }); i += 2 }
                 8 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 6 }

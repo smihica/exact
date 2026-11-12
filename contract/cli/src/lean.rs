@@ -461,8 +461,13 @@ impl Emitter<'_> {
                 ),
                 None => String::new(),
             };
+            // `when cond` (LLP 1161.002 D1); a family refuses one.
+            let gate = match &r.gate {
+                Some(g) => format!(", gate := .some ({})", self.expr(g)?),
+                None => String::new(),
+            };
             resources.push(format!(
-                "{{ name := {}, ty := {}, source := {}, args := {}{each} }}",
+                "{{ name := {}, ty := {}, source := {}, args := {}{each}{gate} }}",
                 string(&r.name),
                 ty(&ct.resources[i]),
                 string(&r.source),
@@ -500,8 +505,12 @@ impl Emitter<'_> {
                     None => ".none".into(),
                 };
                 // `queue` (LLP 1092 D1) only where declared: the embedding
-                // of every other program is as it was.
-                let queue = if m.queue { ", queue := true" } else { "" };
+                // of every other program is as it was. A `parallel` one is
+                // newest-wins there (LLP 1161.000 D7).
+                let queue = match m.mode {
+                    contract_syntax::MutationMode::Queue => ", queue := true",
+                    _ => "",
+                };
                 format!(
                     "{{ name := {}, ty := {}, refreshes := [{}], andThen := {then}{queue} }}",
                     string(&m.name),
@@ -674,7 +683,7 @@ impl Emitter<'_> {
             // `pending(x)`/`failed(x)` name a resource or a mutation: a
             // prop's ascription around the name is not an expression here.
             Expr::Call(name, args, _)
-                if matches!(name.as_str(), "pending" | "failed" | "failure")
+                if matches!(name.as_str(), "pending" | "failed" | "failure" | "current")
                     && matches!(args.as_slice(), [Expr::Typed(x, _, _)] if matches!(**x, Expr::Ident(..))) =>
             {
                 let [Expr::Typed(x, _, _)] = args.as_slice() else {

@@ -4,6 +4,8 @@
 use serde_json::Value;
 use std::process::{Command, Output};
 
+mod entries;
+
 fn vocab(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_contract"))
         .arg("vocab")
@@ -15,6 +17,64 @@ fn vocab(args: &[&str]) -> Output {
 fn stdout(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
     String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+#[test]
+fn a_closed_output_pipe_ends_quietly() {
+    for args in [
+        &["--help"][..],
+        &["vocab"],
+        &["vocab", "--all"],
+        &["vocab", "--json"],
+        &["symbols", "apps/shelf/app.contract"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+            .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn other_output_errors_still_fail() {
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args(["vocab", "--json"])
+        .stdout(
+            std::fs::File::options()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .output()
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(error.starts_with("contract: stdout:"), "{error}");
+}
+
+#[test]
+fn time_names_numeric_instant_sources() {
+    let out = stdout(&vocab(&["time"]));
+    let json: Value = serde_json::from_str(&stdout(&vocab(&["--json", "time"]))).unwrap();
+    for note in [out.as_str(), json["tag"]["note"].as_str().unwrap()] {
+        assert!(!note.contains("date("), "{note}");
+        for expected in ["epoch milliseconds", "data module", "exactTime()"] {
+            assert!(note.contains(expected), "{note}");
+        }
+        for repair in [
+            "datetime=event.at",
+            "datetime=(wall.epochAtZero + performanceNow())",
+        ] {
+            assert!(note.contains(repair), "{note}");
+        }
+    }
 }
 
 /// An event record an arity refusal names (`ScrollEvent`) and a grammar word
@@ -302,6 +362,26 @@ fn an_unknown_name_gets_the_compilers_suggestion_and_exit_1() {
 }
 
 #[test]
+fn text_path_refusal_names_the_supported_svg_text() {
+    for args in [vec!["textPath"], vec!["textPath", "--json"]] {
+        let output = vocab(&args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let refusal = if args.contains(&"--json") {
+            let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+            doc["refused"].as_str().unwrap().to_owned()
+        } else {
+            String::from_utf8(output.stderr).unwrap()
+        };
+        assert!(refusal.contains("`textPath` (text on a path)"), "{refusal}");
+        assert!(refusal.contains("LLP 1055.000 §4, stage 11"), "{refusal}");
+        assert!(
+            refusal.contains("use `text` with `x` and `y` inside `svg`, with `tspan` for runs"),
+            "{refusal}"
+        );
+    }
+}
+
+#[test]
 fn json_lists_everything_and_one_entry() {
     let doc: Value = serde_json::from_str(&stdout(&vocab(&["--json"]))).unwrap();
     let names = |key: &str| -> Vec<String> {
@@ -419,7 +499,7 @@ fn collection_edges_name_the_required_shape_and_the_plain_feed_alternative() {
     for event in ["reachstart", "reachend"] {
         let output = stdout(&vocab(&[event]));
         assert!(
-            output.contains("only on `list virtualized=true` with one direct `each`"),
+            output.contains("only on `list virtualized=true` with one direct `for`"),
             "{output}"
         );
         assert!(
@@ -549,7 +629,7 @@ fn the_functions_are_listed_and_in_the_json() {
         "{all}"
     );
     assert!(
-        all.contains("compiler intrinsics:\n  pending, failed, failure, path"),
+        all.contains("compiler intrinsics:\n  pending, current, failed, failure, path"),
         "{all}"
     );
     let doc: Value = serde_json::from_str(&stdout(&vocab(&["--json"]))).unwrap();

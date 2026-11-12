@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -45,11 +45,40 @@ pub struct Location {
 pub trait Provider: Send + Sync {
     fn open(&self, location: Location) -> Result<Arc<dyn Connection>, HostError>;
 }
+/// How a `transaction` treats foreign keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignKeys {
+    /// Each statement is checked as it runs, as everywhere else.
+    Enforce,
+    /// For a migration that rebuilds a table other rows reference: the
+    /// provider turns enforcement off before the transaction begins, runs
+    /// `PRAGMA foreign_key_check` before it commits, rolls back and fails on
+    /// any violation, and turns enforcement back on whatever happens.
+    Check,
+}
+
+static PROVIDER: OnceLock<Arc<dyn Provider>> = OnceLock::new();
+
+/// Install the provider linked by the app shell before creating any sessions.
+/// Repeated registrations keep the process's first provider.
+pub fn link(provider: Arc<dyn Provider>) {
+    let _ = PROVIDER.set(provider);
+}
+
+/// The app shell's provider; none in an artifact built without SQL storage.
+pub fn linked() -> Option<Arc<dyn Provider>> {
+    PROVIDER.get().cloned()
+}
+
 pub trait Connection: Send + Sync {
     fn prepare(&self, sql: &str) -> Result<StatementInfo, HostError>;
     fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, HostError>;
     fn query(&self, sql: &str, params: &[Value]) -> Result<Rows, HostError>;
-    fn transaction(&self, commands: &[Command]) -> Result<Vec<ExecuteResult>, HostError>;
+    fn transaction(
+        &self,
+        commands: &[Command],
+        foreign_keys: ForeignKeys,
+    ) -> Result<Vec<ExecuteResult>, HostError>;
     fn close(&self) -> Result<(), HostError>;
 }
 
@@ -77,7 +106,14 @@ impl Database {
         self.connection.query(sql, params)
     }
     pub fn transaction(&self, commands: &[Command]) -> Result<Vec<ExecuteResult>, HostError> {
-        self.connection.transaction(commands)
+        self.connection.transaction(commands, ForeignKeys::Enforce)
+    }
+    pub fn transaction_with(
+        &self,
+        commands: &[Command],
+        foreign_keys: ForeignKeys,
+    ) -> Result<Vec<ExecuteResult>, HostError> {
+        self.connection.transaction(commands, foreign_keys)
     }
     pub fn close(&self) -> Result<(), HostError> {
         self.connection.close()

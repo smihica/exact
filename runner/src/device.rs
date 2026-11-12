@@ -245,6 +245,19 @@ pub const DEVICES: &[Device] = &[
         web: None,
         ..ROW
     },
+    // A visible push (LLP 1133.004 §9 P2): the Push API's name. Nothing asks
+    // about push itself (the prompt is notifications', which it needs), so no
+    // purpose. The environment's value is the build's, by the signing
+    // (`host/apple/presence.mjs`). A Mac takes `aps-environment` only with a
+    // provisioning profile, so the row writes nothing there, as tvOS omits it.
+    Device {
+        name: "push",
+        purpose: false,
+        needs: Some("notifications"),
+        ios_entitlements: &["aps-environment"],
+        tvos: false,
+        ..ROW
+    },
     // Deviation: the web has no name; its speech API is gated by `microphone`.
     Device {
         name: "speech-recognition",
@@ -691,6 +704,23 @@ mod tests {
         let both = format!("{one}\ndevice.geolocation locationPurpose");
         let errors = device_grants(&both).unwrap_err();
         assert!(errors[0].contains("(grant-twice)"), "{errors:?}");
+    }
+
+    /// LLP 1133.004 §9 P2: a push line names no purpose and stands beside the
+    /// notifications line, whose authorization it shows under.
+    #[test]
+    fn push_needs_notifications_and_names_no_purpose() {
+        let ok = device_grants("device.notifications purpose.notifications\ndevice.push").unwrap();
+        let push = ok.iter().find(|g| g.device.name == "push").unwrap();
+        assert!(push.purpose.is_empty());
+        assert_eq!(push.device.ios_entitlements, ["aps-environment"]);
+        assert!(
+            !push.device.tvos && push.device.hardened.is_none() && push.device.macos.is_empty()
+        );
+        let alone = device_grants("device.push").unwrap_err();
+        assert!(alone[0].contains("(grant-needs)"), "{alone:?}");
+        let named = device_grants("device.notifications n\ndevice.push purpose.push").unwrap_err();
+        assert!(named[0].contains("names no purpose"), "{named:?}");
     }
 
     /// LLP 1133.021 D13: background location adds to precise location, and

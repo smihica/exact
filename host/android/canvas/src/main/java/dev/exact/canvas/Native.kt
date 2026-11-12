@@ -56,7 +56,7 @@ object Native {
      * D7.3) and whose a touch there is (D8): the axes exact2's own gestures there claim (bit 0 sideways, bit 1 up
      * and down), a count, the hosted text field the touch is for (0: none; [Fields]), and eleven numbers a scroller,
      * innermost first: its id, flags (bit 0 it takes a sideways drag from here, bit 1 one up or down, bit 2 its
-     * rows are a node the reader can move), its revision, then as float bits its offset (x, y), its farthest offset
+     * rows are a node the reader can move, bit 3 no scrollbar), its revision, then as float bits its offset (x, y), its farthest offset
      * (x, y) and the box it shows in (x, y, width, height). exact2 tells the reader of each of them from then on
      * ([scrollers]). After the scrollers: the native module button under the point (0: none), then its painted
      * box x, y, width and height as float bits, in pixels, its allocation slot and generation, and how many long

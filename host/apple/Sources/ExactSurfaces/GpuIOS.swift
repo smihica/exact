@@ -41,11 +41,19 @@ final class MetalCanvasView: UIView {
     deinit { MetalLayerPool.give(metalLayer) }
     override func layoutSubviews() {
         super.layoutSubviews()
-        if metalLayer.frame != bounds { metalLayer.frame = bounds }
+        guard metalLayer.frame != bounds else { return }
+        let resized = metalLayer.frame.size != .zero && metalLayer.frame.size != bounds.size
+        metalLayer.frame = bounds
+        // A canvas at rest draws again at its new size; after a layout nothing else asks for a frame.
+        if resized { (superview as? NodeView)?.canvases?.session?.frames.requestCanvas() }
     }
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        metalLayer.contentsScale = window?.screen.scale ?? traitCollection.displayScale
+        let scale = window?.screen.scale ?? traitCollection.displayScale
+        guard metalLayer.contentsScale != scale else { return }
+        metalLayer.contentsScale = scale
+        // A resting canvas draws again at its new scale.
+        (superview as? NodeView)?.canvases?.session?.frames.requestCanvas()
     }
     /// The canvas's first frame is with the compositor: the layer shows it.
     func reveal() {
@@ -140,6 +148,8 @@ final class CanvasesHost {
         var id: UInt32 = 0
         var presentable = true
         var wants = false
+        /// The box (points and scale) its last render drew at.
+        var drawnBox: SIMD3<Float>?
         /// The tick that last judged this canvas on screen and rendered it
         /// (`CanvasesHost.ticks`): a starved render draws that tick's frame.
         var shownTick = 0
@@ -392,26 +402,43 @@ final class CanvasesHost {
         return true
     }
 
+    /// Tells assistive technology that a canvas's placed children appeared,
+    /// disappeared or reordered.
+    nonisolated(unsafe) static var postLayoutChanged: () -> Void = { UIAccessibility.post(notification: .layoutChanged, argument: nil) }
+
     /// After a frame, where the surface put each child (LLP 1014 D5): the
     /// homography on the child, `nil` for the kernel's frame.
     private func readPlacements(_ m: GpuModule, _ e: Entry) {
         guard e.each, let overlay = e.view.overlay else { return }
         var h = [Float](repeating: 0, count: 10)
-        for (i, child) in overlay.subviews.compactMap({ $0 as? NodeView }).enumerated() {
+        let children = overlay.subviews.compactMap { $0 as? NodeView }
+        for (i, child) in children.enumerated() {
             let outcome = h.withUnsafeMutableBufferPointer { m.placement(e.id, UInt32(i), $0.baseAddress, $0.count) }
-            let next: [Double]? = outcome == 1 ? h.map { Double($0) } : nil
-            let changed = next != child.placement || child.placementHidden != (outcome == 2)
-            child.placement = next
+            child.placement = outcome == 1 ? h.map { Double($0) } : nil
             child.placementHidden = outcome == 2
-            child.alpha = outcome == 0 ? 1 : 0
-            if changed { child.placementChanged() }
+            child.followPlacement()
         }
-        // Alpha 0 keeps UIKit from drawing what the surface composites, and
-        // UIKit's own walk skips a view at alpha 0, so the children are
-        // listed. UIKit takes a list as given: what its walk leaves out
+        // The children are listed in the order the surface was given them,
+        // and the list (and the layout change below) changes only when that
+        // set does. UIKit takes a list as given: what its walk leaves out
         // (`isHidden`; `accessibilityElementsHidden`, which `aria-hidden`,
-        // `inert` and a hidden placement set) is left out here.
-        overlay.accessibilityElements = overlay.subviews.compactMap { $0 as? NodeView }.filter { !$0.accessibilityElementsHidden && !$0.isHidden }
+        // `inert` and a hidden placement set; a transparent view, below which
+        // UIKit stops applying its rules to what the list hands it) is left
+        // out here. A placed child is never transparent (`NodeLayer`); one
+        // the surface leaves in place is at its author's opacity.
+        let exposed = children.filter { !$0.accessibilityElementsHidden && !$0.isHidden && $0.alpha >= 0.01 }
+        let listed = overlay.accessibilityElements ?? []
+        guard listed.count != exposed.count || !zip(listed, exposed).allSatisfy({ ($0 as AnyObject) === $1 }) else { return }
+        overlay.accessibilityElements = exposed
+        // A placed child that moves is read where it is on demand
+        // (`accessibilityFrame`), as a scrolled or animated view is. A layout
+        // change is for when "an individual element appears or disappears"
+        // (UIAccessibilityLayoutChangedNotification), and makes VoiceOver
+        // read the screen again: posted once when the list changes, behind a
+        // sheet or under `inert` too (a re-read there is the accepted cost).
+        // Its argument is "the element that VoiceOver should move to", so
+        // none: a child appearing is no reason to move the cursor off another.
+        Self.postLayoutChanged()
     }
 
     /// Every canvas whose children changed since its last capture is painted
@@ -498,7 +525,7 @@ final class CanvasesHost {
             if !each { _ = m.childrenCount(e.id, 0) }
             if !each, let overlay = e.view.overlay {
                 for case let child as NodeView in overlay.subviews {
-                    child.placement = nil; child.placementHidden = false; child.alpha = 1
+                    child.placement = nil; child.placementHidden = false; child.followPlacement()
                 }
                 overlay.accessibilityElements = nil
                 composite(overlay, !e.through)
@@ -567,7 +594,7 @@ final class CanvasesHost {
     var wantsFrames: Bool {
         guard !modules.isEmpty, visible else { return false }
         return entries.values.contains { e in
-            e.needsFrame(dirty:(e.module?.dirty(e.id) ?? 0) != 0, editing:e.through && e.view.overlay.map { editing(under: $0) } == true)
+            e.needsFrame(dirty:(e.module?.dirty(e.id) ?? 0) != 0 || e.resized(e.view.canvasMetal.map(box)), editing:e.through && e.view.overlay.map { editing(under: $0) } == true)
         }
     }
 
@@ -645,12 +672,14 @@ final class CanvasesHost {
             // twice on the turn a batch already captured.
             if e.through, !e.view.paintedThisTurn, let overlay = e.view.overlay, editing(under: overlay) { capture(m, e) }
             m.syncDynamicRange(e.id, view: e.view, layer: e.view.canvasMetal?.metalLayer)
-            guard live(e.view.id) === e, e.wants || m.dirty(e.id) != 0, let metal = e.view.canvasMetal else { continue }
+            guard live(e.view.id) === e, let metal = e.view.canvasMetal, e.wants || m.dirty(e.id) != 0 || e.resized(box(metal)) else { continue }
             // D4: a canvas renders when the host judges it on screen. A
             // virtualized list keeps rows mounted past the viewport; their
             // canvases keep what they want (and their dirty inputs) and render
             // the first frame they are seen.
             guard shown(e, metal) else { more = true; continue }
+            // Under its frame-rate cap (`Surface::max_fps`), a canvas skips the frames before its deadline.
+            if let due = m.due, due(e.id, now) == 0 { more = true; continue }
             e.shownTick = ticks
             // Waiting for the drawable it asked for as its last frame was
             // presented (gpu/src/acquire.rs): a render now would draw
@@ -678,8 +707,13 @@ final class CanvasesHost {
     /// Ticks so far: which tick judged a canvas on screen (`Entry.shownTick`).
     private var ticks = 1
 
+    private func box(_ metal: MetalCanvasView) -> SIMD3<Float> {
+        SIMD3(Float(metal.bounds.width), Float(metal.bounds.height), Float(metal.metalLayer.contentsScale))
+    }
+
     private func renderNow(_ m: GpuModule, _ e: Entry, _ metal: MetalCanvasView, _ now: Double, tick: Int) {
         let scale = Float(metal.metalLayer.contentsScale)
+        e.drawnBox = box(metal)
         let r = m.render(e.id, Float(metal.bounds.width), Float(metal.bounds.height), scale, now)
         e.picture = nil
         // A render that went without a drawable recorded nothing: no frame

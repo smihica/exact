@@ -208,6 +208,12 @@ impl Asm {
         self.op(Opcode::FailureResource, &[Arg::Idx(r.0)])
     }
 
+    /// Push whether a resource shows an answer to its current call arguments
+    /// (LLP 1161.001 D1).
+    pub fn current_resource(&mut self, r: ResourcesId) -> &mut Self {
+        self.op(Opcode::CurrentResource, &[Arg::Idx(r.0)])
+    }
+
     /// Pop into the locals stack.
     pub fn bind_local(&mut self) -> &mut Self {
         self.simple(Opcode::BindLocal)

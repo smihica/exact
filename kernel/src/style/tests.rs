@@ -470,7 +470,7 @@ fn unpadded_reads_what_the_engine_style_would() {
         Dimension::Env(Edge::Top, -62.0),
     ] {
         let mut p = StyleProps::default();
-        p.padding_bottom = d;
+        p.padding_bottom = d.clone();
         assert_eq!(p.unpadded(&env), engine(&p), "{d:?}");
     }
     for (style, width) in [
@@ -489,6 +489,7 @@ fn unpadded_reads_what_the_engine_style_would() {
 
 #[test]
 fn calc_lengths_parse_one_percent_and_one_pixel_term_and_resolve_by_basis() {
+    let _lowering = super::handles::Lowering::new();
     for (text, percent, points) in [
         ("calc(100% - 89px)", 100.0, -89.0),
         ("calc(50% + 12.5px)", 50.0, 12.5),
@@ -780,7 +781,7 @@ fn segment_lengths_round_trip_the_wire() {
             Dimension::Segment(var, 15, 15, 3.0),
         ] {
             let mut w = Writer::new();
-            w.dimension(d);
+            w.dimension(d.clone());
             let bytes = w.into_vec();
             assert_eq!(bytes.len(), 7, "{d:?}");
             assert_eq!(bytes[0], 8 + var as u8);
@@ -888,6 +889,16 @@ fn a_profiles_colour_is_the_platforms_to_draw() {
         crate::gradient::BackgroundImage::check("linear-gradient(red, color(--dci-p3 1 0 0))")
             .unwrap_err();
     assert!(why.contains("never mixed"), "{why}");
+}
+
+#[test]
+fn every_style_codec_has_a_row() {
+    use crate::generated::StyleCodec;
+
+    let codecs: std::collections::HashSet<_> =
+        StyleId::ALL.into_iter().map(StyleId::codec).collect();
+    // Enum is the last variant; StyleCodec's discriminants start at zero.
+    assert_eq!(codecs.len(), StyleCodec::Enum as usize + 1, "{codecs:?}");
 }
 
 #[test]

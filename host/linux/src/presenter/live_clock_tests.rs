@@ -611,3 +611,67 @@ fn a_held_frame_wait_supplies_demand_for_an_update_wait() {
     assert!(p.animation_frame(10.0).is_none());
     assert_eq!(ticks(&p), 2.0);
 }
+
+/// The live clock (`Instant`: `CLOCK_MONOTONIC` on Linux and Android) stops
+/// through a suspend and the date does not, and a clock can be set: each
+/// leaves the date told at the clock's zero away from the machine's.
+#[test]
+fn the_date_follows_the_machine_after_a_sleep_or_a_clock_change() {
+    let plan = crate::test_plan(
+        r#"shape Time
+  epochAtZero: number
+  utcOffset: number
+  locale: string
+  formatLocale: string
+  timeZone: string
+  seed: number
+component App
+  resource time = exactTime() as shape Time
+  view
+    text testId="date" `${time.epochAtZero}`
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with(
+        &plan,
+        NoData,
+        (400., 100.),
+        1.,
+        PathBuf::from("."),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let shown = |p: &Presenter<NoData>| {
+        let k = p.host().kernel();
+        let node = k.node_by_key(k.find_by_test_id("date")[0]).unwrap();
+        let text = node.props.str(exact_kernel::PropId::Text).unwrap();
+        text.parse::<f64>().unwrap()
+    };
+    p.set_live_clock(Some(Rc::new(|| 5000.0)));
+    let zero = || {
+        let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        wall.unwrap().as_secs_f64() * 1000.0 - 5000.0
+    };
+    let offset = crate::zone::local_offset_minutes();
+    // Less than a second away is the same date.
+    let near = zero() - 400.0;
+    assert!(p.set_time(near, offset).is_none());
+    assert!(p.follow_local_offset().is_none());
+    assert_eq!(p.host().runner().wall_time().epoch_at_zero, near);
+    // An hour's sleep, through which the live clock stood at 5000, and a
+    // clock set back a day: each is retold at the next check.
+    for told in [zero() - 3_600_000.0, zero() + 86_400_000.0] {
+        assert!(p.set_time(told, offset).is_none());
+        assert_eq!(shown(&p), told);
+        assert!(p.follow_local_offset().is_none());
+        let retold = p.host().runner().wall_time().epoch_at_zero;
+        assert!((retold - zero()).abs() < 1000.0, "{retold} for {told}");
+        assert_eq!(shown(&p), retold);
+    }
+    // Under a driver's clock the date is the drive's, never the machine's.
+    let drive = zero() - 3_600_000.0;
+    assert!(p.set_time(drive, offset).is_none());
+    p.set_live_clock(None);
+    assert!(p.follow_local_offset().is_none());
+    assert_eq!(p.host().runner().wall_time().epoch_at_zero, drive);
+}

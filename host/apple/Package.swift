@@ -99,6 +99,8 @@ let executables: [Target] = [
 // as a decision rather than a drawn frame, so it needs no window, no run
 // loop, and no clock (LLP 1033 D4a).
 let tests: [Target] = [
+    .target(name: "ExactPackage", path: "modules", exclude: ["ExactExtensions.swift", "ExactNativeModule.swift", "ExactNativeViews.swift", "ExactServices.swift", "ExactTamber.swift"], sources: ["ExactPackage.swift"]),
+    .target(name: "SignInImplementation", dependencies: ["ExactPackage"], path: "tests/SignInImplementation"),
     .target(name: "ExactWidgetTimeline", dependencies: ["ExactCore"], path: "widget", exclude: ["Timeline.swift"], sources: ["WidgetTimelineWaiters.swift"]),
     // The sound arm's C mixer (LLP 1096 D8), rendered offline by the tests,
     // and its AVAudioEngine calls (ARC, cleaning up on a caught exception, as
@@ -109,7 +111,7 @@ let tests: [Target] = [
     .target(name: "ExactNowPlaying", path: "videoarm", exclude: ["VideoArm.swift", "PictureInPicture.swift"], sources: ["NowPlaying.swift"]),
     // The share extension's Swift (LLP 1133.024 D4), which links no Exact runtime; build.mjs compiles the appex itself.
     .target(name: "ExactShare", path: "share"),
-    .testTarget(name: "ExactKitTests", dependencies: ["ExactWidgetTimeline", "ExactCore", "ExactSnapshot", "ExactKit", "ExactUpdates", "ExactGroupedLists", "ExactMarkdown", "ExactSurfaces", "ExactDrag", "ExactMediaPicker", "ExactAuthSession", "ExactSoundRender", "ExactNowPlaying", "ExactShare"], path: "Tests/ExactKitTests",
+    .testTarget(name: "ExactKitTests", dependencies: ["ExactPackage", "SignInImplementation", "ExactWidgetTimeline", "ExactCore", "ExactSnapshot", "ExactKit", "ExactUpdates", "ExactGroupedLists", "ExactMarkdown", "ExactSurfaces", "ExactDrag", "ExactMediaPicker", "ExactAuthSession", "ExactNumerals", "ExactSoundRender", "ExactNowPlaying", "ExactShare"], path: "Tests/ExactKitTests",
                 resources: [.copy("ColorFixtures"), .copy("SnapshotFixtures")], swiftSettings: devTools + gallerySettings + caltrainSettings),
 ]
 
@@ -129,6 +131,7 @@ let package = Package(
         .executable(name: "ExactWatch", targets: ["ExactWatch"]),
         .executable(name: "ExactMac", targets: ["ExactMac"]),
         .executable(name: "ExactIOS", targets: ["ExactIOS"]),
+        .executable(name: "ExactClip", targets: ["ExactIOS"]),
         .executable(name: "ExactHostMac", targets: ["ExactHostMac"]),
         .executable(name: "ExactHostIOS", targets: ["ExactHostIOS"]),
     ]),

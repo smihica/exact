@@ -1,3 +1,4 @@
+import { symbolSheet } from './glue-fixture.mjs';
 // LLP 1121 stage 14 C2: an icon whose SVG fills even-odd draws its holes on
 // the web. Its element is marked `data-symbol-evenodd` (element.rs, or the JS
 // target's `draw`, which reads the form's `evenodd:` marker), and each
@@ -6,7 +7,7 @@
 // wound alike is clear in its middle. The same path as a nonzero icon is
 // filled through, as before. Measured from the screen, in each engine.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
@@ -19,13 +20,13 @@ const img = (id, rule) => `<img id="${id}" data-symbol-source="symbol:icon||0 0 
 const content = `<div style="display:flex;gap:16px;padding:16px">${img('odd', 'evenodd')}${img('nonzero', 'nonzero')}</div>`;
 // Each runtime's painter, its module's other parts stood in for.
 const RUNTIMES = {
-  'host/web/glue.js': ['const views = new Map([...document.querySelectorAll("#exact-root img")].entries()), log = () => {};', ['tintFit', 'refreshSymbols'], 'refreshSymbols();'],
+  'host/web/glue.js': ['const views = new Map([...document.querySelectorAll("#exact-root img")].entries()), log = () => {}, host = {};', ['tintFit', 'refreshSymbols'], 'refreshSymbols();'],
   'host/web-js/symbols.js': ['const All = true, journal = [], clock = { now: 0 }, appSource = () => {}, Images = new Set(document.querySelectorAll("#exact-root img")), image = e => Images.add(e);', ['inked', 'refresh'], 'refresh();'],
 };
 
 for (const engine of ['chromium', 'firefox', 'webkit']) for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) test(`${engine}: an even-odd icon draws its hole, a nonzero one is filled through (${file})`, async () => {
   const source = readFileSync(resolve(ROOT, file), 'utf8');
-  const style = source.match(/'(@property --exact-tint[^']*)'/)[1];
+  const style = symbolSheet(source);
   const html = withLook(readFileSync(resolve(ROOT, 'host/web/index.html'), 'utf8'))
     .replace('<div id="exact-root"></div>', `<style>${style} #exact-root img { --exact-tint: rgb(255, 0, 0) !important; }</style><div id="exact-root">${content}</div>`)
     .replace('<script type="module" src="./glue.js"></script>', `<script>${stand} ${glueDeclarations(source, names)} globalThis.paint = () => { ${run} };</script>`);
@@ -89,7 +90,7 @@ test('symbols.js iconForm and draw read a form as Icon::parse does', async () =>
 // as a props batch swaps them), its painter run after each. The ring and its middle are sampled each
 // time: the mask is rebuilt with the new `fill-rule`, and the previous rule's attribute is gone.
 for (const engine of ['chromium', 'firefox', 'webkit']) for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) test(`${engine}: an icon whose rule changes is drawn by its new rule (${file})`, async () => {
-  const source = readFileSync(resolve(ROOT, file), 'utf8'), style = source.match(/'(@property --exact-tint[^']*)'/)[1];
+  const source = readFileSync(resolve(ROOT, file), 'utf8'), style = symbolSheet(source);
   const js = file.endsWith('symbols.js');
   const declarations = glueDeclarations(source, js ? [...names, 'iconForm', 'draw'] : [...names, 'applyProps']);
   // The web host's side: element.rs's attributes for each rule (tests/it/icon_rule.rs holds them), and

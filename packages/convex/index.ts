@@ -13,8 +13,6 @@ export interface ConvexLive {
   status: string;
   /** Rises when a query's answer may have changed. Every query resource takes it as an argument. */
   rev: number;
-  /** Rises with every frame Convex sends, its 15-second `Ping` included. */
-  beat: number;
   /** Why the socket ended; "" otherwise. */
   error: string;
   /** Convex's words when it refused the token; "" otherwise. */
@@ -24,7 +22,7 @@ export interface ConvexLive {
 type Socket = { send(data: string): void; close(code?: number, reason?: string): void };
 type StreamEvent = { readonly type: string; readonly data: string | ArrayBuffer; readonly kind?: string; readonly message?: string; readonly code?: number; readonly reason?: string };
 
-const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+const MAX_MESSAGE_BYTES = 8 * 1024 * 1024, IDLE_TIMEOUT_MS = 60000;
 
 /** Convex's own pure functions, which the app imports from its `convex` and hands over: `getFunctionName` from
  *  `convex/server`, `convexToJson` and `jsonToConvex` from `convex/values`. The module imports no package itself,
@@ -41,6 +39,9 @@ export interface ConvexOptions {
    *  query's result, so it is the sum of them. A larger one ends the socket as `failed`. Natively an open stream
    *  counts twice its ceiling against the 68 MiB that independent reads share. */
   maxMessageBytes?: number;
+  /** How long the socket may carry nothing before the host ends it, in milliseconds of real time: 60000 when absent,
+   *  four of the frames Convex sends every 15 s. The socket then ends as `closed`, to be opened again. */
+  idleTimeoutMs?: number;
 }
 
 export interface ConvexClient {
@@ -56,7 +57,7 @@ export interface ConvexClient {
   /** An action: its result. It rejects as a mutation does. */
   action<A extends Reference<'action'>>(ref: A, args: ArgsOf<A>): Promise<ReturnOf<A>>;
   /** The person's token (a JWT the deployment is configured to accept), or `undefined` signed out. Call it in a
-   *  mutation's source, before any `await`: the web sends only from a source's own turn, and a call after one throws. */
+   *  mutation's source; in an `async` one it may follow an `await`. From a plain `.then` callback its send throws on the web. */
   setAuth(token: string | undefined): void;
   /** The queries Convex is asked for and the requests in flight, for a test or a log. */
   inspect(): { queries: { id: number; udfPath: string; sent: boolean; answered: boolean }[]; requests: number };
@@ -69,7 +70,7 @@ export function convex(address: string, functions: ConvexFunctions, options: Con
   const url = `${address.replace(/^http/, 'ws').replace(/\/+$/, '')}/api/${PROTOCOL}/sync`;
   let socket: Socket | undefined, epoch = 0;
   const send = (frames: Frame[]) => { for (const frame of frames) socket?.send(JSON.stringify(frame)); };
-  const snapshot = (): ConvexLive => ({ status: sync.status, rev: sync.rev, beat: sync.beat, error: sync.error, authError: sync.authError });
+  const snapshot = (): ConvexLive => ({ status: sync.status, rev: sync.rev, error: sync.error, authError: sync.authError });
   const settle = <T>(outcome: Outcome, shape?: (value: any) => T): T => {
     if (!outcome.ok) throw new ConvexFailure(outcome.message, outcome.data);
     return shape ? shape(outcome.value) : outcome.value as T;
@@ -83,6 +84,8 @@ export function convex(address: string, functions: ConvexFunctions, options: Con
     socket = undefined;
     return fetch(url, {
       exactIndependentHttp: { maxResponseBytes: options.maxMessageBytes ?? MAX_MESSAGE_BYTES },
+      // A socket that carries nothing ends as a Timeout, which is `closed` below (LLP 1016.000 D11).
+      exactIdleTimeout: options.idleTimeoutMs ?? IDLE_TIMEOUT_MS,
       exactStream(event: StreamEvent, given?: Socket): ConvexLive {
         if (mine !== epoch) return snapshot();
         if (event.type === 'open') { socket = given; send(sync.opened()); }

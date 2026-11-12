@@ -66,19 +66,16 @@ extension NodeView {
     private var isLeavingFocus: Bool { Self.leaving.contains(ObjectIdentifier(self)) }
     /// The editor editing this node's field: none once its editing is ending (`leavingFocus`).
     var editingEditor: NSTextView? { isLeavingFocus ? nil : field?.currentEditor() as? NSTextView }
-    /// A write to a field that AppKit applies by ending the field editor's
-    /// editing and beginning it again
-    /// (`-[NSTextField setPlaceholderAttributedString:]` does, so the editor
-    /// shows the new placeholder). The field keeps the focus throughout, so
-    /// the app hears no blur and no `change` from it, as the web changes a
-    /// focused input's placeholder with neither. Editing that does not come
-    /// back ends as any does.
+    /// A placeholder write or a change of field class can end AppKit's
+    /// editing and begin it again. The input keeps its focus throughout,
+    /// so the app hears no blur or `change`. Editing that does not resume
+    /// in the node's current field ends as any does.
     func keepingEditing(_ f: NSTextField, _ change: () -> Void) {
         guard f.currentEditor() != nil, Self.restartingEditing == nil else { return change() }
         Self.restartingEditing = self
         change()
         Self.restartingEditing = nil
-        if f.currentEditor() == nil { editingEnded() }
+        if field?.currentEditor() == nil { editingEnded() }
     }
     nonisolated(unsafe) private static weak var restartingEditing: NodeView?
     @objc package func controlTextDidChange(_ obj: Notification) {

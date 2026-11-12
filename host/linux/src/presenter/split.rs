@@ -396,6 +396,7 @@ impl<D: DataSource> Presenter<D> {
             hidden: stack.iter().skip(routes.len() + 1).any(|id| {
                 kernel.node(*id).is_some_and(|n| {
                     n.props.str(PropId::NavigationPresentation) == Some("fullscreen")
+                        && !crate::navigation::over_page(&n)
                 })
             }),
             routes,

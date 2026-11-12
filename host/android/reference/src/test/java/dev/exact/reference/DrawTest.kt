@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.LocalMinimumInteractiveComponentSize
+import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.darkColorScheme
@@ -143,6 +144,7 @@ class InputsTest {
         for (name in listOf("light", "dark")) schemes.put(name, scheme(DrawTest.schemeOf(name)))
         File(out, "schemes.json").writeText(schemes.toString(2))
         val padding = ButtonDefaults.ContentPadding
+        val segment = SegmentedButtonDefaults.ContentPadding
         val defaults = JSONObject()
             .put("TextFieldDefaults.MinHeight", TextFieldDefaults.MinHeight.value)
             .put("TextFieldDefaults.MinWidth", TextFieldDefaults.MinWidth.value)
@@ -154,6 +156,8 @@ class InputsTest {
             .put("ButtonDefaults.ContentPadding.top", padding.calculateTopPadding().value)
             .put("ButtonDefaults.ContentPadding.end", padding.calculateEndPadding(LayoutDirection.Ltr).value)
             .put("ButtonDefaults.ContentPadding.bottom", padding.calculateBottomPadding().value)
+            .put("SegmentedButtonDefaults.ContentPadding.start", segment.calculateStartPadding(LayoutDirection.Ltr).value)
+            .put("SegmentedButtonDefaults.ContentPadding.top", segment.calculateTopPadding().value)
             .put("CheckboxDefaults.StrokeWidth", CheckboxDefaults.StrokeWidth.value)
             .put("LocalMinimumInteractiveComponentSize", touch)
         File(out, "defaults.json").writeText(defaults.toString(2))

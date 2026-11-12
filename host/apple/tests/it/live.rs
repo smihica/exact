@@ -45,7 +45,10 @@ fn a_running_build_applies_a_batch_in_place() {
     host.dispatch(bump, Event::Press);
     let frame = host.runner().kernel().node(count).unwrap().frame;
     let out = host.apply_live(&batch.json());
-    assert!(out.starts_with("{\"live\":\"applied\""), "{out}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["live"],
+        "applied"
+    );
     let k = host.runner().kernel();
     let node = k.node(count).unwrap();
     assert_eq!(
@@ -58,9 +61,11 @@ fn a_running_build_applies_a_batch_in_place() {
         "no restart: the state stays"
     );
     assert_eq!(node.frame, frame, "a colour moves no geometry");
-    assert!(host
-        .apply_live(&batch.json())
-        .starts_with("{\"live\":\"stale\""));
+    let out = host.apply_live(&batch.json());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["live"],
+        "stale"
+    );
 }
 
 /// LLP 1121 stage 5, commit 2: a role override's value edit reaches a
@@ -93,7 +98,10 @@ fn a_running_build_takes_a_role_override_edit_in_place() {
     assert!(boot.contains(r#""AccentColor":[10,122,255,255]"#), "{boot}");
     assert!(boot.contains(r#""text_color":[17,17,17,255]"#), "{boot}");
     let out = host.apply_live(&batch.json());
-    assert!(out.starts_with("{\"live\":\"applied\""), "{out}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["live"],
+        "applied"
+    );
     assert!(
         out.contains(
             r#"{"op":"roles","roles":{"CanvasText":[34,34,34,255],"AccentColor":[255,0,0,255]}}"#

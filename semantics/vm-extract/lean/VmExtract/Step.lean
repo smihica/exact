@@ -66,6 +66,7 @@ theorem exec_ok : ∀ i, ExecOk i
   | .failureResource r => exec_failureResource r
   | .failedMutation k => exec_failedMutation k
   | .failureMutation k => exec_failureMutation k
+  | .currentResource r => exec_currentResource r
 
 /-- Fetch and run the instruction at `m.pos`: what the model does with the
 code at `M.pc`. -/

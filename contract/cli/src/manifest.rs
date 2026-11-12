@@ -485,8 +485,7 @@ fn validate_rust_policy(value: &serde_json::Value, depth: u8) -> Result<(), Stri
     }
 }
 
-/// `typescript`: `{ placement?, platforms?: { <platform>: { placement? } } }`
-/// (LLP 1027.002 §6), nothing else.
+/// TypeScript placement (LLP 1027.002 §6) and source mounts; no other keys.
 fn validate_placement_policy(value: &serde_json::Value) -> Result<(), String> {
     let object = value.as_object().ok_or("typescript must be an object")?;
     let placement = |v: &serde_json::Value, at: &str| -> Result<(), String> {
@@ -524,12 +523,7 @@ fn validate_placement_policy(value: &serde_json::Value) -> Result<(), String> {
                     }
                 }
             }
-            // Mounted directories and import aliases: the bake resolves and checks them (`js/bake`).
-            "aliases" => {
-                value
-                    .as_object()
-                    .ok_or("typescript.aliases must be an object of specifier to directory")?;
-            }
+            // Mounted directories: the bake resolves and checks them (`js/bake`).
             "sources" => {
                 value
                     .as_object()
@@ -568,6 +562,15 @@ mod placement_tests {
             .contains("typescript.sources"));
         let unknown = manifest(serde_json::json!({"typescript": {"elsewhere": 1}}));
         assert!(unknown.placement("typescript", "ios").is_err());
+    }
+
+    #[test]
+    fn typescript_aliases_are_refused() {
+        let m = manifest(serde_json::json!({"typescript": {"aliases": {"@core": "../core"}}}));
+        assert_eq!(
+            m.placement("typescript", "ios"),
+            Err("invalid typescript policy key: aliases".into())
+        );
     }
 }
 

@@ -1,8 +1,43 @@
 // What an Apple app links: the capabilities its composition names, and the
-// SDK its executable records.
+// SDK its executable records, with the device launch link of LLP 1047.001.001.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { readFileSync, mkdirSync, rmSync, cpSync, statSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
+
+/** Save a distributed image's symbols before removing its local symbol table.
+ * `strip` keeps the image's UUID; `strip: false` writes the dSYM alone.
+ * A direct Swift link supplies its dSYM: the driver's temporary objects are already gone. */
+export function stripForDistribution(executable, dsym, { strip = true, sourceDsym = null } = {}) {
+  // dsymutil reports each symbol it could not find in an object file on stderr; only a failure is said.
+  const run = (cmd, args) => { const r = spawnSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] }); if (r.status !== 0) throw new Error(`${cmd} ${args.join(' ')} failed (${r.status ?? r.signal}): ${r.stderr ?? ''}`); };
+  mkdirSync(dirname(dsym), { recursive: true });
+  rmSync(dsym, { recursive: true, force: true });
+  if (sourceDsym) {
+    cpSync(sourceDsym, dsym, { recursive: true });
+    rmSync(sourceDsym, { recursive: true });
+  } else run('dsymutil', [executable, '-o', dsym]);
+  if (!strip) return { dsym, saved: 0 };
+  const before = statSync(executable).size;
+  run('strip', ['-x', executable]);
+  return { dsym, saved: before - statSync(executable).size };
+}
+/** Embedded products name a dSYM outside their shipped bundle. */
+export function stripProductionExecutable(executable, { production, ipa = null, dsym = ipa ? `${ipa.replace(/\.ipa$/, '')}.dSYM` : `${executable}.dSYM`, sourceDsym = null, strip = true }) {
+  if (!production) return null;
+  return stripForDistribution(executable, dsym, { sourceDsym, strip });
+}
+
+/** Production compiler policy (LLP 1047.001 D9). tvOS shares host.ios. */
+export function appleProduction(app, platform, args = []) {
+  const game = !!app.manifest.game;
+  const at = args.indexOf('--optimize');
+  const optimize = at >= 0 ? args[at + 1]
+    : app.manifest.host?.[platform === 'macos' ? 'macos' : 'ios']?.optimize
+      ?? (game ? 'speed' : args.includes('--embed') || platform !== 'macos' ? 'size' : 'speed');
+  if (!['speed', 'size'].includes(optimize)) throw new Error(`host/apple: --optimize is speed or size, not ${optimize}`);
+  if (game && optimize === 'size') throw new Error('host/apple: games cannot optimize for size because their generated Cargo workspace has no size profile; use speed');
+  return { optimize, profile: optimize === 'size' ? 'size' : 'release' };
+}
 
 /** The capabilities with a Swift half, by name, and the product of
  * `Package.swift` (its `capabilities` table) each is. */
@@ -37,8 +72,19 @@ export function appleComposition(graph, production, ahead = [], granted = false)
 
 /** The system frameworks only a capability's Swift half brings, and so
  * absent from an executable whose composition does not link it (LLP
- * 1047.001.000 §6, the check's first form). */
-const CAPABILITY_FRAMEWORKS = [['ExactMediaPicker', 'PhotosUI'], ['ExactAuthSession', 'AuthenticationServices'], ['ExactNumerals', 'SwiftUI'], ['ExactSnapshot', 'WidgetKit'], ['ExactSnapshot', 'ActivityKit']];
+ * 1047.001.000 §6, the check's first form). SafariServices belongs to
+ * @exact/in-app-browser in ExactAppModules, not a SwiftPM capability product. */
+const CAPABILITY_FRAMEWORKS = [['@exact/in-app-browser', 'SafariServices'], ['ExactMediaPicker', 'PhotosUI'], ['ExactAuthSession', 'AuthenticationServices'], ['ExactNumerals', 'SwiftUI'], ['ExactSnapshot', 'WidgetKit'], ['ExactSnapshot', 'ActivityKit']];
+
+export function appleLaunchFrameworks(destination, product) {
+  return destination === 'ios' && ['ExactIOS', 'ExactHostIOS'].includes(product) ? ['SafariServices'] : [];
+}
+
+export function appleLaunchLinkArgs(destination, product) {
+  // UIKit's -[UIApplication _accessibilityInit] loads this closure at every launch;
+  // dyld loads it cheaper (LLP 1047.001.001). Keep the link even with dylib dead stripping.
+  return appleLaunchFrameworks(destination, product).flatMap(name => ['-Xlinker', '-needed_framework', '-Xlinker', name]);
+}
 
 /** The dylibs an executable's load commands name (`LC_LOAD_DYLIB` and its
  * weak, re-export, lazy and upward forms), every slice of a universal one.

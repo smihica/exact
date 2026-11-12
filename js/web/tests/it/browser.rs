@@ -151,8 +151,8 @@ fn grant_sets() -> String {
         "net.fetch https://fixture.exact.test\n",
         "secret.keep dpop\n",
         "net.fetch https://api.castle.xyz\nsecret.keep castle.session\n",
-        // js/tests/fixtures/storage.ts's, as it declares them (its widget cache writes since 5363e50241).
-        "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n",
+        // js/tests/fixtures/storage.ts's declared grants.
+        "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\nfs.read bundle:/Resources/shipped\n",
         "fs.read app:/\nfs.write app:/\nsqlite.open app:/data",
         "fs.read app:/data/move\nfs.write app:/data/move",
         "fs.read app:/data",
@@ -182,6 +182,8 @@ import { chromium } from './scripts/agent-launch.mjs';
 const { executable: browserExecutable, unavailable: browserMissing } = chromium();
 if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
+import { buildHostGlue } from './host/web-js/glue.mjs';
+await buildHostGlue(process.cwd());
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -254,7 +256,7 @@ await new Promise(r=>server.listen(0,'127.0.0.1',r));
 // @ref LLP 1043.000 §3 D7/D8 — exercise the actual fixture server without Chrome.
 if(process.env.EXACT_MODULE_ROUTES_ONLY==='1'){
   try {
-    const glue=readFileSync('host/web/glue.js','utf8');
+    const glue=readFileSync(webHostFiles()['glue.js'],'utf8');
     const requested=[...glue.matchAll(/loadAfterPaint\(['"]\.\/([^'"]+)['"]/g)].map(match=>match[1]);
     assert(requested.length>0,'negative control: the loader inventory cannot be empty');
     const problems=[];
@@ -578,7 +580,7 @@ try {
     };
     // The fixture's own grants (js/tests/fixtures/storage.ts, js/tests/it/storage.rs GRANTS): its module declares
     // them, and admission refuses a module whose declaration differs from the admitted one.
-    const storageIdentity=admit({appId:'dev.exact.storage-test',grants:'fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n'});
+    const storageIdentity=admit({appId:'dev.exact.storage-test',grants:'fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\nfs.read bundle:/Resources/shipped\n'});
     const beforeStorage=(await indexedDB.databases()).length;
     let storage=await prepare(await payload(fixtures.storage,storageIdentity),storageIdentity);
     if((await indexedDB.databases()).length!==beforeStorage)throw new Error('prepare opened storage');
@@ -612,6 +614,8 @@ try {
     if(await storageCall('sql-code-words')!=='failed/failed/failed/failed')throw new Error('SQL text decided a storage code');
     const vacuumRefused=await storageCall('sql-vacuum-refused');
     if(!vacuumRefused.includes('not authorized: ATTACH and DETACH')||!vacuumRefused.includes('not authorized: PRAGMA foreign_keys: '))throw new Error(`SQLite step-time refusal parity: ${vacuumRefused}`);
+    const migration=await storageCall('sql-migration');
+    if(migration!=='ok|10:1,20:1,30:1,40:2|enforced|foreign key check failed, the batch is rolled back: 3 foreign-key violations: fk_gone row 20 (references fk_t), fk_nulled row 30 (references fk_t), fk_plain row 10 (references fk_t)|10:1,20:1,30:1,40:2|enforced|refused|failed|enforced|mismatch|enforced|ok|ok|unwritable|foreign key check failed, the batch is rolled back: 1 foreign-key violation: fk_tc row 1 (references fk_tp)|counted|enforced|enforced|enforced|Error/Unavailable/failed/SQLite transaction options: unknown option busy; the one option is foreignKeys|Error/Unavailable/failed/SQLite transaction options: unknown option foreignKey; the one option is foreignKeys|Error/Unavailable/failed/SQLite transaction options must be an object|Error/Unavailable/failed/SQLite transaction options: foreignKeys is "check" or absent|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: fk_big row 1 (references fk_t), fk_big row 9007199254740993 (references fk_t)|failed/foreign key check failed, the batch is rolled back: 1 foreign-key violation: a fk_wr row (references fk_t)|failed/foreign key check failed, the batch is rolled back: 4 foreign-key violations: fk_\u{E000}1 row 1 (references fk_t), fk_\u{E000}2 row 1 (references fk_t), fk_\u{E000}3 row 1 (references fk_t), and 1 more|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: busy row 1 (references fk_t), database is locked row 1 (references fk_t)|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: fk_two row 1 (references fk_q), fk_two row 1 (references fk_t)|kept|kept|kept|kept|1/1|failed/SQLite transaction options: unknown option __proto__; the one option is foreignKeys|failed/SQLite transaction options: unknown option constructor; the one option is foreignKeys|kept|failed/SQLite transaction options: foreignKeys is "check" or absent|failed/SQLite transaction options: unknown option other; the one option is foreignKeys|failed/SQLite transaction options must be an object')throw new Error(`SQLite foreignKeys check parity: ${migration}`);
     const fetchStart=await invoke(storage,'work',['fetch','a'],[],['session']);
     if(fetchStart.request?.url!=='https://example.test/a')throw new Error('storage to fetch continuation');
     const fetchEnd=await invoke(storage,'work',['fetch','a'],[],['session'],response('reply'));
@@ -1114,6 +1118,8 @@ import { chromium } from './scripts/agent-launch.mjs';
 const { executable: browserExecutable, unavailable: browserMissing } = chromium();
 if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
+import { buildHostGlue } from './host/web-js/glue.mjs';
+await buildHostGlue(process.cwd());
 import { moduleBinding, moduleInterfaces } from './js/bake/src/typescript.mjs';
 import { rolldown } from 'rolldown';
 import { spawn } from 'node:child_process';

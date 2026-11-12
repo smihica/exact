@@ -531,3 +531,25 @@ component App
     let app = AppDir::new(&fields, &[("strings/en.json", r#"{"hi":"Hi {name}"}"#)]);
     app.compile().unwrap();
 }
+
+/// The plan is a function of `strings/*.json` too (LLP 1060 D3), so the
+/// source graph lists them: a build script's `rerun_if_changed` and the dev
+/// session watch them, and editing one rebuilds the plan.
+#[test]
+fn the_source_graph_lists_the_strings_tables() {
+    let app = AppDir::new(
+        "component App\n  view\n    text t(\"greeting\")\n",
+        &[
+            ("strings/en.json", r#"{ "greeting": "Hello" }"#),
+            ("strings/fr.json", r#"{ "greeting": "Bonjour" }"#),
+        ],
+    );
+    let graph = contract::source_graph(&app.0.join("app.contract"));
+    let named = |file: &str| {
+        graph
+            .sources
+            .iter()
+            .any(|s| s.path.ends_with(format!("strings/{file}")))
+    };
+    assert!(named("en.json") && named("fr.json"), "{:?}", graph.sources);
+}

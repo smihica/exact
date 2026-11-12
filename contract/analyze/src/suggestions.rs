@@ -207,7 +207,7 @@ impl Writes<'_> {
         // A standalone land can run continuations armed by an earlier input;
         // a queue can send its next request during that same due-work step.
         for m in &self.root.mutations {
-            if m.queue && self.slots.contains(&m.name) {
+            if m.mode == contract_syntax::MutationMode::Queue && self.slots.contains(&m.name) {
                 out.insert(m.name.clone());
             }
             if let Some((then, _)) = &m.then {

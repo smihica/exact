@@ -66,7 +66,7 @@ fn agent_and_timed_bind_observe_final_propagated_ticks_and_restore_generation() 
     });
     assert_eq!(ticks, [59, 60]);
     ticks.clear();
-    sim.bind_with(&[], Some(2000.), |w, left| {
+    sim.bind_with(&[], Some(2000.), Clock::Seekable, |w, left| {
         if left < 2 {
             ticks.push(w.tick());
         }

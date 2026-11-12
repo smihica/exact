@@ -86,10 +86,36 @@ fn invalid_windows_names_fail_before_io() {
     for path in [
         "C:relative",
         "\\\\server\\share",
-        "\\\\?\\C:\\",
+        "\\\\?\\UNC\\server\\share",
         "\\\\.\\C:\\",
+        "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\",
     ] {
-        assert!(Directory::root(path, false).is_err());
+        assert!(Directory::root(path, false).is_err(), "{path:?}");
+    }
+}
+
+#[test]
+fn a_verbatim_drive_root_is_the_drive_path() {
+    let f = Fixture::new();
+    f.dir("root")
+        .write("value", b"bytes", false, TOKEN)
+        .unwrap();
+    let canonical = fs::canonicalize(f.path("root")).unwrap();
+    let verbatim = canonical.to_str().unwrap();
+    assert!(verbatim.starts_with("\\\\?\\"), "{verbatim}");
+    assert_eq!(
+        Directory::root(verbatim, false)
+            .unwrap()
+            .read("value")
+            .unwrap(),
+        b"bytes"
+    );
+    for path in [
+        format!("{verbatim}\\.\\"),
+        format!("{verbatim}\\..\\root"),
+        format!("{verbatim}/nested"),
+    ] {
+        assert!(Directory::root(&path, false).is_err(), "{path:?}");
     }
 }
 

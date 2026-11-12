@@ -195,6 +195,223 @@ fn a_tap_holds_its_modifiers_for_the_press() {
     assert!(reply.contains("error"), "{reply}");
 }
 
+#[test]
+fn a_refused_modifier_does_not_stay_held_for_later_input() {
+    refused_keys_preserve_modifiers(false);
+}
+
+#[test]
+fn a_refused_chord_preserves_held_modifiers() {
+    refused_keys_preserve_modifiers(true);
+}
+
+fn refused_keys_preserve_modifiers(chords: bool) {
+    let plan = contract::compile(
+        r#"component App
+  state log = ""
+  action pick(e: MouseEvent)
+    log = `tap:${e.shiftKey}:${e.ctrlKey}:${e.altKey}:${e.metaKey}`
+  action keyed(k: string, e: KeyboardEvent)
+    log = `key:${k}:${e.shiftKey}:${e.ctrlKey}:${e.altKey}:${e.metaKey}`
+  action released(k: string)
+    log = `up:${k}`
+  view
+    column width=300
+      button press=pick key=keyed keyup=released testId="b" width=50 height=20
+      button disabled=true testId="off" width=50 height=20
+      button inert=true testId="inert" width=50 height=20
+      text log testId="log" height=20
+"#,
+    )
+    .unwrap();
+    let (mut p, boot_error) = Presenter::boot_with(
+        &plan.encode(),
+        (),
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(boot_error.is_none(), "{boot_error:?}");
+    let id = |test_id: &str| {
+        let k = p.host().kernel();
+        k.node_by_key(k.find_by_test_id(test_id)[0]).unwrap().id
+    };
+    let (b, off, inert, log_id) = (id("b"), id("off"), id("inert"), id("log"));
+    let log = |p: &Presenter<()>| {
+        p.host()
+            .kernel()
+            .node(log_id)
+            .unwrap()
+            .props
+            .str(exact_kernel::PropId::Text)
+            .unwrap()
+            .to_owned()
+    };
+    let tap = format!(r#"{{"op":"tap","id":{b}}}"#);
+    let accepted = |p: &mut Presenter<()>, request: &str| {
+        let reply = handle(p, request);
+        assert!(!reply.contains("error"), "{request}: {reply}");
+    };
+    let edge = |p: &mut Presenter<()>, key: &str, phase: &str| {
+        accepted(
+            p,
+            &format!(r#"{{"op":"type","id":{b},"key":"{key}","phase":"{phase}"}}"#),
+        );
+    };
+    let reply = handle(&mut p, &tap);
+    assert!(!reply.contains("error"), "{reply}");
+    assert_eq!(log(&p), "tap:false:false:false:false");
+    for (name, left, right, flags) in [
+        ("Shift", "ShiftLeft", "ShiftRight", "true:false:false:false"),
+        (
+            "Control",
+            "ControlLeft",
+            "ControlRight",
+            "false:true:false:false",
+        ),
+        ("Alt", "AltLeft", "AltRight", "false:false:true:false"),
+        ("Meta", "MetaLeft", "MetaRight", "false:false:false:true"),
+    ] {
+        let chord = format!("{name}+a");
+        let keys = if chords {
+            vec![chord.as_str()]
+        } else {
+            vec![name, left, right]
+        };
+        for key in keys {
+            for held in [vec![], vec![left], vec![right], vec![left, right]] {
+                for phase in ["", r#", "phase":"down""#] {
+                    for repeat in [false, true] {
+                        for (target, reason) in [
+                            (off, format!("view {off} is disabled or inert")),
+                            (inert, format!("view {inert} is disabled or inert")),
+                            (u32::MAX, format!("no view {}", u32::MAX)),
+                        ] {
+                            for held_key in &held {
+                                edge(&mut p, held_key, "down");
+                            }
+                            let before = log(&p);
+                            let request = format!(
+                                r#"{{"op":"type","id":{target},"key":"{key}"{phase},"repeat":{repeat}}}"#
+                            );
+                            let reply: serde_json::Value =
+                                serde_json::from_str(&handle(&mut p, &request)).unwrap();
+                            assert_eq!(reply["error"], reason, "{request}: {reply}");
+                            assert_eq!(
+                                log(&p),
+                                before,
+                                "refused input dispatched an event: {request}"
+                            );
+                            let expected = if held.is_empty() {
+                                "false:false:false:false"
+                            } else {
+                                flags
+                            };
+                            accepted(&mut p, &tap);
+                            assert_eq!(
+                                log(&p),
+                                format!("tap:{expected}"),
+                                "held {held:?}, after {request}"
+                            );
+                            edge(&mut p, "a", "down");
+                            assert_eq!(
+                                log(&p),
+                                format!("key:a:{expected}"),
+                                "held {held:?}, after {request}"
+                            );
+                            edge(&mut p, "a", "up");
+                            for (i, held_key) in held.iter().enumerate() {
+                                edge(&mut p, held_key, "up");
+                                accepted(&mut p, &tap);
+                                let expected = if i + 1 == held.len() {
+                                    "false:false:false:false"
+                                } else {
+                                    flags
+                                };
+                                assert_eq!(
+                                    log(&p),
+                                    format!("tap:{expected}"),
+                                    "released {held_key}, after {request}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_partly_refused_chord_releases_only_its_new_modifiers() {
+    for chord in ["Shift+Alt+Control+a", "Shift+Alt+a"] {
+        let plan = contract::compile(
+            r#"component App
+  state blocked = false
+  state log = ""
+  action down(k: string)
+    log = `${log}down:${k};`
+    if k == "Alt"
+      blocked = true
+  action up(k: string)
+    log = `${log}up:${k};`
+  action pick(e: MouseEvent)
+    log = `${log}tap:${e.shiftKey}:${e.ctrlKey}:${e.altKey}:${e.metaKey};`
+  view
+    column width=300 key=down keyup=up
+      button press=pick testId="b" width=50 height=20
+      button disabled=blocked testId="target" width=50 height=20
+      text log testId="log" height=20
+"#,
+        )
+        .unwrap();
+        let (mut p, boot_error) = Presenter::boot_with(
+            &plan.encode(),
+            (),
+            (300.0, 300.0),
+            1.0,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(boot_error.is_none(), "{boot_error:?}");
+        let id = |test_id: &str| {
+            let k = p.host().kernel();
+            k.node_by_key(k.find_by_test_id(test_id)[0]).unwrap().id
+        };
+        let (b, target, log) = (id("b"), id("target"), id("log"));
+        let reply = handle(
+            &mut p,
+            &format!(r#"{{"op":"type","id":{b},"key":"Shift","phase":"down"}}"#),
+        );
+        assert!(!reply.contains("error"), "{reply}");
+        let reply: serde_json::Value = serde_json::from_str(&handle(
+            &mut p,
+            &format!(r#"{{"op":"type","id":{target},"key":"{chord}"}}"#),
+        ))
+        .unwrap();
+        assert_eq!(
+            reply["error"],
+            format!("view {target} is disabled or inert")
+        );
+        for request in [
+            format!(r#"{{"op":"tap","id":{b}}}"#),
+            format!(r#"{{"op":"type","id":{b},"key":"Shift","phase":"up"}}"#),
+            format!(r#"{{"op":"tap","id":{b}}}"#),
+        ] {
+            let reply = handle(&mut p, &request);
+            assert!(!reply.contains("error"), "{request}: {reply}");
+        }
+        assert_eq!(
+            p.host().kernel().node(log).unwrap().props.str(exact_kernel::PropId::Text),
+            Some("down:Shift;down:Shift;down:Alt;up:Alt;tap:true:false:false:false;up:Shift;tap:false:false:false:false;"),
+            "{chord}"
+        );
+    }
+}
+
 /// A request that answers long after the drive moves on.
 #[derive(Default)]
 struct Stalled;

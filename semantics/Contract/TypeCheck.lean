@@ -244,6 +244,8 @@ def inferCall (p : Program) (G : Scope) : Scope → String → List Expr → Opt
         else if name = "failure" then
           (if (isResource p x || isMutation p x) && (lookupTy x Γ).isNone && (lookupTy x G).isSome
            then .some (.option (.record "Failure")) else .none)
+        else if name = "current" then
+          (if isResource p x && (lookupTy x Γ).isNone && (lookupTy x G).isSome then .some .bool else .none)
         else
           match ts? with
           | .some ts => boundedTy p (rosterTy name ts)
@@ -386,10 +388,18 @@ def checkState (p : Program) (i : Nat) : Bool :=
   | .none => true
 
 def checkDerive (p : Program) (d : DeriveDecl) : Bool := inferLe p (settleScope p) [] d.body d.ty
-/-- A resource's arguments, and over a list its list and key (a string,
-number or bool: the compiler's `type-resource-for-key`), and its source's
-one signature. -/
+/-- A resource's `when` is a bool, read where its arguments are (the
+compiler's `type-when-not-bool`); a resource over a list has none
+(`syntax-resource-for-when`; LLP 1161.002 D1). -/
+def resourceGate (p : Program) (r : ResourceDecl) : Bool :=
+  match r.gate with
+  | .none => true
+  | .some g => r.each.isNone && inferLe p (settleScope p) [] g .bool
+/-- A resource's `when`, its arguments, and over a list its list and key
+(a string, number or bool: the compiler's `type-resource-for-key`), and
+its source's one signature. -/
 def checkResource (p : Program) (r : ResourceDecl) : Bool :=
+  resourceGate p r &&
   match r.each with
   | .none =>
     match inferList p (settleScope p) [] r.args with
@@ -511,8 +521,16 @@ theorem inferCall_rest {p : Program} {G Γ : Scope} {name : String} {args : List
                 simp at h; subst h; exact .failure hfd hr.1.1 hr.1.2 hr.2
               · simp at h
             · split at h
-              · next ts => exact .roster hfd (hts ts rfl) (boundedTy_some h)
-              · simp at h
+              · next hn =>
+                subst hn
+                split at h
+                · next hr =>
+                  simp only [Bool.and_eq_true, Option.isNone_iff_eq_none] at hr
+                  simp at h; subst h; exact .current hfd hr.1.1 hr.1.2 hr.2
+                · simp at h
+              · split at h
+                · next ts => exact .roster hfd (hts ts rfl) (boundedTy_some h)
+                · simp at h
       · split at h
         · next hn =>
           subst hn
@@ -948,7 +966,7 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
     shapes := ?_, names := hnames, routeShapes := hrs, routerSlot := hrslot, states := hst, derivesComplete := hdt, resourcesComplete := hrt,
     mutations := hmt, params := ?_, fns := ?_, rootInits := ?_, lateInits := ?_, derives := ?_,
     resources := ?_, actions := ?_, tasks := ?_, taskActions := ?_, taskLiterals := ?_, taskGates := ?_,
-    thenActions := ?_,
+    resourceGates := ?_, thenActions := ?_,
     view := checkNodes_sound _ hview }
   · intro sh hs f hf
     simp only [checkShapes, List.all_eq_true] at hsh
@@ -967,7 +985,8 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
   · intro d hd; exact inferLe_sound (hderives d hd)
   · intro r hr
     have := hres r hr
-    simp only [checkResource] at this
+    simp only [checkResource, Bool.and_eq_true] at this
+    obtain ⟨-, this⟩ := this
     split at this
     · next he =>
       split at this
@@ -1035,6 +1054,11 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
         · next u hu => exact ⟨_, infer_sound _ hu⟩
         · next u hu => exact ⟨_, infer_sound _ hu⟩
         · simp at hk
+  · intro r hr g hg
+    have := hres r hr
+    simp only [checkResource, resourceGate, hg, Bool.and_eq_true] at this
+    obtain ⟨u, hu, -⟩ := inferLe_sound this.1.2
+    exact ⟨u, hu⟩
   · intro m hm a ha
     have := hthen m hm
     simp only [thenAction, ha] at this

@@ -18,13 +18,9 @@ pub(super) struct Checkpoint {
     /// How many let-go requests with effects were collected before it.
     letting: usize,
     slots: Vec<Value>,
-    resources: Option<Vec<Option<ResourceState>>>,
-    stale: Vec<bool>,
-    store_readers: Vec<bool>,
-    watching: Vec<Vec<String>>,
-    failed_args: Vec<Option<Vec<Value>>>,
+    resources: Vec<super::resources::ResourceRow>,
+    module_readers: std::collections::BTreeMap<String, std::collections::BTreeMap<usize, String>>,
     uploads: super::uploads::Uploads,
-    failed_why: Vec<Option<crate::failure::Failure>>,
     failed_mut: Vec<Option<crate::failure::Failure>>,
     refresh_next: Vec<usize>,
     writes: super::writes::Writes,
@@ -42,12 +38,10 @@ pub(super) struct Checkpoint {
     root_font: (super::root_font::RootFont, f32, u32),
     /// Kept answers refused before this commit (`kept::refuse`).
     refused: usize,
-    resource_inspection: Vec<crate::perf::ResourceWork>,
     /// Who each request and `then` is from (LLP 1133.023 D7).
     origins: super::modules::OriginsSaved,
     /// The arguments refused a child's resource (LLP 1133.007 D13).
     refused_args: super::modules::Refused,
-    gone: Vec<bool>, // which elements of resources over lists had left (`each.rs`)
 }
 
 /// What a settlement publishes that a refusal after it — the gate step
@@ -58,9 +52,6 @@ pub(super) struct Published {
     settled: Option<super::settlement::Settled>,
     derives: Vec<Option<Value>>,
     derive_store_dependent: Vec<bool>,
-    resource_values: Vec<Option<crate::held::Held>>,
-    resources: Vec<Option<ResourceState>>,
-    awaiting: Vec<bool>,
     requests: usize,
 }
 
@@ -73,9 +64,8 @@ impl<D: DataSource> Runner<D> {
         self.scrolled.inline = read;
     }
 
-    /// Before a commit. `resources`: the commit edits the settled caches
-    /// before settling (a reply does).
-    pub(super) fn checkpoint(&mut self, resources: bool) -> Checkpoint {
+    /// Before a commit, including every resource field a refusal restores.
+    pub(super) fn checkpoint(&mut self) -> Checkpoint {
         self.start_commit();
         self.derives_evaluated = 0;
         self.copied_at_checkpoint = self.store.copied_bytes();
@@ -86,13 +76,9 @@ impl<D: DataSource> Runner<D> {
         Checkpoint {
             store,
             slots: self.slots.clone(),
-            resources: resources.then(|| self.resources.clone()),
-            stale: self.stale.clone(),
-            store_readers: self.store_readers.clone(),
-            watching: self.watching.clone(),
-            failed_args: self.failed_args.clone(),
+            resources: self.resources.clone(),
+            module_readers: self.extensions.readers.clone(),
             uploads: self.uploads.clone(),
-            failed_why: self.failed_why.clone(),
             failed_mut: self.failed_mut.clone(),
             refresh_next: self.refresh_next.clone(),
             writes: self.writes.clone(),
@@ -108,9 +94,6 @@ impl<D: DataSource> Runner<D> {
                     settled: self.settled.clone(),
                     derives: self.derives.clone(),
                     derive_store_dependent: self.derive_store_dependent.clone(),
-                    resource_values: self.resource_values.clone(),
-                    resources: self.resources.clone(),
-                    awaiting: self.awaiting.clone(),
                     requests: self.requests.len(),
                 })
             }),
@@ -122,11 +105,9 @@ impl<D: DataSource> Runner<D> {
                 self.ids.theme.window,
             ),
             refused: self.keeping.refused.len(),
-            resource_inspection: self.ids.work.resources.clone(),
             origins: self.origins_saved(),
             refused_args: self.refused_saved(),
             letting: self.letting_len(),
-            gone: self.gone_members(),
         }
     }
 
@@ -164,20 +145,19 @@ impl<D: DataSource> Runner<D> {
                 self.forgot = true;
                 let kept = self.restore_store_refused(c.store);
                 self.slots = c.slots;
-                if let Some(resources) = c.resources {
-                    self.resources = resources;
+                let mut resources = c.resources;
+                // A refused call still drew randomness; the bake must not keep its answer.
+                for (old, attempted) in resources.iter_mut().zip(&self.resources) {
+                    old.entropy_reader |= attempted.entropy_reader;
                 }
-                self.stale = c.stale;
-                self.store_readers = c.store_readers;
+                self.resources = resources;
+                self.extensions.readers = c.module_readers;
+                self.release_sampled();
                 // A spent reply's turn read the store: its failure stands, and so does the read.
                 if let Some(i) = self.module_work.reply_reader.take() {
-                    self.store_readers[i] = true;
+                    self.resources[i].store_reader = true;
                 }
-                self.watching = c.watching;
-                self.failed_args = c.failed_args;
                 self.uploads = c.uploads;
-                self.ids.work.resources = c.resource_inspection;
-                self.failed_why = c.failed_why;
                 self.failed_mut = c.failed_mut;
                 self.refresh_next = c.refresh_next;
                 if kept {
@@ -187,15 +167,20 @@ impl<D: DataSource> Runner<D> {
                 let seq = self.writes.seq;
                 self.writes = c.writes;
                 self.writes.seq = seq;
-                self.overlays.iter_mut().for_each(|o| *o = None);
+                self.resources
+                    .iter_mut()
+                    .map(|row| &mut row.overlay)
+                    .for_each(|o| *o = None);
                 self.unsent = c.unsent;
                 self.reconciling = c.reconciling;
                 // A send its source refused when it was sent stays ended.
-                for (m, id) in std::mem::take(&mut self.refused_unsent) {
-                    self.unsent.retain(|u| u.0 != m);
+                for (target, id) in std::mem::take(&mut self.refused_unsent) {
+                    self.unsent.retain(|u| u.0 != target);
                     self.writes.records.retain(|r| Some(r.id) != id);
                     // And what it showed in is still read again.
-                    self.reconcile_after(m);
+                    if let Some(m) = target.mutation() {
+                        self.reconcile_after(m);
+                    }
                 }
                 self.pending = c.pending;
                 self.letting_restored(c.letting);
@@ -207,9 +192,6 @@ impl<D: DataSource> Runner<D> {
                     self.settled = p.settled;
                     self.derives = p.derives;
                     self.derive_store_dependent = p.derive_store_dependent;
-                    self.resource_values = p.resource_values;
-                    self.resources = p.resources;
-                    self.awaiting = p.awaiting;
                     // A resource request the settlement handed out goes
                     // with it: never taken, its continuation is let go.
                     let dropped: Vec<RequestOut> = self.requests.drain(p.requests..).collect();
@@ -217,7 +199,6 @@ impl<D: DataSource> Runner<D> {
                         self.discard_request(&r.request);
                     }
                 }
-                self.restore_members(&c.gone);
                 self.sync_pending_flags();
                 self.commands.truncate(c.commands);
                 // A refusal the restore undid is not said.
@@ -287,7 +268,7 @@ impl<D: DataSource> Runner<D> {
         frames: &[Frame],
     ) -> Result<CommitReceipt, RunnerError> {
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(false);
+        let checkpoint = self.checkpoint();
         let result = self.run_action_inner(action, args, frames);
         self.conclude(checkpoint, &result, was_poisoned);
         self.arm_then(result.is_ok());
@@ -409,13 +390,14 @@ impl<D: DataSource> Runner<D> {
         // the mutation's slot inside this commit; a request goes to the host
         // once the commit stands. A queue mutation's send is asked only when
         // the mutation is free and it is the commit's first; else it waits
-        // its turn (LLP 1092 D2).
-        let mut later: Vec<(usize, String, Vec<Value>, Request)> = Vec::new();
+        // its turn (LLP 1092 D2). A parallel one's is always asked, as its
+        // own target (LLP 1161.000 D2, D5).
+        let mut later: Vec<Later> = Vec::new();
         let mut answered: Vec<(u32, Value)> = Vec::new();
         let mut asked: Vec<usize> = Vec::new();
         let mut landed_now: Vec<usize> = Vec::new();
         let mut failed_now = Vec::new();
-        // Non-queue mutations whose send replaces one in flight without a
+        // Newest-wins mutations whose send replaces one in flight without a
         // request of its own: an answer at once, or one waiting for the source.
         let mut replaced: Vec<usize> = Vec::new();
         // A send before the source can answer — a TypeScript module a native
@@ -428,51 +410,64 @@ impl<D: DataSource> Runner<D> {
         let mut unsent: Vec<Unsent> = Vec::new();
         for (m, source, sargs) in &outcome.sends {
             let m = *m as usize;
-            self.accept_write(m, source, sargs);
-            let queue = self.plan.mutations[m].queue;
+            let mode = self.plan.mutations[m].mode;
+            let queue = mode == MutationMode::Queue;
+            if mode == MutationMode::Parallel {
+                let more = (later.iter().map(|l| l.0)).chain(unsent.iter().map(|u| u.0));
+                if let Err(e) =
+                    self.parallel_bound(m, more.filter(|t| t.mutation() == Some(m)).count())
+                {
+                    self.discard_later(&later);
+                    return Err(e);
+                }
+            }
+            let target = self.send_target(m);
+            let write = self.accept_write(target, source, sargs);
             let early = !self.data.ready() && !exact_plan::runner_owned_source(source);
             if early && !queue {
-                unsent.retain(|u| u.0 != m);
-                unsent.push((m, source.clone(), sargs.clone(), self.sent_by()));
+                if let Err(e) = self.check_send_arguments(m, sargs) {
+                    self.discard_later(&later);
+                    return Err(e);
+                }
                 // It replaces a send still in flight (newest wins).
-                replaced.push(m);
+                if mode == MutationMode::Newest {
+                    unsent.retain(|u| u.0.mutation() != Some(m));
+                    replaced.push(m);
+                }
+                unsent.push((target, source.clone(), sargs.clone(), self.sent_by()));
                 continue;
             }
             if queue && (early || asked.contains(&m) || !self.asks_now(m)) {
-                if let Err(e) = self.wait_turn(m, source, sargs) {
+                if let Err(e) = self.wait_turn(m, source, sargs, write) {
                     self.discard_later(&later);
                     return Err(e);
                 }
                 continue;
             }
             asked.push(m);
-            match self.ask_send(m, source, sargs) {
+            match self.ask_send(target, source, sargs, write) {
                 Ok(super::queue::Asked::Now(slot, v)) => {
                     answered.push((slot as u32, v));
                     self.landed.push(m);
                     landed_now.push(m);
                     // It replaces an earlier send of this action still to go
                     // out (newest wins): that request never goes.
-                    if !queue {
-                        let earlier: Vec<_> = later
-                            .iter()
-                            .filter(|l| l.0 == m)
-                            .map(|l| l.3.clone())
-                            .collect();
-                        for request in &earlier {
-                            self.discard_request(request);
-                        }
-                        later.retain(|l| l.0 != m);
+                    if mode == MutationMode::Newest {
+                        let (older, rest) = later.into_iter().partition(|l| l.0 == target);
+                        later = rest;
+                        self.discard_later(&older);
                     }
                 }
                 Ok(super::queue::Asked::Later(request)) => {
-                    later.push((m, source.clone(), sargs.clone(), request))
+                    later.push((target, source.clone(), sargs.clone(), request))
                 }
                 Ok(super::queue::Asked::Failed) => {
-                    let (older, rest) = later.into_iter().partition(|l| l.0 == m);
-                    later = rest;
-                    self.discard_later(&older);
-                    self.pending_mut[m] = false;
+                    if mode != MutationMode::Parallel {
+                        let (older, rest) = later.into_iter().partition(|l| l.0 == target);
+                        later = rest;
+                        self.discard_later(&older);
+                        self.pending_mut[m] = false;
+                    }
                     failed_now.push(m);
                 }
                 Err(e) => {
@@ -534,12 +529,10 @@ impl<D: DataSource> Runner<D> {
         // An assignment to a mutation's slot tentatively makes it not
         // pending. The pending map is changed only after settlement stands:
         // a refused assignment did not change what reply the view wants.
-        // A queue's assignment forgets nothing: every reply still lands
-        // (LLP 1092 D4).
+        // A queue's or a parallel mutation's assignment forgets nothing:
+        // every reply still lands (LLP 1092 D4, LLP 1161.000 D4).
         let assigned: Vec<usize> = (0..self.plan.mutations.len())
-            .filter(|m| {
-                written.contains(&self.plan.mutations[*m].slot.0) && !self.plan.mutations[*m].queue
-            })
+            .filter(|m| written.contains(&self.plan.mutations[*m].slot.0) && self.newest_wins(*m))
             .collect();
         for m in 0..self.plan.mutations.len() {
             if written.contains(&self.plan.mutations[m].slot.0) {
@@ -557,27 +550,36 @@ impl<D: DataSource> Runner<D> {
         }
         // A send answered at once replaces one in flight: not pending.
         for m in &landed_now {
-            if !self.plan.mutations[*m].queue {
+            if self.newest_wins(*m) {
                 self.pending_mut[*m] = false;
             }
         }
-        for (m, _, _, _) in &later {
-            if !assigned.contains(m) {
-                self.pending_mut[*m] = true;
+        let of = |t: Target| t.mutation().expect("a send's target names its mutation");
+        for m in later.iter().map(|l| of(l.0)) {
+            if !assigned.contains(&m) {
+                self.pending_mut[m] = true;
             }
         }
         // A send that goes now replaces one still waiting for the source
         // (newest wins)
-        for m in asked.iter().filter(|m| !self.plan.mutations[**m].queue) {
-            self.unsent.retain(|u| u.0 != *m);
+        for m in asked
+            .iter()
+            .copied()
+            .filter(|m| self.newest_wins(*m))
+            .collect::<Vec<_>>()
+        {
+            self.unsent.retain(|u| u.0 != Target::Mutation(m));
         }
         // Waiting from here, so the settlement sees them pending; a refusal
         // puts the waiting sends back as they were (the checkpoint).
-        for (m, source, args, by) in &unsent {
-            self.unsent.retain(|u| u.0 != *m);
-            if !assigned.contains(m) {
-                self.unsent.push((*m, source.clone(), args.clone(), *by));
-                self.pending_mut[*m] = true;
+        for u in &unsent {
+            let m = of(u.0);
+            if self.newest_wins(m) {
+                self.unsent.retain(|w| w.0 != u.0);
+            }
+            if !assigned.contains(&m) {
+                self.unsent.push(u.clone());
+                self.pending_mut[m] = true;
             }
         }
         // What the action refreshes, added to what is already waiting
@@ -599,7 +601,7 @@ impl<D: DataSource> Runner<D> {
         let replacing: Vec<usize> = (assigned.iter().chain(&landed_now).chain(&replaced))
             .chain(&failed_now)
             .copied()
-            .filter(|m| !self.plan.mutations[*m].queue)
+            .filter(|m| self.newest_wins(*m))
             .collect();
         let mut let_go = Vec::new();
         for m in replacing {
@@ -621,8 +623,8 @@ impl<D: DataSource> Runner<D> {
                 // Settlement's flags follow the tickets, and this commit's
                 // requests are handed out after the step: a gate reads them
                 // pending, as the settled derives did.
-                for (m, _, _, _) in &later {
-                    self.pending_mut[*m] |= !assigned.contains(m);
+                for m in later.iter().map(|l| of(l.0)) {
+                    self.pending_mut[m] |= !assigned.contains(&m);
                 }
                 self.gate_step()
             })
@@ -662,20 +664,24 @@ impl<D: DataSource> Runner<D> {
         // A send answered at once, or waiting for the source, replaces one
         // still in flight (newest wins): the older reply is not wanted.
         for m in landed_now.into_iter().chain(replaced).chain(failed_now) {
-            if !self.plan.mutations[m].queue {
+            if self.newest_wins(m) {
                 self.forget_ticket(Target::Mutation(m));
             }
         }
         self.sync_pending_flags();
-        for (m, source, args, request) in later {
-            self.enqueue(Target::Mutation(m), source, args, request, false);
-            if assigned.contains(&m) {
-                self.forget(Target::Mutation(m));
+        for (target, source, args, request) in later {
+            self.enqueue(target, source, args, request, false);
+            if assigned.contains(&of(target)) {
+                self.forget(target);
             }
         }
-        for (m, ..) in unsent.iter().filter(|u| !assigned.contains(&u.0)) {
+        for m in unsent
+            .iter()
+            .map(|u| of(u.0))
+            .filter(|m| !assigned.contains(m))
+        {
             self.log(super::lines::unsent(
-                self.plan.str(self.plan.mutations[*m].name),
+                self.plan.str(self.plan.mutations[m].name),
             ));
         }
         self.take_set_modes(first_command);
@@ -787,41 +793,6 @@ impl<D: DataSource> Runner<D> {
         Ok(self.plan.mutation(mutation).slot.0 as usize)
     }
 
-    pub(super) fn target_name(&self, t: Target) -> String {
-        match t {
-            Target::Resource(i) => self.plan.str(self.plan.resources[i].name).to_string(),
-            Target::Mutation(m) => self.plan.str(self.plan.mutations[m].name).to_string(),
-        }
-    }
-
-    /// Drop the request in flight for `target`, if any: its reply, when it
-    /// comes, is dropped too (a `POST` already sent is not unsent — LLP 1016 D5).
-    pub(super) fn forget(&mut self, target: Target) {
-        self.forget_ticket(target);
-        if let Target::Mutation(m) = target {
-            self.unsent.retain(|u| u.0 != m);
-        }
-        self.sync_pending_flags();
-    }
-
-    /// Let go of `target`'s request in flight, keeping a send that waits
-    /// for the source; `false` keeps a child (LLP 1133.007 D13).
-    pub(super) fn forget_ticket(&mut self, target: Target) -> bool {
-        if self.holds_child(target) {
-            return false;
-        }
-        if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
-            let p = self.pending.remove(pos);
-            self.note_retired(&p);
-            let t = p.ticket;
-            self.note_let_go(t, target);
-            self.let_go_request(p);
-            self.forgot = true;
-            self.log(super::lines::forgot(t, &self.target_name(target)));
-        }
-        true
-    }
-
     /// The resources mutation `m` declares it refreshes.
     pub(super) fn declared_refreshes(&self, m: usize) -> Vec<usize> {
         let range = self.plan.mutations[m].refreshes;
@@ -870,8 +841,11 @@ impl<D: DataSource> Runner<D> {
                 // (new arguments: a new streak after a turn over its budget)
                 p.reasks = 0;
                 if let Target::Resource(i) = target {
-                    p.inspection_generation =
-                        self.ids.work.resources.get(i).map_or(0, |w| w.request);
+                    p.inspection_generation = self
+                        .resources
+                        .get(i)
+                        .map(|row| &row.inspection)
+                        .map_or(0, |w| w.request);
                 }
                 let (ticket, upload) = (p.ticket, p.upload);
                 // An upload kept for newer arguments is asked at them too (D10).
@@ -917,7 +891,7 @@ impl<D: DataSource> Runner<D> {
         self.pending.push(PendingReq {
             inspection_generation: match target {
                 Target::Resource(i) => self.inspected_request(i),
-                Target::Mutation(_) => 0,
+                Target::Mutation(_) | Target::Sent(..) => 0,
             },
             refusal: refusal.map(|why| (why, false)),
             refused: false,
@@ -942,7 +916,7 @@ impl<D: DataSource> Runner<D> {
             replay_unsafe: request.has_effects(),
             origin: self.writes.tick(),
             write: match target {
-                Target::Mutation(m) => self.asked_write(m),
+                Target::Mutation(_) | Target::Sent(..) => self.asked_write(target),
                 Target::Resource(_) => None,
             },
             held: request.is_held(),
@@ -1059,7 +1033,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// The `Later` sends an action collected before a refusal dropped them.
-    pub(super) fn discard_later(&mut self, later: &[(usize, String, Vec<Value>, Request)]) {
+    pub(super) fn discard_later(&mut self, later: &[Later]) {
         for (_, _, _, request) in later {
             self.discard_request(request);
         }
@@ -1081,14 +1055,6 @@ impl<D: DataSource> Runner<D> {
             Some((_, count)) => *count += 1,
             None => self.held_replies.push((name, 1)),
         }
-    }
-
-    /// Whether resource `i` has a stream open that has delivered: it is not
-    /// pending, but a newer answer must still let its ticket go.
-    pub(super) fn streaming(&self, i: usize) -> bool {
-        self.pending
-            .iter()
-            .any(|p| p.target == Target::Resource(i) && !p.in_flight())
     }
 
     /// Whether request `ticket` is still wanted. A host asks after each
@@ -1192,7 +1158,7 @@ impl<D: DataSource> Runner<D> {
         }
         self.overrun.replied = false;
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(true);
+        let checkpoint = self.checkpoint();
         let p = self.pending.remove(pos);
         self.sync_pending_flags();
         if p.held || p.long_poll {
@@ -1249,19 +1215,17 @@ impl<D: DataSource> Runner<D> {
         // refused commit of this message does not undo.
         let upload = self.pending[pos].upload;
         self.pending[pos].sent |= upload;
-        let checkpoint = self.checkpoint(true);
+        let checkpoint = self.checkpoint();
         if self.pending[pos].long_poll {
             self.long_poll_replied(pos);
         }
         let p = &mut self.pending[pos];
         if let (Some(count), Outcome::Message(m)) = (p.stream.as_mut(), &outcome) {
-            count.messages += 1;
             count.coalesced += u64::from(m.coalesced);
             sockets::socket_message(count, m);
         }
         let p = p.clone();
         self.note_child_outcome(p.ticket, &outcome);
-        self.sync_pending_flags();
         let (ticket, target, name) = (p.ticket, p.target, self.target_name(p.target));
         let what = super::lines::fulfilling(ticket, &name, summary);
         let before = self.sockets.len();
@@ -1312,8 +1276,8 @@ impl<D: DataSource> Runner<D> {
         let message = p.stream.is_some() && matches!(outcome, Outcome::Message(_));
         let failed_end = matches!(outcome, Outcome::Failed { .. });
         let ty = match p.target {
-            Target::Resource(i) => self.plan.resources[i].ty,
-            Target::Mutation(m) => self.plan.mutations[m].ty,
+            Target::Resource(i) => self.resource_row(i).ty,
+            Target::Mutation(m) | Target::Sent(m, _) => self.plan.mutations[m].ty,
         };
         self.store.take_topics();
         self.snapshot_sockets();
@@ -1337,9 +1301,7 @@ impl<D: DataSource> Runner<D> {
         } else if self.plan.module_named(&p.source).is_some() {
             self.module_parse(p.target, ty, &p.source, outcome)
         } else {
-            let parsed =
-                self.data
-                    .parse_for(p.target, &mut self.store, &p.source, &p.args, outcome);
+            let parsed = self.parse_frame(&p, message, outcome);
             self.refuse_locked(parsed)
         };
         // What the turn of a reply to a request with effects wrote stands,
@@ -1369,15 +1331,15 @@ impl<D: DataSource> Runner<D> {
             // A read in a later turn (after an `await`) makes a store reader
             // as one in the first does (LLP 1146 §2.3).
             if self.store.reads() > reads_before {
-                self.store_readers[i] = true;
+                self.resources[i].store_reader = true;
                 self.module_work.reply_reader = Some(i);
             }
             // A module's source that data code read: the answer is asked
             // again when that source's answer changes (LLP 1133.002 D14).
             let module = (p.keepable.as_ref()).and_then(|r| self.module_topic(&r.body));
             for topic in self.store.take_topics().into_iter().chain(module) {
-                if !self.watching[i].contains(&topic) {
-                    self.watching[i].push(topic);
+                if !self.resources[i].watching.contains(&topic) {
+                    self.resources[i].watching.push(topic);
                 }
             }
         }
@@ -1430,6 +1392,10 @@ impl<D: DataSource> Runner<D> {
                     next.reasks = p.reasks;
                     next.effects |= next.continuation.is_some() && effects;
                     next.replay_unsafe |= p.replay_unsafe;
+                    if p.upload {
+                        self.uploads
+                            .continue_at(p.ticket, next, p.sent || !failed_end);
+                    }
                 }
                 return self.update();
             }
@@ -1447,16 +1413,23 @@ impl<D: DataSource> Runner<D> {
                 });
             }
         }
+        if message || turn {
+            let pending = self.pending.iter_mut().find(|q| q.ticket == p.ticket);
+            if let Some(count) = pending.and_then(|p| p.stream.as_mut()) {
+                count.messages += 1;
+            }
+            self.sync_pending_flags();
+        }
         match p.target {
             Target::Resource(i) => {
-                let shown = self.resources[i].take();
+                let shown = self.resources[i].state.take();
                 self.revalidated(i, shown.as_ref(), &value);
-                self.stale[i] = false;
-                self.failed_args[i] = None;
+                self.resources[i].stale = false;
+                self.resources[i].failed_args = None;
                 self.keep_answer(i, &p.args, &value);
                 // An upload's end is the answer it stands on at its arguments;
                 // one that never reached the network is an ordinary answer (D10).
-                if p.upload && !message {
+                if p.upload && !message && !turn {
                     let end = super::UploadEnd::Answered(value.clone());
                     self.upload_over(p.ticket, p.sent || !failed_end, end);
                 }
@@ -1464,7 +1437,7 @@ impl<D: DataSource> Runner<D> {
                     self.log(super::lines::asked_again(p.ticket, &name));
                     self.force_refresh(i);
                 }
-                self.resources[i] = Some(ResourceState {
+                self.resources[i].state = Some(ResourceState {
                     inspection_generation: p.inspection_generation,
                     args: p.args,
                     value: crate::held::Held::new(value),
@@ -1472,15 +1445,21 @@ impl<D: DataSource> Runner<D> {
                     placeholder: false,
                     kept_seed: false,
                     answered_for: None,
+                    asleep: false,
+                    slept: false,
                     origin: p.origin,
                 });
                 self.inspected_success(i, p.inspection_generation);
             }
-            Target::Mutation(m) => {
-                self.failed_mut[m] = None;
+            Target::Mutation(m) | Target::Sent(m, _) => {
                 let slot = self.mutation_slot(m)?;
-                self.land_write(m, p.write, &value);
-                self.slots[slot] = Value::some(value);
+                self.land_write(p.target, p.write, &value);
+                // A parallel send's reply concluding after a later send's
+                // leaves the slot and the failure (LLP 1161.000 D4).
+                if self.conclude_send(p.target) {
+                    self.failed_mut[m] = None;
+                    self.slots[slot] = Value::some(value);
+                }
                 self.landed.push(m);
                 // The reply landed: what the mutation changed is asked again
                 // in this commit (LLP 1054.000.000 D1); its write shows until

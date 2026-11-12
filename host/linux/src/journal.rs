@@ -21,7 +21,7 @@ const CAPACITY: usize = 4096;
 pub struct Event {
     /// `startup`, `app.event`, `app.attributes`, `app.error`, …
     pub kind: String,
-    /// Seconds on `CLOCK_BOOTTIME`, the launch marks' clock.
+    /// Seconds on the launch marks' clock ([`crate::launch_marks::boottime`]).
     pub at: f64,
     /// Seconds since the Unix epoch.
     pub wall: f64,

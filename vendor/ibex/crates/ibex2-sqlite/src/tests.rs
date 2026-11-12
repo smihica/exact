@@ -1,5 +1,5 @@
 use super::*;
-use ibex2::stdlib::sqlite::{Database, Provider};
+use ibex2::stdlib::sqlite::{Database, ForeignKeys, Provider};
 fn open(dir: &tempfile::TempDir) -> Database {
     let path = dir.path().canonicalize().unwrap().join("app.db");
     Database::new(SqliteProvider.open(Location { path }).unwrap())
@@ -329,4 +329,375 @@ fn only_sqlite_s_own_result_marks_a_failure_busy() {
     let got = format!("{:?}", db.execute("INSERT INTO words VALUES ('x')", &[]));
     held.execute_batch("ROLLBACK").unwrap();
     assert!(got.starts_with("Err(Failed(\"SQLite EBUSY: "), "{got}");
+}
+fn run(db: &Database, statements: &[(&str, &[Value])], mode: ForeignKeys) -> Result<(), String> {
+    let commands: Vec<Command> = statements
+        .iter()
+        .map(|(sql, params)| Command {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+        })
+        .collect();
+    db.transaction_with(&commands, mode)
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+fn sql(statements: &[&'static str]) -> Vec<(&'static str, &'static [Value])> {
+    statements.iter().map(|s| (*s, &[][..])).collect()
+}
+fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
+    db.query(sql, &[]).unwrap().rows
+}
+/// `t` with a child of each delete action, each with a row that names it.
+fn family(db: &Database) {
+    run(
+        db,
+        &sql(&[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE TABLE plain(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id))",
+            "CREATE TABLE gone(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id) ON DELETE CASCADE)",
+            "CREATE TABLE nulled(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id) ON DELETE SET NULL)",
+            "CREATE TABLE strict(id INTEGER PRIMARY KEY, p INTEGER NOT NULL REFERENCES t(id) ON DELETE SET NULL)",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b')",
+            "INSERT INTO plain VALUES (10, 1)",
+            "INSERT INTO gone VALUES (20, 1)",
+            "INSERT INTO nulled VALUES (30, 1)",
+            "INSERT INTO strict VALUES (40, 2)",
+        ]),
+        ForeignKeys::Enforce,
+    )
+    .unwrap();
+}
+fn children(db: &Database) -> Vec<Vec<Vec<Value>>> {
+    ["plain", "gone", "nulled", "strict"]
+        .map(|table| rows(db, &format!("SELECT * FROM {table} ORDER BY id")))
+        .to_vec()
+}
+/// Drizzle's rebuild of `t`, statement for statement; `copied` picks the rows.
+fn drizzle(copied: &'static str) -> Vec<&'static str> {
+    vec![
+        "PRAGMA foreign_keys=OFF",
+        "CREATE TABLE `__new_t` (\n\t`id` integer PRIMARY KEY,\n\t`name` text,\n\t`extra` text\n)",
+        copied,
+        "DROP TABLE `t`",
+        "ALTER TABLE `__new_t` RENAME TO `t`",
+        "PRAGMA foreign_keys=ON",
+    ]
+}
+const ALL: &str = "INSERT INTO `__new_t`(\"id\", \"name\") SELECT \"id\", \"name\" FROM `t`";
+const FAILED: &str = "Failed(\"SQLite: foreign key check failed, the batch is rolled back: ";
+/// An ordinary batch still refuses an orphan, as before any migration.
+fn enforced(db: &Database) {
+    let orphan = [(
+        "INSERT INTO plain VALUES (?, ?)",
+        &[Value::Integer(99), Value::Integer(99)][..],
+    )];
+    let got = run(db, &orphan, ForeignKeys::Enforce).unwrap_err();
+    assert!(
+        got.contains(
+            "statement 1 of 1 (INSERT INTO plain VALUES (?, ?)): FOREIGN KEY constraint failed"
+        ),
+        "{got}"
+    );
+}
+#[test]
+fn a_foreign_key_check_batch_runs_drizzle_s_rebuild_and_keeps_every_child_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    family(&db);
+    let before = children(&db);
+    // Enforced, the same batch is refused at its first statement.
+    let got = run(&db, &sql(&drizzle(ALL)), ForeignKeys::Enforce).unwrap_err();
+    assert!(
+        got.contains(
+            "statement 1 of 6 (PRAGMA foreign_keys=OFF): not authorized: PRAGMA foreign_keys: "
+        ),
+        "{got}"
+    );
+    assert!(
+        got.contains("transaction(statements, { foreignKeys: \\\"check\\\" })"),
+        "{got}"
+    );
+    // An insert compiled while enforcement is off, reused after it.
+    let mut batch = sql(&drizzle(ALL));
+    batch.push((
+        "INSERT INTO plain VALUES (?, ?)",
+        &[Value::Integer(11), Value::Integer(2)],
+    ));
+    run(&db, &batch, ForeignKeys::Check).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT name FROM pragma_table_info('t') ORDER BY cid"),
+        [
+            [Value::Text("id".into())],
+            [Value::Text("name".into())],
+            [Value::Text("extra".into())]
+        ]
+    );
+    // With enforcement off, DROP TABLE ran no ON DELETE action: the
+    // CASCADE child keeps its row, the SET NULL children their references.
+    let mut after = before.clone();
+    after[0].push(vec![Value::Integer(11), Value::Integer(2)]);
+    assert_eq!(children(&db), after);
+    assert!(rows(&db, "PRAGMA foreign_key_check").is_empty());
+    enforced(&db);
+    // Enforced, the dropped table's delete would run those actions.
+    let got = run(
+        &db,
+        &sql(&["DELETE FROM t WHERE id = 1"]),
+        ForeignKeys::Enforce,
+    )
+    .unwrap_err();
+    assert!(got.contains("FOREIGN KEY constraint failed"), "{got}");
+}
+#[test]
+fn a_foreign_key_check_batch_that_leaves_an_orphan_rolls_back_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    family(&db);
+    let before = children(&db);
+    let only_b =
+        "INSERT INTO `__new_t`(\"id\", \"name\") SELECT \"id\", \"name\" FROM `t` WHERE id = 2";
+    let got = run(&db, &sql(&drizzle(only_b)), ForeignKeys::Check).unwrap_err();
+    assert_eq!(
+        got,
+        format!("{FAILED}3 foreign-key violations: gone row 20 (references t), nulled row 30 (references t), plain row 10 (references t)\")")
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM pragma_table_info('t')"),
+        [[Value::Integer(2)]]
+    );
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM t"), [[Value::Integer(2)]]);
+    assert_eq!(children(&db), before);
+    enforced(&db);
+    let got = run(
+        &db,
+        &sql(&["INSERT INTO plain VALUES (11, 7)"]),
+        ForeignKeys::Check,
+    )
+    .unwrap_err();
+    assert_eq!(
+        got,
+        format!("{FAILED}1 foreign-key violation: plain row 11 (references t)\")")
+    );
+    enforced(&db);
+    // A parent dropped and never made again: every row naming it.
+    let got = run(&db, &sql(&["DROP TABLE t"]), ForeignKeys::Check).unwrap_err();
+    assert_eq!(
+        got,
+        format!("{FAILED}4 foreign-key violations: gone row 20 (references t), nulled row 30 (references t), plain row 10 (references t), and 1 more\")")
+    );
+    assert_eq!(children(&db), before);
+    enforced(&db);
+}
+#[test]
+fn a_foreign_key_check_batch_leaves_enforcement_on_and_its_pragmas_stay_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    family(&db);
+    // The migrators' lines are no-ops in the batch, whatever their value;
+    // defer_foreign_keys and the rest stay refused.
+    run(
+        &db,
+        &sql(&[
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA foreign_keys = 1",
+            "PRAGMA main.foreign_keys=off",
+            "PRAGMA foreign_keys",
+        ]),
+        ForeignKeys::Check,
+    )
+    .unwrap();
+    enforced(&db);
+    for pragma in ["PRAGMA defer_foreign_keys=ON", "PRAGMA journal_mode=OFF"] {
+        let got = run(&db, &sql(&[pragma]), ForeignKeys::Check).unwrap_err();
+        assert!(got.contains("not authorized: PRAGMA "), "{got}");
+        enforced(&db);
+    }
+    // A failing statement.
+    let got = run(
+        &db,
+        &sql(&[
+            "INSERT INTO plain VALUES (12, 77)",
+            "INSERT INTO missing VALUES (1)",
+        ]),
+        ForeignKeys::Check,
+    )
+    .unwrap_err();
+    assert!(
+        got.contains("statement 2 of 2 (INSERT INTO missing VALUES (1)): no such table"),
+        "{got}"
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM plain"),
+        [[Value::Integer(1)]]
+    );
+    enforced(&db);
+    // Outside a batch the line is refused, as before.
+    let got = format!(
+        "{:?}",
+        db.execute("PRAGMA foreign_keys=OFF", &[]).unwrap_err()
+    );
+    assert!(
+        got.contains("not authorized: PRAGMA foreign_keys: "),
+        "{got}"
+    );
+    // A batch on another thread waits for the connection: it never runs
+    // while a migration has enforcement off.
+    let migrations = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                run(&db, &sql(&drizzle(ALL)), ForeignKeys::Check).unwrap();
+            }
+        })
+    };
+    for _ in 0..50 {
+        enforced(&db);
+    }
+    migrations.join().unwrap();
+    enforced(&db);
+}
+#[test]
+fn a_foreign_key_check_batch_checks_rows_not_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    family(&db);
+    // A parent made again without a key its children can name: SQLite's
+    // check itself fails, so the batch does.
+    let got = run(
+        &db,
+        &sql(&[
+            "CREATE TABLE __new_t(id INTEGER, name TEXT)",
+            "INSERT INTO __new_t SELECT * FROM t",
+            "DROP TABLE t",
+            "ALTER TABLE __new_t RENAME TO t",
+        ]),
+        ForeignKeys::Check,
+    )
+    .unwrap_err();
+    assert!(
+        got.starts_with(&format!("{FAILED}foreign key mismatch - \\\""))
+            && got.contains("referencing \\\"t\\\""),
+        "{got}"
+    );
+    enforced(&db);
+    // A parent dropped while no row names it passes the check, and leaves
+    // its child table refusing every write.
+    run(
+        &db,
+        &sql(&[
+            "CREATE TABLE lone(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE orphaned(p INTEGER REFERENCES lone(id))",
+        ]),
+        ForeignKeys::Enforce,
+    )
+    .unwrap();
+    run(&db, &sql(&["DROP TABLE lone"]), ForeignKeys::Check).unwrap();
+    let got = format!(
+        "{:?}",
+        db.execute("INSERT INTO orphaned VALUES (NULL)", &[])
+            .unwrap_err()
+    );
+    assert!(got.contains("no such table: main.lone"), "{got}");
+}
+#[test]
+fn a_foreign_key_check_batch_checks_temporary_tables_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    family(&db);
+    let got = run(
+        &db,
+        &sql(&[
+            "CREATE TEMP TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TEMP TABLE c(pid INTEGER REFERENCES p(id))",
+            "INSERT INTO c VALUES (1)",
+        ]),
+        ForeignKeys::Check,
+    )
+    .unwrap_err();
+    assert_eq!(
+        got,
+        format!("{FAILED}1 foreign-key violation: c row 1 (references p)\")")
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM temp.sqlite_schema"),
+        [[Value::Integer(0)]]
+    );
+    enforced(&db);
+}
+/// Bytes allocated on each thread, so a test can bound what one call costs.
+struct Counting;
+thread_local! {
+    static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn count(bytes: usize) {
+    let _ = ALLOCATED.try_with(|a| a.set(a.get().saturating_add(bytes)));
+}
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count(layout.size());
+        std::alloc::System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        count(size);
+        std::alloc::System.realloc(ptr, layout, size)
+    }
+}
+#[global_allocator]
+static COUNTING: Counting = Counting;
+#[test]
+fn a_large_foreign_key_check_failure_names_three_rows_and_counts_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    // More orphans than a query may return (MAX_ROWS), each in a table with
+    // a long name. The rows are made whole in one batch; the second deletes
+    // their parents, so the check fails on all of them.
+    let name = format!("c{}", "x".repeat(1_000));
+    let fill = |table: &str| {
+        format!(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < {}) INSERT INTO {table} SELECT x FROM n",
+            MAX_ROWS + 1
+        )
+    };
+    let create = format!("CREATE TABLE {name}(pid INTEGER REFERENCES p(id))");
+    let (parents, children) = (fill("p"), fill(&name));
+    run(
+        &db,
+        &[
+            ("CREATE TABLE p(id INTEGER PRIMARY KEY)", &[][..]),
+            (&create, &[][..]),
+            (&parents, &[][..]),
+            (&children, &[][..]),
+        ],
+        ForeignKeys::Enforce,
+    )
+    .unwrap();
+    // Every byte Rust allocates on this thread while the failing batch runs,
+    // frees not subtracted: an upper bound on what the check and its message
+    // hold at once (SQLite's own memory is not Rust's). Kept to the three
+    // rows named, it stays under what a query result may hold
+    // (MAX_RESULT_BYTES); collecting every row took about 120 MB.
+    let before = ALLOCATED.with(|a| a.get());
+    let got = run(&db, &sql(&["DELETE FROM p"]), ForeignKeys::Check).unwrap_err();
+    let allocated = ALLOCATED.with(|a| a.get()) - before;
+    assert!(allocated < MAX_RESULT_BYTES, "{allocated} bytes");
+    let row = |id: usize| format!("{name} row {id} (references p)");
+    assert_eq!(
+        got,
+        format!(
+            "{FAILED}{} foreign-key violations: {}, {}, {}, and {} more\")",
+            MAX_ROWS + 1,
+            row(1),
+            row(2),
+            row(3),
+            MAX_ROWS - 2
+        )
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM p"),
+        [[Value::Integer(MAX_ROWS as i64 + 1)]]
+    );
 }

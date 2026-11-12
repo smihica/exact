@@ -149,3 +149,47 @@ fn a_link_the_grants_holder_plants_reaches_nothing_outside_the_grant() {
         matches!(call(FsOp::Lstat, "home:/.t3/p", None), Ok(FsResult::Stat(s)) if s.is_symlink)
     );
 }
+
+/// A `bundle:` root installed at a folder inside the app (the shape iOS and
+/// tvOS use, exact2 LLP 1133.007 D6) confines its paths to that folder: a
+/// file beside it is not under it, `..` is refused, no `fs.write bundle:`
+/// line parses, and with `home:` unset a `home:` path refuses as
+/// unsupported. Which folder the host names is exact2's to test
+/// (`host/apple/tests/bundle_root.rs`).
+#[test]
+fn a_bundle_root_of_declared_trees_reaches_nothing_beside_them() {
+    let _rooted = ROOTED.lock().unwrap_or_else(|e| e.into_inner());
+    let app = std::env::temp_dir().join(format!("ibex2-declared-{}.app", std::process::id()));
+    let _ = std::fs::remove_dir_all(&app);
+    std::fs::create_dir_all(app.join("ExactResources/Resources/data")).unwrap();
+    std::fs::write(app.join("ExactResources/Resources/data/cities.json"), b"[]").unwrap();
+    std::fs::write(app.join("Info.plist"), b"plist").unwrap();
+    set_roots(Roots {
+        home: None,
+        bundle: Some(app.join("ExactResources")),
+    });
+    let grants =
+        GrantSet::parse("fs.read bundle:/Resources/data\nfs.read bundle:/Info.plist").unwrap();
+    let read = |path: &str| call(&grants, FsOp::ReadFile, path, None, None);
+    assert_eq!(
+        read("bundle:/Resources/data/cities.json").unwrap(),
+        FsResult::Bytes(b"[]".to_vec())
+    );
+    // The app's own files are beside the root, not below it.
+    let beside = format!("{:?}", read("bundle:/Info.plist"));
+    assert!(beside.contains("os error 2"), "{beside}");
+    assert!(
+        format!("{:?}", read("bundle:/Resources/data/../../../Info.plist")).contains(". or ..")
+    );
+    assert!(GrantSet::parse("fs.write bundle:/Resources/data").is_err());
+    let home = GrantSet::parse("fs.read home:/.t3").unwrap();
+    let got = format!(
+        "{:?}",
+        call(&home, FsOp::ReadFile, "home:/.t3/x", None, None)
+    );
+    assert!(
+        got.contains("unsupported: no home: directory here"),
+        "{got}"
+    );
+    std::fs::remove_dir_all(&app).unwrap();
+}

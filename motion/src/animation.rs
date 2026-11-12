@@ -174,30 +174,93 @@ pub struct Animation {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Animations(pub Vec<Animation>);
 
-/// Why an animation was refused.
+/// Why an animation was refused: one variant per check, so its sentence
+/// names the rule that broke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimationError {
     /// More than [`MAX_ANIMATIONS`] entries.
     TooMany,
-    /// More than [`MAX_KEYFRAMES`] keyframes, or more than one value per
-    /// property in one keyframe.
+    /// More than [`MAX_KEYFRAMES`] keyframes.
     TooManyKeyframes,
-    /// A time, count, offset or value was not finite.
-    NonFinite,
-    /// A negative duration or iteration count, or an offset outside `[0, 1]`.
-    OutOfRange,
+    /// More than [`MAX_VALUES`] values in one keyframe.
+    TooManyValues,
+    /// A property, a `font-variation-settings` axis or a dark value set
+    /// twice in one keyframe.
+    Repeated(Property),
+    /// A number that was not finite: which one.
+    NonFinite(&'static str),
+    /// A negative duration.
+    NegativeDuration,
+    /// A negative iteration count.
+    NegativeCount,
+    /// A keyframe offset outside `[0, 1]`.
+    OffsetOutOfRange,
     /// Keyframes out of offset order.
     Unordered,
     /// A scalar property carried a second component.
     ValueShape,
     /// The easing was invalid.
     Easing(EasingError),
-    /// A property keyframes do not animate: half of a `box-shadow` without
-    /// the other, or a dark value for no colour of the keyframe.
-    NotAnimatable(Property),
+    /// Half of a `box-shadow`, its geometry or its colour, without the other.
+    HalfShadow,
+    /// A dark value for a property that is no colour, or with no light value
+    /// beside it.
+    DarkWithoutLight(Property),
+    /// Keyframes that name different `font-variation-settings` axes.
+    AxesDiffer,
     /// An `-exact-exit-animation` that never ends — an `infinite` count, or
     /// `paused` — would keep its leaving node forever (LLP 1063).
     Endless,
+}
+
+impl std::fmt::Display for AnimationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnimationError::TooMany => write!(f, "a node takes at most {MAX_ANIMATIONS} animations"),
+            AnimationError::TooManyKeyframes => {
+                write!(f, "keyframes hold at most {MAX_KEYFRAMES} keyframes")
+            }
+            AnimationError::TooManyValues => {
+                write!(f, "a keyframe sets at most {MAX_VALUES} values")
+            }
+            AnimationError::Repeated(Property::FontVariationSettings) => {
+                f.write_str("a keyframe sets each `font-variation-settings` axis once")
+            }
+            AnimationError::Repeated(p) => write!(f, "a keyframe sets `{}` once", p.name()),
+            AnimationError::NonFinite("iteration count") => {
+                f.write_str("an iteration count is a number or `infinite`")
+            }
+            AnimationError::NonFinite(what) => write!(f, "an animation's {what} is finite"),
+            AnimationError::NegativeDuration => f.write_str("a duration is 0 or more"),
+            AnimationError::NegativeCount => f.write_str("an iteration count is 0 or more"),
+            AnimationError::OffsetOutOfRange => {
+                f.write_str("a keyframe's offset is from 0% to 100%")
+            }
+            AnimationError::Unordered => f.write_str("keyframes are in the order of their offsets"),
+            AnimationError::ValueShape => {
+                f.write_str("a property is given more numbers than it takes")
+            }
+            AnimationError::Easing(e) => e.fmt(f),
+            AnimationError::HalfShadow => {
+                f.write_str("a keyframe sets a `box-shadow`'s geometry and colour together")
+            }
+            AnimationError::DarkWithoutLight(p) if !p.is_color() => {
+                write!(f, "`{}` is no colour, and only a colour takes a dark value", p.name())
+            }
+            AnimationError::DarkWithoutLight(p) => write!(
+                f,
+                "a keyframe gives `{}` a dark value only beside its light one",
+                p.name()
+            ),
+            // @ref LLP 1019 §13 D10 — the axes interpolate one by one.
+            AnimationError::AxesDiffer => f.write_str(
+                "every keyframe that sets `font-variation-settings` names the same axes, which interpolate one by one",
+            ),
+            AnimationError::Endless => f.write_str(
+                "an exit animation ends: it is not `infinite` and not `paused`",
+            ),
+        }
+    }
 }
 
 impl Default for Animation {
@@ -251,10 +314,10 @@ impl Keyframes {
         let mut axes: Option<Vec<u32>> = None;
         for frame in self.0.iter() {
             if !frame.offset.is_finite() {
-                return Err(AnimationError::NonFinite);
+                return Err(AnimationError::NonFinite("keyframe offset"));
             }
             if !(0.0..=1.0).contains(&frame.offset) {
-                return Err(AnimationError::OutOfRange);
+                return Err(AnimationError::OffsetOutOfRange);
             }
             if frame.offset < last {
                 return Err(AnimationError::Unordered);
@@ -264,7 +327,7 @@ impl Keyframes {
                 e.validate().map_err(AnimationError::Easing)?;
             }
             if frame.values.len() > MAX_VALUES {
-                return Err(AnimationError::TooManyKeyframes);
+                return Err(AnimationError::TooManyValues);
             }
             for (i, (p, v)) in frame.values.iter().enumerate() {
                 // One value per property; `font-variation-settings` has one
@@ -274,10 +337,10 @@ impl Keyframes {
                         && (*p != Property::FontVariationSettings || w.axis_tag() == v.axis_tag())
                 };
                 if frame.values[..i].iter().any(twice) {
-                    return Err(AnimationError::TooManyKeyframes);
+                    return Err(AnimationError::Repeated(*p));
                 }
                 if !v.is_finite() {
-                    return Err(AnimationError::NonFinite);
+                    return Err(AnimationError::NonFinite("keyframe value"));
                 }
                 if !v.fits(*p) {
                     return Err(AnimationError::ValueShape);
@@ -290,7 +353,7 @@ impl Keyframes {
                     _ => None,
                 };
                 if half.is_some_and(|h| !frame.values.iter().any(|(q, _)| *q == h)) {
-                    return Err(AnimationError::NotAnimatable(*p));
+                    return Err(AnimationError::HalfShadow);
                 }
             }
             // Axes interpolate one by one (CSS Fonts 4 §7.2), so every
@@ -298,24 +361,20 @@ impl Keyframes {
             let tags = frame.axis_tags();
             if !tags.is_empty() {
                 match &axes {
-                    Some(first) if *first != tags => {
-                        return Err(AnimationError::NotAnimatable(
-                            Property::FontVariationSettings,
-                        ))
-                    }
+                    Some(first) if *first != tags => return Err(AnimationError::AxesDiffer),
                     Some(_) => {}
                     None => axes = Some(tags),
                 }
             }
             for (i, (p, v)) in frame.dark.iter().enumerate() {
                 if !p.is_color() || !frame.values.iter().any(|(q, _)| q == p) {
-                    return Err(AnimationError::NotAnimatable(*p));
+                    return Err(AnimationError::DarkWithoutLight(*p));
                 }
                 if frame.dark[..i].iter().any(|(q, _)| q == p) {
-                    return Err(AnimationError::TooManyKeyframes);
+                    return Err(AnimationError::Repeated(*p));
                 }
                 if !v.is_finite() {
-                    return Err(AnimationError::NonFinite);
+                    return Err(AnimationError::NonFinite("keyframe value"));
                 }
             }
         }
@@ -353,11 +412,20 @@ impl Keyframes {
 impl Animation {
     /// Check every rule the sampler relies on.
     pub fn validate(&self) -> Result<(), AnimationError> {
-        if !self.duration.is_finite() || !self.delay.is_finite() || self.iterations.is_nan() {
-            return Err(AnimationError::NonFinite);
+        if !self.duration.is_finite() {
+            return Err(AnimationError::NonFinite("duration"));
         }
-        if self.duration < 0.0 || self.iterations < 0.0 {
-            return Err(AnimationError::OutOfRange);
+        if !self.delay.is_finite() {
+            return Err(AnimationError::NonFinite("delay"));
+        }
+        if self.iterations.is_nan() {
+            return Err(AnimationError::NonFinite("iteration count"));
+        }
+        if self.duration < 0.0 {
+            return Err(AnimationError::NegativeDuration);
+        }
+        if self.iterations < 0.0 {
+            return Err(AnimationError::NegativeCount);
         }
         self.easing.validate().map_err(AnimationError::Easing)?;
         self.keyframes.validate()
@@ -366,7 +434,7 @@ impl Animation {
     /// Whether every number that must be finite is (`iterations` may be
     /// infinite).
     pub fn is_finite(&self) -> bool {
-        !matches!(self.validate(), Err(AnimationError::NonFinite))
+        !matches!(self.validate(), Err(AnimationError::NonFinite(_)))
     }
 
     /// The active duration: duration × iteration count (0 when either is 0).

@@ -151,9 +151,9 @@ class GeofencingModule(context: ExtensionContext) : ExactExtension(context) {
 
     private fun fine(done: () -> Unit) {
         if (has(FINE)) return done()
-        context.requestPermissions(arrayOf(FINE, COARSE)) {
+        context.requestPermissions(arrayOf(FINE, COARSE)) { answered ->
             val a = context.activity
-            if (!has(FINE) && a != null && !a.shouldShowRequestPermissionRationale(FINE)) {
+            if (FINE in answered && !has(FINE) && a != null && !a.shouldShowRequestPermissionRationale(FINE)) {
                 app.getSharedPreferences("exact.permissions", Context.MODE_PRIVATE).edit().putBoolean(FINE, true).apply()
             }
             done()

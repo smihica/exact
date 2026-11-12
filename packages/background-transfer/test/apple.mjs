@@ -10,8 +10,12 @@
 //   response body in `app:/data/transfers/<id>/<index>`, the URL shown
 //   without its query, the bytes counted; retired by the handler.
 // - A download to `saveTo`: the body in that file.
+// - A download over a file in `saveTo`: the body replaces it.
+// - A `saveTo` that is a folder: refused, the folder kept; a folder made
+//   there while the body is on its way: kept, the body not placed.
 // - A 404: `backgroundfetchfail`, `bad-status`.
-// - A URL no `net.fetch` line grants: refused before anything is sent.
+// - A URL no `net.fetch` line grants, or one with a user name and
+//   password: refused before anything is sent.
 // - A download held by the server and aborted: `backgroundfetchabort`,
 //   `aborted`.
 // - Nothing the journal shows carries the credential.
@@ -23,6 +27,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { checker } from '../../camera/test/fixture.mjs';
 import { until } from '../../photos/test/fixture.mjs';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 const here = import.meta.dir, pkg = resolve(here, '..'), root = resolve(pkg, '../..');
 const argv = process.argv.slice(2), sim = argv.includes('--sim') ? argv[argv.indexOf('--sim') + 1] : process.env.EXACT_SIM;
@@ -46,6 +51,7 @@ const server = Bun.serve({ port: 0, hostname: '127.0.0.1', idleTimeout: 0, async
   sent[id] = { path: url.pathname, method: req.method, body: await req.text(), token: url.searchParams.get('token'), authorization: req.headers.get('authorization') };
   if (url.pathname === '/upload') return new Response(`kept ${id}`, { status: 201, headers: { 'Content-Type': 'text/plain' } });
   if (url.pathname === '/file' && url.searchParams.get('hold')) await wait(120_000);
+  if (url.pathname === '/file' && url.searchParams.get('wait')) await wait(3_000);
   if (url.pathname === '/file') return new Response(`file ${id}`, { headers: { 'Content-Type': 'text/plain' } });
   return new Response('missing', { status: 404 });
 } });
@@ -53,7 +59,7 @@ const origin = `http://127.0.0.1:${server.port}`;
 
 function makeFixture() {
   const dir = mkdtempSync(join(tmpdir(), 'exact-transfer-')), app = join(dir, 'bgtfixture');
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac'], root);
   for (const f of ['app.contract', 'app.ts']) cpSync(join(here, 'fixture', f), join(app, f));
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -62,6 +68,9 @@ function makeFixture() {
   manifest.dependencies = { ...manifest.dependencies, '@exact/background-transfer': `file:${pkg}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, id, remove: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -69,7 +78,7 @@ for (const host of hosts.length ? hosts : ['macos']) {
   const where = host === 'ios' ? 'ios-simulator' : 'macos';
   if (host === 'ios' && !sim) throw new Error('ios: name a simulator you booted (--sim <udid>)');
   const fixture = makeFixture();
-  Object.assign(process.env, { EXACT_APP_DIR: fixture.app, EXACT2: root, EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
+  Object.assign(process.env, { EXACT_APP_DIR: fixture.app, EXACT: root, EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
   if (sim) process.env.EXACT_SIM = sim;
   try {
     run('bun', [resolve(root, 'host/apple/build.mjs'), ...(host === 'ios' ? ['--ios', '--sim', sim] : []), 'bgtfixture-apple'], root);
@@ -95,6 +104,23 @@ for (const host of hosts.length ? hosts : ['macos']) {
       const d1 = await until(s, 'noted', (t) => t.startsWith('d1'), 60_000);
       check(where, 'a download lands in its saveTo file', d1 === 'd1 success success  200 file d1' && heard.d1?.path === 'app:/data/saved/d1.txt' && heard.d1?.downloaded === '7',
         `${d1} ${JSON.stringify(heard.d1)}`);
+
+      await s.tap('replace-r1');
+      const r1 = await until(s, 'noted', (t) => t.startsWith('r1'), 60_000);
+      check(where, 'a download over a file in saveTo replaces it', r1 === 'r1 success success  200 file r1' && heard.r1?.path === 'app:/data/saved/r1.txt', `${r1} ${JSON.stringify(heard.r1)}`);
+
+      await s.tap('folder-f1');
+      const f1 = await until(s, 'started', (t) => t !== 'started', 20_000);
+      check(where, 'a saveTo that is a folder is refused before anything is sent', f1 === 'TypeError' && !sent.f1, f1);
+
+      await s.tap('appear-f2');
+      const f2 = await until(s, 'noted', (t) => t.startsWith('f2'), 60_000);
+      check(where, 'a folder made at saveTo is kept, the body not placed in it', f2.startsWith('f2 success success') && heard.f2?.path === '' && heard.f2?.kept === 'kept',
+        `${f2} ${JSON.stringify(heard.f2)}`);
+
+      await s.tap('userinfo-c1');
+      const c1 = await until(s, 'started', (t) => t !== 'started', 20_000);
+      check(where, 'a URL with a user name and password is refused before anything is sent', c1 !== 'started' && c1 !== 'none' && !sent.c1, c1);
 
       await s.tap('missing-m1');
       const m1 = await until(s, 'noted', (t) => t.startsWith('m1'), 60_000);

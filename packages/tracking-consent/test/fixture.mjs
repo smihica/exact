@@ -6,6 +6,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { root, run } from '../../contacts/test/fixture.mjs';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 export { root, run };
 
@@ -14,7 +15,7 @@ export function makeFixture(name = 'tracking-consent') {
   const pkg = resolve(root, 'packages', name), here = join(pkg, 'test/fixture');
   const short = name.replace(/-.*/, '');
   const dir = mkdtempSync(join(tmpdir(), `exact-${short}-`)), app = join(dir, `${short}fixture`);
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac,linux'], root);
   for (const f of ['app.contract', 'app.ts', 'strings']) if (existsSync(join(here, f))) cpSync(join(here, f), join(app, f), { recursive: true });
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -23,6 +24,9 @@ export function makeFixture(name = 'tracking-consent') {
   manifest.dependencies = { ...manifest.dependencies, [`@exact/${name}`]: `file:${pkg}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, name: basename(app), id, remove: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

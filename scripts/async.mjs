@@ -9,7 +9,7 @@
  * the web host's app-building document test in its own step, the web JS target's conformance run
  * (`host/web-js/conform.mjs --strict`), the separate game workspace and in-repo game tests,
  * the UIKit XCTests on a simulator and the tvOS and watchOS compiles (`build.mjs
- * --tvos --no-install`, `--watchos --no-install`), the
+ * --tvos --no-install`, `--watchos --no-install`), the SVG and motion parity smokes' Linux legs, the
  * Contract semantics (`semantics/README.md`) as four checks — the Lean proofs,
  * the extracted VM's proofs, the differential run against the Lean semantics
  * and the web JS target's against the runner — each skipped when its inputs
@@ -58,7 +58,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, openSync, closeSync, readFileSync, writeFileSync } from 'node:fs';
 import { availableParallelism, loadavg } from 'node:os';
 import { basename, resolve } from 'node:path';
-import { Graph, LANE_DISTS, Repo, WEB_APPS, select, stepEnv, suites } from './affected.mjs';
+import { Graph, LANE_DISTS, PARITY, Repo, WEB_APPS, parityLeg, select, stepEnv, suites } from './affected.mjs';
 import { INPUTS, Inputs, Store, checkEnv, decide, outcomeOf } from './async-inputs.mjs';
 import { main as issue } from './issue.mjs';
 import { noteOf, publish, stoppedEarly } from './known.mjs';
@@ -121,7 +121,7 @@ export function glueTests(root) {
   const files = [...['host/web', 'host/web-js'].flatMap(dir => [...new Bun.Glob(`${dir}/**/*.test.{mjs,js}`).scanSync({ cwd: root, onlyFiles: true })]),
     ...new Bun.Glob('modules/*/tests/*.test.mjs').scanSync({ cwd: root, onlyFiles: true })].filter(file => !LEFT_OUT.test(file)).sort().map(file => `./${file}`);
   // The glue lane is macOS: link.test reads Mach-O load commands with Apple tools.
-  return [...files, './host/apple/link.test.mjs', './host/apple/cloak.test.mjs', ...['app-workspace', 'app-bake', 'app-apple', 'app-keychain', 'app-manifest', 'exact', 'check-watchdog', 'push', 'agent', 'agent-launch', 'agent-drag', 'tamber-server', 'tamber-watch', 'tamber-events-get', 'tamber-edit-held', 'test-children', 'scale-check', 'tool-drive', 'help-parity', 'tamber-builds', 'tamber-inspect', 'tamber-select-walk', 'tamber-scrub', 'tamber-dtcg', 'design-tool-levels', 'tamber-tool-answers', 'design-tool', 'design-tool-ops', 'design-tool-library', 'design-tool-canvas', 'design-tool-scrub', 'design-tool-kinds', 'design-tool-inspect', 'design-tool-noaxes', 'design-tool-commit', 'design-tool-fields', 'design-tool-dock', 'design-tool-edit-dock', 'design-tool-poll', 'design-tool-scale', 'library-gate', 'stage12-gate', 'position-reads', 'wasm-check', 'tamber-body-limit', 'tamber-upstream', 'tamber-request', 'tamber-tool-via', 'design-tool-harness', 'tamber-timing', 'agent-clock-until', 'agent-held', 'android-manifest'].map(name => `./scripts/${name}.test.mjs`), './scripts/deploy-paths.test.mjs', './scripts/async-inputs.test.mjs', './scripts/coverage.test.mjs', './scripts/affected.test.mjs'];
+  return [...files, './host/apple/link.test.mjs', './host/apple/cloak.test.mjs', ...['app-workspace', 'app-bake', 'app-apple', 'app-keychain', 'app-manifest', 'exact', 'check-watchdog', 'push', 'agent', 'agent-launch', 'agent-drag', 'tamber-server', 'tamber-watch', 'tamber-events-get', 'tamber-edit-held', 'test-children', 'scale-check', 'tool-drive', 'help-parity', 'tamber-builds', 'tamber-inspect', 'tamber-select-walk', 'tamber-scrub', 'tamber-dtcg', 'design-tool-levels', 'tamber-tool-answers', 'design-tool', 'design-tool-ops', 'design-tool-library', 'design-tool-canvas', 'design-tool-scrub', 'design-tool-kinds', 'design-tool-inspect', 'design-tool-noaxes', 'design-tool-commit', 'design-tool-fields', 'design-tool-dock', 'design-tool-edit-dock', 'design-tool-poll', 'design-tool-scale', 'library-gate', 'stage12-gate', 'position-reads', 'wasm-check', 'tamber-body-limit', 'tamber-upstream', 'tamber-request', 'tamber-tool-via', 'design-tool-harness', 'tamber-timing', 'agent-clock-until', 'agent-held', 'android-manifest', 'app-hosts', 'verify-signal'].map(name => `./scripts/${name}.test.mjs`), './scripts/deploy-paths.test.mjs', './scripts/async-inputs.test.mjs', './scripts/coverage.test.mjs', './scripts/affected.test.mjs'];
 }
 /**
  * What a commit's checks run (scripts/affected.mjs): the suites whose inputs the files changed since the last commit
@@ -149,16 +149,17 @@ export function laneSelection(changed, { root = WT, full = false, repo } = {}) {
     webBuild: ids.has('bun:host/web/tests/document.test.mjs'),
     webAx: WEB_AX.some(file => ids.has(`bun:${file.slice(2)}`)),
     conform: WEB_APPS.filter(app => ids.has(`conform:${app}`)),
+    parity: PARITY.filter(smoke => ids.has(`parity:${smoke}`)),
     ios: ids.has('xctest:ios'), iosOnly, touch: ids.has('touch:ios'), tvos: ids.has('compile:tvos'), watchos: ids.has('compile:watchos'),
   };
 }
 const WEB_AX = ['./host/web/tests/accessibility-tree.test.mjs', './host/web/tests/presence-preload.test.mjs', './host/web/tests/zero-viewport.test.mjs'];
 /** Every suite (a full run), as `laneSelection` gives it; `glue` is computed when it is not given. */
 export function everything(root = WT, glue) {
-  return { full: true, ids: [], cargo: [], game: true, glue: glue ?? glueTests(root), webBuild: true, webAx: true, conform: WEB_APPS, ios: true, iosOnly: null, touch: true, tvos: true, watchos: true };
+  return { full: true, ids: [], cargo: [], game: true, glue: glue ?? glueTests(root), webBuild: true, webAx: true, conform: WEB_APPS, parity: PARITY, ios: true, iosOnly: null, touch: true, tvos: true, watchos: true };
 }
 /** No suite: what runs whatever changed. */
-export const nothing = () => ({ full: false, ids: [], cargo: [], game: false, glue: [], webBuild: false, webAx: false, conform: [], ios: false, iosOnly: null, touch: false, tvos: false, watchos: false, lane: [] });
+export const nothing = () => ({ full: false, ids: [], cargo: [], game: false, glue: [], webBuild: false, webAx: false, conform: [], parity: [], ios: false, iosOnly: null, touch: false, tvos: false, watchos: false, lane: [] });
 /** The checks a selection can leave out: a full run's that no suite's selection runs. */
 export const gated = () => {
   const names = selection => new Set(checks('', null, selection).map(([name]) => name));
@@ -241,6 +242,9 @@ export function checks(sha, since, selection = {}) {
     // These remain async-only; a missing Playwright browser is a named failure
     // whose log gives the exact outside-the-repo install command.
     ...when(conform.length, ['firefox', 'webkit'].map(browser => [`conform-${browser}`, 'bun', ['host/web-js/conform.mjs', ...conform, '--synthetic', '--browser', browser, '--strict', '--wasm-root', resolve(STATE_DIR, 'conform-wasm'), '--js-from', resolve(STATE_DIR, 'conform'), '--out', resolve(STATE_DIR, `conform-${browser}`)]])),
+    // The paint walk's pixels against Chrome's (Charlie, 2026-11-11; LLP 1159.000 D6): each gallery on the Linux
+    // host, whose walk Windows and Android paint with too. Seconds once the gallery is built; no window, no simulator.
+    ...selection.parity.map(smoke => [`parity-${smoke}`, 'sh', ['-c', parityLeg(smoke)]]),
     ...when(selection.ios, [['ios', 'bun', ['host/apple/build.mjs', '--test', '--ios', ...(selection.iosOnly ? ['--only', selection.iosOnly.join(',')] : [])]]]),
     // Real touches through the XCTest runner on a simulator (LLP 1080.000 §6):
     // a runner that does not start fails here, never skips.

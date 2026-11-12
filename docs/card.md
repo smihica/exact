@@ -62,7 +62,7 @@ functions: call -> result
   x.toString() -> string
   text.toUpperCase() -> string
   text.trim() -> string
-  pending(resourceOrMutationName)  failed(resourceOrMutationName)  failure(resourceOrMutationName)  path("routeName", args…)  empty(field=constant, …)  some(expr)  DeclaredShape(field=value, …)
+  pending(resourceOrMutation)  current(resource)  failed(resourceOrMutation)  failure(resourceOrMutation)  path("route", args…)  empty(field=value, …)  some(expr)  DeclaredShape(field=value, …)
 
 tags: attributes; on events. Every tag also takes CSS style attributes and colour roles (`contract vocab <style>`)
   view box row column main nav article aside section header footer hr table caption thead tbody tfoot tr th td dl dt dd: id testId role title tabindex; on press hover key keyup focus blur contextmenu dblclick
@@ -163,7 +163,7 @@ colour: Leave the accent unsaid (a brand is an app.tamber) and controls unpainte
     text "Total" color="-exact-secondary-label"
     view padding=12 background-color="-exact-secondary-background"
       text "Over" color="-exact-system-red"
-reading and writing data: `loadItems` and `addItem` are in app.ts and answer exactly their shape; a refusal is a reply (`ok: false, error`), not a throw. `then act` after `refreshes` clears the field on an ok reply; `pending(added)` stops a second send.
+reading and writing data: app.ts's `loadItems`, `addItem` answer exactly their shape; a refusal is a reply (`ok: false, error`), not a throw. `then act` after `refreshes` clears the field on ok; `pending(added)` stops a second send, `parallel` runs both.
   shape Reply
     ok: bool
   resource items = loadItems() as shape string[] else empty()

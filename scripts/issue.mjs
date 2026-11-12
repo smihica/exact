@@ -33,22 +33,24 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, relative, resolve, sep } from 'node:path';
 
 const REQUIRED_FIELDS = ['Status', 'Systems', 'Author', 'Date'];
 const SCORE_FIELDS = ['Impact', 'Urgency', 'Ease', 'Confidence', 'Score reviewed', 'Score rationale'];
 const SCORE_DIMENSIONS = ['Impact', 'Urgency', 'Ease', 'Confidence'];
 
 /** Closure words authors reach for instead of the single legal token `Closed`. */
-const CLOSURE_SYNONYMS = /^(closed|resolved|fixed|done|complete|completed)\b/i;
+const CLOSURE_SYNONYMS = /^(closed|resolved|fixed|done|complete|completed)\b(?!-\S)/i;
 /**
- * Separators between a status token and the qualifier appended to it.
+ * Remove one separator, keeping punctuation that starts the qualifier.
+ * A dot or hyphen needs whitespace after it to distinguish it from a dotfile,
+ * flag or negative number. Newlines belong to the qualifier.
  * Deliberately excludes parentheses: a parenthesised qualifier is unwrapped by
  * an exact whole-value match instead, so `Closed (fixed) and (verified)` is not
  * mangled into `fixed) and (verified`.
  */
-const QUALIFIER_LEAD = /^[\s—–:;,.\-]+/;
+const QUALIFIER_LEAD = /^[ \t]*(?:[—–:;,]|[.\-](?=\s|$))?[ \t]*/;
 
 /**
  * The pre-LLP-0361 header shape: a plain bullet list with no bold markers
@@ -174,12 +176,12 @@ export function parseIssue(text) {
     let endIndex = index;
     const limit = inHeader ? blockEnd : lines.length;
     while (endIndex + 1 < limit && isContinuation(lines[endIndex + 1])) endIndex += 1;
-    const continuations = lines.slice(index + 1, endIndex + 1).map((line) => line.trim());
+    const continuations = lines.slice(index + 1, endIndex + 1);
     // The previous whole-file regex let `\s*` cross a newline, so an empty
     // `**Systems:**` took its value from the following line. Preserved, or
     // issues that are green today would go red.
-    const value = match[2] !== '' ? match[2] : (continuations[0] ?? '');
-    const fullValue = [match[2], ...continuations].filter(Boolean).join(' ');
+    const value = match[2] !== '' ? match[2] : (continuations[0]?.trim() ?? '');
+    const fullValue = [match[2], ...continuations].join(eol).trimStart();
 
     fields.set(name, {
       name,
@@ -202,6 +204,11 @@ export function parseIssue(text) {
 
 export function fieldValue(parsed, name) {
   return parsed.fields.get(name)?.value ?? '';
+}
+
+function headerField(parsed, name) {
+  const entry = parsed.fields.get(name);
+  return entry?.beforeBody ? entry : undefined;
 }
 
 /** Locate a `## Resolution` body section, if the author wrote one. */
@@ -257,7 +264,7 @@ export function validateIssue(path, text) {
   }
 
   const parsed = parseIssue(text);
-  const status = parsed.fields.get('Status');
+  const status = headerField(parsed, 'Status');
   // A whole header in the pre-LLP-0361 plain-bullet shape reads as "every field
   // is missing". Say what is actually wrong, once, instead of four times.
   const legacy = REQUIRED_FIELDS.some((field) => parsed.fields.has(field)) ? null : findLegacyHeader(parsed);
@@ -316,22 +323,22 @@ export function validateIssue(path, text) {
       fixable: true,
       hint: `The path decides the value: a file under \`${directory}\` is ${expectedStatus}.`,
     });
-  } else if (status.value !== expectedStatus) {
+  } else if (status.fullValue !== expectedStatus) {
     const { remainder, recognized } = splitStatus(status.fullValue, expectedStatus);
     push({
       code: 'status:value',
       line: status.line,
-      message: `**Status:** must be exactly \`${expectedStatus}\` on the ${closed ? 'closed' : 'open'} path — the value is the whole rest of the line, so a qualifier makes it a different status.`,
+      message: `**Status:** must be exactly \`${expectedStatus}\` on the ${closed ? 'closed' : 'open'} path — the value includes the rest of the line and any continuation lines, so a qualifier makes it a different status.`,
       found: `**Status:** ${status.fullValue}`,
       required: `**Status:** ${expectedStatus}`,
       fixable: recognized,
       hint: recognized
         ? closed
-          ? `\`--fix\` rewrites the token to \`Closed\` and moves ${remainder ? `\`${truncate(remainder)}\`` : 'any qualifier'} verbatim into **Resolution:** (or into a labelled body note if **Resolution:** is already set). It never rewords it.`
+          ? `\`--fix\` rewrites the token to \`Closed\` and moves ${remainder ? `\`${truncate(remainder)}\`` : 'any qualifier'} verbatim into **Resolution:** (or into a labelled body note if it spans lines or **Resolution:** is already set). It never rewords it.`
           : `\`--fix\` rewrites the token to \`Open\` and moves ${remainder ? `\`${truncate(remainder)}\`` : 'any qualifier'} verbatim into a labelled body note directly under the header.`
-        : closed
-          ? 'cdcstack issue statuses are exactly `Open` and `Closed`. Set it to `Closed` and put the detail in **Resolution:**.'
-          : 'This issue is under `issues/` but its Status reads as closed. Either move it properly — `bun scripts/issue.mjs close <path> --resolution "…"` — or set **Status:** Open.',
+        : !closed && CLOSURE_SYNONYMS.test(status.fullValue)
+          ? 'This issue is under `issues/` but its Status reads as closed. Either move it properly — `bun scripts/issue.mjs close <path> --resolution "…"` — or set **Status:** Open.'
+          : `\`--fix\` does not recognize this as a \`${expectedStatus}\` status token and will not rewrite it. Set **Status:** ${expectedStatus} and put any detail in ${closed ? '**Resolution:**' : 'the body'}.`,
     });
   }
 
@@ -414,20 +421,23 @@ function dateFromFilename(path) {
  * Only the EXPECTED token is ever removed. A closure synonym (`Resolved`,
  * `Fixed`, …) carries the KIND of resolution, which is exactly what
  * `Resolution:` is for, so the whole value survives as the remainder rather
- * than losing its first word. `recognized: false` means the value is not a
- * status word at all and moving text around would be guessing.
+ * than losing its first word. `recognized: false` means converting the value
+ * to the expected status needs a human decision.
  */
 export function splitStatus(value, expected) {
-  const exact = new RegExp(`^${expected}\\b`, 'i');
+  const exact = new RegExp(`^${expected}\\b(?!-\\S)`, 'i');
   if (exact.test(value)) {
     // `Closed (fixed on main)` -> `fixed on main`, but only when the remainder
     // is exactly one balanced parenthesised group.
-    const wrapped = new RegExp(`^${expected}\\s*\\(([^()]*)\\)$`, 'i').exec(value);
-    if (wrapped) return { remainder: wrapped[1].trim(), recognized: true };
-    return { remainder: value.replace(exact, '').replace(QUALIFIER_LEAD, '').trim(), recognized: true };
+    const wrapped = new RegExp(`^${expected}[ \\t]*\\(([^()]*)\\)$`, 'i').exec(value);
+    if (wrapped) {
+      const remainder = /[\r\n]/.test(wrapped[1]) ? wrapped[1] : wrapped[1].trim();
+      return { remainder, recognized: true };
+    }
+    return { remainder: value.replace(exact, '').replace(QUALIFIER_LEAD, ''), recognized: true };
   }
   if (expected === 'Closed' && CLOSURE_SYNONYMS.test(value)) {
-    return { remainder: value.trim(), recognized: true };
+    return { remainder: value, recognized: true };
   }
   return { remainder: value, recognized: false };
 }
@@ -471,7 +481,7 @@ function upsertHeaderField(lines, parsed, name, value, { after, first } = {}) {
     next.splice(anchor.endLine, 0, line);
     return next;
   }
-  if (parsed.blockStart >= 0) {
+  if (parsed.blockStart >= 0 && parsed.blockStart < parsed.bodyStart) {
     next.splice(first ? parsed.blockStart : parsed.headerEnd, 0, line);
     return next;
   }
@@ -539,11 +549,11 @@ export function fixIssue(path, text, { liftResolution = false } = {}) {
     }
   }
 
-  const status = parsed.fields.get('Status');
+  const status = headerField(parsed, 'Status');
   if (!status || !status.value) {
     lines = upsertHeaderField(lines, parsed, 'Status', expectedStatus, { first: true });
     changes.push(`set **Status:** ${expectedStatus} (the path decides it)`);
-  } else if (status.value !== expectedStatus) {
+  } else if (status.fullValue !== expectedStatus) {
     const { remainder, recognized } = splitStatus(status.fullValue, expectedStatus);
     if (recognized) {
       lines = replaceField(lines, status, expectedStatus);
@@ -556,7 +566,7 @@ export function fixIssue(path, text, { liftResolution = false } = {}) {
   lines = [...parsed.lines];
 
   if (pendingNote) {
-    if (closed && !fieldValue(parsed, 'Resolution')) {
+    if (closed && !fieldValue(parsed, 'Resolution') && !/[\r\n]/.test(pendingNote)) {
       lines = upsertHeaderField(lines, parsed, 'Resolution', pendingNote, { after: 'Status' });
       changes.push(`moved the Status-line text into **Resolution:** verbatim: \`${truncate(pendingNote)}\``);
     } else {
@@ -606,10 +616,10 @@ optional             **Severity:** · **Related:** · **Marker:**
 optional all-or-none **Impact:** **Urgency:** **Ease:** **Confidence:**
                      **Score reviewed:** **Score rationale:**
 
-A leading \`- \` is fine. The value is the WHOLE rest of the line, so a
-qualifier on **Status:** ("Closed (fixed upstream)", "Open — unverified")
-makes it a different status. Body sections such as \`## Resolution\` are
-never read as metadata.
+A leading \`- \` is fine. The value includes the rest of the line and any
+continuation lines, so a qualifier on **Status:** ("Closed (fixed upstream)",
+"Open — unverified") makes it a different status. Body sections such as
+\`## Resolution\` are never read as metadata.
 ────────────────────────────────────────────────────────────────────────────`;
 
 const COMMANDS_FOOTER = `
@@ -666,12 +676,38 @@ export function trackedIssuePaths(root) {
 export function runFormatCheck(root, { fix = false, liftResolution = false, paths = null } = {}) {
   const problems = [];
   const fixed = [];
-  const all = trackedIssuePaths(root);
   const scoped = Array.isArray(paths) && paths.length > 0;
-  const selected = scoped ? all.filter((path) => paths.includes(path)) : all;
-  for (const path of selected) {
-    const absolute = resolve(root, path);
-    let text = readFileSync(absolute, 'utf8');
+  const selected = scoped ? paths : trackedIssuePaths(root);
+  const seen = new Set();
+  let scanned = 0;
+  for (const given of selected) {
+    const absolute = resolve(root, given);
+    const path = relative(root, absolute).split(sep).join('/');
+    if (seen.has(path)) continue;
+    seen.add(path);
+    if (!/^issues\/(?:closed\/)?[^/]+\.md$/.test(path) || path === 'issues/README.md') {
+      problems.push({
+        path: given,
+        code: 'path',
+        message: 'Not an issue file: name a Markdown file under issues/ or issues/closed/, excluding issues/README.md.',
+        fixable: false,
+      });
+      continue;
+    }
+    let text;
+    try {
+      if (!statSync(absolute).isFile()) throw new Error('not a regular file');
+      text = readFileSync(absolute, 'utf8');
+    } catch (error) {
+      problems.push({
+        path: given,
+        code: 'path',
+        message: `Cannot read issue file: ${error.message}`,
+        fixable: false,
+      });
+      continue;
+    }
+    scanned += 1;
     if (fix) {
       const result = fixIssue(path, text, { liftResolution });
       if (result.changes.length > 0 && result.text !== text) {
@@ -683,7 +719,7 @@ export function runFormatCheck(root, { fix = false, liftResolution = false, path
     problems.push(...validateIssue(path, text));
   }
 
-  return { problems, fixed, scanned: selected.length };
+  return { problems, fixed, scanned };
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +844,7 @@ function commandClose(root, args) {
   let lines = [...parsed.lines];
   const carried = [];
 
-  const status = parsed.fields.get('Status');
+  const status = headerField(parsed, 'Status');
   if (status) {
     const { remainder, recognized } = splitStatus(status.fullValue, 'Open');
     // Anything that is not the bare token `Open` is author text and is kept,
@@ -820,14 +856,16 @@ function commandClose(root, args) {
   }
   parsed = parseIssue(render(parsed, lines));
   lines = [...parsed.lines];
-  if (!parsed.fields.get('Status')) {
+  if (!headerField(parsed, 'Status')) {
     lines = upsertHeaderField(lines, parsed, 'Status', 'Closed', { first: true });
     parsed = parseIssue(render(parsed, lines));
     lines = [...parsed.lines];
   }
 
   const existingResolution = parsed.fields.get('Resolution');
-  if (existingResolution?.fullValue) carried.push(`previous **Resolution:** ${existingResolution.fullValue}`);
+  if (existingResolution?.beforeBody && existingResolution.fullValue) {
+    carried.push(`previous **Resolution:** ${existingResolution.fullValue}`);
+  }
   lines = upsertHeaderField(lines, parsed, 'Resolution', resolution.trim(), { after: 'Status' });
 
   for (const note of carried) {
@@ -883,7 +921,7 @@ function commandCheck(root, args) {
   if (fixed.length > 0) console.log('');
   if (problems.length > 0) {
     console.error(formatReport(problems));
-    return 1;
+    return problems.some(problem => problem.code === 'path') ? 2 : 1;
   }
   console.log('Issue format passed.');
   return 0;

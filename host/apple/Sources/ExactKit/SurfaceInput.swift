@@ -159,12 +159,21 @@ extension Agent {
         }
         let p = node.local(inWindow)
         let at = [Agent.r2(point.x), Agent.r2(point.y)]
-        func send(_ phase: String) -> Bool {
-            if node.isSurfaceControl { return node.control(phase, point: p) }
-            // A move's motion is its position's change; a down or up has none.
-            let from = phase == "move" ? canvasPoint ?? p : p
-            canvasPoint = p
-            return session.canvases.input(node, ["t": "pointer", "phase": phase, "id": 1, "x": p.x, "y": p.y, "dx": p.x - from.x, "dy": p.y - from.y, "kind": "touch", "buttons": phase == "up" || phase == "cancel" ? 0 : 1])
+        // A sample stamped `time`, the contact's (a set agent clock still wins,
+        // LLP 1133.013 D7). Its point and time become the contact's only once
+        // the surface takes it, so a refused one leaves the last delivered.
+        func send(_ phase: String, at p: CGPoint = p, time: Double? = nil) -> Bool {
+            let ok: Bool
+            if node.isSurfaceControl {
+                ok = node.control(phase, point: p, timestamp: time)
+            } else {
+                // A move's motion is its position's change; a down or up has none.
+                let from = phase == "move" ? canvasPoint ?? p : p
+                ok = session.canvases.input(node, ["t": "pointer", "phase": phase, "id": 1, "x": p.x, "y": p.y, "dx": p.x - from.x, "dy": p.y - from.y, "kind": "touch", "buttons": phase == "up" || phase == "cancel" ? 0 : 1], timestamp: time)
+                if ok { canvasPoint = p }
+            }
+            if ok, let time { canvasTime = time }
+            return ok
         }
         if let wheel = request["wheel"] as? [Double], wheel.count == 2 {
             guard wheel.allSatisfy(\.isFinite) else { return ["error": "wheel deltas must be finite"] }
@@ -184,20 +193,49 @@ extension Agent {
         switch phase {
         case "down":
             guard contact == nil else { return ["error": "a contact is already down; up or cancel it first"] }
-            guard node.focusSurfacePointer(), send("down") else { return ["error": "surface refused pointer"] }
+            guard node.focusSurfacePointer(), send("down", time: CACurrentMediaTime()) else { return ["error": "surface refused pointer"] }
             contact = point; canvasContact = node
             return ["contact": node.id, "phase": "down", "at": at, "delivery": "recognized"]
-        case "move", "up", "cancel":
+        case "move":
+            guard let from = contact else { return ["error": "no contact is down"] }
+            let ms = max(0, request["ms"] as? Double ?? 0)
+            // A drag's bound on `over` (`DRAG_BOUNDS.over`), so no duration makes an unbounded loop.
+            guard ms <= 2000 else { return ["error": "tap move: over \(ms) ms is past its bound, 2000 ms"] }
+            // One move per 16 ms, each stamped at its pace on the contact's time,
+            // as the web, AppKit, Linux and pan carriers deliver a timed move
+            // (LLP 1035.003 D1). On the platform's clock the run loop turns
+            // between them, so frames are drawn during the move; on the agent's
+            // nothing waits, and the samples share the clock's time (LLP 1133.013 D7).
+            let steps = max(1, Int((ms / 16).rounded()))
+            for i in 1...steps {
+                let f = CGFloat(i) / CGFloat(steps)
+                let q = CGPoint(x: from.x + (point.x - from.x) * f, y: from.y + (point.y - from.y) * f)
+                let time = (canvasTime ?? CACurrentMediaTime()) + ms / 1000 / Double(steps)
+                guard send("move", at: node.local(vp.convert(CGPoint(x: q.x + vp.pageOrigin.x, y: q.y + vp.pageOrigin.y), to: nil)), time: time) else {
+                    // The samples before it were delivered: the contact is where they left it.
+                    return ["error": "surface refused pointer", "at": [Agent.r2(contact?.x ?? from.x), Agent.r2(contact?.y ?? from.y)]]
+                }
+                contact = q
+                if ms > 0, session.clock == nil { RunLoop.main.run(until: Date(timeIntervalSinceNow: ms / 1000 / Double(steps))) }
+            }
+        case "up", "cancel":
             guard contact != nil else { return ["error": "no contact is down"] }
-            guard send(phase!) else { return ["error": "surface refused pointer"] }
-            contact = phase == "move" ? point : nil
-            if contact == nil { canvasContact = nil }
+            // The lift is one frame after the last sample, as on the other carriers.
+            // On the platform's clock it is delivered no earlier than its stamp,
+            // so the next contact's down, stamped on arrival, comes after it.
+            let time = (canvasTime ?? CACurrentMediaTime()) + 1.0 / 60
+            if session.clock == nil, time > CACurrentMediaTime() { RunLoop.main.run(until: Date(timeIntervalSinceNow: time - CACurrentMediaTime())) }
+            guard send(phase!, time: time) else { return ["error": "surface refused pointer"] }
+            contact = nil; canvasContact = nil; canvasTime = nil
         case "hold":
             guard let previous = contact else { return ["error": "no accepted contact is down"] }
             if point != previous {
-                guard send("move") else { return ["error": "surface refused pointer"] }
+                guard send("move", time: canvasTime) else { return ["error": "surface refused pointer"] }
                 contact = point
             }
+            let ms = max(0, request["ms"] as? Double ?? 0)
+            if ms.isFinite { canvasTime = (canvasTime ?? CACurrentMediaTime()) + ms / 1000 }
+            holdTime(ms, request)
         default: return ["error": "unknown pointer phase \(phase!)"]
         }
         return ["phase": phase!, "at": at, "delivery": "recognized"]

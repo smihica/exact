@@ -255,32 +255,74 @@ impl Emitter {
     }
     /// Validate authored parameters before any derivation or tick mutation.
     pub fn validate(&self) -> Result<(), String> {
-        let valid = self.rate.is_finite()
-            && self.rate >= 0.
-            && self.rate <= 1_000_000.
-            && self.lifetime.is_finite()
-            && self.lifetime > 0.
-            && self.lifetime <= 60.
-            && self.speed.is_finite()
-            && self.spread.is_finite()
-            && (0. ..=std::f32::consts::PI).contains(&self.spread)
-            && self.gravity.is_finite()
-            && self.drag.is_finite()
-            && self.drag >= 0.
-            && self.size.iter().all(|v| v.is_finite() && *v >= 0.)
-            && self.color.iter().flatten().all(|v| v.is_finite())
-            && self.bound.iter().all(|v| v.is_finite())
-            && (0..3).all(|i| self.bound[i] <= self.bound[i + 3])
-            && match self.shape {
-                Shape::Point => true,
-                Shape::Sphere(r) => r.is_finite() && r >= 0.,
-                Shape::Cone(r, h) => r.is_finite() && h.is_finite() && r >= 0. && h >= 0.,
-                Shape::Box(size) => size.is_finite() && size.min_element() >= 0.,
-            };
-        if valid {
-            Ok(())
+        let checks = [
+            (
+                self.rate.is_finite() && (0. ..=1_000_000.).contains(&self.rate),
+                "rate",
+                "finite births per second in [0, 1000000]",
+            ),
+            (
+                self.lifetime.is_finite() && self.lifetime > 0. && self.lifetime <= 60.,
+                "lifetime",
+                "finite seconds in (0, 60]",
+            ),
+            (self.speed.is_finite(), "speed", "finite"),
+            (
+                self.spread.is_finite() && (0. ..=std::f32::consts::PI).contains(&self.spread),
+                "spread",
+                "finite radians in [0, π]",
+            ),
+            (self.gravity.is_finite(), "gravity", "finite components"),
+            (
+                self.drag.is_finite() && self.drag >= 0.,
+                "drag",
+                "finite and nonnegative",
+            ),
+            (
+                self.size.iter().all(|v| v.is_finite() && *v >= 0.),
+                "size",
+                "finite nonnegative keys",
+            ),
+            (
+                self.color.iter().flatten().all(|v| v.is_finite()),
+                "color",
+                "finite key components",
+            ),
+            (
+                self.bound.iter().all(|v| v.is_finite())
+                    && (0..3).all(|i| self.bound[i] <= self.bound[i + 3]),
+                "bound",
+                "finite minima no greater than maxima",
+            ),
+            (
+                match self.shape {
+                    Shape::Point => true,
+                    Shape::Sphere(r) => r.is_finite() && r >= 0.,
+                    Shape::Cone(r, h) => r.is_finite() && h.is_finite() && r >= 0. && h >= 0.,
+                    Shape::Box(size) => size.is_finite() && size.min_element() >= 0.,
+                },
+                "shape",
+                "finite nonnegative dimensions",
+            ),
+        ];
+        match checks.into_iter().find(|(valid, _, _)| !valid) {
+            Some((_, field, expected)) => Err(format!("Emitter: invalid {field} ({expected})")),
+            None => Ok(()),
+        }
+    }
+    /// Validate for simulation or rendering, journaling only a new or changed
+    /// refusal for this entity. Diagnostics are neither saved nor hashed.
+    pub fn validate_for(&self, w: &World, entity: crate::Entity) -> bool {
+        let mut errors = w.emitter_errors.borrow_mut();
+        if let Err(error) = self.validate() {
+            if errors.get(&entity) != Some(&error) {
+                w.log(format_args!("{error} #{}", entity.index()));
+                errors.insert(entity, error);
+            }
+            false
         } else {
-            Err("Emitter: invalid shape, rate, lifetime, motion, keys or bounds".into())
+            errors.remove(&entity);
+            true
         }
     }
     fn displayed_age(&self, alpha: f32) -> f64 {
@@ -420,17 +462,21 @@ pub struct Particle {
 /// Advance saved emitter state once from Game::tick, to choose its order; the
 /// simulation steps emitters after the tick otherwise, and never twice a tick.
 /// Existing particles reserve capacity first; births share remaining capacity in
-/// entity order. Invalid emitters report a named journal line and do not emit.
+/// entity order. Invalid emitters do not emit; a new or changed refusal names
+/// the failing field in the journal.
 /// No renderer or wall clock is involved.
 pub fn step(w: &World) {
     let _span = w.span("emitter::step");
     if w.in_tick && w.emitted.replace(true) {
         return;
     }
+    w.emitter_errors
+        .borrow_mut()
+        .retain(|entity, _| w.has::<Emitter>(*entity));
     let hz = w.hz() as f64;
     let mut alive = 0u32;
-    for (_, e) in w.query::<&mut Emitter>().iter() {
-        if e.validate().is_err() {
+    for (entity, e) in w.query::<&mut Emitter>().iter() {
+        if !e.validate_for(w, entity) {
             continue;
         }
         if !(e.running && e.rate > 0.)
@@ -459,9 +505,9 @@ pub fn step(w: &World) {
         alive = alive.saturating_add(e.state.alive);
     }
     let mut left = PARTICLE_BUDGET.saturating_sub(alive);
+    let errors = w.emitter_errors.borrow();
     for (entity, e) in w.query::<&mut Emitter>().iter() {
-        if let Err(error) = e.validate() {
-            w.log(format!("{} #{}", error, entity.index()));
+        if errors.contains_key(&entity) {
             continue;
         }
         let state = &mut e.state;

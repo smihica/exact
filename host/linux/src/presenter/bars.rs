@@ -289,7 +289,7 @@ impl<D: DataSource> Presenter<D> {
                         label: row.title,
                         symbol: row.symbol,
                         selected: node.props.bool(PropId::AccessibilitySelected) == Some(true),
-                        enabled: row.enabled,
+                        enabled: row.enabled && !self.host.authored_visibility(*id).1,
                     })
                 })
                 .collect(),

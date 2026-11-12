@@ -132,7 +132,7 @@ final class HatchClock {
     private func rearm() {
         timer?.invalidate(); timer = nil
         guard let session = natives?.session, session.clock == nil, let next = afters.map(\.due).min() else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: max(0, (next - now) / 1000), repeats: false) { [weak self] _ in
+        timer = SessionClockTimer.schedule(after: max(0, (next - now) / 1000)) { [weak self] _ in
             guard let self else { return }
             let now = self.now
             self.fires = 0

@@ -375,7 +375,12 @@ fn a_painting_hosts_entry_includes_the_apps_hatches_with_its_platforms_typed_key
 #[test]
 fn a_word_added_to_a_game_app_json_after_its_shells_names_the_stale_copy() {
     use sha2::{Digest, Sha256};
-    let app = App::new("stale", "", r#"column data-pointer-lock="on""#);
+    let app = App::new(
+        "stale",
+        "",
+        r#"column data-pointer-lock="on" hatch="avatar"
+      my-view"#,
+    );
     let generated = app.0.join(".shells");
     std::fs::create_dir_all(&generated).unwrap();
     std::fs::copy(app.0.join("app.json"), generated.join("app.json")).unwrap();
@@ -385,27 +390,40 @@ fn a_word_added_to_a_game_app_json_after_its_shells_names_the_stale_copy() {
     };
     record(&app);
     let current = app.compile().unwrap_err();
+    assert_eq!(current.len(), 3, "{current:?}");
     assert!(
-        current[0].message.contains("declares no data-* words")
-            && !current[0].message.contains("stale"),
+        current
+            .iter()
+            .any(|e| e.message.contains("declares no data-* words"))
+            && current.iter().all(|e| !e.message.contains("stale")),
         "{current:?}"
     );
     let authored = std::fs::read_to_string(app.0.join("app.json")).unwrap();
     std::fs::write(
         app.0.join("app.json"),
-        authored.replacen('{', r#"{"data":["pointer-lock"],"#, 1),
+        authored.replacen(
+            '{',
+            r#"{"data":["pointer-lock"],"hatches":["avatar"],"modules":["my-view"],"#,
+            1,
+        ),
     )
     .unwrap();
     let stale = app.compile().unwrap_err();
-    assert_eq!(stale[0].id, "bake-undeclared-data", "{stale:?}");
-    assert!(
-        stale[0].message.contains(".shells/app.json is stale")
-            && stale[0]
-                .message
-                .contains("`bun exact.mjs shells` regenerates it"),
-        "{}",
-        stale[0].message
-    );
+    assert_eq!(stale.len(), 3, "{stale:?}");
+    for id in [
+        "bake-undeclared-data",
+        "bake-undeclared-hatch",
+        "bake-unknown-module",
+    ] {
+        let error = stale.iter().find(|e| e.id == id).unwrap();
+        assert!(
+            error.message.contains(".shells/app.json is stale")
+                && error
+                    .message
+                    .contains("`bun exact.mjs shells` regenerates it"),
+            "{error}"
+        );
+    }
     // Regenerated (the bake copies the resolved file and records its source), it builds.
     std::fs::copy(app.0.join("app.json"), generated.join("app.json")).unwrap();
     record(&app);

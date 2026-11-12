@@ -79,6 +79,44 @@ fn families(tag: &str, locale: &str) -> &'static [&'static str] {
     }
 }
 
+enum Han {
+    Japanese,
+    Korean,
+    HongKong,
+    Traditional,
+    Simplified,
+}
+
+/// The document's Han form, shared by the platform family lists. Language
+/// tags are case-insensitive; extensions and private use do not name its
+/// script or region (RFC 5646 §2.2).
+fn han_locale(locale: &str) -> Option<Han> {
+    let mut subtags = locale.split(['-', '_']);
+    let language = subtags.next()?;
+    if language.eq_ignore_ascii_case("ja") {
+        return Some(Han::Japanese);
+    }
+    if language.eq_ignore_ascii_case("ko") {
+        return Some(Han::Korean);
+    }
+    if !language.eq_ignore_ascii_case("zh") {
+        return None;
+    }
+    let mut form = Han::Simplified;
+    for subtag in subtags.take_while(|s| s.len() != 1) {
+        if subtag.eq_ignore_ascii_case("Hans") {
+            return Some(Han::Simplified);
+        }
+        if subtag.eq_ignore_ascii_case("HK") || subtag.eq_ignore_ascii_case("MO") {
+            return Some(Han::HongKong);
+        }
+        if subtag.eq_ignore_ascii_case("Hant") || subtag.eq_ignore_ascii_case("TW") {
+            form = Han::Traditional;
+        }
+    }
+    Some(form)
+}
+
 #[cfg(target_os = "windows")]
 const COMMON: &[&str] = &[
     "Segoe UI",
@@ -94,12 +132,12 @@ fn common(_locale: &str) -> Vec<&'static str> {
 
 #[cfg(target_os = "windows")]
 fn han(locale: &str) -> &'static [&'static str] {
-    match locale {
-        "ja" => &["Yu Gothic"],
-        "ko" => &["Malgun Gothic"],
-        "zh-HK" => &["MingLiU_HKSCS"],
-        "zh-TW" => &["Microsoft JhengHei UI"],
-        _ => &["Microsoft YaHei UI"],
+    match han_locale(locale) {
+        Some(Han::Japanese) => &["Yu Gothic"],
+        Some(Han::Korean) => &["Malgun Gothic"],
+        Some(Han::HongKong) => &["MingLiU_HKSCS"],
+        Some(Han::Traditional) => &["Microsoft JhengHei UI"],
+        Some(Han::Simplified) | None => &["Microsoft YaHei UI"],
     }
 }
 
@@ -149,12 +187,12 @@ fn common(_locale: &str) -> Vec<&'static str> {
 
 #[cfg(target_os = "macos")]
 fn han(locale: &str) -> &'static [&'static str] {
-    match locale {
-        "ja" => &["Hiragino Sans"],
-        "ko" => &["Apple SD Gothic Neo"],
-        "zh-HK" => &["PingFang HK"],
-        "zh-TW" => &["PingFang TC"],
-        _ => &["PingFang SC"],
+    match han_locale(locale) {
+        Some(Han::Japanese) => &["Hiragino Sans"],
+        Some(Han::Korean) => &["Apple SD Gothic Neo"],
+        Some(Han::HongKong) => &["PingFang HK"],
+        Some(Han::Traditional) => &["PingFang TC"],
+        Some(Han::Simplified) | None => &["PingFang SC"],
     }
 }
 
@@ -244,7 +282,7 @@ fn unix_common(android: bool, locale: &str) -> Vec<&'static str> {
     }
     let mut list: Vec<&'static str> = Vec::new();
     if android {
-        if han_language(locale) {
+        if han_locale(locale).is_some() {
             list.push(cjk[0]);
         }
         list.push("Noto Sans Symbols");
@@ -267,21 +305,14 @@ fn unix_common(android: bool, locale: &str) -> Vec<&'static str> {
     list
 }
 
-/// Whether `locale` is a language a Han face is chosen for.
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn han_language(locale: &str) -> bool {
-    let language = locale.split(['-', '_']).next().unwrap_or("");
-    matches!(language, "ja" | "ko" | "zh")
-}
-
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn han(locale: &str) -> &'static [&'static str] {
-    match locale {
-        "ja" => &["Noto Sans CJK JP"],
-        "ko" => &["Noto Sans CJK KR"],
-        "zh-HK" => &["Noto Sans CJK HK"],
-        "zh-TW" => &["Noto Sans CJK TC"],
-        _ => &["Noto Sans CJK SC"],
+    match han_locale(locale) {
+        Some(Han::Japanese) => &["Noto Sans CJK JP"],
+        Some(Han::Korean) => &["Noto Sans CJK KR"],
+        Some(Han::HongKong) => &["Noto Sans CJK HK"],
+        Some(Han::Traditional) => &["Noto Sans CJK TC"],
+        Some(Han::Simplified) | None => &["Noto Sans CJK SC"],
     }
 }
 
@@ -332,14 +363,74 @@ const SCRIPTS: &[(&str, &[&str])] = &[
     ("Yiii", &["Noto Sans Yi", "Noto Sans CJK SC"]),
 ];
 
-#[cfg(all(test, not(any(target_os = "windows", target_os = "macos"))))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn han_faces_follow_language_script_and_region_subtags() {
+        let cases: &[(&str, &[&str])] = &[
+            ("ja", &["ja-JP", "ja-Jpan-JP", "JA-jp", "ja_JP"]),
+            ("ko", &["ko-KR", "ko-Kore-KR", "KO-kr", "ko_KR"]),
+            (
+                "zh-TW",
+                &["zh-Hant", "zh-Hant-TW", "zh-hant-cn", "ZH-tw", "zh_Hant"],
+            ),
+            (
+                "zh-HK",
+                &["zh-Hant-HK", "zh-MO", "zh-Hant-MO", "ZH-hk", "zh_Hant_HK"],
+            ),
+            (
+                "zh",
+                &["zh-Hans", "zh-CN", "zh-Hans-CN", "zh-SG", "en", "en-TW"],
+            ),
+            (
+                "zh",
+                &["zh-Hans-TW", "zh-Hans-HK", "zh-Hans-MO", "ZH-hans-tw"],
+            ),
+            (
+                "zh",
+                &["zh-x-Hant", "zh-CN-x-HK", "zh-u-rg-twzzzz", "zh-a-HK"],
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (base, tags) in cases {
+            for tag in *tags {
+                if han(tag) != han(base) {
+                    mismatches.push(format!("{tag}: {:?}, expected {:?}", han(tag), han(base)));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn cjk_subtags_lead_the_linux_and_android_fallback_chains() {
+        for (tag, expected) in [
+            ("ja-JP", "Noto Sans CJK JP"),
+            ("ko-KR", "Noto Sans CJK KR"),
+            ("zh-Hant", "Noto Sans CJK TC"),
+            ("zh-Hant-TW", "Noto Sans CJK TC"),
+            ("zh-Hant-HK", "Noto Sans CJK HK"),
+            ("zh-MO", "Noto Sans CJK HK"),
+            ("zh-Hans-TW", "Noto Sans CJK SC"),
+            ("zh-Hans-HK", "Noto Sans CJK SC"),
+            ("zh-Hans-MO", "Noto Sans CJK SC"),
+            ("JA-jp", "Noto Sans CJK JP"),
+        ] {
+            assert_eq!(unix_common(false, tag)[3], expected, "Linux: {tag}");
+            assert_eq!(unix_common(true, tag)[0], expected, "Android: {tag}");
+        }
+        assert_eq!(unix_common(true, "en-TW")[0], "Noto Sans Symbols");
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn at(list: &[&str], name: &str) -> usize {
         list.iter().position(|n| *n == name).expect(name)
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn a_symbol_falls_back_to_a_cjk_face_before_a_monospace_one_on_linux() {
         // `→` is in Noto Sans Mono and Noto Sans CJK, not in Noto Sans:
@@ -356,6 +447,7 @@ mod tests {
         assert_eq!(unix_common(false, "ja")[3], "Noto Sans CJK JP");
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn android_follows_its_fonts_xml_chain() {
         // fonts.xml lists Noto Sans Symbols (the subset, which has `→`)
@@ -382,6 +474,7 @@ mod tests {
         assert!(!list.iter().any(|n| n.contains("Mono")));
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     #[test]
     fn a_script_without_families_of_its_own_takes_the_last_resort() {
         // Each script's list is what it was when every script was set its

@@ -40,7 +40,8 @@ extension NodeView {
         ColorSchemes.changed(self)
     }
 
-    private var colorScheme: UIUserInterfaceStyle {
+    /// Its computed `color-scheme` (inherited, so a node under one that sets it has it too).
+    var colorScheme: UIUserInterfaceStyle {
         switch style["color_scheme"]?.string {
         case "dark": .dark
         case "light": .light

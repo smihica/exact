@@ -14,8 +14,8 @@ import * as source from '__APP_TS__';
 import { createSecretFacade, hasGrant, inOverlay, overlaying, setAppGrantSet } from './admission.js';
 import { tsGrantSet } from './admission-data.js';
 import { sourceTypes } from './names.js';
-import { checkpoint, clock, commit, drive, inflight, journal, Origin, painted, R, Resources } from './rt.js';
-import { Shaped } from './shape.js';
+import { checkpoint, clock, commit, drive, inflight, journal, Origin, painted, R, Resources, time } from './rt.js';
+import { failureCode, failureReason, Shaped } from './shape.js';
 import { ledger, requestKey } from './uploads.js';
 useFetch(sourceFetch);
 // The app's id is app.json's, which the build writes here; app.ts need not export one.
@@ -23,7 +23,7 @@ const appId = source.appId;
 // Work an answer awaits that is no held fetch, counted on its answer (ts-fetch.js `answering.ordinary`, LLP 1016.000 D9).
 const ordinary = start => (answering.ordinary ?? (f => f()))(start);
 // What an answer's timers run on (ts-fetch.js `arm`).
-answering.page = { clock, journal, drive };
+answering.page = { clock, journal, drive, time };
 __AUTH_IMPORT__
 // Values cross by the plan's types (`named` into the module's objects,
 // `arrays` back into the runtime's arrays), with each type's converters made
@@ -139,36 +139,75 @@ const kind = v => v === null ? 'null' : typeof v === 'boolean' ? 'a bool' : type
 const describe = t => typeof t === 'string' ? { n: 'a number', b: 'a bool', s: 'a string' }[t] ?? 'null'
   : Array.isArray(t) ? t[0] === '?' ? `null or ${describe(t[1])}` : 'an array' : 'an object';
 const omitted = x => x === undefined || typeof x === 'function' || typeof x === 'symbol';
-const enumerable = Object.prototype.propertyIsEnumerable;
-function outside(v, t) {
-  // What `JSON.stringify` makes of it: `toJSON`, null for a non-finite number.
-  if (v !== null && typeof v === 'object' && typeof v.toJSON === 'function') v = v.toJSON();
-  if (omitted(v) || (typeof v === 'number' && !isFinite(v))) v = null;
+const enumerable = Object.prototype.propertyIsEnumerable, tag = Object.prototype.toString;
+// A wrapper's own value, read as JSON reads it (ECMA-262 SerializeJSONProperty step 4).
+const BOXES = [['[object Number]', Number.prototype.valueOf, Number], ['[object String]', String.prototype.valueOf, String],
+  ['[object Boolean]', Boolean.prototype.valueOf, b => Boolean.prototype.valueOf.call(b)]];
+function unboxed(v) {
+  const name = tag.call(v);
+  for (const [n, slot, read] of BOXES) {
+    if (name !== n) continue;
+    try { slot.call(v); } catch { return v; } // a tag alone does not make a wrapper
+    return read(v);
+  }
+  return v;
+}
+// What `JSON.stringify` writes for `v` under `key` (a name, or an array's index): its `toJSON`'s value,
+// a wrapper's primitive, null for a non-finite number, 0 for -0, and undefined for what it leaves out.
+function json(v, key) {
+  if ((v !== null && typeof v === 'object') || typeof v === 'bigint') {
+    if (typeof v.toJSON === 'function') v = v.toJSON(String(key));
+    if (v !== null && typeof v === 'object' && Object.getPrototypeOf(v) !== Object.prototype && !Array.isArray(v)) v = unboxed(v);
+  }
+  if (typeof v === 'number') return isFinite(v) ? v + 0 : null;
+  return omitted(v) ? undefined : v;
+}
+// `v`, already as JSON writes it, checked against `t`, with each part as JSON writes it: a part that JSON
+// leaves as it is stays the same object, so an unchanged or frozen tree converts as an identity. OUT, with
+// the reason in `fault`, when it does not conform.
+const OUT = Symbol('outside');
+let fault = '';
+const refuse = e => { fault = e; return OUT; };
+function written(v, t) {
   if (typeof t === 'string') {
     const ok = t === 'n' ? typeof v === 'number' : t === 'b' ? typeof v === 'boolean' : t === 's' ? typeof v === 'string' : v === null;
-    return ok ? null : `expected ${describe(t)}, got ${kind(v)}`;
+    return ok ? v : refuse(`expected ${describe(t)}, got ${kind(v)}`);
   }
-  if (Array.isArray(t) && t[0] === '?') return v === null ? null : outside(v, t[1]);
+  if (Array.isArray(t) && t[0] === '?') return v === null ? null : written(v, t[1]);
   if (Array.isArray(t)) {
-    if (!Array.isArray(v)) return `expected an array, got ${kind(v)}`;
-    for (let i = 0; i < v.length; i++) { const e = outside(v[i], t[1]); if (e) return e; }
-    return null;
+    if (!Array.isArray(v)) return refuse(`expected an array, got ${kind(v)}`);
+    let out = null;
+    for (let i = 0; i < v.length; i++) {
+      const x = v[i], w = written(json(x, i) ?? null, t[1]);
+      if (w === OUT) return OUT;
+      if (out) out.push(w); else if (!same(w, x)) { out = v.slice(0, i); out.push(w); }
+    }
+    return out ?? v;
   }
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return `expected an object, got ${kind(v)}`;
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return refuse(`expected an object, got ${kind(v)}`);
+  let out = null;
   for (const f in t) {
-    if (!enumerable.call(v, f) || omitted(v[f])) return `field \`${f}\` is missing`;
-    const e = outside(v[f], t[f]);
-    if (e) return `field \`${f}\`: ${e}`;
+    const x = enumerable.call(v, f) ? v[f] : undefined, j = json(x, f);
+    if (j === undefined) return refuse(`field \`${f}\` is missing`);
+    const w = written(j, t[f]);
+    if (w === OUT) return refuse(`field \`${f}\`: ${fault}`);
+    if (!out && !same(w, x)) {
+      // Null-prototype, so a field named `__proto__` is a field.
+      out = Object.create(null);
+      for (const g in t) { if (g === f) break; out[g] = v[g]; }
+    }
+    if (out) out[f] = w;
   }
   let extra = null;
-  for (const key of Object.keys(v)) if (!Object.hasOwn(t, key) && !omitted(v[key]) && (extra === null || key < extra)) extra = key;
-  return extra === null ? null : `field \`${extra}\` is not in the shape`;
+  for (const key of Object.keys(v)) if (!Object.hasOwn(t, key) && json(v[key], key) !== undefined && (extra === null || key < extra)) extra = key;
+  return extra === null ? out ?? v : refuse(`field \`${extra}\` is not in the shape`);
 }
-// Revalidate every answer: freezing a proxy does not freeze its serialization behavior
+// The answer as a native host receives it, the text `JSON.stringify` writes (js/src/binary.js), checked as
+// js/value's `decode_tree` checks it. Revalidate every answer: freezing a proxy does not freeze its serialization behavior.
 const checked = (name, v, t) => {
-  const e = outside(v, t);
-  if (e) throw Object.assign(new Error(`\`${name}\` answered outside its shape: ${e}`), { kind: 'Unavailable', [Shaped]: true });
-  return v;
+  const w = written(json(v, '') ?? null, t);
+  if (w === OUT) throw Object.assign(new Error(`\`${name}\` answered outside its shape: ${fault}`), { kind: 'Unavailable', [Shaped]: true });
+  return w;
 };
 export const named = (v, t) => converters(t)[0](v);
 const arrays = (v, t, o) => converters(t)[1](v, o);
@@ -269,8 +308,18 @@ function landed(op, ok, value) {
   journal.push(`t=${clock.now} ${line}`);
   op.reject(error);
 }
+// A stream's mapper has no storage in any turn of its call (LLP 1016.000 D7), refused in Hermes's words
+// (js/src/prelude.js `storageCall`); null elsewhere.
+function inMapper(method) {
+  if (!answering.mapperCall) return null;
+  const error = codedError(new Error(`storage.${method}() called in a stream's mapper: it was never run. Start storage inside an answer`));
+  journal.push(`t=${clock.now} storage refused: ${error.message}`);
+  return Promise.reject(error);
+}
 function queued(what, run) {
   if (overlaying.on) return Promise.reject(inOverlay(`storage.${what.split(' ')[0]}()`)); // `what` is the method, then its path
+  const mapper = inMapper(what.split(' ')[0]);
+  if (mapper) return mapper;
   if (head && queue.length >= MAX_QUEUED) {
     journal.push(`t=${clock.now} storage refused: full (${what})`);
     return Promise.reject(Object.assign(new Error(`storage queue full: ${MAX_QUEUED} operations wait`), { kind: 'Unavailable', code: 'full' }));
@@ -300,6 +349,89 @@ function leftOpen() {
     journal.push(`t=${clock.now} storage: ${h.path} is still open after a failure in background work that opened it: if that work owns it, close it in a finally (finally { db.close() }), or the next open finds it locked (LLP 1097 D7)`);
   }
 }
+const FILE_METHODS = ['readFile', 'writeFile', 'atomicWriteFile', 'appendFile', 'readdir', 'mkdir', 'rm', 'stat', 'rename', 'copyFile', 'realpath'];
+const DIRECTORIES = Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' });
+// A page rendered on the server has no storage (LLP 1048.000 D9): each call is
+// refused here, before any adapter loads, and never answers, so the answer that
+// made it stays pending and keeps its placeholder, as the render host holds a
+// storage request. The render does not wait for it, and the reader's page asks
+// it again once it adopts the page (render.mjs). The lowered bundles restore the
+// answer across `await`. Each answer has its own facade; its `owner` names
+// refusals when no answer is current, as in a plain `.then`.
+// `compressImage` and `transformImage` options, checked as the native prelude checks them (binary.js
+// `imageOptions`) before anything is asked of storage: the options to run with, or the TypeError a call rejects with.
+function imageOptions(method, from, to, options, limits) {
+  const api = `storage.fs.${method}()`, out = { ...limits }, o = options ?? {};
+  const finite = n => typeof n === 'number' && Number.isFinite(n), side = n => Number.isInteger(n) && n >= 1 && n <= 16384;
+  const checks = { rotate: [finite, 'a finite number of degrees'], flip: [w => w === 'horizontal' || w === 'vertical', '"horizontal" or "vertical"'],
+    crop: [c => c && typeof c === 'object' && [c.x, c.y, c.width, c.height].every(finite) && c.width > 0 && c.height > 0, '{x, y, width, height}, finite, with a positive width and height'] };
+  if (method === 'transformImage') Object.assign(checks, { resizeWidth: [side, 'an integer from 1 to 16384'], resizeHeight: [side, 'an integer from 1 to 16384'],
+    resizeQuality: [w => ['pixelated', 'low', 'medium', 'high'].includes(w), '"pixelated", "low", "medium" or "high"'], type: [t => typeof t === 'string' && /^image\/[a-z0-9.+-]+$/.test(t), 'a media type such as "image/jpeg"'],
+    quality: [q => typeof q === 'number' && q >= 0 && q <= 1, 'a number from 0 to 1'], metadata: [w => ['keep', 'no-location', 'none'].includes(w), '"keep", "no-location" or "none"'] });
+  if (typeof from !== 'string' || typeof to !== 'string') return new TypeError(`${api}: from and to must be app:/ paths`);
+  if (typeof o !== 'object') return new TypeError(`${api}: options must be an object`);
+  for (const [name, [ok, says]] of Object.entries(checks)) {
+    if (o[name] === undefined) continue;
+    if (!ok(o[name])) return new TypeError(`${api}: ${name} must be ${says}`);
+    out[name] = o[name];
+  }
+  return out;
+}
+function compressLimits(from, to, options) {
+  const api = 'storage.fs.compressImage()', d = options?.maxDimension, b = options?.maxBytes;
+  if (typeof from !== 'string' || typeof to !== 'string') return new TypeError(`${api}: from and to must be app:/ paths`);
+  if (!options || typeof options !== 'object') return new TypeError(`${api}: options must be {maxDimension, maxBytes}`);
+  if (!Number.isInteger(d) || d < 1 || d > 8192) return new TypeError(`${api}: maxDimension must be an integer from 1 to 8192`);
+  if (!Number.isInteger(b) || b < 1 || b > 67108864) return new TypeError(`${api}: maxBytes must be an integer from 1 to 67108864`);
+  const type = options.type === undefined ? 'image/jpeg' : options.type;
+  if (type !== 'image/jpeg' && type !== 'image/png') return new TypeError(`${api}: type must be "image/jpeg" or "image/png"`);
+  return { maxDimension: d, maxBytes: b, type };
+}
+const optionsRefusal = (...args) => { const out = imageOptions(...args); return out instanceof Error ? out : null; };
+const isDocument = args => args.slice(0, 2).some(p => typeof p === 'string' && p.startsWith('doc:/'));
+// A write's `expect` (LLP 1069.010.000 D2a) is the glue's, documents only.
+const expecting = (m, args) => ['writeFile', 'atomicWriteFile', 'appendFile'].includes(m) && args[2]?.expect;
+const expectRefusal = (m, args) => expecting(m, args) && !isDocument(args) ? new TypeError(`storage.fs.${m}(): expect is for doc:/ paths`) : null;
+// A page rendered on the server has no storage (LLP 1048.000 D9): a call is refused before any adapter loads and never
+// answers. Nothing was started, so nothing waits for it (held.js `answersAtWork`). The reader's page asks its source
+// again even if the source answered without waiting for storage. `owner`, the answer's call, is named in the
+// journal and the server's log; a stream's controller is the owner of the file its body is read from as it opens, and
+// a stream refused that file starts no request, so it no longer counts as in flight (held.js `counted`).
+const refusedInRender = new Set();
+function refuseInRender(api, owner) {
+  journal.push(`t=${clock.now} storage refused (render): ${owner?.name ?? owner?.streamName ?? 'background work'}: ${api}: a page rendered on the server has no storage; the reader's page asks again`);
+  if (owner) { owner.refused = api; owner.recount?.(); }
+  const name = owner?.name ?? owner?.streamName;
+  if (name) refusedInRender.add(name);
+  return new Promise(() => {});
+}
+// Set as this module loads, before any app module's code can make a file-body fetch (a prewarmed realm evaluates them
+// well before its render starts).
+if (globalThis.__exactRender) answering.refuseStorage = refuseInRender;
+// Answers that watched a document in a render (`storage.fs.watch`), by name: the reader's page asks each again, as it
+// does an open stream's, and makes its watch.
+const watchedInRender = new Set();
+function renderStorage(owner) {
+  // What the device rejects before asking storage it rejects here too, so a source that catches it answers alike.
+  const refuse = (api, check = () => null) => (...args) => {
+    const error = check(...args);
+    return error ? Promise.reject(error) : refuseInRender(api, answering.call ?? owner);
+  };
+  const fs = Object.fromEntries([...FILE_METHODS.map(m => [m, refuse(`storage.fs.${m}()`, (...args) => expectRefusal(m, args))]),
+    ['compressImage', refuse('storage.fs.compressImage()', (from, to, options) => { const limits = compressLimits(from, to, options); return limits instanceof Error ? limits : optionsRefusal('compressImage', from, to, options, limits); })],
+    ['transformImage', refuse('storage.fs.transformImage()', (from, to, options) => optionsRefusal('transformImage', from, to, options, {}))],
+    ...['recentDocuments', 'forgetDocument'].map(m => [m, refuse(`storage.fs.${m}()`)])]);
+  // A watch makes the device's checks (`watchDocument`), so what throws there throws here. The answer it belongs to is
+  // the one running now, as on the device: a facade is no answer context.
+  const watch = path => {
+    const api = 'storage.fs.watch()';
+    if (overlaying.on) throw inOverlay(api);
+    if (!watching) throw new Error(`${api} outside an answer`);
+    if (typeof path !== 'string' || !path.startsWith('doc:/')) throw new TypeError(`${api}: path must be a doc:/ path`);
+    watchedInRender.add(answering.call.name);
+  };
+  return Object.freeze({ fs: Object.freeze({ directories: DIRECTORIES, ...fs, watch }), sqlite: Object.freeze({ open: refuse('storage.sqlite.open()') }), work: promise => Promise.resolve(promise) });
+}
 function storageOf(grants) {
   const admitted = ['fs-read', 'fs-write', 'sqlite-open'].some(kind => hasGrant(grants, kind));
   let fs, sqlite;
@@ -326,10 +458,10 @@ function storageOf(grants) {
   // In the storage queue, as every storage call is (an overlay refuses it).
   const keptDocuments = (what, f) => ordinary(() => queued(what, () => documents().then(() => f(globalThis.exact.documents))).catch(refused));
   let listWatched = false;
-  const isDocument = args => args.slice(0, 2).some(p => typeof p === 'string' && p.startsWith('doc:/'));
   // A document copied into an app file needs both (documents-glue.js `copyFile`).
   const copiesIn = (m, args) => m === 'copyFile' && typeof args[0] === 'string' && args[0].startsWith('doc:/') && typeof args[1] === 'string' && args[1].startsWith('app:/');
-  const denied = (op, document = false) => (document ? Promise.resolve() : key()).then(() => {
+  // `op` is `fs.<method>` or `sqlite.open <path>: …`: a mapper's call is refused before the grants, as natively.
+  const denied = (op, document = false) => inMapper(op.split(/[. ]/)[1]) ?? (document ? Promise.resolve() : key()).then(() => {
     throw Object.assign(new Error(`denied: ${op}`), { kind: 'Unavailable', code: 'denied' });
   });
   const databases = () => sqlite ??= key().then(k => import(new URL('./storage-sqlite.js', import.meta.url).href).then(m => m.createSqlite(k, grants)));
@@ -337,10 +469,32 @@ function storageOf(grants) {
   const wrap = (o, convert, path) => Object.freeze(Object.fromEntries(Object.entries(convert).map(([m, then]) =>
     [m, (...args) => queued(`${m} ${path}`, () => o[m](...args)).then(then ? v => then(v, path) : undefined)])));
   const statement = (s, path) => wrap(s, { execute: null, query: null, close: null }, path);
+  // Each entry's sql and params read once; options as a record with no
+  // prototype, so `__proto__` stays a key the validation refuses.
+  const batchNow = c => Array.isArray(c) ? c.map(e => {
+    if (!e || typeof e !== 'object') return e;
+    const { sql, params } = e;
+    return { sql, params: Array.isArray(params) ? params.map(v => v instanceof Uint8Array ? new Uint8Array(v) : v) : params };
+  }) : c;
+  const optionsNow = o => {
+    if (o === null || typeof o !== 'object') return o;
+    const f = o.foreignKeys, r = Object.create(null);
+    for (const k of Object.keys(o)) if (k !== 'foreignKeys') Object.defineProperty(r, k, { value: true, enumerable: true });
+    if (f !== undefined) r.foreignKeys = f;
+    return r;
+  };
   const database = (d, path, call) => {
     const handle = { path, call, told: false };
     openDatabases.add(handle);
-    const db = wrap(d, { execute: null, query: null, prepare: statement, transaction: null, close: null }, path);
+    const wrapped = wrap(d, { execute: null, query: null, prepare: statement, transaction: null, close: null }, path);
+    // A transaction's batch and options as they are at the call, not when the
+    // queue reaches it (js/src/prelude.js `batchNow`, `optionsNow`).
+    const db = { ...wrapped, transaction: (commands, options) => {
+      let args;
+      try { args = [batchNow(commands), optionsNow(options)]; }
+      catch (e) { return Promise.reject(Object.assign(new Error(String(e?.message ?? e)), { kind: 'Unavailable', code: 'failed' })); }
+      return wrapped.transaction(...args);
+    } };
     // A close counts once issued; one refused or failed leaves the database open, and tracked.
     return Object.freeze({ ...db, close: (...args) => {
       openDatabases.delete(handle);
@@ -348,36 +502,16 @@ function storageOf(grants) {
       return db.close(...args).catch((e) => { openDatabases.add(handle); throw e; });
     } });
   };
-  const methods = ['readFile', 'writeFile', 'atomicWriteFile', 'appendFile', 'readdir', 'mkdir', 'rm', 'stat', 'rename', 'copyFile', 'realpath'];
-  // `compressImage` (LLP 1069.002 A1) and `transformImage` (LLP 1133.019
-  // D14): their options are checked before either is queued, as the native
-  // prelude checks them (binary.js `imageOptions`); app files only.
+  // `compressImage` (LLP 1069.002 A1) and `transformImage` (LLP 1133.019 D14): their options are checked before either
+  // is queued (`imageOptions`); app files only.
   const image = (method, from, to, options, limits) => {
-    const api = `storage.fs.${method}()`, out = { ...limits }, o = options ?? {};
-    const finite = n => typeof n === 'number' && Number.isFinite(n), side = n => Number.isInteger(n) && n >= 1 && n <= 16384;
-    const checks = { rotate: [finite, 'a finite number of degrees'], flip: [w => w === 'horizontal' || w === 'vertical', '"horizontal" or "vertical"'],
-      crop: [c => c && typeof c === 'object' && [c.x, c.y, c.width, c.height].every(finite) && c.width > 0 && c.height > 0, '{x, y, width, height}, finite, with a positive width and height'] };
-    if (method === 'transformImage') Object.assign(checks, { resizeWidth: [side, 'an integer from 1 to 16384'], resizeHeight: [side, 'an integer from 1 to 16384'],
-      resizeQuality: [w => ['pixelated', 'low', 'medium', 'high'].includes(w), '"pixelated", "low", "medium" or "high"'], type: [t => typeof t === 'string' && /^image\/[a-z0-9.+-]+$/.test(t), 'a media type such as "image/jpeg"'],
-      quality: [q => typeof q === 'number' && q >= 0 && q <= 1, 'a number from 0 to 1'], metadata: [w => ['keep', 'no-location', 'none'].includes(w), '"keep", "no-location" or "none"'] });
-    if (typeof from !== 'string' || typeof to !== 'string') return Promise.reject(new TypeError(`${api}: from and to must be app:/ paths`));
-    if (typeof o !== 'object') return Promise.reject(new TypeError(`${api}: options must be an object`));
-    for (const [name, [ok, says]] of Object.entries(checks)) {
-      if (o[name] === undefined) continue;
-      if (!ok(o[name])) return Promise.reject(new TypeError(`${api}: ${name} must be ${says}`));
-      out[name] = o[name];
-    }
+    const out = imageOptions(method, from, to, options, limits);
+    if (out instanceof Error) return Promise.reject(out);
     return (admitted ? queued(`${method} ${from}`, () => files().then(f => f[method](from, to, out))) : denied(`fs.${method}`)).catch(refused);
   };
   const compressImage = (from, to, options) => {
-    const api = 'storage.fs.compressImage()', d = options?.maxDimension, b = options?.maxBytes;
-    if (typeof from !== 'string' || typeof to !== 'string') return Promise.reject(new TypeError(`${api}: from and to must be app:/ paths`));
-    if (!options || typeof options !== 'object') return Promise.reject(new TypeError(`${api}: options must be {maxDimension, maxBytes}`));
-    if (!Number.isInteger(d) || d < 1 || d > 8192) return Promise.reject(new TypeError(`${api}: maxDimension must be an integer from 1 to 8192`));
-    if (!Number.isInteger(b) || b < 1 || b > 67108864) return Promise.reject(new TypeError(`${api}: maxBytes must be an integer from 1 to 67108864`));
-    const type = options.type === undefined ? 'image/jpeg' : options.type;
-    if (type !== 'image/jpeg' && type !== 'image/png') return Promise.reject(new TypeError(`${api}: type must be "image/jpeg" or "image/png"`));
-    return image('compressImage', from, to, options, { maxDimension: d, maxBytes: b, type });
+    const limits = compressLimits(from, to, options);
+    return limits instanceof Error ? Promise.reject(limits) : image('compressImage', from, to, options, limits);
   };
   // `fs.watch(path, {recursive})` (LLP 1069.010.000 D1): the answer depends
   // on a document the person chose; the page's FileSystemObserver announces
@@ -393,15 +527,14 @@ function storageOf(grants) {
     if (path === 'doc:/') return void (listWatched || documents().then(() => { if (!listWatched) globalThis.exact.documents.onList(() => announce(topic, 'changed')); listWatched = true; }).catch(() => {}));
     documents().then(() => globalThis.exact.documents.observe(path, recursive, grants, () => announce(topic, 'changed'))).catch(() => {});
   };
-  const expecting = (m, args) => ['writeFile', 'atomicWriteFile', 'appendFile'].includes(m) && args[2]?.expect;
   return Object.freeze({
-    fs: Object.freeze({ directories: Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' }),
+    fs: Object.freeze({ directories: DIRECTORIES,
       compressImage: (...a) => ordinary(() => compressImage(...a)), watch: watchDocument,
       recentDocuments: () => keptDocuments('fs.recentDocuments', d => d.recent(grants)), forgetDocument: path => keptDocuments(`fs.forgetDocument ${path}`, d => d.forget(path, grants)),
       transformImage: (from, to, options) => ordinary(() => image('transformImage', from, to, options, {})),
-      ...Object.fromEntries(methods.map(m => [m, (...args) => ordinary(() => {
-        // A write's `expect` (LLP 1069.010.000 D2a) is the glue's, documents only.
-        if (expecting(m, args) && !isDocument(args)) return Promise.reject(new TypeError(`storage.fs.${m}(): expect is for doc:/ paths`));
+      ...Object.fromEntries(FILE_METHODS.map(m => [m, (...args) => ordinary(() => {
+        const wrongExpect = expectRefusal(m, args);
+        if (wrongExpect) return Promise.reject(wrongExpect);
         const captured = structuredClone(args);
         const run = () => copiesIn(m, captured) ? documents().then(files).then(f => globalThis.exact.documents.copyFile(captured[0], captured[1], grants, f))
           : isDocument(captured) ? documents().then(f => f[m](...captured)) : files().then(f => f[m](...captured), orEmpty(m, captured[0]));
@@ -413,12 +546,17 @@ function storageOf(grants) {
 }
 // A stream (LLP 1016.000; ts-fetch.js), opened by ts-stream.js, loaded on
 // first use so a module that never streams carries none of it.
-const opener = (stream, conv, name) => (deliver, controller) => { controller.streamName = name; return import('./ts-stream.js').then(m => m.open(stream, conv, tsGrantSet, deliver, controller)); };
+const opener = (stream, conv, name) => (deliver, controller) => {
+  controller.streamName = name;
+  return import('./ts-stream.js').then(m => m.open(stream, conv, tsGrantSet, deliver, controller))
+    .catch(e => ({ error: String(e?.message ?? e), code: failureCode(e), reason: failureReason(e) }));
+};
 export function install(data, mixed = false, modules = null) {
   data.appId = appId;
   bodyFiles.appId = appId ?? null; // `exactBodyFrom`'s store (ts-fetch.js)
   data.grants = setAppGrantSet(tsGrantSet);
-  const storage = storageOf(tsGrantSet);
+  const storage = globalThis.__exactRender ? renderStorage(null) : storageOf(tsGrantSet);
+  if (globalThis.__exactRender) { data.watchedInRender = watchedInRender; data.refusedInRender = refusedInRender; }
   // The module's storage, as the runner's `state.background` (LLP 1097 D8).
   if (storage) data.background = () => ({ queued: queue.length, inFlight: head ? 1 : 0, ...counts });
   // A rejection nothing handled reaches the journal, as on every host (D8):
@@ -437,12 +575,13 @@ export function install(data, mixed = false, modules = null) {
   // its steps by the bundle's async helper (js/bake/src/typescript.mjs
   // `asyncContextHelper`, LLP 1133.002 D14), as Hermes's prelude does with
   // its `currentCall`: a watch, a fetch or a storage step after an `await` is
-  // that answer's. The synchronous turn alone stays `call.turn`.
+  // that answer's, and one in a stream's mapper call is still refused. The
+  // synchronous turn alone stays `call.turn`.
   globalThis.__exact_async_context = Object.freeze({
-    current: () => ({ call: answering.call, watching, asking }),
+    current: () => ({ call: answering.call, watching, asking, mapperCall: answering.mapperCall }),
     swap(to) {
-      const before = { call: answering.call, watching, asking };
-      answering.call = to?.call ?? null; watching = to?.watching ?? null; asking = to?.asking ?? '';
+      const before = { call: answering.call, watching, asking, mapperCall: answering.mapperCall };
+      answering.call = to?.call ?? null; watching = to?.watching ?? null; asking = to?.asking ?? ''; answering.mapperCall = to?.mapperCall ?? null;
       return before;
     },
   });
@@ -457,6 +596,7 @@ export function install(data, mixed = false, modules = null) {
     seeded = true;
     const page = checkpoint().kept;
     for (const r of page ? Resources : []) {
+      if (r.member) continue; // The checkpoint holds the list's aggregate; the source answers one member.
       const k = page.get(r.name), types = sourceTypes[r.source];
       if (k && types) try { source.kept(r.source, k[0].map((a, i) => named(a, types[0][i])), named(k[1], types[1])); } catch {}
     }
@@ -486,7 +626,7 @@ export function install(data, mixed = false, modules = null) {
     };
     let r;
     thrown = null;
-    try { r = source.answer(name, args.map((a, i) => named(a, params[i])), seen, storage, modules ? native : null); } catch (e) { call.settled = true; if (!mutation) thrown = effectsOf(true); throw e; } finally { call.turn = false; asking = ''; watching = null; answering.call = null; }
+    try { r = source.answer(name, args.map((a, i) => named(a, params[i])), seen, globalThis.__exactRender ? renderStorage(call) : storage, modules ? native : null); } catch (e) { call.settled = true; if (!mutation) thrown = effectsOf(true); throw e; } finally { call.turn = false; asking = ''; watching = null; answering.call = null; }
     const shaped = types ? v => checked(name, v, result) : v => v;
     // A stream's answer has replied once it returns (LLP 1016.000): what runs on is background work.
     // Socket operations go out only with a value given now: not with a
@@ -504,7 +644,12 @@ export function install(data, mixed = false, modules = null) {
       // Once: an answer let go while its timers were armed never settles, and ends here (ts-fetch.js `dropTimers`).
       const settle = () => { if (call.settled) return; call.settled = true; dropTimers(call); answering.untraced.delete(call); pendingAnswers--; if (!pendingAnswers && owed) { owed = false; leftOpen(); } };
       call.abandon = settle;
-      return { promise: r.then(v => (settle(), conv(shaped(v), result, target_)), e => { settle(); leftOpen(); throw e; }), store: seen.read, effects, call };
+      // In flight: its later turns may send (ts-stream.js `later`), behind what this source sent, once the commit
+      // that asked it stands; a refused commit takes those batches back.
+      call.flight = true;
+      const stood = Object.assign(() => { call.stood = true; for (const go of call.waiting ?? []) go(); call.waiting = null; },
+        { refused: why => { call.stood = false; for (const go of call.waiting ?? []) go.refused(why); call.waiting = null; call.unsent = []; } });
+      return { promise: r.then(v => (settle(), conv(shaped(v), result, target_)), e => { settle(); leftOpen(); throw e; }), store: seen.read, effects: [...(effects ?? []), stood], call };
     }
     call.settled = true; dropTimers(call); answering.untraced.delete(call);
     return { v: conv(shaped(r), result, target_), store: seen.read, effects };

@@ -20,9 +20,9 @@
 import { journal, clock, Sounds, Mutations, Resources, R, data, drive, untracked, Refusal } from './rt.js';
 import { plain } from './format.js';
 import { Midi } from './midi.js';
-import { follower, feed, tempo, position, LOOKAHEAD as CLOCK_AHEAD, DRIFT } from './clockin.js';
+import { follower, feed, tempo, position, LOOKAHEAD as CLOCK_AHEAD, DRIFT, TICKS_PER_SECOND } from './clockin.js';
 
-const LOOKAHEAD = 1000, REFILL = 500, SEGMENTS = 1024, LOOPS_PER_SECOND = 1000, FROM_LIMIT = 2147483648, SHORTEST = 1 / 1048576, EXACT = 4503599627370496, OFFSET_LIMIT = 500, HOLD = 50, TICKS_PER_SECOND = 1000;
+const LOOKAHEAD = 1000, REFILL = 500, SEGMENTS = 1024, LOOPS_PER_SECOND = 1000, FROM_LIMIT = 2147483648, SHORTEST = 1 / 1048576, EXACT = 4503599627370496, OFFSET_LIMIT = 500, HOLD = 50;
 const KINDS = ['selection', 'impact', 'impact-light', 'impact-medium', 'impact-heavy', 'impact-soft', 'impact-rigid', 'success', 'warning', 'error'];
 const say = line => journal.push(`t=${clock.now} ${line}`);
 const num = n => !Number.isFinite(n) ? 'null' : n < 0 ? `-${plain(-n)}` : plain(n); // the runner's `num`
@@ -85,7 +85,7 @@ function read(name, args) {
       : bpm / 60 / length > LOOPS_PER_SECOND ? `it would loop more than ${num(LOOPS_PER_SECOND)} times a second`
       : !(Number.isFinite(offset) && Math.abs(offset) <= OFFSET_LIMIT) ? `its offset ${num(offset)} is not within ${num(OFFSET_LIMIT)} ms` : null;
     if (why) return void say(`${label} dropped: ${why}`);
-    tracks.push({ length, loops, offset, output, steps: items(f[4]).map((s, j) => step(s, length, output, `${label} step ${j + 1}`)).filter(Boolean) });
+    tracks.push({ id: i + 1, length, loops, offset, output, steps: items(f[4]).map((s, j) => step(s, length, output, `${label} step ${j + 1}`)).filter(Boolean) });
   });
   const countIn = from < 0 ? items(args[3]).map((s, j) => step(s, -from, null, `sequence ${name}: count-in step ${j + 1}`)).filter(Boolean) : [];
   const clockIn = text(args[4]);
@@ -95,7 +95,7 @@ function read(name, args) {
   return { tracks, bpm, from, countIn, clockIn, clockOut };
 }
 const samePlay = (a, b) => !!a && !!b && Object.is(a.bpm, b.bpm) && Object.is(a.from, b.from) && a.clockIn === b.clockIn && a.clockOut === b.clockOut && sameSteps(a.countIn, b.countIn)
-  && a.tracks.length === b.tracks.length && a.tracks.every((t, i) => ['length', 'loops', 'offset'].every(k => Object.is(t[k], b.tracks[i][k])) && t.output === b.tracks[i].output && sameSteps(t.steps, b.tracks[i].steps));
+  && a.tracks.length === b.tracks.length && a.tracks.every((t, i) => ['id', 'length', 'loops', 'offset'].every(k => Object.is(t[k], b.tracks[i][k])) && t.output === b.tracks[i].output && sameSteps(t.steps, b.tracks[i].steps));
 const sameSteps = (a, b) => a.length === b.length && a.every((s, i) => ['beat', 'gain', 'note', 'velocity', 'channel', 'duration', 'rate', 'pan'].every(k => Object.is(s[k], b[i][k])) && ['src', 'group', 'haptic'].every(k => s[k] === b[i][k]));
 const endBeat = p => p.tracks.some(t => t.loops === 0) ? null : p.tracks.reduce((m, t) => Math.max(m, t.loops * t.length), 0);
 // The hits whose time is in [from, to) under `seg`, in order: time, then track (0 the count-in), then step.
@@ -132,11 +132,15 @@ function fill(at, how) {
   // it) is dropped: past 2^53 an index no longer steps by 1. What is left may now end.
   const end = beatAt(seg(), at + LOOKAHEAD), n = Play.tracks.length;
   Play.tracks = Play.tracks.filter(t => {
+    if (seg().bpm / 60 / t.length > LOOPS_PER_SECOND) {
+      say(`sequence ${Seqs[Owner].name}: track ${t.id} dropped: it would loop more than ${num(LOOPS_PER_SECOND)} times a second`);
+      return false;
+    }
     const far = (t.loops === 0 || t.loops - 1 >= EXACT) && !(Math.abs(end / t.length) < EXACT);
     if (far) say(`sequence ${Seqs[Owner].name}: a track dropped: beat ${num(end)} is past exact loop counting`);
     return !far;
   });
-  if (Play.tracks.length !== n) timing(at);
+  if (Play.tracks.length !== n) { timing(at); if (Follow) Skip = 0; }
   // Following a clock, to past the last delivery, under its one segment (clock.rs).
   const from = IssuedTo, following = Follow != null, to = following ? Math.max(ClockTo, from) : at + LOOKAHEAD, live = !clock.agent, g = seg();
   Midi.ticks(b => time(g, b), to, endBeat(Play), live ? at : -Infinity, at);
@@ -153,7 +157,8 @@ function fill(at, how) {
   const full = T().batch(() => {
     for (let k = 0; k < list.length; k++) {
       const h = list[k];
-      if (following && (h.beat < HitsFloor || kept.some(e => e[0] === h.beat && e[1] === h.track && e[2] === h.step))) continue;
+      const track = h.track === 0 ? 0 : Play.tracks[h.track - 1].id; // stable when another track drops
+      if (following && (h.beat < HitsFloor || kept.some(e => e[0] === h.beat && e[1] === track && e[2] === h.step))) continue;
       const s = stepOf(Play, h), [offset, output] = trackOf(Play, h), when = h.at + offset;
       let counted = late;
       // Played now at the arming, skipped at an edit, late only at a stalled live wake (more than REFILL past).
@@ -167,7 +172,7 @@ function fill(at, how) {
       else if (note != null) unsent ??= output;
       if (s.haptic) { const w = place(when); if (w != null) T().haptic(s.haptic, w, h.at, at); }
       if (counted > late) late++;
-      if (following) fresh.push([h.beat, h.track, h.step, h.at]);
+      if (following) fresh.push([h.beat, track, h.step, h.at]);
     }
     return null;
   });
@@ -347,14 +352,14 @@ function publish() {
 }
 function stood(seen, t = clock.now) {
   const before = answerKey();
+  if (Owner != null && !seen[Owner].on) stop(t, 'gate');
   seen.forEach((s, i) => {
     const q = Seqs[i], wasOn = q.on, wasKey = q.kt;
     q.on = s.on; q.kt = s.key;
     // The input followed changed (D9): a restart, as a key's (rulings #13).
     const rising = s.on && (!wasOn || s.key !== wasKey), refollow = !!Play && Play.clockIn !== text(s.args[4]);
     if (Owner === i) {
-      if (!s.on) stop(t, 'gate');
-      else if (s.key !== wasKey || refollow) { T().batch(() => T().retract(t)); Midi.retractSeq(t); Midi.endSeq(t); arm(i, t, s.args); } // a restart: Stop, then Start at its new beat 0
+      if (s.key !== wasKey || refollow) { T().batch(() => T().retract(t)); Midi.retractSeq(t); Midi.endSeq(t); arm(i, t, s.args); } // a restart: Stop, then Start at its new beat 0
       else if (Raw.length !== s.args.length || !Raw.every((a, k) => same(a, s.args[k]))) edit(t, s.args);
     } else if (rising) {
       if (Owner != null) say(`sequence ${q.name} did not play: sequence ${Seqs[Owner].name} is playing`);
@@ -371,7 +376,7 @@ const look = q => {
 };
 Sounds.transportAnswer = Answer;
 Sounds.gate = () => { Pending = null; if (Seqs.length) Pending = untracked(() => Seqs.map(look)); };
-Sounds.stood = () => { const seen = Pending; Pending = null; if (seen) stood(seen); };
+Sounds.stood = () => { const seen = Pending; Pending = null; if (seen) stood(seen); else T()?.flush(); };
 // The beat at `t` while a sequence plays, by the segment that holds it; −1 while stopped or waiting (a MIDI input's `beat`).
 // Following a clock, by the one segment hits are issued under: its segments do not join (D9).
 Sounds.beatAt = t => Owner == null || State === 'waiting' || !Segments.length ? -1 : beatAt(Follow ? seg() : Segments.findLast(g => g.at <= t) ?? Segments[0], t);

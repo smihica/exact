@@ -7,11 +7,11 @@
 use exact_js::Module;
 use exact_kernel::Kernel;
 use exact_plan::{Plan, Value};
-use exact_runner::{DataSource, FailureKind, Outcome, RequestOut, Runner};
+use exact_runner::{DataSource, FailureKind, Outcome, Placement, RequestOut, Runner};
 
 const HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/timers.hbc"));
 const APP: &str = "test.timers";
-const GRANTS: &str = "net.fetch https://fixture.exact.test\n";
+const GRANTS: &str = "net.fetch https://fixture.exact.test\nsecret.keep shared\n";
 
 const SRC: &str = r#"
 component App
@@ -55,6 +55,8 @@ component App
     send result = tickThenFetch()
   action chain
     send result = chain()
+  action sleepThenFetch
+    send result = sleepThenFetch()
   action respin(v: number)
     n = v
   view
@@ -81,6 +83,87 @@ fn runner() -> Runner<Module> {
         "/",
     )
     .unwrap()
+}
+
+exact_logic::configured!(Generated, exact_data::Placed<Module>, || {
+    exact_logic::Swappable::off(module().placed(exact_runner::Placement::Main))
+});
+
+fn generated_runner() -> Runner<Generated> {
+    let mut source = Generated::default();
+    source.activate().unwrap();
+    Runner::boot(
+        plan(),
+        source,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_kept_post_reply_reaches_the_generated_entry() {
+    let mut r = generated_runner();
+    let post = |r: &mut Runner<Generated>, n: &str| {
+        r.act("post", vec![Value::str(n), Value::str("direct")])
+            .unwrap();
+        let mut fetches = pump(r);
+        assert_eq!(fetches.len(), 1);
+        fetches.remove(0)
+    };
+    let first = post(&mut r, "1");
+    let second = post(&mut r, "2");
+    assert!(r.holds(first.ticket), "the let-go POST runs on");
+    r.fulfill(first.ticket, ok()).unwrap();
+    pump(&mut r);
+    r.fulfill(second.ticket, ok()).unwrap();
+    pump(&mut r);
+    r.act("readLog", vec![]).unwrap();
+    pump(&mut r);
+    assert_eq!(result(&r, "result"), said("posted 1,posted 2"));
+}
+
+#[test]
+fn a_reply_after_its_timer_wins_reaches_the_generated_entry() {
+    let mut r = generated_runner();
+    r.act("raceFetch", vec![]).unwrap();
+    let fetches = pump(&mut r);
+    assert_eq!(fetches.len(), 1);
+    seek(&mut r, 100.);
+    assert_eq!(result(&r, "result"), said("slept"));
+    assert!(r.holds(fetches[0].ticket));
+    r.fulfill(fetches[0].ticket, ok()).unwrap();
+    pump(&mut r);
+    r.act("readLog", vec![]).unwrap();
+    pump(&mut r);
+    assert_eq!(result(&r, "result"), said("fetch landed"));
+}
+
+fn reports_storage_change(mut source: impl DataSource) {
+    source.activate().unwrap();
+    assert!(!source.take_storage_changed());
+    for _ in 0..2 {
+        source.note_storage_changed();
+        assert!(source.take_storage_changed());
+        assert!(!source.take_storage_changed(), "a change is taken once");
+    }
+}
+
+#[test]
+fn native_storage_changes_reach_a_placed_module() {
+    reports_storage_change(module());
+    for placement in [
+        exact_runner::Placement::Main,
+        exact_runner::Placement::Worker,
+    ] {
+        reports_storage_change(module().placed(placement));
+    }
+}
+
+#[test]
+fn native_storage_changes_reach_the_generated_entry() {
+    reports_storage_change(Generated::default());
 }
 
 /// A host's work after a commit or an advance: each continuation dispatched
@@ -113,10 +196,19 @@ fn pump<D: DataSource>(r: &mut Runner<D>) -> Vec<RequestOut> {
                 return fetches;
             }
             for (ticket, dispatch) in work {
-                let exact_runner::Dispatch::Run(exact_runner::Work::Now(run)) = dispatch else {
-                    panic!("a continuation runs now");
+                let outcome = match dispatch {
+                    exact_runner::Dispatch::Run(exact_runner::Work::Now(run)) => run(),
+                    exact_runner::Dispatch::Run(exact_runner::Work::Later(run)) => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        run(exact_runner::Reply::new(move |outcome| {
+                            let _ = tx.send(outcome);
+                        }));
+                        rx.recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("the worker replied")
+                    }
+                    _ => panic!("a continuation runs"),
                 };
-                r.fulfill(ticket, run()).unwrap();
+                r.fulfill(ticket, outcome).unwrap();
             }
         }
     })
@@ -436,8 +528,85 @@ impl DataSource for Quiet {
         APP
     }
     fn grants(&self) -> &str {
-        ""
+        "secret.keep shared"
     }
+}
+
+fn mixed_runner(javascript: Placement, rust: Placement) -> Runner<impl DataSource> {
+    let mixed = exact_data::Mixed::new(
+        module().placed(javascript),
+        exact_data::Placed::new(Quiet, rust),
+        &["slept", "spin", "chain", "sleepThenFetch"],
+        &[],
+    )
+    .unwrap();
+    let mut source = exact_data_host::Storage::new(mixed);
+    source.activate().unwrap();
+    Runner::boot(
+        plan(),
+        source,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_worker_child_resumes_its_timer_behind_the_composers() {
+    let mut r = mixed_runner(Placement::Worker, Placement::Main);
+    pump(&mut r);
+    r.act("sleep", vec![Value::str("superseded"), Value::Number(100.)])
+        .unwrap();
+    pump(&mut r);
+    r.act("sleep", vec![Value::str("a"), Value::Number(450.)])
+        .unwrap();
+    pump(&mut r);
+    assert!(!r.has_pending() && r.in_flight().is_empty());
+    assert_eq!(r.data_timer_due_ms(), Some(450.));
+    seek(&mut r, 449.);
+    assert_eq!(result(&r, "result"), Value::NONE);
+    seek(&mut r, 450.);
+    assert_eq!(result(&r, "result"), said("a after 450"));
+    assert_eq!(r.data_timer_due_ms(), None);
+
+    r.act("chain", vec![]).unwrap();
+    pump(&mut r);
+    seek(&mut r, 1150.);
+    assert_eq!(result(&r, "result"), said("chained"));
+
+    r.act("sleepThenFetch", vec![]).unwrap();
+    assert!(pump(&mut r).is_empty());
+    let advanced = r.advance_until_request(1250.);
+    assert!(advanced.error.is_none(), "{:?}", advanced.error);
+    let fetches = pump(&mut r);
+    assert_eq!(fetches.len(), 1);
+    r.fulfill(fetches[0].ticket, ok()).unwrap();
+    pump(&mut r);
+    assert_eq!(result(&r, "result"), said("fetched after sleep"));
+}
+
+#[test]
+fn an_ordered_main_child_arms_timers_from_the_runner_clock() {
+    let mut r = mixed_runner(Placement::Main, Placement::Worker);
+    pump(&mut r);
+    seek(&mut r, 10_000.);
+    r.act("sleep", vec![Value::str("a"), Value::Number(450.)])
+        .unwrap();
+    pump(&mut r);
+    assert_eq!(result(&r, "result"), Value::NONE);
+    assert_eq!(r.data_timer_due_ms(), Some(10_450.));
+    seek(&mut r, 10_449.);
+    assert_eq!(result(&r, "result"), Value::NONE);
+    seek(&mut r, 10_450.);
+    assert_eq!(result(&r, "result"), said("a after 450"));
+    r.act("chain", vec![]).unwrap();
+    pump(&mut r);
+    for due in [10_550., 10_750., 11_150.] {
+        assert_eq!(r.data_timer_due_ms(), Some(due));
+        seek(&mut r, due);
+    }
+    assert_eq!(result(&r, "result"), said("chained"));
 }
 
 /// The same race behind what a native host stacks over the module: app

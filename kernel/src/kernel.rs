@@ -41,8 +41,7 @@ pub use block::{BlockAxis, BlockMeasure, HostBlock};
 pub use cover::HostCover;
 pub(crate) use cover::{
     applied_padding as cover_padding, apply as apply_cover, chain_changed as cover_chain_changed,
-    children_changed as cover_children_changed, published_extent,
-    style_changed as cover_style_changed,
+    children_changed as cover_children_changed, style_changed as cover_style_changed,
 };
 pub use sticky::StickyConstraint;
 
@@ -289,7 +288,7 @@ impl<'a> NodeRef<'a> {
             .map(|(run, leaf)| match run.inline {
                 Some(_)
                     if arena.computed_source(leaf, StyleId::Visibility).visibility
-                        == crate::Visibility::Hidden =>
+                        != crate::Visibility::Visible =>
                 {
                     "".into()
                 }
@@ -920,7 +919,7 @@ impl Kernel {
     pub fn has_hairlines(&self) -> bool {
         use crate::style::relative::Unit;
         let arena = &self.arena;
-        (arena.relative_slots.iter()).any(|slot| {
+        (arena.relative.all.iter()).any(|slot| {
             let rows = &arena.style(slot).relative;
             rows.iter().any(|(_, unit, _)| unit == Unit::Hairline)
         })

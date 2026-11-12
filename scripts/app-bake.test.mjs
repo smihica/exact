@@ -6,12 +6,50 @@ import { createServer } from 'node:net';
 import { cargoBakeInputs } from './cargo-dep-info.mjs';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, delimiter, dirname, resolve } from 'node:path';
+import { basename, delimiter, dirname, relative, resolve } from 'node:path';
 import { classifyArtifacts, buildBake, bakeTarget, pendingBuildInputs } from './app.mjs';
 import { pinned } from './test-workspace.mjs';
 import { fileURLToPath } from 'node:url';
+import { copyStaticTreeIfPresent, syncStaticTree } from '../host/web/serve.mjs';
+
+test.each([
+  ['host/web-js/build.mjs', "// Launch modules' web services", '\nif (devReload)', '', ['assets', 'deck'], false],
+  ['host/windows/build.mjs', "  for (const name of ['assets','deck'])", '\n  copyShaders', '', ['assets', 'deck'], true],
+  ['host/apple/watch.mjs', '    for (const entry of entries) copyFileSync', '\n    const appInfo', '', ['assets', 'deck'], false],
+  ['host/apple-painted/build.mjs', "  writeFileSync(resolve(bundle, 'Contents/Info.plist')", "\n  run('codesign'", 'Contents/Resources', ['assets'], true],
+  ['scripts/agent-android.mjs', "  // The host opens the module", "\n  // The module's shader text", 'assets/app', ['assets'], false],
+])('%s packages static files without Finder metadata', async (file, start, end, prefix, folders, reused) => {
+  const root = mkdtempSync(resolve(import.meta.dir, '../target/static-package-'));
+  const appDir = resolve(root, 'app'), output = resolve(root, 'output');
+  try {
+    mkdirSync(resolve(output, 'Contents/Resources'), { recursive: true });
+    for (const folder of folders) {
+      const tree = resolve(appDir, folder);
+      mkdirSync(resolve(tree, 'nested'), { recursive: true });
+      for (const name of ['.DS_Store', 'nested/.DS_Store', 'nested/.config', 'image.png']) writeFileSync(resolve(tree, name), name);
+      if (reused) {
+        mkdirSync(resolve(output, prefix, folder, 'nested'), { recursive: true });
+        for (const name of ['.DS_Store', 'nested/.DS_Store']) writeFileSync(resolve(output, prefix, folder, name), 'old metadata');
+      }
+    }
+    // Run the packaging step itself; the native toolchains are outside this test.
+    const source = readFileSync(resolve(import.meta.dir, '..', file), 'utf8');
+    const from = source.indexOf(start), to = source.indexOf(end, from);
+    assert.ok(from >= 0 && to > from, `${file}: packaging step`);
+    const bindings = { cpSync, copyFileSync, existsSync, mkdirSync, writeFileSync, resolve, dirname, copyStaticTreeIfPresent, syncStaticTree,
+      app: { dir: appDir }, appDir, output, out: output, bundle: output, staged: output,
+      launchWeb: [], entries: [], live: false, gpu: null, ts: false, macInfoPlist: () => '' };
+    await new (async function () {}).constructor(...Object.keys(bindings), source.slice(from, to))(...Object.values(bindings));
+    for (const folder of folders) {
+      const tree = resolve(output, prefix, folder);
+      assert.equal(existsSync(resolve(tree, '.DS_Store')), false);
+      assert.equal(existsSync(resolve(tree, 'nested/.DS_Store')), false);
+      for (const name of ['nested/.config', 'image.png']) assert.equal(readFileSync(resolve(tree, name), 'utf8'), name);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('kept registry units rebuild foreign dep-info while retaining valid units', async () => {
   const { keptCrates } = await import('../host/apple/crates.mjs');
@@ -605,6 +643,49 @@ test.each([false, true])('ordinary buildBake with split directories=%s streams p
   } finally { rmSync(dir,{recursive:true,force:true}); }
 }, 180000);
 
+test('a path dependency\'s build script: a watched file outside its package is named from it, a directory outside is refused', () => {
+  const dir = pinned(realpathSync(mkdtempSync(resolve(tmpdir(), 'r14-outside-watch-'))));
+  const write = (name, text) => { mkdirSync(dirname(resolve(dir,name)), {recursive:true}); writeFileSync(resolve(dir,name),text); };
+  try {
+    const target = bakeTarget('linux'), id = 'com.exact.plain', app = resolve(dir,'app');
+    // `watcher` is another repository's crate: its `../../.env` is under neither the app, its workspace nor exact2.
+    write('vendor/watcher/Cargo.toml', '[package]\nname="watcher"\nversion="0.1.0"\nedition="2021"\n');
+    write('vendor/watcher/src/lib.rs', 'pub const VALUE: u32 = 7;\n');
+
+    write('app/Cargo.toml', '[workspace]\nmembers=["linux"]\nresolver="2"\n');
+    write('app/linux/Cargo.toml', '[package]\nname="plain-linux"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nwatcher={path="../../vendor/watcher"}\n');
+    write('app/linux/src/main.rs', 'fn main() { let _ = watcher::VALUE; }');
+    write('app/app.contract', 'component App\n  view\n    text "plain"\n');
+    write('app/linux/build.rs', `fn main() {
+      let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+      std::fs::write(out.join("compat.json"), r#"${JSON.stringify({target,inputs:{platform:'linux',app:id,store:{L:'0'},keys:[]}})}"#).unwrap();
+      std::fs::write(out.join("artifacts.json"), r#"{"version":1,"artifacts":[],"sources":{}}"#).unwrap();
+      std::fs::write(out.join("app.plan"), b"fixture").unwrap();
+    }`);
+    const fixture = {dir:app, workspace:app, target:resolve(app,'target'), name:'plain', id, manifest:{app:{id,name:'Plain'},rust:false}};
+    write('app/bake.mjs', `import {buildBake} from ${JSON.stringify(resolve(import.meta.dir,'app.mjs'))};
+      const receipt = buildBake({...${JSON.stringify(fixture)},crate:kind=>'plain-'+kind},'linux',${JSON.stringify(target)},{profile:'dev',output:${JSON.stringify(resolve(app,'bakes'))}});
+      console.log(JSON.stringify(receipt));`);
+    const bake = (watched) => {
+      write('vendor/watcher/build.rs', `fn main() { println!("cargo:rerun-if-changed=${watched}"); }\n`);
+      return spawnSync(process.execPath,[resolve(app,'bake.mjs')],{cwd:app,encoding:'utf8',env:{...process.env,EXACT_UPDATE_TRUST:'development'}});
+    };
+    const receipt = (built) => { assert.equal(built.status,0,built.stderr); return JSON.parse(built.stdout.trim().split('\n').at(-1)).binary; };
+    // The name has `/` on every host: a receipt's names are the same on every machine.
+    const file = receipt(bake('../../.env'));
+    assert.ok(file.absent.includes('crate:watcher@0.1.0/../../.env'),JSON.stringify(file.absent));
+    assert.ok(file.missing.includes(resolve(dir,'.env')));
+    // A directory inside its own package is recorded as before.
+    const inside = receipt(bake('src'));
+    assert.ok(inside.directories.some(d => d.path === resolve(dir,'vendor/watcher/src')), JSON.stringify(inside.directories.map(d => d.path)));
+    // A directory outside it is refused, saying which package watches what and what to do.
+    const refused = bake('../..');
+    assert.notEqual(refused.status, 0);
+    assert.ok(refused.stderr.includes(`watcher 0.1.0's build script watches ${dir}, a directory outside its package`), refused.stderr);
+    assert.match(refused.stderr, /may watch files outside its package and directories inside it: have it print `cargo:rerun-if-changed=<file>` for each file it reads there/);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+}, 180000);
+
 test('ordinary bake metadata follows intermediate directory A, B and the unset default', () => {
   const dir=pinned(realpathSync(mkdtempSync(resolve(tmpdir(),'exact metadata directories-'))));
   const previous=process.env.CARGO_BUILD_BUILD_DIR;
@@ -799,6 +880,164 @@ test('rewriting an input with its own bytes does not make a web build stale', as
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 60000);
 
+for (const assets of ['none', 'create', 'update', 'prune', 'create level', 'update level', 'prune level', 'release level']) test(`a wasm build keeps authored inputs (${assets === 'none' ? 'ordinary app' : assets + ' game assets'})`, async () => {
+  const { resolveApp } = await import('./app.mjs');
+  const { refuseStale, webChanges } = await import('./agent-launch.mjs');
+  const target = resolve(import.meta.dir, '../target');
+  mkdirSync(target, { recursive: true });
+  const dir = realpathSync(mkdtempSync(resolve(target, 'web-build-inputs-')));
+  const source = resolve(dir, 'app.contract'), dist = resolve(dir, 'target/web-dist');
+  const operation = assets.split(' ')[0], level = assets.endsWith(' level');
+  const game = assets !== 'none', edit = operation !== 'create';
+  const asset = level ? 'levels/start.level.json' : 'strip.tex';
+  const baked = level ? '{"seed":2}' : 'completed bake';
+  const before = 'component App\n  view\n    text "MarketsFirst"\n';
+  const after = edit ? before.replace('MarketsFirst', 'MarketsSecond') : before;
+  const ceiling = process.env.GIT_CEILING_DIRECTORIES;
+  // Keep the fixture in this worktree while giving its app walk the no-Git case.
+  process.env.GIT_CEILING_DIRECTORIES = target;
+  try {
+    if (game) assert.notEqual(spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir }).status, 0);
+    writeFileSync(source, before);
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Build inputs', app: { id: 'com.exact.build-inputs', name: 'Build inputs' }, rust: false,
+      ...(game ? { game: { crate: 'build-inputs-logic', type: 'BuildInputs' } } : {}) }));
+    if (game) {
+      mkdirSync(resolve(dir, 'assets'), { recursive: true });
+      writeFileSync(resolve(dir, 'assets/authored.txt'), 'authored before');
+      writeFileSync(resolve(dir, 'config.level.json'), '{"seed":1}');
+      writeFileSync(resolve(dir, 'assets/config.level.json'), '{"seed":1}');
+      if (level) {
+        mkdirSync(resolve(dir, 'levels'), { recursive: true });
+        writeFileSync(resolve(dir, asset), baked);
+        mkdirSync(resolve(dir, 'logic/src'), { recursive: true });
+        writeFileSync(resolve(dir, 'logic/src/lib.rs'), `use exact_game::*;
+#[derive(Default, Data)] pub struct Settings { pub seed: u64 }
+pub struct BuildInputs;
+impl Game for BuildInputs {
+    const ID: &'static str = "build-inputs";
+    ${operation === 'release' ? '' : `const LEVEL: Option<asset::Level> = Some(asset::Level::of::<Settings>("${asset}"));`}
+    type Args = ();
+    fn setup(_: &mut World, _: &()) {}
+    fn tick(_: &mut World, _: &Input, _: &()) {}
+}
+`);
+      } else if (operation !== 'prune') {
+        mkdirSync(resolve(dir, 'art'), { recursive: true });
+        writeFileSync(resolve(dir, 'art/strip.png'), 'art to bake');
+      }
+      if (['update', 'prune', 'release'].includes(operation)) {
+        mkdirSync(dirname(resolve(dir, 'assets', asset)), { recursive: true });
+        writeFileSync(resolve(dir, 'assets', asset), level ? '{"seed":1}' : 'previous bake');
+        if (!level) writeFileSync(resolve(dir, '.baked-assets.json'), JSON.stringify({ 'strip.tex': createHash('sha256').update('previous bake').digest('hex') }));
+        else {
+          mkdirSync(resolve(dir, '.shells'), { recursive: true });
+          writeFileSync(resolve(dir, '.shells/level.json'), JSON.stringify(asset));
+        }
+      }
+    }
+    // The child stubs compilation; --bake packages the receipt and writes the real marker.
+    // Authored inputs change during baking or packaging; generated assets change after copying.
+    const script = `
+      import { mock } from 'bun:test';
+      import { createHash } from 'node:crypto';
+      import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+      import { resolve } from 'node:path';
+      const appPath = ${JSON.stringify(resolve(import.meta.dir, 'app.mjs'))};
+      const actual = await import(appPath);
+      const servePath = ${JSON.stringify(resolve(import.meta.dir, '../host/web/serve.mjs'))};
+      const serve = await import(servePath), cards = serve.publicFileCards;
+      mock.module(servePath, () => ({ ...serve, publicFileCards(stage) {
+        if (${game && edit}) writeFileSync(${JSON.stringify(resolve(dir, 'assets/authored.txt'))}, 'authored after');
+        if (${operation === 'update'}) writeFileSync(${JSON.stringify(resolve(dir, 'assets', asset))}, 'edited during packaging');
+        return cards(stage);
+      } }));
+      mock.module(appPath, () => ({ ...actual, buildBake(app, platform, target, { env }) {
+        const started = Date.now();
+        const source = resolve(app.dir, 'app.contract');
+        const header = Buffer.alloc(36);
+        header.write('EXPL'); header.writeUInt32LE(Buffer.byteLength(app.id), 32);
+        const plan = Buffer.concat([header, Buffer.from(app.id), readFileSync(source)]);
+        const inputs = { app: app.id, platform };
+        const id = createHash('sha256').update('exact2 compatibility id v1\\n').update(JSON.stringify(inputs)).digest('hex').slice(0, 32);
+        const receipt = { id, inputs, target, embedded: { assets: [], plan: {
+          sha256: createHash('sha256').update(plan).digest('hex'), bytes: plan.length,
+        } } };
+        mkdirSync(env.EXACT_BAKE_OUTPUT, { recursive: true });
+        writeFileSync(resolve(env.EXACT_BAKE_OUTPUT, platform + '-' + target + '.plan'), plan);
+        writeFileSync(source, ${JSON.stringify(after)});
+        if (${game}) {
+          if (${edit}) writeFileSync(resolve(app.dir, 'assets/config.level.json'), '{"seed":2}');
+          const asset = resolve(app.dir, 'assets', ${JSON.stringify(asset)});
+          if (${operation === 'prune' || operation === 'release'}) {
+            if (${operation === 'prune'}) rmSync(asset);
+            else writeFileSync(asset, '{"seed":3}');
+            if (!${level}) rmSync(resolve(app.dir, '.baked-assets.json'));
+            else rmSync(resolve(app.dir, '.shells/level.json'));
+          } else {
+            mkdirSync(resolve(asset, '..'), { recursive: true });
+            writeFileSync(asset, ${level ? `readFileSync(resolve(app.dir, ${JSON.stringify(asset)}))` : JSON.stringify(baked)});
+            if (!${level}) writeFileSync(resolve(app.dir, '.baked-assets.json'), JSON.stringify({ 'strip.tex': createHash('sha256').update('completed bake').digest('hex') }));
+            else {
+              mkdirSync(resolve(app.dir, '.shells'), { recursive: true });
+              writeFileSync(resolve(app.dir, '.shells/level.json'), ${JSON.stringify(JSON.stringify(asset))});
+            }
+          }
+          if (${level && edit}) writeFileSync(resolve(app.dir, ${JSON.stringify(asset)}), '{"seed":3}');
+          writeFileSync(resolve(app.dir, 'assets/exact-tables.json'), '{}');
+        }
+        receipt.embedded.assets = serve.listAssets(app.dir);
+        writeFileSync(resolve(env.EXACT_BAKE_OUTPUT, platform + '-' + target + '.json'), JSON.stringify(receipt));
+        return { started, binary: { sha256: 'fixture', inputs: [] } };
+      } }));
+      process.argv = [process.execPath, ${JSON.stringify(resolve(import.meta.dir, '../host/web/build.mjs'))}, ${JSON.stringify(dir)}, '--bake'];
+      await import(${JSON.stringify(resolve(import.meta.dir, '../host/web/build.mjs'))});
+    `;
+    const built = spawnSync(process.execPath, ['-e', script], {
+      env: { ...process.env, EXACT_APP_DIR: dir, EXACT_WEB_DIST: dist, CARGO_TARGET_DIR: resolve(dir, 'target') },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    assert.equal(built.status, 0, built.stderr);
+    assert.ok(readFileSync(resolve(dist, 'app.plan')).includes(Buffer.from('MarketsFirst')));
+    assert.equal(readFileSync(source, 'utf8'), after);
+    const app = resolveApp(dir), markerPath = resolve(dist, '.exact-build.json');
+    // A long packaging step makes the marker newer than the edit; no elapsed-time wait is needed.
+    const finished = new Date(Date.now() + 10_000);
+    utimesSync(markerPath, finished, finished);
+    const shown = game ? source : relative(resolve(import.meta.dir, '..'), source);
+    const changed = !edit ? [] : game ? [
+      source, resolve(dir, 'assets/authored.txt'), resolve(dir, 'assets/config.level.json'),
+      ...(['update', 'release'].includes(operation) ? [resolve(dir, 'assets', asset)] : []),
+      ...(level ? [resolve(dir, asset)] : []),
+    ] : [shown];
+    assert.deepEqual(webChanges(dist, app).app, changed);
+    if (edit) assert.throws(() => refuseStale('web', markerPath, webChanges(dist, app).all, 'bun host/web/build.mjs --wasm'), /web build is stale/);
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    assert.equal(marker.inputs[shown], createHash('sha1').update(before).digest('hex'));
+    if (game) assert.equal(marker.inputs[resolve(dir, 'assets/config.level.json')], createHash('sha1').update('{"seed":1}').digest('hex'));
+    if (level) assert.equal(marker.inputs[resolve(dir, asset)], createHash('sha1').update(baked).digest('hex'));
+    if (operation === 'prune') assert.equal(marker.inputs[resolve(dir, 'assets', asset)], null);
+    if (operation === 'release') assert.equal(marker.inputs[resolve(dir, 'assets', asset)], createHash('sha1').update('{"seed":1}').digest('hex'));
+    assert.ok(marker.inputsAt <= JSON.parse(readFileSync(resolve(dist, 'bake.json'), 'utf8')).started);
+    writeFileSync(source, before);
+    if (game) writeFileSync(resolve(dir, 'assets/authored.txt'), 'authored before');
+    if (game) writeFileSync(resolve(dir, 'assets/config.level.json'), '{"seed":1}');
+    if (level) writeFileSync(resolve(dir, asset), baked);
+    if (operation === 'update') writeFileSync(resolve(dir, 'assets', asset), baked);
+    if (operation === 'release') writeFileSync(resolve(dir, 'assets', asset), '{"seed":1}');
+    assert.deepEqual(webChanges(dist, app).all, []);
+    if (game && operation !== 'prune') {
+      assert.equal(readFileSync(resolve(dist, 'assets', asset), 'utf8'), operation === 'release' ? '{"seed":3}' : baked);
+      writeFileSync(resolve(dir, 'assets', asset), 'edited after build');
+      assert.deepEqual(webChanges(dist, app).app, [resolve(dir, 'assets', asset)]);
+    }
+  } finally {
+    delete process.env.EXACT_APP_DIR;
+    if (ceiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = ceiling;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 60_000);
+
 // LLP 1012.001.000 D1: a drive's check compares every receipt input's bytes with its digest, so a file replaced with
 // other bytes of the same length, its mtime put back (`cp -p`, `rsync -a`), is still found.
 test('a receipt input is found changed by its bytes, whatever its size and mtime', () => {
@@ -884,9 +1123,8 @@ test('build output claims exclude contenders and recover after an owner is kille
   }
 }, 15000);
 
-// A claim's holder (the Apple build's, the touch runner's device lock) is live unless shown dead: gone, or a pid
-// started after the claim; a claim that does not parse, or whose holder `ps` cannot date, is live (round-2 review).
-test('a claim is live unless its holder is shown gone or reused', async () => {
+// An unreadable claim or process start time cannot establish that the holder has exited or its PID was reused.
+test('a claim is live unless its holder is shown exited or reused', async () => {
   const { claimLive } = await import('./app.mjs');
   const claim = (pid, started) => JSON.stringify({ pid, started });
   assert.equal(claimLive(claim(process.pid, new Date().toISOString())), true, 'this process, claimed now');

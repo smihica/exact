@@ -1,7 +1,6 @@
-// A source that never returns on its own: a synchronous loop only an
-// interrupt from another thread ends (LLP 1048.000 D10). `words` answers at
-// once, except for the name "spin", for which it spins, telling the native
-// module, where there is one, from inside the loop once it is running.
+// Synchronous loops only an interrupt from another thread ends (LLP
+// 1048.000 D10). Each tells the native module, where there is one, from
+// inside the loop once it is running.
 
 type Words = string[];
 
@@ -11,6 +10,18 @@ function words(args: unknown[], native: Native): Words {
   const names = Array.isArray(args[0]) ? args[0] : [];
   const name = typeof names[0] === "string" ? names[0] : "";
   if (name === "spin") spin(native);
+  if (name === "console-json") console.log({ toJSON() { spin(native); } });
+  if (name === "console-stack") {
+    const error = new Error("spinning stack");
+    Object.defineProperty(error, "stack", { get() { spin(native); } });
+    console.error(error);
+  }
+  if (name === "console-string") {
+    console.log({
+      toJSON() { throw new Error("cannot serialize"); },
+      toString() { spin(native); },
+    });
+  }
   return ["hello", name];
 }
 

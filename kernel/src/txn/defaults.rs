@@ -24,6 +24,7 @@ pub(super) fn before_prop(
             .collect(),
         PropId::AccessibilityRole
         | PropId::AccessibilityControls
+        | PropId::AccessibilityOrientation
         | PropId::Type
         | PropId::ButtonStyle
         | PropId::Popover
@@ -123,6 +124,9 @@ pub(super) fn changed(
     }
     if before.tab_bar != after.tab_bar {
         rows = rows.union(NodeArena::tab_bar_rows());
+    }
+    if before.segmented != after.segmented {
+        rows = rows.union(NodeArena::segmented_rows());
     }
     if !rows.is_empty() {
         style_changed(arena, layout, slot, rows, receipt);

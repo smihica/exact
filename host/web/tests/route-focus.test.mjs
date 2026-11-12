@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1115.000 D4 part A in a real browser: a route is a page, so the focus
 // follows it. The shell's stylesheet, the navigation glue's projection
 // (navigation.js) and the input piece (input-glue.js), which both web targets
@@ -7,7 +8,6 @@
 // ones (CDP mouse and key events), since a pointer's press and a key's differ
 // in what the browser focuses and whether it draws the ring.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium, suiteBrowser } from '../../../scripts/agent-launch.mjs';

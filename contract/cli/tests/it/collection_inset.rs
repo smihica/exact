@@ -573,6 +573,41 @@ fn scroll_into_view_reads_the_scroll_padding_it_runs_with() {
     assert_eq!(correction.offset, 50.0 * ROW - 50.0, "below the new header");
 }
 
+#[test]
+fn calculated_scroll_padding_clamps_at_use_for_keyed_jumps() {
+    for (axis, before, after) in [
+        (ListAxis::Vertical, "top", "bottom"),
+        (ListAxis::Horizontal, "left", "right"),
+    ] {
+        for side in [before, after] {
+            for (value, padding) in [
+                ("calc(10px - 50vw)", 0.0),
+                ("calc(200px - 50vw)", 0.0),
+                ("calc(250px - 50vw)", 50.0),
+                ("calc(env(safe-area-inset-top) - 100px)", 0.0),
+                ("calc(env(safe-area-inset-top) - 7px)", 40.0),
+            ] {
+                let app = padded(
+                    100,
+                    axis,
+                    "92",
+                    &format!(r#"scroll-padding-{side}="{value}""#),
+                )
+                .replace(r#" scroll-padding="92 0 83""#, "")
+                .replace(r#" scroll-padding="0 83 0 92""#, "");
+                let mut r = boot(&app);
+                host(&mut r, 0.0);
+                let (action, expected) = if side == before {
+                    ("start", TOP + 50.0 * ROW - padding)
+                } else {
+                    ("center", TOP + 50.5 * ROW - (PORT - padding) / 2.0)
+                };
+                assert_eq!(into(&mut r, action, 50.0, 0.0), expected, "{side}: {value}");
+            }
+        }
+    }
+}
+
 /// The action's computed scroll padding applies before the first correction,
 /// including font-relative lengths. Hosts receive only the final commit.
 #[test]

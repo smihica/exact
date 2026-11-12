@@ -236,6 +236,10 @@ final class SvgScene {
     private var nodeOf: [Int: UInt32] = [:]
     private var pressable: Set<Int> = []
     private var passes: Set<Int> = []
+    private var painted: [Int: (fill: Bool, stroke: Bool)] = [:]
+    /// A filter's unpainted content keeps its geometry and element ancestry
+    /// for hits; the picture's pixels and region do not affect them (D17).
+    private var filterShapes: [Int: CALayer] = [:]
     /// A system font where no presenter's fonts are known.
     static let systemFonts: SvgText.Fonts = { size, _, _, _ in CTFontCreateUIFontForLanguage(.system, size, nil) ?? CTFontCreateWithName("Helvetica" as CFString, size, nil) }
 
@@ -319,10 +323,10 @@ final class SvgScene {
     private var drawn: [Int: Int] = [:]
 
     /// Whether shape `id` must be drawn from `e`: it changed, or is new.
-    private func drew(_ id: Int, _ e: [String: Any], dark: Bool) -> Bool {
+    private func drew(_ id: Int, _ e: [String: Any], dark: Bool, hitOnly: Bool) -> Bool {
         var h = Hasher()
         for k in e.keys.sorted() where k != "a" { h.combine(k); CssAnimations.digest(e[k], into: &h) }
-        h.combine(dark); h.combine(scale); h.combine(tint.map { "\($0)" })
+        h.combine(dark); h.combine(scale); h.combine(tint.map { "\($0)" }); h.combine(hitOnly)
         let d = h.finalize()
         if drawn[id] == d { return false }
         drawn[id] = d
@@ -357,6 +361,8 @@ final class SvgScene {
             wrapSpecs.removeValue(forKey: id); wrapInstalled.removeValue(forKey: id)
             node.removeValue(forKey: ObjectIdentifier(layer)); parentOf.removeValue(forKey: id)
             nodeOf.removeValue(forKey: id); pressable.remove(id); passes.remove(id)
+            painted.removeValue(forKey: id)
+            filterShapes.removeValue(forKey: id)?.removeFromSuperlayer()
         }
     }
 
@@ -378,15 +384,22 @@ final class SvgScene {
     private func hit(_ layer: CALayer, _ p: CGPoint) -> Int? {
         // Opacity does not change a hit (SVG 2 pointer-events); hiding does.
         if layer.isHidden { return nil }
-        if let mask = layer.mask, !SvgScene.covers(mask, mask.convert(p, from: layer)) { return nil }
-        if layer.masksToBounds, !layer.bounds.contains(p) { return nil }
         let mine = node[ObjectIdentifier(layer)]
+        let island = mine.flatMap { islands[$0.uid]?.layer }
+        if let mask = layer.mask, !SvgScene.covers(mask, mask.convert(p, from: layer), ignoring: island) { return nil }
+        if layer.masksToBounds, !layer.bounds.contains(p) { return nil }
         if let mine, passes.contains(mine.uid) { return nil }
+        if let mine, let content = filterShapes[mine.uid] ?? shadows[mine.uid]?.cast {
+            return hit(content, content.convert(p, from: layer))
+        }
+        if let shape = layer as? CAShapeLayer, let mine, let paint = painted[mine.uid] {
+            return SvgScene.paints(shape, at: p, fill: paint.fill, stroke: paint.stroke) ? mine.uid : nil
+        }
         for sub in (layer.sublayers ?? []).reversed() where sub !== layer.mask {
-            // A part layer (a gradient's, a text run's) hits as its element.
+            // A text run's glyph layers hit as their element.
             if let found = hit(sub, sub.convert(p, from: layer)) { return found == -1 ? (mine?.uid ?? -1) : found }
         }
-        if let shape = layer as? CAShapeLayer, SvgScene.paints(shape, at: p) {
+        if let shape = layer as? CAShapeLayer, SvgScene.paints(shape, at: p, fill: shape.fillColor != nil, stroke: shape.strokeColor != nil) {
             return mine?.uid ?? -1
         }
         return nil
@@ -394,10 +407,10 @@ final class SvgScene {
 
     /// Whether a shape layer paints `p`: its fill, or its stroke's outline
     /// (caps, joins and dashes as Core Graphics strokes them).
-    private static func paints(_ shape: CAShapeLayer, at p: CGPoint) -> Bool {
+    private static func paints(_ shape: CAShapeLayer, at p: CGPoint, fill: Bool, stroke: Bool) -> Bool {
         guard let path = shape.path else { return false }
-        if shape.fillColor != nil, path.contains(p, using: shape.fillRule == .evenOdd ? .evenOdd : .winding) { return true }
-        guard shape.strokeColor != nil, shape.lineWidth > 0 else { return false }
+        if fill, path.contains(p, using: shape.fillRule == .evenOdd ? .evenOdd : .winding) { return true }
+        guard stroke, shape.lineWidth > 0 else { return false }
         var line = path
         if let dash = shape.lineDashPattern, !dash.isEmpty {
             line = path.copy(dashingWithPhase: shape.lineDashPhase, lengths: dash.map { CGFloat($0.doubleValue) })
@@ -407,10 +420,11 @@ final class SvgScene {
         return line.copy(strokingWithWidth: shape.lineWidth, lineCap: cap, lineJoin: join, miterLimit: shape.miterLimit).contains(p)
     }
 
-    /// Whether a clip mask covers `p`: any of its opaque shapes, inside its
-    /// own mask.
-    private static func covers(_ mask: CALayer, _ p: CGPoint) -> Bool {
-        if let inner = mask.mask, !covers(inner, inner.convert(p, from: mask)) { return false }
+    /// Clip paths intersect; a mask island at the end of the chain does
+    /// not restrict hits, even where its coverage is zero.
+    private static func covers(_ mask: CALayer, _ p: CGPoint, ignoring island: CALayer?) -> Bool {
+        if mask === island { return true }
+        if let inner = mask.mask, !covers(inner, inner.convert(p, from: mask), ignoring: island) { return false }
         return (mask.sublayers ?? []).contains { sub in
             guard let s = sub as? CAShapeLayer, let path = s.path else { return false }
             return path.contains(sub.convert(p, from: mask), using: s.fillRule == .evenOdd ? .evenOdd : .winding)
@@ -438,6 +452,7 @@ final class SvgScene {
         live = [:]
         #endif
         node = [:]; parentOf = [:]; nodeOf = [:]; pressable = []; passes = []
+        painted = [:]; filterShapes = [:]
     }
 
     /// The layer to place for an element: itself, or the outer of its
@@ -467,7 +482,7 @@ final class SvgScene {
         return pair.outer
     }
 
-    private func attach(_ elements: [Any], to parent: CALayer, dark: Bool, clock: Double?, alive: inout Set<Int>, owner: Int? = nil) {
+    private func attach(_ elements: [Any], to parent: CALayer, dark: Bool, clock: Double?, alive: inout Set<Int>, owner: Int? = nil, hitOnly: Bool = false) {
         var order: [CALayer] = []
         for case let e as [String: Any] in elements {
             let id = Int(num(e["id"]))
@@ -478,6 +493,10 @@ final class SvgScene {
             if e["pn"] != nil { passes.insert(id) } else { passes.remove(id) }
             let text = e["tx"] as? [Any]
             let group = e["g"] != nil || text != nil
+            let filter = e["fl"] as? [String: Any]
+            if filter == nil || hitOnly || filter.flatMap(SvgScene.dropShadow) != nil {
+                filterShapes.removeValue(forKey: id)?.removeFromSuperlayer()
+            }
             let layer: CALayer
             if let existing = layers[id], (existing is CAShapeLayer) != group { layer = existing } else {
                 layers[id]?.removeFromSuperlayer()
@@ -501,9 +520,10 @@ final class SvgScene {
                     layer.isHidden = view == nil
                     layer.sublayerTransform = CATransform3DMakeAffineTransform(view ?? .identity)
                 }
-                attach(e["c"] as? [Any] ?? [], to: layer, dark: dark, clock: clock, alive: &alive, owner: id)
+                let children = hitOnly ? filter?["c"] ?? e["c"] : e["c"]
+                attach(children as? [Any] ?? [], to: layer, dark: dark, clock: clock, alive: &alive, owner: id, hitOnly: hitOnly)
                 // @ref LLP 1055.000 D14 — a filtered element's picture is an island.
-                if let fl = e["fl"] as? [String: Any], let drop = SvgScene.dropShadow(fl) {
+                if !hitOnly, let fl = filter, let drop = SvgScene.dropShadow(fl) {
                     // A lone drop shadow is Core Animation's own shadow on
                     // the element, clipped to the filter region: no pixels
                     // of ours (F1's 300 shadowed POIs held a 21 MB island
@@ -518,7 +538,7 @@ final class SvgScene {
                     pair.cast.shadowOffset = drop.offset
                     attach(fl["c"] as? [Any] ?? [], to: pair.cast, dark: dark, clock: clock, alive: &alive, owner: id)
                     if pair.clip.superlayer !== layer { layer.addSublayer(pair.clip) }
-                } else if let fl = e["fl"] as? [String: Any] {
+                } else if !hitOnly, let fl = filter {
                     if let pair = shadows.removeValue(forKey: id) { pair.clip.removeFromSuperlayer() }
                     var h = Hasher()
                     CssAnimations.digest(fl, into: &h)
@@ -531,16 +551,23 @@ final class SvgScene {
                     if pictures[id]?.layer !== picture { pictures[id]?.layer.removeFromSuperlayer() }
                     pictures[id] = (key, picture)
                     if picture.superlayer !== layer { layer.addSublayer(picture) }
+                    let content = filterShapes[id] ?? still(CALayer())
+                    content.opacity = 0
+                    filterShapes[id] = content
+                    attach(fl["c"] as? [Any] ?? [], to: content, dark: dark, clock: clock, alive: &alive, owner: id, hitOnly: true)
+                    if content.superlayer !== layer { layer.addSublayer(content) }
                 } else {
                     if let old = pictures.removeValue(forKey: id) { old.layer.removeFromSuperlayer(); forget(id) }
                     if let pair = shadows.removeValue(forKey: id) { pair.clip.removeFromSuperlayer() }
                 }
-            } else if let shape = layer as? CAShapeLayer, drew(id, e, dark: dark) {
+            } else if let shape = layer as? CAShapeLayer, drew(id, e, dark: dark, hitOnly: hitOnly) {
                 shape.path = path(e["p"])
                 let pos = nums(e["pos"])
                 shape.position = pos.count == 2 ? CGPoint(x: pos[0], y: pos[1]) : .zero
                 shape.fillColor = color(e["f"], dark: dark, tint: tint)
                 shape.strokeColor = color(e["s"], dark: dark, tint: tint)
+                painted[id] = (shape.fillColor != nil || SvgPaint.server(e["f"]) != nil,
+                               shape.strokeColor != nil || SvgPaint.server(e["s"]) != nil)
                 shape.lineWidth = CGFloat(num(e["w"]))
                 shape.lineCap = [CAShapeLayerLineCap.butt, .round, .square][min(Int(num(e["cap"])), 2)]
                 shape.lineJoin = [CAShapeLayerLineJoin.miter, .round, .bevel][min(Int(num(e["join"])), 2)]
@@ -549,7 +576,7 @@ final class SvgScene {
                 let dash = nums(e["dash"])
                 shape.lineDashPattern = dash.isEmpty ? nil : dash.map { NSNumber(value: $0) }
                 shape.lineDashPhase = CGFloat(num(e["ph"]))
-                if SvgPaint.needsParts(e) {
+                if !hitOnly, SvgPaint.needsParts(e) {
                     // Gradients or a paint order: part layers paint it.
                     shape.fillColor = nil; shape.strokeColor = nil
                     SvgPaint.parts(shape, e, scale: scale, dark: dark, fonts: fonts ?? SvgScene.systemFonts) { [tint] in color($0, dark: $1, tint: tint) }
@@ -565,7 +592,7 @@ final class SvgScene {
             // @ref LLP 1055.000 D10 — a clip is the layer's mask; a mask
             // is an island inside it.
             layer.mask = SvgPaint.clip(e["cl"]) { path($0) }
-            if let mk = e["mk"] as? [String: Any] {
+            if !hitOnly, let mk = e["mk"] as? [String: Any] {
                 var h = Hasher()
                 CssAnimations.digest(mk, into: &h)
                 h.combine(scale); h.combine(dark)

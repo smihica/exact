@@ -20,6 +20,26 @@ pub(super) struct Assets {
     ranges: BTreeMap<u32, Range>,
     digests: BTreeMap<u32, u64>,
     structure: Option<Structure>,
+    // What each drawn entity drew at the last rebuild, the assets that is, and
+    // the textures whose arrival changes what one draws.
+    shown: BTreeMap<u32, Shown>,
+    held: std::collections::BTreeSet<String>,
+    waiting: std::collections::BTreeSet<String>,
+}
+/// Texture names by `MaterialData` slot order, `None` keeping the material's.
+type Slots = [Option<String>; 5];
+/// What an entity draws: its `Mesh`'s model once that can draw, until then
+/// the rigid model it drew before (a skin swapped to a model still in flight);
+/// and its `MaterialOverride` textures once all of them can draw, until then
+/// the ones it drew before (the model's own, the first time).
+#[derive(Clone, PartialEq)]
+struct Shown {
+    entity: exact_game::Entity,
+    model: String,
+    textures: Vec<(u32, Slots)>,
+    // Drawing a prior model in place of the `Mesh`'s: the `ModelLod` levels,
+    // which belong to the new model, are not drawn meanwhile.
+    fallback: bool,
 }
 struct Structure {
     models: Vec<(exact_game::Entity, String)>,
@@ -37,6 +57,95 @@ impl Assets {
         self.structure = None;
         self.records.clear();
         self.entities.clear();
+        // `shown` and `held` stay: a restore or a paranoid sample keeps entity
+        // ids, so an entity keeps its look across it, and the next rebuild
+        // drops the records of entities that no longer draw.
+        self.waiting.clear();
+    }
+    /// The models drawn at the last rebuild, fallbacks included: what the
+    /// engine keeps resident for this renderer (`Sim::hold_assets`).
+    pub fn held(&self) -> &std::collections::BTreeSet<String> {
+        &self.held
+    }
+    /// Whether a texture an entity waits for can draw now.
+    pub fn arrived(&self, r: &impl Writes) -> bool {
+        self.waiting.iter().any(|n| r.texture_ready(n))
+    }
+    /// What `entity`, whose `Mesh` names `wanted`, draws now; adds the
+    /// textures it waits for to `waiting`.
+    fn resolve(
+        &self,
+        w: &World,
+        r: &impl Writes,
+        entity: exact_game::Entity,
+        wanted: &str,
+        waiting: &mut std::collections::BTreeSet<String>,
+    ) -> Shown {
+        let prior = self
+            .shown
+            .get(&entity.index())
+            .filter(|s| s.entity == entity);
+        let ready = |set: &[(u32, Slots)]| {
+            set.iter()
+                .flat_map(|(_, s)| s.iter().flatten())
+                .all(|n| r.texture_ready(n))
+        };
+        let mut textures = Vec::new();
+        if let Some(overrides) = w.get::<exact_game::MaterialOverrides>(entity) {
+            for o in &overrides.0 {
+                let names = o.textures.names();
+                if names.iter().any(Option::is_some) {
+                    textures.push((o.material, names.map(|n| n.map(str::to_owned))));
+                }
+            }
+        }
+        let model_ready = r.model(wanted).is_some();
+        if model_ready && ready(&textures) {
+            return Shown {
+                entity,
+                model: wanted.to_owned(),
+                textures,
+                fallback: false,
+            };
+        }
+        waiting.extend(
+            textures
+                .iter()
+                .flat_map(|(_, s)| s.iter().flatten())
+                .filter(|n| !r.texture_ready(n))
+                .cloned(),
+        );
+        // The whole previous look, model and textures, until the new one can
+        // draw: a prior model other than the `Mesh`'s must be rigid to stand in.
+        let drawable = |p: &Shown| {
+            if p.model == wanted {
+                model_ready
+            } else {
+                r.model(&p.model).is_some_and(|d| rigid(&d))
+            }
+        };
+        if let Some(prior) = prior.filter(|p| drawable(p) && ready(&p.textures)) {
+            return Shown {
+                fallback: prior.model != wanted,
+                ..prior.clone()
+            };
+        }
+        // Nothing drawn before: the model's own textures until the set arrives.
+        Shown {
+            entity,
+            model: wanted.to_owned(),
+            textures: Vec::new(),
+            fallback: false,
+        }
+    }
+    fn hold(&mut self) {
+        self.held = (self.shown.values())
+            .flat_map(|s| {
+                std::iter::once(&s.model)
+                    .chain(s.textures.iter().flat_map(|(_, t)| t.iter().flatten()))
+            })
+            .cloned()
+            .collect();
     }
 
     // `drawn` is the feed's current Mesh+Transform query, with effective
@@ -56,25 +165,28 @@ impl Assets {
         ];
         // Compare borrowed names before building a replacement. Primitive
         // effects can change batches while thousands of model names stay put.
-        let unchanged = self.structure.as_ref().is_some_and(|saved| {
-            saved.revisions == revisions
-                && w.query::<(&Mesh, &Transform)>()
-                    .iter()
-                    .zip(drawn)
-                    .filter_map(|((entity, (mesh, _)), &(expected, visible, _))| {
-                        debug_assert_eq!(entity, expected);
-                        match mesh {
-                            Mesh::Asset(name) if visible => Some((entity, name.as_str())),
-                            _ => None,
-                        }
-                    })
-                    .eq(saved.models.iter().map(|(e, name)| (*e, name.as_str())))
-        });
+        // A texture an entity waited for arrived: resolve every entity again.
+        let arrived = self.arrived(r);
+        let unchanged = !arrived
+            && self.structure.as_ref().is_some_and(|saved| {
+                saved.revisions == revisions
+                    && w.query::<(&Mesh, &Transform)>()
+                        .iter()
+                        .zip(drawn)
+                        .filter_map(|((entity, (mesh, _)), &(expected, visible, _))| {
+                            debug_assert_eq!(entity, expected);
+                            match mesh {
+                                Mesh::Asset(name) if visible => Some((entity, name.as_str())),
+                                _ => None,
+                            }
+                        })
+                        .eq(saved.models.iter().map(|(e, name)| (*e, name.as_str())))
+            });
         if unchanged && self.patch_looks(w, r)? {
             self.append_batches(batches, slots);
             return Ok(());
         }
-        if self.remove_models(w, drawn, revisions) {
+        if !arrived && self.remove_models(w, drawn, revisions) {
             r.part_looks(&self.part_bases, &self.part_looks);
             r.levels(&self.levels, &self.lods);
             if let Err(error) = r.instances(&self.records) {
@@ -109,9 +221,16 @@ impl Assets {
         for group in self.groups.values_mut() {
             group.clear();
         }
+        let (mut shown, mut waiting) = (BTreeMap::new(), Default::default());
         for (entity, name) in &structure.models {
-            self.entity(w, r, *entity, name)?;
+            let next = self.resolve(w, r, *entity, name, &mut waiting);
+            if self.entity(w, r, &next)? {
+                shown.insert(entity.index(), next);
+            }
         }
+        self.shown = shown;
+        self.waiting = waiting;
+        self.hold();
         self.digests = look_digests(w);
         r.part_looks(&self.part_bases, &self.part_looks);
         r.levels(&self.levels, &self.lods);
@@ -237,6 +356,9 @@ impl Assets {
             retained
         });
         self.digests = digests;
+        let ranges = &self.ranges;
+        self.shown.retain(|slot, _| ranges.contains_key(slot));
+        self.hold();
         true
     }
 
@@ -273,8 +395,11 @@ impl Assets {
             let Some(Mesh::Asset(name)) = w.get::<Mesh>(entity).as_deref().cloned() else {
                 return Ok(false);
             };
+            let mut waiting = std::mem::take(&mut self.waiting);
+            let next = self.resolve(w, r, entity, &name, &mut waiting);
+            self.waiting = waiting;
             let mut fresh = Assets::default();
-            fresh.entity(w, r, entity, &name)?;
+            fresh.entity(w, r, &next)?;
             let same = fresh.records.len() == count
                 && fresh.part_looks.len() == part_count
                 && fresh
@@ -307,6 +432,10 @@ impl Assets {
                 old.glow = new.glow;
             }
             self.part_looks[part_first..part_first + part_count].copy_from_slice(&fresh.part_looks);
+            if self.shown.get(&slot) != Some(&next) {
+                self.shown.insert(slot, next);
+                self.hold();
+            }
             r.patch_looks(
                 first,
                 &self.records[first..first + count],
@@ -317,14 +446,15 @@ impl Assets {
         self.digests = digests;
         Ok(true)
     }
-    /// One model entity's records (every level), looks, levels and groups.
+    /// One model entity's records (every level), looks, levels and groups;
+    /// whether it drew anything.
     fn entity(
         &mut self,
         w: &World,
         r: &mut impl Writes,
-        entity: exact_game::Entity,
-        name: &str,
-    ) -> Result<(), RenderError> {
+        shown: &Shown,
+    ) -> Result<bool, RenderError> {
+        let (entity, name) = (shown.entity, shown.model.as_str());
         let part_first = self.part_looks.len();
         let looks = w.get::<exact_game::NodeMaterials>(entity);
         let overrides = w.get::<exact_game::MaterialOverrides>(entity);
@@ -336,15 +466,33 @@ impl Assets {
             crate::lod::validate(lod)
                 .map_err(|e| RenderError::scene(format!("entity {}: {e}", entity.index())))?;
         }
-        let count = 1 + lod.as_ref().map_or(0, |l| l.levels.len());
+        // A prior model standing in draws without the new model's levels; its
+        // `hide` distance still applies.
+        let levels = match &lod {
+            Some(lod) if !shown.fallback => &lod.levels[..],
+            _ => &[],
+        };
+        let count = 1 + levels.len();
         let first = self.records.len();
         let mut present = 0u8;
         let mut drawn = false;
         for level in 0..count {
-            let model = match (&lod, level) {
-                (Some(lod), 1..) => lod.levels[level - 1].model.as_str(),
+            let model = match level {
+                1.. => levels[level - 1].model.as_str(),
                 _ => name,
             };
+            // The level's materials drawn with this instance's textures.
+            let mut variants = Vec::new();
+            if !shown.textures.is_empty() {
+                let materials = r.model(model).map(|d| d.materials.to_vec());
+                for (index, names) in &shown.textures {
+                    if let Some(&base) = materials.as_ref().and_then(|m| m.get(*index as usize)) {
+                        if let Some(variant) = r.material_variant(base, names) {
+                            variants.push((base, variant));
+                        }
+                    }
+                }
+            }
             let Some(draws) = r.model(model) else {
                 continue;
             };
@@ -371,7 +519,7 @@ impl Assets {
                     .0
                     .iter()
                     .find(|o| o.material as usize == index)?;
-                Some((o.color, o.emissive))
+                Some((o.color, o.emissive, o.uv_offset))
             };
             drawn |= !nodes.is_empty();
             if !nodes.is_empty() {
@@ -392,9 +540,28 @@ impl Assets {
                 let mut base = 0;
                 // A draw of several materials: each part's entry carries its own.
                 let materials = members.and_then(|m| m.2.get(i)).map_or(&[][..], |p| &p[..]);
-                if parts.len() == 1 {
-                    look = find(&parts[0]);
-                } else if !materials.is_empty() || parts.iter().any(|p| find(p).is_some()) {
+                // The material's UV offset, in each of the record's entries.
+                // A custom material's shader reads no look table.
+                let offset = material_look(material)
+                    .and_then(|l| l.2)
+                    .filter(|_| !draws.custom.contains(&material));
+                let [u, v] = offset.unwrap_or_default();
+                if parts.len() <= 1 {
+                    look = parts.first().and_then(find);
+                    // One neutral entry for the whole record, holding the offset.
+                    if offset.is_some() {
+                        base = self.part_looks.len() as u32 + 1;
+                        let mut entry = [0.; 18];
+                        entry[..4].copy_from_slice(&[1.; 4]);
+                        entry[16..].copy_from_slice(&[u, v]);
+                        let mut end = [0.; 18];
+                        end[7] = f32::from_bits(u32::MAX);
+                        self.part_looks.extend([entry, end]);
+                    }
+                } else if !materials.is_empty()
+                    || offset.is_some()
+                    || parts.iter().any(|p| find(p).is_some())
+                {
                     // A merged draw finds each vertex's part by its vertex range,
                     // or by its number when it has several materials.
                     let starts = &members.unwrap().1[i];
@@ -427,22 +594,28 @@ impl Assets {
                                         m[5],
                                         m[6],
                                         m[7],
+                                        u,
+                                        v,
                                     ]
                                 }),
                         );
-                    let mut end = [0.; 16];
+                    let mut end = [0.; 18];
                     end[7] = f32::from_bits(u32::MAX);
                     self.part_looks.push(end);
                 }
                 let (mut tint, mut glow) =
                     look.map_or(([1.; 4], [0.; 3]), |l| (l.color, l.emissive));
-                if let Some((color, g)) = material_look(material) {
+                if let Some((color, g, _)) = material_look(material) {
                     if let Some(c) = color {
                         tint = std::array::from_fn(|i| tint[i] * c[i]);
                         base |= REPLACE;
                     }
                     glow = std::array::from_fn(|i| glow[i] + g[i]);
                 }
+                let material = variants
+                    .iter()
+                    .find(|(b, _)| *b == material)
+                    .map_or(material, |v| v.1);
                 self.part_bases.push(base);
                 self.levels.push(level as u8);
                 self.records.push(DrawInstance {
@@ -469,7 +642,7 @@ impl Assets {
         }
         if let (Some(lod), true) = (&lod, drawn) {
             let mut starts = [0.; crate::lod::MAX_LEVELS];
-            for (start, l) in starts[1..].iter_mut().zip(&lod.levels) {
+            for (start, l) in starts[1..].iter_mut().zip(levels) {
                 *start = l.distance;
             }
             self.lods.push(crate::lod::Lod {
@@ -495,8 +668,18 @@ impl Assets {
                 },
             );
         }
-        Ok(())
+        Ok(drawn)
     }
+}
+
+/// A model without skins or animated parts, whose records draw for any
+/// entity: what an entity may keep drawing in place of a model in flight.
+fn rigid(draws: &crate::models::Draws<'_>) -> bool {
+    draws
+        .nodes
+        .iter()
+        .chain(draws.merged)
+        .all(|n| n.3.is_none())
 }
 
 #[cfg(test)]
@@ -523,6 +706,8 @@ fn look_digests(w: &World) -> BTreeMap<u32, u64> {
             l.material.hash(h);
             l.color.map(|c| c.map(f32::to_bits)).hash(h);
             l.emissive.map(f32::to_bits).hash(h);
+            l.textures.names().hash(h);
+            l.uv_offset.map(|o| o.map(f32::to_bits)).hash(h);
         }
     }
     hashers.into_iter().map(|(k, h)| (k, h.finish())).collect()

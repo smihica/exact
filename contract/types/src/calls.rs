@@ -516,7 +516,7 @@ fn similar_function<'a>(name: &str, scope: &'a Scope, shapes: &'a Shapes) -> Opt
         return None;
     }
     let global = |candidate: &str| {
-        matches!(candidate, "pending" | "failed" | "failure")
+        matches!(candidate, "pending" | "failed" | "failure" | "current")
             || (candidate == "path" && shapes.routes.is_some())
             || shapes.fns.contains_key(candidate)
             || super::Stdlib::from_name(candidate)
@@ -527,7 +527,7 @@ fn similar_function<'a>(name: &str, scope: &'a Scope, shapes: &'a Shapes) -> Opt
         .keys()
         .map(String::as_str)
         .chain(super::Stdlib::ALL.iter().map(|f| f.name()))
-        .chain(["pending", "failed", "failure", "path"]);
+        .chain(["pending", "failed", "failure", "current", "path"]);
     let mut found = None;
     for candidate in names {
         if !one_spelling_edit(name.as_bytes(), candidate.as_bytes()) || !global(candidate) {

@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1115.000 D4.11, D4.12 and D4.14 in a real browser: what the shell's stylesheet (index.html, both web
 // targets) and the navigation glue do. A material the host
 // paints honours the person's settings: with Reduce Transparency the bar is opaque and does not blur, and
@@ -7,7 +8,6 @@
 // dragged out as a picture; the select's chevron and the switch's thumb follow the page's direction; and a
 // plain `dialog` has no padding of the user agent's. The nodes are as the hosts write them.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

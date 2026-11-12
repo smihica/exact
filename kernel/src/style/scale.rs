@@ -145,8 +145,11 @@ pub fn substitute(expr: &str, column: Column) -> Option<String> {
 /// 32); `None` for a text that folds to no px.
 pub fn fold(text: &str) -> Option<f32> {
     match crate::style::calc::parse(text) {
-        // Past f32's range the calc saturates: no length a row reads back.
-        Ok(Some(crate::style::Dimension::Points(n))) if n.is_finite() && n.abs() < f32::MAX => {
+        // At the largest length the calc saturates (`calc::LARGEST`): no
+        // length a row reads back.
+        Ok(Some(crate::style::Dimension::Points(n)))
+            if n.is_finite() && f64::from(n.abs()) < crate::style::calc::LARGEST =>
+        {
             Some(n)
         }
         _ => None,

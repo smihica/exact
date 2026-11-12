@@ -231,8 +231,9 @@ pub trait Host<V> {
     fn load_param(&self, i: u64, pc: usize) -> Result<V, Trap>;
     /// The item, index or binding of the frame `depth` from the innermost.
     fn load_frame(&self, op: Opcode, depth: u64, pc: usize) -> Result<V, Trap>;
-    /// Whether resource `i` has a request in flight (`PendingResource`) or
-    /// failed (`FailedResource`).
+    /// Whether resource `i` has a request in flight (`PendingResource`),
+    /// failed (`FailedResource`), or shows an answer to its current call
+    /// arguments (`CurrentResource`).
     fn resource_flag(&self, op: Opcode, i: u64, pc: usize) -> Result<bool, Trap>;
     /// `none`, or `some` of why resource `i` failed (`FailureResource`).
     fn resource_failure(&mut self, i: u64, pc: usize) -> Result<V, Trap>;
@@ -752,7 +753,7 @@ pub fn exec<V: Val, H: Host<V>>(
             host.send(a0, ins.args[1], args);
         }
         Opcode::Refresh => host.refresh(a0),
-        Opcode::PendingResource | Opcode::FailedResource => {
+        Opcode::PendingResource | Opcode::FailedResource | Opcode::CurrentResource => {
             let flag = host.resource_flag(op, a0, pc)?;
             m.stack.push(V::boolean(flag));
         }

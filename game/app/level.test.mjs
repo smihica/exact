@@ -44,6 +44,14 @@ test('a level-only game bakes its declared type without an art directory', () =>
     expect(readFileSync(resolve(dir, '.shells/web/Cargo.toml'), 'utf8')).not.toContain('exact-data-host');
     const windows = Bun.TOML.parse(readFileSync(resolve(dir, '.shells/windows/Cargo.toml'), 'utf8'));
     expect(windows.dependencies['exact-linux'].workspace).toBe(true);
+    expect(windows.dependencies['ibex2-sqlite'].workspace).toBe(true);
+    for (const kind of ['apple', 'linux', 'windows', 'android']) {
+      const shell = Bun.TOML.parse(readFileSync(resolve(dir, `.shells/${kind}/Cargo.toml`), 'utf8'));
+      const deps = kind === 'android' ? shell.target['cfg(target_os = "android")'].dependencies : shell.dependencies;
+      expect(deps['exact-logic'].workspace).toBe(true);
+    }
+    const web = Bun.TOML.parse(readFileSync(resolve(dir, '.shells/web/Cargo.toml'), 'utf8'));
+    expect(web.dependencies['ibex2-sqlite']).toBeUndefined();
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
 

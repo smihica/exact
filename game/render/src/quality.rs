@@ -71,6 +71,15 @@ impl Rung {
                 }
             }
         }
+        // Local layers are memory a game's `Shadows` cannot know the device
+        // has: Low keeps today's 1024² (4 MiB a layer), Mid at most 2048².
+        let cap = if self.level == GpuTier::Low {
+            1024
+        } else {
+            2048
+        };
+        let local = &mut input.local_shadows.resolution;
+        *local = (*local).min(cap);
         // An inserted `AmbientOcclusion` is the game's, quality and all.
     }
 
@@ -207,5 +216,24 @@ mod tests {
         };
         Rung::resolve(Quality::Mid, GpuTier::High).clamp(&mut mid, false);
         assert_eq!(mid.sun.unwrap().shadows.unwrap().cascades, 1);
+    }
+
+    #[test]
+    fn a_rung_caps_local_shadow_layers_even_when_the_game_asked() {
+        let local = |level, resolution| {
+            let mut input = crate::FrameInput {
+                local_shadows: crate::LocalShadows {
+                    resolution,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Rung::resolve(level, GpuTier::High).clamp(&mut input, true);
+            input.local_shadows.resolution
+        };
+        assert_eq!(local(Quality::Low, 4096), 1024);
+        assert_eq!(local(Quality::Low, 512), 512);
+        assert_eq!(local(Quality::Mid, 4096), 2048);
+        assert_eq!(local(Quality::High, 4096), 4096);
     }
 }

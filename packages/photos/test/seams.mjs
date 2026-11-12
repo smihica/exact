@@ -22,6 +22,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 const here = import.meta.dir, root = resolve(here, '../../..');
 const engines = process.argv.slice(2).length ? process.argv.slice(2) : ['chromium', 'firefox', 'webkit', ...(process.platform === 'darwin' ? ['macos'] : [])];
@@ -145,7 +146,7 @@ component Fixture
 /** An app outside the repo with the package; `grants` its grant lines. */
 function makeApp(grants) {
   const dir = mkdtempSync(join(scratch, 'app-')), app = join(dir, 'swatchfixture');
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'mac'], root);
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
   write(app, {
@@ -157,6 +158,9 @@ function makeApp(grants) {
   manifest.dependencies = { ...manifest.dependencies, '@fixture/swatches': `file:${swatches}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   run('bun', ['exact.mjs', 'web-build', '--render', 'none'], app);
   return app;
 }
@@ -170,7 +174,7 @@ const img = (evaluate, testId) => evaluate(`(() => {
 
 const granted = makeApp('device.photos purpose.swatches');
 process.env.EXACT_APP_DIR = granted;
-process.env.EXACT2 = root;
+process.env.EXACT = root;
 const { open } = await import(resolve(root, 'scripts/agent.mjs'));
 const browserOf = { chromium: 'chrome', firefox: 'firefox', webkit: 'webkit' };
 

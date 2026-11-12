@@ -448,22 +448,65 @@ fn a_tool_s_sign_in_is_refused_person_required() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_dropped_sign_in_is_disposed_of_by_its_member() {
-    let (_app, mut host, data) = boot("dispose");
-    host.r.act("google", vec![]).unwrap();
-    host.pump();
-    let (ticket, _) = host.tickets()[0].clone();
-    host.r.act("idle", vec![]).unwrap();
-    host.pump();
-    host.r
-        .answer_hold(ticket, &HoldAnswer::Value(credential(GOOGLE)))
-        .unwrap();
-    host.pump();
-    let logs = host.logs();
-    assert!(
-        logs.contains("dispose sign-in h-1: its reply was dropped"),
-        "{logs}"
-    );
-    assert!(data.0.lock().unwrap().is_empty(), "no data code read it");
+    for bound in [false, true] {
+        let (_app, mut host, data) = boot("dispose");
+        let held: Arc<Mutex<Option<Reply>>> = Default::default();
+        let heard: Arc<Mutex<Vec<Json>>> = Default::default();
+        if bound {
+            let held = held.clone();
+            let heard = heard.clone();
+            host.r
+                .native_slot()
+                .host(Some(Arc::new(move |body: Vec<u8>, reply: Reply| {
+                    let body: Json = serde_json::from_slice(&body).unwrap();
+                    heard.lock().unwrap().push(body.clone());
+                    if body["send"] == "identity" {
+                        *held.lock().unwrap() = Some(reply);
+                    } else {
+                        reply.send(Outcome::Response(Response {
+                            status: 200,
+                            headers: vec![],
+                            body: b"{}".to_vec(),
+                        }));
+                    }
+                })));
+            host.r.bind_extensions(&["passkeys", "sign-in"], &[]);
+        }
+        host.r.act("google", vec![]).unwrap();
+        host.pump();
+        let ticket = host.tickets().first().map(|(ticket, _)| *ticket);
+        host.r.act("idle", vec![]).unwrap();
+        host.pump();
+        if bound {
+            held.lock()
+                .unwrap()
+                .take()
+                .expect("sign-in received the request")
+                .send(Outcome::Response(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: credential(GOOGLE).into_bytes(),
+                }));
+        } else {
+            host.r
+                .answer_hold(ticket.unwrap(), &HoldAnswer::Value(credential(GOOGLE)))
+                .unwrap();
+        }
+        host.pump();
+        let logs = host.logs();
+        assert!(
+            logs.contains("dispose sign-in h-1: its reply was dropped"),
+            "bound={bound}: {logs}"
+        );
+        assert!(data.0.lock().unwrap().is_empty(), "no data code read it");
+        if bound {
+            assert!(heard
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body == &json!({"extension": "sign-in", "dispose": ["h-1"]})));
+        }
+    }
 }
 
 /// D10 item 1, D12: Contract may not name the member, and two packages may
@@ -493,4 +536,157 @@ fn the_member_is_data_code_s_and_declared_once() {
         .map(|e| format!("{e:?}"))
         .unwrap_or_default();
     assert!(errors.contains("module-member-twice"), "{errors}");
+}
+
+/// A bound identity-only call reaches sign-in with the complete options.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bound_sign_in_goes_to_the_member_s_package() {
+    let (_app, mut host, _data) = boot("bound");
+    let heard: Arc<Mutex<Vec<Json>>> = Default::default();
+    let seen = heard.clone();
+    host.r
+        .native_slot()
+        .host(Some(Arc::new(move |body: Vec<u8>, reply: Reply| {
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            reply.send(Outcome::Response(Response {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            }));
+        })));
+    host.r.bind_extensions(&["passkeys", "sign-in"], &[]);
+    host.r.act("google", vec![]).unwrap();
+    host.pump();
+    let calls: Vec<Json> = (heard.lock().unwrap().iter())
+        .filter(|b| b["args"]["identity"].is_object())
+        .cloned()
+        .collect();
+    assert_eq!(calls.len(), 1, "{}", host.logs());
+    assert_eq!(calls[0]["extension"], "sign-in");
+    assert_eq!(calls[0]["send"], "identity");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bound_sign_in_preserves_options_and_combined_requests_stay_with_passkeys() {
+    let (_app, mut host, _) = boot("bound-options");
+    host.prefer(
+        "passkeys.getClientCapabilities",
+        json!({ "available": true }),
+    );
+    host.prefer("sign-in.getIdentityCapabilities", json!({ "providers": { "apple": { "active": true, "passive": true, "withPublicKey": true } } }));
+    let heard: Arc<Mutex<Vec<Json>>> = Default::default();
+    let seen = heard.clone();
+    host.r
+        .native_slot()
+        .host(Some(Arc::new(move |body: Vec<u8>, reply: Reply| {
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&body).unwrap());
+            reply.send(Outcome::Response(Response {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            }));
+        })));
+    host.r.bind_extensions(&["passkeys", "sign-in"], &[]);
+    let mut alone = google("web.apps.googleusercontent.com");
+    alone["args"]["mediation"] = json!("required");
+    host.answered(&alone);
+    let mut both = json!({ "extension": "passkeys", "send": "get", "args": {
+        "publicKey": { "challenge": "Z2V0", "rpId": "auth-fixture.exact.test" },
+        "identity": { "mode": "passive", "providers": [{ "configURL": APPLE, "clientId": "com.exact.authfixture.web" }] }
+    } });
+    host.answered(&both);
+    let calls: Vec<Json> = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c["args"]["identity"].is_object())
+        .cloned()
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["extension"], "sign-in");
+    assert_eq!(calls[0]["send"], "identity");
+    assert_eq!(calls[0]["args"], alone["args"]);
+    assert_eq!(calls[1]["extension"], "passkeys");
+    assert_eq!(calls[1]["send"], "get");
+    assert_eq!(calls[1]["args"], both["args"]);
+    alone["args"]["signal"] = json!("signal-1");
+    let unsupported = host.answered(&alone);
+    assert_eq!(unsupported["error"], "NotSupportedError");
+    assert!(unsupported["message"].as_str().unwrap().contains("signal"));
+    host.r.bind_extensions(&["passkeys"], &[]);
+    let answer = host.answered(&both);
+    assert!(answer["error"].is_null(), "{answer}");
+    let calls = heard.lock().unwrap();
+    let call = calls
+        .iter()
+        .rev()
+        .find(|c| c["args"]["identity"].is_object())
+        .unwrap();
+    assert_eq!(call["extension"], "passkeys");
+    assert_eq!(call["send"], "get");
+    assert_eq!(call["args"], both["args"]);
+    drop(calls);
+    both["args"]["publicKey"] = Json::Null;
+    let refused = host.answered(&both);
+    assert_eq!(refused["error"], "NotSupportedError");
+    assert!(refused["message"].as_str().unwrap().contains("identity"));
+    assert_eq!(
+        heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["args"]["identity"].is_object())
+            .count(),
+        3
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_superseded_bound_sign_in_cancels_its_member_request() {
+    let (_app, mut host, _) = boot("cancel-bound");
+    let heard: Arc<Mutex<Vec<Json>>> = Default::default();
+    let held: Arc<Mutex<Option<Reply>>> = Default::default();
+    let seen = heard.clone();
+    let wait = held.clone();
+    host.r
+        .native_slot()
+        .host(Some(Arc::new(move |body: Vec<u8>, reply: Reply| {
+            let body: Json = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push(body.clone());
+            if body["send"] == "identity" {
+                *wait.lock().unwrap() = Some(reply);
+            } else {
+                reply.send(Outcome::Response(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: b"{}".to_vec(),
+                }));
+            }
+        })));
+    host.r.bind_extensions(&["passkeys", "sign-in"], &[]);
+    host.r.act("google", vec![]).unwrap();
+    host.pump();
+    let request = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|b| b["send"] == "identity")
+        .unwrap()["request"]
+        .clone();
+    assert!(request.is_number());
+    host.r.act("idle", vec![]).unwrap();
+    host.pump();
+    let calls = heard.lock().unwrap();
+    let cancels: Vec<&Json> = calls.iter().filter(|b| b["cancel"].is_number()).collect();
+    assert_eq!(
+        cancels,
+        vec![&json!({"extension": "sign-in", "cancel": request})]
+    );
 }

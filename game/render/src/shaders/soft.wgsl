@@ -13,8 +13,7 @@ fn soft_color(v: QuadOut) -> vec4<f32> {
     let clip = frame.view_proj * vec4(v.world, 1.0);
     let ndc = vec3(clip.xy / clip.w, (d - soft.split.x) / (1.0 - soft.split.x));
     let h = soft.inverse_view_proj * vec4(ndc, 1.0);
-    let eye = frame.camera_alpha.xyz;
-    let gap = length(h.xyz / h.w - eye) - length(v.world - eye);
+    let gap = dot(v.world - h.xyz / h.w, view_direction(v.world));
     c.a *= clamp(gap / max(v.cutoff, 1e-4), 0.0, 1.0);
     return c;
 }

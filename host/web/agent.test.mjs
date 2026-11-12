@@ -1,4 +1,4 @@
-import { viewParent, viewChildren } from './navigation.js';
+import { viewParent, viewChildren } from './navigation/lists.js';
 // @ref LLP 1043.000 §3 D7/D8 — flow settlement must not change LLP 1012's API.
 import { test, expect } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
@@ -11,7 +11,9 @@ import { createHash } from 'node:crypto';
 import vm from 'node:vm';
 import { render, sourceMapReader, identifyInspectedNode, heldTicket, holdOf, pickedPaths } from '../../scripts/agent.mjs';
 import { retainDevGeneration, readDevGeneration, readDevGenerationAsync, serveBuildTree } from './serve.mjs';
-import { placeReporter, timeReporter, pageReporter, appRootFontSize, grantOrigins } from './navigation.js';
+import { placeReporter, timeReporter, pageReporter } from './navigation/environment.js';
+import { appRootFontSize } from './navigation/type.js';
+import { grantOrigins } from './navigation/grant-origins.js';
 import { storageKey } from './storage-environment.js';
 import { open } from '../../scripts/agent.mjs';
 import { launchFacts, launchEnvironment, parseFlags } from '../../scripts/agent-launch.mjs';
@@ -727,6 +729,7 @@ function inputFixture() {
     addEventListener(kind, fn) { const list = windowListeners.get(kind) ?? []; list.push(fn); windowListeners.set(kind, list); },
     removeEventListener(kind, fn) { windowListeners.set(kind, (windowListeners.get(kind) ?? []).filter(g => g !== fn)); },
   });
+  f.host = f;
   inputScript.runInContext(f);
   f.attach(el, 7, ['pan']);
   function event(extra = {}) {
@@ -896,6 +899,7 @@ async function startupFixture(rustOnly = false, served = null, timerFirst = fals
       throw new Error('unexpected startup module: ' + file);
     },
   });
+  f.host = f;
   f.exact = served ? { documentPage: { connect: () => ({ started: Promise.resolve(), ...served }) } } : {}; // a served document's capture (document-glue.js)
   // navigation.js's export, which a context global would confuse with the browser's own `globalThis.navigation`.
   vm.runInContext([source.match(/^const AGENT_ADMITTED = .*$/m)[0], "const navigation = { activate: () => events.push('navigation') };", ...['setInputReady', 'activateData', 'main'].map(declaration)].join('\n')

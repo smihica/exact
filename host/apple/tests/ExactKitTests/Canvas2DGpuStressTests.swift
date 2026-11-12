@@ -48,6 +48,36 @@ final class Canvas2DGpuStressTests: XCTestCase {
         return [base[at + 2], base[at + 1], base[at], base[at + 3]] // BGRA → RGBA
     }
 
+    func testCurrentAndSavedFontsDrawInLaterJobs() throws {
+        guard Canvas2DGpuModule.shared != nil else { throw XCTSkip("the Canvas 2D GPU module is not built") }
+        let host = Canvas2DHost(), parent = CALayer(), engine = TextEngine(resolve: { _ in nil })
+        host.textEngine = { engine }
+        func font(_ size: Double) -> (Canvas2DOp, [Double]) {
+            (.font, [size, 400, 0, 100, 0, 0, 0, 0, 0] + "system-ui".unicodeScalars.map { Double($0.value) })
+        }
+        let cover: [(Canvas2DOp, [Double])] = [(.fillColor, [255, 255, 255, 1]), (.fillRect, [0, 0, 60, 40])]
+        let text: [(Canvas2DOp, [Double])] = [(.fillColor, [0, 0, 0, 1]), (.fillText, [2, 30, 1, 0, 72, 105])]
+        func draw(_ records: [(Canvas2DOp, [Double])], fresh: Bool = false) throws -> Data {
+            host.apply(7, payload(1, generation: 0, fresh: fresh, lists: [list(cover + records + text)]), layer: parent)
+            waitFor("GPU text replay") { host.loadingCount == 0 }
+            let surface = try XCTUnwrap(parent.sublayers?.first?.contents as? IOSurface)
+            surface.lock(options: .readOnly, seed: nil)
+            defer { surface.unlock(options: .readOnly, seed: nil) }
+            var data = Data()
+            for y in 0..<surface.height {
+                data.append(Data(bytes: surface.baseAddress.advanced(by: y * surface.bytesPerRow), count: surface.width * 4))
+            }
+            XCTAssertTrue(data.contains(0), "black glyphs draw over the white canvas")
+            return data
+        }
+        let large = try draw([font(20), (.save, [])], fresh: true)
+        let small = try draw([font(12)])
+        XCTAssertNotEqual(large, small)
+        XCTAssertEqual(try draw([]), small, "the current font survives a job with no font record")
+        XCTAssertEqual(try draw([(.restore, [])]), large, "a later job restores the saved font")
+        host.forget(7)
+    }
+
     func testPresentersReplayConcurrentlyThroughOneModule() throws {
         guard Canvas2DGpuModule.shared != nil else { throw missing("module", "no Canvas 2D GPU module (EXACT_CANVAS_GPU_DYLIB)") }
         let presenters = 4, canvases = 8, rounds = 120

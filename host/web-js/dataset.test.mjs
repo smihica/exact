@@ -1,3 +1,4 @@
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
@@ -5,7 +6,7 @@ test('structural selectors retain the front modal and later popovers, with modal
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/dataset.js') return new Response(Bun.file(new URL('./dataset.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../web/navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../web/navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     return new Response(`<main id="exact-root">
       <div id="page" data-mood="accent"></div>
       <div id="ancestor">
@@ -85,7 +86,7 @@ test('dialog modality excludes fullscreen and orders nested or intercepted openi
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/dataset.js') return new Response(Bun.file(new URL('./dataset.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../web/navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../web/navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     return new Response(`<main id="exact-root">
       <div id="page" data-mood="accent"></div>
       <video id="video"></video>
@@ -141,7 +142,7 @@ test('unobserved modals rank below observed openings and auto popovers replace t
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/dataset.js') return new Response(Bun.file(new URL('./dataset.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../web/navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../web/navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     return new Response(`<main id="exact-root">
       <div id="page" data-mood="accent"></div>
       <dialog id="d" data-mood="accent"></dialog>

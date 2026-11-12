@@ -999,7 +999,7 @@ impl<D: DataSource> Presenter<D> {
         {
             return;
         }
-        let (textarea, limit, readonly) = {
+        let (textarea, limit, readonly, number) = {
             let Some(node) = self.host.kernel().node(id) else {
                 return;
             };
@@ -1010,6 +1010,7 @@ impl<D: DataSource> Presenter<D> {
                 node.props.str(PropId::SemanticTag) == Some("textarea"),
                 exact_kernel::control::text_maxlength(node.props),
                 node.props.bool(PropId::Editable) == Some(false),
+                number::Number::of(node.props),
             )
         };
         // What earlier commits replaced goes first: this edit starts from what shows.
@@ -1018,6 +1019,16 @@ impl<D: DataSource> Presenter<D> {
         let selection = self.field_selection(id);
         // A Control or Meta chord types nothing, as in a browser.
         let chord = self.held & 0b1100_1100 != 0;
+        // A number field's vertical arrows step it (`number.rs`).
+        if let Some(number) = number
+            .as_ref()
+            .filter(|_| !chord && matches!(name, "ArrowUp" | "ArrowDown"))
+        {
+            if !readonly {
+                self.step_number(id, number, &value, name == "ArrowUp", now_ms);
+            }
+            return;
+        }
         if matches!(
             name,
             "ArrowLeft" | "ArrowRight" | "Home" | "End" | "ArrowUp" | "ArrowDown"
@@ -1068,7 +1079,20 @@ impl<D: DataSource> Presenter<D> {
                     None => return,
                 }
             }
-            s if s.chars().count() == 1 && !chord => replace(&value, selection, s),
+            s if s.chars().count() == 1 && !chord => match &number {
+                Some(_) => {
+                    let (start, end) = (
+                        byte_at(&value, selection.start),
+                        byte_at(&value, selection.end),
+                    );
+                    let taken = number::insertion(s, &value, start, end);
+                    if taken.is_empty() {
+                        return;
+                    }
+                    replace(&value, selection, &taken)
+                }
+                None => replace(&value, selection, s),
+            },
             _ => return,
         };
         // maxlength stops typing that would lengthen past it, as HTML's does.
@@ -1106,7 +1130,7 @@ impl<D: DataSource> Presenter<D> {
     /// its selection (a field's own paste still inserts, beside any `paste`
     /// handler), within its `maxlength`.
     pub(crate) fn paste_field(&mut self, id: ViewId, text: &str, now_ms: f64) {
-        let limit = {
+        let (limit, number) = {
             let Some(node) = self.host.kernel().node(id) else {
                 return;
             };
@@ -1116,11 +1140,30 @@ impl<D: DataSource> Presenter<D> {
             {
                 return;
             }
-            exact_kernel::control::text_maxlength(node.props)
+            (
+                exact_kernel::control::text_maxlength(node.props),
+                number::Number::of(node.props).is_some(),
+            )
         };
         self.forget_replaced_choices();
         let value = self.field_text(id);
         let selection = self.field_selection(id);
+        let numeric;
+        let text = match number {
+            true => {
+                let (start, end) = (
+                    byte_at(&value, selection.start),
+                    byte_at(&value, selection.end),
+                );
+                numeric = number::insertion(text, &value, start, end);
+                // Nothing a number takes leaves the field as it was.
+                if numeric.is_empty() && !text.is_empty() {
+                    return;
+                }
+                &numeric
+            }
+            false => text,
+        };
         let text = fit(text, &value, selection, limit).to_owned();
         let (next, after) = replace(&value, selection, &text);
         if let Some(e) = self.edit_field(

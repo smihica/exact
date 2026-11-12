@@ -123,6 +123,9 @@ extension NodeView {
     var textAlignmentCode: Int {
         TextStyle.alignment(style)
     }
+    /// The props a paragraph's spec reads (`paragraphSpec`): setting one
+    /// invalidates what was laid out from the old value, whoever asked first.
+    static let paragraphProps: Set<String> = ["text", "markup", "atoms", "atomFaces", "atomStyles", "href", "fitScale"]
     func paragraphSpec() -> Spec {
         if let spec = cachedTextSpec { return spec }
         #if os(macOS)
@@ -150,7 +153,7 @@ extension NodeView {
                                       rtl: style["direction"]?.string == "rtl")
             runs = MarkdownLink.installed?.expand(source, base: base, color: textChannels("text_color", dark: night),
                                                   boldText: text?.boldTextSteps(base.family) == true, atoms: atoms) ?? [textRun(source)]
-            if style["visibility"]?.string == "hidden" { for i in runs.indices { runs[i].hidden = true } }
+            if cssVisibilityHidden { for i in runs.indices { runs[i].hidden = true } }
             // `currentcolor` in a shadow or stroke is each piece's own colour.
             let rows = RunPaintRows(style), own = channels("text_color", dark: night) ?? SystemColor.canvasTextChannels(dark: night, contrast: contrast)
             for i in runs.indices { (runs[i].shadow, runs[i].stroke) = rows.resolve(dark: night, contrast: contrast, elevated: elevated, tint: tint, color: runs[i].color ?? own) }

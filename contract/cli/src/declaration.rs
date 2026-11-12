@@ -782,6 +782,12 @@ fn substitute(entry: &Value, interface: &Value) -> Result<String, String> {
                 b.insert(key.into(), v.clone());
             }
         }
+        if let (Some(min), Some(max)) = (ty["min"].as_f64(), ty["max"].as_f64()) {
+            check(
+                min <= max,
+                &format!("option `{option}`'s `min` ({min}) must not exceed its `max` ({max})"),
+            )?;
+        }
         bounds.insert(option.clone(), Value::Object(b));
     }
     if !bounds.is_empty() {

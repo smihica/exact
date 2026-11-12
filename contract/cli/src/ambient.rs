@@ -16,39 +16,58 @@ pub(crate) fn check(input: &Path) -> Vec<contract::CompileError> {
     let bun = std::env::var_os("BUN")
         .map(PathBuf::from)
         .or_else(|| {
-            let path = PathBuf::from(std::env::var_os("HOME")?).join(".bun-1.4.2/bin/bun");
+            let pin = include_str!("../../../package.json")
+                .split("bun@")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            let path = PathBuf::from(std::env::var_os("HOME")?).join(format!(".bun-{pin}/bin/bun"));
             path.is_file().then_some(path)
         })
         .unwrap_or_else(|| "bun".into());
-    let output = Command::new(bun)
+    let output = Command::new(&bun)
         .arg(root.join("js/bake/src/typescript.mjs"))
         .arg("--ambient")
         .arg(app)
         .output();
-    let failure = |message: String| {
+    let failure = |message: String, file: Option<PathBuf>| {
         vec![contract::CompileError {
             pass: "analyze",
             id: "analyze-ambient-api".into(),
             message,
             span: contract_syntax::Span::default(),
-            file: Some(app.join("app.ts").into_boxed_path()),
+            file: file.map(PathBuf::into_boxed_path),
             related: Box::new([]),
         }]
     };
     let output = match output {
         Ok(output) => output,
-        Err(error) => return failure(format!("ambient API check: {error}")),
+        Err(error) => {
+            let bun = bun.display();
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{bun}: not found; the bake runs Bun (install it, put ~/.bun/bin on PATH, or name it with BUN)")
+            } else {
+                format!("{bun}: {error}")
+            };
+            return failure(format!("ambient API check: {message}"), None);
+        }
     };
     if !output.status.success() {
         let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return failure(said.clone() + &ignored_hint(app, &said));
+        return failure(
+            said.clone() + &ignored_hint(app, &said),
+            Some(app.join("app.ts")),
+        );
     }
     let found: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
         Ok(found) => found,
         Err(error) => {
-            return failure(format!(
-                "ambient API check: invalid diagnostic reply: {error}"
-            ))
+            return failure(
+                format!("ambient API check: invalid diagnostic reply: {error}"),
+                Some(app.join("app.ts")),
+            )
         }
     };
     found

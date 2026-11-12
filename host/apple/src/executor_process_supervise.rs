@@ -16,6 +16,10 @@ use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How often a closed incarnation whose group lives looks at it again.
+const GROUP_POLL: Duration = Duration::from_millis(10);
 
 /// What a supervisor sees of its child: output, its exit, a pipe at end of
 /// file (`None` for both at once), or its stdin queue drained below the
@@ -111,13 +115,22 @@ struct Utf8(Vec<u8>);
 impl Utf8 {
     fn decode(&mut self, bytes: &[u8]) -> String {
         self.0.extend_from_slice(bytes);
-        let valid = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            Err(_) => self.0.len(),
-        };
-        let text = String::from_utf8_lossy(&self.0[..valid]).into_owned();
-        self.0.drain(..valid);
+        let mut complete = 0;
+        while complete < self.0.len() {
+            match std::str::from_utf8(&self.0[complete..]) {
+                Ok(_) => {
+                    complete = self.0.len();
+                    break;
+                }
+                Err(e) => {
+                    complete += e.valid_up_to();
+                    let Some(len) = e.error_len() else { break };
+                    complete += len;
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&self.0[..complete]).into_owned();
+        self.0.drain(..complete);
         text
     }
 
@@ -470,7 +483,13 @@ impl<'a> Supervisor<'a> {
             .flatten()
             .reduce(f64::min);
             self.clock.wait_for(self.waiter, deadline);
-            let input = match self.rx.recv_timeout(self.clock.timeout(deadline)) {
+            let mut wait = self.clock.timeout(deadline);
+            if closed {
+                // Its group is alive and its escalation pending. The group's
+                // end sends no input, so look at it again in short steps.
+                wait = wait.min(GROUP_POLL);
+            }
+            let input = match self.rx.recv_timeout(wait) {
                 Ok(input) => input,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => Input::Release,
@@ -673,4 +692,42 @@ pub(crate) fn exec_reply(
         "timedOut": timed_out,
         "overflow": overflow,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8;
+
+    #[test]
+    fn utf8_keeps_a_split_character_after_invalid_bytes() {
+        let mut decoder = Utf8::default();
+        assert_eq!(decoder.decode(b"\xffab\xe2\x82"), "\u{fffd}ab");
+        assert_eq!(decoder.decode(b"\xac!"), "€!");
+        assert_eq!(decoder.flush(), "");
+
+        for character in ["¢", "€", "😀"] {
+            let bytes = character.as_bytes();
+            for split in 1..bytes.len() {
+                let mut decoder = Utf8::default();
+                let mut first = b"\xffab\xe2\x82x".to_vec();
+                first.extend_from_slice(&bytes[..split]);
+                assert_eq!(decoder.decode(&first), "\u{fffd}ab\u{fffd}x");
+                assert_eq!(decoder.decode(&[]), "");
+                assert_eq!(decoder.decode(&bytes[split..]), character);
+                assert_eq!(decoder.flush(), "");
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_replaces_invalid_sequences_and_flushes_an_incomplete_tail_once() {
+        let mut decoder = Utf8::default();
+        assert_eq!(decoder.decode(b"\xff\xe2"), "\u{fffd}");
+        assert_eq!(decoder.decode(b"\x82"), "");
+        assert_eq!(decoder.decode(b"x\xf0\x90\x80"), "\u{fffd}x");
+        assert_eq!(decoder.decode(b"!ok\x80\xe2\x82"), "\u{fffd}!ok\u{fffd}");
+        assert_eq!(decoder.flush(), "\u{fffd}");
+        assert_eq!(decoder.flush(), "");
+        assert_eq!(decoder.decode("valid €".as_bytes()), "valid €");
+    }
 }

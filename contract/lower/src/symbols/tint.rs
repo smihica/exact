@@ -14,25 +14,20 @@
 
 use crate::warnings::TextStyles;
 use crate::LowerError;
-use contract_syntax::{Attr, Expr, Node, StyleDecl, TemplatePart};
+use contract_syntax::{Attr, Expr, File, Node, StyleDecl, TemplatePart};
 use std::collections::BTreeSet;
 
 /// Every tinted symbol under `nodes`, once per source place (a component used
-/// twice is inlined twice): `styles` are the file's classes, `lowered` what
+/// twice is inlined twice): `file` holds the classes and params, `lowered` what
 /// lowering made of each element (whether a button is the platform's own).
-pub(crate) fn tints(
-    nodes: &[Node],
-    styles: &[StyleDecl],
-    lowered: &TextStyles,
-    out: &mut Vec<LowerError>,
-) {
+pub(crate) fn tints(nodes: &[Node], file: &File, lowered: &TextStyles, out: &mut Vec<LowerError>) {
     let (mut seen, mut faces, mut found) = (BTreeSet::new(), BTreeSet::new(), Vec::new());
     let mut made = std::collections::HashMap::new();
     walk(
         nodes,
         false,
         &mut Pass {
-            styles,
+            styles: &file.styles,
             lowered,
             made: &mut made,
             seen: &mut seen,
@@ -40,12 +35,17 @@ pub(crate) fn tints(
             out: &mut found,
         },
     );
+    if found.is_empty() {
+        return;
+    }
+    let params = crate::params::Shown::local(&crate::params::tokens(file));
     // A row a native face also takes (a class, a component's image) keeps its tint there: the
     // repair is a `color` for the use that is no face, not that row's rewrite.
     for mut warning in found {
         if faces.contains(&place(warning.span)) {
             warning.message = format!("{} (this row also colours a native button's face, which takes `-exact-tint-color` and refuses `color`: give this image its own `color`, or its own class)", warning.message.split("; ").next().unwrap_or_default());
         }
+        warning.message = params.text(&warning.message);
         out.push(warning);
     }
 }

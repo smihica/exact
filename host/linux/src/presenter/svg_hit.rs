@@ -40,6 +40,7 @@ impl<D: DataSource> Presenter<D> {
             content,
             &|id| self.host.presented(id),
             &|id| self.host.presented_path(id),
+            self.dark(),
         );
         scene
             .hit((x - b.rect.0 - content.0, y - b.rect.1 - content.1))

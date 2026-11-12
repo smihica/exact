@@ -28,6 +28,7 @@ fn main() {
         "map_demo_data::Map",
         "map_demo_data::Map",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

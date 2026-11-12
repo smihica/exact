@@ -423,7 +423,8 @@ impl SharedStyles {
 
 /// A hash of the rows most styles differ in; equality decides the rest.
 pub(crate) fn engine_hash(s: &taffy::Style) -> u64 {
-    use std::hash::Hasher;
+    use std::hash::Hash;
+    use taffy::style::GridPlacement;
     let mut h = crate::id::IdHasher::default();
     let mut len = |l: taffy::CompactLength| {
         h.write_u64(((l.tag() as u64) << 32) | u64::from(l.value().to_bits()));
@@ -432,12 +433,44 @@ pub(crate) fn engine_hash(s: &taffy::Style) -> u64 {
     len(s.size.height.into_raw());
     len(s.min_size.width.into_raw());
     len(s.min_size.height.into_raw());
+    len(s.max_size.width.into_raw());
+    len(s.max_size.height.into_raw());
     len(s.flex_basis.into_raw());
+    len(s.inset.left.into_raw());
+    len(s.inset.right.into_raw());
+    len(s.inset.top.into_raw());
+    len(s.inset.bottom.into_raw());
     len(s.margin.left.into_raw());
+    len(s.margin.right.into_raw());
     len(s.margin.top.into_raw());
+    len(s.margin.bottom.into_raw());
     len(s.padding.left.into_raw());
+    len(s.padding.right.into_raw());
     len(s.padding.top.into_raw());
+    len(s.padding.bottom.into_raw());
     len(s.gap.width.into_raw());
+    len(s.gap.height.into_raw());
+    for placement in [
+        &s.rare.grid_row.start,
+        &s.rare.grid_row.end,
+        &s.rare.grid_column.start,
+        &s.rare.grid_column.end,
+    ] {
+        std::mem::discriminant(placement).hash(&mut h);
+        match placement {
+            GridPlacement::Auto => {}
+            GridPlacement::Line(line) => line.as_i16().hash(&mut h),
+            GridPlacement::Span(span) => span.hash(&mut h),
+            GridPlacement::NamedLine(name, line) => {
+                name.hash(&mut h);
+                line.hash(&mut h);
+            }
+            GridPlacement::NamedSpan(name, span) => {
+                name.hash(&mut h);
+                span.hash(&mut h);
+            }
+        }
+    }
     h.write_u64(u64::from(s.flex_grow.to_bits()) << 32 | u64::from(s.flex_shrink.to_bits()));
     h.write_u64(
         (s.display as u64)
@@ -453,6 +486,114 @@ mod tests {
     use super::*;
     use crate::style::Dimension;
     use crate::{StyleId, StyleMask, StyleValue};
+
+    fn engine_comparisons(styles: impl IntoIterator<Item = taffy::Style>) -> usize {
+        let mut table = Interner::default();
+        let mut comparisons = 0;
+        // Keep every style live across the interner's sweeps, as mounted nodes do.
+        let held: Vec<_> = styles
+            .into_iter()
+            .map(|style| {
+                let hash = engine_hash(&style);
+                assert!(table
+                    .get(hash, |other| {
+                        comparisons += 1;
+                        *other == style
+                    })
+                    .is_none());
+                table.insert(hash, style)
+            })
+            .collect();
+        for style in &held {
+            let found = table
+                .get(engine_hash(style), |other| {
+                    comparisons += 1;
+                    *other == **style
+                })
+                .unwrap();
+            assert!(Rc::ptr_eq(style, &found));
+        }
+        comparisons
+    }
+
+    #[test]
+    fn engine_length_lookups_take_linear_comparisons() {
+        use taffy::prelude::length;
+        type Change = fn(&mut taffy::Style, f32);
+        let cases: &[(&str, Change)] = &[
+            ("width", |s, v| s.size.width = length(v)),
+            ("left", |s, v| s.inset.left = length(v)),
+            ("right", |s, v| s.inset.right = length(v)),
+            ("top", |s, v| s.inset.top = length(v)),
+            ("bottom", |s, v| s.inset.bottom = length(v)),
+            ("max-width", |s, v| s.max_size.width = length(v)),
+            ("max-height", |s, v| s.max_size.height = length(v)),
+            ("margin-right", |s, v| s.margin.right = length(v)),
+            ("margin-bottom", |s, v| s.margin.bottom = length(v)),
+            ("padding-right", |s, v| s.padding.right = length(v)),
+            ("padding-bottom", |s, v| s.padding.bottom = length(v)),
+            ("row-gap", |s, v| s.gap.height = length(v)),
+        ];
+        let mut failures = Vec::new();
+        for &(name, change) in cases {
+            for n in [128, 256] {
+                let comparisons = engine_comparisons((1..=n).map(|i| {
+                    let mut style = taffy::Style::DEFAULT;
+                    change(&mut style, i as f32);
+                    style
+                }));
+                if comparisons > 2 * n {
+                    failures.push(format!("{name}: {n} styles, {comparisons} comparisons"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn engine_grid_lookups_take_linear_comparisons() {
+        use taffy::prelude::{line, span, GridPlacement};
+        let mut failures = Vec::new();
+        for position in ["row-start", "row-end", "column-start", "column-end"] {
+            for kind in [
+                "line",
+                "negative-line",
+                "span",
+                "name",
+                "named-line",
+                "named-span",
+            ] {
+                for n in [128, 256] {
+                    let comparisons = engine_comparisons((1..=n).map(|i| {
+                        let mut style = taffy::Style::DEFAULT;
+                        let placement = match kind {
+                            "line" => line(i as i16),
+                            "negative-line" => line(-(i as i16)),
+                            "span" => span(i as u16),
+                            "name" => GridPlacement::NamedLine(format!("track-{i}"), 1),
+                            "named-line" => GridPlacement::NamedLine("track".into(), i as i16),
+                            "named-span" => GridPlacement::NamedSpan("track".into(), i as u16),
+                            _ => unreachable!(),
+                        };
+                        *match position {
+                            "row-start" => &mut style.rare.grid_row.start,
+                            "row-end" => &mut style.rare.grid_row.end,
+                            "column-start" => &mut style.rare.grid_column.start,
+                            "column-end" => &mut style.rare.grid_column.end,
+                            _ => unreachable!(),
+                        } = placement;
+                        style
+                    }));
+                    if comparisons > 2 * n {
+                        failures.push(format!(
+                            "{position} {kind}: {n} styles, {comparisons} comparisons"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn overlay_sharing_preserves_explicit_authorship() {

@@ -1,11 +1,12 @@
-//! The declarations whose clauses order work: `mutation` (its reply, what it
-//! refreshes, its `then`, and whether its sends wait their turn) and `task`
-//! (its schedule).
+//! The declarations whose clauses follow a call or a shape: `resource` (its
+//! source, list, context, placeholder and whether its answer is kept),
+//! `mutation` (its reply, what it refreshes, its `then`, and whether its sends
+//! wait their turn) and `task` (its schedule).
 
 use super::*;
 
 impl Parser {
-    /// `mutation NAME as shape T [queue] [refreshes a, b] [then action]`.
+    /// `mutation NAME as shape T [queue | parallel] [refreshes a, b] [then action]`.
     /// The clauses after the shape may continue on deeper-indented lines, in
     /// the same order (the codeedit diary: `then` on the next line was
     /// `syntax-expected-section`).
@@ -16,10 +17,16 @@ impl Parser {
         self.expect_word("shape")?;
         let shape = self.type_expr()?;
         let mut continued = false;
-        // @ref LLP 1092 D1 — a keyword only here: every send of the
-        // mutation waits for the one before it.
-        let queue = self.clause_ahead("queue", &mut continued);
-        if queue {
+        // @ref LLP 1092 D1, LLP 1161.000 D1 — keywords only here: every
+        // send of the mutation waits for the one before it, or none waits.
+        let mode = if self.clause_ahead("queue", &mut continued) {
+            MutationMode::Queue
+        } else if self.clause_ahead("parallel", &mut continued) {
+            MutationMode::Parallel
+        } else {
+            MutationMode::Newest
+        };
+        if mode != MutationMode::Newest {
             self.next();
         }
         let mut refreshes = Vec::new();
@@ -34,7 +41,7 @@ impl Parser {
         }
         if !refreshes.is_empty()
             && matches!(self.peek_kind(), TokenKind::Ident(word)
-                if !matches!(word.as_str(), "queue" | "refreshes" | "then"))
+                if !matches!(word.as_str(), "queue" | "parallel" | "refreshes" | "then"))
         {
             return self.err(
                 "syntax-expected-newline",
@@ -47,8 +54,9 @@ impl Parser {
         } else {
             None
         };
-        // A clause out of order (r32 t4 wrote `refreshes cards queue`).
-        if let Some(word) = ["queue", "refreshes", "then"]
+        // A clause out of order (r32 t4 wrote `refreshes cards queue`), or
+        // both modes.
+        if let Some(word) = ["queue", "parallel", "refreshes", "then"]
             .into_iter()
             .find(|w| self.at_ident(w))
         {
@@ -56,7 +64,7 @@ impl Parser {
                 "syntax-expected-newline",
                 format!(
                     "`{word}` is out of place: a mutation's clauses go `as shape T`, then \
-                     `queue`, then `refreshes a, b`, then `then action`, each at most once"
+                     `queue` or `parallel`, then `refreshes a, b`, then `then action`, each at most once"
                 ),
             );
         }
@@ -65,7 +73,7 @@ impl Parser {
             return self.err(
                 "syntax-expected",
                 format!(
-                    "a mutation's continued lines hold `queue`, `refreshes …` and `then …`, in that order; found {}",
+                    "a mutation's continued lines hold `queue` or `parallel`, `refreshes …` and `then …`, in that order; found {}",
                     describe(self.peek_kind())
                 ),
             );
@@ -76,9 +84,123 @@ impl Parser {
         Ok(MutationDecl {
             name,
             shape,
-            queue,
+            mode,
             refreshes,
             then,
+            span,
+        })
+    }
+
+    pub(super) fn resource(&mut self) -> R<ResourceDecl> {
+        let span = self.expect_word("resource")?;
+        let name = self.named_ident(span)?;
+        self.expect_punct("=")?;
+        let source = self.source_ident(span)?;
+        self.expect_punct("(")?;
+        let mut args = self.call_args()?;
+        // @ref LLP 1017.000 P4c (amended 2026-11-04) — one request for each
+        // element of a list, keyed as a `for` row is.
+        let each = if self.at_ident("for") {
+            let at = self.next().span;
+            let item = self.named_ident(at)?;
+            self.expect_word("in")?;
+            let list = self.expr()?;
+            let key = if self.at_ident("key") {
+                self.next();
+                self.expect_punct("=")?;
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            if self.at_ident("with") {
+                return self.err(
+                    "syntax-resource-for-with",
+                    "a resource over a list takes no `with`: write the context among the call's arguments",
+                );
+            }
+            Some(ResourceEach {
+                item,
+                list,
+                key,
+                span: at,
+            })
+        } else {
+            None
+        };
+        // @ref LLP 1027.005 D1/D6 — context remains ordinary source arguments.
+        let identity = if self.at_ident("with") {
+            self.next();
+            let identity = args.len();
+            loop {
+                args.push(self.expr()?);
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            Some(identity)
+        } else {
+            None
+        };
+        // @ref LLP 1161.002 D1 — asked only while the condition holds.
+        let gate = if self.at_ident("when") {
+            if each.is_some() {
+                return self.err(
+                    "syntax-resource-for-when",
+                    "a resource over a list takes no `when`: its list already leaves out what it should not ask",
+                );
+            }
+            self.next();
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        self.expect_word("as")?;
+        self.expect_word("shape")?;
+        let shape = self.type_expr()?;
+        // @ref LLP 1048.003 D6 — what shows until the source answers.
+        let placeholder = if self.at_ident("else") {
+            if each.is_some() {
+                return self.err(
+                    "syntax-resource-for-else",
+                    "a resource over a list takes no `else`: each element shows its shape's zero until its answer",
+                );
+            }
+            self.next();
+            let at = self.peek().span;
+            if !matches!(self.peek_kind(), TokenKind::Ident(_)) {
+                // `else []`, `else ""` (app farm round 1): a value, where a call goes.
+                return self.err(
+                    "syntax-placeholder-call",
+                    "a resource's `else` is a call: `else empty()` is its shape's zero (`[]` for a list, `\"\"` for text), with `field=constant` overrides for a record, or `else source(values…)`",
+                );
+            }
+            let source = self.source_ident(at)?;
+            self.expect_punct("(")?;
+            let args = self.call_args()?;
+            Some(Placeholder {
+                source,
+                args,
+                span: at,
+            })
+        } else {
+            None
+        };
+        // @ref LLP 1156.005 D4 — an answer the device's store never keeps.
+        let transient = self.at_ident("transient");
+        if transient {
+            self.next();
+        }
+        self.newline()?;
+        Ok(ResourceDecl {
+            name,
+            source,
+            args,
+            identity,
+            shape,
+            placeholder,
+            each,
+            transient,
+            gate,
             span,
         })
     }

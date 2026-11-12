@@ -227,6 +227,112 @@ fn the_window_says_a_tempo_from_thirteen_packet_leading_ticks() {
 }
 
 #[test]
+fn a_clock_burst_keeps_the_prior_or_last_valid_tempo() {
+    for gap in [0.999, 0.001, 0.000_001, f64::MIN_POSITIVE] {
+        let mut f = Follow::new("clk", 90.0, 0.0);
+        let mut log = Vec::new();
+        f.feed(&ticks(0.0, gap, 29), "s", &mut log);
+        assert_eq!((f.estimate, f.tempo()), (None, 90.0), "gap {gap}");
+        f.feed(&ticks(1000.0, 1.0, 48), "s", &mut log);
+        assert_eq!(f.estimate, Some(2500.0), "the bound is admitted");
+        f.feed(&ticks(2000.0, gap, 29), "s", &mut log);
+        assert_eq!(f.estimate, Some(2500.0), "gap {gap}");
+        f.feed(&ticks(3000.0, 25.0, 48), "s", &mut log);
+        assert_eq!(f.estimate, Some(100.0), "a valid clock recovers");
+    }
+}
+
+#[test]
+fn a_clock_burst_after_a_gap_does_not_expand_the_fill() {
+    let mut r = boot(SOURCE);
+    r.act("start", vec![]).unwrap();
+    r.land_then();
+    now(&mut r, 0xFA);
+    clock(&mut r, 120.0, 2000.0);
+    r.advance(2600.0).unwrap();
+    let before = r.transport().follower().unwrap().estimate;
+    r.take_midi();
+    let burst: Vec<_> = (0..29)
+        .map(|k| (2600.0 - f64::from(28 - k) * 0.001, 0xF8))
+        .collect();
+    deliver(&mut r, &burst);
+    assert_eq!(r.transport().follower().unwrap().estimate, before);
+    r.advance(2800.0).unwrap();
+    let sent = r
+        .take_midi()
+        .iter()
+        .filter(|op| matches!(op, MidiOp::Send { .. }))
+        .count();
+    assert!(sent <= 4, "a one-beat track sent {sent} messages");
+}
+
+#[test]
+fn a_followed_tempo_bounds_tracks_at_start_reanchor_and_edit() {
+    for when in ["start", "reanchor", "edit"] {
+        let source = SOURCE
+            .replace(
+                "state prior = 120",
+                "state prior = 120\n  state length = 0.004\n  action shorten\n    length = 0.004",
+            )
+            .replace("Track(beats=1,", "Track(beats=length,");
+        let source = if when == "edit" {
+            source.replace("state length = 0.004", "state length = 1")
+        } else {
+            source
+        };
+        let mut r = boot(&source);
+        r.act("start", vec![]).unwrap();
+        r.land_then();
+        if when != "start" {
+            now(&mut r, 0xFA);
+        }
+        clock(&mut r, 1250.0, 50.0);
+        match when {
+            "start" => now(&mut r, 0xFA),
+            "edit" => {
+                r.act("shorten", vec![]).unwrap();
+                r.land_then();
+            }
+            _ => {}
+        }
+        assert!(
+            said(&r)
+                .iter()
+                .any(|line| line.contains("would loop more than 1000 times a second")),
+            "{when}: no track was dropped"
+        );
+        r.advance(200.0).unwrap();
+        assert_eq!(answered(&r)[0], Value::str("stopped"), "{when}");
+        assert_eq!(answered(&r)[1], Value::str("ended"), "{when}");
+    }
+}
+
+#[test]
+fn dropping_a_fast_track_keeps_the_other_tracks_hits_and_end() {
+    let source = SOURCE.replace(
+        "Track(beats=1, loops=loops, offset=0, output=\"synth\", steps=[kick(0)])",
+        "Track(beats=0.004, loops=0, offset=0, output=\"synth\", steps=[kick(0)]), Track(beats=1, loops=2, offset=0, output=\"\", steps=[kick(0.13)])",
+    );
+    let mut r = boot(&source);
+    r.act("start", vec![]).unwrap();
+    r.land_then();
+    now(&mut r, 0xFA);
+    assert!(r.transport().clock_hits.iter().any(|h| h.1 == 2));
+    clock(&mut r, 1250.0, 50.0);
+    assert_eq!(r.transport().play.as_ref().unwrap().tracks.len(), 1);
+    assert_eq!(r.transport().play.as_ref().unwrap().tracks[0].id, 2);
+    let ons: Vec<_> = r
+        .midi()
+        .sent()
+        .filter(|s| s.output.is_empty() && s.data[0] == 0x99 && s.by.is_none())
+        .map(|s| s.at)
+        .collect();
+    assert_eq!(ons.len(), 2, "each surviving hit plays once: {ons:?}");
+    r.advance(200.0).unwrap();
+    assert_eq!(answered(&r)[1], Value::str("ended"));
+}
+
+#[test]
 fn start_falls_on_the_next_tick_or_at_its_own_time() {
     let mut f = Follow::new("clk", 120.0, -4.0);
     let mut log = Vec::new();

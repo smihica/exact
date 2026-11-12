@@ -5,6 +5,28 @@ use super::{lines, DataError, DataSource, Runner, RunnerError};
 use crate::request::Answer;
 use exact_plan::Value;
 
+/// Every executor must be able to carry an argument (LLP 1027 D2).
+pub(super) fn check_arguments(name: &str, args: &[Value]) -> Result<(), RunnerError> {
+    fn finite(value: &Value) -> bool {
+        match value {
+            Value::Number(n) => n.is_finite(),
+            Value::Option(Some(value)) => finite(value),
+            Value::List(items) | Value::Record(items) => items.iter().all(finite),
+            _ => true,
+        }
+    }
+    if let Some(i) = args.iter().position(|arg| !finite(arg)) {
+        return Err(RunnerError::Data {
+            resource: name.to_string(),
+            error: DataError::BadArguments(format!(
+                "argument {} contains a non-finite number",
+                i + 1
+            )),
+        });
+    }
+    Ok(())
+}
+
 /// Asks of one resource made by answers' commits, each with arguments unlike
 /// the last, within a second, that say an argument moves on every answer.
 const CHURN_ASKS: u32 = 50;
@@ -23,10 +45,15 @@ pub(super) struct Churn {
 }
 
 impl<D: DataSource> Runner<D> {
+    pub(super) fn check_send_arguments(&self, m: usize, args: &[Value]) -> Result<(), RunnerError> {
+        check_arguments(self.plan.str(self.plan.mutations[m].name), args)
+    }
+
     pub(super) fn query(&mut self, i: usize, args: &[Value]) -> Result<Answer, RunnerError> {
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i);
         let source = self.plan.str(row.source).to_string();
         let resource = self.plan.str(row.name).to_string();
+        check_arguments(&resource, args)?;
         // Delivery is the runner's own (LLP 1030 D7): the data seam never
         // sees it, and a data crate could not answer it if it did.
         if source == "exactActivities" {
@@ -183,6 +210,128 @@ mod tests {
             "/",
         )
         .unwrap()
+    }
+
+    /// A source whose storage is not ready yet: `answer` refuses with its
+    /// error, or (with none) hands the host a continuation to finish once it is.
+    struct NotReady(Option<DataError>);
+    impl DataSource for NotReady {
+        fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::Unavailable(source.into()))
+        }
+        fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
+            match self.0.clone() {
+                Some(error) => Err(error),
+                None => Ok(Answer::Later(crate::Request::continuation(1))),
+            }
+        }
+    }
+
+    // `docs/reference.md`, "Rust data sources": a resource the build left
+    // unbaked is asked at boot. `Unavailable`, `UnknownSource`, `BadArguments`
+    // and `Interface` from `answer` refuse the boot. On a resource with a
+    // value to show (here its type's zero), `Failed` boots with it failed,
+    // `DeferredAtBake` and `Answer::Later` boot with it pending, and `Overrun`
+    // boots pending, is asked again at 250 ms and 1 s, and fails on the third.
+    // A row that is another's `else source()` has nothing to show, and each of
+    // those refuses the boot there.
+    #[test]
+    fn what_an_answer_at_boot_does_by_its_kind() {
+        let plan = |fallback: bool| {
+            let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+            let string = b.primitive(TypeKind::String);
+            let arg = b.constant(&Value::Number(0.));
+            let r = b.resource("r", "src", &[arg], string, None);
+            if fallback {
+                // `resource s = src(0) else source()`: `r` is `s`'s placeholder row.
+                let s = b.resource("s", "src", &[arg], string, None);
+                b.set_resource_placeholder(s, r);
+            }
+            b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+            b.finish().unwrap()
+        };
+        let boot_on = |plan, error| {
+            Runner::boot(
+                plan,
+                NotReady(error),
+                Kernel::with_monospace(),
+                Default::default(),
+                "/",
+            )
+        };
+        let boot = |error| boot_on(plan(false), error);
+        for error in [
+            DataError::Unavailable("storage is not ready".into()),
+            DataError::UnknownSource("src".into()),
+            DataError::BadArguments("no account".into()),
+            DataError::Interface("the module trapped".into()),
+        ] {
+            assert!(
+                matches!(
+                    boot(Some(error.clone())),
+                    Err(RunnerError::Data { ref resource, error: ref refused }) if resource == "r" && *refused == error
+                ),
+                "{error:?} refuses the boot"
+            );
+        }
+        let failed = boot(Some(DataError::Failed(
+            crate::failure::FailureCode::Storage,
+            "storage is not ready".into(),
+            String::new(),
+        )))
+        .unwrap();
+        assert_eq!(failed.resource("r"), Some(&Value::str("")));
+        assert_eq!(
+            failed.failed_resources(),
+            vec![("r", "storage is not ready")]
+        );
+        assert_eq!(
+            failed.resources[0].failed_why.as_ref().map(|f| f.code),
+            Some(crate::failure::FailureCode::Storage)
+        );
+        assert!(!failed.resources[0].pending);
+        for pending in [Some(DataError::DeferredAtBake("at bake".into())), None] {
+            assert!(boot(pending).unwrap().resources[0].pending);
+        }
+        let mut overrun = boot(Some(DataError::Overrun("over budget".into()))).unwrap();
+        assert!(overrun.resources[0].pending && overrun.failed_resources().is_empty());
+        let t0 = overrun.now_ms();
+        overrun.advance(t0 + 250.).unwrap();
+        assert!(overrun.resources[0].pending && overrun.failed_resources().is_empty());
+        overrun.advance(t0 + 1250.).unwrap();
+        assert!(!overrun.resources[0].pending);
+        assert_eq!(overrun.failed_resources(), vec![("r", "over budget")]);
+        // The same plan with `r` as `s`'s `else source()` row: each of the
+        // kinds that booted above refuses, `Failed` and `Overrun` as `r`'s,
+        // and an answer later as `s`'s, whose placeholder must answer now.
+        let fallback = boot_on(plan(true), None).err();
+        assert!(
+            matches!(&fallback, Some(RunnerError::Data { resource, error: DataError::Unavailable(why) })
+                if resource == "s" && why.contains("a placeholder answers now")),
+            "{fallback:?}"
+        );
+        for error in [
+            DataError::Failed(
+                crate::failure::FailureCode::Storage,
+                "not ready".into(),
+                String::new(),
+            ),
+            DataError::Overrun("over budget".into()),
+        ] {
+            assert!(
+                matches!(boot_on(plan(true), Some(error.clone())), Err(RunnerError::Data { ref resource, error: ref refused }) if resource == "r" && *refused == error),
+                "{error:?} refuses the boot of a placeholder row"
+            );
+        }
+        let deferred = boot_on(
+            plan(true),
+            Some(DataError::DeferredAtBake("at bake".into())),
+        )
+        .err();
+        assert!(
+            matches!(&deferred, Some(RunnerError::Data { resource, .. }) if resource == "s"),
+            "{deferred:?}"
+        );
     }
 
     fn said(r: &Runner<Later>) -> Vec<String> {

@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 import { withLook } from '../web/look.mjs';
 import { createDocument } from './dom.js';
-import { listItem, unwrapListItem } from '../web/navigation.js';
+import { listItem, unwrapListItem } from '../web/navigation/lists.js';
 
 test('the render DOM writes list items and unwraps their rows', () => {
   const previous = globalThis.document, doc = createDocument();

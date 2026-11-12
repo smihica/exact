@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "reflow_data::Reflow",
             "reflow_data::Reflow::default()",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

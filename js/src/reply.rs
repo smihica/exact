@@ -14,9 +14,9 @@ impl Module {
         // answers decode directly to Value, without a second full value tree.
         let captured = engine.has_reply_strings();
         let decoded = if captured {
-            serde_json::from_str(text)
+            exact_js_value::json::parse(text.as_bytes())
                 .map(|fields| exact_js_value::Reply {
-                    fields,
+                    fields: fields.into(),
                     value: Ok(Value::Unit),
                 })
                 .map_err(|e| e.to_string())

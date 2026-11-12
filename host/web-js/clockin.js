@@ -3,13 +3,14 @@
 // playing sequence follows an input's MIDI clock, and does what it hears.
 // - Tempo: a window of the last WINDOW tick stamps, `(n − 1)` ticks over its span, taken only on a packet-leading tick
 //   once MIN_TICKS are in it; a stamp earlier than the last or GAP after it empties the window. Before the first
-//   estimate, the prior (`bpm=`).
+//   estimate, the prior (`bpm=`). Estimates above clock out's TICKS_PER_SECOND bound leave that tempo unchanged.
 // - Position counts ticks: the kth tick after Start is beat `from + k / 24`. Start puts `from` at the tick it predicts
 //   next (never before Start), else at Start's own time; Continue resumes at Song Position since the last Stop, else
 //   where that Stop held it, else beat 0.
 // - Each run of ticks ends in an anchor (the last tick's time, its beat, the tempo), at each transport message and at
 //   the delivery's end.
 export const WINDOW = 48, MIN_TICKS = 13, GAP = 500, BATCH = 50, LOOKAHEAD = BATCH + 50, DRIFT = 2;
+export const TICKS_PER_SECOND = 1000;
 
 /** A follower of `input`, `prior` its tempo before an estimate, Start putting beat `from` at the next tick. */
 export const follower = (input, prior, from) => ({ input, stamps: [], estimate: null, prior, from, running: false, base: 0, next: 0, spp: null, held: null, lastTick: null, ticks: 0, seen: null });
@@ -28,7 +29,10 @@ function stamp(f, at) {
     while (f.stamps.length > 1 && f.stamps[0] === removed) removed = f.stamps.shift();
   }
   const n = f.stamps.length, elapsed = at - f.stamps[0], leading = prev == null || at > prev;
-  if (leading && n >= MIN_TICKS && elapsed > 0) f.estimate = 60000 * (n - 1) / (elapsed * 24);
+  if (leading && n >= MIN_TICKS && elapsed > 0) {
+    const bpm = 60000 * (n - 1) / (elapsed * 24);
+    if (bpm * 24 / 60 <= TICKS_PER_SECOND) f.estimate = bpm;
+  }
 }
 const anchor = f => ({ at: f.lastTick ?? 0, beat: f.base + (f.next - 1) / 24, bpm: tempo(f) });
 

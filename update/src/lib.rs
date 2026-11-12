@@ -64,7 +64,7 @@ pub use envelope::{
     canonical_bytes, check_asset_names, sha256_hex, Card, Envelope, FileCard, StreamCard,
 };
 pub use store::{
-    head_url, AssetSet, Check, Embedded, Generation, PreparedSelection, Selection,
+    head_url, AssetSet, Check, Embedded, EmbeddedAsset, Generation, PreparedSelection, Selection,
     SelectionRefusal, Staged, Status, Store, Trust,
 };
 

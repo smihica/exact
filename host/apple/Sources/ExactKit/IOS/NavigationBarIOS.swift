@@ -362,11 +362,28 @@ extension NavigationHost {
         if tabBarShows, let root = container, let tabs = NavigationTabs.of(root, presenter), let index = tabs.tabs.firstIndex(where: { $0 === node }) {
             guard !node.disabled else { return ["error": "tab #\(id) is disabled"] }
             guard before(nil), !node.disabled, !node.inert, presenter.views[node.id] === node else { return ["error": "tab #\(id) changed during its pointer handlers"] }
-            // As the bar's own tap: the selected tab at its root scrolls to the top
-            let root = reselectedRoot(index), requests = root == nil ? nil : presenter.collections.lastRequests()
-            presenter.press(node.id)
-            if let root { scrollToTop(root, since: requests) }
-            return ["tapped": id, "pressed": id, "delivery": "host-activation", "native": "tab-bar-item"]
+            let reply: [String: Any] = ["tapped": id, "pressed": id, "delivery": "host-activation", "native": barItem(ofTab: index) != nil ? "tab-bar-item" : "more-list-row"]
+            // Tap a tab whose item the bar shows as a person's tap runs: UIKit's sequence through Exact's delegate
+            // (`TabDelegateProxy`; the order measured with real touches, as `tapTab` replays it)
+            if let tabsController = tabController, let controller = tabStack(index), barItem(ofTab: index) != nil {
+                let reselect = controller === tabsController.selectedViewController
+                // Ask the app's delegate, then `mayShow`, as `TabDelegateProxy` does, so the reply can say which declined
+                if tabProxy.app?.tabBarController?(tabsController, shouldSelect: controller) == false {
+                    return ["error": "tab #\(id): the app's tab bar delegate declined the tap (its shouldSelect returned false), so UIKit selects nothing"]
+                }
+                guard mayShow(tabsController, controller) else {
+                    // Above the selected tab's root, UIKit pops only where Back goes; another tab's press left the
+                    // router off that tab, and UIKit shows the router's (`mayShow`)
+                    return reselect ? ["error": "tab #\(id): \(backRefusal)"] : reply
+                }
+                if reselect { (controller as? UINavigationController)?.popToRootViewController(animated: !ExactEnv.agentFreezes) }
+                else { tabsController.selectedViewController = controller }
+                tabProxy.tabBarController(tabsController, didSelect: controller)
+                return reply
+            }
+            // Press a row of More's list's tab: the router selects it, which UIKit shows under More
+            pressTab(node, scrolling: reselectedRoot(index))
+            return reply
         }
         let shown = controllers.values.filter { c in
             guard let nav = c.navigationController, nav.topViewController === c, barShows(nav) else { return false }
@@ -440,27 +457,21 @@ extension NavigationHost {
     /// title's subtitle.
     func retheme() {
         var seen = Set<ObjectIdentifier>()
-        for nav in [primaryNavigation].compactMap({ $0 }) + presentedNavigations + tabNavigations.values where seen.insert(ObjectIdentifier(nav)).inserted { titleInk(nav) }
+        for nav in [primaryNavigation].compactMap({ $0 }) + presentedNavigations + tabStacks.values.compactMap({ $0 as? UINavigationController })
+        where seen.insert(ObjectIdentifier(nav)).inserted { titleInk(nav) }
         for c in controllers.values {
             c.titleView?.retheme()
             c.search?.ink()
         }
     }
 
-    /// `publish` records the controller where Exact keeps it before the
-    /// hatch runs, which may ask for it again (`HeldStackIOS`'s `realize`).
-    func makeNavigation(first: NodeView?, publish: (UINavigationController) -> Void = { _ in }) -> UINavigationController {
+    func makeNavigation(first: NodeView?) -> UINavigationController {
         let nav = UINavigationController()
-        stackCount += 1
-        let stack = NavigationStack(showsBar: true, order: stackCount)
-        stack.proxy.host = self
-        stacks[ObjectIdentifier(nav)] = stack
-        nav.delegate = stack.proxy
+        let stack = registerStack(nav)
         #if !os(tvOS)
         nav.navigationBar.prefersLargeTitles = true
         #endif
         titleInk(nav)
-        publish(nav)
         if presenter.session?.natives.hatchesConnected == true {
             stack.showsBar = hatching(nav) { presenter.session?.natives.navigationHatch(nav, built: true, showsBar: stack.showsBar, label: stack.label) } ?? stack.showsBar
             stack.hatched = true
@@ -472,11 +483,32 @@ extension NavigationHost {
         return nav
     }
 
+    /// Exact's record of `nav`, a stack it keeps, and its delegate. More is
+    /// one too (iOS), its list UIKit's.
+    @discardableResult
+    func registerStack(_ nav: UINavigationController) -> NavigationStack {
+        stackCount += 1
+        let stack = NavigationStack(showsBar: true, order: stackCount)
+        stack.proxy.host = self
+        stacks[ObjectIdentifier(nav)] = stack
+        nav.delegate = stack.proxy
+        return stack
+    }
+
+    /// `nav` leaves Exact: its record and its delegate go, and its routes and
+    /// a plain tab leave it, as they may go into the next containers (a
+    /// remount, new tabs); More keeps its list.
+    func release(_ nav: UINavigationController) {
+        retireStack(nav)
+        nav.delegate = nil
+        nav.setViewControllers(nav.stackFront.filter { !($0 is PlainTab) }, animated: false)
+    }
+
     /// The `navigation` hatch for a stack built before the module connected
     /// (a cold launch's), before any of its routes' hatches run. A changed
     /// `showsBar` moves the content once, journaled (LLP 1075.003 Q3 (c)).
     func hatchNavigation(_ nav: UINavigationController) {
-        guard let natives = presenter.session?.natives, natives.hatchesConnected,
+        guard nav !== more, let natives = presenter.session?.natives, natives.hatchesConnected,
               let stack = stacks[ObjectIdentifier(nav)], !stack.hatched else { return }
         let before = barShows(nav)
         stack.showsBar = hatching(nav) { natives.navigationHatch(nav, built: true, showsBar: stack.showsBar, label: stack.label) }
@@ -489,9 +521,8 @@ extension NavigationHost {
 
     /// Project each route of a stack into its navigation item when its
     /// authored source changed, then run the route hatch — before UIKit lays
-    /// the stack out (LLP 1075.003 §3.2, §3.5 "projected defaults"). A held
-    /// stack (HeldStackIOS) is projected as a navigation controller that
-    /// hides its bar would be; no `navigation` hatch has met it.
+    /// the stack out (LLP 1075.003 §3.2, §3.5 "projected defaults"). A plain
+    /// tab (PlainTabIOS) has no bar: its route's header is its content.
     func prepareRoutes(_ routes: [RouteController], in stack: UIViewController) {
         let nav = stack as? UINavigationController
         if let nav {
@@ -502,18 +533,17 @@ extension NavigationHost {
             projectBack(routes, in: nav)
         }
         followTablist(routes, in: stack)
-        let stackShows = nav.map(barShows) ?? !ExactEnv.authoredChrome
-        let back = container?.props["navigationBack"]
         let presented = nav.map { nav in presentedNavigations.contains { $0 === nav } } ?? false
+        // Count UIKit's list before a tab's root under More: More pushes the root over it, with a Back to it
+        let front = nav?.stackFront.count ?? 0
         for (index, c) in routes.enumerated() {
             // The bar is each route's (LLP 1115.000 D5.2, D5.3): its header,
             // the system Back alone on a pushed route with none of its own
             // (no header, a hidden one, one that is not a bar's), or no bar
             // where the route says so or has nothing to go back to.
-            c.pushed = index > 0
+            c.pushed = index + front > 0
             let transparent = Self.transparentBar(c.node)
-            let shape = stackShows ? HeaderShape.bar(of: c.node, back: back, backIsUIKits: index > 0) : nil
-            let bar = stackShows ? self.bar(of: c.node, pushed: index > 0) : .hidden
+            let (shape, bar) = barShape(of: c, in: nav)
             let shows = bar != .hidden
             if shows {
                 for entry in (shape?.leading ?? []) + (shape?.trailing ?? []) where entry.menu {
@@ -522,7 +552,8 @@ extension NavigationHost {
                     }
                 }
             }
-            let canGoBack = index > 0 && canInvokeBack && shape?.authoredBack != true
+            // Let a root under More go back: UIKit's Back returns to More's list
+            let canGoBack = (index > 0 ? canInvokeBack : front > 0) && shape?.authoredBack != true
             let scroller = contentScroller(of: c), scroll = contentScrollView(of: c)
             let dataset = c.node.props["dataset"]
             func barSource(_ key: (HeaderShape.Item) -> String) -> BarSource {
@@ -575,6 +606,25 @@ extension NavigationHost {
         if let nav, nav.transitionCoordinator == nil, let top = nav.topViewController as? RouteController, routes.contains(top) {
             showBar(nav, animated: nav.view.window != nil)
         }
+    }
+
+    /// The header shape and the bar a route shows in its stack (`prepareRoutes`, `selectScrollEdges`).
+    private func barShape(of c: RouteController, in nav: UINavigationController?) -> (HeaderShape?, NavigationRules.Bar) {
+        guard nav.map(barShows) ?? false else { return (nil, .hidden) }
+        return (HeaderShape.bar(of: c.node, back: container?.props["navigationBack"], backIsUIKits: c.pushed), bar(of: c.node, pushed: c.pushed))
+    }
+
+    /// Select `c`'s top and bottom scroll views again, as its stack's pass
+    /// does (`collapse`, `reachBottom`), for edges an app gave back to
+    /// Exact's selection with nil: at once, since a native call outside a
+    /// batch starts no pass.
+    func selectScrollEdges(of c: RouteController) {
+        guard let stack = c.stack else { return }
+        let nav = stack as? UINavigationController
+        let (shape, bar) = barShape(of: c, in: nav)
+        collapse(c, shape: shape, shows: bar != .hidden, scroller: contentScroller(of: c))
+        reachBottom(c, presented: nav.map { nav in presentedNavigations.contains { $0 === nav } } ?? false)
+        coversChanged()
     }
 
     /// The header a bar stands for takes no room from the turn it is lifted,
@@ -876,7 +926,16 @@ extension NavigationHost {
             let adjustment: UIScrollView.ContentInsetAdjustmentBehavior = Self.transparentBar(c.node) ? .never : .automatic
             if sv.contentInsetAdjustmentBehavior != adjustment { sv.contentInsetAdjustmentBehavior = adjustment }
         }
-        guard c.collapseScroll !== target || c.collapseScrollView !== physical else { return }
+        guard c.collapseScroll !== target || c.collapseScrollView !== physical else {
+            // Select it again where the route's selection differs (an app gave the edge back with
+            // nil), as `reachBottom` does for the bottom edge, and lay the bar out for a pushed large
+            // title as below
+            if c.contentScrollView(for: .top) !== c.automaticTopScroll {
+                c.projectContentScrollView(c.automaticTopScroll, for: .top)
+                c.navigationController?.navigationBar.setNeedsLayout()
+            }
+            return
+        }
         let old = c.collapseScroll, oldView = c.collapseScrollView
         if let old, let sv = oldView { old.retainScrollPosition(from: sv) }
         c.collapseScroll = target
@@ -893,7 +952,7 @@ extension NavigationHost {
         // …and is there before UIKit is handed it: a bar handed a
         // scroller that far from its top closes an open large title.
         if atStart, let sv = shown, sv.contentOffset.y != -sv.adjustedContentInset.top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: -sv.adjustedContentInset.top), in: sv) }
-        c.projectContentScrollView(shown ?? c.bandedTop, for: .top) // or the scroller its control bars are over (LLP 1131)
+        c.projectContentScrollView(c.automaticTopScroll, for: .top)
         // The scroller left behind gets the page's offsets back only once the
         // bar follows the new one: UIKit reads its inset taken away while the
         // bar still follows it as a scroll, and closes an open large title.
@@ -965,8 +1024,8 @@ extension NavigationHost {
         let found = presented || presenter.viewportFit != "cover" ? (Self.bottomScroller(in: c.node, cover: c.bottomClearance) ?? peer) : nil
         let target = found === c.collapseScroll && Self.transparentBar(c.node) ? nil : found
         let projects = !c.nativeContentScrollEdges.contains(.bottom)
-        guard c.edgeScroll !== target || (projects && c.contentScrollView(for: .bottom) !== (target?.scrollView ?? c.bandedBottom)) else { return }
-        if let old = c.edgeScroll, let sv = old.scrollView, old !== c.collapseScroll, !arrangementInsets(sv, in: c) { sv.contentInsetAdjustmentBehavior = .never }
+        guard c.edgeScroll !== target || (projects && c.contentScrollView(for: .bottom) !== c.automaticBottomScroll) else { return }
+        if let old = c.edgeScroll, old !== target, let sv = old.scrollView, old !== c.collapseScroll, !arrangementInsets(sv, in: c) { sv.contentInsetAdjustmentBehavior = .never }
         if projects, let previous = c.contentScrollView(for: .bottom), previous !== target?.scrollView,
            previous !== c.collapseScrollView, !arrangementInsets(previous, in: c) { previous.contentInsetAdjustmentBehavior = .never }
         c.edgeScroll = target
@@ -981,7 +1040,7 @@ extension NavigationHost {
         if atStart, let sv = shown, sv.contentOffset.y != -sv.adjustedContentInset.top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: -sv.adjustedContentInset.top), in: sv) }
         // tvOS has no bottom bar whose edge follows a scroller.
         #if !os(tvOS)
-        c.projectContentScrollView(shown ?? c.bandedBottom, for: .bottom)
+        c.projectContentScrollView(c.automaticBottomScroll, for: .bottom)
         #endif
         presenter.session?.log("navigation: route \(c.key) \(target == nil ? "keeps its content above the bottom edge" : "scrolls its content to the bottom edge")")
     }

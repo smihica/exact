@@ -195,7 +195,10 @@ final class NfcRegistry: NSObject {
         if let s = session as? NFCTagReaderSession { s.restartPolling() }
     }
 
-    /// Restart polling once `tag` has left the field (D11).
+    /// Restart polling once `tag` has left the field (D11). A session whose
+    /// delegate takes `didDetect tags` detects no further tag until it is
+    /// told to (`restartPolling`), so a read, write or lock that leaves the
+    /// session open ends here.
     private func whenGone(_ available: @escaping () -> Bool) {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
             guard let self, self.session != nil else { return }
@@ -255,14 +258,17 @@ final class NfcRegistry: NSObject {
             self.claims.removeAll { $0 === c }
             c.settle(["error": error, "message": cause])
             let sentence = c.words.errors[cause]
-            if self.claims.isEmpty { self.finishIfIdle(sentence ?? cause, failed: true) }
-            else if let sentence { self.session?.alertMessage = sentence }
+            if self.claims.isEmpty { return self.finishIfIdle(sentence ?? cause, failed: true) }
+            if let sentence { self.session?.alertMessage = sentence }
+            self.whenGone { tag.isAvailable }
         }
         let succeed: () -> Void = { [weak self] in
             guard let self else { return }
             self.claims.removeAll { $0 === c }
             c.settle(["serialNumber": serial])
-            if self.claims.isEmpty { self.finishIfIdle(c.words.done) } else if let done = c.words.done { self.session?.alertMessage = done }
+            if self.claims.isEmpty { return self.finishIfIdle(c.words.done) }
+            if let done = c.words.done { self.session?.alertMessage = done }
+            self.whenGone { tag.isAvailable }
         }
         let records = c.message.compactMap { r -> NFCNDEFPayload? in
             guard case .success(let (tnf, type, id, payload)) = NfcRecords.encode(r, lang: Locale.current.language.languageCode?.identifier ?? "en") else { return nil }

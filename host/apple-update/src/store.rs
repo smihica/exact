@@ -24,7 +24,9 @@
 //! The buffer discipline is the runtime's (`exact_in`/`exact_out`) for
 //! calls that have no runtime: `exact_update_in(len)` hands out the input
 //! buffer a path payload is written into, every call answers with a length,
-//! and `exact_update_out()` is the output's address. Nothing here is
+//! and `exact_update_out()` is the output's address. There is one of each
+//! per process, so a host calling from several threads holds one lock from
+//! a call's payload to its copied answer (`Updates.buffers` in Swift). Nothing here is
 //! `unsafe`; the one pointer that leaves is the line a finished check hands
 //! the callback, alive for that call only.
 

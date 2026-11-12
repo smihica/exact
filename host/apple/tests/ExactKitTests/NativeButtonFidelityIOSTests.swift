@@ -255,6 +255,35 @@ final class NativeButtonFidelityIOSTests: XCTestCase {
         _ = cache.answer(face: try face("123456789", "heart", style: "plain"), widthKind: 0, width: 60)
         XCTAssertEqual(cache.misses, misses + 1)
     }
+    func testAWrappedCountDoesNotSupplyAnotherCountsHeight() throws {
+        let surface = UIView()
+        surface.traitOverrides.preferredContentSizeCategory = .large
+        surface.updateTraitsIfNeeded()
+        let traits = surface.traitCollection
+        for style in ["plain", "bordered", "filled"] {
+            for first in ["1,234,567", "5"] {
+                let cache = ButtonMeasureCache()
+                cache.configure(traits, in: surface)
+                func data(_ title: String) throws -> Data {
+                    try JSONSerialization.data(withJSONObject: ["title": title, "symbol": "heart", "ios": style], options: [.sortedKeys])
+                }
+                let short = cache.measure(ButtonFace(json: try data("5")), widthKind: 0, width: 100, traits: traits)
+                let wrapped = cache.measure(ButtonFace(json: try data("1,234,567")), widthKind: 0, width: 100, traits: traits)
+                XCTAssertGreaterThan(wrapped.height, short.height, "the reference count wraps: \(style)")
+                for title in [first, "1,234,567", "5", "88", "12,345,678", "9"] {
+                    let face = try data(title)
+                    let answered = cache.answer(face: face, widthKind: 0, width: 100)
+                    let measured = cache.measure(ButtonFace(json: face), widthKind: 0, width: 100, traits: traits)
+                    XCTAssertEqual(answered.width, measured.width, accuracy: 0.001, "\(style) \(first) then \(title)")
+                    XCTAssertEqual(answered.height, measured.height, accuracy: 0.001, "\(style) \(first) then \(title)")
+                }
+                let misses = cache.misses
+                _ = cache.answer(face: try data("4"), widthKind: 0, width: 100)
+                _ = cache.answer(face: try data("1,234,567"), widthKind: 0, width: 100)
+                XCTAssertEqual(cache.misses, misses, "short counts use the shortcut; a repeated wrapped count uses its exact entry")
+            }
+        }
+    }
     // Independent use of UIKit's public system-spacing API for the reference column.
     func testMinContentUsesUnbreakableRunsAndTheNativeChrome() throws {
         let session = try fixture(); defer { session.destroy() }

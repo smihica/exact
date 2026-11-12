@@ -33,8 +33,6 @@ pub(crate) fn colour_codec(row: StyleId) -> bool {
         row.codec(),
         StyleCodec::ColorValue
             | StyleCodec::KeywordColor
-            | StyleCodec::Rgba8
-            | StyleCodec::Color2
             | StyleCodec::SymbolPalette
             | StyleCodec::Paint
             | StyleCodec::BackgroundImage
@@ -138,7 +136,7 @@ fn grouped_list(file: &File, tag: &str, attrs: &[Attr]) -> bool {
             .rfind(|s| s.name == name)
             .map(|s| s.attrs.as_slice())
     };
-    let Ok(class) = crate::class::rows(attrs, &style) else {
+    let Ok(class) = crate::class::rows(attrs, &style, &[]) else {
         return false;
     };
     let expanded: Vec<Attr> = class
@@ -200,7 +198,7 @@ fn grouped_refused(file: &File, tag: &str, attrs: &[Attr]) -> bool {
             .rfind(|s| s.name == name)
             .map(|s| s.attrs.as_slice())
     };
-    let Ok(class) = crate::class::rows(attrs, &style) else {
+    let Ok(class) = crate::class::rows(attrs, &style, &[]) else {
         return false;
     };
     let expanded: Vec<Attr> = class
@@ -237,7 +235,7 @@ fn has_class_family(file: &File, attrs: &[Attr]) -> bool {
             .rfind(|s| s.name == name)
             .map(|s| s.attrs.as_slice())
     };
-    matches!(crate::class::rows(attrs, &style), Ok(Some((_, rows))) if rows.iter().any(|a| a.name == "font-family"))
+    matches!(crate::class::rows(attrs, &style, &[]), Ok(Some((_, rows))) if rows.iter().any(|a| a.name == "font-family"))
 }
 
 /// Whether lowering's `check_svg` passes the element `tag` with `attrs`
@@ -259,7 +257,7 @@ fn prepared(
             .rfind(|s| s.name == name)
             .map(|s| s.attrs.as_slice())
     };
-    let Ok(class) = crate::class::rows(attrs, &style) else {
+    let Ok(class) = crate::class::rows(attrs, &style, &[]) else {
         return false;
     };
     let joined: Vec<Attr>;
@@ -548,7 +546,7 @@ impl Said {
                     };
                     let class = match class_left {
                         true => None,
-                        false => crate::class::rows(a, &style).ok().flatten(),
+                        false => crate::class::rows(a, &style, &[]).ok().flatten(),
                     };
                     let judged = class.as_ref().is_some_and(|(_, rows)| {
                         let joined: Vec<Attr> = rows.iter().chain(own).cloned().collect();

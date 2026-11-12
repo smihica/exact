@@ -650,6 +650,41 @@ mod clip_masks {
     }
 
     #[test]
+    fn clip_mask_tracks_each_corner_shape_across_frames() {
+        use exact_kernel::corner::CornerShape;
+
+        let size = (300.0, 300.0);
+        let ts = Transform::identity();
+        let mut raster = Raster::new();
+        for css in [
+            "round",
+            "bevel",
+            "round bevel bevel bevel",
+            "round round bevel bevel",
+            "round round round bevel",
+            "round",
+            "superellipse(1.25)",
+            "superellipse(1.75)",
+            "-exact-continuous",
+            "square",
+            "notch",
+            "round",
+        ] {
+            let shape = Shape::new((0.0, 0.0, 100.0, 100.0), [40.0; 4])
+                .with_corners(Some(CornerShape::check(css).unwrap()));
+            let expected = oracle(size, 1.0, Some(&shape), ts);
+            let (first, owner) = frame(&mut raster, size, 1.0, &shape, ts);
+            let (second, again) = frame(&mut raster, size, 1.0, &shape, ts);
+            assert!(
+                first.data() == expected.data(),
+                "changed corner shape: {css}"
+            );
+            assert!(second.data() == expected.data(), "same corner shape: {css}");
+            assert!(owner.ptr_eq(&again), "same shape reuses its mask: {css}");
+        }
+    }
+
+    #[test]
     fn clip_mask_nested_and_later_parentless_do_not_mutate_or_replace_first() {
         let mut engine = engine();
         let p = engine.layout(&spec(&"nested scrollport line\n".repeat(160)), Some(230.0));

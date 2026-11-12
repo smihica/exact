@@ -201,6 +201,140 @@ test('manifest colours follow the web and retired launch and alias keys are refu
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('host.web.head takes script, link and meta entries and refuses the rest by entry', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  const read = head => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Head', app: { id: 'test.head', name: 'Head' }, host: { web: { head } } })); return readManifest(dir, 'fixture'); };
+  try {
+    read([{ script: { async: true, src: 'https://a.example/t.js' } }, { script: { type: 'application/ld+json', text: { '@type': 'WebSite' } } }, { meta: { name: 'author', content: 'J' } }]);
+    assert.throws(() => read([{ meta: { name: 'author', content: 'J' } }, { style: { text: 'p{}' } }, { script: {}, link: {} }, { script: { async: false } },
+      { link: { rel: 'preconnect', text: 'x' } }, { meta: { property: 'og:title', content: 'x' } }, { link: { rel: 'Canonical', href: '/' } }]), (error) => {
+      assert.match(error.message, /host\.web\.head\[1\]: style is not a tag the head takes \(script, link, meta\)/);
+      assert.match(error.message, /host\.web\.head\[2\]: \{"script":\{\},"link":\{\}\} is not one tag/);
+      assert.match(error.message, /host\.web\.head\[3\]\.script\.async: false; an attribute is a string, or true/);
+      assert.match(error.message, /host\.web\.head\[4\]\.link\.text: a link has no content/);
+      assert.match(error.message, /host\.web\.head\[5\]: Exact writes this meta itself, from the Contract `head` element/);
+      assert.match(error.message, /host\.web\.head\[6\]: Exact writes this link itself/);
+      assert.doesNotMatch(error.message, /head\[0\]|matches 0 of the allowed forms/);
+      return true;
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('host.windows.window takes its size and refuses keepRunning, which the Windows host does not build', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  const read = window => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Tray', app: { id: 'test.tray', name: 'Tray' }, host: { windows: { window } } }));
+    return readManifest(dir, 'fixture');
+  };
+  try {
+    assert.doesNotThrow(() => read({ width: 800, height: 600 }));
+    assert.throws(() => read({ keepRunning: true }), /host\.windows\.window\.keepRunning: not a known key/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a misspelt key beside host.web.head is refused as any unknown key is', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  try {
+    for (const key of ['headers', 'heads']) {
+      writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Head', app: { id: 'test.head', name: 'Head' }, host: { web: { [key]: [] } } }));
+      assert.throws(() => readManifest(dir, 'fixture'), new RegExp(`host\\.web\\.${key}: not a known key`));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("host.web.head refuses what Exact writes or reads itself, however spelt", async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  const read = web => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Head', app: { id: 'test.head', name: 'Head' }, host: { web } })); return readManifest(dir, 'fixture'); };
+  try {
+    // Another app's files, a file whose name differs only in case, a preload of anything else and another `alternate`
+    // are the app's own.
+    read({ head: [{ script: { type: 'module', src: 'https://cdn.example/app.js' } }, { link: { rel: 'modulepreload', href: 'https://cdn.example/x.js' } },
+      { script: { type: 'module', src: './App.js' } }, { link: { rel: 'preload', href: '/Navigation.js', as: 'script' } },
+      { link: { rel: 'preload', href: './font.woff2', as: 'font' } }, { link: { rel: 'alternate', type: 'application/rss+xml', href: '/feed.xml' } },
+      { meta: { name: 'author', 'data-x': 'y', 'xml:lang': 'en' } }] });
+    const refused = [
+      [{ script: { type: 'module', src: './app.js' } }, /\[0\]: Exact writes this script itself/],
+      [{ script: { src: '/glue.js?v=1' } }, /\[1\]: Exact writes this script itself/],
+      [{ script: { type: 'Application/vnd.exact.checkpoint', text: { answers: [] } } }, /\[2\]: Exact writes this script itself/],
+      [{ meta: { name: 'exact-native', content: './x.js' } }, /\[3\]: Exact writes this meta itself/],
+      [{ link: { rel: 'preload', href: './app.wasm?v=2', as: 'fetch' } }, /\[4\]: Exact writes this link itself/],
+      [{ link: { rel: 'modulepreload', href: 'app.js' } }, /\[5\]: Exact writes this link itself/],
+      [{ link: { rel: 'alternate', type: 'application/vnd.exact.envelope+json', href: './exact.json' } }, /\[6\]: Exact writes this link itself/],
+      [{ link: { rel: 'shortcut icon', href: '/x.ico' } }, /\[7\]: Exact writes this link itself/],
+      [{ link: { rel: 'icon\tshortcut', href: '/x.ico' } }, /\[8\]: Exact writes this link itself/],
+      [{ meta: { NAME: 'viewport', content: 'x' } }, /\[9\]: Exact writes this meta itself/],
+      [{ meta: { '<x': '1' } }, /\[10\]\.meta: "<x" is not an attribute name/],
+      [{ meta: { 'a"b': '1' } }, /\[11\]\.meta: "a\\"b" is not an attribute name/],
+      [{ meta: { name: 'x', Name: 'y' } }, /\[12\]\.meta: "Name" is the attribute "name" again/],
+      // Resolved against the shells' `<base href="/">`, as the browser does.
+      [{ link: { rel: 'modulepreload', href: '../navigation.js' } }, /\[13\]: Exact writes this link itself/],
+      [{ script: { type: 'module', src: './x/../app.js?duplicate=1' } }, /\[14\]: Exact writes this script itself/],
+      [{ link: { rel: 'modulepreload', href: './foo/../navigation.js' } }, /\[15\]: Exact writes this link itself/],
+      [{ link: { rel: 'modulepreload', href: '%2e%2e/navigation.js' } }, /\[16\]: Exact writes this link itself/],
+      [{ link: { rel: 'preload', href: '../app.wasm', as: 'fetch' } }, /\[17\]: Exact writes this link itself/],
+      [{ script: { src: '%61pp.js' } }, /\[18\]: Exact writes this script itself/],
+      // And as serve.mjs answers the request the page sends: `%2f` is a separator, a trailing one is dropped.
+      [{ script: { type: 'module', src: '/%2fapp.js' } }, /\[19\]: Exact writes this script itself/],
+      [{ script: { type: 'module', src: '/%2Fglue.js' } }, /\[20\]: Exact writes this script itself/],
+      [{ script: { type: 'module', src: './app.js/' } }, /\[21\]: Exact writes this script itself/],
+      [{ link: { rel: 'modulepreload', href: '/navigation.js%2f' } }, /\[22\]: Exact writes this link itself/],
+      [{ script: { type: 'module', src: '/./app.js' } }, /\[23\]: Exact writes this script itself/],
+      [{ script: { type: 'module', src: '/%2e/app.js' } }, /\[24\]: Exact writes this script itself/],
+      [{ meta: { name: 'Color-Scheme', content: 'dark' } }, /\[25\]: Exact writes this meta itself, from app.json's userInterfaceStyle/],
+    ];
+    assert.throws(() => read({ head: refused.map(([entry]) => entry) }), (error) => {
+      for (const [, says] of refused) assert.match(error.message, says);
+      return true;
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("host.web.head takes an attribute that names a property of Object, and its own origin's files are Exact's", async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  const read = (head, origin) => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Head', app: { id: 'test.head', name: 'Head', ...(origin ? { origin } : {}) }, host: { web: { head } } })); return readManifest(dir, 'fixture'); };
+  try {
+    read([{ meta: { name: 'author', constructor: 'Person' } }, { script: { src: '/widget.js', __proto__x: 'y', toString: 'z', valueOf: '1' } }]);
+    assert.throws(() => read([{ meta: { constructor: 'a', Constructor: 'b' } }]), /\[0\]\.meta: "Constructor" is the attribute "constructor" again/);
+    // Another origin's `app.js` is its own; the app's origin, written whole or without its scheme, names Exact's.
+    read([{ script: { type: 'module', src: 'https://cdn.example/app.js' } }, { script: { type: 'module', src: 'https://example.com.cdn.example/app.js' } }], 'https://example.com');
+    const own = ['https://example.com/app.js', '//example.com/glue.js?v=1', 'https://EXAMPLE.com:443/./app.wasm', 'https://example.com/x/../navigation.js'];
+    assert.throws(() => read(own.map((src) => ({ script: { type: 'module', src } })), 'https://example.com'), (error) => {
+      own.forEach((_, i) => assert.match(error.message, new RegExp(`\\[${i}\\]: Exact writes this script itself`)));
+      return true;
+    });
+    // With no origin declared, an absolute URL is another site's.
+    read([{ script: { type: 'module', src: 'https://example.com/app.js' } }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// HTML's tokenizer ends a script element only at `</script` followed by whitespace, `/` or `>`, and leaves script data
+// for the escaped states only at `<!--` (HTML, 13.2.5 "Tokenization"). A JSON text has those written `\u003C…`; a
+// JavaScript text is never rewritten, since `\u003C` in code is a syntax error: one holding either is refused.
+test("host.web.head writes a script's text as it is, refuses one HTML would read a tag in, and escapes JSON's", async () => {
+  const { webHead, webHeadProblems } = await import('./web-head.mjs');
+  const head = (text, type) => ({ host: { web: { head: [{ script: { ...(type ? { type } : {}), text } }] } } });
+  const written = (text) => webHead(head(text)).slice('<script>'.length, -'</script>\n'.length);
+  for (const code of ['const script = 4; window.ok = 1<script / 2;', 'const scripts = [1]; let n = 0; for (let i = 0; i<scripts.length; i++) n++;',
+    'const a = 2; window.lt = a</scripted/.test("scripted");', 'const x = 3; window.y = x<script >2 ? 0 : 1;', "window.seen = '\\x3C/script>' + '<' + '!--';"]) {
+    assert.equal(written(code), code);
+    new Function(written(code));
+  }
+  for (const [code, seen] of [['if (a <!--b) {}', '<!--'], ['<!--\nwindow.ok = 1;\n', '<!--'], ['if (a </script>/) {}', '</script'],
+    ["window.seen = '</SCRIPT\t';", '</script'], ["x = '</script/'", '</script'], ['{"name": "</script>"}', '</script']]) {
+    const problems = webHeadProblems(head(code, code.startsWith('{') ? 'application/ld+json' : undefined));
+    assert.equal(problems.length, 1, code);
+    assert.match(problems[0], new RegExp(`^host\\.web\\.head\\[0\\]\\.script\\.text: holds "${seen}", .*write it so the parser cannot see it`), code);
+  }
+  // A JSON text reads `\u003C` as `<`.
+  const json = webHead(head({ name: '</script><!--<script>' }, 'application/ld+json'));
+  assert.equal(JSON.parse(json.slice(json.indexOf('>') + 1, json.lastIndexOf('</script>'))).name, '</script><!--<script>');
+});
+
 test('readManifest names the game.presentation rename instead of an unknown key', async () => {
   const { readManifest } = await import('./app.mjs');
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
@@ -453,4 +587,22 @@ test('source identities match Cargo roots for Windows canonical drive and UNC pa
     assert.equal(sourcePath(path, 'win32'), path);
     assert.equal(sourcePath(canonical, 'darwin'), canonical);
   }
+});
+
+test('`userInterfaceStyle` takes Expo\'s three values, refusing others by name, and fixes the Apple binaries\' metadata', async () => {
+  const { readManifest, nativeManifestMetadata } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-style-'));
+  const read = (style) => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Style', app: { id: 'dev.exact.style', name: 'Style' }, ...(style === undefined ? {} : { userInterfaceStyle: style }) }));
+    return readManifest(dir, 'style');
+  };
+  try {
+    for (const style of ['light', 'dark']) {
+      for (const platform of ['ios', 'macos']) assert.equal(nativeManifestMetadata(read(style), platform).userInterfaceStyle, style);
+      for (const platform of ['android', 'linux', 'windows']) assert.equal(nativeManifestMetadata(read(style), platform).userInterfaceStyle, undefined);
+    }
+    // `automatic` is the default: a binary built with it is the one built without the key.
+    assert.deepEqual(nativeManifestMetadata(read('automatic'), 'ios'), nativeManifestMetadata(read(undefined), 'ios'));
+    assert.throws(() => read('Dark'), /userInterfaceStyle: "Dark" is not one of "automatic", "light", "dark"/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

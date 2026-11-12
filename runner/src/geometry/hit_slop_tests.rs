@@ -103,6 +103,18 @@ fn a_clip_cuts_the_slop() {
 }
 
 #[test]
+fn a_one_axis_clip_cuts_that_axis_only() {
+    // CSS Overflow 3 §3.1: `clip` beside `visible` clips one axis, so the
+    // child is hit below the box and not beside it.
+    let r = boot(
+        "      box id=\"clip\" position=\"absolute\" left=0 top=0 width=50 height=50 overflow-x=\"clip\"\n        box id=\"inner\" width=100 height=100 flex-shrink=0\n",
+    );
+    assert_eq!(hit(&r, 25.0, 25.0), at("inner"));
+    assert_eq!(hit(&r, 25.0, 75.0), at("inner"));
+    assert_eq!(hit(&r, 75.0, 25.0), at("page"));
+}
+
+#[test]
 fn a_negative_or_percentage_slop_is_refused() {
     for value in ["-4px", "10%", "4px -2px"] {
         let source = format!(

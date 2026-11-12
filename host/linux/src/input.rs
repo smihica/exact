@@ -279,6 +279,7 @@ impl Input {
             let touch = d
                 .supported_keys()
                 .is_some_and(|keys| keys.contains(evdev::KeyCode::BTN_TOUCH));
+            let wheels = Wheels::new(d.supported_relative_axes());
             let events = match d.fetch_events() {
                 Ok(events) => events,
                 Err(e)
@@ -341,19 +342,10 @@ impl Input {
                     EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, v) => {
                         pointer.relative.1 += v as f32;
                     }
-                    EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL_HI_RES, v) => {
-                        out.push(InputEvent::Wheel(0.0, -(v as f32) / 120.0 * LINE))
-                    }
-                    EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL_HI_RES, v) => {
-                        out.push(InputEvent::Wheel((v as f32) / 120.0 * LINE, 0.0))
-                    }
-                    EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, v) => {
-                        // A device with high-resolution wheels reports both;
-                        // the coarse one is folded by the loop (see `coalesce`).
-                        out.push(InputEvent::Wheel(0.0, -(v as f32) * LINE));
-                    }
-                    EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL, v) => {
-                        out.push(InputEvent::Wheel((v as f32) * LINE, 0.0))
+                    EventSummary::RelativeAxis(_, code, v) => {
+                        if let Some(event) = wheels.event(code, v) {
+                            out.push(event);
+                        }
                     }
                     EventSummary::Key(_, code, value) => {
                         let code = code.0;
@@ -389,7 +381,7 @@ impl Input {
         for index in gone.into_iter().rev() {
             self.devices.remove(index);
         }
-        coalesce(out)
+        out
     }
 }
 
@@ -430,19 +422,35 @@ impl PointerReport {
     }
 }
 
-/// A device that reports both `REL_WHEEL` and `REL_WHEEL_HI_RES` in one
-/// report would scroll twice; keep the fine one.
-fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
-    let fine = events
-        .iter()
-        .any(|e| matches!(e, InputEvent::Wheel(_, dy) if dy.abs() % LINE != 0.0));
-    if !fine {
-        return events;
+// High-resolution wheels also report coarse ticks. Choose by the device's
+// capabilities on each axis: 120 high-resolution units can be a whole detent.
+struct Wheels {
+    vertical_hi_res: bool,
+    horizontal_hi_res: bool,
+}
+impl Wheels {
+    fn new(axes: Option<&evdev::AttributeSetRef<RelativeAxisCode>>) -> Self {
+        Self {
+            vertical_hi_res: axes.is_some_and(|a| a.contains(RelativeAxisCode::REL_WHEEL_HI_RES)),
+            horizontal_hi_res: axes
+                .is_some_and(|a| a.contains(RelativeAxisCode::REL_HWHEEL_HI_RES)),
+        }
     }
-    events
-        .into_iter()
-        .filter(|e| !matches!(e, InputEvent::Wheel(dx, dy) if (dy.abs() % LINE == 0.0 && *dy != 0.0) || (dx.abs() % LINE == 0.0 && *dx != 0.0)))
-        .collect()
+
+    fn event(&self, code: RelativeAxisCode, value: i32) -> Option<InputEvent> {
+        let v = value as f32;
+        match code {
+            RelativeAxisCode::REL_WHEEL_HI_RES => Some(InputEvent::Wheel(0., -v / 120. * LINE)),
+            RelativeAxisCode::REL_HWHEEL_HI_RES => Some(InputEvent::Wheel(v / 120. * LINE, 0.)),
+            RelativeAxisCode::REL_WHEEL if !self.vertical_hi_res => {
+                Some(InputEvent::Wheel(0., -v * LINE))
+            }
+            RelativeAxisCode::REL_HWHEEL if !self.horizontal_hi_res => {
+                Some(InputEvent::Wheel(v * LINE, 0.))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The US evdev map: physical code, unshifted/shifted logical key.
@@ -543,6 +551,120 @@ pub(crate) fn key(code: u16, shift: bool) -> Option<(&'static str, &'static str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use RelativeAxisCode as Rel;
+
+    fn wheel_events(axes: &[Rel], events: &[(Rel, i32)]) -> Vec<InputEvent> {
+        let axes = axes.iter().collect::<evdev::AttributeSet<_>>();
+        let wheels = Wheels::new(Some(&axes));
+        events
+            .iter()
+            .filter_map(|&(code, value)| wheels.event(code, value))
+            .collect()
+    }
+
+    #[test]
+    fn wheel_detent_is_delivered_once() {
+        for (ticks, units, points) in [(-1, -120, 40.), (1, 120, -40.), (2, 240, -80.)] {
+            assert_eq!(
+                wheel_events(
+                    &[Rel::REL_WHEEL, Rel::REL_WHEEL_HI_RES],
+                    &[(Rel::REL_WHEEL, ticks), (Rel::REL_WHEEL_HI_RES, units)],
+                ),
+                vec![InputEvent::Wheel(0., points)]
+            );
+            assert_eq!(
+                wheel_events(
+                    &[Rel::REL_HWHEEL, Rel::REL_HWHEEL_HI_RES],
+                    &[(Rel::REL_HWHEEL_HI_RES, units), (Rel::REL_HWHEEL, ticks)],
+                ),
+                vec![InputEvent::Wheel(-points, 0.)]
+            );
+        }
+    }
+
+    #[test]
+    fn wheel_horizontal_fine_delta_replaces_the_coarse_tick() {
+        assert_eq!(
+            wheel_events(
+                &[Rel::REL_HWHEEL, Rel::REL_HWHEEL_HI_RES],
+                &[(Rel::REL_HWHEEL, 1), (Rel::REL_HWHEEL_HI_RES, 15)],
+            ),
+            vec![InputEvent::Wheel(5., 0.)]
+        );
+    }
+
+    #[test]
+    fn wheel_fine_and_whole_deltas_are_kept_across_reads() {
+        let axes = [Rel::REL_WHEEL, Rel::REL_WHEEL_HI_RES];
+        assert_eq!(
+            wheel_events(
+                &axes,
+                &[
+                    (Rel::REL_WHEEL_HI_RES, -15),
+                    (Rel::REL_WHEEL, -1),
+                    (Rel::REL_WHEEL_HI_RES, -120),
+                ],
+            ),
+            vec![InputEvent::Wheel(0., 5.), InputEvent::Wheel(0., 40.)]
+        );
+        assert!(wheel_events(&axes, &[(Rel::REL_WHEEL, -1)]).is_empty());
+        assert_eq!(
+            wheel_events(&axes, &[(Rel::REL_WHEEL_HI_RES, -15); 8]),
+            vec![InputEvent::Wheel(0., 5.); 8]
+        );
+    }
+
+    #[test]
+    fn wheel_capabilities_are_independent_per_axis_and_device() {
+        let mut events = wheel_events(
+            &[Rel::REL_WHEEL, Rel::REL_WHEEL_HI_RES, Rel::REL_HWHEEL],
+            &[
+                (Rel::REL_WHEEL, -1),
+                (Rel::REL_WHEEL_HI_RES, -15),
+                (Rel::REL_HWHEEL, 1),
+            ],
+        );
+        events.extend(wheel_events(
+            &[Rel::REL_WHEEL, Rel::REL_HWHEEL, Rel::REL_HWHEEL_HI_RES],
+            &[
+                (Rel::REL_WHEEL, -1),
+                (Rel::REL_HWHEEL, 1),
+                (Rel::REL_HWHEEL_HI_RES, 15),
+            ],
+        ));
+        assert_eq!(
+            events,
+            vec![
+                InputEvent::Wheel(0., 5.),
+                InputEvent::Wheel(40., 0.),
+                InputEvent::Wheel(0., 40.),
+                InputEvent::Wheel(5., 0.),
+            ]
+        );
+    }
+
+    #[test]
+    fn wheel_coarse_only_devices_keep_both_axes() {
+        assert_eq!(
+            wheel_events(
+                &[Rel::REL_WHEEL, Rel::REL_HWHEEL],
+                &[
+                    (Rel::REL_WHEEL, -1),
+                    (Rel::REL_WHEEL, 2),
+                    (Rel::REL_HWHEEL, -2),
+                    (Rel::REL_HWHEEL, 1),
+                ],
+            ),
+            vec![
+                InputEvent::Wheel(0., 40.),
+                InputEvent::Wheel(0., -80.),
+                InputEvent::Wheel(-80., 0.),
+                InputEvent::Wheel(40., 0.),
+            ]
+        );
+        assert_eq!(Wheels::new(None).event(Rel::REL_X, 10), None);
+    }
+
     #[test]
     fn physical_press_repeat_and_release_keep_code_and_logical_key() {
         let mut keyboard = Keyboard::default();

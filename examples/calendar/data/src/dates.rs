@@ -1,4 +1,11 @@
 //! Gregorian civil dates. Schedules keep wall-clock endpoints, not UTC durations.
+//! The person's own calendars and activity are instants, placed on days in the
+//! reader's zone at the offset in force at each one.
+
+#[cfg(not(target_arch = "wasm32"))]
+use chrono::{DateTime, NaiveDate, Offset, TimeDelta, TimeZone};
+#[cfg(not(target_arch = "wasm32"))]
+use chrono_tz::Tz;
 
 pub(crate) const FIRST_MONTH: i32 = 1900 * 12;
 pub(crate) const LAST_MONTH: i32 = 2100 * 12 + 11;
@@ -163,6 +170,50 @@ pub(crate) fn in_range(day: i32) -> bool {
     day >= month_first(FIRST_MONTH) && day < month_first(LAST_MONTH + 1)
 }
 
+/// The reader's zone, by `time.timeZone`'s IANA name; UTC for a name the
+/// zone database does not know.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn zone(name: &str) -> Tz {
+    name.parse().unwrap_or(Tz::UTC)
+}
+
+/// `zone`'s offset from UTC at an instant, both in ms.
+#[cfg(not(target_arch = "wasm32"))]
+fn offset(zone: Tz, ms: f64) -> f64 {
+    DateTime::from_timestamp_millis(ms as i64).map_or(0.0, |at| {
+        let offset = zone.offset_from_utc_datetime(&at.naive_utc()).fix();
+        f64::from(offset.local_minus_utc()) * 1000.0
+    })
+}
+
+/// The local day an instant falls on in `zone`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn local_day(ms: f64, zone: Tz) -> i32 {
+    ((ms + offset(zone, ms)) / DAY_MS).floor() as i32
+}
+
+/// The minute of its local day an instant falls on in `zone`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn local_minute(ms: f64, zone: Tz) -> u16 {
+    let local = ms + offset(zone, ms);
+    ((local - (local / DAY_MS).floor() * DAY_MS) / 60_000.0) as u16
+}
+
+/// The instant `day` begins in `zone`: its earlier local midnight where the
+/// clocks repeat it, or the first minute after a change that skips it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn midnight(day: i32, zone: Tz) -> f64 {
+    let wall = day as f64 * DAY_MS;
+    let Some(midnight) = NaiveDate::from_num_days_from_ce_opt(day + 719_163)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+    else {
+        return wall;
+    };
+    (0..=180)
+        .find_map(|m| (zone.from_local_datetime(&(midnight + TimeDelta::minutes(m)))).earliest())
+        .map_or(wall - offset(zone, wall), |at| at.timestamp_millis() as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +241,32 @@ mod tests {
         assert!(parse_time("1:00").is_err());
         assert_eq!(display_time(0), "12:00 AM");
         assert_eq!(display_time(12 * 60), "12:00 PM");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_day_begins_at_its_own_offset() {
+        let la = zone("America/Los_Angeles");
+        let hour = 3_600_000.0;
+        // 4 July 2026 begins at 07:00 UTC, the -7 hours of summer.
+        let july_4 = ordinal(2026, 7, 4);
+        assert_eq!(midnight(july_4, la), 1_783_148_400_000.0);
+        assert_eq!(local_day(midnight(july_4, la), la), july_4);
+        assert_eq!(local_day(midnight(july_4, la) - 1.0, la), july_4 - 1);
+        assert_eq!(local_minute(midnight(july_4, la) + 9.0 * hour, la), 9 * 60);
+        // The day the clocks go forward is 23 hours long, the day they go back 25.
+        let spring = ordinal(2026, 3, 8);
+        let fall = ordinal(2026, 11, 1);
+        assert_eq!(midnight(spring + 1, la) - midnight(spring, la), 23.0 * hour);
+        assert_eq!(midnight(fall + 1, la) - midnight(fall, la), 25.0 * hour);
+        // Santiago skips midnight on 6 September 2026: the day begins at 01:00, UTC-3.
+        let santiago = zone("America/Santiago");
+        let skipped = ordinal(2026, 9, 6);
+        assert_eq!(
+            midnight(skipped, santiago),
+            skipped as f64 * DAY_MS + 4.0 * hour
+        );
+        assert_eq!(zone("Not/A_Zone"), Tz::UTC);
     }
 
     #[test]

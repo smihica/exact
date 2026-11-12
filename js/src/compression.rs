@@ -148,8 +148,8 @@ impl Decompressor {
         }
     }
 
-    /// Inflate until `input` is used up or the deflate data ends; what is
-    /// left of `input` after its end.
+    /// Inflate until more input is needed or the deflate data ends,
+    /// returning the unconsumed input.
     fn inflate_into<'a>(
         &mut self,
         mut input: &'a [u8],
@@ -176,7 +176,8 @@ impl Decompressor {
                 }
                 // Output to come still: go on into more room.
                 Ok(_) if full => {}
-                Ok(_) if input.is_empty() => break,
+                // The inflater can hold output after consuming the last input byte.
+                Ok(_) if input.is_empty() && r.bytes_written == 0 => break,
                 // Neither output room nor input was the reason it stopped.
                 Ok(_) if r.bytes_consumed == 0 && r.bytes_written == 0 => {
                     out.truncate(at);
@@ -438,6 +439,26 @@ mod tests {
         assert_eq!(inflate_all(Format::Deflate, &bytes).unwrap(), text);
         let raw = miniz_oxide::deflate::compress_to_vec(&text, 6);
         assert_eq!(inflate_all(Format::DeflateRaw, &[&raw]).unwrap(), text);
+    }
+
+    #[test]
+    fn a_final_match_crossing_a_window_inflates_whole() {
+        for len in [32768, 32769, 65537, 98305] {
+            let input = vec![0; len];
+            for format in [Format::DeflateRaw, Format::Deflate, Format::Gzip] {
+                let packed = compress_all(format, &input);
+                for chunk_len in [packed.len(), 1] {
+                    let mut d = Decompressor::new(format);
+                    let mut out = Vec::new();
+                    for chunk in packed.chunks(chunk_len) {
+                        d.write(chunk, &mut out).unwrap();
+                    }
+                    assert_eq!(out.len(), len, "{format:?}, chunk size {chunk_len}");
+                    assert_eq!(out, input);
+                    d.finish().unwrap();
+                }
+            }
+        }
     }
 
     #[test]

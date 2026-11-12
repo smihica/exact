@@ -1,0 +1,10 @@
+{
+  "name": "@exact/push",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A visible push from the app's own server: the platform's push credential as a live value, by the Push API's names (LLP 1133.004 §9).",
+  "exports": {
+    ".": "./exact.json",
+    "./apple": "./apple/exact.json"
+  }
+}

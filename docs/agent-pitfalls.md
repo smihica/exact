@@ -35,7 +35,7 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   there only while the view shows. iOS and macOS keep it in place. Cause: the web
   build (the JS target) reads a leaving view's box during its page update, after it
   has already applied the action's other changes; iOS and macOS read it before any
-  change ([LLP 1063](../llp/1063-presence-and-layout-motion.rfc.md), "Known gaps"). What to
+  change (LLP 1063, "Known gaps"). What to
   do: give the space to the leaving view instead of its parent, for example a
   `margin-top` on a banner in place of a column's `padding-top` that follows whether a
   banner shows, so the action that removes the view does not also change its
@@ -183,14 +183,14 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
 - **A raised `z-index` leaves a dragged card under the next column.** A card at
   `position="relative" z-index=10`, dragged over a neighbouring column, paints
   beneath it. Cause: `z-index` orders siblings, not a whole stacking context as in
-  CSS (a declared deviation, [LLP 1001](../llp/1001-kernel-v1.spec.md) "`z-index`
+  CSS (a declared deviation, LLP 1001 "`z-index`
   orders siblings"), and on the web a box that follows a positioned or stacked box
   becomes a paint group (`isolation: isolate`). A child cannot rise above its
   parent's later siblings. Fix: raise the ancestor that is a sibling of the others
   (the card's column, while it holds the dragged card), or draw the dragged card in
   an overlay at the board level. For cards between lists, a `reorderGroup` on the
-  lists has the host draw the card in its top layer instead ([LLP
-  1094](../llp/1094-dropping-across-lists.rfc.md)). (Authoring bench, LLP 1087,
+  lists has the host draw the card in its top layer instead (LLP
+  1094). (Authoring bench, LLP 1087,
   t4-kanban: two builders, 5 and 10 minutes, 2026-10-04.) A chess board's drag ghost
   is the same: a ghost inside the square it left stays under the squares after it;
   draw it as a later sibling of the squares, positioned in the board (chess diary #5).
@@ -962,15 +962,15 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   (`bun exact.mjs docs convex live queries`). Drive a new package once (`agent web "clock
   data" logs`) before building on it. (LLP 1157 §1, 2026-11-10.)
 
-- **A native drive against a real Convex deployment: the second launch's
+- **A drive against a real Convex deployment: the second launch's
   writes do nothing.** A mutation replies ok and the data does not change.
-  Cause: under the driver a native host's `crypto.getRandomValues` is seeded
-  (`EXACT_AGENT_SEED`, 1 by default), so every launch draws the same session
+  Cause: under the driver `crypto.getRandomValues` is seeded on every host
+  (`--seed`, 1 by default), so every launch draws the same session
   id, and Convex answers a request id it has seen from that session with the
-  first answer, without running it. Fix: a new `--seed` for each launch
+  first answer, without running it; `logs` says the draws are seeded. Fix: a new `--seed` for each launch
   (`agent macos --seed 7 …`), or drive against the stand-in
-  (`bun exact.mjs docs convex live queries`). The web draws the browser's entropy, and a
-  launch outside the driver the system's. (LLP 1157 §6, 2026-11-10.)
+  (`bun exact.mjs docs convex live queries`). A launch outside the driver draws
+  the system's entropy. (LLP 1157 §6, 2026-11-10.)
 
 - **A helper action does not see what its caller just assigned.** `sel = next`
   then `follow()`, with `follow` reading `sel`, would read the old `sel`: a call
@@ -993,13 +993,11 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   ends the page first. Fix: navigate in the mutation's `then`, which runs once the
   write has answered. (Authoring bench, LLP 1087, a2-contacts and t2-todo, 2026-10-05.)
 
-- **A module event's attribute refused as unknown on the root.** `main
-  reading=tagRead` fails `lower-unknown-attr` ("`main` has no attribute
-  `reading`") when the file also declares a derive, state or action named
-  `reading`, even with `reading` in the `use` line: the local name hides the
-  module's event, so the attribute is never bound. Shelf's `derive reading` (the
-  books in progress) did this to `@exact/nfc`'s `reading` event (LLP 1133.035).
-  Fix: rename the local name.
+- **Import a module event where its attribute is written.** After `use reading
+  as tagEvent from "@exact/nfc"`, write `main tagEvent=tagRead` on the root.
+  The attribute uses the imported name; `reading=` is unknown unless imported
+  under that name too. A local state, derive, action or loop binding named
+  `reading` does not hide the imported event from an attribute.
 
 - **Repeating with `pause` mutations.** A `then` cannot send its own mutation
   (`analyze-then-self-send`), and two mutations whose `then`s send each other
@@ -1879,9 +1877,8 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   feature already exists under a name you did not search for. Haptics
   (`haptic()`, `-exact-press-haptic`) were proposed as a new gap after they had
   landed. Fix: before calling something missing, search
-  `docs/contract-for-agents.md` and the LLP index (`ls llp/`, then `grep -ril
-  <term> llp`). Name the LLP that lacks it when you report the gap. (Signal
-  Clone, 2026-10-04.)
+  `docs/contract-for-agents.md` and `docs/reference.md`, and ask `contract vocab
+  <name>`. (Signal Clone, 2026-10-04.)
 
 - **`build.mjs --test --ios` never returns after the tests pass.** Cause:
   `xcodebuild test` can sit for ten minutes or more after `Test Suite 'Selected
@@ -2048,10 +2045,19 @@ price: answers arrive `Later`, outside the action's transaction (LLP 1027.002 D1
   and its assets with it, only when `app.ts` imports it: import its driver even if the app
   uses nothing from it yet. (LLP 1154, 2026-10-31.)
 
-- **A file added to a `file:` package does not reach the app.** Bun installs a `file:`
-  package as directories of links to the files it had then: an edit to one reaches the app at
-  once (and the bake's `#[path]` names the source), but a new file, an `exact.json` or a
-  shim, is not in `node_modules` until the next `bun install`. (LLP 1154, 2026-10-31.)
+- **An edit to a `file:` package inside the app does not reach the app.** Bun (1.4.2) copies
+  a `file:` package whose path is inside the app's directory (`file:./packages/p`) into
+  `node_modules`, each file keeping its modification time, and every build reads it there:
+  an edit or an added file is not in the copy, and a removed file is still in it, until the
+  next `bun install`, which copies the package again and drops removed files. A `file:`
+  package outside the app's directory, as `exact add` writes for a standard package, is
+  installed as links to each file: an edit reaches the build at once. A file the build opens
+  under `node_modules` (an `exact.json`, a shim, a Swift or Kotlin source it names) is not
+  there when added, and is a broken link when removed, until `bun install`; a file reached
+  from one already opened (a Rust module beside the root, a Contract file a `use` names) is
+  the source's own. `ls -l node_modules/<package>/<file>` shows which you have: `->` is a
+  link, anything else a copy. After changing a copied package, run `bun install` in the app.
+  (#115, 2026-11-11.)
 
 ## Games
 

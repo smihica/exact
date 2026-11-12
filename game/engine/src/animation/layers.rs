@@ -113,6 +113,7 @@ impl Layers {
                     old,
                     if a.looping { next } else { time },
                     a.looping,
+                    !a.sampled,
                     &mut a.playback.crossed,
                 );
                 pose.crossed.extend(a.playback.crossed.iter().cloned());

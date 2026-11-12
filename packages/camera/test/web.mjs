@@ -73,7 +73,7 @@ const stored = (page, path) => page.evaluate(async ([prefix, path]) => {
 /** The viewfinder's video: its size and whether it plays a stream. */
 const viewfinder = page => page.evaluate(() => {
   const v = document.querySelector('[data-testid="viewfinder"] video');
-  return v ? { width: v.videoWidth, height: v.videoHeight, stream: !!v.srcObject, transform: v.style.transform } : null;
+  return v ? { width: v.videoWidth, height: v.videoHeight, stream: !!v.srcObject, transform: v.style.transform, fit: v.style.objectFit } : null;
 });
 
 for (const engine of engines) {
@@ -126,6 +126,7 @@ for (const engine of engines) {
     check(engine, "the track's settings are the browser's", /^[1-9]\d*x[1-9]\d*$/.test(size), size);
     const shown = await waitFor(() => viewfinder(page), v => v?.width > 0);
     check(engine, 'the viewfinder plays the track', shown?.width > 0 && shown.stream, JSON.stringify(shown));
+    check(engine, "a written object-fit is the viewfinder's", shown?.fit === 'cover', JSON.stringify(shown));
     const cameras = await until(page, 'cameras', t => Number(t) >= 1);
     check(engine, 'enumerateDevices lists the camera', Number(cameras) >= 1, cameras);
     const caps = await until(page, 'caps', t => Number(t.split(' ')[0]) > 0);

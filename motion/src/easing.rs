@@ -116,6 +116,31 @@ pub enum EasingError {
     TooManyStops,
 }
 
+impl std::fmt::Display for EasingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EasingError::NonFinite => f.write_str("an easing's numbers are finite"),
+            EasingError::ControlPointOutOfRange => {
+                f.write_str("a `cubic-bezier()` control point's x is from 0 to 1")
+            }
+            EasingError::ZeroSteps => f.write_str("`steps()` takes at least one step"),
+            EasingError::JumpNoneNeedsTwoSteps => {
+                f.write_str("`steps()` with `jump-none` takes at least two steps")
+            }
+            EasingError::TooFewStops => f.write_str("`linear()` takes at least two stops"),
+            EasingError::StopsNotSorted => {
+                f.write_str("the positions of `linear()` stops do not decrease")
+            }
+            EasingError::StopOutOfRange => {
+                f.write_str("a `linear()` stop's position is from 0% to 100%")
+            }
+            EasingError::TooManyStops => {
+                write!(f, "`linear()` takes at most {MAX_LINEAR_STOPS} stops")
+            }
+        }
+    }
+}
+
 impl Easing {
     /// Check every rule the evaluator relies on. Validated once, at the
     /// boundary; after that `progress` may assume the shape.

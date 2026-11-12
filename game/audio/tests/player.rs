@@ -629,6 +629,7 @@ fn refused_start_is_retried_without_a_transport_bump() {
             self.accepted
         }
         fn set(&mut self, _: u64, _: f32, _: f32) {}
+        fn set_pitch(&mut self, _: u64, _: f32) {}
         fn stop(&mut self, _: u64) {}
     }
     let sim = Sim::<SoundGame>::new(()).unwrap();
@@ -719,4 +720,333 @@ fn spatial_controls_are_saved_and_distance_models_have_no_hidden_cutoff() {
         .calls
         .iter()
         .any(|c| matches!(c, Call::Set { left, right, .. } if *left == 0. && *right == 0.5)));
+}
+
+#[test]
+fn live_pitch_does_not_restart_the_player() {
+    let mut sim = Sim::<SoundGame>::new(()).unwrap();
+    let mut player = Player::new(RecordingOutput::default(), 48000);
+    player.sync(sim.world(), None, Default::default());
+    audio::pitch(sim.world_mut(), 0, 2.0);
+    player.output.calls.clear();
+    player.sync(sim.world(), None, Default::default());
+    assert!(player
+        .output
+        .calls
+        .contains(&Call::Pitch { id: 0, pitch: 2.0 }));
+    assert!(!player
+        .output
+        .calls
+        .iter()
+        .any(|call| matches!(call, Call::Start { .. } | Call::Stop { .. })));
+}
+
+#[test]
+fn changing_rates_integrate_progress_restore_and_end_at_the_right_tick() {
+    let mut sim = Sim::<SoundGame>::new(()).unwrap();
+    sim.advance(0.0, Clock::Seekable);
+    sim.advance(250.0, Clock::Seekable);
+    assert_eq!(sim.world().tick(), 15);
+    audio::pitch(sim.world_mut(), 0, 2.0);
+    assert_eq!(sim.world().resource::<audio::Voices>().voices[0].ends, 38);
+    sim.advance(500.0, Clock::Seekable);
+    audio::pitch(sim.world_mut(), 0, 0.5);
+    sim.advance(600.0, Clock::Seekable);
+    let voice = sim.world().resource::<audio::Voices>().voices[0].clone();
+    assert_eq!(voice.playback_ticks(36), 15.0 + 15.0 * 2.0 + 6.0 * 0.5);
+    assert_eq!(voice.ends, 60);
+    let save = sim.save().unwrap();
+    let mut restored = Sim::<SoundGame>::new(()).unwrap();
+    restored.restore(&save).unwrap();
+    assert_eq!(sim.world().hash(), restored.world().hash());
+    assert_eq!(sim.world().save(), restored.world().save());
+    let mut player = recording();
+    player.sync(restored.world(), None, Default::default());
+    assert!(matches!(
+        player.output.calls[0],
+        Call::Start {
+            offset: 38400,
+            pitch: 0.5,
+            ..
+        }
+    ));
+    // A device replacement uses the same saved source position.
+    player.output.calls.clear();
+    player.sync(
+        restored.world(),
+        None,
+        exact_game_audio::Transport {
+            generation: 1,
+            playing: true,
+        },
+    );
+    assert!(player.output.calls.iter().any(|c| matches!(
+        c,
+        Call::Start {
+            offset: 38400,
+            pitch: 0.5,
+            ..
+        }
+    )));
+    restored.advance(0.0, Clock::Seekable);
+    restored.advance(383.4, Clock::Seekable);
+    assert_eq!(restored.world().tick(), 59);
+    assert_eq!(restored.world().resource::<audio::Voices>().voices.len(), 1);
+    restored.advance(400.0, Clock::Seekable);
+    assert_eq!(restored.world().tick(), 60);
+    assert!(restored
+        .world()
+        .resource::<audio::Voices>()
+        .voices
+        .is_empty());
+}
+
+#[test]
+fn unchanged_pitch_keeps_save_bytes_and_world_hashes() {
+    let mut plain = Sim::<SoundGame>::new(()).unwrap();
+    let mut repeated = Sim::<SoundGame>::new(()).unwrap();
+    for ms in [0.0, 100.0, 200.0, 300.0] {
+        plain.advance(ms, Clock::Seekable);
+        repeated.advance(ms, Clock::Seekable);
+        audio::pitch(repeated.world_mut(), 0, 1.0);
+        assert_eq!(plain.world().save(), repeated.world().save());
+        assert_eq!(plain.world().hash(), repeated.world().hash());
+        assert!(repeated.world().resource::<audio::Voices>().voices[0]
+            .playback
+            .is_none());
+    }
+}
+
+#[test]
+fn pitch_bounds_fade_deadline_and_missing_voices() {
+    let mut sim = Sim::<SoundGame>::new(()).unwrap();
+    for rate in [f32::NAN, f32::INFINITY, -1.0, 100.0, 0.5] {
+        let id = sim.world_mut().play("chime").pitch(rate).start();
+        let expected = sim
+            .world()
+            .resource::<audio::Voices>()
+            .voices
+            .last()
+            .unwrap()
+            .pitch;
+        audio::pitch(sim.world_mut(), 0, rate);
+        assert_eq!(
+            sim.world().resource::<audio::Voices>().voices[0].pitch,
+            expected
+        );
+        audio::stop(sim.world_mut(), id);
+    }
+    audio::fade(sim.world_mut(), 0, 0.25);
+    audio::pitch(sim.world_mut(), 0, 0.01);
+    assert_eq!(sim.world().resource::<audio::Voices>().voices[0].ends, 15);
+    let save = sim.world().save();
+    audio::pitch(sim.world_mut(), u64::MAX, 3.0);
+    assert_eq!(sim.world().save(), save);
+}
+
+#[test]
+fn per_tick_pitch_keeps_fractional_progress_across_loop_wraps_and_restore() {
+    struct Engine;
+    impl Game for Engine {
+        type Args = ();
+        const ID: &'static str = "pitch-each-tick";
+        fn setup(w: &mut World, _: &()) {
+            w.sounds([("engine", Synth::sine(100.0).seconds(0.25).looped())]);
+            w.play("engine").offset(0.125).start();
+        }
+        fn tick(w: &mut World, _: &Input, _: &()) {
+            audio::pitch(w, 0, (w.tick() % 4 + 1) as f32 * 0.25);
+            audio::step(w);
+        }
+    }
+    let mut sim = Sim::<Engine>::new(()).unwrap();
+    sim.advance(0.0, Clock::Seekable);
+    sim.advance(1000.0, Clock::Seekable);
+    assert_eq!(sim.world().tick(), 60);
+    let voices = sim.world().resource::<audio::Voices>();
+    let voice = &voices.voices[0];
+    // The setup rate plays the first tick; tick 0's change takes effect at boundary 1.
+    let expected = 1.0
+        + (0..59)
+            .map(|tick| (tick % 4 + 1) as f64 * 0.25)
+            .sum::<f64>();
+    assert_eq!(voice.playback_ticks(60), expected);
+    assert_eq!(voice.pitch, 1.0);
+    assert_eq!(voice.ends, u64::MAX);
+    drop(voices);
+    let mut restored = Sim::<Engine>::new(()).unwrap();
+    restored.restore(&sim.save().unwrap()).unwrap();
+    let mut player = recording();
+    player.sync(restored.world(), None, Default::default());
+    // Synthesis overlaps 480 frames at the seam, leaving a 11,520-frame loop.
+    let offset = ((expected * 800.0 + 6000.0) % 11520.0) as usize;
+    assert!(
+        matches!(player.output.calls[0], Call::Start { offset: actual, pitch: 1.0, .. } if actual == offset)
+    );
+    restored.advance(0.0, Clock::Seekable);
+    restored.advance(500.0, Clock::Seekable);
+    sim.advance(1500.0, Clock::Seekable);
+    assert_eq!(sim.world().save(), restored.world().save());
+    assert_eq!(sim.world().hash(), restored.world().hash());
+}
+
+#[test]
+fn short_voice_lifetimes_match_builder_pitch_and_change_back() {
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for seconds in [0.1, 0.2] {
+        for sampled in [false, true] {
+            let mut world = World::new(60, 0);
+            world.sounds([("short", Synth::sine(440.).seconds(seconds))]);
+            if sampled {
+                world.resource_mut::<Sounds>().add(
+                    "short",
+                    audio::Sample {
+                        asset: "short.sound".into(),
+                        frames: (seconds * 44100.) as u64,
+                        rate: 44100,
+                        channels: 1,
+                        ..Default::default()
+                    },
+                );
+            }
+            let builder = world.play("short").pitch(2.).start();
+            let live = world.play("short").start();
+            let end = |w: &World, id| {
+                w.resource::<audio::Voices>()
+                    .voices
+                    .iter()
+                    .find(|v| v.id == id)
+                    .unwrap()
+                    .ends
+            };
+            let original = end(&world, live);
+            assert_eq!(original, if seconds == 0.1 { 6 } else { 12 });
+            audio::pitch(&mut world, live, 2.);
+            actual.push((seconds, sampled, end(&world, live)));
+            expected.push((seconds, sampled, end(&world, builder)));
+            audio::pitch(&mut world, live, 1.);
+            actual.push((seconds, sampled, end(&world, live)));
+            expected.push((seconds, sampled, original));
+        }
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn sample_duration_rounding_matches_builder_pitch() {
+    let mut world = World::new(60, 0);
+    world.sounds([("sample", Synth::default())]);
+    world.resource_mut::<Sounds>().add(
+        "sample",
+        audio::Sample {
+            asset: "sample.sound".into(),
+            frames: 22785,
+            rate: 44100,
+            channels: 1,
+            ..Default::default()
+        },
+    );
+    world.play("sample").pitch(0.5).start();
+    let live = world.play("sample").start();
+    audio::pitch(&mut world, live, 0.5);
+    let voices = world.resource::<audio::Voices>();
+    assert_eq!(voices.voices[0].ends, 62);
+    assert_eq!(voices.voices[1].ends, 62);
+}
+
+#[test]
+fn raw_pitch_write_preserves_resume_progress_and_finite_end() {
+    struct Raw;
+    impl Game for Raw {
+        type Args = ();
+        const ID: &'static str = "raw-pitch";
+        fn setup(w: &mut World, _: &()) {
+            w.sounds([
+                ("loop", Synth::sine(440.).seconds(3.).looped()),
+                ("finite", Synth::sine(440.).seconds(3.)),
+            ]);
+            w.play("loop").start();
+            w.play("finite").start();
+        }
+        fn tick(w: &mut World, _: &Input, _: &()) {
+            if w.tick() == 29 {
+                for v in &mut w.resource_mut::<audio::Voices>().voices {
+                    v.pitch = 2.;
+                }
+            }
+            audio::step(w);
+        }
+    }
+    let mut sim = Sim::<Raw>::new(()).unwrap();
+    let mut player = recording();
+    sim.advance(0., Clock::Seekable);
+    player.sync(sim.world(), None, Default::default());
+    sim.advance(500., Clock::Seekable);
+    assert_eq!(sim.world().resource::<audio::Voices>().voices[1].ends, 105);
+    player.sync(sim.world(), None, Default::default());
+    assert_eq!(
+        player
+            .output
+            .calls
+            .iter()
+            .filter(|c| matches!(c, Call::Start { .. }))
+            .count(),
+        2
+    );
+    sim.advance(1000., Clock::Seekable);
+    assert_eq!(
+        sim.world().resource::<audio::Voices>().voices[0].playback_ticks(60),
+        90.
+    );
+    player.output.calls.clear();
+    player.sync(
+        sim.world(),
+        None,
+        exact_game_audio::Transport {
+            generation: 1,
+            playing: true,
+        },
+    );
+    assert!(matches!(
+        player
+            .output
+            .calls
+            .iter()
+            .find(|c| matches!(c, Call::Start { .. })),
+        Some(Call::Start {
+            offset: 72000,
+            pitch: 2.,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn elapsed_pitch_round_trip_keeps_the_original_end() {
+    let mut sim = Sim::<SoundGame>::new(()).unwrap();
+    sim.world_mut()
+        .resource_mut::<Sounds>()
+        .add("short", Synth::sine(440.).seconds(0.3));
+    let id = sim.world_mut().play("short").start();
+    sim.advance(0., Clock::Seekable);
+    sim.advance(283.4, Clock::Seekable);
+    assert_eq!(sim.world().tick(), 17);
+    audio::pitch(sim.world_mut(), id, 2.);
+    audio::pitch(sim.world_mut(), id, 1.);
+    assert_eq!(sim.world().resource::<audio::Voices>().voices[1].ends, 18);
+}
+
+#[test]
+fn unchanged_builder_rates_keep_their_lifetime_rounding() {
+    for (seconds, expected) in [(0.3, 1801), (1.1, 6601)] {
+        let mut world = World::new(60, 0);
+        world.sounds([("short", Synth::sine(440.).seconds(seconds))]);
+        world.play("short").pitch(0.01).start();
+        let id = world.play("short").start();
+        audio::pitch(&mut world, id, 0.01);
+        for voice in &world.resource::<audio::Voices>().voices {
+            assert_eq!(voice.ends, expected);
+        }
+    }
 }

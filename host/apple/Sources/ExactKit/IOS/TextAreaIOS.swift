@@ -512,7 +512,7 @@ extension NodeView {
         // Not the screen's scroller: the status bar scrolls that (LLP 1115).
         f.scrollsToTop = false
         #endif
-        addSubview(f)
+        (clipBox ?? self).addSubview(f)
         textArea = f
     }
     func configureMarkup() {

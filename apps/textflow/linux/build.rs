@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "textflow_data::Textflow",
             "textflow_data::Textflow::default()",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

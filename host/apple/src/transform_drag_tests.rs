@@ -73,7 +73,7 @@ impl Packet {
         bytes
     }
     fn send(self, host: &mut Host<NoData>) -> String {
-        host.transform_motion(&self.bytes())
+        host.transform_motion(&self.bytes()).finish()
     }
 }
 fn quoted(json: &str, field: &str) -> u64 {
@@ -654,6 +654,108 @@ fn apple_bridge_preserves_high_sequence_and_exact_packet_length() {
     assert_ne!(begin.tokens[0], begin.tokens[1]);
 }
 
+fn bridge_activity_reply(geometry: bool) {
+    let action = if geometry {
+        "    measured = measured + 1"
+    } else {
+        "    released = released + 1"
+    };
+    let source = format!(
+        "shape ID\n  id: string\nshape State\n  title: string\n{}",
+        SOURCE
+            .replace(
+                "component App\n",
+                "component App\n  mutation sent as shape ID\n"
+            )
+            .replace(
+                action,
+                &format!(
+                    "{action}\n    send sent = startActivity(\"train\", State(title=\"Train\"))"
+                )
+            )
+    );
+    let mut bridge = Bridge::new();
+    bridge.link_activities();
+    let n = bridge.boot(
+        &contract::compile(&source).unwrap().encode(),
+        NoData,
+        Hooks::none(),
+        400.0,
+        800.0,
+    );
+    let boot: serde_json::Value = serde_json::from_slice(bridge.output_bytes(n as usize)).unwrap();
+    let binding = boot["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|op| op["op"] == "transform-drag")
+        .unwrap();
+    let [runtime, handle, target, clip] = ["runtime", "handleKey", "targetKey", "clipKey"]
+        .map(|key| binding[key].as_str().unwrap().parse().unwrap());
+    let mut p = Packet {
+        op: 10,
+        identity: [runtime, handle, target, clip, 1],
+        tokens: [0; 2],
+        values: [320.25, 200.5, 320.25, 200.5, 0.0, 0.0],
+        now: 0.0,
+    };
+    let send = |bridge: &mut Bridge<NoData>, p: Packet| -> serde_json::Value {
+        let n = bridge.input_write(&p.bytes());
+        let n = bridge.transform_motion(n);
+        serde_json::from_slice(bridge.output_bytes(n as usize)).unwrap()
+    };
+    let mut reply = send(&mut bridge, p);
+    if !geometry {
+        p.op = 11;
+        p.values = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        reply = send(&mut bridge, p);
+        p.tokens = ["translateToken", "scaleToken"]
+            .map(|key| reply[key].as_str().unwrap().parse().unwrap());
+        p.op = 13;
+        p.now = 10.0;
+        p.values[0] = 12.0;
+        reply = send(&mut bridge, p);
+        assert_eq!(reply["dispatched"], true);
+        assert_eq!(reply["velocity"].as_array().unwrap().len(), 3);
+    }
+    assert_eq!(reply["accepted"], true);
+    assert_eq!(reply["committed"], true);
+    assert!(reply.get("ops").is_none());
+    let batch = &reply["batch"];
+    assert_eq!(batch["error"], serde_json::Value::Null);
+    let ops = batch["ops"].as_array().unwrap();
+    assert_eq!(ops[0]["op"], "activity");
+    assert_eq!(ops[0]["request"]["command"], "startActivity");
+    assert_eq!(
+        ops[0]["request"]["args"],
+        serde_json::json!(["train", {"title": "Train"}])
+    );
+    assert!(bridge.request_active(ops[0]["ticket"].as_u64().unwrap()));
+    let expected = if geometry { "0/1/320.25" } else { "1/1/320.25" };
+    assert!(
+        ops.iter()
+            .any(|op| op["op"] == "props" && op["set"]["text"] == expected),
+        "{reply}"
+    );
+    let n = bridge.pump(10.0);
+    let next: serde_json::Value = serde_json::from_slice(bridge.output_bytes(n as usize)).unwrap();
+    assert!(next["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|op| op["op"] != "activity"));
+}
+
+#[test]
+fn apple_bridge_keeps_release_presenter_work_in_its_batch() {
+    bridge_activity_reply(false);
+}
+
+#[test]
+fn apple_bridge_keeps_geometry_presenter_work_in_its_batch() {
+    bridge_activity_reply(true);
+}
+
 #[test]
 fn one_target_multiple_handles_refuses_second_target_until_owner_disappears() {
     let source=SOURCE.replace("      text `${released}", "      column testId=\"clip-other\" width=320.25 height=200.5 overflow=\"hidden\" padding=0 border-width=0\n        column id=\"other-photo\" testId=\"other-photo\" width=\"100%\" height=\"100%\" box-sizing=\"border-box\" padding=0 border-width=0\n          column testId=\"other-handle\" transformDragFor=\"other-photo\" transformgeometry=geometry transformrelease=finish\n      text `${released}")
@@ -783,7 +885,7 @@ fn rejected_packets_keep_unrelated_motion_and_timer_status() {
     host.hold_end(opacity, HoldEnd::Cancel, 0.);
     let before = format!("{:?}", host.engine());
     for bytes in [vec![], vec![0; 119], vec![0; 121], vec![0; 120]] {
-        let reply = host.transform_motion(&bytes);
+        let reply = host.transform_motion(&bytes).finish();
         assert!(reply.contains("\"motion\":true"), "{reply}");
         assert!(reply.contains("\"timers\":true"), "{reply}");
         assert!(reply.contains("\"error\":\""), "{reply}");

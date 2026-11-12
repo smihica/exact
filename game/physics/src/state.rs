@@ -17,7 +17,7 @@ use std::{
 // v3 writes each static collider that its entry rebuilds bit-exactly as a hole.
 const SNAPSHOT: &[u8] = b"EXPHYS\0\x03";
 
-#[derive(Clone, Debug, Default, Data)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Entry {
     pub entity: Entity,
     pub body_handle: Option<[u32; 2]>,
@@ -25,7 +25,17 @@ pub(crate) struct Entry {
     pub body: Option<Body>,
     pub collider: Option<Collider>,
     pub pose: Transform,
+    // The handles of `Collider::extra`, in its order; written only when present.
+    pub extra_handles: Vec<[u32; 2]>,
 }
+crate::types::record!(Entry {
+    entity,
+    body_handle,
+    collider_handle,
+    body,
+    collider,
+    pose,
+} unnamed {} named { extra_handles });
 impl Entry {
     pub fn bh(&self) -> Option<RigidBodyHandle> {
         self.body_handle
@@ -34,6 +44,13 @@ impl Entry {
     pub fn ch(&self) -> Option<ColliderHandle> {
         self.collider_handle
             .map(|h| ColliderHandle::from_raw_parts(h[0], h[1]))
+    }
+    // The primary collider's handle, then the extras'.
+    pub fn colliders(&self) -> impl Iterator<Item = [u32; 2]> + '_ {
+        self.collider_handle
+            .iter()
+            .chain(&self.extra_handles)
+            .copied()
     }
 }
 // The world and write revisions the last sync observed; derived, never saved.
@@ -51,12 +68,14 @@ pub(crate) struct Live {
     // parented at the last sync, and each index's entry.
     pub bodies: BTreeSet<Entity>,
     pub parented: BTreeSet<Entity>,
+    // Entities whose collider has extras.
+    pub extended: BTreeSet<Entity>,
     pub slots: BTreeMap<u32, Entity>,
     // Collider handles removed this step, unmapped once its events are named.
     pub removed: Vec<[u32; 2]>,
     pub synced: Option<Synced>,
     // Static colliders verified equal to their entry's rebuild since last edited;
-    // sync forgets every row it visits.
+    // sync invalidates only colliders it touches.
     pub elidable: BTreeSet<[u32; 2]>,
     // Each entry's hash, kept until sync or writeback next touches the entry.
     pub digests: BTreeMap<Entity, u64>,
@@ -66,7 +85,12 @@ impl Live {
         Self {
             reverse: entries
                 .values()
-                .filter_map(|e| e.collider_handle.map(|h| (h, e.entity)))
+                .flat_map(|e| e.colliders().map(|h| (h, e.entity)))
+                .collect(),
+            extended: entries
+                .values()
+                .filter(|e| !e.extra_handles.is_empty())
+                .map(|e| e.entity)
                 .collect(),
             bodies: entries
                 .values()
@@ -269,7 +293,7 @@ fn rebuild(e: &Entry) -> Result<rapier3d::prelude::Collider, &'static str> {
     let c = e
         .collider
         .as_ref()
-        .filter(|_| e.body.is_none())
+        .filter(|c| e.body.is_none() && c.extra.is_empty())
         .ok_or("physics: a collider hole's entry is not a static collider")?;
     Ok(crate::step::try_collider(c, e.pose, None)?
         .position(crate::math::try_pose(e.pose)?)
@@ -303,6 +327,115 @@ pub(crate) fn raw(handle: ColliderHandle) -> [u32; 2] {
 mod tests {
     use super::*;
     use exact_game::bin;
+
+    #[test]
+    fn restored_static_colliders_stay_elidable_after_a_moving_step() {
+        use crate::{CapsuleController, Physics, Shape};
+        use exact_game::{Vec3, World};
+
+        let mut w = World::new(60, 0);
+        crate::register(&mut w);
+        w.spawn((
+            Transform::at(0.0, -0.5, 0.0),
+            Collider {
+                shape: Shape::Box {
+                    half: Vec3::new(20.0, 0.5, 20.0),
+                },
+                ..Collider::default()
+            },
+        ));
+        for i in 0..8 {
+            w.spawn((
+                Transform::at(i as f32 * 2.0, 0.0, 5.0),
+                Collider {
+                    shape: Shape::Cylinder {
+                        radius: 0.35,
+                        height: 6.0,
+                    },
+                    offset: Vec3::Y * 3.0,
+                    ..Collider::default()
+                },
+            ));
+        }
+        w.spawn_named(
+            "player",
+            (Transform::at(0.0, 1.0, 0.0), CapsuleController::default()),
+        );
+        let advance = |w: &mut World| {
+            crate::capsule(w, "player").step(Vec3::X);
+            crate::step(w);
+        };
+        advance(&mut w);
+        let mut restored = World::new(60, 0);
+        crate::register(&mut restored);
+        restored.load(&w.save()).unwrap();
+        let elidable = |w: &World| {
+            w.resource::<Physics>()
+                .executor
+                .0
+                .borrow_mut()
+                .live()
+                .elidable
+                .clone()
+        };
+        let rebuilt = elidable(&restored);
+        assert_eq!(rebuilt.len(), 9);
+        for _ in 0..3 {
+            advance(&mut w);
+            advance(&mut restored);
+            assert_eq!(elidable(&restored), rebuilt);
+            assert_eq!(restored.hash(), w.hash());
+            assert_eq!(restored.save(), w.save());
+        }
+    }
+
+    #[test]
+    fn static_collider_edits_invalidate_their_verified_rebuilds() {
+        use crate::Physics;
+        use exact_game::{Vec3, World};
+
+        let mut w = World::new(60, 0);
+        crate::register(&mut w);
+        let entities: Vec<_> = (0..7)
+            .map(|i| w.spawn((Transform::at(i as f32 * 3.0, 0.0, 0.0), Collider::default())))
+            .collect();
+        crate::step(&mut w);
+        w.load(&w.save()).unwrap();
+        let handle = {
+            let p = w.resource::<Physics>();
+            let mut saved = p.executor.0.borrow_mut();
+            assert_eq!(saved.live().elidable.len(), entities.len());
+            saved.live().entries[&entities[0]].collider_handle.unwrap()
+        };
+        // A write without a value change still visits the row during sync.
+        w.get_mut::<Transform>(entities[0]).unwrap().position += Vec3::ZERO;
+        w.get_mut::<Transform>(entities[1]).unwrap().position.y += 1.0;
+        w.get_mut::<Transform>(entities[2]).unwrap().scale *= 2.0;
+        w.get_mut::<Collider>(entities[3]).unwrap().friction = 0.75;
+        w.insert(entities[4], Body::default());
+        w.remove::<Collider>(entities[5]);
+        w.despawn(entities[6]);
+        crate::step(&mut w);
+        {
+            let p = w.resource::<Physics>();
+            let mut saved = p.executor.0.borrow_mut();
+            assert_eq!(saved.live().elidable, BTreeSet::from([handle]));
+        }
+        for remove_body in [false, true] {
+            if remove_body {
+                w.remove::<Body>(entities[4]);
+                crate::step(&mut w);
+            }
+            let p = w.resource::<Physics>();
+            let mut saved = p.executor.0.borrow_mut();
+            saved.refresh();
+            let cached = saved.bytes.clone();
+            saved.live().elidable.clear();
+            saved.dirty = true;
+            saved.refresh();
+            assert_eq!(saved.bytes, cached);
+        }
+    }
 
     #[test]
     fn snapshot_refusal_names_expected_format_and_seen_bytes() {
@@ -622,6 +755,122 @@ mod tests {
             crate::step(&mut restored);
             assert_eq!(inertia(&restored), stored, "mass {mass}");
         }
+    }
+
+    // An authored inertia replaces the derived one along the body's axes and keeps
+    // the derived mass and centre of mass, with a collider or without one.
+    #[test]
+    fn an_authored_inertia_replaces_the_derived_one() {
+        use crate::{Physics, Shape};
+        use exact_game::{Vec3, World};
+        let inertia = Vec3::new(1.0, 2.0, 3.0);
+        let offset = Vec3::new(0.0, 0.25, 0.0);
+        let collider = Collider {
+            shape: Shape::Box {
+                half: Vec3::new(0.5, 0.1, 0.2),
+            },
+            offset,
+            ..Collider::default()
+        };
+        for (mass, collider, com) in [
+            (0.0, Some(collider.clone()), offset),
+            (3.0, Some(collider), offset),
+            (3.0, None, Vec3::ZERO),
+        ] {
+            let mut w = World::new(60, 0);
+            crate::register(&mut w);
+            let body = Body {
+                gravity: 0.0,
+                mass,
+                inertia,
+                ..Body::default()
+            };
+            let e = w.spawn((Transform::default(), body));
+            if let Some(c) = collider.clone() {
+                w.insert(e, c);
+            }
+            crate::step(&mut w);
+            let p = w.resource::<Physics>();
+            let mut saved = p.executor.0.borrow_mut();
+            let live = saved.live();
+            let rb = &live.rapier.bodies[live.entries[&e].bh().unwrap()];
+            let m = rb.mass_properties().local_mprops;
+            let want = match (mass, collider.is_some()) {
+                (0.0, true) => 1000.0 * 1.0 * 0.2 * 0.4,
+                _ => mass,
+            };
+            assert!((m.mass() - want).abs() < 1e-3, "{mass}: {}", m.mass());
+            assert_eq!(crate::math::vec3(m.principal_inertia()), inertia);
+            assert_eq!(crate::math::vec3(m.local_com), com);
+            assert_eq!(
+                m.principal_inertia_local_frame,
+                rapier3d::math::Rotation::IDENTITY
+            );
+        }
+    }
+
+    // The solver settings are written only when set, reach Rapier's integration
+    // parameters at the next step, and survive a save; a world loaded from a save
+    // that omits them takes the defaults.
+    #[test]
+    fn solver_settings_are_saved_only_when_set_and_reach_rapier() {
+        use crate::Physics;
+        use exact_game::{json, World};
+        use rapier3d::dynamics::FrictionModel;
+        let mut w = World::new(60, 0);
+        crate::register(&mut w);
+        w.spawn((Transform::default(), Body::default(), Collider::default()));
+        crate::step(&mut w);
+        let plain = w.save();
+        let text = json::to_string(&*w.resource::<Physics>()).unwrap();
+        for name in [
+            "solver_iterations",
+            "contact_frequency",
+            "coulomb_friction",
+            "friction_",
+        ] {
+            assert!(!text.contains(name), "{text}");
+        }
+        {
+            let mut p = w.resource_mut::<Physics>();
+            p.solver_iterations = 8;
+            p.contact_frequency = 20.0;
+            p.static_contact_frequency = 40.0;
+            p.contact_damping_ratio = 5.0;
+            p.coulomb_friction = true;
+            p.friction_gravity = 50.0;
+            p.friction_slip_speed = 0.2;
+        }
+        crate::step(&mut w);
+        let check = |w: &World| {
+            let p = w.resource::<Physics>();
+            let mut saved = p.executor.0.borrow_mut();
+            let ip = saved.live().rapier.integration_parameters;
+            assert_eq!(ip.num_solver_iterations, 8);
+            assert_eq!(ip.contact_softness.natural_frequency, 20.0);
+            assert_eq!(ip.static_contact_softness.natural_frequency, 40.0);
+            assert_eq!(ip.static_contact_softness.damping_ratio, 5.0);
+            assert_eq!(ip.friction_model, FrictionModel::Coulomb);
+            assert_eq!((ip.friction_gravity, ip.friction_slip_speed), (50.0, 0.2));
+        };
+        check(&w);
+        let text = json::to_string(&*w.resource::<Physics>()).unwrap();
+        assert!(
+            text.contains("\"solver_iterations\":8") && text.contains("\"coulomb_friction\":true"),
+            "{text}"
+        );
+        let mut restored = World::new(60, 0);
+        crate::register(&mut restored);
+        restored.load(&w.save()).unwrap();
+        assert_eq!(restored.hash(), w.hash());
+        assert_eq!(restored.resource::<Physics>().solver_iterations, 8);
+        crate::step(&mut w);
+        crate::step(&mut restored);
+        assert_eq!(restored.hash(), w.hash());
+        check(&restored);
+        restored.load(&plain).unwrap();
+        let p = restored.resource::<Physics>();
+        assert_eq!((p.solver_iterations, p.coulomb_friction), (4, false));
     }
 
     #[test]

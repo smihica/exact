@@ -31,6 +31,8 @@ pub struct Glyph {
 pub struct Line {
     /// Its clusters, in order.
     pub glyphs: Vec<Glyph>,
+    /// Further lines were omitted by `line-clamp` after this one.
+    pub clamped: bool,
 }
 
 impl Line {
@@ -260,6 +262,9 @@ fn layout<const PAINT: bool>(
     out.wrapped(&cells);
     out.finish_line();
     if out.clamp > 0 {
+        if PAINT && out.rows > out.clamp {
+            out.lines.last_mut().unwrap().clamped = true;
+        }
         out.rows = out.rows.min(out.clamp);
     }
     out

@@ -1414,22 +1414,31 @@ fn an_exclusive_owner_protects_signed_floors_and_live_downloads() {
     let signing = key(73);
     let keys = [("k1", signing.verifying_key().to_bytes())];
     if let Some(dir) = std::env::var_os(CHILD_DIR) {
-        let result = open_store(std::path::Path::new(&dir), embedded(&keys));
+        let mut store = open_store(std::path::Path::new(&dir), embedded(&keys)).unwrap();
+        assert_eq!(store.select().seq, 5);
+        let checked = store.check(
+            "https://cdn.example/exact.json",
+            &mut |_| Ok(Vec::new()),
+            &mut |_| None,
+        );
         if std::env::var_os("EXACT_UPDATE_OWNER_RELEASED").is_some() {
-            assert_eq!(result.unwrap().select().seq, 5);
+            assert!(!checked.unwrap_err().contains("another process owns"));
         } else {
-            assert!(result.unwrap_err().contains("exclusive owner"));
+            assert!(checked.unwrap_err().contains("another process owns"));
         }
         return;
     }
     let temp = Temp::new("exclusive-signed-owner");
     let mut store = open_store(temp.path(), embedded(&keys)).unwrap();
-    assert!(open_store(temp.path(), embedded(&keys))
-        .unwrap_err()
-        .contains("exclusive owner"));
     let mut newer = Bundle::new(5, b"plan five");
     newer.signer = Some(("k1".into(), signing.clone()));
     let mut origin = Origin::of(&newer);
+    let mut second = open_store(temp.path(), embedded(&keys)).unwrap();
+    assert!(origin
+        .check(&mut second)
+        .unwrap_err()
+        .contains("another process owns"));
+    drop(second);
     let Ok(Check::Staged { entry, .. }) = origin.check(&mut store) else {
         panic!("signed stage");
     };
@@ -1457,7 +1466,7 @@ fn an_exclusive_owner_protects_signed_floors_and_live_downloads() {
     child(false);
     assert!(
         temporary.exists(),
-        "a rejected owner cannot sweep a live download"
+        "a second process cannot sweep a live download"
     );
     drop(store);
     child(true);

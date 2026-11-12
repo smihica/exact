@@ -98,10 +98,71 @@ fn a_nodes_looks_are_page_rules_that_follow_a_live_token() {
 /// parent's (LLP 1007.001), where its look would paint nothing.
 #[test]
 fn a_text_with_a_look_keeps_its_box() {
-    let src = "component App\n  view\n    column testId=\"box\"\n      text \"t\" testId=\"t\"\n        :hover\n          opacity = 0.5\n";
-    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e:?}"));
-    let (_, boot) = Host::boot(&plan.encode(), NoData, Default::default(), "/").unwrap();
-    let text = created(&boot, "t");
-    assert!(!text.contains("display:contents"), "{text}");
-    assert!(boot.contains("{\"op\":\"looks\""), "{boot}");
+    use exact_web::document::{checkpoint, digest, project_tree};
+
+    exact_web::link(exact_web_capabilities::ALL);
+    for state in [None, Some("hover"), Some("focus-visible")] {
+        let mut src = String::from(
+            "routes nav\n  home \"/\" render=build\n\ncomponent App\n  view\n    column testId=\"box\"\n      text \"hi\"\n",
+        );
+        if let Some(state) = state {
+            src.push_str(&format!(
+                "        :{state}\n          background-color = \"#00ff00\"\n"
+            ));
+        }
+        let plan = contract::compile(&src).unwrap_or_else(|e| panic!("{e:?}"));
+        let (mut host, boot) = Host::boot(&plan.encode(), NoData, Default::default(), "/").unwrap();
+        let kernel = host.runner().kernel();
+        let parent = kernel
+            .node_by_key(kernel.find_by_test_id("box")[0])
+            .unwrap();
+        let (parent, text) = (parent.id, parent.children()[0]);
+        let folds = state.is_none();
+        let check_batch = |batch: &str| {
+            let text_op = batch
+                .split("{\"op\":\"create\",")
+                .find(|op| op.starts_with(&format!("\"id\":{text},")))
+                .unwrap()
+                .split("{\"op\":")
+                .next()
+                .unwrap();
+            assert_eq!(text_op.contains("display:contents"), folds, "{text_op}");
+            let parent_op = created(batch, "box");
+            assert_eq!(parent_op.contains("display:block;"), folds, "{parent_op}");
+        };
+        check_batch(&boot);
+        for (id, display) in [(text, "display:contents;"), (parent, "display:block;")] {
+            let parts =
+                exact_web::host::template::parts_with(kernel, &plan, id, true, true).unwrap();
+            assert_eq!(parts.css.contains(display), folds, "{parts:?}");
+        }
+        let doc = host.document().unwrap();
+        let tree = host.runner_mut().document_tree().unwrap();
+        let (direct, _) = project_tree(&tree, host.runner(), Default::default()).unwrap();
+        for (path, root) in [("kernel", &doc.root), ("direct", &direct.root)] {
+            for (id, display) in [(text, "display:contents;"), (parent, "display:block;")] {
+                let at = root.find(&format!(" data-view=\"{id}\"")).unwrap();
+                let start = root[..at].rfind('<').unwrap();
+                let end = at + root[at..].find('>').unwrap();
+                let tag = &root[start..end];
+                assert_eq!(tag.contains(display), folds, "{path} {state:?}: {tag}");
+            }
+        }
+        let page = checkpoint(host.runner(), "/");
+        let written = digest(&plan.encode(), "/", &page, &doc.root);
+        let (_, batch) = Host::boot_checkpoint(
+            &plan.encode(),
+            NoData,
+            &page,
+            &written,
+            Vec::new(),
+            None,
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        assert!(batch.contains("\"adopted\":true"), "{batch}");
+        check_batch(&batch);
+        assert_eq!(batch.contains("{\"op\":\"looks\""), !folds, "{batch}");
+    }
 }

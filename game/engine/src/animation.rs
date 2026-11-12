@@ -120,6 +120,8 @@ impl Animation {
 pub struct Blend {
     /// Extracted root motion and this tick's crossed markers.
     pub playback: Playback,
+    /// Whether this standalone controller has successfully sampled; saved across restore.
+    pub sampled: bool,
     /// Animator parameter name, or empty to use axis directly.
     pub parameter: String,
     /// Position along the clip knots; units are the author's.
@@ -336,6 +338,8 @@ pub struct Animator {
     pub current: u32,
     /// Seconds spent in the current state.
     pub since: f32,
+    // Saved independently of state time: loop transitions preserve playback through pauses.
+    started: bool,
     /// Saved named number, bool and trigger parameters.
     pub params: Vec<(String, Param)>,
     from: Vec<f32>,
@@ -391,7 +395,7 @@ impl Animator {
             .states
             .get(self.current as usize)
             .ok_or("animator current state out of range")?;
-        if !resample && self.since == 0. && !state.looping && state.speed < 0. {
+        if !resample && !self.started && !state.looping && state.speed < 0. {
             pose.phase = 1.;
         }
         let finished = if state.speed < 0. {
@@ -445,11 +449,11 @@ impl Animator {
         } else {
             self.fade_duration
         };
-        if next.is_some() {
-            // Looping locomotion retains phase; entering/leaving a one-shot starts afresh.
-            if !state.looping || !was_looping {
-                pose.phase = if state.speed < 0. { 1. } else { 0. };
-            }
+        // Looping locomotion retains phase; entering/leaving a one-shot starts afresh.
+        let restart = next.is_some() && (!state.looping || !was_looping);
+        let started = self.started && !restart;
+        if restart {
+            pose.phase = if state.speed < 0. { 1. } else { 0. };
         }
         if !state.paused {
             since += dt;
@@ -463,6 +467,7 @@ impl Animator {
             model,
             root,
             state.looping,
+            !resample && !state.paused && !started,
         );
         if !resample
             && !state.paused
@@ -502,6 +507,7 @@ impl Animator {
         }
         self.from_motion = from_motion;
         self.since = since;
+        self.started = started || !state.paused;
         self.fade_time = fade_time;
         self.fade_duration = fade_duration;
         Ok(())
@@ -684,8 +690,14 @@ pub fn sample(clip: &Clip, time: f32, rest: &[f32], out: &mut Vec<f32>) {
         }
     }
 }
-fn crossed(mark: f32, old: f32, new: f32, duration: f32, looping: bool) -> bool {
-    if old == new || mark < 0. || mark > duration {
+fn crossed(mark: f32, old: f32, new: f32, duration: f32, looping: bool, starting: bool) -> bool {
+    if mark < 0. || mark > duration {
+        return false;
+    }
+    if starting && mark == old {
+        return true;
+    }
+    if old == new {
         return false;
     }
     if looping && duration > 0. {
@@ -706,10 +718,11 @@ fn markers(
     old: f32,
     new: f32,
     looping: bool,
+    starting: bool,
     out: &mut Vec<String>,
 ) {
     for (t, name) in clip.markers.iter().chain(extra) {
-        if crossed(*t, old, new, clip.duration(), looping) && !out.contains(name) {
+        if crossed(*t, old, new, clip.duration(), looping, starting) && !out.contains(name) {
             out.push(name.clone());
         }
     }
@@ -724,6 +737,7 @@ fn advance_pair(
     model: &Model,
     root: Option<u32>,
     looping: bool,
+    starting: bool,
 ) {
     let duration = math::lerp(a.duration(), b.duration(), weight);
     let old = p.phase;
@@ -766,6 +780,7 @@ fn advance_pair(
         old * a.duration(),
         next * a.duration(),
         looping,
+        starting,
         &mut p.crossed,
     );
     if weight > 0. {
@@ -775,6 +790,7 @@ fn advance_pair(
             old * b.duration(),
             next * b.duration(),
             looping,
+            starting,
             &mut p.crossed,
         );
     }
@@ -1050,7 +1066,15 @@ pub fn step(w: &mut World) -> Motion {
                 };
                 let next = if a.looping { next } else { time };
                 sample(c, time, &rig.rest, &mut p.local);
-                markers(c, &a.markers, old, next, a.looping, &mut p.crossed);
+                markers(
+                    c,
+                    &a.markers,
+                    old,
+                    next,
+                    a.looping,
+                    !a.sampled,
+                    &mut p.crossed,
+                );
                 p.root_motion = extract_motion(
                     c,
                     old,
@@ -1078,9 +1102,11 @@ pub fn step(w: &mut World) -> Motion {
                     &model,
                     root,
                     true,
+                    !b.sampled,
                 );
                 finish(p, &mut runtime.scratch, root)?;
                 if !stepped {
+                    b.sampled = true;
                     b.playback.record(p);
                 }
             } else if let Some(mut a) = w.get_mut::<Animator>(e) {
@@ -1116,7 +1142,7 @@ pub fn step(w: &mut World) -> Motion {
                 p.local.copy_from_slice(&rig.rest);
                 finish(p, &mut runtime.scratch, None)?;
             }
-            if let Some(layers) = layers {
+            if let Some(layers) = layers.filter(|_| !stepped) {
                 *w.get_mut::<Layers>(e).unwrap() = layers;
             }
             // Commit history only after successful sampling/IK. Birth has no bind predecessor.

@@ -382,6 +382,69 @@ fn sky_gradient_sun_disc_and_height_fog() {
     assert!(seen.abs_diff(tone(0.02)) <= 3, "{seen} vs {}", tone(0.02));
 }
 
+#[test]
+fn orthographic_height_fog_uses_parallel_rays_from_the_camera_plane() {
+    let Some(gpu) = gpu() else { return };
+    let mut r = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+    let (v, i) = shapes::plane();
+    let plane = r.add_mesh(&v, &i);
+    r.write_transforms_both(0, &transform(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(400.)))
+        .unwrap();
+    r.write_materials(0, &material([0.; 3], 0.)).unwrap();
+    r.set_batches(&[Batch::new(plane, 0..1)], &[0]).unwrap();
+    let texture = target(&gpu, (160, 100), wgpu::TextureFormat::Rgba8Unorm);
+    let mut f = frame();
+    f.camera_position = Vec3::new(0., 30., 0.);
+    let view = view::look_at_mat4(f.camera_position, Vec3::ZERO, -Vec3::Z);
+    f.environment.fog = Some(Fog {
+        color: Some([1.; 3].into()),
+        density: 0.02,
+        height_falloff: 0.03,
+        linear: None,
+    });
+    let mut unscaled = [0; 3];
+    for (orthographic, scale) in [(true, 1.), (true, 0.5), (true, 2.), (false, 1.)] {
+        f.view = glam::Mat4::from_scale(Vec3::new(1., 1., 1. / scale)) * view;
+        f.proj = if orthographic {
+            directx::orthographic(-48., 48., -30., 30., 0.1, 200.)
+        } else {
+            directx::perspective(90f32.to_radians(), 1.6, 0.1, 200.)
+        };
+        let pixels = render(&gpu, &mut r, &texture, &f);
+        let row = [20, 80, 140].map(|x| pixels.at(x, 50)[0]);
+        eprintln!("fog: orthographic={orthographic}, scale={scale}: {row:?}");
+        let spread = row.iter().max().unwrap() - row.iter().min().unwrap();
+        if orthographic {
+            assert!(spread <= 1, "equal fog segments must shade alike: {row:?}");
+            // The integral of density 0.02 * exp(-0.03*y) from y=0 to y=30.
+            let expected = tone(1. - (-0.02 * (1. - (-0.9_f32).exp()) / 0.03).exp());
+            assert!(row[1].abs_diff(expected) <= 1, "{row:?} vs {expected}");
+            if scale == 1. {
+                unscaled = row;
+            } else {
+                assert_eq!(row, unscaled, "camera scale preserves world-space fog");
+            }
+        } else {
+            assert!(spread > 8, "perspective edge rays travel farther: {row:?}");
+        }
+    }
+    // Horizontal sky rays cross different densities at different heights.
+    r.set_batches(&[], &[]).unwrap();
+    f.camera_position = Vec3::new(0., 200., 0.);
+    f.view = glam::Mat4::from_translation(-f.camera_position);
+    f.proj = directx::orthographic(-48., 48., -30., 30., 0.1, 200.);
+    let sky = render(&gpu, &mut r, &texture, &f);
+    for y in [20, 50, 80] {
+        let height = 200. + (0.5 - (y as f32 + 0.5) / 100.) * 60.;
+        let expected = tone(1. - (-0.02 * 10000. * (-0.03 * height).exp()).exp());
+        let actual = sky.at(80, y)[0];
+        assert!(
+            actual.abs_diff(expected) <= 1,
+            "sky row {y}: {actual} vs {expected}"
+        );
+    }
+}
+
 pub(super) mod direct;
 pub(super) mod first_instance;
 pub(super) mod half;

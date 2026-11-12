@@ -208,6 +208,35 @@ test('agent alignments are malformed with or without a view; authored refusals s
   expect(result.missing).toEqual({list:'#-1', status:'refused: view -1 is not a mounted virtualized list'});
 }, 60_000);
 
+test('refused keys keep their original text in state', async () => {
+  const keys = ['C:\\notes\\c.txt', 'first\nsecond', 'say "hi"', '\t\r\0\b\f\u001fé🦀', 'c.txt'];
+  const result = await evaluate(`(() => {
+    const port = document.createElement('div'); port.id = 'refused-files';
+    port.style.cssText = 'height:100px;width:200px;overflow:auto';
+    document.getElementById('exact-root').append(port);
+    const files = rt.sig(['a.txt', 'b.txt']);
+    const own = rt.scope(() => list.vl(port, files, item => item(), (wrapper, item) => {
+      const row = document.createElement('div'); row.textContent = item();
+      row.style.height = '20px'; wrapper.append(row);
+    }, {est:20, pw:[], ph:[100]}));
+    const out = [];
+    try {
+      for (const key of ${JSON.stringify(keys)}) for (const duplicate of [false, true]) {
+        rt.commit(() => rt.W(files, duplicate ? [key, key] : ['a.txt', 'b.txt']));
+        rt.Hosts.scrollIntoView('refused-files', key, null, null, null, null, null);
+        out.push(exact.lists.intoView().at(-1));
+      }
+      return out;
+    } finally {
+      rt.end(own); port.remove(); rt.settled();
+    }
+  })()`);
+  expect(result).toEqual(keys.flatMap(key => [
+    {list:'refused-files', status:`refused: no row keyed s:${key} in the list`},
+    {list:'refused-files', status:`refused: the list holds s:${key} more than once`},
+  ]));
+});
+
 test('element jumps use Chrome scroll padding and margins and settle once', async () => {
   const result = await evaluate(`(async () => {
     const root = document.getElementById('exact-root');

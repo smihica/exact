@@ -6,6 +6,16 @@ component App
   action copy
     copyText(`n is ${n}`)
     haptic("success")
+  action presentation
+    focus("field")
+    blur("field")
+    focus()
+    blur()
+    setScheme("dark")
+    copyText("copied")
+    haptic("selection")
+    setScheme("system")
+    n = n + 1
   action branchy(v: number)
     if v > 0
       copyText("positive")
@@ -19,6 +29,7 @@ component App
     column
       text `${n}` testId="n"
       button "copy" press=copy testId="copy"
+      button "presentation" press=presentation testId="presentation"
       button "pos" press=branchy(1) testId="pos"
       button "neg" press=branchy(-1) testId="neg"
       button "broken" press=broken testId="broken"
@@ -27,6 +38,11 @@ test "commands in order"
   tap "copy"
   tap "pos"
   tap "neg"
+  expect state n == 3
+
+test "linked commands are observed in order"
+  tap "presentation"
+  tap "presentation"
   expect state n == 3
 
 test "refused action issues no command"

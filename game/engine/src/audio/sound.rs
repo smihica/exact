@@ -266,6 +266,16 @@ impl Fade {
     }
 }
 
+/// Source progress at the last rate change. Rate-weighted ticks retain fractional
+/// samples across changes; conversion to source frames happens only at playback.
+#[derive(Data, Default, Clone, Copy, Debug, PartialEq)]
+pub struct Playback {
+    /// Completed world tick boundary.
+    pub at: u64,
+    /// Sum of playback rate × elapsed ticks since the voice began.
+    pub ticks: f64,
+}
+
 /// Voice fields added with samples are written only when set.
 impl Data for Voice {
     fn write(&self, w: &mut dyn Writer) {
@@ -280,6 +290,10 @@ impl Data for Voice {
         self.gain.write(w);
         w.field("pitch");
         self.pitch.write(w);
+        if self.integrated_pitch != self.pitch {
+            w.field("integrated_pitch");
+            self.integrated_pitch.write(w);
+        }
         w.field("position");
         self.position.write(w);
         w.field("synth");
@@ -304,9 +318,14 @@ impl Data for Voice {
             w.field("fade");
             self.fade.write(w);
         }
+        if self.playback.is_some() {
+            w.field("playback");
+            self.playback.write(w);
+        }
         w.end_struct();
     }
     fn read(&mut self, r: &mut dyn Reader) -> Result<(), DataError> {
+        let mut integrated_pitch = None;
         r.begin_struct()?;
         while let Some(field) = r.field()? {
             let at = field.clone();
@@ -316,6 +335,11 @@ impl Data for Voice {
                 "at" => self.at.read(r),
                 "gain" => self.gain.read(r),
                 "pitch" => self.pitch.read(r),
+                "integrated_pitch" => {
+                    let mut rate = 0.0;
+                    rate.read(r).map(|()| integrated_pitch = Some(rate))
+                }
+                "playback" => self.playback.read(r),
                 "position" => self.position.read(r),
                 "synth" => self.definition.read(r),
                 "began" => self.began.read(r),
@@ -328,6 +352,7 @@ impl Data for Voice {
             }
             .map_err(|e| e.at(at))?;
         }
+        self.integrated_pitch = integrated_pitch.unwrap_or(self.pitch);
         Ok(())
     }
 }

@@ -155,7 +155,7 @@ impl Namespace {
                 let path = directory.join(filename);
                 let existed = path.exists();
                 let mut file = options.open(path).map_err(|e| e.to_string())?;
-                match file.try_lock() {
+                match crate::try_lock(&file) {
                     Ok(()) => {}
                     Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
                     Err(error) => return Err(error.to_string()),
@@ -232,17 +232,25 @@ fn ensure_directory(directory: &std::path::Path) -> Result<(), String> {
 
 /// Acknowledge file-backed credential renames/removals and their directory
 /// ancestry. A backend's best-effort directory sync is insufficient for leases.
+/// An ancestor the process may not open is passed over: it cannot be synced
+/// by any means, and Android denies an app its data directory's parents
+/// (`/data/user/0`). `directory` itself must be synced.
 pub fn sync_directory_chain(directory: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         let mut path = Some(directory);
-        while let Some(directory) = path {
-            match File::open(directory) {
-                Ok(file) => file.sync_all().map_err(|error| error.to_string())?,
+        while let Some(ancestor) = path {
+            match File::open(ancestor) {
+                Ok(file) => file
+                    .sync_all()
+                    .map_err(|error| format!("sync {}: {error}", ancestor.display()))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && ancestor != directory => {}
+                Err(error) => return Err(format!("open {}: {error}", ancestor.display())),
             }
-            path = directory.parent();
+            path = ancestor.parent();
         }
         Ok(())
     }

@@ -3,7 +3,7 @@ use super::{
     AlignContent, AlignItems, AlignSelf, CheapCloneStr, CompactLength, CoreStyle, Dimension, JustifyContent,
     LengthPercentage, LengthPercentageAuto, Style,
 };
-use crate::compute::grid::{GridCoordinate, GridLine, OriginZeroLine, MAX_GRID_TRACKS};
+use crate::compute::grid::{GridCoordinate, GridLine, LineLimit, OriginZeroLine};
 use crate::geometry::{AbsoluteAxis, AbstractAxis, Line, MinMax, Size};
 use crate::style_helpers::*;
 use crate::sys::{DefaultCheapStr, Vec};
@@ -219,6 +219,12 @@ pub trait GridContainerStyle: CoreStyle {
     #[inline(always)]
     fn grid_auto_flow(&self) -> GridAutoFlow {
         Style::<Self::CustomIdent>::DEFAULT.grid_auto_flow
+    }
+
+    /// EXACT PATCH 70: the highest line, in OriginZero coordinates, that the grid places an item at
+    #[inline(always)]
+    fn grid_line_limit(&self) -> u16 {
+        super::RareStyle::<Self::CustomIdent>::DEFAULT.grid_line_limit
     }
 
     /// How large should the gaps between items in a grid or flex container be?
@@ -532,17 +538,22 @@ impl<S: CheapCloneStr> core::str::FromStr for GridPlacement<S> {
 
 impl<S: CheapCloneStr> GridPlacement<S> {
     /// Apply a mapping function if the [`GridPlacement`] is a `Line`. Otherwise return `self` unmodified.
-    pub fn into_origin_zero_placement_ignoring_named(&self, explicit_track_count: u16) -> OriginZeroGridPlacement {
+    /// EXACT PATCH 70: within `limit`, the grid's.
+    pub fn into_origin_zero_placement_ignoring_named(
+        &self,
+        explicit_track_count: u16,
+        limit: LineLimit,
+    ) -> OriginZeroGridPlacement {
         match self {
             Self::Auto => OriginZeroGridPlacement::Auto,
             // Spans are clamped between 1 (a zero span is an invalid value which is treated as 1)
             // and the maximum track limit (https://www.w3.org/TR/css-grid-1/#overlarge-grids)
-            Self::Span(span) => OriginZeroGridPlacement::Span((*span).clamp(1, MAX_GRID_TRACKS)),
+            Self::Span(span) => OriginZeroGridPlacement::Span((*span).clamp(1, limit.max_span())),
             // Grid line zero is an invalid index, so it gets treated as Auto
             // See: https://developer.mozilla.org/en-US/docs/Web/CSS/grid-row-start#values
             Self::Line(line) => match line.as_i16() {
                 0 => OriginZeroGridPlacement::Auto,
-                _ => OriginZeroGridPlacement::Line(line.into_origin_zero_line(explicit_track_count)),
+                _ => OriginZeroGridPlacement::Line(line.into_origin_zero_line(explicit_track_count, limit)),
             },
             Self::NamedLine(_, _) => OriginZeroGridPlacement::Auto,
             Self::NamedSpan(_, _) => OriginZeroGridPlacement::Auto,
@@ -552,31 +563,36 @@ impl<S: CheapCloneStr> GridPlacement<S> {
 
 impl<S: CheapCloneStr> Line<GridPlacement<S>> {
     /// Apply a mapping function if the [`GridPlacement`] is a `Line`. Otherwise return `self` unmodified.
-    pub fn into_origin_zero_ignoring_named(&self, explicit_track_count: u16) -> Line<OriginZeroGridPlacement> {
+    pub fn into_origin_zero_ignoring_named(
+        &self,
+        explicit_track_count: u16,
+        limit: LineLimit,
+    ) -> Line<OriginZeroGridPlacement> {
         Line {
-            start: self.start.into_origin_zero_placement_ignoring_named(explicit_track_count),
-            end: self.end.into_origin_zero_placement_ignoring_named(explicit_track_count),
+            start: self.start.into_origin_zero_placement_ignoring_named(explicit_track_count, limit),
+            end: self.end.into_origin_zero_placement_ignoring_named(explicit_track_count, limit),
         }
     }
 }
 
 impl NonNamedGridPlacement {
     /// Apply a mapping function if the [`GridPlacement`] is a `Track`. Otherwise return `self` unmodified.
+    /// EXACT PATCH 70: within `limit`, the grid's.
     pub fn into_origin_zero_placement(
         &self,
         explicit_track_count: u16,
-        // resolve_named: impl Fn(&str) -> Option<GridLine>
+        limit: LineLimit,
     ) -> OriginZeroGridPlacement {
         match self {
             Self::Auto => OriginZeroGridPlacement::Auto,
             // Spans are clamped between 1 (a zero span is an invalid value which is treated as 1)
             // and the maximum track limit (https://www.w3.org/TR/css-grid-1/#overlarge-grids)
-            Self::Span(span) => OriginZeroGridPlacement::Span((*span).clamp(1, MAX_GRID_TRACKS)),
+            Self::Span(span) => OriginZeroGridPlacement::Span((*span).clamp(1, limit.max_span())),
             // Grid line zero is an invalid index, so it gets treated as Auto
             // See: https://developer.mozilla.org/en-US/docs/Web/CSS/grid-row-start#values
             Self::Line(line) => match line.as_i16() {
                 0 => OriginZeroGridPlacement::Auto,
-                _ => OriginZeroGridPlacement::Line(line.into_origin_zero_line(explicit_track_count)),
+                _ => OriginZeroGridPlacement::Line(line.into_origin_zero_line(explicit_track_count, limit)),
             },
         }
     }
@@ -631,10 +647,14 @@ impl Line<NonNamedGridPlacement> {
     }
 
     /// Apply a mapping function if the [`GridPlacement`] is a `Track`. Otherwise return `self` unmodified.
-    pub fn into_origin_zero(&self, explicit_track_count: u16) -> Line<OriginZeroGridPlacement> {
+    pub fn into_origin_zero(
+        &self,
+        explicit_track_count: u16,
+        limit: LineLimit,
+    ) -> Line<OriginZeroGridPlacement> {
         Line {
-            start: self.start.into_origin_zero_placement(explicit_track_count),
-            end: self.end.into_origin_zero_placement(explicit_track_count),
+            start: self.start.into_origin_zero_placement(explicit_track_count, limit),
+            end: self.end.into_origin_zero_placement(explicit_track_count, limit),
         }
     }
 }

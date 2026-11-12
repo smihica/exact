@@ -6,6 +6,45 @@ use exact_kernel::{
     StyleProps,
 };
 
+#[test]
+fn scroll_margin_percentages_are_refused_on_the_wire() {
+    for value in ["10%", "calc(10% + 4px)", "min(10%, 4px)"] {
+        let mut source = StyleProps::default();
+        source
+            .set_dynamic(
+                StyleId::Width,
+                &exact_kernel::StyleValue::Text(value.into()),
+            )
+            .unwrap();
+        for id in [
+            StyleId::ScrollMarginTop,
+            StyleId::ScrollMarginRight,
+            StyleId::ScrollMarginBottom,
+            StyleId::ScrollMarginLeft,
+        ] {
+            let mut style = StyleProps::default();
+            style.rare.scroll_margin_top = source.width.clone();
+            style.rare.scroll_margin_right = source.width.clone();
+            style.rare.scroll_margin_bottom = source.width.clone();
+            style.rare.scroll_margin_left = source.width.clone();
+            style.mask.set(id);
+            let bytes = wire::frame::encode(
+                1,
+                0,
+                &[Op::SetStyle {
+                    id: 1,
+                    patch: Box::new(style),
+                }],
+            );
+            assert_eq!(
+                wire::frame::decode(&bytes),
+                Err(DecodeError::PercentNotAdmitted { style: id }),
+                "{id:?}: {value}"
+            );
+        }
+    }
+}
+
 fn ops() -> Vec<Op> {
     let mut root_style = StyleProps::default();
     root_style.width = Dimension::Points(120.0);

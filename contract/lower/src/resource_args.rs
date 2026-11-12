@@ -42,6 +42,11 @@ impl Lowerer<'_> {
             }
             let range = self.b.args(&args);
             self.b.set_resource_args(self.resources[i], range);
+            // @ref LLP 1161.002 D1 — read in the root's scope, as the arguments are.
+            if let Some(gate) = &r.gate {
+                let code = self.expr_code(gate, &inner, 0)?;
+                self.b.set_resource_gate(self.resources[i], code);
+            }
             // @ref LLP 1027.005 D6 — declare first, install the full argument
             // list, then count its context tail. No `with` keeps the default 0.
             if let Some(identity) = r.identity {

@@ -222,6 +222,39 @@ fn named_surface_arguments_survive_plan_roundtrip_and_live_updates() {
 }
 
 #[test]
+fn view_binders_preserve_surface_names() {
+    let source =
+        include_str!("../../../../semantics/corpus/components/view-surface-names.contract");
+    for prefix in ["", "component App\n  view\n    Scene()\n"] {
+        let plan = contract::compile(&format!("{prefix}{source}")).unwrap();
+        for surface in &plan.surfaces {
+            assert_eq!(plan.str(surface.name), "world");
+        }
+        let mut r = Runner::boot(
+            plan,
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        let updates = r.take_surface_updates();
+        let args: Vec<_> = updates.iter().map(|u| u.arguments_json()).collect();
+        assert_eq!(
+            args,
+            [
+                "{}",
+                r#"{"seed":9}"#,
+                "{}",
+                r#"{"seed":1}"#,
+                "{}",
+                r#"{"seed":2}"#
+            ]
+        );
+    }
+}
+
+#[test]
 fn d6_empty_v5_surface_call_is_named_and_v4_refuses() {
     let plan = contract::compile("component App\n  view\n    canvas surface=world()\n").unwrap();
     assert_eq!(plan.surfaces[0].mode, exact_plan::SurfaceArgsMode::Named);

@@ -118,10 +118,16 @@ struct NodePaint {
     paint: BoxPaint,
     payload: Payload,
     opacity: f32,
-    clips: bool,
+    /// Its effective overflow, which says what it clips its children to.
+    axes: (Overflow, Overflow),
     css_clip: exact_kernel::clip::ClipPath,
     scroll: Option<(f32, f32)>,
     action: ActionNode,
+}
+impl NodePaint {
+    fn clips(&self) -> bool {
+        self.axes != (Overflow::Visible, Overflow::Visible)
+    }
 }
 pub(super) struct Picture {
     publication: Rc<RegionPublication>,
@@ -293,7 +299,8 @@ impl Picture {
                         )
                     }),
                     NodeType::Svg => {
-                        let mut svg = super::svg::resolve_svg(scene, &node, geometry.content);
+                        let mut svg =
+                            super::svg::resolve_svg(scene, &node, geometry.content, painter.dark);
                         exact_kernel::style::wide::Settle::settle(&mut svg);
                         Payload::Svg(Rc::new(svg))
                     }
@@ -405,7 +412,7 @@ impl Picture {
                 paint,
                 payload,
                 opacity,
-                clips,
+                axes,
                 css_clip: node.style.rare.clip_path.clone(),
                 scroll: scroll_offset,
                 action,
@@ -671,10 +678,7 @@ impl<'a> Replay<'a> {
                             .into_iter()
                             .chain(n.paint.widths)
                             .all(f32::is_finite)
-                        && n.paint
-                            .radii
-                            .into_iter()
-                            .all(exact_kernel::Dimension::is_finite);
+                        && n.paint.radii.iter().all(|d| d.is_finite());
                     n.paint.emit(&geometry, |shape, _| {
                         finite &= finite_rect(shape.rect)
                             && shape
@@ -790,17 +794,13 @@ impl<'a> Replay<'a> {
                         Payload::Empty => {}
                         Payload::Image(image, fit, tint) => {
                             if let Some(dst) = object_fit(image.natural(), *fit, g.content) {
-                                painter.backend.image(
-                                    image,
-                                    image.placed(dst),
-                                    &[Shape::rect(g.content), g.outer],
-                                    parent,
-                                    *tint,
-                                );
+                                let clips = [g.content_edge()];
+                                let placed = image.placed(dst);
+                                painter.backend.image(image, placed, &clips, parent, *tint);
                             }
                         }
                         Payload::Svg(s) => {
-                            painter.paint_svg(s, n.clips, g.outer.rect, g.content, parent);
+                            painter.paint_svg(s, n.clips(), n.paint.content_shape(g), parent);
                         }
                         Payload::Text(p, palette, inline) => {
                             if let Some(inline) = inline {
@@ -819,10 +819,10 @@ impl<'a> Replay<'a> {
                             );
                         }
                     }
-                    if n.clips {
-                        painter.backend.push_clip(&g.outer, parent);
+                    if let Some(shape) = field::overflow_clip(&g.outer, n.paint.widths, n.axes) {
+                        painter.backend.push_clip(&shape, parent);
                         clips.push(clip);
-                        let own = bbox(parent, g.outer.rect);
+                        let own = bbox(parent, shape.rect);
                         clip = Some(clip.map_or(own, |c| intersect(c, own)));
                     }
                 }
@@ -831,7 +831,7 @@ impl<'a> Replay<'a> {
                     if n.opacity <= 0. {
                         continue;
                     }
-                    if n.clips {
+                    if n.clips() {
                         painter.backend.pop_clip();
                         clip = clips.pop().unwrap();
                     }

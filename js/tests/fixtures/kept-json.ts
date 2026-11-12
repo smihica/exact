@@ -46,7 +46,7 @@ const wrapped = deep(list((i) => (i === 2 ? ({ ...make(i), n: wrapper } as unkno
 // A string that ends in U+0000 and digits after a quote (JSON's `\"\u00001"`), as a value and as a key.
 const nulTail = Object.freeze(list((i) => (i === 2 ? make(i, 'a"' + "\u0000" + "1") : deep(make(i)))));
 const nulTailKey = Object.freeze(list((i) => (i === 2 ? ({ ...make(i), ['a"' + "\u0000" + "1"]: "k" } as Row) : deep(make(i)))));
-// Boxed strings whose own toString JSON honors (defined, since the hardened String.prototype's can't be assigned over): spelled like a token only once converted, and the reverse.
+// Boxed strings whose own toString JSON honors: spelled like a token only once converted, and the reverse.
 const spelled = new String("ordinary");
 Object.defineProperty(spelled, "toString", { value: () => "\u0000" + "1" });
 const unspelled = new String("\u0000" + "1");

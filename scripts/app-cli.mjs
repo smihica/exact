@@ -1,12 +1,18 @@
 // An app's commands (LLP 1086; LLP 1116.006 D7): what `bun exact.mjs <verb>` runs in an app that
-// `exact new` made. Its exact.mjs is a few lines that find this checkout (EXACT2) and call `run`, so
+// `exact new` made. Its exact.mjs is a few lines that find this checkout (EXACT) and call `run`, so
 // a builder reading it learns where the verbs are (`bun exact.mjs --help`), not this code. An
 // exact.mjs written before this file held all of it, and still runs; `bun exact.mjs update` thins it.
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { constants, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { noteBunLoaded } from '../js/bake/src/__exact_env.mjs';
+
+/** The hosts a `test`, `agent` or `verify` may name first. */
+const APP_HOSTS = ['web', 'ios', 'macos', 'mac', 'linux', 'windows', 'android'];
+/** The host `verb` runs on, taken off `rest` when its first word names one (help's optional `[web|ios|…]`): a test
+ *  file or an op written first stays where it is, and the run is the web's. */
+export const hostOf = (verb, rest) => ['test', 'agent', 'verify'].includes(verb) && APP_HOSTS.includes(rest[0]) ? rest.shift() : 'web';
 
 /** The compiler's warnings in what a build said (LLP 1116.004 D7), each once as `contract build` prints
  * it, `file:line:col warning [id] text`: the web compiler's or a bake's own line, Cargo's for a build
@@ -34,7 +40,7 @@ export function webBuildFailure(stderr) {
   // Keep TypeScript's lines (`app.ts(2,8): error TS…`), the shared ambient
   // check's file:line:col diagnostics, including paths with spaces, and its
   // refusals of package code (js/bake/src/typescript.mjs `capturedSources`).
-  const packageRefusal = (l) => / (?:imports Node's built-in|uses the DOM's|uses Node's|loads a module by a computed name|loads code from a string|uses the page's)|, (?:which is not installed|a native addon|which the checked capture did not resolve)|: not an npm package name and version| must be a constant the build reads without running|^(?:Error: )?two copies of /.test(l);
+  const packageRefusal = (l) => / (?:imports Node's built-in|uses the DOM's|uses Node's|loads a module by a computed name|loads code from a string|uses the page's)|, (?:which is not installed|a native addon|which the checked capture did not resolve)|: not an npm package name and version| must be a constant the build reads without running|^(?:Error: )?two copies of |^(?:Error: )?package (?:declarations exceed|code exceeds) 64 MiB/.test(l);
   const marker = /^(error|[A-Z]\w*Error|E[A-Z]+)\b:?/;
   const kept = (l) => marker.test(l.trim()) || /\): error TS\d+:|^(?:Error: )?(?:tsconfig: |module outside captured app: |source links are not captured: )|^note: /.test(l) || ambientDiagnostic(l) || packageRefusal(l) || /\bunoptimized$|\bnot on PATH\b|import\.meta\.env/.test(l);
   const message = [];
@@ -81,7 +87,7 @@ export function warningLines(dir, host, warnings) {
 /** A compiler warning that is information, not a problem: `tamber-unreachable` names a control whose host draws the
  *  platform's own look, which the author should know of and cannot change (LLP 1121 D9, amended 2026-10-30). A drive
  *  and verify say it but do not count it. contract's `warning_rank::information` is the same test. */
-export const information = (w) => / warning \[tamber-unreachable\] /.test(w);
+export const information = (w) => / warning \[(tamber-unreachable|style-undrawn)\] /.test(w);
 
 /** A compiler warning only the web's picture shows: an SF Symbol drawn blank where the web is the one target besides
  *  Apple's (contract's `web_only`). Its first use names the targets, `ships web (…), where it is blank`; a later one,
@@ -114,6 +120,7 @@ export function appVerbs(name, dir, { host = 'web', game = false } = {}) {
     android: ['scripts/agent-android.mjs', 'build', name, '--apk', '--install'],
     update: ['scripts/exact.mjs', 'new', dir, '--update'],
     lock: ['scripts/app-cli.mjs', '--lock', dir],
+    add: ['scripts/exact.mjs', 'add'],
     contract: ['scripts/exact.mjs', 'contract'],
     tamber: ['scripts/exact.mjs', 'tamber'],
     hatch: ['scripts/exact.mjs', 'hatch'],
@@ -140,7 +147,7 @@ export function appVerbs(name, dir, { host = 'web', game = false } = {}) {
 export const beforeBuild = {
   status: false, web: true, 'web-build': true, serve: true, test: false, agent: false, verify: true, ios: true, mac: true, share: true,
   linux: true, windows: true, android: true, update: false, lock: false, hatch: false, snapback: true, backend: false, docs: false,
-  feedback: false,
+  feedback: false, add: false,
   contract: ([command, ...rest]) => ['build', 'types', 'rust', 'verify', 'test', 'lean', 'symbols', 'gallery'].includes(command)
     || command === 'tamber' && checksDesign(rest),
   tamber: (rest) => checksDesign(rest),
@@ -155,8 +162,27 @@ export const beforeBuild = {
 const checksDesign = ([command, ...rest]) => ['check', 'eval', 'ir', 'gen', 'serve'].includes(command)
   || command === 'import' && rest[0] === 'css' || command === 'tool' && !rest.includes('--via');
 
-/** `bun exact.mjs <verb> [arguments]` for the app `name` in `dir`, with the checkout `exact2`; the exit code. */
-export async function run({ dir, name, game = false, exact2, args }) {
+/** `bun exact.mjs <verb> [arguments]` for the app `name` in `dir`, with the checkout `exact2`; the exit code.
+ * A build verb under `--json` (help.mjs `jsonBuilt`) prints exactly one object on stdout however it ends: the artifact
+ * the build named, or `{code, error}` with a non-zero status, a refusal or a throw included. */
+export async function run(options) {
+  const { args } = options;
+  if (!JSON_BUILDS.includes(args[0]) || !args.includes('--json') || args.includes('--help') || args.includes('-h')) return verbRun(options, null);
+  let said = false;
+  const reply = (object) => { said = true; console.log(JSON.stringify(object)); };
+  let status;
+  try { status = await verbRun(options, reply); }
+  catch (error) {
+    const message = String(error?.message ?? error);
+    console.error(message);
+    if (!said) reply({ code: 'build_failed', error: message });
+    return 1;
+  }
+  if (!said) reply({ code: 'build_failed', error: `${args[0]} ${status ? `failed (exit ${status})` : 'named no artifact'}; what it said is on stderr` });
+  return said && !status ? 0 : status || 1;
+}
+
+async function verbRun({ dir, name, game = false, exact2, args }, reply) {
   // Before any process starts: which settings Bun loaded from this directory's `.env` files (LLP 1153 D4).
   noteBunLoaded();
   // The design tool's tests, drives and verify run on this checkout's own port (port-lock.mjs `checkoutPort`, unless
@@ -170,17 +196,27 @@ export async function run({ dir, name, game = false, exact2, args }) {
     if (staged) { dir = staged.dir; args = [args[0], ...staged.args]; }
   }
   const [verb, ...rest] = args;
-  const host = (verb === 'test' || verb === 'agent' || verb === 'verify') && rest[0] && !rest[0].startsWith('-') ? rest.shift() : 'web';
+  const host = hostOf(verb, rest);
   const verbs = appVerbs(name, dir, { host, game });
   // The app's own verbs (paint, minesweeper, ledger: a regenerated file dropped the ones added to it): app.json's
   // `commands`, each a command as argv (`"seed": ["bun", "seed.mjs"]`), run in the app's directory with the
   // arguments after the verb. A game's app.json is optional.
   const manifest = resolve(dir, 'app.json');
-  const declared = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : {};
+  let declared = {};
+  try { if (existsSync(manifest)) declared = JSON.parse(readFileSync(manifest, 'utf8')); }
+  catch (error) {
+    if (!reply) throw error;
+    const message = `${manifest}: ${error.message}`;
+    console.error(message);
+    reply({ code: 'app_json', error: message });
+    return 1;
+  }
   const own = declared.commands ?? {};
   const clash = Object.keys(own).find((name) => verbs[name]);
   if (clash) {
-    console.error(`app.json commands.${clash}: ${clash} is one of exact.mjs's own verbs; give the app's another name`);
+    const message = `app.json commands.${clash}: ${clash} is one of exact.mjs's own verbs; give the app's another name`;
+    console.error(message);
+    reply?.({ code: 'app_json', error: message });
     return 2;
   }
   // Help (LLP 1116 D4): `--help` or `-h` among a verb's arguments, `help [<verb>]` or no verb prints exact2's own
@@ -191,7 +227,7 @@ export async function run({ dir, name, game = false, exact2, args }) {
   const asked = !verb || ['help', '--help', '-h'].includes(verb) ? rest.find(known) ?? rest.find((a) => !a.startsWith('-') && a !== 'all') ?? '' : verbs[verb] && (rest.includes('--help') || rest.includes('-h')) ? verb : null;
   if (asked !== null) {
     const help = await import(resolve(exact2, 'scripts/help.mjs')).catch(() => null);
-    if (!help) { console.error(`no exact2 at ${exact2}: EXACT2 names the checkout`); return 1; }
+    if (!help) { console.error(`no Exact checkout at ${exact2}: EXACT names the checkout`); return 1; }
     return help.printHelp(asked, { verbs: Object.keys(verbs), own, all: rest.includes('all') });
   }
   if (verb === 'status' || verb === 'web' && rest.includes('--ready')) {
@@ -220,6 +256,25 @@ export async function run({ dir, name, game = false, exact2, args }) {
     for (const line of feedback.nudge(dir, { verb, host, exit, ms: Date.now() - started, args: rest, interrupted })) console.error(line);
   } catch {}
   return exit; };
+  // A build verb's `--json` (`reply`): one object on stdout, and the build's output on stderr. A failure is
+  // `{code, error}`, as share's, with a non-zero status. It reports a finished artifact, so it takes no launch, no build
+  // left running and no test run; and a flag the build's script refuses is refused before anything is built.
+  const jsonBuilt = reply != null;
+  if (jsonBuilt && ['--run', '--prebuild', '--test'].some((flag) => rest.includes(flag))) {
+    const error = `${verb} --json reports the built artifact, so it takes none of --run, --prebuild and --test`;
+    console.error(error);
+    reply({ code: 'json_flags', error });
+    return log(2);
+  }
+  if (jsonBuilt) {
+    let refusal = null;
+    const refused = (await import(resolve(exact2, 'scripts/help.mjs'))).guardFlags(verb, rest, { fail: (message) => { refusal = message; console.error(message); }, exit: (code) => ({ code }) })?.code;
+    if (refused != null) { reply({ code: 'unknown_flag', error: refusal }); return log(refused); }
+  }
+  if (['ios', 'mac'].includes(verb)) {
+    const error = (await import(resolve(exact2, 'scripts/help.mjs'))).appleBuildRefusal(rest);
+    if (error) { console.error(error); reply?.({ code: 'build_failed', error }); return log(2); }
+  }
   // A native verb names its platform in app.json the first time, after that platform's setup rows, and keeps the
   // generated workspace current unless the app authored one (LLP 1153 D1.2; scripts/app-shells.mjs). A drive's
   // host counts (`test ios`). Absent from a checkout that lacks the module (the scaffold's test SDK), it is skipped.
@@ -230,7 +285,7 @@ export async function run({ dir, name, game = false, exact2, args }) {
     const device = rest.includes('--device') || verb === 'share';
     const report = named ? null : await import(resolve(exact2, 'scripts/exact.mjs')).then(({ sdkReport, platformReport }) => platformReport(platform, sdkReport(process.env, { only: platform, device }), { device })).catch((error) => ({ error: String(error?.message ?? error) }));
     const brought = await shells.bringPlatform(dir, platform, { report, name });
-    if (brought.refused) { console.error(brought.refused); return log(1); }
+    if (brought.refused) { console.error(brought.refused); reply?.({ code: 'platform_refused', error: brought.refused }); return log(1); }
     for (const line of brought.lines) console.error(line);
   }
   // The automatic build reports on stderr, so a drive's stdout stays its reply (`--json`).
@@ -240,7 +295,8 @@ export async function run({ dir, name, game = false, exact2, args }) {
     const child = spawn(command, args, {
       stdio,
       cwd,
-      env: { ...process.env, HERMES_LEAN_SYS_OFFLINE: '1', EXACT_APP_DIR: dir, EXACT2: exact2, EXACT_LAUNCHER_PID: String(process.pid), ...env },
+      // EXACT2 as well, for an app's scripts that read that name (LLP 1036.001 D3)
+      env: { ...process.env, HERMES_LEAN_SYS_OFFLINE: '1', EXACT_APP_DIR: dir, EXACT: exact2, EXACT2: exact2, EXACT_LAUNCHER_PID: String(process.pid), ...env },
     });
     piped(child);
     const pass = (signal) => { interrupted = true; stopped ??= signal; child.kill(signal); }, signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
@@ -266,6 +322,7 @@ export async function run({ dir, name, game = false, exact2, args }) {
     : verb === 'contract' && rest[0] === 'build' ? (message) => [{ id: 'app-before-build', severity: 'error', message, file: manifest, line: 0, col: 0, end_col: 0, related: [] }]
     : verb === 'share' ? (message) => ({ code: 'before_build', error: message })
     : verb === 'verify' ? (message) => ({ error: message, exit: 1 })
+    : jsonBuilt ? (message) => ({ code: 'before_build', error: message })
     : null;
   const quiet = verb === 'contract' && jsonFailure != null;
   const prepare = async () => {
@@ -273,7 +330,7 @@ export async function run({ dir, name, game = false, exact2, args }) {
     if (before === undefined || process.env.EXACT_BEFORE_BUILD) return 0;
     const refuse = (code, message) => {
       if (!jsonFailure) { console.error(message); return code; }
-      console.log(JSON.stringify(jsonFailure(message)));
+      (reply ?? ((object) => console.log(JSON.stringify(object))))(jsonFailure(message));
       return 1;
     };
     if (!(Array.isArray(before) && before.length && before.every((part) => typeof part === 'string' && part))) {
@@ -338,7 +395,9 @@ if (verb === 'contract') {
     && !rest.some((a, i) => (a === '--url' && !rest[i + 1]?.startsWith('/')) || a === '--web-dist');
   // Xcode's builds are a Mac's: on Windows, the verbs that need one say what Windows has instead.
   if (process.platform === 'win32' && (['ios', 'mac'].includes(verb) || ['test', 'agent', 'verify'].includes(verb) && ['ios', 'macos', 'mac'].includes(host))) {
-    console.error(`${verb}${verb === 'ios' || verb === 'mac' ? '' : ` ${host}`} needs a Mac (Xcode); on Windows: bun exact.mjs windows --run opens the app, test windows and verify windows check it`);
+    const message = `${verb}${verb === 'ios' || verb === 'mac' ? '' : ` ${host}`} needs a Mac (Xcode); on Windows: bun exact.mjs windows --run opens the app, test windows and verify windows check it`;
+    console.error(message);
+    reply?.({ code: 'platform_refused', error: message });
     return log(2);
   }
   const drivesNative = (verb === 'test' || verb === 'agent') && ['ios', 'macos', 'mac', 'windows'].includes(host) && !rest.includes('--device');
@@ -403,6 +462,7 @@ if (verb === 'contract') {
   // A finished site is served to this machine unless --lan asks for every interface (LLP 1153 D3.3); the dev loop
   // and serve.mjs run alone keep LAN (LLP 1023 D8).
   if (verb === 'serve' && !rest.includes('--lan')) rest.push('--loopback');
+  if (jsonBuilt) return log(await jsonBuild(spawned, [resolve(exact2, verbs[verb][0]), ...verbs[verb].slice(1), ...rest], verb, reply));
   if (verb !== 'test') return log(await script(verbs[verb], rest));
   // An app with a server of its own (the rest pattern's) has it run for the tests, where app.ts calls it, on an empty
   // database kept through them: as verify runs it, by the same code (LLP 1116.007 D2).
@@ -417,6 +477,29 @@ if (verb === 'contract') {
     }
     return failed;
   }, { verb: 'test', optional: true }));
+}
+
+/** The verbs whose build reports its artifact under `--json` (help.mjs `reportBuilt`). */
+const JSON_BUILDS = ['ios', 'mac', 'web-build', 'linux', 'windows', 'android'];
+
+/** A build verb under `--json`: the build runs with its stdout on this stderr and writes its result to descriptor 3,
+ * and this prints that object, or `{code, error}` when the build failed or named no artifact. The exit code. */
+async function jsonBuild(spawned, args, verb, reply) {
+  let said = '', ended;
+  const code = await spawned(process.execPath, args, ['inherit', 2, 2, 'pipe'], undefined, (child) => {
+    child.stdio[3].setEncoding('utf8');
+    child.stdio[3].on('data', (chunk) => { said += chunk; });
+    ended = new Promise((done) => { child.stdio[3].on('end', done); child.stdio[3].on('error', done); });
+  }, { EXACT_JSON_FD: '3' });
+  // What it wrote before it exited, unless a process it left running holds the descriptor open
+  await Promise.race([ended, new Promise((done) => setTimeout(done, 2000).unref())]);
+  let result = null;
+  try { result = JSON.parse(said.trim().split('\n').at(-1)); } catch {}
+  if (!code && typeof result?.path === 'string') { reply(result); return 0; }
+  const error = code ? `${verb} failed (exit ${code}); what it said is on stderr` : `${verb} built nothing it could name; what it said is on stderr`;
+  console.error(error);
+  reply({ code: 'build_failed', error });
+  return code || 1;
 }
 
 /** The app's web build, run as a drive's first step: what it says goes to stderr as it comes, except the compiler's
@@ -437,6 +520,46 @@ async function webBuildQuiet(spawned, args, dir) {
   return code;
 }
 
+/** What the web build's wasm-bindgen CLI processes in a workspace's graph resolved for wasm32 (`cargo metadata
+ * --filter-platform`): the packages `roots` names and their normal dependencies, not dev or build ones. The
+ * wasm-bindgen versions there, and each package of the workspace or a path that requires wasm-bindgen, with its
+ * requirement. */
+export function gpuBindgen(metadata, roots) {
+  const byId = new Map(metadata.packages.map((p) => [p.id, p])), nodes = new Map((metadata.resolve?.nodes ?? []).map((n) => [n.id, n]));
+  const normal = (dep) => (dep.dep_kinds ?? [{ kind: null }]).some((k) => k.kind === null);
+  const seen = new Set(), queue = metadata.workspace_members.filter((id) => roots.includes(byId.get(id)?.name));
+  while (queue.length) { const id = queue.pop(); if (!seen.has(id)) { seen.add(id); queue.push(...(nodes.get(id)?.deps ?? []).filter(normal).map((d) => d.pkg)); } }
+  const reached = [...seen].map((id) => byId.get(id)).filter(Boolean);
+  return {
+    held: [...new Set(reached.filter((p) => p.name === 'wasm-bindgen').map((p) => p.version))],
+    requiring: reached.filter((p) => !p.source).flatMap((p) => p.dependencies.filter((d) => d.name === 'wasm-bindgen' && !d.kind).map((d) => ({ name: p.name, req: d.req, manifest: p.manifest_path }))),
+  };
+}
+
+/** A note when the app's GPU modules link a wasm-bindgen other than the CLI the web build runs (`exact setup` installs
+ * the version exact2 pins in game/Cargo.toml), which refuses any other; null otherwise. The modules are `<app>-gpu`,
+ * in gpu/, and `<app>-gpu-<module>` for each of app.json's `gpu.modules`; with no gpu/ crate the web build
+ * (host/web-js/build.mjs) builds none of them. */
+function bindgenFinding(dir, workspace, options) {
+  const game = resolve(import.meta.dir, '../game/Cargo.toml');
+  const pin = existsSync(game) ? String(Bun.TOML.parse(readFileSync(game, 'utf8')).workspace?.dependencies?.['wasm-bindgen'] ?? '').replace(/^=/, '') : '';
+  const read = (path) => { try { return Bun.TOML.parse(readFileSync(path, 'utf8')); } catch { return null; } };
+  const app = String(read(resolve(dir, 'gpu/Cargo.toml'))?.package?.name ?? '').match(/^(.+)-gpu$/)?.[1];
+  if (!pin || !app) return null;
+  let modules = []; try { modules = Object.keys(JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')).gpu?.modules ?? {}); } catch {}
+  const wasm = spawnSync('cargo', ['metadata', '--offline', '--locked', '--filter-platform', 'wasm32-unknown-unknown', '--format-version', '1'], { ...options, cwd: workspace });
+  if (wasm.status !== 0) return null;
+  const { held, requiring } = gpuBindgen(JSON.parse(wasm.stdout), [`${app}-gpu`, ...modules.map((m) => `${app}-gpu-${m}`)]);
+  if (!held.length || held.every((version) => version === pin)) return null;
+  // Paths as the recipe writes them, with `/` on every host.
+  const shown = (path) => relative(workspace, path).split(sep).join('/');
+  const blocking = requiring.filter((r) => !Bun.semver.satisfies(pin, r.req)), own = shown(resolve(dir, 'gpu/Cargo.toml'));
+  return `The GPU module's wasm build links wasm-bindgen ${held.join(', ')} (${requiring.map((r) => `${r.name} requires ${r.req}`).join(', ')}), and the web build's wasm-bindgen CLI is ${pin}, which refuses any other: the web build will fail. `
+    + (blocking.length
+      ? `Change ${blocking.map((r) => `${r.name}'s requirement (${shown(r.manifest)})`).join(' and ')} to wasm-bindgen = "=${pin}", then run bun exact.mjs lock again.`
+      : `Require wasm-bindgen = "=${pin}" in ${own}'s wasm32 dependencies, then run bun exact.mjs lock again: Cargo moves wasm-bindgen and the crates that name its version with it.`);
+}
+
 /** Explicit app lock repair: preserve selected versions and resolve only manifest drift. */
 export async function lockApp(dir) {
   const { cargoEnvironment } = await import('./app.mjs');
@@ -455,7 +578,9 @@ export async function lockApp(dir) {
   if (result.status !== 0) throw new Error(`could not resolve ${lock}: ${result.stderr || result.error?.message}`);
   const { lockChanges } = await import('../game/app/shells.mjs');
   const changes = lockChanges(before, readFileSync(lock, 'utf8'));
-  return `${lock}: ${changes.length ? `resolved\n${changes.join('\n')}` : 'current; no changes'}`;
+  const said = `${lock}: ${changes.length ? `resolved\n${changes.join('\n')}` : 'current; no changes'}`;
+  const found = bindgenFinding(dir, workspace, options);
+  return found ? `${said}\n${found}` : said;
 }
 if (import.meta.main && process.argv[2] === '--lock') {
   try { console.log(await lockApp(process.argv[3])); }

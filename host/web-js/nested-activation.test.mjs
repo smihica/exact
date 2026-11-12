@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
 import { existsSync } from 'node:fs';
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 async function fixture(run) {
@@ -8,7 +9,8 @@ async function fixture(run) {
     if (path.endsWith('/names.js')) return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
     if (path === '/') return new Response('<div id="exact-root"></div>', { headers: { 'content-type': 'text/html' } });
     const file = new URL('../..' + path, import.meta.url);
-    return new Response(Bun.file(existsSync(file) ? file : new URL('../web/' + path.split('/').pop(), import.meta.url)));
+    const source = existsSync(file) ? file : new URL('../web/' + path.split('/').pop(), import.meta.url);
+    return new Response(hostFixtureFile(source), { headers: { 'content-type': 'text/javascript' } });
   } });
   const browser = await suiteBrowser(), page = await browser.newPage();
   try {

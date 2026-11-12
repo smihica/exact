@@ -9,6 +9,8 @@ pub type AssetResolver = Arc<dyn Fn(&str) -> Result<Option<Arc<[u8]>>, String> +
 pub(super) enum ImageInput {
     /// Entry-zero files stay off the presenter thread.
     Path(PathBuf),
+    /// An `app:/` file, opened through no symbolic link (`picker::open`).
+    File(std::fs::File),
     /// A selected generation is verified before the boot fallback decision.
     Bytes(Arc<[u8]>),
 }
@@ -68,6 +70,11 @@ impl Assets {
     pub fn read(&self, name: &str) -> Option<Arc<[u8]>> {
         match self.image_input(name)? {
             ImageInput::Path(path) => std::fs::read(path).ok().map(Arc::from),
+            ImageInput::File(mut file) => {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+                Some(Arc::from(bytes))
+            }
             ImageInput::Bytes(bytes) => Some(bytes),
         }
     }
@@ -92,7 +99,7 @@ impl Assets {
         // An `app:/tmp`, `app:/cache` or `app:/data` source is the app's own
         // file, read by the host (LLP 1069.002 D7): a picked photo's preview.
         if name.starts_with("app:/") {
-            return crate::picker::resolve(name).map(ImageInput::Path);
+            return crate::picker::open(name).map(ImageInput::File);
         }
         // A `data:` URL, as a page's `<img>` takes one, to its bound (LLP 1011 §2).
         if name.starts_with("data:") {

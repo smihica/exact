@@ -7,10 +7,10 @@
 //
 // usage: bun packages/camera/test/android.mjs
 //   (an NDK of clang 18 or newer in ANDROID_NDK_HOME, and a JDK 17 or newer in JAVA_HOME)
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { checker, makeFixture, root, run } from './fixture.mjs';
+import { checker, makeFixture, root } from './fixture.mjs';
 
 const { app } = makeFixture(), name = basename(app);
 // A date control: the plan uses `dates`, so the APK links Compose Material 3 beside CameraX.
@@ -19,18 +19,8 @@ const contract = readFileSync(resolve(app, 'app.contract'), 'utf8')
   .replace('  action unplace\n', '  action setDay(value: string)\n    day = value\n  action unplace\n')
   .replace('      if placed\n', '      input type="date" value=day change=setDay aria-label="Day" testId="day"\n      if placed\n');
 writeFileSync(resolve(app, 'app.contract'), contract);
-// `exact new` writes no Canvas library: Weatherlight's, by path into this checkout.
-const template = resolve(root, 'apps/weatherlight/android'), crate = resolve(app, 'android');
-mkdirSync(resolve(crate, 'src'), { recursive: true });
-writeFileSync(resolve(crate, 'Cargo.toml'), readFileSync(resolve(template, 'Cargo.toml'), 'utf8')
-  .replace('name = "weatherlight-android"', `name = "${name}-android"`).replaceAll('"../../../', `"${root}/`));
-writeFileSync(resolve(crate, 'build.rs'), readFileSync(resolve(template, 'build.rs'), 'utf8').replace('"bake Weatherlight"', '"bake the fixture"'));
-writeFileSync(resolve(crate, 'src/lib.rs'), readFileSync(resolve(template, 'src/lib.rs'), 'utf8'));
-const workspace = resolve(app, 'Cargo.toml');
-writeFileSync(workspace, readFileSync(workspace, 'utf8').replace('members = ["apple", "linux", "web"]', 'members = ["android", "apple", "linux", "web"]'));
-run('bun', ['exact.mjs', 'lock'], app);
 const { check, failed } = checker();
-const env = { ...process.env, EXACT_APP_DIR: app, EXACT2: root, HERMES_LEAN_SYS_OFFLINE: '1' };
+const env = { ...process.env, EXACT_APP_DIR: app, EXACT: root, HERMES_LEAN_SYS_OFFLINE: '1' };
 const build = (...flags) => spawnSync('bun', [resolve(root, 'scripts/agent-android.mjs'), 'build', name, '--apk', ...flags], { cwd: root, env, encoding: 'utf8', maxBuffer: 1 << 28 });
 const lock = resolve(app, 'gradle.lockfile'), checksums = resolve(app, 'gradle-verification.xml');
 try {

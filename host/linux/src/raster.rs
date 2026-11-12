@@ -42,12 +42,13 @@ use tiny_skia::{
 // One optional CPU coverage mask, never a source, picture or node owner.
 const CLIP_CACHE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 struct ClipKey {
     width: u32,
     height: u32,
     scale: u32,
     shape: [u32; 12],
+    corners: Option<exact_kernel::corner::CornerShape>,
     transform: [u32; 6],
 }
 
@@ -191,6 +192,7 @@ impl Raster {
 
     fn clip_key(&self, shape: &Shape, ts: Transform) -> Option<ClipKey> {
         let bytes = (self.width as usize).checked_mul(self.height as usize)?;
+        let corners = shape.corners;
         let shape = [
             shape.rect.0,
             shape.rect.1,
@@ -221,6 +223,7 @@ impl Raster {
             height: self.height,
             scale: self.scale.to_bits(),
             shape: shape.map(f32::to_bits),
+            corners,
             transform: transform.map(f32::to_bits),
         })
     }
@@ -260,8 +263,8 @@ impl Raster {
             self.height as f32,
         ));
         let Some(path) = rounded_rect(shape) else {
-            // mask_with skips invalid shapes when it already has a parent.
-            return if self.clips.is_empty() {
+            // mask_with skips invalid nonempty shapes under a parent clip.
+            return if self.clips.is_empty() || shape.rect.2 <= 0.0 || shape.rect.3 <= 0.0 {
                 (0.0, 0.0, 0.0, 0.0)
             } else {
                 parent
@@ -452,7 +455,7 @@ impl Backend for Raster {
                     self.width as f32 / self.scale,
                     self.height as f32 / self.scale,
                 )),
-                [255; 4],
+                self.page.unwrap_or([255; 4]),
                 Transform::identity(),
             );
         }
@@ -904,6 +907,10 @@ impl Backend for Raster {
     }
 
     // @ref LLP 1055.000 D14 — an island in its element's user space.
+    fn supports_island_image(&self) -> bool {
+        true
+    }
+
     fn island_image(&mut self, image: Arc<Pixmap>, dst: Rect4, ts: Transform, mode: u8) {
         if mode != 0 {
             self.window_underlay = None;
@@ -945,6 +952,10 @@ impl Backend for Raster {
             t.draw_pixmap(0, 0, image.as_ref().as_ref(), &paint, dev, mask.as_deref());
         }
     }
+
+    /// Glyphs draw sharp here: only a painter that blurs them as it draws
+    /// them takes the sigma (LLP 1077 D15).
+    fn text_blur(&mut self, _sigma: f32) {}
 
     fn surface_image(&mut self, image: Arc<Pixmap>, dst: Rect4) {
         self.canvas(&image, dst, &[], Transform::identity());
@@ -1342,6 +1353,9 @@ fn css_clip_intersection_matches_full_mask_for_curves_transforms_and_tiling() {
 #[test]
 fn nested_shape_masks_match_original_intersections() {
     fn original(raster: &Raster, shapes: &[Shape], ts: Transform) -> Option<Mask> {
+        if shapes.iter().any(|s| s.rect.2 <= 0.0 || s.rect.3 <= 0.0) {
+            return Mask::new(raster.width, raster.height);
+        }
         let dev = raster.device(ts);
         let (mut mask, remaining) = if let Some(parent) = raster.active_clip() {
             ((**parent).clone(), shapes)

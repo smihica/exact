@@ -52,7 +52,7 @@ fn main() {
         contract::linux_entry(
             "caltrain_data::Caltrain",
             "caltrain_data::Caltrain",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

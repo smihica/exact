@@ -194,6 +194,61 @@ final class NodePoolIOSTests: XCTestCase {
         XCTAssertEqual(p.pool.count, 0)
     }
 
+    func testARecycledParagraphDropsItsColumnFragments() throws {
+        let p = Presenter()
+        window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        p.viewport.frame = window.bounds; window.addSubview(p.viewport); window.makeKeyAndVisible()
+        func row(_ base: Int, fragmented: Bool) -> [[String: Any]] {
+            [["op": "create", "id": base, "kind": "view", "style": ["column_rule_style": "solid"]],
+             ["op": "create", "id": base + 1, "kind": "text", "props": ["text": "A paragraph for this row"],
+              "style": ["font_size": 16.0]],
+             ["op": "children", "id": base, "ids": [base + 1]],
+             ["op": "frame", "id": base, "x": 0.0, "y": 0.0, "w": 320.0, "h": 300.0],
+             ["op": "frame", "id": base + 1, "x": 0.0, "y": 0.0,
+              "w": fragmented ? 288.0 : 134.0, "h": fragmented ? 154.0 : 269.0]]
+        }
+        p.apply(wireBatch([collections([(10, 10)]),
+            ["op": "create", "id": 1, "kind": "list", "style": ["overflow_y": "scroll"]]]
+            + row(10, fragmented: true)
+            + [["op": "children", "id": 1, "ids": [10]], ["op": "roots", "ids": [1]],
+               ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 320.0, "h": 400.0],
+               ["op": "content", "id": 1, "w": 320.0, "h": 2000.0],
+               ["op": "fragments", "id": 10, "columns": [[0, 0, 134, 154, 1], [154, 0, 134, 154, 1]]],
+               ["op": "fragments", "id": 11,
+                "fragments": [[0, 0, 134, 154, 0, 8, 0, 0], [154, 0, 134, 115, 8, 14, 154, -154]]]]))
+        let oldRow = try XCTUnwrap(p.views[10]), text = try XCTUnwrap(p.views[11])
+        let lastLine = CGPoint(x: 50, y: 250)
+        func rules() -> CALayer? { oldRow.layer.sublayers?.first { $0.name == "exact-column-rules" } }
+        XCTAssertNotNil(rules())
+        XCTAssertEqual(text.columnRecord?.fragments.count, 2)
+        XCTAssertFalse(text.fragmentHit(lastLine))
+
+        // Destroyed nodes receive no clearing fragments op; a whole new text receives none either.
+        p.apply(wireBatch([collections([])] + destroy([10, 11]) + [["op": "children", "id": 1, "ids": []]]))
+        XCTAssertTrue(p.pool.isParked(oldRow))
+        XCTAssertNil(oldRow.columnRecord)
+        XCTAssertNil(rules())
+        XCTAssertNil(text.columnRecord)
+        p.apply(wireBatch([collections([(20, 20)])] + row(20, fragmented: false)
+            + [["op": "children", "id": 1, "ids": [20]]]))
+        XCTAssertTrue(p.views[20] === oldRow && p.views[21] === text)
+        XCTAssertNil(rules())
+        XCTAssertNil(text.columnRecord)
+        XCTAssertEqual(text.paragraphBox(), text.contentBox())
+        XCTAssertTrue(text.fragmentHit(lastLine))
+        XCTAssertEqual(text.paragraphPoint(lastLine), lastLine)
+        var paints = 0
+        _ = UIGraphicsImageRenderer(size: text.bounds.size).image { context in
+            text.eachFragment(context.cgContext) { box, offset in
+                paints += 1
+                XCTAssertEqual(box, text.contentBox())
+                XCTAssertEqual(offset, .zero)
+                XCTAssertTrue(context.cgContext.boundingBoxOfClipPath.contains(lastLine))
+            }
+        }
+        XCTAssertEqual(paints, 1, "a whole paragraph paints once without the old row's clips")
+    }
+
     /// A paragraph of inline runs parks with its row: the next row's
     /// `paragraph` op gives it only its own runs, and no bitmap is kept.
     func testAParagraphOfInlineRunsParksAndShowsOnlyTheNextRuns() throws {
@@ -1076,7 +1131,7 @@ private enum FakeModule {
         }
         let none: @convention(c) (UnsafeMutableRawPointer?) -> Void = { _ in }
         let reuse: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { FakeModule.instance($0).resets += 1; return 0 }
-        put(UInt32(3), 0); put(UInt32(112), 4); put(UnsafeRawPointer(roster), 8)
+        put(NativeViews.tableMajor, 0); put(UInt32(112), 4); put(UnsafeRawPointer(roster), 8)
         put(unsafeBitCast(create, to: UnsafeRawPointer.self), 16); put(unsafeBitCast(view, to: UnsafeRawPointer.self), 24)
         put(unsafeBitCast(set, to: UnsafeRawPointer.self), 32); put(unsafeBitCast(destroy, to: UnsafeRawPointer.self), 48)
         // The module entries are never called here (the test installs an instance).

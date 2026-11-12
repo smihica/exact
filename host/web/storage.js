@@ -113,6 +113,15 @@ export function createStorage(win, admitted, scope, key = storageKey(admitted.ap
     try { captured = structuredClone(args); } catch (e) { return failed(e); }
     return enqueue(() => raw[name](...captured), convert, discard, true, name);
   }
+  // A transaction's options read once, as every other host reads them (an
+  // inherited or getter `foreignKeys` included), as a record a clone keeps:
+  // other keys by name, a `foreignKeys` that is no string as `null`, and
+  // options that are a function or symbol as a string. storage-sqlite.js
+  // validates the record.
+  const plainOptions = options => typeof options === 'function' || typeof options === 'symbol' ? typeof options
+    : options === null || typeof options !== 'object' ? options : Object.assign(
+    Object.fromEntries(Object.keys(options).filter(k => k !== 'foreignKeys').map(k => [k, true])),
+    (f => f === undefined ? {} : { foreignKeys: typeof f === 'string' ? f : null })(options.foreignKeys));
   const closeDiscarded = raw => { void raw.close().catch(() => {}); };
   const statement = raw => Object.freeze({
     execute: params => method(raw, 'execute', [params]),
@@ -123,7 +132,7 @@ export function createStorage(win, admitted, scope, key = storageKey(admitted.ap
     execute: (sql, params) => method(raw, 'execute', [sql, params]),
     query: (sql, params) => method(raw, 'query', [sql, params]),
     prepare: sql => method(raw, 'prepare', [sql], statement, closeDiscarded),
-    transaction: commands => method(raw, 'transaction', [commands]),
+    transaction: (commands, options) => { try { options = plainOptions(options); } catch (e) { return failed(e); } return method(raw, 'transaction', [commands, options]); },
     close: () => method(raw, 'close', []),
   });
   // A document the person chose (`doc:/`, LLP 1069.010 D1) is a handle the

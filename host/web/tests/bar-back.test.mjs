@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1116.000 D4, in Chrome, Firefox and WebKit: a pushed route's bar draws the system Back for the root's
 // `navigationBack` control, where iOS draws UIKit's (NavigationBarIOS.swift `projectBack`): the arrow alone for a
 // control with no words, else its words, the control pressed through it. A control that is an item of the bar iOS makes
@@ -11,7 +12,7 @@
 // either writes them: an author's rows inline (the wasm runtime) or in a class (the JS target).
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -221,7 +222,7 @@ async function withBackPage(engine, run) {
     const path = new URL(request.url).pathname;
     if (path === '/') return new Response(html, { headers: { 'content-type': 'text/html' } });
     const file = Bun.file(resolve(ROOT, 'host/web', '.' + path));
-    return await file.exists() ? new Response(file) : new Response(null, { status: 404 });
+    return await file.exists() ? new Response(readFileSync(file.name), { headers: { 'content-type': file.type } }) : new Response(null, { status: 404 });
   } });
   let suite;
   try {

@@ -79,6 +79,8 @@ component App
     send result = utc()
   action intl
     send result = intl(elapsedMs)
+  action localDates
+    send result = localDates(elapsedMs, "UTC")
   view
     text value testId="value"
 "#;
@@ -261,6 +263,70 @@ fn explicit_dates_and_seeds_repeat_across_calls_modules_and_async_interleaving()
             panic!("expected settled explicit answer")
         };
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_date_formatters_follow_the_system_time_zone() {
+    // TZ and Foundation's zone cache belong to the process, not a test thread.
+    const CHILD: &str = "EXACT_TEST_DATE_ZONE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "inputs::new_date_formatters_follow_the_system_time_zone",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("TZ", "America/Los_Angeles")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    unsafe extern "C" {
+        fn tzset();
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFTimeZoneResetSystem();
+    }
+    let mut module = module();
+    let mut first: Option<serde_json::Value> = None;
+    for zone in ["America/Los_Angeles", "Asia/Tokyo", "America/Los_Angeles"] {
+        std::env::set_var("TZ", zone);
+        // No other test runs in this child; both native zone caches must reread TZ.
+        unsafe {
+            tzset();
+            CFTimeZoneResetSystem();
+        }
+        let answer = module
+            .query(
+                "localDates",
+                &[Value::Number(1_794_340_800_000.0), Value::str(zone)],
+            )
+            .unwrap();
+        let read: serde_json::Value = serde_json::from_str(answer.as_str().unwrap()).unwrap();
+        assert_eq!(read["engineZone"], zone, "the engine sees the new zone");
+        assert_eq!(read["current"], read["expected"], "{zone}");
+        if let Some(first) = &first {
+            assert_eq!(
+                read["held"], first["held"],
+                "existing formatters keep their zone"
+            );
+            assert_eq!(read["pinned"], first["pinned"], "explicit UTC stays fixed");
+        } else {
+            assert_eq!(read["held"][0], zone);
+            first = Some(read);
+        }
     }
 }
 

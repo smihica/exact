@@ -30,6 +30,30 @@ function records(bytes) {
   return out;
 }
 
+test('arcTo near-collinear turns record a line to the corner', () => {
+  for (const dy of [1e-7, 1e-4, 1e-2, 0.0244, 0.0245]) {
+    for (const sign of [-1, 1]) for (const x2 of [0, 200]) for (const path2d of [false, true]) {
+      const ctx = new Recorder(), path = path2d ? new Path2D() : ctx;
+      path.moveTo(0, 50);
+      path.arcTo(100, 50, x2, 50 + sign * dy, 5);
+      if (path2d) ctx.stroke(path); else ctx.stroke();
+      const lists = ctx._.take();
+      expect(lists.length).toBe(1);
+      const r = records(lists[0]);
+      expect(r.every(([, k]) => k.every(Number.isFinite))).toBe(true);
+      const lines = r.filter(([c]) => c === (path2d ? 81 : 42)).map(([, k]) => k);
+      const curves = r.filter(([c]) => c === (path2d ? 83 : 44)).length;
+      if (dy <= 0.0244) {
+        expect(lines).toEqual([[100, 50]]);
+        expect(curves).toBe(0);
+      } else {
+        expect(lines).not.toEqual([[100, 50]]);
+        expect(curves).toBeGreaterThan(0);
+      }
+    }
+  }
+});
+
 test('a display-p3 canvas records Display P3 bytes, as the Rust recorder does', () => {
   // canvas/tests/cases.rs `a_display_p3_canvas_records_display_p3_bytes`.
   const ctx = new Recorder();
@@ -42,4 +66,11 @@ test('a display-p3 canvas records Display P3 bytes, as the Rust recorder does', 
   expect(r.filter(([c]) => c === 10).map(([, k]) => k)).toEqual([[234, 51, 35, 1], [255, 0, 0, 1]]);
   const pixel = r.find(([c]) => c === 72)[1][4];
   expect([pixel >>> 24, (pixel >>> 16) & 255, (pixel >>> 8) & 255, pixel & 255]).toEqual([234, 51, 35, 255]);
+});
+
+test('a number after Z ends the path there, as Chrome does', () => {
+  // `Z` takes no numbers (SVG 2 §9.5.4); repeating it for the number never ended.
+  const drawn = (d) => { const ctx = new Recorder(); ctx.stroke(new Path2D(d)); return ctx._.take(); };
+  expect(drawn('M0 0 L10 0 Z 5')).toEqual(drawn('M0 0 L10 0 Z'));
+  expect(drawn('M0 0 L10 0 z5 5')).toEqual(drawn('M0 0 L10 0 z'));
 });

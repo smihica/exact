@@ -194,21 +194,46 @@ fn an_unrelated_commit_does_not_call_the_time_formatter() {
 
 #[test]
 fn datetime_edits_name_the_instant_and_the_wrong_tag() {
-    let error =
+    let literal =
         contract::compile("component App\n  view\n    time datetime=\"2026-10-17T12:00:00Z\"\n")
             .unwrap_err();
-    assert!(
-        error.message.contains("epoch milliseconds") && error.message.contains("date("),
-        "{error:?}"
-    );
     let bound = contract::compile(
         "component App\n  state raw = \"2026-10-17T12:00:00Z\"\n  view\n    time datetime=raw\n",
     )
     .unwrap_err();
-    assert!(
-        bound.message.contains("epoch milliseconds") && bound.message.contains("date("),
-        "{bound:?}"
-    );
+    for error in [&literal, &bound] {
+        assert_eq!(error.id, "lower-time-instant");
+        assert!(!error.message.contains("date("), "{literal:?}\n{bound:?}");
+        for expected in ["epoch milliseconds", "data module", "exactTime()"] {
+            assert!(error.message.contains(expected), "{error:?}");
+        }
+        for repair in [
+            "datetime=event.at",
+            "datetime=(wall.epochAtZero + performanceNow())",
+        ] {
+            assert!(error.message.contains(repair), "{error:?}");
+        }
+    }
+    for repair in literal
+        .message
+        .split('`')
+        .filter(|s| s.starts_with("datetime="))
+    {
+        contract::compile(&format!(
+            r#"shape Event
+  at: number
+shape Time
+  epochAtZero: number
+  utcOffset: number
+component App
+  resource event = eventTime() as shape Event
+  resource wall = exactTime() as shape Time
+  view
+    time {repair}
+"#
+        ))
+        .unwrap();
+    }
     let error = contract::compile("component App\n  view\n    view datetime=0\n").unwrap_err();
     assert!(
         error.message.contains("`view`") && error.message.contains("`time`"),

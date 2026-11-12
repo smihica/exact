@@ -10,8 +10,8 @@
 // to the explainer's interface (https://github.com/webmachinelearning/prompt-api),
 // which holds the implementation to that interface: availability by
 // options, a create inside the press with its download's progress, both
-// prompt forms, a constraint passed as a schema, the open tool loop and
-// abort by signal. It proves nothing of a browser's own model: that is
+// prompt forms, a constraint passed as a schema, the open tool loop, and
+// abort by signal and before the input is admitted. It proves nothing of a browser's own model: that is
 // drive 9, by a person in Chrome (`test/checklist.md`).
 //
 // `--agent` drives the fixture under the agent instead (§10's drives 7 and
@@ -121,6 +121,19 @@ if (agent) {
       check(engine, 'abort by signal ends the response aborted, its text kept', stopped === 'aborted 0' && (await text(page, 'reply')).startsWith('Slowly'), `${stopped} ${await text(page, 'reply')}`);
       await page.waitForFunction(() => globalThis.__standIn.aborted, null, { timeout: 2000 }).catch(() => {});
       check(engine, 'the stand-in saw the signal', await page.evaluate(() => globalThis.__standIn.aborted), 'not aborted');
+
+      // A Stop pressed while the browser measures the input ends the response before its input is admitted, and
+      // the session's next prompt still runs.
+      await page.evaluate(() => { globalThis.__standIn.measureMs = 500; });
+      await page.getByTestId('stream').click();
+      await until(page, 'reply-state', t => t.startsWith('generating'));
+      await page.getByTestId('stop').click();
+      const early = await until(page, 'reply-state', t => t.startsWith('aborted'));
+      await page.evaluate(() => { globalThis.__standIn.measureMs = 0; });
+      await page.waitForTimeout(600);
+      await page.getByTestId('stream').click();
+      const next = await until(page, 'reply', t => t === 'Hello there, friend.');
+      check(engine, 'a response aborted before its input is admitted lets the next prompt run', early === 'aborted 0' && next === 'Hello there, friend.' && (await until(page, 'reply-state', t => t.startsWith('complete'))) === 'complete 0', `${early} ${next} ${await text(page, 'reply-state')}`);
       check(engine, 'no page errors', !errors.length, errors.join('; '));
       await context.close();
     } finally {
@@ -135,7 +148,7 @@ process.exit(failed() ? 1 : 0);
 
 /** A stand-in `LanguageModel` with the explainer's interface: `downloadable` until a create downloads it. */
 function standIn() {
-  const state = globalThis.__standIn = { model: 'downloadable', next: 'text', created: null, aborted: false, toolResponse: false };
+  const state = globalThis.__standIn = { model: 'downloadable', next: 'text', created: null, aborted: false, toolResponse: false, measureMs: 0 };
   const stream = (pieces, signal, wait = 10) => new ReadableStream({
     async pull(c) {
       if (!pieces.length) return c.close();
@@ -146,7 +159,10 @@ function standIn() {
   });
   class Session extends EventTarget {
     constructor(o) { super(); this.contextWindow = 4096; this.contextUsage = 0; this.tools = (o.expectedOutputs ?? []).some(x => x.type === 'tool-call'); }
-    async measureContextUsage(input) { return 4 + Math.ceil(JSON.stringify(input).length / 4); }
+    async measureContextUsage(input) {
+      if (state.measureMs) await new Promise(r => setTimeout(r, state.measureMs));
+      return 4 + Math.ceil(JSON.stringify(input).length / 4);
+    }
     promptStreaming(input, o = {}) {
       if (Array.isArray(input) && input[0]?.content?.[0]?.type === 'tool-response') { state.toolResponse = true; return stream(['You ', 'noted ', 'it.'], o.signal); }
       if (o.responseConstraint) return stream([JSON.stringify({ title: 'Stand-in title' })], o.signal);

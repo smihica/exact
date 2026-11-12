@@ -24,6 +24,7 @@ fn edge_handlers_require_a_virtualized_collection() {
             for explanation in [
                 event,
                 "virtualized list",
+                "write `list virtualized=true` with one direct `for`",
                 "LLP 1010",
                 "plain list",
                 "geometric window",

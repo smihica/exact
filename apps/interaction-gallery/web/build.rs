@@ -31,6 +31,7 @@ fn main() {
         "interaction_gallery_data::Gallery",
         "interaction_gallery_data::Gallery::default()",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

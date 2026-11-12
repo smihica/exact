@@ -179,7 +179,7 @@ fn module(cases: &[Ready]) -> String {
         s.push_str(&c.lean.program);
         let _ = write!(
             s,
-            "\ndef {n}_oracle : Oracle := OracleText.parse! {}\n\ndef {n}_events : List Observe.Event := [{}]\n\ndef {n}_plan : LowerCheck.PlanInfo :=\n  {}\n\n",
+            "\ndef {n}_oracle : Oracle := OracleText.parse! {}\n\ndef {n}_events : List Observe.ScriptEvent := [{}]\n\ndef {n}_plan : LowerCheck.PlanInfo :=\n  {}\n\n",
             string(&c.lean.oracle),
             c.lean.events.join(", "),
             c.plan
@@ -404,4 +404,64 @@ pub fn run(cases: Vec<Case>, batch: usize, tag: &str) -> Result<bool, String> {
         "difftest lowering: {checked} cases checked ({skipped} not compiled, {boot_refused} boot refused): runs {agree} agree, {both} both fail, {diverge} diverge; bodies {same} identical to Contract.Lower, {differ} differ, {refused} refused by it, {undecoded} undecoded"
     );
     Ok(!failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::script::{self, Event};
+    use exact_plan::{builder::PlanBuilder, DerivesId, Value};
+
+    #[test]
+    #[ignore = "async lane: needs the Lean toolchain"]
+    fn landings_check_the_configuration_after_queued_continuations() {
+        leanrun::build().unwrap();
+        let source = include_str!("../../corpus/trace/queue.contract")
+            .replace("  state n = 0", "  state n = 0\n  derive observed = n");
+        let mut case = script::scripted("lowering-land", &source, None)
+            .unwrap()
+            .remove(0)
+            .case;
+        // No later clock or input may land the work on the checker's behalf.
+        case.events.truncate(2);
+        assert_eq!(case.events, [Event::Tap("save".into()), Event::InputLand]);
+        let plan = compile(&case).unwrap();
+        let mut broken = PlanBuilder::from_plan(plan.clone());
+        let zero = broken.constant(&Value::Number(0.0));
+        broken.set_derive_body(DerivesId(0), zero);
+        let broken = broken.finish().unwrap();
+        let mut cases = Vec::new();
+        for landing in [Event::InputLand, Event::Land] {
+            case.events[1] = landing;
+            for plan in [&plan, &broken] {
+                cases.push(Ready {
+                    lean: prepare(&case, cases.len()).unwrap().lean,
+                    plan: plan_info(plan),
+                });
+            }
+        }
+        let (head, reports) = run_batch(&cases, &work_dir(), "lowering-land-test").unwrap();
+        assert!(head.is_empty(), "{head:?}");
+        for pair in reports.chunks_exact(2) {
+            let [good, broken] = pair else { unreachable!() };
+            assert!(!good.boot_refused && !broken.boot_refused);
+            assert!(good.sum[0] > 0);
+            assert!(good.lines.is_empty(), "{:?}", good.lines);
+            assert_eq!(good.sum[2], 0);
+            assert_eq!(broken.sum[2], 1, "{:?}", broken.lines);
+            let vm = format!(
+                "DIVERGE derive observed cfg2: vm {} ",
+                crate::observe::number(0.0)
+            );
+            let sem = format!(" / semantics {} ", crate::observe::number(2.0));
+            assert!(
+                broken
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with(&vm) && line.contains(&sem)),
+                "{:?}",
+                broken.lines
+            );
+        }
+    }
 }

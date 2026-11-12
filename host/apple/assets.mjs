@@ -143,7 +143,7 @@ export function appleRefusals(app, platform, { archive = false } = {}) {
 export function iosAssets(app, dir, device, options = {}) {
   return appleAssets(app, dir, { ...options, device, platform: options.tv ? 'tvos' : 'ios' });
 }
-export function appleAssets(app, dir, { platform = 'macos', device = false, catalog = false, kept = null, expected, expectedLaunchImage, launch = 'system' } = {}) {
+export function appleAssets(app, dir, { platform = 'macos', device = false, catalog = false, requireIcon = catalog, kept = null, expected, expectedLaunchImage, launch = 'system' } = {}) {
   const sourcePlatform = platform === 'tvos' ? 'ios' : platform;
   const catalogs = appleAssetCatalogInventory(app, platform);
   const selected = catalogs.find(entry => entry.path.endsWith('.icon'));
@@ -152,6 +152,8 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
   const launchImage = platform === 'ios' ? launchImageInventory(app) : null;
   if (expectedLaunchImage !== undefined && JSON.stringify(launchImage) !== JSON.stringify(expectedLaunchImage))
     throw new Error('the launch image changed after the bake; rebuild before packaging');
+  const refused = platform === 'ios' && iconRefusal(app, catalogs, requireIcon);
+  if (refused) throw new Error(refused);
   if (platform !== 'ios' && !catalogs.length) { rmSync(resolve(dir, 'Assets.car'), { force: true }); return {}; }
   if (kept) {
     const icons = (app.manifest.icons ?? []).map(icon => [icon, existsSync(resolve(app.dir, icon.src)) ? createHash('sha256').update(readFileSync(resolve(app.dir, icon.src))).digest('hex') : null]);
@@ -167,7 +169,7 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
       rmSync(making, { recursive: true, force: true });
       mkdirSync(making, { recursive: true });
       try {
-        writeFileSync(resolve(making, 'keys.json'), JSON.stringify(appleAssets(app, making, { platform, device, catalog, expected: catalogs, expectedLaunchImage: launchImage, launch })));
+        writeFileSync(resolve(making, 'keys.json'), JSON.stringify(appleAssets(app, making, { platform, device, catalog, requireIcon, expected: catalogs, expectedLaunchImage: launchImage, launch })));
         rmSync(made, { recursive: true, force: true });
         renameSync(making, made);
       } finally { rmSync(making, { recursive: true, force: true }); }
@@ -200,8 +202,6 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
     const keys = platform === 'ios' ? { ...appIcon(app, dir, 'ios', { catalog: catalog || alternateIcons.length ? assets : false }), ...launchScreen(app, assets, launch, picture) } : {};
     const hasIcon = existsSync(resolve(assets, 'AppIcon.appiconset'));
     const iconName = selected ? basename(selected.path, '.icon') : hasIcon ? 'AppIcon' : null;
-    const refused = platform === 'ios' && iconRefusal(app, catalogs, catalog);
-    if (refused) throw new Error(refused);
     if (hasIcon || keys.UILaunchScreen) {
       writeFileSync(resolve(assets, 'Contents.json'), JSON.stringify({ info: { author: 'exact', version: 1 } }));
       sources.push(assets);
@@ -223,7 +223,7 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
         '--output-partial-info-plist', partial, '--output-format', 'human-readable-text'], { stdio: 'ignore' });
       Object.assign(keys, JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', partial], { encoding: 'utf8', stdio: 'pipe' }).stdout));
     }
-    if (catalog && platform === 'ios') {
+    if (catalog && platform === 'ios' && iconName) {
       const contents = JSON.parse(run('xcrun', ['assetutil', '--info', resolve(dir, 'Assets.car')], { encoding: 'utf8', stdio: 'pipe' }).stdout);
       if (!contents.some(asset => asset.Name === iconName)) throw new Error(`host/apple: ${dir}/Assets.car has no ${iconName}`);
     }
@@ -321,7 +321,7 @@ function machO(path) {
 function bundleExecutable(bundle) {
   const executable = (plist) => {
     if (!existsSync(plist)) return null;
-    const xml = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(plist, 'latin1'))?.[1];
+    const xml = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(readFileSync(plist, 'utf8'))?.[1];
     if (xml) return xml;
     const read = spawnSync('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', plist], { encoding: 'utf8' });
     return read.status === 0 ? read.stdout.trim() || null : null;
@@ -372,7 +372,7 @@ export function signingOrder(bundle, compat = null, identity = null) {
         walk(path, bundleExecutable(path));
         order.push(path);
       } else if (name.isDirectory()) walk(path, main);
-      else if (name.isFile() && path !== main && !preserved.has(path) && machO(path)) order.push(path);
+      else if (name.isFile() && path.normalize('NFD') !== main?.normalize('NFD') && !preserved.has(path) && machO(path)) order.push(path);
     }
   };
   walk(resolve(bundle, 'Contents'), bundleExecutable(bundle));
@@ -436,7 +436,7 @@ export function helperEntitlements(bundle, manifest, compat, order) {
   const declared = Object.entries(compat?.reach?.helperEntitlements ?? {});
   const signed = new Map(), errors = [];
   if (!declared.length) return signed;
-  const roots = macResourceMappings(manifest).map(({ to }) => to);
+  const roots = nativeResourceMappings(manifest).map(({ to }) => to);
   const contents = resolve(bundle, 'Contents');
   // Signing a nested bundle signs the executable Foundation resolves for it,
   // whichever file the walk took for its main one; so a target that is that
@@ -497,32 +497,114 @@ export function signRelease(bundle, { compat, manifest, identity, id, scratch, t
   }
 }
 
-/** Native files are binary inputs, never plan assets or TypeScript sources. */
-export function macResourceMappings(manifest) {
-  const mappings = manifest.host?.macos?.resources ?? [];
+/** The folder of an iOS or tvOS bundle that holds the trees `host.ios.resources`
+ *  declares and nothing else: what `bundle:/` names there (LLP 1133.007 D6). Their
+ *  `to` is the Mac's `Resources/…`, so one `fs.read bundle:/<to>` line reads the
+ *  same tree on both. */
+export const IOS_RESOURCE_ROOT = 'ExactResources';
+
+/** Refuse an iOS or tvOS executable name (`executableName` of the app's name, or of
+ *  the App Clip's: `key` says which) that is, ignoring case as the volume may, a name
+ *  the build writes beside it at the top of the flat bundle: `IOS_RESOURCE_ROOT` when
+ *  trees are declared, and what every bundle holds. One written over the other fails
+ *  the build part-way. */
+export function iosExecutableRefusal(manifest, name, key = 'app.name') {
+  const written = [...(manifest.host?.ios?.resources?.length ? [IOS_RESOURCE_ROOT] : []), 'Frameworks', 'Info.plist', 'receipt.json', '_CodeSignature'];
+  const taken = written.find(n => n.toLowerCase() === name.toLowerCase());
+  if (taken) throw new Error(`app.json's ${key} "${name}" names an iOS executable, which its bundle's own "${taken}" would take the place of: rename it`);
+}
+
+/** The trees every Apple bundle gets from the build's capture (`copyAppleStaticTrees`):
+ *  under the Mac's `Contents/Resources`, at the top of an iOS bundle. */
+export const APPLE_STATIC_TREES = ['assets', 'deck', 'shaders', 'rust', 'plans', 'typescript', 'activities'];
+
+/** What the Mac build writes under `Contents/Resources` (bundle.mjs, intents.mjs) beside
+ *  the trees an app declares, which may not take one of these places; and a
+ *  `<locale>.lproj` for each usage string (`writeUsageStrings`). */
+export const MAC_RESOURCES_WRITTEN = [...APPLE_STATIC_TREES, 'receipt.json', 'Assets.car', 'AppIcon.icns', 'Metadata.appintents'];
+
+/** Which file `path` is, read without following a link at its end: its device and
+ *  inode. Two directories are never one identity, whatever their names; a name the
+ *  volume resolves in another case or Unicode normalization is the same one. */
+export const fileIdentity = (path) => {
+  const info = lstatSync(path, { throwIfNoEntry: false, bigint: true });
+  return info ? `${info.dev}:${info.ino}` : null;
+};
+
+/** The identities of the app directories `host.macos.resources` and
+ *  `host.ios.resources` copy into a bundle (`from`, relative to app.json), which no
+ *  TypeScript capture reads (host/web-js/build.mjs; js/bake/src/lib.rs `sources`
+ *  reads the same two keys, by the same rule). */
+export const resourceIdentities = (appDir, manifest) => new Set(['macos', 'ios']
+  .flatMap(platform => (manifest.host?.[platform]?.resources ?? []).map(({ from }) => fileIdentity(resolve(appDir, from))))
+  .filter(Boolean));
+
+/** Native files are binary inputs, never plan assets or TypeScript sources:
+ *  `host.macos.resources` under the Mac's `Contents`, `host.ios.resources`
+ *  (iOS and tvOS) under `IOS_RESOURCE_ROOT`, as resources only. */
+export function nativeResourceMappings(manifest, platform = 'macos') {
+  const key = `host.${platform}.resources`, mac = platform === 'macos';
+  const mappings = manifest.host?.[platform]?.resources ?? [];
   const safe = path => typeof path === 'string' && path.length && !isAbsolute(path)
     && !path.includes('\\') && !path.includes('\0') && path.split('/').every(p => p && p !== '.' && p !== '..');
   const reserved = new Set(['assets', 'deck', 'gpu', 'fonts', 'strings', 'web', 'apple', 'linux', 'src', 'data', 'modules', 'node_modules', 'target', 'dist']);
   const overlap = (a, b) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
   for (const [i, entry] of mappings.entries()) {
     if (!safe(entry.from) || reserved.has(entry.from.split('/')[0]) || entry.from.startsWith('.'))
-      throw new Error('host.macos.resources.from must name a separate app-relative resource directory, outside source, asset and output roots');
-    if (!safe(entry.to) || !/^(Resources|Helpers|Frameworks)\/.+/.test(entry.to)
-      || ['Resources/assets', 'Resources/deck', 'Resources/shaders', 'Resources/receipt.json', 'Resources/AppIcon.icns'].some(p => overlap(entry.to, p))
+      throw new Error(`${key}.from must name a separate app-relative resource directory, outside source, asset and output roots`);
+    if (!safe(entry.to) || !(mac ? /^(Resources|Helpers|Frameworks)\/.+/ : /^Resources\/.+/).test(entry.to)
+      || MAC_RESOURCES_WRITTEN.some(name => overlap(entry.to, `Resources/${name}`))
       || entry.to.split('/').some(p => p.endsWith('.lproj')))
-      throw new Error('host.macos.resources.to must name a private path under Resources/, Helpers/ or Frameworks/');
+      throw new Error(`${key}.to must name a private path under ${mac ? 'Resources/, Helpers/ or Frameworks/' : 'Resources/'}`);
     if (mappings.slice(0, i).some(other => overlap(other.from, entry.from) || overlap(other.to, entry.to)))
-      throw new Error('host.macos.resources entries must not overlap');
+      throw new Error(`${key} entries must not overlap`);
     if (Object.keys(manifest.typescript?.sources ?? {}).some(name => overlap(name, entry.from)))
-      throw new Error('host.macos.resources cannot overlap typescript.sources');
+      throw new Error(`${key} cannot overlap typescript.sources`);
   }
   return mappings;
 }
 
+/** Refuse an iOS or tvOS app's `fs.read bundle:/Resources/…` line that reaches no
+ *  tree either platform declares, as a forgotten `host.ios.resources` entry: there
+ *  `bundle:/` holds the declared trees and nothing else (LLP 1133.007 D6). The grants
+ *  are every host's, so any other line is left, as a `home:` line is: one naming the
+ *  Mac's `Contents` (`bundle:/Info.plist`, `bundle:/Helpers/…`, what the Mac build
+ *  writes under `Resources/`, `MAC_RESOURCES_WRITTEN`) or a tree only the Mac declares reads nothing on iOS,
+ *  and the read fails there at run time. */
+export function iosBundleGrants(manifest, grants) {
+  const declared = (platform) => (manifest.host?.[platform]?.resources ?? []).map(({ to }) => to.split('/'));
+  const ios = nativeResourceMappings(manifest, 'ios').map(({ to }) => to), trees = [...declared('ios'), ...declared('macos')];
+  const refused = [];
+  for (const line of (grants ?? '').split('\n')) {
+    const [, verb, spelt] = /^\s*(\S+)\s+(.+?)\s*$/.exec(line) ?? [];
+    let target = spelt ?? '';
+    try { if (target.startsWith('"')) target = JSON.parse(target); } catch { continue; }
+    if (verb !== 'fs.read' || !target.startsWith('bundle:/')) continue;
+    // By whole names, empty ones dropped, as the grant parser reads a target.
+    const names = target.slice('bundle:/'.length).split('/').filter(Boolean);
+    // `resources` in another case opens `Resources` on a Mac's volume and nothing on iOS: it is held to the trees too.
+    if (names[0]?.toLowerCase() !== 'resources' || names.length < 2 || (names[0] === 'Resources' && (MAC_RESOURCES_WRITTEN.includes(names[1]) || names[1].endsWith('.lproj')))) continue;
+    const within = (to) => names.every((name, i) => i >= to.length || name === to[i]);
+    if (!trees.some(within)) refused.push(line.trim());
+  }
+  if (refused.length) throw new Error(`${refused.map(line => `\`${line}\``).join(', ')}: on iOS and tvOS, bundle:/ holds only the trees host.ios.resources declares (${ios.map(to => `bundle:/${to}`).join(', ') || 'none declared'}), and no host declares one this reaches: declare the tree in app.json's host.ios.resources (and host.macos.resources for the Mac), or grant a path under one`);
+}
+
+/** Give a bundle beside the app's (the App Clip's, the sample host's) the app's
+ *  declared trees: its `IOS_RESOURCE_ROOT` folder, when there are trees, and not a
+ *  file of that name, such as an executable an app named so leaves there. */
+export function shareIosResources(manifest, from, to) {
+  const root = resolve(from, IOS_RESOURCE_ROOT);
+  if (manifest.host?.ios?.resources?.length && lstatSync(root, { throwIfNoEntry: false })?.isDirectory())
+    cpSync(root, resolve(to, IOS_RESOURCE_ROOT), { recursive: true });
+}
+
 /** Validate links before copying. Relative links stay inside their declared
- * tree, so a copied helper cannot accidentally depend on the producer machine. */
-export function macResourceInventory(app, contents = null) {
-  const mappings = macResourceMappings(app.manifest);
+ * tree, so a copied helper cannot accidentally depend on the producer machine.
+ * An iOS tree holds neither links, which `bundle:` follows none of, nor
+ * Mach-O code, which an app cannot run from its resources. */
+export function nativeResourceInventory(app, contents = null, platform = 'macos') {
+  const mappings = nativeResourceMappings(app.manifest, platform), mac = platform === 'macos';
   if (!mappings.length) return [];
   const result = [], block = Buffer.alloc(1024 * 1024);
   const inside = (root, path) => path === root || path.startsWith(root + '/');
@@ -534,6 +616,10 @@ export function macResourceInventory(app, contents = null) {
     const walk = path => {
       const stat = lstatSync(path), name = relative(source, path), mode = stat.mode & 0o777;
       const item = { from, to, name, mode };
+      if (!mac && stat.isSymbolicLink())
+        throw new Error(`host.${platform}.resources: ${from}/${name} is a link, and bundle: follows none (LLP 1133.007 §9): put the file it names there`);
+      if (!mac && stat.isFile() && machO(path))
+        throw new Error(`host.${platform}.resources: ${from}/${name} is Mach-O code, which an app cannot run from its resources: ship code as a native module`);
       if (stat.isSymbolicLink()) {
         item.link = readlinkSync(path);
         if (isAbsolute(item.link) || !inside(source, resolve(dirname(path), item.link)) || !inside(root, realpathSync(path)))
@@ -547,7 +633,7 @@ export function macResourceInventory(app, contents = null) {
         // Everything under Contents/Helpers is signed as code; a file that is not, outside a nested bundle (a helper app's
         // own Info.plist), fails only at the final codesign, "code object is not signed at all" (LLP 1156.004 D2).
         const placed = `${to}/${name}`.split('/');
-        if (placed[0] === 'Helpers' && !placed.slice(0, -1).some(part => NESTED_BUNDLE.test(part)) && !machO(path))
+        if (mac && placed[0] === 'Helpers' && !placed.slice(0, -1).some(part => NESTED_BUNDLE.test(part)) && !machO(path))
           throw new Error(`native resource ${from}/${name} is not code, and everything placed under Contents/Helpers is signed as code: put a file a helper reads under Resources/ (host.macos.resources "to": "Resources/…")`);
       } else throw new Error(`native resource is not a file, directory or link: ${path}`);
       result.push(item);
@@ -558,11 +644,13 @@ export function macResourceInventory(app, contents = null) {
   return result;
 }
 
-export function copyMacResources(app, contents, expected = null) {
-  const inventory = macResourceInventory(app);
+/** Copy the declared trees under `contents` (the Mac's `Contents`, an iOS
+ *  bundle's `IOS_RESOURCE_ROOT`), as `expected` recorded them. */
+export function copyNativeResources(app, contents, expected = null, platform = 'macos') {
+  const inventory = nativeResourceInventory(app, null, platform);
   if (expected && JSON.stringify(inventory) !== JSON.stringify(expected))
     throw new Error('native resources changed after the binary receipt; rebuild');
-  for (const { from, to } of macResourceMappings(app.manifest)) {
+  for (const { from, to } of nativeResourceMappings(app.manifest, platform)) {
     const destination = resolve(contents, to);
     // Never merge with generated bundle contents or traverse an existing link.
     for (let at = destination; at !== resolve(contents); at = dirname(at)) {
@@ -576,7 +664,7 @@ export function copyMacResources(app, contents, expected = null) {
   // cp preserves regular-file modes; explicitly retain directory modes too.
   for (const item of inventory.toReversed()) if (!Object.hasOwn(item, 'link'))
     chmodSync(resolve(contents, item.to, item.name), item.mode);
-  if (JSON.stringify(macResourceInventory(app, contents)) !== JSON.stringify(inventory))
+  if (JSON.stringify(nativeResourceInventory(app, contents, platform)) !== JSON.stringify(inventory))
     throw new Error('native resources changed during bundle copy; rebuild');
   return inventory;
 }

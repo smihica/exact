@@ -179,7 +179,8 @@ impl Linked {
             .with(Capability::Io)
             .with(Capability::Transitions)
             .with(Capability::Numerals)
-            .with(Capability::Dates);
+            .with(Capability::Dates)
+            .with(Capability::Sqlite);
         if self.markup.is_some() {
             uses = uses.with(Capability::Markdown);
         }

@@ -370,3 +370,70 @@ fn launch_defers_subscription_and_recovers_a_panic() {
         .iter()
         .any(|a| { a["key"] == "event.name" && a["value"]["stringValue"] == "retained" }));
 }
+
+/// The event names of every logs request the sink received, sorted.
+fn posted_names(seen: &Seen) -> Vec<String> {
+    let mut names: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.0.ends_with("/logs"))
+        .flat_map(|r| r.2["resourceLogs"].as_array().unwrap().clone())
+        .flat_map(|r| r["scopeLogs"][0]["logRecords"].as_array().unwrap().clone())
+        .map(|l| {
+            let attrs = l["attributes"].as_array().unwrap();
+            let name = attrs.iter().find(|a| a["key"] == "event.name").unwrap();
+            name["value"]["stringValue"].as_str().unwrap().to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn two_processes_add_to_one_queue_and_send_each_row_once() {
+    // The sink answers after a pause, so the two dispatches below overlap.
+    let (url, seen) = sink(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        (200, "")
+    });
+    let dir = std::env::temp_dir().join(format!(
+        "exact-observe-test-processes-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = json!({ "projectId": "p1", "endpoint": url, "dispatchInDebug": true });
+    let open = |session: &str| {
+        Service::new(
+            config.as_object().unwrap().clone(),
+            &json!({ "id": "com.example.processes" }),
+            true,
+            dir.clone(),
+            session.into(),
+            0.0,
+        )
+    };
+    let event =
+        |s: &mut Service, name: &str| s.event(&json!({ "kind": "app.event", "name": name }));
+    let stored = || -> Vec<Value> {
+        let logs = read_json(&dir.join("queue.json"))["logs"].clone();
+        logs.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].clone())
+            .collect()
+    };
+    let mut a = open("s-a");
+    event(&mut a, "first");
+    let mut b = open("s-b");
+    event(&mut b, "second");
+    event(&mut a, "third");
+    assert_eq!(stored(), ["first", "second", "third"]);
+
+    let threads = [a, b].map(|mut s| std::thread::spawn(move || s.dispatch()));
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(posted_names(&seen), ["first", "second", "third"]);
+    assert!(stored().is_empty());
+}

@@ -112,6 +112,18 @@ enum DateValue {
         default: return local.string(from: d)
         }
     }
+
+    /// The wall clock's fields in the picker's zone-free representation,
+    /// using the same reference day as parsed bounds for a time-only input.
+    static func initial(_ kind: String, now: Date = Date(), timeZone: TimeZone = .current,
+                        minimum: Date? = nil, maximum: Date? = nil) -> Date {
+        let f = formatter(kind == "date" ? "yyyy-MM-dd" : kind == "time" ? "HH:mm" : "yyyy-MM-dd'T'HH:mm")
+        f.timeZone = timeZone
+        var value = parse(kind, f.string(from: now))!
+        if let minimum { value = max(value, minimum) }
+        if let maximum { value = min(value, maximum) }
+        return value
+    }
 }
 
 /// A select's options and the one it shows (`exact_select_options`).

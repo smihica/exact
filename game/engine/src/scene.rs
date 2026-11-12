@@ -522,15 +522,23 @@ impl Default for DirectionalLight {
 }
 
 /// An omnidirectional light at the entity's position.
-#[derive(Clone, Copy, Debug, PartialEq, Component)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointLight {
     /// Linear RGB light color.
     pub color: [f32; 3],
-    /// Luminous intensity in candela: `d` metres away it delivers
-    /// `intensity / d²` lux, on the same scale as `DirectionalLight::illuminance`.
+    /// Luminous intensity in candela at the default `decay`: `d` metres away
+    /// it delivers `intensity / d²` lux, on the same scale as
+    /// `DirectionalLight::illuminance`. At another `decay` it is the
+    /// illuminance 1 m away, an artistic scale.
     pub intensity: f32,
-    /// Maximum influence distance.
+    /// Maximum influence distance. Light fades smoothly to zero at it, whatever
+    /// the `decay`.
     pub range: f32,
+    /// The exponent of distance the light falls off by: `intensity / d^decay`.
+    /// 2 (the default) is physical inverse-square falloff; 0 is none, so only
+    /// the range window, a spot's cone and the surface's angle shape the light
+    /// (three.js `decay`). Negative values are 0.
+    pub decay: f32,
 }
 impl Default for PointLight {
     fn default() -> Self {
@@ -538,8 +546,13 @@ impl Default for PointLight {
             color: [1.0; 3],
             intensity: 100.0,
             range: 10.0,
+            decay: 2.0,
         }
     }
+}
+crate::data::opt_in_record!(PointLight { color, intensity, range } opt_in { decay });
+impl Component for PointLight {
+    const NAME: &'static str = "PointLight";
 }
 
 /// Marks a `PointLight` or `SpotLight` that casts shadows; lights are
@@ -550,18 +563,21 @@ pub struct LightShadows;
 
 /// A cone of light along the entity's −Z, the way a camera looks: a flashlight
 /// or a street lamp. Intensity is candela on the axis, as `PointLight`'s.
-#[derive(Clone, Copy, Debug, PartialEq, Component)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpotLight {
     /// Linear RGB light color.
     pub color: [f32; 3],
     /// Luminous intensity on the axis in candela.
     pub intensity: f32,
-    /// Maximum influence distance.
+    /// Maximum influence distance, where the light has faded to zero.
     pub range: f32,
     /// Half-angle in radians inside which the cone is at full intensity.
     pub inner: f32,
     /// Half-angle in radians at which the cone reaches zero; at most π/2.
     pub outer: f32,
+    /// The exponent of distance the light falls off by, as `PointLight::decay`
+    /// (default 2; at another value `intensity` is an artistic scale).
+    pub decay: f32,
 }
 impl Default for SpotLight {
     fn default() -> Self {
@@ -571,8 +587,13 @@ impl Default for SpotLight {
             range: 20.0,
             inner: 0.3,
             outer: 0.45,
+            decay: 2.0,
         }
     }
+}
+crate::data::opt_in_record!(SpotLight { color, intensity, range, inner, outer } opt_in { decay });
+impl Component for SpotLight {
+    const NAME: &'static str = "SpotLight";
 }
 
 /// Draws this entity in the camera's viewmodel layer: a first-person weapon or
@@ -610,6 +631,7 @@ impl Default for NodeMaterial {
 pub struct NodeMaterials(pub Vec<NodeMaterial>);
 
 /// One model material's look on one instance: see `MaterialOverrides`.
+/// Name the fields you set and end with `..Default::default()`.
 #[derive(Clone, Debug, Default, PartialEq, crate::Data)]
 pub struct MaterialOverride {
     /// The model's material index (the glTF material's index in its file).
@@ -619,11 +641,57 @@ pub struct MaterialOverride {
     pub color: Option<[f32; 4]>,
     /// Linear emission added wherever the material draws.
     pub emissive: [f32; 3],
+    /// Replaces the material's textures on this instance: one model per shape,
+    /// its skin chosen per instance. Each named `.tex` asset is requested while
+    /// an instance names it and released when none does. Until all of an
+    /// instance's named textures can draw, it keeps the textures it drew before
+    /// (the model's own the first time), so it never draws blank.
+    pub textures: TextureSlots,
+    /// Added to the material's base colour and emission texture coordinates
+    /// on this instance, after the material's own UV transform (glTF
+    /// `KHR_texture_transform`), in the transformed space: a ribbon's tail
+    /// scrolled each frame, flowing water, a shield's pattern. The sampler's
+    /// wrap mode applies past the edge. Normal, metallic-roughness and
+    /// occlusion maps stay put; a `CustomMaterial` ignores it. Changing it
+    /// patches the instance in place; its first appearance rebatches once.
+    /// `None` draws as before.
+    pub uv_offset: Option<[f32; 2]>,
+}
+/// Texture names replacing a model material's own, by slot; `None` keeps the
+/// material's. A slot the material samples no texture in stays untextured,
+/// and the material's UV transforms apply to the replacement.
+#[derive(Clone, Debug, Default, PartialEq, crate::Data)]
+pub struct TextureSlots {
+    /// Base colour (sRGB).
+    pub base_color: Option<String>,
+    /// Tangent-space normal map.
+    pub normal: Option<String>,
+    /// glTF metallic-roughness: roughness in G, metallic in B.
+    pub metallic_roughness: Option<String>,
+    /// Ambient occlusion in R.
+    pub occlusion: Option<String>,
+    /// Emission (sRGB).
+    pub emissive: Option<String>,
+}
+impl TextureSlots {
+    /// The names in the order of `asset::MaterialData`'s texture fields: base
+    /// colour, normal, metallic-roughness, emissive, occlusion.
+    pub fn names(&self) -> [Option<&str>; 5] {
+        [
+            &self.base_color,
+            &self.normal,
+            &self.metallic_roughness,
+            &self.emissive,
+            &self.occlusion,
+        ]
+        .map(Option::as_deref)
+    }
 }
 /// Per-material looks of a model instance: one soldier model in every team's
 /// armour colour, one crop model in each mutation's look. Every part with that
-/// material changes, merged or not, and instances with different overrides still
-/// draw together. Applies before `NodeMaterials`, under the entity's `Material`.
+/// material changes, merged or not, and instances with different colours still
+/// draw together, as do instances with the same textures. Applies before
+/// `NodeMaterials`, under the entity's `Material`.
 /// Presentation state: write it from `Game::present`; never saved or hashed.
 #[derive(Clone, Debug, Default, PartialEq, crate::Presentation)]
 pub struct MaterialOverrides(pub Vec<MaterialOverride>);

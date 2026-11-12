@@ -423,10 +423,23 @@ impl<D: DataSource> Host<D> {
                 }
                 continue;
             }
+            if p.property == Property::Opacity {
+                // A run has no layer: its paragraph paints the value.
+                if let Some((owner, _)) = self.inline_runs.get(&view) {
+                    let painted = self.paint.opacities.get(&view).copied().unwrap_or(1.0);
+                    if p.value.x != painted {
+                        self.dirty_paragraphs.insert(*owner);
+                    }
+                    continue;
+                }
+            }
             self.present_value(view, p.property, p.node, p.value, boot, batch);
         }
         for (view, inherits) in colored {
             self.present_colors(view, batch, inherits);
+        }
+        if !self.dirty_paragraphs.is_empty() {
+            self.emit_paragraphs(batch);
         }
         self.land_flights(batch);
     }
@@ -459,6 +472,8 @@ impl<D: DataSource> Host<D> {
         if identity && (boot || batch.at_identity(view, property.name())) {
             return;
         }
+        // A run has no box of its own to move, and transforms do not apply
+        // to a non-replaced inline box (CSS Transforms 1 §3).
         if self.inline_runs.contains_key(&view) || self.svg.presented(view) {
             return;
         }

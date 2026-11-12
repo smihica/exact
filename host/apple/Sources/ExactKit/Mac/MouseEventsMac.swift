@@ -173,7 +173,7 @@ extension Presenter {
         var ancestor = node.superview
         while let view = ancestor {
             if let node = view as? NodeView, node.overflowClips {
-                drawn = drawn.intersection(node.drawnRect(node.bounds))
+                drawn = drawn.intersection(node.drawnRect(node.clipBox?.frame ?? node.bounds))
             } else if let clip = view as? NSClipView {
                 let rect = (clip.superview?.superview as? NodeView).map {
                     $0.drawnRect($0.convert(clip.bounds, from: clip))

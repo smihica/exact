@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // `pointerdown`/`pointerup` in a real browser (LLP 1005 §Events): the input
 // glue's `pointer`, driven by CDP mouse events. Down before any press, up
 // wherever the button lifts (heard on the document; no click), both bubbling
@@ -5,7 +6,6 @@
 // nothing on a disabled node; `pointermove` and the `PointerEvent` record
 // (LLP 1056 §8.6): a held pointer's moves anywhere, a free one's over it.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

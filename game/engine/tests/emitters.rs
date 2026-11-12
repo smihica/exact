@@ -3,6 +3,153 @@
 use exact_game::emitter::{self, Particle, Shape};
 use exact_game::*;
 
+struct InvalidEmitter;
+impl Game for InvalidEmitter {
+    const ID: &'static str = "invalid-emitter";
+    type Args = ();
+    fn setup(w: &mut World, _: &()) {
+        w.spawn_named(
+            "smoke",
+            (
+                Transform::default(),
+                Emitter {
+                    spread: 30.,
+                    ..Emitter::sparks()
+                },
+            ),
+        );
+        w.publish("score", 1.0);
+    }
+    fn tick(_: &mut World, _: &Input, _: &()) {}
+}
+
+#[test]
+fn an_invalid_emitter_preserves_the_journal() {
+    let mut sim = Sim::<InvalidEmitter>::new(()).unwrap();
+    assert_eq!(sim.run(70_000.), 4200);
+    let w = sim.world();
+    assert_eq!(w.require::<Emitter>("smoke").state.alive, 0);
+    let journal = w.journal();
+    let refusals: Vec<_> = journal
+        .iter()
+        .filter(|event| event.line.contains("Emitter:"))
+        .collect();
+    assert_eq!(refusals.len(), 1, "journal has {} lines", journal.len());
+    assert!(refusals[0].line.contains("spread"));
+    assert!(journal
+        .iter()
+        .any(|event| event.line.contains("publish score")));
+}
+
+fn refusals(w: &World) -> Vec<String> {
+    w.journal()
+        .into_iter()
+        .filter(|event| event.line.contains("Emitter:"))
+        .map(|event| event.line)
+        .collect()
+}
+
+#[test]
+fn emitter_refusals_follow_each_entity_and_reason() {
+    let mut w = World::new(60, 0);
+    let invalid = Emitter {
+        spread: 30.,
+        ..Emitter::default()
+    };
+    let a = w.spawn(invalid.clone());
+    let b = w.spawn(invalid.clone());
+    for _ in 0..3 {
+        emitter::step(&w);
+    }
+    let lines = refusals(&w);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].ends_with(&format!("#{}", a.index())));
+    assert!(lines[1].ends_with(&format!("#{}", b.index())));
+
+    w.get_mut::<Emitter>(a).unwrap().spread = 0.;
+    w.get_mut::<Emitter>(a).unwrap().lifetime = 120.;
+    for _ in 0..3 {
+        emitter::step(&w);
+    }
+    let lines = refusals(&w);
+    assert_eq!(lines.len(), 3);
+    assert!(lines[2].contains("lifetime"));
+
+    w.get_mut::<Emitter>(a).unwrap().lifetime = 1.;
+    emitter::step(&w);
+    emitter::step(&w);
+    assert!(w.get::<Emitter>(a).unwrap().state.alive > 0);
+    assert_eq!(refusals(&w).len(), 3);
+    w.get_mut::<Emitter>(a).unwrap().lifetime = 120.;
+    emitter::step(&w);
+    assert_eq!(refusals(&w).len(), 4, "recovery ends the refusal");
+
+    let removed = w.remove::<Emitter>(b).unwrap();
+    emitter::step(&w);
+    w.insert(b, removed);
+    emitter::step(&w);
+    assert_eq!(refusals(&w).len(), 5, "removal ends the refusal");
+
+    assert!(w.despawn(b));
+    let replacement = w.spawn(invalid);
+    assert_eq!(replacement.index(), b.index());
+    assert_ne!(replacement, b);
+    emitter::step(&w);
+    assert_eq!(refusals(&w).len(), 6, "a reused slot has its own refusal");
+}
+
+#[test]
+fn emitter_refusals_are_not_saved_or_hashed() {
+    let mut w = World::new(60, 0);
+    let entity = w.spawn(Emitter {
+        spread: 30.,
+        ..Emitter::default()
+    });
+    let saved = w.save();
+    let hash = w.hash();
+    assert!(!w.get::<Emitter>(entity).unwrap().validate_for(&w, entity));
+    emitter::step(&w);
+    assert!(!w.get::<Emitter>(entity).unwrap().validate_for(&w, entity));
+    assert_eq!(refusals(&w).len(), 1);
+    assert_eq!(w.save(), saved);
+    assert_eq!(w.hash(), hash);
+    w.load(&saved).unwrap();
+    assert!(refusals(&w).is_empty());
+    for _ in 0..3 {
+        emitter::step(&w);
+    }
+    assert_eq!(refusals(&w).len(), 1, "a restored world reports afresh");
+}
+
+#[test]
+fn emitter_validation_names_the_failed_field() {
+    type Invalidator = fn(&mut Emitter);
+    let cases: [(&str, Invalidator); 13] = [
+        ("rate", |e| e.rate = -1.),
+        ("lifetime", |e| e.lifetime = 120.),
+        ("speed", |e| e.speed = f32::NAN),
+        ("spread", |e| e.spread = 30.),
+        ("gravity", |e| e.gravity.y = f32::INFINITY),
+        ("drag", |e| e.drag = -1.),
+        ("size", |e| e.size[1] = -1.),
+        ("color", |e| e.color[1][2] = f32::NAN),
+        ("bound", |e| e.bound[3] = e.bound[0] - 1.),
+        ("bound", |e| e.bound[1] = f32::NAN),
+        ("shape", |e| e.shape = Shape::Sphere(-1.)),
+        ("shape", |e| e.shape = Shape::Cone(1., f32::INFINITY)),
+        ("shape", |e| e.shape = Shape::Box(Vec3::splat(-1.))),
+    ];
+    for (field, invalidate) in cases {
+        let mut e = Emitter::default();
+        invalidate(&mut e);
+        let error = e.validate().unwrap_err();
+        assert!(
+            error.starts_with(&format!("Emitter: invalid {field} (")),
+            "{error}"
+        );
+    }
+}
+
 struct Rain<const EXPLICIT: bool>;
 impl<const EXPLICIT: bool> Game for Rain<EXPLICIT> {
     const ID: &'static str = "rain";

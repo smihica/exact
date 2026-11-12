@@ -365,12 +365,13 @@ impl App<'_> {
                     .filter_map(|s| Some(s.ended.as_ref()?.0.as_str())),
             )
             .collect();
+        let mut mentioned = BTreeSet::new();
+        for e in &automatic {
+            names(e, &mut mentioned);
+        }
         r.actions
             .iter()
-            .filter(|a| {
-                named.contains(a.name.as_str())
-                    || automatic.iter().any(|e| mentions(e, &|n| n == a.name))
-            })
+            .filter(|a| named.contains(a.name.as_str()) || mentioned.contains(a.name.as_str()))
             .all(|a| !self.binds_router(a) && self.only_refused(&a.body))
     }
 
@@ -705,6 +706,17 @@ fn mentions(e: &Expr, is: &dyn Fn(&str) -> bool) -> bool {
     match e {
         Expr::Ident(n, _) | Expr::Call(n, _, _) if is(n) => true,
         _ => parts(e).into_iter().any(|x| mentions(x, is)),
+    }
+}
+
+/// Every name an expression names or calls, at any depth: the names
+/// [`mentions`] can accept.
+fn names<'e>(e: &'e Expr, out: &mut BTreeSet<&'e str>) {
+    if let Expr::Ident(n, _) | Expr::Call(n, _, _) = e {
+        out.insert(n.as_str());
+    }
+    for x in parts(e) {
+        names(x, out);
     }
 }
 

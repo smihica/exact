@@ -62,7 +62,8 @@ fn main() {
             contract::rust_entry(
                 "markdown_stress_data::MarkdownStress",
                 "markdown_stress_data::MarkdownStress::default()",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap()
         ),

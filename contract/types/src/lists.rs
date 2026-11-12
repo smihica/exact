@@ -400,7 +400,7 @@ pub(crate) fn infer_call(
 
 /// A callback's body and the scope it reads: the item (of type `item`) and
 /// its index bound to its parameters, which are at most two and distinct.
-fn callback<'a>(
+pub(crate) fn callback<'a>(
     name: &str,
     arrow: &'a Expr,
     item: Ty,

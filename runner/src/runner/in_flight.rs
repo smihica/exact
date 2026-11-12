@@ -5,16 +5,68 @@
 use super::*;
 
 impl<D: DataSource> Runner<D> {
+    /// Whether resource `i` has a stream open that has committed a value: it is not
+    /// pending, but a newer answer must still let its ticket go.
+    pub(super) fn streaming(&self, i: usize) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.target == Target::Resource(i) && !p.in_flight())
+    }
+
+    /// The flags `current(x)` reads (LLP 1161.001 D1), from the shown
+    /// answers and the arguments of the last settlement.
+    pub(super) fn sync_current_flags(&mut self) {
+        let now = self.settled.as_ref().map(|s| &s.resource_args);
+        for i in 0..self.resources.len() {
+            let args = now.and_then(|a| a.get(i)).map_or(&[][..], Vec::as_slice);
+            self.resources[i].current = self.is_current(i, self.resources[i].state.as_ref(), args);
+        }
+        // A family is current when every member it lists is.
+        for i in 0..self.resources.len() {
+            if self.is_family(i) {
+                let members = (0..self.resources.len())
+                    .filter(|&m| self.member(m).is_some_and(|x| x.family == i && !x.gone));
+                let all = members
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .all(|&m| self.resources[m].current);
+                self.resources[i].current = all;
+            }
+        }
+    }
+
+    /// Whether `state` answers resource `i`'s arguments `now`: an answer, not
+    /// its placeholder, asked with the call arguments it has now. `with`
+    /// values are context, not identity (LLP 1027.005 D1), so they are not
+    /// compared.
+    pub(super) fn is_current(
+        &self,
+        i: usize,
+        state: Option<&ResourceState>,
+        now: &[Value],
+    ) -> bool {
+        let Some(s) = state else { return false };
+        if s.placeholder || s.slept {
+            return false;
+        }
+        let context = self.resource_row(i).context as usize;
+        let identity = |a: &[Value]| a.len().saturating_sub(context).min(a.len());
+        let asked = s.answered_args();
+        asked[..identity(asked)] == now[..identity(now)]
+    }
+
     /// The pending flags `pending(x)` reads, from the tickets in flight and
     /// what waits for its source.
     pub(super) fn sync_pending_flags(&mut self) {
-        self.pending_res = vec![false; self.plan.resources.len()];
+        for row in &mut self.resources {
+            row.pending = false;
+        }
         self.pending_mut = vec![false; self.plan.mutations.len()];
-        // A stream is pending until its first message (LLP 1016.000 D1).
+        // A stream is pending until its first value commits (LLP 1016.000 D1).
         for p in self.pending.iter().filter(|p| p.in_flight()) {
             match p.target {
-                Target::Resource(i) => self.pending_res[i] = true,
-                Target::Mutation(m) => self.pending_mut[m] = true,
+                Target::Resource(i) => self.resources[i].pending = true,
+                Target::Mutation(m) | Target::Sent(m, _) => self.pending_mut[m] = true,
             }
         }
         // A queue's waiting send is pending too (LLP 1092 D4).
@@ -23,13 +75,52 @@ impl<D: DataSource> Runner<D> {
         }
         // A placeholder shown until the source can answer is pending too,
         // and so is a send waiting for it.
-        for (i, awaiting) in self.awaiting.iter().enumerate() {
-            self.pending_res[i] |= *awaiting;
+        for row in &mut self.resources {
+            row.pending |= row.awaiting;
         }
-        for (m, ..) in &self.unsent {
-            self.pending_mut[*m] = true;
+        for m in self.unsent.iter().filter_map(|u| u.0.mutation()) {
+            self.pending_mut[m] = true;
         }
         self.pending_families();
+        self.sync_current_flags();
+    }
+
+    /// A target's resource or mutation name.
+    pub(super) fn target_name(&self, t: Target) -> String {
+        match t {
+            Target::Resource(i) => self.plan.str(self.resource_row(i).name).to_string(),
+            Target::Mutation(m) | Target::Sent(m, _) => {
+                self.plan.str(self.plan.mutations[m].name).to_string()
+            }
+        }
+    }
+
+    /// Drop the request in flight for `target`, if any: its reply, when it
+    /// comes, is dropped too (a `POST` already sent is not unsent — LLP 1016 D5).
+    pub(super) fn forget(&mut self, target: Target) {
+        self.forget_ticket(target);
+        if let Target::Mutation(_) = target {
+            self.unsent.retain(|u| u.0 != target);
+        }
+        self.sync_pending_flags();
+    }
+
+    /// Let go of `target`'s request in flight, keeping a send that waits
+    /// for the source; `false` keeps a child (LLP 1133.007 D13).
+    pub(super) fn forget_ticket(&mut self, target: Target) -> bool {
+        if self.holds_child(target) {
+            return false;
+        }
+        if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
+            let p = self.pending.remove(pos);
+            self.note_retired(&p);
+            let t = p.ticket;
+            self.note_let_go(t, target);
+            self.let_go_request(p);
+            self.forgot = true;
+            self.log(super::lines::forgot(t, &self.target_name(target)));
+        }
+        true
     }
 
     /// Every request in flight: the resource's or mutation's name and its ticket.
@@ -69,7 +160,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Whether any request is in flight (the agent's `settle` waits on it).
-    /// An open stream counts only until its first message (LLP 1016.000
+    /// An open stream counts until its first value commits (LLP 1016.000
     /// D5): after that it is open, not in flight, or `settle` never ends.
     /// A request held for the agent (LLP 1069.007 D3) is not I/O either: no
     /// clock waits on it, nor on one the server holds (LLP 1016.000 D9,

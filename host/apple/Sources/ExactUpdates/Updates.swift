@@ -29,6 +29,13 @@ enum Updates {
         let assets: [String]
     }
 
+    /// The C entries share one input and one output buffer per process, and
+    /// their callers run on several threads (a resolver's raster workers, the
+    /// widget publisher, an activation on the main thread). A call holds this
+    /// from writing its payload until it has copied its answer, so no other
+    /// call replaces either in between.
+    private static let buffers = NSLock()
+
     private static func read(_ len: UInt32) -> Data {
         guard len > 0, let api, let bytes = api.pointee.output() else { return Data() }
         return Data(bytes: bytes, count: Int(len))
@@ -49,13 +56,16 @@ enum Updates {
     static func open(assets: URL) -> Bool {
         let base = WidgetContainer.updateBase?.path ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.path ?? NSTemporaryDirectory()
         guard let payload = try? JSONSerialization.data(withJSONObject: ["base": base, "assets": assets.path]) else { return false }
-        let n = write(String(decoding: payload, as: UTF8.self))
-        let len = api!.pointee.open(n)
-        if len == 0 { return true }
-        FileHandle.standardError.write(Data("exact update: \(String(decoding: read(len), as: UTF8.self))\n".utf8))
+        let refusal: Data? = buffers.withLock {
+            let len = api!.pointee.open(write(String(decoding: payload, as: UTF8.self)))
+            return len == 0 ? nil : read(len)
+        }
+        guard let refusal else { return true }
+        FileHandle.standardError.write(Data("exact update: \(String(decoding: refusal, as: UTF8.self))\n".utf8))
         return false
     }
 
+    /// The selection `select` or `prepare` answered; the caller holds `buffers`.
     private static func selection(_ len: UInt32) -> Selection? {
         let obj = (try? JSONSerialization.jsonObject(with: read(len)) as? [String: Any]) ?? [:]
         guard let token = (obj["token"] as? NSNumber)?.uint64Value, token != 0,
@@ -65,19 +75,23 @@ enum Updates {
                          plan: plan, assets: obj["assets"] as? [String] ?? [])
     }
 
-    static func selection() -> Selection? { selection(api!.pointee.select()) }
-    static func prepare() -> Selection? { selection(api!.pointee.prepare()) }
+    static func selection() -> Selection? { buffers.withLock { selection(api!.pointee.select()) } }
+    static func prepare() -> Selection? { buffers.withLock { selection(api!.pointee.prepare()) } }
     static func commit(_ selection: Selection) -> Bool {
-        let len = api!.pointee.commit(selection.token)
-        if len != 0 { fputs("exact update: \(String(decoding: read(len), as: UTF8.self))\n", stderr) }
-        return len == 0
+        let refusal: Data? = buffers.withLock {
+            let len = api!.pointee.commit(selection.token)
+            return len == 0 ? nil : read(len)
+        }
+        guard let refusal else { return true }
+        fputs("exact update: \(String(decoding: refusal, as: UTF8.self))\n", stderr)
+        return false
     }
     static func discard(_ selection: Selection) { api!.pointee.discard(selection.token) }
     static func refuse(_ token: UInt64, reason: String) {
-        _ = api!.pointee.refuse(token, write(reason))
+        buffers.withLock { _ = api!.pointee.refuse(token, write(reason)) }
     }
     static func asset(_ selection: Selection, name: String) -> Result<Data?, NSError> {
-        let data = read(api!.pointee.asset(selection.token, write(name)))
+        let data = buffers.withLock { read(api!.pointee.asset(selection.token, write(name))) }
         switch data.first {
         case 0: return .success(nil)
         case 1: return .success(Data(data.dropFirst()))

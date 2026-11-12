@@ -26,7 +26,7 @@ pub fn capture() -> &'static str {
 /// built); an interaction page's are removed: it fetches nothing before a
 /// handler's intent. Refuses a shell that no longer has those places.
 pub fn page(shell: &str, rendered: &Rendered) -> Result<String, String> {
-    if shell.contains(JS_ENTRY) {
+    if is_js(shell) {
         return page_js(shell, rendered);
     }
     let mut html = shell.to_string();
@@ -92,10 +92,20 @@ pub fn page(shell: &str, rendered: &Rendered) -> Result<String, String> {
         rendered.digest, rendered.activate.name(), rendered.checkpoint
     );
     cut(&mut html, glue, glue, &checkpoint)?;
-    let viewports = html.matches("<meta name=\"viewport\"").count();
+    // Counted outside script elements ([`blanked`]) and before the shell's
+    // sheet, the first after the render's head (which may hold a sheet of
+    // its own): after it, `host.web.head`'s entries are the app's.
+    let seen = blanked(&html);
+    let head_end = seen
+        .find(&rendered.head)
+        .map_or(0, |at| at + rendered.head.len());
+    let own = &seen[..seen[head_end..]
+        .find("<style>")
+        .map_or(seen.len(), |at| at + head_end)];
+    let viewports = own.matches("<meta name=\"viewport\"").count();
     let preloads = ["app.wasm", "navigation.js", "glue.js"]
         .iter()
-        .filter(|file| html.contains(&format!("preload\" href=\"./{file}")))
+        .filter(|file| own.contains(&format!("preload\" href=\"./{file}")))
         .count();
     let expected = if interaction { 0 } else { 2 };
     if viewports != 1 || preloads != expected || !html.contains(&rendered.head) {
@@ -236,7 +246,30 @@ impl Js {
 /// Whether `shell` is the JavaScript runtime's, whose pages a server can
 /// send in two parts ([`head_js`], [`body_js`]).
 pub(crate) fn is_js(shell: &str) -> bool {
-    shell.contains(JS_ENTRY)
+    js_entry(shell).is_some()
+}
+
+/// The JavaScript runtime's entry after the shell's root, outside script
+/// text ([`blanked`]): [`JS_ENTRY`], or the `<script type="module">` an
+/// `--inline` shell holds the bundle in (`host/web-js/build.mjs`). A page
+/// puts its checkpoint in that place, and its capture script loads
+/// `./app.js`.
+fn js_entry(shell: &str) -> Option<std::ops::Range<usize>> {
+    const INLINE: &str = "<script type=\"module\">";
+    let (_, root_end) = shell_root(shell)?;
+    let seen = &blanked(shell)[root_end..];
+    let (at, len) = match seen.find(JS_ENTRY) {
+        Some(at) => (at, JS_ENTRY.len()),
+        None => {
+            let at = seen.find(INLINE)?;
+            let text = seen[at + INLINE.len()..].find("</script>")?;
+            if !seen[at + INLINE.len()..][..text].trim().is_empty() {
+                return None;
+            }
+            (at, INLINE.len() + text + "</script>".len())
+        }
+    };
+    Some(root_end + at..root_end + at + len)
 }
 
 /// The shell's places, in its order: `<html…>`, `<title>` through the
@@ -248,7 +281,7 @@ struct Places {
     root: usize,
     root_open: usize,
     root_end: usize,
-    entry: usize,
+    entry: std::ops::Range<usize>,
 }
 
 fn places(shell: &str) -> Result<Places, String> {
@@ -263,8 +296,8 @@ fn places(shell: &str) -> Result<Places, String> {
     let stop = shell[meta..].find(">\n").ok_or_else(|| lacks("viewport"))? + meta + 2;
     let (root, root_end) =
         shell_root(shell).ok_or_else(|| lacks("<div id=\"exact-root\"></div>"))?;
-    let entry = shell.find(JS_ENTRY).ok_or_else(|| lacks(JS_ENTRY))?;
-    if !(end <= title && stop <= root.start && root_end <= entry) {
+    let entry = js_entry(shell).ok_or_else(|| lacks(JS_ENTRY))?;
+    if !(end <= title && stop <= root.start && root_end <= entry.start) {
         return Err("the JavaScript shell's places are out of order".into());
     }
     Ok(Places {
@@ -277,13 +310,18 @@ fn places(shell: &str) -> Result<Places, String> {
     })
 }
 
-/// The shell's `modulepreload` lines between the viewport meta and the root.
+/// The shell's `modulepreload` lines between the viewport meta and its
+/// sheet. After the sheet, `host.web.head`'s entries are the app's.
 fn preloads(shell: &str, places: &Places) -> Vec<(usize, usize)> {
+    let shell = &blanked(shell);
     let mut found = Vec::new();
     let mut from = places.title.1;
-    while let Some(at) = shell[from..places.root].find(MODULE_PRELOAD) {
+    let end = shell[from..places.root]
+        .find("<style>")
+        .map_or(places.root, |at| at + from);
+    while let Some(at) = shell[from..end].find(MODULE_PRELOAD) {
         let at = at + from;
-        let Some(stop) = shell[at..places.root].find(">\n") else {
+        let Some(stop) = shell[at..end].find(">\n") else {
             break;
         };
         found.push((at, at + stop + 2));
@@ -389,113 +427,82 @@ pub(crate) fn body_js(
     late: bool,
     marked: bool,
 ) -> String {
+    body_after_boot_js(shell, js, rendered, late, marked, None)
+}
+
+pub(crate) fn body_after_boot_js(
+    shell: &str,
+    js: &Js,
+    rendered: &Rendered,
+    late: bool,
+    marked: bool,
+    boot: Option<&crate::direct::Boot>,
+) -> String {
     let document = &rendered.document;
+    let mut html = std::borrow::Cow::Borrowed(document.root.as_str());
+    if let Some(at) = document
+        .hero_image
+        .as_ref()
+        .and_then(|image| image.priority_at)
+    {
+        html.to_mut().insert_str(at, " fetchpriority=\"high\"");
+    }
     let mut root = String::with_capacity(document.root.len());
     if rendered.runtime_form {
-        root.push_str(&document.root);
+        root.push_str(&html);
     } else {
-        for_runtime(&mut root, &document.root, &js.classes);
+        for_runtime(&mut root, &html, &js.classes);
     }
     // The tokens `render.mjs` reads: the document, then the shell from its root.
     let style = js.rules.as_ref().map(|rules| {
         let have = crate::page_style::tokens(&(root.clone() + &shell[js.at.root..]));
         crate::page_style::select(rules, &have)
     });
-    let hero = hero_image(&mut root);
-    let mut out = body_open_js(
-        shell,
-        js,
-        &rendered.head,
-        document.scroll_document,
-        late,
-        marked,
-        style.as_deref().map_or(Sheet::Whole, Sheet::Own),
+    let mut out = boot.map_or_else(
+        || {
+            body_open_js(
+                shell,
+                js,
+                &rendered.head,
+                document.scroll_document,
+                late,
+                marked,
+                style.as_deref().map_or(Sheet::Whole, Sheet::Own),
+            )
+        },
+        |boot| boot.open(shell, js, document, late),
     );
-    // Before the root's open tag, which `body_open_js` ends with.
-    if let Some(link) = hero {
-        out.insert_str(out.len() - (js.at.root_open - js.at.root), &link);
-    }
+    preload_image(&mut out, shell, document.hero_image.as_ref());
     out.reserve(root.len() + rendered.checkpoint.len() + shell.len() - js.at.root);
     out.push_str(&root);
-    out.push_str(&body_close_js(
+    let close = body_close_js(
         shell,
         js,
         &rendered.digest,
         rendered.activate,
         &rendered.wake,
         &rendered.checkpoint,
-    ));
+    );
+    out.push_str(&crate::direct::close_after_boot(close, boot.is_some()));
     out
 }
 
-/// A page's first shown image, when it loads with the page (no `for`
-/// repeats it, LLP 1048.007 D5), is likely its largest paint: it is fetched
-/// at high priority and preloaded ahead of the document, as `render.mjs`
-/// `heroImage` does. A route the stack covers is `inert` and hidden, and
-/// what it holds is not the page's. Writes the priority into `root`;
-/// returns the preload.
-fn hero_image(root: &mut String) -> Option<String> {
-    const VOID: &[&str] = &[
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
-        "track", "wbr",
-    ];
-    let mut covered: Vec<bool> = Vec::new();
-    let mut from = 0;
-    while let Some(at) = root[from..].find('<').map(|i| from + i) {
-        let end = at + root[at..].find('>')?;
-        from = end;
-        let inner = &root[at + 1..end];
-        let (close, inner) = match inner.strip_prefix('/') {
-            Some(rest) => (true, rest),
-            None => (false, inner),
-        };
-        let name_len = inner
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .unwrap_or(inner.len());
-        if name_len == 0 || !inner.starts_with(|c: char| c.is_ascii_alphabetic()) {
-            continue;
-        }
-        let name = inner[..name_len].to_ascii_lowercase();
-        let attrs = &inner[name_len..];
-        if close {
-            covered.pop();
-            continue;
-        }
-        if name == "img" {
-            let Some(src) = attrs
-                .split_once(" src=\"")
-                .and_then(|(_, rest)| rest.split_once('"'))
-                .map(|(src, _)| src)
-            else {
-                continue;
-            };
-            if covered.contains(&true) || src.starts_with("data:") {
-                continue;
-            }
-            if attrs.contains(" loading=\"lazy\"") {
-                return None;
-            }
-            let link = format!("<link rel=\"preload\" as=\"image\" href=\"{src}\">");
-            root.insert_str(at + 4, " fetchpriority=\"high\"");
-            return Some(link);
-        }
-        if VOID.contains(&name.as_str()) || attrs.ends_with('/') {
-            continue;
-        }
-        // A style's or a script's text is not markup.
-        if name == "style" || name == "script" {
-            if let Some(i) = root[from..].find(&format!("</{name}")) {
-                from += i;
-            }
-        }
-        let inert = attrs
-            .match_indices(" inert")
-            .any(|(i, m)| matches!(attrs[i + m.len()..].chars().next(), None | Some(' ' | '=')));
-        covered.push(
-            inert || attrs.contains("visibility:hidden") || attrs.contains("visibility: hidden"),
-        );
+/// Insert the hero's preload before the root's opening tag.
+pub(crate) fn preload_image(
+    open: &mut String,
+    shell: &str,
+    hero: Option<&exact_web::document::HeroImage>,
+) {
+    if let Some(hero) = hero {
+        let src = hero
+            .src
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        let link = format!("<link rel=\"preload\" as=\"image\" href=\"{src}\">");
+        open.insert_str(open.len() - root_open(shell).len(), &link);
     }
-    None
 }
 
 /// Which sheet a page's rest carries when the build analyzed the shell's
@@ -567,7 +574,7 @@ pub(crate) fn body_close_js(
     let at = &js.at;
     let mut out = String::with_capacity(shell.len() - at.root + checkpoint.len() + 256);
     out.push_str("</div>");
-    out.push_str(&shell[at.root_end..at.entry]);
+    out.push_str(&shell[at.root_end..at.entry.start]);
     let wake = if wake.is_empty() {
         String::new()
     } else {
@@ -589,7 +596,7 @@ pub(crate) fn body_close_js(
             checkpoint
         ),
     );
-    out.push_str(&shell[at.entry + JS_ENTRY.len()..]);
+    out.push_str(&shell[at.entry.end..]);
     out
 }
 
@@ -626,11 +633,93 @@ fn without_fonts(head: &str) -> String {
     out
 }
 
+/// `html` with each script element's text blanked, byte for byte, so the
+/// shell's places (its root, entry, preloads and viewport) are found only
+/// in its own markup: a script's text, an `--inline` bundle's or a
+/// `host.web.head` entry's, may spell any of them. A script element starts
+/// where HTML's tokenizer starts one (HTML, 13.2.5 "Tokenization"): a
+/// `<script` start tag in markup, not inside a comment, a quoted attribute
+/// value, or the text of an element HTML reads as raw text or RCDATA
+/// (`style`, `title`, `textarea`, …), which may hold that spelling. Its text
+/// runs from the start tag's `>` to the first `</script` followed by
+/// whitespace, `/` or `>` ("Script data state" and the end tag states after
+/// it): an entry's text holds no `<!--` (`scripts/web-head.mjs`), so the
+/// escaped states that could pass over that end tag are never entered. As
+/// `render.mjs` `blanked`.
+fn blanked(html: &str) -> String {
+    const RAW_TEXT: [&str; 8] = [
+        "style", "title", "textarea", "xmp", "iframe", "noembed", "noframes", "noscript",
+    ];
+    let lower = html.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let ends_name = |at: usize| {
+        matches!(
+            b.get(at),
+            Some(b'\t' | b'\n' | 0x0c | b'\r' | b' ' | b'/' | b'>')
+        )
+    };
+    let mut out = html.as_bytes().to_vec();
+    let mut at = 0;
+    while let Some(open) = lower[at..].find('<').map(|i| i + at) {
+        if lower[open..].starts_with("<!--") {
+            at = lower[open + 4..]
+                .find("-->")
+                .map_or(b.len(), |i| open + 4 + i + 3);
+            continue;
+        }
+        let name_end = (open + 1..b.len())
+            .find(|&i| ends_name(i))
+            .unwrap_or(b.len());
+        let name = &lower[open + 1..name_end];
+        if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase) {
+            at = open + 1;
+            continue;
+        }
+        // The start tag's `>`, past its quoted attribute values.
+        let mut end = name_end;
+        let mut quote = None;
+        while end < b.len() {
+            match (quote, b[end]) {
+                (None, b'>') => break,
+                (None, q @ (b'"' | b'\'')) => quote = Some(q),
+                (Some(q), c) if c == q => quote = None,
+                _ => {}
+            }
+            end += 1;
+        }
+        at = (end + 1).min(b.len());
+        if name != "script" && !RAW_TEXT.contains(&name) {
+            continue;
+        }
+        // Its text, to the first end tag of its name followed by
+        // whitespace, `/` or `>`.
+        let tag = format!("</{name}");
+        let mut from = at;
+        let close = loop {
+            match lower[from..].find(&tag).map(|i| i + from) {
+                Some(close) if ends_name(close + tag.len()) => break Some(close),
+                Some(close) => from = close + tag.len(),
+                None => break None,
+            }
+        };
+        let Some(close) = close else { break };
+        if name == "script" {
+            out[at..close].fill(b' ');
+        }
+        at = close;
+    }
+    // Whole characters were blanked: a script's text starts after an ASCII
+    // `>` and ends before an ASCII `<`.
+    String::from_utf8(out).expect("blanking keeps UTF-8")
+}
+
 /// The document's element in the shell, `<div id="exact-root"></div>`,
 /// with what the build writes on it (`data-audio-session`, LLP 1096 D7):
-/// its opening tag's range and where its `</div>` ends.
+/// its opening tag's range and where its `</div>` ends. The one outside
+/// every script element ([`blanked`]).
 fn shell_root(shell: &str) -> Option<(std::ops::Range<usize>, usize)> {
     const OPEN: &str = "<div id=\"exact-root\"";
+    let shell = &blanked(shell);
     let at = shell.find(OPEN)?;
     let rest = &shell[at + OPEN.len()..];
     let attrs = match rest.strip_prefix(" data-audio-session=\"") {
@@ -912,6 +1001,7 @@ mod tests {
                 head: Default::default(),
                 keyframes: String::new(),
                 scroll_document: true,
+                hero_image: None,
             },
             head: String::new(),
             checkpoint: "{}".into(),
@@ -931,6 +1021,114 @@ mod tests {
         assert!(!body_js(shell, &js, &rendered, false, true).contains(&mark));
         rendered.document.scroll_document = false;
         assert!(!body_js(shell, &js, &rendered, false, false).contains(&mark));
+    }
+
+    /// LLP 1048.000 D3: the app's `host.web.head`, which the build writes
+    /// after the shell's sheet, is in every page's head once, whether the
+    /// page carries the whole sheet or only its own rules, and whatever
+    /// its entries' text says: a script's text that spells the root, the
+    /// entry or a preload line is not taken for the shell's own.
+    #[test]
+    fn a_page_keeps_the_apps_head_entries_after_the_sheet() {
+        let entries = concat!(
+            "<script async src=\"https://a.example/t.js\"></script>\n<script>x('<style>p{}</style>')</script>\n",
+            "<script>const r = '<div id=\"exact-root\"></div>', p = `<link rel=\"modulepreload\" href=\"./x.js\">\n`;</script>\n",
+        );
+        let shell = format!("<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n<base href=\"/\">\n<title>Blog</title>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"modulepreload\" href=\"./app.js\">\n<style>p{{margin:0}}</style>\n{entries}<div id=\"exact-root\"></div>\n<script type=\"module\" src=\"./app.js\"></script>\n");
+        for rules in [None, Some("[]")] {
+            let js = Js::of(&shell).unwrap();
+            let js = match rules {
+                Some(rules) => js.with_rules(rules),
+                None => js,
+            };
+            for preload in [true, false] {
+                let head = head_js(&shell, &js, "en", "ltr", preload, false);
+                assert_eq!(head.matches(entries).count(), 1, "{head}");
+                assert_eq!(head.contains("p{margin:0}"), rules.is_none(), "{head}");
+            }
+        }
+    }
+
+    /// The shell's root, entry and preloads are the ones outside every
+    /// script element: a script before the root (a `host.web.head` entry),
+    /// one after it, an `--inline` shell's bundle in the entry's place, or
+    /// all of them may spell the root, whole or only its opening tag, and
+    /// the page's document and checkpoint still go in the shell's own.
+    #[test]
+    fn the_shells_places_are_outside_its_scripts() {
+        let head = "<script>const r = '<div id=\"exact-root\"></div>';</script>\n";
+        let after = "<script>const a = '<div id=\"exact-root\"';</script>\n";
+        let external = "<script type=\"module\" src=\"./app.js\"></script>\n";
+        let inline = "<script type=\"module\">const b = '<div id=\"exact-root\"></div>', c = '<div id=\"exact-root\"';</script>\n";
+        for (head, after, entry) in [
+            (head, "", external),
+            ("", after, external),
+            (head, after, external),
+            ("", "", inline),
+            (head, after, inline),
+        ] {
+            let shell = format!("<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n<base href=\"/\">\n<title>Blog</title>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<link rel=\"modulepreload\" href=\"./app.js\">\n<style>p{{margin:0}}</style>\n{head}<div id=\"exact-root\"></div>\n{after}{entry}");
+            assert!(is_js(&shell), "{shell}");
+            let js = Js::of(&shell).unwrap();
+            let rendered = Rendered {
+                document: exact_web::document::Document {
+                    lang: "en".into(),
+                    dir: "ltr".into(),
+                    root: "<p>PAGE</p>".into(),
+                    viewport_fit: None,
+                    interactive_widget: None,
+                    head: Default::default(),
+                    keyframes: String::new(),
+                    scroll_document: false,
+                    hero_image: None,
+                },
+                head: String::new(),
+                checkpoint: "{}".into(),
+                digest: "0".into(),
+                state: Default::default(),
+                settled: crate::Settled::Complete,
+                activate: exact_plan::ActivatePolicy::Inferred,
+                wake: String::new(),
+                runtime_form: false,
+            };
+            let page = head_js(&shell, &js, "en", "ltr", false, false)
+                + &body_js(&shell, &js, &rendered, false, false);
+            for script in [head, after].into_iter().filter(|s| !s.is_empty()) {
+                assert_eq!(page.matches(script).count(), 1, "{page}");
+            }
+            // The entry's place holds the checkpoint; the capture script
+            // loads `./app.js`.
+            assert!(!page.contains(entry), "{page}");
+            let root = page
+                .find("<div id=\"exact-root\"><p>PAGE</p></div>")
+                .expect(&page);
+            let checkpoint = "<script type=\"application/vnd.exact.checkpoint\"";
+            assert_eq!(page.matches(checkpoint).count(), 1, "{page}");
+            assert!(root < page.find(checkpoint).unwrap(), "{page}");
+            assert!(head.is_empty() || page.find(head).unwrap() < root, "{page}");
+        }
+    }
+
+    /// What only spells a script tag is not one: a title, a sheet, a
+    /// comment or an attribute value holding `<script` (an app named
+    /// "Learn <script> tags", a head entry's `meta`) leaves the shell's
+    /// root and entry where they are, and the shell a JavaScript one.
+    #[test]
+    fn a_script_tag_in_a_title_sheet_comment_or_attribute_is_not_one() {
+        for title in ["Learn <script> tags", "Learn &lt;script> tags"] {
+            let shell = format!("<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n<base href=\"/\">\n<title>{title}</title>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<!-- <script> -->\n<link rel=\"modulepreload\" href=\"./app.js\">\n<style>p::after{{content:\"<script>\"}}</style>\n<meta name=\"x\" content=\"<script>\" data-y='<script>'>\n<div id=\"exact-root\"></div>\n<script type=\"module\" src=\"./app.js\"></script>\n");
+            assert!(is_js(&shell), "{shell}");
+            let js = Js::of(&shell).unwrap();
+            assert_eq!(
+                &shell[js.at.root..js.at.root_end],
+                "<div id=\"exact-root\"></div>"
+            );
+            assert_eq!(
+                &shell[js.at.entry.clone()],
+                "<script type=\"module\" src=\"./app.js\"></script>"
+            );
+            assert_eq!(preloads(&shell, &js.at).len(), 1, "{shell}");
+        }
     }
 
     /// LLP 1115.000 D4.6: a rendered page keeps the manifest's `lang`, which

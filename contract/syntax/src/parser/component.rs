@@ -120,7 +120,8 @@ impl Parser {
                         "provide" => {
                             self.next();
                             self.newline()?;
-                            let mut provides: Vec<Binding> = Vec::new();
+                            let mut provides = Vec::new();
+                            let mut names = std::collections::HashMap::new();
                             for b in self.block(|p| {
                                 let (name, span) = p.ident()?;
                                 let expr = if p.eat_punct("=") {
@@ -131,8 +132,8 @@ impl Parser {
                                 p.newline()?;
                                 Ok(Binding { name, expr, span })
                             })? {
-                                if let Some(first) = provides.iter().find(|p| p.name == b.name) {
-                                    return duplicate("provided name", &b.name, b.span, first.span);
+                                if let Some(first) = names.insert(b.name.clone(), b.span) {
+                                    return duplicate("provided name", &b.name, b.span, first);
                                 }
                                 provides.push(b);
                             }

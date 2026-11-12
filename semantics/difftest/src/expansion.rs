@@ -14,9 +14,10 @@
 //!  (b) runs the component-level semantics (`Contract.CompSem`) on the
 //!      unexpanded file and the flat semantics on Rust's expansion over the
 //!      case's events, the oracle the runner's transcript, and compares the
-//!      observations: every line but the slots the expansion lifted out of
-//!      children (`slot name#n …`), which the component-level semantics
-//!      keeps per instance, not as root slots.
+//!      observations, omitting commit traces (`ran …`), which the component
+//!      semantics does not emit, and the slots the expansion lifted out of
+//!      children (`slot name#n …`), which it keeps per instance, not as root
+//!      slots.
 //!
 //! A structural difference is a disagreement between the two expanders; an
 //! observational one is a disagreement between the expansion and the
@@ -131,13 +132,13 @@ fn module(cases: &[(usize, Prepared)]) -> String {
     s
 }
 
-/// Comparable lines: `#` commentary dropped, a multi-line outcome split,
-/// and (for the flat side) the lifted slots.
+/// Compare outcomes and configurations, omitting commentary, commit traces
+/// (the component semantics has none), and the flat side's lifted slots.
 fn comparable(lines: &[String], flat: bool) -> Vec<String> {
     lines
         .iter()
         .flat_map(|l| l.lines().map(str::to_string).collect::<Vec<_>>())
-        .filter(|l| !l.starts_with('#'))
+        .filter(|l| !l.starts_with('#') && !l.starts_with("ran "))
         .filter(|l| {
             !flat
                 || !l
@@ -375,4 +376,51 @@ fn keep(dir: &Path, i: usize, case: &Case, flat: &[String], comp: &[String]) -> 
     let _ = std::fs::write(stem.with_extension("flat.txt"), flat.join("\n"));
     let _ = std::fs::write(stem.with_extension("comp.txt"), comp.join("\n"));
     format!("{}.{{contract,events,flat.txt,comp.txt}}", stem.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commits_do_not_make_equal_configurations_diverge() {
+        let lines = [
+            "#struct ok",
+            "#flat",
+            "== tap \"go\"",
+            "outcome ok",
+            "ran task tick ok",
+            "ran then finished ok",
+            "ran handler go ok",
+            "slot count n3ff0000000000000",
+            "slot local#0 n4000000000000000",
+            "#comp",
+            "== tap \"go\"",
+            "outcome ok",
+            "slot count n3ff0000000000000",
+        ]
+        .map(str::to_string);
+        assert!(matches!(verdict(&lines).0, Verdict::Agree));
+    }
+
+    #[test]
+    fn differences_after_a_commit_remain_visible() {
+        for (flat, comp) in [
+            ("outcome ok", "outcome refused\n# missing handler"),
+            (
+                "slot count n3ff0000000000000",
+                "slot count n4000000000000000",
+            ),
+            ("command focus \"a\"", "command focus \"b\""),
+            ("view \"label\" \"a\"", "view \"label\" \"b\""),
+            ("trace disagrees", ""),
+        ] {
+            let lines = ["#flat", "ran handler go ok", flat, "#comp", comp].map(str::to_string);
+            let Verdict::Diverge { at, flat: got, .. } = verdict(&lines).0 else {
+                panic!("{flat:?} and {comp:?} must differ")
+            };
+            assert_eq!(at, 0);
+            assert_eq!(got, [flat]);
+        }
+    }
 }

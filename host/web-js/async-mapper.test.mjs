@@ -1,3 +1,4 @@
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 // A stream's mapper that returns a promise on the web JS target (ts-stream.js `open`; Charlie, 2026-11-10): each
 // message answers when its mapper's promise settles, a later message's mapper call never overtakes an earlier one's,
 // a rejection answers as a throw does, and the stream's end waits behind a call still pending.
@@ -14,7 +15,7 @@ beforeAll(async () => {
   // of the URL's query is one message, delivered at once, and the body then ends with a 200.
   dir = mkdtempSync(resolve(tmpdir(), 'exact-ts-async-mapper-'));
   for (const name of ['ts-stream.js', 'ts-fetch.js', 'ts-body-from.js', 'shape.js', 'uploads.js']) cpSync(resolve(root, 'host/web-js', name), resolve(dir, name));
-  for (const name of ['grant-admission.js', 'faults.js', 'address-space.js', 'navigation.js', 'storage-environment.js']) cpSync(resolve(root, 'host/web', name), resolve(dir, name));
+  for (const name of ['grant-admission.js', 'faults.js', 'address-space.js', 'navigation.js', 'storage-environment.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(root, 'host/web', name)));
   writeFileSync(resolve(dir, 'http-body.js'), `export function streamed(req, grantSet, message) {
   for (const data of new URL(req.url).searchParams.getAll('e')) message({ event: '', id: '', data, coalesced: 0 });
   return Promise.resolve({ status: 200, body: new Uint8Array() });

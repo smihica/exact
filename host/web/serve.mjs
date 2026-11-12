@@ -155,8 +155,8 @@ function* devGenerationRead(cache, pathname) {
 export function readDevGeneration(cache, pathname) { return runReads(devGenerationRead(cache, pathname)); }
 export function readDevGenerationAsync(cache, pathname) { return runReadsAsync(devGenerationRead(cache, pathname)); }
 
-/** Every regular file under a static source tree, sorted and refused when
- * the root or any entry is a symlink or another special filesystem object. */
+/** Static files other than Finder's `.DS_Store` metadata, sorted and refused
+ * when the root or any entry is a symlink or another special filesystem object. */
 export function listStaticFiles(source) {
   return Object.keys(filesystem({ op: 'names', root: resolve(source) }));
 }

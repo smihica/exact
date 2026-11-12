@@ -11,7 +11,7 @@ import { resolve, toNamespacedPath } from 'node:path';
 import { applyPattern, createApp } from '../game/new.mjs';
 import { findings } from '../host/apple/feel/analyze.mjs';
 import { chromium } from './agent-launch.mjs';
-import { ago, appServer, draftFields, fixedType, groups, judgeRelaunch, judgeReload, movedClock, persistedStates, pinnedLaunch, recordedServerAddress, refusalsOf, relaunchFacts, relaunchStore, reloadLine, reloadNote, report, reusable, savedChanges, screenTexts, serverUrl, shotName, storedTexts, warningsOfBuild } from './verify.mjs';
+import { ago, appServer, buildWarnings, draftFields, fixedType, groups, judgeRelaunch, judgeReload, movedClock, persistedStates, pinnedLaunch, recordedServerAddress, refusalsOf, relaunchFacts, relaunchStore, reloadLine, reloadNote, report, reusable, savedChanges, screenTexts, serverUrl, shotName, storedTexts, warningsOfBuild } from './verify.mjs';
 import { semanticsSummary } from './verify-semantics.mjs';
 
 const SIZES = [[390, 844], [1280, 900]];
@@ -254,6 +254,17 @@ test('the compiler\'s warnings are read from the build\'s JSON, every one, in th
   // build) still yields the warning lines in it.
   assert.deepEqual(warningsOfBuild(JSON.stringify([entry(1, 'x', 'm', '/elsewhere/a.contract'), entry(2, 'y', 'n', null)]), cwd), ['/elsewhere/a.contract:1:5 warning [x] m', '2:5 warning [y] n']);
   assert.deepEqual(warningsOfBuild(`error: could not compile\n${cwd}/app.contract:9:5 warning [lower-header-unplaced] text form\n`, cwd), ['app.contract:9:5 warning [lower-header-unplaced] text form']);
+});
+
+// An outside workspace carries every crates.io patch exact2 requires (LLP 1036.001 D2); Cargo says each one the app's
+// graph does not use, on the runs that build, which flipped verify between clean and four problems.
+test('the build\'s warnings leave out the unused patches exact2 requires, never the author\'s own', () => {
+  const vendored = (name, dir = name) => `warning: patch \`${name} v0.11.1 (${resolve(import.meta.dir, '..', 'vendor', dir)})\` was not used in the crate graph`;
+  const own = 'warning: patch `itoa v1.0.99 (/work/app/patches/itoa)` was not used in the crate graph';
+  const moved = 'warning: patch `parley v0.11.1 (/work/app/patches/parley)` was not used in the crate graph';
+  const output = [vendored('accesskit_windows', 'accesskit-windows'), vendored('fontique'), vendored('parley'), vendored('wgpu-hal'),
+    'help: Check that the patched package version and available features are compatible', own, moved, 'warning: unused variable: `x`'].join('\n');
+  assert.deepEqual(buildWarnings(output), [own, moved, 'warning: unused variable: `x`']);
 });
 
 // LLP 1116.010 D6: a screen survives a reload. Each test's end screen is reloaded where it stands and its texts compared;
@@ -803,7 +814,7 @@ test.skipIf(!!chromium().unavailable)('verify on a server app: its own server on
     assert.match(tested.stderr, new RegExp(`^test: bun server\\.ts at http://127\\.0\\.0\\.1:${port}, on an empty database \\(\\.exact/test/db\\.sqlite, removed after\\)$`, 'm'));
     assert.match(tested.stdout, /^1 passed, 0 failed$/m);
     assert.ok(readFileSync(resolve(dir, 'data.db')).equals(before), 'test leaves the builder\'s data.db as it was');
-    writeFileSync(resolve(dir, 'test.mjs'), "const { withAppServer } = await import(`${process.env.EXACT2}/scripts/verify.mjs`);\nprocess.exit(await withAppServer(import.meta.dir, () =>\n  Bun.spawn(['bun', 'exact.mjs', 'test', ...process.argv.slice(2)], { cwd: import.meta.dir, stdio: ['inherit', 'inherit', 'inherit'] }).exited));\n");
+    writeFileSync(resolve(dir, 'test.mjs'), "const { withAppServer } = await import(`${process.env.EXACT}/scripts/verify.mjs`);\nprocess.exit(await withAppServer(import.meta.dir, () =>\n  Bun.spawn(['bun', 'exact.mjs', 'test', ...process.argv.slice(2)], { cwd: import.meta.dir, stdio: ['inherit', 'inherit', 'inherit'] }).exited));\n");
     writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ ...JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')), commands: { 'api-test': ['bun', 'test.mjs'] } }, null, 2));
     const old = plain('api-test');
     assert.equal(old.status, 0, old.stdout + old.stderr);

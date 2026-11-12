@@ -303,3 +303,71 @@ fn shared_secret_broker_bounds_waiters_and_releases_cancelled_slots() {
 fn file_secret_durability_is_refused_without_an_acknowledged_platform_primitive() {
     assert!(sync_directory_chain(std::path::Path::new("scratch/secrets")).is_err());
 }
+
+/// A backend over files in `directory` that acknowledges a write as the Linux
+/// and Android host's does (`SecretFiles`): written, then the directory chain
+/// synced.
+#[cfg(unix)]
+struct Files(PathBuf);
+#[cfg(unix)]
+impl Backend for Files {
+    fn read(&self, name: &str) -> Result<Option<String>, String> {
+        match std::fs::read_to_string(self.0.join(name)) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    fn write(&self, name: &str, value: Option<&str>) -> Result<(), String> {
+        std::fs::write(self.0.join(name), value.unwrap_or_default()).map_err(|e| e.to_string())?;
+        sync_directory_chain(&self.0)
+    }
+}
+
+/// An exclusive transaction's write under a store whose ancestor the app may
+/// not open, as Android's `/data/user/0` is to an app, is acknowledged; the
+/// secrets directory itself unopenable is still an error.
+#[cfg(unix)]
+#[test]
+fn an_exclusive_write_under_an_unopenable_ancestor_is_acknowledged() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new();
+    let (closed, store) = (temp.0.join("user"), temp.0.join("user/app/cache"));
+    let (leases, secrets) = (store.join("secret-leases"), store.join("secrets"));
+    std::fs::create_dir_all(&leases).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let mode = |path: &PathBuf, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    // Traversable, not readable: `open` answers EACCES (unless this runs as root).
+    mode(&closed, 0o311);
+    struct Reopen(PathBuf);
+    impl Drop for Reopen {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _reopen = Reopen(closed.clone());
+    if File::open(&closed).is_ok() {
+        eprintln!("skipped: this process may open a 0311 directory");
+        return;
+    }
+    let coordinator = Coordinator::new(Namespace::disk(leases), Arc::new(Files(secrets.clone())));
+    let lease = acquire(&coordinator);
+    lease.begin_effect().unwrap();
+    lease.write(Some("signed-in")).unwrap();
+    lease.finish().unwrap();
+    drop(lease);
+    assert_eq!(
+        acquire(&coordinator).read().unwrap().as_deref(),
+        Some("signed-in")
+    );
+
+    mode(&secrets, 0o300);
+    let refused = sync_directory_chain(&secrets).unwrap_err();
+    mode(&secrets, 0o700);
+    assert!(
+        refused.contains(&secrets.display().to_string()),
+        "{refused}"
+    );
+}

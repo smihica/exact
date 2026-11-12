@@ -132,7 +132,7 @@ final class BuildHeld {
     /// The system appearance as it was: a pin's are set again over it.
     func restoreAppearance() {
         #if os(macOS)
-        let following = NSApp.appearance == nil || NSApp.appearance === Agent.systemAppearance
+        let following = Agent.followsSystem
         Agent.systemAppearance = appearance.system
         if following { NSApp.appearance = appearance.app }
         DisplayPreferences.changed()

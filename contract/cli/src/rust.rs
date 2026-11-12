@@ -5,8 +5,9 @@
 //! `Value::record` pass the runner's shape check; a named field cannot swap.
 
 use exact_plan::{Plan, TypeKind, TypesId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::path::Path;
 
 const KEYWORDS: &[&str] = &[
     "as", "async", "await", "box", "break", "const", "continue", "dyn", "else", "enum", "extern",
@@ -43,6 +44,16 @@ pub(crate) fn field_name(name: &str) -> String {
 }
 
 pub(crate) fn type_name(name: &str) -> String {
+    // The loader scopes shapes with `__<file>`; module calls use the same
+    // separator for their options and platform records.
+    if name.contains("__") {
+        let name: String = name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(|part| part[..1].to_ascii_uppercase() + &part[1..])
+            .collect();
+        return type_name(&name);
+    }
     let mut out: String = name
         .chars()
         .map(|c| {
@@ -79,33 +90,67 @@ pub(crate) fn check_fields<'a>(
     Ok(())
 }
 
-/// Generate Rust structs for every named record in a compiled Contract,
-/// each with `From<&T> for Value` and `TryFrom<&Value> for T` in the
-/// declared field order. A build-time artifact: a data crate's `build.rs`
+/// Compile the data seam's plan and its generated call-record names. The names
+/// stay beside the plan: its module signatures do not distinguish authored
+/// option types from generated platform-word records with the same spelling.
+/// Like `contract rust`, this does not check GPU surface arguments.
+pub fn compile_path_for_rust(
+    path: &Path,
+) -> Result<(Plan, BTreeSet<String>), Vec<crate::CompileError>> {
+    let src = crate::read_source(path)?;
+    let app_root = crate::app_root(path)?;
+    let (file, sources) = crate::sources::load(path, &src, &app_root)?;
+    let call_records = file
+        .modules
+        .iter()
+        .flat_map(crate::modules::records)
+        .map(|shape| shape.name)
+        .collect();
+    let (plan, _) = crate::compile_loaded(
+        path,
+        &app_root,
+        file,
+        sources,
+        false,
+        false,
+        contract_lower::Profile::Web,
+        None,
+    )?;
+    Ok((plan, call_records))
+}
+
+/// Generate Rust structs for authored Contract shapes, data source signatures,
+/// and the records their fields reach. Each has `From<&T> for Value` and
+/// `TryFrom<&Value> for T` in the declared field order.
+/// A build-time artifact: a data crate's `build.rs`
 /// writes it into `OUT_DIR` and `include!`s it; it is never committed.
-pub fn rust(plan: &Plan) -> Result<String, String> {
+/// Pass the call-record names from [`compile_path_for_rust`], or an empty set
+/// for a plan from [`crate::compile`], which cannot import native modules.
+pub fn rust(plan: &Plan, call_records: &BTreeSet<String>) -> Result<String, String> {
     Plan::decode(&plan.encode()).map_err(|e| format!("invalid plan: {e:?}"))?;
     // One struct per shape name; the plan may hold a shape more than once.
-    let mut named: BTreeMap<String, usize> = BTreeMap::new();
+    let mut named = BTreeMap::new();
     for (i, row) in plan.types.iter().enumerate() {
         let name = plan.str(row.name);
-        if row.kind == TypeKind::Record && !name.is_empty() {
-            named.entry(name.to_string()).or_insert(i);
+        if row.kind == TypeKind::Record && !name.is_empty() && !call_records.contains(name) {
+            reach(plan, TypesId(i as u32), &mut named)?;
         }
     }
-    let mut mapped = BTreeMap::new();
-    for name in named.keys() {
-        let rust = type_name(name);
-        if rust == "ContractValue" {
-            return Err(format!(
-                "shape `{name}` takes the name of the generated trait `ContractValue`; rename the shape"
-            ));
+    for row in &plan.sources {
+        let name = plan.str(row.name);
+        if exact_plan::runner_owned_source(name) || plan.module_named(name).is_some() {
+            continue;
         }
-        if let Some(previous) = mapped.insert(rust.clone(), name) {
-            return Err(format!(
-                "shapes `{previous}` and `{name}` both become Rust `{rust}`"
-            ));
+        reach(plan, row.ty, &mut named)?;
+        for param in row.params.iter() {
+            reach(plan, plan.source_params[param.0 as usize].ty, &mut named)?;
         }
+    }
+    if let Some(ty) = named.get("ContractValue") {
+        let name = plan.str(plan.types[ty.0 as usize].name);
+        return Err(format!(
+            "shape `{name}` takes the name of the generated trait `ContractValue`; rename the shape"
+        ));
     }
     let ty = |i: TypesId| -> Result<String, String> { rust_type(plan, i) };
     // A shape may be named `Option`, `String`, `From` or `f64`, and its
@@ -161,12 +206,12 @@ pub fn rust(plan: &Plan) -> Result<String, String> {
          }\n",
     );
     for (name, &i) in &named {
-        let row = &plan.types[i];
+        let row = &plan.types[i.0 as usize];
+        let shape = plan.str(row.name);
         let fields = &plan.fields
             [row.fields.start as usize..row.fields.start as usize + row.fields.len as usize];
-        check_fields(name, fields.iter().map(|f| plan.str(f.name)))?;
-        writeln!(out, "\n/// Contract `shape {name}`.").unwrap();
-        let name = type_name(name);
+        check_fields(shape, fields.iter().map(|f| plan.str(f.name)))?;
+        writeln!(out, "\n/// Contract `shape {shape}`.").unwrap();
         writeln!(
             out,
             "#[derive(Debug, Clone, PartialEq, Default)]\npub struct {name} {{"
@@ -227,6 +272,40 @@ pub fn rust(plan: &Plan) -> Result<String, String> {
         .unwrap();
     }
     Ok(out)
+}
+
+/// Every record `ty` holds, by its Rust name.
+pub(crate) fn reach(
+    plan: &Plan,
+    ty: TypesId,
+    out: &mut BTreeMap<String, TypesId>,
+) -> Result<(), String> {
+    let row = plan.types.get(ty.0 as usize).ok_or("a type out of range")?;
+    match row.kind {
+        TypeKind::Option | TypeKind::List => {
+            reach(plan, row.elem.ok_or("a type with no element")?, out)
+        }
+        TypeKind::Record => {
+            let name = plan.str(row.name);
+            let rust = type_name(name);
+            if let Some(previous) = out.get(&rust) {
+                let previous = plan.str(plan.types[previous.0 as usize].name);
+                return if previous == name {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "shapes `{previous}` and `{name}` both become Rust `{rust}`"
+                    ))
+                };
+            }
+            out.insert(rust, ty);
+            for f in row.fields.iter().map(|id| &plan.fields[id.0 as usize]) {
+                reach(plan, f.ty, out)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn rust_type(plan: &Plan, i: TypesId) -> Result<String, String> {

@@ -663,11 +663,11 @@ fn a_picture_on_screen_asks_again_for_a_failed_download_and_shows_it() {
     assert_eq!(images.retry_due_in(), None);
 }
 
-/// Two image nodes of one source.
-fn kernel2(source: &str) -> Kernel {
+/// Image nodes of one source.
+fn kernel_images(source: &str, count: u32) -> Kernel {
     let mut k = Kernel::with_monospace();
     let mut ops = Vec::new();
-    for id in [1, 2] {
+    for id in 1..=count {
         ops.push(Op::CreateView {
             id,
             node_type: NodeType::Image,
@@ -683,6 +683,79 @@ fn kernel2(source: &str) -> Kernel {
     k
 }
 
+fn wait_for_failed_download(images: &mut Images, id: u32) {
+    let source = images.views[&id].source_id.as_ref().unwrap().id;
+    let deadline = Instant::now() + SETTLED;
+    loop {
+        let seen = images.revision();
+        if matches!(
+            images.backend.prepared(source),
+            Some(crate::image::Prepared::Failed(_))
+        ) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "the download fails");
+        images.pause_wait(seen, remaining);
+    }
+    // A fast failure may already have scheduled retries. Keep them
+    // from expiring on the wall clock before every view sees it.
+    for view in images.views.values_mut() {
+        if let Some(at) = &mut view.retry_at {
+            *at = deadline;
+        }
+    }
+    images.poll();
+}
+
+#[test]
+fn views_of_one_failed_url_error_after_one_shared_retry_ladder() {
+    for count in [1, 3] {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let requests = asked.clone();
+        let origin = serve(move |_, _| {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Answer::Status(503)
+        });
+        let url = format!("{origin}/dead.png");
+        let k = kernel_images(&url, count);
+        let mut images = images();
+        images.sync(&k, &k.roots());
+        for attempt in 0..=crate::image::RETRY_AFTER.len() {
+            wait_for_failed_download(&mut images, 1);
+            assert_eq!(asked.load(Ordering::SeqCst), attempt + 1);
+            if attempt < crate::image::RETRY_AFTER.len() {
+                assert!(
+                    images.load_events.is_empty(),
+                    "no error before the last retry"
+                );
+                for view in images.views.values_mut() {
+                    *view.retry_at.as_mut().expect("a retry is due") = Instant::now();
+                }
+                images.poll();
+            }
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 7, "one shared retry ladder");
+        let mut failed: Vec<_> = images.load_events.iter().map(|e| e.id).collect();
+        failed.sort_unstable();
+        assert_eq!(
+            failed,
+            (1..=count).collect::<Vec<_>>(),
+            "every image errors after the same download"
+        );
+        assert!(images
+            .load_events
+            .iter()
+            .all(|e| e.error.as_deref() == Some("HTTP 503")));
+        assert_eq!(images.retry_due_in(), None, "no retry after error");
+        images.load_events.clear();
+        images.sync(&k, &k.roots());
+        images.wait(SETTLED);
+        assert_eq!(asked.load(Ordering::SeqCst), 7);
+        assert!(images.load_events.is_empty(), "errors are sent once");
+    }
+}
+
 #[test]
 fn a_view_of_the_same_url_joins_another_views_retry_even_when_it_was_off_screen() {
     let asked = Arc::new(AtomicUsize::new(0));
@@ -695,20 +768,25 @@ fn a_view_of_the_same_url_joins_another_views_retry_even_when_it_was_off_screen(
         }
     });
     let url = format!("{origin}/shared.png");
-    let k = kernel2(&url);
+    let k = kernel_images(&url, 2);
     let mut images = images();
     images.sync(&k, &k.roots());
-    until(&mut images, |images| images.views[&1].refusal.is_some());
+    wait_for_failed_download(&mut images, 1);
+    assert!(images.views[&1].refusal.is_some());
     // Only the first is on screen while it asks again and lands.
-    let started = Instant::now();
-    while !images.bitmaps.contains_key(&1) {
-        assert!(started.elapsed() < SETTLED, "the first shows");
-        images.poll();
-        images.sync_visible(&k, &k.roots(), 1., |id| id == 1);
-        std::thread::sleep(Duration::from_millis(5));
+    images.sync_visible(&k, &k.roots(), 1., |id| id == 1);
+    if let Some(at) = &mut images.views.get_mut(&1).unwrap().retry_at {
+        *at = Instant::now();
     }
+    images.poll();
+    images.wait(SETTLED);
+    assert!(images.bitmaps.contains_key(&1));
+    assert_eq!(images.views[&1].retries, 1);
+    assert_eq!(images.views[&2].retries, 0, "no retry spent off screen");
     // The second, shown again, joins that download rather than keeping the failed one.
-    turns_until(&mut images, &k, |images| images.bitmaps.contains_key(&2));
+    images.sync(&k, &k.roots());
+    images.wait(SETTLED);
+    assert!(images.bitmaps.contains_key(&2));
     assert_eq!(asked.load(Ordering::SeqCst), 2, "one retry served both");
 }
 
@@ -834,7 +912,7 @@ fn a_view_that_joined_a_retry_never_cancels_it_with_its_own_older_deadline() {
         }
     });
     let url = format!("{origin}/shared.png");
-    let k = kernel2(&url);
+    let k = kernel_images(&url, 2);
     let mut images = images();
     images.sync(&k, &k.roots());
     // The second view's backoff is further along (it showed earlier): its deadline comes later than the first's.

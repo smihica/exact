@@ -126,10 +126,11 @@ impl<D: DataSource> Presenter<D> {
             Some(text) => std::fs::write(&to, text).map_err(|e| e.to_string()),
             None => r["request"]["from"]
                 .as_str()
-                .and_then(crate::picker::resolve)
+                .and_then(crate::picker::open)
                 .ok_or_else(|| "no app file to copy".to_owned())
-                .and_then(|from| {
-                    std::fs::copy(from, &to)
+                .and_then(|mut from| {
+                    let mut to = std::fs::File::create(&to).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut from, &mut to)
                         .map(drop)
                         .map_err(|e| e.to_string())
                 }),

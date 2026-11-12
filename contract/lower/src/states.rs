@@ -34,8 +34,16 @@ const RUNNER_ROWS: [&str; 6] = [
     "-exact-tint-color",
 ];
 
-/// The rows `:hover` and `:focus-visible` take: none that inherits.
-const HOST_ROWS: [&str; 4] = ["background-color", "border-color", "opacity", "box-shadow"];
+/// The rows `:hover` and `:focus-visible` take. Their `color` reaches the
+/// subtree as the node's own does (a descendant that writes its own keeps
+/// it); the web and Apple show it, and Linux's looks paint the box only.
+const HOST_ROWS: [&str; 5] = [
+    "background-color",
+    "color",
+    "border-color",
+    "opacity",
+    "box-shadow",
+];
 
 /// The rows `:active` takes, and the press paint's row each lowers to: the
 /// press's colour reaches the subtree, so `color` is one (LLP 1061 D7).
@@ -142,7 +150,6 @@ pub(crate) fn refusal(state: &str, row: &Attr, values: bool) -> Option<LowerErro
             }
             (_, "-exact-press-scale") => " and a press scale is `:active`'s".to_string(),
             ("active", _) => " and is the host's press (LLP 1061 D7)".to_string(),
-            _ if host => " and never changes what a child inherits".to_string(),
             _ => String::new(),
         };
         return Some(LowerError {
@@ -293,7 +300,7 @@ const BASE: &str = "$state-base";
 
 /// Whether `e` names a metric the compiler writes anywhere in it (a grouped
 /// list's ground), which no author's row may.
-fn metric_in(e: &Expr) -> bool {
+pub(crate) fn metric_in(e: &Expr) -> bool {
     match e {
         Expr::Str(t, _) => exact_kernel::style::metrics::named(t).is_some(),
         Expr::Ternary(_, a, b, _) => metric_in(a) || metric_in(b),
@@ -484,6 +491,12 @@ impl Lowerer<'_> {
         let mut checked: Option<Expr> = None;
         for name in ["checked", "aria-checked", "aria-selected", "aria-pressed"] {
             let Some(v) = written(name) else { continue };
+            let v = match tags::attr(name) {
+                Some(tags::AttrTarget::Prop(prop)) => {
+                    values::aria_bool_literal(name, prop, &v).unwrap_or(v)
+                }
+                _ => v,
+            };
             let v = match (name, &v) {
                 ("aria-pressed", Expr::Str(s, sp)) => Expr::Bool(s == "true", *sp),
                 ("aria-pressed", Expr::Bool(..)) => v,

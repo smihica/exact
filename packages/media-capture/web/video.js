@@ -110,10 +110,12 @@ export function video({ changed, agent, log, tracks, nextId, media, shown }) {
   /** Take the lease: the camera runs. */
   async function activate(t) {
     t.active = true;
+    // This activation's lease: one given back and taken again while the device opens is another, whose own open adopts.
+    const lease = t.lease = (t.lease ?? 0) + 1;
     if (!agent && (!t.source || t.source.readyState === 'ended')) {
       try {
         const source = await reopen(t);
-        if (!t.active || t.readyState !== 'live') { source.stop(); return; }
+        if (!t.active || t.lease !== lease || t.readyState !== 'live') { source.stop(); return; }
         adopt(t, source);
         say(`${t.id}: opened again`);
       } catch (e) {
@@ -128,7 +130,7 @@ export function video({ changed, agent, log, tracks, nextId, media, shown }) {
   }
   /** Give the lease back: the camera stops and the track is idle. */
   function deactivate(t) {
-    t.active = false;
+    t.active = false; t.lease = (t.lease ?? 0) + 1;
     if (!agent) stopSource(t);
     mute(t, 'idle');
   }
@@ -235,11 +237,18 @@ export function video({ changed, agent, log, tracks, nextId, media, shown }) {
         if (agent) {
           const facing = c.facingMode ?? (c.deviceId === AGENT.user.deviceId ? 'user' : 'environment');
           Object.assign(t, agentCamera(facing));
-        } else if (t.source) {
+        } else {
+          // Opened even while idle, so the answer and the next lease name the camera moved to; idle, it closes again.
           stopSource(t);
           t.settings = { ...t.settings, deviceId: null };
-          try { adopt(t, (await media.getUserMedia({ video: next })).getVideoTracks()[0]); }
+          let source;
+          try { source = (await media.getUserMedia({ video: next })).getVideoTracks()[0]; }
           catch (e) { say(`${t.id}: could not move: ${failure(e).error}`); end(t, failure(e).error); return failure(e); }
+          // A lease taken while it opened may have opened the camera too; this open replaces that one.
+          stopSource(t);
+          if (t.readyState === 'ended') { source.stop(); return shape(t); }
+          adopt(t, source);
+          if (!t.active) stopSource(t);
         }
         say(`${t.id}: moved to ${t.label}`);
         if (t.active) each(t, x => x.live?.(t.source));

@@ -34,17 +34,21 @@ struct StickyConstraint: Equatable {
     /// How far to move the box with its scroller at `scroll`: Chrome's rule,
     /// as the kernel's `StickyConstraint::offset` (the end inset pulls the
     /// box back into the scrollport, never before its limit's start; the
-    /// start inset then pushes it, never past its limit's end).
+    /// start inset then pushes it, never past its limit's end, so it wins
+    /// where both cannot hold).
     func offset(_ scroll: CGPoint) -> CGPoint {
         func axis(_ scroll: CGFloat, _ start: CGFloat?, _ end: CGFloat?, _ i: Int) -> CGFloat {
             let lo = natural[i], hi = natural[i + 2]
             var d: CGFloat = 0
             if let end {
+                // CSS Positioned Layout 3 §3.4 reduces the end inset so the
+                // sticky view rectangle can contain the border box.
+                let end = min(end, port[i + 2] - port[i] - (start ?? 0) - (hi - lo))
                 let pull = max(port[i + 2] + scroll - end - hi, min(limit[i] - lo, 0))
                 if pull < 0 { d += pull }
             }
             if let start {
-                let push = min(port[i] + scroll + start - lo, max(limit[i + 2] - hi, 0))
+                let push = min(port[i] + scroll + start - lo - d, max(limit[i + 2] - hi - d, 0))
                 if push > 0 { d += push }
             }
             return d

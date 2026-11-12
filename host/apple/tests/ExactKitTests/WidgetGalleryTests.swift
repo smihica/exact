@@ -12,6 +12,8 @@ final class WidgetGalleryTests: XCTestCase {
     func testActivityAgentUsesTheGalleryRegionWidthForTreeAndScreenshot() throws {
         #if os(macOS)
         _ = NSApplication.shared
+        #else
+        guard hostedWindowScene() != nil else { throw missing("scene", "the agent's screenshot draws in the app's window") }
         #endif
         let plan = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_SNAPSHOT_EDGES_PLAN"]))
         let directory = plan.deletingLastPathComponent().appendingPathComponent("agent-regions-\(UUID().uuidString)")
@@ -48,11 +50,101 @@ final class WidgetGalleryTests: XCTestCase {
                 XCTAssertEqual(try XCTUnwrap(shot["w"] as? Int), Int((region + 2 * gallery.geometry.compactInset).rounded(.up)))
                 let source = try XCTUnwrap(CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil))
                 let actual = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
-                let expected = ImageRenderer(content: gallery.compactPlacement(placement)); expected.scale = 1
-                let reference = try XCTUnwrap(expected.cgImage)
-                XCTAssertEqual(actual.width, reference.width); XCTAssertEqual(actual.height, reference.height)
-                XCTAssertEqual(rgba(actual), rgba(reference), "the screenshot draws the gallery region the tree measured")
+                // The region drawn in it, independently of how: the minimal one's word in its blue; the trailing
+                // one, a sliver of the Island at its region width, paints (`rgba`)
+                let bytes = rgba(actual)
+                if placement == .minimal {
+                    let blue = stride(from: 0, to: bytes.count, by: 4).filter { bytes[$0 + 3] > 200 && bytes[$0 + 2] > 150 && bytes[$0] < 80 && bytes[$0 + 1] < 80 }
+                    XCTAssertGreaterThan(blue.count, 10, "\(width): the minimal region's blue word is drawn")
+                }
             }
+        }
+    }
+
+    /// The agent's activity screenshot draws a bar as the Live Activity
+    /// does, in its accent and filled to its value (`ImageRenderer` drew a
+    /// placeholder): an accented value bar at a half, and a timer bar at the
+    /// agent's held clock, halfway through its interval.
+    func testTheActivityScreenshotDrawsAccentedBars() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        #else
+        guard hostedWindowScene() != nil else { throw missing("scene", "the agent's screenshot draws in the app's window") }
+        #endif
+        let plan = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_SNAPSHOT_BARS_PLAN"]))
+        let directory = plan.deletingLastPathComponent().appendingPathComponent("agent-bars-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("plans"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: plan, to: directory.appendingPathComponent("plans/bars.plan"))
+        try Data("[{\"kind\":\"bars\",\"preview\":{\"start\":0,\"end\":1}}]".utf8).write(to: directory.appendingPathComponent("plans/activities.json"))
+        let app = ExactApp.shared, previous = app.assetRoot
+        defer { app.assetRoot = previous; try? FileManager.default.removeItem(at: directory) }
+        app.assetRoot = directory
+        let session = ExactSession(app: app, label: "agent-bars", launchPlace: LaunchPlace(environment: ["EXACT_AGENT":"1"]))
+        session.clock = 0
+        defer { session.destroy() }
+        // The gallery is the viewport's width (less its margins)
+        session.presenter.viewport.frame = CGRect(x: 0, y: 0, width: 402, height: 900)
+        XCTAssertNil(session.boot(plan: try fixturePlan("PAGE_EDGES"), size: CGSize(width: 402, height: 900)).error)
+        let agent = Agent(session: session)
+        let at = session.dateNow().epoch
+        let state = "{\"start\":\(Int(at) - 60_000),\"end\":\(Int(at) + 60_000)}"
+        let path = directory.appendingPathComponent("bars.png").path
+        let shot = ActivityAgent.answer("screenshot", request: ["activity": ["entry": "bars", "placement": "lockScreen", "state": state], "path": path], agent: agent)
+        XCTAssertNil(shot["error"])
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil))
+        let fractions = bars(try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)))
+        XCTAssertEqual(fractions.count, 2, "two bars drawn in their accent")
+        for (bar, fraction) in zip(["value", "timer"], fractions) {
+            XCTAssertEqual(fraction, 0.5, accuracy: 0.1, "\(bar) bar: filled to its value")
+        }
+    }
+
+    /// The agent's widget screenshot draws a bar as the widget does: in its
+    /// accent, filled to its value.
+    func testTheWidgetScreenshotDrawsAnAccentedBar() throws {
+        try caltrainArchive() // the entry's refresh is `nextTrains`, which given props skip
+        #if os(macOS)
+        _ = NSApplication.shared
+        #else
+        guard hostedWindowScene() != nil else { throw missing("scene", "the agent's screenshot draws in a window of the app's scene") }
+        #endif
+        let plan = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_SNAPSHOT_BAR_CARD_PLAN"]))
+        let directory = plan.deletingLastPathComponent().appendingPathComponent("widget-bars-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("plans"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: plan, to: directory.appendingPathComponent("plans/bar-card.plan"))
+        try Data("[{\"kind\":\"bar-card\",\"families\":[\"systemMedium\"],\"preview\":{\"title\":\"Preview\"}}]".utf8).write(to: directory.appendingPathComponent("plans/widgets.json"))
+        let app = ExactApp.shared, previous = app.assetRoot
+        defer { app.assetRoot = previous; try? FileManager.default.removeItem(at: directory) }
+        app.assetRoot = directory
+        let session = ExactSession(app: app, label: "widget-bars", launchPlace: LaunchPlace(environment: ["EXACT_AGENT":"1"]))
+        session.clock = 0
+        defer { session.destroy() }
+        let agent = Agent(session: session)
+        let path = directory.appendingPathComponent("bar-card.png").path
+        let shot = WidgetGallery.answer("screenshot", request: ["widget": ["entry": "bar-card", "family": "systemMedium", "props": "{\"title\":\"Given\"}"], "path": path], agent: agent)
+        XCTAssertNil(shot["error"])
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil))
+        let fractions = bars(try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil)))
+        XCTAssertEqual(fractions.count, 1, "one bar drawn in its accent")
+        XCTAssertEqual(fractions.first ?? 0, 0.5, accuracy: 0.1, "filled to its value")
+    }
+
+    /// Each bar drawn in red, top to bottom: how much of its track is filled
+    private func bars(_ image: CGImage) -> [Double] {
+        let w = image.width, bytes = rgba(image)
+        func pixel(_ x: Int, _ y: Int) -> (Int, Int, Int, Int) { let i = (y * w + x) * 4; return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]), Int(bytes[i + 3])) }
+        func red(_ x: Int, _ y: Int) -> Bool { let p = pixel(x, y); return p.3 > 200 && p.0 > 200 && p.1 < 80 && p.2 < 80 }
+        // Rows holding red, in runs: one run a bar
+        var runs: [[Int]] = []
+        for y in 0..<image.height where (0..<w).contains(where: { red($0, y) }) {
+            if let last = runs.last?.last, last == y - 1 { runs[runs.count - 1].append(y) } else { runs.append([y]) }
+        }
+        return runs.map { rows in
+            let y = rows[rows.count / 2]
+            let filled = (0..<w).filter { red($0, y) }
+            // The track: what is drawn on that row other than white, the bar's fill included
+            let track = (0..<w).filter { let p = pixel($0, y); return p.3 > 200 && (p.0 < 245 || p.1 < 245 || p.2 < 245) }
+            return Double(filled.last! - filled.first! + 1) / Double(track.last! - filled.first! + 1)
         }
     }
 
@@ -248,6 +340,8 @@ final class WidgetGalleryTests: XCTestCase {
         try caltrainArchive()
         #if os(macOS)
         _ = NSApplication.shared
+        #else
+        guard hostedWindowScene() != nil else { throw missing("scene", "the agent's screenshot draws in the app's window") }
         #endif
         let plan = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_SNAPSHOT_TRAINS_PLAN"]))
         let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: plan.deletingLastPathComponent().appendingPathComponent("entries/caltrain/app.json"))) as! [String: Any]

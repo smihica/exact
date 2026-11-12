@@ -806,6 +806,7 @@ final class WebArm: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     func serve(error: String? = nil) {
         guard !invalidated else { return }
         checkOwned()
+        let src = src.flatMap { $0.isEmpty ? nil : $0 }
         if partition == nil, error == nil, sandbox == nil, let file = src.flatMap(localFile), file.1 == "application/pdf", showPDF(file.0) { return }
         closePDF()
         if partition != nil { return servePartitioned() }

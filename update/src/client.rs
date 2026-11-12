@@ -23,7 +23,7 @@
 use crate::binary::{Activate, Baked};
 use crate::envelope::sha256_hex;
 use crate::store::{
-    Check, Generation, PreparedSelection, Selection, SelectionRefusal, Status, Store,
+    Check, EmbeddedAsset, Generation, PreparedSelection, Selection, SelectionRefusal, Status, Store,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -63,8 +63,8 @@ pub struct Client {
     baked: Baked,
     head_url: Option<String>,
     assets_root: PathBuf,
-    /// Embedded asset digests by name, hashed the first time a check asks.
-    digests: HashMap<String, Option<String>>,
+    /// Embedded assets by name, hashed the first time a check asks.
+    embedded: HashMap<String, Option<EmbeddedAsset>>,
     /// Whether the selection at open is what booted (a plan the host was
     /// handed — `EXACT_PLAN`, the dev loop — boots instead and is nobody's
     /// to count).
@@ -79,7 +79,7 @@ pub struct CheckRequest {
     store: Store,
     head: String,
     assets_root: PathBuf,
-    digests: HashMap<String, Option<String>>,
+    embedded: HashMap<String, Option<EmbeddedAsset>>,
 }
 
 /// A finished download, ready to revalidate against the live client record.
@@ -88,7 +88,7 @@ pub struct DownloadedCheck {
     dir: PathBuf,
     head: String,
     envelope: Result<crate::Envelope, String>,
-    digests: HashMap<String, Option<String>>,
+    embedded: HashMap<String, Option<EmbeddedAsset>>,
 }
 
 impl CheckRequest {
@@ -104,9 +104,9 @@ impl CheckRequest {
         fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> DownloadedCheck {
         let mut embedded = |name: &str| {
-            self.digests
+            self.embedded
                 .entry(name.to_string())
-                .or_insert_with(|| embedded_asset_digest(&self.assets_root, name))
+                .or_insert_with(|| embedded_asset(&self.assets_root, name))
                 .clone()
         };
         let envelope = self.store.download(&self.head, fetch, &mut embedded);
@@ -114,7 +114,7 @@ impl CheckRequest {
             dir: self.store.dir().to_path_buf(),
             head: self.head,
             envelope,
-            digests: self.digests,
+            embedded: self.embedded,
         }
     }
 }
@@ -160,7 +160,7 @@ impl Client {
             baked,
             head_url,
             assets_root: assets_root.to_path_buf(),
-            digests: HashMap::new(),
+            embedded: HashMap::new(),
             booted_selection: false,
             started: false,
             succeeded: false,
@@ -297,7 +297,7 @@ impl Client {
             store: self.store.check_snapshot(),
             head,
             assets_root: self.assets_root.clone(),
-            digests: self.digests.clone(),
+            embedded: self.embedded.clone(),
         })
     }
 
@@ -307,12 +307,12 @@ impl Client {
         if downloaded.dir != self.dir() || self.head_url.as_deref() != Some(&downloaded.head) {
             return Outcome::Refused("the update client changed during its check".into());
         }
-        self.digests.extend(downloaded.digests);
+        self.embedded.extend(downloaded.embedded);
         let envelope = match downloaded.envelope {
             Ok(envelope) => envelope,
             Err(why) => return Outcome::Refused(why),
         };
-        let mut embedded = |name: &str| self.digests.get(name).cloned().flatten();
+        let mut embedded = |name: &str| self.embedded.get(name).cloned().flatten();
         match self
             .store
             .finish_check(envelope, &downloaded.head, &mut embedded)
@@ -364,12 +364,12 @@ fn store_dir(base: &Path, app_id: &str) -> PathBuf {
     base.join("exact").join(id).join("update")
 }
 
-/// The digest of the asset the binary embeds under `name`, or `None`. The
+/// The asset the binary embeds under `name`, hashed, or `None`. The
 /// name is the envelope's — `assets/mark.png`, `deck/index.html`,
 /// `shaders/glass.wgsl` — under the asset root; a `shaders/` name is also
 /// tried under `gpu/`, where the source tree keeps them when the root is
 /// the app directory rather than a bundle.
-fn embedded_asset_digest(root: &Path, name: &str) -> Option<String> {
+fn embedded_asset(root: &Path, name: &str) -> Option<EmbeddedAsset> {
     if crate::envelope::safe_name(name).is_err() {
         return None;
     }
@@ -377,10 +377,13 @@ fn embedded_asset_digest(root: &Path, name: &str) -> Option<String> {
     if name.starts_with("shaders/") {
         candidates.push(root.join("gpu").join(name));
     }
-    candidates
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .map(|bytes| sha256_hex(&bytes))
+    candidates.into_iter().find_map(|path| {
+        let bytes = std::fs::read(&path).ok()?;
+        Some(EmbeddedAsset {
+            sha256: sha256_hex(&bytes),
+            path,
+        })
+    })
 }
 
 fn json_string(s: &str, out: &mut String) {
@@ -443,11 +446,14 @@ mod tests {
         c.boot_succeeded(&c.generation()).unwrap();
         assert_eq!(c.status().stream, "embedded");
         assert_eq!(
-            embedded_asset_digest(&assets, "assets/mark.png").as_deref(),
-            Some(sha256_hex(b"a mark").as_str())
+            embedded_asset(&assets, "assets/mark.png"),
+            Some(EmbeddedAsset {
+                sha256: sha256_hex(b"a mark"),
+                path: assets.join("assets/mark.png"),
+            })
         );
-        assert_eq!(embedded_asset_digest(&assets, "assets/none.png"), None);
-        assert_eq!(embedded_asset_digest(&assets, "../mark.png"), None);
+        assert_eq!(embedded_asset(&assets, "assets/none.png"), None);
+        assert_eq!(embedded_asset(&assets, "../mark.png"), None);
         // A check with no reachable origin is a refusal, never an error.
         let mut fetch = |url: &str| -> Result<Vec<u8>, String> { Err(format!("down: {url}")) };
         assert_eq!(

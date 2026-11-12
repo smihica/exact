@@ -184,6 +184,7 @@ struct Emitter {
     range: f32,
     // Cosines of the inner and outer half-angles; a point light has none.
     cone: Option<[f32; 2]>,
+    decay: f32,
     shadows: bool,
 }
 impl Emitter {
@@ -193,6 +194,7 @@ impl Emitter {
             intensity: light.intensity,
             range: light.range,
             cone: None,
+            decay: light.decay,
             shadows,
         }
     }
@@ -208,6 +210,7 @@ impl Emitter {
             intensity: light.intensity,
             range: light.range,
             cone: Some([inner_cos, outer_cos]),
+            decay: light.decay,
             shadows,
         }
     }
@@ -577,6 +580,7 @@ impl Scene {
                 range: l.light.range,
                 direction: (pose.rotation * -Vec3::Z).normalize_or(-Vec3::Z),
                 cone: l.light.cone,
+                decay: l.light.decay,
                 shadows: l.light.shadows,
             });
         }
@@ -620,6 +624,11 @@ impl Scene {
             sun,
             fill,
             lights: &self.output,
+            local_shadows: w
+                .try_resource::<Shadows>()
+                .as_deref()
+                .map(crate::LocalShadows::from)
+                .unwrap_or_default(),
             lights_dropped: self.dropped,
             environment: e,
             environment_map: self.map.as_ref().map(|m| crate::EnvironmentMapInput {

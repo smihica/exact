@@ -258,37 +258,139 @@ pub(crate) fn family(text: &str, names: &mut dyn Names) -> Result<String, FoldEr
             _ => return fail("tamber-kind", format!("`{text}` is not a family token")),
         }
     }
-    let mut members = Vec::new();
-    for member in split_commas(text) {
-        let member = member.trim();
-        let quoted = member.len() >= 2
-            && (member.starts_with('"') && member.ends_with('"')
-                || member.starts_with('\'') && member.ends_with('\''));
-        let ok = if quoted {
-            !member[1..member.len() - 1].contains(['"', '\''])
-        } else {
-            !member.is_empty()
-                && member.split_whitespace().all(|w| {
-                    w.chars()
-                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-                        && !w.starts_with(|c: char| c.is_ascii_digit())
-                })
-        };
-        if !ok {
-            return fail(
-                "tamber-kind",
-                format!(
-                    "`{text}`: `{member}` is no family name (quote a name with other characters)"
-                ),
-            );
-        }
-        members.push(if quoted {
-            member.to_string()
-        } else {
-            member.split_whitespace().collect::<Vec<_>>().join(" ")
-        });
+    family_names(text).map_err(|e| FoldError {
+        id: "tamber-kind",
+        message: format!("`{text}`: {}", e.message),
+    })?;
+    Ok(split_commas(text)
+        .into_iter()
+        .map(|member| {
+            let member = member.trim();
+            if member.starts_with(['\'', '"']) {
+                member.to_string()
+            } else {
+                member
+                    .split([' ', '\t', '\n', '\r', '\x0c'])
+                    .filter(|word| !word.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Check a CSS family list and return its compiled stack names. Quoted
+/// generics remain quoted so the compiler treats them as named families.
+pub fn family_names(value: &str) -> Result<Vec<String>, FoldError> {
+    if value.contains('\\') {
+        return fail(
+            "lower-font-family-list",
+            "CSS escapes in font-family are not implemented; use the actual family characters",
+        );
     }
-    Ok(members.join(", "))
+    let mut quote = None;
+    let mut names = Vec::new();
+    let mut start = 0;
+    for (i, c) in value.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c == ',' {
+            names.push(&value[start..i]);
+            start = i + 1;
+        }
+    }
+    names.push(&value[start..]);
+    if quote.is_some() || names.len() > 64 {
+        return fail(
+            "lower-font-family-list",
+            "font-family expects at most 64 comma-separated CSS family names with balanced quotes",
+        );
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let name = name.trim();
+            let quoted = name.starts_with(['\'', '"']);
+            let name = if quoted
+                && name.len() >= 2
+                && name.ends_with(name.chars().next().unwrap())
+                && !name[1..name.len() - 1].contains(name.chars().next().unwrap())
+            {
+                &name[1..name.len() - 1]
+            } else if name.contains(['\'', '"']) {
+                return fail(
+                    "lower-font-family-list",
+                    "a quoted CSS family name must occupy one whole list member",
+                );
+            } else {
+                name
+            };
+            // Stack lowering strips boundary double quotes from compiled names.
+            if name.starts_with('"') || name.ends_with('"') {
+                return fail(
+                    "lower-font-family-list",
+                    "double quote characters at the start or end of a font-family name are not implemented",
+                );
+            }
+            if name.is_empty() || name.contains([';', '{', '}']) {
+                return fail(
+                    "lower-font-family-list",
+                    "font-family expects nonempty CSS family names separated by commas",
+                );
+            }
+            if !quoted
+                && ["cursive", "fantasy", "math", "emoji", "fangsong"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+            {
+                return fail(
+                    "lower-font-family-generic",
+                    format!("CSS generic family `{name}` has no native mapping in exact2; supported generics are system-ui, ui-sans-serif, sans-serif, ui-serif, serif, ui-monospace, monospace and ui-rounded"),
+                );
+            }
+            if !quoted
+                && ["inherit", "initial", "unset", "revert", "revert-layer"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+            {
+                return fail(
+                    "lower-font-family-wide",
+                    format!("CSS-wide font-family value `{name}` is not represented by plan stack ids; `inherit` alone takes the surrounding text's family, or name an explicit family list"),
+                );
+            }
+            // The run-time rule (runner `runtime_family_members`) and the browser's.
+            if !quoted && !exact_plan::is_css_family_name(name) {
+                return fail(
+                    "lower-font-family-list",
+                    format!("unquoted font-family name `{name}` is not a sequence of CSS identifiers; quote it"),
+                );
+            }
+            let generic = [
+                "system-ui",
+                "ui-sans-serif",
+                "sans-serif",
+                "ui-serif",
+                "serif",
+                "ui-monospace",
+                "monospace",
+                "ui-rounded",
+            ];
+            Ok(
+                if quoted && generic.contains(&name.to_ascii_lowercase().as_str()) {
+                    format!("\"{name}\"")
+                } else if !quoted && name.eq_ignore_ascii_case("-apple-system") {
+                    "system-ui".into()
+                } else if !quoted && generic.contains(&name.to_ascii_lowercase().as_str()) {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.to_string()
+                },
+            )
+        })
+        .collect()
 }
 
 /// The kind a value's text makes it, where it says (§3): CSS `font` syntax

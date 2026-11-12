@@ -179,3 +179,31 @@ test "type in both fields"
         2
     );
 }
+
+#[test]
+fn host_facts_are_the_runners_own_sources_never_a_gated_resources() {
+    let sources = |file: &str, text: &str| {
+        let scripts = script::scripted(file, text, None).unwrap();
+        let plan = compile(&scripts[0].case).unwrap();
+        let oracle = Oracle::for_case(&plan, &scripts[0].case);
+        let (_, oracle) = observe::run(plan, oracle, &scripts[0].case.events);
+        let oracle = oracle.unwrap();
+        let mut names: Vec<String> = oracle
+            .host_sources()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    // Closed at boot, these resources ask the oracle once their `when` opens.
+    assert!(sources("gate", include_str!("../../corpus/resources/gate.contract")).is_empty());
+    assert_eq!(
+        sources(
+            "device-facts",
+            include_str!("../../corpus/components/device-facts.contract")
+        ),
+        ["exactPage", "exactViewport"]
+    );
+}

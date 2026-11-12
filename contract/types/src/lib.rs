@@ -36,6 +36,7 @@ mod injects;
 mod lists;
 mod literals;
 mod media;
+mod mutations;
 mod payload;
 mod persist;
 /// Router declaration checking and compile-time path expansion (LLP 1038 D2/D3).
@@ -817,26 +818,6 @@ fn infer_unbounded(e: &Expr, scope: &Scope, shapes: &Shapes) -> Result<Ty, TypeE
             if let Some(t) = failure::check(name, args, *span, scope) {
                 return t;
             }
-            if name == "pending" {
-                // `pending(x)`: whether resource or mutation `x` has a
-                // request in flight (LLP 1016 D3). Not a roster call: its
-                // argument is a name, not a value.
-                let [Expr::Ident(target, tspan)] = args.as_slice() else {
-                    return err(
-                        "type-pending-argument",
-                        "`pending(x)` names one resource or mutation",
-                        *span,
-                    );
-                };
-                return match scope.lookup(target) {
-                    Some((Ref::Resource(_) | Ref::Mutation(_), _)) => Ok(Ty::Bool),
-                    _ => err(
-                        "type-pending-argument",
-                        format!("`{target}` is not a resource or a mutation"),
-                        *tspan,
-                    ),
-                };
-            }
             if records::is_record_call(name, shapes) {
                 return records::infer_record(name, args, *span, scope, shapes);
             }
@@ -1336,7 +1317,6 @@ fn check_with_sites(
         });
     }
     check_children(&called, &mut types, &mut sink);
-    let children = sink.errors.len();
     // The root is checked against its inlined view, so a handler's real call
     // site (behind a child's prop) types the action's parameters.
     // The expanded root (LLP 1017 P4c): the inlined view plus every stateful
@@ -1351,7 +1331,7 @@ fn check_with_sites(
             span: e.span,
         });
     }
-    check_root(file, &mut types, &expanded, &mut sink);
+    let independent = check_root(file, &mut types, &expanded, &mut sink);
     persist::check(file, &types, &expanded, &mut sink);
     // What lowering lowers: each caller's names renamed apart from what its
     // callees read, after the checks spoke in the author's (LLP 1089 D7).
@@ -1363,7 +1343,7 @@ fn check_with_sites(
             expanded,
         })
     } else {
-        let mut errors = prefer_call_sites(sink.errors, children, file, &types, &expanded);
+        let mut errors = uses::prefer_call_sites(sink.errors, independent, file, &types, &expanded);
         for e in &mut errors {
             records::nominal(e, &types.shapes, file);
         }
@@ -1407,17 +1387,18 @@ fn check_children(file: &File, types: &mut Types, sink: &mut Sink) {
     }
 }
 
-/// Call sites before the views they expand into: the children's uses, then
-/// the expanded root and its own uses and injects.
+/// Check child uses before the expanded root; return the boundary between
+/// independent errors and errors substitution may have caused.
 fn check_root(
     file: &File,
     types: &mut Types,
     expanded: &contract_syntax::Expanded,
     sink: &mut Sink,
-) {
+) -> usize {
     for (c, ct) in file.components.iter().zip(&types.components).skip(1) {
         uses::check_uses(&c.view, &types.component_scope(c, ct), types, file, sink);
     }
+    let independent = sink.errors.len();
     types.components[0] =
         component::check_component(&expanded.root, types, Some(&expanded.owners), sink);
     // @ref LLP 1048.000 D2 — each route's `pages=` source, in the root's seam.
@@ -1439,54 +1420,7 @@ fn check_root(
         types,
         file,
     ));
-}
-
-/// Refusals are first checked against the call sites that lead to them: a
-/// misspelled prop is named where it is written (never reported as the prop
-/// it left missing), then a mistyped data argument at the root's uses (never
-/// as what the substituted value broke inside the callee). When a call site
-/// is at fault, what the expanded root found inside a child's lines is its
-/// consequence and is left out; the root's own refusals and a child's own
-/// (the first `children`) are independent and stay. Only a refusal pays for
-/// this.
-fn prefer_call_sites(
-    errors: Vec<TypeError>,
-    children: usize,
-    file: &File,
-    types: &Types,
-    expanded: &contract_syntax::Expanded,
-) -> Vec<TypeError> {
-    let mut sites = Sink::default();
-    // Uses whose missing prop is the one a misspelling there was meant as.
-    let mut explained = Vec::new();
-    for c in &file.components {
-        uses::check_prop_names(&c.view, file, &mut sites, &mut explained);
-    }
-    uses::check_root_uses(&file.components[0], &expanded.root, types, file, &mut sites);
-    if sites.errors.is_empty() {
-        return errors;
-    }
-    for (i, e) in errors.into_iter().enumerate() {
-        if i < children || !in_child(file, e.span) {
-            sites.push(e);
-        }
-    }
-    sites.errors.retain(|e| {
-        !(matches!(e.id, "syntax-missing-prop" | "type-missing-prop")
-            && explained.contains(&e.span))
-    });
-    sites.errors
-}
-
-/// Whether `span` lies in a child component's own lines: each component runs
-/// from its header to the next component's header in the same file.
-fn in_child(file: &File, span: Span) -> bool {
-    file.components
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.span.source_id == span.source_id && c.span.line <= span.line)
-        .max_by_key(|(_, c)| c.span.line)
-        .is_some_and(|(i, _)| i > 0)
+    independent
 }
 
 #[cfg(test)]

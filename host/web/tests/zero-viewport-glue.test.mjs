@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import vm from 'node:vm';
 import { glueDeclarations } from './glue-fixture.mjs';
 
@@ -36,6 +36,7 @@ function host(width, height) {
       exact_set_page: () => { calls.push(['page']); return '{}'; },
     },
   };
+  state.host = state;
   vm.createContext(state);
   vm.runInContext(`${declarations}\nglobalThis.boot = bootNow; globalThis.media = mediaChanged; globalThis.pageChanged = pageChanged;`, state);
   return { state, calls, listeners,

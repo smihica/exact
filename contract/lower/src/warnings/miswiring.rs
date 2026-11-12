@@ -15,6 +15,7 @@
 //! use or a slot is the benefit of the doubt.
 
 use crate::LowerError;
+use contract_syntax::inline::calls::shown;
 use contract_syntax::{Attr, Expr, Node, Span, TemplatePart};
 
 /// The children of a node, through choices.
@@ -152,7 +153,7 @@ impl Name {
 /// An expression's spelling, when it is a name, a field of one, a call or a number.
 fn spell(e: &Expr) -> Option<String> {
     match e {
-        Expr::Ident(n, _) => Some(n.clone()),
+        Expr::Ident(n, _) => Some(shown(n).to_string()),
         Expr::Member(base, field, _) => Some(format!("{}.{field}", spell(base)?)),
         Expr::Number(n, _) => Some(n.to_string()),
         Expr::Str(s, _) => Some(format!("{s:?}")),

@@ -1,6 +1,6 @@
 //! Pointer focus, canvas action ownership, and restored contact routing.
 use super::{ControlBinding, DataSource, Presenter, Value};
-use exact_kernel::{NodeType, PropId, ViewId};
+use exact_kernel::{ControlKind, NodeType, PropId, ViewId};
 use exact_plan::EventKind;
 use exact_runner::Event;
 use serde_json::json;
@@ -327,7 +327,7 @@ impl<D: DataSource> Presenter<D> {
             .keys()
             .any(|view| self.surfaces.wants_input(*view))
     }
-    fn pad_target(&self) -> Option<u32> {
+    pub(crate) fn pad_target(&self) -> Option<u32> {
         match self.focus {
             Some(id) => self.input_surface(id),
             None => {
@@ -502,8 +502,14 @@ impl<D: DataSource> Presenter<D> {
             };
             self.key_down_with(name, code, repeat, self.host.now());
         }
-        // Dismissal already restores the surface's invoker; keep that focus.
+        // Escape hands the keys back to a canvas that takes them, from an
+        // editor beside it: only an app with such a canvas leaves the field, as
+        // a browser leaves the focus where it is in any other. Dismissal
+        // already restores the surface's invoker; keep that focus.
+        let keyed_canvas =
+            (self.surfaces.canvases.keys()).any(|view| self.surfaces.wants_input(*view));
         if code == "Escape"
+            && keyed_canvas
             && !surface_was_open
             && self.focus.is_some_and(|id| {
                 self.host
@@ -704,18 +710,28 @@ impl<D: DataSource> Presenter<D> {
                     || n.props.str(PropId::Action).is_some()
                     || n.node_type == NodeType::TextInput
                     // A native button is a button under any role (LLP 1069.011.000 D1).
-                    // A checkbox and a radio are HTML's focusable controls: a
-                    // press focuses one, as Chrome's does, and a radio's arrows
-                    // move the focus (x2apps survey #2).
-                    || matches!(
-                        exact_kernel::ControlKind::of(n.node_type, n.props),
+                    // Every other control is one of HTML's focusable areas
+                    // ("input elements whose type attribute are not in the
+                    // Hidden state, select elements"; HTML, "The tabindex
+                    // attribute"): a press focuses one, as Chrome's does. A
+                    // date or time control is one only where its press opens
+                    // a picker: with none it takes no key or press
+                    // (LLP 1069.001).
+                    || match ControlKind::of(n.node_type, n.props) {
                         Some(
-                            exact_kernel::ControlKind::Button
-                                | exact_kernel::ControlKind::Radio
-                                | exact_kernel::ControlKind::Checkbox
-                                | exact_kernel::ControlKind::Switch
-                        )
-                    )
+                            ControlKind::Button
+                            | ControlKind::Radio
+                            | ControlKind::Checkbox
+                            | ControlKind::Switch
+                            | ControlKind::Select
+                            | ControlKind::Range
+                            | ControlKind::File,
+                        ) => true,
+                        Some(ControlKind::Date | ControlKind::Time | ControlKind::DateTimeLocal) => {
+                            self.date_picks()
+                        }
+                        Some(ControlKind::Progress | ControlKind::ProgressBar) | None => false,
+                    }
                     || matches!(
                         n.props.str(PropId::AccessibilityRole),
                         Some("button" | "link")
@@ -830,7 +846,7 @@ impl<D: DataSource> Presenter<D> {
             return Some(hit);
         }
         let control = if mouse_click {
-            self.click_control(hit, now_ms, click)
+            self.click_control(hit, now_ms, click, true)
         } else {
             self.toggle_control(hit, now_ms)
         };

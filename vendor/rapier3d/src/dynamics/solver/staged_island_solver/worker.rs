@@ -166,6 +166,7 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     let builder = unsafe { &mut *ctx.coulomb_builders.add(chunk_id) };
                     let constraint = unsafe { &mut *ctx.coulomb_constraints.add(chunk_id) };
                     ContactWithCoulombFrictionBuilder::generate(
+                        ctx.base_params,
                         cref_ids,
                         manifold_refs,
                         bodies,

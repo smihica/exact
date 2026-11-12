@@ -379,6 +379,34 @@ fn a_pushed_route_has_the_up_arrow_which_goes_back() {
 }
 
 #[test]
+fn a_modal_route_blocks_the_shell_tab_bar_until_dismissed() {
+    for presentation in ["modal", "fullscreen", "push"] {
+        let source = APP.replace(
+            "testId=\"route-detail\"",
+            &format!("testId=\"route-detail\" navigationPresentation=\"{presentation}\""),
+        );
+        let (mut p, _) = barred(&source);
+        tap(&mut p, "open").unwrap();
+        touch(&mut p, BOTTOM, Some("tab-other"));
+        let modal = presentation != "push";
+        assert_eq!(top(&mut p).title, if modal { "Detail" } else { "Other" });
+        if !modal {
+            touch(&mut p, BOTTOM, Some("tab-home"));
+        } else {
+            assert!(tap(&mut p, "tab-other").is_err());
+            assert!(p
+                .bar_stops()
+                .iter()
+                .all(|(node, _)| *node != id(&p, "tab-other")));
+        }
+        assert!(p.system_back(0.));
+        assert_eq!(top(&mut p).title, "Home");
+        touch(&mut p, BOTTOM, Some("tab-other"));
+        assert_eq!(top(&mut p).title, "Other");
+    }
+}
+
+#[test]
 fn a_route_with_no_header_or_that_says_no_bar_has_none() {
     let (mut p, _) = barred(APP);
     // Pushed with no header: no bar. Android's Back is the system's.

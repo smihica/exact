@@ -39,8 +39,8 @@ impl Default for SpringConfig {
 /// Why a spring configuration was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpringError {
-    /// A parameter was infinite or NaN.
-    NonFinite,
+    /// A parameter was infinite or NaN: which one.
+    NonFinite(&'static str),
     /// Stiffness must be positive.
     NonPositiveStiffness,
     /// Damping must be nonnegative.
@@ -49,6 +49,22 @@ pub enum SpringError {
     NonPositiveMass,
     /// Finite parameters produced coefficients or samples outside f64's range.
     OutOfRange,
+}
+
+impl std::fmt::Display for SpringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SpringError::NonFinite("stiffness") => "a spring's stiffness is finite",
+            SpringError::NonFinite("damping") => "a spring's damping is finite",
+            SpringError::NonFinite(_) => "a spring's mass is finite",
+            SpringError::NonPositiveStiffness => "a spring's stiffness is above 0",
+            SpringError::NegativeDamping => "a spring's damping is 0 or more",
+            SpringError::NonPositiveMass => "a spring's mass is above 0",
+            SpringError::OutOfRange => {
+                "the spring's stiffness or damping is too large for its mass to compute its motion: use a larger mass, or a smaller stiffness or damping"
+            }
+        })
+    }
 }
 
 /// Below this displacement and speed, the spring is at rest. Absolute, in the
@@ -80,8 +96,14 @@ impl SpringSample {
 impl SpringConfig {
     /// Check the parameters. Validated once, at the boundary.
     pub fn validate(&self) -> Result<(), SpringError> {
-        if !self.stiffness.is_finite() || !self.damping.is_finite() || !self.mass.is_finite() {
-            return Err(SpringError::NonFinite);
+        for (value, name) in [
+            (self.stiffness, "stiffness"),
+            (self.damping, "damping"),
+            (self.mass, "mass"),
+        ] {
+            if !value.is_finite() {
+                return Err(SpringError::NonFinite(name));
+            }
         }
         if self.stiffness <= 0.0 {
             return Err(SpringError::NonPositiveStiffness);

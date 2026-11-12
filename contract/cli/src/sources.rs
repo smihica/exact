@@ -22,7 +22,17 @@ use contract_syntax::{File, NameSpans, Span, UseDecl, UseName};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
+
+/// A file's scope by local name: each name a `use` of the file may write,
+/// with every meaning it has there (its namespace and program-unique name).
+type ByLocal = HashMap<String, Vec<(Kind, String)>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub(crate) struct Sources {
     paths: Vec<PathBuf>,
@@ -155,6 +165,8 @@ pub(crate) fn load_partial(
     app_root: &Path,
     refused: &mut Refused,
 ) -> Result<(File, Sources), Vec<CompileError>> {
+    #[cfg(test)]
+    LOADS.with(|loads| loads.set(loads.get() + 1));
     let root_key = path.canonicalize().unwrap_or_else(|_| {
         path.file_name()
             .map(|name| app_root.join(name))
@@ -269,7 +281,7 @@ impl Loader<'_> {
         ));
         let library = library::read(&self.sources, self.app_root);
         match self.scope() {
-            Ok(mut file) => {
+            Ok((mut file, scopes)) => {
                 let escaped = contract_lower::params::escaped(&file, &owned);
                 if !escaped.is_empty() {
                     let all = escaped.into_iter().map(CompileError::from).collect();
@@ -279,7 +291,8 @@ impl Loader<'_> {
                 file.library_packages = library.packages;
                 file.design = design;
                 file.package_designs = package_designs;
-                crate::modules::desugar(&mut file).map_err(|all| resolve(&self.sources, all))?;
+                crate::modules::desugar(&mut file, &scopes)
+                    .map_err(|all| resolve(&self.sources, all))?;
                 Ok(file)
             }
             Err(all) => Err(resolve(&self.sources, all)),
@@ -399,7 +412,10 @@ fn design(
     sources.texts.push(text.as_str().into());
     let home = root
         .parent()
-        .and_then(|dir| path.strip_prefix(dir).ok())
+        .and_then(|dir| {
+            let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            key.strip_prefix(dir).ok()
+        })
         .map_or_else(
             || {
                 path.file_name()
@@ -790,8 +806,8 @@ impl Loader<'_> {
 
     /// Give every declaration its program-unique name (D4), rewrite each
     /// file through its own scope (D1, D5), and merge the files into the one
-    /// `File` every later pass reads.
-    fn scope(&mut self) -> Result<File, Vec<CompileError>> {
+    /// `File` every later pass reads. Keep the scopes for module event attributes.
+    fn scope(&mut self) -> Result<(File, Vec<Scope>), Vec<CompileError>> {
         self.prepare_members()?;
         if self.units.len() == 1 {
             let mut file = self.units.pop().unwrap().file;
@@ -799,15 +815,20 @@ impl Loader<'_> {
             self.sources.motion = contract_lower::motion::substitute(&mut file, &self.motion);
             contract_syntax::resolve_clock_timelines(&mut file).map_err(|e| vec![e.into()])?;
             file.uses.clear();
-            return Ok(file);
+            return Ok((file, vec![Scope::default()]));
         }
         let unique = self.unique_names();
         let mut scopes: Vec<Option<Scope>> = (0..self.units.len()).map(|_| None).collect();
+        let mut by_local: Vec<Option<ByLocal>> = (0..self.units.len()).map(|_| None).collect();
         for index in 0..self.units.len() {
-            self.scope_of(index, &unique, &mut scopes)
+            self.scope_of(index, &unique, &mut scopes, &mut by_local)
                 .map_err(|e| vec![e])?;
         }
-        let elsewhere = self.declared_elsewhere(&unique);
+        let mut scopes: Vec<Scope> = scopes
+            .into_iter()
+            .map(|s| s.expect("every unit is scoped"))
+            .collect();
+        let elsewhere = Arc::new(self.declared_elsewhere(&unique));
         self.declared = self
             .units
             .iter()
@@ -820,27 +841,54 @@ impl Loader<'_> {
         // Every file's references to names it does not see, refused together.
         let mut missing = Vec::new();
         let mut refused: Vec<CompileError> = Vec::new();
-        let shape_owners: Vec<(usize, Vec<String>, String)> = self
-            .units
-            .iter()
-            .enumerate()
-            .flat_map(|(index, unit)| {
-                let path = &self.sources.paths[index];
-                let shown = path
-                    .strip_prefix(self.app_root)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string();
-                let unique = &unique;
-                unit.file.shapes.iter().map(move |s| {
-                    let generated = unique[index]
-                        .get(&(Kind::Call, s.name.clone()))
-                        .cloned()
-                        .unwrap_or_else(|| s.name.clone());
-                    (index, vec![s.name.clone(), generated], shown.clone())
+        let mut foreign_shapes: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        for (index, unit) in self.units.iter().enumerate() {
+            let path = &self.sources.paths[index];
+            let shown = path
+                .strip_prefix(self.app_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            for s in &unit.file.shapes {
+                let generated = unique[index]
+                    .get(&(Kind::Call, s.name.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| s.name.clone());
+                for name in [s.name.clone(), generated] {
+                    let owners = foreign_shapes.entry(name).or_default();
+                    owners.push((index, shown.clone()));
+                }
+            }
+        }
+        let foreign_shapes = Arc::new(foreign_shapes);
+        let unique_of = &unique;
+        let shapes: Arc<HashSet<String>> = Arc::new(
+            self.units
+                .iter()
+                .enumerate()
+                .flat_map(|(u, unit)| {
+                    unit.file
+                        .shapes
+                        .iter()
+                        .filter_map(move |s| unique_of[u].get(&(Kind::Call, s.name.clone())))
                 })
-            })
-            .collect();
+                .cloned()
+                .collect(),
+        );
+        let modules: Arc<HashSet<String>> = Arc::new(
+            self.units
+                .iter()
+                .enumerate()
+                .flat_map(|(u, unit)| {
+                    unit.file
+                        .modules
+                        .iter()
+                        .filter_map(move |m| unique_of[u].get(&(Kind::Call, m.name.clone())))
+                })
+                .cloned()
+                .collect(),
+        );
+        let builtin_types = Arc::new(builtin_types());
         // @ref LLP 1121 D3 — the design's duration and easing tokens are
         // written into each motion row before scoping reads an animation's
         // keyframes name (the root's design, the app's).
@@ -853,25 +901,13 @@ impl Loader<'_> {
         }
         self.units = units;
         for (index, unit) in self.units.iter_mut().enumerate() {
-            let mut scope = scopes[index].take().expect("every unit is scoped");
-            scope.elsewhere = elsewhere
-                .iter()
-                .filter(|(key, e)| e.unit != index && !scope.names.contains_key(*key))
-                .map(|(key, e)| (key.clone(), e.clone()))
-                .collect();
-            // Every other file's shape this file does not see as a shape, by
-            // its declared and its generated name.
-            scope.foreign_shapes = shape_owners
-                .iter()
-                .filter(|(owner, _, _)| *owner != index)
-                .flat_map(|(_, names, file)| names.iter().map(move |n| (n.clone(), file.clone())))
-                .filter(|(n, _)| {
-                    !scope
-                        .names
-                        .get(&(Kind::Call, n.clone()))
-                        .is_some_and(|to| scope.shapes.contains(to))
-                })
-                .collect();
+            let scope = &mut scopes[index];
+            scope.unit = index;
+            scope.elsewhere = Arc::clone(&elsewhere);
+            scope.foreign_shapes = Arc::clone(&foreign_shapes);
+            scope.shapes = Arc::clone(&shapes);
+            scope.modules = Arc::clone(&modules);
+            scope.builtin_types = Arc::clone(&builtin_types);
             let mut aliases: Vec<_> = scope
                 .names
                 .iter()
@@ -888,7 +924,7 @@ impl Loader<'_> {
                 .collect();
             atoms.sort();
             unit.file.atom_scopes.insert(index as u32, atoms);
-            rescope(&mut unit.file, &scope).map_err(|e| vec![e.into()])?;
+            rescope(&mut unit.file, scope).map_err(|e| vec![e.into()])?;
             // Refusals that are no `use` line's to fix, reported with the rest.
             refused.extend(scope.refused.take().into_iter().map(CompileError::from));
             let misses = scope.missing.take();
@@ -896,7 +932,10 @@ impl Loader<'_> {
                 let found: Vec<_> = misses
                     .into_iter()
                     .map(|m| {
-                        let e = scope.elsewhere[&(m.kind, m.name.clone())].clone();
+                        let e = scope
+                            .elsewhere(m.kind, &m.name)
+                            .expect("a missing name is another file's")
+                            .clone();
                         (m, e)
                     })
                     .collect();
@@ -941,7 +980,7 @@ impl Loader<'_> {
                 .collect());
         }
         self.splice_members();
-        Ok(self.merge())
+        Ok((self.merge(), scopes))
     }
 
     /// Each unit's own declarations, by namespace and name, to their
@@ -956,6 +995,17 @@ impl Loader<'_> {
         // members block's are its listing file's (LLP 1091.002 D4).
         let listed = self.listed_by();
         let (bound, in_blocks) = self.bindings_by_file();
+        // Collision checks need only the files that bind this spelling.
+        let by_name = |files: &[HashSet<String>]| {
+            let mut by: HashMap<String, Vec<usize>> = HashMap::new();
+            for (file, names) in files.iter().enumerate() {
+                for name in names {
+                    by.entry(name.clone()).or_default().push(file);
+                }
+            }
+            by
+        };
+        let (bound_by, in_blocks_by) = (by_name(&bound), by_name(&in_blocks));
         let called: Vec<HashSet<String>> = self
             .units
             .iter()
@@ -1013,25 +1063,25 @@ impl Loader<'_> {
                             // An intrinsic's spelling: a `fn` of it is never
                             // what a call of the name reads, so one imported
                             // under another name must not take it back.
-                            && (matches!(name, "action" | "pending" | "failed" | "failure")
+                            && (matches!(name, "action" | "pending" | "failed" | "failure" | "current")
                                 // A shape spelled `path`: its constructor is
                                 // the router's `path()` under any alias.
                                 || (name == "path"
                                     && unit.file.shapes.iter().any(|s| s.name == name))
                                 || (index > 0 && exact_plan::Stdlib::from_name(name).is_some())
                                 || captures(name)
-                                || bound.iter().enumerate().any(|(other, names)| {
-                                    other != index && names.contains(name)
-                                })
-                                || in_blocks.iter().enumerate().any(|(other, names)| {
-                                    listed[other] != Some(index) && names.contains(name)
+                                || bound_by
+                                    .get(name)
+                                    .is_some_and(|files| files.iter().any(|&other| other != index))
+                                || in_blocks_by.get(name).is_some_and(|files| {
+                                    files.iter().any(|&other| listed[other] != Some(index))
                                 }))
                     };
                     // A generated name is no binding's in any file either, or
                     // the binding's calls (in its own file too) would reach it.
                     let bound_anywhere = |unique: &str| {
-                        let mut all = bound.iter().chain(&in_blocks);
-                        unique != name && all.any(|names| names.contains(unique))
+                        unique != name
+                            && (bound_by.contains_key(unique) || in_blocks_by.contains_key(unique))
                     };
                     while taken.contains(&(kind, unique.clone()))
                         || roster(&unique)
@@ -1060,13 +1110,14 @@ impl Loader<'_> {
         index: usize,
         unique: &[HashMap<(Kind, String), String>],
         scopes: &mut [Option<Scope>],
+        by_local: &mut [Option<ByLocal>],
     ) -> Result<(), CompileError> {
         if scopes[index].is_some() {
             return Ok(());
         }
         let targets = self.units[index].targets.clone();
         for &target in &targets {
-            self.scope_of(target, unique, scopes)?;
+            self.scope_of(target, unique, scopes, by_local)?;
         }
         let mut names = unique[index].clone();
         let unit = &self.units[index];
@@ -1074,13 +1125,14 @@ impl Loader<'_> {
             let from = scopes[target]
                 .as_ref()
                 .expect("a used file is scoped before its user");
+            let index_of_from = by_local[target]
+                .as_ref()
+                .expect("a used file is indexed with its scope");
             for n in &u.names {
-                let found: Vec<_> = from
-                    .names
-                    .iter()
-                    .filter(|((_, local), _)| *local == n.name)
-                    .map(|((kind, _), to)| (*kind, to.clone()))
-                    .collect();
+                let found: Vec<_> = index_of_from
+                    .get(n.name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
                 if found.is_empty() {
                     return Err(unknown(u, n, from));
                 }
@@ -1159,37 +1211,21 @@ impl Loader<'_> {
                 }
             }
         }
+        // Preserve namespace order when one spelling has several meanings.
+        let mut local: ByLocal = HashMap::new();
+        for ((kind, name), to) in &names {
+            local
+                .entry(name.clone())
+                .or_default()
+                .push((*kind, to.clone()));
+        }
+        by_local[index] = Some(local);
+        // The program-wide tables (what is declared elsewhere, the shapes,
+        // the modules, the compiler's types) are set by `scope`, shared.
         scopes[index] = Some(Scope {
             names,
-            elsewhere: HashMap::new(),
             // The roster plus the intrinsics (`pending`, `failed`, `path`, `t`).
             roster: Some(compiler_call),
-            builtin_types: builtin_types(),
-            foreign_shapes: HashMap::new(),
-            shapes: self
-                .units
-                .iter()
-                .enumerate()
-                .flat_map(|(u, unit)| {
-                    unit.file
-                        .shapes
-                        .iter()
-                        .filter_map(move |s| unique[u].get(&(Kind::Call, s.name.clone())))
-                })
-                .cloned()
-                .collect(),
-            modules: self
-                .units
-                .iter()
-                .enumerate()
-                .flat_map(|(u, unit)| {
-                    unit.file
-                        .modules
-                        .iter()
-                        .filter_map(move |m| unique[u].get(&(Kind::Call, m.name.clone())))
-                })
-                .cloned()
-                .collect(),
             ..Scope::default()
         });
         Ok(())
@@ -1336,7 +1372,10 @@ fn builtin_types() -> HashSet<String> {
 /// type checker reads before any `fn` (`pending`, `failed`, `path`, `t`).
 fn compiler_call(name: &str) -> bool {
     exact_plan::Stdlib::from_name(name).is_some()
-        || matches!(name, "pending" | "failed" | "failure" | "path" | "t")
+        || matches!(
+            name,
+            "pending" | "failed" | "failure" | "current" | "path" | "t"
+        )
 }
 
 /// A file's own top-level names, by namespace, in source order.

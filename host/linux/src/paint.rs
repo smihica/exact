@@ -31,6 +31,7 @@ mod presentation;
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 pub(crate) use presentation::Presentation;
 pub mod border;
+mod box_filter;
 pub(crate) mod button;
 mod caret;
 pub(crate) mod control;
@@ -194,6 +195,13 @@ struct BoxGeometry {
     // sums them: flowed text is measured and painted around the same bits.
     inset: (f32, f32),
 }
+impl BoxGeometry {
+    /// The content box on the content edge's curve: where a picture or a
+    /// canvas's bitmap is clipped, inside the border (CSS Backgrounds 3 §5.3).
+    fn content_edge(&self) -> Shape {
+        self.outer.within(self.content)
+    }
+}
 fn paint_rect(frame: exact_kernel::Frame, offset: (f32, f32)) -> Rect4 {
     (
         frame.x - offset.0,
@@ -222,10 +230,10 @@ impl BoxPaint {
         });
         Self {
             radii: [
-                s.border_radius_top_left,
-                s.border_radius_top_right,
-                s.border_radius_bottom_right,
-                s.border_radius_bottom_left,
+                s.border_radius_top_left.clone(),
+                s.border_radius_top_right.clone(),
+                s.border_radius_bottom_right.clone(),
+                s.border_radius_bottom_left.clone(),
             ]
             .map(|d| d.resolve(&env)),
             env: env.clone(),
@@ -272,8 +280,11 @@ impl BoxPaint {
         let pad = self.padding;
         BoxGeometry {
             inset: (pad[3] + widths[3], pad[0] + widths[0]),
-            outer: Shape::elliptical(rect, border::resolve_radii(self.radii, &self.env, w, h))
-                .with_corners(self.corners),
+            outer: Shape::elliptical(
+                rect,
+                border::resolve_radii(self.radii.clone(), &self.env, w, h),
+            )
+            .with_corners(self.corners),
             content: (
                 x + widths[3] + pad[3],
                 y + widths[0] + pad[0],
@@ -322,37 +333,6 @@ impl BoxPaint {
         if self.background[3] > 0 && shape.rect.2 > 0.0 && shape.rect.3 > 0.0 {
             emit(shape, self.background);
         }
-    }
-    /// Where the background paints: the border box, the padding box or the
-    /// content box, each with its radii less what it is inset by; `None` for
-    /// `text`, which the paragraph paints (`text_clip`).
-    fn background_shape(&self, geometry: &BoxGeometry) -> Option<Shape> {
-        use exact_kernel::BackgroundClip;
-        let outer = geometry.outer;
-        let inset = match self.clip {
-            BackgroundClip::BorderBox => return Some(outer),
-            BackgroundClip::Text => return None,
-            BackgroundClip::PaddingBox => self.widths,
-            BackgroundClip::ContentBox => {
-                let (w, p) = (self.widths, self.padding);
-                [w[0] + p[0], w[1] + p[1], w[2] + p[2], w[3] + p[3]]
-            }
-        };
-        let (x, y, w, h) = outer.rect;
-        let [t, r, b, l] = inset;
-        let less = |(a, c): (f32, f32), dx: f32, dy: f32| ((a - dx).max(0.0), (c - dy).max(0.0));
-        Some(
-            Shape::elliptical(
-                (x + l, y + t, (w - l - r).max(0.0), (h - t - b).max(0.0)),
-                [
-                    less(outer.radii[0], l, t),
-                    less(outer.radii[1], r, t),
-                    less(outer.radii[2], r, b),
-                    less(outer.radii[3], l, b),
-                ],
-            )
-            .with_corners(outer.corners),
-        )
     }
     /// The outer `box-shadow`s, under everything else (LLP 1064 D2), the
     /// list's first on top (LLP 1077 D4).
@@ -499,7 +479,7 @@ pub struct Scene<'a> {
 }
 
 mod frame;
-pub use backend::{Backend, FrameTarget, WindowLayer, POINTER};
+pub use backend::{Backend, FrameTarget, WindowLayer};
 pub use frame::Frame;
 
 /// The painter: the walk over one backend.
@@ -1085,7 +1065,7 @@ impl Painter {
             && self
                 .backend
                 .push_css_clip(&node.style.rare.clip_path, ts.pre_translate(x, y));
-        self.content(walk, &node, (x, y, w, h), ts, offset, clip_rect);
+        self.box_content(walk, &node, (x, y, w, h), ts, offset, clip_rect);
         self.dark = previous;
         if path_clip {
             self.backend.pop_clip();
@@ -1152,11 +1132,10 @@ impl Painter {
             // @ref LLP 1056 D7 — a 2D canvas's kept bitmap fills its content box.
             NodeType::Canvas => {
                 self.row_refuse();
+                let clips = [geometry.content_edge()];
                 if self.window_canvas == Some(node.id) {
-                    self.backend
-                        .split_window_canvas(content, &[Shape::rect(content), outer], ts);
+                    self.backend.split_window_canvas(content, &clips, ts);
                 } else if let Some(c) = self.canvases.get(&node.id) {
-                    let clips = [Shape::rect(content), outer];
                     self.backend.canvas(&c.pixels, content, &clips, ts);
                 } else {
                     self.native(node, content, &outer, ts);
@@ -1181,9 +1160,10 @@ impl Painter {
                     };
                     self.symbol(node, content, ink, ts);
                 } else {
-                    self.row_slot(node.id, content, outer, ts);
+                    let edge = geometry.content_edge();
+                    self.row_slot(node.id, content, edge, ts);
                     self.backend.slot_begin(node.id);
-                    self.picture(walk, node, content, outer, ts);
+                    self.picture(walk, node, content, edge, ts);
                     self.backend.slot_end();
                 }
             }
@@ -1192,7 +1172,7 @@ impl Painter {
             NodeType::TextInput => {
                 self.text_input(walk, node, rect, surface.outer.rect, content, &outer, ts)
             }
-            NodeType::Svg => self.svg(walk, node, rect, content, ts),
+            NodeType::Svg => self.svg(walk, node, paint.content_shape(&geometry), ts),
             NodeType::Video | NodeType::WebView | NodeType::NativeView => {
                 self.native(node, content, &outer, ts)
             }
@@ -1201,7 +1181,7 @@ impl Painter {
                     control::select_label(walk.scene.kernel, node, walk.scene.chosen.get(&node.id));
                 let focused = walk.scene.focus == Some(node.id);
                 let label = label.as_deref().unwrap_or("");
-                self.field_control(node, content, focused, ts, label, true);
+                self.field_control(walk, node, content, &outer, focused, ts, label, true);
             }
             // @ref LLP 1069.001 D7 — a date control is a field showing its
             // value (`control::date_text`); `type` sets it.
@@ -1214,7 +1194,7 @@ impl Painter {
                 let chosen = walk.scene.chosen.get(&node.id);
                 let shown = control::date_text(node, chosen, self.dates.as_ref());
                 let focused = walk.scene.focus == Some(node.id);
-                self.field_control(node, content, focused, ts, &shown, false);
+                self.field_control(walk, node, content, &outer, focused, ts, &shown, false);
             }
             NodeType::Control if node.props.str(PropId::Type) == Some("range") => {
                 self.range_control(node, content, ts, walk.scene.chosen.get(&node.id))
@@ -1255,11 +1235,12 @@ impl Painter {
         // Children: clipped by this box when its overflow is not visible,
         // moved by its scroll offset when it scrolls.
         let (ox, oy) = effective_overflow(node);
-        let clips = ox != Overflow::Visible || oy != Overflow::Visible;
+        let clip = field::overflow_clip(&surface.outer, paint.widths, (ox, oy));
+        let clips = clip.is_some();
         let mut child_rect = clip_rect;
-        if clips {
-            self.backend.push_clip(&surface.outer, ts);
-            let own = bbox(ts, surface.outer.rect);
+        if let Some(clip) = clip {
+            self.backend.push_clip(&clip, ts);
+            let own = bbox(ts, clip.rect);
             child_rect = Some(match clip_rect {
                 Some(c) => intersect(c, own),
                 None => own,
@@ -1459,6 +1440,17 @@ fn intersect(a: Rect4, b: Rect4) -> Rect4 {
     let y1 = (a.1 + a.3).min(b.1 + b.3);
     (x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
 }
+
+/// The pointer arrow's outline, at the origin, in points.
+pub const POINTER: [(f32, f32); 7] = [
+    (0.0, 0.0),
+    (0.0, 16.0),
+    (4.0, 12.5),
+    (7.0, 19.0),
+    (9.5, 18.0),
+    (6.5, 11.5),
+    (11.5, 11.5),
+];
 
 #[cfg(test)]
 mod inline_image_tests;

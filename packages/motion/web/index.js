@@ -4,11 +4,13 @@
 // (host/web-js/modules.js) calls it outside the agent; under the agent the
 // runner's substitute answers and this is never loaded.
 //
-// - One acquisition per name for the page (D4): a `Sensor` object, or one
-//   listener of an event, at the fastest `frequency` its readers ask; each
-//   reader group (a name with one `frequency`, `referenceFrame` and
-//   `history`) keeps a ring of its own thinned samples, numbered, and is
-//   answered statelessly from the cursor the runner passes as `after` (D5).
+// - One acquisition per name for the page (D4), and for `deviceOrientation`
+//   one per event type (`absolute` picks `deviceorientationabsolute`): a
+//   `Sensor` object, or one listener of an event, at the fastest
+//   `frequency` its readers ask; each reader group (a name with one
+//   `frequency`, `referenceFrame` and `history`) keeps a ring of its own
+//   thinned samples, numbered, and is answered statelessly from the cursor
+//   the runner passes as `after` (D5).
 // - The device frame is the specifications' (Device Orientation §3.1);
 //   `referenceFrame: "screen"` turns x and y by `screen.orientation.angle`
 //   (Accelerometer §7.1), per reader, from the one stream.
@@ -75,7 +77,7 @@ const xyz = v => (v && [v.x, v.y, v.z].every(n => typeof n === 'number') ? [v.x,
 export function implementation({ changed, now = () => performance.now(), foreground = () => true, log = () => {}, surfaces } = {}) {
   // The page's time origin to the session clock: a sample's DOMHighResTimeStamp, on the session's (D7).
   const offset = () => now() - performance.now();
-  const streams = new Map(); // name → { sensor | listener, frequency, groups: Map, latest }
+  const streams = new Map(); // streamKey(name, args) → { name, absolute, stop, frequency, groups: Map, latest }
   const inputs = new Map(); // `${surface} ${sensor}` → { writer, name, period, next, dropped }
   let decided = null, paused = false;
 
@@ -113,21 +115,22 @@ export function implementation({ changed, now = () => performance.now(), foregro
     return { x, y, z, timestamp: at };
   };
 
-  // The platform stream of `name`, started at `frequency`: a Generic Sensor object, else an event.
-  const start = (name, frequency) => {
+  // The platform stream `s`, started at `frequency`: a Generic Sensor object, else an event.
+  const start = (s, frequency) => {
+    const name = s.name;
     if (CLASSES[name] && hasClass(name)) {
       const Class = global[CLASSES[name]], options = frequency ? { frequency } : {};
       const sensor = new Class(options);
       sensor.addEventListener('reading', () => {
         const values = ORIENTATIONS.has(name) ? [...sensor.quaternion] : [sensor.x, sensor.y, sensor.z];
-        if (values.every(Number.isFinite)) take(streams.get(name), reading(name, values, sensor.timestamp));
+        if (values.every(Number.isFinite)) take(s, reading(name, values, sensor.timestamp));
       });
-      sensor.addEventListener('error', e => fail(name, e.error?.name === 'NotAllowedError' ? 'NotAllowedError' : e.error?.name === 'NotReadableError' ? 'NotReadableError' : 'NotSupportedError'));
+      sensor.addEventListener('error', e => fail(s, e.error?.name === 'NotAllowedError' ? 'NotAllowedError' : e.error?.name === 'NotReadableError' ? 'NotReadableError' : 'NotSupportedError'));
       sensor.start();
       return () => sensor.stop();
     }
     const motion = ['accelerometer', 'linearAccelerationSensor', 'gravitySensor', 'gyroscope', 'deviceMotion'].includes(name);
-    const type = name === 'absoluteOrientationSensor' || (name === 'deviceOrientation' && streams.get(name)?.absolute) ? 'deviceorientationabsolute' : 'deviceorientation';
+    const type = name === 'absoluteOrientationSensor' || s.absolute ? 'deviceorientationabsolute' : 'deviceorientation';
     const listener = motion ? e => {
       const sign = webkit() ? -1 : 1, with_ = xyz(e.accelerationIncludingGravity), without = xyz(e.acceleration);
       const at = e.timeStamp, scale = v => v && v.map(n => n * sign);
@@ -141,15 +144,15 @@ export function implementation({ changed, now = () => performance.now(), foregro
         const v3 = v => (v ? { x: v[0], y: v[1], z: v[2] } : null);
         const extra = { acceleration: v3(scale(without)), accelerationIncludingGravity: v3(scale(with_)),
           rotationRate: r ? { alpha: finite(r.alpha), beta: finite(r.beta), gamma: finite(r.gamma) } : null, interval: e.interval ?? 0 };
-        return take(streams.get(name), reading(name, [0, 0, 0], at, extra));
+        return take(s, reading(name, [0, 0, 0], at, extra));
       }
-      if (values?.every(Number.isFinite)) take(streams.get(name), reading(name, values, at));
+      if (values?.every(Number.isFinite)) take(s, reading(name, values, at));
     } : e => {
       if (name === 'deviceOrientation') {
         const extra = { alpha: finite(e.alpha), beta: finite(e.beta), gamma: finite(e.gamma), absolute: !!e.absolute };
-        return take(streams.get(name), reading(name, [0, 0, 0], e.timeStamp, extra));
+        return take(s, reading(name, [0, 0, 0], e.timeStamp, extra));
       }
-      if ([e.alpha, e.beta, e.gamma].every(n => typeof n === 'number')) take(streams.get(name), reading(name, quaternionFromAngles(e.alpha, e.beta, e.gamma), e.timeStamp));
+      if ([e.alpha, e.beta, e.gamma].every(n => typeof n === 'number')) take(s, reading(name, quaternionFromAngles(e.alpha, e.beta, e.gamma), e.timeStamp));
     };
     addEventListener(motion ? 'devicemotion' : type, listener);
     return () => removeEventListener(motion ? 'devicemotion' : type, listener);
@@ -160,19 +163,21 @@ export function implementation({ changed, now = () => performance.now(), foregro
     if (name === 'absoluteOrientationSensor' || name === 'deviceOrientation') return 'ondeviceorientationabsolute' in global || name === 'deviceOrientation';
     return hasEvents();
   };
-  const fail = (name, code) => {
-    const stream = streams.get(name);
-    if (!stream) return;
-    stream.error = code;
-    for (const g of stream.groups.values()) for (const w of g.waiting.splice(0)) w();
-    changed(`motion.${name}`);
+  const fail = (s, code) => {
+    s.error = code;
+    for (const g of s.groups.values()) for (const w of g.waiting.splice(0)) w();
+    changed(`motion.${s.name}`);
   };
-  // The stream of `name`, running at the fastest frequency of its groups and inputs.
+  const streamKey = (name, args) => (name === 'deviceOrientation' && args.absolute ? 'deviceOrientation absolute' : name);
+  // The stream of `name` that `args` reads, running at the fastest frequency of its groups and inputs.
   const stream = (name, args) => {
-    let s = streams.get(name);
-    if (!s) streams.set(name, s = { name, groups: new Map(), frequency: null, stop: null, latest: null, error: null, absolute: !!args.absolute });
+    const key = streamKey(name, args);
+    let s = streams.get(key);
+    if (!s) streams.set(key, s = { name, groups: new Map(), frequency: null, stop: null, latest: null, error: null, absolute: key !== name });
     const g = group(s, args);
     restart(s);
+    // A reader that moved to the other `deviceOrientation` event left its old stream with no group (`releaseArgs`).
+    for (const [k, o] of streams) if (o !== s && o.name === name && !o.groups.size) { o.stop?.(); streams.delete(k); }
     return [s, g];
   };
   const rate = s => {
@@ -184,7 +189,7 @@ export function implementation({ changed, now = () => performance.now(), foregro
     if (s.stop && f === s.frequency) return;
     s.stop?.();
     s.frequency = f;
-    s.stop = paused ? null : start(s.name, f);
+    s.stop = paused ? null : start(s, f);
   };
 
   // `MotionSensors`: each sensor by its `startSensorInput` name, and the two events.
@@ -299,19 +304,20 @@ export function implementation({ changed, now = () => performance.now(), foregro
     foreground: visibility,
     /** A reader group gone (LLP 1133.009 D10 item 12). */
     releaseArgs(name, args) {
-      const s = streams.get(name);
+      const s = streams.get(streamKey(name, args ?? {}));
       if (!s) return;
       s.groups.delete(group(s, args ?? {}).key);
       restart(s);
     },
-    /** The last reader of `name` gone: its stream stops unless a canvas input still reads it. */
+    /** The last reader of `name` gone: its streams stop unless a canvas input still reads one. */
     release(name) {
-      const s = streams.get(name);
-      if (!s) return;
-      s.groups.clear();
-      if ([...inputs.values()].some(i => i.name === name)) return restart(s);
-      s.stop?.();
-      streams.delete(name);
+      for (const [key, s] of streams) {
+        if (s.name !== name) continue;
+        s.groups.clear();
+        if ([...inputs.values()].some(i => i.name === name)) { restart(s); continue; }
+        s.stop?.();
+        streams.delete(key);
+      }
     },
   };
 }

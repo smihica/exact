@@ -280,9 +280,9 @@ function encodedBytes(v, pc, route) {
   }
 }
 export function x_encodeURIComponent(v, pc) { if (9 * v.length > MAX) encodedBytes(v, pc, false); return encodeURIComponent(v); }
-/** After the route segment's own refusal of `""`, `.` and `..` (D6). */
+/** The route parameter's trap precedes its encoded-size check (D6). */
 export function x_encodeRouteSegment(v, pc) {
-  if (v === "" || v === "." || v === "..") return segmentOf(v);
+  if (v === "" || v === "." || v === "..") throw new Trap("PathParameter", pc);
   if (9 * v.length > MAX) encodedBytes(v, pc, true);
   return segmentOf(v);
 }

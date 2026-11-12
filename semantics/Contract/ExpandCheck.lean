@@ -123,11 +123,39 @@ private def childFactsEnv : CompSem.CEnv :=
 
 -- Before settlement, a child's status read must reach its resource,
 -- rather than report the quiet status of an unknown name.
-#guard ["pending", "failed", "failure"].all fun which =>
+#guard ["pending", "failed", "failure", "current"].all fun which =>
   ["viewport", "page"].all fun name =>
     match CompSem.ceval 10 childFactsEnv (.inst "Child" [] []) [] (.call which [.var name]) with
     | .error .pending => true
     | _ => false
+
+private def typingProgram (events : List String) : CProgram :=
+  { root := {
+      name := "App",
+      states := [{ name := "text", ty := .string, init := .str "" }],
+      actions := [
+        { name := "input", params := [("value", .string)],
+          body := [.assign "text" (.var "value")] },
+        { name := "change", params := [("value", .string)],
+          body := [.assign "text" (.str "changed")] }],
+      view := [.element "column" [] [] [] [
+        .element "input" [] [("testId", .str "field")]
+          (events.map fun e => (e, e, [])) []]] } }
+
+#guard [(["input"], "typed"), (["change"], "changed"), (["change", "input"], "typed")].all
+  fun (handlers, expected) =>
+    let p := typingProgram handlers
+    let (c, _) := CompSem.cboot p {}
+    match CompSem.cstep p {} c (.change "field" "typed") with
+    | (c, .ok) => (lookup "text" c.slots).any (Value.same (.str expected))
+    | _ => false
+
+#guard
+  let p := typingProgram ["input", "change"]
+  let (c, _) := CompSem.cboot p {}
+  match CompSem.cstep p {} c (.other "field" "change" (.some (.str "typed"))) with
+  | (c, .ok) => (lookup "text" c.slots).any (Value.same (.str "changed"))
+  | _ => false
 
 /-- Both checks for one case, as lines: `#expand-error`, `#struct`, `#types`
 (each with what differs, or `ok`), then the flat observation after

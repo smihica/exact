@@ -46,8 +46,34 @@
     for (let i = 0; i < syms.length; i++) out[out.length] = syms[i];
     return out;
   };
+  // Freezing writable data properties would also forbid an inheritor's own
+  // assignment (ECMA-262 OrdinarySetWithOwnDescriptor). Keep the intrinsic
+  // fixed while letting a receiver define the property it would have made.
+  const allowOverride = function (obj, key, value, enumerable) {
+    const accessor = {
+      __proto__: null,
+      configurable: false,
+      enumerable: enumerable,
+      get() { return value; },
+      set(next) {
+        if (this === obj) throw new TypeError("Cannot assign to a frozen intrinsic");
+        const own = getOwn(this, key);
+        if (own) {
+          if (!isData(own) || !own.writable) throw new TypeError("Cannot assign to a read-only property");
+          define(this, key, { __proto__: null, value: next });
+        } else {
+          define(this, key, { __proto__: null, value: next, writable: true, enumerable: true, configurable: true });
+        }
+      },
+    };
+    freeze(accessor.get);
+    freeze(accessor.set);
+    define(obj, key, accessor);
+  };
   const seen = new Set();
   const queue = [];
+  const objects = [];
+  const prototypes = new Set();
 
   seen.add(globalThis);
   const globals = keysOf(globalThis);
@@ -69,7 +95,7 @@
     if (obj === null || (typeof obj !== "object" && typeof obj !== "function")) continue;
     if (seen.has(obj)) continue;
     seen.add(obj);
-    try { freeze(obj); } catch (e) {}
+    objects[objects.length] = obj;
     // Names AND symbols: `Date.prototype[Symbol.toPrimitive]` and the RegExp
     // `Symbol.match`/`split`/... functions are reachable only by symbol, and a
     // walk by name left every one of them extensible.
@@ -79,9 +105,31 @@
       let d;
       try { d = getOwn(obj, keys[i]); } catch (e) { continue; }
       if (!d) continue;
-      if (isData(d)) queue[queue.length] = d.value;
-      else { queue[queue.length] = d.get; queue[queue.length] = d.set; }
+      if (isData(d)) {
+        queue[queue.length] = d.value;
+        if (typeof obj === "function" && keys[i] === "prototype") prototypes.add(d.value);
+      } else { queue[queue.length] = d.get; queue[queue.length] = d.set; }
     }
-    try { queue[queue.length] = protoOf(obj); } catch (e) {}
+    try {
+      const proto = protoOf(obj);
+      prototypes.add(proto);
+      queue[queue.length] = proto;
+    } catch (e) {}
+  }
+  // Discover prototypes before locking anything: a constructor may be visited
+  // after its prototype. Original values stay in objects even when a getter
+  // replaces their descriptor, so the freeze still reaches them.
+  for (let i = 0; i < objects.length; i++) {
+    const obj = objects[i];
+    if (prototypes.has(obj)) {
+      const keys = keysOf(obj);
+      for (let j = 0; j < keys.length; j++) {
+        const d = getOwn(obj, keys[j]);
+        if (d && isData(d) && d.configurable && d.writable) {
+          allowOverride(obj, keys[j], d.value, d.enumerable);
+        }
+      }
+    }
+    try { freeze(obj); } catch (e) {}
   }
 })();

@@ -10,6 +10,9 @@
 //! compiler is, for one frame, a host.
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+mod build_advice;
+pub use build_advice::{compile_path_advised, resource_clock_warnings, surface_findings, Advised};
+
 mod activities;
 mod excerpt;
 pub use excerpt::excerpt;
@@ -69,12 +72,14 @@ pub use contract_types::strings::Strings;
 /// The data seam, re-exported for an app's build script: the bake asks the
 /// crate its grants for the compatibility id (`Caltrain.grants()`).
 pub use exact_runner::DataSource;
-pub use logic::{apple_linked, linux_entry, rust_entry, web_linked, web_rust_mode};
+pub use logic::{
+    apple_linked, linux_entry, native_storage_constructor, rust_entry, web_linked, web_rust_mode,
+};
 pub use manifest::{Activity, Manifest, Widget};
 pub use map::{plan_digest, SourceMap};
 pub use module_rust::module_rust;
 pub use resolve::Origin;
-pub use rust::rust;
+pub use rust::{compile_path_for_rust, rust};
 pub use sources::{
     code_beside, design_path, with_contract_texts, with_design_text, GraphBase, Package, Source,
     SourceGraph,
@@ -164,7 +169,7 @@ pub struct CompileError {
     pub message: String,
     /// Original token range, including its compilation-local source identity.
     pub span: Span,
-    /// Resolved file path, absent only when compiling standalone source text.
+    /// Resolved file path, absent for standalone source text or a failure outside a source file.
     pub file: Option<Box<Path>>,
     /// Other authored declarations or bindings involved in this rejection.
     pub related: Box<[RelatedLocation]>,
@@ -603,39 +608,6 @@ pub struct SurfaceFindings {
     pub newer: Option<PathBuf>,
 }
 
-/// [`SurfaceFindings`] for the file at `path`; Err when its sources or the
-/// declaration cannot be read.
-pub fn surface_findings(path: &Path) -> Result<SurfaceFindings, Vec<CompileError>> {
-    let src = read_source(path).map_err(|e| vec![e])?;
-    let app_root = app_root(path)?;
-    let (file, sources) = sources::load(path, &src, &app_root)?;
-    let findings = match surface::arguments(&app_root).map_err(|e| vec![e])? {
-        Some(declared) => contract_analyze::check_surface_arguments(&file, &declared)
-            .err()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| sources.resolve(e.into()))
-            .collect(),
-        None => Vec::new(),
-    };
-    Ok(SurfaceFindings {
-        findings,
-        newer: surface::newer_rust(&app_root),
-    })
-}
-
-/// Non-blocking advice for resource arguments fed by a live frame clock.
-/// Includes imported derives and functions, with the authored resource location.
-pub fn resource_clock_warnings(path: &Path) -> Result<Vec<CompileError>, Vec<CompileError>> {
-    let src = read_source(path).map_err(|e| vec![e])?;
-    let app_root = app_root(path)?;
-    let (file, sources) = sources::load(path, &src, &app_root)?;
-    Ok(contract_analyze::resource_clock_warnings(&file)
-        .into_iter()
-        .map(|e| sources.resolve(e.into()))
-        .collect())
-}
-
 /// Compile a terminal entry (LLP 1101 D2): the terminal profile's refusals,
 /// every one, then the ordinary compile.
 pub fn compile_path_terminal(path: &Path) -> Result<Plan, Vec<CompileError>> {
@@ -991,9 +963,10 @@ fn compile_loaded(
     if !surface.is_empty() {
         return Err(surface);
     }
-    for v in &views {
+    let placed = package_views::placed(&plan);
+    for v in views.iter().filter(|v| placed.contains(&v.tag)) {
         let binds: Vec<&str> = v.binds.iter().map(String::as_str).collect();
-        plan.add_view(&v.tag, &v.extension, v.displayed, &binds);
+        plan.add_view(&v.tag, (&v.extension, &v.package), v.displayed, &binds);
     }
     reach::from_manifest(path, &app_root, &file, &mut plan)?;
     Ok((plan, sites.map(|sites| SourceMap::new(sites, sources))))
@@ -1101,7 +1074,16 @@ fn compile_file_warned(
             profile,
             warned.as_ref().map(|_| &mut lower_warnings),
         )
-        .map_err(|all| each(all, |e| e)),
+        .map_err(|all| each(all, |e| e))
+        .and_then(|built| {
+            // A component nothing uses is not lowered; its literal values
+            // are checked as the lint checks them (LLP 1156.005 D3).
+            let unused = contract_lower::lint_unused(file);
+            match unused.is_empty() {
+                true => Ok(built),
+                false => Err(each(unused, |e| e)),
+            }
+        }),
         Err(all) => {
             if warned.is_some() {
                 lower_warnings = contract_lower::warnings(&checked);
@@ -1334,13 +1316,12 @@ fn fact_shape(
 /// nothing bounding it (it grows, and never scrolls — 0102, 0103), and a
 /// pressable with zero area (nothing can press it — valet 0003). A pressable
 /// holding an image or a canvas is exempt: their size is the host's.
+/// A pressable hidden by `display: none` on itself or an ancestor is skipped.
 ///
 /// Unanswered (`answered` false, [`check`]), a verdict that could rest on a
 /// placeholder is not given: an empty list's `scroll`, or a button whose
-/// label is a resource's empty zero. What stays is a pressable whose zero
-/// area is its own style's — `display: none` on it or an ancestor, a zero
-/// `width` or `height` — which no answer changes (files diary F13: a hidden
-/// shortcut button).
+/// label is a resource's empty zero. A zero-area pressable is still refused
+/// if its own `width` or `height` is explicitly zero.
 fn lint<D: DataSource>(runner: &mut Runner<D>, answered: bool) -> Result<(), BakeError> {
     let (w, h) = LINT_VIEWPORT;
     let roots = runner.roots();
@@ -1420,7 +1401,7 @@ fn lint<D: DataSource>(runner: &mut Runner<D>, answered: bool) -> Result<(), Bak
                 if node.frame.width > 0.0 && node.frame.height > 0.0 {
                     continue;
                 }
-                if (!answered && !styled_out(kernel, node)) || in_placeholder(kernel, node) {
+                if (!answered && !has_zero_dimension(node)) || in_placeholder(kernel, node) {
                     continue;
                 }
                 let mut stack = node.children();
@@ -1464,14 +1445,9 @@ fn in_placeholder(kernel: &Kernel, node: exact_kernel::NodeRef<'_>) -> bool {
     false
 }
 
-/// Whether a node's zero area is its style's: `display: none` on it or an
-/// ancestor, or a zero `width` or `height` of its own.
-fn styled_out(kernel: &Kernel, node: exact_kernel::NodeRef<'_>) -> bool {
+fn has_zero_dimension(node: exact_kernel::NodeRef<'_>) -> bool {
     let zero = |d: Dimension| matches!(d, Dimension::Points(p) if p == 0.0);
-    if zero(node.style.width) || zero(node.style.height) {
-        return true;
-    }
-    hidden(kernel, node)
+    zero(node.style.width.clone()) || zero(node.style.height.clone())
 }
 
 fn hidden(kernel: &Kernel, node: exact_kernel::NodeRef<'_>) -> bool {

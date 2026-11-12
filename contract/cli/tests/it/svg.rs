@@ -104,6 +104,81 @@ fn the_sparkline_compiles_to_nodes_rows_and_resolved_animations() {
 }
 
 #[test]
+fn animation_lists_refuse_computed_longhands() {
+    for (name, literal) in [
+        (
+            "animation",
+            r#"animation="spin 1s linear infinite, fade 2s""#,
+        ),
+        ("animation-name", r#"animation-name="spin, fade""#),
+    ] {
+        for computed in [
+            r#"animation-play-state=(frozen ? "paused" : "running")"#,
+            "animation-duration=duration",
+        ] {
+            for attrs in [
+                format!("{literal} {computed}"),
+                format!("{computed} {literal}"),
+            ] {
+                let src = format!(
+                    r#"keyframes spin
+  to rotate="360deg"
+keyframes fade
+  to opacity=0
+component A
+  state frozen = false
+  state duration = "3s"
+  view
+    column {attrs}
+"#
+                );
+                let error = contract::compile(&src).unwrap_err();
+                assert_eq!(error.id, "lower-animation-longhand", "{error}");
+                assert_eq!(
+                    error.message,
+                    format!(
+                        "`{name}` is a list, and another part is computed: a computed animation is one animation"
+                    )
+                );
+                assert_eq!(error.span.line, 9);
+                assert_eq!(error.span.col as usize, 12 + attrs.find(literal).unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_longhands_keep_the_shorthand_list() {
+    for (longhand, paused) in [("", false), (r#"animation-play-state="paused""#, true)] {
+        let r = boot(&format!(
+            r#"keyframes spin
+  to rotate="360deg"
+keyframes fade
+  to opacity=0
+component A
+  view
+    column testId="a" animation="spin 1s linear infinite, fade 2s" {longhand}
+"#
+        ));
+        let k = r.kernel();
+        let animations = &k
+            .node_by_key(k.find_by_test_id("a")[0])
+            .unwrap()
+            .style
+            .animation;
+        assert_eq!(
+            animations
+                .0
+                .iter()
+                .map(|a| (a.name.as_str(), a.duration, a.paused))
+                .collect::<Vec<_>>(),
+            [("spin", 1.0, paused), ("fade", 2.0, paused)]
+        );
+        assert!(animations.0[0].iterations.is_infinite());
+    }
+}
+
+#[test]
 fn a_computed_part_composes_one_animation() {
     let r = boot(
         "keyframes spin\n  to opacity=0\ncomponent A\n  state frozen = true\n  view\n    column testId=\"b\" animation=\"spin 1s linear infinite\" animation-play-state=(frozen ? \"paused\" : \"running\")\n",
@@ -452,6 +527,26 @@ fn attribute_lengths_refuse_finished_bare_exponents() {
 }
 
 #[test]
+fn text_path_refusal_points_to_positioned_svg_text() {
+    let svg =
+        |body: &str| format!("component A\n  view\n    svg width=100 height=40\n      {body}\n");
+    for body in [
+        "text \"hi\" x=10 y=20",
+        "text x=10 y=20\n        tspan \"hi\"",
+    ] {
+        contract::compile(&svg(body)).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let error = contract::compile(&svg("textPath \"hi\"")).unwrap_err();
+    assert_eq!(error.id, "lower-unknown-tag");
+    assert_eq!(
+        error.message,
+        "unknown tag `textPath`; `textPath` (text on a path) is not in exact2's SVG yet \
+         (LLP 1055.000 §4, stage 11); use `text` with `x` and `y` inside `svg`, \
+         with `tspan` for runs"
+    );
+}
+
+#[test]
 fn refusals_are_named() {
     let svg = |body: &str| {
         format!("component A\n  state n = 0\n  action go\n    n = 1\n  view\n    svg width=10 height=10\n      {body}\n")
@@ -523,7 +618,7 @@ fn stage_one_geometry_transforms_and_classes() {
     let e = node("e");
     assert_eq!(e.node_type, NodeType::SvgEllipse);
     assert_eq!(
-        (e.style.cx, e.style.cy, e.style.rx),
+        (e.style.cx.clone(), e.style.cy.clone(), e.style.rx.clone()),
         (Points(50.0), Percent(50.0), Points(10.0))
     );
     assert_eq!(e.style.ry, exact_kernel::Dimension::Auto);
@@ -534,9 +629,15 @@ fn stage_one_geometry_transforms_and_classes() {
     );
     assert_eq!(e.style.transform_box, exact_kernel::TransformBox::FillBox);
     let rect = node("r");
-    assert_eq!((rect.style.x, rect.style.y), (Percent(10.0), Points(2.0)));
+    assert_eq!(
+        (rect.style.x.clone(), rect.style.y.clone()),
+        (Percent(10.0), Points(2.0))
+    );
     assert_eq!(rect.style.height, Points(96.0), "1in is 96 user units");
-    assert_eq!((rect.style.width, rect.style.rotate), (Points(40.0), 15.0));
+    assert_eq!(
+        (rect.style.width.clone(), rect.style.rotate),
+        (Points(40.0), 15.0)
+    );
     // A component's root inside a `g`; a computed number is a length's text.
     let tick = node("tick");
     assert_eq!(tick.node_type, NodeType::SvgLine);

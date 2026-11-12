@@ -177,6 +177,12 @@ pub extern "C" fn mde_before_input(
     })
 }
 
+/// A drag within the editor, in source coordinates from before its deletion.
+#[no_mangle]
+pub extern "C" fn mde_move(h: u32, from: u32, to: u32, at: u32, len: u32, now: f64) -> u32 {
+    with(h, len, |e, text| bits(e.move_text(from, to, at, text, now)))
+}
+
 /// The platform changed the text to the input itself.
 #[no_mangle]
 pub extern "C" fn mde_reconcile(h: u32, len: u32, sel_from: u32, sel_to: u32, now: f64) -> u32 {

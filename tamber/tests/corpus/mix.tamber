@@ -10,3 +10,5 @@ theme
   over.pair = color-mix(in srgb, light-dark(#fff, #000), #808080)
   zero = color-mix(in srgb, red 0%, blue 0%)
   with.transparent = color-mix(in srgb, #1083fe 40%, transparent)
+  opposite.longer = color-mix(in lch longer hue, lch(70 30 180), lch(70 30 0))
+  opposite.hsl = color-mix(in hsl, #fff000, #000fff)

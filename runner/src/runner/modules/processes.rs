@@ -204,6 +204,13 @@ impl<D: DataSource> Runner<D> {
         (self.extensions.processes.refused).retain(|(t, a)| *t != target || a == args);
     }
 
+    /// Resource `i`'s refused arguments, whatever they are, go: its row is
+    /// a new member's.
+    pub(in crate::runner) fn forget_refused_row(&mut self, i: usize) {
+        let target = Target::Resource(i);
+        (self.extensions.processes.refused).retain(|(t, _)| *t != target);
+    }
+
     /// Whether `target`'s request in flight is a child this commit's origin
     /// may not let go (D13): a tool's, a wake's or the device's would end
     /// its group. Every path that lets a ticket go asks first; a kept child

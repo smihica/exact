@@ -44,7 +44,7 @@ private final class BlurBackground: NSVisualEffectView {
 }
 
 package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
-    package override func selectAll(_ sender: Any?) { presenter?.selection.selectAll() }
+    package override func selectAll(_ sender: Any?) { presenter?.selection.selectAll(in: window) }
 
     package let id: UInt32
     /// Bumped whenever it moves to another superview or window: a captured
@@ -285,7 +285,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         if presenter?.menus.key(event) == true || presenter?.dialogs.key(event) == true { return }
         if isParagraph, window?.firstResponder === self, event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
-            case "a": presenter?.selection.selectAll(); return
+            case "a": presenter?.selection.selectAll(in: window); return
             case "c": presenter?.selection.copy(); return
             default: break
             }
@@ -332,7 +332,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     package override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if isParagraph, window?.firstResponder === self, event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
-            case "a": presenter?.selection.selectAll(); return true
+            case "a": presenter?.selection.selectAll(in: window); return true
             case "c": presenter?.selection.copy(); return true
             default: break
             }
@@ -816,16 +816,16 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
     /// refuses a point outside a view's frame before it asks the subviews,
     /// so a positioned popup beyond its parent's box took no clicks (ledger
     /// F13, shop F18). Outside this box and unclipped, the children are
-    /// asked here, topmost first. `point` is in the superview's space.
+    /// asked here (in a one-axis clip's box, which shares the node's space), topmost first.
     private func overflowHit(_ point: NSPoint) -> NSView? {
-        guard !isHidden, scroll == nil, clipBox == nil, !clipsToBounds, !subviews.isEmpty else { return nil }
+        guard !isHidden, scroll == nil, clipBox == nil || clipsOneAxis, !clipsToBounds, !(clipBox ?? self).subviews.isEmpty else { return nil }
         let local = convert(point, from: superview)
         let outsideX = local.x < bounds.minX || local.x > bounds.maxX
         let outsideY = local.y < bounds.minY || local.y > bounds.maxY
         guard outsideX || outsideY else { return nil }
         if outsideX && (style["overflow_x"]?.string ?? "visible") != "visible" { return nil }
         if outsideY && (style["overflow_y"]?.string ?? "visible") != "visible" { return nil }
-        let order = subviews.enumerated().sorted {
+        let order = (clipBox ?? self).subviews.enumerated().sorted {
             let (a, b) = ($0.element.layer?.zPosition ?? 0, $1.element.layer?.zPosition ?? 0)
             return a != b ? a > b : $0.offset > $1.offset
         }
@@ -1194,7 +1194,7 @@ package final class NodeView: NSView, NSTextViewDelegate, NSTextFieldDelegate {
         // On a layer-backed view this is the layer's `masksToBounds`, unless
         // the node casts a shadow that clipping would clip (`BoxShadow.swift`).
         // A paragraph paints its own text, which a box would not clip.
-        syncClipBox(overflowClips && kind != "text" && shadowColor != nil && scroll == nil && overlay == nil && materialContent == nil)
+        syncClipBox(overflowClips && kind != "text" && (shadowColor != nil || clipsOneAxis) && scroll == nil && overlay == nil && materialContent == nil)
         let clipped = overflowClips && clipBox == nil
         if clipsToBounds != clipped { clipsToBounds = clipped }
         applyClipRadius()

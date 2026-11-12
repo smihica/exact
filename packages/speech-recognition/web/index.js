@@ -32,17 +32,21 @@ const AGENT_STATUS = { available: true, state: 'granted', inputs: ['track', 'mic
 const NO_INFO = { id: '', leavesDevice: false, finalCount: 0, transcript: null, files: 0, error: null };
 const NO_RECOGNITION = { id: '', state: 'ended', audio: false, sound: false, speech: false, results: [], finalCount: 0, interim: null, leavesDevice: false, error: null, message: null };
 
-/** A final result's text in pieces of at most 16 KB, split at a word boundary (D7). */
+/** A final result's text in pieces of at most 16 KB of UTF-8, preferring a word boundary (D7). */
 export function pieces(text) {
-  const out = [];
+  const out = [], encoder = new TextEncoder(), buffer = new Uint8Array(SPLIT);
   let rest = text;
-  while (new TextEncoder().encode(rest).length > SPLIT) {
-    let cut = rest.lastIndexOf(' ', SPLIT);
-    if (cut <= 0) cut = SPLIT;
+  while (true) {
+    // encodeInto reads only whole code points that fit in the byte buffer.
+    const { read } = encoder.encodeInto(rest, buffer);
+    if (read === rest.length) break;
+    let cut = rest.lastIndexOf(' ', read);
+    if (cut <= 0) cut = read;
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).trimStart();
   }
-  out.push(rest);
+  // An empty input still represents a result: nomatch has no alternatives (D7).
+  if (rest || !out.length) out.push(rest);
   return out;
 }
 
@@ -83,8 +87,8 @@ export function implementation({ changed, agent, now, log, tracks, files, foregr
   function final(r, alternatives, start = null, end = null) {
     const best = alternatives[0]?.transcript ?? '';
     const parts = pieces(best);
-    parts.forEach((text, i) => {
-      const result = { index: r.finalCount++, alternatives: i === 0 && parts.length === 1 ? alternatives : [{ transcript: text, confidence: alternatives[0]?.confidence ?? 0 }], start, end, apple: null };
+    parts.forEach(text => {
+      const result = { index: r.finalCount++, alternatives: parts.length === 1 && text === best ? alternatives : [{ transcript: text, confidence: alternatives[0]?.confidence ?? 0 }], start, end, apple: null };
       r.results.push(result);
       if (r.results.length > MAX_HISTORY) r.results.shift();
       write(r, JSON.stringify(result) + '\n');

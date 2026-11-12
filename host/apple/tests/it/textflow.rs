@@ -231,6 +231,76 @@ fn list_settlement_publishes_final_mounted_flow_and_clears_disappearing_shapes()
     );
 }
 
+#[test]
+fn retired_column_fragments_are_not_cleared_and_whole_new_rows_need_no_record() {
+    struct Rows;
+    impl DataSource for Rows {
+        fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+            Ok(Value::list(
+                (0..100).map(|n| Value::Number(n as f64)).collect(),
+            ))
+        }
+    }
+    let sentence = "The river carries its quiet story through the garden and beyond the trees. The birds follow the water past the bridge and into the fields at the edge of the village.";
+    let plan = contract::compile(&format!(
+        r#"component App
+  resource rows = rows() as shape number[]
+  view
+    list testId="list" virtualized=true estimated-item-height=140 width=320 height=400
+      for row in rows key=row
+        view column-count=2 column-gap=20 width=320
+          text "{sentence}" testId=`first-${{row}}`
+          text (row % 2 == 0 ? "A short note." : "{sentence} {sentence} {sentence}")
+"#
+    ))
+    .unwrap()
+    .encode();
+    let (mut h, boot) = Host::boot(
+        &plan,
+        Rows,
+        Box::new(MonospaceMeasurer::default()),
+        320.,
+        400.,
+    )
+    .unwrap();
+    let old = id(&h, "first-0");
+    let kernel = h.runner().kernel();
+    let old_key = kernel.find_by_test_id("first-0")[0];
+    let old_fragments = kernel.fragments(old_key).unwrap();
+    assert_eq!(old_fragments.len(), 2);
+    let old_clip_height = old_fragments[0].height;
+    assert!(boot.contains(&format!("\"op\":\"fragments\",\"id\":{old},")));
+    let whole = id(&h, "first-1");
+    assert!(kernel
+        .fragments(kernel.find_by_test_id("first-1")[0])
+        .is_none());
+    assert!(!boot.contains(&format!("\"op\":\"fragments\",\"id\":{whole},")));
+    let snapshot = h.runner().collections().remove(0);
+    let feedback = exact_runner::CollectionFeedback {
+        view: snapshot.view,
+        revision: snapshot.revision,
+        scroll_sequence: snapshot.scroll_sequence + 1,
+        offset: 6000.,
+        port_cross: 320.,
+        port_main: 400.,
+        cross: 320.,
+        padding: [0.; 2],
+        measurements: vec![],
+        focus_view: None,
+        interaction_view: None,
+    };
+    let batch = h.collection_feedback(&feedback.encode().unwrap(), 0.);
+    assert!(batch.contains(&format!("\"op\":\"destroy\",\"id\":{old}}}")));
+    assert!(!batch.contains(&format!("\"op\":\"fragments\",\"id\":{old},")));
+    let kernel = h.runner().kernel();
+    let next_key = kernel.find_by_test_id("first-41")[0];
+    let next = kernel.node_by_key(next_key).unwrap();
+    assert!(kernel.fragments(next_key).is_none());
+    assert!(next.frame.height > old_clip_height);
+    assert!(batch.contains(&format!("\"op\":\"create\",\"id\":{},", next.id)));
+    assert!(!batch.contains(&format!("\"op\":\"fragments\",\"id\":{},", next.id)));
+}
+
 // @ref LLP 1043.000 §8 — the Reader's drop cap: an auto-height paragraph is
 // measured through the seam around the shape it is painted around.
 #[test]

@@ -199,6 +199,9 @@ pub struct ButtonFaceStyle {
     pub button: crate::StyleProps,
     /// Image-to-text gap on the face axis. None asks the host's system spacing.
     pub image_gap: Option<f32>,
+    /// Where a radio drawn as a segment sits in its group
+    /// ([`crate::segmented`]); None for any other button.
+    pub segment: Option<crate::SegmentPlace>,
 }
 
 impl ButtonFaceStyle {
@@ -219,7 +222,7 @@ impl ButtonFaceStyle {
             &mut s.padding_bottom,
             &mut s.padding_left,
         ] {
-            *side = length(*side, containing_width);
+            *side = length(side.clone(), containing_width);
         }
         // Native configurations and the painted button use circular corners;
         // retain their scalar-radius approximation for percentage corners.
@@ -230,7 +233,7 @@ impl ButtonFaceStyle {
             &mut s.border_radius_bottom_right,
             &mut s.border_radius_bottom_left,
         ] {
-            *corner = length(*corner, basis);
+            *corner = length(corner.clone(), basis);
         }
     }
 }

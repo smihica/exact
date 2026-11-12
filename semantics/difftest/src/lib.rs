@@ -305,7 +305,7 @@ pub fn refusal_class(reason: &str) -> &'static str {
         | "TaskKey" | "ResourceKey" | "PathParameter" | "KeyKind" | "Router" => "value",
         "RangeCount" if reason.contains("non_finite: true") => "value",
         "RangeCount" if reason.contains("non_finite: false") => "app",
-        "UnwrapNone" | "DuplicateKey" | "List" | "Collection" => "app",
+        "UnwrapNone" | "List" | "Collection" => "app",
         "router" if reason.contains(" refused: ") => "app",
         "KernelSchemaMismatch"
         | "AppMismatch"
@@ -512,9 +512,6 @@ pub fn corpus(dirs: &[PathBuf]) -> Result<(Vec<Scripted>, Vec<String>), String> 
     let mut out = Vec::new();
     let mut errors = Vec::new();
     for f in files {
-        if f.to_string_lossy().ends_with(".test.contract") {
-            continue;
-        }
         // Named from the project, however the path was spelled: the name
         // seeds the case's data.
         let f = f.canonicalize().unwrap_or(f);
@@ -654,20 +651,20 @@ pub fn explore(name: &str, source: &str, path: Option<&Path>) -> Scripted {
     script
 }
 
-/// Every `.contract` file at `path` (a file, or a directory searched
-/// recursively).
+/// Every `.contract` program at `path` (a file, or a directory searched
+/// recursively), excluding `.test.contract` sidecars.
 pub fn collect(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     if path.is_file() {
-        out.push(path.to_path_buf());
+        if !path.to_string_lossy().ends_with(".test.contract") {
+            out.push(path.to_path_buf());
+        }
         return Ok(());
     }
     let entries = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for entry in entries {
         let p = entry.map_err(|e| e.to_string())?.path();
-        if p.is_dir() {
+        if p.is_dir() || p.extension().is_some_and(|x| x == "contract") {
             collect(&p, out)?;
-        } else if p.extension().is_some_and(|x| x == "contract") {
-            out.push(p);
         }
     }
     Ok(())
@@ -681,6 +678,28 @@ pub fn shrink(case: &Case, tag: &str) -> Result<Case, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_programs_excludes_property_sidecars() {
+        let corpus = leanrun::project().join("corpus");
+        let program = corpus.join("properties/holds.contract");
+        let sidecar = program.with_extension("test.contract");
+        let mut files = Vec::new();
+        collect(&corpus, &mut files).unwrap();
+        assert!(files.contains(&program));
+        for file in &files {
+            assert!(
+                !file.to_string_lossy().ends_with(".test.contract"),
+                "property sidecar collected as a program: {}",
+                file.display()
+            );
+        }
+
+        files.clear();
+        collect(&program, &mut files).unwrap();
+        collect(&sidecar, &mut files).unwrap();
+        assert_eq!(files, vec![program]);
+    }
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|l| l.to_string()).collect()

@@ -4,7 +4,7 @@ use crate::boundary::{HostArg, HostError, HostValue};
 use crate::grant::GrantSet;
 use crate::host_opcodes::sqlite_async;
 use crate::stdlib::sqlite::{
-    Command, Database, ExecuteResult, Location, Provider, Rows, Statement, Value,
+    Command, Database, ExecuteResult, ForeignKeys, Location, Provider, Rows, Statement, Value,
 };
 use std::collections::HashMap;
 use std::sync::{
@@ -178,7 +178,7 @@ pub(crate) fn run(
         let provider = registry
             .provider
             .get()
-            .ok_or_else(|| HostError::Failed("SQLite provider is not installed".into()))?;
+            .ok_or_else(|| HostError::Failed("Unlinked(\"sqlite\")".into()))?;
         let database = Database::new(provider.open(Location { path })?);
         let mut databases = registry.databases.lock().unwrap();
         if registry.closed.load(Ordering::Acquire) {
@@ -218,8 +218,13 @@ pub(crate) fn run(
             registry.statement(id)?.query(&parameters(&args[1..])?)?,
         )),
         sqlite_async::TRANSACTION => {
-            let n = count(number(args, 1)?)?;
-            let mut offset = 2;
+            let foreign_keys = match number(args, 1)? {
+                0.0 => ForeignKeys::Enforce,
+                1.0 => ForeignKeys::Check,
+                _ => return Err(invalid("unknown SQLite foreign key mode")),
+            };
+            let n = count(number(args, 2)?)?;
+            let mut offset = 3;
             let mut commands = Vec::new();
             for _ in 0..n {
                 let sql = string(args, offset)?.to_owned();
@@ -241,7 +246,9 @@ pub(crate) fn run(
                 return Err(invalid("unexpected SQLite transaction arguments"));
             }
             registry.result(ResultData::Batch(
-                registry.database(id)?.transaction(&commands)?,
+                registry
+                    .database(id)?
+                    .transaction_with(&commands, foreign_keys)?,
             ))
         }
         sqlite_async::CLOSE => {

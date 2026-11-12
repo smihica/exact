@@ -32,6 +32,71 @@ fn contract(args: &[&str]) -> (bool, String, String) {
 }
 
 #[test]
+fn usage_lists_every_binding_language() {
+    for (args, success) in [
+        (vec!["tamber"], false),
+        (vec!["tamber", "--help"], true),
+        (vec!["tamber", "gen"], false),
+    ] {
+        let (ok, out, error) = contract(&args);
+        let said = out + &error;
+        assert_eq!(ok, success, "{args:?}: {said}");
+        assert!(
+            said.contains("gen ts|rust|swift|kotlin <app dir | app.contract | file.tamber>"),
+            "{args:?}: {said}"
+        );
+    }
+}
+
+#[test]
+fn family_stack_check_and_css_import_report_the_refused_value() {
+    let dir = app(
+        "family-stack",
+        "tamber t\n\ntheme\n  family.text = \"Comic Sans MS\", cursive\n",
+    );
+    let at = dir.to_str().unwrap();
+    let (ok, _, error) = contract(&["tamber", "check", at]);
+    assert!(!ok && error.contains("app.tamber:4:17:"), "{error}");
+    assert!(error.contains("cursive"), "{error}");
+
+    std::fs::write(dir.join("app.tamber"), "tamber t\n").unwrap();
+    let css = dir.join("tokens.css");
+    std::fs::write(
+        &css,
+        ":root { --hand: \"Comic Sans MS\", cursive; --empty: ''; --ink: #111111; }",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .args([
+            "tamber",
+            "import",
+            "css",
+            css.to_str().unwrap(),
+            "--app",
+            at,
+        ])
+        .output()
+        .unwrap();
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(
+        report.contains("--hand") && report.contains("--empty"),
+        "{report}"
+    );
+    let written = std::fs::read_to_string(dir.join("app.tamber")).unwrap();
+    assert!(
+        written.contains("ink =") && !written.contains("hand =") && !written.contains("empty ="),
+        "{written}"
+    );
+    exact_tamber::check(&written, &contract_lower::tamber_vocab()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn check_eval_and_ir_read_the_apps_design() {
     let dir = app("ok", DESIGN);
     let at = dir.to_str().unwrap();

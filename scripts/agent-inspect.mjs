@@ -145,7 +145,7 @@ export function sourceMapReaders(locators) {
 export function identifyResources(reply, maps) {
   const digest = reply.planDigest, map = maps?.get(digest);
   for (const [name, row] of Object.entries(reply.resourceStatus ?? {})) {
-    const at = map?.resources?.[name];
+    const at = map?.resources?.[name.replace(/\[\d+\]$/, '')];
     const valid = sourceLocation(at);
     row.declaration = valid
       ? {status:'compatible', digest, file:at.file, line:at.line, col:at.col, end_col:at.end_col, component:at.component}
@@ -393,7 +393,7 @@ function rangeAndPort(scroller) {
  *
  *   node #{id} [{testId}] {Type} · site {n} · instance {keys} · epoch E · incarnation I
  *     {row} = {value} ({authored | inherited from #id | initial}[, applied {…}])
- *     space viewport X,Y W×H · frame X,Y W×H (kernel, in the parent) · window X,Y W×H · screen X,Y W×H · scale S
+ *     space viewport X,Y W×H · frame X,Y W×H (kernel, in the parent or containing block) · window X,Y W×H · screen X,Y W×H · scale S
  *     scroll [viewport | #id] sx,sy of rx,ry · … (outermost first)   clip #id overflow|clip-path · …
  *     visible hidden=… inert=… inViewport=… clipped=…       native key=value …
  *     browser {row}="{the browser's computed value}" …      (the web's oracle beside the kernel's answer)
@@ -426,7 +426,7 @@ function renderNode(n) {
   for (const c of n.columns ?? []) out.push(`  column ${c.x},${c.y} ${c.w}×${c.h}${c.holds ? '' : ' · holds nothing'}`);
   if (n.fragment_skipped) out.push(`  kept whole in its column: ${n.fragment_skipped}`);
   const sp = n.space ?? {};
-  out.push(`  space viewport ${box(sp.viewport)}${n.frame ? ` · frame ${box(n.frame)} (kernel, in the parent)` : ''}${sp.window ? ` · window ${box(sp.window)}` : ''}${sp.screen ? ` · screen ${box(sp.screen)}` : ''}${sp.capture?.scale != null ? ` · scale ${sp.capture.scale}` : ''}`);
+  out.push(`  space viewport ${box(sp.viewport)}${n.frame ? ` · frame ${box(n.frame)} (kernel, in the parent or containing block)` : ''}${sp.window ? ` · window ${box(sp.window)}` : ''}${sp.screen ? ` · screen ${box(sp.screen)}` : ''}${sp.capture?.scale != null ? ` · scale ${sp.capture.scale}` : ''}`);
   if (n.scroll?.length) out.push(`  scroll ${n.scroll.map((c) => `${c.id != null ? `#${c.id}` : 'viewport'} ${c.sx},${c.sy}${rangeAndPort(c)}`).join(' · ')}`);
   if (n.clip?.length) out.push(`  clip ${n.clip.map((c) => `#${c.id} ${c.kind}`).join(' · ')}`);
   if (n.visible) out.push(`  visible ${sorted(n.visible).map(([k, v]) => `${k}=${v}`).join(' ')}`);
@@ -645,8 +645,8 @@ export function perfDelta(a, b) {
     counted[key] = {...after, counts};
   }
   // Each resource's asks between the reads (LLP 1146 D3); a host that counts none has no `resources`.
-  const asked = new Map((a.resources ?? []).map(r => [r.name, r.asked]));
-  const resources = b.resources?.map(r => ({ ...r, asked: r.asked - (asked.get(r.name) ?? 0) })).filter(r => r.asked > 0);
+  const asked = new Map((a.resources ?? []).map(r => [r.member ?? r.name, r.asked]));
+  const resources = b.resources?.map(r => ({ ...r, asked: r.asked - (asked.get(r.member ?? r.name) ?? 0) })).filter(r => r.asked > 0);
   return { ...b, ...counted, sites, handlers, ...(resources ? { resources } : {}), from: { seq: a.seq, clock: a.clock } };
 }
 
@@ -737,7 +737,7 @@ export function renderPerf(r) {
     }
     for (const w of r.world ?? []) {
       const g = n => n == null ? '—' : `${Math.round(n * 100) / 100} ms`, ms = x => x ? `p50 ${g(x.p50)} p95 ${g(x.p95)} p99 ${g(x.p99)} mean ${g(x.mean)}` : '—';
-      out.push(`  world ${w.canvas}: frame ${ms(w.perf.frameMs)} · tick ${ms(w.perf.tickMs)} · feed ${ms(w.perf.feedMs)} · encode ${ms(w.perf.encodeMs)}`);
+      out.push(`  world ${w.canvas}: frame ${ms(w.perf.frameMs)} · tick ${ms(w.perf.tickMs)} · feed ${ms(w.perf.feedMs)} · encode ${ms(w.perf.encodeMs)}${w.perf.pipelineMs ? ` · pipelines ${ms(w.perf.pipelineMs)}` : ''}`);
     }
     for (const l of r.late ?? []) out.push(`  t=${l.t} late: ${l.missed} missed (${l.interval} ms)${l.overrun ? ` · committed ${l.overrun} ms late` : ''} · seq ${l.seq ? l.seq.join('..') : '—'}${l.apply != null ? ` · apply ${l.apply}` : ''}${l.layout != null ? ` · layout ${l.layout}` : ''}${l.loaf ? ` · loaf script ${l.loaf.script}${l.loaf.styleLayout != null ? ` style+layout ${l.loaf.styleLayout}` : ''}` : ''}${l.phases ? ` · ${[...l.phases].sort((a, b) => b.ms - a.ms).map(p => `${p.phase} ${p.ms}`).join(' ')} unattributed ${l.unattributed}` : ''}`);
     return out.join('\n');

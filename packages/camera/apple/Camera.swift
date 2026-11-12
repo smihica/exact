@@ -233,9 +233,9 @@ public final class CameraModule: ExactPackage {
         let output = source.shared("camera.photo") { PhotoOutput(source) }
         output.capture(args: args, source: source) { [self] result in
             switch result {
-            case .failure(let code):
+            case .failure(let failure):
                 holder.leave()
-                reply(["error": code])
+                reply(["error": failure.code])
             case .success(let data):
                 let ext = Self.isHEIF(data) ? "heic" : "jpg"
                 guard let (path, url) = written(ext) else { holder.leave(); return reply(["error": "UnknownError"]) }

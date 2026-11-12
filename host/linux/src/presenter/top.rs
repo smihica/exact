@@ -667,8 +667,9 @@ impl<D: DataSource> Presenter<D> {
             event::ENTER | event::SPACE => {
                 self.surface_key("Enter", now_ms);
             }
-            event::TAB | event::DOWN | event::RIGHT => self.surface_step(false),
-            event::TAB_BACK | event::UP | event::LEFT => self.surface_step(true),
+            event::TAB | event::DOWN => self.surface_step(false),
+            event::TAB_BACK | event::UP => self.surface_step(true),
+            event::LEFT | event::RIGHT => self.surface_horizontal(what == event::LEFT, now_ms),
             _ => {}
         }
     }
@@ -700,9 +701,6 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A key while a surface is open goes to it and to nothing of the page:
-    /// Escape dismisses it, Tab and the arrows move its own focus, Enter
-    /// and Space choose the focused row. Whether a surface took the key.
     /// Whether a surface is open to take the keys ([`Self::surface_key`]).
     pub(crate) fn surface_takes_keys(&self) -> bool {
         self.alert_takes_back() || self.top.open.is_some()
@@ -724,6 +722,10 @@ impl<D: DataSource> Presenter<D> {
         ))
     }
 
+    /// A key while a surface is open goes to it and to nothing of the page.
+    /// Tab and Up/Down move its focus; Right opens a menu row's submenu;
+    /// Left/Right move between an alert's buttons. Enter and Space choose
+    /// the focused row, and Escape dismisses the surface.
     pub(super) fn surface_key(&mut self, name: &str, now_ms: f64) -> bool {
         if !matches!(
             name,
@@ -749,8 +751,9 @@ impl<D: DataSource> Presenter<D> {
                 self.dismiss_surface(now_ms);
             }
             "Tab" => self.surface_step(self.modifiers().shift),
-            "ArrowDown" | "ArrowRight" => self.surface_step(false),
-            "ArrowUp" | "ArrowLeft" => self.surface_step(true),
+            "ArrowDown" => self.surface_step(false),
+            "ArrowUp" => self.surface_step(true),
+            "ArrowLeft" | "ArrowRight" => self.surface_horizontal(name == "ArrowLeft", now_ms),
             "Home" | "End" if self.top.overlay.enabled => self.surface_edge(name == "End"),
             "Enter" | " " => {
                 if let Some(index) = self.top.open.as_ref().and_then(|open| open.focused) {
@@ -760,6 +763,35 @@ impl<D: DataSource> Presenter<D> {
             _ => {}
         }
         true
+    }
+
+    /// A submenu replaces its parent, so Left has no parent to return to.
+    fn surface_horizontal(&mut self, backward: bool, now_ms: f64) {
+        let Some(open) = self.top.open.as_ref() else {
+            return;
+        };
+        if open.kind == SurfaceKind::Alert {
+            self.surface_step(backward);
+        } else if !backward {
+            let index = open.focused.filter(|index| {
+                open.plan
+                    .rows()
+                    .nth(*index)
+                    .is_some_and(|row| row.enabled && row.opens.is_some())
+            });
+            if let Some(index) = index {
+                let serial = open.serial;
+                self.choose(index, now_ms, None);
+                if self
+                    .top
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.serial != serial && open.focused.is_none())
+                {
+                    self.surface_step(false);
+                }
+            }
+        }
     }
 
     /// An authored focus command selects the row in its shell window,

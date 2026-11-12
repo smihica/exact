@@ -49,17 +49,18 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 async function load(storage: Storage) {
   if (loaded) return;
+  // Only a missing file is a first launch. Any other failure (and the build's 'bake') leaves the
+  // module unloaded, so no command saves an empty list over the file.
+  const bytes = await storage.fs.readFile(FILE).catch((e: { code?: string }) => { if (e.code === 'ENOENT') return null; throw e; });
   try {
-    const data = JSON.parse(new TextDecoder().decode(await storage.fs.readFile(FILE)));
-    if (data.version === 1 && Array.isArray(data.conversations)) {
+    const data = bytes && JSON.parse(new TextDecoder().decode(bytes));
+    if (data?.version === 1 && Array.isArray(data.conversations)) {
       conversations = data.conversations;
       serial = Number(data.serial) || 0;
       // An answer that was streaming when the app quit is kept as far as it got.
       for (const c of conversations) { if (c.streaming) { c.streaming = false; c.job = ''; } c.session = ''; }
     }
-  } catch (e) {
-    if ((e as { code?: string }).code === 'bake') throw e;
-  }
+  } catch { /* A damaged file starts with no conversations. */ }
   loaded = true;
 }
 async function persist(storage: Storage) {

@@ -116,10 +116,10 @@ internal class EventStore(private val context: ExtensionContext, private val say
         if (missing.isNotEmpty()) return reply(CalendarModule.error("NotAllowedError", "the manifest declares no ${missing.joinToString(", ")}"))
         if (permissions.all(::has)) return then()
         if (permissions.any { context.permission(it).state == "denied" }) return reply(CalendarModule.error("NotAllowedError"))
-        context.requestPermissions(permissions.toTypedArray()) {
+        context.requestPermissions(permissions.toTypedArray()) { answered ->
             // A refusal with no rationale owed after it is permanent: the history `permission` reads.
             val activity = context.activity
-            for (p in permissions) if (!has(p) && activity != null && !activity.shouldShowRequestPermissionRationale(p)) {
+            for (p in permissions) if (p in answered && !has(p) && activity != null && !activity.shouldShowRequestPermissionRationale(p)) {
                 app.getSharedPreferences("exact.permissions", android.content.Context.MODE_PRIVATE).edit().putBoolean(p, true).apply()
             }
             say("asked ${permissions.joinToString(",") { it.substringAfterLast('.') }}: ${if (permissions.all(::has)) "granted" else "not granted"}")
@@ -172,6 +172,9 @@ internal class EventStore(private val context: ExtensionContext, private val say
 
     private val zone: ZoneId get() = ZoneId.systemDefault()
 
+    /** An all-day occurrence's UTC midnight, read as the local date it names. */
+    private fun localDay(ms: Long) = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli()
+
     private fun page(args: JSONObject, reply: (JSONObject) -> Unit) {
         if (!args.has("start") || !args.has("end") || args.getDouble("end") < args.getDouble("start")) {
             return reply(CalendarModule.error("TypeError", "start and end are instants, end not before start"))
@@ -186,7 +189,8 @@ internal class EventStore(private val context: ExtensionContext, private val say
             answer(reply) {
                 // From the cursor's start: what follows it in the order starts no earlier.
                 val from = maxOf(start, after?.start ?: start)
-                val list = occurrences(from.toLong(), end.toLong(), only).filter { (k, _) ->
+                // Include all-day rows stored at UTC midnights; trim their converted local spans below.
+                val list = occurrences((from - 86_400_000).toLong(), (end + 86_400_000).toLong(), only).filter { (k, _) ->
                     k.start < end && (k.end > start || (k.start == k.end && k.start >= start)) && (after == null || k > after)
                 }.sortedBy { it.first }
                 val shown = list.take(limit)
@@ -199,7 +203,7 @@ internal class EventStore(private val context: ExtensionContext, private val say
 
     private val instanceColumns = arrayOf(Instances.EVENT_ID, Instances.BEGIN, Instances.END, Instances.ALL_DAY, Instances.TITLE, Instances.DESCRIPTION,
         Instances.EVENT_LOCATION, Instances.EVENT_TIMEZONE, Instances.CALENDAR_ID, Instances.STATUS, Instances.AVAILABILITY, Instances.UID_2445,
-        Instances.RRULE, Instances.ORIGINAL_ID, Instances.ORIGINAL_INSTANCE_TIME)
+        Instances.RRULE, Instances.ORIGINAL_ID, Instances.ORIGINAL_INSTANCE_TIME, Instances.ORIGINAL_ALL_DAY, Instances.RDATE)
 
     private fun occurrences(from: Long, to: Long, only: List<Long>?): List<Pair<AgentCalendar.Key, JSONObject>> {
         val uri = Instances.CONTENT_URI.buildUpon().also { ContentUris.appendId(it, from); ContentUris.appendId(it, to) }.build()
@@ -213,15 +217,20 @@ internal class EventStore(private val context: ExtensionContext, private val say
         val allDay = c.getInt(3) == 1
         val named = c.string(7)?.let { try { ZoneId.of(it) } catch (e: java.time.DateTimeException) { null } }
         val shown = if (allDay) zone else named ?: zone
-        // An all-day occurrence's UTC midnights, read as the local dates they name.
         val (s, t) = if (allDay) {
-            val day = { ms: Long -> Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli() }
-            day(c.getLong(1)) to day(c.getLong(2))
+            localDay(c.getLong(1)) to localDay(c.getLong(2))
         } else c.getLong(1) to c.getLong(2)
         val series = c.string(13)?.toLongOrNull()
-        val recurring = c.string(12) != null || series != null
-        val original = if (series != null && !c.isNull(14)) c.getLong(14) else c.getLong(1)
-        val recurrence = if (recurring) AgentCalendar.local(Instant.ofEpochMilli(original).atZone(shown).toLocalDateTime()) else null
+        val recurring = c.string(12) != null || c.string(16) != null || series != null
+        val exception = series != null && !c.isNull(14)
+        val original = if (exception) c.getLong(14) else c.getLong(1)
+        // An exception may change whether the occurrence is all day without changing its original start.
+        val originalAllDay = if (exception) c.getInt(15) == 1 else allDay
+        val recurrence = if (recurring) {
+            val start = if (originalAllDay) localDay(original) else original
+            val recurrenceZone = if (originalAllDay) zone else shown
+            AgentCalendar.local(Instant.ofEpochMilli(start).atZone(recurrenceZone).toLocalDateTime())
+        } else null
         val id = (series ?: c.getLong(0)).toString()
         val event = JSONObject()
             .put("id", id).put("uid", c.string(11) ?: JSONObject.NULL).put("calendarId", c.getLong(8).toString())
@@ -300,10 +309,8 @@ internal class EventStore(private val context: ExtensionContext, private val say
             .put("id", saved.toString()).put("calendarId", calendar.id.toString()).put("uid", event.text("uid") ?: JSONObject.NULL)
             .put("timeZone", written ?: JSONObject.NULL).put("recurrenceId", JSONObject.NULL).put("apple", JSONObject.NULL)
             .put("status", event.text("status") ?: "confirmed").put("freeBusyStatus", event.text("freeBusyStatus") ?: "busy")
-        // An all-day event's local dates, in the device's zone, as a read answers them.
         val (s, t) = if (written == null) {
-            val day = { ms: Long -> Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate().atStartOfDay(zone).toInstant().toEpochMilli() }
-            day(begin) to day(finish)
+            localDay(begin) to localDay(finish)
         } else begin to finish
         for (field in listOf("description", "location", "url")) if (!out.has(field)) out.put(field, JSONObject.NULL)
         return out.put("utcStart", s.toDouble()).put("utcEnd", t.toDouble())

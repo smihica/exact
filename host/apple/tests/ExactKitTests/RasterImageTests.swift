@@ -1,6 +1,8 @@
 import XCTest
 import ImageIO
 import CoreGraphics
+import CoreText
+import ExactCore
 #if os(macOS)
 import AppKit
 #else
@@ -9,6 +11,22 @@ import UIKit
 @testable import ExactKit
 
 final class RasterImageTests: XCTestCase {
+    func testSVGPictureFontsUseTheirNamesWeightAndStyle() {
+        let families: [[[Any]]] = [
+            [[true, "Helvetica"]],
+            [[true, "MissingExactFont"], [false, "monospace"]]
+        ]
+        let fonts = SvgText.imageFonts(families)
+        let bold = fonts(16, 700, 8, false)
+        XCTAssertEqual(CTFontCopyFamilyName(bold) as String, "Helvetica")
+        XCTAssertTrue(CTFontGetSymbolicTraits(bold).contains(.traitBold))
+        XCTAssertTrue(CTFontGetSymbolicTraits(fonts(16, 400, 8, true)).contains(.traitItalic))
+        let expected = TextEngine(assets: { _ in nil }).font(size: 16, weight: 400, family: 6, italic: false) as CTFont
+        XCTAssertEqual(CTFontCopyPostScriptName(fonts(16, 400, 9, false)) as String, CTFontCopyPostScriptName(expected) as String)
+        let system = SvgText.imageFonts([])
+        XCTAssertTrue(CTFontGetSymbolicTraits(system(16, 700, 0, false)).contains(.traitBold))
+    }
+
     private func fixture(_ width: Int, _ height: Int, type: String = "public.png", orientation: Int = 1) throws -> Data {
         let ctx = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
             bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))

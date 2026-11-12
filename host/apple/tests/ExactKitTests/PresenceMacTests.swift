@@ -197,6 +197,74 @@ final class PresenceMacTests: XCTestCase {
         XCTAssertTrue(v.layer!.affineTransform().isIdentity)
     }
 
+    func testRemovingScrollingDuringAResizeRestoresVisibleOverflow() throws {
+        let p = fixture(), card = try XCTUnwrap(p.views[2]), child = try XCTUnwrap(p.views[3])
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = p.viewport
+        window.orderFront(nil)
+        defer { window.orderOut(nil) }
+        p.apply(wireBatch([
+            ["op": "style", "id": 2, "style": ["border_radius": 20,
+                "overflow_x": "auto", "overflow_y": "auto"]],
+            ["op": "frame", "id": 3, "x": 380.0, "y": 0.0, "w": 100.0, "h": 50.0],
+            ["op": "present", "id": 2, "property": "layout", "h": 100.0],
+        ]))
+        window.displayIfNeeded()
+        waitForMainQueue()
+        card.applySurface()
+        let surface = try XCTUnwrap(card.surface), scroll = try XCTUnwrap(card.scroll)
+        XCTAssertTrue(scroll.layer?.mask === surface.clip)
+        p.apply(wireBatch([["op": "style", "id": 2, "style": ["border_radius": 20,
+            "overflow_x": "visible", "overflow_y": "visible"]]]))
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 75.0]]))
+        XCTAssertNotNil(card.surface, "the resize is still active")
+        XCTAssertNil(card.scroll)
+        XCTAssertTrue(child.superview === card)
+        XCTAssertGreaterThan(child.frame.maxX, card.bounds.maxX)
+        XCTAssertNil(scroll.layer?.mask, "the detached scroller releases the mask")
+        XCTAssertNil(surface.clipped, "visible overflow has no clipping target")
+        XCTAssertNil(card.layer?.mask, "the surface must not fall back to masking the host")
+        XCTAssertFalse(card.clipsToBounds)
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 0.0]]))
+        XCTAssertNil(card.surface)
+        XCTAssertNil(card.layer?.mask)
+        XCTAssertFalse(card.clipsToBounds)
+    }
+
+    func testNativeContentClipsInsideAResizingBorder() throws {
+        let p = fixture()
+        for (id, kind, props) in [(10, "textarea", ["value": "Content"]),
+                                  (11, "image", ["imageSource": "symbol:sf/square.fill", "symbolName": "square.fill"])] {
+            p.apply(wireBatch([
+                ["op": "create", "id": id, "kind": kind, "props": props,
+                 "style": ["appearance": "none", "border_width": 6, "border_radius": 40,
+                           "overflow_x": "hidden", "overflow_y": "hidden"]],
+                ["op": "roots", "ids": [1, id]],
+                ["op": "frame", "id": id, "x": 0.0, "y": 0.0, "w": 200.0, "h": 200.0],
+                ["op": "present", "id": id, "property": "layout", "h": -100.0],
+            ]))
+            let node = try XCTUnwrap(p.views[UInt32(id)])
+            let native = try XCTUnwrap(kind == "textarea" ? node.textAreaScroll : node.symbolClip)
+            let surface = try XCTUnwrap(node.surface)
+            XCTAssertTrue(native.superview === node.clipBox, "\(kind) belongs inside the padding-edge clip")
+            XCTAssertTrue(native.superview?.layer?.mask === surface.clip)
+            XCTAssertFalse(try XCTUnwrap(surface.clip.path).contains(CGPoint(x: 7, y: 7)))
+            // Native content created after the clip must enter it too.
+            if kind == "textarea" {
+                node.textAreaScroll?.removeFromSuperview()
+                node.makeTextArea()
+            } else {
+                node.clearSymbol()
+                node.updateSymbol()
+            }
+            let replacement = try XCTUnwrap(kind == "textarea" ? node.textAreaScroll : node.symbolClip)
+            XCTAssertTrue(replacement.superview === node.clipBox)
+            p.apply(wireBatch([["op": "present", "id": id, "property": "layout", "h": 0.0]]))
+            XCTAssertTrue(replacement.superview === node, "native content returns when the surface ends")
+        }
+    }
+
     func testASurfaceTheLayerCannotSayIsDrawnUprightAtTheShownSize() throws {
         let p = fixture()
         let v = try XCTUnwrap(p.views[3])

@@ -459,6 +459,148 @@ fn a_same_clock_signed_zero_change_refuses_the_stale_candidate() {
 }
 
 #[test]
+fn mode_batches_carry_presenter_work_after_inspection() {
+    let plan = contract::compile(
+        r#"shape ID
+  id: string
+shape State
+  title: string
+component App
+  mutation sent as shape ID
+  action start
+    send sent = startActivity("train", State(title="Train"))
+  view
+    text "Train"
+"#,
+    )
+    .unwrap()
+    .encode();
+    let mut bridge = Bridge::new();
+    bridge.link_activities();
+    bridge.boot(&plan, Dot, Hooks::none(), 390., 844.);
+    bridge
+        .host
+        .as_mut()
+        .unwrap()
+        .runner_mut()
+        .act("start", vec![])
+        .unwrap();
+
+    let len = bridge.input_write(b"?");
+    let len = bridge.set_mode(len);
+    assert_eq!(output(&bridge, len), json!({"modes": {}}));
+    let len = bridge.input_write(b"https://example.com/train");
+    let len = bridge.location_of(len);
+    assert_eq!(bridge.output_bytes(len as usize), b"/train");
+
+    let len = bridge.input_write(b"");
+    let len = bridge.set_mode(len);
+    let reply = output(&bridge, len);
+    assert_eq!(reply["modes"], json!({}));
+    assert_eq!(reply["error"], Json::Null);
+    let ops = reply["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "activity");
+    assert_eq!(ops[0]["request"]["command"], "startActivity");
+    assert!(bridge.request_active(ops[0]["ticket"].as_u64().unwrap()));
+}
+
+#[test]
+fn live_batches_flush_presenter_and_executor_work() {
+    struct Work(std::sync::mpsc::Sender<()>);
+    impl DataSource for Work {
+        fn query(&mut self, name: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::UnknownSource(name.into()))
+        }
+        fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
+            Ok(Answer::Later(exact_runner::Request::continuation(1)))
+        }
+        fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
+            let ran = self.0.clone();
+            Some(Box::new(move || {
+                ran.send(()).unwrap();
+                Outcome::Storage(vec![])
+            }))
+        }
+        fn parse(
+            &mut self,
+            _: &mut Store,
+            _: &str,
+            _: &[Value],
+            _: Outcome,
+        ) -> Result<Answer, DataError> {
+            Ok(Answer::Now(Value::record(vec![Value::str("saved")])))
+        }
+    }
+    let plan = contract::compile(
+        r#"shape ID
+  id: string
+shape State
+  title: string
+component App
+  mutation sent as shape ID
+  mutation saved as shape ID
+  action start
+    send sent = startActivity("train", State(title="Train"))
+    send saved = write()
+  view
+    text "Train"
+"#,
+    )
+    .unwrap();
+    let tokens = exact_runner::design::tokens(&plan);
+    let design = exact_runner::design::digest(&tokens);
+    let snapshot = exact_runner::design::snapshot(&exact_runner::design::shape(&plan), &tokens);
+    let mut batch = snapshot.clone();
+    batch.base = Some(design.clone());
+    let mut stale = batch.clone();
+    stale.base = Some("stale".into());
+    let (ran, received) = std::sync::mpsc::channel();
+    let mut bridge = Bridge::new();
+    bridge.link_activities();
+    bridge.boot(&plan.encode(), Work(ran), Hooks::none(), 390., 844.);
+    for (frame, status) in [(batch, "applied"), (snapshot, "applied"), (stale, "stale")] {
+        bridge
+            .host
+            .as_mut()
+            .unwrap()
+            .runner_mut()
+            .act("start", vec![])
+            .unwrap();
+        let len = bridge.input_write(b"{}");
+        let len = bridge.design_rows(len);
+        let invalid: Json = serde_json::from_slice(bridge.output_bytes(len as usize)).unwrap();
+        assert_eq!(invalid["error"], "live: not a tamber batch or snapshot");
+        assert!(received.try_recv().is_err());
+
+        let len = bridge.input_write(frame.json().as_bytes());
+        let len = bridge.design_rows(len);
+        let reply: Json = serde_json::from_slice(bridge.output_bytes(len as usize)).unwrap();
+        assert_eq!(reply["live"], status);
+        assert_eq!(reply["unsupported"], false);
+        assert_eq!(reply["design"], design);
+        let ops = reply["ops"].as_array().unwrap();
+        let activity = ops.iter().find(|op| op["op"] == "activity");
+        let work = received.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            activity.is_some() && work.is_ok(),
+            "{reply}; executor: {work:?}"
+        );
+        let activity = activity.unwrap();
+        assert_eq!(activity["request"]["command"], "startActivity");
+        assert!(bridge.request_active(activity["ticket"].as_u64().unwrap()));
+
+        let len = bridge.pump(0.);
+        let reply: Json = serde_json::from_slice(bridge.output_bytes(len as usize)).unwrap();
+        assert!(reply["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|op| op["op"] != "activity"));
+    }
+}
+
+#[test]
 fn a_clock_only_change_refuses_a_candidate_that_would_rewind_time() {
     let plan = contract::compile("component App\n  state value = 0\n  view\n    text `${value}`\n")
         .unwrap()

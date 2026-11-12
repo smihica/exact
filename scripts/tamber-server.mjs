@@ -42,7 +42,7 @@ import { fileURLToPath } from 'node:url';
 //   - `history` `{limit?, skip?}` (`tamber/1.1`, LLP 1122 D9): the git log of
 //     the design's files, newest first (20, at most 100; at most 10,000
 //     skipped), each commit's
-//     files with their diff and their token-level edits (`what`, `name`,
+//     files with their diff and their declaration edits (`what`, `name`,
 //     `when`, `before`, `after`), scripts/tamber-history.mjs reading git.
 //   - `revert` `{commit, client}`: that commit's inverse, planned on the
 //     files as they are now and held as a proposal (its `review.revert`
@@ -1055,6 +1055,7 @@ export function tamberServer({ appDir, spawnServe = spawnContract, watchDir = wa
       return { ok: { recomputed: true, replaces: id, ...fresh.ok } };
     };
     const recompute = async (ops, kept = ops.map((_, i) => i)) => {
+      if (reverted) return replan(ops.map(revertKey));
       const old = p.shown.review;
       const review = old && {
         ...old,
@@ -1063,15 +1064,11 @@ export function tamberServer({ appDir, spawnServe = spawnContract, watchDir = wa
       };
       let fresh; // A re-import (the server's own mark, never its review's fields) is marked again on the design as it is, and held on that same text, else marked again (stage 10b).
       const remark = async () => { const m = await ask({ method: 'import-plan', marks: ops }); if (!m.ok) return m; delete review.dials; delete review.pins; Object.assign(review, marked(ops, m.ok.dials.map(d => ({ ...d, from: old.dials?.find(o => o.dial === d.dial)?.from ?? [] })), m.ok.pins)); return hold(p.client, ops, m.ok.digest ? { [relative(appDir, designPath(appDir) ?? resolve(appDir, design))]: m.ok.digest } : undefined, id, review, own, 'write', undefined, p.restoring); };
-      // Some of a revert's items: on the files it was planned on, or that
-      // selection planned again.
-      if (reverted) review.revert = { ...review.revert, only: ops.map(revertKey) };
       // Its guards stay its guards: a part, or one planned again on files
       // moved since, checks what the whole was planned on.
       const own = Object.fromEntries(Object.entries(p.guards).filter(([path]) => !(p.inferred ?? []).includes(path)));
       if (!p.reimport && review) { delete review.dials; delete review.pins; } // a client's own marks are not carried past its operations
-      try { if (p.reimport && !reverted) for (let i = 0; i < 3 && (!i || fresh.error?.conflict); i++) fresh = await remark(); else fresh = await hold(p.client, ops, reverted ? { ...p.base, ...p.guards } : undefined, id, review, reverted ? undefined : own, 'write', undefined, p.restoring, p.shown.editedBy); } catch (e) { restore(id, p); throw e; }
-      if (reverted && fresh.error?.conflict) return replan(review.revert.only);
+      try { if (p.reimport) for (let i = 0; i < 3 && (!i || fresh.error?.conflict); i++) fresh = await remark(); else fresh = await hold(p.client, ops, undefined, id, review, own, 'write', undefined, p.restoring, p.shown.editedBy); } catch (e) { restore(id, p); throw e; }
       return replaced(fresh);
     };
     const some = items && new Set(items).size < p.ops.length;
@@ -1140,7 +1137,7 @@ export function tamberServer({ appDir, spawnServe = spawnContract, watchDir = wa
     const ops = [], already = [], conflicts = [], moved = [], code = [], files = {};
     // One file a request, each within the server's line.
     for (const { file, before, after } of c.ok.files) {
-      const planned = await ask({ method: 'revert-plan', pairs: [{ file, before, after }] });
+      const planned = await ask({ method: 'revert-plan', pairs: [{ file, before, after }], only });
       if (planned.status === 413) { conflicts.push({ file, edit: null, now: null, why: 'its versions are too large to compare (over 1 MiB)' }); continue; }
       if (!planned.ok) return planned;
       // Only the edits a person kept, when they kept some.
@@ -1470,7 +1467,7 @@ export async function forward(req, res, url, access, target) {
  * stage 9 D's `set-row`, `add-param` and `remove-param`). */
 const contractOp = o => /^((un)?set-state|set-row|add-param|remove-param)$/.test(o?.op ?? '');
 
-/** What a revert's operation or edit is to: its file, the token, dial or
+/** What a revert's operation or edit is to: its file, the token, param, dial or
  * axis, and the `when` (conditions in any order), so a selection of a
  * revert's items is the same edits when it is planned again. */
 const whenKey = when => JSON.stringify([...(when ?? [])].map(c => `${c.axis}=${c.value}`).sort());
@@ -1479,8 +1476,8 @@ const whenKey = when => JSON.stringify([...(when ?? [])].map(c => `${c.axis}=${c
 const editKey = (file, e) => `${file}\0${e.what}\0${e.name}${e.what === 'state' ? `\0${e.state}\0${e.row}` : e.what === 'row' ? `\0${e.row}` : ''}\0${whenKey(e.when)}`;
 const revertKey = o => /^(un)?set-state$/.test(o.op) ? editKey(o.file, { what: 'state', name: o.style, state: o.state, row: o.row, when: [] })
   : o.op === 'set-row' ? editKey(o.file, { what: 'row', name: o.style, row: o.row, when: [] }) : editKey(o.file, {
-  what: o.op === 'set-dial' ? 'dial' : /axis/.test(o.op) ? 'axis' : 'token',
+  what: o.op === 'set-dial' ? 'dial' : /axis/.test(o.op) ? 'axis' : /^(un)?set-param$/.test(o.op) ? 'param' : 'token',
   name: o.op === 'add-axis' ? o.name : o.axis ?? o.name,
   // An axis's values each their own item, as a token's `when`s are.
-  when: ['set-token', 'unset-token-when'].includes(o.op) ? o.when : /axis-value/.test(o.op) ? [{ axis: o.axis, value: o.value }] : [],
+  when: ['set-token', 'unset-token-when', 'set-param', 'unset-param'].includes(o.op) ? o.when : /axis-value/.test(o.op) ? [{ axis: o.axis, value: o.value }] : [],
 });

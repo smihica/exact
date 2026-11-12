@@ -27,6 +27,59 @@ fn scene(batch: &str) -> serde_json::Value {
 }
 
 #[test]
+fn svg_filter_colors_follow_session_and_view_appearance() {
+    use exact_kernel::svg::filter::{Filter, Op};
+    let app = r##"component App
+  view
+    svg testId="chart" width=100 height=100 color="#000000"
+      filter id="f"
+        feFlood flood-color="light-dark(#00aa00, #ff00ff)"
+      rect width=20 height=10 filter="drop-shadow(8px 8px 0px light-dark(#00aa00, #ff00ff))"
+      rect x=40 width=20 height=10 filter="url(#f)"
+"##;
+    let (mut host, batch) = Host::boot(
+        &contract::compile(app).unwrap().encode(),
+        NoData,
+        Box::new(MonospaceMeasurer::default()),
+        100.0,
+        100.0,
+    )
+    .unwrap();
+    let check = |batch: &str, expected: [f32; 4]| {
+        let s = scene(batch);
+        assert_eq!(s["els"].as_array().unwrap().len(), 2);
+        for item in s["els"].as_array().unwrap() {
+            let encoded: Vec<f32> = item["fl"]["p"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_f64().unwrap() as f32)
+                .collect();
+            let filter = Filter::decode(&encoded).unwrap();
+            let color = match filter.primitives[0].op {
+                Op::DropShadow(.., c) | Op::Flood(c) => c,
+                ref op => panic!("unexpected filter: {op:?}"),
+            };
+            for (actual, expected) in color.into_iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-5, "{color:?}");
+            }
+        }
+    };
+    let light = [0.0, 170.0 / 255.0, 0.0, 1.0];
+    let dark = [1.0, 0.0, 1.0, 1.0];
+    check(&batch, light);
+    check(&host.set_scheme(true), dark);
+    check(&host.set_scheme(false), light);
+    let kernel = host.runner.kernel();
+    let chart = kernel
+        .node_by_key(kernel.find_by_test_id("chart")[0])
+        .unwrap()
+        .id;
+    check(&host.set_view_scheme(chart, true), dark);
+    check(&host.set_view_scheme(chart, false), light);
+}
+
+#[test]
 fn an_svg_is_one_scene_with_lowered_animations() {
     let plan = contract::compile(APP).unwrap().encode();
     let (host, batch) = Host::boot(

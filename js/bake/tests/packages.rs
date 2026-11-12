@@ -333,6 +333,143 @@ fn a_retargeted_install_link_is_another_bake() {
     assert!(swapped["a@1.0.0"] != digests["a@1.0.0"] && swapped["b@1.0.0"] != digests["b@1.0.0"]);
 }
 
+/// Code from a string throws on every host (Hermes compiles none; the web's
+/// module realm refuses it as Hermes does), so a package that uses it is no
+/// longer refused: each producer builds it and warns once per site, naming
+/// the package, its version and the file, a guarded probe and an unguarded
+/// call alike (#128).
+#[test]
+fn package_code_from_a_string_builds_with_a_warning_per_site() {
+    let app = App::new("strings");
+    app.put(
+        "packages.d.ts",
+        "declare module 'lazy' { export const fast: () => boolean; export const made: () => number; export const guarded: () => number; }\n",
+    );
+    app.put(
+        "node_modules/lazy/package.json",
+        r#"{"name":"lazy","version":"2.0.0","main":"index.js"}"#,
+    );
+    app.put(
+        "node_modules/lazy/index.js",
+        concat!(
+            "exports.fast = () => { try { const F = Function; new F(''); return true; } catch { return false; } };\n",
+            "exports.made = () => new Function('return 1')() + (0, eval)('1') + globalThis.eval('1');\n",
+            // A `typeof` test guards nothing here: the stand-in is a function, and the call throws.
+            "exports.guarded = () => { if (typeof globalThis.Function === 'function') return globalThis.Function('return 42')(); if (typeof globalThis.eval === 'function') return globalThis.eval('1'); };\n",
+            // A stand-in's own `constructor` is the throwing stand-in, fixed in place: a probe through it is warned.
+            "exports.ctor = () => { try { return Function.constructor('return 1')() + eval.constructor('return 1')(); } catch { return 0; } };\n",
+            // A parameter named `Function` hides the global in its own function only; `instanceof` builds nothing.
+            "exports.own = function (Function) { return new Function('x') && eval instanceof Function; }; exports.later = () => { try { return new Function('return 1')(); } catch { return 0; } };\n",
+        ),
+    );
+    // A package whose runtime is TypeScript or JSX, with its types apart, is checked as JavaScript is.
+    app.put(
+        "node_modules/typed/package.json",
+        r#"{"name":"typed","version":"1.0.0","main":"index.ts","types":"index.d.ts"}"#,
+    );
+    app.put(
+        "node_modules/typed/index.d.ts",
+        "export declare const compile: (source: string) => unknown;\n",
+    );
+    app.put(
+        "node_modules/typed/index.ts",
+        "import { run } from './run.jsx';\nexport const compile = (source: string): unknown => { try { return new Function(source) && run(); } catch { return null; } };\n",
+    );
+    app.put(
+        "node_modules/typed/run.jsx",
+        "export const run = () => eval('1');\n",
+    );
+    // The app's own TypeScript is checked for code from a string too.
+    // A namespace's body and an enum's members run; a `const` that holds a class is not `Function` because an inner
+    // scope later binds that class's name to `Function`.
+    app.answer(
+        "import { fast, made, guarded } from 'lazy'; import { compile } from 'typed'; namespace N { export const v = () => new Function('')(); } enum E { A = ((f: unknown) => 1)(() => new Function('')) } class Base {} const F = Base; export function proto() { const Base = Function; return [F.prototype, Base, N.v, E.A]; }",
+        "String(fast() ? made() + guarded() : count) + (count < 0 ? new Function('')() : '') + (count < -1 ? compile('') : '')",
+    );
+    let sites = [
+        "lazy@2.0.0/index.js:1:40 warning [code-from-string] uses 'Function'",
+        "lazy@2.0.0/index.js:2:26 warning [code-from-string] uses 'Function'",
+        "lazy@2.0.0/index.js:2:55 warning [code-from-string] uses 'eval'",
+        "lazy@2.0.0/index.js:2:68 warning [code-from-string] uses 'eval'",
+        "lazy@2.0.0/index.js:3:81 warning [code-from-string] uses 'Function'",
+        "lazy@2.0.0/index.js:3:167 warning [code-from-string] uses 'eval'",
+        "lazy@2.0.0/index.js:4:37 warning [code-from-string] uses 'Function'",
+        "lazy@2.0.0/index.js:4:74 warning [code-from-string] uses 'eval'",
+        "lazy@2.0.0/index.js:5:135 warning [code-from-string] uses 'Function'",
+        "typed@1.0.0/index.ts:2:72 warning [code-from-string] uses 'Function'",
+        "typed@1.0.0/run.jsx:1:26 warning [code-from-string] uses 'eval'",
+        "app.ts:5:113 warning [code-from-string] uses 'Function'",
+        "app.ts:2:119 warning [code-from-string] uses 'Function'",
+        "app.ts:2:180 warning [code-from-string] uses 'Function'",
+        "app.ts:2:265 warning [code-from-string] uses 'Function'",
+    ];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let built = std::process::Command::new(std::env::var_os("BUN").unwrap_or_else(|| "bun".into()))
+        .arg(root.join("host/web-js/build.mjs"))
+        .args(["logic", "--out"])
+        .arg(app.0.join("web-out"))
+        .env("EXACT_APP_DIR", &app.0)
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "{said}");
+    for site in sites {
+        assert_eq!(
+            said.matches(&format!("{site}, which builds code from a string"))
+                .count(),
+            1,
+            "{site}: {said}"
+        );
+    }
+    if exact_js::ENGINE_LINKED {
+        let mut producer = exact_js_bake::Producer::new(Tools::default()).unwrap();
+        for warnings in [
+            producer.bake(&app.0, None).unwrap().warnings,
+            bake(&app.0, &Tools::default()).unwrap().warnings,
+        ] {
+            for site in sites {
+                assert_eq!(
+                    warnings.iter().filter(|w| w.starts_with(site)).count(),
+                    1,
+                    "{site}: {warnings:?}"
+                );
+            }
+        }
+    }
+    // Line 5's parameter and `instanceof` are not the global's builder: its one warning is the later call.
+    assert_eq!(said.matches("lazy@2.0.0/index.js:5:").count(), 1, "{said}");
+    // The list is the producer's, in the stage: an app file of its name is refused, not overwritten.
+    app.put("__exact_code_warnings.json", "[\"the app's own\"]");
+    for result in every(&app) {
+        assert!(result
+            .expect_err("reserved")
+            .contains("reserved for the producer"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(app.0.join("__exact_code_warnings.json")).unwrap(),
+        "[\"the app's own\"]"
+    );
+}
+
+/// Hermes's `eval` is no constructor, as the web's stand-ins are not
+/// (host/web/code-from-strings.test.mjs `EVAL_NEW`, the same answers).
+#[test]
+fn eval_is_no_constructor_on_hermes() {
+    if !exact_js::ENGINE_LINKED {
+        return;
+    }
+    let app = App::new("eval-new");
+    app.answer(
+        "const thrown = (f: () => unknown) => { try { f(); return 'ran'; } catch (e) { return (e as Error).name; } };",
+        "[thrown(() => new (eval as any)('1')), thrown(() => Reflect.construct(eval as any, [])), typeof (eval as any).prototype, eval instanceof Function, count].join(' ')",
+    );
+    assert_eq!(
+        message(&app),
+        Value::str("TypeError TypeError undefined true 0")
+    );
+}
+
 /// What no executor has is refused by every producer, naming the package,
 /// its version and the file: a Node built-in, a native addon, a dependency
 /// not installed, the DOM, Node's globals, and a computed `require`. Nothing
@@ -385,26 +522,15 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
             "module.exports = () => globalThis.localStorage.getItem('k');\n",
             "bad@3.1.0 (index.js:2:24) uses the DOM's 'localStorage'",
         ),
-        // The page's other names for itself, and code from a string.
+        // A local named `Function` is the alias check's: here it holds `process`.
+        (
+            "const Function = globalThis.process;\nmodule.exports = () => Function.cwd();\n",
+            "bad@3.1.0 (index.js:3:24) uses Node's 'process'",
+        ),
+        // The page's other names for itself.
         (
             "module.exports = () => globalThis.top.document.cookie;\n",
             "bad@3.1.0 (index.js:2:24) uses the DOM's 'top'",
-        ),
-        (
-            "module.exports = Function('return 1');\n",
-            "bad@3.1.0 (index.js:2:18) loads code from a string ('Function')",
-        ),
-        (
-            "module.exports = new Function('return 1');\n",
-            "bad@3.1.0 (index.js:2:22) loads code from a string ('Function')",
-        ),
-        (
-            "module.exports = Function.prototype.constructor('return 1');\n",
-            "bad@3.1.0 (index.js:2:18) loads code from a string ('Function')",
-        ),
-        (
-            "module.exports = (0, eval)('1');\n",
-            "bad@3.1.0 (index.js:2:22) loads code from a string ('eval')",
         ),
         // Node's `process` read where its absence throws: bare (`?.` does not
         // catch a name that is not there), or a member of an absent value.
@@ -450,8 +576,8 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
     );
     let ran = app.0.join("ran");
     app.answer("import bad from 'bad';", "bad + count");
-    // What reaches the constructor or a global the check cannot follow, one per line: `Function.prototype` held
-    // or destructured; a `const` holding `globalThis.process` (a `for` head's, one whose `globalThis` a later
+    // A global the check cannot follow, one per line (the first two, `Function.prototype` held or destructured, are
+    // warned as every use of `Function` is, not refused): a `const` holding `globalThis.process` (a `for` head's, one whose `globalThis` a later
     // scope shadows, one holding an optional chain from it or from another such `const`) used unguarded; that chain
     // as a parameter's default;
     // a test the check cannot read as `process` being there (a property beside one, `||`, `!`); `Function`
@@ -477,8 +603,6 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
         &format!("{}{}\n", sentinel(&ran), unfollowed.join("\n")),
     );
     let refusals = [
-        "2:15) loads code from a string ('Function')",
-        "3:31) loads code from a string ('Function')",
         "4:48) uses Node's 'process'",
         "5:69) uses Node's 'process'",
         "6:38) uses Node's 'process'",
@@ -487,7 +611,6 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
         "9:94) uses Node's 'process'",
         "10:85) uses Node's 'process'",
         "11:88) uses Node's 'process'",
-        "13:21) loads code from a string ('Function')",
         "14:59) uses the DOM's 'Element'",
     ];
     for result in every(&app) {
@@ -550,6 +673,22 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
         assert!(
             error.contains("src/helper.js:1:30 uses Node's 'Buffer'"),
             "{error}"
+        );
+    }
+    // A TypeScript value of the app's own named `Function`, a namespace, an enum or a parameter property, is not the
+    // global: no refusal, and no warning. (Nothing in a module, strict code, may bind `eval`.)
+    app.answer(
+        "namespace Function { export const prototype = 1; } namespace M { enum Function { prototype = 2 } export const p = Function.prototype; } class C { constructor(private Function: { prototype: number }) {} p() { return this.Function.prototype; } }",
+        "String(Function.prototype + M.p + new C({ prototype: 3 }).p()) + count",
+    );
+    for result in every(&app) {
+        result.expect("TypeScript locals named Function and eval");
+    }
+    if exact_js::ENGINE_LINKED {
+        let warnings = bake(&app.0, &Tools::default()).unwrap().warnings;
+        assert!(
+            !warnings.iter().any(|w| w.contains("code from a string")),
+            "{warnings:?}"
         );
     }
     // A package's identity names a place in the capture: one that would leave it is refused, writing nothing.
@@ -790,4 +929,27 @@ for (const source of ['/abs/other.js', './unrecorded', 'pkg'])
         "{}",
         String::from_utf8_lossy(&checked.stderr)
     );
+}
+
+/// A module that may ask a transaction to check foreign keys needs the
+/// prelude runtime that honours the option (`compat.rs` `TYPESCRIPT_RUNTIME`
+/// 10), as an older one would drop it and run the rebuild enforced. Its
+/// options can be data (here a migration's, parsed from JSON, with no
+/// `foreignKeys` in the bundle), so the `sqlite.open` grant decides.
+#[test]
+fn a_module_that_may_check_foreign_keys_needs_the_runtime_that_honours_it() {
+    if !exact_js::ENGINE_LINKED {
+        return;
+    }
+    for (grants, needs) in [("sqlite.open app:/data/a.db", 10), ("", 0)] {
+        let app = App::new(&format!("foreign-keys-{needs}"));
+        app.put(
+            "app.ts",
+            &format!("import type {{ Sources, Answer }} from './app.contract.d.ts';\nexport const appId = 'test.exact.logic';\nexport const grants = '{grants}';\nconst migration = JSON.parse('{{\"commands\": [], \"options\": {{\"foreign\\\\u004beys\": \"check\"}}}}');\nconst sources: Sources = {{ message: ([count], _store, storage) => storage.sqlite.open('app:/data/a.db').then(db => db.transaction(migration.commands, migration.options)).then(() => String(count), () => String(count)) }};\nexport const answer: Answer = (source, args, store, storage) => sources[source](args, store, storage);\n"),
+        );
+        let baked = bake(&app.0, &Tools::default()).unwrap();
+        assert!(!String::from_utf8_lossy(&baked.bytecode).contains("foreignKeys"));
+        let receipt: Json = serde_json::from_str(&baked.receipt).unwrap();
+        assert_eq!(receipt["typescriptRuntime"], needs, "{grants}");
+    }
 }

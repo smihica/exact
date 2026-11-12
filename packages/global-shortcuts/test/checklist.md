@@ -7,3 +7,9 @@ tests are `contract/cli/tests/it/desktop.rs`.
 
 A press needs a key pressed at the keyboard, which the agent does not make:
 the substitute's `tap @ref` is the drive's press.
+
+`bun test packages/global-shortcuts/test/pairs.test.mjs` checks pair delivery
+with synthetic macOS modifier events, including missed presses and releases.
+For the keyboard check, mount a reader of `Meta+Meta` while left Command is
+held, release it, and press right Command alone: no shortcut. Then hold both:
+one shortcut; releasing either raises none.

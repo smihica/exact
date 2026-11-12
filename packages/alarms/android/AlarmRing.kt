@@ -69,6 +69,7 @@ internal object AlarmRing {
     /** Sets `r` (a new one, or one that replaces the tag's), anchored now. */
     fun set(c: Context, r: AlarmRecord) {
         AlarmRecords.get(c, r.tag)?.let { end(c, it) }
+        // Ring teardown is queued: its notification must not share the replacement's code.
         r.code = AlarmRecords.nextCode(c)
         arm(c, r)
     }
@@ -132,10 +133,9 @@ internal object AlarmRing {
     fun snooze(c: Context, tag: String) {
         val r = AlarmRecords.get(c, tag) ?: return
         val snooze = r.snooze ?: return stop(c, tag)
-        end(c, r)
         r.at = System.currentTimeMillis() + snooze
         r.state = "countdown"
-        arm(c, r)
+        set(c, r)
     }
 
     /** Revocation, or a denial: every alarm the system holds ends; a paused countdown holds none and stays (D7). */

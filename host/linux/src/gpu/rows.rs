@@ -1,7 +1,6 @@
 //! The control arm retains Vello scene fragments. @ref LLP 1149 D4, D15.
 use super::*;
 use std::{collections::HashMap, rc::Rc};
-use vello::kurbo::Shape as _;
 
 pub(super) enum Op {
     Scene(vello::Scene),
@@ -206,8 +205,8 @@ impl Gpu {
             self.height as f64 * scale,
         );
         for layer in &self.layers {
-            if let backdrop::Layer::Clip(_, ts, path) | backdrop::Layer::Group(ts, path) = layer {
-                bounds = bounds.intersect(ts.transform_rect_bbox(path.bounding_box()));
+            if let Some(clip) = layer.bounds() {
+                bounds = bounds.intersect(clip);
             }
         }
         let row = Rect::new(
@@ -250,6 +249,9 @@ impl Gpu {
                 Op::Push(layer) => self.push_recorded(match layer {
                     backdrop::Layer::Clip(rule, t, p) => {
                         backdrop::Layer::Clip(*rule, offset * *t, p.clone())
+                    }
+                    backdrop::Layer::Union(t, paths, bounds) => {
+                        backdrop::Layer::Union(offset * *t, paths.clone(), *bounds)
                     }
                     backdrop::Layer::Group(t, p) => backdrop::Layer::Group(offset * *t, p.clone()),
                     backdrop::Layer::Opacity(alpha) => backdrop::Layer::Opacity(*alpha),

@@ -424,7 +424,10 @@ final class TextRasterizer {
 }
 
 extension NodeView {
-    var canRasterText: Bool {
+    var canRasterText: Bool { rastersText && !rollsNumerals }
+    /// What a paragraph's raster needs of its structure, whether or not its
+    /// numerals roll instead.
+    private var rastersText: Bool {
         if textRasterFailed && textRasterKey != nil { return false }
         // `text-overflow: ellipsis` truncates in the raster job, as `draw(_:)`
         // does (LLP 1053 G5): a label stretched across a row rasters its text,
@@ -432,14 +435,62 @@ extension NodeView {
         // is made again from the range it broke at (`LineGeometry.clamped`).
         guard isParagraph && flowShapes.isEmpty && columnRecord == nil && !Capture.capturing && window != nil && backgroundClip != "text"
             && bounds.width > 0 && bounds.height > 0 else { return false }
-        return canvasAbove == nil && !paintsVisibleInlineRun && !rollsNumerals
+        return canvasAbove == nil && !paintsVisibleInlineRun
     }
+    /// A rolling paragraph is drawn again when it changes: its new text
+    /// may move it between the capability and the raster (`Presenter.touched`).
+    var hasContentTransition: Bool { (style["content_transition"]?.string ?? "none") != "none" }
     /// LLP 1077 D15: the paragraph's numerals roll per glyph, drawn by the
-    /// Numerals capability rather than as a raster (`NumeralLink`). Not in a
-    /// capture, which draws the paragraph as a picture.
+    /// Numerals capability (SwiftUI's `Text`) rather than as a raster
+    /// (`NumeralLink`), when that draws what Exact's painter would:
+    /// - its structure is one a raster could hold (`rastersText`);
+    /// - its layout is one whole line of text, uncut by `text-overflow` or
+    ///   `line-clamp`, with no image in it (LLP 1011.002) and no white space
+    ///   it keeps (`white-space: pre`, `pre-wrap`, or at its end), which
+    ///   `Text` places otherwise, and what is painted, the glyphs and the
+    ///   runs' backgrounds on the painted baseline, lies within the box;
+    /// - its paint is what `Text` draws from an attributed string (font,
+    ///   colour, kerning, underline, line-through) and the backgrounds
+    ///   `showNumerals` paints: no shadow, no stroke, nothing hidden.
+    /// Any other paragraph is drawn as any other; where it rasters, the
+    /// raster rolls whole.
     var rollsNumerals: Bool {
-        NumeralLink.installed != nil && !Capture.capturing
-            && (style["content_transition"]?.string ?? "none") != "none"
+        guard NumeralLink.installed != nil, hasContentTransition, rastersText, !cssVisibilityHidden else { return false }
+        let spec = paragraphSpec()
+        guard spec.shadow == nil, !spec.runs.contains(where: { $0.box != nil || $0.hidden || $0.stroke != nil || $0.shadow != nil }),
+              let p = paragraphLayout(), p.lines.count <= 1 else { return false }
+        guard let first = p.lines.first else { return true }
+        let box = paragraphBox()
+        let line = spec.ellipsis ? p.ellipsized(0, spec: spec, width: box.width) : first
+        guard line === first, p.clampedRange == nil, !spec.preserves, CTLineGetTrailingWhitespaceWidth(first) == 0 else { return false }
+        // The line's ink, where `TextEngine.draw` puts it: the raster keeps
+        // ink past the box, this view's own drawing does not.
+        let scale = max(1, window?.screen.scale ?? traitCollection.displayScale)
+        let x = box.minX + p.origin(0, align: spec.align, width: box.width)
+        let baseline = TextEngine.paintedLine(p.baselines[0], top: box.minY, scale: scale, lineScale: p.lineScale)
+        let glyphs = CTLineGetBoundsWithOptions(first, .useGlyphPathBounds)
+        var ink = glyphs.isEmpty ? CGRect.null : CGRect(x: x + glyphs.minX, y: baseline - glyphs.maxY, width: glyphs.width, height: glyphs.height)
+        for fill in TextLinePaint.backgrounds(first, at: CGPoint(x: x, y: baseline)) { ink = ink.union(fill.rect) }
+        return ink.isNull || bounds.contains(ink)
+    }
+    /// The paragraph as the Numerals capability draws it: its line at the
+    /// line's place and baseline. SwiftUI's
+    /// `Text` reads no inline box's background, so those are painted here,
+    /// under it, for the text as it now reads; they do not roll.
+    func showNumerals(_ ctx: CGContext) {
+        guard let engine = text, let capability = NumeralLink.installed else { return }
+        dropTextRaster()
+        let spec = paragraphSpec(), box = paragraphBox(), mode = style["content_transition"]?.string ?? "numeric"
+        let shown = engine.attributed(spec)
+        guard let p = paragraphLayout(), let line = p.lines.first else {
+            return capability.show(self, attributed: shown, box: contentBox(), baseline: nil, align: spec.align, mode: mode)
+        }
+        TextEngine.draw(p, spec: spec, in: box, context: ctx, pass: .backgrounds)
+        let baseline = TextEngine.paintedLine(p.baselines[0], top: box.minY, scale: TextEngine.deviceScale(ctx), lineScale: p.lineScale)
+        let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        let lineBox = CGRect(x: box.minX + p.origin(0, align: spec.align, width: box.width), y: box.minY,
+                             width: max(1, width), height: max(1, p.height, baseline - box.minY))
+        capability.show(self, attributed: shown, box: lineBox, baseline: baseline - box.minY, align: spec.align, mode: mode)
     }
     /// The whole paragraph's pixels are up for its current text and box: a
     /// refresh has nothing to do for it until a change clears its key

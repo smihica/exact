@@ -160,8 +160,9 @@ fn viewport_shape(shape: &TypeExpr, file: &File, at: Span) -> Result<(), Vec<Com
     let fail = |m: String| vec![refusal("snapshot-viewport", m, at)];
     let TypeExpr::Named(name, _) = shape else {
         return Err(fail(format!(
-            "`{}` takes a shape of the viewport's fields (`width`, `height`, …), not `{shape:?}`",
-            super::VIEWPORT_SLOT
+            "`{}` takes a shape of the viewport's fields (`width`, `height`, …), not `{}`",
+            super::VIEWPORT_SLOT,
+            crate::modules::written(shape)
         )));
     };
     let Some(declared) = file.shapes.iter().find(|s| &s.name == name) else {
@@ -433,6 +434,8 @@ pub(super) fn compile_file(
             shape,
             placeholder: None,
             each: None,
+            transient: false,
+            gate: None,
             span: at,
         });
         wrapper.provides.push(Binding {
@@ -495,7 +498,12 @@ fn preview(v: &Value, ty: &TypeExpr, file: &File, depth: usize) -> Result<Expr, 
         return Err("props nest more than 64 levels".into());
     }
     let span = ty.span();
-    let bad = || format!("{v} does not match {ty:?}; supply preview props of the declared shape");
+    let bad = || {
+        format!(
+            "{v} does not match {}; supply preview props of the declared shape",
+            crate::modules::written(ty)
+        )
+    };
     Ok(match ty {
         TypeExpr::Named(name, _) => match name.as_str() {
             "number" => Expr::Number(v.as_f64().ok_or_else(bad)?, span),
@@ -507,10 +515,7 @@ fn preview(v: &Value, ty: &TypeExpr, file: &File, depth: usize) -> Result<Expr, 
                     .iter()
                     .find(|s| s.name == *name)
                     .ok_or_else(bad)?;
-                let object = v
-                    .as_object()
-                    .filter(|o| o.len() == shape.fields.len())
-                    .ok_or_else(bad)?;
+                let object = v.as_object().ok_or_else(bad)?;
                 let args = shape
                     .fields
                     .iter()
@@ -520,11 +525,17 @@ fn preview(v: &Value, ty: &TypeExpr, file: &File, depth: usize) -> Result<Expr, 
                             .ok_or_else(|| format!("missing `{}`; add it to preview", f.name))?;
                         Ok(Expr::NamedArg(
                             f.name.clone(),
-                            Box::new(preview(value, &f.ty, file, depth + 1)?),
+                            Box::new(
+                                preview(value, &f.ty, file, depth + 1)
+                                    .map_err(|message| format!("`{}`: {message}", f.name))?,
+                            ),
                             span,
                         ))
                     })
                     .collect::<Result<Vec<_>, String>>()?;
+                if object.len() != shape.fields.len() {
+                    return Err(bad());
+                }
                 Expr::Call(name.clone(), args, span)
             }
         },

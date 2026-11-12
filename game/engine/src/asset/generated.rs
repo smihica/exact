@@ -141,6 +141,8 @@ impl World {
             .iter()
             .all(|t| self.assets.states.get(t) == Some(&AssetState::Loaded));
         self.assets.identify(name, digest);
+        // A retired cosmetic name taken by generated geometry is no longer cosmetic.
+        self.assets.cosmetic.remove(name);
         self.assets.declared.insert(name.into());
         let model_textures = model.textures.clone();
         self.assets.models.insert(name.into(), model.into());
@@ -152,5 +154,129 @@ impl World {
         };
         self.assets.states.insert(name.into(), state);
         Ok(Mesh::asset(name))
+    }
+}
+impl World {
+    /// `Present::cosmetic_model`: presentation residency, never an identity,
+    /// a declaration or a requirement, so nothing here reaches the simulation.
+    pub(crate) fn cosmetic_model(
+        &mut self,
+        name: &str,
+        build: impl FnOnce() -> Model,
+    ) -> Result<(), String> {
+        let assets = &self.assets;
+        if assets.cosmetic.contains(name)
+            && assets.models.contains_key(name)
+            && !assets.identities.contains_key(name)
+        {
+            return Ok(());
+        }
+        if !super::asset_name(name) || !name.ends_with(".model") {
+            return Err(format!("cosmetic `{name}`: expected a .model asset name"));
+        }
+        if assets.declared.contains(name)
+            || assets.identities.contains_key(name)
+            || (assets.models.contains_key(name) && !assets.cosmetic.contains(name))
+        {
+            return Err(format!(
+                "cosmetic `{name}`: the name is a declared, generated or delivered model"
+            ));
+        }
+        let model = build();
+        model
+            .validate()
+            .map_err(|e| format!("cosmetic `{name}`: {e}"))?;
+        let assets = &mut *self.assets;
+        if !assets.cosmetic.contains(name) {
+            assets.cosmetic.insert(name.into());
+        }
+        for texture in &model.textures {
+            assets.request(texture);
+        }
+        // A texture that already failed is not delivered again: the model fails now.
+        let failed = model
+            .textures
+            .iter()
+            .find_map(|t| match assets.states.get(t) {
+                Some(AssetState::Failed(e)) => Some(e.clone()),
+                _ => None,
+            });
+        let ready = model
+            .textures
+            .iter()
+            .all(|t| assets.states.get(t) == Some(&AssetState::Loaded));
+        assets.set_dependencies(name, model.textures.clone());
+        assets.models.insert(name.into(), model.into());
+        assets.states.insert(
+            name.into(),
+            match failed {
+                Some(reason) => AssetState::Failed(reason),
+                None if ready => AssetState::Loaded,
+                None => AssetState::Pending,
+            },
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn textured(texture: &str) -> Model {
+        let mesh = MeshData {
+            positions: vec![0., 0., 0., 0., 0., 1., 1., 0., 0.],
+            normals: [0., 1., 0.].repeat(3),
+            uvs: vec![0.; 6],
+            indices: vec![0, 1, 2],
+            bounds: [0., 0., 0., 1., 0., 1.],
+            ..Default::default()
+        };
+        Model {
+            bounds: mesh.bounds,
+            meshes: vec![mesh],
+            materials: vec![MaterialData {
+                base_color_texture: Some(0),
+                ..Default::default()
+            }],
+            textures: vec![texture.into()],
+            nodes: vec![Node {
+                mesh: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    // A texture that already failed is not delivered again: a cosmetic model
+    // registered over it fails at once instead of waiting forever.
+    #[test]
+    fn a_cosmetic_model_over_a_failed_texture_fails_at_once() {
+        let mut w = World::new(60, 0);
+        w.assets
+            .states
+            .insert("gone.tex".into(), AssetState::Failed("gone".into()));
+        w.cosmetic_model("late.model", || textured("gone.tex"))
+            .unwrap();
+        assert_eq!(
+            w.assets.states.get("late.model"),
+            Some(&AssetState::Failed("gone".into()))
+        );
+    }
+
+    // A retired cosmetic name later registered as generated geometry is the
+    // generated model's: a cosmetic registration is refused without building.
+    #[test]
+    fn a_retired_cosmetic_name_taken_by_generated_geometry_is_refused() {
+        let mut w = World::new(60, 0);
+        w.cosmetic_model("skin.model", || textured("a.tex"))
+            .unwrap();
+        w.assets.retire(&Default::default());
+        assert!(w.assets.models.get("skin.model").is_none());
+        w.generated_model("skin.model", textured("b.tex")).unwrap();
+        let error = w
+            .cosmetic_model("skin.model", || unreachable!("never built"))
+            .unwrap_err();
+        assert!(error.contains("generated"), "{error}");
+        assert!(!w.assets.cosmetic.contains("skin.model"));
     }
 }

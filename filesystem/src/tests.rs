@@ -38,6 +38,63 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn static_trees_omit_finder_metadata_and_keep_other_dotfiles() {
+    let fixture = Fixture::new();
+    let root = fixture.dir("assets");
+    fixture.dir("assets/icons");
+    fixture.dir("assets/.well-known");
+    for name in [
+        ".DS_Store",
+        "icons/.DS_Store",
+        ".well-known/.DS_Store",
+        ".config",
+        ".well-known/data.json",
+        "icons/a.png",
+        "mark.png",
+        "mark.DS_Store",
+    ] {
+        fs::write(fixture.path(&format!("assets/{name}")), name).unwrap();
+    }
+    let names = [
+        ".config",
+        ".well-known/data.json",
+        "icons/a.png",
+        "mark.DS_Store",
+        "mark.png",
+    ];
+    for op in ["names", "tree"] {
+        let entries = operate(&root, &json!({"op":op}), None).unwrap();
+        assert_eq!(
+            entries.as_object().unwrap().keys().collect::<Vec<_>>(),
+            names,
+            "{op}"
+        );
+        for name in names {
+            let expected = if op == "tree" {
+                json!(STANDARD.encode(name))
+            } else {
+                Value::Null
+            };
+            assert_eq!(entries[name], expected);
+        }
+    }
+    assert!(root.names().unwrap().contains(&".DS_Store".to_owned()));
+    let copy = fixture.path("copy");
+    operate(
+        &root,
+        &json!({"op":"copy", "target":copy, "token":TOKEN}),
+        None,
+    )
+    .unwrap();
+    for name in names {
+        assert_eq!(fs::read(copy.join(name)).unwrap(), name.as_bytes());
+    }
+    for name in [".DS_Store", "icons/.DS_Store", ".well-known/.DS_Store"] {
+        assert!(!copy.join(name).exists(), "{name} was copied");
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn a_static_inventory_refuses_a_fifo() {
     let fixture = Fixture::new();

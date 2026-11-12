@@ -11,6 +11,20 @@ import { popoverCommand, appRootFontSize, liveById, declaredScheme, setFieldSele
 // A development page may hold a fact over the app's own (LLP 1122 T7, theme2's F2 ruling: a copy the design tool pins):
 // the app's choice kept as asked, with how to apply it, and applied only when the fact is not held.
 const asked = (fact, value, apply) => { const x = globalThis.exact; if (!x) return apply(); (x.asked ??= {})[fact] = { value, apply }; if (!x.held?.[fact]) apply(); else x.onAsked?.(); };
+// Bare focus is the window's; under the agent it is journaled (LLP 1133.005 D10).
+export const focus = (say, agentMode) => id => id == null
+  ? (agentMode() ? say("focus window") : window.focus()) : liveById(id)?.focus();
+export const blur = () => id => {
+  const a = document.activeElement;
+  if (a && a !== document.body && (id == null || a.id === id)) a.blur();
+};
+export const setScheme = () => s => asked("scheme", s, () => {
+  document.documentElement.style.colorScheme = s === "system" ? "" : s;
+});
+// Never the person's clipboard under the agent (LLP 1133.006 §7).
+export const copyText = (_say, agentMode) => t => { if (!agentMode()) navigator.clipboard?.writeText(t); };
+// LLP 1077 D14: vibration where the browser has it.
+export const haptic = () => k => navigator.vibrate?.(k === "selection" ? 5 : 12);
 // The field's own method, by its id (x2apps codeedit #2); commands run
 // once the commit's tree is in place, so a value set beside it is there.
 export const removeAllRanges = () => () => getSelection()?.removeAllRanges();

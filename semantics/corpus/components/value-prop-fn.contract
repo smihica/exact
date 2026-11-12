@@ -1,0 +1,58 @@
+fn pick(n: number): number = n + 1
+component App
+  state lo = 0
+  state hi = 10
+  state v = 5
+  state other = 7
+  action change()
+    v = 9
+  view
+    column
+      Child(min=lo, max=hi, value=v, pick=other)
+      button "Change" press=change testId="change"
+component Child
+  props
+    min: number
+    max: number
+    value: number
+    pick: number
+  state initial = max(min, min(max, value))
+  state shown = 0
+  derive bounded = pick(max(min, min(max, value)))
+  action up()
+    shown = min(max, value + 1) + pick(pick)
+  action relay()
+    up()
+  provide
+    bound = bounded
+  view
+    column
+      Frame()
+        text `${min(4, 9)} ${min} ${max} ${pick}` testId="fill"
+      text `${initial} ${bounded} ${shown}` testId="values"
+      Label(value=bounded)
+      button "Up" press=up testId="up"
+      button "Relay" press=relay testId="relay"
+component Frame
+  slot
+  view
+    children
+component Label
+  props
+    value: number
+  inject
+    bound: number
+  view
+    text `${value} ${bound}` testId="passed"
+
+test "value props leave function calls intact"
+  expect text "fill" == "4 0 10 7"
+  expect text "values" == "5 6 0"
+  expect text "passed" == "6 6"
+  tap "up"
+  expect text "values" == "5 6 14"
+  tap "change"
+  expect text "values" == "5 10 14"
+  expect text "passed" == "10 10"
+  tap "relay"
+  expect text "values" == "5 10 18"

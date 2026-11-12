@@ -899,7 +899,7 @@ fn production_trust_requires_keys_and_has_a_distinct_cohort() {
 /// so one that uses nothing newer goes to a binary whose prelude is older.
 #[test]
 fn a_bundle_needs_the_runtime_of_the_newest_option_it_names() {
-    use super::typescript_runtime_of as needs;
+    let needs = |bundle: &[u8]| super::typescript_runtime_of(bundle, "");
     assert_eq!(needs(b"export const answer = () => 'idle';"), 0);
     assert_eq!(needs(b"fetch(u, {exactBodyFrom: p})"), 1);
     assert_eq!(needs(b"fetch(u, {exactBodyTo: p, exactBodyFrom: q})"), 4);
@@ -914,19 +914,53 @@ fn a_bundle_needs_the_runtime_of_the_newest_option_it_names() {
         6
     );
     assert_eq!(needs(b"(await fs.lstat(p)).isSymbolicLink"), 6);
-    assert_eq!(needs(b"return new Response(body, {status: 201})"), 7);
-    assert_eq!(needs(b"return new globalThis.Response(body)"), 7);
-    assert_eq!(needs(b"return Response.redirect(u, 303)"), 7);
+    assert_eq!(needs(b"return new Response(body, {status: 201})"), 8);
+    assert_eq!(needs(b"return new globalThis.Response(body)"), 8);
+    assert_eq!(needs(b"return Response.redirect(u, 303)"), 8);
     assert_eq!(needs(b"const copy = (await fetch(u)).clone()"), 7);
     assert_eq!(needs(b"const copy = r.clone.call(r)"), 7);
     assert_eq!(needs(b"const {clone: copy} = r; return copy.call(r)"), 7);
     assert_eq!(needs(b"return (await fetch(u)).statusText"), 7);
     assert_eq!(needs(b"if (r.bodyUsed) return"), 7);
     assert_eq!(needs(b"const c = structuredClone(v)"), 0);
+    assert_eq!(needs(b"return Response.json({a: 1})"), 8);
+    // LLP 1016.000 D11's idle timeout.
     assert_eq!(
-        needs(b"return Response.json({a: 1})"),
+        needs(b"fetch(u, {exactStream: m, exactIdleTimeout: 6e4})"),
+        9
+    );
+    // A transaction's options are data: what decides 10 is the grant.
+    assert_eq!(needs(b"await db.transaction(m.commands, m.options)"), 0);
+    let with = |grants: &str| {
+        super::typescript_runtime_of(b"await db.transaction(m.commands, m.options)", grants)
+    };
+    assert_eq!(
+        with("sqlite.open app:/data/a.db"),
         super::TYPESCRIPT_RUNTIME
     );
+    assert_eq!(
+        with("fs.read app:/data\n  sqlite.open app:/data"),
+        super::TYPESCRIPT_RUNTIME
+    );
+    assert_eq!(with("# sqlite.open app:/data/a.db\nfs.read app:/data"), 0);
+    assert_eq!(with("fs.write app:/data/sqlite.open"), 0);
+}
+
+#[test]
+fn stream_bodies_require_a_runtime_that_reads_or_refuses_them() {
+    for bundle in [
+        "new Response(stream).arrayBuffer()",
+        "fetch(url, {method: 'POST', body: new ReadableStream(source)})",
+        "fetch(url, {method: 'POST', body: new CompressionStream('gzip').readable})",
+        "fetch(url, {method: 'POST', body: new DecompressionStream('gzip').readable})",
+        "fetch(url, {method: 'POST', body: new TransformStream().readable})",
+    ] {
+        assert_eq!(
+            super::typescript_runtime_of(bundle.as_bytes(), ""),
+            8,
+            "{bundle}"
+        );
+    }
 }
 
 /// A module client with a store pins its compiled module into the id:
@@ -984,4 +1018,111 @@ fn a_store_pins_the_compiled_module_and_its_hash_is_required_without_one_too() {
     manifest.json["deploy"] = serde_json::json!({"store": {"ios": "0"}});
     assert_eq!(stored_module(&meta, &manifest, "ios"), Ok(None));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Writes a crate named `name` at `dir` whose manifest ends with `deps`.
+fn krate(dir: &Path, name: &str, deps: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub const A: u8 = 1;\n").unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{deps}"),
+    )
+    .unwrap();
+}
+
+/// The binary links the path crates its data crate depends on: an edit to
+/// one moves the id, as an edit to `data/` does; a dev-dependency's does not.
+#[test]
+fn the_data_crates_path_dependencies_are_identity() {
+    let dir = app("path-deps");
+    let inputs = || {
+        let m = Manifest::read(&dir).unwrap();
+        compatibility_with_trust(
+            &dir,
+            "ios",
+            "aarch64-apple-ios",
+            &m,
+            Some(""),
+            "development",
+        )
+        .unwrap()
+        .inputs
+    };
+    assert!(inputs()["dataCrate"].get("crates").is_none());
+    let workspace = "[workspace]\nmembers = [\"data\"]\nresolver = \"2\"\n";
+    std::fs::write(dir.join("Cargo.toml"), workspace).unwrap();
+    krate(
+        &dir.join("data"),
+        "app-data",
+        "[dependencies]\nparse = { path = \"../parse\" }\n\
+         [dev-dependencies]\ntool = { path = \"../tool\" }\n",
+    );
+    let leaf = "[build-dependencies]\nleaf = { path = \"../leaf\" }\n";
+    krate(&dir.join("parse"), "parse", leaf);
+    krate(&dir.join("leaf"), "leaf", "");
+    krate(&dir.join("tool"), "tool", "");
+    let crates = inputs()["dataCrate"]["crates"].clone();
+    let names: Vec<&String> = crates.as_object().unwrap().keys().collect();
+    assert_eq!(
+        names,
+        ["leaf", "parse"],
+        "the closure, less dev-dependencies"
+    );
+    let first = id(&dir, "ios");
+    std::fs::write(dir.join("tool/src/lib.rs"), "pub const A: u8 = 2;\n").unwrap();
+    assert_eq!(first, id(&dir, "ios"), "a dev-dependency is not linked");
+    std::fs::write(dir.join("parse/src/lib.rs"), "pub const A: u8 = 2;\n").unwrap();
+    let parse = id(&dir, "ios");
+    assert_ne!(first, parse, "a path dependency's edit moves it");
+    std::fs::write(dir.join("leaf/src/lib.rs"), "pub const A: u8 = 2;\n").unwrap();
+    assert_ne!(parse, id(&dir, "ios"), "so does a transitive one's");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A path crate outside the app's workspace is no member of it, so the
+/// closure is read from Cargo's full graph.
+#[test]
+fn a_path_dependency_outside_the_workspace_is_identity() {
+    let root = app("outside-deps");
+    let dir = root.join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::rename(root.join("app.json"), dir.join("app.json")).unwrap();
+    std::fs::remove_dir_all(root.join("data")).unwrap();
+    let workspace = "[workspace]\nmembers = [\"data\"]\nresolver = \"2\"\n";
+    std::fs::write(dir.join("Cargo.toml"), workspace).unwrap();
+    let shared = "[dependencies]\nshared = { path = \"../../shared\" }\n";
+    krate(&dir.join("data"), "app-data", shared);
+    krate(&root.join("shared"), "shared", "");
+    let first = id(&dir, "ios");
+    assert_eq!(first, id(&dir, "ios"), "stable across computations");
+    std::fs::write(root.join("shared/src/lib.rs"), "pub const A: u8 = 2;\n").unwrap();
+    assert_ne!(first, id(&dir, "ios"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// exact2's own crates stay out of the closure, since the id's other inputs
+/// name them; another app's crates are this app's code.
+#[test]
+fn the_closure_leaves_out_exact2s_own_crates() {
+    let apps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps");
+    let names = |app: &str| -> Vec<String> {
+        super::path_crates(&apps.join(app).join("data"))
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(names("markdown"), ["markdown-parse"]);
+    assert_eq!(
+        names("exact-live"),
+        [
+            "completion-storm-data",
+            "interaction-gallery-data",
+            "markdown-parse",
+            "markdown-stress-data",
+            "messages-stress-data"
+        ]
+    );
+    assert!(names("caltrain").is_empty());
 }

@@ -1,0 +1,41 @@
+// The conformance fixture of @exact/push (LLP 1133.004 §9): the token as a
+// live value, the one call that asks, and the route a push's tap opens.
+use subscribePush, pushSubscription, pushPermissionState, PushSubscription, PushPermissionStatus from "@exact/push"
+
+routes nav
+  home "/"
+  notfound
+
+component App
+  state got = "none"
+  resource subscription = pushSubscription() as shape option<PushSubscription>
+  resource permission = pushPermissionState() as shape PushPermissionStatus
+  mutation subscribed as shape PushSubscription
+  action back
+    nav = back(nav)
+  action follow(location: string)
+    got = location
+  action subscribe
+    send subscribed = subscribePush()
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow
+      column padding=120 gap=12
+        text testId="route" `${top(nav).name} ${top(nav).url}`
+        text testId="got" got
+        text testId="permission" permission.state
+        match subscription
+          case some(s)
+            match s.apple
+              case some(a)
+                text testId="token" a.deviceToken
+              case none
+                text testId="token" "none"
+          case none
+            text testId="token" "none"
+        match subscribed
+          case some(s)
+            text testId="subscribed" "answered"
+          case none
+            text testId="subscribed" "not yet"
+        button testId="subscribe" press=subscribe
+          text "Turn on push"

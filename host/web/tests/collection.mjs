@@ -11,14 +11,18 @@ import { resolve } from 'node:path';
 import { Cdp } from '../../../scripts/agent.mjs';
 import { webContentType } from '../serve.mjs';
 import { chromium } from '../../../scripts/agent-launch.mjs';
+import { buildHostGlue, webHostFiles } from '../../web-js/glue.mjs';
 const dir = process.env.EXACT_COLLECTION_TEST, dist = resolve(dir, 'dist');
 const gallery = process.env.EXACT_COLLECTION_GALLERY === '1';
-const javascript = resolve(process.env.EXACT_COLLECTION_JS ?? 'host/web');
+const javascript = process.env.EXACT_COLLECTION_JS ? resolve(process.env.EXACT_COLLECTION_JS) : null;
+if (!javascript) await buildHostGlue(resolve(import.meta.dir, '../../..'));
 assert(process.env.EXACT_COLLECTION_DIST, 'set EXACT_COLLECTION_DIST to a built pure Rust web dist');
 cpSync(process.env.EXACT_COLLECTION_DIST, dist, { recursive: true });
 // A frozen baseline from before the after-paint pieces has none to copy.
-const pieces = ['glue.js', 'navigation.js', ...['collection-glue.js', 'motion-glue.js'].filter(name => existsSync(resolve(javascript, name)))];
-for (const name of pieces) cpSync(resolve(javascript,name), dist + '/' + name);
+const sources = webHostFiles('base');
+const source = name => javascript ? resolve(javascript, name) : resolve(import.meta.dir, '../../..', sources[name]);
+const pieces = ['glue.js', 'navigation.js', ...['collection-glue.js', 'motion-glue.js'].filter(name => existsSync(source(name)))];
+for (const name of pieces) cpSync(source(name), dist + '/' + name);
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 writeFileSync(dir + '/identity.json', JSON.stringify({carrier: resolve(process.env.EXACT_COLLECTION_DIST), javascript,
   files: Object.fromEntries(['app.wasm','app.plan',...pieces].map(name => [name, {carrier: existsSync(resolve(process.env.EXACT_COLLECTION_DIST,name)) ? hash(resolve(process.env.EXACT_COLLECTION_DIST,name)) : null, tested: hash(dist+'/'+name)}]))}, null, 2));

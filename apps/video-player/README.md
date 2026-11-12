@@ -25,7 +25,7 @@ settles layout without seeking the video.
 The component is an HTML video element on the web and an AVKit view on Apple.
 AVKit lives in an optional, separately loaded `libexact_video.dylib` artifact.
 The property and event matrix, ownership rules, and further player design are
-in [LLP 1042](../../llp/1042-video.spec.md).
+in LLP 1042.
 
 ## Verification — 2026-09-18
 

@@ -44,7 +44,8 @@ fn main() {
             contract::rust_entry(
                 "video_player_data::Player",
                 "video_player_data::Player",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

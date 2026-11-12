@@ -6,6 +6,21 @@ const workers = new Map();
 let nextClient = 0;
 const failure = message => Object.assign(new Error(message), { kind: 'Unavailable' });
 
+// Absent (`undefined` or `null`), or `{ foreignKeys: 'check' }`; anything
+// else is refused, so a misspelt option never runs a migration enforced. The
+// words are the native binding's (ibex2 bindings/sqlite.js), and the code is
+// `failed`, as the native prelude gives a binding's argument error: never
+// read from the words, which name the app's key.
+function transactionMode(options) {
+  const invalid = message => Object.assign(new Error(message), { kind: 'Unavailable', code: 'failed' });
+  if (options === undefined || options === null) return undefined;
+  if (typeof options !== 'object') throw invalid('SQLite transaction options must be an object');
+  for (const key of Object.keys(options)) if (key !== 'foreignKeys') throw invalid(`SQLite transaction options: unknown option ${key}; the one option is foreignKeys`);
+  const { foreignKeys } = options;
+  if (foreignKeys !== undefined && foreignKeys !== 'check') throw invalid('SQLite transaction options: foreignKeys is "check" or absent');
+  return foreignKeys;
+}
+
 export function createSqlite(appId, grants) {
   let shared = workers.get(appId);
   if (!shared) {
@@ -63,7 +78,11 @@ export function createSqlite(appId, grants) {
       execute: (sql, params = []) => request('execute', [id, sql, params]),
       query: (sql, params = []) => request('query', [id, sql, params]),
       prepare: sql => request('prepare', [id, sql]).then(s => statement(id, s)),
-      transaction: commands => request('transaction', [id, commands]),
+      transaction: (commands, options) => {
+        let foreignKeys;
+        try { foreignKeys = transactionMode(options); } catch (error) { return Promise.reject(error); }
+        return request('transaction', [id, commands, foreignKeys === 'check']);
+      },
       close: () => request('close', [id]),
     });
   }

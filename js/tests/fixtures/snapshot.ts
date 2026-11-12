@@ -1,6 +1,6 @@
 // LLP 1126.000 WP5: the same module answers now, fetches, and reads a saved file.
 const appId = 'test.widget-js';
-const grants = 'net.fetch https://widget.test\nfs.read app:/data\nfs.write app:/data\nsecret.keep session\n';
+const grants = 'net.fetch https://widget.test\nfs.read app:/data\nfs.write app:/data\nsecret.keep session\nfs.read bundle:/Resources/shipped\n';
 const row = (date: number, title: string) => [{date, props: {title}}];
 function answer(_source: string, [date]: number[], store: any, storage: any) {
   if (date === 1) return row(date, store.get('session') ?? 'missing');
@@ -8,6 +8,8 @@ function answer(_source: string, [date]: number[], store: any, storage: any) {
   if (date === 3) return storage.fs.readFile('app:/data/value').then((b: Uint8Array) => row(date, String.fromCharCode(...new Uint8Array(b))));
   if (date === 4) return storage.fs.atomicWriteFile('app:/data/value', new Uint8Array([88])).then(() => row(date, 'wrote'));
   if (date === 5) { store.set('session', 'overwrite'); return row(date, 'wrote secret'); }
+  // A widget's refresh reads `app:` only: a shipped file under `bundle:` is refused (exact2 LLP 1133.007 D6).
+  if (date === 6) return storage.fs.readFile('bundle:/Resources/shipped/hello.txt').then(() => row(date, 'read'), (e: any) => row(date, `${e.name} ${e.code}`));
   if (Math.abs(date) >= 1000) {
     let sum = 0;
     for (let i = 0; i < Math.abs(date); i++) sum = (sum + i) | 0;

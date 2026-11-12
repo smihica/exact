@@ -14,7 +14,8 @@ the actual `displacement` and `grounded` state.
   visits every row. A static collider without a Body costs nothing per tick.
   Dynamic poses, velocities and sleep return to components; kinematics use next pose.
 - One step uses `world.dt()`. A collision-only pass after moving kinematics supplies
-  same-tick sensor transitions. Events are sorted; `Announce` journals transitions.
+  same-tick sensor transitions. Events are sorted by entity pair, preserving each
+  pair's transition order within the step; `Announce` journals that order.
   Sleeping bodies still step; any awake dynamic body reports busy to Sim, even
   when its pose is unchanged. Support edits wake all.
   Two fixed solids (colliders without a Body, or with a Static one) never pair, so a
@@ -22,8 +23,41 @@ the actual `displacement` and `grounded` state.
   So a static collider the game teleports or carries under a parent (it has no Body)
   emits no Touch, and journals no Announce, against static walls or terrain; give it
   a Kinematic Body, or make it a sensor, to keep those transitions.
-- Density defaults to 1000 kg/m³; explicit mass is kg. Friction combines geometrically,
-  restitution by maximum. Contact slop is 0.1 mm; other integration defaults are Rapier's.
+- Density defaults to 1000 kg/m³; explicit mass is kg, and `physics::mass` reads the
+  mass a step gave a body, derived or not. `Body::inertia` authors the principal
+  inertia along the body's axes (all zero derives it). `Body::force` is a world-space
+  force at the centre of mass that persists until written back to zero; it is saved
+  in the Rapier snapshot and replays exactly after a restore. Friction combines
+  geometrically. Restitution combines by `Collider::bounce_combine`: `Max` (the
+  default), `Multiply`, `Min` or `Average`; a pair whose colliders differ takes the
+  later of those (Rapier's priority), so `Average` needs both. `ccd`, `force`,
+  `inertia` and a non-default `bounce_combine` are saved and hashed only when set. Contact slop is 0.1 mm; other integration defaults
+  are Rapier's. The Physics resource sets the solver: `solver_iterations` (substeps,
+  4), `contact_frequency` and `static_contact_frequency` (the contact springs
+  between moving bodies and against a fixed one, 30 and 60 Hz),
+  `contact_damping_ratio` (both springs, 10) and `coulomb_friction` (one friction
+  constraint per contact point instead of Rapier's grouped friction with a twist
+  constraint). They are applied each step, live in the saved snapshot, and enter
+  the resource's encoding only when they differ from those defaults.
+  `friction_gravity` (with `coulomb_friction`) bounds friction by weight, as
+  cannon-es does: a point touching when a step starts may take friction ×
+  `friction_gravity` × the pair's reduced mass × the substep's duration in each
+  substep, whatever its normal load, so a contact lifting off keeps its friction
+  for that step; below `friction_slip_speed` a point keeps the Coulomb bound, so
+  resting and rolling contacts settle flat. Contacts with multibodies keep Coulomb
+  friction. The vendored Rapier carries the bound (marked Exact2 in
+  `contact_with_coulomb_friction.rs`); its two integration parameters are not in
+  the snapshot, since the resource holds them, so EXPHYS stays v3. At zero, the
+  default, every contact keeps Rapier's Coulomb bound exactly.
+- `Collider::extra` lists `ExtraShape`s (shape, offset, friction, bounce and its
+  combine rule, layer, mask) added to the collider's Body with no mass; they are
+  Rapier colliders on that body, rebuilt with the primary and saved with the world
+  (`Entry::extra_handles`, written only when present). An entity with extras
+  reports one begin and one end per entity pair, derived from Rapier's per-collider
+  touch state before and after the step (a pair that begins and ends within the
+  step is reported begin then end), so a touch with two of its shapes is one
+  touch. For now queries and capsules see the primary shape only. Extras need a
+  Body and cannot be meshes or heightfields.
 - Shapes: sphere, box, Y capsule/cylinder (total height), static mesh and heightfield
   (row-major, rows Z/columns X), and a convex hull of 4 to 255 points that any body
   may use, optionally rounded (its mass and inertia are the rounded solid's). Curved shapes and

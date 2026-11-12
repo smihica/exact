@@ -97,10 +97,24 @@ class Element extends Node {
       });
     });
   }
-  get value() { return this.localName === 'textarea' ? this.textContent : this.getAttribute('value') ?? ''; }
+  get value() {
+    if (this.localName === 'select') {
+      const options = this.options;
+      return (options.find(o => o.hasAttribute('selected')) ?? options.find(o => !o.hasAttribute('disabled')))?.value ?? '';
+    }
+    if (this.localName === 'option') return this.getAttribute('value') ?? this.textContent.replace(/[\t\n\f\r ]+/g, ' ').replace(/^ | $/g, '');
+    return this.localName === 'textarea' ? this.textContent : this.getAttribute('value') ?? '';
+  }
   get options() { return this.childNodes.filter(c => c.localName === 'option'); }
   // A select's value is the option that carries it, `selected` (document.rs).
-  set value(v) { if (this.localName === 'select') for (const o of this.childNodes) o.toggleAttribute?.('selected', o.getAttribute('value') === v); else if (this.localName === 'textarea') this.textContent = v; else if (v === '') this.removeAttribute('value'); else this.setAttribute('value', v); }
+  set value(v) {
+    if (this.localName === 'select') {
+      const options = this.options, selected = options.find(o => o.value === String(v));
+      for (const o of options) o.toggleAttribute('selected', o === selected);
+    } else if (this.localName === 'textarea') this.textContent = v;
+    else if (v === '' && this.localName !== 'option') this.removeAttribute('value');
+    else this.setAttribute('value', v);
+  }
   set checked(v) { this.toggleAttribute('checked', !!v); }
   get checked() { return this.hasAttribute('checked'); }
   set muted(v) {} pause() {} play() { return Promise.resolve(); }
@@ -108,6 +122,13 @@ class Element extends Node {
   // Read only (symbols.js `tinted`): the class attribute's names.
   get classList() { const names = (this.getAttribute('class') ?? '').split(/\s+/).filter(Boolean); return Object.assign(names, { contains: c => names.includes(c) }); }
   set href(v) { this.setAttribute('href', v); }
+  // Reflected as a browser reflects it, so a link renderMarkup sends out of the app is written with it.
+  get target() { return this.getAttribute('target') ?? ''; }
+  set target(v) { this.setAttribute('target', v); }
+  get rel() { return this.getAttribute('rel') ?? ''; }
+  set rel(v) { this.setAttribute('rel', v); }
+  get alt() { return this.getAttribute('alt') ?? ''; }
+  set alt(v) { this.setAttribute('alt', v); }
   html(inheritedFont = 16) {
     // Symbol images need a real natural size before adoption: the element's
     // font size, from its static class or live inline row, else inherited.

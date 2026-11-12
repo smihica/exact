@@ -128,7 +128,7 @@ extension Agent {
         /// Whether `s` or a view in it paints at `p` something a style does not say for certain: a fill, a picture, a
         /// material, a native control's own background.
         func paints(_ s: UIView, at p: CGPoint) -> Bool {
-            guard !s.isHidden, s.alpha > 0.01, s.convert(s.bounds, to: nil).contains(p) else { return false }
+            guard !s.isHidden, s.alpha > 0.01, (s as? NodeView)?.drawnBySurface != true, s.convert(s.bounds, to: nil).contains(p) else { return false }
             if let n = s as? NodeView {
                 if n.kind == "image" || n.symbolView != nil || n.style["background_image"] != nil || (n.channels("background_color")?[3] ?? 0) > 0 { return true }
             } else if s.layer.contents != nil || s is UIVisualEffectView || s is UIImageView || (s.backgroundColor.flatMap { rgba($0, traits: s.traitCollection) } != nil) {
@@ -261,7 +261,7 @@ extension Agent {
         // and not each of its children.
         var visited = Set<ObjectIdentifier>()
         func walk(_ v: UIView, alpha: CGFloat, held: Bool, out: Bool = false, parent: NodeView? = nil) {
-            guard visited.insert(ObjectIdentifier(v)).inserted, !v.isHidden, v.alpha > 0.01, v.layer.opacity > 0.01 else { return }
+            guard visited.insert(ObjectIdentifier(v)).inserted, !v.isHidden, v.alpha > 0.01, v.layer.opacity > 0.01, (v as? NodeView)?.drawnBySurface != true else { return }
             let a = alpha * v.alpha * CGFloat(v.layer.opacity)
             var heldBelow = held, outBelow = out
             if let n = v as? NodeView {
@@ -420,7 +420,7 @@ extension Agent {
         /// own label or control, with a box, under nothing hidden.
         func holdsContent(_ v: UIView) -> Bool {
             v.subviews.contains { s in
-                guard !s.isHidden, s.alpha > 0.01, s.layer.opacity > 0.01 else { return false }
+                guard !s.isHidden, s.alpha > 0.01, s.layer.opacity > 0.01, (s as? NodeView)?.drawnBySurface != true else { return false }
                 if let n = s as? NodeView {
                     guard !n.inert, !n.cssVisibilityHidden else { return false }
                     if !n.bounds.isEmpty, n.isParagraph || n.takesPress || n.actsAsButton || n.field != nil || n.textArea != nil { return true }

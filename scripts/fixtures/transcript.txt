@@ -14,7 +14,7 @@ node #2 Text · site 3 · instance "north" · epoch 2 · incarnation 1
   font_size = 20 (authored)
   letter_spacing = 0 (initial)
   text_color = light-dark(#000000, #ffffff) (inherited from #1)
-  space viewport 20,12.5 380×18 · frame 20,12.5 380×18 (kernel, in the parent) · window 20,56.5 380×18 · scale 2
+  space viewport 20,12.5 380×18 · frame 20,12.5 380×18 (kernel, in the parent or containing block) · window 20,56.5 380×18 · scale 2
   scroll viewport 0,0 of 0,0 · #5 0,100 of 0,640 port 0,90 420×150
   clip #5 overflow
   visible clipped=false hidden=false inViewport=true inert=false

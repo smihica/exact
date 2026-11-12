@@ -97,8 +97,8 @@ impl Resolver<'_, '_> {
             if cs.display == Display::None || cs.visibility != Visibility::Visible {
                 continue;
             }
-            // A `use` contributes its target's shape, placed.
-            let (shape, at) = if c.node_type == NodeType::SvgUse {
+            // A `use` places its target's transformed shape.
+            let (shape, mut at) = if c.node_type == NodeType::SvgUse {
                 let Some(t) = c
                     .props
                     .str(PropId::Href)
@@ -109,7 +109,7 @@ impl Resolver<'_, '_> {
                 else {
                     continue;
                 };
-                (t, tf::translate(vp.x(cs.x), vp.y(cs.y)))
+                (t, tf::translate(vp.x(cs.x.clone()), vp.y(cs.y.clone())))
             } else if c.node_type.is_svg_shape() {
                 (c, tf::IDENTITY)
             } else {
@@ -119,6 +119,12 @@ impl Resolver<'_, '_> {
             let Some((path, _)) = self.geometry(&shape, &ss, vp) else {
                 continue;
             };
+            if c.node_type == NodeType::SvgUse {
+                let target = self
+                    .transform(&shape, &ss, vp)
+                    .map_or(tf::IDENTITY, |t| t.affine());
+                at = tf::mul(at, target);
+            }
             let m = self
                 .transform(&c, &cs, vp)
                 .map_or(tf::IDENTITY, |t| t.affine());

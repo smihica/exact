@@ -12,6 +12,7 @@ async function persist(storage: Storage): Promise<string> {
   const rowid: bigint = (await insert.execute(["text"])).lastInsertRowid;
   const value: SQLValue = (await db.query("SELECT 1")).rows[0][0];
   await db.transaction([{ sql: "INSERT INTO notes VALUES (?)", params: [bytes] }]);
+  await db.transaction([{ sql: "DROP TABLE notes" }], { foreignKeys: "check" });
   await insert.close();
   await db.close();
   return `${contents.byteLength}:${names.length}:${file}:${rowid}:${value}`;
@@ -23,6 +24,8 @@ function invalid(storage: Storage) {
   storage.fs.writeFile("app:/data/note", "text");
   // @ts-expect-error arbitrary objects cannot be bound as SQL parameters
   storage.sqlite.open("app:/data/app.db").then(db => db.query("SELECT ?", [{}]));
+  // @ts-expect-error a transaction checks foreign keys at commit, or as each statement runs
+  storage.sqlite.open("app:/data/app.db").then(db => db.transaction([], { foreignKeys: "off" }));
   // @ts-expect-error no ambient synchronous file access
   storage.fs.readFileSync("app:/data/note");
 }

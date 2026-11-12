@@ -1,4 +1,6 @@
 //! Read contrast colors and observe changes, including sent window messages.
+//! The same subclass wakes the loop when the date may have jumped, for the
+//! loop's turn to retell it (`Presenter::follow_local_offset`).
 #![allow(unsafe_code)]
 use exact_linux::presenter::ContrastPalette;
 use std::{
@@ -20,8 +22,9 @@ use windows_sys::Win32::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
-            PostMessageW, SystemParametersInfoW, SPI_GETHIGHCONTRAST, WM_NCDESTROY, WM_NULL,
-            WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED,
+            PostMessageW, SystemParametersInfoW, PBT_APMRESUMEAUTOMATIC, SPI_GETHIGHCONTRAST,
+            WM_NCDESTROY, WM_NULL, WM_POWERBROADCAST, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+            WM_THEMECHANGED, WM_TIMECHANGE,
         },
     },
 };
@@ -139,6 +142,14 @@ unsafe extern "system" fn changed(
         ) && !(*(data as *const Cell<bool>)).replace(true)
         {
             // Sent broadcasts need a queued message to wake a waiting loop.
+            PostMessageW(window, WM_NULL, 0, 0);
+        } else if message == WM_TIMECHANGE
+            || (message == WM_POWERBROADCAST && wparam == PBT_APMRESUMEAUTOMATIC as usize)
+        {
+            // The system clock was set, or the system resumed from sleep
+            // ("delivered every time the system resumes"):
+            // https://learn.microsoft.com/windows/win32/sysinfo/wm-timechange
+            // https://learn.microsoft.com/windows/win32/power/pbt-apmresumeautomatic
             PostMessageW(window, WM_NULL, 0, 0);
         }
         DefSubclassProc(window, message, wparam, lparam)

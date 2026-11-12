@@ -337,7 +337,7 @@ for (file, type, id, size, orientation) in [("gainmap-iso.jpg", "public.jpeg", "
                                            kCGImageDestinationEncodeRequest: kCGImageDestinationEncodeToISOGainmap])
     expect(Expectation(file: file, id: id, class: "hdr", variant: "own8", space: "display-p3", bitsPerComponent: 8,
         note: "ISO 21496-1 gain map, headroom 4; SDR base shown on an SDR display; HDR (stage 3) linear values as the patches say"
-            + (orientation == 6 ? "; EXIF orientation 6" : "") + (size > W ? "; 4096² so a 16-bit HDR plan exceeds the 32 MiB ceiling" : ""),
+            + (orientation == 6 ? "; EXIF orientation 6" : "") + (size > W ? "; 4096² so a 16-bit HDR plan exceeds the 192 MiB viewport ceiling" : ""),
         patches: cells.map { r, c in Patch(x: Int(r.minX), y: 0, w: Int(r.width), h: Int(r.height), source: c, linearSRGB: linearSRGB(c, in: spaces["display-p3-linear"]!), nits: nil) }))
 }
 // F14 — OpenEXR, linear float: HDR.

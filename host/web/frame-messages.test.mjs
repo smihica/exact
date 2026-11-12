@@ -1,3 +1,4 @@
+import { hostFixtureFile } from './tests/glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
@@ -7,7 +8,7 @@ test('iframe replies keep order and ownership, with no queue across replacement 
     const path = new URL(request.url).pathname;
     if (path === '/frame-messages.js') return new Response(Bun.file(new URL('./frame-messages.js', import.meta.url)));
     if (path === '/commands.js') return new Response(Bun.file(new URL('../web-js/commands.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('./navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('./navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     if (path === '/prompt-glue.js') return new Response(Bun.file(new URL('./prompt-glue.js', import.meta.url)));
     if (path === '/alert-message.js') return new Response(Bun.file(new URL('./alert-message.js', import.meta.url)));
     if (path === '/menu-rows.js') return new Response(Bun.file(new URL('./menu-rows.js', import.meta.url)));

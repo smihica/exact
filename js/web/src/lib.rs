@@ -426,6 +426,13 @@ impl Module {
                         .map_err(|_| unavailable("a request timeout must be 1 to 3600000 ms"))?,
                 );
             }
+            // `exactIdleTimeout` (LLP 1016.000 D11): this host's sockets
+            // do not carry it, so it is refused rather than dropped.
+            if !r["idle_timeout_ms"].is_null() {
+                return Err(unavailable(
+                    "exactIdleTimeout is unavailable on the web's wasm host",
+                ));
+            }
             // `exactHeld` (LLP 1016.000 D9): no clock waits on it.
             request.held = r["held"] == true;
             // `exactUploadProgress`: the page sends it with XMLHttpRequest.

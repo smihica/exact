@@ -407,7 +407,8 @@ macro_rules! canvas_jni {
             /// What the reader draws around the page, when that is not what
             /// this last returned (else null): where the page is in the
             /// window (x, y, width, height, pixels), the colour behind it
-            /// (ARGB), and 1 when its scheme is dark.
+            /// (ARGB), and flags: bit 0 is the dark scheme (light navigation
+            /// icons), bit 1 is light status bar icons.
             #[no_mangle]
             pub unsafe extern "system" fn Java_dev_exact_canvas_Native_chrome(
                 env: *mut JNIEnv,

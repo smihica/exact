@@ -31,6 +31,7 @@ fn main() {
         "exact_bounded_data::Heavy",
         "exact_bounded_data::Heavy::default()",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

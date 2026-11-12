@@ -98,7 +98,7 @@ fn what_cannot_animate_or_resolve_is_refused_at_compile_time() {
         (
             app("keyframes k\n  to opacity=\"lots\"\n", ""),
             "lower-keyframes",
-            "`keyframes k`",
+            "`keyframes k`: `lots` is not a value `opacity` takes",
         ),
         (
             app("keyframes k\n  120% opacity=1\n", ""),
@@ -111,7 +111,17 @@ fn what_cannot_animate_or_resolve_is_refused_at_compile_time() {
                 "",
             ),
             "lower-keyframes",
-            "`keyframes k`",
+            "a spring is a transition's timing function, not an animation's",
+        ),
+        (
+            app(breathe, "animation=\"breathe\" animation-duration=\"1\""),
+            "lower-animation-longhand",
+            "`animation-duration`: `1` is not a time: a time is a number with `s` or `ms`",
+        ),
+        (
+            app(breathe, "animation=\"breathe 1s\" animation-direction=\"bogus\""),
+            "lower-animation-longhand",
+            "`bogus` is not a direction: normal, reverse, alternate or alternate-reverse",
         ),
         (
             app("keyframes k\n  to opacity=1 opacity=0\n", ""),
@@ -135,6 +145,29 @@ fn what_cannot_animate_or_resolve_is_refused_at_compile_time() {
         let error = contract::compile(&source).unwrap_err();
         assert_eq!(error.id, id, "{source}\n{error}");
         assert!(error.message.contains(says), "{error}");
+    }
+    // A refusal states the parser's rule, the shorthand alone or beside a
+    // longhand, never a Rust variant's name.
+    for (attrs, says) in [
+        (
+            "animation=\"breathe 1s steps(0)\"",
+            "`steps()` takes at least one step",
+        ),
+        (
+            "animation=\"breathe 1s steps(0)\" animation-delay=\"0s\"",
+            "`steps()` takes at least one step",
+        ),
+        (
+            "animation=\"breathe 1s 2s 3s\"",
+            "has a third time: an animation takes a duration, then a delay",
+        ),
+    ] {
+        let error = contract::compile(&app(breathe, attrs)).unwrap_err();
+        assert!(error.message.contains(says), "{error}");
+        assert!(
+            !error.message.contains("not a CSS `animation` shorthand"),
+            "{error}"
+        );
     }
     // A condition may choose between literals; `none` is one.
     contract::compile(&app(
@@ -229,7 +262,7 @@ fn each_names_the_position_and_a_moved_row_reads_its_new_one() {
     }
     assert_eq!(
         contract_syntax::fmt::format("component App\n  resource keys = keys(false) as shape string[]\n  view\n    column\n      for k ,  i in keys key=k\n        text k\n").unwrap(),
-        "component App\n  resource keys = keys(false) as shape string[]\n  view\n    column\n      for k, i in keys key = k\n        text k\n"
+        "component App\n  resource keys = keys(false) as shape string[]\n  view\n    column\n      for k, i in keys key=k\n        text k\n"
     );
 }
 
@@ -648,4 +681,20 @@ fn a_colour_keyframe_takes_the_designs_tokens() {
         scale.message.contains("one factor for both axes"),
         "{scale}"
     );
+}
+
+/// A class choice whose one side sets animation longhands and whose other
+/// sets none: the other side is no animation, from either starting state,
+/// not a binding that traps formatting the absent longhand.
+#[test]
+fn a_class_choice_without_animation_on_one_side_bakes_from_either() {
+    for active in [false, true] {
+        let src = format!(
+            "keyframes spin\n  from rotate=0\n  to rotate=360\nstyle Idle\n  opacity=1\nstyle Active\n  animation-name=\"spin\"\n  animation-duration=\"200ms\"\ncomponent App\n  state active = {active}\n  view\n    view class=(active ? Active : Idle)\n"
+        );
+        let plan = contract::compile(&src).unwrap();
+        if let Err(e) = contract::bake(plan, ()) {
+            panic!("active={active}: {e}");
+        }
+    }
 }

@@ -9,6 +9,11 @@
 //!   each reader's event as an activation (D11 item 3). `MOD_NOREPEAT`
 //!   keeps a held chord to one press. A modifier pair needs a low-level
 //!   keyboard hook, which is not built: it answers `not-allowed`.
+//! - **Print Screen alone** can be consumed by Snipping Tool even when
+//!   `RegisterHotKey` succeeds (#195). A nonzero DWORD or an unreadable
+//!   `HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled`
+//!   answers `reserved`. A missing value is reserved from build 22000,
+//!   or when the build cannot be read; an explicit zero permits registration.
 //! - **Attention** flashes the taskbar button until the window comes to
 //!   the front, or three times for an informational request
 //!   ([FlashWindowEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-flashwindowex)).
@@ -44,6 +49,31 @@ fn chord(keys: &str) -> Result<(u32, u32), &'static str> {
     Ok((bits, virtual_key(key).ok_or("invalid")?))
 }
 
+/// `VK_SNAPSHOT`, the Print Screen key.
+const PRINT_SCREEN: u32 = 0x2C;
+
+/// A missing DWORD is `Ok(None)`; read errors include a wrong registry type.
+/// Unknown ownership refuses bare Print Screen, including an unknown build
+/// when the setting is missing. Build 22000 is the conservative Windows 11 cutoff.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn available_chord(
+    chord: (u32, u32),
+    snipping: Result<Option<u32>, u32>,
+    windows_build: Option<u32>,
+) -> Result<(u32, u32), &'static str> {
+    if chord == (0, PRINT_SCREEN) {
+        let free = match snipping {
+            Ok(Some(value)) => value == 0,
+            Ok(None) => windows_build.is_some_and(|build| build < 22000),
+            Err(_) => false,
+        };
+        if !free {
+            return Err("reserved");
+        }
+    }
+    Ok(chord)
+}
+
 /// The virtual-key code of an `aria-keyshortcuts` key name: a letter or
 /// digit, F1–F24, or a named key (`KeyboardEvent.key`'s names).
 fn virtual_key(key: &str) -> Option<u32> {
@@ -72,6 +102,7 @@ fn virtual_key(key: &str) -> Option<u32> {
         "ArrowUp" => 0x26,
         "ArrowRight" => 0x27,
         "ArrowDown" => 0x28,
+        "PrintScreen" => PRINT_SCREEN,
         _ => return None,
     })
 }
@@ -96,10 +127,13 @@ mod imp {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use windows_sys::Win32::{
-        Foundation::{GetLastError, HWND},
+        Foundation::{
+            GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_PATH_NOT_FOUND,
+            ERROR_SUCCESS, HWND,
+        },
         System::Registry::{
-            RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
-            RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
+            RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER,
+            HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
         },
         UI::{
             Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT},
@@ -113,6 +147,7 @@ mod imp {
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const APPROVED: &str =
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    const KEYBOARD: &str = r"Control Panel\Keyboard";
     /// `RegisterHotKey` fails so when another app holds the chord.
     const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
 
@@ -193,9 +228,23 @@ mod imp {
             }
         }
 
+        fn available_chord(&self, keys: &str) -> Result<(u32, u32), Refusal> {
+            let chord = super::chord(keys)?;
+            if chord != (0, super::PRINT_SCREEN) {
+                return Ok(chord);
+            }
+            let snipping = self.snipping();
+            let build = if snipping == Ok(None) {
+                self.windows_build()
+            } else {
+                None
+            };
+            super::available_chord(chord, snipping, build)
+        }
+
         /// Registers `keys` under `atom`, or says why not.
         fn register(&self, keys: &str, atom: i32) -> Result<(), Refusal> {
-            let (modifiers, key) = super::chord(keys)?;
+            let (modifiers, key) = self.available_chord(keys)?;
             let ok = unsafe {
                 RegisterHotKey(std::ptr::null_mut(), atom, modifiers | MOD_NOREPEAT, key)
             };
@@ -206,6 +255,52 @@ mod imp {
                 ERROR_HOTKEY_ALREADY_REGISTERED => "in-use",
                 _ => "reserved",
             })
+        }
+
+        fn snipping(&self) -> Result<Option<u32>, u32> {
+            let (key, name) = (wide(KEYBOARD), wide("PrintScreenKeyForSnippingEnabled"));
+            let mut value = 0u32;
+            let mut size = std::mem::size_of::<u32>() as u32;
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_CURRENT_USER,
+                    key.as_ptr(),
+                    name.as_ptr(),
+                    RRF_RT_REG_DWORD,
+                    std::ptr::null_mut(),
+                    (&mut value as *mut u32).cast(),
+                    &mut size,
+                )
+            };
+            match status {
+                ERROR_SUCCESS if size == std::mem::size_of::<u32>() as u32 => Ok(Some(value)),
+                ERROR_SUCCESS => Err(ERROR_INVALID_DATA),
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
+                error => Err(error),
+            }
+        }
+
+        fn windows_build(&self) -> Option<u32> {
+            let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+            let name = wide("CurrentBuildNumber");
+            let mut buffer = [0u16; 32];
+            let mut size = std::mem::size_of_val(&buffer) as u32;
+            let status = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    key.as_ptr(),
+                    name.as_ptr(),
+                    RRF_RT_REG_SZ,
+                    std::ptr::null_mut(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return None;
+            }
+            let end = buffer.iter().position(|c| *c == 0)?;
+            String::from_utf16(&buffer[..end]).ok()?.parse().ok()
         }
 
         fn read_string(&self, key: &str) -> Option<String> {
@@ -265,6 +360,7 @@ mod imp {
             };
             let mut chords = self.chords.borrow_mut();
             if let Some(chord) = chords.iter_mut().find(|c| c.keys == keys) {
+                self.available_chord(keys)?;
                 if !chord
                     .readers
                     .iter()
@@ -300,6 +396,7 @@ mod imp {
 
         fn check_hotkey(&self, keys: &str) -> Result<(), Refusal> {
             if self.chords.borrow().iter().any(|c| c.keys == keys) {
+                self.available_chord(keys)?;
                 return Ok(());
             }
             // An atom of its own, given back at once.
@@ -390,7 +487,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{chord, login_launch, run_value};
+    use super::{available_chord, chord, login_launch, run_value};
 
     #[test]
     fn a_chord_is_its_modifier_bits_and_virtual_key() {
@@ -401,6 +498,48 @@ mod tests {
         assert_eq!(chord("Shift+Shift"), Err("not-allowed"));
         assert_eq!(chord("Hyper+K"), Err("invalid"));
         assert_eq!(chord("Control+Semicolon"), Err("invalid"));
+        assert_eq!(chord("PrintScreen"), Ok((0, 0x2C)));
+        assert_eq!(chord("Control+PrintScreen"), Ok((2, 0x2C)));
+    }
+
+    #[test]
+    fn print_screen_is_reserved_unless_snipping_is_known_free() {
+        let alone = chord("PrintScreen").unwrap();
+        for (build, missing_free) in [
+            (Some(19045), true),
+            (Some(21999), true),
+            (Some(22000), false),
+            (Some(26300), false),
+            (None, false),
+        ] {
+            for (reading, free) in [
+                (Ok(Some(0)), true),
+                (Ok(Some(1)), false),
+                (Ok(Some(2)), false),
+                (Ok(Some(u32::MAX)), false),
+                (Ok(None), missing_free),
+                (Err(5), false),    // ERROR_ACCESS_DENIED
+                (Err(1630), false), // ERROR_UNSUPPORTED_TYPE
+                (Err(13), false),   // ERROR_INVALID_DATA
+            ] {
+                assert_eq!(
+                    available_chord(alone, reading, build),
+                    if free { Ok(alone) } else { Err("reserved") },
+                    "reading {reading:?}, build {build:?}"
+                );
+                for keys in [
+                    "Control+PrintScreen",
+                    "Alt+PrintScreen",
+                    "Shift+PrintScreen",
+                    "Meta+PrintScreen",
+                    "F12",
+                    "Control+K",
+                ] {
+                    let chord = chord(keys).unwrap();
+                    assert_eq!(available_chord(chord, reading, build), Ok(chord));
+                }
+            }
+        }
     }
 
     #[test]

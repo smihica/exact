@@ -4,6 +4,19 @@ import android.graphics.Matrix
 import android.graphics.RenderNode
 import java.nio.IntBuffer
 
+/** Unknown ops must reach the caller: they also disqualify the glyph-only recording path. */
+internal inline fun Structure.walkColorLayer(ops: IntArray, visit: (Int) -> Unit) {
+    val b = IntBuffer.wrap(ops)
+    var i = 0
+    while (i < ops.size) {
+        visit(i)
+        i = when (ops[i]) {
+            1, 2, 4, 5, 6, 7, 9, 19, 40, 45, 46, 47 -> end(b, i)
+            else -> ops.size
+        }
+    }
+}
+
 /**
  * Nodes exact2's reader animates (host/linux/src/lower.rs): each a RenderNode drawn by reference from its row (op 29),
  * recorded from op 30, moved and faded every display frame from its keyframes (op 31) as a browser's compositor plays
@@ -122,6 +135,7 @@ internal class Layers(
     }
 
     private val layers = HashMap<Int, Layer>()
+    private val structure = Structure()
     private val freeing = ArrayList<Int>()
     /** CLOCK_MONOTONIC (System.nanoTime) at the engine's zero. */
     private var origin = 0L
@@ -197,30 +211,25 @@ internal class Layers(
         var plain = true
         var values: FloatArray? = null
         fun fl(k: Int) = java.lang.Float.intBitsToFloat(ops[k])
-        var i = 0
-        while (i < ops.size) {
+        structure.walkColorLayer(ops) { i ->
             if (ops[i] != 1 && ops[i] != 9) plain = false
             when (ops[i]) {
                 1 -> {
                     // As Player's op 1 sets them (scaleX, skewX, transX, skewY, scaleY, transY).
                     values = floatArrayOf(fl(i + 1), fl(i + 3), fl(i + 5), fl(i + 2), fl(i + 4), fl(i + 6), 0f, 0f, 1f)
-                    i += 7
                 }
-                2 -> { if (l.backgroundAt < 0) { l.backgroundAt = i + 1; l.backgroundTarget = ops[i + 1]; l.backgroundNow = ops[i + 1] }; i += 14 }
-                4 -> i += 13
-                6 -> i += 1
-                7 -> i += 2
+                2 -> if (l.backgroundAt < 0) {
+                    l.backgroundAt = i + 1
+                    l.backgroundTarget = ops[i + 1]
+                    l.backgroundNow = ops[i + 1]
+                }
                 9 -> {
                     glyphs.add(i + 3)
                     val n = ops[i + 5]; val face = font(ops[i + 1]); val m = values
                     if (face == null || m == null) plain = false
                     else if (n > 0) runs.add(Run(m, face, fl(i + 2), fl(i + 4), IntArray(n) { ops[i + 6 + 3 * it] },
                         FloatArray(2 * n) { fl(i + 6 + 3 * (it / 2) + 1 + it % 2) }))
-                    i += 6 + 3 * n
                 }
-                19 -> i += 26
-                40 -> i += 27
-                else -> i = ops.size
             }
         }
         if (glyphs.isNotEmpty()) { l.glyphColors = glyphs.toIntArray(); l.textTarget = ops[glyphs[0]]; l.textNow = l.textTarget }

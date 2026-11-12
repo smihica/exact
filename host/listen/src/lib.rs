@@ -318,7 +318,9 @@ impl Loop {
 
     /// No new connections: a newer listener holds the address.
     fn displace(&mut self) {
-        if self.bound.take().is_some() {
+        if let Some(bound) = self.bound.take() {
+            bind::forget(&self.config.path, bound.identity);
+            drop(bound);
             self.emit(Event::Standing("displaced"));
         }
     }
@@ -333,7 +335,8 @@ impl Loop {
         match &self.bound {
             Some(bound) if now == Some(bound.identity) => {}
             // Removed under it: bound again where it can be.
-            Some(_) if now.is_none() => {
+            Some(bound) if now.is_none() => {
+                bind::forget(&self.config.path, bound.identity);
                 self.bound = None;
                 if let Ok(bound) = bind::publish(&self.config.path, false, false) {
                     self.bound = Some(bound);

@@ -3,9 +3,9 @@ import UIKit
 import XCTest
 @testable import ExactKit
 
-/// A plain UIKit scroller (not `scrollFollowEnd`, not a list) keeps the
-/// reader's content still when a box above the port changes size or is
-/// inserted, as CSS scroll anchoring does in Chrome (#138 X23d).
+/// Plain UIKit scrollers keep the reader's content still when a box above
+/// the port changes size or is inserted, as CSS scroll anchoring does in
+/// Chrome (#138 X23d).
 final class ScrollAnchoringIOSTests: XCTestCase {
     private var window: UIWindow!
 
@@ -44,6 +44,58 @@ final class ScrollAnchoringIOSTests: XCTestCase {
         let (p, sv) = fixture(top: 200)
         p.apply(wireBatch([["op": "style", "id": 2, "style": ["height": 0.0]]] + rows(header: 0)))
         XCTAssertEqual(sv.contentOffset.y, 152)
+    }
+
+    func testRetiringNavigationRestoresTheReaderBeforeDeliveringCovers() {
+        for followEnd in [false, true] {
+            let (p, sv) = fixture(top: 200)
+            p.apply(wireBatch([["op": "props", "id": 1, "set": ["scrollFollowEnd": String(followEnd)]]]))
+            sv.contentOffset.y = 200
+            // The retired navigation had covered the header before this batch.
+            p.navigation.covers = [2: .whole]
+            p.navigation.delivered = p.navigation.covers
+            var deliveries = 0
+            p.onCovers = { changes in
+                deliveries += 1
+                XCTAssertFalse(p.applying)
+                XCTAssertEqual(changes.count, 1)
+                XCTAssertEqual(changes.first?.0, 2)
+                XCTAssertNil(changes.first?.1)
+                XCTAssertEqual(sv.contentOffset.y, 152, accuracy: 0.5)
+                p.apply(wireBatch(self.rows(header: 0, inserted: 60)))
+            }
+            // Retirement runs while the batch still holds its scroll captures.
+            p.onViewportFit = { p.navigation.reset() }
+            defer { p.onViewportFit = nil; p.onCovers = nil; p.reset() }
+            p.apply(wireBatch([["op": "props", "id": 1, "set": ["viewportFit": "cover"]]] + rows(header: 0)))
+            XCTAssertEqual(deliveries, 1)
+            XCTAssertEqual(sv.contentOffset.y, 212, accuracy: 0.5, "followEnd=\(followEnd)")
+        }
+    }
+
+    func testAReplacementCoverWinsOverTheRetiredNavigationsCover() {
+        let (p, _) = fixture(top: 200)
+        let replacement = HostCover.inset(top: 20, bottom: 0)
+        p.navigation.covers = [2: .whole]
+        p.navigation.delivered = p.navigation.covers
+        var deliveries: [[(UInt32, HostCover?)]] = []
+        p.onCovers = { changes in
+            XCTAssertFalse(p.applying)
+            deliveries.append(changes)
+        }
+        p.onViewportFit = {
+            p.navigation.reset()
+            p.navigation.covers = [2: replacement]
+        }
+        defer { p.onViewportFit = nil; p.onCovers = nil; p.reset() }
+        p.apply(wireBatch([["op": "props", "id": 1, "set": ["viewportFit": "cover"]]]))
+        XCTAssertEqual(deliveries.count, 1)
+        XCTAssertEqual(deliveries.first?.count, 1)
+        XCTAssertEqual(deliveries.first?.first?.0, 2)
+        XCTAssertEqual(deliveries.first?.first?.1, replacement)
+        p.navigation.reset()
+        XCTAssertEqual(deliveries.count, 2, "outside a batch, retirement delivers immediately")
+        XCTAssertNil(deliveries.last?.first?.1)
     }
 
     func testRowsInsertedAboveThePortLeaveTheContentStill() {

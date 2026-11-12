@@ -184,6 +184,8 @@ fn a_preferred_value_is_laid_over_the_default_and_clear_restores_it() {
     );
 }
 
+// The power reading it keeps is the build target's first, macOS's.
+#[cfg(target_os = "macos")]
 #[test]
 fn an_unsupported_target_fails_not_supported() {
     let (_app, r) = boot("web", "web");

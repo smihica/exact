@@ -94,7 +94,7 @@ pub(super) fn refuse(
 /// The store name a resource's kept answer lives under.
 /// The kept entries in `snapshot` no declared reader of `plan` seeds. A
 /// cold boot seeds a first frame only from declared readers' kept answers,
-/// so any other entry (a reader made transient, a resource removed) is
+/// so any other entry (a reader made `transient`, a resource removed) is
 /// forgotten on disk, not carried forever. A reload's carried readers are
 /// checked for compatibility instead.
 pub(super) fn obsolete(plan: &exact_plan::Plan, snapshot: &[(String, Vec<u8>)]) -> Vec<String> {
@@ -104,10 +104,27 @@ pub(super) fn obsolete(plan: &exact_plan::Plan, snapshot: &[(String, Vec<u8>)]) 
             let resource = name.strip_prefix(Store::KEPT)?;
             (!(0..plan.resources.len()).any(|i| {
                 (plan.resources[i].reader || kept_module(plan, i))
+                    && !plan.resources[i].transient
                     && plan.str(plan.resources[i].name) == resource
             }))
             .then(|| name.clone())
         })
+        .collect()
+}
+
+/// The kept entries in `names` that belong to a `transient` resource of
+/// `plan` (LLP 1156.005 D4): forgotten wherever a snapshot is adopted.
+pub(super) fn transient<'n>(
+    plan: &exact_plan::Plan,
+    names: impl Iterator<Item = &'n String>,
+) -> Vec<String> {
+    names
+        .filter(|name| {
+            name.strip_prefix(Store::KEPT).is_some_and(|resource| {
+                (plan.resources.iter()).any(|r| r.transient && plan.str(r.name) == resource)
+            })
+        })
+        .cloned()
         .collect()
 }
 
@@ -197,7 +214,7 @@ impl<D: DataSource> Runner<D> {
     pub(super) fn identity_unknown(&self, i: usize, states: &[Option<ResourceState>]) -> bool {
         use crate::instance::Input;
         let deps = self.sites.deps();
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i).clone();
         let identity = row.args.len as usize - usize::from(row.context);
         let mut work: Vec<_> = row
             .args
@@ -210,7 +227,7 @@ impl<D: DataSource> Runner<D> {
             for input in deps.inputs(&reads) {
                 match input {
                     Input::Resource(r) | Input::PendingResource(r) | Input::FailedResource(r)
-                        if self.store_readers[r]
+                        if self.resources[r].store_reader
                             && states[r]
                                 .as_ref()
                                 .is_some_and(|s| s.placeholder || s.value.is_compiled()) =>
@@ -234,17 +251,21 @@ impl<D: DataSource> Runner<D> {
     /// for its placeholder (LLP 1027 D4, 2026-10-10).
     pub(super) fn journal_build_time(&mut self) {
         let secrets = self.store.opened_with_secrets();
-        for i in 0..self.stale.len() {
-            let Some(state) = self.resources[i].as_ref().filter(|_| self.stale[i]) else {
+        for i in 0..self.resources.len() {
+            let Some(state) = self.resources[i]
+                .state
+                .as_ref()
+                .filter(|_| self.resources[i].stale)
+            else {
                 continue;
             };
-            let name = self.plan.str(self.plan.resources[i].name);
+            let name = self.plan.str(self.resource_row(i).name);
             let line = if state.value.is_compiled() {
                 super::lines::build_time(name)
             } else if state.placeholder
                 && secrets
-                && self.store_readers[i]
-                && self.plan.resources[i].initial.len > 0
+                && self.resources[i].store_reader
+                && self.resource_row(i).initial.len > 0
             {
                 super::lines::secrets_unseen(name)
             } else {
@@ -259,12 +280,12 @@ impl<D: DataSource> Runner<D> {
     /// already carry URLs), so a stale answer is traceable to its key.
     pub(super) fn journal_kept_seeds(&mut self) {
         self.journal_refused();
-        for i in 0..self.plan.resources.len() {
-            if let Some(state) = self.resources[i].as_ref().filter(|s| s.kept_seed) {
+        for i in 0..self.resources.len() {
+            if let Some(state) = self.resources[i].state.as_ref().filter(|s| s.kept_seed) {
                 let mut args = String::new();
                 crate::agent::untyped_json(&Value::list(state.args.clone()), &mut args);
                 let line =
-                    super::lines::kept_shown(self.plan.str(self.plan.resources[i].name), &args);
+                    super::lines::kept_shown(self.plan.str(self.resource_row(i).name), &args);
                 self.log(line);
             }
         }
@@ -283,7 +304,11 @@ impl<D: DataSource> Runner<D> {
     /// many arguments as the call identifies and fit its shape; otherwise
     /// the refusal is noted for the journal.
     pub(super) fn kept_seed(&mut self, i: usize) -> Option<(Vec<Value>, Value)> {
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i).clone();
+        // @ref LLP 1156.005 D4 — boot forgot any entry kept before it was.
+        if row.transient {
+            return None;
+        }
         let name = self.plan.str(row.name);
         let entry = self.store.kept(&kept_name(name))?;
         let identity = row.args.len as usize - usize::from(row.context);
@@ -308,8 +333,8 @@ impl<D: DataSource> Runner<D> {
             self.log("kept answers not shown: the launch begins with a presence secret locked (LLP 1133.010 D5)");
         }
         for (i, &taken) in seeded.iter().enumerate() {
-            if !self.plan.resources[i].reader
-                || exact_plan::runner_owned_source(self.plan.str(self.plan.resources[i].source))
+            if !self.resource_row(i).reader
+                || exact_plan::runner_owned_source(self.plan.str(self.resource_row(i).source))
             {
                 continue;
             }
@@ -318,12 +343,12 @@ impl<D: DataSource> Runner<D> {
             if taken && !device_state {
                 continue;
             }
-            self.stale[i] = true;
-            if self.resources[i].is_some() || locked {
+            self.resources[i].stale = true;
+            if self.resources[i].state.is_some() || locked {
                 continue;
             }
             if let Some((args, value)) = self.kept_seed(i) {
-                self.resources[i] = Some(ResourceState {
+                self.resources[i].state = Some(ResourceState {
                     inspection_generation: 0,
                     args,
                     value: crate::held::Held::new(value),
@@ -331,6 +356,8 @@ impl<D: DataSource> Runner<D> {
                     placeholder: false,
                     kept_seed: true,
                     answered_for: None,
+                    asleep: false,
+                    slept: false,
                     origin: 0,
                 });
             }
@@ -363,13 +390,13 @@ impl<D: DataSource> Runner<D> {
             return;
         }
         for i in 0..self.plan.resources.len() {
-            if !kept_module(&self.plan, i) || self.resources[i].is_some() {
+            if !kept_module(&self.plan, i) || self.resources[i].state.is_some() {
                 continue;
             }
             let Some((args, value)) = self.kept_seed(i) else {
                 continue;
             };
-            self.resources[i] = Some(ResourceState {
+            self.resources[i].state = Some(ResourceState {
                 inspection_generation: 0,
                 args,
                 value: crate::held::Held::new(value),
@@ -377,11 +404,13 @@ impl<D: DataSource> Runner<D> {
                 placeholder: false,
                 kept_seed: true,
                 answered_for: None,
+                asleep: false,
+                slept: false,
                 origin: 0,
             });
             match ready {
                 true => self.refresh_next.push(i),
-                false => self.stale[i] = true,
+                false => self.resources[i].stale = true,
             }
         }
     }
@@ -394,17 +423,19 @@ impl<D: DataSource> Runner<D> {
             return;
         }
         let module = self.keeping.modules && kept_module(&self.plan, i);
-        if !module && (!self.keeping.on || !self.store_readers[i]) {
+        if !module && (!self.keeping.on || !self.resources[i].store_reader)
+            || self.resource_row(i).transient
+        {
             return;
         }
         // @ref LLP 1039 D3 / LLP 1030 D7 — runner facts are never kept answers.
-        let source = self.plan.str(self.plan.resources[i].source);
+        let source = self.plan.str(self.resource_row(i).source);
         if exact_plan::runner_owned_source(source) {
             return;
         }
         // @ref LLP 1027.005 D6 — context reaches the source but does not
         // enter the kept entry or its budget.
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i).clone();
         let args = &args[..row.args.len as usize - usize::from(row.context)];
         let name = kept_name(self.plan.str(row.name));
         if !fits(args, value) {
@@ -482,7 +513,7 @@ impl<D: DataSource> Runner<D> {
             return;
         };
         self.keeping.of_launch.push(i);
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i).clone();
         let line = format!(
             "`{name}`'s kept answer is never shown at launch: its identifying argument {n} is this launch's {what}, which changes every launch. Pass it after `with` (`resource {name} = {source}(…) with …`), which still reaches the source but is not counted (LLP 1027.005)",
             name = self.plan.str(row.name),
@@ -497,7 +528,7 @@ impl<D: DataSource> Runner<D> {
     fn reads_clock(&self, i: usize, k: usize) -> bool {
         use crate::instance::Input;
         let deps = self.sites.deps();
-        let Some(arg) = self.plan.resources[i].args.iter().nth(k) else {
+        let Some(arg) = self.resource_row(i).args.iter().nth(k) else {
             return false;
         };
         let mut work = vec![deps.reads_of(&self.plan, self.plan.arg(arg).expr)];
@@ -506,7 +537,7 @@ impl<D: DataSource> Runner<D> {
             for input in deps.inputs(&reads) {
                 match input {
                     Input::Resource(r) | Input::PendingResource(r) | Input::FailedResource(r)
-                        if self.plan.str(self.plan.resources[r].source) == crate::time::SOURCE =>
+                        if self.plan.str(self.resource_row(r).source) == crate::time::SOURCE =>
                     {
                         return true;
                     }
@@ -529,7 +560,7 @@ impl<D: DataSource> Runner<D> {
         snapshot: Vec<(String, Vec<u8>)>,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(false);
+        let checkpoint = self.checkpoint();
         let result = self.restore_store(snapshot).and_then(|change| {
             if !change.any {
                 return Ok(None);
@@ -571,7 +602,7 @@ impl<D: DataSource> Runner<D> {
         snapshot: Vec<(String, Vec<u8>)>,
     ) -> Result<crate::StoreChange, RunnerError> {
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(false);
+        let checkpoint = self.checkpoint();
         let result = self.restore_store(snapshot);
         self.conclude(checkpoint, &result, was_poisoned);
         result
@@ -581,7 +612,12 @@ impl<D: DataSource> Runner<D> {
         &mut self,
         snapshot: Vec<(String, Vec<u8>)>,
     ) -> Result<crate::StoreChange, RunnerError> {
+        // Another writer (an older build of the app) may have kept one again.
+        let transient = transient(&self.plan, snapshot.iter().map(|(name, _)| name));
         let change = self.store.refresh_snapshot(snapshot);
+        for name in &transient {
+            self.store.forget_kept(name);
+        }
         if !change.any {
             return Ok(change);
         }
@@ -595,14 +631,12 @@ impl<D: DataSource> Runner<D> {
     }
 
     pub(super) fn store_readers(&self) -> Vec<usize> {
-        self.store_readers
+        crate::vm::Column::rows(&self.resources, |row| &row.store_reader)
             .iter()
             .enumerate()
             .filter_map(|(i, reads)| {
                 (*reads
-                    && !exact_plan::runner_owned_source(
-                        self.plan.str(self.plan.resources[i].source),
-                    ))
+                    && !exact_plan::runner_owned_source(self.plan.str(self.resource_row(i).source)))
                 .then_some(i)
             })
             .collect()
@@ -637,11 +671,14 @@ impl<D: DataSource> Runner<D> {
         } else {
             Vec::new()
         };
-        let stale: Vec<usize> = (0..self.stale.len())
-            .filter(|i| self.stale[*i] || readers.contains(i))
+        let stale: Vec<usize> = (0..self.resources.len())
+            .filter(|i| self.resources[*i].stale || readers.contains(i))
             .collect();
         // Writes made before the source was ready are overlaid from here
-        self.overlays.iter_mut().for_each(|o| *o = None);
+        self.resources
+            .iter_mut()
+            .map(|row| &mut row.overlay)
+            .for_each(|o| *o = None);
         if self.unsent.is_empty() {
             if !change.any && stale.is_empty() && self.writes.records.is_empty() {
                 return Ok(None);
@@ -655,7 +692,7 @@ impl<D: DataSource> Runner<D> {
             self.unsent.len()
         );
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(false);
+        let checkpoint = self.checkpoint();
         self.refresh_next.extend(&stale);
         self.owe(&stale);
         let result = if self.poisoned {
@@ -673,8 +710,8 @@ impl<D: DataSource> Runner<D> {
                 .and_then(|_| self.gate_step())
             {
                 Ok(()) => {
-                    for ((origin, id), (m, source, args, request)) in by.into_iter().zip(later) {
-                        let target = super::Target::Mutation(m);
+                    for ((origin, id), (target, source, args, request)) in by.into_iter().zip(later)
+                    {
                         self.as_invocation(origin, id, |r| {
                             r.enqueue(target, source, args, request, false)
                         });
@@ -693,13 +730,13 @@ impl<D: DataSource> Runner<D> {
         // `data_ready`): they are dropped, said in the journal, and their
         // writes end.
         if dropped {
-            for (m, ..) in std::mem::take(&mut self.unsent) {
-                let name = self.plan.str(self.plan.mutations[m].name).to_string();
+            for (target, ..) in std::mem::take(&mut self.unsent) {
+                let name = self.target_name(target);
                 self.log(super::lines::unsent_refused(
                     &name,
                     "data_ready was refused",
                 ));
-                self.end_write(m, None);
+                self.end_write(target, None);
             }
             self.sync_pending_flags();
         }
@@ -725,22 +762,17 @@ impl<D: DataSource> Runner<D> {
     /// long ago, so a source's refusal ends that one send, said in the
     /// journal, as a refused reply does — never this commit.
     #[allow(clippy::type_complexity)]
-    fn send_unsent(
-        &mut self,
-    ) -> (
-        Vec<(CallOrigin, u64)>,
-        Vec<(usize, String, Vec<Value>, super::Request)>,
-    ) {
+    fn send_unsent(&mut self) -> (Vec<(CallOrigin, u64)>, Vec<super::Later>) {
         let (mut by, mut later) = (Vec::new(), Vec::new());
-        for (m, source, args, (origin, id)) in std::mem::take(&mut self.unsent) {
+        for (target, source, args, (origin, id)) in std::mem::take(&mut self.unsent) {
             let sent = later.len();
-            self.as_invocation(origin, id, |r| r.send_one(m, source, args, &mut later));
+            self.as_invocation(origin, id, |r| r.send_one(target, source, args, &mut later));
             by.extend(std::iter::repeat_n((origin, id), later.len() - sent));
         }
         self.sync_pending_flags();
         // Pending until the request goes out with the commit, or is let go.
-        for (m, ..) in &later {
-            self.pending_mut[*m] = true;
+        for m in later.iter().filter_map(|l| l.0.mutation()) {
+            self.pending_mut[m] = true;
         }
         (by, later)
     }
@@ -753,33 +785,45 @@ impl<D: DataSource> Runner<D> {
     /// One of [`Self::send_unsent`]'s sends, under its commit's origin.
     fn send_one(
         &mut self,
-        m: usize,
+        target: super::Target,
         source: String,
         args: Vec<Value>,
-        later: &mut Vec<(usize, String, Vec<Value>, super::Request)>,
+        later: &mut Vec<super::Later>,
     ) {
-        let target = super::Target::Mutation(m);
+        let m = target
+            .mutation()
+            .expect("a send's target names its mutation");
         let name = self.plan.str(self.plan.mutations[m].name).to_string();
-        self.mutation_requests += 1;
-        let answer = if Self::activity_send(&source) {
-            self.activity_request(&source, &args)
-        } else {
-            self.store.set_clock_ms(self.now_ms);
-            let answer = self
-                .data
-                .answer_for(target, &mut self.store, &source, &args);
-            self.refuse_locked(answer)
-        };
-        // What its turn sent as an answer (LLP 1016.000 D7, the amendment
-        // of 2026-10-18).
-        self.stage_answer(target);
+        let answer = self
+            .check_send_arguments(m, &args)
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|()| {
+                self.mutation_requests += 1;
+                let answer = if Self::activity_send(&source) {
+                    self.activity_request(&source, &args)
+                } else {
+                    self.store.set_clock_ms(self.now_ms);
+                    let answer = self
+                        .data
+                        .answer_for(target, &mut self.store, &source, &args);
+                    self.refuse_locked(answer)
+                };
+                // What its turn sent as an answer (LLP 1016.000 D7, the amendment
+                // of 2026-10-18).
+                self.stage_answer(target);
+                answer.map_err(|e| format!("{e:?}"))
+            });
         let refused = match answer {
             Ok(super::Answer::Now(value)) if self.conforms(&value, self.plan.mutations[m].ty) => {
                 match self.mutation_slot(m) {
                     Ok(slot) => {
-                        self.forget_ticket(super::Target::Mutation(m));
-                        self.land_write(m, None, &value);
-                        self.slots[slot] = Value::some(value);
+                        if self.newest_wins(m) {
+                            self.forget_ticket(target);
+                        }
+                        self.land_write(target, None, &value);
+                        if self.conclude_send(target) {
+                            self.slots[slot] = Value::some(value);
+                        }
                         self.landed.push(m);
                         for r in self.declared_refreshes(m) {
                             self.force_refresh(r);
@@ -794,18 +838,18 @@ impl<D: DataSource> Runner<D> {
                 Some("its answer does not fit the mutation's shape".to_string())
             }
             Ok(super::Answer::Later(request)) => {
-                later.push((m, source, args, request));
+                later.push((target, source, args, request));
                 None
             }
-            Err(error) => Some(format!("{error:?}")),
+            Err(error) => Some(error),
         };
         if let Some(why) = refused {
             self.log(super::lines::unsent_refused(&name, &why));
             // Its write ends; the resources it showed in drop it in
             // this commit, and a refusal of the commit does not bring
             // it back.
-            self.refused_unsent.push((m, self.asked_write(m)));
-            self.end_write(m, None);
+            self.refused_unsent.push((target, self.asked_write(target)));
+            self.end_write(target, None);
         }
     }
 }
@@ -842,6 +886,56 @@ mod tests {
         }
         assert!(decode(&encode(&args, &deep)).is_some());
         assert_eq!(kept_name("remembered"), "exact.kept.remembered");
+    }
+
+    #[test]
+    fn activation_refuses_a_waiting_non_finite_send_without_asking_its_source() {
+        use crate::{DataError, Target};
+        use exact_kernel::{Kernel, NodeType};
+        use exact_plan::{builder::PlanBuilder, TypeKind};
+
+        struct Calls(usize);
+        impl DataSource for Calls {
+            fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+                self.0 += 1;
+                Ok(Value::str("answer"))
+            }
+        }
+        let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+        let string = b.primitive(TypeKind::String);
+        let optional = b.option(string);
+        let none = b.constant(&Value::NONE);
+        for name in ["invalid", "valid"] {
+            let slot = b.slot(name, optional, none);
+            b.mutation(name, slot, string);
+        }
+        b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+        let mut r = Runner::boot(
+            b.finish().unwrap(),
+            Calls(0),
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        // Exercise activation's boundary independently of the action's check.
+        for (m, n) in [f64::INFINITY, 1.0].into_iter().enumerate() {
+            r.unsent.push((
+                Target::Mutation(m),
+                "save".into(),
+                vec![Value::Number(n)],
+                r.sent_by(),
+            ));
+        }
+        r.data_ready().unwrap();
+        assert_eq!(r.data.0, 1);
+        assert_eq!(r.mutation_requests(), 1);
+        assert_eq!(r.slot("invalid"), Some(&Value::NONE));
+        assert_eq!(r.slot("valid"), Some(&Value::some(Value::str("answer"))));
+        assert!(!r.has_pending());
+        assert!(r.pending_mut.iter().all(|pending| !pending));
+        assert!(r.journal().any(|line| line.contains("invalid")
+            && line.contains("argument 1 contains a non-finite number")));
     }
 
     #[test]

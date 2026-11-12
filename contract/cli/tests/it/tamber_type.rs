@@ -49,6 +49,72 @@ const DESIGN: &str = "tamber t\n\naxes\n  density = regular | roomy\n\ntheme\n  
 const VIEW: &str = "component App\n  view\n    column\n      text \"Body\" testId=\"body\" font=\"type.body\"\n      text \"Title\" testId=\"title\" font=\"type.title\"\n      text \"System\" testId=\"system\" font=\"type.system\"\n      text \"Mono\" testId=\"mono\" font-family=\"family.mono\"\n      text \"Dense\" testId=\"dense\" font=\"type.dense\"\n      column -exact-mode=\"density=roomy\"\n        text \"Roomy\" testId=\"roomy\" font=\"type.dense\"\n";
 
 #[test]
+fn an_unused_family_stack_refusal_names_its_design_file_and_line() {
+    let entry = app(
+        "refused-stack",
+        "component App\n  view\n    text \"x\" color=\"ink\"\n",
+    );
+    let design = entry.with_extension("tamber");
+    for (token, reason) in [
+        ("family.text = \"Comic Sans MS\", cursive", "cursive"),
+        ("type.body = 16px/1.4 \"Comic Sans MS\", cursive", "cursive"),
+        (r#"family.text = '"Missing"', monospace"#, "quote"),
+        (r#"type.body = 16px/1.4 '"Missing"', monospace"#, "quote"),
+    ] {
+        std::fs::write(
+            &design,
+            format!("tamber t\n\ntheme\n  ink = light-dark(#111111, #eeeeee)\n  {token}\n"),
+        )
+        .unwrap();
+        let error = contract::compile_path(&entry).unwrap_err();
+        assert_eq!(error.file.as_deref(), Some(design.as_path()), "{error:?}");
+        assert_eq!(error.span.line, 5, "{error:?}");
+        assert!(
+            error.span.col > 0 && error.message.contains(reason),
+            "{error:?}"
+        );
+    }
+    std::fs::remove_dir_all(entry.parent().unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transaction_refuses_an_invalid_unused_family_stack_without_writing() {
+    use super::tamber_rows_check::transaction;
+    use super::tamber_serve::Serve;
+    use serde_json::json;
+
+    let entry = app(
+        "transaction-stack",
+        "component App\n  view\n    text \"x\"\n",
+    );
+    let dir = entry.parent().unwrap();
+    let path = entry.with_extension("tamber");
+    let design = "tamber t\n\ntheme\n  family.text = \"Inter\", system-ui\n  type.body = 16px/1.4 system-ui\n";
+    std::fs::write(&path, design).unwrap();
+    let mut server = Serve::start(dir, &[]);
+    for (name, value, line) in [
+        ("family.text", "\"Comic Sans MS\", cursive", 4),
+        ("type.body", "16px/1.4 \"Comic Sans MS\", cursive", 5),
+    ] {
+        let refused = transaction(
+            &mut server,
+            dir,
+            json!({"op": "set-token", "name": name, "value": value}),
+        );
+        let diagnostic = &refused["error"]["diagnostics"][0];
+        assert_eq!(diagnostic["line"], line, "{refused}");
+        assert!(
+            diagnostic["message"].as_str().unwrap().contains("cursive"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), design);
+    }
+    drop(server);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_type_token_writes_only_its_longhands() {
     let plan = contract::compile_path(&app("rows", VIEW)).unwrap_or_else(|e| panic!("{e:?}"));
     let kinds: Vec<(String, u8)> = plan
@@ -167,6 +233,60 @@ fn a_family_token_is_the_stack_the_compiler_declared() {
     r.set_token("face", "\"InterVariable\", system-ui", &[])
         .unwrap();
     assert_eq!(node(&r, "switch").style.font_family, georgia);
+}
+
+#[test]
+fn quoted_family_tokens_resolve_with_their_fallback() {
+    let entry = app(
+        "quoted-fallback",
+        "component App\n  view\n    column\n      text \"x\" testId=\"family\" font-family=\"family.text\"\n      text \"y\" testId=\"type\" font=\"type.body\"\n",
+    );
+    for (family, name) in [
+        ("\"Missing\", monospace", "Missing"),
+        ("'Missing', monospace", "Missing"),
+        ("\"monospace\", monospace", "monospace"),
+        ("'monospace', monospace", "monospace"),
+        ("\"A, B\", monospace", "A, B"),
+        ("\"O'Brien\", monospace", "O'Brien"),
+        (r#""'Missing'", monospace"#, "'Missing'"),
+        (r#"'Say "hi" again', monospace"#, r#"Say "hi" again"#),
+    ] {
+        std::fs::write(
+            entry.with_extension("tamber"),
+            format!(
+                "tamber t\n\ntheme\n  family.text = {family}\n  type.body = 16px/1.4 {family}\n"
+            ),
+        )
+        .unwrap();
+        let plan = contract::compile_path(&entry).unwrap();
+        let stack = exact_runner::bridge::plan_stack(&plan, family).unwrap();
+        let members: Vec<_> = plan
+            .stack(exact_plan::StacksId(stack.into()))
+            .members
+            .iter()
+            .map(|id| {
+                let member = plan.stack_member(id);
+                (
+                    member.kind,
+                    member.family.map(|f| plan.str(plan.familie(f).name)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                (exact_plan::StackMemberKind::Family, Some(name)),
+                (exact_plan::StackMemberKind::Monospace, None),
+            ],
+            "{family}"
+        );
+        let r = booted(plan);
+        for id in ["family", "type"] {
+            assert!(node(&r, id).style.mask.has(StyleId::FontFamily));
+            assert_eq!(node(&r, id).style.font_family, stack, "{family}");
+        }
+    }
+    std::fs::remove_dir_all(entry.parent().unwrap()).unwrap();
 }
 
 #[test]

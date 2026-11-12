@@ -2,7 +2,29 @@
 
 use super::{err, infer, Ref, Scope, Ty, TypeError, Types};
 use crate::checks::can_unify;
-use contract_syntax::{Binding, File, Node, Span};
+use contract_syntax::{Binding, File, Node};
+
+#[derive(Clone)]
+struct Provider<'a> {
+    binding: &'a Binding,
+    ty: Ty,
+    computed_action: bool,
+}
+
+impl<'a> Provider<'a> {
+    fn new(
+        binding: &'a Binding,
+        scope: &Scope,
+        types: &Types,
+        file: &File,
+    ) -> Result<Self, TypeError> {
+        Ok(Self {
+            binding,
+            ty: infer(&binding.expr, scope, &types.shapes)?,
+            computed_action: super::uses::computed_action(&binding.expr, scope, types, file),
+        })
+    }
+}
 
 /// A slot's fill, checked where `children` stands with its caller's scope
 /// and providers (LLP 1035.005.000 D9: the slot's own section does not
@@ -11,7 +33,7 @@ use contract_syntax::{Binding, File, Node, Span};
 struct Fill<'a> {
     nodes: &'a [Node],
     scope: Scope,
-    provides: Vec<(String, Ty, Span)>,
+    provides: Vec<Provider<'a>>,
     outer: Option<Box<Fill<'a>>>,
 }
 
@@ -19,18 +41,14 @@ struct Fill<'a> {
 /// `provides` is the root's `provide` section, `scope` its scope.
 pub(super) fn check_injects<'a>(
     nodes: &'a [Node],
-    provides: &[Binding],
+    provides: &'a [Binding],
     scope: &Scope,
     types: &Types,
     file: &'a File,
 ) -> Result<(), TypeError> {
     let mut provided = Vec::new();
     for b in provides {
-        provided.push((
-            b.name.clone(),
-            infer(&b.expr, scope, &types.shapes)?,
-            b.span,
-        ));
+        provided.push(Provider::new(b, scope, types, file)?);
     }
     check_inject_nodes(nodes, scope, types, file, &mut provided, None, 0, 0)
 }
@@ -41,7 +59,7 @@ fn check_inject_nodes<'a>(
     scope: &Scope,
     types: &Types,
     file: &'a File,
-    provides: &mut Vec<(String, Ty, Span)>,
+    provides: &mut Vec<Provider<'a>>,
     fill: Option<&Fill<'a>>,
     depth: u32,
     site_depth: usize,
@@ -86,14 +104,28 @@ fn check_inject_nodes<'a>(
                 let target_c = &file.components[target];
                 let target_t = &types.components[target];
                 for (j, inject) in target_c.injects.iter().enumerate() {
-                    let Some((_, got, provided_at)) = provides
+                    let Some(provider) = provides
                         .iter()
                         .rev()
-                        .find(|(provided, _, _)| provided == &inject.name)
+                        .find(|p| p.binding.name == inject.name)
                     else {
                         continue;
                     };
+                    let Provider {
+                        binding,
+                        ty: got,
+                        computed_action,
+                    } = provider;
                     let want = &target_t.props[target_c.props.len() + j];
+                    if matches!(want, Ty::Action(_)) {
+                        super::uses::check_action_binding(
+                            &binding.name,
+                            &binding.expr,
+                            binding.span,
+                            *computed_action,
+                            true,
+                        )?;
+                    }
                     if !can_unify(want, got) {
                         return err(
                             "type-provide",
@@ -101,7 +133,7 @@ fn check_inject_nodes<'a>(
                                 "the provided `{}` is `{got}`, but `{name}` injects `{want}`",
                                 inject.name
                             ),
-                            *provided_at,
+                            binding.span,
                         );
                     }
                 }
@@ -121,8 +153,7 @@ fn check_inject_nodes<'a>(
                 });
                 let outer = provides.len();
                 for b in &target_c.provides {
-                    let got = infer(&b.expr, &target_scope, &types.shapes)?;
-                    provides.push((b.name.clone(), got, b.span));
+                    provides.push(Provider::new(b, &target_scope, types, file)?);
                 }
                 let checked = check_inject_nodes(
                     &target_c.view,

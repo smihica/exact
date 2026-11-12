@@ -31,6 +31,20 @@ fn main() {
     let compat = exact_bake::compatibility_id(&app_dir, platform, &target, &manifest, Some(grants))
         .unwrap_or_else(|e| panic!("compatibility id: {e}"));
     std::fs::write(out_dir.join("compat.json"), compat.to_json()).unwrap();
+    for (name, linked) in [("sqlite", vec!["sqlite"]), ("empty", vec![])] {
+        let inputs = serde_json::json!({"platform": platform, "linked": linked});
+        std::fs::write(
+            out_dir.join(format!("composition-{name}.rs")),
+            contract::rust_entry(
+                "exact_data_host::Storage<super::Fixture>",
+                "exact_data_host::Storage::new(super::Fixture)",
+                "off",
+                &inputs,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
     let host = if compat.inputs["store"]["L"] == "0" {
         "exact_apple"
     } else {
@@ -43,7 +57,8 @@ fn main() {
             contract::rust_entry(
                 "exact_data_host::Storage<calendar_data::Calendar>",
                 "exact_data_host::Storage::new(calendar_data::Calendar::default())",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap()
         ),

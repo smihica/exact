@@ -142,7 +142,7 @@ final class PictureInPictureHost {
         guard window != nil || handle != nil else { return }
         source = src
         // A file the image names, as it resolves one: the app's own (`app:/`) or a bundled asset.
-        let url = src.hasPrefix("app:/") ? AppFiles.url(src) : URL(string: src)?.scheme == nil ? node.presenter?.session?.app.resolveAsset(src) : nil
+        let url = src.hasPrefix("app:/") ? AppFiles.file(src) : URL(string: src)?.scheme == nil ? node.presenter?.session?.app.resolveAsset(src) : nil
         guard let path = url?.path else {
             // Before the window opens, an unreadable picture fails the request; after, the window keeps the last.
             if entered { node.presenter?.session?.log("requestPictureInPicture: \(src) is not a file the window can read") }

@@ -480,6 +480,11 @@ impl<D: DataSource> Presenter<D> {
                         if let Some((key, point, field)) = focus {
                             self.focus_on_down(key, point, now_ms, field);
                         }
+                        if let Some(key) = self.contact.as_ref().and_then(|c| {
+                            (c.canvas.is_none() && c.retained.is_none()).then_some(c.hit)
+                        }) {
+                            self.begin_range_drag(key, (x, y));
+                        }
                         Ok(taken)
                     }
                 }
@@ -660,7 +665,7 @@ impl<D: DataSource> Presenter<D> {
         }
         let feedback = pressed.and_then(|id| {
             let node = self.host.kernel().node(id)?;
-            let (key, origin) = (node.key, node.style.transform_origin);
+            let (key, origin) = (node.key, node.style.transform_origin.clone());
             self.box_of(id).map(|b| (key, b.unpressed(origin)))
         });
         let press_activates = feedback.is_some_and(|(key, _)| {
@@ -701,6 +706,11 @@ impl<D: DataSource> Presenter<D> {
     /// The canvas holding the contact, if one does.
     pub(crate) fn contact_canvas(&self) -> Option<u32> {
         self.contact.as_ref().and_then(|c| c.canvas)
+    }
+    pub(super) fn contact_has_gesture(&self) -> bool {
+        self.contact
+            .as_ref()
+            .is_some_and(|c| c.hold.is_some() || c.group || c.panning)
     }
     /// The canvas a free pointer at a viewport point is over, where a press
     /// there would be the canvas's own.
@@ -763,7 +773,7 @@ impl<D: DataSource> Presenter<D> {
         let mut contact = self.contact.take().unwrap();
         contact.last_ms = now_ms;
         contact.event_ms = event_ms;
-        if self.drag_field(x, y) {
+        if self.drag_field(x, y) || self.drag_range((x, y)) {
             contact.position = (x, y);
             self.contact = Some(contact);
             return Ok(true);
@@ -839,7 +849,7 @@ impl<D: DataSource> Presenter<D> {
         }
         contact.position = (x, y);
         if contact.group {
-            let moved = self.move_group((x, y), now_ms);
+            let moved = self.move_group((x, y));
             if self.group_live() {
                 self.contact = Some(contact);
             } else {
@@ -863,7 +873,7 @@ impl<D: DataSource> Presenter<D> {
                 return match self.begin_group(binding, contact.origin, now_ms) {
                     Ok(true) => {
                         contact.group = true;
-                        let moved = self.move_group((x, y), now_ms);
+                        let moved = self.move_group((x, y));
                         self.contact = Some(contact);
                         moved
                     }
@@ -1004,6 +1014,7 @@ impl<D: DataSource> Presenter<D> {
         let mark = self.hatch_pointer_mark(crate::hatches::Phase::Up, x, y);
         let result = self.pointer_lift(x, y, now_ms, event_ms);
         self.field_drag = None;
+        self.forget_range_drag();
         self.refresh_feedback();
         self.hatch_pointer(mark, crate::hatches::Phase::Up, x, y);
         result
@@ -1029,6 +1040,8 @@ impl<D: DataSource> Presenter<D> {
                 return Err(error);
             }
         };
+        // A range's `change` precedes the click, as HTML's does.
+        self.end_range_drag();
         let Some(contact) = self.contact.take() else {
             return Ok(false);
         };
@@ -1241,6 +1254,8 @@ impl<D: DataSource> Presenter<D> {
     pub fn pointer_cancel(&mut self, now_ms: f64) -> Result<(), String> {
         self.overlay_pointer_cancel();
         self.field_drag = None;
+        self.end_range_drag();
+        self.forget_range_drag();
         self.brush.scrollbars.drag = None;
         self.brush.scrollbars.pressed = false;
         let at = self.contact_position().or(self.pointer).unwrap_or((0., 0.));

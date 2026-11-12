@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 export const here = import.meta.dir, pkg = resolve(here, '..'), root = resolve(pkg, '../..');
 
@@ -21,7 +22,7 @@ const kept = process.env.EXACT_CLIPBOARD_FIXTURE;
 export function makeFixture() {
   const reuse = kept && existsSync(join(kept, 'app.json'));
   const app = reuse ? resolve(kept) : kept ? resolve(kept) : join(mkdtempSync(join(tmpdir(), 'exact-clipboard-')), 'clipfixture');
-  if (!reuse) run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  if (!reuse) run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac'], root);
   for (const f of ['app.contract', 'app.ts', 'strings']) cpSync(join(here, 'fixture', f), join(app, f), { recursive: true });
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -30,6 +31,9 @@ export function makeFixture() {
   manifest.dependencies = { ...manifest.dependencies, '@exact/clipboard': `file:${pkg}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, id };
 }
 

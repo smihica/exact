@@ -205,7 +205,16 @@ fn every_command_help_succeeds_without_reading_or_changing_files() {
     for flag in ["--help", "-h"] {
         app.write(flag, "this is not a Contract source\n");
     }
-    for command in ["", "build", "migrate", "symbols", "fmt", "types", "test"] {
+    let top = Command::new(env!("CARGO_BIN_EXE_contract"))
+        .arg("--help")
+        .current_dir(&app.0)
+        .output()
+        .unwrap();
+    let top = String::from_utf8(top.stdout).unwrap();
+    for command in [
+        "", "build", "migrate", "symbols", "sources", "fmt", "types", "rust", "test", "lean",
+        "verify", "vocab", "gallery",
+    ] {
         for flag in ["--help", "-h"] {
             let mut process = Command::new(env!("CARGO_BIN_EXE_contract"));
             if !command.is_empty() {
@@ -217,7 +226,29 @@ fn every_command_help_succeeds_without_reading_or_changing_files() {
             let text = String::from_utf8(output.stdout).unwrap();
             assert!(text.starts_with("usage:"), "{text}");
             assert!(text.contains(&format!("contract {command}")), "{text}");
+            if !command.is_empty() {
+                let usage = text
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .strip_prefix("usage: ")
+                    .unwrap();
+                assert!(
+                    top.lines().any(|line| line.trim().starts_with(usage)),
+                    "top-level help omits {usage}:\n{top}"
+                );
+            }
         }
+    }
+    for args in [vec![], vec!["unknown-command"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_contract"))
+            .args(&args)
+            .current_dir(&app.0)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), top);
     }
     for flag in ["--help", "-h"] {
         assert_eq!(

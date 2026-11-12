@@ -127,6 +127,9 @@ public final class ExactPackageContext {
     private let afterFn: (Double, @escaping () -> Void) -> () -> Void
     /// The host's region carrier (LLP 1133.021 D14).
     public let regions: ExactRegions
+    /// The app's remote-notification registration, kept by the host (LLP
+    /// 1133.004 §9 P3).
+    public let push: ExactPushRegistration
 
     public init(agent: Bool, session: String, hostSession: String = "", changed: @escaping (String) -> Void,
                 log: @escaping (String) -> Void, now: @escaping () -> Double,
@@ -148,6 +151,7 @@ public final class ExactPackageContext {
                     return work.cancel
                 },
                 regions: ExactRegions = ExactRegions { _, _ in nil },
+                push: ExactPushRegistration = ExactPushRegistration { nil },
                 expireWake: @escaping (String) -> Void = { _ in },
                 state: @escaping ([String: Any]) -> Void = { _ in }) {
         self.agent = agent; self.session = session; self.hostSession = hostSession
@@ -155,7 +159,7 @@ public final class ExactPackageContext {
         self.tracks = tracks; fileFn = file; self.audioSession = audioSession; pictureFn = picture
         self.surfaces = surfaces; orientationFn = orientation; viewFn = view; invokeFn = invoke
         emitFn = emit; activationFn = activation; wakeFn = wake; self.wakes = wakes; self.transfers = transfers
-        self.pads = pads; afterFn = after; self.regions = regions; expireWakeFn = expireWake; stateFn = state
+        self.pads = pads; afterFn = after; self.regions = regions; self.push = push; expireWakeFn = expireWake; stateFn = state
     }
 
     /// `body` once, `ms` later on the session's clock: the agent's under the
@@ -232,6 +236,8 @@ public final class ExactPackageContext {
     /// The file an admitted `app:/` path names (LLP 1133.009 D10 item 4):
     /// the session's own directories, a scratch tree under the agent.
     /// Admission has checked the path against the calling source's grants.
+    /// A destination may be missing; an existing destination must be a regular
+    /// file, and existing parts must lead through no symbolic link.
     public func file(_ path: String) -> URL? { fileFn(path) }
 
     /// Under the agent, what the implementation discloses of its own objects
@@ -482,6 +488,20 @@ public final class ExactRegions {
     public func pending(name: String) -> [String: Any]? { callFn("pending", ["name": name]) as? [String: Any] }
     /// The transition of `name` was delivered: the store forgets it.
     public func delivered(name: String) { _ = callFn("delivered", ["name": name]) }
+}
+
+/// The app's remote-notification registration (LLP 1133.004 §9 P3): the
+/// system answers `registerForRemoteNotifications()` on the app delegate,
+/// which forwards the answer to the host, and the host keeps the last one.
+/// The host never registers; the implementation does. Each answer is posted
+/// as `changed` on the main thread, its `userInfo` what `current` reads.
+public final class ExactPushRegistration {
+    public static let changed = Notification.Name("exact.push.changed")
+    private let readFn: () -> [String: Any]?
+    public init(_ read: @escaping () -> [String: Any]?) { readFn = read }
+    /// `{token?, error?, answers}`: the last device token in lowercase hex,
+    /// or the last failure's message, and how many answers this process had.
+    public var current: [String: Any] { readFn() ?? ["answers": 0] }
 }
 
 /// A wake the host was given for an implementation's due requests.

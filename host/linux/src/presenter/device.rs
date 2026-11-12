@@ -64,7 +64,8 @@ impl<D: DataSource> Presenter<D> {
     ///   `prefers-color-scheme` follow it);
     /// - the font scale is the root font size, 16 times it;
     /// - the locale is the viewer's place, which chooses the app's string
-    ///   table and its dates;
+    ///   table and its dates, except under the agent, whose drive names the
+    ///   place;
     /// - "remove animations" is `prefers-reduced-motion`, high contrast is
     ///   `prefers-contrast: more`;
     /// - a television is `pointer: none` and `hover: none`; a touch screen
@@ -117,12 +118,19 @@ impl<D: DataSource> Presenter<D> {
             // A field the shell hosts starts at the scaled size too (D8).
             error = error.or(self.scale_field_font(device.font_scale));
         }
-        // A tag the runner refuses (an empty one) leaves the place as it was.
-        if !device.locale.is_empty() && place != *self.host.runner().place() {
+        // A tag the runner refuses (an empty one) leaves the place as it was,
+        // and so does a drive: its place (`EXACT_AGENT_LOCALE`) is the app's
+        // whatever the phone's language, as on every other host.
+        if !self.agent && !device.locale.is_empty() && place != *self.host.runner().place() {
             error = error.or(self.set_place(&place));
         }
-        // A date control shows its value as the device writes it (D9).
-        let dates = crate::paint::dates::Dates::from_lines(&device.dates);
+        // A date control shows its value as the device writes it (D9); under
+        // a drive, as HTML writes it, since the phone writes in its own
+        // language rather than the drive's.
+        let dates = match self.agent {
+            true => None,
+            false => crate::paint::dates::Dates::from_lines(&device.dates),
+        };
         if self.brush.dates != dates {
             self.brush.dates = dates;
             self.dirty = true;

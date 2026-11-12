@@ -123,12 +123,9 @@ const LINES: &[(&str, &str, &str)] = &[
     ("host/web-js/rt.js", r#"if (typeof k + ":" + (Object.is(k, -0) ? 0 : k) !== r.k) break;"#, "a keyed list's key, type and value"),
     ("host/web-js/rt.js", r#"k = typeof k + ":" + (Object.is(k, -0) ? 0 : k);"#, "a keyed list's key, type and value"),
     ("host/web-js/rt.js", r#"if (next.has(k)) { const n = seen.get(k) ?? 1; seen.set(k, n + 1); k = "d" + n + ":" + k; journal.push(`each: repeated key ${k}`); }"#, "a repeated key's disambiguation"),
-    ("host/web/glue.js", r#"const need=`surface.${op.mode==="capture"?"read":"write"} ${op.name}`;"#, "the ternary in a canvas surface's grant (`\"read\":\"write\"` holds a colon literal's text)"),
-    ("host/web/navigation.js", "const namespace = at < 0 ? target.startsWith('/') ? '' : null : target.slice(0, at) + ':';", "a grant path's namespace (`pathTuple`)"),
-    ("host/web/navigation.js", "const namespace = at < 0 ? path.startsWith('/') ? '' : null : path.slice(0, at) + ':';", "a grant path's namespace (`grantPathParts`)"),
     (
-        "host/web/navigation.js",
-        "const isWide = wide(), said = [isWide, viewParent(list) === nav && list.getAttribute(\"aria-orientation\"), ...[nav, list].map(el => el && [el.className, el.style.display, el.style.flexDirection, el.style.position, el.style.appearance].join(\"|\"))].join(\"/\"); if (placed.get(nav) !== said) { nav.removeAttribute(\"data-exact-sidebar\"); nav.toggleAttribute(\"data-exact-sidebar\", isWide && unsaidBar(nav, list)); placed.set(nav, said); }",
+        "host/web/navigation/routes.js",
+        r#"].join("|"))"#,
         "the sidebar's placement key, its styles joined",
     ),
 ];
@@ -483,7 +480,10 @@ fn the_scan_catches_each_bypass() {
     assert!(readers("x/b.js", "const [host, port] = url.split(':');")
         .0
         .is_empty());
-    let (found, seen) = readers("host/web/navigation.js", "// data-symbol\n  const namespace = at < 0 ? path.startsWith('/') ? '' : null : path.slice(0, at) + ':';\n");
+    let (found, seen) = readers(
+        "host/web/navigation/routes.js",
+        "// data-symbol\n  ].join(\"|\"))\n",
+    );
     assert!(found.is_empty(), "{found:?}");
-    assert_eq!(seen, vec![9]);
+    assert_eq!(seen, vec![7]);
 }

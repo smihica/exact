@@ -7,8 +7,9 @@
 // a finite take whose `ended=` action reads the time it ended, a `from` past
 // exact counting, a take whose end is already past at its arming, and a
 // take whose `ended=` starts a second, finite sequence with no `ended=`, and
-// tracks dropped once a beat kept across an edit is past exact counting. The
-// journal's `sound`, `sequence` and `haptic` lines, `state.sounds`,
+// tracks dropped once a beat kept across an edit is past exact counting, and
+// gate handovers in both declaration orders. The journal's `sound`,
+// `sequence` and `haptic` lines, `state.sounds`,
 // `state.transport` and `exactTransport()`'s answer compare on every
 // target. (No slot shares a name with Caltrain's: the wasm page carries its
 // first world into this plan by slot name.)
@@ -61,6 +62,9 @@ component Seq
     seqPlaying = true
   action seqStop
     seqPlaying = false
+  action seqSwap
+    seqPlaying = !seqPlaying
+    seqCoda = !seqCoda
   action seqFaster
     seqBpm = 150
   action seqEdit
@@ -91,6 +95,7 @@ component Seq
     seqFrom = 0
     seqLoops = 0
     seqHandoff = false
+    seqCoda = false
     seqPlaying = true
   action seqNarrow
     seqWide = false
@@ -109,6 +114,7 @@ component Seq
       text `ended at ${seqEndedAt}` testId="ended"
       button "start" press=seqStart testId="start"
       button "stop" press=seqStop testId="stop"
+      button "swap" press=seqSwap testId="swap"
       button "faster" press=seqFaster testId="faster"
       button "edit" press=seqEdit testId="edit"
       button "restart" press=seqRestart testId="restart"

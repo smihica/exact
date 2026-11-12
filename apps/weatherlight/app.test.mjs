@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, mock, test } from 'bun:test';
 import { open } from '../../scripts/agent.mjs';
 import { checkOp, ratio } from '../../scripts/agent-check.mjs';
 import { startNet } from '../../host/web-js/conformance/net.mjs';
@@ -166,3 +166,47 @@ for (const offline of [false, true]) {
     }
   }, 30000);
 }
+
+// The counts kept in app:/data, through the data module's own answers.
+mock.module('@exact/geolocation', () => ({ watchPosition: () => { throw new Error('unexpected geolocation call'); } }));
+mock.module('@exact/purchases', () => ({
+  acknowledge: async () => {}, consume: async () => {},
+  unfinishedPurchases: async () => [{ purchaseState: 'purchased', itemId: 'tip.small', purchaseToken: 't2' }],
+}));
+
+function store(code) {
+  const files = new Map([
+    ['app:/data/tips.json', JSON.stringify({ tips: 7, tokens: ['t1'] })],
+    ['app:/data/visits.json', JSON.stringify({ days: [1, 2, 3], asked: '' })],
+  ]);
+  const writes = [];
+  const storage = { fs: {
+    readFile: async (path) => {
+      if (code) throw Object.assign(new Error(`read failed (${code})`), { code });
+      const text = files.get(path);
+      if (text === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return new TextEncoder().encode(text).buffer;
+    },
+    atomicWriteFile: async (path) => { writes.push(path); },
+  } };
+  return { storage, writes };
+}
+
+// Only a missing file reads as empty. Any other failed read writes nothing,
+// so a count started from empty never replaces the stored one.
+test('a failed read writes nothing over the stored counts', async () => {
+  const { answer } = await import('./app.ts?case=failed');
+  const { storage, writes } = store('failed');
+  for (const [source, args] of [['deliverPurchases', []], ['visits', [864000000]], ['reviewAsked', []], ['tips', []]]) {
+    await expect(answer(source, args, {}, storage)).rejects.toThrow('read failed');
+  }
+  expect(writes).toEqual([]);
+});
+
+test('a read counts on from the file, and the build reads empty', async () => {
+  const { answer } = await import('./app.ts?case=read');
+  const { storage } = store();
+  expect(await answer('deliverPurchases', [], {}, storage)).toEqual({ tips: 8 });
+  expect(await answer('visits', [864000000], {}, storage)).toEqual({ days: 4, ask: false });
+  expect(await answer('tips', [], {}, store('bake').storage)).toEqual({ tips: 0 });
+});

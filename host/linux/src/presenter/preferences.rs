@@ -61,17 +61,26 @@ impl<D: DataSource> Presenter<D> {
         self.after_commit()
     }
 
-    /// The local zone's offset now, told when it is not the runner's: the
-    /// display loop asks before each advance, so a DST change or a new zone
-    /// reaches the timer that fires after it (habits F6). An agent drive's
-    /// offset is the drive's (`agent.rs` `retell_offset`), never this.
+    /// The machine's date at the live clock's zero and the local zone's
+    /// offset, told when either moved from the runner's: the offset, or the
+    /// date by a second or more (the runner's own threshold). The date moves
+    /// when the clock is set, and through a suspend, which the live clock
+    /// (`Instant`: `CLOCK_MONOTONIC` on Linux and Android) does not count.
+    /// Each loop asks before its advance and frame, and on the platform's
+    /// notice of a clock change or a resume, so the timer that fires after
+    /// a DST change, a new zone or a sleep reads the date (habits F6).
+    /// Under a driver's clock (no live clock) the date and offset are the
+    /// drive's (`agent.rs` `retell_offset`), never this.
     pub fn follow_local_offset(&mut self) -> Option<String> {
+        let clock = self.live_clock.as_ref()?;
+        let epoch = unix_ms() - clock();
         let time = self.host.runner().wall_time();
         let offset = crate::zone::local_offset_minutes();
-        if time.epoch_at_zero <= 0.0 || offset == time.utc_offset {
+        let moved = (epoch - time.epoch_at_zero).abs() >= 1000.0;
+        if time.epoch_at_zero <= 0.0 || (!moved && offset == time.utc_offset) {
             return None;
         }
-        self.set_time(time.epoch_at_zero, offset)
+        self.set_time(epoch, offset)
     }
 
     /// `prefers-reduced-motion`, `-reduced-transparency`, `-contrast` and
@@ -184,7 +193,12 @@ impl<D: DataSource> Presenter<D> {
 
     /// Report an individual view's appearance (LLP 1062 D4).
     pub fn set_view_scheme(&mut self, view: ViewId, dark: bool) {
+        let before = self.host.presented(view).dark;
         self.host.set_view_scheme(view, dark);
+        // View reports are paint state, outside the kernel's commit epoch.
+        if before != self.host.presented(view).dark {
+            self.window.status_bar.invalidate();
+        }
         self.dirty = true;
     }
 

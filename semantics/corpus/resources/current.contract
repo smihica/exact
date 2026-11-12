@@ -1,0 +1,41 @@
+// `current(r)`: with answers that arrive synchronously, a settled resource
+// shows an answer to its arguments, after new arguments and after a refresh
+// of the same ones (LLP 1161.001 D5). A family is current when every
+// member is.
+shape Item
+  id: string
+
+component App
+  state q = 1
+  state ids = ["a", "b"]
+  resource items = items(q) as shape Item[]
+  resource details = item(i) for i in ids as shape Item
+  derive fresh = current(items)
+  derive allFresh = current(details)
+  action next
+    q = q + 1
+  action reload
+    refresh items
+  action add
+    ids = ids.concat(["c"])
+  view
+    column
+      if current(items)
+        text `${items.length}` testId="count"
+      else
+        text "loading" testId="loading"
+      button "next" press=next testId="next"
+      button "reload" press=reload testId="reload"
+      button "add" press=add testId="add"
+
+test "current after each ask"
+  expect state fresh == true
+  expect tree missing "loading"
+  expect state allFresh == true
+  tap "next"
+  expect state fresh == true
+  tap "reload"
+  expect state fresh == true
+  expect tree missing "loading"
+  tap "add"
+  expect state allFresh == true

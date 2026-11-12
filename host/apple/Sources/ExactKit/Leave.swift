@@ -16,14 +16,11 @@ public protocol ExactLeaveDelegate: AnyObject {
 }
 
 extension ExactSession {
-    /// The sessions that observe, once each, whatever their activations.
-    nonisolated(unsafe) private static var leaving = Set<ObjectIdentifier>()
-
     /// Answers the packages of this session that ask to leave: the ask names
     /// the session by its view, the context's.
     func observeLeaving() {
-        guard Self.leaving.insert(ObjectIdentifier(self)).inserted else { return }
-        NotificationCenter.default.addObserver(forName: Notification.Name("exact.leave"), object: nil, queue: nil) { [weak self] note in
+        guard state != .destroyed, leaveObserver == nil else { return }
+        leaveObserver = NotificationCenter.default.addObserver(forName: Notification.Name("exact.leave"), object: nil, queue: nil) { [weak self] note in
             guard let self, let ask = note.object as? NSMutableDictionary, let mine = view, ask["view"] as AnyObject? === mine,
                   let url = ask["url"] as? String, let how = ask["how"] as? String else { return }
             ask["allow"] = (delegate as? ExactLeaveDelegate)?.exactSession(self, shouldLeaveFor: url, how: how) ?? true

@@ -42,7 +42,7 @@ fn plan(timeout: &str) -> Plan {
         );
         b.module(
             source,
-            "test.motion",
+            ("test.motion", "@fixture/test.motion"),
             name,
             false,
             false,
@@ -177,7 +177,7 @@ mod shared_permission {
         let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
         let string = b.primitive(TypeKind::String);
         let source = b.source("position", &[], string);
-        b.module(source, "testgeo", "position", false, false, "when-prompt", "", r#"{"default":"position","permission":{"name":"location","status":"status","field":"state","denied":"NotAllowedError"}}"#);
+        b.module(source, ("testgeo", "@fixture/testgeo"), "position", false, false, "when-prompt", "", r#"{"default":"position","permission":{"name":"location","status":"status","field":"state","denied":"NotAllowedError"}}"#);
         let r0 = b.resource("first", "position", &[], string, None);
         b.resource("second", "position", &[], string, None);
         let mut refresh = Asm::new();
@@ -221,4 +221,215 @@ mod shared_permission {
             "both surviving waiters are released"
         );
     }
+}
+
+/// A source whose substitute's `default` is written `null` reads none, an
+/// option's absent value; one with no `default` at all has no value.
+#[test]
+fn a_default_written_null_is_a_value() {
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let string = b.primitive(TypeKind::String);
+    for (name, substitute) in [("none", r#"{"default":null}"#), ("unset", "{}")] {
+        let source = b.source(name, &[], string);
+        b.module(
+            source,
+            ("test.push", "@fixture/test.push"),
+            name,
+            true,
+            false,
+            "never",
+            "",
+            substitute,
+        );
+    }
+    b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+    let r = boot(b.finish().unwrap());
+    let rows = r.plan.modules.clone();
+    assert_eq!(r.value_of(&rows[0]), Some(serde_json::Value::Null));
+    assert_eq!(r.value_of(&rows[1]), None);
+}
+
+/// A source with an `ungranted` value reads it while its permission is not
+/// granted, whatever it was given before, and its own value once granted
+/// (a push subscription, LLP 1133.004 §9 P3).
+#[test]
+fn an_ungranted_value_stands_until_the_permission_is_granted() {
+    use super::Decision;
+    use serde_json::{json, Value};
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let string = b.primitive(TypeKind::String);
+    let source = b.source("subscription", &[], string);
+    let substitute = r#"{"default":null,"ungranted":null,"permission":{"name":"notifications","status":"status","field":"state","denied":"NotAllowedError"}}"#;
+    b.module(
+        source,
+        ("test.push", "@fixture/test.push"),
+        "subscription",
+        true,
+        false,
+        "never",
+        "",
+        substitute,
+    );
+    b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+    let mut r = boot(b.finish().unwrap());
+    let row = r.plan.modules[0].clone();
+    let token = json!({"apple": {"deviceToken": "ab12"}});
+    r.extensions.preferred.insert(r.key(&row), token.clone());
+    let read = |r: &Runner<Source>| match r.decide(&row, false, &json!({})) {
+        Decision::Now(value) => value,
+        _ => panic!("a read answers now"),
+    };
+    for state in ["prompt", "denied"] {
+        r.set_permission("notifications", state);
+        assert_eq!(read(&r), Value::Null, "{state}");
+    }
+    r.set_permission("notifications", "granted");
+    assert_eq!(read(&r), token);
+}
+
+#[test]
+fn member_only_routing_preserves_options_and_uses_the_members_binding() {
+    use serde_json::{json, Value as Json};
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let string = b.primitive(TypeKind::String);
+    for (extension, name, sub) in [
+        (
+            "owner",
+            "get",
+            json!({"implementation": true, "takes": ["publicKey", "mediation", "signal"], "ceremony": {"options": "publicKey"}}),
+        ),
+        (
+            "one",
+            "first",
+            json!({"implementation": true, "memberOf": "owner.get", "member": "first"}),
+        ),
+        (
+            "two",
+            "second",
+            json!({"implementation": true, "memberOf": "owner.get", "member": "second"}),
+        ),
+    ] {
+        let source = b.source(&format!("{extension}.{name}"), &[], string);
+        b.module(
+            source,
+            (extension, extension),
+            name,
+            true,
+            false,
+            "never",
+            "",
+            &sub.to_string(),
+        );
+    }
+    b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+    let mut r = boot(b.finish().unwrap());
+    let owner = r.plan.modules[0].clone();
+    let member = r.plan.modules[1].clone();
+    r.extensions
+        .bound
+        .extend(["owner".into(), "one".into(), "two".into()]);
+    let args = json!({"first": {"value": 7}, "mediation": "required", "signal": "signal-1"});
+    assert!(r.members_refused(&owner, &args).is_none());
+    let body: Json = serde_json::from_slice(&r.forward_body(&owner, args.clone(), None)).unwrap();
+    assert_eq!(body["extension"], "one");
+    assert_eq!(body["send"], "first");
+    assert_eq!(body["args"], args);
+    assert!(body["request"].is_number());
+
+    let mut both = args.clone();
+    both["publicKey"] = json!({"challenge": "abc"});
+    let body: Json = serde_json::from_slice(&r.forward_body(&owner, both.clone(), None)).unwrap();
+    assert_eq!(body["extension"], "owner");
+    assert_eq!(body["send"], "get");
+    assert_eq!(body["args"], both);
+
+    let mut two = args.clone();
+    two["second"] = json!({});
+    assert_eq!(
+        r.members_refused(&owner, &two).unwrap()["error"],
+        "NotSupportedError"
+    );
+    assert!(r.member_forward(&owner, &two).is_none());
+    r.extensions.bound.remove("one");
+    assert!(r.members_refused(&owner, &both).is_none());
+    let refused = r.members_refused(&owner, &args).unwrap();
+    assert_eq!(refused["error"], "NotSupportedError");
+    assert!(refused["message"].as_str().unwrap().contains("first"));
+
+    r.extensions.agent.insert("one".into());
+    r.extensions
+        .preferred
+        .insert(r.key(&owner), json!({"wrong": true}));
+    r.extensions
+        .preferred
+        .insert(r.key(&member), json!({"member": true}));
+    assert!(r.members_refused(&owner, &args).is_none());
+    let body: Json = serde_json::from_slice(&r.forward_body(&owner, args.clone(), None)).unwrap();
+    assert_eq!(body["preferred"], json!({"member": true}));
+    r.extensions.bound.insert("one".into());
+    let body: Json = serde_json::from_slice(&r.forward_body(&owner, args, None)).unwrap();
+    assert!(body.get("preferred").is_none());
+}
+
+#[test]
+fn a_dropped_bound_member_reply_retires_its_provisional_request() {
+    use crate::{Dispatch, Reply, Request, Work};
+    use serde_json::{json, Value as Json};
+    use std::sync::{Arc, Mutex};
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let string = b.primitive(TypeKind::String);
+    for (extension, name, sub) in [
+        (
+            "owner",
+            "get",
+            json!({"takes": ["publicKey"], "ceremony": {"options": "publicKey"}}),
+        ),
+        (
+            "sign-in",
+            "identity",
+            json!({"memberOf": "owner.get", "member": "identity", "handles": {"handle": "identity"}}),
+        ),
+    ] {
+        let source = b.source(&format!("{extension}.{name}"), &[], string);
+        b.module(
+            source,
+            (extension, extension),
+            name,
+            true,
+            false,
+            "never",
+            "",
+            &sub.to_string(),
+        );
+    }
+    b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+    let mut r = boot(b.finish().unwrap());
+    let heard: Arc<Mutex<Vec<Json>>> = Default::default();
+    let seen = heard.clone();
+    r.native_slot()
+        .host(Some(Arc::new(move |body: Vec<u8>, reply: Reply| {
+            let body: Json = serde_json::from_slice(&body).unwrap();
+            seen.lock().unwrap().push(body.clone());
+            reply.send(super::response(&json!({"error": "AbortError"})));
+        })));
+    r.bind_extensions(&["owner", "sign-in"], &[]);
+    let body = json!({"extension": "owner", "send": "get", "args": {"identity": {}}})
+        .to_string()
+        .into_bytes();
+    r.note_handles(42, "data", &body);
+    let Dispatch::Run(Work::Later(work)) = r.native_work(&Request::native(body)) else {
+        panic!("a bound member's reply is watched")
+    };
+    work(Reply::new(|_| {}));
+    r.dispose_dropped();
+    assert!(
+        r.extensions.provisional.is_empty(),
+        "a completed reply with no handle retires its request"
+    );
+    assert!(r.extensions.arrived.lock().unwrap().is_empty());
+    assert!(heard
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|b| b.get("dispose").is_none()));
 }

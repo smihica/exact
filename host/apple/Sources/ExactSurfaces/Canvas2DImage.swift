@@ -99,8 +99,11 @@ final class Canvas2DHost: Canvas2DEnv {
     /// one to present: an animation drops frames instead of queueing them,
     /// and the newest replay done always shows.
     private let replay = DispatchQueue(label: "exact.canvas2d.replay", qos: .userInitiated)
-    /// Replays dispatched and not yet shown.
-    private var pending = 0
+    /// Replays dispatched and not yet shown (`loadingCount`); each one's end,
+    /// shown or dropped, tells `onReplayEnded`.
+    private var pending = 0 { didSet { if pending < oldValue { onReplayEnded?() } } }
+    /// A replay ended: what the session counts as outstanding may have cleared.
+    var onReplayEnded: (() -> Void)?
     /// Each canvas's latest arrival, and the newest one shown: an older
     /// replay's pixels are never shown over a newer one's.
     private var sequence: [UInt32: Int] = [:]
@@ -136,8 +139,6 @@ final class Canvas2DHost: Canvas2DEnv {
     /// A handle decoded (its image) or not (nil): the session tells the runtime.
     var onImage: ((String, CGImage?) -> Void)?
     private var images: [String: CGImage] = [:]
-    /// Every font a list has set, as last resolved.
-    private var resolved: [Canvas2DFont: CTFont] = [:]
     private var loading: Set<String> = []
 
     func canvasFont(_ f: Canvas2DFont) -> CTFont? { textEngine?()?.canvasText.font(f) }
@@ -164,7 +165,19 @@ final class Canvas2DHost: Canvas2DEnv {
                     done.wait()
                 }
                 let image = bytes.flatMap { CGImageSourceCreateWithData($0 as CFData, nil) }
-                    .flatMap { CGImageSourceCreateImageAtIndex($0, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) }
+                    .flatMap { source -> CGImage? in
+                        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                              let w = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                              let h = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+                        // Full-size transformed pixels make both drawImage and
+                        // the dimensions reported to the runner honor EXIF.
+                        return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                            kCGImageSourceCreateThumbnailFromImageAlways: true,
+                            kCGImageSourceCreateThumbnailWithTransform: true,
+                            kCGImageSourceThumbnailMaxPixelSize: max(w.intValue, h.intValue),
+                            kCGImageSourceShouldCacheImmediately: true,
+                        ] as CFDictionary)
+                    }
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.loading.remove(src)
@@ -207,14 +220,11 @@ final class Canvas2DHost: Canvas2DEnv {
         }
         // What the replay reads, resolved here: the decoded images, and the
         // fonts its text sets (the text engine is the main thread's).
-        // A list sets a font only when it changes, and the replayer keeps it
-        // from list to list: every font resolved before rides along, and the
-        // ones these lists set are resolved again.
-        var again: Set<Canvas2DFont> = []
+        // Earlier fonts belong to the replayer's current and saved states.
+        var fonts: [Canvas2DFont: CTFont] = [:]
         for case let data? in lists {
-            for f in Canvas2DReplayer.fonts(in: data) where again.insert(f).inserted { resolved[f] = canvasFont(f) }
+            for f in Canvas2DReplayer.fonts(in: data) where fonts[f] == nil { fonts[f] = canvasFont(f) }
         }
-        let fonts = resolved
         nextSeq += 1
         let seq = nextSeq
         if sequence[id] == nil { born[id] = seq }
@@ -283,8 +293,14 @@ final class Canvas2DHost: Canvas2DEnv {
             }
         }
         if let g = gpus[id], g.lifetime == job.lifetime, g.generation == job.generation {
+            var fonts = k.tracker.resolvedFonts
+            fonts.merge(job.fonts) { _, new in new }
+            k.tracker.env = env
+            for data in lists { k.tracker.trackFonts(data) }
+            k.tracker.env = nil
+            let gpuEnv = Canvas2DSnapshot(images: job.images, fonts: fonts)
             let t0 = CFAbsoluteTimeGetCurrent()
-            let (surface, bad) = g.replay(lists, env: env)
+            let (surface, bad) = g.replay(lists, env: gpuEnv)
             let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             if bad { unreadable += 1 }
             if surface == nil { gpus[id] = nil; Canvas2DGpuModule.log("canvas gpu: canvas \(id) failed; Core Graphics draws its next bitmap") }
@@ -301,7 +317,10 @@ final class Canvas2DHost: Canvas2DEnv {
             }
             return
         }
+        k.tracker.env = env
         for data in lists { k.keep(data) }
+        k.tracker.env = nil
+        let keptEnv = Canvas2DSnapshot(images: job.images, fonts: k.fonts)
         // The policy (LLP 1056 §8.4): recorded while it animates, from a
         // cover, drawing nothing a recording draws differently, within the
         // bound, at the display's own scale.
@@ -310,7 +329,7 @@ final class Canvas2DHost: Canvas2DEnv {
         if record, let start = k.start {
             replayers[id] = nil
             k.recording = true
-            recording = .init(lists: k.lists, start: start, env: env, width: job.w, height: job.h, scale: job.scale, space: job.space)
+            recording = .init(lists: k.lists, start: start, env: keptEnv, width: job.w, height: job.h, scale: job.scale, space: job.space)
         } else {
             let r: Canvas2DReplayer
             if let existing = replayers[id], !k.recording {
@@ -323,6 +342,7 @@ final class Canvas2DHost: Canvas2DEnv {
                 r = Canvas2DReplayer(width: job.w, height: job.h, scale: job.scale, lifetime: job.lifetime, generation: job.generation, space: job.space)
                 r.env = env
                 if let start = k.start {
+                    r.env = keptEnv
                     r.restore(start)
                     for data in k.lists where !r.apply(data) { unreadable += 1 }
                 } else {
@@ -434,11 +454,12 @@ private final class Canvas2DJob {
         if later.fresh {
             fresh = true; w = later.w; h = later.h; scale = later.scale
             lifetime = later.lifetime; generation = later.generation; lists = later.lists
+            fonts = later.fonts
         } else {
             lists += later.lists
+            fonts.merge(later.fonts) { _, new in new }
         }
         images = later.images
-        fonts.merge(later.fonts) { _, new in new }
         seq = later.seq
         animating = later.animating
         stretch = later.stretch

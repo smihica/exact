@@ -1458,6 +1458,7 @@ mod outcome;
 use asynch::{asynch_lanes, asynchronous, drained};
 use outcome::{
     bounded_outcome, build_number, check_headers, fetch_failure, fetch_request, retained, Deadline,
+    Quiet,
 };
 
 #[path = "executor_forget.rs"]

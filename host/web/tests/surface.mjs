@@ -1,7 +1,8 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import {assetDelivery} from '../gpu-assets.js';
-import { inertAncestor } from '../navigation.js';
+import { inertAncestor } from '../navigation/layers.js';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+
 import { glueDeclarations, checkedGlueCall } from './glue-fixture.mjs';
 
 // Run the production lazy module and applyBatch with a deterministic GPU and
@@ -41,7 +42,7 @@ export async function fixture(options = {}) {
     gpu_assets: () => '{"requests":[],"retired":[]}', gpu_asset: () => true, gpu_lifecycle: () => true, gpu_clock: () => true, gpu_period: () => {},
   };
   const glue = readFileSync(process.env.R8A_GLUE_SOURCE || new URL('../glue.js', import.meta.url), 'utf8');
-  const applySource = glueDeclarations(glue, ['applyBatch', 'wakeLock', 'holdWake', 'orientationLock', 'holdOrientation']);
+  const applySource = glueDeclarations(glue, ['applyBatch', 'holdWake', 'holdOrientation']);
   const operationSource = glueDeclarations(glue, ['apply']);
   const applyOperations = new Function('exact', 'views', 'globalThis', `
     let timelinesMoved = false;
@@ -50,6 +51,7 @@ export async function fixture(options = {}) {
     const root = {}, log = () => {}, navigation = {project() {}}, inputReady = false, agentKeepsStore = false;
     const prepareContexts = () => {}, runFocusCommands = () => {}, inertAncestor = () => false, refreshSymbols = () => {}, focusAutofocus = () => {}, inputHandlers = null, positionContexts = () => {}, markScrollDocument = () => {};
     const viewFor = (_, id) => views.get(id), noteFit = () => {};
+    const host = { timelinesMoved, listSelection, inputReady, inputHandlers };
     ${operationSource}; return apply;
   `)(exact, views, {exact});
   const applyBatch = new Function('globalThis', 'apply', `
@@ -57,6 +59,7 @@ export async function fixture(options = {}) {
     const register = () => {}, seek = () => {}, root = {}, log = () => {};
     const loadAfterPaint = () => { throw new Error('surface fixture: unexpected lazy module load'); };
     const agentMode = false, frameSampler = null, textflow = null, page = null, clocks = {sync() {}}, presence = {hold: () => false}, letGo = () => {}, motion = {commit() {}, followTimelines() {}}, arrange = {commit() {}}, flowBatch = () => {}, refitTexts = () => {};
+    const host = { timelinesMoved, agentClock, followOnSeek, frameSampler, textflow, page };
     ${applySource}
     return (${checkedGlueCall})(applyBatch);
   `)({ exact }, batch => { for (const op of batch.ops) { if (typeof op === 'function') op(); else applyOperations({ops:[op]}); } });

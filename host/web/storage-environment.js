@@ -3,7 +3,32 @@
 // agent its repeatable random stream. The I/O adapters load on first use.
 const AGENT_ADMITTED = true; // false in a production bake: host/web/build.mjs rewrites this line (LLP 1069.007 D2)
 export const directories = Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' });
+// Code from a string runs on no host a data module runs on: Hermes compiles none, and throws `SyntaxError: Parsing
+// source code unsupported` at the call. The realm's `Function` and `eval` throw that too, so a package's guarded probe
+// (zod's `allowsEval`) takes its fallback as it does on Hermes; `x instanceof Function`, `Function.prototype` and its
+// `call`, `apply` and `bind` are the realm's. The constructor a function's own `constructor` names is still the
+// realm's, as LLP 1027 D5 records. Before the module loads, and after whatever of the realm's own runs a string
+// (module-worker.js's `evaluate`) has taken `eval`. As host/web-js/ts-fetch.js does for the JS target.
+export function refuseCodeFromStrings(realm) {
+  const refuse = () => { throw new realm.SyntaxError('Parsing source code unsupported: a data source runs no code from a string (Function, eval), as on Hermes'); };
+  // Made here, in the page's realm, so each is given the module realm's `Function.prototype` as its own prototype too:
+  // `Function instanceof Function` and `eval instanceof Function` hold there, as they did.
+  const prototype = realm.Function.prototype;
+  const NoFunction = Object.setPrototypeOf(Object.defineProperties(function Function(body) { return refuse(body); }, { prototype: { value: prototype } }), prototype);
+  // A method, since no function may be named `eval` in strict code; as `eval`, not a constructor.
+  const noEval = Object.setPrototypeOf({ eval(source) { return refuse(source); } }.eval, prototype);
+  // Each has its own `constructor`, the stand-in, where a function inherits the real one from `Function.prototype`;
+  // what reaches `Function.prototype.constructor` reaches the real one (LLP 1027 D5).
+  // Fixed, so no `delete` or write uncovers the inherited one.
+  for (const f of [NoFunction, noEval]) Object.defineProperty(f, 'constructor', { value: NoFunction, writable: false, configurable: false });
+  Object.defineProperty(realm, 'Function', { value: NoFunction, writable: true, configurable: true });
+  Object.defineProperty(realm, 'eval', { value: noEval, writable: true, configurable: true });
+}
 export const now = Date.now.bind(Date);
+// File versions must distinguish writes across tabs and workers, even when
+// their clocks agree. Capture the host's randomness before a module replaces it.
+const fillRandom = crypto.getRandomValues.bind(crypto);
+export const fileVersion = () => fillRandom(new Uint32Array(4)).join('-');
 // The URL the page was opened at, which names a drive and its scratch store:
 // an app's router rewrites `location` as it navigates (the drive's `?agent&…`
 // goes with it), the document's navigation entry keeps it. A page that opens
@@ -148,3 +173,5 @@ export async function retrySecretWrite(key, current, write, locks = globalThis.n
   if (!locks) throw new Error('This browser cannot coordinate a secret write retry');
   await locks.request(key, () => { if (current()) write(); });
 }
+
+if (globalThis.exact) globalThis.exact.retrySecretWrite = retrySecretWrite;

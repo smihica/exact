@@ -30,6 +30,7 @@ fn main() {
         "spark_data::Profiles",
         "spark_data::Profiles",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

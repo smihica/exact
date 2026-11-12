@@ -154,6 +154,7 @@ def ceval : Nat → CEnv → Frame → Locals → Expr → Result Value
       | "pending", [.var x] => cpending fuel ce f ls "pending" x
       | "failed", [.var x] => cpending fuel ce f ls "failed" x
       | "failure", [.var x] => cpending fuel ce f ls "failure" x
+      | "current", [.var x] => cpending fuel ce f ls "current" x
       | _, _ => do
         let vs ← cevalList fuel ce f ls args
         stdlib ce.root name vs
@@ -228,11 +229,11 @@ def cvar : Nat → CEnv → String → InstId → List (String × Expr × Frame 
           if C.deviceResources.any (·.name == x) then ce.root.global (hoisted C.name x)
           else .error (.unbound x)
 
-/-- What `pending(x)`, `failed(x)` (`false`) or `failure(x)` (`none`) says
-of a name that is no resource. -/
+/-- What `pending(x)`, `failed(x)`, `current(x)` (`false`) or `failure(x)`
+(`none`) says of a name that is no resource. -/
 def quiet (which : String) : Value := if which = "failure" then .none else .bool false
 
-/-- `pending(x)` / `failed(x)` / `failure(x)` in an instance's frame: about
+/-- `pending(x)` / `failed(x)` / `failure(x)` / `current(x)` in an instance's frame: about
 the resource the name stands for when it is a prop (or a derive) that is a
 name; a state or a local is no resource. -/
 def cpending : Nat → CEnv → Frame → Locals → String → String → Result Value
@@ -643,7 +644,7 @@ def CConfig.empty : CConfig :=
   { slots := [], settled := {}, store := [], view := [], now := 0, timers := [] }
 
 def rootEnv (p : CProgram) (slots : List (String × Value)) (st : Settled) (now : F64) : Env :=
-  { prog := rootProgram p, slots, derives := st.derives, resources := st.resources, now }
+  { prog := rootProgram p, slots, derives := st.derives, resources := st.resources, now, idle := st.idle }
 
 /-- Render the root's view against the root's slots and settled values,
 keeping the instances `prev` holds; `every` when the host builds every tab
@@ -825,7 +826,12 @@ def cdispatchAt (p : CProgram) (o : Oracle) (c : CConfig) (target event : String
 
 def cstep (p : CProgram) (o : Oracle) (c : CConfig) : Observe.Event → CConfig × Outcome
   | .tap t => cdispatchAt p o c t "press" .none
-  | .change t s => cdispatchAt p o c t "change" (.some (.str s))
+  | .change t s =>
+    let event :=
+      if ((cfindTestId t c.view).map fun n => n.handlers.any (·.event == "input")).getD false then
+        "input"
+      else "change"
+    cdispatchAt p o c t event (.some (.str s))
   | .clock ms => cadvance p o c (c.now + ms)
   | .other t e v => cdispatchAt p o c t e v
 

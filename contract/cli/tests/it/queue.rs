@@ -485,7 +485,7 @@ fn poison_and_reload_forget_waiting_sends_without_asking() {
 #[test]
 fn queue_parses_in_its_position_and_lowers_to_the_plan() {
     let plan = contract::compile(APP).unwrap();
-    assert!(plan.mutations.iter().all(|m| m.queue));
+    assert!((plan.mutations.iter()).all(|m| m.mode == exact_plan::MutationMode::Queue));
     // Only after the shape: `queue` is a keyword nowhere else.
     let e = contract::compile(&APP.replace(
         "as shape Ack queue refreshes probe then afterWrote",

@@ -30,8 +30,8 @@ settlement waits on its `pending` reads rather than failing with them.
 * `refused` covers the data seam (an oracle with no answer for a call, a
   source or mutation answering a value of the wrong shape), a number that
   is not finite crossing a boundary (a derive, a slot written or
-  initialized, an action's argument, a row key: `ValTy` admits NaN and the
-  infinities, `conforms` does not), the host's own input (no element with
+  initialized, a source's or action's argument, a row key: `ValTy` admits
+  NaN and the infinities, `conforms` does not), the host's own input (no element with
   that `testId`, no handler for that event, a payload that does not fit the
   action's remaining parameters), the router (a forged router value
   committed, a verb or read of a value of the shape `Router` that is not a
@@ -120,7 +120,7 @@ theorem ConfigOK.armNexts {p : Program} {c : Config} (hc : ConfigOK p c) : Confi
 theorem ConfigOK.envGood {p : Program} {c : Config} (hc : ConfigOK p c) (hpres : SlotsPresent p c.slots)
     (rows : List RowId) :
     EnvGood p { prog := p, slots := c.slots, derives := c.settled.derives,
-                resources := c.settled.resources, rows := rowSlots c.store rows, now := c.now } :=
+                resources := c.settled.resources, rows := rowSlots c.store rows, now := c.now, idle := c.settled.idle } :=
   ⟨rfl, hc.slots, hpres, hc.store.rowSlots rows, hc.settled.1, hc.settled.2⟩
 
 /-! ## Pieces of a commit -/
@@ -164,10 +164,10 @@ theorem settleEnvOK {p : Program} (hp : WellTyped p) {slots : List (String × Va
     (hslots : ∀ x v, (x, v) ∈ slots → lifted p x = false → ValTy p v (slotTy p x)) :
     SettleHyps p (settleScope p) slots now := by
   refine ⟨⟨hp.fns, hp.routeShapes⟩, fun d hd => ?_, fun r hr => (hp.resources r hr).imp fun _ h => h.1,
-    fun st hst => ?_⟩
+    hp.resourceGates, fun st hst => ?_⟩
   · obtain ⟨t, ht, -⟩ := hp.derives d hd; exact ⟨t, ht⟩
   have := envOKE_gen (E := Legit) (L := lifted p)
-    (env := { prog := p, slots, derives := st.derives, resources := st.resources, now })
+    (env := { prog := p, slots, derives := st.derives, resources := st.resources, now, idle := st.idle })
     hp (fun _ h _ => h) rfl hpres hslots RowsOK.nil hst (.inl trivial)
   exact ⟨this.1, fun x t hx => GoodR.of_goodW (this.2.1 x t hx)⟩
 
@@ -215,7 +215,7 @@ theorem GoodW.map {α β} {E : Err → Prop} {P : α → Prop} {Q : β → Prop}
 typed in the component's scope, and a key that is no key is a refusal. -/
 theorem gateStep_good {p : Program} (hp : WellTyped p) {slots st now ts}
     (henv : EnvOKE p Strict (compScope p)
-      { prog := p, slots, derives := st.derives, resources := st.resources, now })
+      { prog := p, slots, derives := st.derives, resources := st.resources, now, idle := st.idle })
     (hts : TimersOK p ts) : GoodW Strict (fun _ => True) (gateStep p slots st now ts) := by
   have hfn : ProgOK p := ⟨hp.fns, hp.routeShapes⟩
   have hE : ∀ e, Legit e → e ≠ .pending → Strict e := fun _ h hn => ⟨h, hn⟩
@@ -792,7 +792,7 @@ theorem boot_configOK {p : Program} (hp : WellTyped p) (o : Oracle) : ConfigOK p
     simp only [Prod.mk.injEq] at hb
     obtain ⟨rfl, -⟩ := hb
     have hrender := renderTabs_good hp (E := Legit) (fun _ h _ => h) fuel
-      (cx := { env := { prog := p, slots, derives := st.derives, resources := st.resources, now := 0 },
+      (cx := { env := { prog := p, slots, derives := st.derives, resources := st.resources, now := 0, idle := st.idle },
                store := [], tabs := { every := o.everyTab } })
       ⟨rfl, hs, hpres, RowsOK.nil, hsettled.1, hsettled.2⟩ (.inr trivial) StoreOK.nil
     rw [hr] at hrender

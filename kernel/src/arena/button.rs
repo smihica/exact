@@ -7,6 +7,7 @@ pub(crate) struct ButtonInputs {
     env: crate::Env,
     neutral_tab_root: Option<f32>,
     neutral_role_floor: bool,
+    segment: Option<crate::SegmentPlace>,
     /// A list row's inset (LLP 1138), which the face's padding takes.
     row_inset: Option<[f32; 2]>,
     nodes: Vec<ButtonNode>,
@@ -30,6 +31,7 @@ impl ButtonInputs {
         if self.env != *arena.env()
             || self.neutral_tab_root != arena.neutral_tab_root(slot)
             || self.neutral_role_floor != arena.neutral_role_floor(slot)
+            || self.segment != arena.segment_place(slot)
             || self.row_inset != crate::rows::row_inset(arena, slot)
         {
             return false;
@@ -143,7 +145,12 @@ impl NodeArena {
                         let mut runs = Vec::new();
                         self.text_runs(child, &mut runs);
                         let text: String = runs.iter().map(|r| &*r.text).collect();
-                        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let white_space = self
+                            .computed_source(child, StyleId::WhiteSpace)
+                            .white_space
+                            .model();
+                        let text = exact_textflow::collapse(&[text.as_str()], white_space)
+                            .map_or(text, |collapsed| collapsed.runs.concat());
                         let text = (!text.is_empty()).then_some(text);
                         if texts == 1 {
                             face.title = text;
@@ -194,6 +201,7 @@ impl NodeArena {
             env: self.env.clone(),
             neutral_tab_root: self.neutral_tab_root(slot),
             neutral_role_floor: self.neutral_role_floor(slot),
+            segment: self.segment_place(slot),
             row_inset: crate::rows::row_inset(self, slot),
             nodes: self
                 .subtree(slot)
@@ -348,6 +356,7 @@ impl NodeArena {
             symbol,
             button,
             image_gap: own.mask.has(gap_row).then_some(gap),
+            segment: self.segment_place(slot),
         })
     }
 }

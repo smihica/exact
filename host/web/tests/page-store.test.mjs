@@ -1,9 +1,9 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The page's store writes (navigation.js `storeInPage`): kept answers share
 // `localStorage`'s quota with the app's secrets and persisted states, and
 // are the cache among them (LLP 1027 D4).
 import { test, expect } from 'bun:test';
-import { storeInPage, pageStore } from '../navigation.js';
-import { readFileSync } from 'node:fs';
+import { storeInPage, pageStore } from '../navigation/store.js';
 import vm from 'node:vm';
 import { glueDeclarations } from './glue-fixture.mjs';
 
@@ -39,7 +39,13 @@ function host(storage, warned, enabled = true) {
     console: { warn: (...line) => warned.push(line), error: (...line) => { throw new Error(line.join(' ')); } },
   };
   Object.defineProperty(scope, 'localStorage', { get: storage });
-  scope.pendingStore = pageStore(storage, scope.console.warn, { request: (_key, work) => work() });
+  const load = async (file, exported) => {
+    expect(file).toBe('./storage-environment.js');
+    expect(exported).toBe('retrySecretWrite');
+    return (await import('../storage-environment.js'))[exported];
+  };
+  scope.pendingStore = pageStore(load, storage, scope.console.warn, { request: (_key, work) => work() });
+  scope.host = scope;
   vm.createContext(scope);
   vm.runInContext(glueDeclarations(readFileSync(new URL('../glue.js', import.meta.url), 'utf8'), ['apply']), scope);
   return async (...ops) => { scope.apply({ ops }); await scope.pendingStore.flush(); };

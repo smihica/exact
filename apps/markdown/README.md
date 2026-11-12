@@ -288,7 +288,7 @@ mounts rows, since AppKit scrolls it concurrently. That difference is what the
 120 Hz machine has to judge. An earlier series, on the build before the
 window-restoration change below, counted 1, 1 and 4 for Exact and none for Legend.
 
-**What was wrong**, in the order measurement found it (`llp/1044` F4–F7 asked the
+**What was wrong**, in the order measurement found it (LLP 1044 F4–F7 asked the
 questions; none of this was the parser, JSON or view creation):
 
 1. **Every layout laid the whole mounted list out twice.** Vendored Taffy passed

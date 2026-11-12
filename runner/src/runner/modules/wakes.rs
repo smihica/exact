@@ -517,7 +517,8 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// The platform expired the current wake, or its deadline passed
-    /// (module doc). The commits its requests' failures made.
+    /// (module doc). The commits that publish its failed requests and
+    /// dropped waiting sends.
     pub fn expire_wake(&mut self) -> (Vec<CommitReceipt>, Option<RunnerError>) {
         let mut receipts = Vec::new();
         let mut error = None;
@@ -549,7 +550,15 @@ impl<D: DataSource> Runner<D> {
             );
         }
         self.drop_invocation_thens(id);
-        self.drop_queued_of(id);
+        if self.drop_queued_of(id) {
+            let result = self.as_invocation(CallOrigin::Wake, id, |r| {
+                r.commit_again(Vec::new(), "an expired wake's queued sends")
+            });
+            match result {
+                Ok(receipt) => receipts.push(receipt),
+                Err(e) => error = error.or(Some(e)),
+            }
+        }
         let open: Vec<usize> = (self.extensions.wakes.current.as_ref())
             .map(|w| w.invocations.iter().enumerate())
             .into_iter()

@@ -1309,15 +1309,22 @@ impl Point<'_> {
         let inside = |b: [f64; 4]| {
             local.is_some_and(|(x, y)| b[0] <= x && x < b[2] && b[1] <= y && y < b[3])
         };
-        let clips = style.overflow_x != Overflow::Visible || style.overflow_y != Overflow::Visible;
-        let border = style.border_widths_in(arena.env());
-        let clipped = clips
-            && !inside([
-                f64::from(border[3]),
-                f64::from(border[0]),
-                width - f64::from(border[1]),
-                height - f64::from(border[2]),
-            ]);
+        // The padding box on each axis that clips: `clip` beside `visible`
+        // clips its own axis alone (CSS Overflow 3 §3.1).
+        let border = style.border_widths_in(arena.env()).map(f64::from);
+        let (ox, oy) = (style.overflow_x, style.overflow_y);
+        let (x_clips, y_clips) = (
+            ox.computed(oy) != Overflow::Visible,
+            oy.computed(ox) != Overflow::Visible,
+        );
+        let mut clip = [border[3], border[0], width - border[1], height - border[2]];
+        if !x_clips {
+            (clip[0], clip[2]) = (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        if !y_clips {
+            (clip[1], clip[3]) = (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        let clipped = (x_clips || y_clips) && !inside(clip);
         if !clipped && native.is_none() {
             let mut children: Vec<(i64, usize, u32)> = arena
                 .children(slot)

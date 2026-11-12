@@ -4,6 +4,7 @@
 // any shape. A chunk is anchored by its runs' total advance and set on the
 // baseline `dominant-baseline` names, with Chrome's arithmetic: integer
 // ascent and descent, the x-height from the font.
+import ExactCore
 import CoreGraphics
 import CoreText
 import Foundation
@@ -12,6 +13,21 @@ import QuartzCore
 enum SvgText {
     /// A font for a run: size, CSS weight, family index, italic.
     typealias Fonts = (CGFloat, Int, Int, Bool) -> CTFont
+
+    static func imageFonts(_ value: Any?) -> Fonts {
+        let lists = value as? [[[Any]]] ?? []
+        let stacks: [[(Bool, String)]] = lists.map { members in
+            members.compactMap { member in
+                guard member.count == 2, let installed = member[0] as? Bool, let name = member[1] as? String else { return nil }
+                return (installed, name)
+            }
+        }
+        let engine = TextEngine(assets: { _ in nil })
+        engine.installPictureFonts(stacks)
+        return { size, weight, family, italic in
+            engine.font(size: size, weight: weight, family: family, italic: italic) as CTFont
+        }
+    }
 
     /// Rebuild `group`'s sublayers from a text item's chunks.
     static func build(_ group: CALayer, chunks: [Any], dark: Bool, fonts: Fonts, color: (Any?, Bool) -> CGColor?) {

@@ -2,11 +2,12 @@
 // shared web reader owns admission and lifetime; the mapper produces a
 // snapshot for every protocol frame. Loaded only for a streaming source.
 import { streamed } from './http-body.js';
-import { answering, isSignal, ownSignal, SOCKET_AND_FETCH } from './ts-fetch.js';
+import { answering, answers, isSignal, letGo, ownSignal, SOCKET_AND_FETCH } from './ts-fetch.js';
 import { rt } from './rt-link.js'; // (rt.js's own, as a lazy chunk takes them: rt-link.js)
 const { clock, journal } = rt;
 import { failureCode, failureReason } from './shape.js';
 import { bodyFromRefusal, methodOf, readBodyFile } from './ts-body-from.js';
+import { refuseStreamBody } from './uploads.js';
 
 const KINDS = ['Response', 'Network', 'Refused', 'Unsupported', 'Aborted', , , , , , 'Timeout'], said = new TextDecoder();
 // Hermes's checks and words on `init` (js/src/prelude.js `fetch`): a
@@ -19,8 +20,10 @@ function request(input, init, redirect) {
   // `exactBodyFrom` (LLP 1108 D6 R2): read as the stream opens (http-body.js).
   const bodyFrom = init.exactBodyFrom === undefined ? undefined : init.exactBodyFrom, refusal = bodyFrom === undefined ? null : bodyFromRefusal(input, init);
   if (refusal) throw new TypeError(refusal);
-  // A BufferSource body goes as its bytes, copied now, as Hermes sends one (an upload's); anything else as its text.
-  const body = init.body, raw = body == null ? undefined : body instanceof ArrayBuffer ? new Uint8Array(body.slice(0))
+  // The transport takes a complete body, as Hermes's does.
+  const body = init.body;
+  refuseStreamBody(body);
+  const raw = body == null ? undefined : body instanceof ArrayBuffer ? new Uint8Array(body.slice(0))
     : ArrayBuffer.isView(body) ? new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)) : new TextEncoder().encode(String(body));
   const request = typeof Request === 'function' && input instanceof Request ? input : null;
   // The caller's signal, as Fetch picks it (`init.signal` over the Request's)
@@ -33,7 +36,11 @@ function request(input, init, redirect) {
   const upload = uploadOf(init, method, url, redirect), timeoutMs = upload ? init.exactTimeout : undefined;
   if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3600000))
     throw new TypeError('exactTimeout must be an integer number of milliseconds from 1 to 3600000');
-  return { method, url, signal, headers: [...new Headers(init.headers ?? request?.headers ?? [])], raw, bodyFrom, redirect, maxResponseBytes: independent ?? 1048576, longPoll: longPollOf(init.exactLongPoll, method, url), upload, timeoutMs };
+  // Read again as the stream opens: what `fetch` checked may have changed since (LLP 1016.000 D11).
+  const idle = init.exactIdleTimeout;
+  if (idle !== undefined && (!Number.isInteger(idle) || idle < 1 || idle > 3600000)) throw new TypeError('exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000');
+  if (idle !== undefined && (upload || init.exactLongPoll !== undefined || !/^wss?:/i.test(url))) throw new TypeError('exactIdleTimeout: only a WebSocket stream takes an idle timeout');
+  return { method, url, signal, headers: [...new Headers(init.headers ?? request?.headers ?? [])], raw, bodyFrom, redirect, maxResponseBytes: independent ?? 1048576, longPoll: longPollOf(init.exactLongPoll, method, url), upload, timeoutMs, idleTimeoutMs: idle };
 }
 // `exactUploadProgress` (LLP 1016.000 D10), as js/src/binary.js `uploadOf` checks it.
 function uploadOf(init, method, url, redirect) {
@@ -65,7 +72,9 @@ function longPollOf(poll, method, url) {
 // A turn's operations, sent once its commit stands. The whole batch is
 // checked again before any frame: an earlier batch in the same commit may
 // have filled the browser's buffer or closed the socket.
-const publish = operations => () => {
+const publish = (operations, call) => () => {
+  // Sent or refused, they are no longer the call's to count (`bufferedAmount`, the buffer's bound).
+  if (call?.unsent) call.unsent = call.unsent.filter(x => !operations.includes(x));
   const totals = new Map();
   for (const x of operations) {
     if (x.owner.signal.aborted || x.owner.active?.() === false) throw new DOMException('the socket is not open', 'InvalidStateError');
@@ -77,43 +86,69 @@ const publish = operations => () => {
     journal.push(`t=${clock.now} socket ${x.op}: ${x.size} bytes (${x.owner.streamName})`);
   }
 };
+// What an answer in flight sent in a later turn (its code after an `await` in an async function, or its
+// own timer): one batch for the turn, sent when the turn ends (a timer's as its callback returns, before the
+// next timer of the advance; an `await`'s step in the microtask after it), behind what its source sent,
+// which waits for the commit that asked it (LLP 1016.000 D7, the amendment of 2026-11-10 on later turns). A
+// refused commit takes the batches that waited for it back, and so does the answer's being let go while one
+// waits; the journal says which.
+function later(call) {
+  const batch = call.laterOps;
+  if (!batch) return; // the turn's end already took it
+  call.laterOps = null;
+  const go = publish(batch, call);
+  const said = why => journal.push(`t=${clock.now} answer ${call.name} failed: ${why}; socket frames were refused`);
+  const refused = why => { call.unsent = call.unsent.filter(x => !batch.includes(x)); said(why); };
+  // Let go since it staged these, it sends nothing more. Its ticket is its owner's until its reply lands, which
+  // rt.js wires after the commit that asked it stands, so an answer that gave its value still sends what waited.
+  const run = Object.assign(() => { if (letGo(call)) return refused('the answer was let go'); try { go(); } catch (e) { said(e?.message ?? e); } }, { refused });
+  if (call.stood) run(); else if (call.stood === false) refused('the commit that asked it was refused'); else (call.waiting ??= []).push(run);
+}
+answering.later = later;
 // The module never sees the browser socket. Operations belong to the current
 // mutation's answer, to the socket's own mapper while it answers `open` or a
-// `message` (`answering.mapper`), or to a resource's answer while its source
-// runs, the one turn of it this page can tie to it (LLP 1016.000 D7, the
-// amendment of 2026-10-18). rt.js publishes them only after the commit that
-// settles that turn, or that ran that source, stands.
+// `message` (`answering.mapper`), or to an answer in flight: while its source
+// runs, and in each later turn the bundle's async helper or its own timer puts
+// it back for (ts-data.js `__exact_async_context`, ts-fetch.js `runAs`; LLP
+// 1016.000 D7, the amendments of 2026-10-18 and 2026-11-10). rt.js publishes
+// a source's only after the commit that settles that turn, or that ran that
+// source, stands.
 function handle(transport, owner) {
   const encoder = new TextEncoder();
   answering.sockets = true;
   const turn = () => answering.mapper?.owner === owner ? answering.mapper : answering.call;
   const stage = (op, data, reason, size = 0) => {
     const call = turn(), mapper = !!call && call === answering.mapper, answer = !!call && !mapper && !call.mutation;
-    // An answer's code after an `await` or in its timer runs as that answer
-    // (ts-data.js `__exact_async_context`), but its source has returned and
-    // what it sent has gone to the commit: the page has no turn to send it in.
-    if (!mapper && !call?.turn) throw new Error(`socket.${op} is only available in a mutation's or a resource's synchronous source, or its socket's own mapper (on the web, not after an await or in a timer)`);
-    if (owner.signal.aborted || owner.active?.() === false || answer && !owner.resource) throw new DOMException('the socket is not open', 'InvalidStateError');
-    if (!mapper && !answer && call.fetched) { call.socketConflict = true; throw new Error(SOCKET_AND_FETCH); }
+    // Code no answer is put back for (a plain `.then` callback outside an async function) has no turn here.
+    if (!mapper && !call) throw new Error(`socket.${op} is only available in an answer's own turns (its source, its code after an \`await\` in an async function, its timer), or its socket's own mapper`);
+    // A later turn: only of an answer still in flight. One that gave its value, failed or was let go has none.
+    const resumed = !mapper && !call.turn;
+    if (resumed && (!call.flight || !answers(call) || call.stood === false)) throw new DOMException(`socket.${op}: the answer has given its value or was let go`, 'InvalidStateError');
+    if (owner.signal.aborted || owner.active?.() === false || (answer || resumed) && !owner.resource) throw new DOMException('the socket is not open', 'InvalidStateError');
+    // A mutation's synchronous source may not both send and fetch; an answer in flight's later turns may.
+    if (!mapper && !answer && !resumed && call.fetched) { call.socketConflict = true; throw new Error(SOCKET_AND_FETCH); }
     // Overload fails a mapper's snapshot, caught or not.
     const over = e => { if (mapper && e.name === 'QuotaExceededError') call.overload = e; return e; };
-    const kind = mapper ? 'mapper call' : answer ? 'answer' : 'mutation';
-    const operations = call.socketOps ??= [];
-    if (operations.length >= 256) throw over(new DOMException(`socket ${kind} exceeds 256 operations`, 'QuotaExceededError'));
-    if (operations.some(x => x.transport === transport && x.op === 'close')) throw new DOMException('the socket is not open', 'InvalidStateError');
-    // The turn's payload is bounded as a whole; each socket's buffer with
-    // what the turn stages on it.
-    if (operations.reduce((n, x) => n + x.size, 0) + size > 1048576) throw over(new DOMException(`socket ${kind} exceeds 1 MiB`, 'QuotaExceededError'));
-    try { transport.check(operations.reduce((n, x) => x.transport === transport ? n + x.size : n, 0) + size); } catch (e) { throw over(e); }
-    if (!mapper && !operations.length) (call.effects ??= []).push(publish(operations));
-    operations.push({ transport, owner, op, data, reason, size });
+    const kind = mapper ? 'mapper call' : answer || resumed ? 'answer' : 'mutation';
+    // The call's bounds are over all its turns; its buffer's, over what it has staged and not yet sent.
+    const all = call.socketAll ??= [], unsent = call.unsent ??= [];
+    if (all.length >= 256) throw over(new DOMException(`socket ${kind} exceeds 256 operations`, 'QuotaExceededError'));
+    if (call.closed?.has(transport)) throw new DOMException('the socket is not open', 'InvalidStateError');
+    if (all.reduce((n, x) => n + x.size, 0) + size > 1048576) throw over(new DOMException(`socket ${kind} exceeds 1 MiB`, 'QuotaExceededError'));
+    try { transport.check(unsent.reduce((n, x) => x.transport === transport ? n + x.size : n, 0) + size); } catch (e) { throw over(e); }
+    const operations = resumed ? (call.laterOps ??= []) : (call.socketOps ??= []);
+    if (resumed) { if (!operations.length) queueMicrotask(() => later(call)); }
+    else if (!mapper && !operations.length) (call.effects ??= []).push(publish(operations, call));
+    const staged = { transport, owner, op, data, reason, size };
+    operations.push(staged); all.push({ size }); unsent.push(staged);
+    if (op === 'close') (call.closed ??= new Set()).add(transport);
   };
   return Object.freeze({
     get readyState() { return owner.signal.aborted ? 3 : transport.readyState; },
     // The browser's count (WHATWG: as of the task's start, plus its sends)
     // and what this turn has staged on the socket.
     get bufferedAmount() {
-      const staged = turn()?.socketOps ?? [];
+      const staged = turn()?.unsent ?? [];
       return transport.bufferedAmount + staged.reduce((n, x) => x.transport === transport ? n + x.size : n, 0);
     },
     send(data) {
@@ -167,6 +202,9 @@ export function open({ input, init, redirect }, conv, grantSet, deliver, control
   const value = (event, frame) => {
     if (controller.active?.() === false) return { error: 'the stream was let go', code: 'error' };
     const turn = socket && frame ? answering.mapper = { owner: controller, socketOps: null, overload: null } : null;
+    // The call is the mapper's in every turn, and no answer's (ts-fetch.js `answering.mapperCall`).
+    const outer = { call: answering.call, mapperCall: answering.mapperCall };
+    answering.call = null; answering.mapperCall = controller;
     try {
       const v = map(event, socket);
       if (turn?.overload) throw turn.overload;
@@ -176,7 +214,7 @@ export function open({ input, init, redirect }, conv, grantSet, deliver, control
       if (!v || typeof v.then !== 'function') return effects ? { v: conv(v), effects } : { v: conv(v) };
       effects?.[0]();
       return Promise.resolve(v).then(v => controller.active?.() === false ? { error: 'the stream was let go', code: 'error' } : { v: conv(v) }).catch(e => failed(e));
-    } catch (e) { return failed(e, turn); } finally { if (turn) answering.mapper = null; }
+    } catch (e) { return failed(e, turn); } finally { if (turn) answering.mapper = null; Object.assign(answering, outer); }
   };
   // A later frame's mapper call waits for an earlier one's promise, and so
   // does the end: `behind` is the last call still settling.
@@ -199,7 +237,7 @@ export function open({ input, init, redirect }, conv, grantSet, deliver, control
     g.enter(controller.streamName, m.received);
     try { message(m); } finally { g.leave(); }
   };
-  return streamed(req, grantSet, timed, controller, readBodyFile, protocol)
+  return streamed(req, grantSet, timed, controller, (path, set) => readBodyFile(path, set, controller), protocol)
     .then(o => {
       gate()?.ended(controller.streamName);
       if (o.close) journal.push(`t=${clock.now} socket close: ${o.close.code} ${o.close.reason} (${controller.streamName})`);

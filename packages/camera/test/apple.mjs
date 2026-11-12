@@ -15,17 +15,47 @@
 //   fails `NotFoundError` before anything is asked. checklist.md is the
 //   iPhone's.
 //
+// First, on this Mac, two Swift tests compiled with a package's Apple
+// sources: the capture session's notifications as the track's mute reason,
+// posted by hand (`interruptions.swift`, with media-capture's), and a failed
+// capture's answer to `takePhoto` (`photo-failure.swift`, with the camera's).
+//
 // usage: bun packages/camera/test/apple.mjs [macos] [ios] [--sim <name|udid>] [--ask]
-import { existsSync, readdirSync, rmSync } from 'node:fs';
-import { basename, dirname, resolve } from 'node:path';
-import { checker, makeFixture, root, run } from './fixture.mjs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { checker, here, makeFixture, root, run } from './fixture.mjs';
 
 const argv = process.argv.slice(2), sim = argv.includes('--sim') ? argv[argv.indexOf('--sim') + 1] : process.env.EXACT_SIM;
 const hosts = argv.filter((a, i) => ['macos', 'ios'].includes(a) && argv[i - 1] !== '--sim');
-const { app } = makeFixture(), name = basename(app);
-Object.assign(process.env, { EXACT_APP_DIR: app, EXACT2: root, HERMES_LEAN_SYS_OFFLINE: '1', EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
-const { open } = await import(resolve(root, 'scripts/agent.mjs'));
 const { check, failed } = checker();
+
+{
+  const out = mkdtempSync(join(tmpdir(), 'exact-camera-swift-')), packages = resolve(root, 'packages');
+  run('xcrun', ['swiftc', '-parse-as-library', '-emit-library', '-static', '-module-name', 'ExactPackage', '-emit-module', '-emit-module-path', join(out, 'ExactPackage.swiftmodule'),
+    resolve(root, 'host/apple/modules/ExactPackage.swift'), '-o', join(out, 'libExactPackage.a')], out);
+  const tests = {
+    interruptions: ['media-capture/apple/MediaCapture.swift', 'media-capture/apple/VideoCapture.swift'],
+    'photo-failure': ['camera/apple/Camera.swift', 'camera/apple/Viewfinder.swift'],
+  };
+  for (const [test, sources] of Object.entries(tests)) {
+    run('xcrun', ['swiftc', '-parse-as-library', '-swift-version', '5', '-I', out, '-L', out, '-lExactPackage', ...sources.map((f) => join(packages, f)),
+      join(here, `${test}.swift`), '-o', join(out, test)], out);
+    const r = spawnSync(join(out, test), [], { cwd: out, encoding: 'utf8' }), lines = r.stdout.trim().split('\n');
+    for (const line of lines) {
+      const [verdict, where, ...name] = line.split(' ');
+      if (verdict === 'PASS' || verdict === 'FAIL') check(where, name.join(' '), verdict === 'PASS', line);
+    }
+    // It exits 1 after a FAIL line; any other way it stopped short.
+    if (r.status !== 0 && !lines.some((l) => l.startsWith('FAIL '))) check(`apple-${test}`, 'runs to its end', false, `${r.status ?? r.signal}: ${r.stderr}`);
+  }
+  rmSync(out, { recursive: true, force: true });
+}
+
+const { app } = makeFixture(), name = basename(app);
+Object.assign(process.env, { EXACT_APP_DIR: app, EXACT: root, HERMES_LEAN_SYS_OFFLINE: '1', EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
+const { open } = await import(resolve(root, 'scripts/agent.mjs'));
 
 /** Each testId's text in the tree. */
 const texts = async (s) => {

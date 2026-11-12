@@ -5,7 +5,7 @@
 //! The header read gives the natural size the loader's metadata carries.
 
 /// What the loader draws from: the scene's JSON and whether it has text,
-/// which Swift draws where the session's fonts are (D3).
+/// which Swift draws on the main thread (D3).
 #[derive(Debug)]
 pub struct Picture {
     /// The scene, as the `svg` op carries one.
@@ -24,7 +24,14 @@ pub fn scene(text: &str, width: f32, height: f32) -> Result<Picture, String> {
         .kernel()
         .node(loaded.svg())
         .ok_or("the svg node is not in the kernel")?;
-    let json = crate::host::svg::image_scene(loaded.kernel(), &node, (0.0, 0.0, width, height))?;
+    let mut json =
+        crate::host::svg::image_scene(loaded.kernel(), &node, (0.0, 0.0, width, height))?;
+    json.pop();
+    json.push_str(",\"fonts\":");
+    json.push_str(
+        &serde_json::to_string(&loaded.document.fonts).expect("font names are JSON strings"),
+    );
+    json.push('}');
     Ok(Picture {
         json,
         text: loaded.document.text,
@@ -167,6 +174,23 @@ mod tests {
         assert!(super::scene("<svg>", 1.0, 1.0)
             .unwrap_err()
             .contains("never closed"));
+    }
+
+    #[test]
+    fn a_picture_carries_its_font_stacks_with_its_runs() {
+        let picture = super::scene(r#"<svg><text font-family="Arial, sans-serif" font-weight="bold">A<tspan font-family="'serif', monospace">B</tspan></text></svg>"#, 200.0, 40.0).unwrap();
+        assert!(picture.warnings.is_empty(), "{:?}", picture.warnings);
+        let json: serde_json::Value = serde_json::from_str(&picture.json).unwrap();
+        assert_eq!(
+            json["fonts"],
+            serde_json::json!([
+                [[true, "Arial"], [false, "sans-serif"]],
+                [[true, "serif"], [false, "monospace"]],
+            ])
+        );
+        assert!(picture.json.contains("\"ff\":8"));
+        assert!(picture.json.contains("\"ff\":9"));
+        assert!(picture.json.contains("\"fw\":700"));
     }
 
     #[test]

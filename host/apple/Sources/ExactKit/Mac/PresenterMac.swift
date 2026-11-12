@@ -717,7 +717,7 @@ package final class Presenter {
     /// The view AppKit sends the held button's drags and up to: the one it
     /// went down on, perhaps a child of the held node, kept in the window
     /// until the button comes up even if a batch removes it (`MouseChainMac`).
-    var pointerSource: NodeView?
+    package internal(set) var pointerSource: NodeView?
     /// The drag last delivered as a `pointermove` (LLP 1056 §3 stage 3).
     weak var pointerDrag: NSEvent?
     /// Each node's latest free move, in the order the pointer reached them,
@@ -1003,6 +1003,11 @@ package final class Presenter {
     }
 
     func apply(_ batch: Batch) {
+        let pressChanged = pressPaintChanges(batch)
+        // Keep the surface's explicit transactions inside the batch: a top-level
+        // commit can submit its size before the following sibling transforms.
+        CATransaction.begin()
+        defer { CATransaction.commit() }
         session?.fieldChrome.presented(batch.layoutProvisional)
         defer { applyLanguage(batch); toolbar.languageApplied(batch); applyWakeLock(batch); applyOrientationLock(batch) }
         PaintOrder.begin()
@@ -1265,6 +1270,7 @@ package final class Presenter {
         // passes them: a full pass sorted every view in the session on
         // every batch, a list's scroll included.
         let changed = touchedAndAbove(batch.ops.lazy.filter { Self.accessibilityOps.contains($0.op) }.map(\.id)).union(reparented)
+        for id in touchedAndAbove(pressChanged) { views[id]?.endPressCrossFade() }
         let ariaProps = batch.ops.filter { $0.op == .props && ($0.props["accessibilityDisabled"] != nil || $0.clear.contains("accessibilityDisabled")) }.map(\.id)
         let disabledRoots = Set(ariaProps).union(reparented.filter { id in
             guard let node = views[id] else { return false }

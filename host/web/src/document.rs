@@ -41,7 +41,9 @@ mod markup;
 #[path = "page.rs"]
 mod page;
 use crate::css;
-use bars::bar_header;
+#[path = "document_before.rs"]
+mod before;
+use before::Before;
 use exact_kernel::paint_order::{self, Child, Facts};
 use exact_kernel::{NodeFacts, PropId, SortedMap, SortedSet, ViewId};
 use exact_plan::EventKind;
@@ -79,6 +81,17 @@ pub struct Document {
     /// An element is the page's scroller (`scroll document`, LLP 1048.003
     /// D4): `<html data-scrolldocument>`, which the shell's rule reads.
     pub scroll_document: bool,
+    /// The first shown, eager image, preloaded on JavaScript pages (LLP 1048.007 D5).
+    pub hero_image: Option<HeroImage>,
+}
+
+/// The image selected for a JavaScript page's preload and fetch priority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeroImage {
+    /// The source URL before HTML escaping.
+    pub src: String,
+    /// Byte offset in `Document::root` for adding a missing `fetchpriority` attribute.
+    pub priority_at: Option<usize>,
 }
 
 /// Why a tree has no document.
@@ -214,6 +227,8 @@ pub struct Writing<'w> {
     /// Handed each finished run of the root's HTML of at least
     /// [`STREAM_CHUNK`] bytes, as it is written: a server sends it on.
     pub sink: Option<&'w mut dyn FnMut(&str)>,
+    /// Mark a rendered JavaScript page's first eager image at high priority.
+    pub prioritize_image: bool,
 }
 
 /// How an inline style is written in the runtime's form ([`Writing::style`]).
@@ -243,7 +258,7 @@ pub fn project_tree<D: DataSource>(
             .and_then(|n| n.site)
             .is_some_and(|site| exact_runner::rows::repeated(runner.plan(), site))
     };
-    let (out, keyframes, scroll_document, _, sent) = write(
+    let (out, keyframes, scroll_document, _, sent, hero_image) = write(
         tree,
         tree.roots(),
         handlers,
@@ -261,6 +276,7 @@ pub fn project_tree<D: DataSource>(
         head: tree.head(),
         keyframes,
         scroll_document,
+        hero_image,
         root: out,
     };
     Ok((document, sent))
@@ -268,9 +284,9 @@ pub fn project_tree<D: DataSource>(
 
 /// What a document's head and body need before its root is written, from
 /// its tree alone (a streamed page sends them first): the `@keyframes`
-/// rules its elements' animations name, and whether an element is the
-/// page's scroller — as the walk finds them.
-pub fn before_root(tree: &DocTree) -> (String, bool) {
+/// rules its elements' animations name, whether an element is the page's
+/// scroller, and the first eager image — as the walk finds them.
+pub fn before_root(tree: &DocTree, plan: &exact_plan::Plan) -> (String, bool, Option<HeroImage>) {
     let mut keyframes = SortedMap::new();
     let mut scroll = false;
     for node in tree.nodes() {
@@ -285,7 +301,19 @@ pub fn before_root(tree: &DocTree) -> (String, bool) {
             exact_kernel::NodeType::SvgFe | exact_kernel::NodeType::SvgFilter
         ) && node.props.bool(PropId::ScrollDocument) == Some(true);
     }
-    (keyframes.values().map(String::as_str).collect(), scroll)
+    let before = Before::new(tree, tree.roots(), &tree.handlers(plan), &|id| {
+        tree.node(id)
+            .and_then(|n| n.site)
+            .is_some_and(|site| exact_runner::rows::repeated(plan, site))
+    });
+    (
+        keyframes.values().map(String::as_str).collect(),
+        scroll,
+        before.hero.map(|(_, src)| HeroImage {
+            src,
+            priority_at: None,
+        }),
+    )
 }
 
 fn first_prop<S: Source>(src: &S, roots: &[ViewId], id: PropId) -> Option<String> {
@@ -316,7 +344,7 @@ fn walk<D: DataSource>(
             .site_of(id)
             .is_some_and(|(site, _)| exact_runner::rows::repeated(runner.plan(), site))
     };
-    let (out, keyframes, scroll_document, computed, _) = write(
+    let (out, keyframes, scroll_document, computed, _, hero_image) = write(
         &src,
         &roots,
         handlers,
@@ -324,7 +352,10 @@ fn walk<D: DataSource>(
         &lazy,
         font_names_for_runner(runner),
         computed,
-        Writing::default(),
+        Writing {
+            prioritize_image: !bare,
+            ..Default::default()
+        },
     )?;
     let document = Document {
         lang: runner.resolved_locale().into(),
@@ -335,6 +366,7 @@ fn walk<D: DataSource>(
         head: runner.head(),
         keyframes,
         scroll_document,
+        hero_image,
     };
     Ok((document, computed))
 }
@@ -352,7 +384,18 @@ fn write<S: Source>(
     fonts: Vec<String>,
     computed: Option<Computed>,
     writing: Writing<'_>,
-) -> Result<(String, String, bool, Option<Computed>, String), DocumentError> {
+) -> Result<
+    (
+        String,
+        String,
+        bool,
+        Option<Computed>,
+        String,
+        Option<HeroImage>,
+    ),
+    DocumentError,
+> {
+    let before = Before::new(src, roots, &handlers, lazy);
     let mut walk = Walk {
         src,
         isolation: isolation(src, roots),
@@ -361,8 +404,8 @@ fn write<S: Source>(
         handlers,
         presses,
         lazy,
-        routes: SortedMap::new(),
-        bars: SortedSet::new(),
+        routes: before.routes,
+        bars: before.bars,
         sites: SortedSet::new(),
         keyframes: SortedMap::new(),
         out: String::new(),
@@ -372,19 +415,15 @@ fn write<S: Source>(
         touch: 0,
         select: None,
         scroll_document: false,
-        page: SortedSet::new(),
+        page: before.page,
+        hero: before.hero.as_ref().map(|(id, _)| *id),
+        prioritize_image: writing.prioritize_image,
+        image_priority_at: None,
         css: std::collections::HashMap::new(),
         style: writing.style,
         sink: writing.sink,
         sent: 0,
     };
-    let mut live = Vec::new();
-    for root in roots {
-        walk.page_scrollers(*root, false, &mut Vec::new(), &mut live);
-    }
-    if let [path] = &live[..] {
-        walk.page = path.iter().copied().collect();
-    }
     for root in roots {
         walk.element(*root, None, 16., false)?;
     }
@@ -395,6 +434,10 @@ fn write<S: Source>(
         walk.scroll_document,
         walk.computed,
         rest,
+        before.hero.map(|(_, src)| HeroImage {
+            src,
+            priority_at: walk.image_priority_at,
+        }),
     ))
 }
 
@@ -602,12 +645,15 @@ struct Walk<'r, 'w, S: Source> {
     touch: u32,
     /// Open routes `navigation.project` hides.
     hidden: u32,
-    /// The open `select`'s value: the option that carries it is `selected`.
+    /// The open `select`'s value, consumed by its first matching option.
     select: Option<String>,
     scroll_document: bool,
     /// The page's scroller's ancestors while one element is it:
     /// `data-exact-frame` (host/web-js/document.js `markDocument`).
     page: SortedSet<ViewId>,
+    hero: Option<ViewId>,
+    prioritize_image: bool,
+    image_priority_at: Option<usize>,
     /// A shared style's CSS, by the style's address: the nodes of a
     /// repeated template share one style, and its CSS is computed once.
     css: std::collections::HashMap<usize, String>,
@@ -713,7 +759,6 @@ impl<S: Source> Walk<'_, '_, S> {
         let kept = self.computed.is_some().then(|| style.clone());
         // `glue.js` create: a canvas is a `div` holding the surface element.
         let element = if tag == "canvas" { "div" } else { tag };
-        self.route_children(&node, &children);
         bars::mark_sites(self.src, &node, &children, &mut self.sites);
         let chosen = (element == "select").then(|| props.get("value").cloned());
         // A waiting keyed row is opaque to adoption. Its complete paint
@@ -790,10 +835,9 @@ impl<S: Source> Walk<'_, '_, S> {
                 // `writeValue`: an input's value and a button's (a reflected
                 // attribute) are the element's; a textarea's is its text.
                 "value" => match element {
-                    "input" | "button" | "option" => {
-                        if element == "option" && self.select.as_ref() == Some(value) {
-                            attrs.push(("selected".into(), None));
-                        }
+                    // `progress` is HTML's `<progress value max>` (LLP 1116 D8): without
+                    // its value a determinate bar is written indeterminate.
+                    "input" | "button" | "option" | "progress" => {
                         attrs.push((name.clone(), Some(value.clone())));
                     }
                     "textarea" => content = Some(value.clone()),
@@ -830,6 +874,18 @@ impl<S: Source> Walk<'_, '_, S> {
                     attrs.push((name.clone(), Some("about:blank".into())));
                 }
                 _ => attrs.push((name.clone(), Some(value.clone()))),
+            }
+        }
+        if element == "option" {
+            if let Some(selected) = &self.select {
+                let value = props
+                    .get("value")
+                    .cloned()
+                    .unwrap_or_else(|| option_label(src, id));
+                if &value == selected {
+                    attrs.push(("selected".into(), None));
+                    self.select = None;
+                }
             }
         }
         if let (Some(computed), Some(css)) = (self.computed.as_mut(), kept) {
@@ -1017,6 +1073,13 @@ impl<S: Source> Walk<'_, '_, S> {
     ) -> Result<(), DocumentError> {
         self.out.push('<');
         self.out.push_str(element);
+        if element == "img" && self.hero == Some(id) {
+            if self.prioritize_image {
+                self.out.push_str(" fetchpriority=\"high\"");
+            } else {
+                self.image_priority_at = Some(self.out.len());
+            }
+        }
         let runtime = self.style;
         let has_class = runtime.is_some() && attrs.iter().any(|(n, _)| n == "class");
         for (name, value) in attrs {
@@ -1047,86 +1110,6 @@ impl<S: Source> Walk<'_, '_, S> {
         }
         self.out.push('>');
         Ok(())
-    }
-
-    /// Each path from the roots to an element that is a page scroller on the
-    /// page, not in a hidden route, as the walk will find them: found
-    /// before any opening tag streams, marking the routes as it goes.
-    fn page_scrollers(
-        &mut self,
-        id: ViewId,
-        hidden: bool,
-        path: &mut Vec<ViewId>,
-        live: &mut Vec<Vec<ViewId>>,
-    ) {
-        let src = self.src;
-        let Some(node) = src.facts(id) else { return };
-        if node.node_type.is_metadata() {
-            return;
-        }
-        let hidden = hidden || self.routes.get(&id).is_some_and(|r| r.hidden);
-        if !hidden
-            && !matches!(
-                node.node_type,
-                exact_kernel::NodeType::SvgFe | exact_kernel::NodeType::SvgFilter
-            )
-            && node.props.bool(PropId::ScrollDocument) == Some(true)
-        {
-            live.push(path.clone());
-        }
-        let children = src.children(id);
-        self.route_children(&node, &children);
-        path.push(id);
-        for child in children.iter().copied() {
-            self.page_scrollers(child, hidden, path, live);
-        }
-        path.pop();
-    }
-
-    /// Mark the routes under a navigation root as `navigation.project` does;
-    /// with tabs, as the `tabs` capability does ([`tab_routes`]).
-    fn route_children(&mut self, node: &NodeFacts<'_>, children: &[ViewId]) {
-        if node.props.str(PropId::NavigationBack).is_none() {
-            return;
-        }
-        let src = self.src;
-        let key = node.props.str(PropId::NavigationKey);
-        if let Some(tabs) = crate::link::linked().tabs {
-            for (id, hidden, inert) in tabs(src, children, key) {
-                self.routes.insert(id, Route { hidden, inert });
-                if let Some(header) = bar_header(src, &self.handlers, id) {
-                    self.bars.insert(header);
-                }
-            }
-            return;
-        }
-        let routes: Vec<NodeFacts<'_>> = children
-            .iter()
-            .filter_map(|c| src.facts(*c))
-            .filter(|c| c.props.str(PropId::NavigationKey).is_some())
-            .collect();
-        // A key that names no route leaves the stack as it is.
-        let Some(selected) = routes
-            .iter()
-            .position(|r| r.props.str(PropId::NavigationKey) == key)
-        else {
-            return;
-        };
-        let modal = routes[selected].props.str(PropId::NavigationPresentation) == Some("modal");
-        for (index, route) in routes.iter().enumerate() {
-            if let Some(header) = bar_header(src, &self.handlers, route.id) {
-                self.bars.insert(header);
-            }
-            let active = index == selected;
-            let shown = active || (modal && index + 1 == selected);
-            self.routes.insert(
-                route.id,
-                Route {
-                    hidden: !shown,
-                    inert: !active,
-                },
-            );
-        }
     }
 
     /// `renderMarkup`: each piece a `span`, or an `a` when it is a link to
@@ -1177,6 +1160,11 @@ impl<S: Source> Walk<'_, '_, S> {
             }
             if link {
                 attrs.push(("href".to_owned(), Some(piece.href.clone())));
+                // It leaves the app, as natively: renderMarkup's rule (navigation.js).
+                if super::element::leaves_app(&piece.href) {
+                    attrs.push(("target".to_owned(), Some("_blank".to_owned())));
+                    attrs.push(("rel".to_owned(), Some("external noopener".to_owned())));
+                }
             }
             let lines: Vec<&str> = if hang {
                 vec![piece.text.as_str()]
@@ -1260,6 +1248,19 @@ fn symbol_scale() -> f64 {
         exact_kernel::MetricValue::Number(n) => n,
         _ => 1.0,
     }
+}
+
+/// An option without `value` uses its text (LLP 1069.001 D2).
+fn option_label(src: &impl Source, id: ViewId) -> String {
+    let mut text = String::new();
+    let mut pending = vec![id];
+    while let Some(id) = pending.pop() {
+        if let Some(node) = src.facts(id) {
+            text.push_str(node.props.str(PropId::Text).unwrap_or(""));
+            pending.extend(src.children(id).iter().rev());
+        }
+    }
+    exact_kernel::control::option_label(&text)
 }
 
 /// Append `text` escaped for HTML text (`attribute` false) or a

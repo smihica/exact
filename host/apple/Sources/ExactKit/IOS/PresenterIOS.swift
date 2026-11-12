@@ -781,6 +781,11 @@ package final class Presenter {
     }
 
     func apply(_ batch: Batch) {
+        let pressChanged = pressPaintChanges(batch)
+        // Keep the surface's explicit transactions inside the batch: a top-level
+        // commit can submit its size before the following sibling transforms.
+        CATransaction.begin()
+        defer { CATransaction.commit() }
         session?.fieldChrome.presented(batch.layoutProvisional)
         let outerWaiting = fieldsWaiting; fieldsWaiting = menus.waitingFields(batch)
         defer { fieldsWaiting = outerWaiting }
@@ -819,6 +824,9 @@ package final class Presenter {
         var moved = false // create, frame or content ops: rows may have come or moved (`HeavyLeaves.batchApplied`)
         defer {
             collections.endBatch()
+            // Restore and author offsets after collection inset compensation,
+            // before deferred callbacks can replace the captured positions.
+            restoreScrollPositions()
             pool.end()
             PaintOrder.end()
             if outermost {
@@ -1054,6 +1062,7 @@ package final class Presenter {
         session?.canvases.captureIfNeeded()
         let changed = touchedAndAbove(touchedIDs + geometryApplied)
         geometryApplied = []
+        for id in touchedAndAbove(pressChanged) { views[id]?.endPressCrossFade() }
         swipeActions.sync(changed: changed, reshaped: touchedAndAbove(reshapedIDs)); rowCells.sync(changed: changed)
         groupedLists?.sync(changed: changed); reachPageEdges() // a list mounted now reaches its bands too
         if !flights.isEmpty { flightsBatchApplied() }
@@ -1089,24 +1098,13 @@ package final class Presenter {
         // What a node's name, state and focus read: not its box (an autofocus waiting for one is indexed).
         let named = touchedAndAbove(batch.ops.compactMap { [.create, .props, .style, .children, .paragraph, .flow].contains($0.op) ? $0.id : nil })
         // Finish controls and frames before UIKit synchronously lays out the destination.
+        navigation.batchApplied(batch, rowsOnly: rowsOnly)
+        #if os(iOS)
+        if #available(iOS 27.1, *) { arrangements.sync() }
+        #endif
+        keyboardToolbars.finishBackendChange()
         afterBatch { [weak self] in
             guard let self else { return }
-            navigation.batchApplied(batch, rowsOnly: rowsOnly)
-            #if os(iOS)
-            if #available(iOS 27.1, *) { arrangements.sync() }
-            #endif
-            keyboardToolbars.finishBackendChange()
-            for id in scrollers.union(pendingScrolls).union(materialNodes) {
-                guard let node = views[id] else { continue }
-                // Navigation can resize a native port after its row projection.
-                // Settle that layout before restoring or authoring an offset.
-                if node.groupedOwner { node.scrollView?.layoutIfNeeded() }
-                if !collections.owns(node.id) { node.restoreScrollPosition() }
-                if node.pendingScrollTop != nil || node.pendingScrollLeft != nil { collections.userIntent(node.id) }
-                node.applyPendingScroll()
-                if let material = node.materialView { node.sendSubviewToBack(node.glassSlot ?? material) }
-            }
-            pendingScrolls = pendingScrolls.filter { self.views[$0]?.pendingScrollTop != nil || self.views[$0]?.pendingScrollLeft != nil }
             syncAccessibility(changed: named.union(ariaMoved), disabledRoots: disabledRoots)
         }
         #if os(iOS)
@@ -1472,7 +1470,7 @@ package final class Presenter {
         var paragraph: NodeView? = start
         while let node = paragraph, node.kind == "text" {
             if textChanged || children { node.invalidateText() }
-            if boxChanged || !node.canRasterText { node.setNeedsDisplay() }
+            if boxChanged || node.hasContentTransition || !node.canRasterText { node.setNeedsDisplay() }
             paragraph = node.superview as? NodeView
         }
         if children, start.overlay != nil { start.needsCapture = true }

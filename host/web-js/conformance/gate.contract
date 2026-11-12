@@ -1,0 +1,34 @@
+// data: completion-storm
+// Synthetic conformance plan: a resource's `when` (LLP 1161.002) and `current`
+// (LLP 1161.001), on Completion Storm's sources. `lost(0, _)` answers now with
+// how many requests it has sent, so an ask that should not happen shows in
+// `probe`'s number. Closed, `probe` asks nothing and keeps its value, which is
+// not current; opened, it is asked again, forced, even at the same arguments.
+// `latest` is ungated: a refresh of the same arguments leaves it current.
+component Gate
+  state open = false
+  state tick = 0
+  resource probe = lost(0, tick) when open as shape number else empty()
+  resource latest = lost(0, 0) as shape number else empty()
+  action show
+    open = true
+  action hide
+    open = false
+  action bump
+    tick = tick + 1
+  action again
+    refresh probe
+    refresh latest
+  view
+    column testId="root" height="100%" box-sizing="border-box" padding=10 gap=6 background-color="#ffffff"
+      text `probe ${probe} ${current(probe) ? "current" : "kept"} ${pending(probe) ? "pending" : "settled"}` testId="probe"
+      text `latest ${current(latest) ? "current" : "kept"}` testId="latest"
+      row gap=4 flex-wrap="wrap"
+        button press=show testId="show"
+          text "show"
+        button press=hide testId="hide"
+          text "hide"
+        button press=bump testId="bump"
+          text "bump"
+        button press=again testId="again"
+          text "refresh"

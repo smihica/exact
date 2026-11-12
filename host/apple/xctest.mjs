@@ -14,14 +14,17 @@ const read = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: 'utf8', 
  * Plans embed the current schema digest. App entries need the test app's `appId` to boot. */
 export function compileFixtures(root, run, env, dir, prefix, appId) {
   const contract = args => run(env.EXACT_CONTRACT, ['build', ...args]);
+  contract([resolve(root, 'host/apple/tests/fixtures/scroll-snap.contract'), '-o', env[`${prefix}_SCROLL_SNAP_PLAN`] = resolve(dir, 'scroll-snap.plan')]);
   // A test that writes its own manifest names the app the tests link (`SheetFixture`'s `data`).
   env[`${prefix}_TEST_APP_ID`] = appId;
-  for (const [name, key] of [['frame-health', 'FRAME_HEALTH'], ['store-refresh', 'STORE_REFRESH'], ['headless', 'HEADLESS'], ['headless-markdown', 'HEADLESS_MARKDOWN'], ['headless-hidden-markdown', 'HEADLESS_HIDDEN_MARKDOWN'], ['headless-live', 'HEADLESS_LIVE'], ['headless-back', 'HEADLESS_BACK'], ['native-navigation-scroll', 'NATIVE_SCROLL'], ['intersect', 'INTERSECT'], ['native-buttons', 'BUTTONS'], ['keyboard-form', 'KEYBOARD'], ['tab-edge', 'TAB_EDGE'], ['repaint', 'REPAINT'], ['still-title', 'STILL_TITLE'], ['navigation-bars', 'NAVIGATION_BARS'], ['large-title', 'LARGE_TITLE'], ['transparent-bar', 'TRANSPARENT_BAR'], ['bar-band', 'BAR_BAND'], ['pad-bar', 'PAD_BAR'], ['pushed-title', 'PUSHED_TITLE'], ['inline-frame', 'INLINE_FRAME'], ['fieldless', 'FIELDLESS'], ['web-documents', 'WEB_DOCUMENTS'], ['iframe-post-messages', 'IFRAME_POST_MESSAGES'], ['iframe-partition', 'IFRAME_PARTITION'], ['iframe-windows', 'IFRAME_WINDOWS'], ['iframe-pdf', 'IFRAME_PDF'], ['iframe-resident-popover', 'IFRAME_RESIDENT_POPOVER'], ['tab-owner', 'TAB_OWNER'], ['grouped-list-reveal', 'GROUPED_REVEAL'], ['due-now', 'DUE_NOW'], ['caret-reveal', 'CARET_REVEAL'], ['cover-scroll', 'COVER_SCROLL'], ['page-edges', 'PAGE_EDGES'], ['barless-route', 'BARLESS_ROUTE'], ['page-edges-grouped', 'PAGE_EDGES_GROUPED'], ['control-bars', 'CONTROL_BARS'], ['search-scope', 'SEARCH_SCOPE'], ['held-tab', 'HELD_TAB'], ['pull-refresh', 'PULL_REFRESH'], ['edge-effect', 'EDGE_EFFECT'], ['sticky-bar', 'STICKY_BAR'], ['glass-press', 'GLASS_PRESS'], ['surface-pairs', 'SURFACE_PAIRS'], ['prevent-focus', 'PREVENT_FOCUS'], ['accent-bars', 'ACCENT_BARS'], ['accent-tabs', 'ACCENT_TABS']]) {
+  for (const [name, key] of [['frame-health', 'FRAME_HEALTH'], ['store-refresh', 'STORE_REFRESH'], ['headless', 'HEADLESS'], ['headless-markdown', 'HEADLESS_MARKDOWN'], ['headless-hidden-markdown', 'HEADLESS_HIDDEN_MARKDOWN'], ['headless-live', 'HEADLESS_LIVE'], ['headless-back', 'HEADLESS_BACK'], ['native-navigation-scroll', 'NATIVE_SCROLL'], ['intersect', 'INTERSECT'], ['native-buttons', 'BUTTONS'], ['keyboard-form', 'KEYBOARD'], ['tab-edge', 'TAB_EDGE'], ['repaint', 'REPAINT'], ['still-title', 'STILL_TITLE'], ['navigation-bars', 'NAVIGATION_BARS'], ['large-title', 'LARGE_TITLE'], ['transparent-bar', 'TRANSPARENT_BAR'], ['bar-band', 'BAR_BAND'], ['pad-bar', 'PAD_BAR'], ['pushed-title', 'PUSHED_TITLE'], ['inline-frame', 'INLINE_FRAME'], ['fieldless', 'FIELDLESS'], ['web-documents', 'WEB_DOCUMENTS'], ['iframe-post-messages', 'IFRAME_POST_MESSAGES'], ['iframe-partition', 'IFRAME_PARTITION'], ['iframe-windows', 'IFRAME_WINDOWS'], ['iframe-pdf', 'IFRAME_PDF'], ['iframe-resident-popover', 'IFRAME_RESIDENT_POPOVER'], ['tab-owner', 'TAB_OWNER'], ['grouped-list-reveal', 'GROUPED_REVEAL'], ['due-now', 'DUE_NOW'], ['caret-reveal', 'CARET_REVEAL'], ['cover-scroll', 'COVER_SCROLL'], ['page-edges', 'PAGE_EDGES'], ['barless-route', 'BARLESS_ROUTE'], ['page-edges-grouped', 'PAGE_EDGES_GROUPED'], ['control-bars', 'CONTROL_BARS'], ['search-scope', 'SEARCH_SCOPE'], ['barless-tab', 'BARLESS_TAB'], ['pull-refresh', 'PULL_REFRESH'], ['edge-effect', 'EDGE_EFFECT'], ['sticky-bar', 'STICKY_BAR'], ['glass-press', 'GLASS_PRESS'], ['surface-pairs', 'SURFACE_PAIRS'], ['prevent-focus', 'PREVENT_FOCUS'], ['accent-bars', 'ACCENT_BARS'], ['accent-tabs', 'ACCENT_TABS']]) {
     contract([resolve(root, `scripts/fixtures/${name}.contract`), '-o', env[`${prefix}_${key}_PLAN`] = resolve(dir, `${name}.plan`)]);
   }
   contract([resolve(root, 'host/apple/tests/fixtures/sticky-transition.contract'), '-o', env[`${prefix}_STICKY_TRANSITION_PLAN`] = resolve(dir, 'sticky-transition.plan')]);
   // SwipeScrollDragTests': swipeleft and swiperight rows and a scroller's drag events.
   contract([resolve(root, 'host/apple/tests/fixtures/swipe-scroll-drag.contract'), '-o', env[`${prefix}_SWIPE_SCROLL_DRAG_PLAN`] = resolve(dir, 'swipe-scroll-drag.plan')]);
+  // SnapshotDriverTests' live tree: a bar and a ring under an ancestor's accent.
+  contract([resolve(root, 'host/apple/tests/fixtures/live-accent.contract'), '-o', env[`${prefix}_LIVE_ACCENT_PLAN`] = resolve(dir, 'live-accent.plan')]);
   // HeldStateTests' own (a card that presses over a flat leaf), beside them.
   contract([resolve(root, 'host/apple/tests/fixtures/held-state.contract'), '-o', env[`${prefix}_HELD_STATE_PLAN`] = resolve(dir, 'held-state.plan')]);
   // AgentStickyReveal{Mac,IOS}Tests': rows under a sticky header and dock.
@@ -30,6 +33,8 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   contract([resolve(root, 'host/apple/tests/fixtures/restart-list.contract'), '-o', env[`${prefix}_RESTART_LIST_PLAN`] = resolve(dir, 'restart-list.plan')]);
   // NavigationTabsIOSTests': the selected tab tapped again over a list its press asks a row of.
   contract([resolve(root, 'host/apple/tests/fixtures/tab-top-request.contract'), '-o', env[`${prefix}_TAB_TOP_REQUEST_PLAN`] = resolve(dir, 'tab-top-request.plan')]);
+  // NavigationMoreIOSTests': more tabs than an iPhone's tab bar shows, so UIKit lists some under More.
+  contract([resolve(root, 'host/apple/tests/fixtures/more-tabs.contract'), '-o', env[`${prefix}_MORE_TABS_PLAN`] = resolve(dir, 'more-tabs.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/feedback-race.contract'), '-o', env[`${prefix}_FEEDBACK_RACE_PLAN`] = resolve(dir, 'feedback-race.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/async-advance.contract'), '-o', env[`${prefix}_ASYNC_ADVANCE_PLAN`] = resolve(dir, 'async-advance.plan')]);
   contract([resolve(root, 'host/apple/tests/fixtures/timer-admission.contract'), '-o', env[`${prefix}_TIMER_ADMISSION_PLAN`] = resolve(dir, 'timer-admission.plan')]);
@@ -56,6 +61,12 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   writeFileSync(resolve(refusing, 'app.json'), JSON.stringify({ name: 'Refusing refresh', app: { id: appId, name: 'Refusing refresh' }, widgets: [{ kind: 'refusing', families: ['systemSmall'], component: 'Card', props: 'Props', refresh: 'nextTrains', preview: { title: 'Preview' } }] }));
   // Caltrain's nextTrains answers a different Props shape: the refresh must refuse.
   contract([resolve(refusing, 'app.contract'), '--entry', 'refusing', '-o', env[`${prefix}_SNAPSHOT_REFUSING_PLAN`] = resolve(dir, 'refusing.plan')]);
+  // WidgetGalleryTests: an accented bar at a half through the agent's widget screenshot.
+  const barCard = resolve(dir, 'entries/bar-card');
+  mkdirSync(barCard, { recursive: true });
+  writeFileSync(resolve(barCard, 'app.contract'), 'shape CardProps\n  title: string\ncomponent App\n  view\n    text "App"\ncomponent BarCard\n  props\n    title: string\n  view\n    column background-color="#ffffff" padding=8\n      progress value=0.5 accent-color="#ff0000" width=200\n');
+  writeFileSync(resolve(barCard, 'app.json'), JSON.stringify({ name: 'Bar card', app: { id: appId, name: 'Bar card' }, widgets: [{ kind: 'bar-card', families: ['systemMedium'], component: 'BarCard', props: 'CardProps', refresh: 'nextTrains', preview: { title: 'Preview' } }] }));
+  contract([resolve(barCard, 'app.contract'), '--entry', 'bar-card', '-o', env[`${prefix}_SNAPSHOT_BAR_CARD_PLAN`] = resolve(dir, 'bar-card.plan')]);
   // An activity whose Lock Screen placement has a background and a link (ActivityDriverTests: the tint, the URL).
   const tinted = resolve(dir, 'entries/tinted');
   mkdirSync(tinted, { recursive: true });
@@ -81,6 +92,12 @@ export function compileFixtures(root, run, env, dir, prefix, appId) {
   cpSync(resolve(root, 'host/apple/tests/fixtures/activity-edges.contract'), resolve(edges, 'app.contract'));
   writeFileSync(resolve(edges, 'app.json'), JSON.stringify({ app: { id: appId, name: 'Activity edges' }, live_activities: [{ kind: 'edges', component: 'Edges', state: 'EdgeState', preview: { title: 'Private account label' } }] }));
   contract([resolve(edges, 'app.contract'), '--entry', 'edges', '-o', env[`${prefix}_SNAPSHOT_EDGES_PLAN`] = resolve(dir, 'edges.plan')]);
+  // WidgetGalleryTests: accented bars through the agent's activity screenshot.
+  const bars = resolve(dir, 'entries/activity-bars');
+  mkdirSync(bars, { recursive: true });
+  cpSync(resolve(root, 'host/apple/tests/fixtures/activity-bars.contract'), resolve(bars, 'app.contract'));
+  writeFileSync(resolve(bars, 'app.json'), JSON.stringify({ app: { id: appId, name: 'Activity bars' }, live_activities: [{ kind: 'bars', component: 'Bars', state: 'BarsState', preview: { start: 0, end: 1 } }] }));
+  contract([resolve(bars, 'app.contract'), '--entry', 'bars', '-o', env[`${prefix}_SNAPSHOT_BARS_PLAN`] = resolve(dir, 'bars.plan')]);
   if (prefix === 'EXACT') {
     const app = resolve(dir, 'SnapshotAssets.app'), resources = resolve(app, 'Contents/Resources');
     const extension = resolve(app, 'Contents/PlugIns/Card.appex');

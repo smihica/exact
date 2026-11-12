@@ -67,7 +67,7 @@ const readToml = (path) => { try { return Bun.TOML.parse(readFileSync(path, 'utf
 /** The crates an app writes beside app.json. */
 export const APP_CRATES = ['apple', 'ios', 'macos', 'linux', 'web', 'windows', 'android', 'data', 'gpu'];
 /** How an app with Rust of its own gets the workspace it needs (LLP 1153 D1.4: the generated one, copied up). */
-export const NO_WORKSPACE = 'An app with Rust of its own (a gpu/ or data/ crate) copies the generated workspace up from .exact/shells/ beside app.json and adds its crates there (LLP 1153 D1.4).';
+export const NO_WORKSPACE = 'An app with Rust of its own (a gpu/ or data/ crate) copies the generated workspace up from .exact/shells/, which a native verb writes only while no such crate is there: `bun exact.mjs contract vocab gpu-module` says how.';
 /** Whether the workspace at `root` owns the package at `path`, as Cargo reads it: a `members` glob names it, or a
  * member depends on it by a path under the root (Cargo's automatic membership), and `exclude` (a prefix or a glob)
  * does not name it. Read from the files alone. */
@@ -127,6 +127,10 @@ export function appleCargo(command, arguments_, options = {}) {
     !targets.length && process.platform === 'darwin' && ['build', 'rustc', 'check', 'test', 'clippy'].includes(arguments_[0]));
   if (!apple) return [command, arguments_, options];
   const environment = { ...(options.env ?? process.env) }, directories = [];
+  // No SDKROOT, whatever the caller inherited: rustc and cc-rs ask xcrun for each target's own SDK. One left here
+  // reaches the build scripts' C and C++ compiles for the Mac too, where cc-rs passes no -isysroot and clang takes
+  // SDKROOT: an iOS SDK there fails `-Werror` (aws-lc-sys's probes) on -Wincompatible-sysroot.
+  delete environment.SDKROOT;
   for (let at = resolve(options.cwd ?? process.cwd()); ; at = dirname(at)) {
     directories.push(at);
     if (at === dirname(at)) break;

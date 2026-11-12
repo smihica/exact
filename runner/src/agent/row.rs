@@ -101,7 +101,7 @@ pub fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
         RowValue::Number(n) => {
             let _ = write!(out, "{}", num(n));
         }
-        RowValue::Color(c) | RowValue::ColorValue(ColorValue::Fixed(c)) => quote(&hex(c), out),
+        RowValue::ColorValue(ColorValue::Fixed(c)) => quote(&hex(c), out),
         RowValue::ColorValue(ColorValue::LightDark(l, d)) => {
             quote(&format!("light-dark({}, {})", hex(l), hex(d)), out)
         }
@@ -156,7 +156,7 @@ pub fn row_json(row: StyleId, v: RowValue<'_>, out: &mut String) {
         RowValue::Filter(f) => quote(&f.css(), out),
         RowValue::BackdropFilter(f) => quote(&f.css(), out),
         RowValue::Animations(a) => quote(&a.css(), out),
-        RowValue::Color2(_) | RowValue::Tracks(_) | RowValue::Placement(_) => quote("(grid)", out),
+        RowValue::Tracks(_) | RowValue::Placement(_) => quote("(grid)", out),
     }
 }
 

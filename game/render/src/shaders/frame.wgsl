@@ -50,6 +50,18 @@ struct Frame {
     water_drift: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
+fn view_direction(world: vec3<f32>) -> vec3<f32> {
+    if frame.toon.w > 0.5 { return normalize(-frame.view_depth.xyz); }
+    return normalize(frame.camera_alpha.xyz - world);
+}
+// The eye for perspective rays, or the point on the camera plane for parallel rays.
+fn view_origin(world: vec3<f32>) -> vec3<f32> {
+    if frame.toon.w > 0.5 {
+        let forward = normalize(frame.view_depth.xyz);
+        return world - forward * dot(forward, world - frame.camera_alpha.xyz);
+    }
+    return frame.camera_alpha.xyz;
+}
 fn environment(y: f32) -> vec3<f32> {
     return mix(frame.horizon_disc.xyz,
         select(frame.ground_exposure.xyz, frame.zenith_ambient.xyz, y >= 0.0), abs(y));
@@ -87,10 +99,7 @@ fn fog_amount(end: vec3<f32>) -> f32 {
 // or for an orthographic camera from its plane; `wet` false when none does.
 struct Submerged { start: vec3<f32>, stop: vec3<f32>, wet: bool }
 fn submerged(end: vec3<f32>) -> Submerged {
-    var start = frame.camera_alpha.xyz;
-    if frame.toon.w > 0.5 {
-        start = end - frame.view_depth.xyz * dot(frame.view_depth, vec4(end, 1.0));
-    }
+    var start = view_origin(end);
     var stop = end;
     let height = frame.water.x;
     if start.y > height && stop.y > height { return Submerged(start, stop, false); }
@@ -109,11 +118,11 @@ fn linear_fog(end: vec3<f32>) -> f32 {
     }
     return smoothstep(frame.toon.x, frame.toon.y, depth);
 }
-// Analytic integral of exponential height density along the eye-to-end segment.
+// Analytic integral of exponential height density along the view ray's segment.
 // Shared by surfaces and sky; the near-horizontal limit avoids cancellation.
 // With water, the fog is the water's: only the ray's submerged part counts.
 fn fog_transmission(end: vec3<f32>) -> f32 {
-    var start = frame.camera_alpha.xyz;
+    var start = view_origin(end);
     var stop = end;
     if frame.water.y > 0.0 {
         let part = submerged(end);

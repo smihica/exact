@@ -52,26 +52,37 @@ final class ButtonMeasureCache: @unchecked Sendable {
             lock.unlock()
             return measured
         }
+        let needsNumeral = numeral.map { numerals[$0.key] == nil } ?? false
         misses += 1
         lock.unlock()
         return Owner.shared.callMain {
             lock.lock(); let current = traits; lock.unlock()
             let now = Key(face: data, widthKind: widthKind, width: width, traits: .init(current))
+            let face = ButtonFace(json: data)
             var title: NSAttributedString?
-            var measured = measure(ButtonFace(json: data), widthKind: widthKind, width: CGFloat(width), traits: current, probe: data, title: &title)
+            var measured = measure(face, widthKind: widthKind, width: CGFloat(width), traits: current, probe: data, title: &title)
+            var reference: Numeral?
+            if needsNumeral, now == key {
+                // A count can wrap inside its digits. Its reference must fit
+                // unconstrained, including the button's insets, symbol and gap.
+                // Keep definite-offer rounding; intrinsic widths add a pixel.
+                let unwrapped = widthKind == 0
+                    ? measure(face, widthKind: 0, width: .greatestFiniteMagnitude, traits: current, probe: data, title: &title)
+                    : measured
+                if let title { reference = Numeral(unwrapped, title: title, scale: max(1, current.displayScale)) }
+            }
             lock.lock()
             entries[now] = measured
-            if let numeral, now == key, let title { numerals[numeral.key] = Numeral(measured, title: title, scale: max(1, current.displayScale)) }
+            if let numeral, let reference { numerals[numeral.key] = reference }
             lock.unlock()
             measured.provisional = now == key ? 0 : 1
             return measured
         }
     }
 
-    /// A count's button (a like's, a reply's) measured once for its face:
-    /// its title is digits, on one line it cannot break, so another count's
-    /// button is that one wider or narrower by the difference of the two
-    /// titles' ink, as UIKit lays its label out at its text's width rounded
+    /// A count's button (a like's, a reply's) measured unwrapped for its face:
+    /// another count's single-line button is wider or narrower by the
+    /// difference of the titles' ink, as UIKit lays its label out at its text's width rounded
     /// up to the pixel. Measured in the title's own attributes, off the main
     /// thread: every count is a new face, and each asked a configured button
     /// on main (a feed's posts, ~1 ms each).

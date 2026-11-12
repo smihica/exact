@@ -29,6 +29,7 @@ fn main() {
         "typetour_data::Tour",
         "typetour_data::Tour",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

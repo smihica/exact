@@ -520,15 +520,19 @@ package final class TextEngine {
     /// Whether this engine is a measurer whose answers are published: its
     /// residency then keeps shaped text only, the table the answers.
     private var publishes: Bool { painter != nil && (answers?.limit ?? 0) > 0 }
-    package var fonts: [String: PlatformFont] = [:]
+    private(set) package var fonts: [String: PlatformFont] = [:]
     private var residency: TextResidency
     package var residencyStats: TextResidencyStats { residency.stats }
     /// The NodeView's existing cachedTextLayout is the accepted lease. The
     /// cache keeps only a weak lookup once that view owns the paragraph.
     package func accepted(_ paragraph: Paragraph) { residency.accepted(paragraph) }
-    /// Under memory pressure, shaped text no view holds is dropped, as the
-    /// raster loader drops its cold images.
-    package func dropCold() { residency.dropCold(); answers?.discardGlyphs() }
+    /// Under memory pressure, drop cached fonts and shaped text no view holds.
+    /// Live paragraphs retain the fonts they use.
+    package func dropCold() {
+        clearFonts()
+        residency.dropCold()
+        answers?.discardGlyphs()
+    }
     /// At rest (`ExactSession.rest`): shaped text no view holds goes.
     package func dropColdShaped() { residency.dropColdShaped(); answers?.discardGlyphs() }
     /// A screen shows about `visibleParagraphs` paragraphs: cold shaped
@@ -661,7 +665,7 @@ package final class TextEngine {
     /// the candidate; checkpoints retain and restore their original namespace.
     package func install(_ pointer: UnsafePointer<ExactFontCatalog>?) {
         presentation?.reset()
-        fonts.removeAll(keepingCapacity: true)
+        clearFonts()
         residency = TextResidency(softTargetBytes: residency.softTargetBytes)
         residency.keepsAnswers = !publishes
         dropMeasuredBreaks()
@@ -681,18 +685,7 @@ package final class TextEngine {
             let name = row.family.map { String(decoding: UnsafeBufferPointer(start: $0, count: row.family_len), as: UTF8.self) } ?? ""
             if row.source_len == 0 {
                 if stack < 8 { continue }
-                let generics = ["system-ui", "ui-sans-serif", "sans-serif", "ui-serif", "serif", "ui-monospace", "monospace", "ui-rounded"]
-                let generic = row.weight == 1 ? generics.firstIndex(of: name.lowercased()) : nil
-                let descriptor: CTFontDescriptor?
-                if let generic { descriptor = CTFontCopyFontDescriptor(font(size: 16, weight: 400, family: generic, italic: false) as CTFont) }
-                else {
-                    // An installed family is its real faces, matched as declared
-                    // ones are: traits on a family descriptor never chose the
-                    // italic or bold file (the reader diary's Georgia).
-                    staged[stack, default: []] += Self.installedFaces(name)
-                    continue
-                }
-                if let descriptor { staged[stack, default: []].append(RegisteredFace(family: name, generic: generic, weight: 0, italic: false, descriptor: descriptor)) }
+                staged[stack, default: []] += installedMember(name, generic: row.weight == 1)
                 continue
             }
             guard let sourceBytes = row.source else { failed.insert(stack); continue }
@@ -716,6 +709,14 @@ package final class TextEngine {
             fputs("[Fonts] font.registration.failed: stack=\(stack)\n", stderr)
         }
         catalog = staged
+    }
+
+    /// SVG images have their own stack ids and use only installed fonts.
+    package func installPictureFonts(_ stacks: [[(Bool, String)]]) {
+        install(nil)
+        for (index, members) in stacks.enumerated() {
+            catalog[index + 8] = members.flatMap { installedMember($0.1, generic: !$0.0) }
+        }
     }
 
     /// A declared face's descriptors: from its bundled file, else its bytes.
@@ -758,8 +759,7 @@ package final class TextEngine {
         let settings = features.map { [kCTFontOpenTypeFeatureTag: $0.0, kCTFontOpenTypeFeatureValue: $0.1] } as CFArray
         let descriptor = CTFontDescriptorCreateWithAttributes([kCTFontFeatureSettingsAttribute: settings] as CFDictionary)
         let f = CTFontCreateCopyWithAttributes(base as CTFont, size, nil, descriptor) as PlatformFont
-        fonts[key] = f
-        return f
+        return cacheFont(f, for: key)
     }
 
     /// `stretch` is CSS `font-stretch`: it chooses among a declared family's
@@ -789,11 +789,10 @@ package final class TextEngine {
                 let group = faces.filter { $0.family == member.family }
                 cascade.append(CTFontCopyFontDescriptor(candidate(TextEngine.matched(group, weight: weight, italic: italic, stretch: stretch)) as CTFont))
             }
-            guard !cascade.isEmpty else { fonts[key] = base; return base }
+            guard !cascade.isEmpty else { return cacheFont(base, for: key) }
             let descriptor = CTFontDescriptorCreateWithAttributes([kCTFontCascadeListAttribute: cascade] as CFDictionary)
             let f = CTFontCreateCopyWithAttributes(base as CTFont, size, nil, descriptor) as PlatformFont
-            fonts[key] = f
-            return f
+            return cacheFont(f, for: key)
         }
         // Each hundred's named instance is kept under its own key, so a
         // weight between two (a transition's frame) makes one font.
@@ -801,9 +800,18 @@ package final class TextEngine {
             ? namedSystemFace(size: size, weight: TextEngine.namedWeight(weight), family: family, italic: italic)
             : TextEngine.cssWeight(weight, size: size) { self.font(size: size, weight: $0, family: family, italic: italic) }
         f = TextEngine.cssAxes(f, stretch: stretch, variations: variations, size: size)
-        fonts[key] = f
-        return f
+        return cacheFont(f, for: key)
     }
+
+    /// Sizes and axes can change every frame. Bound every insertion, including
+    /// the named weights and generic fallbacks a request resolves recursively.
+    package func cacheFont(_ font: PlatformFont, for key: String) -> PlatformFont {
+        if fonts.count >= 256 { clearFonts() }
+        fonts[key] = font
+        return font
+    }
+
+    package func clearFonts() { fonts.removeAll(keepingCapacity: true) }
 
     /// A platform generic at a named weight, as UIKit (AppKit) makes it.
     private func namedSystemFace(size: CGFloat, weight w: PlatformFont.Weight, family: Int, italic: Bool) -> PlatformFont {

@@ -66,8 +66,8 @@ pub struct NodeArena {
     pub(crate) exclusion_slots: SlotSet,
     /// @ref LLP 1093 D7 — multi-column containers and their last cuts.
     pub(crate) frag: crate::fragment::FragState,
-    /// Slots whose style writes a row in `rem`/`em` (LLP 1069.000 D3).
-    pub(crate) relative_slots: SlotSet,
+    /// Relative rows and the slots whose inputs changed (LLP 1069.000 D3).
+    pub(crate) relative: crate::txn::relative::Slots,
     /// System symbols whose role or font changed: their natural size is
     /// measured again before the next layout (`Kernel::measure_symbols`).
     pub(crate) symbols_owed: SlotSet,
@@ -184,7 +184,7 @@ impl Clone for NodeArena {
             flow: self.flow.clone(),
             exclusion_slots: self.exclusion_slots.clone(),
             frag: self.frag.clone(),
-            relative_slots: self.relative_slots.clone(),
+            relative: self.relative.clone(),
             symbols_owed: self.symbols_owed.clone(),
             measured_symbols: self.measured_symbols.clone(),
             mark_sizes: self.mark_sizes.clone(),
@@ -274,7 +274,7 @@ impl NodeArena {
         self.flow.clear();
         self.exclusion_slots.clear();
         self.frag = Default::default();
-        self.relative_slots.clear();
+        self.relative = Default::default();
         self.symbols_owed.clear();
         self.measured_symbols.clear();
         self.mark_sizes.clear();
@@ -927,7 +927,7 @@ impl NodeArena {
         self.mark_reports.remove(&slot);
         self.exclusion_slots.remove(slot);
         self.frag.forget(slot);
-        self.relative_slots.remove(slot);
+        self.relative.forget(slot);
         self.symbols_owed.remove(slot);
         self.measured_symbols.remove(slot);
         self.button_bases.remove(&slot);
@@ -971,6 +971,9 @@ impl NodeArena {
     pub(crate) fn set_parent(&mut self, slot: u32, parent: Option<u32>) {
         if parent.is_some() && self.parents[slot as usize] != parent {
             self.flags[slot as usize].insert(NodeFlags::ATTACHED);
+        }
+        if self.parents[slot as usize] != parent {
+            self.relative.invalidate(slot);
         }
         self.parents[slot as usize] = parent;
     }
@@ -1064,11 +1067,7 @@ impl NodeArena {
     }
 
     fn set_shared_style(&mut self, slot: u32, style: Rc<StyleProps>) {
-        if style.relative.is_empty() {
-            self.relative_slots.remove(slot);
-        } else {
-            self.relative_slots.insert(slot);
-        }
+        self.relative.update(slot, !style.relative.is_empty());
         if crate::fragment::is_multicol(&style) {
             self.frag.containers.insert(slot);
         } else {

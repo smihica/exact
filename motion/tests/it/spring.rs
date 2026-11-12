@@ -257,7 +257,10 @@ fn invalid_parameters_are_refused_by_name() {
     );
     assert_eq!(bad(|c| c.damping = -1.0), Err(SpringError::NegativeDamping));
     assert_eq!(bad(|c| c.mass = 0.0), Err(SpringError::NonPositiveMass));
-    assert_eq!(bad(|c| c.mass = f64::INFINITY), Err(SpringError::NonFinite));
+    assert_eq!(
+        bad(|c| c.mass = f64::INFINITY),
+        Err(SpringError::NonFinite("mass"))
+    );
     assert_eq!(under().validate(), Ok(()));
 }
 

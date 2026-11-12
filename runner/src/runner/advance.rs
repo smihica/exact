@@ -65,6 +65,21 @@ impl<D: DataSource> Runner<D> {
         a
     }
 
+    /// Native Forward at the host's time. As with [`Runner::dispatch_at`],
+    /// a timer's refusal rides along and the input still runs.
+    pub fn host_forward_at(&mut self, root: ViewId, now_ms: f64) -> Advanced {
+        let mut a = self.advance_timed(now_ms);
+        match self.host_forward(root) {
+            Ok(receipt) => a.receipts.extend(receipt.map(|receipt| Timed {
+                at_ms: now_ms.max(self.now_ms),
+                receipt,
+            })),
+            Err(e) => a.error = Some(e),
+        }
+        a.now_ms = self.now_ms;
+        a
+    }
+
     /// Move the clock to `now_ms`, firing every timer due, in order, each at
     /// its own due time. A refusal stops the advance there: the commits so
     /// far are returned with their times, the clock stays at the refusing

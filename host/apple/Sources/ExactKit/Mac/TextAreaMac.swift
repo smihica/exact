@@ -440,7 +440,7 @@ extension NodeView {
         scroller.hasVerticalScroller = true
         scroller.autohidesScrollers = true
         scroller.documentView = f
-        addSubview(scroller)
+        (clipBox ?? self).addSubview(scroller)
         textArea = f
         textAreaScroll = scroller
     }

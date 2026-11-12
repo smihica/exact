@@ -120,6 +120,85 @@ fn the_test_command_emits_structured_properties_beside_scripts() {
 }
 
 #[test]
+fn the_test_command_reports_errors_at_their_source() {
+    let dir = std::env::temp_dir().join(format!("contract-property-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let app = dir.join("app.contract");
+    let imported = dir.join("broken.contract");
+    let tests = dir.join("app.test.contract");
+    std::fs::write(&tests, "always \"whole\"\n  expect state count whole\n").unwrap();
+    let with_import = "use Broken from \"./broken.contract\"\ncomponent App\n  state count = 0\n  view\n    Broken()\n";
+    let cases = [
+        (
+            "",
+            "",
+            &app,
+            "1:1 [analyze-no-component] a file needs a component",
+        ),
+        (
+            "shape Data\n  n: number\nfn one(): number = 1\n",
+            "",
+            &app,
+            "1:1 [analyze-no-component] a file needs a component",
+        ),
+        (
+            "component App\n  state count = 0\n  view\n    text \"hi\" oops=\n",
+            "",
+            &app,
+            "4:20 [syntax-expected-expression]",
+        ),
+        (
+            "component App\n  state count = 0\n  view\n    Missing()\n",
+            "",
+            &app,
+            "4:5 [syntax-unknown-component]",
+        ),
+        (
+            with_import,
+            "component Broken\n  view\n    text \"hi\" oops=\n",
+            &imported,
+            "3:20 [syntax-expected-expression]",
+        ),
+        (
+            with_import,
+            "component Broken\n  view\n    Missing()\n",
+            &imported,
+            "3:5 [syntax-unknown-component]",
+        ),
+        (
+            "component App\n  state other = 0\n  view\n    text \"hi\"\n",
+            "",
+            &tests,
+            "2:3 [analyze-property-read]",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (source, dependency, file, location) in cases {
+        std::fs::write(&app, source).unwrap();
+        std::fs::write(&imported, dependency).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_contract"))
+            .arg("test")
+            .arg(&tests)
+            .output()
+            .unwrap();
+        let error = String::from_utf8(output.stderr).unwrap();
+        let expected = format!("{}:{location}", file.display());
+        if output.status.code() != Some(1)
+            || !output.stdout.is_empty()
+            || !error.starts_with(&expected)
+        {
+            failures.push(format!(
+                "expected {expected}, got {}: {error}",
+                output.status
+            ));
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn the_cone_follows_derives_and_functions_but_respects_local_names() {
     let property = contract::properties("always \"p\"\n  expect state outer whole\n").unwrap();
     for (program, reason) in [

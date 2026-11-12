@@ -36,7 +36,7 @@ struct Anchor {
     chain: Vec<(NodeKey, StyleProps)>,
     positioned: BTreeMap<NodeKey, bool>,
     requested: Option<f64>,
-    scroller: Option<NodeKey>,
+    scroller: Option<(NodeKey, StyleProps)>,
 }
 
 impl State {
@@ -116,6 +116,12 @@ const LAYOUT: &[StyleId] = &[
     StyleId::Rotate,
     StyleId::Scale,
 ];
+
+fn layout_changed(before: &StyleProps, after: &StyleProps) -> bool {
+    // Rotate's numeric value holds the angle without its resolved axis.
+    before.rotate_axis != after.rotate_axis
+        || LAYOUT.iter().any(|&id| before.get(id) != after.get(id))
+}
 
 fn requested(kernel: &Kernel, id: ViewId) -> Option<f64> {
     kernel.node(id)?.props.get(PropId::ScrollTop)?.as_float()
@@ -260,7 +266,7 @@ fn capture(
                 (f.width - left - right).max(0.),
                 (f.height - top - bottom).max(0.),
             ],
-            Some(node.key),
+            Some((node.key, node.style.clone())),
         )
     };
     let key = select(kernel, &nodes, id, port)?;
@@ -288,20 +294,22 @@ fn capture(
 
 impl Anchor {
     fn shift(&self, kernel: &Kernel, scroller: ViewId) -> Option<f32> {
-        if kernel.node(scroller).map(|n| n.key) != self.scroller {
-            return None;
+        match (kernel.node(scroller), &self.scroller) {
+            (Some(node), Some((key, style))) => {
+                if node.key != *key || layout_changed(style, node.style) {
+                    return None;
+                }
+            }
+            (None, None) => {}
+            _ => return None,
         }
         let node = kernel.node_by_key(self.key)?;
         let mut at = Some(node.id);
         for (key, style) in &self.chain {
             let current = kernel.node(at?)?;
-            // Rotate's numeric value holds the angle without its resolved axis.
             if current.key != *key
-                || current.style.rotate_axis != style.rotate_axis
                 || excluded(kernel, current, scroller)
-                || LAYOUT
-                    .iter()
-                    .any(|&id| current.style.get(id) != style.get(id))
+                || layout_changed(style, current.style)
             {
                 return None;
             }

@@ -21,6 +21,7 @@ extension NodeView {
         if isNativeButton { return false } // UIKit owns the single focus stop (LLP 1104 D6).
         if let index = explicitTabIndex, index < 0 { return false }
         if cssVisibilityHidden { return false } // no remote stop, nor Select (e28279b3b)
+        if placedAncestor != nil { return false } // the focus engine would find it at its own frame, not where the surface draws it
         return canBecomeFirstResponder || (!disabled && !inert && handlers.contains("press")) || focusableScroller
     }
 

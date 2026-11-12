@@ -17,7 +17,7 @@ fn explicit_stateless_control_is_preserved() {
         Ok(Source::Stateless)
     );
     assert_eq!(
-        Source::Stateless.entry("off").unwrap(),
+        Source::Stateless.entry(&serde_json::json!({"platform": "web", "rustMode": "off", "linked": []})).unwrap(),
         "type AppData = messages_stress_data::MessagesStress;\n#[allow(dead_code)]\nfn app_data() -> AppData { messages_stress_data::MessagesStress }\n"
     );
 }
@@ -25,8 +25,8 @@ fn explicit_stateless_control_is_preserved() {
 #[test]
 fn reuse_generates_the_real_type_and_constructor() {
     assert_eq!(
-        Source::Reuse.entry("off").unwrap(),
-        "type AppData = messages_stress_data::ReusableMessagesStress;\n#[allow(dead_code)]\nfn app_data() -> AppData { messages_stress_data::ReusableMessagesStress::default() }\n"
+        Source::Reuse.entry(&serde_json::json!({"platform": "macos", "rustMode": "off", "linked": []})).unwrap(),
+        "exact_logic::configured!(AppData, messages_stress_data::ReusableMessagesStress, || exact_logic::Swappable::off(messages_stress_data::ReusableMessagesStress::default()));\n#[allow(dead_code)]\nfn app_data() -> AppData { Default::default() }\n"
     );
 }
 

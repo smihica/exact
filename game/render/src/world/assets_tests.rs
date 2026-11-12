@@ -10,6 +10,10 @@ struct Recording {
     custom: std::collections::BTreeSet<MaterialId>,
     revision: u64,
     lookups: Cell<usize>,
+    absent: Vec<&'static str>,
+    // Resident textures, and the texture sets materials were drawn with.
+    ready: Vec<&'static str>,
+    sets: Vec<[Option<String>; 5]>,
 }
 impl Default for Recording {
     fn default() -> Self {
@@ -30,13 +34,16 @@ impl Default for Recording {
             custom: Default::default(),
             revision: 1,
             lookups: Cell::new(0),
+            absent: vec!["missing"],
+            ready: Vec::new(),
+            sets: Vec::new(),
         }
     }
 }
 impl Writes for Recording {
     fn model(&self, name: &str) -> Option<crate::models::Draws<'_>> {
         self.lookups.set(self.lookups.get() + 1);
-        (name != "missing").then_some(crate::models::Draws {
+        (!self.absent.contains(&name)).then_some(crate::models::Draws {
             nodes: &self.nodes,
             names: &self.names,
             merged: &self.nodes,
@@ -49,6 +56,22 @@ impl Writes for Recording {
     }
     fn assets_revision(&self) -> u64 {
         self.revision
+    }
+    fn texture_ready(&self, name: &str) -> bool {
+        self.ready.contains(&name)
+    }
+    fn material_variant(
+        &mut self,
+        _: MaterialId,
+        names: &[Option<String>; 5],
+    ) -> Option<MaterialId> {
+        let set = self.sets.iter().position(|s| s == names);
+        Some(MaterialId(
+            100 + set.unwrap_or_else(|| {
+                self.sets.push(names.clone());
+                self.sets.len() - 1
+            }),
+        ))
     }
     fn max_slots(&self) -> u32 {
         100_000
@@ -146,6 +169,7 @@ fn removing_models_compacts_parts_lods_skin_records_and_batches_like_a_fresh_fee
                     material: 0,
                     color: Some([0.5; 4]),
                     emissive: [0.25; 3],
+                    ..Default::default()
                 }]),
             );
             w.insert(
@@ -244,4 +268,146 @@ fn sparse_model_removals_keep_entity_order_across_unloaded_models() {
     assert!(assets.records.is_empty());
     assert!(assets.entities.is_empty());
     assert!(assets.ranges.is_empty());
+}
+
+/// A `Mesh` swapped to a model still in flight keeps drawing the rigid model
+/// the entity drew before, and the feed holds it until the new one draws.
+#[test]
+fn a_swapped_mesh_draws_its_prior_rigid_model_until_the_new_one_can() {
+    let mut w = World::new(60, 0);
+    let die = w.spawn((Transform::default(), Mesh::asset("model")));
+    let (mut assets, mut r) = (Assets::default(), Recording::default());
+    r.nodes[0].3 = None;
+    r.absent.push("walnut");
+    feed(&mut assets, &w, &mut r);
+    let before = format!("{:?}", assets.records);
+    assert!(!assets.records.is_empty());
+    w.insert(die, Mesh::asset("walnut"));
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(format!("{:?}", assets.records), before);
+    assert_eq!(assets.held().iter().collect::<Vec<_>>(), ["model"]);
+    // A restore or paranoid sample resets the feed; the entity keeps its look.
+    assets.reset();
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(format!("{:?}", assets.records), before);
+    // Another swap before the first lands still shows the model last drawn.
+    w.insert(die, Mesh::asset("missing"));
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(format!("{:?}", assets.records), before);
+    w.insert(die, Mesh::asset("walnut"));
+    feed(&mut assets, &w, &mut r);
+    // It lands: the renderer's model revision moves, and the entity draws it.
+    r.absent.retain(|n| *n != "walnut");
+    r.revision += 1;
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(assets.held().iter().collect::<Vec<_>>(), ["walnut"]);
+    assert_eq!(assets.shown[&die.index()].model, "walnut");
+    // A new entity has nothing to fall back to, and a skinned model never
+    // stands in for another: both draw nothing until theirs lands.
+    let fresh = w.spawn((Transform::default(), Mesh::asset("missing")));
+    r.nodes[0].3 = Some(2);
+    r.revision += 1;
+    w.insert(die, Mesh::asset("missing"));
+    feed(&mut assets, &w, &mut r);
+    assert!(assets.records.is_empty());
+    assert!(assets.held().is_empty());
+    assert!(!assets.shown.contains_key(&fresh.index()));
+}
+
+/// An instance's override textures switch as one set: while any texture of
+/// the new set is not resident it keeps the whole set it drew, never a mix.
+#[test]
+fn a_texture_set_switches_whole_once_every_texture_is_resident() {
+    let skin = |base: &str, normal: &str| {
+        exact_game::MaterialOverrides(vec![exact_game::MaterialOverride {
+            material: 0,
+            textures: exact_game::TextureSlots {
+                base_color: Some(base.into()),
+                normal: Some(normal.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }])
+    };
+    let mut w = World::new(60, 0);
+    let die = w.spawn((Transform::default(), Mesh::asset("model")));
+    let (mut assets, mut r) = (Assets::default(), Recording::default());
+    r.nodes[0].3 = None;
+    r.ready = vec!["oak.tex", "oak-n.tex", "walnut.tex"];
+    w.insert(die, skin("oak.tex", "oak-n.tex"));
+    let drawn = |assets: &Assets| {
+        assets
+            .records
+            .iter()
+            .map(|r| r.material.0)
+            .collect::<Vec<_>>()
+    };
+    feed(&mut assets, &w, &mut r);
+    // Material 0's records draw the oak set (variant 100); material 1 its own.
+    assert_eq!(drawn(&assets), [100, 1]);
+    let held = |a: &Assets| a.held().iter().cloned().collect::<Vec<_>>();
+    assert_eq!(held(&assets), ["model", "oak-n.tex", "oak.tex"]);
+    // Half the walnut set is resident: the whole oak set stays.
+    w.insert(die, skin("walnut.tex", "walnut-n.tex"));
+    assert!(assets.patch_looks(&w, &mut r).unwrap());
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(drawn(&assets), [100, 1]);
+    assert_eq!(r.sets.len(), 1, "no mixed set is ever made");
+    assert!(!assets.arrived(&r));
+    // The rest arrives: the feed sees it and draws the walnut set.
+    r.ready.push("walnut-n.tex");
+    assert!(assets.arrived(&r));
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(drawn(&assets), [101, 1]);
+    assert_eq!(held(&assets), ["model", "walnut-n.tex", "walnut.tex"]);
+    // Another shape that can draw, with a set still in flight: the whole
+    // walnut look, model included, stays until the cherry set is complete.
+    w.insert(die, Mesh::asset("shape"));
+    w.insert(die, skin("cherry.tex", "cherry-n.tex"));
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(drawn(&assets), [101, 1]);
+    assert_eq!(held(&assets), ["model", "walnut-n.tex", "walnut.tex"]);
+    r.ready.extend(["cherry.tex", "cherry-n.tex"]);
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(drawn(&assets), [102, 1]);
+    assert_eq!(held(&assets), ["cherry-n.tex", "cherry.tex", "shape"]);
+}
+
+/// While an entity draws a prior model in place of its `Mesh`'s, its
+/// `ModelLod` levels (the new model's) are not drawn: one look at any distance
+/// up to `hide`.
+#[test]
+fn a_fallback_draws_without_the_new_models_levels() {
+    let mut w = World::new(60, 0);
+    let die = w.spawn((Transform::default(), Mesh::asset("model")));
+    let (mut assets, mut r) = (Assets::default(), Recording::default());
+    r.nodes[0].3 = None;
+    r.absent.push("walnut");
+    feed(&mut assets, &w, &mut r);
+    w.insert(
+        die,
+        exact_game::ModelLod {
+            levels: vec![exact_game::LodLevel {
+                distance: 10.,
+                model: "coarse".into(),
+            }],
+            hide: Some(20.),
+        },
+    );
+    w.insert(die, Mesh::asset("walnut"));
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(assets.records.len(), 2, "the prior model's two nodes only");
+    // One level, the stand-in, which still hides past 20 m.
+    assert_eq!(
+        assets
+            .lods
+            .iter()
+            .map(|l| (l.levels, l.hide))
+            .collect::<Vec<_>>(),
+        [(1, 20.)]
+    );
+    r.absent.clear();
+    r.revision += 1;
+    feed(&mut assets, &w, &mut r);
+    assert_eq!(assets.records.len(), 4, "walnut and its coarse level");
 }

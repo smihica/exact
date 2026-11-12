@@ -27,6 +27,7 @@ fn written_props(
         is_root: false,
         inline_run: false,
         symbol_color: false,
+        has_looks: false,
     })
 }
 
@@ -101,6 +102,7 @@ fn a_progress_with_a_value_is_htmls_progress_element() {
         is_root: false,
         inline_run: false,
         symbol_color: false,
+        has_looks: false,
     };
     assert_eq!(super::tag_of(&facts, false), "progress");
     assert_eq!(
@@ -147,6 +149,7 @@ fn a_progress_is_a_busy_progressbar_box_the_page_draws_a_ring_in() {
         is_root: false,
         inline_run: false,
         symbol_color: false,
+        has_looks: false,
     };
     assert_eq!(super::tag_of(&facts, false), "div");
     assert_eq!(super::tag_of(&facts, true), "span", "in a button");
@@ -187,6 +190,7 @@ fn a_progress_is_a_busy_progressbar_box_the_page_draws_a_ring_in() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         };
         let css = super::host_css_of(&facts, Some(&parent), String::new(), "div");
         assert!(!css.contains("justify-self"), "{display:?}: {css}");
@@ -213,6 +217,7 @@ fn a_progress_or_canvas_in_block_flow_follows_the_parents_justify_items() {
         is_root: false,
         inline_run: false,
         symbol_color: false,
+        has_looks: false,
     };
     for (items, forced) in [
         ("normal", true),
@@ -236,6 +241,7 @@ fn a_progress_or_canvas_in_block_flow_follows_the_parents_justify_items() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         };
         for (kind, props, tag) in [
             (NodeType::Control, &props, "div"),
@@ -271,6 +277,7 @@ fn a_date_or_time_control_takes_the_field_look_unless_the_author_has_it() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         })
         .contains_key("data-exact-field")
     };
@@ -305,6 +312,7 @@ fn a_textfield_appearance_is_native_and_marked_for_the_page() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         });
         (
             out.contains_key("data-native"),
@@ -338,6 +346,7 @@ fn a_link_out_of_the_app_opens_a_new_browsing_context() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         });
         let get = |k: &str| out.get(k).cloned();
         (get("target"), get("rel"))
@@ -505,6 +514,7 @@ fn svg_geometry_attributes_preserve_css_lengths() {
             is_root: false,
             inline_run: false,
             symbol_color: false,
+            has_looks: false,
         };
         let mut out = super::SortedMap::new();
         super::svg_props_of(&|_, _| None, &facts, &mut out);
@@ -554,6 +564,7 @@ fn complex_svg_geometry_attributes_take_the_initial_value() {
                 is_root: false,
                 inline_run: false,
                 symbol_color: false,
+                has_looks: false,
             };
             let mut out = super::SortedMap::new();
             super::svg_props_of(&|_, _| None, &facts, &mut out);
@@ -618,6 +629,7 @@ fn a_live_region_says_whether_it_is_announced_whole() {
         is_root: false,
         inline_run: false,
         symbol_color: false,
+        has_looks: false,
     };
     let out = super::props_of(&facts);
     assert_eq!(out.get("aria-live").map(String::as_str), Some("polite"));

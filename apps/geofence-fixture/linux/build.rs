@@ -43,7 +43,8 @@ fn main() {
             contract::rust_entry(
                 "geofence_fixture_data::Fences",
                 "geofence_fixture_data::Fences",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap()
         ),

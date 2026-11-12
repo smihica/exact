@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
+import { writeCrawlerFiles } from './crawl.mjs';
 import { warmGameInputs, warmGameEnvironment, publishWarmGame } from '../web-js/module.mjs';
+import { generatedInputFiles } from '../../game/inputs.mjs';
 // Build the web app (LLP 1071): the JS target, `host/web-js/build.mjs`, the
 // plan compiled to one ES module over a small runtime, into the same dist;
 // what it refuses (a capability the runtime lacks, named) fails the build.
@@ -21,7 +23,8 @@ import { warmGameInputs, warmGameEnvironment, publishWarmGame } from '../web-js/
 // (LLP 1115.000 D4 part B; look.mjs composes the sheet).
 // Developer builds bake development trust; EXACT_UPDATE_TRUST=production
 // requires signing keys, and the deploy verb always selects production.
-import { grantOrigins } from './navigation.js';
+import { grantOrigins } from './navigation/grant-origins.js';
+import { buildHostGlue, gateAgent } from '../web-js/glue.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -33,14 +36,15 @@ import { compilerWarnings, webInputDigests } from '../../scripts/agent-launch.mj
 import { webBuildFailure } from '../../scripts/app-cli.mjs';
 import { builtSettings } from '../../js/bake/src/__exact_env.mjs';
 import { authClientMetadata, checkModuleRoster, gpuModules, markWorlds, rustPolicy, webGpuArtifacts, webHostFiles, worldSurfaces } from '../../scripts/app.mjs';
+import { webHead } from '../../scripts/web-head.mjs';
 import { buildRust, rustFiles, rustCards, rustPackage } from '../../scripts/rust.mjs';
 import { webAppManifest, webDist, copyShaders, bakeOutput, bakeWatchEnv, buildBake, contractLast, readBake, verifyBakeFiles, developmentBuildEnv, resolveApp } from '../../scripts/app.mjs';
 import { buildEditor, buildFlow } from '../web-js/module.mjs';
 import { closeFilesystemReader } from '../../scripts/filesystem.mjs';
-import { guardFlags } from '../../scripts/help.mjs';
+import { guardFlags, reportBuilt } from '../../scripts/help.mjs';
 import { BINARYEN_DOWNLOAD, splitStages, unsplitReason } from './stages.mjs';
-import { withLook } from './look.mjs';
-import { appManifestDigest, buildFileCards, copyStaticTreeIfPresent, listAssets, hostingNotes, publicFileCards, replaceBuild, webEnvelope, moduleCards, MODULE_FILES } from './serve.mjs';
+import { interfaceStyle, withInterfaceStyle, withLook } from './look.mjs';
+import { appManifestDigest, buildFileCards, copyStaticTreeIfPresent, listAssets, hostingNotes, planRouteTable, publicFileCards, replaceBuild, webEnvelope, moduleCards, MODULE_FILES } from './serve.mjs';
 import { foreignBeside } from './generations.mjs';
 
 guardFlags('web-build', process.argv.slice(2));
@@ -143,6 +147,8 @@ if (target !== '--wasm' && !game && !bakeOnly) {
     replaceBuild(stage, dist);
     stage = null;
     if (outDir) console.log(hostingNotes(dist, existsSync(resolve(app.dir, 'exact.mjs')) ? 'bun exact.mjs serve' : 'bun host/web/serve.mjs').join('\n'));
+    // A release is `--out`'s alone: without it the JS target builds for development, whatever EXACT_UPDATE_TRUST says.
+    if (process.argv.includes('--json')) reportBuilt({ path: dist, target: 'web', trust: outDir ? 'production' : 'development' });
     process.exit(0);
   }
   console.error(`${webBuildFailure(js.stderr).join('\n')}\n${app.name}: the web build (the JS target) failed; the wasm target is internal (--wasm)`);
@@ -178,8 +184,20 @@ const keepNames = process.env.EXACT_WEB_NAMES === '1';
 // whole, as does a machine whose binaryen isn't the pinned one.
 const unsplit = keepNames || buildEnv.EXACT_WEB_LINK === 'all' ? 'a development or names build' : unsplitReason();
 if (keepNames || !unsplit) buildEnv.CARGO_PROFILE_WEB_STRIP = 'debuginfo';
+// Capture before the bake so edits made during compilation or packaging stay detectable.
+const inputsAt = Date.now(), inputs = webInputDigests(app, false);
+const generated = game ? generatedInputFiles(app.dir) : [];
 const warmInputs = !bakeOnly ? warmGameInputs(app, {...buildEnv, EXACT_GAME_PROOF_PROFILE:proofProfile}) : null;
 const buildReceipt = contractLast(() => buildBake(app, 'web', 'wasm32-unknown-unknown', {env:buildEnv, check:bakeOnly, gpuProfile}));
+// Game bakes create, replace and prune assets. Capture those outputs before packaging;
+// authored files keep their initial digests, including handwritten assets beside generated ones.
+if (game) {
+  const outputs = new Set(generatedInputFiles(app.dir));
+  for (const path of new Set([...generated, ...outputs])) {
+    if (!existsSync(path)) inputs[path] = null;
+    else if (outputs.has(path)) inputs[path] = createHash('sha1').update(readFileSync(path)).digest('hex');
+  }
+}
 const built = resolve(app.target, 'wasm32-unknown-unknown/web', crate.replace(/-/g, '_') + '.wasm');
 // Build one app into its own staging directory. Only a complete build replaces
 // dist, so a server sees the previous app or the next one, never a mixture;
@@ -235,28 +253,25 @@ copyStaticTreeIfPresent(deck, resolve(stage, 'deck'));
 // — never a string in the wasm.
 copyShaders(app, resolve(stage, 'shaders'));
 // The neutral sheet follows the browser resets (LLP 1115.000 D4 part B; look.mjs).
-writeFileSync(resolve(stage, 'index.html'), withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8')));
-// A production bake never enters agent mode (LLP 1069.007 D2, ruled): every
-// host file that reads `?agent` declares `AGENT_ADMITTED`, and this build
-// ships it false, so the minifier drops the agent's paths from a release.
-const AGENT_ADMITTED = 'const AGENT_ADMITTED = true;';
+writeFileSync(resolve(stage, 'index.html'), withInterfaceStyle(withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8')), interfaceStyle(app.manifest)));
 const production = buildEnv.EXACT_UPDATE_TRUST === 'production';
-const gateAgent = (code, name) => {
-  if (!production) return code;
-  if (/searchParams\.has\(["']agent["']\)|params\.has\(["']agent["']\)/.test(code) && !code.includes(AGENT_ADMITTED)) throw new Error(`${name} reads ?agent without AGENT_ADMITTED; a production build must not admit agent mode (LLP 1069.007 D2)`);
-  return code.replaceAll(AGENT_ADMITTED, 'const AGENT_ADMITTED = false;');
-};
+const hostDir = resolve(stage, '.host');
 function copyHostFiles(group) {
   for (const [name, source] of Object.entries(webHostFiles(group))) {
     if (!name.endsWith('.js')) { copyFileSync(resolve(root, source), resolve(stage, name)); continue; }
     // Production ships executable code, without source comments and long
     // local names. Keep exports and property names intact across modules.
-    const result = minifySync(name, gateAgent(readFileSync(resolve(root, source), 'utf8'), name), { module: name !== 'module-prelude.js' && name !== 'module-binary.js' });
+    const code = readFileSync(source.startsWith('target/web-host/') ? resolve(hostDir, name) : resolve(root, source), 'utf8');
+    const result = minifySync(name, production ? gateAgent(code, name) : code, { module: name !== 'module-prelude.js' && name !== 'module-binary.js' });
     if (result.errors.length) throw new Error(`${name}: ${JSON.stringify(result.errors)}`);
     writeFileSync(resolve(stage, name), result.code);
   }
 }
-if (!bakeOnly) copyHostFiles('base');
+if (!bakeOnly) {
+  await buildHostGlue(root, { production, out: hostDir });
+  copyHostFiles('base');
+  rmSync(hostDir, { recursive: true });
+}
 if (!bakeOnly && !production) copyHostFiles('development');
 // These app-independent modules use the same input-checked products as the JS
 // target, so a gameplay edit does not rerun Cargo and wasm-opt for either leaf.
@@ -394,18 +409,21 @@ const pageNative = app.modules.web;
 // the app paints its own, and the canvas beyond it is the browser's for the
 // page's colour scheme, as on the JS target (a launch white kept under an
 // app that chose dark showed beside its root; Markdown's conformance).
-const launchLight = app.manifest.background_color, launchDark = app.manifest.background_color_dark;
+// A fixed `userInterfaceStyle` takes its side alone, as the iOS launch screen does.
 const hex = (value) => /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(value ?? '') ? value : null;
+const launchLight = app.manifest.background_color, launchDark = interfaceStyle(app.manifest) === 'light' ? null : hex(app.manifest.background_color_dark);
 const launchHtml = 'html:has(#exact-root:empty)';
-const launchCss = hex(launchLight) ? `${launchHtml}{background-color:${launchLight}}${hex(launchDark) ? `@media (prefers-color-scheme:dark){${launchHtml}{background-color:${launchDark}}}` : ''}` : '';
+const launchCss = !hex(launchLight) ? '' : interfaceStyle(app.manifest) === 'dark' ? `${launchHtml}{background-color:${launchDark ?? launchLight}}`
+  : `${launchHtml}{background-color:${launchLight}}${launchDark ? `@media (prefers-color-scheme:dark){${launchHtml}{background-color:${launchDark}}}` : ''}`;
 writeFileSync(resolve(stage, 'index.html'), readFileSync(resolve(stage, 'index.html'), 'utf8')
   .replace(/<style>([\s\S]*?)<\/style>/, (_, css) => `<style>${minifyCss(css)}${launchCss}</style>`)
   .replace('<html lang="en">', `<html lang="${escapeHtml(webManifest.lang)}">`)
   .replace('<title>Exact</title>', `<title>${escapeHtml(webManifest.name)}</title>`)
   // LLP 1116 D8: the app's icon in place of the shell's default one.
   .replace(/<link rel="icon"[^>]*>/, (link) => icon ? `<link rel="icon" type="${escapeHtml(icon.type ?? 'image/png')}" href="./${escapeHtml(icon.src)}">` : link)
-  // `app.json`'s `audio_session` (LLP 1096 D7), which sound-glue.js gives the Audio Session API where it exists.
-  .replace('<div id="exact-root"></div>', app.manifest.audio_session ? `<div id="exact-root" data-audio-session="${escapeHtml(app.manifest.audio_session)}"></div>` : '<div id="exact-root"></div>')
+  // `app.json`'s `audio_session` (LLP 1096 D7), which sound-glue.js gives the Audio Session API where it exists, and
+  // its `host.web.head` before the root, after the sheet, as the JS target writes it (LLP 1048.000 D3).
+  .replace('<div id="exact-root"></div>', `${webHead(app.manifest)}${app.manifest.audio_session ? `<div id="exact-root" data-audio-session="${escapeHtml(app.manifest.audio_session)}"></div>` : '<div id="exact-root"></div>'}`)
   .replace(
     '<script type="module" src="./glue.js"></script>',
     `<link rel="alternate" type="application/vnd.exact.envelope+json" href="./exact.json">\n<link rel="manifest" href="./manifest.json">\n${webManifest.theme_color ? `<meta name="theme-color" content="${escapeHtml(webManifest.theme_color)}">\n` : ''}${pageNative ? '<meta name="exact-native" content="./modules/index.js">\n' : ''}<script type="module" src="./glue.js"></script>`,
@@ -460,7 +478,6 @@ if (buildLocations.length && renderAt) {
   const shell = readFileSync(resolve(stage, 'index.html'), 'utf8');
   const pages = rendered.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line));
   if (pages.length) writeFileSync(resolve(stage, 'shell.html'), shell);
-  const listed = [];
   for (const doc of pages) {
     if (doc.error) throw new Error(`${renderBin} ${doc.location}: ${doc.error}`);
     const html = doc.page;
@@ -468,14 +485,8 @@ if (buildLocations.length && renderAt) {
     if (!resolve(stage, file).startsWith(stage + '/')) throw new Error(`${renderBin}: location ${doc.location} leaves dist`);
     mkdirSync(resolve(stage, file, '..'), { recursive: true });
     writeFileSync(resolve(stage, file), html);
-    if (!doc.notfound && !/noindex/i.test(doc.robots ?? '')) listed.push(doc.location);
   }
-  if (pages.length) {
-    const xml = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const origin = app.origin?.replace(/\/+$/, '');
-    if (origin) writeFileSync(resolve(stage, 'sitemap.xml'), `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${listed.map((location) => `  <url><loc>${xml(origin + location)}</loc></url>\n`).join('')}</urlset>\n`);
-    writeFileSync(resolve(stage, 'robots.txt'), `User-agent: *\nAllow: /\n${origin ? `Sitemap: ${origin}/sitemap.xml\n` : ''}`);
-  }
+  if (pages.length) writeCrawlerFiles(stage, pages, app.origin, planRouteTable(planBytes));
   // A render that reached its deadline still ships: its placeholders show
   // until the runtime asks what was pending (LLP 1048.000 D9).
   const late = pages.filter((doc) => doc.settled === false).map((doc) => doc.location);
@@ -564,14 +575,16 @@ writeFileSync(resolve(stage, '.exact-build.json'), JSON.stringify({
   exactBuild: 1, app: { id: app.id, name: app.displayName }, manifestSha256: appManifestDigest(app),
   files: await publicFileCards(stage).finally(closeFilesystemReader),
   // Content digests of what this build read: a staleness check compares bytes, not times.
-  inputs: webInputDigests(app, false),
+  inputs, inputsAt,
   // Each setting its module inlined (LLP 1153 D4), from the paired module's receipt, as a JS build's marker says them.
   ...builtSettings(stage),
 }) + '\n');
 // In place in one step where the system has one (serve.mjs `replaceBuild`).
 publishWarmGame(app, stage, dist, warmInputs, buildReceipt, {...buildEnv, EXACT_GAME_PROOF_PROFILE:proofProfile});
 stage = null;
+if (bakeOnly && process.argv.includes('--json')) reportBuilt({ path: dist, target: 'web', trust: buildEnv.EXACT_UPDATE_TRUST });
 if (bakeOnly) { console.log(`${relative(process.cwd(), dist) || "."}: the bake (no wasm): app.plan ${kib(planBytes.length)}, exact.json, index.html; documents: ${documentNote}${authNote}${passkeyNote}; modules: ${moduleNote}`); process.exit(0); }
 const textFlowWasm = readFileSync(resolve(dist, 'textflow.wasm'));
 const markdownEditor = readFileSync(resolve(dist, 'markup-editor.wasm'));
 console.log(`${relative(process.cwd(), dist) || "."}: app.wasm ${kib(wasm.length)} (${kib(gzipSync(wasm, { level: 9 }).length)} gzip; ${optNote}), index.html, glue.js, app.plan ${kib(planBytes.length)}, exact.json; documents: ${documentNote}${authNote}${passkeyNote}; GPU: ${gpuNote}; modules: ${moduleNote}; markup-editor.wasm ${kib(markdownEditor.length)} (${kib(gzipSync(markdownEditor, { level: 9 }).length)} gzip), on demand; textflow.wasm ${kib(textFlowWasm.length)} (${kib(gzipSync(textFlowWasm, { level: 9 }).length)} gzip), on demand`);
+if (process.argv.includes('--json')) reportBuilt({ path: dist, target: 'web', trust: buildEnv.EXACT_UPDATE_TRUST });

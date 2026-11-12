@@ -1,17 +1,17 @@
 // A native drive's build first (agent-build.mjs, LLP 1116.002 D4): the decision an app's exact.mjs makes before
 // `test ios|macos` and `agent ios|macos`, on the driver's own record, with no simulator and no build run.
-import { afterEach, beforeEach, test } from 'bun:test';
+import { afterEach, beforeEach, test, expect } from 'bun:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, relative, resolve } from 'node:path';
+import { basename, delimiter, dirname, relative, resolve } from 'node:path';
 import { appleArtifacts, appleRunBinary } from '../host/apple/build.mjs';
 import { moduleGraph, notBuildInput } from './agent-launch.mjs';
-import { buildArgs, buildFirst, buildReason, childFailure, failureSummary, linuxRebuild, lockHolder, logged, nativeBuild, overrideDir, planOverride, planSource, ownVerb, prebuild, rebuildCommand, refuseBuild } from './agent-build.mjs';
+import { buildArgs, buildFirst, buildReason, childFailure, failureSummary, linuxRebuild, lockHolder, logged, nativeBuild, overrideDir, planOverride, planSource, planSources, ownVerb, prebuild, rebuildCommand, refuseBuild } from './agent-build.mjs';
 import { openStdio } from './agent-stdio.mjs';
-import { linuxBinary, resolveApp } from './app.mjs';
+import { linuxBinary, resolveApp, PINNED_RUST } from './app.mjs';
 
 test('Mac drives use the assembled app bundle even without catalogs or widgets', () => {
   const { dir } = scratchApp('ats-drive');
@@ -252,7 +252,7 @@ test('a missing or stale build is built first, said in one line; a fresh one run
 
     // An exact.mjs from before test and agent built first is told how to get that.
     assert.equal(rebuildCommand(app, 'ios'), `(cd '${dir}' && bun exact.mjs ios)`);
-    write('exact.mjs', "const cli = resolve(EXACT2, 'scripts/app-cli.mjs');\n"); // the launcher (LLP 1116.006 D7)
+    write('exact.mjs', "const cli = resolve(EXACT, 'scripts/app-cli.mjs');\n"); // the launcher (LLP 1116.006 D7)
     assert.equal(rebuildCommand(app, 'ios'), `(cd '${dir}' && bun exact.mjs ios)`);
     write('exact.mjs', '// an older one\n');
     assert.equal(rebuildCommand(app, 'mac'), `(cd '${dir}' && bun exact.mjs mac) (after bun exact.mjs update, test and agent build it themselves)`);
@@ -575,6 +575,30 @@ test('a failed background build is said once by the next drive, from its part of
     said.length = 0;
     await drive();
     assert.ok(!said.some(line => line.includes('background')), said.join('\n'));
+    // Changed sources explain the older failure; signing or linking may still fail.
+    write('app.ts', 'export const grants = \'\';');
+    const sourceRecord = () => ({ id: 'old', args: ['--ios'], started: '08:02:54', pid: 1, exit: 1, bytes: build.length,
+      sources: { ...planSources(app), [resolve(dir, 'app.json')]: createHash('sha256').update(readFileSync(resolve(dir, 'app.json'))).digest('hex') } });
+    write('.exact/ios-build.log', build);
+    write('.exact/ios-prebuild.json', JSON.stringify(sourceRecord()));
+    said.length = 0;
+    await drive();
+    assert.ok(said.some(line => line.includes('bake failed')), 'a failure with matching sources is still reported');
+    for (const file of ['app.ts', 'app.contract', 'app.json']) {
+      const record = sourceRecord(), original = readFileSync(resolve(dir, file), 'utf8');
+      write('.exact/ios-prebuild.json', JSON.stringify(record));
+      write(file, file === 'app.json' ? original.replace(/}\s*$/, ', "env": {"API_URL": {}} }') : original + '\n');
+      write('.exact/ios-build.log', build);
+      said.length = 0;
+      await drive();
+      assert.ok(said[0].startsWith("This failure is from a background build started before the app's sources last changed; the current sources are checked now.\n"), said.join('\n'));
+      assert.ok(said[0].includes(build.trim()) && said[0].includes('failed (exit 1)'), said[0]);
+      assert.equal(readFileSync(resolve(dir, '.exact/ios-prebuild-failed.log'), 'utf8'), build);
+      assert.ok(said.some(line => line.startsWith('building for iOS:')), 'the current build still runs');
+      assert.ok(!existsSync(resolve(dir, '.exact/ios-prebuild.json')));
+      write(file, original);
+    }
+    said.length = 0;
     // One that ended before it could say (its shell gone) is dropped, unsaid.
     write('.exact/ios-prebuild.json', JSON.stringify({ args: ['--ios'], started: '08:02:54', pid: 2 ** 22 + 1 }));
     await drive();
@@ -659,6 +683,9 @@ test('a failed web build keeps the explanation under a bare error marker', async
   const rustc = 'error[E0308]: mismatched types\n --> gpu/src/lib.rs:3:5\n  |\n3 |     1u8\n  |     ^^^ expected `u32`\n';
   const trace = 'error: no plan\n      at main (/x/build.mjs:1:1)\n\nBun v1.3.0 (macOS arm64)\n';
   assert.deepEqual(webBuildFailure(rustc + trace), ['error[E0308]: mismatched types\nerror: no plan']);
+  // The capture's size caps say which packages (js/bake/src/typescript.mjs `stagePackages`).
+  const capped = 'package declarations exceed 64 MiB: heavy 69.0 MiB (from page/main.ts). The type check stages …';
+  assert.deepEqual(webBuildFailure(`${capped}\nerror: app: app.ts failed the type check every host's build runs\n`), [`${capped}\nerror: app: app.ts failed the type check every host's build runs`]);
 });
 
 // An Apple build's bake says its warnings on every build: the SF Symbols only the web draws blank one line where the
@@ -698,4 +725,197 @@ test("a package-cache lock's holder is named by the process that has the file op
   assert.deepEqual(calls, ['lsof', 'ps']);
   // A build directory's lock names no path: the cargo processes running are the candidates.
   assert.equal(lockHolder('Blocking waiting for file lock on build directory', () => ({ stdout: '' })), 'its holder is not found');
+});
+
+// The NDK's compilers and archiver, by the host the build runs on: Windows's are `.cmd` scripts and `.exe` tools.
+test("the Android build finds the NDK's tools for a Mac, Linux and Windows host", async () => {
+  const { androidToolchainEnv } = await import('./agent-android.mjs');
+  const ndk = mkdtempSync(resolve(tmpdir(), 'exact-ndk-'));
+  try {
+    const hosts = { darwin: ['darwin-x86_64', '', ''], linux: ['linux-x86_64', '', ''], win32: ['windows-x86_64', '.cmd', '.exe'] };
+    for (const [platform, [folder, script, exe]] of Object.entries(hosts)) {
+      const bin = resolve(ndk, 'toolchains/llvm/prebuilt', folder, 'bin');
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(resolve(bin, `aarch64-linux-android29-clang${script}`), '');
+      const env = androidToolchainEnv({ ANDROID_NDK_HOME: ndk, HERMES_LEAN_SYS_DIR_aarch64_linux_android: 'hermes' }, platform);
+      expect([env.CC_aarch64_linux_android, env.CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER, env.CXX_aarch64_linux_android, env.AR_aarch64_linux_android])
+        .toEqual([`aarch64-linux-android29-clang${script}`, `aarch64-linux-android29-clang${script}`, `aarch64-linux-android29-clang++${script}`, `llvm-ar${exe}`].map((tool) => resolve(bin, tool)));
+    }
+    rmSync(resolve(ndk, 'toolchains/llvm/prebuilt/windows-x86_64'), { recursive: true });
+    expect(() => androidToolchainEnv({ ANDROID_NDK_HOME: ndk }, 'win32')).toThrow(`the NDK at ${ndk} has no aarch64-linux-android29-clang.cmd`);
+  } finally { rmSync(ndk, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform === 'win32')('Gradle keeps its given environment with PATH javac and no JAVA_HOME or Studio', async () => {
+  const { androidJavaEnv, runGradle } = await import('./agent-android.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-java-'));
+  try {
+    const bin = resolve(dir, 'bin'), studio = resolve(dir, 'absent-studio');
+    mkdirSync(bin);
+    for (const tool of ['java', 'javac']) writeFileSync(resolve(bin, tool), '#!/bin/sh\necho \'openjdk version "21.0.1"\' >&2\n', { mode: 0o755 });
+    const env = { PATH: bin, GRADLE_OPTS: '-Xmx128m' }, calls = [];
+    expect(Bun.which('javac', { PATH: env.PATH })).toBe(resolve(bin, 'javac'));
+    for (const platform of ['darwin', 'linux']) {
+      expect(androidJavaEnv(env, platform, studio)).toBeNull();
+      expect(runGradle(['--version'], { env }, platform, { studio, run: (...args) => { calls.push(args); return { status: 0 }; } })).toBe(true);
+      expect(calls.at(-1)[2].env).toBe(env);
+      expect(calls.at(-1)[2].env).toEqual({ PATH: bin, GRADLE_OPTS: '-Xmx128m' });
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The receipt fixture retains the pinned Android bundle's API and Intl flags; cargo records the build's environment.
+for (const [form, dependencies, api] of [
+  ['inline', '[dependencies]\nexact-js = { path = "../js" }', 30],
+  ['table', '[dependencies.exact-js]\npath = "../js"', 30],
+  ['quoted key', '[dependencies]\n"exact-js" = { path = "../js" }', 30],
+  ['target table', '[target.\'cfg(target_os = "android")\'.dependencies.exact-js]\npath = "../js"', 30],
+  ['renamed', '[dependencies]\nengine = { package = "exact-js", path = "../js" }', 30],
+  ['Linux-only target', '[target.\'cfg(target_os = "linux")\'.dependencies.exact-js]\npath = "../js"', 29],
+  ['workspace alias', '[dependencies]\nengine = { workspace = true }', 30],
+  ['transitive', '[dependencies]\nbridge = { path = "../bridge" }', 30],
+  ['transitive build-only', '[build-dependencies]\nbridge = { path = "../bridge" }', 29],
+  ['dev-only', '[dev-dependencies.exact-js]\npath = "../js"', 29],
+  ['disabled optional', '[dependencies]\nexact-js = { path = "../js", optional = true }', 29],
+  ['other member feature', '[dependencies]\nshared = { path = "../shared" }', 29],
+  ['procedural macro', '[dependencies]\nmacros = { path = "../macros" }', 29],
+  ['no runtime Hermes', '[build-dependencies.exact-js]\npath = "../js"', 29],
+]) test.skipIf(process.platform === 'win32')(`the headless Android build passes API ${api} to cargo for ${form} dependencies`, async () => {
+  const { patchLines } = await import('./app.mjs');
+  const { hermesApi } = await import('./agent-android.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-android-link-'));
+  try {
+    const tools = resolve(dir, 'tools'), bundle = resolve(dir, 'bundle');
+    const bin = resolve(dir, 'toolchains/llvm/prebuilt', process.platform === 'darwin' ? 'darwin-x86_64' : 'linux-x86_64', 'bin');
+    for (const sub of [tools, bundle, bin, resolve(dir, 'linux')]) mkdirSync(sub, { recursive: true });
+    for (const level of [29, 30]) writeFileSync(resolve(bin, `aarch64-linux-android${level}-clang`), '');
+    expect(hermesApi(bundle)).toBeNull();
+    writeFileSync(resolve(bundle, 'hermes-input-receipt.json'), JSON.stringify({ build: { flags: ['-DHERMES_ENABLE_INTL=false', '-DANDROID_PLATFORM=android-30'] } }));
+    writeFileSync(resolve(dir, 'app.contract'), 'app "Fixture"\n');
+    writeFileSync(resolve(dir, 'Cargo.toml'), `[workspace]\nresolver = "2"\nmembers = ["linux", "js", "bridge", "shared", "other", "macros"]\n[workspace.dependencies]\nengine = { package = "exact-js", path = "js" }\n[patch.crates-io]\n${patchLines(dir).join('\n')}\n`);
+    writeFileSync(resolve(dir, 'rust-toolchain.toml'), `[toolchain]\nchannel = "${PINNED_RUST}"\n`);
+    writeFileSync(resolve(dir, 'linux/Cargo.toml'), `[package]\nname = "${basename(dir)}-linux"\nversion = "0.1.0"\n${dependencies}\n`);
+    for (const [name, deps] of [['linux', null], ['js', ''], ['bridge', '[dependencies]\nexact-js = { path = "../js" }'],
+      ['shared', '[dependencies]\nexact-js = { path = "../js", optional = true }\n[features]\njs = ["dep:exact-js"]'],
+      ['other', '[dependencies]\nshared = { path = "../shared", features = ["js"] }'],
+      ['macros', '[lib]\nproc-macro = true\n[dependencies]\nexact-js = { path = "../js" }']]) {
+      mkdirSync(resolve(dir, name, 'src'), { recursive: true });
+      writeFileSync(resolve(dir, name, 'src/lib.rs'), '');
+      if (deps !== null) writeFileSync(resolve(dir, name, 'Cargo.toml'), `[package]\nname = "${name === 'js' ? 'exact-js' : name}"\nversion = "0.1.0"\n${deps}\n`);
+    }
+    // Cargo resolves local fixture crates; the stand-in records the build without compiling them.
+    const metadata = spawnSync('cargo', ['metadata', '--offline', '--format-version', '1', '--filter-platform', 'aarch64-linux-android'], { cwd: dir, encoding: 'utf8' });
+    expect(metadata.status).toBe(0);
+    writeFileSync(resolve(tools, 'rustup'), '#!/bin/sh\necho aarch64-linux-android\n', { mode: 0o755 });
+    writeFileSync(resolve(tools, 'cargo'), `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+if (process.argv[2] === 'tree') {
+  writeFileSync(${JSON.stringify(resolve(dir, 'tree-call'))}, JSON.stringify(process.argv.slice(2)));
+  const result = spawnSync(${JSON.stringify(Bun.which('cargo'))}, process.argv.slice(2), { encoding: 'utf8' });
+  process.stdout.write(result.stdout); process.stderr.write(result.stderr); process.exit(result.status);
+}
+if (process.argv[2] === 'metadata') {
+  writeFileSync(${JSON.stringify(resolve(dir, 'metadata-call'))}, JSON.stringify(process.argv.slice(2)));
+  console.log(${JSON.stringify(metadata.stdout)});
+}
+else writeFileSync(${JSON.stringify(resolve(dir, 'cargo-call'))}, JSON.stringify({ args: process.argv.slice(2), env: process.env }));
+`, { mode: 0o755 });
+    const built = spawnSync(process.execPath, ['scripts/agent-android.mjs', 'build', dir], { encoding: 'utf8', env: {
+      ...process.env, PATH: tools + delimiter + process.env.PATH, ANDROID_NDK_HOME: dir,
+      CARGO_TARGET_DIR: resolve(dir, 'target'), HERMES_LEAN_SYS_DIR_aarch64_linux_android: bundle,
+    } });
+    expect(built.stderr).toBe('');
+    expect(built.status).toBe(0);
+    const call = JSON.parse(readFileSync(resolve(dir, 'cargo-call'), 'utf8'));
+    expect(call.args[0]).toBe('build');
+    expect(call.args.slice(call.args.indexOf('--target'), call.args.indexOf('--target') + 2)).toEqual(['--target', 'aarch64-linux-android']);
+    expect(call.env.HERMES_LEAN_SYS_DIR_aarch64_linux_android).toBe(bundle);
+    expect(call.env.CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER).toBe(resolve(bin, `aarch64-linux-android${api}-clang`));
+    expect(call.env.CC_aarch64_linux_android).toBe(resolve(bin, 'aarch64-linux-android29-clang'));
+    expect(JSON.parse(readFileSync(resolve(dir, 'tree-call'), 'utf8'))).toEqual([
+      'tree', '-p', `${basename(dir)}-linux`, '--target', 'aarch64-linux-android', '-e', 'normal,no-proc-macro',
+      '--prefix', 'none', '--format', '{p}', '--locked', '--offline',
+    ]);
+    if (form === 'Linux-only target') {
+      const withoutHermes = spawnSync(process.execPath, ['scripts/agent-android.mjs', 'build', dir], { encoding: 'utf8', env: {
+        ...process.env, PATH: tools + delimiter + process.env.PATH, ANDROID_NDK_HOME: dir, CARGO_TARGET_DIR: resolve(dir, 'target'),
+        HERMES_LEAN_SYS_DIR_aarch64_linux_android: '', EXACT_HERMES_ANDROID_CACHE: resolve(dir, 'no-hermes'), CARGO_HOME: resolve(dir, 'cargo-home'),
+      } });
+      expect(withoutHermes.stderr).toBe('');
+      expect(withoutHermes.status).toBe(0);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const cold of [false, true]) test(`the Android dependency query ${cold ? 'fetches missing target crates once' : 'prepares a missing shells directory'}`, () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-android-query-')), shells = resolve(dir, '.shells'), calls = resolve(dir, 'calls');
+  try {
+    writeFileSync(resolve(dir, 'cargo'), `#!${process.execPath}
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+if (!existsSync(${JSON.stringify(shells)})) { console.error('shells missing before tree'); process.exit(1); }
+if (args[0] === 'fetch') writeFileSync(${JSON.stringify(resolve(dir, 'fetched'))}, '');
+else if (${cold} && !existsSync(${JSON.stringify(resolve(dir, 'fetched'))})) {
+  console.error('attempting to make an HTTP request, but --offline was specified'); process.exit(1);
+} else if (args[0] === 'tree') console.log('fixture-android v0.1.0');
+else console.log(JSON.stringify({ packages: [{ id: 'app', name: 'fixture-android' }], resolve: { nodes: [{ id: 'app', deps: [] }] } }));
+`, { mode: 0o755 });
+    if (cold) mkdirSync(shells);
+    expect(existsSync(shells)).toBe(cold);
+    const child = spawnSync(process.execPath, ['--eval', `
+      import { mkdirSync } from 'node:fs';
+      import { androidUsesHermes } from ${JSON.stringify(resolve(import.meta.dir, 'agent-android.mjs'))};
+      console.log(androidUsesHermes({ workspace: ${JSON.stringify(shells)}, crate: () => 'fixture-android',
+        prepare: () => mkdirSync(${JSON.stringify(shells)}, { recursive: true }) }, 'android'));
+    `], { encoding: 'utf8', env: { ...process.env, PATH: dir + delimiter + process.env.PATH } });
+    expect(child.status).toBe(0);
+    expect(child.stdout.trim()).toBe('false');
+    expect(existsSync(shells)).toBe(true);
+    const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(commands.map(args => args[0])).toEqual(cold ? ['tree', 'fetch', 'tree'] : ['tree']);
+    if (cold) expect(commands[1]).toEqual(['fetch', '--locked', '--target', 'aarch64-linux-android']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const failure of ['cold', 'still cold', 'stale lock']) test(`the Android game query preserves its captured lock when ${failure}`, () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-android-game-query-')), calls = resolve(dir, 'calls');
+  try {
+    mkdirSync(resolve(dir, 'logic/src'), { recursive: true });
+    writeFileSync(resolve(dir, 'logic/src/lib.rs'), `impl Game for Fixture { const ID: &'static str = "fixture"; }`);
+    writeFileSync(resolve(dir, 'app.contract'), 'app "Fixture"\n');
+    const lock = 'version = 4\n';
+    writeFileSync(resolve(dir, 'Cargo.lock'), lock);
+    writeFileSync(resolve(dir, 'cargo'), `#!${process.execPath}
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+if (args[0] === 'fetch') writeFileSync(${JSON.stringify(resolve(dir, 'fetched'))}, '');
+else if (args[0] === 'metadata') {
+  if (${failure === 'stale lock'}) { console.error('cannot update the lock file because --locked was passed'); process.exit(1); }
+  if (${failure === 'still cold'} || !existsSync(${JSON.stringify(resolve(dir, 'fetched'))})) {
+    console.error('failed to download jni-sys: attempting to make an HTTP request, but --offline was specified'); process.exit(1);
+  }
+  console.log(JSON.stringify({ packages: [], resolve: { nodes: [] } }));
+} else if (args[0] === 'tree') console.log('fixture-android v0.1.0');
+`, { mode: 0o755 });
+    const child = spawnSync(process.execPath, ['--eval', `
+      import { resolveApp } from ${JSON.stringify(resolve(import.meta.dir, 'app.mjs'))};
+      import { androidUsesHermes } from ${JSON.stringify(resolve(import.meta.dir, 'agent-android.mjs'))};
+      console.log(androidUsesHermes(resolveApp(${JSON.stringify(dir)}), 'android'));
+    `], { encoding: 'utf8', env: { ...process.env, PATH: dir + delimiter + process.env.PATH } });
+    expect(child.status).toBe(failure === 'cold' ? 0 : 1);
+    if (failure === 'cold') expect(child.stdout.trim()).toBe('false');
+    else expect(child.stderr).toContain(failure === 'stale lock' ? 'lock file' : '--offline was specified');
+    expect(readFileSync(resolve(dir, 'Cargo.lock'), 'utf8')).toBe(lock);
+    expect(readFileSync(resolve(dir, '.shells/Cargo.lock'), 'utf8')).toBe(lock);
+    const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(commands.map(args => args[0])).toEqual(failure === 'stale lock' ? ['metadata']
+      : failure === 'cold' ? ['metadata', 'fetch', 'metadata', 'tree'] : ['metadata', 'fetch', 'metadata']);
+    for (const args of commands.filter(args => args[0] === 'metadata')) {
+      expect(args).toEqual(['metadata', '--offline', '--locked', '--filter-platform', 'aarch64-linux-android', '--format-version', '1']);
+    }
+    if (failure !== 'stale lock') expect(commands[1]).toEqual(['fetch', '--locked', '--target', 'aarch64-linux-android']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 
 thread_local!(static HEARD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) });
 thread_local!(static STATE: RefCell<&'static str> = const { RefCell::new("prompt") });
+thread_local!(static NOTIFIER: RefCell<Option<crate::package::Notifier>> = const { RefCell::new(None) });
 
 fn heard() -> Vec<String> {
     HEARD.with(|h| std::mem::take(&mut *h.borrow_mut()))
@@ -25,6 +26,7 @@ impl Package for Probe {
             h.borrow_mut()
                 .push(format!("made agent={}", context.agent()))
         });
+        NOTIFIER.with(|n| *n.borrow_mut() = Some(context.notifier()));
         Probe { context }
     }
     fn later(&mut self, name: &str, args: &Json, _: Option<&Json>, reply: Reply) {
@@ -172,4 +174,72 @@ fn an_admitted_call_reads_the_status_first() {
     p.run_commands(Nothing::default);
     assert_eq!(made.recv().unwrap(), json!({ "name": "ask" }));
     assert_eq!(heard(), ["later status {} tool", "later ask {} tool"]);
+}
+
+/// A plan that reads a module the composed package answers.
+const READS_GEOLOCATION: &str = "use geolocationStatus, GeolocationStatus from \"@exact/geolocation\"\ncomponent App\n  resource status = geolocationStatus() as shape GeolocationStatus\n  view\n    text \"Hi\"\n";
+
+/// Whether the runner binds the package's extension.
+fn bound(p: &Presenter<Nothing>) -> bool {
+    let state = (p.host().runner().extensions_json()).expect("the plan names a module");
+    serde_json::from_str::<Json>(&state).unwrap()["geolocation"]["bound"] == true
+}
+
+/// A replacement runner, the dev loop's reload's or an activated update's,
+/// is given what the last one had: the native slot's handler and the bound
+/// extensions. An instance made before it announces into the new slot.
+#[test]
+fn a_replaced_runner_reaches_the_packages_as_the_last_did() {
+    let plan = crate::test_plan(READS_GEOLOCATION);
+    let (mut p, _) = Presenter::boot_with(
+        &plan,
+        Nothing,
+        (400., 800.),
+        1.,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    p.serve_packages(vec![Entry::of::<Probe>("geolocation")]);
+    let ping = || json!({"extension": "geolocation", "send": "ping", "args": {}});
+    assert_eq!(
+        call(&mut p, ping()).recv().unwrap(),
+        json!({ "name": "ping" })
+    );
+    assert!(bound(&p));
+    heard();
+    let reload = |p: &mut Presenter<Nothing>, plan: &[u8]| {
+        p.reload(plan, Nothing).unwrap();
+    };
+    let update = |p: &mut Presenter<Nothing>, plan: &[u8]| {
+        let staged = super::super::delivery::tests::StagedPlan(plan.into());
+        p.set_updates(Some(Box::new(staged)));
+        assert!(p.activate_update(Nothing).unwrap());
+    };
+    for (name, replace) in [
+        ("reload", &reload as &dyn Fn(&mut _, &[u8])),
+        ("update", &update),
+    ] {
+        replace(&mut p, &plan);
+        assert!(
+            bound(&p),
+            "{name}: the extension is bound in the new runner"
+        );
+        let answer = call(&mut p, ping());
+        assert_eq!(answer.recv().unwrap(), json!({ "name": "ping" }), "{name}");
+        assert!(
+            !heard().iter().any(|h| h.starts_with("made")),
+            "{name}: the instance made before answers"
+        );
+        // Binding announced the module's topics; those are applied first.
+        let now = p.host().now();
+        p.pump(now);
+        assert!(!p.host().has_announced());
+        let notifier = NOTIFIER.with(|n| n.borrow().clone()).unwrap();
+        notifier.changed("geolocation.geolocationStatus");
+        assert!(
+            p.host().has_announced(),
+            "{name}: announced into the new runner"
+        );
+    }
 }

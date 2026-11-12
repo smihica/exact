@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // Work after a rendering opportunity (host/web/navigation.js `afterPaint`):
 // two animation frames or a second, whichever is first, run once, so a page in
 // a cross-origin frame scrolled out of view (the design tool's canvas) still
@@ -5,19 +6,37 @@
 // (3), its QUEUE follow-up; review2's 10:26 conditions). The functions are
 // read from the sources and run against stand-in frames and timers.
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { glueCase, glueDeclarations } from './glue-fixture.mjs';
 
 const navigation = readFileSync(new URL('../navigation.js', import.meta.url), 'utf8');
 const glue = readFileSync(new URL('../glue.js', import.meta.url), 'utf8');
-const afterPaint = navigation.match(/^export (function afterPaint\(fn, agent = false\) \{.*\})$/m)[1];
+const afterPaint = glueDeclarations(navigation, ['afterPaint']);
 const loadGpu = glue.match(/function loadGpuIfNeeded\(\) \{[^]*?\n\}/)[0];
 const dropSurface = glue.match(/function dropSurface\(id\) \{[^{}]*\}/)[0];
+
+test('after-paint loads reuse published exports and retry a failed load', async () => {
+  const scripts = [], exact = {};
+  const document = { createElement: () => ({}), head: { append: script => scripts.push(script) } };
+  const source = glueDeclarations(glue, ['loadAfterPaint']).replace('import.meta.url', JSON.stringify('http://localhost/glue.js'));
+  const load = new Function('document', 'globalThis', `${source}\nreturn loadAfterPaint;`)(document, { exact });
+  const failed = load('./storage-environment.js', 'retrySecretWrite');
+  scripts[0].onerror();
+  await expect(failed).rejects.toThrow('host module loader failed: ./storage-environment.js');
+  const retried = load('./storage-environment.js', 'retrySecretWrite');
+  expect(scripts).toHaveLength(2);
+  expect(scripts[1]).toMatchObject({ type: 'module', src: 'http://localhost/storage-environment.js' });
+  exact.retrySecretWrite = () => {};
+  scripts[1].onload();
+  expect(await retried).toBe(exact.retrySecretWrite);
+  for (let i = 0; i < 10; i++) expect(await load('./storage-environment.js', 'retrySecretWrite')).toBe(exact.retrySecretWrite);
+  expect(scripts).toHaveLength(2);
+});
 
 // Stand-in frames and timers: each queued, fired when the test says.
 const world = (exact = {}) => {
   const frames = [], timers = [], loads = [];
   const made = new Function('requestAnimationFrame', 'setTimeout', 'loadAfterPaint', 'exact',
-    `let gpuLoading = null; const globalThis = { exact }; ${afterPaint}\n${loadGpu}\n${dropSurface}\nreturn { afterPaint, loadGpuIfNeeded, dropSurface };`)(
+    `const host = { gpuLoading: null }; const globalThis = { exact }; ${afterPaint}\n${loadGpu}\n${dropSurface}\nreturn { afterPaint, loadGpuIfNeeded, dropSurface };`)(
     fn => frames.push(fn), (fn, ms) => timers.push([fn, ms]), file => { loads.push(file); return Promise.resolve(); }, exact);
   const frame = () => { const now = frames.splice(0); for (const fn of now) fn(); };
   return { ...made, frames, timers, loads, frame, timer: () => timers.splice(0).forEach(([fn]) => fn()) };
@@ -77,7 +96,7 @@ test('a canvas surface loads its GPU module after paint, once; one destroyed bef
 test("glue.js schedules each GPU load through afterPaint and takes a destroyed surface out of the queue; gpu-modules.js's own wait races the second too", async () => {
   // Where the loads are scheduled (a surface op and a restart), and the destroy op: through the helpers above, so a
   // revert of either site fails here (no GPU app runs in the test browser).
-  const surface = glue.match(/case "surface": \{[^]*?break;\n      \}/)[0], destroy = glue.match(/case "destroy": \{[^]*?break;\n      \}/)[0];
+  const surface = glueCase(glue, 'surface'), destroy = glueCase(glue, 'destroy');
   expect(surface).toContain('afterPaint(loadGpuIfNeeded, agentMode)');
   expect(surface).not.toContain('requestAnimationFrame(');
   expect(glue).toContain('if (bytes) afterPaint(loadGpuIfNeeded, agentMode);');

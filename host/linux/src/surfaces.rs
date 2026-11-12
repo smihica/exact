@@ -537,17 +537,9 @@ impl Surfaces {
             .filter(|id| host.kernel().node(*id).is_none())
             .collect();
         for view in dead {
-            let c = self.canvases.remove(&view).unwrap();
-            self.edits_admitted |= self.abis[&c.artifact].agent(c.id, &json!({"op":"state"}))
-                ["world"]["developmentEdits"]
-                == true;
-            self.abis[&c.artifact].destroy(c.id);
+            changed |= self.retire(view, host);
             #[cfg(target_os = "android")]
             self.windows.remove(&view);
-            if c.owner {
-                self.error = self.error.take().or(host.surface_record(&c.name, None));
-                changed = true;
-            }
         }
         let updates = host.take_surface_updates();
         if updates.is_empty() && self.canvases.is_empty() && !self.work.is_empty() {
@@ -631,15 +623,7 @@ impl Surfaces {
                 .get(&update.view)
                 .is_some_and(|c| c.name != update.name)
             {
-                let old = self.canvases.remove(&update.view).unwrap();
-                self.edits_admitted |= self.abis[&old.artifact]
-                    .agent(old.id, &json!({"op":"state"}))["world"]["developmentEdits"]
-                    == true;
-                self.abis[&old.artifact].destroy(old.id);
-                if old.owner {
-                    self.error = self.error.take().or(host.surface_record(&old.name, None));
-                    changed = true;
-                }
+                changed |= self.retire(update.view, host);
             }
             let Some(abi) = self.abis.get(&artifact) else {
                 continue;
@@ -1490,6 +1474,8 @@ mod tests;
 #[path = "surface_controls_tests.rs"]
 mod control_tests;
 
+#[path = "surfaces/retire.rs"]
+mod retire;
 #[path = "surfaces/tier.rs"]
 mod tier;
 use tier::agent_tier;

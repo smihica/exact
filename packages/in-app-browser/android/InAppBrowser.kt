@@ -2,6 +2,7 @@
 // browser provides Custom Tabs, else the default browser.
 //
 // - The embedder decides first ([ExtensionContext.leave], D22 item 7): a refusal answers `NotAllowedError`.
+// - The intent carries no package (D12, ruled 2026-11-11), so a link an installed app claims opens that app.
 // - It answers `opened` at launch: the platform reports a tab's navigation and hiding only to a bound
 //   `CustomTabsSession`, which the module does not keep (§18).
 // - `overApp` is whether a Custom Tabs provider resolves, read again at each resume (D11); the package's `queries`

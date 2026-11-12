@@ -24,6 +24,52 @@ pub struct TextItem {
     pub chunks: Vec<TextChunk>,
 }
 
+impl TextItem {
+    /// A box that holds every glyph, standing in for the object bounding box
+    /// when a `filter` or a `mask` sizes its region by it: the box is the
+    /// glyph cells' (SVG 2 §8.10), whose advances only the host measures.
+    /// Each character is taken as at most an em and a half wide and each
+    /// glyph within an em and a half of its baseline, whatever the anchor
+    /// and baseline, so the region is larger than the box, never smaller.
+    pub(super) fn reach(&self) -> super::Rect4 {
+        // Where a chunk can start on each axis, as a range: one that
+        // continues from the last can start wherever that one could end.
+        let (mut x, mut y) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let mut out: Option<super::Rect4> = None;
+        for chunk in &self.chunks {
+            if let Some(v) = chunk.x {
+                x = (v, v);
+            }
+            if let Some(v) = chunk.y {
+                y = (v, v);
+            }
+            let (mut advance, mut shift, mut em, mut stroke) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for run in &chunk.runs {
+                let size = run.style.font_size.max(0.0);
+                let chars = run.text.chars().count() as f32;
+                advance += run.dx.abs() + chars * (1.5 * size + run.style.letter_spacing.abs());
+                shift += run.dy.abs();
+                em = em.max(size);
+                if run.stroke.is_some() {
+                    stroke = stroke.max(run.width / 2.0);
+                }
+            }
+            // An anchor moves a chunk back by up to its advance.
+            x = (x.0 - advance, x.1 + advance);
+            y = (y.0 - shift, y.1 + shift);
+            let reach = 1.5 * em + stroke;
+            let r = (
+                x.0 - stroke,
+                y.0 - reach,
+                x.1 - x.0 + 2.0 * stroke,
+                y.1 - y.0 + 2.0 * reach,
+            );
+            out = Some(out.map_or(r, |o| super::union(o, r)));
+        }
+        out.unwrap_or_default()
+    }
+}
+
 /// Runs laid out one after another from one absolute position.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextChunk {
@@ -113,7 +159,7 @@ impl Resolver<'_, '_> {
         let mut space = true;
         self.runs(node, style, vp, &mut chunks, &mut space, true);
         for chunk in &mut chunks {
-            if let Some(last) = chunk.runs.last_mut() {
+            if let Some(last) = chunk.runs.iter_mut().rev().find(|r| !r.text.is_empty()) {
                 if last.text.ends_with(' ') {
                     last.text.pop();
                 }

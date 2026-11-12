@@ -79,6 +79,7 @@ const BYTECODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app.hbc"));
 /// The app's module without the production per-call deadline, which is not a
 /// stable gate on a shared test machine; these fixtures test behavior.
 fn module() -> Module {
+    ibex2_sqlite::link();
     let mut module = Module::new(BYTECODE.to_vec(), APP, GRANTS);
     module.set_budget_ms(f64::INFINITY);
     module

@@ -224,6 +224,18 @@ impl Geometry {
         (x, line.top, 1., line.height)
     }
 
+    pub(crate) fn horizontal_bounds(&self) -> (f32, f32) {
+        self.lines
+            .iter()
+            .flat_map(|line| {
+                std::iter::once(line.empty_x)
+                    .chain(line.spans.iter().flat_map(|s| [s.left, s.right]))
+            })
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(left, right), x| {
+                (left.min(x), right.max(x))
+            })
+    }
+
     fn on_line(&self, index: usize, x: f32) -> Cursor {
         let line = &self.lines[index];
         let offset = line

@@ -9,9 +9,9 @@
 //! The compiler checks the route table; its types are checked once at boot.
 //! No host interprets slots.
 
-use super::{Carried, CommitReceipt, DataSource, Runner, RunnerError};
-use exact_kernel::SortedSet;
-use exact_plan::{Plan, SlotsId, Stdlib, TypeKind, TypesId, Value};
+use super::{Carried, CommitReceipt, DataSource, Event, Runner, RunnerError};
+use exact_kernel::{SortedSet, ViewId};
+use exact_plan::{EventKind, Plan, SlotsId, Stdlib, TypeKind, TypesId, Value};
 use exact_route::{Entry, Router, Tab, Table};
 use std::cell::RefCell;
 
@@ -85,8 +85,13 @@ pub trait Routing {
     /// The location a native host's Forward goes to, the nearest of the
     /// visits Back left (`history.rs`; LLP 1115.000 D5.5).
     fn ahead(&self) -> Option<&str>;
+    /// Mark the current delivery as native Forward, even if its `go` pops visits.
+    fn set_forward(&mut self, forward: bool);
     /// Whether `location` names a declared route pattern (LLP 1038 §7).
     fn matches_pattern(&self, location: &str) -> bool;
+    /// Whether the table declares one location: a single route besides
+    /// `notfound`, which is then the root `/` (`Table::check`).
+    fn one_location(&self) -> bool;
     /// Set what `sharedFiles` answers for a share's token (LLP 1133.024 D3);
     /// false when it already answers that.
     fn share(&self, token: &str, files: Value) -> bool;
@@ -128,6 +133,7 @@ pub struct RouterContext {
     /// The locations of the visits Back left, the nearest last: where a
     /// native host's Forward goes (`history.rs`).
     ahead: Vec<String>,
+    forward: bool,
     /// What each `open`, `push`, `replace` or `go` to a location with a
     /// fragment returned in the commit being made, with the visit and
     /// fragment it left on top: an explicit navigation, which scrolls even
@@ -238,6 +244,7 @@ impl RouterContext {
             fragment: None,
             activations: 0,
             ahead: Vec::new(),
+            forward: false,
             navigations: RefCell::new(Vec::new()),
             refusals: RefCell::new(Vec::new()),
             reads: RefCell::new(None),
@@ -277,6 +284,8 @@ impl RouterContext {
     }
 
     fn router(&self, value: &Value) -> Option<Router> {
+        #[cfg(test)]
+        tests::DECODES.set(tests::DECODES.get() + 1);
         let v = record(value)?;
         if v.len() != 3 {
             return None;
@@ -715,6 +724,18 @@ impl Routing for RouterContext {
     }
 
     fn commit(&mut self, value: Value, change: Option<RouterChange>) {
+        // A fresh but equal value can still consume Forward or activate a
+        // fragment. Only the already committed object needs no work.
+        if change.is_none()
+            && self.navigations.borrow().is_empty()
+            && self
+                .committed
+                .as_ref()
+                .is_some_and(|old| crate::compare::same(old, &value))
+        {
+            self.forward = false;
+            return;
+        }
         // A navigation to the fragment the top already shows changes no
         // value, and scrolls again, as a browser's link to it does: it is
         // published as a change of its own, so a host arms it as any other.
@@ -739,7 +760,14 @@ impl Routing for RouterContext {
         self.navigations.borrow_mut().clear();
         if let Some(after) = self.router(&value) {
             let before = self.committed.as_ref().and_then(|v| self.router(v));
-            super::history::step(before.as_ref(), &after, &mut self.ahead);
+            // A successful verb returns a fresh value, even `go` to the
+            // current location. An ignored handler leaves the same object.
+            let forward = std::mem::take(&mut self.forward)
+                && self
+                    .committed
+                    .as_ref()
+                    .is_some_and(|old| !crate::compare::same(old, &value));
+            super::history::step(before.as_ref(), &after, &mut self.ahead, forward);
         }
         self.committed = Some(value);
         if let Some(mut change) = change {
@@ -804,12 +832,20 @@ impl Routing for RouterContext {
         self.ahead.last().map(String::as_str)
     }
 
+    fn set_forward(&mut self, forward: bool) {
+        self.forward = forward;
+    }
+
     fn take_change(&mut self) -> Option<RouterChange> {
         self.pending.take()
     }
 
     fn matches_pattern(&self, location: &str) -> bool {
         self.table.matches_pattern(location).is_some()
+    }
+
+    fn one_location(&self) -> bool {
+        self.table.routes.iter().filter(|r| !r.notfound).count() == 1
     }
 }
 
@@ -985,6 +1021,16 @@ impl<D: DataSource> Runner<D> {
             .is_some_and(|r| r.matches_pattern(location))
     }
 
+    /// Whether the route table declares one location besides `notfound`
+    /// (which the compiler writes for most apps, LLP 1116.009 D2). A push of
+    /// the location on top is no new visit (LLP 1038), so only a push of it
+    /// with another query, or of a location nothing matches, puts a route
+    /// above the root. `false` without a router. The Mac's toolbar shows no
+    /// Back for such an app until one does (LLP 1115.000 D5.1).
+    pub fn route_one_location(&self) -> bool {
+        self.router.as_ref().is_some_and(|r| r.one_location())
+    }
+
     /// The canonical location of a retained visit, or `None` when it is
     /// absent. Without its fragment: a `go` there returns to the visit as it
     /// was, where a fragment would scroll it again (LLP 1153 D5).
@@ -1030,11 +1076,28 @@ impl<D: DataSource> Runner<D> {
     /// Where the platform's own Forward goes, or `None` (no router, or
     /// nothing ahead): the nearest location Back left on the selected
     /// stack, as a browser's session history keeps it. A native host
-    /// delivers it as the web host delivers a Forward (LLP 1038 D7): to the
-    /// navigation root's `navigate`, else by [`Runner::host_go`] (LLP
-    /// 1115.000 D5.5).
+    /// delivers it with [`Runner::host_forward`] so the commit retains its
+    /// direction even when `go` shortens the stack (LLP 1115.000 D5.5).
     pub fn location_ahead(&self) -> Option<String> {
         self.router.as_deref()?.ahead().map(String::from)
+    }
+
+    /// Deliver native Forward to the root's `navigate`, or the runner's
+    /// own `go` when it has no handler. The direction belongs to this
+    /// delivery alone, including when the handler refuses the commit.
+    pub fn host_forward(&mut self, root: ViewId) -> Result<Option<CommitReceipt>, RunnerError> {
+        let Some(location) = self.location_ahead() else {
+            return Ok(None);
+        };
+        self.find(root).ok_or(RunnerError::UnknownView(root))?;
+        self.router.as_mut().unwrap().set_forward(true);
+        let result = if self.handlers_of(root).contains(&EventKind::Navigate) {
+            self.dispatch(root, Event::Navigate(location)).map(Some)
+        } else {
+            self.host_navigate(&location, true)
+        };
+        self.router.as_mut().unwrap().set_forward(false);
+        result
     }
 
     /// The platform's own Back from the selected visit `id`, for a route
@@ -1082,14 +1145,22 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// The platform's own navigation to `location` under a navigation root
-    /// with no `navigate` handler: the browser's Forward, or a same-origin
-    /// link to a declared route (LLP 1115.000 D4.3). It is the router's
-    /// `go`, written by the runner as one commit of its own, as the app's
+    /// with no `navigate` handler, such as a same-origin link to a declared
+    /// route (LLP 1115.000 D4.3). Native Forward uses [`Runner::host_forward`].
+    /// It is the router's `go`, written as one commit, as the app's
     /// `nav = go(nav, location)` would be — journaled as `host go`, refused
     /// like any commit. `None` (nothing done) without a router, or when
     /// `go` leaves the router as it is: no route matches `location`, or it
     /// is already the selected top.
     pub fn host_go(&mut self, location: &str) -> Result<Option<CommitReceipt>, RunnerError> {
+        self.host_navigate(location, false)
+    }
+
+    fn host_navigate(
+        &mut self,
+        location: &str,
+        forward: bool,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
         let Some(context) = self.router.as_deref() else {
             return Ok(None);
         };
@@ -1099,8 +1170,17 @@ impl<D: DataSource> Runner<D> {
             return Ok(None);
         };
         let next = context
-            .call(&self.plan, Stdlib::Go, &[current, Value::str(location)])
-            .filter(|next| context.read(next).is_some_and(|r| r != router) || context.activated());
+            .call(
+                &self.plan,
+                Stdlib::Go,
+                &[current.clone(), Value::str(location)],
+            )
+            .filter(|next| {
+                context.read(next).is_some_and(|r| r != router)
+                    || context.activated()
+                    // Forward must commit even when only its history changes.
+                    || (forward && !crate::compare::same(&current, next))
+            });
         self.log_router_refusals();
         match next {
             Some(next) => self.host_commit(slot, next, "host go"),
@@ -1116,7 +1196,7 @@ impl<D: DataSource> Runner<D> {
         what: &str,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
         let was_poisoned = self.poisoned;
-        let checkpoint = self.checkpoint(false);
+        let checkpoint = self.checkpoint();
         let result = if self.poisoned {
             Err(RunnerError::Poisoned)
         } else {
@@ -1137,21 +1217,92 @@ impl<D: DataSource> Runner<D> {
     /// @ref LLP 1038 D5 — written beside `resources.initial`.
     pub fn resource_args(&self, name: &str) -> Option<&[Value]> {
         let i = self
-            .plan
-            .resources
-            .iter()
+            .resource_rows()
             .position(|r| self.plan.str(r.name) == name)?;
-        self.resources[i].as_ref().map(|r| r.args.as_slice())
+        self.resources[i].state.as_ref().map(|r| r.args.as_slice())
     }
 
     /// Whether resource `name` shows a placeholder, not an answer (LLP
     /// 1054.000.002 D4): the bake compiles no value for it.
     pub fn resource_is_placeholder(&self, name: &str) -> bool {
-        self.plan
-            .resources
-            .iter()
+        self.resource_rows()
             .position(|r| self.plan.str(r.name) == name)
-            .and_then(|i| self.resources[i].as_ref())
+            .and_then(|i| self.resources[i].state.as_ref())
             .is_some_and(|r| r.placeholder)
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/it/support/router.rs"]
+mod test_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static DECODES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn unrelated_commits_do_not_decode_the_router_at_any_stack_depth() {
+        let table = Table {
+            routes: [
+                ("home", "/", None, true),
+                ("thread", "/t/:thread", Some(0), false),
+            ]
+            .into_iter()
+            .map(|(name, pattern, parent, tab)| exact_route::Route {
+                name: name.into(),
+                pattern: pattern.into(),
+                parent,
+                tab,
+                notfound: false,
+            })
+            .collect(),
+        };
+        let mut decodes = Vec::new();
+        for depth in [1, 4, 16] {
+            let mut runner = Runner::boot(
+                test_fixture::plan(&table),
+                (),
+                exact_kernel::Kernel::with_monospace(),
+                Default::default(),
+                "/",
+            )
+            .unwrap();
+            for visit in 1..=depth {
+                runner
+                    .act("push", vec![Value::str(&format!("/t/{visit}"))])
+                    .unwrap();
+            }
+            runner.take_router_change();
+            runner.act("back", vec![]).unwrap();
+            let value = runner.slot("nav").unwrap().clone();
+            assert_eq!(runner.derive("depth"), Some(&Value::Number(depth as f64)));
+            let before = DECODES.get();
+            for edit in 0..100 {
+                runner
+                    .act("encode", vec![Value::str(&format!("edit {edit}"))])
+                    .unwrap();
+            }
+            decodes.push(DECODES.get() - before);
+            assert_eq!(runner.slot("encoded"), Some(&Value::str("edit%2099")));
+            assert!(crate::compare::same(runner.slot("nav").unwrap(), &value));
+            assert_eq!(runner.location_ahead(), Some(format!("/t/{depth}")));
+            let pending = runner.take_router_change().unwrap();
+            assert_eq!(pending.visits.len(), depth);
+            assert_eq!(pending.removed.len(), 1);
+            runner
+                .act("encode", vec![Value::str("after drain")])
+                .unwrap();
+            assert!(runner.take_router_change().is_none());
+        }
+        assert_eq!(
+            decodes,
+            [0, 0, 0],
+            "100 unrelated commits at depths 1, 4 and 16"
+        );
     }
 }

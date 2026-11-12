@@ -6,7 +6,7 @@
 import { spawnSync } from 'node:child_process';
 import { bakeTarget, bakeWatchEnv, cargoEnvironment, linuxBinary, linuxBuild, resolveApp } from './app.mjs';
 import { placeLibrary, prepareLibrary } from './package-libraries.mjs';
-import { guardFlags } from './help.mjs';
+import { guardFlags, reportBuilt } from './help.mjs';
 import { desktopEntry } from './desktop-entry.mjs';
 import { recordBuiltSettings } from '../js/bake/src/__exact_env.mjs';
 import { writeFileSync } from 'node:fs';
@@ -33,5 +33,6 @@ if (built.status === 0) {
   recordBuiltSettings(binary, app);
   console.log(binary);
   console.log(entry);
+  if (process.argv.includes('--json')) reportBuilt({ path: binary, target: 'linux', trust: process.env.EXACT_UPDATE_TRUST ?? 'development' });
 }
 process.exit(built.status ?? 1);

@@ -94,6 +94,8 @@ final class MouseReorder {
         defer { candidate = nil; downEvent = nil }
         if grouped {
             grouped = false; contact = nil
+            // The monitor consumes this up before NodeView can release the pointer.
+            presenter?.pointerSource?.pointerReleased(event)
             presenter?.reorderGroup?.move(event.locationInWindow)
             presenter?.reorderGroup?.finish(cancel: false)
             return true

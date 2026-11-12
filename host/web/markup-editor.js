@@ -163,6 +163,7 @@ function installMarkupEditor(textarea, host) {
   let source = '', lines = [], records = [], starts = [0], index = new WeakMap(), payload = '', placed = null;
   let destroyed = false, composing = false, notifying = false, pointer = false, pendingValue, pendingSync = false;
   let nativeHidden = null, direction = 'none', told = null, reported = '', moving = false, reread = false, atomStyles = {}, atomKinds = {}, atomed = null;
+  let dragDelete = null, dragTimer, dropPoint = NONE;
   // The app's `paragraphDirs` words; whether they still wait to be placed by
   // line number; each line's text and word as drawn; and the drawn words as
   // the editor last kept them for its undo steps (LLP 1045 D11).
@@ -333,16 +334,23 @@ function installMarkupEditor(textarea, host) {
     const line = lines[lo];
     if (!line) return { node: el, offset: 0 };
     const local = p - starts[lo], found = [], edges = [];
+    let before, after;
     let acc = 0;
     for (const [i, kid] of [...line.childNodes].entries()) {
       if (isIsland(kid)) { if (acc === local) edges.push({ node: line, offset: i }); continue; }
       const t = kid.nodeType === 3 ? kid : kid.firstChild?.nodeType === 3 ? kid.firstChild : null, len = kid.nodeName === 'BR' ? 0 : kid.textContent.length;
       if (kid.exactIsland && acc + len === local) edges.push({ node: line, offset: i + 1 });
-      else if (t && !kid.classList?.contains('md-hide') && acc <= local && local <= acc + len) found.push({ node: t, offset: local - acc, start: local === acc, end: local === acc + len });
+      else if (t && !kid.classList?.contains('md-hide')) {
+        if (acc <= local && local <= acc + len) found.push({ node: t, offset: local - acc, start: local === acc, end: local === acc + len });
+        else if (acc + len < local) before = { node: t, offset: len };
+        else if (!after) after = { node: t, offset: 0 };
+      }
       acc += len;
     }
     if (found.length) return right ? found.find(c => !c.end) ?? found.at(-1) : found.find(c => !c.start) ?? found[0];
     if (edges.length) return edges[0];
+    // Several adjacent markers can put a source caret inside one hidden span.
+    if (before || after) return right ? after ?? before : before ?? after;
     const br = line.querySelector(':scope > br');
     return { node: line, offset: br ? [...line.childNodes].indexOf(br) : line.childNodes.length };
   }
@@ -518,6 +526,7 @@ function installMarkupEditor(textarea, host) {
     if (value === source) { pendingValue = undefined; return; }
     if (composing || notifying) { pendingValue = value; return; }
     pendingValue = undefined;
+    clearDrag();
     const bits = wasm.mde_set_value(h, put(value));
     if (bits & SOURCE) { read(); render(); place(false); emit(); }
   }
@@ -575,6 +584,7 @@ function installMarkupEditor(textarea, host) {
   function destroy() {
     if (destroyed) return;
     destroyed = true;
+    clearDrag();
     document.removeEventListener('selectionchange', selectionChanged);
     window.removeEventListener('pointerup', release); window.removeEventListener('pointercancel', release);
     observer.disconnect();
@@ -585,6 +595,23 @@ function installMarkupEditor(textarea, host) {
   // typing must reach the shared editor, and the app's `beforeinput` the
   // selection it applies to, before either decides (capture runs first).
   el.addEventListener('beforeinput', e => { if (!destroyed && !composing && !e.isComposing) selectionChanged(); }, true);
+  el.addEventListener('drop', e => {
+    const point = document.caretPositionFromPoint?.(e.clientX, e.clientY);
+    const range = point ? null : document.caretRangeFromPoint?.(e.clientX, e.clientY);
+    const node = point?.offsetNode ?? range?.startContainer, offset = point?.offset ?? range?.startOffset;
+    dropPoint = node && el.contains(node) ? toSource(node, offset) : NONE;
+  });
+  function clearDrag() {
+    clearTimeout(dragTimer);
+    dragDelete = null;
+  }
+  function finishDrag() {
+    if (!dragDelete) return;
+    const [a, b] = dragDelete;
+    clearDrag();
+    after(wasm.mde_before_input(h, kindOf('deleteByDrag'), put(''), a, b, now()), { inputType: 'deleteByDrag' });
+  }
+  el.addEventListener('dragend', finishDrag);
   /** The editor's own handling, after the app's `beforeinput` (installed after `host.replace`): one it prevented changes nothing. */
   function beforeInput(e) {
     if (destroyed || composing || e.defaultPrevented || e.isComposing || e.inputType === 'insertCompositionText') return;
@@ -592,9 +619,30 @@ function installMarkupEditor(textarea, host) {
     const kind = kindOf(e.inputType);
     if (!kind) { rememberNativeSelection(); return; }
     let a = NONE, b = NONE;
-    const target = (kind === 9 || kind >= 11) && e.getTargetRanges?.()[0];
+    const drop = e.inputType === 'insertFromDrop';
+    if (!drop) finishDrag();
+    const target = (drop || kind === 9 || kind >= 11) && e.getTargetRanges?.()[0];
     if (target) { const x = toSource(target.startContainer, target.startOffset), y = toSource(target.endContainer, target.endOffset); a = Math.min(x, y); b = Math.max(x, y); }
     const dt = e.dataTransfer, data = e.data ?? (dt && (dt.getData('text/markdown') || dt.getData('text/plain'))) ?? '';
+    if (e.inputType === 'deleteByDrag') {
+      e.preventDefault();
+      dragDelete = [...(target ? [a, b] : sel()), dropPoint];
+      dropPoint = NONE;
+      // Chromium has already chosen the drop's DOM node. Keep it attached
+      // through insertFromDrop; a move outside this editor still deletes.
+      dragTimer = setTimeout(finishDrag, 0);
+      return;
+    }
+    if (drop && dragDelete) {
+      // WebKit keeps the source selection as its target when deletion was
+      // cancelled. Its hit-tested drop caret still names the destination.
+      const [from, to, point] = dragDelete, at = target && a === b ? a : point !== NONE ? point : sel()[0];
+      clearDrag();
+      e.preventDefault();
+      after(wasm.mde_move(h, from, to, at, put(data), now()), { inputType: e.inputType, data: e.data });
+      return;
+    }
+    if (drop && target) wasm.mde_set_selection(h, a, b);
     const bits = wasm.mde_before_input(h, kind, put(data), a, b, now());
     if (!(bits & HANDLED)) { rememberNativeSelection(); return; } // native typing, read back on input
     e.preventDefault();

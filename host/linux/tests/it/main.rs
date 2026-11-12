@@ -6,6 +6,7 @@ mod accent;
 mod ahead;
 mod animation;
 mod arrange;
+mod box_filter;
 mod colors;
 mod field_align;
 mod focus;

@@ -5,28 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const AGENT_EPOCH: f64 = 1_767_225_600_000.;
 
-fn locale(value: &str) -> String {
-    let (head, modifier) = value.split_once('@').unwrap_or((value, ""));
-    let tag = head.split('.').next().unwrap_or("");
-    if tag.is_empty() || matches!(tag, "C" | "POSIX") {
-        return "en-US".into();
-    }
-    let mut parts = tag.split(['_', '-']);
-    let language = parts.next().unwrap_or("").to_ascii_lowercase();
-    let region = parts.next().map(str::to_ascii_uppercase);
-    // A glibc script modifier is a BCP 47 script subtag (`sr_RS@latin` is `sr-Latn-RS`).
-    let script = match modifier {
-        "latin" => Some("Latn"),
-        "cyrillic" => Some("Cyrl"),
-        _ => None,
-    };
-    [Some(language), script.map(str::to_string), region]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 /// An IANA name from `TZ` as the C library reads it: a leading `:` and a
 /// `zoneinfo/` path are forms of a name; a POSIX rule (`PST8PDT,M3.2.0,…`) is not one.
 fn zone_name(value: &str) -> Option<String> {
@@ -44,28 +22,26 @@ fn zone_name(value: &str) -> Option<String> {
 pub(crate) fn launch(
     interactive: bool,
     env: impl Fn(&str) -> Option<String>,
-) -> (Launch, Vec<String>) {
+) -> Result<(Launch, Vec<String>), String> {
     let mut notes = Vec::new();
     let mut place = if interactive {
+        let (locale, format_locale) = exact_runner::time::posix_locales(&env);
+        let mut bytes = [0; 4];
+        getrandom::fill(&mut bytes).map_err(|e| format!("launch seed: {e}"))?;
         Place {
-            locale: locale(
-                &["LC_ALL", "LC_TIME", "LANG"]
-                    .iter()
-                    .find_map(|key| env(key).filter(|s| !s.is_empty()))
-                    .unwrap_or_default(),
-            ),
+            locale,
             time_zone: env("TZ")
                 .and_then(|tz| zone_name(&tz))
                 .or_else(|| iana_time_zone::get_timezone().ok())
                 .unwrap_or_else(|| "UTC".into()),
-            seed: 0.,
-            format_locale: String::new(),
+            seed: f64::from(u32::from_ne_bytes(bytes)),
+            format_locale,
         }
     } else {
         Place {
             locale: env("EXACT_AGENT_LOCALE").unwrap_or_else(|| "en-US".into()),
             time_zone: env("EXACT_AGENT_TIME_ZONE").unwrap_or_else(|| "UTC".into()),
-            seed: 1.,
+            seed: exact_runner::time::agent_seed(env("EXACT_AGENT_SEED"))?,
             format_locale: env("EXACT_AGENT_FORMAT_LOCALE").unwrap_or_default(),
         }
     };
@@ -135,14 +111,14 @@ pub(crate) fn launch(
         };
         place.time_zone = "UTC".into();
     }
-    (
+    Ok((
         Launch {
             time: Some(time),
             place: Some(place),
             ..Launch::NONE
         },
         notes,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -150,16 +126,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn posix_locales_drop_codesets_and_modifiers() {
-        for (value, expected) in [
-            ("sr_RS@latin", "sr-Latn-RS"),
-            ("ca_ES@valencia", "ca-ES"),
-            ("de_DE.UTF-8@euro", "de-DE"),
-            ("C@calendar=gregorian", "en-US"),
-            ("POSIX", "en-US"),
+    fn interactive_launch_separates_message_and_format_locales() {
+        for (all, messages, time, lang, expected) in [
+            ("", "", "de_DE.UTF-8", "en_US.UTF-8", ("en-US", "de-DE")),
+            ("", "fr_FR.UTF-8", "", "en_US.UTF-8", ("fr-FR", "en-US")),
+            ("ja_JP.UTF-8", "fr_FR", "de_DE", "en_US", ("ja-JP", "ja-JP")),
+            ("", "fr_FR", "", "", ("fr-FR", "")),
+            ("C.UTF-8", "fr_FR", "de_DE", "en_US", ("en-US", "en-US")),
+            ("", "", "", "", ("en-US", "")),
         ] {
-            assert_eq!(locale(value), expected);
+            let (facts, notes) = launch(true, |key| {
+                Some(
+                    match key {
+                        "LC_ALL" => all,
+                        "LC_MESSAGES" => messages,
+                        "LC_TIME" => time,
+                        "LANG" => lang,
+                        "TZ" => "UTC",
+                        "EXACT_AGENT" => "1",
+                        key if key.starts_with("EXACT_AGENT_") => {
+                            panic!("interactive launch read {key}")
+                        }
+                        _ => return None,
+                    }
+                    .into(),
+                )
+            })
+            .unwrap();
+            assert!(notes.is_empty(), "{notes:?}");
+            let place = facts.place.unwrap();
+            assert_eq!(
+                (place.locale.as_str(), place.format_locale.as_str()),
+                expected
+            );
         }
+    }
+
+    #[test]
+    fn interactive_launch_draws_a_fresh_u32_seed() {
+        let seeds: Vec<_> = (0..4)
+            .map(|_| {
+                let (facts, notes) =
+                    launch(true, |key| (key == "TZ").then(|| "UTC".into())).unwrap();
+                assert!(notes.is_empty(), "{notes:?}");
+                let place = facts.place.unwrap();
+                assert!(place.validate().is_ok(), "{place:?}");
+                place.seed
+            })
+            .collect();
+        assert!(seeds.iter().any(|seed| *seed != seeds[0]), "{seeds:?}");
     }
 
     #[test]
@@ -169,8 +184,10 @@ mod tests {
             "EXACT_AGENT_TIME_ZONE" => Some("America/Toronto".into()),
             "EXACT_AGENT_LOCALE" => Some("fr-CA".into()),
             "EXACT_AGENT_FORMAT_LOCALE" => Some("fr-FR".into()),
+            "EXACT_AGENT_SEED" => Some("42".into()),
             _ => panic!("headless launch read {key}"),
-        });
+        })
+        .unwrap();
         assert!(notes.is_empty());
         let time = facts.time.unwrap();
         assert_eq!(
@@ -178,12 +195,44 @@ mod tests {
             (1_790_000_000_000., -240.)
         );
         let place = facts.place.unwrap();
+        assert_eq!(place.seed, 42.);
         assert_eq!(
             (place.locale.as_str(), place.format_locale.as_str()),
             ("fr-CA", "fr-FR")
         );
-        let (default, _) = launch(false, |_| None);
+        let (default, _) = launch(false, |_| None).unwrap();
         assert_eq!(default.time.unwrap().epoch_at_zero, AGENT_EPOCH);
+        assert_eq!(default.place.unwrap().seed, 1.);
+    }
+
+    #[test]
+    fn headless_seed_accepts_the_u32_range_and_refuses_invalid_values() {
+        for (value, expected) in [("0", 0.), ("4294967295", 4_294_967_295.)] {
+            let (facts, notes) = launch(false, |key| {
+                (key == "EXACT_AGENT_SEED").then(|| value.into())
+            })
+            .unwrap();
+            assert!(notes.is_empty(), "{notes:?}");
+            let place = facts.place.unwrap();
+            assert_eq!(place.seed, expected);
+            assert!(place.validate().is_ok());
+        }
+        for value in [
+            "4294967296",
+            "9007199254740991",
+            "-1",
+            "1.5",
+            "NaN",
+            "seven",
+            "",
+        ] {
+            let error = launch(false, |key| {
+                (key == "EXACT_AGENT_SEED").then(|| value.into())
+            })
+            .unwrap_err();
+            assert!(error.contains("EXACT_AGENT_SEED"), "{value}: {error}");
+            assert!(error.contains("0 through 2^32 - 1"), "{value}: {error}");
+        }
     }
 
     #[test]
@@ -194,7 +243,7 @@ mod tests {
             ("EXACT_AGENT_TIME_ZONE", "Bad/Zone"),
             ("EXACT_AGENT_EPOCH", "not a date"),
         ] {
-            let (facts, notes) = launch(false, |k| (k == key).then(|| value.into()));
+            let (facts, notes) = launch(false, |k| (k == key).then(|| value.into())).unwrap();
             assert_eq!(notes.len(), 1);
             assert!(facts.place.unwrap().validate().is_ok());
             assert!(facts.time.unwrap().validate().is_ok());
@@ -210,7 +259,7 @@ mod tests {
                 _ => None,
             }
         };
-        let (facts, notes) = launch(true, env(":America/Los_Angeles"));
+        let (facts, notes) = launch(true, env(":America/Los_Angeles")).unwrap();
         let place = facts.place.unwrap();
         assert_eq!(
             (place.locale.as_str(), place.time_zone.as_str()),
@@ -222,7 +271,7 @@ mod tests {
             Some("Europe/Paris")
         );
         // A POSIX rule is not a name: the machine's zone stands in, the locale stays.
-        let (facts, _) = launch(true, env("PST8PDT,M3.2.0,M11.1.0"));
+        let (facts, _) = launch(true, env("PST8PDT,M3.2.0,M11.1.0")).unwrap();
         let place = facts.place.unwrap();
         assert_eq!(place.locale, "fr-FR");
         assert!(place.validate().is_ok());

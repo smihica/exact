@@ -6,6 +6,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 export const root = resolve(import.meta.dir, '../../..');
 export { checker } from '../../camera/test/fixture.mjs';
@@ -22,7 +23,7 @@ export const run = (cmd, args, cwd, env = process.env) => {
 export function makeFixture(name, { grants, reads = true } = {}) {
   const pkg = resolve(root, 'packages', name), here = join(pkg, 'test/fixture');
   const dir = mkdtempSync(join(tmpdir(), `exact-${name}-`)), app = join(dir, `${name}fixture`);
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac,linux'], root);
   for (const f of ['app.contract', 'app.ts', 'strings']) cpSync(join(here, f), join(app, f), { recursive: true });
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -34,6 +35,9 @@ export function makeFixture(name, { grants, reads = true } = {}) {
   manifest.dependencies = { ...manifest.dependencies, [`@exact/${name}`]: `file:${pkg}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, name: basename(app), id, remove: () => rmSync(dir, { recursive: true, force: true }) };
 }
 

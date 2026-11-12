@@ -43,6 +43,9 @@ pub enum Request {
     /// D6): the shell takes Back only while it has, so that Back at the
     /// first screen leaves with the system's own animation.
     Back(bool),
+    /// Whether canvas routing takes pad input (LLP 1133.022 D4): otherwise
+    /// the reader leaves controller events to Android's navigation.
+    PadInput(bool),
     /// The software keyboard: hidden (0), shown for an `input` (1) or for a
     /// `textarea` (3); and the field it is for where the shell hosts that
     /// field (LLP 1115.001 D8), which then takes the focus and shows its
@@ -121,6 +124,7 @@ impl Request {
             Request::Module(_) => 11,
             Request::Presence(_) => 12,
             Request::Orientation(_) => 13,
+            Request::PadInput(_) => 14,
         }
     }
 }
@@ -211,6 +215,7 @@ pub(super) struct State {
     back: Option<bool>,
     back_epoch: Option<u64>,
     keyboard: Option<(u32, ViewId)>,
+    pad_input: Option<bool>,
     /// What the shell was last told of the wake lock and the kernel epoch
     /// that was read at; whether a host with no shell journaled it.
     wakelock: Option<bool>,
@@ -231,6 +236,10 @@ pub(super) struct State {
     packages: packages::Packages,
     /// Whether the native slot's handler is installed.
     handling: bool,
+    /// The target this host said and the extensions it bound (as in
+    /// production, under the agent): what a replacement runner is told.
+    target: Option<&'static str>,
+    bound: Option<(Vec<String>, Vec<String>)>,
 }
 
 /// `EXACT_LOG_REQUESTS=1`: each request and each answer on stderr (a
@@ -269,7 +278,9 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
                 string(out, part.as_deref().unwrap_or_default());
             }
         }
-        Request::Back(goes) | Request::KeepScreenOn(goes) => out.push(i32::from(*goes)),
+        Request::Back(goes) | Request::KeepScreenOn(goes) | Request::PadInput(goes) => {
+            out.push(i32::from(*goes));
+        }
         Request::Keyboard(kind, field) => out.extend([*kind as i32, *field as i32]),
         // 0 for none; else 1, the types' bits (portrait-primary 1,
         // portrait-secondary 2, landscape-primary 4, landscape-secondary 8),
@@ -330,13 +341,50 @@ impl<D: DataSource> Presenter<D> {
         } else {
             "linux"
         };
-        self.host.runner_mut().set_module_target(target);
+        self.say_target(target);
         if self.requests.packages.is_empty() {
             return;
         }
         self.handle_modules();
+        let native = self.host.runner().native_slot();
+        self.requests.packages.slot(native);
         let (real, under) = self.requests.packages.bound();
-        self.host.runner_mut().bind_extensions(&real, &under);
+        let owned = |names: Vec<&str>| names.into_iter().map(str::to_owned).collect();
+        self.bind_modules(owned(real), owned(under));
+    }
+
+    /// The host's target, which a module's per-target words are read by.
+    pub(crate) fn say_target(&mut self, target: &'static str) {
+        self.requests.target = Some(target);
+        self.host.runner_mut().set_module_target(target);
+    }
+
+    /// The extensions this host's implementations answer: `real` as in
+    /// production, `under` told they run under the agent.
+    pub(crate) fn bind_modules(&mut self, real: Vec<String>, under: Vec<String>) {
+        fn names(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        (self.host.runner_mut()).bind_extensions(&names(&real), &names(&under));
+        self.requests.bound = Some((real, under));
+    }
+
+    /// A replacement runner (a reload, an activated update) is given what
+    /// the last one had: the native slot's handler, which wakes the new
+    /// executor, the target and the bound extensions. The package instances
+    /// already made announce into its slot.
+    pub(super) fn modules_replaced(&mut self) {
+        if std::mem::take(&mut self.requests.handling) {
+            self.handle_modules();
+        }
+        let native = self.host.runner().native_slot();
+        self.requests.packages.slot(native);
+        if let Some(target) = self.requests.target {
+            self.host.runner_mut().set_module_target(target);
+        }
+        if let Some((real, under)) = self.requests.bound.take() {
+            self.bind_modules(real, under);
+        }
     }
 
     /// The session ends: each package instance's `destroy`.
@@ -377,13 +425,13 @@ impl<D: DataSource> Presenter<D> {
             return;
         }
         let mut queued = false;
-        let (native, wake) = (self.host.runner().native_slot(), self.executor.waker());
+        let wake = self.executor.waker();
         for (body, reply) in calls {
             let extension = packages::extension_of(&body).unwrap_or_default();
             if self.requests.packages.serves(&extension) {
                 let now = self.host.now();
                 let inbox = self.requests.inbox.clone();
-                (self.requests.packages).dispatch(&body, reply, now, &native, &inbox, &wake);
+                (self.requests.packages).dispatch(&body, reply, now, &inbox, &wake);
             } else if self.requests.shell {
                 let id = self.queue(Request::Module(String::from_utf8_lossy(&body).into_owned()));
                 self.requests.modules.insert(id, reply);
@@ -442,8 +490,9 @@ impl<D: DataSource> Presenter<D> {
     /// What the shell is told of the app's state, when it is not what it
     /// was last told: whether Back has somewhere to go (read again only
     /// after a commit, since it walks the tree) and whether a text field
-    /// holds the focus, which shows and hides the software keyboard. Queued
-    /// with no wake: the shell calls this as it takes its requests.
+    /// holds the focus, which shows and hides the software keyboard; and
+    /// whether a canvas takes pad input. Queued with no wake: the shell
+    /// calls this as it takes its requests.
     pub fn tell_shell(&mut self) {
         if !self.requests.shell {
             return;
@@ -463,6 +512,11 @@ impl<D: DataSource> Presenter<D> {
         if self.requests.keyboard != Some(keyboard) {
             self.requests.keyboard = Some(keyboard);
             self.queue(Request::Keyboard(keyboard.0, keyboard.1));
+        }
+        let pad_input = self.pad_target().is_some();
+        if self.requests.pad_input != Some(pad_input) {
+            self.requests.pad_input = Some(pad_input);
+            self.queue(Request::PadInput(pad_input));
         }
         if let Some(held) = self.wakelock_moved() {
             self.queue(Request::KeepScreenOn(held));
@@ -671,6 +725,7 @@ impl<D: DataSource> Presenter<D> {
         (self.requests.back, self.requests.back_epoch) = (None, None);
         self.requests.keyboard = None;
         (self.requests.wakelock, self.requests.wakelock_epoch) = (None, None);
+        self.requests.pad_input = None;
         let waiting: Vec<u32> = (self.requests.waiting.iter())
             .filter(|(_, w)| !matches!(w, Waiting::Pick(_)))
             .map(|(id, _)| *id)

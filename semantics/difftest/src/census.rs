@@ -169,6 +169,10 @@ mod tests {
             "unclassified"
         );
         assert_eq!(refusal_class("Trap(FutureError { pc: 0 })"), "unclassified");
+        assert_eq!(
+            refusal_class("Instance(DuplicateKey { region: RegionsId(0) })"),
+            "unclassified"
+        );
     }
 
     #[test]

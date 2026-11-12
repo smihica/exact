@@ -30,6 +30,7 @@ fn main() {
         "shared_elements_data::Shared",
         "shared_elements_data::Shared",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

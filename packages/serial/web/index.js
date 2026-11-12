@@ -44,7 +44,8 @@ export function implementation({ changed }) {
           if (!c.open) break;
           const { value, done } = await reader.read();
           if (done) break;
-          if (value?.length) { c.pending.push(...value); changed('serial.serialInput'); }
+          // One byte at a time: a spread passes each as an argument, which a read near `bufferSize`'s 16 MiB exceeds.
+          if (value?.length) { for (const byte of value) c.pending.push(byte); changed('serial.serialInput'); }
         }
       } catch (e) {
         // A non-fatal error ends this readable; the port gives a new one (Web Serial's "readable" steps).

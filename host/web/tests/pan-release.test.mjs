@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // `panrelease` in a real browser (LLP 1057 §10.6 phase 2): the input glue's
 // pan, driven by CDP mouse and touch events. A pan that began ends with one
 // release carrying the tracker's velocity over the contact's samples (each at
@@ -5,7 +6,6 @@
 // a cancelled contact releases at rest, and the journal says why. The tracker itself is the engine's
 // (host/web/src/pan_velocity.rs); here a stand-in records what the glue feeds it.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

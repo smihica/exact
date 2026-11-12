@@ -1,10 +1,10 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // exact2's menu rule in a real browser (LLP 1021; theme2 2026-10-21 19:47,
 // 22:05): a popover a row of a menu (`role="menu"`) opens is opened as if by
 // the menu's own invoker, so the menu closing as its row is chosen doesn't
 // take it along; a submenu, itself a menu, stays nested in its menu; a row
 // that hides its menu is unchanged. Both web targets run host/web/menu-rows.js.
 import { expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

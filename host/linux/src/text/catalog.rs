@@ -126,26 +126,11 @@ impl Catalog {
             .iter()
             .skip(self.families.len().saturating_sub(compiled))
         {
-            let mut chosen = FamilyChoice::SansSerif;
-            for member in exact_runner::bridge::runtime_family_members(list) {
-                let name = member.name;
-                let generic = match name.to_ascii_lowercase().as_str() {
-                    "serif" | "ui-serif" => Some(FamilyChoice::Serif),
-                    "monospace" | "ui-monospace" => Some(FamilyChoice::Monospace),
-                    "system-ui" | "ui-sans-serif" | "sans-serif" | "ui-rounded" => {
-                        Some(FamilyChoice::SansSerif)
-                    }
-                    _ => None,
-                };
-                if let Some(generic) = generic.filter(|_| !member.quoted) {
-                    chosen = generic;
-                    break;
-                }
-                if fonts::installed_family(&mut self.fonts.collection, &name) {
-                    chosen = FamilyChoice::Declared(name);
-                    break;
-                }
-            }
+            let chosen = self.installed_stack(
+                exact_runner::bridge::runtime_family_members(list)
+                    .into_iter()
+                    .map(|m| (m.quoted, m.name)),
+            );
             self.families.push(chosen);
         }
         let end = self.families.len() as u16;
@@ -153,6 +138,39 @@ impl Catalog {
             .retain(|(family, ..), _| !(*family >= first && *family < end));
         first..end
     }
+    pub(super) fn install_picture(&mut self, lists: &[Vec<(bool, String)>]) {
+        for list in lists {
+            let chosen = self.installed_stack(list.iter().cloned());
+            self.families.push(chosen);
+        }
+    }
+
+    fn installed_stack(
+        &mut self,
+        members: impl IntoIterator<Item = (bool, String)>,
+    ) -> FamilyChoice {
+        let mut chosen = FamilyChoice::SansSerif;
+        for (installed, name) in members {
+            let generic = match name.to_ascii_lowercase().as_str() {
+                "serif" | "ui-serif" => Some(FamilyChoice::Serif),
+                "monospace" | "ui-monospace" => Some(FamilyChoice::Monospace),
+                "system-ui" | "ui-sans-serif" | "sans-serif" | "ui-rounded" => {
+                    Some(FamilyChoice::SansSerif)
+                }
+                _ => None,
+            };
+            if let Some(generic) = generic.filter(|_| !installed) {
+                chosen = generic;
+                break;
+            }
+            if fonts::installed_family(&mut self.fonts.collection, &name) {
+                chosen = FamilyChoice::Declared(name);
+                break;
+            }
+        }
+        chosen
+    }
+
     /// The installed faces, with `sans-serif`, `serif` and `monospace` settled
     /// as the host settles them.
     pub(super) fn new() -> Self {

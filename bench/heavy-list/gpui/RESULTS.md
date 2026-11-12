@@ -2311,7 +2311,7 @@ D3D11/egui/Ink-wgpu medians were **175.98/248.76/716.21 ms**, rising to
 **249.30/348.00/1007.25 ms** after supported driver-cache resets. G6d corrected
 readiness ordering; the historical startup distributions do not isolate a
 scheduling gain or close [G6c's paired-startup question](#g6c-one-paint-per-refresh).
-[S2](../../../llp/1149-the-renderer.rfc.md#d12--where-it-is-the-presenter-and-what-the-same-everywhere-promises)
+S2 in LLP 1149 D12
 records Shelf first screens of **142 ms D3D11 versus 859 ms wgpu**;
 [C6](../../../host/ink/MEASUREMENTS.md#device-startup-host-dev) measured
 **48 versus 139 ms** device creation and **457 ms** wgpu pipelines. Those

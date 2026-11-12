@@ -236,6 +236,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         sessions = [("a", a), ("b", b)]
         return true
     }
+    #if !os(tvOS)
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        exact.registeredForRemoteNotifications(deviceToken: deviceToken)
+    }
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        exact.failedToRegisterForRemoteNotifications(error: error)
+    }
+    #endif
     // A scene, not an app-wide window: an app that adopts no scene
     // lifecycle traps at launch on iOS 27.
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {

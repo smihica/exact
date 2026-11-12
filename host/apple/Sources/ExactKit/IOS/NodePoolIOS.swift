@@ -20,11 +20,11 @@
 // - geometry and presentation: frame, transform, translate/scale/rotate,
 //   opacity, hidden; `content`; the create's frame and present ops set them;
 // - paint: the text raster, paragraph and inline runs (the new row's
-//   `paragraph` op sets its own), layout caches, the live-region text, the
-//   layer's bitmap; a raster image, its sublayer and its load (the
-//   generation moves, so no completion lands); the symbol's key (its size is
-//   reported again for the new id), keeping the glyph view unless the new
-//   node shows no symbol;
+//   `paragraph` op sets its own), column fragments and rules, layout caches,
+//   the live-region text and layer bitmap; raster images, their sublayers
+//   and loads (the generation moves, so no completion lands); the symbol's
+//   key (its size is reported again for the new id), keeping the glyph view
+//   unless the new node shows no symbol;
 // - input and accessibility: interaction enabled, the element, traits,
 //   label, value, hint, identifier, hidden-elements, all set again by props;
 // - motion: an `svg`'s scene layers and every Core Animation spec the view
@@ -536,6 +536,10 @@ extension NodeView {
         cancelSurfaceControls()
         invalidateText()
         cachedTextLayout = nil
+        if columnRecord != nil {
+            columnRecord = nil
+            layoutColumnRules()
+        }
         parkTextRaster()
         liveText = nil
         loadGeneration += 1

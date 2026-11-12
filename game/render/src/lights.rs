@@ -14,8 +14,8 @@ use glam::{Vec3, Vec4Swizzles};
 /// Screen tiles across, down, and depth slices.
 pub(crate) const CLUSTERS: [u32; 3] = [16, 9, 24];
 const CELLS: usize = (CLUSTERS[0] * CLUSTERS[1] * CLUSTERS[2]) as usize;
-/// u32 words per light record (lights.wgsl).
-pub(crate) const RECORD_WORDS: usize = 16;
+/// u32 words per light record (lights.wgsl): five vec4s.
+pub(crate) const RECORD_WORDS: usize = 20;
 
 pub(crate) struct Lights {
     pub buffer: Buffer,
@@ -186,6 +186,7 @@ impl Lights {
             self.words[matrices + i * 16..matrices + (i + 1) * 16]
                 .copy_from_slice(&view.to_cols_array().map(f32::to_bits));
         }
+        let filter = filter_words(&frame.local_shadows);
         for (i, light) in lights.iter().enumerate() {
             let [inner, outer] = light.cone.unwrap_or([-2., -2.]);
             let shadow = shadows.layers.get(i).copied().flatten();
@@ -206,6 +207,15 @@ impl Lights {
                 shadow.map_or(-1., |(layer, _)| layer as f32),
                 shadow.map_or(0., |(layer, _)| (matrices + layer as usize * 16) as f32),
                 shadow.map_or(0., |(_, texel)| texel),
+                // NaN takes the default; a negative exponent would brighten with distance.
+                if light.decay.is_nan() {
+                    2.
+                } else {
+                    light.decay.max(0.)
+                },
+                filter[0],
+                filter[1],
+                filter[2],
             ];
             self.words[i * RECORD_WORDS..(i + 1) * RECORD_WORDS]
                 .copy_from_slice(&record.map(f32::to_bits));
@@ -234,6 +244,35 @@ impl Lights {
             .grow(device, queue, (self.words.len() * 4) as u64);
         self.buffer.write(queue, 0, bytes(&self.words));
         grew
+    }
+}
+
+/// Record words 17-19, the local shadow filter (shadow_sample.wgsl
+/// `light_visibility`): 0, the tap spacing in texels; or 1 (PCF-soft) or 2
+/// (bilinear), the normalized depth bias and the normal bias in metres.
+fn filter_words(settings: &crate::LocalShadows) -> [f32; 3] {
+    let finite = |n: f32| if n.is_finite() { n } else { 0. };
+    match settings.filter {
+        crate::ShadowFilter::ReceiverPlane => {
+            let softness = settings.softness;
+            [
+                0.,
+                if softness.is_finite() {
+                    softness.max(0.)
+                } else {
+                    1.
+                },
+                0.,
+            ]
+        }
+        crate::ShadowFilter::PcfSoft {
+            depth_bias,
+            normal_bias,
+        } => [1., finite(depth_bias), finite(normal_bias)],
+        crate::ShadowFilter::Bilinear {
+            depth_bias,
+            normal_bias,
+        } => [2., finite(depth_bias), finite(normal_bias)],
     }
 }
 

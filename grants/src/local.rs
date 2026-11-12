@@ -1,7 +1,7 @@
 //! The local network as a grant names it (LLP 1133.036 D5): decided from a
 //! URL's host as written, never from where a name resolves.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The target word of `net.fetch local-network` and `net.websocket
 /// local-network`.
@@ -16,10 +16,17 @@ pub const DEVELOPMENT: &str = "development";
 /// brackets), is on the local network: an RFC 1918, link-local IPv4,
 /// unique-local IPv6 or link-local IPv6 literal, an IPv4-mapped IPv6 address
 /// judged by the IPv4 address it carries, or a name ending in `.local`
-/// (RFC 6762 §3). The cloud metadata address 169.254.169.254 is excluded.
-/// With `loopback`, also 127.0.0.0/8, `[::1]` and `localhost`.
+/// (RFC 6762 §3), except the [`is_cloud_metadata`] addresses. With
+/// `loopback`, also 127.0.0.0/8, `[::1]` and `localhost`.
+///
+/// `vendor/ibex`'s `ibex2::grant::is_local_network`, which native hosts admit
+/// by, and the web's `isLocalNetwork` (`host/web/navigation.js`) mirror it;
+/// `host/web/tests/fixtures/grants.json` holds all three to the same answers.
 pub fn is_local_network(host: &str, loopback: bool) -> bool {
     let host = host.to_ascii_lowercase();
+    if is_cloud_metadata(&host) {
+        return false;
+    }
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         return inner
             .parse::<Ipv6Addr>()
@@ -30,6 +37,28 @@ pub fn is_local_network(host: &str, loopback: bool) -> bool {
     }
     let name = host.strip_suffix('.').unwrap_or(&host);
     name.ends_with(".local") && name.len() > ".local".len() || loopback && name == "localhost"
+}
+
+/// Whether `host`, as a URL serializes it, is a cloud instance metadata
+/// service: 169.254.169.254 (EC2, Google Cloud, Azure), its IPv4-mapped
+/// IPv6 spelling, or `[fd00:ec2::254]`, EC2's IPv6 endpoint on Nitro
+/// instances
+/// (<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html>).
+/// They are link-local and unique-local, but where one answers, it answers
+/// with the instance's credentials, so a `local-network` line never admits
+/// them.
+pub fn is_cloud_metadata(host: &str) -> bool {
+    const V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+    const V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address == V4,
+        Ok(IpAddr::V6(address)) => address == V6 || address.to_ipv4_mapped() == Some(V4),
+        Err(_) => false,
+    }
 }
 
 /// Whether `kind` is a DNS-SD service type `net.dns-sd` may name (LLP
@@ -52,8 +81,7 @@ pub fn is_service_type(kind: &str) -> bool {
 }
 
 fn local_v4(address: Ipv4Addr, loopback: bool) -> bool {
-    address != Ipv4Addr::new(169, 254, 169, 254)
-        && (address.is_private() || address.is_link_local() || loopback && address.is_loopback())
+    address.is_private() || address.is_link_local() || loopback && address.is_loopback()
 }
 
 fn local_v6(address: Ipv6Addr, loopback: bool) -> bool {
@@ -103,8 +131,10 @@ mod tests {
             "172.31.255.255",
             "192.168.1.40",
             "169.254.3.4",
+            "169.254.169.253",
             "[fd12:3456::1]",
             "[fc00::1]",
+            "[fd00:ec2::253]",
             "[fe80::1]",
             "[::ffff:192.168.1.40]",
             "wled-a1b2c3.local",
@@ -116,6 +146,9 @@ mod tests {
         for host in [
             "169.254.169.254",
             "[::ffff:169.254.169.254]",
+            "[::ffff:a9fe:a9fe]",
+            "[fd00:ec2::254]",
+            "[FD00:EC2:0:0:0:0:0:254]",
             "172.32.0.1",
             "8.8.8.8",
             "100.64.0.1",
@@ -148,5 +181,6 @@ mod tests {
         assert!(!is_local_network("8.8.8.8", true));
         assert!(!is_local_network("169.254.169.254", true));
         assert!(!is_local_network("[::ffff:a9fe:a9fe]", true));
+        assert!(!is_local_network("[fd00:ec2::254]", true));
     }
 }

@@ -674,6 +674,11 @@ package final class Runtime {
     package func routeMatches(_ location: String) -> Bool {
         return on(busy: false) { exact_route_matches(rt, write(location)) != 0 }
     }
+    /// Whether the route table declares one location besides `notfound` (LLP 1115.000 D5.1);
+    /// `nil` while the runtime is busy.
+    package func routeOneLocation() -> Bool? {
+        on(busy: nil) { exact_route_one_location(rt) != 0 }
+    }
     /// The location of the visit beneath the route keyed `key` on its stack,
     /// `nil` for a stack's root or a key that names no visit (LLP 1115 D5).
     package func locationBeneath(_ key: String) -> String? {
@@ -722,6 +727,13 @@ package final class Runtime {
     }
     package func hostGo(_ location: String, now: Double) -> Batch {
         on { read(exact_host_go(rt, write(location), now)) }
+    }
+    package func hostForward(_ root: UInt32, now: Double) -> Batch {
+        on { read(exact_host_forward(rt, root, now)) }
+    }
+    /// Build the tab panels `panels`, selecting none (LLP 1075.003 §9.14).
+    package func buildTabs(_ panels: [UInt32], now: Double) -> Batch {
+        on { read(exact_build_tabs(rt, write(panels.map(String.init).joined(separator: ",")), now)) }
     }
     /// A received share, `{"root", "target", "share", "inbox"?}` (LLP 1133.024 D2–D4).
     package func share(_ json: String, now: Double) -> Batch { on { read(exact_share(rt, write(json), now)) } }

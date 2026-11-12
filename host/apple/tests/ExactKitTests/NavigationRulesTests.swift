@@ -433,6 +433,32 @@ final class MacShortcutTests: XCTestCase {
                          characters: key, charactersIgnoringModifiers: ignoring ?? key, isARepeat: repeating, keyCode: code)!
     }
 
+    /// Supply layout translations without changing the Mac's input source.
+    private final class LayoutEvent: NSEvent {
+        let wrapped: NSEvent, unshifted: String, command: String, commandShift: String
+        init(_ event: NSEvent, unshifted: String, command: String, commandShift: String) {
+            wrapped = event; self.unshifted = unshifted
+            self.command = command; self.commandShift = commandShift
+            super.init()
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+        override var type: NSEvent.EventType { wrapped.type }
+        override var window: NSWindow? { wrapped.window }
+        override var characters: String? { wrapped.characters }
+        override var charactersIgnoringModifiers: String? { wrapped.charactersIgnoringModifiers }
+        override var modifierFlags: NSEvent.ModifierFlags { wrapped.modifierFlags }
+        override var keyCode: UInt16 { wrapped.keyCode }
+        override var isARepeat: Bool { wrapped.isARepeat }
+        override func characters(byApplyingModifiers modifiers: NSEvent.ModifierFlags) -> String? {
+            switch modifiers {
+            case []: return unshifted
+            case .command: return command
+            case [.command, .shift]: return commandShift
+            default: return wrapped.characters(byApplyingModifiers: modifiers)
+            }
+        }
+    }
+
     func testNamedKeysPrintablePlusAndContextKeysReachTheirDeclaredAction() {
         let presenter = Presenter(), window = window(presenter)
         defer { window.close() }
@@ -627,6 +653,39 @@ final class MacShortcutTests: XCTestCase {
         XCTAssertFalse(menu.performKeyEquivalent(with: event("ㅠ", window: window, modifiers: [.command, .control], code: 11)))
         XCTAssertFalse(menu.performKeyEquivalent(with: event("ㅂ", window: window, code: 15)), "R's key has no command")
         XCTAssertEqual(sent, ["Toggle Sidebar"])
+    }
+
+    func testCommandUsesTheCommandLayoutsCharacter() {
+        let presenter = Presenter(), window = window(presenter)
+        defer { window.close() }
+        _ = button(1, "Stop", "Meta+.", in: presenter)
+        _ = button(2, "Edit", "Meta+e Meta+Shift+e Meta+Control+e", in: presenter)
+        _ = button(3, "Paste", "Meta+Shift+v", in: presenter)
+        _ = button(4, "Greater", "Meta+Shift+>", in: presenter)
+        _ = button(5, "Shift Period", "Meta+Shift+.", in: presenter)
+        var presses: [UInt32] = []
+        presenter.onPress = { presses.append($0) }
+        let cases: [(String, String, String, String, String, UInt16, NSEvent.ModifierFlags, UInt32)] = [
+            // Dvorak - QWERTY Command changes the layout while Command is held.
+            (".", "v", "v", ".", ">", 47, .command, 1),
+            ("e", ".", ".", "e", "e", 14, .command, 2),
+            (".", "V", "v", ".", ">", 47, [.command, .shift], 4),
+            (">", "V", "v", ".", ">", 47, [.command, .shift], 4),
+            ("e", ">", ".", "e", "e", 14, [.command, .shift], 2),
+            // Ordinary Dvorak keeps its layout under Command.
+            ("v", "V", "v", "v", "v", 47, [.command, .shift], 3),
+            (".", ">", ".", ".", ".", 14, [.command, .shift], 4),
+            // US Shift and Control retain their logical keys.
+            (".", ">", ".", ".", ".", 47, [.command, .shift], 4),
+            ("\u{5}", "e", "e", "e", "e", 14, [.command, .control], 2),
+        ]
+        for (character, ignoring, unshifted, command, commandShift, code, modifiers, id) in cases {
+            presses.removeAll()
+            let key = LayoutEvent(event(character, window: window, modifiers: modifiers, code: code, ignoring: ignoring),
+                                  unshifted: unshifted, command: command, commandShift: commandShift)
+            XCTAssertTrue(presenter.shortcuts.perform(key), "\(character), ignoring modifiers: \(ignoring)")
+            XCTAssertEqual(presses, [id])
+        }
     }
 
     func testOptionMatchesProducedCharactersAndDoesNotMatchDeadKeys() {

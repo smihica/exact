@@ -255,6 +255,10 @@
       "name": "@exact/purchases",
       "version": "1.0.0",
     },
+    "packages/push": {
+      "name": "@exact/push",
+      "version": "1.0.0",
+    },
     "packages/quick-actions": {
       "name": "@exact/quick-actions",
       "version": "1.0.0",
@@ -418,6 +422,8 @@
     "@exact/photos": ["@exact/photos@workspace:packages/photos"],
 
     "@exact/purchases": ["@exact/purchases@workspace:packages/purchases"],
+
+    "@exact/push": ["@exact/push@workspace:packages/push"],
 
     "@exact/quick-actions": ["@exact/quick-actions@workspace:packages/quick-actions"],
 

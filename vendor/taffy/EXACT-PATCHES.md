@@ -3,7 +3,7 @@
 - **Upstream:** `taffy` 0.14.0, crates.io package supplied offline at
   `~/Library/Caches/exact2-textflow/taffy-0.14.0/` (M8, 2026-09-18).
   Its `.cargo_vcs_info.json` pins commit `77f385683c1d698c91a23a259f87fdddf26925fb`.
-- **Why vendored:** patches 3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68 and 69 below remain. `[patch.crates-io]`
+- **Why vendored:** patches 3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70 and 71 below remain. `[patch.crates-io]`
   selects this copy; the kernel declares `taffy = "0.14"`.
 - **Owner:** Charlie Cheever (kernel/layout).
 - **Features:** std, taffy_tree, flexbox, grid, block_layout, content_size, calc.
@@ -2210,3 +2210,56 @@ patch), `a_relative_row_without_insets_moves_nothing_however_aligned`,
 `a_popover_row_before_a_viewport_keeps_its_cells_on_it` and
 `a_relative_rows_cells_take_the_engines_offset`. Every `browser_*` Chrome
 case and the layout-equality comparisons pass unchanged.
+
+## Patch 70: a grid container may raise its highest line — Exact's
+
+Taffy clamps every placement to lines −10,000 to 10,000 and every span to
+10,000 tracks (`MAX_GRID_TRACKS`, its reading of
+[CSS Grid 1 §8.1.2](https://www.w3.org/TR/css-grid-1/#overlarge-grids)), so
+items placed past the 10,000th track all land in it. A table laid out as a
+grid (`kernel/src/layout/table.rs`, LLP 1153 D7.3) gives each row a track of
+its own, and Chrome lays out a table of any length. An authored grid keeps
+the limit, past which the kernel refuses its values (LLP 1001 §1).
+
+`RareStyle::grid_line_limit` (read through
+`GridContainerStyle::grid_line_limit`; 10,000 by default) is the highest
+line, in OriginZero coordinates, at which a grid places an item, and the
+largest span, up to `i16::MAX`. `LineLimit` carries it to everything that
+read the constants: the conversion to OriginZero lines, the grid size
+estimate, the placement of in-flow and absolutely positioned items, and the
+detailed layout info (which takes the limit that covers its own lines). So
+that every track index still fits an `i16`, the lowest line rises as the
+highest passes 22,767; at `i16::MAX`, the kernel's value for a table, nothing
+is placed before the explicit grid, where a table places nothing. Since a
+line and a span may each reach `i16::MAX`, adding a span to a line saturates
+(`OriginZeroLine` plus or minus a `u16`), and the result is clamped as
+before. The `into_origin_zero*` methods of `GridPlacement`,
+`Line<GridPlacement>`, `NonNamedGridPlacement` and `Line<NonNamedGridPlacement>`
+take a `LineLimit`, which Taffy does not export, so only Taffy calls them.
+The explicit grid's own limit of 10,000 tracks is unchanged.
+
+Chrome for Testing 156.0.8078.4 lays 10,010 rows of `tr > td > div` (a 20 × 10
+div) out with row 10,000 at y 140,002 and row 10,009 at 140,128, the table
+140,142 tall; before the patch Exact put every row from 10,000 on at row
+9,999's 139,988, the table 140,002 tall. On an Apple M5 Pro at the
+`host-dev` profile, best of three, a first layout of 10,010 such rows takes
+96 ms (98 before the patch), and of 30,000 rows 321 ms (313); a layout after
+one cell's width changes takes 74 ms (75) and 238 ms (235).
+
+**Held by** `kernel/tests/it/table.rs`'s
+`a_tables_rows_past_ten_thousand_follow_each_other` (Chrome's frames above),
+which failed before the patch, and
+`compute::grid::placement::tests::test_placement_algorithm::a_raised_line_limit_places_rows_past_ten_thousand`
+(a raised limit's lines, spans and lowest line, and the default limit's
+placements unchanged). Every `browser_*` Chrome case and the layout-equality
+comparisons pass unchanged.
+
+## 71. Styles own their opaque calculation handles
+
+`RareStyle::keep_calc` retains an evaluator's owner beside the style's raw
+calculation handles, including grid tracks. Style clones share these owners;
+the last drop releases them. Ordinary styles allocate no owner list. The
+kernel uses weak hash indexes, so dropping a style can reclaim calculations
+without invalidating a detached dimension or another retained style.
+
+Held by the kernel's calculation reclamation and retained-style tests.

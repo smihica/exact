@@ -14,7 +14,7 @@ mod step;
 mod types;
 
 pub use character::{capsule, CapsuleHandle, CapsuleStep};
-use exact_game::{Ref, World};
+use exact_game::{Entity, Ref, World};
 pub use queries::{overlap, queries, raycast, sweep, Queries};
 pub use step::step;
 pub use types::*;
@@ -43,6 +43,17 @@ impl std::ops::Deref for Touches<'_> {
 /// A bare slice would outlive the engine's dynamic storage lease and be unsound.
 pub fn events(world: &World) -> Touches<'_> {
     Touches(world.resource::<Physics>())
+}
+
+/// The mass in kilograms that the last step gave an entity's Body: the authored
+/// `Body::mass`, or the one derived from its collider. None until a step has seen
+/// the Body.
+pub fn mass(world: &World, entity: Entity) -> Option<f32> {
+    let physics = world.resource::<Physics>();
+    let saved = physics.executor.0.borrow();
+    let live = saved.live.as_ref()?;
+    let h = live.entries.get(&entity)?.bh()?;
+    Some(live.rapier.bodies[h].mass())
 }
 
 /// Whether every dynamic Body is asleep, including bodies without colliders.

@@ -43,6 +43,29 @@ final class PlatformWeightsTests: XCTestCase {
         XCTAssertEqual(TextEngine.cssWeight(of: between), 650)
     }
 
+    func testAxesReadFromTheTableAreCoreTexts() {
+        var faces = TextEngine.namedWeights.map { PlatformFont.systemFont(ofSize: 17, weight: $0) }
+        faces += [PlatformFont.monospacedSystemFont(ofSize: 13, weight: .medium), PlatformFont.preferredFont(forTextStyle: .body),
+                  engine.font(size: 17, weight: 600, family: 3, italic: false), engine.font(size: 17, weight: 650, family: 0, italic: true)]
+        for face in faces {
+            XCTAssertFalse(TextEngine.axes(face).isEmpty, name(face))
+            XCTAssertEqual(TextEngine.axes(face), TextEngine.namedAxes(face), name(face))
+        }
+        // A face without the axis has none either way.
+        let plain = CTFontCreateWithName("Helvetica" as CFString, 12, nil) as PlatformFont
+        XCTAssertEqual(TextEngine.axes(plain), TextEngine.namedAxes(plain))
+        XCTAssertNil(TextEngine.cssWeight(of: plain))
+        // Every installed face: Skia's axes are fractions Core Text cuts, not rounds.
+        var variable = 0
+        for name in CTFontManagerCopyAvailablePostScriptNames() as? [String] ?? [] {
+            let face = CTFontCreateWithName(name as CFString, 12, nil) as PlatformFont
+            let named = TextEngine.namedAxes(face)
+            if !named.isEmpty { variable += 1 }
+            XCTAssertEqual(TextEngine.axes(face), named, name)
+        }
+        XCTAssertGreaterThan(variable, 0)
+    }
+
     func testItalicKeepsItsWeight() {
         let italic = engine.font(size: 17, weight: 700, family: 0, italic: true)
         XCTAssertTrue(name(italic).hasSuffix("BoldItalic"), name(italic))

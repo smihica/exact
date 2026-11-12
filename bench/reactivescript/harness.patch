@@ -1,0 +1,752 @@
+From e641cfb499ebb8f7fea446602d0a1e3631ad4374 Mon Sep 17 00:00:00 2001
+From: bench <bench@localhost>
+Date: Wed, 11 Nov 2026 03:12:44 -0800
+Subject: [PATCH] eval: a contract arm (Exact), and a desk9 reference in
+ Contract
+
+The contract arm builds an Exact app (app.contract and app.ts, made by `exact new`
+from the checkout EXACT2 names) with its own exact.mjs web-build. Its data module
+imports the task's src/api.js and runs in the page's realm, so flights.js and the
+driver are unchanged. ./check is the Contract compiler, which also type-checks
+app.ts; --inline-docs appends Exact's docs/start-here.md.
+
+The desk9 reference uses a resource's when and current(x) (LLP 1161.001, 1161.002)
+and parallel mutations (LLP 1161.000). On an Exact with them it passes every
+visible, hidden and overlap test, and the fuzzer finds no hole in 20 seeds.
+---
+ eval/harness/build.mjs                     |   3 +
+ eval/harness/check.mjs                     |   3 +
+ eval/harness/contract.mjs                  |  50 +++
+ eval/harness/prompt-arms.json              |  12 +
+ eval/harness/scaffold.mjs                  |  14 +-
+ eval/harness/score.mjs                     |   2 +-
+ eval/reference/desk9/contract/app.contract | 401 +++++++++++++++++++++
+ eval/reference/desk9/contract/app.ts       | 108 ++++++
+ 8 files changed, 589 insertions(+), 4 deletions(-)
+ create mode 100644 eval/harness/contract.mjs
+ create mode 100644 eval/reference/desk9/contract/app.contract
+ create mode 100644 eval/reference/desk9/contract/app.ts
+
+diff --git a/eval/harness/build.mjs b/eval/harness/build.mjs
+index 769bfdd..80838b0 100644
+--- a/eval/harness/build.mjs
++++ b/eval/harness/build.mjs
+@@ -6,12 +6,14 @@
+ //   vanilla arm: `src/main.ts` default-exports `mount(root: HTMLElement)`, called once with the `#app` container
+ //   foldkit arm: `src/main.ts` exports Model, init, update and view; booted with Runtime.makeApplication and
+ //              Runtime.run, as Foldkit's own `src/entry.ts` does
++//   contract arm: an Exact app, built by its own `exact.mjs web-build` (harness/contract.mjs)
+ // The app's API is `src/api.js` over `src/flights.js`: every call is a flight the test lands or fails.
+ // Usage: node harness/build.mjs <dir> [rx|react]   (the arm defaults to what `<dir>/arm` says)
+ import { execFileSync } from "node:child_process";
+ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+ import path from "node:path";
+ import { fileURLToPath, pathToFileURL } from "node:url";
++import { buildContract } from "./contract.mjs";
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ const evalDir = path.resolve(here, "..");
+@@ -35,6 +37,7 @@ async function solidPlugin() {
+ 
+ export async function build(dir, arm = armOf(dir)) {
+   dir = realpathSync(path.resolve(dir));
++  if (arm === "contract") return buildContract(dir);
+   const work = path.join(dir, ".build");
+   rmSync(work, { recursive: true, force: true }); mkdirSync(work, { recursive: true });
+   // the app's bare imports resolve from the harness's packages
+diff --git a/eval/harness/check.mjs b/eval/harness/check.mjs
+index 6de099f..c19dfdd 100644
+--- a/eval/harness/check.mjs
++++ b/eval/harness/check.mjs
+@@ -4,12 +4,14 @@
+ //   solid: tsc --noEmit -p . and eslint (eslint-plugin-solid's v2 config)
+ //   vanilla: tsc --noEmit -p . (strict)
+ //   foldkit: tsc --noEmit -p . with Foldkit's template tsconfig (its lint, oxlint + effect-tsgo, is not on npm)
++//   contract: `exact.mjs contract build app.contract`, which also type-checks app.ts
+ // Usage: node harness/check.mjs <dir>
+ import { execFileSync } from "node:child_process";
+ import { existsSync, symlinkSync } from "node:fs";
+ import path from "node:path";
+ import { fileURLToPath, pathToFileURL } from "node:url";
+ import { RXC, armOf } from "./build.mjs";
++import { checkContract } from "./contract.mjs";
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ const evalDir = path.resolve(here, "..");
+@@ -21,6 +23,7 @@ const run = (cmd, args, cwd) => {
+ 
+ export function check(dir) {
+   dir = path.resolve(dir);
++  if (armOf(dir) === "contract") return checkContract(dir);
+   if (!existsSync(path.join(dir, "node_modules"))) symlinkSync(path.join(evalDir, "node_modules"), path.join(dir, "node_modules"));
+   if (armOf(dir) === "rx") return run(RXC, ["check", "src/main.rx"], dir);
+   const bin = n => path.join(evalDir, "node_modules/.bin", n);
+diff --git a/eval/harness/contract.mjs b/eval/harness/contract.mjs
+new file mode 100644
+index 0000000..8a89024
+--- /dev/null
++++ b/eval/harness/contract.mjs
+@@ -0,0 +1,50 @@
++// The contract arm: an Exact app (https://github.com/expo/exact), `app.contract` for the interface and `app.ts` for its
++// data module, which imports the task's `src/api.js`. A desk is the directory `exact new` makes, with the eval's files
++// beside it. EXACT2 names the Exact checkout the desk is made from; the desk's own `exact.mjs` keeps that path.
++//
++// The build is Exact's web JS target, a release build (`exact.mjs web-build --out`). The data module runs in the page's
++// realm, so `src/flights.js` puts `__flights` on the page as it does in every other arm, and the driver is unchanged.
++// BUN names the Bun to run `exact.mjs` with (default: `bun` on PATH).
++import { execFileSync, spawnSync } from "node:child_process";
++import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
++import path from "node:path";
++
++const bun = () => process.env.BUN ?? "bun";
++const exactEnv = () => ({ ...process.env, EXACT_FEEDBACK: "0", NO_COLOR: "1" });
++
++export function exact2() {
++  const dir = process.env.EXACT2;
++  if (!dir || !existsSync(path.join(dir, "scripts/exact.mjs"))) throw new Error("EXACT2 must name an Exact checkout (its scripts/exact.mjs)");
++  return path.resolve(dir);
++}
++
++/** `<dir>/dist`, built by the desk's `exact.mjs` (Exact keeps a build inside an app in `dist`, which its source scans
++ * skip); a compile error is the `compile` stage's output */
++export function buildContract(dir) {
++  const dist = path.join(dir, "dist");
++  const r = spawnSync(bun(), ["exact.mjs", "web-build", "--out", dist], { cwd: dir, env: exactEnv(), encoding: "utf8", maxBuffer: 64 << 20 });
++  if (r.status !== 0) return { ok: false, stage: "compile", output: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
++  return { ok: true, dist };
++}
++
++/** the compiler's diagnostics, warnings included, as the agent's `./check` shows them */
++export function checkContract(dir) {
++  const r = spawnSync(bun(), ["exact.mjs", "contract", "build", "app.contract"], { cwd: dir, env: exactEnv(), encoding: "utf8", maxBuffer: 64 << 20 });
++  return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() || "ok" };
++}
++
++/** `exact new <dir>`, then the scaffold's own files go in beside it. The placeholder test is removed: `./test` is the
++ * desk's test command, as in every arm. */
++export function newContractDesk(dir) {
++  if (existsSync(dir)) throw new Error(`${dir} exists; a contract desk starts from \`exact new\``);
++  execFileSync(bun(), [path.join(exact2(), "scripts/exact.mjs"), "new", dir], { env: exactEnv(), stdio: "pipe" });
++  rmSync(path.join(dir, "app.test.contract"), { force: true });
++}
++
++/** Exact's one required guide, for the prompt's inline docs */
++export const startHere = () => readFileSync(path.join(exact2(), "docs/start-here.md"), "utf8");
++
++/** copies a reference app's files over a desk's placeholders */
++export function copyContractReference(from, dir) {
++  for (const f of ["app.contract", "app.ts"]) cpSync(path.join(from, f), path.join(dir, f));
++}
+diff --git a/eval/harness/prompt-arms.json b/eval/harness/prompt-arms.json
+index b176568..431c562 100644
+--- a/eval/harness/prompt-arms.json
++++ b/eval/harness/prompt-arms.json
+@@ -46,5 +46,17 @@
+     "LANG_RULE": "plain TypeScript and the browser DOM, with no UI framework or library: `src/main.ts` must default-export `function mount(root: HTMLElement): void`, which the harness calls once with the page's `#app` element. You may add files under `src/`. No packages are installed for you to use.",
+     "API_TYPES": "`src/api.d.ts`",
+     "CHECKER": "the TypeScript compiler (strict)"
++  },
++  "contract": {
++    "DOCS_RULE": ", except that you may read Exact's documentation in {{EXACT2}}/docs and look names up with `bun exact.mjs contract vocab <name>` and `bun exact.mjs docs <heading words>`",
++    "LANG_RULE": "Exact, with Contract for the interface and TypeScript for its data module. This directory is an Exact app that `exact new` made from the Exact checkout at {{EXACT2}}; the tests run its web build in a browser. Exact's guide is `{{EXACT2}}/docs/start-here.md`, the only required reading; the rest of `{{EXACT2}}/docs` is lookup. `app.contract` is the interface and `app.ts` its data module, whose sources call the backend: import it with `import * as api from './src/api.js'`. Give an element a test id with `testId=\"…\"`. The only commands that build, test, drive or serve the app are `./check` and `./test` below: do not run the `bun exact.mjs` verbs that do (`web`, `web-build`, `serve`, `test`, `verify`, `agent`, or a platform's).",
++    "API_TYPES": "`src/api.d.ts`",
++    "CHECKER": "the Contract compiler (`bun exact.mjs contract build app.contract`), which also type-checks `app.ts`"
++  },
++  "contract-inline": {
++    "DOCS_RULE": ", except that you may read Exact's documentation in {{EXACT2}}/docs and look names up with `bun exact.mjs contract vocab <name>` and `bun exact.mjs docs <heading words>`",
++    "LANG_RULE": "Exact, with Contract for the interface and TypeScript for its data module. This directory is an Exact app that `exact new` made from the Exact checkout at {{EXACT2}}; the tests run its web build in a browser. Exact's guide, `docs/start-here.md`, is at the end of this message: it is the only required reading, and the rest of `{{EXACT2}}/docs` is lookup. `app.contract` is the interface and `app.ts` its data module, whose sources call the backend: import it with `import * as api from './src/api.js'`. Give an element a test id with `testId=\"…\"`. The only commands that build, test, drive or serve the app are `./check` and `./test` below: do not run the `bun exact.mjs` verbs that do (`web`, `web-build`, `serve`, `test`, `verify`, `agent`, or a platform's).",
++    "API_TYPES": "`src/api.d.ts`",
++    "CHECKER": "the Contract compiler (`bun exact.mjs contract build app.contract`), which also type-checks `app.ts`"
+   }
+ }
+diff --git a/eval/harness/scaffold.mjs b/eval/harness/scaffold.mjs
+index 1d74126..28ae3f1 100644
+--- a/eval/harness/scaffold.mjs
++++ b/eval/harness/scaffold.mjs
+@@ -12,11 +12,15 @@
+ // For foldkit, the docs are Foldkit's own FOLDKIT.md (create-foldkit-app's template) at the end of the prompt, and the
+ // Foldkit repository at the installed release's tag readable in docs/foldkit, as Foldkit tells agents to vendor it
+ // (examples, skills, AGENTS.md, the framework source); FOLDKIT_REPO names the checkout (default ../../foldkit).
+-// Arms: rx, react, solid (Solid 2 TSX, round 5), foldkit (round 6), vanilla (plain TypeScript and DOM, no framework).
+-// Usage: node harness/scaffold.mjs <task> <rx|react|solid|foldkit|vanilla> <dir> [--reference] [--brief <name>] [--base <dir>] [--inline-docs]
++// For contract, the desk is an Exact app that `exact new` makes from the checkout EXACT2 names (harness/contract.mjs),
++// and the inline docs are Exact's one required guide, `docs/start-here.md`; the reference is `app.contract` and `app.ts`.
++// Arms: rx, react, solid (Solid 2 TSX, round 5), foldkit (round 6), vanilla (plain TypeScript and DOM, no framework),
++// contract (Exact).
++// Usage: node harness/scaffold.mjs <task> <rx|react|solid|foldkit|vanilla|contract> <dir> [--reference] [--brief <name>] [--base <dir>] [--inline-docs]
+ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+ import path from "node:path";
+ import { fileURLToPath, pathToFileURL } from "node:url";
++import { copyContractReference, exact2, newContractDesk, startHere } from "./contract.mjs";
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ const evalDir = path.resolve(here, "..");
+@@ -25,6 +29,7 @@ const foldkitRepo = process.env.FOLDKIT_REPO ?? path.resolve(evalDir, "../../fol
+ export function scaffold(task, arm, dir, { reference = false, brief = null, base = null, inline = false } = {}) {
+   const t = path.join(evalDir, "tasks", task);
+   dir = path.resolve(dir);
++  if (arm === "contract") newContractDesk(dir);
+   mkdirSync(path.join(dir, "src"), { recursive: true }); mkdirSync(path.join(dir, "tests"), { recursive: true });
+   writeFileSync(path.join(dir, "arm"), `${arm}\n`);
+   cpSync(path.join(t, brief ? `brief-${brief}.md` : "brief.md"), path.join(dir, "BRIEF.md"));
+@@ -60,7 +65,8 @@ export function scaffold(task, arm, dir, { reference = false, brief = null, base
+   }
+   // Solid's own docs ship in its package: the agent can read them there before its first build
+   if (arm === "solid" && !existsSync(path.join(dir, "node_modules"))) symlinkSync(path.join(evalDir, "node_modules"), path.join(dir, "node_modules"));
+-  if (reference) cpSync(path.join(evalDir, "reference", task, arm), path.join(dir, "src"), { recursive: true });
++  if (reference && arm === "contract") copyContractReference(path.join(evalDir, "reference", task, arm), dir);
++  else if (reference) cpSync(path.join(evalDir, "reference", task, arm), path.join(dir, "src"), { recursive: true });
+   if (base) {
+     cpSync(path.join(t, "BASE.md"), path.join(dir, "BASE.md"));
+     // everything the earlier app had (a chain step's base is the previous agent's src/, which may hold more than
+@@ -76,11 +82,13 @@ export function scaffold(task, arm, dir, { reference = false, brief = null, base
+ export function prompt(arm, dir, { plain = false, change = false, inline = false } = {}) {
+   const docs = inline && arm !== "react";
+   const fill = { ...JSON.parse(readFileSync(path.join(here, "prompt-arms.json"), "utf8"))[docs ? `${arm}-inline` : arm] };
++  if (arm === "contract") fill.EXACT2 = exact2();
+   fill.BACKEND_NOTE = plain ? "" : " whose answers the tests control";
+   let text = readFileSync(path.join(here, change ? "prompt-change.md" : "prompt.md"), "utf8");
+   for (let i = 0; i < 2; i++) for (const k of [...Object.keys(fill), "DIR"]) text = text.replaceAll(`{{${k}}}`, k === "DIR" ? dir : fill[k]);
+   if (docs && arm === "rx") for (const f of ["language.md", "async.md", "reference.md"]) text += `\n---\n\n${readFileSync(path.join(evalDir, "../guide", f), "utf8")}`;
+   if (docs && arm === "foldkit") text += `\n---\n\n${readFileSync(path.join(foldkitRepo, "packages/create-foldkit-app/templates/base/FOLDKIT.md"), "utf8")}`;
++  if (docs && arm === "contract") text += `\n---\n\n${startHere()}`;
+   if (docs && arm === "solid") text += `\n---\n\n${readFileSync(path.join(evalDir, "node_modules/solid-js/skills/solid-2.0/SKILL.md"), "utf8").replace(/^---\n[\s\S]*?\n---\n+/, "")}`;
+   return text;
+ }
+diff --git a/eval/harness/score.mjs b/eval/harness/score.mjs
+index 02f5ec9..cd97569 100644
+--- a/eval/harness/score.mjs
++++ b/eval/harness/score.mjs
+@@ -24,7 +24,7 @@ const round5 = new Set(["desk", "labels", "related", "count", "chain1", "chain2"
+ const rows = [];
+ for (const name of readdirSync(runs).sort()) {
+   const dir = path.join(runs, name);
+-  const m = name.match(/^(\w+)-(rx|react|solid|foldkit|vanilla)-(\d+)$/);
++  const m = name.match(/^(\w+)-(rx|react|solid|foldkit|vanilla|contract)-(\d+)$/);
+   if (!m) continue;
+   const [, task, arm, n] = m;
+   const alongside = round5.has(task) ? round5Alongside : round4Alongside;
+diff --git a/eval/reference/desk9/contract/app.contract b/eval/reference/desk9/contract/app.contract
+new file mode 100644
+index 0000000..2c31b03
+--- /dev/null
++++ b/eval/reference/desk9/contract/app.contract
+@@ -0,0 +1,401 @@
++// The issue desk: issues, help and settings behind three tabs.
++//
++// Every resource is the root's, so a page's state lives here too, and opening a page resets it. A resource asks only
++// while its page is open and it has something to ask (`when`), and asks again when that turns true; "loading" is
++// `not current(…)`, so a refresh keeps what shows. Writes show at once through app.ts's overlay. Each kind of write
++// is a `parallel` mutation: every send is asked at once, and each shows until its own reply.
++
++shape Row
++  id: number
++  title: string
++  assignee: option<string>
++
++shape IssueList
++  loaded: bool
++  rows: Row[]
++
++shape Detail
++  found: bool
++  title: string
++  body: string
++
++shape Comment
++  author: string
++  text: string
++  sending: bool
++
++shape Hit
++  id: number
++  name: string
++
++shape Item
++  found: bool
++  name: string
++  blurb: string
++
++shape Settings
++  name: string
++  theme: string
++  density: string
++  saving: bool
++
++shape Assigned
++  id: number
++  assignee: string
++
++shape Renamed
++  id: number
++  title: string
++
++shape Closed
++  id: number
++
++shape Posted
++  author: string
++  text: string
++
++shape Saved
++  name: string
++  theme: string
++  density: string
++
++fn rowText(r: Row): string = `#${r.id} ${r.title} (${match r.assignee { case some(a) => a, case none => "unassigned" }})`
++fn message(f: option<Failure>): string = match f { case some(x) => x.message, case none => "" }
++
++component Desk
++  state page = "issues"
++
++  // The issues page. The tab's count reads the open list, which keeps its last answer while the closed list shows,
++  // while it loads again, and while another page is open.
++  state filter = "open"
++  state user = "guest"
++  state selected = 0
++  state titleDraft = ""
++  state commentDraft = ""
++  state labelDraft = ""
++
++  // The help page.
++  state query = ""
++  state hit = 0
++
++  derive onIssues = page == "issues"
++  derive chosen = onIssues and selected != 0
++
++  resource openIssues = fetchIssues("open") when onIssues and filter == "open" as shape IssueList else empty()
++  resource closedIssues = fetchIssues("closed") when onIssues and filter == "closed" as shape IssueList else empty()
++  resource detail = fetchIssue(selected) when chosen as shape Detail else empty()
++  resource comments = fetchComments(selected) when chosen as shape Comment[] else empty()
++  resource labels = fetchLabels(selected) when chosen as shape string[] else empty()
++  resource related = search(detail.title) when chosen and current(detail) and detail.found as shape Hit[] else empty()
++  resource results = search(query) when page == "help" and query.length >= 2 as shape Hit[] else empty()
++  resource item = fetchItem(hit) when page == "help" and hit != 0 as shape Item else empty()
++  resource settings = loadSettings() when page == "settings" as shape Settings else empty()
++
++  mutation assigned as shape Assigned parallel refreshes openIssues, closedIssues
++  mutation renamed as shape Renamed parallel refreshes openIssues, closedIssues, detail
++  mutation closed as shape Closed parallel refreshes openIssues, closedIssues
++  mutation rowAssigned as shape Assigned parallel refreshes openIssues, closedIssues
++  mutation rowClosed as shape Closed parallel refreshes openIssues, closedIssues
++  mutation posted as shape Posted parallel refreshes comments
++  mutation labelAdded as shape string[] parallel refreshes labels
++  mutation labelRemoved as shape string[] parallel refreshes labels
++  mutation saved as shape Saved parallel refreshes settings
++
++  derive open = filter == "open"
++  derive rows = open ? openIssues.rows : closedIssues.rows
++  derive listLoading = open ? not current(openIssues) : not current(closedIssues)
++  derive listError = open ? message(failure(openIssues)) : message(failure(closedIssues))
++  derive issuesTab = openIssues.loaded ? `Issues (${openIssues.rows.length})` : "Issues"
++  derive rowError = message(failure(rowAssigned)) != "" ? message(failure(rowAssigned)) : message(failure(rowClosed))
++  derive labelError = message(failure(labelAdded)) != "" ? message(failure(labelAdded)) : message(failure(labelRemoved))
++
++  action openIssuesPage
++    if page != "issues"
++      page = "issues"
++      filter = "open"
++      user = "guest"
++      selected = 0
++      titleDraft = ""
++      commentDraft = ""
++      labelDraft = ""
++      assigned = none
++      renamed = none
++      closed = none
++      posted = none
++      labelAdded = none
++      labelRemoved = none
++      rowAssigned = none
++      rowClosed = none
++  action openHelpPage
++    if page != "help"
++      page = "help"
++      query = ""
++      hit = 0
++  action openSettingsPage
++    if page != "settings"
++      page = "settings"
++      saved = none
++
++  action setUser(v: string)
++    user = v
++  action showOpen
++    filter = "open"
++  action showClosed
++    filter = "closed"
++  action select(id: number)
++    selected = id
++    titleDraft = ""
++    commentDraft = ""
++    labelDraft = ""
++    assigned = none
++    renamed = none
++    closed = none
++    posted = none
++    labelAdded = none
++    labelRemoved = none
++  action retry
++    refresh detail
++
++  action assign
++    send assigned = assign(selected, user)
++  action setTitle(v: string)
++    titleDraft = v
++  action rename
++    if titleDraft != ""
++      send renamed = renameIssue(selected, titleDraft)
++  action close
++    send closed = closeIssue(selected)
++  action rowAssign(id: number)
++    send rowAssigned = assign(id, user)
++    rowClosed = none
++  action rowClose(id: number)
++    send rowClosed = closeIssue(id)
++    rowAssigned = none
++
++  action setComment(v: string)
++    commentDraft = v
++  action post
++    if commentDraft != ""
++      send posted = addComment(selected, user, commentDraft)
++      commentDraft = ""
++  action setLabel(v: string)
++    labelDraft = v
++  action addLabel
++    if labelDraft != "" and not labels.includes(labelDraft)
++      send labelAdded = addLabel(selected, labelDraft)
++      labelRemoved = none
++      labelDraft = ""
++  action removeLabel(label: string)
++    send labelRemoved = removeLabel(selected, label)
++    labelAdded = none
++
++  action openRelated(id: number)
++    let title = detail.title
++    page = "help"
++    query = title
++    hit = id
++
++  action setQuery(v: string)
++    query = v
++    hit = 0
++  action pick(id: number)
++    hit = id
++  action retryItem
++    refresh item
++
++  action retryLoad
++    refresh settings
++  action save(name: string, theme: string, density: string)
++    send saved = saveSettings(name, theme, density)
++
++  view
++    column gap=12 padding=12
++      row gap=8
++        button press=openIssuesPage testId="tab-issues"
++          text issuesTab
++        button press=openHelpPage testId="tab-help"
++          text "Help"
++        button press=openSettingsPage testId="tab-settings"
++          text "Settings"
++      if page == "issues"
++        column gap=8
++          input value=user input=setUser aria-label="Current user" testId="user"
++          row gap=8
++            button press=showOpen testId="filter-open"
++              text "open"
++            button press=showClosed testId="filter-closed"
++              text "closed"
++          column gap=4 testId="list"
++            if listError != ""
++              text `list error: ${listError}`
++            else if listLoading
++              text `loading ${filter} issues`
++            else
++              for r in rows key=r.id
++                row gap=8
++                  button press=select(r.id) testId="issue"
++                    text rowText(r)
++                  button press=rowAssign(r.id) testId="row-assign"
++                    text `assign to ${user}`
++                  if open
++                    button press=rowClose(r.id) testId="row-close"
++                      text "close"
++          if rowError != ""
++            text `row error: ${rowError}` testId="row-error"
++          column gap=6 testId="detail"
++            if selected == 0
++              text "select an issue"
++            else
++              if failed(detail)
++                text `detail error: ${message(failure(detail))}`
++              else if not current(detail)
++                text `loading #${selected}`
++              else if not detail.found
++                text `detail error: issue #${selected} not found`
++              else
++                text `#${selected} ${detail.title}` role="heading" aria-level=2
++                text detail.body
++              button press=retry testId="retry"
++                text "retry"
++              button press=assign testId="assign"
++                text `assign to ${user}`
++              if message(failure(assigned)) != ""
++                text message(failure(assigned))
++              row gap=8
++                input value=titleDraft input=setTitle aria-label="New title" testId="title-input"
++                button press=rename testId="rename"
++                  text "rename"
++              if message(failure(renamed)) != ""
++                text `rename error: ${message(failure(renamed))}`
++              button press=close testId="close"
++                text "close"
++              if message(failure(closed)) != ""
++                text `close error: ${message(failure(closed))}`
++              column gap=4 testId="comments"
++                if failed(comments)
++                  text `comments error: ${message(failure(comments))}`
++                else if not current(comments)
++                  text "loading comments"
++                else
++                  for c, i in comments key=i
++                    text `${c.author}: ${c.text}${c.sending ? " (sending…)" : ""}` testId="comment"
++              row gap=8
++                input value=commentDraft input=setComment aria-label="Comment" testId="comment-input"
++                button press=post testId="post"
++                  text "post"
++              if message(failure(posted)) != ""
++                text `post error: ${message(failure(posted))}`
++              column gap=4 testId="labels"
++                if failed(labels)
++                  text `labels error: ${message(failure(labels))}`
++                else if not current(labels)
++                  text "loading labels"
++                else
++                  for l in labels key=l
++                    row gap=8
++                      text l testId="label"
++                      button press=removeLabel(l) testId="remove-label"
++                        text `remove ${l}`
++              row gap=8
++                input value=labelDraft input=setLabel aria-label="Label" testId="label-input"
++                button press=addLabel testId="add-label"
++                  text "add label"
++              if labelError != ""
++                text `label error: ${labelError}`
++              if current(detail) and detail.found
++                column gap=4 testId="related"
++                  if failed(related)
++                    text `related help failed: ${message(failure(related))}`
++                  else if not current(related)
++                    text "finding related help"
++                  else if related.length == 0
++                    text "no related help"
++                  else
++                    for h in related.slice(0, 3) key=h.id
++                      button press=openRelated(h.id) testId="related-hit"
++                        text h.name
++      if page == "help"
++        column gap=8
++          input value=query input=setQuery aria-label="Search help" testId="query"
++          column gap=4 testId="results"
++            if query.length == 1
++              text `too short: ${query}`
++            else if query.length >= 2
++              if failed(results)
++                text `search failed: ${message(failure(results))}`
++              else
++                if current(results)
++                  text `${results.length} results for ${query}`
++                else
++                  text "searching…"
++                for h in results key=h.id
++                  button press=pick(h.id) testId="hit"
++                    text `${h.id == hit ? "> " : ""}${h.name}`
++          column gap=4 testId="item"
++            if hit == 0
++              text "pick a result"
++            else if failed(item)
++              text `failed: ${message(failure(item))}`
++              button press=retryItem testId="retry-item"
++                text "retry"
++            else if not current(item)
++              text "loading…"
++            else if not item.found
++              text `item ${hit} not found`
++            else
++              text item.name role="heading" aria-level=2
++              text item.blurb
++      if page == "settings"
++        column gap=8
++          if not current(settings)
++            column gap=4 testId="load"
++              if failed(settings)
++                text `Could not load settings: ${message(failure(settings))}`
++                button press=retryLoad testId="retry-load"
++                  text "retry"
++              else
++                text "Loading settings…"
++          else
++            text `Saved: ${settings.name} · ${settings.theme} · ${settings.density}${settings.saving ? " (saving…)" : ""}` testId="saved"
++            if message(failure(saved)) != ""
++              text `Save failed: ${message(failure(saved))}` testId="save-error"
++            SettingsForm(name0=settings.name, theme0=settings.theme, density0=settings.density, save=save)
++
++// The draft: filled from the settings loaded when it appears, then the person's own. A save never changes it.
++component SettingsForm
++  props
++    name0: string
++    theme0: string
++    density0: string
++    save: action
++  state name = name0
++  state theme = theme0
++  state density = density0
++  derive nameError = name == "" ? "Display name is required" : name.length > 20 ? `Display name must be at most 20 characters, not ${name.length}` : ""
++  action setName(v: string)
++    name = v
++  action light
++    theme = "light"
++  action dark
++    theme = "dark"
++  action toggleDensity
++    density = density == "compact" ? "comfortable" : "compact"
++  action trySave
++    if nameError == ""
++      save(name, theme, density)
++  view
++    column gap=8
++      input value=name input=setName aria-label="Display name" testId="name"
++      text `${name.length}/20` testId="name-count"
++      if nameError != ""
++        text nameError testId="name-error"
++      row gap=8
++        button press=light testId="theme-light"
++          text "light"
++        button press=dark testId="theme-dark"
++          text "dark"
++        button press=toggleDensity testId="density-toggle"
++          text density
++      text `Preview: ${theme} / ${density}` testId="preview"
++      button press=trySave buttonStyle="filled" testId="save"
++        text "Save"
+diff --git a/eval/reference/desk9/contract/app.ts b/eval/reference/desk9/contract/app.ts
+new file mode 100644
+index 0000000..a23f67f
+--- /dev/null
++++ b/eval/reference/desk9/contract/app.ts
+@@ -0,0 +1,108 @@
++// The desk's data module: each source calls the backend in src/api.js and projects its answer onto the declared shape.
++// The overlay shows writes still out over the answers they change.
++import type { Answer, Overlay, Result, Sources } from './app.contract.d.ts';
++import * as api from './src/api.js';
++
++export const grants = '';
++
++type IssueList = Result<'fetchIssues'>;
++type Detail = Result<'fetchIssue'>;
++type Comments = Result<'fetchComments'>;
++type Labels = Result<'fetchLabels'>;
++type Settings = Result<'loadSettings'>;
++
++const sources: Sources = {
++  fetchIssues: async ([filter]): Promise<IssueList> => {
++    const rows = await api.fetchIssues(filter as 'open' | 'closed');
++    return { loaded: true, rows: rows.map((r) => ({ id: r.id, title: r.title, assignee: r.assignee })) };
++  },
++  fetchIssue: async ([id]): Promise<Detail> => {
++    const d = await api.fetchIssue(id);
++    return d ? { found: true, title: d.title, body: d.body } : { found: false, title: '', body: '' };
++  },
++  fetchComments: async ([id]): Promise<Comments> =>
++    (await api.fetchComments(id)).map((c) => ({ author: c.author, text: c.text, sending: false })),
++  fetchLabels: async ([id]): Promise<Labels> => api.fetchLabels(id),
++  search: async ([q]) => (await api.search(q)).map((h) => ({ id: h.id, name: h.name })),
++  fetchItem: async ([id]) => {
++    const item = await api.fetchItem(id);
++    return item ? { found: true, name: item.name, blurb: item.blurb } : { found: false, name: '', blurb: '' };
++  },
++  loadSettings: async (): Promise<Settings> => {
++    const s = await api.loadSettings();
++    return { name: s.name, theme: s.theme, density: s.density, saving: false };
++  },
++  assign: async ([id, user]) => {
++    const r = await api.assign(id, user);
++    return { id: r.id, assignee: r.assignee };
++  },
++  renameIssue: async ([id, title]) => {
++    const r = await api.renameIssue(id, title);
++    return { id: r.id, title: r.title };
++  },
++  closeIssue: async ([id]) => ({ id: (await api.closeIssue(id)).id }),
++  addComment: async ([id, author, text]) => {
++    const c = await api.addComment(id, author, text);
++    return { author: c.author, text: c.text };
++  },
++  addLabel: async ([id, label]) => api.addLabel(id, label),
++  removeLabel: async ([id, label]) => api.removeLabel(id, label),
++  saveSettings: async ([name, theme, density]) => {
++    const s = await api.saveSettings({ name, theme: theme as 'light' | 'dark', density: density as 'comfortable' | 'compact' });
++    return { name: s.name, theme: s.theme, density: s.density };
++  },
++};
++export const answer: Answer = (source, args, store, storage, native) => sources[source](args, store, storage, native);
++
++// The writes still out, over the answers they change. A write whose reply landed before the answer was asked is in the
++// answer already (`answered`), so only the others are laid over it, in the order the runner gives them.
++export const overlay: Overlay = (source, args, answer, writes) => {
++  const out = writes.filter((w) => !w.answered);
++  const id = args[0];
++  switch (source) {
++    case 'fetchIssues': {
++      let rows = (answer as IssueList).rows;
++      for (const w of out) {
++        const issue = w.args[0] as number;
++        if (w.source === 'assign') rows = rows.map((r) => (r.id === issue ? { ...r, assignee: w.args[1] as string } : r));
++        if (w.source === 'renameIssue') rows = rows.map((r) => (r.id === issue ? { ...r, title: w.args[1] as string } : r));
++        if (w.source === 'closeIssue' && id === 'open') rows = rows.filter((r) => r.id !== issue);
++      }
++      return { ...(answer as IssueList), rows };
++    }
++    case 'fetchIssue': {
++      const detail = answer as Detail;
++      let title = detail.title;
++      for (const w of out) if (w.source === 'renameIssue' && w.args[0] === id) title = w.args[1] as string;
++      return detail.found ? { ...detail, title } : undefined;
++    }
++    case 'fetchComments': {
++      const rows = [...(answer as Comments)];
++      for (const w of out) {
++        if (w.source !== 'addComment' || w.args[0] !== id) continue;
++        rows.push({ author: w.args[1] as string, text: w.args[2] as string, sending: w.reply === undefined });
++      }
++      return rows;
++    }
++    case 'fetchLabels': {
++      let shown = answer as Labels;
++      for (const w of out) {
++        if (w.args[0] !== id) continue;
++        const label = w.args[1] as string;
++        if (w.source === 'addLabel' && !shown.includes(label)) shown = [...shown, label];
++        if (w.source === 'removeLabel') shown = shown.filter((l) => l !== label);
++      }
++      return shown;
++    }
++    case 'loadSettings': {
++      let shown = answer as Settings;
++      for (const w of out) {
++        const reply = w.reply as { name: string; theme: string; density: string } | undefined;
++        const [name, theme, density] = w.args as string[];
++        shown = reply ? { ...shown, ...reply, saving: false } : { ...shown, name, theme, density, saving: true };
++      }
++      return shown;
++    }
++  }
++  return undefined;
++};
+-- 
+2.54.0 (Apple Git-157)
+

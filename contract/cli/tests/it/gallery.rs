@@ -487,6 +487,34 @@ fn git_init(dir: &Path) {
 }
 
 #[test]
+fn the_cli_reports_when_git_closes_its_input_pipe() {
+    let dir = fixture("git-pipe");
+    git_init(&dir);
+    let mut out = dir.join("target/gallery");
+    // The three paths sent to git exceed a 64 KiB pipe, so its early exit
+    // reaches the writer even if the entire pipe buffer was initially free.
+    for _ in 0..120 {
+        out.push("x".repeat(200));
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_contract"))
+        .arg("gallery")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .env("GIT_DIR", "/dev/null")
+        .output()
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{error}");
+    assert!(output.stdout.is_empty());
+    assert!(
+        error.contains("git couldn't say whether it ignores the gallery's files"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_checkout_under_a_target_directory_and_a_cache_git_does_not_ignore_are_refused() {
     let base = std::env::temp_dir().join(format!("exact2-gallery-git-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);

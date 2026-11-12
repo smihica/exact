@@ -268,7 +268,7 @@ impl<D: DataSource> Host<D> {
         #[cfg(target_os = "macos")]
         let boot_trace = exact_ink::device::apple::Trace::new(c"boot runner through first commit");
         let secret_session =
-            system::SecretSession::new(data.app_id()).map_err(HostError::Layout)?;
+            system::SecretSession::new(data.app_id(), data.grants()).map_err(HostError::Layout)?;
         secret_session.seed(
             carried
                 .map(|carried| carried.store.clone())
@@ -836,7 +836,7 @@ impl<D: DataSource> Host<D> {
         self.runner.native_work(request)
     }
 
-    /// Work a source held at dispatch that the last commit released.
+    /// Work a source held at dispatch that is now ready to run.
     pub fn release_work(&mut self) -> Vec<(u64, exact_runner::Dispatch)> {
         self.runner.release_work()
     }

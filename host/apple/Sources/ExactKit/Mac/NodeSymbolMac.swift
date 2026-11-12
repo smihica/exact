@@ -29,7 +29,7 @@ extension NodeView {
             if name.isEmpty, props["symbolPath"] == nil, !source.hasPrefix("symbol:sf/"), source != "symbol:", symbolRefusal != source { symbolRefusal = source; presenter?.session?.log("image \(RasterRetry.withoutQuery(source)) refused: unknown symbol role") }
             if !name.isEmpty || source.hasPrefix("symbol:sf/") || source == "symbol:" { symbolRefusal = nil }
             let clip = symbolClip ?? SymbolClip()
-            if symbolClip == nil { clip.wantsLayer = true; clip.layer?.masksToBounds = true; symbolClip = clip; addSubview(clip) }
+            if symbolClip == nil { clip.wantsLayer = true; clip.layer?.masksToBounds = true; symbolClip = clip; (clipBox ?? self).addSubview(clip) }
             // A template path is filled as its paths at the frame (stage 14 C1,
             // IconShapeMac.swift); an SF Symbol or a bitmap is an image view's.
             // One leaf in the clip: a source that changes kind swaps it.

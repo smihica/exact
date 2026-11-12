@@ -315,3 +315,40 @@ fn plain_copy_of_a_selection_finds_atoms_in_the_whole_source() {
     assert_eq!(plain_range(s, Range::new(10, 19), &a), "file a");
     assert_eq!(plain_range(s, Range::new(0, 25), &a), "hi Ex and file a b");
 }
+
+/// The plain text of `s` from `from` through the end of `to` (each found
+/// once, `to` after `from`), as ⌘⇧C copies a selection.
+fn copy(s: &str, from: &str, to: &str, a: &Atoms) -> String {
+    let start = s.find(from).unwrap();
+    let end = start + s[start..].find(to).unwrap() + to.len();
+    let units = |b: usize| s[..b].encode_utf16().count() as u32;
+    plain_range(s, Range::new(units(start), units(end)), a)
+}
+
+#[test]
+fn plain_copy_of_a_selection_reads_it_as_the_whole_source_does() {
+    let a = Atoms::default();
+    let code = "```\ntotal = a*b*c\nname = __init__\n```\n";
+    assert_eq!(copy(code, "name", "__\n", &a), "name = __init__\n");
+    assert_eq!(copy(code, "a*b", "*c", &a), "a*b*c");
+    assert_eq!(
+        copy(code, "total", "__\n", &a),
+        "total = a*b*c\nname = __init__\n"
+    );
+    let comment = "```\nx = 1\n# a comment\ntotal = a*b*c\n```\n";
+    assert_eq!(copy(comment, "# a", "*c", &a), "# a comment\ntotal = a*b*c");
+    assert_eq!(copy("call `x = a*b*c;` here\n", "a*b", "*c", &a), "a*b*c");
+    assert_eq!(copy("a **bold word** b\n", "word", " b", &a), "word b");
+    assert_eq!(
+        copy("a **bold word** b\n", "*bold", " b", &a),
+        "bold word b"
+    );
+    assert_eq!(copy("- one\n- two\n", "ne", "tw", &a), "ne\n• tw");
+    // A private-use character in the source is text, not an atom's stand-in.
+    let a = atoms(&[("@ada", "Ada Lovelace")]);
+    let s = "icon \u{E000} for @ada\n";
+    assert_eq!(copy(s, "icon", "ada", &a), "icon \u{E000} for Ada Lovelace");
+    assert_eq!(copy(s, "\u{E000}", "for", &a), "\u{E000} for");
+    // Part of an atom copies its label: the reader sees one pill.
+    assert_eq!(copy(s, "for", "@a", &a), "for Ada Lovelace");
+}

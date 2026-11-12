@@ -328,18 +328,18 @@ public:
   // and abort hooks, when requested. Prefer this over the compatibility-named
   // entry point above when checking explicitly; both run the complete guard.
   void verify_trusted_bootstrap_unreachable();
-  // Every fail-closed check that must precede the freeze: a deferred intrinsic
-  // snapshot has been captured, and trusted-bootstrap outputs are unreachable.
+  // Every fail-closed check that must precede the freeze: an intrinsic snapshot
+  // exists and still matches, and trusted-bootstrap outputs are unreachable.
   void verify_harden_preconditions();
   // The post-install hardening step through the adapter: validates `script`
   // as this runtime's Hermes bytecode (the header checks install() applies),
-  // runs verify_harden_preconditions(), and only then evaluates it.
+  // runs verify_harden_preconditions(), evaluates it, and pins the resulting
+  // frozen descriptors, including the prototype shadowing accessors.
   // `script` is HARDEN_SOURCE compiled by this engine's hermesc -- in Rust,
-  // ibex2::bindings::HARDEN_BYTECODE (path: HARDEN_BYTECODE_PATH). A caller
-  // that requested a trusted-bootstrap output through install_with MUST harden with
-  // this method rather than evaluating HARDEN_SOURCE itself; evaluating it
-  // directly skips the guard. For a plain install() it is equivalent to
-  // evaluating the bytecode. Throws, and freezes nothing, on refusal.
+  // ibex2::bindings::HARDEN_BYTECODE (path: HARDEN_BYTECODE_PATH). Every caller
+  // must use this method: evaluating HARDEN_SOURCE directly skips the guard
+  // and leaves SQLite's captured descriptors out of date. A precondition
+  // refusal throws without freezing anything.
   // @ref LLP 0068#opt-in-fetch-primitives-protocol — the bindings door gets the same harden guard as the owning runtime
   void harden(const CompiledScript& script);
   jsi::Function async_binding(const char* name, uint32_t op, const void* grants);

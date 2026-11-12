@@ -62,6 +62,9 @@ pub mod desktop;
 extern crate self as exact_linux;
 #[cfg(target_os = "linux")]
 pub mod display;
+#[cfg(all(test, unix, not(target_os = "linux")))]
+#[path = "display/flip.rs"]
+mod display_flip;
 mod doc_watch;
 pub mod executor;
 pub mod fetch;

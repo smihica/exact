@@ -390,15 +390,18 @@ fn publication_preserves_owned_and_shared_contract_values() {
     assert!(sim.take_published().is_some());
     let events = sim.world().journal().len();
     sim.world().publish("number", -0.0_f64);
-    assert!(sim.take_published().is_none());
-    assert_eq!(sim.world().journal().len(), events);
+    assert_eq!(
+        sim.take_published().as_deref(),
+        Some(r#"{"number":-0,"record":["héllo",[7,true],"present"],"text":"lit"}"#)
+    );
+    assert_eq!(sim.world().journal().len(), events + 1);
     sim.world().publish("number", f64::NAN);
     let with_nan = r#"{"number":null,"record":["héllo",[7,true],"present"],"text":"lit"}"#;
     assert_eq!(sim.take_published().as_deref(), Some(with_nan));
     let events = sim.world().journal().len();
     sim.world().publish("number", f64::NAN);
-    assert_eq!(sim.take_published().as_deref(), Some(with_nan));
-    assert_eq!(sim.world().journal().len(), events + 1);
+    assert!(sim.take_published().is_none());
+    assert_eq!(sim.world().journal().len(), events);
     assert_eq!(sim.world().hash(), hash);
     assert_eq!(sim.world().save(), saved);
 }

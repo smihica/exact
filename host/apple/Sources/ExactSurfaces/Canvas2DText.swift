@@ -54,6 +54,8 @@ final class CanvasText {
             let d = CTFontDescriptorCreateWithAttributes([kCTFontFeatureSettingsAttribute: features] as CFDictionary)
             font = CTFontCreateCopyWithAttributes(font, size, nil, d)
         }
+        // Animated sizes must not keep a session's entire font history.
+        if fonts.count >= 256 { fonts.removeAll(keepingCapacity: true) }
         fonts[key] = font
         return font
     }
@@ -170,7 +172,7 @@ extension Canvas2DReplayer {
     /// `fillText`/`strokeText`: the run from its left end on its alphabetic
     /// baseline (`x`, `y` in user space), squeezed by `scaleX` about it.
     func drawText(_ c: CGContext, fill: Bool, x: Double, y: Double, scaleX: Double, rtl: Bool, text: String) {
-        guard let resolved = env?.canvasFont(state.font) else { return }
+        guard let resolved = state.resolvedFont else { return }
         let line = CanvasText.line(resolved, state.font, text, rtl: rtl)
         let style = fill ? state.fill : state.stroke
         render(c) { c in

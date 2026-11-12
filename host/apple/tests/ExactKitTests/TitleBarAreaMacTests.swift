@@ -10,10 +10,15 @@ import XCTest
 final class TitleBarAreaMacTests: XCTestCase {
     private final class Window: NSWindow {
         var fullscreen = false
+        override var windowTitlebarLayoutDirection: NSUserInterfaceLayoutDirection { .leftToRight }
         override var styleMask: NSWindow.StyleMask {
             get { fullscreen ? super.styleMask.union(.fullScreen) : super.styleMask }
             set { super.styleMask = newValue }
         }
+    }
+
+    private final class RightToLeftWindow: NSWindow {
+        override var windowTitlebarLayoutDirection: NSUserInterfaceLayoutDirection { .rightToLeft }
     }
 
     private static let plan: Result<Data, Error> = Result {
@@ -193,6 +198,46 @@ final class TitleBarAreaMacTests: XCTestCase {
         window.toolbar = NSToolbar(identifier: "titlebar-area")
         view.syncInsets()
         XCTAssertNil(session.presenter.titlebarArea)
+    }
+
+    func testRightToLeftTitleBarsLeaveTheAreaToTheLeftOfTheTrafficLights() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "rtl-titlebar-area")
+        let window = RightToLeftWindow(contentRect: NSRect(x: 100, y: 100, width: 800, height: 600),
+                                       styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                       backing: .buffered, defer: false)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.isReleasedWhenClosed = false
+        let view = ExactView(session: session)
+        window.contentView = view
+        defer { window.close(); session.destroy() }
+        XCTAssertNil(session.boot(plan: try Self.plan.get(), size: CGSize(width: 800, height: 600)).error)
+
+        for overlay in [false, true] {
+            if overlay {
+                window.toolbar = NSToolbar(identifier: "rtl-titlebar-area-overlay")
+                window.toolbarStyle = .unified
+                view.controlsOverlay = true
+            }
+            view.layoutSubtreeIfNeeded()
+            view.syncInsets()
+
+            let close = try XCTUnwrap(window.standardWindowButton(.closeButton))
+            let zoom = try XCTUnwrap(window.standardWindowButton(.zoomButton))
+            let band = try XCTUnwrap(close.superview)
+            XCTAssertGreaterThan(zoom.frame.minX, band.bounds.midX, "AppKit places the traffic lights at the right")
+            let end = zoom.frame.minX - (band.bounds.maxX - close.frame.maxX)
+            if #available(macOS 26.0, *), !overlay {
+                XCTAssertEqual(end, view.rect(for: .safeArea(cornerAdaptation: .horizontal)).maxX)
+            }
+            let area = try XCTUnwrap(session.presenter.titlebarArea)
+            XCTAssertEqual(area, [0, 0, end, band.frame.height])
+            XCTAssertGreaterThan(area[2], 0)
+            XCTAssertLessThanOrEqual(area[0] + area[2], view.bounds.width)
+            let frame = try bar(session)
+            XCTAssertEqual([frame.minX, frame.minY, frame.width, frame.height], [0, 0, end, band.frame.height])
+        }
     }
 }
 #endif

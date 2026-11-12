@@ -47,18 +47,14 @@ component App
   derive problem = match painted { case some(r) => r.error, case none => "" }
 
   // Keeping the connection (LLP 1157 D6). A closed socket is opened again after 1, 2, 4, 8,
-  // then every 16 seconds; the wait starts over once results arrive. A socket that has
-  // carried no frame for a minute is opened again too: Convex pings a quiet one every 15 s.
+  // then every 16 seconds; the wait starts over once results arrive. A socket that carries
+  // nothing for a minute is closed by the host (the module asks it to), and so comes here.
   state waited = 0
   state wait = 1
-  state heard = 0
-  state quiet = 0
   task reconnect when live.status == "closed"
     every(1000, retry)
   task recovered when live.status == "ready" and wait > 1
     after(1000, calm)
-  task watch when live.status == "ready"
-    every(15000, listen)
   action retry
     if waited + 1 >= wait
       waited = 0
@@ -69,16 +65,6 @@ component App
   action calm
     wait = 1
     waited = 0
-  action listen
-    if live.beat == heard
-      if quiet >= 3
-        quiet = 0
-        refresh live
-      else
-        quiet = quiet + 1
-    else
-      heard = live.beat
-      quiet = 0
 
   action pick(h: number)
     hue = h

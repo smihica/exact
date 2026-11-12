@@ -568,13 +568,27 @@ async function wired(canvas = pairing => canvasGateway({ loop: loopBase, pairing
 }
 
 test('with stage 10 A: `canvas` through the real dispatcher (read), enter, proxy, and A\'s revoke ending the stream and the next request', async () => {
+  const doc = readFileSync(new URL('../docs/tamber-protocol.md', import.meta.url), 'utf8');
+  const section = /^### `canvas`[^\n]*\n([\s\S]*?)(?=^#{2,3} )/m.exec(doc)?.[1];
+  expect(section).toBeDefined();
+  const example = /```json\n([^`]+)```/.exec(section)?.[1];
+  expect(example).toBeDefined();
+  const request = JSON.parse(example);
+  expect(request).toEqual({ method: 'canvas' });
+  expect(/^\| `read` \|.*$/m.exec(doc)?.[0]).toContain('`canvas`');
+  expect(/^\| 429 \|.*$/m.exec(doc)?.[0]).toContain('canvas grants');
+  const deferred = doc.split('## Not yet in the protocol\n')[1];
+  expect(deferred).toBeDefined();
+  expect(deferred).not.toMatch(/canvas gateway|remote mode|hosted relay/);
   const w = await wired();
   try {
     const p = await w.pair('read', 'phone');
     expect(p.client).toBe('remote:phone#1');
     // Minted over the wire as a remote request, the paired token in its header only.
-    const minted = await w.post({ method: 'canvas' }, p.token, '/__tamber', '198.51.100.9');
+    const minted = await w.post(request, p.token, '/__tamber', '198.51.100.9');
     expect(minted.status).toBe(200);
+    expect(Object.keys(minted.ok).sort()).toEqual(['expires', 'grant', 'url']);
+    expect(typeof minted.ok.expires).toBe('number');
     expect(minted.ok.url).toBe(`${ORIGIN}/canvas/remote%3Aphone%231/`);
     const entry = await w.at(new URL(minted.ok.url).pathname, enterInit(minted.ok.grant));
     expect(entry.status).toBe(204);

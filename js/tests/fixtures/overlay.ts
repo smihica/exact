@@ -13,7 +13,8 @@ function attempt(call: () => unknown): void {
   pending.push((value as Promise<unknown>).then(() => { results[i] = "resolves"; }, e => { results[i] = "rejects " + e.message; }));
 }
 
-function overlay(): undefined {
+function overlay(source: string, _args: unknown[], answer: unknown): unknown {
+  if (source === "numeric") return answer;
   const subtle = crypto.subtle as any;
   const store = captured!.store;
   attempt(() => crypto.getRandomValues(new Uint8Array(1)));
@@ -31,7 +32,8 @@ function overlay(): undefined {
   return undefined;
 }
 
-function answer(source: string, _args: unknown[], store: unknown, storage: unknown): unknown {
+function answer(source: string, args: unknown[], store: unknown, storage: unknown): unknown {
+  if (source === "numeric") return { n: args[0], big: "x".repeat(Number(args[1])) };
   if (source === "capture") { captured = { store, storage }; return "captured"; }
   if (source === "refusals") {
     const done = Promise.all(pending);

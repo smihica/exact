@@ -177,7 +177,7 @@ public final class ExactApp {
     /// lifecycle, not top-level code before UIApplicationMain (LLP 1012's timing reduction).
     public func makeSession(delegate: ExactSessionDelegate? = nil, label: String = "") -> ExactSession {
         let s = ExactSession(app: self, label: label.isEmpty ? "session-\(sessionRefs.count + 1)" : label)
-        s.delegate = delegate
+        s.delegate = delegate; PushRegistration.listen() // before its packages can register
         sessionRefs.append(WeakSession(s))
         sessionRefs.removeAll { $0.session == nil }
         return s
@@ -203,7 +203,7 @@ public final class ExactApp {
             let resolver = candidate.assets
             return self.applyTogether(candidate.plan, label: label, resolver: resolver, token: 0, identity: candidate.identity, module: candidate.module, letGo: letGo, commit: { true })
         })
-        connection?.onDevStatus = { [weak self] in self?.showDevStatus($0) } // the old one's went at its close
+        connection?.onDevNotice = { [weak self] in self?.showDevStatus($0) } // the old one's went at its close
     }
 
     public func disconnect() {
@@ -214,7 +214,7 @@ public final class ExactApp {
     /// The connection's page URL, when connected (what a deck's `//` source resolves against).
     public var connectedPage: URL? { connection?.page }
     /// The connection's status line for a dev menu, or nil.
-    public var connectionStatus: String? { connection.map { "\($0.page)\($0.devStatus.map { " (\($0.said))" } ?? ($0.terminal != nil ? " (rebuild the host)" : generationPending ? " (preparing Rust update)" : " (live)"))" } }
+    public var connectionStatus: String? { connection.map { "\($0.page)\($0.devStatus.map { " (\($0.said))" } ?? ($0.terminal != nil ? " (rebuild the host)" : $0.refused != nil ? " (edit not applied)" : generationPending ? " (preparing Rust update)" : " (live)"))" } }
     /// Re-resolve the connection (the menu's Reload; clears a `{rebuilt}` stop).
     public func reloadConnection() { connection?.reload() }
 
@@ -354,6 +354,8 @@ public final class ExactSession {
     let buttonMeasurements = ButtonMeasureCache()
     package let presenter: Presenter
     var launchLocation: String? // a pre-boot `openURL`'s location, until the first frame (LaunchURL.swift)
+    /// Nil until this session's launch route is journaled.
+    var seenNavigationEntries: Set<UInt64>?
     var pendingLaunchLocations: [String] = []
     var heldModuleEvents: [String] = [] // module events before first pixel (SessionActivation.swift)
     var protocolHandlers: [[String: String]] = ExactEnv.appMetadata["ExactProtocolHandlers"] as? [[String: String]] ?? []
@@ -488,7 +490,8 @@ public final class ExactSession {
 
     /// Live sessions by handle: what a wake looks up (a stranger's is dropped).
     nonisolated(unsafe) private static var live: [ExactRuntime: WeakSession] = [:]
-    private var preferenceObservers: [NSObjectProtocol] = [], pageObservers: [NSObjectProtocol] = [], localeObserver: NSObjectProtocol?
+    private var preferenceObservers: [NSObjectProtocol] = [], pageObservers: [NSObjectProtocol] = [], placeObservers: [(NotificationCenter, NSObjectProtocol)] = []
+    var leaveObserver: NSObjectProtocol?, shareInboxObserver: NSObjectProtocol?
     #if os(macOS)
     private var colorObserver: NSObjectProtocol?
     #endif
@@ -529,6 +532,7 @@ public final class ExactSession {
             guard let self, self.state != .destroyed else { return }
             self.apply(self.runtime.canvasImage(src, width: image?.width ?? 0, height: image?.height ?? 0, ok: image != nil))
         }
+        presenter.canvas2d.onReplayEnded = { [weak self] in self?.workEnded() }
         presenter.canvas2d.onHeld = { [weak self] view, held in
             guard let self, self.state != .destroyed else { return }
             self.runtime.canvasHeld(view, held)
@@ -561,7 +565,7 @@ public final class ExactSession {
         wire()
         preferenceObservers = DisplayPreferences.observe { [weak self] in self?.tellPreferencesSoon() }
         pageObservers = PageFacts.observe { [weak self] in self?.tellPageSoon() }
-        localeObserver = observeFormatLocale()
+        placeObservers = observePlace()
         #if os(macOS)
         // @ref LLP 1095 D5 — the accent or another system colour changed:
         // what was resolved goes, the report is made again, and every view
@@ -650,7 +654,7 @@ public final class ExactSession {
         landing = true
         // A reply the slices released (`afterFill`) may have left a deadline
         // due: it advances once they have landed, unless a batch waits on them
-        defer { landing = false; if !holdingReports { advanceIfDue() } }
+        defer { landing = false; workEnded(); if !holdingReports { advanceIfDue() } }
         while true {
             published.lock()
             let next = publishedQueue.isEmpty ? nil : publishedQueue.removeFirst()
@@ -705,6 +709,9 @@ public final class ExactSession {
     /// Land every session's slice in flight.
     static func drainAll() { for weak in live.values { weak.session?.drainFill() } }
 
+    /// Work that every session counts ended: the last SVG picture in flight (`hostOutstanding`).
+    static func workEndedEverywhere() { for weak in live.values { weak.session?.workEnded() } }
+
     /// Wait for the slice in flight and land it: what shows, the agent and
     /// every read that must see it (T5, T7, T9).
     public func drainFill() {
@@ -729,7 +736,7 @@ public final class ExactSession {
             // A report inside the built window commits nothing: while a list
             // moves that is most frames. Skip the presenter's finalization
             // pass for it, unless the clock or the motion it reports is news.
-            if changesNothing(batch) && clockUnchanged(batch) { return }
+            if changesNothing(batch) && clockUnchanged(batch) { return workEnded() }
             apply(batch)
         }
         presenter.onClose = { [unowned self] id in apply(runtime.dialogClose(id, now: now())) }
@@ -1065,6 +1072,7 @@ public final class ExactSession {
         // What the pass did that a scroll moves (`scrolledWithoutPass`).
         if scrolled { presenter.scrolledWithoutPass() }
         drainReports()
+        workEnded()
         advanceIfDue()
     }
 
@@ -1167,19 +1175,8 @@ public final class ExactSession {
             transformInputHold?.cancelIfInputIneligible()
             presenter.transformGeometry.changed()
             applying = false
-            ExactLaunch.shared.applied(self, changed: !batch.ops.isEmpty) { [presenter] in
-                // Summarize op kinds and a few node IDs for the TTI trace
-                var kinds: [String: Int] = [:], names: [String] = []
-                for op in batch.ops {
-                    kinds[op.op.rawValue, default: 0] += 1
-                    guard op.nodeID != nil, names.count < 4 else { continue }
-                    let view = presenter.views[op.id]; let name = view?.props["testId"] ?? view?.kind ?? op.kind
-                    if !names.contains(name) { names.append(name) }
-                }
-                let ops = kinds.sorted { $0.value > $1.value }.prefix(3).map { "\($0.key)×\($0.value)" }.joined(separator: " ")
-                return names.isEmpty ? ops : "\(ops) (\(names.joined(separator: ", ")))"
-            }
-            NavigationMarks.shared.applied(self)
+            ExactLaunch.shared.applied(self, batch)
+            workEnded()
             #if os(macOS)
             regions.flush()
             #endif
@@ -1296,9 +1293,10 @@ public final class ExactSession {
 
     /// Drawn once per launch and kept across a dev reload's new runner; its `formatLocale` follows the Region and the hour cycle (`formatLocaleChanged`).
     var launchPlace: LaunchPlace
-    /// The zone's offset last told (`followOffset`, before each advance, so a
-    /// DST change reaches the timer after it, habits F6; `tellAgentOffset`).
-    var toldOffset: Double?, offsetHeld: (zone: String, until: Date)? // `followOffset`
+    /// The date and the zone's offset last told (`followOffset`, before each
+    /// advance, so a DST change or a sleep reaches the timer after it, habits
+    /// F6; `tellAgentOffset`).
+    var toldEpoch: Double?, toldOffset: Double?, offsetHeld: (zone: String, until: Date)? // `followOffset`
     /// Before a first boot the runtime keeps them, so the first frame is laid
     /// out with the device's preferences rather than a mouse's and then again
     /// (`pointer: none` on tvOS sets a different layout).
@@ -1482,7 +1480,9 @@ public final class ExactSession {
         frameHealth.destroy()
         finishHold.moved(false) // its work ends with the runtime
         DisplayPreferences.forget(preferenceObservers)
-        PageFacts.forget(pageObservers); localeObserver.map(NotificationCenter.default.removeObserver)
+        PageFacts.forget(pageObservers); for (center, token) in placeObservers { center.removeObserver(token) }
+        leaveObserver.map(NotificationCenter.default.removeObserver)
+        shareInboxObserver.map(NotificationCenter.default.removeObserver)
         #if os(macOS)
         colorObserver.map(NotificationCenter.default.removeObserver)
         #endif

@@ -32,6 +32,7 @@ fn main() {
         "markdown_stress_data::MarkdownStress",
         "markdown_stress_data::MarkdownStress::default()",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

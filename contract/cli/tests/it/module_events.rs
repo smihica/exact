@@ -205,6 +205,168 @@ fn the_fixture_compiles_its_statements_and_its_root_events() {
 }
 
 #[test]
+fn module_event_attributes_resolve_imports_despite_local_bindings() {
+    let app = App::new("event-scope");
+    for (imported, attribute) in [("chime as heardChime", "heardChime"), ("chime", "chime")] {
+        for (binding, children) in [
+            ("", ""),
+            ("  state chime = false\n", ""),
+            ("  derive chime = false\n", ""),
+            ("  action chime\n    heard = \"local\"\n", ""),
+            (
+                "",
+                "      for chime in [\"one\"] key=chime\n        text chime\n",
+            ),
+        ] {
+            app.write(
+                "app.contract",
+                &format!(
+                    "use {imported} from \"@fixture/bell\"\ncomponent App\n  state heard = \"\"\n{binding}  action hear(tag)\n    heard = tag\n  view\n    column {attribute}=hear\n      text heard\n{children}"
+                ),
+            );
+            let plan = app
+                .compile()
+                .unwrap_or_else(|e| panic!("{imported}, {binding:?}, {children:?}: {e:?}"));
+            assert_eq!(plan.module_events.len(), 1);
+            let event = &plan.module_events[0];
+            assert_eq!(plan.str(event.extension), "bell");
+            assert_eq!(plan.str(event.declared), "chime");
+            assert_eq!(plan.str(plan.action(event.action).name), "hear");
+            let mut r = boot(plan);
+            r.raise_module_event("bell", "chime", r#"["delivered"]"#, CallOrigin::Device)
+                .unwrap();
+            pump(&mut r);
+            assert!(slot(&r, "heard").contains("delivered"), "{}", logs(&r));
+        }
+    }
+}
+
+#[test]
+fn module_event_attributes_require_the_name_in_the_files_scope() {
+    let app = App::new("event-missing-use");
+    for imported in ["chime as heardChime", "clearCount"] {
+        app.write(
+            "app.contract",
+            &format!(
+                "use {imported} from \"@fixture/bell\"\ncomponent App\n  state heard = \"\"\n  action hear(tag: string)\n    heard = tag\n  view\n    column chime=hear\n      text heard\n"
+            ),
+        );
+        let all = app
+            .compile()
+            .err()
+            .unwrap_or_else(|| panic!("compiled `chime=hear` after `use {imported}`"));
+        assert!(
+            all.iter()
+                .any(|e| e.id == "lower-unknown-attr" && e.message.contains("`chime`")),
+            "{imported}: {all:?}"
+        );
+    }
+}
+
+#[test]
+fn module_event_attributes_do_not_capture_same_files_component_arguments() {
+    let app = App::new("event-component-arguments");
+    for (imported, argument) in [("chime as heardChime", "heardChime"), ("chime", "chime")] {
+        app.write(
+            "app.contract",
+            &format!(
+                r#"use {imported} from "@fixture/bell"
+component App
+  state heard = ""
+  action hear(tag: string)
+    heard = tag
+  view
+    column {argument}=hear
+      Label({argument}="ordinary prop")
+component Label
+  props
+    {argument}: string
+  view
+    text {argument}
+"#
+            ),
+        );
+        let plan = app
+            .compile()
+            .unwrap_or_else(|e| panic!("{imported}: {e:?}"));
+        assert_eq!(plan.module_events.len(), 1);
+        let r = boot(plan);
+        assert!(agent::handle(&r, r#"{"op":"tree"}"#).contains("ordinary prop"));
+    }
+}
+
+#[test]
+fn module_event_attributes_do_not_capture_another_files_component_arguments() {
+    let app = App::new("event-file-scope");
+    app.write(
+        "app.contract",
+        r#"use chime from "@fixture/bell"
+use Wrapper from "./wrapper.contract"
+component App
+  state heard = ""
+  action hear(tag: string)
+    heard = tag
+  view
+    column chime=hear
+      Wrapper()
+"#,
+    );
+    app.write(
+        "wrapper.contract",
+        r#"component Wrapper
+  view
+    Label(chime="ordinary prop")
+component Label
+  props
+    chime: string
+  view
+    text chime
+"#,
+    );
+    let plan = app.compile().unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(plan.module_events.len(), 1);
+    let r = boot(plan);
+    assert!(agent::handle(&r, r#"{"op":"tree"}"#).contains("ordinary prop"));
+}
+
+#[test]
+fn module_event_aliases_keep_root_and_handler_checks() {
+    let app = App::new("event-alias-refused");
+    for (ty, view, id, name) in [
+        (
+            "string",
+            "    column\n      text heardChime=hear \"nested\"\n",
+            "contract-event-root",
+            "heardChime",
+        ),
+        (
+            "string",
+            "    column heardChime=hear again=hear\n      text heard\n",
+            "contract-event-root",
+            "again",
+        ),
+        (
+            "number",
+            "    column heardChime=hear\n      text heard\n",
+            "contract-event-handler",
+            "heardChime",
+        ),
+    ] {
+        app.write(
+            "app.contract",
+            &format!(
+                "use chime as heardChime, chime as again from \"@fixture/bell\"\ncomponent App\n  state chime = false\n  state heard = \"\"\n  action hear(tag: {ty})\n    heard = \"heard\"\n  view\n{view}"
+            ),
+        );
+        let all = app.compile().unwrap_err();
+        assert!(
+            all.iter().any(|e| e.id == id && e.message.contains(name)),
+            "{ty}, {view:?}: {all:?}"
+        );
+    }
+}
+
+#[test]
 fn a_send_that_answers_nothing_and_an_event_are_refused_where_they_do_not_belong() {
     let refused = |body: &str| -> Vec<(String, String)> {
         let app = App::new("refused");

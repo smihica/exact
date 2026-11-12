@@ -164,7 +164,9 @@ struct Sig {
 /// A parked answer's key: the runner's target when it named one, then the
 /// source and its arguments. The runner keeps one request in flight per
 /// target, so two targets asking one source with equal arguments are two
-/// calls; a new call on the same key replaces the old one.
+/// calls; a new call on the same key replaces the old one. Each send of a
+/// parallel mutation is its own target (`Target::Sent`, LLP 1161.000 D5), so
+/// two with equal arguments are two calls too.
 type Key = (Option<Target>, String, Vec<u8>);
 
 /// An answer that awaited a fetch: the prelude's call id, and the fetch
@@ -273,6 +275,8 @@ struct HostState {
     /// Under the agent, the repeatable stream `crypto` draws from instead
     /// of the OS (LLP 1069.005 D2b); this instance's, from its start.
     agent: Option<exact_data::crypto::AgentStream>,
+    /// Its seed, until the journal has said the first draw is seeded.
+    agent_unsaid: Option<u64>,
     /// `CryptoKey`s by handle, never on the heap (LLP 1069.005 D1b).
     keys: HashMap<u64, exact_data::crypto::EcKey>,
     next_key: u64,
@@ -461,6 +465,7 @@ impl Module {
     pub fn with_agent_seed(mut self, seed: Option<u64>) -> Module {
         self.agent_seed = seed;
         self.host.agent = seed.map(|s| exact_data::crypto::AgentStream::new(s, "typescript"));
+        self.host.agent_unsaid = seed;
         self
     }
 
@@ -469,6 +474,16 @@ impl Module {
     pub fn with_canvas_surfaces(mut self, surfaces: &[(&str, usize)]) -> Self {
         self.canvas_surfaces = surfaces.iter().map(|(n, a)| (n.to_string(), *a)).collect();
         self
+    }
+
+    /// The module's ABI, read by the bake for its receipt.
+    pub fn abi(&mut self) -> Result<u32, String> {
+        self.load()?;
+        let engine = self.engine.as_ref().expect("loaded");
+        engine
+            .string("abi")?
+            .parse()
+            .map_err(|e| format!("exact-js: invalid ABI: {e}"))
     }
 
     /// The Canvas 2D roster: name and arity.
@@ -900,7 +915,7 @@ impl Module {
         // may a resource's answer and a mutation's after its source (the
         // amendment of 2026-10-18); a call for no target sends nothing.
         let mutation = match target {
-            Some(Target::Mutation(_)) if session => "mutation",
+            Some(Target::Mutation(_) | Target::Sent(..)) if session => "mutation",
             Some(Target::Resource(_)) if session => "answer",
             None if session && source.starts_with(TOOL) => "tool",
             _ => "",
@@ -909,6 +924,7 @@ impl Module {
         let budget_ms = self.turn_budget_ms(started);
         // (its own time on this thread's CPU clock, a wall backstop beside it: turn.rs)
         let clock = TurnClock::start(&self.turn_time);
+        let mut begun = None;
         let result: Result<Step, DataError> = (|| {
             let engine = self.engine.as_mut().expect("checked above");
             let text = engine
@@ -923,6 +939,7 @@ impl Module {
                     .ok_or_else(|| {
                         DataError::Unavailable(format!("`{source}`: a call with no id"))
                     })?;
+                begun = Some(call);
                 engine
                     .drain()
                     .map_err(|e| DataError::Unavailable(format!("`{source}` threw: {e}")))?;
@@ -934,6 +951,17 @@ impl Module {
             Ok(Module::step(sig, engine, source, reply, self.host.baking))
         })();
         self.host.store = None;
+        // An interrupt may stop __exact_call before it returns its id.
+        if result.is_err() && begun.is_none() {
+            begun = self
+                .engine
+                .as_mut()
+                .expect("checked above")
+                .call("__exact_call_id", ["", "", ""])
+                .ok()
+                .and_then(|id| id.parse().ok())
+                .filter(|id| *id != 0);
+        }
         let deadline = self.snapshot_deadline.is_some();
         let over = clock.judge(
             budget_ms,
@@ -944,6 +972,7 @@ impl Module {
         );
         if result.is_err() || over.is_some() {
             self.engine.as_mut().expect("checked above").clear_reply();
+            self.forget_calls(begun.into_iter().collect());
             self.prune_secret_calls();
         }
         // What the turn sent as an answer goes whatever it answers (the
@@ -1111,7 +1140,8 @@ impl Module {
         ) {
             return Err(DataError::Overrun(format!("`{source}`'s overlay {why}")));
         }
-        let reply: Json = serde_json::from_str(&text)
+        let reply = exact_js_value::json::parse(text.as_bytes())
+            .map(Json::from)
             .map_err(|e| DataError::Unavailable(format!("`{source}`'s overlay: {e}")))?;
         let keep = reply
             .get("keep")

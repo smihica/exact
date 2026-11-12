@@ -218,9 +218,13 @@ extension TextLinePaint {
         case ink
         /// Only the glyphs of the runs that cast this shadow, with no shadow.
         case caster(TextRunShadow)
+        /// Only the inline boxes' backgrounds, under glyphs another view
+        /// draws (the Numerals capability's rolling text, `NumeralLink`).
+        case backgrounds
 
         /// An inline background casts no run's shadow.
         var paintsBackgrounds: Bool { if case .caster = self { false } else { true } }
+        var paintsGlyphs: Bool { if case .backgrounds = self { false } else { true } }
     }
 
     /// A line whose glyph runs carry their own shadows, in a context already
@@ -268,6 +272,7 @@ extension TextLinePaint {
         case .caster(let cast):
             draw(zip(runs, shadows).filter { $0.1 == cast && !hidden($0.0) }.map { $0.0 })
             return true
+        case .backgrounds: return true
         }
         guard shadows.contains(where: { $0 != nil }) || runs.contains(where: hidden) else { return false }
         var i = 0

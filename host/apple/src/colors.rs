@@ -45,7 +45,7 @@ impl<D: DataSource> Host<D> {
     /// slice set again in one commit, which paints; the batch says the
     /// window's modes after it.
     pub fn set_modes(&mut self, pins: &[(&str, &str)]) -> String {
-        let batch = match self.runner.set_modes(pins) {
+        let mut batch = match self.runner.set_modes(pins) {
             Ok(Some(receipt)) => self.commit(
                 &[exact_runner::Timed {
                     at_ms: self.now_ms,
@@ -56,8 +56,9 @@ impl<D: DataSource> Host<D> {
             Ok(None) => self.commit(&[], None),
             Err(e) => return self.refused(Some(format!("mode: {e:?}"))),
         };
-        // An object, as every batch is: the modes go first.
-        format!("{{\"modes\":{},{}", self.runner.modes_json(), &batch[1..])
+        batch.pop();
+        batch.push_str(&format!(",\"modes\":{}}}", self.runner.modes_json()));
+        batch
     }
 
     /// Whether [`Host::set_modes`] would take `pins`, changing nothing: the

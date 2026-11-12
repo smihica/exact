@@ -1,3 +1,4 @@
+import { hostFixtureFile, glueDeclarations } from './glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
@@ -11,7 +12,7 @@ async function browserTest(run) {
     const name = path.slice(1);
     for (const dir of ['host/web-js', 'host/web', 'host']) {
       const file = Bun.file(resolve(dir, name));
-      if (await file.exists()) return new Response(file);
+      if (await file.exists()) return new Response(hostFixtureFile(file.name), { headers: { 'content-type': file.type } });
     }
     return new Response('missing', { status: 404 });
   } });
@@ -149,8 +150,8 @@ test('bound sandbox changes preserve app frames after switching from data docume
 }), 90000);
 
 test('wasm iframe events before activation settle and dispatch once after activation', () => browserTest(async (page, server) => {
-  const glue = await Bun.file('host/web/glue.js').text();
-  const attach = glue.slice(glue.indexOf('function attach('), glue.indexOf('function viewFor('));
+  const glue = hostFixtureFile('host/web/glue.js', 'utf8');
+  const attach = glueDeclarations(glue, ['attach']);
   await page.goto(server.url.href);
   const result = await page.evaluate(async attach => {
     // Production listener attachment, with the data executor held until both events arrive.
@@ -159,6 +160,7 @@ test('wasm iframe events before activation settle and dispatch once after activa
       let inputReady = false, ready;
       const moduleReady = new Promise(r => ready = r), events = [];
       const wasm = {exact_dispatch: (...args) => args}, send = e => events.push(e), writeIn = s => s, now = () => 0;
+      const host = { get inputReady() { return inputReady; }, page, wasm };
       ${attach}
       return {views, retiredViews, iframeLoading, events, attach, activate() {inputReady = true; ready();}};
     `)();
@@ -180,9 +182,9 @@ test('wasm iframe events before activation settle and dispatch once after activa
 }), 90000);
 
 test('wasm holds boot-frame posts until activation and discards retired or unauthorized guests', () => browserTest(async (page, server) => {
-  const glue = await Bun.file('host/web/glue.js').text();
-  const listener = glue.slice(glue.indexOf('function ensureMessageListener('), glue.indexOf('visualViewport?.addEventListener', glue.indexOf('function ensureMessageListener(')));
-  const attach = glue.slice(glue.indexOf('function attach('), glue.indexOf('function viewFor('));
+  const glue = hostFixtureFile('host/web/glue.js', 'utf8');
+  const listener = glueDeclarations(glue, ['ensureMessageListener']);
+  const attach = glueDeclarations(glue, ['attach']);
   await page.goto(server.url.href);
   const result = await page.evaluate(async ({listener, attach}) => {
     const {commitGuestOrigin, guestMessageAuthorized} = await import('/navigation.js');
@@ -193,6 +195,7 @@ test('wasm holds boot-frame posts until activation and discards retired or unaut
       const moduleReady = new Promise(r => ready = r), events = [];
       const wasm = {exact_dispatch: (...args) => args}, send = e => events.push(e), writeIn = s => s, now = () => 0;
       ${listener}
+      const host = { get inputReady() { return inputReady; }, page, wasm };
       ${attach}
       return {views, retiredViews, events, attach, activate() {inputReady = true; ready();}};
     `)(guestMessageAuthorized);
@@ -429,8 +432,8 @@ test('a given file a browser would run as a document is given as bytes', () => b
 }), 60000);
 
 test('a javascript: source with an app: value never runs on either web host', () => browserTest(async (page, server) => {
-  const glue = await Bun.file('host/web/glue.js').text();
-  const appFrameSource = glue.slice(glue.indexOf('function appFrameSource('), glue.indexOf('\n', glue.indexOf('function appFrameSource(')));
+  const glue = hostFixtureFile('host/web/glue.js', 'utf8');
+  const appFrameSource = glueDeclarations(glue, ['appFrameSource']);
   await page.goto(server.url.href);
   const result = await page.evaluate(async ({ appFrameSource, scripted }) => {
     globalThis.rt = await import('/rt.js'); globalThis.exact = {};

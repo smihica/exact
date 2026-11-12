@@ -289,6 +289,73 @@ fn another_tabs_stack_is_no_arrival() {
 }
 
 #[test]
+fn a_modal_route_blocks_the_tab_bar_until_dismissed() {
+    for presentation in ["modal", "fullscreen", "push"] {
+        let source = APP.replace(
+            "testId=\"route-detail\"",
+            &format!("testId=\"route-detail\" navigationPresentation=\"{presentation}\""),
+        );
+        let mut p = boot_source(&source);
+        click(&mut p, "open");
+        let tab = id(&p, "tab-other");
+        let modal = presentation != "push";
+        click(&mut p, "tab-other");
+        assert_eq!(
+            p.host
+                .kernel()
+                .node(tab)
+                .unwrap()
+                .props
+                .bool(PropId::AccessibilitySelected),
+            Some(!modal),
+            "{presentation}: only a pushed page permits switching tabs"
+        );
+        if !modal {
+            click(&mut p, "tab-home");
+        }
+        for name in ["tabs", "tab-home", "tab-other"] {
+            assert_eq!(p.host.route_visibility(id(&p, name)), (false, modal));
+        }
+        if modal {
+            assert!(p.tap(tab).unwrap_err().contains("inert"));
+        }
+        let (x, y, w, h) = p.rect_of(tab).unwrap();
+        assert_eq!(p.hit(x + w / 2., y + h / 2.) == Some(tab), !modal);
+        click(&mut p, "back");
+        assert_eq!(p.host.route_visibility(tab), (false, false));
+        click(&mut p, "tab-other");
+        assert_eq!(
+            p.host
+                .kernel()
+                .node(tab)
+                .unwrap()
+                .props
+                .bool(PropId::AccessibilitySelected),
+            Some(true),
+            "{presentation}: dismissing the route restores tab presses"
+        );
+    }
+}
+
+#[test]
+fn a_tablist_no_longer_owned_by_a_navigation_root_is_released() {
+    let source = APP
+        .replace("  state note", "  state tabs = true\n  state note")
+        .replace("    nav = replace(nav, url)", "    tabs = false")
+        .replace("role=\"tablist\"", "role=(tabs ? \"tablist\" : \"group\")")
+        .replace(
+            "testId=\"route-detail\"",
+            "testId=\"route-detail\" navigationPresentation=\"modal\"",
+        );
+    let mut p = boot_source(&source);
+    click(&mut p, "open");
+    let tabs = id(&p, "tabs");
+    assert_eq!(p.host.route_visibility(tabs), (false, true));
+    click(&mut p, "swap");
+    assert_eq!(p.host.route_visibility(tabs), (false, false));
+}
+
+#[test]
 fn a_long_mouse_press_notes_its_activation_before_the_route_arrives() {
     for scale in ["", "-exact-press-scale=0.9"] {
         let source = APP.replace("testId=\"open\"", &format!("testId=\"open\" {scale}"));

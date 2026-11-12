@@ -171,7 +171,7 @@ const COALESCE_MS: f64 = 1500.0;
 /// and the host's words.
 const UNDO_STEPS: usize = 200;
 const UNDO_UNITS: usize = 1 << 22;
-/// Syntax left visible by an edit that used to be hidden is removed.
+/// Characters eligible for cleanup when their hidden syntax no longer holds.
 const ORPHANS: &[u8] = b"*_~`[]()#>-+.! ";
 
 struct Sim {
@@ -543,6 +543,39 @@ impl Editor {
         change
     }
 
+    /// Move a dragged range to `at`, all in the original source coordinates.
+    /// The platform supplies the dropped text; deletion and insertion share
+    /// one undo step and the same hidden-syntax cleanup.
+    pub fn move_text(&mut self, from: u32, to: u32, at: u32, text: &[u16], now: f64) -> Change {
+        self.now = now;
+        let (from, to) = self.proj.outward(self.clamp((from, to)));
+        let at = self.snap(at.min(self.len()));
+        if (from..=to).contains(&at) {
+            return Change::default();
+        }
+        self.set_selection(from, to);
+        let reps = self
+            .proj
+            .visible_parts(from, to)
+            .into_iter()
+            .map(|(a, b)| (a, b, Vec::new()))
+            .collect::<Vec<_>>();
+        let removed = self.simulate(&reps, true);
+        let at = removed.caret(at);
+        // Resolve insertion against the source after deletion, including its
+        // syntax cleanup, without putting that intermediate state in history.
+        let mut moved = Self {
+            source: removed.result,
+            atoms: self.atoms.clone(),
+            ..Self::new()
+        };
+        moved.restyle();
+        moved.set_selection(at, at);
+        let (at, _) = moved.selection();
+        moved.insert(&clean(text), at, at);
+        self.commit(moved.source, moved.sel, moved.sticky.is_some(), Kind::Edit)
+    }
+
     /// Select everything.
     pub fn select_all(&mut self) -> Change {
         self.sel = (0, self.len());
@@ -882,10 +915,12 @@ impl Editor {
         self.source = to.source;
         self.words = to.words;
         self.words_back = true;
-        self.sticky = None;
         self.pending = [None; 4];
         self.restyle();
         self.sel = self.clamp(to.sel);
+        // Undo keeps the edit's chosen side of hidden markers.
+        self.sticky =
+            (self.sel.0 == self.sel.1 && self.snap(self.sel.0) != self.sel.0).then_some(self.sel.0);
         Change {
             source: true,
             place: true,
@@ -939,9 +974,17 @@ impl Editor {
         self.commit(sim.result, (c, c), false, kind)
     }
 
-    /// Apply replacements, then remove syntax that was hidden before and is
-    /// visible after (half a bold pair, say): it would read as stray text.
+    /// Remove emptied inline pairs before reparsing, then hidden syntax exposed
+    /// by the edit. Otherwise the empty pair can become a rule, fence or new span.
     fn simulate(&self, reps: &[Rep], cleanup: bool) -> Sim {
+        let move_pair = |&(open, close): &(Range, Range), map: &Map| {
+            let moved = |r: Range| {
+                let start = map.char(r.start)?;
+                let end = map.char(r.end - 1)? + 1;
+                (end - start == r.end - r.start).then_some(Range::new(start, end))
+            };
+            Some((moved(open)?, moved(close)?))
+        };
         let (mut text, first) = splice(&self.source, reps);
         let mut sim = Sim {
             result: Vec::new(),
@@ -956,22 +999,35 @@ impl Editor {
         } else {
             Vec::new()
         };
-        sim.maps.push(first);
-        for _ in 0..3 {
-            if survivors.is_empty() {
-                break;
-            }
-            let styled = md::style_with(&utf8(&text), None, &self.atoms);
-            let proj = Projection::new(&text, &styled);
-            let orphans: Vec<u32> = survivors
+        let mut pairs: Vec<_> = if cleanup {
+            self.styled
+                .delimiters
                 .iter()
-                .copied()
-                .filter(|&i| {
-                    text.get(i as usize)
-                        .is_some_and(|&c| c < 128 && ORPHANS.contains(&(c as u8)))
-                        && !proj.is_hidden(i)
-                })
+                .filter_map(|pair| move_pair(pair, &first))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        sim.maps.push(first);
+        while !survivors.is_empty() {
+            let mut orphans: Vec<u32> = pairs
+                .iter()
+                .filter(|(open, close)| open.end == close.start)
+                .flat_map(|(open, close)| open.start..close.end)
                 .collect();
+            if orphans.is_empty() {
+                let styled = md::style_with(&utf8(&text), None, &self.atoms);
+                let proj = Projection::new(&text, &styled);
+                orphans = survivors
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        text.get(i as usize)
+                            .is_some_and(|&c| c < 128 && ORPHANS.contains(&(c as u8)))
+                            && !proj.is_hidden(i)
+                    })
+                    .collect();
+            }
             if orphans.is_empty() {
                 break;
             }
@@ -980,6 +1036,10 @@ impl Editor {
             let (next, map) = splice(&text, &reps);
             text = next;
             survivors = survivors.iter().filter_map(|&i| map.char(i)).collect();
+            pairs = pairs
+                .iter()
+                .filter_map(|pair| move_pair(pair, &map))
+                .collect();
             sim.maps.push(map);
         }
         sim.result = text;
@@ -1131,8 +1191,9 @@ impl Editor {
         let proj = &self.proj;
         if from == to {
             // At a line's text, Backspace drops its prefix: heading, bullet, quote.
-            if let Some(prefix) = proj.prefix_run(from.saturating_sub(1), from) {
-                if backward && prefix.end == from {
+            let at = proj.canonical(from);
+            if let Some(prefix) = proj.prefix_run(at.saturating_sub(1), at) {
+                if backward && prefix.end == at {
                     return self.commit_reps(
                         vec![(prefix.start, prefix.end, Vec::new())],
                         prefix.start,
@@ -1223,14 +1284,11 @@ impl Editor {
             };
             let sim = self.simulate(&edit.reps, true);
             if sim.orphans == 0 || i == last {
-                let sel = if sim.orphans == 0 {
-                    edit.sel
-                } else {
-                    (sim.caret(a + 1), sim.caret(a + 1))
-                };
-                let change = self.commit(sim.result, sel, false, Kind::Edit);
-                self.sel = (self.snap(self.sel.0), self.snap(self.sel.1));
-                return change;
+                // The shared edit already mapped its selection through the first splice.
+                let mapped = |p| sim.maps[1..].iter().fold(p, |p, m| m.caret(p));
+                let sel = (mapped(edit.sel.0), mapped(edit.sel.1));
+                // Keep the shared edit's side of an opener through DOM selection echoes.
+                return self.commit(sim.result, sel, true, Kind::Edit);
             }
         }
         Change::default()

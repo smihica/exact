@@ -1,0 +1,99 @@
+{
+  "kind": "interface",
+  "name": "@exact/push",
+  "version": "1.0.0",
+  "grants": [
+    "device.push"
+  ],
+  "permission": {
+    "name": "notifications",
+    "status": "pushPermissionState",
+    "field": "state",
+    "denied": "NotAllowedError"
+  },
+  "shapes": {
+    "ApplePushSubscription": {
+      "deviceToken": "string"
+    },
+    "PushSubscription": {
+      "apple": "option<ApplePushSubscription>"
+    },
+    "PushPermissionStatus": {
+      "available": "bool",
+      "state": "enum<granted|prompt|denied|unknown>"
+    }
+  },
+  "names": [
+    {
+      "send": "subscribePush",
+      "request": true,
+      "answers": "PushSubscription",
+      "substitute": {
+        "from": "pushSubscription",
+        "ticket": "subscription",
+        "cancel": {
+          "error": "AbortError"
+        },
+        "unsupported": [
+          "macos",
+          "tvos",
+          "android",
+          "web",
+          "linux",
+          "windows",
+          "terminal"
+        ]
+      }
+    },
+    {
+      "source": "pushSubscription",
+      "live": true,
+      "answers": "option<PushSubscription>",
+      "substitute": {
+        "default": null,
+        "ungranted": null
+      }
+    },
+    {
+      "source": "pushPermissionState",
+      "live": true,
+      "answers": "PushPermissionStatus",
+      "substitute": {
+        "default": {
+          "available": true,
+          "state": "prompt"
+        },
+        "targets": {
+          "macos": {
+            "available": false,
+            "state": "unknown"
+          },
+          "tvos": {
+            "available": false,
+            "state": "unknown"
+          },
+          "android": {
+            "available": false,
+            "state": "unknown"
+          },
+          "web": {
+            "available": false,
+            "state": "unknown"
+          },
+          "linux": {
+            "available": false,
+            "state": "unknown"
+          },
+          "windows": {
+            "available": false,
+            "state": "unknown"
+          },
+          "terminal": {
+            "available": false,
+            "state": "unknown"
+          }
+        }
+      }
+    }
+  ]
+}

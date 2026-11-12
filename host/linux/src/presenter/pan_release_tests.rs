@@ -75,6 +75,29 @@ fn a_tap_presses_and_releases_nothing() {
 }
 
 #[test]
+fn a_wheel_before_pan_recognition_preserves_the_press() {
+    let mut p = boot();
+    assert!(p.pointer_down(100., 100., 0.).unwrap());
+    p.pointer_move(102., 101., 10.).unwrap();
+    p.wheel_at(102., 101., 0., 40.);
+    assert_eq!(out(&p), vec![0., 0., 0., 0., 0.]);
+    p.pointer_up(102., 101., 20.).unwrap();
+    assert_eq!(out(&p), vec![0., 0., 0., 0., 1.]);
+}
+
+#[test]
+fn a_wheel_cancels_a_recognized_pan_with_one_release_at_rest() {
+    let mut p = boot();
+    assert!(p.pointer_down(100., 100., 0.).unwrap());
+    p.pointer_move(150., 100., 16.).unwrap();
+    p.pointer_move(200., 100., 32.).unwrap();
+    p.wheel_at(200., 100., 0., 40.);
+    assert_eq!(out(&p), vec![100., 0., 0., 1., 0.]);
+    p.pointer_up(200., 100., 50.).unwrap();
+    assert_eq!(out(&p), vec![100., 0., 0., 1., 0.]);
+}
+
+#[test]
 fn a_cancelled_pan_releases_at_rest() {
     let mut p = boot();
     assert!(p.pointer_down(100., 100., 0.).unwrap());

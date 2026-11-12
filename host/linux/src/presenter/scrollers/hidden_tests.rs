@@ -1,5 +1,5 @@
 //! A scroller under a hidden route keeps its offset (Excord's Android picture dismiss, theme2 2026-10-28 07:39):
-//! a full-screen route over a list hides the list's route, whose layout then has no travel, and the clamp put
+//! a full-screen route with no background hides the list's route, whose layout then has no travel, and the clamp put
 //! the list at 0, so the list showed its first rows when the route came back. On Linux and Android alike.
 use super::*;
 

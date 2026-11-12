@@ -217,6 +217,41 @@ fn a_hidden_image_is_no_run() {
 }
 
 #[test]
+fn a_nonvisible_image_keeps_its_box_but_contributes_no_readable_label() {
+    for visibility in ["visible", "hidden", "collapse"] {
+        let mut k = paragraph(
+            &[
+                (StyleId::Height, "20px"),
+                (StyleId::Width, "30px"),
+                (StyleId::Visibility, visibility),
+            ],
+            "ab",
+        );
+        k.apply(
+            1,
+            2,
+            &[Op::SetProp {
+                id: 4,
+                prop: PropId::AccessibilityLabel,
+                value: "star".into(),
+            }],
+        )
+        .unwrap();
+        let paragraph = k.node(2).unwrap();
+        assert_eq!(paragraph.text_runs()[1].inline.unwrap().width, 30.0);
+        assert_eq!(
+            paragraph.read_runs(),
+            [
+                "ab",
+                if visibility == "visible" { "star" } else { "" },
+                " ef"
+            ],
+            "{visibility}"
+        );
+    }
+}
+
+#[test]
 fn an_image_on_a_line_the_clamp_cuts_shows_nothing() {
     let mut k = paragraph(
         &[(StyleId::Height, "10px"), (StyleId::Width, "30px")],

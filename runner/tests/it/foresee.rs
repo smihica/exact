@@ -18,6 +18,9 @@ const SOURCE: &str = "component App
   action show(t: string)
     shown = some(t)
     open = true
+  action hide
+    shown = none
+    open = false
   action bump
     n = n + 1
   view
@@ -27,6 +30,7 @@ const SOURCE: &str = "component App
       button press=bump testId=\"b\"
         text `${n}`
       text \"plain\" testId=\"c\"
+      button \"Close\" press=hide testId=\"close\"
       column testId=\"host\"
         match shown
           case some(t)
@@ -98,6 +102,17 @@ fn a_press_that_opens_a_screen_is_foreseen_and_the_runner_is_as_it_was() {
     assert!(agent::tree(&r).contains("hello"));
     // Shown now: the same press mounts nothing more.
     assert!(r.foresee(view(&r, "a")).is_none());
+
+    let (shown_tree, shown_state) = (agent::tree(&r), agent::state(&r));
+    assert!(r.foresee(view(&r, "close")).is_none());
+    assert_eq!(agent::tree(&r), shown_tree);
+    assert_eq!(agent::state(&r), shown_state);
+    r.dispatch(view(&r, "close"), Event::Press).unwrap();
+    assert_eq!(r.kernel().live_count(), live);
+    assert!(r.kernel().find_first_by_test_id("detail").is_none());
+    assert!(r.kernel().find_first_by_test_id("flag").is_none());
+    assert_eq!(r.slot("open"), Some(&Value::Bool(false)));
+    assert_eq!(r.slot("shown"), Some(&Value::Option(None)));
 }
 
 #[test]

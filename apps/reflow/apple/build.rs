@@ -44,7 +44,8 @@ fn main() {
             contract::rust_entry(
                 "reflow_data::Reflow",
                 "reflow_data::Reflow::default()",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

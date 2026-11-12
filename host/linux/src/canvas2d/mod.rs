@@ -187,21 +187,14 @@ impl Replayer {
         self.base.pre_concat(self.state.author)
     }
 
-    fn stroke_style(&self) -> Option<Stroke> {
-        let mut stroke = Stroke {
+    fn stroke_style(&self) -> Stroke {
+        Stroke {
             width: self.state.width,
             miter_limit: self.state.miter,
             line_cap: self.state.cap,
             line_join: self.state.join,
-            dash: None,
-        };
-        if !self.state.dash.is_empty() {
-            if self.state.dash.iter().all(|v| *v == 0.0) {
-                return None;
-            }
-            stroke.dash = StrokeDash::new(self.state.dash.clone(), self.state.dash_offset);
+            dash: StrokeDash::new(self.state.dash.clone(), self.state.dash_offset),
         }
-        Some(stroke)
     }
 
     /// Fill a path in canvas coordinates with the fill style.
@@ -223,9 +216,7 @@ impl Replayer {
     }
 
     fn stroke_user_path(&mut self, user: &Path, env: &Env<'_>) {
-        let Some(stroke) = self.stroke_style() else {
-            return;
-        };
+        let stroke = self.stroke_style();
         let ts = self.device();
         let source = self.source(self.state.stroke, env);
         self.draw(Geom::Stroke(user, stroke, ts), source);
@@ -283,7 +274,8 @@ impl Replayer {
         if fill {
             let source = self.source(self.state.fill, env);
             self.draw(Geom::Fill(&path, FillRule::Winding, ts), source);
-        } else if let Some(stroke) = self.stroke_style() {
+        } else {
+            let stroke = self.stroke_style();
             let source = self.source(self.state.stroke, env);
             self.draw(Geom::Stroke(&path, stroke, ts), source);
         }

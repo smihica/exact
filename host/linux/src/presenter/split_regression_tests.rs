@@ -95,21 +95,43 @@ fn split_parent_scroll_moves_a_detail_lists_reorder_clip() {
 }
 
 #[test]
-fn split_fullscreen_hides_the_list_while_modal_leaves_it_visible() {
-    for presentation in ["modal", "fullscreen"] {
+fn split_fullscreen_background_keeps_both_panes_visible_and_inert() {
+    for (presentation, background, hidden) in [
+        ("modal", "", false),
+        ("fullscreen", "", true),
+        ("fullscreen", "background-color=\"transparent\"", false),
+        (
+            "fullscreen",
+            "background-color=\"rgba(0, 0, 0, 0.5)\"",
+            false,
+        ),
+        (
+            "fullscreen",
+            "background-image=\"linear-gradient(transparent, transparent)\"",
+            false,
+        ),
+    ] {
         let mut p = boot_source(
             1200.,
             &APP.replace("SPLIT", "auto")
-                .replace("\"modal\"", &format!("\"{presentation}\"")),
+                .replace("\"modal\"", &format!("\"{presentation}\""))
+                .replace(
+                    "position=\"absolute\"",
+                    &format!("{background} position=\"absolute\""),
+                ),
         );
         tap(&mut p, "a");
         tap(&mut p, "sheet-item");
         let row = id(&p, "a");
-        assert_eq!(
-            p.host.route_visibility(row),
-            (presentation == "fullscreen", true)
-        );
-        assert_eq!(p.box_of(row).is_none(), presentation == "fullscreen");
+        for name in ["a", "field-item"] {
+            let node = id(&p, name);
+            assert_eq!(
+                p.host.route_visibility(node),
+                (hidden, true),
+                "{background}"
+            );
+            assert_eq!(p.box_of(node).is_none(), hidden);
+        }
         assert!(p.host.runner().inactive(row));
         tap(&mut p, "close");
         assert_eq!(p.host.route_visibility(row), (false, false));

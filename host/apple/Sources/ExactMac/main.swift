@@ -42,6 +42,8 @@ if agentReadable { Agent.prepareStdio() }
 // default, is undocumented, which shipped code does not read (LLP 1035.003 §3).
 let app = NSApplication.shared
 ExactEnv.stamp("NSApplication.shared")
+// The manifest's fixed `userInterfaceStyle`, before any window or view reads an appearance.
+app.appearance = ExactEnv.fixedAppearance
 // Under a script (LLP 1012) the app is an accessory — no Dock tile, no
 // activation, so a running smoke never takes the focus from whoever is
 // typing; its window is made key for a `type` when one comes (`AgentMac`).
@@ -81,15 +83,16 @@ final class Adapter: ExactSessionDelegate {
     /// The capabilities: `setScheme` is the app's appearance — `light`,
     /// `dark`, or `system`, as the web's `color-scheme`, where following the
     /// user's preference is the absence of an override rather than a third
-    /// appearance; `openURL` is a link the reader followed
-    /// (`TextSelectionMac`); anything else is named and refused.
+    /// appearance (the manifest's fixed `userInterfaceStyle`, when it has
+    /// one); `openURL` is a link the reader followed (`TextSelectionMac`);
+    /// anything else is named and refused.
     func exactSession(_ session: ExactSession, command name: String, args: [Any]) {
         switch name {
         case "setScheme":
             switch args.first as? String {
             case "dark": app.appearance = NSAppearance(named: .darkAqua)
             case "light": app.appearance = NSAppearance(named: .aqua)
-            default: app.appearance = nil
+            default: app.appearance = ExactEnv.fixedAppearance
             }
         case "openURL": open(args.first as? String ?? "", from: session) { session.answerOpenURL(args, opened: $0) }
         // `window.close()` (studio diary R17): the window this session

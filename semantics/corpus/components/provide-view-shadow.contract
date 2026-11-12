@@ -1,0 +1,33 @@
+component App
+  state item = "root"
+  state index = 9
+  state items = ["a", "b"]
+  state option = some("bound")
+  provide
+    current = item
+    number = index
+  view
+    column
+      Row(id="outside")
+      for item, index in items key=item
+        Row(id=`${item}-${index}`)
+      match option
+        case some(item)
+          Row(id=item)
+        case none
+          Row(id="none")
+
+component Row
+  props
+    id: string
+  inject
+    current: string
+    number: number
+  view
+    text `${current}:${number}` testId=`row-${id}`
+
+test "a provided value keeps its defining scope under root view binders"
+  expect text "row-outside" == "root:9"
+  expect text "row-a-0" == "root:9"
+  expect text "row-b-1" == "root:9"
+  expect text "row-bound" == "root:9"

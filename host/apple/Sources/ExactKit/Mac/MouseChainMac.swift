@@ -410,7 +410,7 @@ extension NodeView {
         !disabled && ((editor as? NSTextView)?.isSelectable ?? true) && ((editor as? NSControl)?.isEnabled ?? true)
     }
     /// `pointerup` for every node the button's down was held by, innermost first.
-    func pointerReleased(_ event: NSEvent?) {
+    package func pointerReleased(_ event: NSEvent?) {
         holdPresenter?.flushHoverMove()
         // The button is up: what lies under the pointer now is what is
         // hovered, with no further move, as AppKit's tracking areas report an

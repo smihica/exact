@@ -5,6 +5,7 @@
 //! A host applies the replacements as ordinary, undoable edits.
 
 use crate::block::{self, BlockKind, B};
+use crate::inline::Construct;
 use crate::offsets::Offsets;
 use crate::style::analyze;
 use crate::{Range, BOLD, CODE, ITALIC, LINK, STRIKE};
@@ -204,10 +205,15 @@ fn inline(source: &str, sel: B, kind: u8, marker: &str) -> Draft {
             selection: Some(sel.start + m..sel.start + m),
         };
     }
-    // Markers hug the text, a line at a time: `** a**` is not bold.
+    // Markers hug each line's content, leaving its block syntax outside.
     let mut reps = Vec::new();
-    let mut at = sel.start;
-    for piece in source[sel.clone()].split('\n') {
+    for line in (Lines { source }).touched(&sel) {
+        let at = sel.start.max(prefix(source, &line).content);
+        let end = sel.end.min(line.end);
+        if at >= end {
+            continue;
+        }
+        let piece = &source[at..end];
         let lead = piece.len() - piece.trim_start().len();
         let text = piece.trim();
         if !text.is_empty() {
@@ -217,7 +223,6 @@ fn inline(source: &str, sel: B, kind: u8, marker: &str) -> Draft {
                 marker.to_string(),
             ));
         }
-        at += piece.len() + 1;
     }
     let selection = match (reps.first(), reps.last()) {
         (Some(first), Some(last)) => {
@@ -404,16 +409,19 @@ fn indent(source: &str, sel: B, out: bool) -> Draft {
         .touched(&sel)
         .into_iter()
         .filter_map(|l| {
+            // A quoted line's indent is counted after its `>` markers.
+            let (_, _, quote) = block::quote_prefix(&source[l.clone()]);
+            let at = l.start + quote;
             if !out {
-                return Some((l.start..l.start, "  ".to_string()));
+                return Some((at..at, "  ".to_string()));
             }
-            let text = &source[l.clone()];
+            let text = &source[at..l.end];
             let lead = if text.starts_with('\t') {
                 1
             } else {
                 text.bytes().take(2).take_while(|&c| c == b' ').count()
             };
-            (lead > 0).then(|| (l.start..l.start + lead, String::new()))
+            (lead > 0).then(|| (at..at + lead, String::new()))
         })
         .collect();
     Draft {
@@ -510,16 +518,98 @@ fn footnote(source: &str, sel: B) -> Draft {
     }
 }
 
-fn newline(source: &str, sel: B) -> Draft {
+// An autolink's literal text must not introduce formatting or another URL in its label.
+fn link_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\`*_~[]<>:".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Close and reopen the constructs a block break would otherwise cut apart.
+fn split_inline(source: &str, sel: &B, text: String, constructs: &[Construct]) -> Draft {
+    let mut active: Vec<_> = constructs
+        .iter()
+        .filter(|c| matches!(c.kind, BOLD | ITALIC | STRIKE | CODE | LINK))
+        .filter(|c| {
+            (c.inner.start < sel.start && sel.start < c.inner.end)
+                || (c.inner.start < sel.end && sel.end < c.inner.end)
+        })
+        .collect();
+    active.sort_by_key(|c| c.outer.start);
+    let autolink = |c: &Construct| {
+        (c.kind == LINK && &source[c.outer.start..c.inner.start] == "<")
+            .then(|| format!("]({})", destination(c.href.as_deref().unwrap_or_default())))
+    };
+    let mut reps = Vec::new();
+    // Trimming an outer format must not move its delimiter inside a nested one.
+    let mut left_at = 0;
+    for c in active.iter().rev() {
+        if c.inner.start < sel.start && sel.start < c.inner.end {
+            let left = &source[c.inner.start..sel.start];
+            if let Some(close) = autolink(c) {
+                reps.push((
+                    c.outer.start..sel.start,
+                    format!("[{}{close}", link_label(left)),
+                ));
+                continue;
+            }
+            let at = if c.kind == CODE {
+                sel.start
+            } else {
+                sel.start - (left.len() - left.trim_end().len())
+            }
+            .max(left_at);
+            left_at = at;
+            reps.push((at..at, source[c.inner.end..c.outer.end].to_string()));
+        }
+    }
+    reps.push((sel.clone(), text));
+    let mut openers = Vec::new();
+    let mut right_at = source.len();
+    for c in active.iter().rev() {
+        if c.inner.start < sel.end && sel.end < c.inner.end {
+            let right = &source[sel.end..c.inner.end];
+            if let Some(close) = autolink(c) {
+                openers.push((sel.end..sel.end, "[".into()));
+                openers.push((
+                    sel.end..c.outer.end,
+                    format!("{}{close}", link_label(right)),
+                ));
+                continue;
+            }
+            let at = if c.kind == CODE {
+                sel.end
+            } else {
+                sel.end + (right.len() - right.trim_start().len())
+            }
+            .min(right_at);
+            right_at = at;
+            openers.push((at..at, source[c.outer.start..c.inner.start].to_string()));
+        }
+    }
+    reps.extend(openers.into_iter().rev());
+    reps.sort_by_key(|(r, _)| (r.start, r.end));
+    // A rewritten right-hand label starts at the caret but stays after it.
+    let caret = (sel.end as isize
+        + reps
+            .iter()
+            .filter(|(r, _)| r.end <= sel.end)
+            .map(|(r, t)| t.len() as isize - r.len() as isize)
+            .sum::<isize>()) as usize;
+    Draft {
+        reps,
+        selection: Some(caret..caret),
+    }
+}
+
+fn newline(source: &str, mut sel: B) -> Draft {
     let lines = Lines { source };
     let line = lines.start(sel.start)..lines.end(sel.start);
-    let plain = |text: String| {
-        let caret = sel.start + text.len();
-        Draft {
-            reps: vec![(sel.clone(), text)],
-            selection: Some(caret..caret),
-        }
-    };
     // Inside a fence a line is literal: Return keeps its indent and nothing else.
     let analysis = analyze(source, None);
     let coded = analysis.blocks.iter().any(|b| {
@@ -529,12 +619,43 @@ fn newline(source: &str, sel: B) -> Draft {
             && b.range.start <= sel.start
             && sel.start <= b.range.end
     });
+    let p = prefix(source, &line);
+    let split = !coded && (p.kind.is_some() || p.quoted) && sel.start >= p.content;
+    if split {
+        // At an inline edge, keep the whole construct on its side of the break.
+        for edge in [&mut sel.start, &mut sel.end] {
+            while let Some(c) = analysis
+                .constructs
+                .iter()
+                .find(|c| c.inner.start == *edge || c.inner.end == *edge)
+            {
+                let at = if c.inner.start == *edge {
+                    c.outer.start
+                } else {
+                    c.outer.end
+                };
+                if at == *edge {
+                    break;
+                }
+                *edge = at;
+            }
+        }
+    }
+    let plain = |text: String| {
+        if split {
+            return split_inline(source, &sel, text, &analysis.constructs);
+        }
+        let caret = sel.start + text.len();
+        Draft {
+            reps: vec![(sel.clone(), text)],
+            selection: Some(caret..caret),
+        }
+    };
     if coded {
         let text = &source[line.clone()];
         let lead = &text[..text.len() - text.trim_start().len()];
         return plain(format!("\n{lead}"));
     }
-    let p = prefix(source, &line);
     let listed = matches!(
         p.kind,
         Some(BlockKind::Bullet | BlockKind::Ordered | BlockKind::Task(_))

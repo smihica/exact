@@ -34,6 +34,7 @@ fn main() {
         "llp_data::Llp",
         "llp_data::Llp::new()",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

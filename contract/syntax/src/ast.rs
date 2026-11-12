@@ -409,7 +409,7 @@ impl TypeExpr {
     }
 }
 /// A component.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Component {
     /// The name.
     pub name: String,
@@ -517,6 +517,11 @@ pub struct ResourceDecl {
     /// `for x in list [key=k]`: one request for each element (LLP 1017.000
     /// P4c, amended 2026-11-04).
     pub each: Option<ResourceEach>,
+    /// `transient` (LLP 1156.005 D4): its answer is never kept across
+    /// launches.
+    pub transient: bool,
+    /// `when cond` (LLP 1161.002): asked only while `cond` holds.
+    pub gate: Option<Expr>,
     /// Where.
     pub span: Span,
 }
@@ -554,9 +559,9 @@ pub struct MutationDecl {
     pub name: String,
     /// The reply's shape, `T`.
     pub shape: TypeExpr,
-    /// `queue`: one send in flight, later sends wait their turn in order
-    /// (LLP 1092 D1, D2); otherwise the newest send wins (LLP 1016 §4).
-    pub queue: bool,
+    /// How its sends overlap: the newest wins, they wait their turn
+    /// (`queue`), or they run together (`parallel`).
+    pub mode: MutationMode,
     /// `refreshes a, b`: resources the runner re-asks, forced, when a send
     /// to this mutation runs and when its reply lands (LLP 1054.000.000 D1).
     pub refreshes: Vec<(String, Span)>,
@@ -564,6 +569,19 @@ pub struct MutationDecl {
     pub then: Option<(String, Span)>,
     /// Where.
     pub span: Span,
+}
+/// How a mutation's sends overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MutationMode {
+    /// A send forgets the one in flight: the newest wins (LLP 1016 §4).
+    #[default]
+    Newest,
+    /// `queue`: one send in flight, later sends wait their turn in order
+    /// (LLP 1092 D1, D2).
+    Queue,
+    /// `parallel`: every send is asked when it is made, and its reply
+    /// lands whatever else is out (LLP 1161.000 D1, D2).
+    Parallel,
 }
 /// A typed parameter (`props` entry or action parameter).
 #[derive(Debug, Clone, PartialEq)]

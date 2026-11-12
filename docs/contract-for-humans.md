@@ -672,7 +672,20 @@ stays true while anything waits. Assigning `saved = none` forgets nothing under
 `queue`: every reply still lands. Keep newest-wins for a sign-in or a draft whose
 late reply should be dropped (LLP 1092).
 
-For a mutation without `queue`, the action that sends `saved` must not also
+Independent writes a person may repeat before the first answers, such as two
+renames or two comments, want every send at once. Declare the mutation
+`parallel` (`mutation renamed as shape Renamed parallel refreshes issues`):
+each send is asked when it is made, its write shows through the overlay until
+its own reply and the answer asked after it, and its reply lands whatever else
+is out. The slot and `failure(renamed)` follow the latest send that has
+concluded, so a late reply never overwrites a newer outcome, and an earlier
+send's failure shows unless a later send has already concluded. `pending`
+stays true while any send is out, an assignment forgets no request, at most 64
+sends are in flight, and there is no `then`. The source is called once per
+send: one that reads local storage, changes it and writes it back must order
+its own work, or the mutation should be `queue` (LLP 1161.000).
+
+For a newest-wins mutation, the action that sends `saved` must not also
 assign `saved = none`. Assignments commit after sends, so that reset can discard
 the new reply even when it appears first. Hide a previous error while
 `pending(saved)` instead. `none` means the slot contains no reply, not a failed write; use
@@ -697,8 +710,7 @@ changed. During a live replacement request, the prior displayed value may remain
 visible even when call arguments changed, so private-data views must gate it by
 owner and authorization. Neither call arguments nor `with` make a resource wait
 for an upstream request to succeed. The default web JS target keeps no persisted
-resource answers; see
-[the platform scope](../llp/1027.005-resource-identity-and-request-context.rfc.md#d5--where-it-applies-and-the-gap-it-leaves).
+resource answers (LLP 1027.005 D5).
 The minute must already contain the current sample for the first ask; a timer
 can update it thereafter. Use `refresh` or `refreshes` for values whose only job
 is forcing another ask. Await true asynchronous prerequisites, such as a valid
@@ -1406,7 +1418,7 @@ dialog's, so `height: 50vh` is half the screen at any sheet height
 and `min-height: 100vh` opens the sheet at its tallest. A route that scrolls itself is measured by what it scrolls,
 laid out in the sheet, so give its rows `flex-shrink: 0`. macOS, the web and
 Linux show a modal route as authored and ignore the detent
-([LLP 1075.003](../llp/1075.003-native-platform-control-merged.plan.md) §9.11).
+(LLP 1075.003 §9.11).
 
 `path("item", value)` checks the route and encodes its parameters. Always build
 locations with it: a template literal as a location is refused and a string
@@ -1429,11 +1441,10 @@ declare `render`, `activate`, `paint` and `pages` policies; these interact with
 the site's build/render pipeline, not just its client-side view. Leave `activate`
 unsaid unless a page needs otherwise: a rendered page then loads no script until
 the reader acts, when nothing on it needs the runtime sooner
-([LLP 1048.007](../llp/1048.007-pages-that-wait-for-the-reader.rfc.md)). Follow
-[the document corpus](../contract/corpus/document.contract),
-[the document tests](../contract/cli/tests/it/document.rs) and
-[LLP 1048.003](../llp/1048.003-documents-in-contract.spec.md) for accepted policy
-values and serving behavior. A compiled interface alone is not a deployed website.
+(LLP 1048.007). Follow
+[the document corpus](../contract/corpus/document.contract) and
+[the document tests](../contract/cli/tests/it/document.rs) for accepted policy
+values and serving behavior (LLP 1048.003). A compiled interface alone is not a deployed website.
 
 ## Time, motion, and geometry
 
@@ -1624,8 +1635,7 @@ for the app to honor, not automatic engine policy. `displayMode: string` reads
 CSS's current `display-mode`: the browser's media query on the web,
 `fullscreen` or `standalone` for the window on macOS, and `standalone` on
 other native hosts. `navigationType` is how the browser loaded the page
-(`navigate`, `reload` or `back_forward`), and empty in a native app. Available fields are documented beside their source validation and
-[the viewport design](../llp/1039-viewport-facts.rfc.md); start with [the viewport corpus](../contract/corpus/viewport.contract).
+(`navigate`, `reload` or `back_forward`), and empty in a native app. Available fields are documented beside their source validation (LLP 1039); start with [the viewport corpus](../contract/corpus/viewport.contract).
 
 Localized strings live in the app's `strings/<locale>.json` files. Author calls
 such as `t("greeting", name=person.name)`, with `{name}` in the table value. The
@@ -1688,9 +1698,9 @@ payload type, current action binding, and whether the node exists.
 
 `app.json` also controls delivery policy. `bun scripts/deploy.mjs <app>` is a
 dry run, which expects a committed tree (or `--dirty`); publication uses `--yes`,
-an origin, a signing key, and the configured signed streams. Read
-[LLP 1030.000](../llp/1030.000-dev-server-as-deployer.rfc.md) before changing
-trust or publishing. Writing Contract does not require inventing a deployment
+an origin, a signing key, and the configured signed streams. Before
+changing trust or publishing, read [the reference](reference.md) on
+`EXACT_UPDATE_TRUST` (LLP 1030.000). Writing Contract does not require inventing a deployment
 service. To put an iOS app on someone's iPhone, run `bun exact.mjs share`: it
 builds the app and prints an AppDrop link that installs it with their own Apple ID.
 
@@ -1711,6 +1721,6 @@ builds the app and prints an AppDrop link that installs it with their own Apple 
 | All language forms | [grammar reference](contract-grammar.md) |
 
 Read current source examples rather than predecessor design documents. A feature
-in `llp/research/` is historical evidence, not proof that the current compiler
+in a predecessor's design document is historical evidence, not proof that the current compiler
 accepts it. When the compiler refuses something, keep its diagnostic id and
 source range: its suggested accepted form is often the quickest next step.

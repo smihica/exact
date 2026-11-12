@@ -1,6 +1,7 @@
-// The Android pedometer's sums (LLP 1133.026 §15 stage 3), fed recorded reads and counter events, since an emulator
-// need not have a step counter or current Play services. `count.mjs` compiles this with `android/Count.kt` and runs it.
+// The Android pedometer's ranges and sums (LLP 1133.026 §15 stage 3), fed clocks, reads and counter events, since an emulator
+// need not have a step counter or current Play services. `count.mjs` compiles this with the Android count and subscription.
 import exact.pedometer.Count
+import exact.pedometer.Subscription
 import kotlin.system.exitProcess
 
 var failed = 0
@@ -39,7 +40,7 @@ fun main() {
     Count(0.0).run {
         counter(500.0, 1.0)
         checkThat("recording: the first answer reads the API", due(1.0))
-        check("recording: the total read", recorded(300.0, 0.0, 1.0), 300.0, 0.0)
+        check("recording: the total read", recorded(300.0, 0.0, 1.0, 1.0), 300.0, 0.0)
         counter(520.0, 2.0)
         checkThat("recording: a fresh total is not read again", !due(2.0))
         check("recording: the total and the counter's increase", between(2.0), 320.0, 0.0)
@@ -47,7 +48,7 @@ fun main() {
         // A hidden stretch: the counter's last value is not trusted, so the return reads the API again.
         hidden()
         checkThat("recording: the return reads the API", due(3.0))
-        check("recording: the return's total", recorded(410.0, 0.0, 4.0), 410.0, 0.0)
+        check("recording: the return's total", recorded(410.0, 0.0, 4.0, 4.0), 410.0, 0.0)
         check("recording: no counter event yet adds nothing", between(5.0), 410.0, 0.0)
         counter(900.0, 6.0)
         counter(915.0, 7.0)
@@ -56,6 +57,85 @@ fun main() {
         counter(3.0, 8.0)
         counter(13.0, 9.0)
         check("recording: a reboot's fall adds no negative steps", between(9.0), 435.0, 0.0)
+    }
+    val epoch = 1794268800000.0
+    Subscription().run {
+        checkThat("subscription: the first request checks Play services", begin())
+        checkThat("subscription: concurrent requests share the pending check", !begin())
+        complete(existing = true, epoch = epoch)
+        val start = epoch - 30 * 60_000
+        val restored = Count(start).range(since, epoch)!!
+        checkThat("subscription: a restored walk reads from its saved start",
+            restored.from == start && restored.endSeconds - restored.startSeconds == 1801L)
+        checkThat("subscription: an existing subscription is remembered without a new start", since == null && !begin())
+        val retained = Count(epoch - 11 * 86_400_000).range(since, epoch)!!
+        checkThat("subscription: an existing subscription retains the last ten days",
+            retained.from == epoch - 10 * 86_400_000 && retained.endSeconds - retained.startSeconds == 864001L)
+    }
+    Subscription().run {
+        begin()
+        failed()
+        checkThat("subscription: a failed check can be retried", begin())
+        complete(existing = false, epoch = epoch)
+        val fresh = Count(epoch - 30 * 60_000).range(since, epoch + 60_000)!!
+        checkThat("subscription: a new subscription bounds an older walk",
+            fresh.from == epoch && fresh.endSeconds - fresh.startSeconds == 61L)
+        checkThat("subscription: later requests keep the new subscription's start", since == epoch && !begin())
+    }
+    Count(epoch).run {
+        counter(500.0, epoch)
+        val first = recorded(120.0, epoch, 1500.0, epoch + 60_000)
+        check("clocks: a Recording total starts at an epoch date", first, 120.0, epoch)
+        checkThat("clocks: a Recording answer has an epoch timestamp", first.at == epoch + 60_000)
+        checkThat("clocks: the session clock expires a total at sixty seconds", !due(61_499.0) && due(61_500.0))
+
+        counter(510.0, epoch + 61_000)
+        val next = between(epoch + 61_000)
+        check("clocks: steps accumulate between reads", next, 130.0, epoch)
+        checkThat("clocks: an interim answer has an epoch timestamp", next.at == epoch + 61_000)
+
+        val adjustedEpoch = epoch - 3_600_000
+        checkThat("clocks: the session clock makes a read due after an epoch correction", due(61_500.0))
+        checkThat("clocks: no inverted request is built after a clock correction", range(epoch, adjustedEpoch) == null)
+        checkThat("clocks: a held Recording total is available", hasRecording)
+        val adjusted = between(adjustedEpoch)
+        check("clocks: a correction keeps the total and the counter's increase", adjusted, 130.0, epoch)
+        checkThat("clocks: a wall-clock correction reaches the answer", adjusted.at == adjustedEpoch)
+        counter(515.0, adjustedEpoch + 1000)
+        check("clocks: steps keep accumulating while the range is inverted", between(adjustedEpoch + 1000), 135.0, epoch)
+        checkThat("clocks: deferring a read leaves it due", due(62_500.0))
+
+        val resumed = range(epoch, epoch + 1)!!
+        checkThat("clocks: a read resumes as soon as the epoch catches up", due(62_500.0) && resumed.endSeconds > resumed.startSeconds)
+        recorded(240.0, resumed.from, 62_500.0, epoch + 1)
+        checkThat("clocks: only a completed read resets the refresh interval", !due(122_499.0) && due(122_500.0))
+
+        hidden()
+        counter(600.0, epoch + 120_000)
+        counter(610.0, epoch + 121_000)
+        val returned = sensor(epoch + 121_000)
+        check("clocks: a foreground return sets an epoch since", returned, 10.0, epoch + 120_000)
+        checkThat("clocks: a sensor answer has an epoch timestamp", returned.at == epoch + 121_000)
+        counter(5.0, epoch + 122_000)
+        check("clocks: a counter reset sets an epoch since", sensor(epoch + 122_000), 0.0, epoch + 122_000)
+    }
+    Count(epoch).run {
+        val first = range(null, epoch)!!
+        checkThat("ranges: an omitted start at the first ask has a valid request",
+            first.from == epoch && first.startSeconds == 1794268800L && first.endSeconds == 1794268801L && first.bucketSeconds == 1)
+        val read = range(epoch, epoch + 60_500)!!
+        checkThat("ranges: a normal refresh uses epoch seconds and one complete bucket",
+            read.startSeconds == 1794268800L && read.endSeconds == 1794268861L && read.bucketSeconds == 61)
+        checkThat("ranges: a subscription can move the boundary", range(epoch + 10_000, epoch + 60_000)!!.from == epoch + 10_000)
+        checkThat("ranges: a clock correction before the subscription defers the read", range(epoch + 10_000, epoch + 5_000) == null)
+        checkThat("ranges: a future start in the same second defers the read", range(null, epoch - 1) == null)
+        checkThat("ranges: retention clamps an old boundary", range(epoch, epoch + 11 * 86_400_000)!!.from == epoch + 86_400_000)
+
+        counter(100.0, epoch - 3_600_000)
+        counter(110.0, epoch - 3_599_000)
+        checkThat("ranges: a correction before the first total leaves the sensor available",
+            !hasRecording && due(1500.0) && range(null, epoch - 3_599_000) == null)
+        check("ranges: the sensor counts while the first range is inverted", sensor(epoch - 3_599_000), 10.0, epoch)
     }
     println(if (failed > 0) "$failed failed" else "all passed")
     exitProcess(if (failed > 0) 1 else 0)

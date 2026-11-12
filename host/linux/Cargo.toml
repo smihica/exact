@@ -126,3 +126,7 @@ caltrain-data = { path = "../../apps/caltrain/data" }
 contract = { path = "../../contract/cli" }
 # A scripted socket transport names the URL type its trait takes.
 url = "2.5"
+
+[target.'cfg(unix)'.dev-dependencies]
+# The KMS flip state and event tests run without a display on macOS too.
+drm = "0.15"

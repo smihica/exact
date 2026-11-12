@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
+import { bundleHostModule } from './glue.mjs';
 
 // LLP 1139.003 D2: a plan that reads only `exactViewport()` shares the
 // session's one page reporter, so the agent's `prefer gpu-tier` reaches its
@@ -17,7 +18,7 @@ test('a viewport-only plan reads the tier the agent prefers', async () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-facts-'));
   try {
     copyFileSync(resolve(import.meta.dir, 'facts.js'), resolve(dir, 'facts.js'));
-    copyFileSync(resolve(import.meta.dir, '../web/navigation.js'), resolve(dir, 'navigation.js'));
+    writeFileSync(resolve(dir, 'navigation.js'), await bundleHostModule(resolve(import.meta.dir, '../..'), 'navigation.js'));
     writeFileSync(resolve(dir, 'rt.js'), 'export const data = {}, Resources = [], commits = []; export const commit = (f, why) => { commits.push(why); f(); }; export function R() {} export const Refusal = Error;');
     const { viewport } = await import(resolve(dir, 'facts.js'));
     const { data, commits } = await import(resolve(dir, 'rt.js'));

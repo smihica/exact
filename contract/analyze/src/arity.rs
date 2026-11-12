@@ -4,7 +4,10 @@
 use super::{handler_arity, AnalyzeError, Related, HANDLERS};
 use contract_syntax::{Component, Expr, File, Node, Span};
 use contract_types::{Ref, Scope, Ty, Types};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+/// A non-action provider still shadows an outer action of the same name.
+type Providers = HashMap<String, Option<Binding>>;
 
 #[derive(Clone)]
 struct Origin {
@@ -79,17 +82,6 @@ struct Graph<'a> {
 }
 
 pub(super) fn check(file: &File, types: &Types, expanded: &Component) -> Result<(), AnalyzeError> {
-    let context_names: BTreeSet<_> = file
-        .components
-        .iter()
-        .enumerate()
-        .flat_map(|(ci, c)| {
-            c.injects.iter().enumerate().filter_map(move |(i, p)| {
-                matches!(types.components[ci].props[c.props.len() + i], Ty::Action(_))
-                    .then_some(p.name.clone())
-            })
-        })
-        .collect();
     let mut graph = Graph {
         file,
         types,
@@ -106,9 +98,10 @@ pub(super) fn check(file: &File, types: &Types, expanded: &Component) -> Result<
         concrete: Vec::new(),
         queue: VecDeque::new(),
     };
+    let carried = carried(file, types, &graph.component_ids);
     for (ci, c) in file.components.iter().enumerate() {
         let mut contexts = BTreeMap::new();
-        for name in &context_names {
+        for name in &carried[ci] {
             let declared = c.injects.iter().find(|p| &p.name == name);
             let id = graph.interface(format!("{}.{}", c.name, name), declared.map(|p| p.span));
             contexts.insert(name.clone(), id);
@@ -137,12 +130,12 @@ pub(super) fn check(file: &File, types: &Types, expanded: &Component) -> Result<
         let mut scope = types.component_scope(scoped, &types.components[ci]);
         // The component's `provide` section covers its whole view (LLP
         // 1035.005.000 D9); a slot fill is walked in its caller's view.
-        let mut providers: Vec<_> = c
+        let providers = c
             .provides
             .iter()
             .map(|b| (b.name.clone(), graph.binding(ci, &b.expr, &scope, b.span)))
             .collect();
-        graph.nodes(ci, &c.view, &mut scope, &mut providers)?;
+        graph.nodes(ci, &c.view, &mut scope, &providers)?;
     }
     while let Some(id) = graph.queue.pop_front() {
         let need = graph.interfaces[id]
@@ -199,6 +192,78 @@ pub(super) fn check(file: &File, types: &Types, expanded: &Component) -> Result<
         return Err(error);
     }
     Ok(())
+}
+
+/// Only channels reachable from an action inject cross a component.
+fn carried(
+    file: &File,
+    types: &Types,
+    component_ids: &BTreeMap<&str, usize>,
+) -> Vec<BTreeSet<String>> {
+    fn used(nodes: &[Node], component_ids: &BTreeMap<&str, usize>, out: &mut BTreeSet<usize>) {
+        for node in nodes {
+            match node {
+                Node::Element { children, .. } => used(children, component_ids, out),
+                Node::Use { name, children, .. } => {
+                    used(children, component_ids, out);
+                    if let Some(&target) = component_ids.get(name.as_str()) {
+                        out.insert(target);
+                    }
+                }
+                Node::Children { .. } => {}
+                Node::When {
+                    then, otherwise, ..
+                } => {
+                    used(then, component_ids, out);
+                    used(otherwise, component_ids, out);
+                }
+                Node::Each { body, .. } => used(body, component_ids, out),
+                Node::Match { some, none, .. } => {
+                    used(&some.1, component_ids, out);
+                    used(none, component_ids, out);
+                }
+            }
+        }
+    }
+    let uses: Vec<BTreeSet<usize>> = (file.components.iter())
+        .map(|c| {
+            let mut out = BTreeSet::new();
+            used(&c.view, component_ids, &mut out);
+            out
+        })
+        .collect();
+    let provided: Vec<BTreeSet<&str>> = (file.components.iter())
+        .map(|c| c.provides.iter().map(|b| b.name.as_str()).collect())
+        .collect();
+    let mut carried: Vec<BTreeSet<String>> = (file.components.iter().enumerate())
+        .map(|(ci, c)| {
+            (c.injects.iter().enumerate())
+                .filter(|(i, _)| {
+                    matches!(types.components[ci].props[c.props.len() + i], Ty::Action(_))
+                })
+                .map(|(_, p)| p.name.clone())
+                .collect()
+        })
+        .collect();
+    let mut parents = vec![Vec::new(); carried.len()];
+    for (parent, children) in uses.iter().enumerate() {
+        for &child in children {
+            parents[child].push(parent);
+        }
+    }
+    let mut queue: VecDeque<_> = carried
+        .iter()
+        .enumerate()
+        .flat_map(|(ci, names)| names.iter().map(move |name| (ci, name.clone())))
+        .collect();
+    while let Some((child, name)) = queue.pop_front() {
+        for &parent in &parents[child] {
+            if !provided[parent].contains(name.as_str()) && carried[parent].insert(name.clone()) {
+                queue.push_back((parent, name.clone()));
+            }
+        }
+    }
+    carried
 }
 
 fn refusal(
@@ -346,7 +411,7 @@ impl Graph<'_> {
         ci: usize,
         nodes: &[Node],
         scope: &mut Scope,
-        providers: &mut Vec<(String, Option<Binding>)>,
+        providers: &Providers,
     ) -> Result<(), AnalyzeError> {
         for node in nodes {
             match node {
@@ -427,13 +492,9 @@ impl Graph<'_> {
                         }
                     }
                     for (name, id) in self.contexts[target].clone() {
-                        match providers
-                            .iter()
-                            .rev()
-                            .find(|(provided, _)| provided == &name)
-                        {
-                            Some((_, Some(binding))) => self.connect(id, binding.clone()),
-                            Some((_, None)) => {} // A non-action provider still shadows an outer one.
+                        match providers.get(&name) {
+                            Some(Some(binding)) => self.connect(id, binding.clone()),
+                            Some(None) => {} // A non-action provider still shadows an outer one.
                             None => self.edges[id].push(Edge {
                                 to: self.contexts[ci][&name],
                                 bound: 0,

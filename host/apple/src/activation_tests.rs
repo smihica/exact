@@ -1056,3 +1056,37 @@ fn shared_secret_lease_fences_a_pending_host_retry() {
         Some("rotated")
     );
 }
+
+// A lease reads and writes through the platform's secret store, which admits
+// only the names the grants keep: one they do not list is `denied: secret.keep`.
+#[test]
+fn a_shared_secret_lease_on_a_name_the_grants_do_not_keep_is_denied() {
+    use crate::store::KeptStore;
+    let bindings = ibex2::host::Host::new()
+        .with_secret_store(Box::new(ibex2::secrets::MemoryStore::new()))
+        .endow(ibex2::grant::GrantSet::parse("secret.keep favourite").unwrap());
+    let shared = crate::store::Platform::of(&bindings)
+        .with_namespace(exact_data::secrets::Namespace::memory())
+        .shared_secrets()
+        .unwrap();
+    let lease = |name: &str| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut wait = shared.acquire(
+            name,
+            Arc::new(move || {
+                let _ = send.send(());
+            }),
+        );
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        wait.take().unwrap().unwrap()
+    };
+    let granted = lease("favourite");
+    assert_eq!(granted.read(), Ok(None));
+    granted.write(Some("kept")).unwrap();
+    drop(granted);
+    let other = lease("other");
+    assert_eq!(other.read(), Err("denied: secret.keep".into()));
+    assert_eq!(other.write(Some("x")), Err("denied: secret.keep".into()));
+}

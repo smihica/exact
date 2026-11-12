@@ -28,10 +28,8 @@ component App
             text p testId=`post-${i}`
 ```
 
-`empty()` sets `owner` to `""`; account IDs must be nonempty. The owner check
-hides A's retained rows after switching to B, even if B fails. A failed refresh
-of A keeps its rows beside Retry; a valid empty answer replaces them.
-Use the same check for a server or workspace: its answer names that owner.
+`empty()` sets `owner` to `""`; use nonempty IDs. The owner check hides A's rows
+while B loads or fails. A failed refresh keeps A's rows; an empty answer clears them.
 
 ```ts
 import type { Answer, Result } from './app.contract.d.ts';
@@ -61,7 +59,6 @@ test "a failed refresh retains rows and retries"
   clock data
   fail fetch "https://jsonplaceholder.typicode.com"
   tap "refresh"
-  expect tree has "loading"
   expect tree has "post-0"
   clock data
   expect tree has "post-0"
@@ -72,14 +69,15 @@ test "a failed refresh retains rows and retries"
   expect tree missing "error"
 ```
 
-`fail fetch` rejects; it cannot delay or supply an HTTP status/body. Use a
-[test server](rest-backend.md) for those.
+`fail fetch` rejects before `tap` returns. To assert loading, hold a reply with a
+[test server](rest-backend.md), which can also supply an HTTP status/body.
 
-For private data, also gate by the authorized principal and auth generation:
-A → B → A must reject the first A session's answers. Check it before writing a cache
-after an await. Await session prerequisites in the source; dependencies do not
-sequence requests. See the
-[data guide](../contract-for-agents.md#data-requests-and-side-effects).
+For private data, gate by principal and auth generation, including after an await
+before caching: A → B → A must reject the first A's answers. Await prerequisites
+in the source; dependencies do not sequence requests ([guide](../contract-for-agents.md#data-requests-and-side-effects)).
 
-Development `state.resourceStatus` reports retained answers and argument equality; `failed` and `failures` give the error and count. It changes neither
-retention nor authorization. `with` only admits persisted answers at boot.
+**Across launches:** reading `native.available` or calling `native.call` makes a
+resource read device state; its answer can be kept and shown before the next fetch.
+Resolve a launch endpoint once in a mount mutation, then pass it as a resource
+argument; keep native access out of fetch sources. Copy [native-module](native-module.md).
+`with` controls boot admission, not persistence. `state.resourceStatus` explains retained answers.

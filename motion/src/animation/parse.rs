@@ -11,7 +11,7 @@
 
 use super::{Animation, AnimationError, Animations, Direction, FillMode, Keyframe, Keyframes};
 use crate::easing::Easing;
-use crate::parse::{easing, split_top_level, time, ParseError};
+use crate::parse::{easing, split_top_level, time, time_like, ParseError};
 use crate::property::{Property, Value};
 use crate::transition::TimingFunction;
 use exact_num::Shortest;
@@ -81,8 +81,13 @@ impl Animations {
                 .into_iter()
                 .filter(|p| !p.is_empty())
                 .collect();
-            if parts.is_empty() || parts.len() > 8 {
-                return Err(ParseError::BadShape(decl.to_string()));
+            if parts.is_empty() {
+                return Err(ParseError::BadShape(format!(
+                    "`{text}` has an empty entry: each comma separates two animations"
+                )));
+            }
+            if parts.len() > 8 {
+                return Err(ParseError::BadShape(format!("`{decl}` has more than eight parts: an animation is a name, a duration, an easing, a delay, an iteration count, a direction, a fill mode and a play state")));
             }
             let mut a = Animation::default();
             let (mut times, mut eased, mut counted) = (0, false, false);
@@ -92,9 +97,11 @@ impl Animations {
                     match times {
                         0 => a.duration = t,
                         1 => a.delay = t,
-                        _ => return Err(ParseError::BadShape(decl.to_string())),
+                        _ => return Err(ParseError::BadShape(format!("`{decl}` has a third time: an animation takes a duration, then a delay"))),
                     }
                     times += 1;
+                } else if time_like(part) {
+                    return Err(ParseError::BadTime(part.to_string()));
                 } else if !eased && easing_keyword(part).is_some() {
                     a.easing = easing_keyword(part).unwrap()?;
                     eased = true;
@@ -114,7 +121,7 @@ impl Animations {
                     a.name = part.trim_matches(|c| c == '"' || c == '\'').to_string();
                     named = true;
                 } else {
-                    return Err(ParseError::BadShape(decl.to_string()));
+                    return Err(ParseError::BadShape(left_over(part, decl, &a.name)));
                 }
             }
             a.validate().map_err(ParseError::InvalidAnimation)?;
@@ -206,7 +213,16 @@ impl Animation {
     /// Set one longhand from one item of its list (CSS Animations 1 §4).
     pub fn set_longhand(&mut self, name: &str, value: &str) -> Result<(), ParseError> {
         let value = value.trim();
-        let bad = || ParseError::BadValue(format!("{name}: {value}"));
+        let bad = || {
+            ParseError::BadValue(match name {
+                "animation-name" => format!("`{value}` is not a keyframes name: a name is an identifier other than `initial`, `inherit`, `unset`, `revert`, `revert-layer` and `default`, or a quoted string"),
+                "animation-iteration-count" => format!("`{value}` is not an iteration count: a number 0 or more, or `infinite`"),
+                "animation-direction" => format!("`{value}` is not a direction: normal, reverse, alternate or alternate-reverse"),
+                "animation-fill-mode" => format!("`{value}` is not a fill mode: none, forwards, backwards or both"),
+                "animation-play-state" => format!("`{value}` is not a play state: running or paused"),
+                _ => format!("`{name}` is not an animation longhand"),
+            })
+        };
         match name {
             "animation-name" if is_name(value) => {
                 self.name = value.trim_matches(|c| c == '"' || c == '\'').to_string()
@@ -245,11 +261,13 @@ impl Keyframes {
         while !rest.is_empty() {
             let open = rest
                 .find('{')
-                .ok_or_else(|| ParseError::BadShape(rest.to_string()))?;
+                .ok_or_else(|| {
+                    ParseError::BadShape(format!("`{rest}` has no `{{`: a keyframe is its selectors, then `{{property: value; …}}`"))
+                })?;
             let close = rest[open..]
                 .find('}')
                 .map(|i| open + i)
-                .ok_or_else(|| ParseError::BadShape(rest.to_string()))?;
+                .ok_or_else(|| ParseError::BadShape(format!("`{rest}` has no closing `}}`")))?;
             let selectors = &rest[..open];
             let body = &rest[open + 1..close];
             let mut easing_here = None;
@@ -260,9 +278,9 @@ impl Keyframes {
                 .map(str::trim)
                 .filter(|d| !d.is_empty())
             {
-                let (name, value) = decl
-                    .split_once(':')
-                    .ok_or_else(|| ParseError::BadShape(decl.to_string()))?;
+                let (name, value) = decl.split_once(':').ok_or_else(|| {
+                    ParseError::BadShape(format!("`{decl}` in a keyframe is not `property: value`"))
+                })?;
                 let (name, value) = (name.trim(), value.trim());
                 if name == "animation-timing-function" {
                     easing_here = Some(easing_only(value)?);
@@ -270,7 +288,11 @@ impl Keyframes {
                 }
                 let property = Property::from_name(name)
                     .filter(|p| *p != Property::Height)
-                    .ok_or_else(|| ParseError::UnknownProperty(name.to_string()))?;
+                    .ok_or_else(|| {
+                        ParseError::BadValue(format!(
+                            "`{name}` is not a property keyframes animate"
+                        ))
+                    })?;
                 let declared = keyframe_values(property, value)?;
                 // A later declaration replaces the whole value: every axis
                 // of a `font-variation-settings`, both halves of a shadow.
@@ -294,7 +316,9 @@ impl Keyframes {
                         .and_then(|n| exact_num::parse_f64(n.trim()).ok())
                         .filter(|n| (0.0..=100.0).contains(n))
                         .map(|n| n / 100.0)
-                        .ok_or_else(|| ParseError::BadShape(s.to_string()))?,
+                        .ok_or_else(|| {
+                            ParseError::BadShape(format!("`{s}` is not a keyframe selector: `from`, `to` or a percentage from 0% to 100%"))
+                        })?,
                 };
                 match frames
                     .iter_mut()
@@ -480,12 +504,41 @@ fn easing_keyword(part: &str) -> Option<Result<Easing, ParseError>> {
     known.then(|| easing_only(part))
 }
 
+/// Why `part` fits no part of the animation `decl` still has free; `name`
+/// is the name it has, if any.
+fn left_over(part: &str, decl: &str, name: &str) -> String {
+    let again = if easing_keyword(part).is_some() {
+        "an easing"
+    } else if count(part).is_some() {
+        "an iteration count"
+    } else if direction(part).is_some() {
+        "a direction"
+    } else if fill(part).is_some() {
+        "a fill mode"
+    } else if matches!(part, "running" | "paused") {
+        "a play state"
+    } else if is_name(part) {
+        return format!(
+            "`{decl}` has a second name, `{part}`, beside `{name}`: an animation has one"
+        );
+    } else {
+        return format!("`{part}` in `{decl}` is no part of an animation: a time, an easing, an iteration count, a direction, a fill mode, a play state or a name, which is an identifier other than `initial`, `inherit`, `unset`, `revert`, `revert-layer` and `default`, or a quoted string");
+    };
+    format!("`{decl}` gives {again} twice, `{part}` the second time: an animation takes one")
+}
+
 fn easing_only(part: &str) -> Result<Easing, ParseError> {
-    match easing(part)? {
+    let refused = |e| {
+        match e {
+        ParseError::BadEasing(_) => ParseError::BadValue(format!(
+            "`{part}` is not an easing: linear, ease, ease-in, ease-out, ease-in-out, step-start, step-end, cubic-bezier(), steps() or linear()"
+        )),
+        e => e,
+    }
+    };
+    match easing(part).map_err(refused)? {
         TimingFunction::Easing(e) => Ok(e),
-        TimingFunction::Spring(_) => Err(ParseError::BadEasing(format!(
-            "{part}: a spring is a transition timing function, not an animation's"
-        ))),
+        TimingFunction::Spring(_) => Err(ParseError::SpringInAnimation(part.to_string())),
     }
 }
 
@@ -516,7 +569,8 @@ fn fill(part: &str) -> Option<FillMode> {
     })
 }
 
-/// A CSS `<custom-ident>` (or a quoted string) that is not a CSS-wide keyword.
+/// A CSS `<custom-ident>` (or a quoted string): not a CSS-wide keyword nor
+/// `default`, which CSS also reserves (CSS Values 4 §4.2).
 fn is_name(part: &str) -> bool {
     if part.len() >= 2
         && ((part.starts_with('"') && part.ends_with('"'))
@@ -553,7 +607,12 @@ fn keyframe_values(
     property: Property,
     value: &str,
 ) -> Result<Vec<(Property, Value, Option<Value>)>, ParseError> {
-    let bad = || ParseError::BadValue(format!("{}: {value}", property.name()));
+    let bad = || {
+        ParseError::BadValue(format!(
+            "`{value}` is not a value `{}` takes",
+            property.name()
+        ))
+    };
     let colour = |text: &str| -> Result<(Value, Option<Value>), ParseError> {
         let text = text.trim();
         if let Some(body) = text
@@ -575,8 +634,7 @@ fn keyframe_values(
             let (light, night) = colour(value)?;
             vec![(p, light, night)]
         }
-        Property::FontVariationSettings => variation_axes(value.trim())
-            .ok_or_else(bad)?
+        Property::FontVariationSettings => variation_axes(value.trim(), bad)?
             .into_iter()
             .map(|(tag, n)| (property, Value::axis(tag, n), None))
             .collect(),
@@ -613,7 +671,12 @@ fn keyframe_values(
 }
 
 fn keyframe_value(property: Property, value: &str) -> Result<Value, ParseError> {
-    let bad = || ParseError::BadValue(format!("{}: {value}", property.name()));
+    let bad = || {
+        ParseError::BadValue(format!(
+            "`{value}` is not a value `{}` takes",
+            property.name()
+        ))
+    };
     Ok(match property {
         // A length or a percentage of the box per axis (chess diary #4):
         // lengths in x and y, percentages in z and w.
@@ -696,9 +759,15 @@ fn keyframe_value(property: Property, value: &str) -> Result<Value, ParseError> 
 /// named twice keeps its last value in its first place. `normal`, which
 /// names no axis, is refused here: a keyframe's axes interpolate one by one
 /// with the other keyframes', so each keyframe names the same ones.
-fn variation_axes(value: &str) -> Option<Vec<(u32, f64)>> {
-    let mut out: Vec<(u32, f64)> = Vec::new();
-    for item in value.split(',').map(str::trim) {
+/// `malformed` is the refusal of an item that is not an axis.
+fn variation_axes(
+    value: &str,
+    malformed: impl Fn() -> ParseError,
+) -> Result<Vec<(u32, f64)>, ParseError> {
+    if value == "normal" {
+        return Err(ParseError::BadValue("`normal` names no axes, and a keyframe's `font-variation-settings` names the axes it animates: `\"wght\" 400`".into()));
+    }
+    let axis = |item: &str| -> Option<(u32, f64)> {
         let quote = item.chars().next().filter(|q| *q == '"' || *q == '\'')?;
         let rest = &item[1..];
         let close = rest.find(quote)?;
@@ -709,16 +778,22 @@ fn variation_axes(value: &str) -> Option<Vec<(u32, f64)>> {
         let number = exact_num::parse_f64(number)
             .ok()
             .filter(|n| n.is_finite())?;
-        let tag = u32::from_be_bytes(tag.as_bytes().try_into().ok()?);
+        Some((u32::from_be_bytes(tag.as_bytes().try_into().ok()?), number))
+    };
+    let mut out: Vec<(u32, f64)> = Vec::new();
+    for item in value.split(',').map(str::trim) {
+        let (tag, number) = axis(item).ok_or_else(&malformed)?;
         if let Some(axis) = out.iter_mut().find(|(t, _)| *t == tag) {
             axis.1 = number;
         } else if out.len() < MAX_AXES {
             out.push((tag, number));
         } else {
-            return None;
+            return Err(ParseError::BadValue(format!(
+                "`{value}` names more than {MAX_AXES} axes: `font-variation-settings` takes at most {MAX_AXES}"
+            )));
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// The most axes one `font-variation-settings` names, as the kernel's row

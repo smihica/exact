@@ -6,8 +6,10 @@
 //! called `preventDefault()`, a field edits, a dialog's Escape closes it,
 //! `aria-keyshortcuts` presses its node (without moving the focus), Tab and
 //! the arrows move the focus — or, with nothing focused, the arrows, Space,
-//! Home and End scroll, as a page's keys do — and Ctrl-C leaves — so an app that wants Ctrl-C (an agent interrupting
-//! a reply) claims it with `preventDefault()`.
+//! Home and End scroll, as a page's keys do. Ctrl-C leaves and Ctrl-Z
+//! suspends unless the app claims them with `preventDefault()`. Ctrl-\ leaves
+//! before any of this: no handler or shortcut can take it, so an app that
+//! claims every key still has one that ends it.
 
 use crate::host::{After, Host, Key};
 use exact_kernel::{PropId, ViewId};
@@ -166,6 +168,9 @@ impl<D: DataSource> Host<D> {
 
     /// A key, routed as the module comment says.
     pub fn key(&mut self, key: Key) -> After {
+        if key == Key::Ctrl('\\') {
+            return After::Quit;
+        }
         self.advance_for_input();
         let chord = key.chord();
         // A focused control the screen has not shown yet (a dialog this
@@ -217,9 +222,9 @@ impl<D: DataSource> Host<D> {
             return After::Continue;
         }
         match key {
-            // Ctrl-\ always leaves; Ctrl-C and Ctrl-D leave when nothing took them.
-            Key::Ctrl('\\') => return After::Quit,
+            // Ctrl-C and Ctrl-D leave when nothing took them.
             Key::Ctrl('c') | Key::Ctrl('d') => return After::Quit,
+            Key::Ctrl('z') => return After::Suspend,
             // With nothing focused the keys scroll, as a page's do on the
             // web; with a control focused the arrows move among controls
             // (a terminal list's convention, LLP 1101 D6).

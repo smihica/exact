@@ -54,6 +54,40 @@ static TAB_BAR: std::sync::LazyLock<StyleProps> = std::sync::LazyLock::new(|| {
     style
 });
 
+/// The neutral segmented control's track (`host/web/neutral.css`, "A
+/// segmented control"): a `radiogroup` of radios on a fill, round at the
+/// control's radius, its radios inside its padding ([`crate::segmented`]).
+static SEGMENTED: std::sync::LazyLock<StyleProps> = std::sync::LazyLock::new(|| {
+    let role =
+        |name| crate::ColorValue::Role(crate::style::roles::role(name).expect("schema role"));
+    let length = |index| {
+        let px = metrics::length_in(index, Column::Neutral, 1.0, 1.0).expect("neutral row");
+        crate::StyleValue::Number(px as f64)
+    };
+    let mut style = StyleProps {
+        background_color: Some(role("-exact-tertiary-fill")),
+        ..StyleProps::default()
+    };
+    style.mask.set(StyleId::BackgroundColor);
+    let padding = length(crate::generated::metric::SEGMENTED_PADDING);
+    let radius = length(crate::generated::metric::CONTROL_RADIUS);
+    for (id, value) in [
+        (StyleId::PaddingTop, &padding),
+        (StyleId::PaddingRight, &padding),
+        (StyleId::PaddingBottom, &padding),
+        (StyleId::PaddingLeft, &padding),
+        (StyleId::BorderRadiusTopLeft, &radius),
+        (StyleId::BorderRadiusTopRight, &radius),
+        (StyleId::BorderRadiusBottomRight, &radius),
+        (StyleId::BorderRadiusBottomLeft, &radius),
+    ] {
+        style
+            .set_dynamic(id, value)
+            .expect("schema segmented value");
+    }
+    style
+});
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DefaultContext {
     pub alert: u8,
@@ -62,6 +96,7 @@ pub(crate) struct DefaultContext {
     pub tab_bar: bool,
     pub tab: bool,
     pub native_tab: bool,
+    pub segmented: bool,
     /// [`NodeArena::said_style_rows`].
     pub said_style: StyleMask,
     /// [`NodeArena::ink_said`]: a move can change it with the colour equal.
@@ -140,6 +175,7 @@ impl NodeArena {
             tab_bar: self.is_neutral_tab_bar(slot),
             tab: self.is_neutral_tab(slot),
             native_tab: self.neutral_tab_root(slot).is_some(),
+            segmented: self.is_neutral_segmented(slot),
             said_style: self.said_style_rows(slot),
             ink_said: self.ink_said(slot),
         }
@@ -153,12 +189,23 @@ impl NodeArena {
         TAB_BAR.mask
     }
 
+    pub(crate) fn segmented_rows() -> StyleMask {
+        SEGMENTED.mask
+    }
+
+    fn is_neutral_segmented(&self, slot: u32) -> bool {
+        metrics::column() == Column::Neutral
+            && self.segmented_radios(slot).is_some()
+            && !self.grouped_row(slot)
+    }
+
     fn structural_starts(&self, slot: u32) -> impl Iterator<Item = &StyleProps> {
         // A route header can also be a tablist. The later header rule wins
         // shared rows while the tab bar's top edge still accompanies its bottom.
         [
             self.is_neutral_header(slot).then(|| &*HEADER),
             self.is_neutral_tab_bar(slot).then(|| &*TAB_BAR),
+            self.is_neutral_segmented(slot).then(|| &*SEGMENTED),
         ]
         .into_iter()
         .flatten()

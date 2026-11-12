@@ -51,7 +51,8 @@ fn main() {
             contract::rust_entry(
                 "llp_data::Llp",
                 "llp_data::Llp::new()",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

@@ -104,8 +104,41 @@ async function twice(): Promise<{ text: string }> {
   return { text: `${await (await first).text()} ${await (await second).text()}` };
 }
 
-function answer(source: string, args: unknown[], store: Store): unknown {
+let busy = false;
+let shared: Promise<string> | null = null;
+let aborted = '';
+async function guardedFetch(): Promise<string> {
+  try {
+    return await (await fetch('https://outlive.test/guarded')).text();
+  } catch (error) {
+    aborted = (error as { kind: string }).kind;
+    throw error;
+  } finally {
+    busy = false;
+    shared = null;
+  }
+}
+function guarded(go: unknown, mode: unknown): string | Promise<string> {
+  if (!go) return 'idle';
+  if (mode === 'memo') return shared ??= guardedFetch();
+  if (busy) return 'busy';
+  busy = true;
+  return guardedFetch();
+}
+
+function interruptedFetch(native: { call(request: unknown): unknown }): never {
+  guarded(true, 'flag');
+  native.call({ spinning: true });
+  for (;;) {}
+}
+
+function answer(source: string, args: unknown[], store: Store, _storage: unknown, native: any): unknown {
   switch (source) {
+    case 'interrupted': return args[0] === 'drain'
+      ? Promise.resolve().then(() => interruptedFetch(native))
+      : interruptedFetch(native);
+    case 'guarded': return guarded(args[0], args[1]);
+    case 'cleanup': return `${busy}/${shared === null}/${aborted}`;
     case 'token': return { text: store.get(KEY) ?? 'none' };
     case 'read': return read(store);
     case 'late': return late(store);

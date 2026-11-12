@@ -36,6 +36,31 @@ pub(super) fn sweep(dir: &Path) {
     }
 }
 
+/// A shared lock on an entry's `exact.json`, for a process that runs the
+/// entry without owning the store. [`remove_entry`] keeps an entry so held.
+pub(super) fn hold_entry(entry: &Path) -> Result<std::fs::File, String> {
+    let path = entry.join("exact.json");
+    let file =
+        std::fs::File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    file.try_lock_shared()
+        .map_err(|e| format!("cannot hold {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// Remove an entry unless a reader holds it ([`hold_entry`]); `false` when
+/// one does. The exclusive lock taken here lasts through the removal, so a
+/// reader that locks after it finds the entry gone.
+pub(super) fn remove_entry(entry: &Path) -> bool {
+    let lock = std::fs::File::open(entry.join("exact.json"));
+    if let Ok(file) = &lock {
+        if matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+            return false;
+        }
+    }
+    let _ = std::fs::remove_dir_all(entry);
+    true
+}
+
 pub(super) fn regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
@@ -241,7 +266,7 @@ mod tests {
         let error = read_card(&path, &card).unwrap_err();
         for max in [
             crate::MAX_ENVELOPE_BYTES as u64,
-            super::super::MAX_RECORD_BYTES,
+            super::super::record::MAX_RECORD_BYTES,
         ] {
             assert!(read_bounded(&path, max)
                 .unwrap_err()

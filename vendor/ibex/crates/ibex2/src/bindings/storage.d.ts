@@ -204,6 +204,9 @@ export interface SQLCommand {
   sql: string;
   params?: SQLValue[];
 }
+export interface SQLTransactionOptions {
+  foreignKeys?: "check";
+}
 export interface SQLite {
   open(path: string): Promise<Database>;
 }
@@ -212,8 +215,11 @@ export interface Database {
   /** Read-only queries; one SQL statement per call. */
   query(sql: string, params?: SQLValue[]): Promise<SQLRows>;
   prepare(sql: string): Promise<Statement>;
-  /** One atomic batch, rolled back on failure; no callback transaction. */
-  transaction(commands: SQLCommand[]): Promise<SQLExecution[]>;
+  /** One atomic batch, rolled back on failure; no callback transaction.
+   * `foreignKeys: "check"` is for a migration that rebuilds a table other
+   * rows reference: foreign keys are not enforced while the batch runs and
+   * are checked once, before it commits. */
+  transaction(commands: SQLCommand[], options?: SQLTransactionOptions): Promise<SQLExecution[]>;
   /** Idempotent; invalidates this database's prepared statements. */
   close(): Promise<void>;
 }

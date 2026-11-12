@@ -1,0 +1,31 @@
+// WidgetGalleryTests: an accented bar and a timer bar in a Live Activity's
+// Lock Screen placement, which the agent's screenshot draws (LLP 1126.001 WP14).
+shape BarsState
+  start: number
+  end: number
+component App
+  view
+    text "App"
+component Bars
+  props
+    start: number
+    end: number
+  view
+    view slot="lockScreen" background-color="#ffffff"
+      progress value=0.5 accent-color="#ff0000" width=200
+      progress start=start end=end accent-color="#ff0000" width=200
+    view slot="compactLeading"
+      text "B"
+    view slot="compactTrailing"
+      text "B"
+    view slot="minimal"
+      text "B"
+    view slot="expanded"
+      view slot="leading"
+        text "B"
+      view slot="trailing"
+        text "B"
+      view slot="center"
+        text "B"
+      view slot="bottom"
+        text "B"

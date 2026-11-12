@@ -16,6 +16,7 @@ internal class Slots(private val again: Player, private val alive: (Int) -> Bool
     val nodes = HashMap<Int, RenderNode>()
     /** Called when [nodes] changes (the worker's copy of it is then made again). */
     var changed: () -> Unit = {}
+    private val structure = Structure()
     private val drawings = HashMap<Int, IntArray>()
     /** The slots each picture is drawn in: freeing it empties them. */
     private val drawnIn = HashMap<Int, HashSet<Int>>()
@@ -110,11 +111,7 @@ internal class Slots(private val again: Player, private val alive: (Int) -> Bool
         while (k < to) {
             val op = b.get(k)
             if (op == 8 || op == 14) each(b.get(k + 1))
-            k = when (op) {
-                1 -> k + 7; 4 -> k + 13; 6 -> k + 1; 8 -> k + 6; 11 -> k + 4; 14 -> k + 18
-                26 -> k + 3 + (b.get(k + 2) + 3) / 4
-                else -> to
-            }
+            k = structure.end(b, k)
         }
     }
 

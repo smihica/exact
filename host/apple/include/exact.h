@@ -215,16 +215,13 @@ size_t exact_gradient(const uint8_t *css, size_t len, float width, float height,
 size_t exact_corner_outline(const float *shape, float x, float y, float width, float height,
     const float *radii, float *out, size_t cap);
 
-/* Intern a CSS calculation tree; return 0 for invalid or compact lengths.
- * The returned handle has no environment; exact_calc_create supplies it. */
-uint32_t exact_calc_parse(const uint8_t *text, size_t len);
-
 /* A style owns this environment snapshot until destroy. Values: top, right, bottom, left,
  * viewport width/height (the window's when a sheet is open), segment cols/rows, the layout
  * regions' count (0 or 20) and the regions (LLP 1123 D10), the title-bar area's count (0 or 4)
- * and its x,y,w,h, then x,y,w,h per segment. create copies them and returns NULL for malformed input or an unknown handle.
+ * and its x,y,w,h, then x,y,w,h per segment. create copies them and parses the UTF-8
+ * expression; NULL for malformed input.
  * resolve borrows a live context; destroy consumes it exactly once (NULL is allowed). */
-void *exact_calc_create(uint32_t handle, const double *values, size_t count);
+void *exact_calc_create(const uint8_t *text, size_t len, const double *values, size_t count);
 double exact_calc_resolve(const void *context, double basis);
 void exact_calc_destroy(void *context);
 
@@ -539,6 +536,10 @@ uint32_t exact_protocol_location_of(ExactRuntime rt, size_t len);
 /* LLP 1038 §7: 1 when the input location names a declared route (a followed
  * link to it navigates in the app), else 0. */
 uint32_t exact_route_matches(ExactRuntime rt, size_t len);
+/* LLP 1115.000 D5.1: 1 when the route table declares one location (a
+ * single route besides notfound, the root `/`), so a route is pushed above
+ * it only by another query or an unmatched location, else 0. Not a batch. */
+uint32_t exact_route_one_location(ExactRuntime rt);
 uint32_t exact_set_launch_location(ExactRuntime rt, size_t len);
 /* LLP 1115 D5: the location of the visit beneath visit `id` on its stack,
  * UTF-8 in exact_out, length 0 when none — where the host's own Back goes
@@ -569,6 +570,11 @@ void exact_module_invoke(ExactRuntime rt, size_t len, ExactInvokeReply reply, vo
 uint32_t exact_host_back(ExactRuntime rt, uint64_t id, double now_ms);
 /* The runner's own go to the UTF-8 location in exact_in, a batch. */
 uint32_t exact_host_go(ExactRuntime rt, size_t len, double now_ms);
+/* Native Forward at the navigation root, a batch. */
+uint32_t exact_host_forward(ExactRuntime rt, uint32_t root, double now_ms);
+/* LLP 1075.003 §9.14: build the tab panels exact_in names, comma-separated
+ * view ids, selecting none, a batch. */
+uint32_t exact_build_tabs(ExactRuntime rt, size_t len, double now_ms);
 /* LLP 1133.024 D2-D4: a received share, the JSON in exact_in
  * ({"root", "target", "share", "inbox"?}), a batch; before the boot its
  * location and tokens become the launch's, and exact_share_land, after
@@ -638,6 +644,9 @@ const uint8_t *exact_field_decorations(const uint8_t *input, size_t len, size_t 
 void exact_top_layer(ExactRuntime rt, const uint32_t *views, const double *rects, const double *clips, uint32_t count, uint32_t modal);
 /* Versioned LE collection feedback in exact_in; returns the ordinary batch. */
 uint32_t exact_collection_feedback(ExactRuntime rt, size_t len, double now_ms);
+/* Read a local row-root snap without mounting views; NaN when absent.
+ * distance is the nearest mounted target's distance, infinity when absent. */
+double exact_collection_snap(ExactRuntime rt, uint32_t view, double proposed, double port, double maximum, double distance);
 /* The agent's tap <list> into <key> (LLP 1070.000): "key\nblock\ninline" in
    exact_in; returns the ordinary batch. */
 uint32_t exact_into_view(ExactRuntime rt, uint32_t view, size_t len);

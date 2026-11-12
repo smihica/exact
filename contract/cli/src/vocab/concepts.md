@@ -58,7 +58,9 @@ names: spinner, skeleton, baked, bake, first-frame
 A resource's `else` is its value until the first answer: `else empty()` is its shape's zero
 (`false`, `""`, `0`, `[]`), so a `loaded: bool` the source always answers `true` tells the
 first frame from an empty answer. `pending(r)` is true while a request is out, `failed(r)`
-once one failed with no answer. `progress` with no `value` is the system spinner.
+once one failed with no answer, and `current(r)` once what it shows answers its current
+arguments: "loading" is `not current(r)`, so a refresh (`pending`, still current) keeps the
+rows. `progress` with no `value` is the system spinner.
 
 ```contract
 shape Feed
@@ -588,7 +590,8 @@ names: send, mutate, post, put, patch, request
 `mutation name as shape T` is the reply slot, an option (`none` until the reply lands);
 `send name = source(args)` in an action asks the data module's source. `pending(name)` is true
 while it is in flight; `refreshes res` asks a resource again when the reply lands, `then act`
-runs an action (no parameters) after it, `queue` keeps sends in order.
+runs an action (no parameters) after it. A send forgets the one in flight; `queue` keeps sends
+in order, one at a time; `parallel` asks each at once and lands every reply (no `then`).
 
 ```contract
 shape Reply
@@ -604,18 +607,19 @@ component App
       text `Add (${items.length})`
 ```
 
-- One send of a mutation per path (`analyze-send-twice`): a second write needs its own mutation or
-  `queue`. Read the reply with `match added { case some(r) => r.ok, case none => false }`.
+- One send of a mutation per path (`analyze-send-twice`): a second write needs its own mutation,
+  `queue` or `parallel`. Read the reply with `match added { case some(r) => r.ok, case none => false }`.
 
 More: docs/recipes/after-a-write.md
 
 ## resource: a read from the data module
-names: source, sources, fetch, load, useEffect, useQuery, query
+names: source, sources, fetch, load, useEffect, useQuery, query, transient, no-store, volatile, ephemeral
 
 `resource name = source(args) as shape T else empty()` asks the source in `app.ts` and shows its
 answer as `name`; the arguments are state, so a change asks again. Until the first answer it is
-`else empty()`, the shape's zero (`[]`, `""`, `0`, `false`). `pending(name)` is true while a
-request is in flight, `failed(name)` when it had no answer. Only the root declares one.
+`else empty()`, the shape's zero. `pending(name)`: a request out; `failed(name)`: no answer;
+`current(name)`: it shows its arguments' answer. `when cond` asks nothing while `cond` is
+false. Only the root declares one.
 
 ```contract
 component App
@@ -631,6 +635,7 @@ component App
 
 - The source answers exactly the shape (an extra field fails it), and a failed fetch is data, not
   an exception. A child takes what it shows as props; `refresh name` in an action asks again.
+- `transient` after the shape: the answer is never kept on the device for the next launch.
 
 More: docs/recipes/fetch-loading-error.md
 
@@ -1041,9 +1046,10 @@ On a button, `-exact-menu` is a literal `about` (directly under About), `app`,
 `file`, `edit`, `view`, `go`, `window`, `help` or `none` (no item; the chord
 stays a shortcut). `dock` beside one of them, or alone, also files the button
 in the app's Dock menu (`-exact-menu="file dock"`). `status` alone presents the
-button as the app's status item: a menu bar item on macOS, a notification-area
-icon on Windows; it takes the button's place, its `popovertarget` menu is the
-item's menu, and with another id it fails `lower-menu-status` (LLP 1133.025).
+button as the app's status item, a menu bar item on macOS (Windows'
+notification-area icon is not built); it takes the button's place, its
+`popovertarget` menu is the item's menu, and with another id it fails
+`lower-menu-status` (LLP 1133.025).
 It adds an item even without a chord and overrides
 `aria-keyshortcuts` chord filing. The item's label is the button's accessible
 label or text; `disabled` disables it. An item in the app menu or Help is the
@@ -1201,15 +1207,19 @@ component App
       text `${n}`
 ```
 
-## status-bar: the colour of the iPhone's status bar, and hiding it
+## status-bar: the phone's status bar icons, and hiding them on iOS
 names: status bar, statusbar, setStatusBarStyle, UIStatusBarStyle, preferredStatusBarStyle, expo-status-bar, system-bars-hidden, statusBarHidden, prefersStatusBarHidden, prefersHomeIndicatorAutoHidden, autoHideHomeIndicator, immersive
 
 `status-bar-style="light-content"` (light text, for a dark surface), `"dark-content"` or
-`"auto"` on any node, bound to state if it changes, sets an iPhone's status bar; of what the
-bar sits over, the declaration painted on top wins. `status-bar-animation="fade"` fades a
-change. Other hosts ignore both.
+`"auto"` on any node, bound to state if it changes, sets the status bar on iOS and Android;
+of what the bar sits over, the declaration painted on top wins. `auto` follows the winner's
+scheme; no valid declaration follows the page's scheme. Android's navigation bar icons
+follow the page's scheme independently (LLP 1105 D7). Android's modal routes are covering
+pages, with no native sheet detent or transition completion; see host/android/README.md,
+Edge to edge. `status-bar-animation="fade"` fades a change on iOS alone. Other hosts ignore
+both properties.
 
-`system-bars-hidden=true` (or `=toyOpen`) hides the status bar and auto-hides the home
+On iOS, `system-bars-hidden=true` (or `=toyOpen`) hides the status bar and auto-hides the home
 indicator while that node's screen is under them, resolved the same way: a `fullscreen`
 route's wins over the stack, a `medium` sheet's does not, and a descendant's `false` shows
 them again.
@@ -1249,7 +1259,8 @@ names: titlebar-area, titlebar-area-x, titlebar-area-y, titlebar-area-width, tit
 Window Controls Overlay's `env(titlebar-area-x|y|width|height)` is the part of the title
 bar the page may draw in, beside the window's controls. On the Mac, under
 `viewport-fit="cover"`, it is AppKit's title bar less the traffic lights: in a 900-point
-window `78 0 822×32`. It is all zero in full screen and while the window has a toolbar (an
+window `78 0 822×32` with a left-to-right title bar, `0 0 822×32` with a right-to-left one.
+It is all zero in full screen and while the window has a toolbar (an
 app with routes has one), and undefined elsewhere: in a browser tab, on iOS, Linux and
 Windows, and on a Mac window that does not cover its title bar. Give each a fallback.
 `"display_override": ["window-controls-overlay"]` in `app.json` gives a Mac window the

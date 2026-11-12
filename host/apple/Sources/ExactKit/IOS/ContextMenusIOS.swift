@@ -662,6 +662,13 @@ final class ContextMenuHost: NSObject, UIContextMenuInteractionDelegate, UIEditM
         return picture
     }
 
+    /// The opacity `ink` shows at in `space`: that of every layer between
+    /// them, a placed canvas child's 0 (`shownOpacity`), since its surface
+    /// draws it elsewhere.
+    static func shownOpacity(of ink: CALayer, in space: CALayer) -> Float {
+        sequence(first: ink, next: { $0.superlayer }).prefix { $0 !== space }.reduce(1) { $0 * $1.shownOpacity }
+    }
+
     /// The run's words over `runArea` as the paragraph shows them: layers that
     /// show the paragraph's own ink (`textRasterLayer`) cut to the run, which
     /// the render server composites as it does the paragraph, at the opacity
@@ -686,7 +693,7 @@ final class ContextMenuHost: NSObject, UIContextMenuInteractionDelegate, UIEditM
         let b = ink.bounds, cut = CGRect(x: (shown.minX - b.minX) / b.width, y: (shown.minY - b.minY) / b.height, width: shown.width / b.width, height: shown.height / b.height)
         let words = CALayer(), area = lines.area
         words.frame = runArea.offsetBy(dx: -area.minX, dy: -area.minY)
-        words.opacity = sequence(first: ink, next: { $0.superlayer }).prefix { $0 !== space }.reduce(1) { $0 * $1.opacity }
+        words.opacity = Self.shownOpacity(of: ink, in: space)
         let pixels: Any?
         if let coverage = (ink.delegate as? CoverageImageView)?.coverage { pixels = coverage.painted() }
         else { pixels = ink.contents }
@@ -787,7 +794,7 @@ final class ContextMenuHost: NSObject, UIContextMenuInteractionDelegate, UIEditM
         }
         // `around` is the area in the superlayer's coordinates, where `frame` holds the layer's bounds
         func walk(_ layer: CALayer, around: CGRect) -> (under: CALayer?, over: CALayer?) {
-            guard !layer.isHidden, layer.opacity > 0 else { return (nil, nil) }
+            guard !layer.isHidden, layer.shownOpacity > 0 else { return (nil, nil) }
             let inside = layer.frame.intersects(around)
             var under: CALayer?, over: CALayer?
             if let view = layer.delegate as? UIVisualEffectView {
@@ -947,7 +954,7 @@ final class ContextMenuHost: NSObject, UIContextMenuInteractionDelegate, UIEditM
         // Whether copies show what `layer` and all it holds put in the area: false where only a snapshot does.
         // `around` is the area in the superlayer's coordinates, where `frame` holds the layer's bounds.
         func visit(_ layer: CALayer, around: CGRect, opacity: Float) -> Bool {
-            guard !layer.isHidden, layer.opacity > 0 else { return true }
+            guard !layer.isHidden, layer.shownOpacity > 0 else { return true }
             // Wherever its old lines lay, which no current frame says
             if transitioning(layer) { return false }
             let alpha = opacity * layer.opacity, inside = layer.frame.intersects(around)

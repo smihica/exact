@@ -38,8 +38,8 @@ fn random(seed: i64) -> i64 {
 
 impl Lattice {
     fn new(seed: f32) -> Lattice {
-        // SVG: the seed is rounded (Chrome rounds half away from zero).
-        let mut seed = seed.round() as i64;
+        // Filter Effects 1 requires truncation toward zero before seed normalization.
+        let mut seed = seed.trunc() as i64;
         if seed <= 0 {
             seed = -(seed % (RAND_M - 1)) + 1;
         }
@@ -78,12 +78,12 @@ impl Lattice {
 
     fn noise2(&self, channel: usize, v: [f64; 2], stitch: Option<&Stitch>) -> f64 {
         let t = v[0] + PERLIN_N;
-        let (mut bx0, rx0) = ((t as i64) & BM, t - (t as i64) as f64);
-        let mut bx1 = (bx0 + 1) & BM;
+        let (mut bx0, rx0) = (t as i64, t - (t as i64) as f64);
+        let mut bx1 = bx0.wrapping_add(1);
         let rx1 = rx0 - 1.0;
         let t = v[1] + PERLIN_N;
-        let (mut by0, ry0) = ((t as i64) & BM, t - (t as i64) as f64);
-        let mut by1 = (by0 + 1) & BM;
+        let (mut by0, ry0) = (t as i64, t - (t as i64) as f64);
+        let mut by1 = by0.wrapping_add(1);
         let ry1 = ry0 - 1.0;
         if let Some(s) = stitch {
             if bx0 >= s.wrap_x {
@@ -204,4 +204,65 @@ pub(crate) fn turbulence(w: usize, h: usize, linear: bool, rect: Rect, s: Space,
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unstitched_noise_accepts_large_coordinates() {
+        let lattice = Lattice::new(3.0);
+        for point in [[1e20, 0.25], [0.25, 1e20], [1e20, 1e20]] {
+            for channel in 0..4 {
+                assert!(lattice.noise2(channel, point, None).is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn turbulence_stitches_opposite_tile_edges() {
+        for (origin, size, base) in [
+            ((0.0, 0.0), (50, 50), (0.033, 0.033)),
+            ((7.0, -13.0), (40, 30), (0.07, 0.11)),
+        ] {
+            let (w, h) = (size.0 + 1, size.1 + 1);
+            for fractal in [false, true] {
+                for octaves in [1, 2, 4] {
+                    // Include both endpoints to compare the continuous tile's edges.
+                    let img = turbulence(
+                        w,
+                        h,
+                        true,
+                        (0, 0, w, h),
+                        Space {
+                            origin,
+                            scale: (1.0, 1.0),
+                        },
+                        Params {
+                            base,
+                            octaves,
+                            seed: 3.0,
+                            fractal,
+                            stitch: true,
+                            tile: (origin.0, origin.1, size.0 as f32, size.1 as f32),
+                        },
+                    );
+                    let pixel = |x, y| &img.px[(y * w + x) * 4..(y * w + x + 1) * 4];
+                    let edges = (0..h)
+                        .map(|y| (pixel(0, y), pixel(w - 1, y)))
+                        .chain((0..w).map(|x| (pixel(x, 0), pixel(x, h - 1))));
+                    for (start, end) in edges {
+                        for (a, b) in start.iter().zip(end) {
+                            assert!(
+                                (a - b).abs() < 1e-6,
+                                "origin={origin:?}, fractal={fractal}, octaves={octaves}: {a} != {b}"
+                            );
+                        }
+                    }
+                    assert!(img.px.chunks_exact(4).any(|p| p != pixel(0, 0)));
+                }
+            }
+        }
+    }
 }
