@@ -34,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tiny_skia::Pixmap;
 
 mod kiosk;
+mod kiosk_scroll;
 mod pointer;
 #[cfg(test)]
 mod tests;
@@ -294,7 +295,7 @@ fn receive_flip(
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
             ) =>
         {
-            return Ok(None)
+            return Ok(None);
         }
         Err(e) => return Err(e),
     };
@@ -464,7 +465,12 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     }
     #[cfg(not(all(feature = "scanout", target_os = "linux")))]
     let direct = false;
+    let mut touch_scroll = (std::env::var("KIOSK_TOUCH_SCROLL").as_deref() == Ok("1"))
+        .then(kiosk_scroll::TouchScroll::default);
     loop {
+        if let Some(scroll) = &mut touch_scroll {
+            scroll.tick(&mut p, wall());
+        }
         if measured {
             // A replaced host's flip and samples are the old runner's.
             frames.host(p.hosts);
@@ -544,7 +550,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         let now = wall();
         let mut timeout = work_timeout(
             display.pending(),
-            p.needs_animation_frame(),
+            p.needs_animation_frame() || touch_scroll.as_ref().is_some_and(|s| s.animating()),
             p.wake_due_ms(),
             now,
         );
@@ -656,7 +662,19 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         if let Some(v) = vnc.as_mut() {
             events.extend(v.take_events());
         }
+        let events = if touch_scroll.is_some() {
+            kiosk_scroll::coalesce(events)
+        } else {
+            events
+        };
+        let touch_time = wall();
         for ev in events {
+            if touch_scroll
+                .as_mut()
+                .is_some_and(|s| s.input(&mut p, &mut pointer, viewport, ev, touch_time))
+            {
+                continue;
+            }
             if let Err(e) =
                 pointer::dispatch(&mut p, &mut pointer, viewport, config.scale, ev, wall())
             {

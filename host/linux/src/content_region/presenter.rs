@@ -134,16 +134,26 @@ impl<D: DataSource> Presenter<D> {
         } else {
             BTreeMap::new()
         };
+        let model_scroll = deferred.then(|| self.collection_paint_scroll()).flatten();
+        // Keep logical scroll offsets clamped; rubber-banding only moves the painted content.
+        let visual_scroll = self.kiosk_overscroll.map(|(id, dy)| {
+            let mut offsets = model_scroll.as_ref().unwrap_or(&self.scroll).clone();
+            offsets.entry(id).or_default().1 += dy;
+            offsets
+        });
+        let painted_scroll = visual_scroll
+            .as_ref()
+            .or(model_scroll.as_ref())
+            .unwrap_or(&self.scroll);
         self.brush.flow_damage(
             &self.host,
             &self.boxes,
             self.viewport,
             self.page,
-            &self.scroll,
+            visual_scroll.as_ref().unwrap_or(&self.scroll),
             self.pointer,
             self.focus,
         );
-        let model_scroll = deferred.then(|| self.collection_paint_scroll()).flatten();
         let menu = self.menu_paint();
         let selection = self.focus.map(|id| self.field_selection(id));
         let host = &self.host;
@@ -154,7 +164,7 @@ impl<D: DataSource> Presenter<D> {
             roots: &roots,
             presented: &presented,
             paths: &|id| host.presented_path(id),
-            scroll: model_scroll.as_ref().unwrap_or(&self.scroll),
+            scroll: painted_scroll,
             page: if deferred {
                 self.model_page()
             } else {
