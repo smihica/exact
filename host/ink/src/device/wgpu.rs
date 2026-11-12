@@ -135,6 +135,8 @@ impl Wgpu {
         let (device, queue) = adapter
             .request_device(&::wgpu::DeviceDescriptor {
                 label: Some("exact-ink"),
+                // Negotiate the actual adapter limits instead of desktop-oriented defaults.
+                required_limits: adapter.limits(),
                 required_features: if caching {
                     ::wgpu::Features::PIPELINE_CACHE
                 } else {
