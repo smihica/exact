@@ -18,7 +18,10 @@ pub(super) fn dispatch<D: DataSource>(
     {
         // An uncertified physical release must end capture without executing
         // a drop. Refusing its coordinates must not strand a hold or item pin.
-        if matches!(event, InputEvent::Button(false) | InputEvent::Aux(_, false)) {
+        if matches!(
+            event,
+            InputEvent::Button(false) | InputEvent::TouchButton(false) | InputEvent::Aux(_, false)
+        ) {
             p.pointer_lost(now_ms)?;
         }
         return Err("pointer mapping does not match the acknowledged surface".into());
@@ -32,20 +35,26 @@ pub(super) fn dispatch<D: DataSource>(
             p.raw_motion(dx / scale, dy / scale);
             p.pointer_move(pointer.0, pointer.1, now_ms)?;
         }
-        InputEvent::Absolute(fx, fy) => {
+        InputEvent::Absolute(fx, fy) | InputEvent::Touch(fx, fy) => {
             if let Some(fx) = fx {
                 pointer.0 = (fx * viewport.0).clamp(0., viewport.0 - 1.);
             }
             if let Some(fy) = fy {
                 pointer.1 = (fy * viewport.1).clamp(0., viewport.1 - 1.);
             }
-            p.set_pointer(Some(*pointer));
+            p.set_pointer(matches!(event, InputEvent::Absolute(..)).then_some(*pointer));
             p.pointer_move(pointer.0, pointer.1, now_ms)?;
         }
-        InputEvent::Button(true) => {
+        InputEvent::Button(true) | InputEvent::TouchButton(true) => {
+            if matches!(event, InputEvent::TouchButton(_)) {
+                p.set_pointer(None);
+            }
             p.pointer_down(pointer.0, pointer.1, now_ms)?;
         }
-        InputEvent::Button(false) => {
+        InputEvent::Button(false) | InputEvent::TouchButton(false) => {
+            if matches!(event, InputEvent::TouchButton(_)) {
+                p.set_pointer(None);
+            }
             p.pointer_up(pointer.0, pointer.1, now_ms)?;
         }
         InputEvent::Aux(bit, down) => p.pointer_aux(bit, down, pointer.0, pointer.1, now_ms),
@@ -235,6 +244,29 @@ component App
             .unwrap();
             assert_eq!(count(&p), if cancel.is_some() { "0" } else { "1" });
             assert_eq!(p.collection_interaction(), None);
+        }
+    }
+
+    #[test]
+    fn kiosk_touch_hides_cursor_and_mouse_reveals_it() {
+        let mut p = fixture();
+        let mut at = (200., 250.);
+        let frame = p.display_frame().unwrap();
+        let hidden = frame.pixels.data().to_vec();
+        assert!(p.display_complete(&frame));
+        for (event, visible) in [
+            (InputEvent::Motion(0., 0.), true),
+            (InputEvent::Touch(Some(0.5), Some(0.5)), false),
+            (InputEvent::Absolute(Some(0.5), Some(0.5)), true),
+            (InputEvent::TouchButton(true), false),
+            (InputEvent::TouchButton(false), false),
+            (InputEvent::Motion(0., 0.), true),
+        ] {
+            dispatch(&mut p, &mut at, (400., 500.), 1., event, 0.).unwrap();
+            let frame = p.display_frame().unwrap();
+            assert_eq!(frame.pixels.data() != hidden, visible, "{event:?}");
+            assert!(p.display_complete(&frame));
+            assert_eq!(at, (200., 250.));
         }
     }
 

@@ -24,6 +24,10 @@ pub enum InputEvent {
     /// The pointer is at a fraction of the screen (an absolute device — a
     /// tablet, a KVM's mouse): `None` on an axis that did not move.
     Absolute(Option<f32>, Option<f32>),
+    /// An absolute contact from a device with BTN_TOUCH; no visible cursor.
+    Touch(Option<f32>, Option<f32>),
+    /// A touchscreen contact began or ended.
+    TouchButton(bool),
     /// The primary button went down (`true`) or up.
     Button(bool),
     /// The secondary (2), middle (4), back (8) or forward (16) button, by
@@ -272,6 +276,9 @@ impl Input {
         self.read_pads(now_ms, &mut out);
         let mut gone = Vec::new();
         for (index, (d, absolute)) in self.devices.iter_mut().enumerate() {
+            let touch = d
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(evdev::KeyCode::BTN_TOUCH));
             let events = match d.fetch_events() {
                 Ok(events) => events,
                 Err(e)
@@ -288,7 +295,10 @@ impl Input {
                     continue;
                 }
             };
-            let mut pointer = PointerReport::default();
+            let mut pointer = PointerReport {
+                touch,
+                ..Default::default()
+            };
             let fraction = |range: (i32, i32), v: i32| {
                 let span = (range.1 - range.0).max(1) as f32;
                 ((v - range.0) as f32 / span).clamp(0.0, 1.0)
@@ -351,7 +361,8 @@ impl Input {
                         match code {
                             // BTN_LEFT (a mouse) and BTN_TOUCH (a
                             // touchscreen). Both are a primary press.
-                            0x110 | 0x14a => out.push(InputEvent::Button(down)),
+                            0x110 => out.push(InputEvent::Button(down)),
+                            0x14a => out.push(InputEvent::TouchButton(down)),
                             // BTN_RIGHT, BTN_MIDDLE.
                             0x111 => out.push(InputEvent::Aux(2, down)),
                             0x112 => out.push(InputEvent::Aux(4, down)),
@@ -398,6 +409,7 @@ fn nonblocking(d: &Device) {
 // callbacks could claim a horizontal swipe before the dominant vertical axis.
 #[derive(Default)]
 struct PointerReport {
+    touch: bool,
     relative: (f32, f32),
     absolute: (Option<f32>, Option<f32>),
 }
@@ -409,7 +421,11 @@ impl PointerReport {
         }
         let (x, y) = std::mem::take(&mut self.absolute);
         if x.is_some() || y.is_some() {
-            out.push(InputEvent::Absolute(x, y));
+            out.push(if self.touch {
+                InputEvent::Touch(x, y)
+            } else {
+                InputEvent::Absolute(x, y)
+            });
         }
     }
 }
@@ -616,6 +632,19 @@ mod tests {
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
+
+    #[test]
+    fn kiosk_touch_report_preserves_partial_axes() {
+        let mut report = PointerReport {
+            touch: true,
+            absolute: (Some(0.25), None),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        report.flush(&mut out);
+        assert_eq!(out, vec![InputEvent::Touch(Some(0.25), None)]);
+    }
+
     #[test]
     fn a_report_keeps_diagonal_intent_atomic_and_boundaries_separate() {
         let mut report = PointerReport::default();

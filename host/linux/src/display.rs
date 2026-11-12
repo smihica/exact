@@ -416,8 +416,8 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         },
         None => None,
     };
+    // A touchscreen starts without a cursor; mouse motion reveals it.
     let mut pointer = (viewport.0 / 2.0, viewport.1 / 2.0);
-    p.set_pointer(Some(pointer));
     // A development display samples its flips, and writes a trace on
     // SIGUSR1 (LLP 1079 D3, D5); a production binary does neither.
     let measured = !exact_runner::delivery::production(&p.compat);
