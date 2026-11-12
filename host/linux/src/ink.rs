@@ -359,6 +359,29 @@ impl Backend for Ink {
         Ok(false)
     }
 
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    unsafe fn attach_scanout(
+        &mut self,
+        fd: i32,
+        connector: u32,
+        size: [u32; 2],
+        refresh: u32,
+        turned: bool,
+    ) -> std::result::Result<(), String> {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.device
+                .attach_scanout(fd, connector, size, refresh, turned)
+        }
+        .map_err(|e| e.to_string())
+    }
+
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    fn presents(&self) -> bool {
+        self.device.has_scanout()
+    }
+
     fn lost_device_needs_cpu(&self) -> bool {
         self.device_lost && matches!(self.device, Selected::Wgpu(_))
     }
@@ -728,6 +751,12 @@ impl Backend for Ink {
             }
             let target = self.flush()?;
             readback = Instant::now();
+            #[cfg(all(feature = "scanout", target_os = "linux"))]
+            if self.device.has_scanout() {
+                // The display has the frame; its receipt carries no pixels.
+                self.device.scan_out(target)?;
+                return Ok(vec![0; self.size[0] as usize * self.size[1] as usize * 4]);
+            }
             self.device.readback(target)
         })();
         let bytes = self

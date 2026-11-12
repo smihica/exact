@@ -189,12 +189,26 @@ impl super::Instance {
             }
         }
 
+        let acquire_drm_display_instance =
+            ext::acquire_drm_display::Instance::new(&self.shared.entry, &self.shared.raw);
+
+        // EXACT (EXACT-PATCHES.md, 15): a split render/display SoC reports
+        // only the render card's nodes, so the display card's fd matches no device
+        // above. Take the device that knows the connector on this fd instead.
+        let physical_device = physical_device.or_else(|| {
+            unsafe { self.shared.raw.enumerate_physical_devices() }
+                .unwrap_or_default()
+                .into_iter()
+                .find(|device| {
+                    unsafe {
+                        acquire_drm_display_instance.get_drm_display(*device, fd, connector_id)
+                    }
+                    .is_ok_and(|display| display != vk::DisplayKHR::null())
+                })
+        });
         let physical_device = physical_device.ok_or(crate::InstanceError::new(
             "Failed to find suitable drm device".to_string(),
         ))?;
-
-        let acquire_drm_display_instance =
-            ext::acquire_drm_display::Instance::new(&self.shared.entry, &self.shared.raw);
 
         let display = unsafe {
             acquire_drm_display_instance

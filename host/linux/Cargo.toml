@@ -111,6 +111,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 # Integration tests only: a new executor waits for a native-worker slot
 # (src/executor.rs `WAIT_FOR_SLOT`), turned on by the dev-dependency below.
 test-wait = []
+# The Ink painter presents to the KMS display directly when asked to.
+scanout = ["exact-ink/scanout"]
 
 [dev-dependencies]
 des = "0.8"

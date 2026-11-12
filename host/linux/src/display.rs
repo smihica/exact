@@ -150,6 +150,27 @@ impl Display {
         self.card.0.as_raw_fd()
     }
 
+    /// Hand the output to the painter (`KIOSK_DIRECT=1`). The mode's refresh
+    /// in millihertz is how the Vulkan display names the same mode.
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    fn attach_scanout<D: DataSource>(&self, p: &mut Presenter<D>) -> Result<(), String> {
+        let (_, _, columns) = self.mode.hsync();
+        let (_, _, lines) = self.mode.vsync();
+        let refresh = f64::from(self.mode.clock()) * 1e6 / (f64::from(columns) * f64::from(lines));
+        // SAFETY: the card is this process's DRM master and lives as long as the
+        // loop; `run` neither polls it nor submits a dumb buffer afterwards, and
+        // ends when this fails.
+        unsafe {
+            p.brush.attach_scanout(
+                self.fd(),
+                self.connector.into(),
+                [self.width, self.height],
+                refresh.round() as u32,
+                self.portrait,
+            )
+        }
+    }
+
     // Copy/submit only when neither scanout nor an outstanding flip owns back.
     // The first set_crtc is synchronous; later calls never wait for a vblank.
     fn submit(&mut self, frame: SubmittedFrame) -> Result<Option<SubmittedFrame>, String> {
@@ -426,6 +447,23 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     );
     let timings = std::env::var("KIOSK_TIMING").as_deref() == Ok("1");
     let mut fps = (std::env::var("KIOSK_FPS").as_deref() == Ok("1")).then(kiosk::Fps::default);
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    let direct = std::env::var("KIOSK_DIRECT").as_deref() == Ok("1");
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    if direct {
+        // Vulkan may drive the display by the time this fails, and nothing here
+        // can take it back: there is no falling back to dumb buffers.
+        let attached = match vnc {
+            Some(_) => Err("VNC needs the frames' pixels".to_string()),
+            None => display.attach_scanout(&mut p),
+        };
+        if let Err(e) = attached {
+            eprintln!("kiosk: no direct scanout: {e}");
+            return 1;
+        }
+    }
+    #[cfg(not(all(feature = "scanout", target_os = "linux")))]
+    let direct = false;
     loop {
         if measured {
             // A replaced host's flip and samples are the old runner's.
@@ -447,7 +485,19 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
                 frames.submitted(wall(), p.host().runner().seq(), p.hosts);
             }
             let render_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let submitted = display.submit(frame);
+            // A painter replaced after a lost device returns pixels, which this
+            // loop can no longer show.
+            #[cfg(all(feature = "scanout", target_os = "linux"))]
+            if direct && !p.brush.presents() {
+                eprintln!("kiosk: the painter stopped presenting to the display");
+                return 1;
+            }
+            // A directly presented frame is already queued for its refresh.
+            let submitted = if direct {
+                Ok(Some(frame))
+            } else {
+                display.submit(frame)
+            };
             if timings {
                 eprintln!(
                     "kiosk: render_readback={render_ms:.2}ms copy_submit={:.2}ms",
@@ -532,8 +582,12 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         if let Some(fd) = p.update_fd() {
             fds.push(fd);
         }
-        fds.push(display.fd());
-        match poll(&fds, display.fd(), timeout) {
+        // The painter's display thread reads the card's events when it owns the flips.
+        let flips = if direct { -1 } else { display.fd() };
+        if !direct {
+            fds.push(flips);
+        }
+        match poll(&fds, flips, timeout) {
             Ok(true) => match display.ready() {
                 Ok(Some(frame)) => {
                     if !marks.done() {

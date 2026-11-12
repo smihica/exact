@@ -57,6 +57,41 @@ impl Selected {
             Self::Fake(_) => unreachable!(),
         }
     }
+
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    pub unsafe fn attach_scanout(
+        &mut self,
+        fd: i32,
+        connector: u32,
+        size: [u32; 2],
+        refresh: u32,
+        turned: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Wgpu(d) | Self::Other(d) => unsafe {
+                // SAFETY: the caller passes through the native device's contract.
+                d.attach_scanout(fd, connector, size, refresh, turned)
+            },
+            Self::Fake(_) => unreachable!(),
+        }
+    }
+
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    pub fn has_scanout(&self) -> bool {
+        match self {
+            Self::Wgpu(d) | Self::Other(d) => d.has_scanout(),
+            Self::Fake(_) => false,
+        }
+    }
+
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    pub fn scan_out(&mut self, texture: TextureId) -> Result<()> {
+        match self {
+            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture),
+            Self::Fake(_) => unreachable!(),
+        }
+    }
 }
 macro_rules! forward {
     ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)+) => {

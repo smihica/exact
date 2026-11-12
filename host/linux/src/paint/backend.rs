@@ -136,6 +136,29 @@ pub trait Backend {
     ) -> Result<bool, String> {
         Ok(false)
     }
+    /// Present to the KMS display directly from now on: later frames return no pixels.
+    ///
+    /// # Safety
+    /// `fd` is the DRM master of the card that scans the connector out and
+    /// outlives the painter; nothing else reads its events or flips its planes
+    /// afterwards, also when this fails.
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    unsafe fn attach_scanout(
+        &mut self,
+        _fd: i32,
+        _connector: u32,
+        _size: [u32; 2],
+        _refresh: u32,
+        _turned: bool,
+    ) -> Result<(), String> {
+        Err("this painter cannot present to a KMS display".into())
+    }
+    /// Whether frames go to the KMS display instead of coming back as pixels.
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    fn presents(&self) -> bool {
+        false
+    }
     /// The selected backend's name.
     fn name(&self) -> &'static str;
     /// Whether geometry queries must draw through this backend to keep its
@@ -404,6 +427,28 @@ impl super::Painter {
     #[cfg(windows)]
     pub(crate) fn prepare_window_frame(&mut self, size: [u32; 2]) -> Result<bool, String> {
         self.backend.prepare_window_frame(size)
+    }
+    /// # Safety
+    /// See [`Backend::attach_scanout`].
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn attach_scanout(
+        &mut self,
+        fd: i32,
+        connector: u32,
+        size: [u32; 2],
+        refresh: u32,
+        turned: bool,
+    ) -> Result<(), String> {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.backend
+                .attach_scanout(fd, connector, size, refresh, turned)
+        }
+    }
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    pub(crate) fn presents(&self) -> bool {
+        self.backend.presents()
     }
     #[cfg(windows)]
     pub(crate) fn device_lost(&self) -> bool {

@@ -1,4 +1,4 @@
-# wgpu-hal 30.0.1 — fourteen local patches: five in Metal, nine in Vulkan
+# wgpu-hal 30.0.1 — fifteen local patches: five in Metal, ten in Vulkan
 
 Complete crates.io archive, including the upstream MIT/Apache licenses and
 `.cargo_vcs_info.json`. No dependency upgrade. Patch 11 offers an explicit native arithmetic-only f16 opt-in. Every changed
@@ -274,6 +274,14 @@ requires at least 2^30, so the adapter's `max_buffer_size` limit was 0 and
 A value below 2^30 is now read as not reported, as on a driver without
 maintenance4: the memory allocation limit and the platform cap still bound
 it. A conformant driver is unaffected. Upstreamable.
+
+## 15. A split render/display device can own a DRM connector (Vulkan)
+
+`src/vulkan/drm.rs`. On Raspberry Pi 4, V3D renders and vc4 scans out.
+The Vulkan device's reported DRM nodes do not identify the display card, so
+the node match rejects a usable connector. When that match fails, ask each
+physical device for the connector through `VK_EXT_acquire_drm_display` and
+use the first non-null display. The normal node match takes precedence.
 
 ## Updating
 

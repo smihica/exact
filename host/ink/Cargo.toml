@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Present to a KMS display directly (VK_KHR_display) instead of reading pixels back.
+scanout = ["wgpu/drm"]
+
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
 tiny-skia = "0.12"

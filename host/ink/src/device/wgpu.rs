@@ -18,6 +18,8 @@ mod atlas;
 mod cache;
 #[cfg(target_os = "macos")]
 mod present;
+#[cfg(all(feature = "scanout", target_os = "linux"))]
+mod scanout;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
@@ -68,10 +70,12 @@ struct BufferSlot {
 }
 
 pub struct Wgpu {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
     instance: ::wgpu::Instance,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
     adapter: ::wgpu::Adapter,
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    scanout: Option<scanout::Scanout>,
     #[cfg(target_os = "macos")]
     window: Option<present::Window>,
     device: ::wgpu::Device,
@@ -302,10 +306,12 @@ impl Wgpu {
         upload(&queue, &white_alpha, [0, 0], [1, 1], &[255]);
         upload(&queue, &white_color, [0, 0], [1, 1], &[255; 4]);
         Ok(Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
             instance,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
             adapter,
+            #[cfg(all(feature = "scanout", target_os = "linux"))]
+            scanout: None,
             #[cfg(target_os = "macos")]
             window: None,
             device,
