@@ -398,13 +398,28 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     /// Whether requests in flight held the last preparation back (its second's clock).
     private let requestsHeld: () -> Bool
     private let acceptProgram: (String?) -> Bool
-    var terminal: String?
+    var terminal: String? { didSet { tellNotice() } }
     /// What the dev loop said it is doing before it had a plan to give:
     /// preparing (its producers' first build), or its start's error.
     enum DevStatus: Equatable { case preparing(String), failed(String) }
-    private(set) var devStatus: DevStatus?
-    /// Told each change of `devStatus` (the window's dev pill); nil when a plan came.
-    var onDevStatus: ((DevStatus?) -> Void)?
+    private(set) var devStatus: DevStatus? { didSet { tellNotice() } }
+    /// The first line of the last save's error, until a generation is taken
+    /// (LLP 1159.001 D1): the app on screen is older than the source.
+    private(set) var refused: String? { didSet { tellNotice() } }
+    /// What the window's dev pill says, the first that holds (LLP 1159.001 D2):
+    /// the loop's own status, a host whose native code the server no longer
+    /// runs (`terminal`), or a save that did not apply.
+    enum DevNotice: Equatable { case loop(DevStatus), stale, refused(String) }
+    var notice: DevNotice? { devStatus.map(DevNotice.loop) ?? (terminal != nil ? .stale : refused.map(DevNotice.refused)) }
+    /// Told each change of `notice`; nil when nothing is left to say.
+    var onDevNotice: ((DevNotice?) -> Void)?
+    private var told: DevNotice?
+    private func tellNotice() {
+        let now = closed ? nil : notice
+        guard now != told else { return }
+        told = now
+        onDevNotice?(now)
+    }
     /// Where a status line goes (stderr; a test's own).
     var log: (String) -> Void = { fputs("exact url: \($0)\n", stderr) }
     /// The program of the last generation this host took (or the app ran
@@ -455,8 +470,8 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     }
 
     func close() {
-        loopDone() // its status leaves the windows with it
         closed = true
+        tellNotice() // what it said leaves the windows with it
         beginResolution()
         stream?.cancel()
         stream = nil
@@ -707,7 +722,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         }
         // Subscribe before payloads finish: hello repairs an edit between
         // discovery and the stream opening, including an asset-only edit.
-        guard currentGeneration() != identity else { pending = nil; return }
+        guard currentGeneration() != identity else { refused = nil; pending = nil; return }
         fetchGeneration(plan: plan, assets: assets, module: module, rust: rustModule, identity: identity, generation: generation)
     }
 
@@ -750,6 +765,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
                             guard !self.closed, self.terminal == nil, generation == self.resolution else { return }
                             let letGo = heldSince.map { ProcessInfo.processInfo.systemUptime - $0 >= 1 } ?? false
                             if applyGeneration(candidate, "generation ← " + (page.host ?? ""), letGo) {
+                                refused = nil
                                 // Its plan carries its own design; value-only edits since are the server's.
                                 syncDesign()
                                 status(String(format: "generation %@: envelope %.1f ms, payloads %.1f ms, preparation %.1f ms", String(identity.prefix(12)), envelopeMs, (fetched - payloadStarted) * 1000, (ProcessInfo.processInfo.systemUptime - fetched) * 1000))
@@ -757,6 +773,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
                                 if requestsHeld() { heldSince = heldSince ?? ProcessInfo.processInfo.systemUptime }
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: commitCandidate)
                             } else {
+                                refused = "this app refused the new build"
                                 status("the host refused the generation; keeping the running app")
                             }
                         }
@@ -788,6 +805,14 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
             }
         }
         pump()
+    }
+
+    /// An error's first line as the pill has room for it: a leading file's
+    /// directory dropped, so the line and what is wrong there are what show.
+    static func brief(_ error: String) -> String {
+        guard let line = error.split(whereSeparator: \.isNewline).first.map(String.init) else { return "the save did not build" }
+        guard line.hasPrefix("/"), let colon = line.firstIndex(of: ":"), let slash = line[..<colon].lastIndex(of: "/") else { return line }
+        return String(line[line.index(after: slash)...])
     }
 
     private static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
@@ -899,7 +924,6 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
             case .preparing(let message): status("dev loop: \(message)")
             case .failed(let message): status("dev loop failed to start: \(message)")
             }
-            onDevStatus?(said)
         }
         pending = nil
         retrySeconds = 1
@@ -914,7 +938,6 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     private func loopDone() {
         guard devStatus != nil else { return }
         devStatus = nil
-        onDevStatus?(nil)
     }
 
     private func failed(_ message: String, generation: UInt64) {
@@ -946,7 +969,11 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
             waitForProgram()
             return
         }
-        if let error = frame["error"] as? String { status("dev: \(error)"); return }
+        if let error = frame["error"] as? String {
+            refused = PlanURL.brief(error)
+            status("dev: \(error)")
+            return
+        }
         if let kind = frame["kind"] as? String, kind == "tamber-batch" || kind == "tamber-snapshot" {
             design(frame)
             return
@@ -962,7 +989,8 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         }
         if frame["ready"] as? Bool == false { return }
         guard let revision = PlanURL.revision(frame), observe(revision) else { return }
-        if currentGeneration() == revision.identity { settle(); return }
+        // The source is what runs again: a save that was refused has been repaired.
+        if currentGeneration() == revision.identity { refused = nil; settle(); return }
         guard pending != revision,
               let path = frame["envelope"] as? String, let url = URL(string: path, relativeTo: page)?.absoluteURL,
               PlanURL.sameOrigin(url, page) else { return }

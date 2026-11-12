@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync} from 'node:fs';
-import {basename, dirname, relative, resolve} from 'node:path';
+import {basename, dirname, relative, resolve, sep} from 'node:path';
 import {spawnSync} from 'node:child_process';
 
 export function gameNonInput(path) {
@@ -65,6 +65,30 @@ export function proofInputFiles(root, app, inventory, ignoredDirectories = new S
     !proofInputExcluded(file, basename(app), prefix, repository) && existsSync(resolve(repository, file))).map(file => relative(root, resolve(repository, file)).replaceAll('\\', '/')).sort();
 }
 
+// The level baker records Game::LEVEL; paired filenames alone do not establish
+// ownership. The tuning carrier has a reserved name; art outputs have a manifest.
+export function generatedInputFiles(app) {
+  const files = [resolve(app, 'assets/exact-tables.json')].filter(existsSync);
+  const assets = resolve(app, 'assets');
+  const level = resolve(app, '.shells/level.json');
+  if (existsSync(level)) {
+    const name = JSON.parse(readFileSync(level, 'utf8'));
+    const path = resolve(assets, name);
+    if (!path.startsWith(assets + sep) || !name.endsWith('.level.json')) throw new Error(`invalid baked level path: ${name}`);
+    if (existsSync(path)) files.push(path);
+  }
+  const manifest = resolve(app, '.baked-assets.json');
+  if (existsSync(manifest)) {
+    files.push(manifest);
+    for (const name of Object.keys(JSON.parse(readFileSync(manifest, 'utf8')))) {
+      const path = resolve(app, 'assets', name);
+      if (!path.startsWith(assets + sep)) throw new Error(`invalid baked asset path: ${name}`);
+      files.push(path);
+    }
+  }
+  return files;
+}
+
 // Generated assets are runtime inputs even when Git excludes the bake's outputs.
 export function executionInputFiles(root, app, inventory, ignoredDirectories, authored) {
   const files = [...(authored ?? proofInputFiles(root, app, inventory, ignoredDirectories))];
@@ -75,15 +99,7 @@ export function executionInputFiles(root, app, inventory, ignoredDirectories, au
     }
   };
   walk(resolve(app,"assets"));
-  const manifest = resolve(app, '.baked-assets.json');
-  if (existsSync(manifest)) {
-    files.push(relative(root, manifest));
-    for (const name of Object.keys(JSON.parse(readFileSync(manifest, 'utf8')))) {
-      const path = resolve(app, 'assets', name);
-      if (!path.startsWith(resolve(app, 'assets') + '/')) throw new Error(`invalid baked asset path: ${name}`);
-      files.push(relative(root, path));
-    }
-  }
+  files.push(...generatedInputFiles(app).map(path => relative(root, path)));
   return [...new Set(files)].sort();
 }
 
@@ -122,9 +138,7 @@ export function proofInputs(root, app, cachePath) {
   const dirty=new Set((status.stdout??'').split('\0').filter(row=>row && row[1]!==' ').map(row=>row.slice(3)));
   let cache={}; try {cache=JSON.parse(readFileSync(cachePath,'utf8'));} catch { /* First proof. */ }
   const next={}, rows=[], prefix=relative(root,app).replaceAll('\\','/')+'/', groups={all:[],gpu:[],host:[],authored:[]}, authoredState=[], assetState=[]; let reads=0;
-  const manifest = resolve(app, '.baked-assets.json');
-  const generated = new Set([prefix + 'assets/exact-tables.json', ...(existsSync(manifest)
-    ? Object.keys(JSON.parse(readFileSync(manifest, 'utf8'))).map(name => prefix + 'assets/' + name) : [])]);
+  const generated = new Set(generatedInputFiles(app).map(path => relative(root, path).replaceAll('\\', '/')));
   const ignoredDirectories = new Set();
   const authoredFiles = new Set(proofInputFiles(root,app,listed.status===0 ? {status:0,stdout:paths.join('\0')} : undefined, ignoredDirectories));
   const files=executionInputFiles(root,app,undefined,ignoredDirectories,authoredFiles);
@@ -150,7 +164,7 @@ export function proofInputs(root, app, cachePath) {
   }
   for(const row of rows) {
     const [file,digest,key]=row, input=[file.startsWith(prefix) ? 'app/' + file.slice(prefix.length) : 'sdk/' + file,digest]; groups.all.push(input);
-    if (authoredFiles.has(file) && file !== prefix + '.baked-assets.json' && !generated.has(file)) {
+    if (authoredFiles.has(file) && !generated.has(file)) {
       // Source provenance survives moving the app relative to the SDK. Keep
       // execution paths and the in-flight file/directory checks unchanged.
       groups.authored.push([file.startsWith(prefix) ? 'app/' + file.slice(prefix.length) : 'sdk/' + file, digest]);

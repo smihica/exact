@@ -1,3 +1,5 @@
+import { symbolSheet } from './glue-fixture.mjs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The document parity check (LLP 1048.000 §4): Caltrain's page as the
 // projection renders it, parsed by Chrome with JavaScript off, against the
 // live host's DOM at the same URL once the runtime is ready. A difference
@@ -5,7 +7,7 @@
 // source, a surface's pixel size, focus — is left out of both sides.
 import { test, expect } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -707,7 +709,7 @@ browserCheck('the ink on an accent fill is chosen for contrast in each scheme', 
 // text's colour. Both targets' symbol sheets; an ink a native face or a bar
 // sets (`--exact-tint`) still wins.
 for (const sheet of ['host/web/glue.js', 'host/web-js/symbols.js']) browserCheck(`an untinted symbol is its text's colour (${sheet})`, async () => {
-  const style = readFileSync(resolve(ROOT, sheet), 'utf8').match(/'(@property --exact-tint[^']*)'/)[1];
+  const style = symbolSheet(readFileSync(resolve(ROOT, sheet), 'utf8'));
   const shell = SHIPPED;
   const img = (id, css = '') => `<img id="${id}" data-symbol-path="M0 0h16v16H0Z" style="width:16px;height:16px;${css}">`;
   const html = shell.replace('<div id="exact-root"></div>', `<style>${style}</style><div id="exact-root"><div style="--exact-accent:light-dark(#6652c5, #b5a4ff)"><div style="color-scheme:light">${img('light')}</div><div style="color-scheme:dark">${img('dark')}</div>${img('authored', '--exact-tint:rgb(255, 0, 0)')}</div>${img('unsaid')}<span id="system" style="color:var(--exact-accent, AccentColor)"></span></div>`).replace('<script type="module" src="./glue.js"></script>', '');
@@ -727,7 +729,7 @@ for (const sheet of ['host/web/glue.js', 'host/web-js/symbols.js']) browserCheck
 // `light-dark()` one by its scheme and a later one at once; an ink set on it
 // (`--exact-tint`) still wins. Both targets' sheets.
 for (const sheet of ['host/web/glue.js', 'host/web-js/symbols.js']) browserCheck(`a symbol draws in its written colour (${sheet})`, async () => {
-  const style = readFileSync(resolve(ROOT, sheet), 'utf8').match(/'(@property --exact-tint[^']*)'/)[1];
+  const style = symbolSheet(readFileSync(resolve(ROOT, sheet), 'utf8'));
   const img = (id, css = '', marked = true) => `<img id="${id}" data-symbol-path="M0 0h16v16H0Z"${marked ? ' data-symbol-color' : ''} style="width:16px;height:16px;${css}">`;
   const html = SHIPPED.replace('<div id="exact-root"></div>', `<style>${style}</style><div id="exact-root" style="--exact-accent:rgb(102, 82, 197)"><div id="ink" style="color:rgb(10, 20, 30)">${img('written')}${img('authored', '--exact-tint:rgb(255, 0, 0)')}${img('unmarked', '', false)}${['light', 'dark'].map(scheme => `<div style="color-scheme:${scheme};color:light-dark(rgb(1, 2, 3), rgb(4, 5, 6))">${img(scheme)}</div>`).join('')}</div></div>`).replace('<script type="module" src="./glue.js"></script>', '');
   await withDocument('/', async tab => {

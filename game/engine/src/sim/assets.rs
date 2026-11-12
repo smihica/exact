@@ -17,7 +17,13 @@ impl<G: Game> Sim<G> {
         let revision = self.world.revision::<crate::Mesh>();
         let sprites_changed =
             crate::sprite::texture_names_changed(&self.world, &mut self.asset_sprite_names);
-        if revision != self.asset_mesh_revision || sprites_changed {
+        // Present rewrites overrides every boundary: compare the names they hold.
+        let overrides = override_textures(&self.world);
+        let overrides_changed = overrides != self.asset_override_names;
+        if overrides_changed {
+            self.asset_override_names = overrides;
+        }
+        if revision != self.asset_mesh_revision || sprites_changed || overrides_changed {
             let names: Vec<_> = self
                 .world
                 .query::<&crate::Mesh>()
@@ -35,6 +41,11 @@ impl<G: Game> Sim<G> {
                         .iter()
                         .map(|(_, s)| (s.texture.clone(), ".tex")),
                 )
+                .chain(
+                    self.asset_override_names
+                        .iter()
+                        .map(|n| (n.clone(), ".tex")),
+                )
                 .collect();
             let mut roots: std::collections::BTreeSet<_> =
                 names.iter().map(|(n, _)| n.clone()).collect();
@@ -44,6 +55,7 @@ impl<G: Game> Sim<G> {
             roots.extend(G::ASSETS.iter().map(|n| (*n).to_owned()));
             roots.extend(G::STREAMED.iter().map(|n| (*n).to_owned()));
             roots.extend(self.world.assets.declared.iter().cloned());
+            roots.extend(self.held.iter().cloned());
             if let Some(level) = G::LEVEL {
                 roots.insert(level.name.into());
             }
@@ -65,9 +77,11 @@ impl<G: Game> Sim<G> {
             .filter(|(n, s)| {
                 (**s == crate::asset::AssetState::Pending || assets.redelivery.contains(*n))
                     && !assets.requested.contains(*n)
-                    // A generated model has no payload: it is Pending only
-                    // until its textures, requested by their own names, arrive.
-                    && !(n.ends_with(".model") && assets.identities.contains_key(n.as_str()))
+                    // A generated or cosmetic model has no payload: it is Pending
+                    // only until its textures, requested by their own names, arrive.
+                    && !(n.ends_with(".model")
+                        && (assets.identities.contains_key(n.as_str())
+                            || assets.cosmetic.contains(n.as_str())))
             })
             .map(|(n, _)| n.clone())
             .collect();
@@ -80,6 +94,15 @@ impl<G: Game> Sim<G> {
         });
         assets.requested.extend(names.iter().cloned());
         names
+    }
+    /// Renderer-only: the assets the renderer draws, including a model an
+    /// entity keeps drawing until the one its `Mesh` names can draw. They stay
+    /// resident while held; a change takes effect at the next `take_assets`.
+    pub fn hold_assets(&mut self, names: &std::collections::BTreeSet<String>) {
+        if *names != self.held {
+            self.held = names.clone();
+            self.asset_mesh_revision = u64::MAX;
+        }
     }
     /// Drain names whose last cosmetic mesh reference disappeared.
     pub fn take_retired_assets(&mut self) -> Vec<String> {
@@ -268,6 +291,11 @@ impl<G: Game> Sim<G> {
             self.finish_assets(name);
             return Ok(());
         }
+        if self.world.assets.cosmetic.contains(name) {
+            return Err(format!(
+                "asset `{name}`: a cosmetic model has no payload; `Game::present` supplies it"
+            ));
+        }
         self.world.assets.request(name);
         self.world.assets.requested.insert(name.into());
         self.world.assets.redelivery.remove(name);
@@ -308,4 +336,17 @@ impl<G: Game> Sim<G> {
         self.finish_assets(name);
         Ok(())
     }
+}
+
+/// The texture names `MaterialOverrides` show, sorted and once each.
+fn override_textures(w: &crate::World) -> Vec<String> {
+    let mut names: Vec<String> = w
+        .query::<&crate::MaterialOverrides>()
+        .iter()
+        .flat_map(|(_, o)| o.0.iter())
+        .flat_map(|o| o.textures.names().into_iter().flatten().map(str::to_owned))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }

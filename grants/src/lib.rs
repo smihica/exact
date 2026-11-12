@@ -22,7 +22,7 @@ mod local;
 mod presence;
 pub mod process;
 mod windows_path;
-pub use local::{is_local_network, is_service_type, DEVELOPMENT, LOCAL_NETWORK};
+pub use local::{is_cloud_metadata, is_local_network, is_service_type, DEVELOPMENT, LOCAL_NETWORK};
 pub use presence::{
     line_presence, presence_words, Policy, Presence, PLATFORM_WORDS, PRESENCE_PREFIX,
 };
@@ -84,6 +84,14 @@ impl PathPrefix {
         let namespace = ["app:", "doc:", "home:", "bundle:"]
             .into_iter()
             .find_map(|ns| Some((ns, path.strip_prefix(ns)?.strip_prefix('/')?)));
+        // A chosen document's path is the host's own, never normalized: an
+        // empty segment, a backslash or a NUL refuses it, as ibex2's parser,
+        // which the native hosts admit by, refuses it (LLP 1069.010 D1).
+        if namespace.is_some_and(|(ns, rest)| {
+            ns == "doc:" && (rest.contains(['\\', '\0']) || rest.contains("//"))
+        }) {
+            return None;
+        }
         let (namespace, path) = if let Some(found) = namespace {
             found
         } else if path.starts_with('/') {
@@ -474,6 +482,15 @@ impl GrantSet {
                     }
                     let origin = origin(target, false)
                         .map_err(|e| format!("line {}: bad origin `{target}`: {e}", index + 1))?;
+                    // A socket's origin is `ws` or `wss`: a line with another scheme would admit none.
+                    if capability == "net.websocket"
+                        && !matches!(origin.scheme.as_str(), "ws" | "wss")
+                    {
+                        return Err(format!(
+                            "line {}: `{target}`: a `net.websocket` line needs `ws` or `wss`",
+                            index + 1
+                        ));
+                    }
                     if capability == "net.fetch" {
                         Grant::Fetch(origin)
                     } else {
@@ -836,6 +853,7 @@ mod tests {
             "169.254.169.254",
             "[::ffff:169.254.169.254]",
             "[::ffff:a9fe:a9fe]",
+            "[fd00:ec2::254]",
         ] {
             assert!(!fetch(Origin::new("http", host, 80)));
             assert!(!socket(Origin::new("ws", host, 80)));

@@ -25,21 +25,11 @@ impl<D: DataSource> Host<D> {
         }
     }
 
-    /// The platform's own Forward to `location`, at `now_ms`, under a
-    /// navigation root with no `navigate` handler ([`Runner::host_go`]).
-    /// Whether the router moved; a refused commit is the error.
-    pub fn host_go(&mut self, location: &str, now_ms: f64) -> Result<bool, String> {
+    /// Native Forward through the root's handler or the runner's own `go`.
+    /// Timers run before the delivery acquires its Forward direction.
+    pub fn host_forward(&mut self, root: ViewId, now_ms: f64) -> Option<String> {
         self.now_ms = now_ms.max(self.now_ms);
-        match self.runner.host_go(location) {
-            Ok(Some(receipt)) => {
-                let at_ms = self.now_ms;
-                match self.commit(&[Timed { at_ms, receipt }], None) {
-                    None => Ok(true),
-                    Some(error) => Err(error),
-                }
-            }
-            Ok(None) => Ok(false),
-            Err(e) => Err(format!("host go: {e:?}")),
-        }
+        let a = self.runner.host_forward_at(root, self.now_ms);
+        self.commit(&a.receipts, a.error.map(|e| format!("host forward: {e:?}")))
     }
 }

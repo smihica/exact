@@ -17,6 +17,21 @@ extension InlineText {
         if let backgroundRef { value.background = backgroundRef.channels(dark: dark, contrast: contrast, elevated: elevated, tint: tint) }
         (value.shadow, value.stroke) = paint.resolve(dark: dark, contrast: contrast, elevated: elevated, tint: tint,
                                                      color: value.color ?? SystemColor.canvasTextChannels(dark: dark, contrast: contrast))
+        if opacity < 1 {
+            // Channels are `BatchValue.textChannels`' (sRGB r g b a, then
+            // optionally a space and its four components), after a shadow's
+            // offsets and blur or a stroke's width.
+            func faded(_ c: [Double]?, from start: Int = 0) -> [Double]? {
+                guard var c, c.count >= start + 4 else { return c }
+                c[start + 3] *= opacity
+                if c.count == start + 9 { c[start + 8] *= opacity }
+                return c
+            }
+            value.color = faded(value.color ?? SystemColor.canvasTextChannels(dark: dark, contrast: contrast))
+            value.background = faded(value.background)
+            value.shadow = faded(value.shadow, from: 3)
+            value.stroke = faded(value.stroke, from: 1)
+        }
         return value
     }
     static func run(_ text: String, style: NodeStyle, href: String = "", dark: Bool, contrast: Bool? = nil, elevated: Bool = false,
@@ -38,7 +53,7 @@ extension InlineText {
                       decoration: style["text_decoration_line"]?.string ?? "", href: href)
         (run.shadow, run.stroke) = RunPaintRows(style).resolve(dark: dark, contrast: contrast, elevated: elevated, tint: tint,
                                                                color: run.color ?? SystemColor.canvasTextChannels(dark: dark, contrast: contrast))
-        run.hidden = style["visibility"]?.string == "hidden"
+        run.hidden = (style["visibility"]?.string ?? "visible") != "visible"
         run.fixedInk = style["text_color"]?.fixesInk == true
         return run
     }

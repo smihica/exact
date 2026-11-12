@@ -1,8 +1,8 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // @ref LLP 1045.000 §4, D4, D5, D7 — inline atoms in the web's Markdown
 // editor, driven by keys and the pointer in Chrome, Firefox and WebKit (the
 // go/no-go of LLP 1045 §1), and in the reader.
 import { afterAll, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { buildEditor } from '../../web-js/module.mjs';
@@ -35,7 +35,7 @@ const attr = s => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 async function editor(engine, source, drive, { width = 500, faceList = [], styles = '{}', kinds = KINDS } = {}) {
   const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(request) {
     const path = new URL(request.url).pathname;
-    if (['/markup-editor.js', '/navigation.js', '/atoms.js', '/geometry-glue.js'].includes(path)) return new Response(Bun.file(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
+    if (['/markup-editor.js', '/navigation.js', '/atoms.js', '/geometry-glue.js'].includes(path)) return new Response(readFileSync(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
     if (path === '/markup-editor.wasm') return new Response(wasm, { headers: { 'content-type': 'application/wasm' } });
     return new Response(`<!doctype html><meta charset="utf-8"><style>body{font:16px/1.4 system-ui} img, video, svg { display: block; }</style>
       <textarea id="editor" markup="markdown" data-atoms="${attr(kinds)}" data-atom-faces="${attr(faces(faceList))}" data-atom-styles="${attr(styles)}" style="width:${width}px;height:200px"></textarea>
@@ -291,7 +291,7 @@ for (const engine of engines) {
   engineTest[engine](`${engine}: in a right-to-left reader a pill's icon is on the right, unless its face pins left to right`, async () => {
     const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path.endsWith('.js')) return new Response(Bun.file(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
+      if (path.endsWith('.js')) return new Response(readFileSync(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
       // The host page's reset (index.html) makes an image a block.
       return new Response(`<!doctype html><meta charset="utf-8"><style>img, video, svg { display: block; }</style><p id="text" markup="markdown" data-exact-text style="direction:rtl"></p><script type="module">
         globalThis.exact = {};
@@ -328,7 +328,7 @@ for (const engine of engines) {
   engineTest[engine](`${engine}: the reader's atom is a button a press, Return or Space reports, and rangeFrame is its pill`, async () => {
     const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(request) {
       const path = new URL(request.url).pathname;
-      if (path.endsWith('.js')) return new Response(Bun.file(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
+      if (path.endsWith('.js')) return new Response(readFileSync(resolve(WEB, path.slice(1))), { headers: { 'content-type': 'text/javascript' } });
       return new Response(`<!doctype html><meta charset="utf-8"><div id="root"><p id="text" markup="markdown" data-exact-text data-atom-styles='{"citation":"color:rgb(1, 2, 3)"}'></p></div><script type="module">
         globalThis.exact = {};
         const { renderMarkup } = await import('./navigation.js');

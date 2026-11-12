@@ -351,7 +351,46 @@ extension NodeView {
     package var overlay: PlainView? { get { extras?.overlay } set { if newValue != nil || extras != nil { more.overlay = newValue } } }
     package var needsCapture: Bool { get { extras?.needsCapture ?? false } set { if newValue || extras != nil { more.needsCapture = newValue } } }
     package var paintedThisTurn: Bool { get { extras?.paintedThisTurn ?? false } set { if newValue || extras != nil { more.paintedThisTurn = newValue } } }
-    package var placement: [Double]? { get { extras?.placement } set { if newValue != nil || extras != nil { more.placement = newValue }; if newValue != nil { Self.placedViews.add(self) } } }
+    /// A canvas child its surface places: the surface draws it, and UIKit
+    /// does not (`NodeLayer.drawnElsewhere`). What reads UIKit's drawing, and
+    /// focus, which would find it at its own box, skip it.
+    package var drawnBySurface: Bool { placement != nil }
+    package var placement: [Double]? {
+        get { extras?.placement }
+        set {
+            if newValue != nil || extras != nil { more.placement = newValue }
+            if newValue != nil { Self.placedViews.add(self) }
+            (layer as? NodeLayer)?.drawnElsewhere = newValue != nil
+        }
+    }
+    /// It became transparent or stopped being: a canvas whose children it is
+    /// among lists them for accessibility again (`readPlacements`), after
+    /// the capture that brings its next frame, as UIKit's own walk would see
+    /// the change at once.
+    func transparencyChanged() {
+        guard let overlay = superview, let canvas = overlay.superview as? NodeView, canvas.overlay === overlay else { return }
+        canvas.needsCapture = true
+        canvases?.scheduleCapture()
+    }
+    /// Its filter published new pixels, at once or when its chain landed: the
+    /// canvas it is drawn through captures it again, as that picture
+    /// (`filterPicture`).
+    func filterPublished() {
+        guard let canvas = canvasAbove else { return }
+        canvas.needsCapture = true
+        canvases?.scheduleCapture()
+    }
+    /// A filtered box's picture (`BoxFilter`), which stands beside the box,
+    /// not in it: what shows it on screen, and what a capture draws.
+    package var filterPicture: CALayer? { boxFilter.flatMap { $0.casts || $0.picture.superlayer == nil ? nil : $0.picture } }
+    /// The picture shown as the box is: hidden with it, and while the box is
+    /// placed, when only its surface shows it. Called once a placement's
+    /// fields are all set (`readPlacements`), and as the box leaves one.
+    package func followPlacement() {
+        guard let picture = filterPicture else { return }
+        let hidden = isHidden || drawnBySurface
+        if picture.isHidden != hidden { CATransaction.begin(); CATransaction.setDisableActions(true); picture.isHidden = hidden; CATransaction.commit() }
+    }
     var symbolView: UIImageView? { get { extras?.symbolView } set { if newValue != nil || extras != nil { more.symbolView = newValue } } }
     var symbolFound: Bool { get { extras?.symbolFound ?? false } set { if newValue || extras != nil { more.symbolFound = newValue } } }
     var symbolKey: String? { get { extras?.symbolKey } set { if newValue != nil || extras != nil { more.symbolKey = newValue } } }

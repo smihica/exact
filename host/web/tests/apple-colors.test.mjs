@@ -1,10 +1,12 @@
+import { parseSync } from 'rolldown/utils';
+import { glueDeclarations } from './glue-fixture.mjs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The web draws Exact's colour roles in Apple's palette in Chrome, Firefox and WebKit, light and dark, as the hosts
 // write a role (`var(--exact-<role>, <the kernel's fallback>)`): the system's own where the browser has WebKit's
 // `-apple-system-*` keyword for it (Safari), else the schema's Apple pair, which the backgrounds always are (WebKit
 // on a Mac resolves all six to one colour). The look's floors hold over them, the web's check reports them, and the
 // glue reports them to the kernel before the boot (glue.js, src/colors.rs).
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { withLook } from '../look.mjs';
 import { chromium as browserPath } from '../../../scripts/agent-launch.mjs';
 
@@ -15,7 +17,11 @@ const row = name => colors.find(r => r[0] === name);
 // A label, two backgrounds, a fill WebKit does not name, a system colour it does and one with no keyword
 const ROLES = ['secondary-label', 'secondary-background', 'grouped-background', 'tertiary-fill', 'system-green', 'system-cyan'];
 // The glue's report, as it runs before the boot
-const PROBE = readFileSync(new URL('glue.js', web), 'utf8').match(/const appleRoles = [^\n]*?wasm\.exact_report_colors\(writeIn\(JSON\.stringify\(colors\)\)\); \}/)[0];
+const boot = glueDeclarations(readFileSync(new URL('wasm/boot.js', web), 'utf8'), ['bootNow']);
+const statements = parseSync('boot.js', boot).program.body[0].body.body;
+const report = statements.findIndex(statement => statement.type === 'VariableDeclaration'
+  && statement.declarations[0].id.name === 'appleRoles');
+const PROBE = boot.slice(statements[report].start, statements[report + 1].end);
 const swatch = (name, scheme) => {
   const [, , , , , , light, dark] = row(name);
   return `<i id="${name}-${scheme}" style="color: var(--exact-${name}, light-dark(${light}, ${dark}))">x</i>`;
@@ -92,7 +98,7 @@ test("every engine draws Exact's colour roles in Apple's palette", async () => {
         // The report: every role the page holds, light and dark, as the page draws it; a role the page does not hold
         // is left out rather than reported as the ink around the probe, and a page with none reports nothing.
         const report = await page.evaluate(([probe, roles]) => {
-          const run = () => { let said = null; new Function('wasm', 'writeIn', probe)({ exact_report_colors: (json) => { said = JSON.parse(json); } }, (text) => text); return said; };
+          const run = () => { let said = null; new Function('host', 'writeIn', probe)({ wasm: { exact_report_colors: (json) => { said = JSON.parse(json); } } }, (text) => text); return said; };
           const all = run(), want = roles.flatMap((name) => ['light', 'dark'].map((scheme) => [name, scheme === 'dark', read(`var(--exact-apple-${name})`, scheme)]));
           document.documentElement.style.setProperty('--exact-apple-system-green', 'initial');
           const less = run().filter(([name]) => name === 'system-green').length;

@@ -1,5 +1,5 @@
 // An app's Rust data source as a standalone logic module (LLP 1029.000,
-// ABI 4) for the JS runtime, when the app declares none of its own: a
+// ABI 6) for the JS runtime, when the app declares none of its own: a
 // generated crate exporting the same DataSource the web build bakes with
 // (`apps/<app>/web/build.rs`'s `contract::bake(plan, <expr>)`).
 // usage: bun host/web-js/module.mjs <app> [--out <dir>] → <dir>/app.module.wasm
@@ -148,6 +148,12 @@ function module(manifest, name, out, label) {
 export function buildModule(app, out = resolve(MODULES, app), draw = false, dir = resolve(root, 'apps', app)) {
   const build = readFileSync(resolve(dir, 'web/build.rs'), 'utf8');
   const expr = /contract::bake\(\s*plan,\s*([\w:]+(?:::(?:default|new)\(\))?)\s*\)/.exec(build)?.[1];
+  // The source is copied as written into a generated crate whose one dependency is the data crate, where build.rs's
+  // `use`s and locals are not. A call it cannot copy, outside comments and strings, is named rather than taken for none.
+  const code = build.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"/g, (m) => m.startsWith('"') ? '""' : ' ');
+  if (!expr && code.includes('contract::bake(') && !JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8')).rust?.module?.package) {
+    throw new Error(`${app}: ${resolve(dir, 'web/build.rs')} passes contract::bake a source the web build does not copy into the module it generates. It copies \`contract::bake(plan, <data crate>::<Type>)\`, \`<data crate>::<Type>::default()\` or \`<data crate>::<Type>::new()\` with no arguments, written with no comma after the source (rustfmt adds one when it breaks the call across lines). For anything else, write a crate that exports the source (\`exact_logic_abi::export!(<Type>, <constructor>)\`, as apps/update-lab/logic does) and name it in app.json's rust.module.package`);
+  }
   if (!expr) return ownModule(app, out, dir);
   const ty = expr.replace(/::(default|new)\(\)$/, '');
   const dataToml = readFileSync(resolve(dir, 'data/Cargo.toml'), 'utf8');

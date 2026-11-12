@@ -313,6 +313,28 @@ HUD children keep native resolution. Bind a `#[live]` argument through this meth
 for an app setting. This is the presented raster's size, and a look frame's; a
 fixture's or a readback's size is the one its caller asks for.
 
+`Game::render_scale` is read again at every frame, so a `#[live]` argument steps
+it while the world runs.
+
+`Game::render_idle(world, args)` lets a world that has come to rest stop
+drawing. Return true when nothing it shows is changing (the dice lie still). The
+canvas draws until both ticks it interpolates between are idle, then asks the
+host for no frame until input, a bind, an asset, a resize or a render hook's
+`Needs::ANIMATE` or `Needs::PENDING` wakes it; queued input and a pending hold or
+tap keep it drawing. The idle time never runs as ticks: the first frame after a
+wake advances one display period, and input that arrived meanwhile lands on its
+first tick. The agent's clock ignores it, so a seeked run ticks every
+millisecond as before. `Game::max_fps(world, args)` caps the drawn frames per
+second (0, the default, for the display's rate), changeable at any frame: 60 at
+rest, say, and 0 while the dice fly. The simulation still ticks at `HZ`; a render
+hook's `Hooks::max_fps` can cap lower (a budget or a thermal cap), and the lower
+non-zero cap stands. `Game::samples(args)` chooses scene sampling (by default
+`Game::SAMPLES`); a change makes the renderer again under the same world, as a
+"smooth edges" setting needs. None of the three is saved or hashed. The web, iOS,
+macOS and Android hosts rest and cap a canvas; the Linux and Windows desktop
+hosts draw a mounted world every display frame and take no cap
+([GPU module ABI](../gpu/README.md#frame-pacing-and-timing)).
+
 `Game::quality(args)` picks the renderer's rung of the quality ladder, read once,
 when the renderer is made, and never saved: the world hash is the same on every
 rung. The default `Quality::Auto` follows the device's GPU tier
@@ -328,7 +350,8 @@ module loads (`high` until then). A rung clamps only what the game left unsaid:
 | `Mid` (a recent phone or tablet) | `Game::SAMPLES` | 1 cascade | 0.75 | as `Water` says |
 | `High` (a computer; the agent's) | `Game::SAMPLES` | as `Shadows` says | 1 | as `Water` says |
 
-What the game says stands on every rung: an inserted `Shadows` resource, an
+What the game says stands on every rung: an inserted `Shadows` resource (but for
+its local lights' layer size, which `Low` caps at 1024² and `Mid` at 2048²), an
 inserted `AmbientOcclusion`, and any `render_scale` the game returns (the default,
 `AUTO_RENDER_SCALE`, leaves the scale to the rung). `Low` leaves out a `Water`'s
 caustics and shafts at present time (`Renderer::set_water_effects`): the saved
@@ -424,6 +447,52 @@ pushed as far, the lower index); a button is down while any pad holds it. Per ho
 | Linux | evdev, at each report, stamped with the report's time moved into the host's clock by one origin per read and kept when that report moves the pads to a canvas, so readings buffered in one read keep their spacing and several pads' arrive in the order they happened (ties by index, then as read); in the kernel's gamepad layout (Xbox drivers' letters read as their positions); a pad's state is read when it opens and delivered ahead of the reports buffered since | pads present at launch only; every pad is reported standard |
 | Windows | XInput's four slots, every 8 ms while one is connected and every 250 ms otherwise, while the window has focus, and all four at once when it regains focus, so a pad unplugged meanwhile reads gone | `GamepadHome` is never down (XInput does not report the guide button); a reading is stamped at its poll |
 
+`input.pointer()` is one primary pointer: the first contact down, or the hovering
+mouse. For several fingers at once, `input.pointers()` is every contact down, sorted by
+id: each touch, and the mouse while a button is held (`PointerContact`: `id`,
+`position`, `press_origin`, `down`, `delta`). `input.pointer_events()` is this tick's
+contact edges in the order they happened (`PointerEdge`: `id`, `phase`, `position`,
+`world_us`): a `Down` where a contact began, an `Up` or `Cancel` where it ended. A move
+is not an edge. A down and up in one tick are two edges, and the contact stays in
+`pointers()` with `down: false` for that tick only. A blur cancels every contact. Input
+applied while the game is paused leaves no edge, so a finger lifted during a pause never
+reads as a tap; nor does an Up or a blur then, so a hold ends when its contact is no
+longer down in `pointers()`, not at an edge. A save holds the contacts down with their
+origins and no edges. Each finger holds the die under it:
+
+```rust
+use exact_game::*;
+#[derive(Clone, Default, Data)]
+struct Grab { finger: u64, die: Entity }
+#[derive(Default, Resource)]
+struct Grabs(Vec<Grab>);
+
+fn tick(w: &mut World, input: &Input, _: &()) {
+    for e in input.pointer_events() {
+        w.resource_mut::<Grabs>().0.retain(|g| g.finger != e.id);
+        if e.phase == PointerPhase::Down {
+            if let Some(die) = die_under(w, input.viewport(), e.position) {
+                w.resource_mut::<Grabs>().0.push(Grab { finger: e.id, die });
+            }
+        }
+    }
+    // A finger no longer down lets go, though it lifted during a pause.
+    let down = |id| input.pointers().iter().any(|p| p.id == id && p.down);
+    w.resource_mut::<Grabs>().0.retain(|g| down(g.finger));
+    let grabs = w.resource::<Grabs>().0.clone();
+    for p in input.pointers() {
+        if let Some(g) = grabs.iter().find(|g| g.finger == p.id) {
+            drag_to(w, g.die, input.viewport(), p.position);
+        }
+    }
+}
+// The game's own pick (a ray through the point) and drag.
+fn die_under(w: &World, viewport: Vec2, at: Vec2) -> Option<Entity> {
+    todo!()
+}
+fn drag_to(w: &mut World, die: Entity, viewport: Vec2, at: Vec2) {}
+```
+
 What is saved and what is hashed differ. A save holds the input queue and the keys,
 pads and contacts held, which the world hash leaves out. The world hash covers the world
 the input changed, plus resources that exist only once a game uses them:
@@ -454,9 +523,14 @@ nothing yet.
 | Fade a glowing mesh | Attach `Glow` to `Material::glow`; call `beacon.glow_to(1.0, 0.5)` once. The renderer samples at frame time. |
 | Fade a point light | Attach `Lit(Spring)` and call `lit.to(w.tick_end(), intensity)`. |
 | A flashlight | `SpotLight { inner, outer, range, intensity, .. }` along the entity's −Z; intensity in candela, as `PointLight`'s |
-| Shadows from a lamp | Add `LightShadows` to a `SpotLight` or `PointLight`; the renderer shadows the nearest few |
+| A lamp without distance falloff | `SpotLight { decay: 0., .. }` or a `PointLight`'s: only the range, cone and angle shape it (three.js `decay`; default 2, inverse-square) |
+| Shadows from a lamp | Add `LightShadows` to a `SpotLight` or `PointLight`; the renderer shadows the nearest few. `Shadows { local_resolution: 2048, local_filter, local_softness, .. }` sizes and filters every lamp's map |
 | A moon | A second `DirectionalLight` (in entity order) is an unshadowed fill |
 | Team colours, mutation looks | A `Material` on a model entity tints every node and adds emission; `NodeMaterials` per named node or `MaterialOverrides` per material (one model in every team's colours), written from `Game::present` ([team colour from a saved `Team`](render/tests/instances.rs): `p.insert(e, MaterialOverrides(vec![MaterialOverride { material: 0, color: Some(team_rgba), ..Default::default() }]))`) |
+| A skin or theme picked while playing | One model per shape, its textures per instance: `MaterialOverride { material: 0, textures: TextureSlots { base_color: Some("walnut.tex".into()), ..Default::default() }, ..Default::default() }` from `Game::present`; each instance keeps its old look until the new textures arrive ([surface test](render/src/surface_tests/cosmetics.rs)) |
+| A scrolling texture: a light running along a ribbon, flowing water | `MaterialOverride { material: 0, uv_offset: Some([head, 0.]), ..Default::default() }` from `Game::present` each frame; blended materials too, one draw, any period ([surface test](render/src/surface_tests/cosmetics.rs)) |
+| No growth or compile when the first pieces spawn | `const PREPARE: &'static [(&'static str, u32)] = &[("die.model", 16)];` sizes the instance and skin buffers before the first frame and prepares the listed models' pipelines in the frames after; `state.world.perf.pipelineMs` times pipeline creation ([surface test](render/src/surface_tests/prepare.rs)) |
+| A model generated when the player picks it | The tick writes `Mesh::asset("walnut-d6.model")`; `Game::present` calls `p.cosmetic_model(name, \|\| model)` for each name a `Mesh` shows. Never saved or hashed, freed when unshown; the entity draws its previous model until the new one can |
 | Cheaper far trees and crowds | `ModelLod { levels: vec![LodLevel { distance: 30., model: "tree_low.model".into() }], hide: Some(120.) }` on the entity |
 | Fade a tree between camera and player | `Opacity(0.3)` on the entity from `Game::present`: a dithered fade, no sorting, never in a save or pin |
 | A first-person weapon | Add `ViewModel` to each part; it draws in front of the world and casts no shadow |
@@ -469,6 +543,7 @@ nothing yet.
 | Turn the drawn camera between ticks | Put `MouseLook { yaw_per_point, pitch_per_point, pitch_limit }` on the camera at the rates the tick turns it by: the drawn camera and its children turn by `Sim::unshown_motion()`, so a turn shows at the next frame whatever the tick and display rates (`engine/tests/look.rs`). Presentation only; insert it in `setup` or register it. |
 | Right or middle mouse button | Bind it as a key: `.button("aim", &["MouseRight"])`; `MouseLeft` and `MouseMiddle` too (`MOUSE_BUTTONS`). Touch contacts press none. |
 | Start a selection rectangle | `input.pointer().and_then(\|p\| p.press_origin)` is the latest MouseLeft/touch Down point, even if movement and Up reach the same tick. Gate commands on your action's pressed/released edges. The origin survives normal Up and saves; Cancel, Blur or replacement clears it. |
+| Several fingers at once | `input.pointers()` (every contact down, by id) and `input.pointer_events()` (this tick's Down, Up and Cancel edges, in order); [Controls](#controls) has a multi-finger grab |
 
 `Character` saves velocity and configuration and reports displacement, grounded,
 jumped and landed. `near`/`near_xz` use current global poses, inclusive radii and
@@ -1067,7 +1142,7 @@ Layout, accessibility and ordinary controls stay with the app host. See
 | Collision and sound | [physics](physics/README.md), [audio](audio/README.md) |
 | App adapters | [shell generation](app/shells.mjs) |
 | Measurements and history | [bench](bench/README.md), [diaries](diaries/README.md) |
-| Architecture | [as built](../llp/1046.003-game-engine-as-built.explainer.md), [agent contract](../llp/1046.001-agent-interface-to-a-game.rfc.md) |
+| Architecture | LLP 1046.003 (as built), LLP 1046.001 (the agent contract) |
 
 From `game/` (an unset `EXACT_UPDATE_TRUST` bakes development trust):
 

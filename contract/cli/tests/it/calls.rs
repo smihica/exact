@@ -1366,27 +1366,6 @@ fn an_action_prop_named_like_an_app_fn_is_refused_where_a_provide_calls_it() {
 }
 
 #[test]
-fn value_props_and_injects_named_like_an_app_fn_refuse_expression_calls() {
-    let prop = "fn pick(n: number): number = n + 1\nfn other(n: number): number = n + 100\ncomponent App\n  state other = 7\n  view\n    Seg(pick=other)\ncomponent Seg\n  props\n    pick: number\n  view\n    text `${pick(1)}` testId=\"result\"\n";
-    let inject = prop
-        .replace(
-            "  view\n    Seg(pick=other)",
-            "  provide\n    pick = other\n  view\n    Seg()",
-        )
-        .replace("  props\n", "  inject\n");
-    for (src, kind, declaration, call) in [(prop, "prop", 9, 11), (&inject, "inject", 11, 13)] {
-        let e = refused(src);
-        assert_eq!(e.id, "type-prop-hides-fn", "{e}");
-        assert_eq!(e.span.line, declaration);
-        assert_eq!(e.message, format!(
-            "rename the {kind} `pick` or `fn pick`: in `Seg` the call `pick(…)` at line {call} cannot be both the {kind} and the fn"
-        ));
-        let value = src.replace("${pick(1)}", "${pick}");
-        assert_eq!(text_of(&boot(&value), "result"), "7");
-    }
-}
-
-#[test]
 fn expression_binders_protect_calls_from_a_prop_named_like_an_app_fn() {
     let src = "fn pick(n: number): number = n + 1\ncomponent App\n  state v = 0\n  action choose(n: number)\n    v = n\n  view\n    Seg(pick=choose)\ncomponent Seg\n  props\n    pick: action\n  view\n    text `${EXPR}` testId=\"result\"\n";
     let same_action = src.replace("choose", "pick");

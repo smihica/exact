@@ -424,10 +424,8 @@ fn colours(row: exact_kernel::StyleId) -> bool {
     use exact_kernel::StyleCodec as C;
     matches!(
         row.codec(),
-        C::Rgba8
-            | C::ColorValue
+        C::ColorValue
             | C::KeywordColor
-            | C::Color2
             | C::Paint
             | C::Filter
             | C::BackgroundImage

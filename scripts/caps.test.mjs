@@ -186,13 +186,41 @@ function boot(html, files = {}) {
 for (const [name, html, files, expectCode, expect] of [
   ['boot sees a single-quoted src', "<script type='module' src='./glue.js'></script>", {}, 0, 'modules reachable before first pixel: 1'],
   ['boot sees an unquoted src', '<script type=module src=./glue.js></script>', {}, 0, 'modules reachable before first pixel: 1'],
+  ['boot counts listed sources as one shipped module', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': "import './wasm/commit.js';",
+    'host/web/wasm/commit.js': '',
+  }, 0, 'modules reachable before first pixel: 1'],
+  ['boot follows a listed source to an unlisted module', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': "import './wasm/commit.js';",
+    'host/web/wasm/commit.js': "import './unlisted.js';",
+    'host/web/wasm/unlisted.js': '',
+  }, 1, 'module before first pixel is outside the allowed host paths: host/web/wasm/unlisted.js'],
   ['boot follows re-exports', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': "export * from '../../apps/app.js';\n", 'apps/app.js': '' }, 1, 'app JS before first pixel'],
-  ['boot ignores comments', '<!-- <script src=../../apps/bypass.js></script> --><script src=./glue.js></script>', { 'host/web/glue.js': "// export * from '../../apps/bypass.js';\n/* import '../../apps/also.js'; */\n" }, 0, 'modules reachable before first pixel: 1'],
+  ['boot ignores HTML comments and commented static imports', '<!-- <script src=../../apps/bypass.js></script> --><script src=./glue.js></script>', { 'host/web/glue.js': "// export * from '../../apps/bypass.js';\n/* import '../../apps/also.js'; */\n" }, 0, 'modules reachable before first pixel: 1'],
   ['boot rejects malformed JavaScript', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': 'export const =' }, 1, 'invalid module syntax'],
   ['boot retains unused static imports', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': "import unused from '../../apps/app.js';", 'apps/app.js': 'export default 1;' }, 1, 'app JS before first pixel'],
   ['boot rejects computed dynamic imports', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': 'import(globalThis.modulePath);' }, 1, 'dynamic import before first pixel'],
+  ['boot rejects dynamic imports after quoted regular expressions', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': String.raw`const stripped = text => text.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
+      import(globalThis.modulePath);`,
+  }, 1, 'dynamic import before first pixel'],
+  ['boot rejects dynamic imports separated by comments', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': 'import /* a module */ // after paint\n (globalThis.modulePath);',
+  }, 1, 'dynamic import before first pixel'],
+  ['boot rejects dynamic imports after a long slash comment', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': '// import ' + '/'.repeat(44) + '\nimport(globalThis.modulePath);',
+  }, 1, 'dynamic import before first pixel'],
+  ['boot forbids dynamic import text in comments', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': '// import(globalThis.modulePath);',
+  }, 1, 'dynamic import before first pixel'],
+  ['boot forbids dynamic import text in literals', '<script type=module src=./glue.js></script>', {
+    'host/web/glue.js': 'const example = "import(path)";',
+  }, 1, 'dynamic import before first pixel'],
   ['document entry rejects an imported runtime', '<script type=module src=./glue.js></script>', { 'host/web/document-glue.js': "import './glue.js';" }, 1, 'document-glue.js must have no imports'],
   ['document entry rejects a dynamic app import', '<script type=module src=./glue.js></script>', { 'host/web/document-glue.js': 'import(globalThis.modulePath);' }, 1, 'document-glue.js must have no imports'],
+  ['document entry rejects a dynamic import after a quoted regex', '<script type=module src=./glue.js></script>', {
+    'host/web/document-glue.js': '/"/; import(globalThis.modulePath);',
+  }, 1, 'document-glue.js must have no imports'],
   ['boot rejects top-level return', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': 'return;' }, 1, 'invalid module syntax'],
   ['boot enforces module strict mode', '<script type=module src=./glue.js></script>', { 'host/web/glue.js': 'with ({}) {}' }, 1, 'invalid module syntax'],
   ['boot fails closed on malformed tags', '<script type=module src="./glue.js></script>', {}, 1, 'malformed HTML'],

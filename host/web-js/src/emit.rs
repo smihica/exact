@@ -177,6 +177,8 @@ struct Em<'a> {
     /// Where each class and each set of looks is in `classes` and `looks`.
     class_at: HashMap<String, usize>,
     looks_at: HashMap<Vec<(u8, String)>, usize>,
+    /// The root node's class, whose background the page's canvas takes (canvas.rs).
+    root_class: Option<usize>,
 
     paint: bool,
     warnings: Vec<String>,
@@ -212,8 +214,9 @@ struct Em<'a> {
 }
 
 /// The runner's reserved sources the JS runtime answers itself: the page's
-/// facts, never the build's (`exactTime` in the entry, the rest in
-/// facts.js). `exactDelivery` answers what the build baked (facts.js).
+/// facts, never the build's (`exactTime` in the entry, by its readers'
+/// fields from facts.js; the rest in facts.js). `exactDelivery` answers
+/// what the build baked (facts.js).
 const HOST_FACTS: &[&str] = &[
     "exactViewport",
     "exactTime",
@@ -261,6 +264,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         looks: Vec::new(),
         class_at: HashMap::new(),
         looks_at: HashMap::new(),
+        root_class: None,
         paint,
         warnings,
         row_actions: Default::default(),
@@ -461,10 +465,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         };
         // Its last `context` arguments are its `with` context (LLP 1027.005
         // D6), which identify no upload it asks (uploads.js, LLP 1016.000 D10).
-        let args = match r.context {
-            0 => format!("()=>[{}]", args.join(",")),
-            n => format!("Object.assign(()=>[{}],{{context:{n}}})", args.join(",")),
-        };
+        let args = each::arguments(plan, r, &args, &top, &mut em.uses)?;
         let _ = write!(
             body,
             "const r_{i}={res}({},{},{args},{initial},{initial_args},{},{placeholder}{carry});",
@@ -484,7 +485,8 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
             .map(|x| format!("r_{}", plan.mutation_refreshes[x.0 as usize].resource.0))
             .collect();
         let mt = em.uses.rt("mut");
-        // A queue's sends wait their turn (LLP 1092 D6; schedule.js).
+        // A queue's sends wait their turn (LLP 1092 D6; schedule.js); a
+        // parallel one's run together (LLP 1161.000 D6).
         let _ = write!(
             body,
             "const m_{i}={mt}({},s_{},[{}],{}{});",
@@ -492,7 +494,11 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
             m.slot.0,
             refreshes.join(","),
             serde_json::to_string(&type_code(plan, m.ty)).unwrap(),
-            if m.queue { ",1" } else { "" }
+            match m.mode {
+                exact_plan::MutationMode::Newest => "",
+                exact_plan::MutationMode::Queue => ",1",
+                exact_plan::MutationMode::Parallel => ",2",
+            }
         );
     }
     // A child's state used outside every region: initialized as the root
@@ -651,7 +657,7 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         list("r", plan.resources.len())
     );
     // The queues read the state a stalled `next` saw (LLP 1092 D3).
-    if plan.mutations.iter().any(|m| m.queue) {
+    if (plan.mutations.iter()).any(|m| m.mode == exact_plan::MutationMode::Queue) {
         let queues = em.uses.rt("queues");
         let _ = write!(body, "{queues}($state);");
     }
@@ -822,9 +828,19 @@ pub fn emit(plan: &Plan, site_attrs: bool, dev_reload: bool) -> Result<Output, S
         let _ = write!(css, ".c{}{{{c}}}", i + 1);
     }
     css.push('}');
+    if let Some(at) = em.root_class {
+        css.push_str(&crate::canvas::rule(&em.classes[at]));
+    }
     for (i, looks) in em.looks.iter().enumerate() {
         let at = format!("[data-exact-looks=\"{}\"]", i + 1);
         css.push_str(&exact_web::host::template::look_rules(&at, looks));
+        // A boundary below that its colour reaches says so (modes.js `data-x-lc`).
+        if modes.is_some() {
+            let below = format!("[data-x-lc~=\"{}\"]", i + 1);
+            css.push_str(&exact_web::host::template::look_colour_below(
+                &at, looks, &below,
+            ));
+        }
     }
     // The classes that set a scheme read the theme's text on it.
     css.push_str(&exact_kernel::style::roles::scheme_classes(&em.classes));
@@ -1052,7 +1068,11 @@ impl Em<'_> {
         let class = if css.is_empty() {
             "0".to_string()
         } else {
-            format!("{}", self.class(&css) + 1)
+            let at = self.class(&css);
+            if i == self.sites.root {
+                self.root_class = Some(at);
+            }
+            format!("{}", at + 1)
         };
         let attrs_js = if attrs.is_empty() {
             "0".to_string()

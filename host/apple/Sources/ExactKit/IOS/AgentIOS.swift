@@ -193,7 +193,7 @@ extension Agent {
         var moving = false
         Agent.pruneUnbegun(now: now)
         while let view = pending.popLast() {
-            guard !view.isHidden, view.alpha > 0 else { continue }
+            guard !view.isHidden, view.alpha > 0, (view as? NodeView)?.drawnBySurface != true else { continue }
             // Only one still running (`inFlight`): not one held at speed 0
             // for the agent's clock (a lowered `@keyframes`), repeating for
             // ever, or kept on the layer past its end. Every one is looked
@@ -538,7 +538,14 @@ extension Agent {
            // A swipe action's control sits past its row's edge until a swipe
            // reveals it; its tap is the action's (below), wherever it sits.
            !presenter.swipeActions.ownsAction(node.id) {
-            guard let point = tapPoint(req, node: node) else {
+            // Judge a segment or bar item at what UIKit draws in its place; `drawnCovered` below judges what covers it
+            var drawn: CGRect?
+            switch drawnPlace(node) {
+            case .failure(let refusal)?: return ["error": "tap #\(node.id): \(refusal.why)"]
+            case .success(let place)?: drawn = box(place.view, region: place.region)
+            case nil: break
+            }
+            guard let point = tapPoint(req, node: node, drawn: drawn) else {
                 return ["error": "tap #\(req["id"] ?? node.id): no visible text fragment; scroll it into view first"]
             }
             if !presenter.reach(of: node).contains(point) {
@@ -1406,7 +1413,7 @@ extension Agent {
             #endif
         }
         func visit(_ layer: CALayer) {
-            guard !layer.isHidden, layer.opacity > 0 else { return }
+            guard !layer.isHidden, layer.opacity > 0, (layer as? NodeLayer)?.drawnElsewhere != true else { return }
             let kind = String(describing: Swift.type(of: layer))
             // A backdrop that only captures (a scroll edge effect's source) draws nothing.
             let backdrop = ["Backdrop", "Portal", "SDF", "Glass"].contains(where: kind.contains)
@@ -1451,7 +1458,10 @@ extension Agent {
     /// The system appearance (LLP 1061 D5): the window scene's trait, which
     /// the window's own style — the app's `setScheme` — overrides, as the
     /// Settings switch sits beneath an app's choice.
+    /// An app whose Info.plist fixes `UIUserInterfaceStyle` (the manifest's
+    /// `userInterfaceStyle`) ignores it, as it ignores the device's switch.
     func systemScheme(dark: Bool) {
+        guard !["Light", "Dark"].contains(Bundle.main.object(forInfoDictionaryKey: "UIUserInterfaceStyle") as? String ?? "") else { return }
         guard let window = session.presenter.viewport.window else { return }
         window.windowScene?.traitOverrides.userInterfaceStyle = dark ? .dark : .light
         window.updateTraitsIfNeeded()

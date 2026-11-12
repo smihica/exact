@@ -245,6 +245,15 @@ pub fn buffer_frame(view: u32, take: bool) -> Result<([u32; 3], usize), bool> {
 }
 
 impl Surfaces {
+    /// Every canvas went with the replaced host. The windows stay the
+    /// reader's, by view, until it detaches them: a new canvas at a window's
+    /// view is attached to it.
+    pub(super) fn windows_replaced(&mut self) {
+        for w in self.windows.values_mut() {
+            w.attached = false;
+        }
+    }
+
     /// Attach every window whose canvas exists and has not got it.
     pub(super) fn attach_windows(&mut self) {
         for (view, w) in self.windows.iter_mut() {
@@ -478,6 +487,13 @@ impl<D: DataSource> Presenter<D> {
                 .rest
                 .due(c.id, (w, h, scale), dirty, lost)
             {
+                continue;
+            }
+            // Under its frame-rate cap (`Surface::max_fps`), a canvas skips
+            // the frames before its deadline and asks for the next.
+            let due = unsafe { abi.symbol::<unsafe extern "C" fn(u32, f64) -> u32>(b"gpu_due") };
+            if !retry && unsafe { due(c.id, now) } == 0 {
+                wants = true;
                 continue;
             }
             let render = unsafe {

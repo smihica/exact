@@ -41,8 +41,12 @@ import kotlin.math.roundToInt
 internal class Scrolling(private val view: ExactView) {
     /** One scroller as exact2 told it, in the view's pixels. */
     class Scroller(val id: Int) {
-        /** Bit 0: it scrolls sideways; bit 1: up and down; bit 2: its rows are a node the reader moves. */
+        /** Bit 0: it scrolls sideways; bit 1: up and down; bit 2: its rows are a node the reader moves; bit 3: no indicator. */
         var flags = 0
+            set(value) {
+                field = value
+                if (barless) { bar?.let { (it.parent as? ViewGroup)?.removeView(it) }; bar = null }
+            }
         /** What exact2 calls its revision: a move sent under an older one is dropped there. */
         var rev = 0
         /** Whether a statement has said where it is. */
@@ -60,6 +64,7 @@ internal class Scrolling(private val view: ExactView) {
         /** Its edges' effects: top, bottom, left, right. */
         val edges = arrayOfNulls<EdgeEffect>(4)
         var bar: Indicator? = null
+        val barless get() = flags and 8 != 0
         val node get() = flags and 4 != 0
         fun at(sideways: Boolean) = if (sideways) nowX + pendX else nowY + pendY
         fun end(sideways: Boolean) = if (sideways) maxX else maxY
@@ -175,7 +180,9 @@ internal class Scrolling(private val view: ExactView) {
         while (i + 11 <= end) {
             val s = scrollers.getOrPut(w[i]) { Scroller(w[i]) }
             if (!s.told) { s.rev = w[i + 2]; s.nowX = f(w[i + 3]); s.nowY = f(w[i + 4]); s.maxX = f(w[i + 5]); s.maxY = f(w[i + 6]) }
-            s.flags = (s.flags and 3) or (w[i + 1] and 4)
+            // A queued hit reply can predate the latest statement: its policy is only a fallback.
+            val policy = (if (s.told) s.flags else w[i + 1]) and 8
+            s.flags = (s.flags and 3) or (w[i + 1] and 4) or policy
             s.port.set(f(w[i + 7]), f(w[i + 8]), f(w[i + 7]) + f(w[i + 9]), f(w[i + 8]) + f(w[i + 10]))
             links.add(Link(s, w[i + 1] and 1 != 0, w[i + 1] and 2 != 0))
             i += 11
@@ -481,6 +488,7 @@ internal class Scrolling(private val view: ExactView) {
 
     /** [s] moved: its indicator shows where it is. */
     private fun indicate(s: Scroller) {
+        if (s.barless) return
         val parent = view.parent as? ViewGroup ?: return
         val w = s.port.width().roundToInt(); val h = s.port.height().roundToInt()
         if (w <= 0 || h <= 0) return

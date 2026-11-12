@@ -268,11 +268,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Read two colors.
-    pub fn color2(&mut self) -> Result<[Color; 2], DecodeError> {
-        Ok([self.color()?, self.color()?])
-    }
-
     /// Read and validate a grid template from its canonical CSS text.
     pub fn tracks(&mut self) -> Result<GridTracks, DecodeError> {
         self.tracks_for_style()
@@ -628,12 +623,6 @@ impl Writer {
         }
     }
 
-    /// Append two colors.
-    pub fn color2(&mut self, c: [Color; 2]) {
-        self.color(c[0]);
-        self.color(c[1]);
-    }
-
     /// Append a grid track list.
     pub fn tracks(&mut self, t: &GridTracks) {
         self.string(t.css());
@@ -729,7 +718,7 @@ mod tests {
         // schema. The literal makes an accidental removal of that coupling a
         // test failure whenever the byte snapshot above is intentionally moved.
         // Recomputed when the schema changes; the digest test prints the value.
-        assert_eq!(SCHEMA_DIGEST, 0x0b98_4af2_c58d_4422);
+        assert_eq!(SCHEMA_DIGEST, 0x4c48_d8bf_3531_7830);
     }
 
     #[test]
@@ -799,7 +788,7 @@ mod tests {
             panic!("{text}");
         };
         let mut w = Writer::new();
-        w.dimension(d);
+        w.dimension(d.clone());
         let bytes = w.into_vec();
         assert_eq!(bytes[0], 24, "a comparison is kind 24");
         let mut r = Reader::new(&bytes);
@@ -1009,7 +998,7 @@ mod viewport_tests {
         for unit in crate::ViewportUnit::ALL {
             let value = Dimension::Viewport(unit, 10.0);
             let mut writer = Writer::new();
-            writer.dimension(value);
+            writer.dimension(value.clone());
             let bytes = writer.into_vec();
             assert_eq!(
                 Reader::new(&bytes).dimension(StyleId::Width, true).unwrap(),

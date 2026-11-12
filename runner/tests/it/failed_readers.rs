@@ -283,3 +283,83 @@ fn reply_picky(r: &mut Runner<Picky>) -> usize {
     }
     tickets.len()
 }
+
+struct ForgettingReaders {
+    forget_from: f64,
+    asks: Vec<String>,
+}
+
+impl DataSource for ForgettingReaders {
+    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+        Err(DataError::UnknownSource(source.into()))
+    }
+
+    fn answer(
+        &mut self,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+    ) -> Result<Answer, DataError> {
+        self.asks.push(source.into());
+        let n = args[0].as_number().unwrap();
+        assert_eq!(store.get("k"), None);
+        if n >= self.forget_from {
+            store.forget("k")?;
+        }
+        Ok(Answer::Now(row(n)))
+    }
+
+    fn grants(&self) -> &str {
+        "secret.keep k"
+    }
+}
+
+fn forgetting_readers(forget_from: f64) -> Runner<ForgettingReaders> {
+    let plan = contract::compile(
+        r#"shape Row
+  n: number
+component App
+  state n = 0
+  resource a = a(n) as shape Row
+  resource b = b(n) as shape Row
+  action bump
+    n = n + 1
+  view
+    text `${a.n} ${b.n}`
+"#,
+    )
+    .unwrap();
+    Runner::boot(
+        plan,
+        ForgettingReaders {
+            forget_from,
+            asks: Vec::new(),
+        },
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .expect("readers that forget an absent name settle")
+}
+
+#[test]
+fn readers_that_forget_an_absent_name_settle_at_boot() {
+    let mut r = forgetting_readers(0.0);
+    assert_eq!(r.data().asks, ["a", "b"]);
+    assert_eq!(r.resource("a"), Some(&row(0.0)));
+    assert_eq!(r.resource("b"), Some(&row(0.0)));
+}
+
+#[test]
+fn readers_that_forget_an_absent_name_settle_after_an_action() {
+    let mut r = forgetting_readers(1.0);
+    assert_eq!(r.data().asks, ["a", "b"]);
+    for n in [1.0, 2.0] {
+        r.data().asks.clear();
+        r.act("bump", vec![]).expect("the action stands");
+        assert_eq!(r.slot("n"), Some(&Value::Number(n)));
+        assert_eq!(r.resource("a"), Some(&row(n)));
+        assert_eq!(r.resource("b"), Some(&row(n)));
+        assert_eq!(r.data().asks, ["a", "b"]);
+    }
+}

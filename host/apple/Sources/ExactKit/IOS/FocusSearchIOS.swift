@@ -30,10 +30,11 @@ enum FocusSearch {
     /// `view` joins one of exact2's containers.
     static func joined(_ view: UIView) {
         // exact2's own views, an image and a material's backdrop are never
-        // focus items; a route's navigation container holds exact2's nodes,
-        // whose own foreign views join the nodes themselves.
+        // focus items; a route's container (a navigation controller or a
+        // plain tab) holds exact2's nodes, whose own foreign views join the
+        // nodes themselves.
         if view is NodeView || view is PlainView || view is ScrollView || view is MetalView
-            || view is UIImageView || view is UIVisualEffectView || view.next is UINavigationController || view.next is HeldStack
+            || view is UIImageView || view is UIVisualEffectView || view.next is UINavigationController || view.next is PlainTab
             || view is NativeButtonIOS { return } // a native button's node keeps the focus (LLP 1069.011 D4)
         candidates.add(view)
     }
@@ -45,7 +46,12 @@ enum FocusSearch {
         return candidates.allObjects.filter { view in
             guard view.window === window, view.isDescendant(of: container) else { return false }
             var v: UIView? = view
-            while let current = v, current !== container { if current.isHidden || current.alpha < 0.01 { return false }; v = current.superview }
+            // Under a canvas child its surface places, a view is where the
+            // surface draws it, not at its own frame, where the search looks.
+            while let current = v, current !== container {
+                if current.isHidden || current.alpha < 0.01 || (current as? NodeView)?.drawnBySurface == true { return false }
+                v = current.superview
+            }
             return container.convert(view.bounds, from: view).intersects(rect)
         }
     }
@@ -94,6 +100,19 @@ final class Viewport: ScrollView {
     override func focusItems(in rect: CGRect) -> [any UIFocusItem] { FocusSearch.items(self, in: rect) }
     #endif
 }
+#if os(tvOS)
+extension NodeView {
+    /// A canvas child its surface places offers nothing of its subtree to
+    /// UIKit's focus search, which finds focus items through each focus
+    /// environment's `focusItemContainer` and its `focusItems(in:)` ("the
+    /// child focus items within the specified rectangle", UIFocusItemContainer):
+    /// it would find them at their own frames, not where the surface draws
+    /// them, a native control inside (a select's button, a field) included.
+    /// tvOS only: on iOS the viewport's search (`FocusSearch.items`) skips
+    /// them, and a node class answering this is logged at each init (above).
+    package override func focusItems(in rect: CGRect) -> [any UIFocusItem] { drawnBySurface ? [] : super.focusItems(in: rect) }
+}
+#endif
 /// Bound focus search to a native route or modal presentation, as the
 /// document viewport does (LLP 1123 D2).
 final class PresentationMount: UIView {

@@ -13,7 +13,7 @@ const USAGE: &str = "usage:
   contract tamber ir <app dir | app.contract | file.tamber> [-o <tamber.json>]
   contract tamber fmt <app dir | app.contract | file.tamber> [--check]
   contract tamber serve --stdio <app dir>   (the design's one writer, tamber/1 over JSON lines)
-  contract tamber gen ts|rust <app dir | app.contract | file.tamber> [-o <dir>]   (bindings, in the app's .exact/tamber/)
+  contract tamber gen ts|rust|swift|kotlin <app dir | app.contract | file.tamber> [-o <dir>]   (bindings, in the app's .exact/tamber/)
   contract tamber import css <stylesheet> [--app <app dir>]   (its custom properties written into the design, between markers a later import rewrites)
   contract tamber import shadcn|tailwind <stylesheet> | dtcg <file or dir> | pen <file.pen> | astryx <resolved json> [--app <app dir>] [--prefix <prefix>]   (a proposal, as JSON)
   contract tamber import-plan <design file>   (one import planned alone: {request, design} on stdin, {ok} or {error} out; the wire's)
@@ -136,12 +136,12 @@ pub fn run(args: &[String]) -> ExitCode {
         (true, true) => exact_tamber::check(&src, &contract_lower::tamber_vocab()),
         // With packages: what the build refuses of them too (`fold_with`).
         (_, false) => {
-            contract::tamber_params::fold_with(&src, &app, &contract_lower::tamber_vocab())
+            contract::tamber_params::fold_with(&src, &app, &contract_lower::tamber_vocab(), None)
                 .map(|(folding, _)| folding)
         }
         (false, true) => exact_tamber::parse(&src).and_then(|d| {
             exact_tamber::check_design(
-                contract::tamber_params::laid(&d, &app),
+                contract::tamber_params::laid(&d, &app, None),
                 &contract_lower::tamber_vocab(),
             )
         }),

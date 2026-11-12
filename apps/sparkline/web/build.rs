@@ -29,6 +29,7 @@ fn main() {
         "sparkline_data::Spark",
         "sparkline_data::Spark",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

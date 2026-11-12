@@ -154,10 +154,16 @@ impl<D: DataSource> Presenter<D> {
             self.pointer,
             self.focus,
         );
-        let menu = self.menu_paint();
+        // Display submission temporarily takes the boxes that place the menu.
+        let menu = self.menu_paint().or_else(|| self.display.menu.clone());
         let selection = self.focus.map(|id| self.field_selection(id));
         let host = &self.host;
         let presented = |id: ViewId| host.presented(id);
+        let page = if deferred {
+            self.model_page()
+        } else {
+            self.page
+        };
         let scene = Scene {
             kernel: host.kernel(),
             hidden: &|id| host.route_visibility(id).0,
@@ -165,11 +171,7 @@ impl<D: DataSource> Presenter<D> {
             presented: &presented,
             paths: &|id| host.presented_path(id),
             scroll: painted_scroll,
-            page: if deferred {
-                self.model_page()
-            } else {
-                self.page
-            },
+            page,
             images: &self.images.bitmaps,
             focus: self.focus,
             selection,
@@ -278,6 +280,7 @@ impl<D: DataSource> Presenter<D> {
         self.boxes = boxes;
         self.boxes_serial += 1;
         if self.last_frame_succeeded {
+            self.boxes_page = page;
             self.ranges.shown.set(self.ranges.session());
         }
         self.publish_ranges();

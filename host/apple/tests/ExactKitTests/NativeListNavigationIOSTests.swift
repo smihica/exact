@@ -72,10 +72,8 @@ final class NativeListNavigationIOSTests: XCTestCase {
 
     private func second(_ session: ExactSession) throws -> (UINavigationController, RouteController, NodeView) {
         let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
-        _ = tabs.delegate?.tabBarController?(tabs, shouldSelect: tabs.viewControllers![1])
-        until("Second selected") { tabs.selectedIndex == 1 }
-        tabs.view.setNeedsLayout()
-        tabs.view.layoutIfNeeded()
+        tapTab(tabs, 1)
+        XCTAssertEqual(tabs.selectedIndex, 1, "Second selected")
         let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let node = try XCTUnwrap(session.presenter.views.values.first {
@@ -274,6 +272,14 @@ final class NativeListNavigationIOSTests: XCTestCase {
         let session = try fixture("native-scroll-selection")
         let (nav, route, node) = try second(session)
         let p = session.presenter, automatic = try XCTUnwrap(node.scrollView)
+        // UIKit cannot find the authored scroller through the route's views, so Exact selects it
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic)
+        let automaticBottom = try XCTUnwrap(route.contentScrollView(for: .bottom))
+        let topCover = { () -> CGFloat in
+            if case .edges(let edges)? = p.navigation.covers[route.node.id] { return edges.top }
+            return 0
+        }
+        let automaticCover = topCover()
         let firstNative = UIScrollView(frame: route.view.bounds), secondNative = UIScrollView(frame: route.view.bounds)
         firstNative.scrollsToTop = false; secondNative.scrollsToTop = false
         firstNative.contentInsetAdjustmentBehavior = .always
@@ -281,12 +287,21 @@ final class NativeListNavigationIOSTests: XCTestCase {
         route.view.addSubview(firstNative); route.view.addSubview(secondNative)
         defer { firstNative.removeFromSuperview(); secondNative.removeFromSuperview() }
 
+        route.setContentScrollView(firstNative, for: .leading)
+        XCTAssertTrue(route.nativeContentScrollEdges.contains(.leading))
+        route.setContentScrollView(nil, for: .leading)
+        XCTAssertFalse(route.nativeContentScrollEdges.contains(.leading), "nil releases a side edge")
+
         route.setContentScrollView(firstNative, for: .all)
+        XCTAssertTrue(route.nativeContentScrollEdges.contains(.leading))
+        XCTAssertTrue(route.nativeContentScrollEdges.contains(.trailing))
         XCTAssertTrue(firstNative.scrollsToTop, "a selected native view is enabled even when its flag was false")
         XCTAssertFalse(automatic.scrollsToTop)
         p.navigation.prepareRoutes([route], in: nav)
         XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(firstNative), "the route hatch receives an app-owned native view")
         XCTAssertEqual(firstNative.contentInsetAdjustmentBehavior, .always, "projection preserves the native bottom selection's inset policy")
+        p.navigation.reportCovers()
+        XCTAssertNotEqual(topCover(), automaticCover, "the authored list leaves the bar's edge, so the route is covered for the bar")
 
         route.setContentScrollView(secondNative, for: .top)
         XCTAssertFalse(firstNative.scrollsToTop, "the previous native target stops competing for status-bar taps")
@@ -308,16 +323,30 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(secondNative.scrollsToTop)
         #endif
 
+        // nil is UIKit's automatic selection, which Exact makes for the route's authored scrollers
         route.setContentScrollView(nil, for: .all)
         XCTAssertFalse(firstNative.scrollsToTop)
         XCTAssertFalse(secondNative.scrollsToTop)
         XCTAssertTrue(automatic.scrollsToTop)
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic, "the bar follows the automatic scroller again")
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === automaticBottom)
+        XCTAssertFalse(route.nativeContentScrollEdges.contains(.leading), "nil releases the leading edge selected by .all")
+        XCTAssertFalse(route.nativeContentScrollEdges.contains(.trailing), "nil releases the trailing edge selected by .all")
+        XCTAssertEqual(topCover(), automaticCover, "the covers follow the edge given back at once")
         p.navigation.prepareRoutes([route], in: nav)
         XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(automatic))
-        XCTAssertNil(route.contentScrollView(for: .top), "UIKit retains automatic discovery")
-        XCTAssertNil(route.contentScrollView(for: .bottom))
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic, "and keeps it through the next pass")
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === automaticBottom)
         XCTAssertEqual(firstNative.contentInsetAdjustmentBehavior, .always)
         XCTAssertEqual(secondNative.contentInsetAdjustmentBehavior, .automatic)
+
+        // nil on an automatic edge changes nothing, and an app that selects the scroller Exact
+        // selects and gives it back gets it again at once, from the top edge's pass
+        route.setContentScrollView(nil, for: .top)
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic)
+        route.setContentScrollView(automatic, for: .top)
+        route.setContentScrollView(nil, for: .top)
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic, "the pass selects its unchanged scroller again")
 
         route.setContentScrollView(firstNative, for: .top)
         XCTAssertTrue(firstNative.scrollsToTop)
@@ -543,14 +572,26 @@ final class NativeListNavigationIOSTests: XCTestCase {
 
     func testAnIdleFollowEndReaderAtTheStartUsesTheNewNativeTitleInset() throws {
         let (session, _, route, node) = try nativeList(initialTop: 0, followEnd: true)
+        let p = session.presenter
         let collection = try XCTUnwrap(node.scrollView)
         let header = try XCTUnwrap(route.lifted)
-        let heading = try XCTUnwrap(session.presenter.views.values.first { $0.props["accessibilityHeadingLevel"] != nil && $0.isDescendant(of: header) })
+        let heading = try XCTUnwrap(p.views.values.first { $0.props["accessibilityHeadingLevel"] != nil && $0.isDescendant(of: header) })
         XCTAssertEqual(collection.contentOffset.y + node.scrollTopInset(collection), 0, accuracy: 0.5)
+        var nested = 0
+        p.onCovers = { _ in
+            guard nested == 0 else { return }
+            nested += 1
+            XCTAssertFalse(p.applying)
+            XCTAssertEqual(route.navigationItem.largeTitleDisplayMode, .never)
+            XCTAssertEqual(collection.contentOffset.y + node.scrollTopInset(collection), 0, accuracy: 0.5,
+                           "covers reach the runtime after the reader uses the new title inset")
+            p.apply(wireBatch([["op": "props", "id": node.id + 2, "set": ["testId": "nested-row"]]]))
+        }
+        defer { p.onCovers = nil }
         collection.contentOffset.y = -collection.adjustedContentInset.top + 0.000001
-        session.presenter.apply(wireBatch([["op": "props", "id": heading.id, "set": ["accessibilityHeadingLevel": "2"]]]))
+        p.apply(wireBatch([["op": "props", "id": heading.id, "set": ["accessibilityHeadingLevel": "2"]]]))
+        XCTAssertEqual(nested, 1)
         collection.layoutIfNeeded()
-        spin(0.2)
         XCTAssertEqual(collection.contentOffset.y + node.scrollTopInset(collection), 0, accuracy: 0.5, "resting at the start does not replay the former title's raw offset")
         XCTAssertEqual(collection.contentOffset.y, -collection.adjustedContentInset.top, accuracy: 0.5)
     }

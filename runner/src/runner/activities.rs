@@ -5,6 +5,7 @@ use exact_kernel::CommitReceipt;
 use exact_plan::{Plan, TypeKind, TypesId, Value};
 use serde_json::{json, Value as Json};
 
+#[derive(Clone, PartialEq)]
 pub(super) struct Activities {
     snapshot: Json,
     demanded: bool,
@@ -59,11 +60,10 @@ fn decode(plan: &Plan, ty: TypesId, v: &Json) -> Option<Value> {
 impl<D: DataSource> Runner<D> {
     /// Enable sends only when the host can load the ActivityKit arm.
     pub fn link_activities(&mut self) -> Result<Option<CommitReceipt>, RunnerError> {
-        self.activities.linked = true;
-        let mut snapshot = self.activities.snapshot.clone();
-        snapshot["linked"] = Json::Bool(true);
-        self.activities.snapshot = snapshot;
-        self.recommit_activities()
+        let mut next = self.activities.clone();
+        next.linked = true;
+        next.snapshot["linked"] = Json::Bool(true);
+        self.replace_activities(next)
     }
 
     /// A failed load is recorded by the host; the next demand may retry it.
@@ -78,7 +78,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     pub(super) fn activities_answer(&mut self, i: usize) -> Result<Value, DataError> {
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i);
         if row.args.len != 0 {
             return Err(DataError::BadArguments(
                 "exactActivities takes no arguments".into(),
@@ -93,30 +93,36 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Enumerated activities, token rotation and state changes, in one commit.
+    /// A refused commit keeps the previous snapshot.
     pub fn set_activities(&mut self, json: &str) -> Result<Option<CommitReceipt>, RunnerError> {
         let mut snapshot: Json = serde_json::from_str(json).map_err(|e| RunnerError::Data {
             resource: "exactActivities".into(),
             error: DataError::BadArguments(e.to_string()),
         })?;
-        self.activities.started = true;
-        self.activities.loading = false;
         snapshot["linked"] = Json::Bool(self.activities.linked);
-        if snapshot == self.activities.snapshot {
-            return Ok(None);
-        }
-        self.activities.snapshot = snapshot;
-        self.recommit_activities()
+        let mut next = self.activities.clone();
+        next.snapshot = snapshot;
+        next.started = true;
+        next.loading = false;
+        self.replace_activities(next)
     }
 
-    fn recommit_activities(&mut self) -> Result<Option<CommitReceipt>, RunnerError> {
-        let readers = self
-            .plan
-            .resources
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| (self.plan.str(r.source) == "exactActivities").then_some(i))
-            .collect();
-        self.recommit(readers, "activities")
+    fn replace_activities(
+        &mut self,
+        next: Activities,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        self.replace_fact(
+            |r| &mut r.activities,
+            next,
+            "exactActivities",
+            |r, previous, mut readers| {
+                // Loading state alone changes no answer.
+                if r.activities.snapshot == previous.snapshot {
+                    readers.clear();
+                }
+                r.recommit(readers, "activities")
+            },
+        )
     }
 
     pub(super) fn activity_send(source: &str) -> bool {
@@ -254,8 +260,10 @@ component App
             ]))
         );
         for action in ["start", "update", "end"] {
+            let requests = r.mutation_requests();
             let error = r.act(action, vec![]).unwrap_err();
             assert!(format!("{error:?}").contains("is not linked into this artifact"));
+            assert_eq!(r.mutation_requests(), requests + 1);
             assert!(r.take_requests().is_empty());
         }
     }
@@ -317,6 +325,54 @@ component App
             );
             assert!(!r.take_activities_demand());
         }
+    }
+    #[test]
+    fn refused_activity_facts_are_restored_and_can_be_retried() {
+        let plan = contract::compile(
+            r#"shape Activities
+  frequentPushesEnabled: bool
+  linked: bool
+component App
+  state allowed = false
+  resource activities = exactActivities() as shape Activities
+  derive spare = 1 / (activities.frequentPushesEnabled && !allowed ? 0 : 1)
+  action allow
+    allowed = true
+  view
+    text `${spare}`
+"#,
+        )
+        .unwrap();
+        let mut r = Runner::boot(
+            plan,
+            NoData,
+            exact_kernel::Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        r.link_activities().unwrap();
+        let previous = r.activities.snapshot.clone();
+        let snapshot = r#"{"activities":[],"frequentPushesEnabled":true}"#;
+        for _ in 0..2 {
+            assert!(matches!(
+                r.set_activities(snapshot),
+                Err(RunnerError::NonFiniteValue { name }) if name == "spare"
+            ));
+            assert_eq!(r.activities.snapshot, previous);
+            assert_eq!(
+                r.resource("activities"),
+                Some(&Value::record(vec![Value::Bool(false), Value::Bool(true)]))
+            );
+        }
+        assert!(r.set_activities(&previous.to_string()).unwrap().is_none());
+        r.act("allow", vec![]).unwrap();
+        assert!(r.set_activities(snapshot).unwrap().is_some());
+        assert_eq!(
+            r.resource("activities"),
+            Some(&Value::record(vec![Value::Bool(true), Value::Bool(true)]))
+        );
+        assert!(r.set_activities(snapshot).unwrap().is_none());
     }
     #[test]
     fn a_failed_demand_retries_and_a_successful_publication_stops_loading() {

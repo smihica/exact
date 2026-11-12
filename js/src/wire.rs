@@ -88,6 +88,16 @@ pub(crate) fn request_from_json(text: &str) -> Result<Request, String> {
                     .ok_or("a request timeout must be 1 to 3600000 ms")? as u32,
             ),
         },
+        // `exactIdleTimeout` (LLP 1016.000 D11), as the prelude checked it.
+        idle_timeout_ms: match j.get("idle_timeout_ms") {
+            None | Some(Json::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|n| (1..=u64::from(exact_runner::MAX_TIMEOUT_MS)).contains(n))
+                    .ok_or("an idle timeout must be 1 to 3600000 ms")? as u32,
+            ),
+        },
         // `exactBodyFrom`: the path alone; the host reads the file when it
         // runs the request, so the bytes never cross the module.
         body_from: match j.get("body_from") {
@@ -131,6 +141,7 @@ pub(crate) fn request_from_json(text: &str) -> Result<Request, String> {
     // A long poll's terms, checked as every host checks them (LLP 1016.000 D8), and an upload's.
     match (request.long_poll_refusal().or(request.ceiling_refusal()))
         .or(request.upload_progress_refusal())
+        .or(request.idle_timeout_refusal())
     {
         Some(why) => Err(why.into()),
         None => match request.listen_refusal() {

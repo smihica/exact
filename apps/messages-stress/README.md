@@ -130,7 +130,7 @@ stress app's selector.
 Three native comparison pairs observed lower loaded advance/decode medians
 with row reuse. Timer tails still exceed 8.33 ms, resize and input results are
 mixed, and the repeat pairs have different timed revision cohorts. See
-[LLP 1041 §8.42](../../llp/1041-graceful-overload.rfc.md#842-two-alternating-native-messages-repeat-pairs-2026-09-17)
+LLP 1041 §8.42
 for the measurements and limits; they do not establish physical 120 Hz.
 
 The existing `history` source accepts an optional `option<string>` cursor as its
@@ -213,7 +213,7 @@ the last logical message. The first refinement mounts 34 rows; later top/end
 observations mount 7–8. These are functional checks, not twenty full traversals
 or frame timings. That drive predates the dedicated gesture-takeover validation
 below. The separate paired runner diagnostic in
-[LLP 1010 §6.6](../../llp/1010-scrolling-v1.spec.md#66-paired-runner-evidence-2026-09-16)
+LLP 1010 §6.6
 covers twenty complete traversals, retained state and CPU work through 25,000 rows.
 
 ## Native hosts

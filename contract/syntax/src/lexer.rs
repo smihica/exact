@@ -116,7 +116,16 @@ impl Lexer {
                     raw: &str|
          -> Result<(), LexError> {
             let line_no = origin.line + i as u32;
-            let first_col = if i == 0 { origin.col } else { 1 };
+            let mut first_col = if i == 0 { origin.col } else { 1 };
+            let raw = if i == 0 && origin.line == 1 && origin.col == 1 {
+                raw.strip_prefix('\u{feff}').map_or(raw, |rest| {
+                    // Spans still index the original source bytes.
+                    first_col += '\u{feff}'.len_utf8() as u32;
+                    rest
+                })
+            } else {
+                raw
+            };
             let line = raw.trim_end();
             let trimmed = line.trim_start();
             if trimmed.is_empty() || trimmed.starts_with("//") {

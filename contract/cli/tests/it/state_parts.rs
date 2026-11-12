@@ -37,8 +37,7 @@ fn refused(src: &str) -> String {
 fn colour(r: &Runner<NoData>, id: &str, style: StyleId) -> String {
     let key = r.kernel().find_by_test_id(id)[0];
     match r.kernel().node_by_key(key).unwrap().computed(style) {
-        RowValue::ColorValue(ColorValue::Fixed(c)) | RowValue::Color(c) => hex(c),
-        RowValue::Color2(c) => hex(c[0]),
+        RowValue::ColorValue(ColorValue::Fixed(c)) => hex(c),
         other => format!("{other:?}"),
     }
 }
@@ -71,6 +70,61 @@ fn checked_folds_under_disabled() {
     assert_eq!(colour(&r, "t", StyleId::BackgroundColor), "#0000ff");
     press(&mut r, "hold");
     assert_eq!(colour(&r, "t", StyleId::BackgroundColor), "#ff0000");
+}
+
+fn checked_aria_tokens(part_on_node: bool) {
+    let mut src = String::from(
+        "style Toggle\n  background-color = \"#ff0000\"\n  :checked\n    background-color = \"#00ff00\"\n\ncomponent App\n  view\n    column\n",
+    );
+    let mut expected = Vec::new();
+    for (attr, role) in [
+        ("aria-checked", "checkbox"),
+        ("aria-selected", "tab"),
+        ("aria-pressed", "button"),
+    ] {
+        for value in ["\"true\"", "\"false\"", "true", "false", "\"mixed\""] {
+            if value == "\"mixed\"" && attr != "aria-pressed" {
+                continue;
+            }
+            let id = format!("case-{}", expected.len());
+            let base = if part_on_node {
+                "background-color=\"#ff0000\""
+            } else {
+                "class=Toggle"
+            };
+            src.push_str(&format!(
+                "      button role=\"{role}\" {attr}={value} {base} testId=\"{id}\"\n"
+            ));
+            if part_on_node {
+                src.push_str("        :checked\n          background-color = \"#00ff00\"\n");
+            }
+            src.push_str("        text \"toggle\"\n");
+            let colour = if matches!(value, "true" | "\"true\"") {
+                "#00ff00"
+            } else {
+                "#ff0000"
+            };
+            expected.push((id, attr, value, colour));
+        }
+    }
+    let r = booted(&src);
+    for (id, attr, value, expected) in expected {
+        assert_eq!(
+            colour(&r, &id, StyleId::BackgroundColor),
+            expected,
+            "{attr}={value}"
+        );
+    }
+}
+
+#[test]
+fn checked_parts_in_a_style_take_aria_boolean_tokens() {
+    checked_aria_tokens(false);
+}
+
+#[test]
+fn checked_parts_on_a_node_take_aria_boolean_tokens() {
+    checked_aria_tokens(true);
 }
 
 /// A state's `border-color` overrides each side the base wrote, through
@@ -135,7 +189,7 @@ fn a_state_part_is_refused_where_it_cannot_be() {
         "lower-state-row"
     );
     assert_eq!(
-        refused(&node(":hover\n          color = \"#000000\"")),
+        refused(&node(":hover\n          -exact-tint-color = \"#000000\"")),
         "lower-state-row"
     );
     assert_eq!(

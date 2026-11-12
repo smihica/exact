@@ -199,7 +199,7 @@ fn shows(r: &Runner<Source>, value: &str) {
 }
 
 fn state(r: &Runner<Source>) -> &ResourceState {
-    r.resources[0].as_ref().unwrap()
+    r.resources[0].state.as_ref().unwrap()
 }
 
 fn answer_writes(r: &Runner<Source>) -> usize {
@@ -251,7 +251,7 @@ fn seed_survives_two_context_changes_and_activation_asks_the_latest_full_argumen
     assert_eq!(r.data.asks, [full("A", "200", 2.)]);
     shows(&r, "fresh");
     assert!(!state(&r).kept_seed);
-    assert!(!r.stale[0]);
+    assert!(!r.resources[0].stale);
     assert!(
         r.journal()
             .any(|l| l.contains("answer answered differently from its kept answer")),
@@ -313,7 +313,7 @@ fn an_activation_answer_outside_its_shape_fails_it_and_keeps_nothing() {
         .iter()
         .any(|(name, _)| *name == "answer"));
     assert!(!state(&r).kept_seed);
-    assert!(r.stale[0]);
+    assert!(r.resources[0].stale);
     assert_eq!(answer_writes(&r), 0);
     r.data.value = Value::str("valid");
     r.data_ready().unwrap();
@@ -395,7 +395,7 @@ fn failed_activation_writes_nothing_and_only_the_full_failed_arguments_suppress_
     let ticket = r.take_requests().remove(0).ticket;
     r.fulfill(ticket, Outcome::Storage(vec![])).unwrap();
     assert!(!r.has_pending());
-    assert_eq!(r.failed_args[0], Some(full("A", "100", 0.)));
+    assert_eq!(r.resources[0].failed_args, Some(full("A", "100", 0.)));
     assert!(!state(&r).kept_seed);
     shows(&r, "kept");
     provisional(&r);
@@ -404,7 +404,7 @@ fn failed_activation_writes_nothing_and_only_the_full_failed_arguments_suppress_
     r.data.fail = false;
     r.act("minute", vec![Value::str("200")]).unwrap();
     assert_eq!(r.data.asks.len(), 2);
-    assert!(r.failed_args[0].is_none());
+    assert!(r.resources[0].failed_args.is_none());
     let ticket = r.take_requests().remove(0).ticket;
     r.fulfill(ticket, Outcome::Storage(vec![])).unwrap();
     shows(&r, "fresh");
@@ -738,11 +738,11 @@ fn a_kept_seed_failed_by_a_refused_activation_stays_failed_across_context() {
     // Activation refused by the app itself: the seed fails for its
     // identifying arguments, and a context change asks nothing.
     r.give_up(&[0], &RunnerError::Cycle);
-    assert!(r.failed_args[0].is_some());
+    assert!(r.resources[0].failed_args.is_some());
     let asks = r.data.asks.len();
     r.act("minute", vec![Value::str("300")]).unwrap();
     assert_eq!(r.data.asks.len(), asks);
-    assert!(r.failed_args[0].is_some());
+    assert!(r.resources[0].failed_args.is_some());
     shows(&r, "kept");
 }
 
@@ -829,4 +829,26 @@ fn kept_answers_over_their_total_forget_the_longest_other() {
         "{}",
         said[0]
     );
+}
+
+/// `resource … transient` (LLP 1156.005 D4): the answer is neither shown
+/// from the store at launch nor written there, and an entry an earlier build
+/// kept is forgotten at boot.
+#[test]
+fn a_transient_resource_keeps_nothing_and_forgets_what_was_kept() {
+    let mut transient = plan(0, false);
+    transient.resources[0].transient = true;
+    let snapshot = entry(&full("A", "100", 0.), &Value::str("kept"));
+    let mut r = boot(transient, Source::default(), snapshot);
+    shows(&r, "loading");
+    assert_eq!(r.store.kept(&kept::kept_name("answer")), None);
+    // The one write is the boot's forgetting.
+    let forgotten = answer_writes(&r);
+    r.data.ready = true;
+    r.data.value = Value::str("fresh");
+    r.data_ready().unwrap();
+    shows(&r, "fresh");
+    r.act("minute", vec![Value::str("200")]).unwrap();
+    assert_eq!(answer_writes(&r), forgotten);
+    assert_eq!(r.store.kept(&kept::kept_name("answer")), None);
 }

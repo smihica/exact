@@ -30,6 +30,9 @@ internal class Requests(private val activity: ExactActivity) {
     var view: ExactView? = null
     /** Called with whether system Back has somewhere to go in the app (LLP 1115.001 D6). */
     var back: (Boolean) -> Unit = {}
+    /** Whether the presenter's canvas routing currently takes pad input (LLP 1133.022 D4). */
+    var padInput = false
+        private set
     /** The top layer's windows (LLP 1115.001 D10): what exact2 says of its open surface goes to them. */
     var surfaces: Surfaces? = null
 
@@ -73,6 +76,7 @@ internal class Requests(private val activity: ExactActivity) {
                     COPY -> copy(string(words, body).first)
                     SHARE -> share(id, words, body)
                     BACK -> back(words[body] != 0)
+                    PAD_INPUT -> padInput = words[body] != 0
                     // The second word, from D8 on: the hosted field the keyboard is for (0: one exact2 paints).
                     KEYBOARD -> view?.keyboard(words[body], if (i - body > 1) words[body + 1] else 0)
                     SURFACE -> surfaces?.told(words, body)
@@ -250,6 +254,7 @@ internal class Requests(private val activity: ExactActivity) {
         const val MODULE = 11
         const val PRESENCE = 12
         const val ORIENTATION = 13
+        const val PAD_INPUT = 14
         /** How long after the activity is in front again a share sheet's choice is still waited for. */
         const val DISMISSED_MS = 500L
     }

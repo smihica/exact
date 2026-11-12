@@ -52,6 +52,58 @@ impl Drop for App {
 }
 
 #[test]
+fn conditional_action_bindings_name_the_callers_file_and_binding() {
+    let app = App::new("conditional-action-binding");
+    let caller = "use Child from \"./child.contract\"\ncomponent Caller\n  state n = 0\n  state flag = true\n  action a\n    n = 1\n  action b\n    n = 2\n  view\n    Child(tap=flag ? a : b)\n";
+    for handler in ["tap", "tap()"] {
+        for provided in [false, true] {
+            let section = if provided { "inject" } else { "props" };
+            app.write(
+                "child.contract",
+                &format!("component Child\n  {section}\n    tap: action\n  view\n    button \"go\" press={handler}\n"),
+            );
+            let caller = if provided {
+                caller.replace(
+                    "  view\n    Child(tap=flag ? a : b)",
+                    "  provide\n    tap = flag ? a : b\n  view\n    Child()",
+                )
+            } else {
+                caller.to_owned()
+            };
+            for imported in [false, true] {
+                let path = app
+                    .write("caller.contract", &caller)
+                    .canonicalize()
+                    .unwrap();
+                let entry = if imported {
+                    app.write(
+                        "app.contract",
+                        "use Caller from \"./caller.contract\"\ncomponent App\n  view\n    Caller()\n",
+                    )
+                } else {
+                    path.clone()
+                };
+                let errors = contract::compile_path_all(&entry, false).err().unwrap();
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                let error = &errors[0];
+                let (id, col) = if provided {
+                    ("type-action-provide-shape", 5)
+                } else {
+                    ("type-action-prop-shape", 11)
+                };
+                assert_eq!(error.id, id, "{error}");
+                assert_eq!(error.file.as_deref(), Some(path.as_path()), "{error}");
+                assert_eq!(
+                    (error.span.line, error.span.col, error.span.end_col),
+                    (10, col, col + 3),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn imported_type_analyze_and_lower_errors_keep_the_offending_token_range() {
     let app = App::new("passes");
     for (source, pass, token) in [
@@ -91,12 +143,58 @@ fn imported_lexer_parser_and_import_errors_name_their_own_file() {
     );
     app.refuse("component Row\n  view\n    text )\n", "syntax", ")");
     app.refuse("component Row\n  view\n    text `é ${}`\n", "syntax", "}");
+    app.refuse(
+        "component Row\n  view\n    text `é ${   }`\n",
+        "syntax",
+        "}",
+    );
     app.refuse("component Row\n  view\n    text `é ${@}`\n", "syntax", "@");
+    app.refuse(
+        "component Row\n  view\n    text `é ${   @ }`\n",
+        "syntax",
+        "@",
+    );
+    app.refuse(
+        "component Row\n  view\n    text `é ${   ) }`\n",
+        "syntax",
+        ")",
+    );
     app.refuse(
         "use Missing from \"./missing.contract\"\ncomponent Row\n  view\n    text \"row\"\n",
         "use",
         "use",
     );
+}
+
+#[test]
+fn spaces_around_template_expressions_leave_the_plan_unchanged() {
+    let source =
+        |body: &str| format!("component App\n  state a = 1\n  view\n    column\n      {body}\n");
+    for (spaced, compact) in [
+        ("text `${ a }`", "text `${a}`"),
+        ("text `${ a}`", "text `${a}`"),
+        ("text `${a }`", "text `${a}`"),
+        ("text `${   a   }`", "text `${a}`"),
+        ("text `x ${ a + 1 } y`", "text `x ${a + 1} y`"),
+        (
+            r#"text `${ a > 0 ? "pos" : "neg" }`"#,
+            r#"text `${a > 0 ? "pos" : "neg"}`"#,
+        ),
+        ("column testId=`row-${ a }`", "column testId=`row-${a}`"),
+        ("text `é ${ a } ${ a + 1 }`", "text `é ${a} ${a + 1}`"),
+        ("text `${ `nested ${ a }` }`", "text `${`nested ${a}`}`"),
+        (
+            r#"text `${ match some(a) { case some(n) => n, case none => 0 } }`"#,
+            r#"text `${match some(a) { case some(n) => n, case none => 0 }}`"#,
+        ),
+    ] {
+        let plan = contract::compile(&source(spaced)).unwrap_or_else(|e| panic!("{spaced}: {e}"));
+        assert_eq!(
+            plan.encode(),
+            contract::compile(&source(compact)).unwrap().encode(),
+            "{spaced}"
+        );
+    }
 }
 
 #[test]
@@ -113,6 +211,8 @@ fn transitive_imports_and_repeated_template_interpolations_keep_byte_columns() {
     for line in [
         "    text `é ${1} xx ${missingName}`",
         "    text `é ${`nested ${missingName}`}`",
+        "    text `é ${ 1 } xx ${   missingName }`",
+        "    text `é ${ `nested ${   missingName }` }`",
     ] {
         let row = app
             .write(

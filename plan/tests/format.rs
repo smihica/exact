@@ -78,6 +78,28 @@ fn a_plan_round_trips_and_its_bytes_are_canonical() {
 }
 
 #[test]
+fn structure_remaps_table_and_bytecode_strings_independently_of_interning_order() {
+    let plan = |words: [&str; 2], literal: &str| {
+        let mut b = PlanBuilder::new(0, 0);
+        for word in words {
+            b.str(word);
+        }
+        let string = b.primitive(TypeKind::String);
+        let mut body = Asm::new();
+        body.str(b.str(literal));
+        let body = b.code(body);
+        b.derive("first", string, body);
+        b.finish().unwrap()
+    };
+    let a = plan(["first", "second"], "second");
+    let b = plan(["second", "first"], "second");
+    assert_ne!(a.encode(), b.encode());
+    assert_eq!(a.structure(), b.structure());
+    let other = plan(["first", "second"], "first");
+    assert_ne!(a.structure(), other.structure());
+}
+
+#[test]
 fn resource_context_defaults_to_zero_and_decoding_refuses_an_oversized_tail() {
     let plan = sample();
     assert_eq!(plan.resources[0].context, 0);
@@ -1009,17 +1031,13 @@ fn a_plan_without_compiled_values_keeps_every_other_data_range() {
     assert_eq!(same, plan);
 }
 
-/// The `module_events` table joins the plan (LLP 1133.004 D6): a native
-/// module's event the root hears, a wake event's budget (LLP 1133.017 D5),
-/// and `currententrychange`, `navigatesuccess` and `navigateerror` the event
-/// kinds (LLP 1020.002 D2); `atompress` joins them (LLP 1045.000 D7), then
-/// `newwindow` and `download` (LLP 1020.002 D5), then `capture` (D7), then `userpromptopened` (D9), then an image's `enterpictureinpicture`, `leavepictureinpicture` and `pictureinpictureerror` (LLP 1042 §9), then `historyswipe` (LLP 1115.000 D5.5), then `swipeleft` and a scroll drag's `scrolldragstart` and `scrolldragend` (Charlie, 2026-11-10). The `tools` table joins it (LLP 1133.023 D5, LLP 1111 D2), and the roster's `sharedFiles` (LLP 1133.024 D3), then `fragment` (LLP 1153 D5); a resource row's `each` (LLP 1017.000 P4c, a resource over a list). Every host needs a new binary for this plan format. The format digest is pinned: a change to `tables/format.json`, a
-/// comment included, moves it, and every host then needs a new binary (LLP
-/// 1030 D3a).
+/// Full interface identities on module, event and view rows change the plan
+/// format. Every host needs a new binary (LLP 1030 D3a). The digest covers
+/// all of `tables/format.json`, including comments.
 #[test]
 fn the_format_digest_is_pinned() {
     assert_eq!(
-        FORMAT_DIGEST, 0xe1abb5602313209a,
+        FORMAT_DIGEST, 0xcb68389a9697d958,
         "the plan format digest moved: if intended, name the break and the hosts that move"
     );
 }
@@ -1060,4 +1078,25 @@ fn invalid_timer_wait_rows_are_refused_by_the_decoder() {
             "wait={wait} max={maximum} frame={frame} tolerance={tolerance}"
         );
     }
+}
+
+#[test]
+fn resumed_type_interning_keeps_the_first_equal_row_and_retyped_enums() {
+    let mut b = PlanBuilder::new(0, 0);
+    let string = b.primitive(TypeKind::String);
+    let empty_record = b.record("enum", &[]);
+    assert_eq!(b.string_enum(&[]), empty_record);
+    assert_eq!(
+        b.plan().types[empty_record.0 as usize].kind,
+        TypeKind::String
+    );
+    let next_record = b.record("enum", &[]);
+    assert_ne!(next_record, empty_record);
+    let mut plan = b.finish().unwrap();
+    plan.types.push(plan.types[string.0 as usize].clone());
+    let mut resumed = PlanBuilder::from_plan(plan);
+    assert_eq!(resumed.primitive(TypeKind::String), string);
+    assert_eq!(resumed.record("enum", &[]), next_record);
+    assert_eq!(resumed.string_enum(&[]), next_record);
+    assert_ne!(resumed.record("enum", &[]), next_record);
 }

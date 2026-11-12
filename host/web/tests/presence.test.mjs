@@ -1,7 +1,9 @@
+import { glueDeclarations, glueCase } from './glue-fixture.mjs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The production presence controller under Chrome's layout and animation
 // clocks, including the host's resize entry and child reconciliation.
 import { beforeAll, afterAll, test, expect } from 'bun:test';
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
@@ -34,8 +36,8 @@ const WEB = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const { unavailable } = chromium();
 const check = need('chrome', unavailable);
 const glue = readFileSync(resolve(WEB, 'glue.js'), 'utf8');
-const children = glue.slice(glue.indexOf('      case "children":'), glue.indexOf('      case "animate":'));
-const resize = glue.slice(glue.indexOf('const mediaChanged ='), glue.indexOf('\nvisualViewport?.'));
+const children = glueCase(glue, 'children');
+const resize = glueDeclarations(glue, ['mediaChanged']);
 const page = `<style>
   body { margin:0 } #exact-root { position:relative; padding:20px }
   #card { width:100px; height:40px; background:red; --exact-layout-transition:1000 0 linear }
@@ -45,7 +47,6 @@ const page = `<style>
 <script type="module">
   import { presenceLoader, animationClock, settleValue } from './navigation.js';
   window.exact = {};
-  let incarnation = 1;
   await import('./presence-glue.js');
   const root = document.getElementById('exact-root'), views = new Map();
   const presence = presenceLoader(async () => exact.presence, root, batch => applyBatch(batch), () => {});
@@ -66,6 +67,7 @@ const page = `<style>
   const readOut = x => x, now = () => 0, preferences = () => 0;
   const positionContexts = () => {}, onPreferences = () => {}, foldBits = () => 0, onFold = () => {}; // no fold posture (LLP 1078 D6)
   const wasm = { exact_resize: () => JSON.stringify(window.resizeBatch) };
+  const host = { wasm, incarnation: 1 };
   ${resize}
   window.fixture = html => {
     for (const a of document.getAnimations()) a.cancel();

@@ -1031,6 +1031,164 @@ fn a_gate_takes_a_bool_a_key_a_scalar_and_neither_reads_the_clock() {
     contract::compile(&src("when toast != \"\" key=n")).unwrap();
 }
 
+fn clock_gate_app(fns: &str, derives: &str, task: &str) -> String {
+    format!(
+        "{fns}\ncomponent App
+  state start = 0
+  state shownFor = 0
+  state xs = [1, 2]
+  state toast = \"x\"
+{derives}
+  action clear()
+    toast = \"\"
+  {task}
+  view
+    text toast
+"
+    )
+}
+
+#[test]
+fn clock_gates_distinguish_a_derive_from_its_function() {
+    for name in ["since", "elapsed"] {
+        for (declaration, id, what) in [
+            (
+                format!("task hide when {name} > 5000\n    after(1000, clear)"),
+                "analyze-task-gate-clock",
+                "`task hide`'s gate",
+            ),
+            (
+                format!("task hide key={name}\n    after(1000, clear)"),
+                "analyze-task-gate-clock",
+                "`task hide`'s key",
+            ),
+            (
+                format!("sequence hide when {name} > 5000\n    play([], bpm=120)"),
+                "analyze-task-gate-clock",
+                "`sequence hide`'s gate",
+            ),
+            (
+                format!("sequence hide key={name}\n    play([], bpm=120)"),
+                "analyze-task-gate-clock",
+                "`sequence hide`'s key",
+            ),
+            (
+                format!("sequence hide when true\n    play([], bpm={name})"),
+                "analyze-sequence-clock",
+                "`sequence hide`'s `bpm`",
+            ),
+        ] {
+            let src = clock_gate_app(
+                "fn elapsed(start: number): number = performanceNow() - start",
+                &format!("  derive {name} = elapsed(start)"),
+                &declaration,
+            );
+            let e = contract::compile(&src).expect_err(&src);
+            assert_eq!(e.id, id, "{src}: {e}");
+            assert!(
+                e.message.starts_with(&format!(
+                    "{what} reads `performanceNow()` through `{name}`."
+                )),
+                "{src}: {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clock_gates_respect_function_parameters() {
+    for parameter in ["ms", "elapsed"] {
+        let fns = format!("fn late({parameter}: number): bool = {parameter} > 5000");
+        for declaration in [
+            "task hide when late(shownFor)\n    after(1000, clear)",
+            "task hide key=late(shownFor)\n    after(1000, clear)",
+            "sequence hide when late(shownFor)\n    play([], bpm=120)",
+            "sequence hide key=late(shownFor)\n    play([], bpm=120)",
+        ] {
+            let src = clock_gate_app(
+                &fns,
+                "  derive elapsed = performanceNow() - start",
+                declaration,
+            );
+            contract::compile(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
+    }
+}
+
+#[test]
+fn clock_gates_respect_arrow_and_match_binders() {
+    for expr in [
+        "xs.filter(elapsed => elapsed > 1).length > 0",
+        "xs.filter((x, elapsed) => elapsed > 1).length > 0",
+        "match some(shownFor) { case some(elapsed) => elapsed > 5000, case none => false }",
+        "xs.filter(elapsed => xs.filter(x => elapsed > x).length > 0).length > 0",
+    ] {
+        for declaration in [
+            format!("task hide when {expr}\n    after(1000, clear)"),
+            format!("sequence hide when {expr}\n    play([], bpm=120)"),
+        ] {
+            let src = clock_gate_app(
+                "",
+                "  derive elapsed = performanceNow() - start",
+                &declaration,
+            );
+            contract::compile(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
+    }
+}
+
+#[test]
+fn clock_gates_keep_reads_outside_local_scopes() {
+    for expr in [
+        "late(shownFor) or late(elapsed)",
+        "xs.filter(elapsed => elapsed > 1).length > elapsed",
+        "match some(shownFor) { case some(elapsed) => elapsed > 5000, case none => elapsed > 0 }",
+        "match some(elapsed) { case some(elapsed) => elapsed > 5000, case none => false }",
+        "xs.filter(elapsed => since > elapsed).length > 0",
+        "xs.filter(elapsed => late(elapsed)).length > since",
+    ] {
+        let src = clock_gate_app(
+            "fn late(elapsed: number): bool = elapsed > 5000",
+            "  derive elapsed = performanceNow() - start\n  derive since = elapsed",
+            &format!("task hide when {expr}\n    after(1000, clear)"),
+        );
+        let e = contract::compile(&src).expect_err(&src);
+        assert_eq!(e.id, "analyze-task-gate-clock", "{src}: {e}");
+    }
+}
+
+#[test]
+fn clock_gates_bind_a_let_only_in_its_body() {
+    use contract_syntax::Expr;
+
+    for (value, reads_clock) in [("shownFor", false), ("elapsed", true)] {
+        let src = clock_gate_app(
+            "",
+            "  derive elapsed = performanceNow() - start",
+            "task hide when elapsed > 5000\n    after(1000, clear)",
+        );
+        let file = contract_syntax::parse(&src).unwrap();
+        let mut checked = contract_types::check(&file, contract_lower::tags::style).unwrap();
+        // `Let` is compiler-only, so install it in the expanded gate.
+        let gate = &mut checked.expanded.root.tasks[0].gate;
+        let body = gate.take().unwrap();
+        let span = body.span();
+        *gate = Some(Expr::Let {
+            name: "elapsed".into(),
+            value: Box::new(Expr::Ident(value.into(), span)),
+            body: Box::new(body),
+            span,
+        });
+        match contract_analyze::check(&checked) {
+            Ok(_) => assert!(!reads_clock, "{value}"),
+            Err(e) => {
+                assert!(reads_clock, "{value}: {e}");
+                assert_eq!(e.id, "analyze-task-gate-clock", "{value}: {e}");
+            }
+        }
+    }
+}
+
 /// @ref LLP 1109 D1 — `now()` is deleted, not deprecated: wherever an
 /// expression may call it, it is refused at its own span with both repairs
 /// in one sentence, and an app's `fn now` still shadows nothing away.
@@ -1091,13 +1249,15 @@ fn now_is_refused_with_both_repairs_at_its_span() {
 fn live_resource_arguments_warn_through_derives_and_functions_but_sampled_state_does_not() {
     let file = contract_syntax::parse(
         r#"
+fn forwardedClock(): number = laterClock()
+fn laterClock(): number = clockValue()
 fn clockValue(): number = performanceNow()
 shape Reply
   value: number
 component App
-  state sampledAt = 0
-  derive live = clockValue() + 1
+  state sampledAt = performanceNow()
   derive forwarded = live
+  derive live = forwardedClock() + 1
   resource direct = read(performanceNow()) as shape Reply else empty()
   resource indirect = read(forwarded) as shape Reply else empty()
   resource context = read() with performanceNow() as shape Reply else empty()
@@ -1117,6 +1277,81 @@ component App
     assert!(warnings
         .iter()
         .all(|w| w.id == "analyze-resource-clock" && w.message.contains("sample")));
+}
+
+#[test]
+fn resource_clock_advice_preserves_lexical_scope() {
+    let file = contract_syntax::parse(
+        r#"
+fn clockValue(): number = performanceNow()
+fn sampled(clockValue: number): number = clockValue
+fn sampledAt(): number = performanceNow()
+fn callback(): number[] = [1].map((clockValue) => clockValue)
+fn matched(): number = match some(1) { case some(clockValue) => clockValue, case none => 0 }
+fn fallback(): number = match none { case some(clockValue) => clockValue, case none => clockValue() }
+shape Reply
+  value: number
+component App
+  state sampledAt = performanceNow()
+  derive forwarded = sampledAt
+  resource parameter = read(sampled(1)) as shape Reply else empty()
+  resource arrow = read(callback().length) as shape Reply else empty()
+  resource matched = read(matched()) as shape Reply else empty()
+  resource fallback = read(fallback()) as shape Reply else empty()
+  resource nested = read([1].map((clockValue) => match some(2) { case some(item) => clockValue + item, case none => clockValue }).length) as shape Reply else empty()
+  resource liveArrow = read([1].map((item) => clockValue() + item).length) as shape Reply else empty()
+  resource sibling = read([1].map((clockValue) => clockValue).length + clockValue()) as shape Reply else empty()
+  resource argument = read(sampled(clockValue())) as shape Reply else empty()
+  resource state = read(forwarded) as shape Reply else empty()
+  view
+    text parameter.value
+"#,
+    )
+    .unwrap();
+    let warnings = contract_analyze::resource_clock_warnings(&file);
+    let expected = ["fallback", "liveArrow", "sibling", "argument"];
+    assert_eq!(warnings.len(), expected.len(), "{warnings:?}");
+    for (warning, name) in warnings.iter().zip(expected) {
+        assert!(warning.message.contains(&format!("`{name}`")), "{warning}");
+    }
+}
+
+#[test]
+fn resource_clock_advice_tracks_let_values_in_their_scope() {
+    use contract_syntax::Expr;
+    let mut file = contract_syntax::parse(
+        "component App\n  resource reply = read(0) as shape Reply else empty()\n  view\n    text reply.value\n",
+    )
+    .unwrap();
+    let span = file.components[0].resources[0].span;
+    let clock = Expr::Call("performanceNow".into(), Vec::new(), span);
+    let name = "value".to_string();
+    let read = Expr::Ident(name.clone(), span);
+    for (value, body, warns) in [
+        (clock.clone(), read.clone(), true),
+        (clock.clone(), Expr::Number(0.0, span), false),
+        (
+            clock,
+            Expr::Let {
+                name: name.clone(),
+                value: Box::new(Expr::Number(0.0, span)),
+                body: Box::new(read),
+                span,
+            },
+            false,
+        ),
+    ] {
+        file.components[0].resources[0].args = vec![Expr::Let {
+            name: name.clone(),
+            value: Box::new(value),
+            body: Box::new(body),
+            span,
+        }];
+        assert_eq!(
+            contract_analyze::resource_clock_warnings(&file).len(),
+            usize::from(warns)
+        );
+    }
 }
 
 #[test]

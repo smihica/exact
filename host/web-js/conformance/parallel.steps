@@ -1,0 +1,10 @@
+tap slow-twice
+clock settle
+tap late-fails
+clock settle
+tap both-fail
+clock settle
+tap clear
+tap both-fail
+tap clear
+clock settle

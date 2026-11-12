@@ -18,8 +18,7 @@
 //! shows plain text, and that editor keeps the painted field it has.
 use crate::text::{Run, RunPaint, Spec, TextEngine};
 use exact_kernel::{AxisOffer, FieldKind, NodeRef, PropId, TextMeasureRequest, TextMetrics};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::Cell;
 
 /// The type a hosted field is set in, in the shell's own units.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,8 +68,6 @@ static SHELL: std::sync::Mutex<Option<Hosting>> = std::sync::Mutex::new(None);
 thread_local! {
     /// A shell for this thread alone (a test's), over the process's.
     static HERE: Cell<Option<Hosting>> = const { Cell::new(None) };
-    /// The file each face resolves to, by family, weight and slant.
-    static FACES: RefCell<HashMap<(u16, u16, bool), String>> = RefCell::new(HashMap::new());
 }
 
 /// The process's shell hosts text fields from now on, at `scale` pixels a
@@ -182,8 +179,8 @@ fn family(engine: &mut TextEngine, style: &exact_kernel::TextStyle, italic: bool
         return String::new();
     }
     let key = (style.font_family, style.font_weight, italic);
-    if let Some(known) = FACES.with(|f| f.borrow().get(&key).cloned()) {
-        return known;
+    if let Some(known) = engine.field_faces.get(&key) {
+        return known.clone();
     }
     // One glyph shaped in the face: the catalog names the file it came from.
     let probe = exact_kernel::TextStyle {
@@ -215,7 +212,7 @@ fn family(engine: &mut TextEngine, style: &exact_kernel::TextStyle, italic: bool
         .into_iter()
         .find_map(|run| run.file)
         .map_or_else(String::new, |(path, index)| format!("{path}#{index}"));
-    FACES.with(|f| f.borrow_mut().insert(key, file.clone()));
+    engine.field_faces.insert(key, file.clone());
     file
 }
 

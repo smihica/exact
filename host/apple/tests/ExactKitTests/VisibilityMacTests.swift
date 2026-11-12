@@ -2,12 +2,12 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactMarkdown
 
 /// CSS `visibility` on macOS: a hidden box keeps its geometry and paints
 /// nothing of its own, and it is not a hit. A descendant whose own style is
-/// `visible` paints and is hit. One that is `hidden` does not. Wire batches
-/// send each node's style as the host will, so the inheriting child carries
-/// `visibility: hidden` itself.
+/// `visible` paints and is hit. Both `hidden` and `collapse` suppress paint.
+/// Wire batches send each node's computed style, including inherited visibility.
 final class VisibilityMacTests: XCTestCase {
     private var window: NSWindow?
     override func tearDown() { window?.close(); window = nil }
@@ -178,12 +178,19 @@ final class VisibilityMacTests: XCTestCase {
     }
 
     func testAVisibleDescendantOfAHiddenBoxPaintsAndIsHit() throws {
+        for visibility in ["hidden", "collapse"] {
+            try testAVisibleDescendantOfAHiddenBoxPaintsAndIsHit(visibility)
+        }
+    }
+
+    private func testAVisibleDescendantOfAHiddenBoxPaintsAndIsHit(_ visibility: String) throws {
         let p = presenter()
+        defer { window?.close(); window = nil }
         p.apply(wireBatch([
             ["op": "create", "id": 1, "kind": "view", "style": ["background_color": [255.0, 255.0, 255.0, 255.0]]],
-            ["op": "create", "id": 2, "kind": "view", "style": ["background_color": [255.0, 0.0, 0.0, 255.0], "visibility": "hidden"]],
+            ["op": "create", "id": 2, "kind": "view", "style": ["background_color": [255.0, 0.0, 0.0, 255.0], "visibility": visibility]],
             ["op": "create", "id": 3, "kind": "view", "style": ["background_color": [0.0, 255.0, 0.0, 255.0], "visibility": "visible"]],
-            ["op": "create", "id": 4, "kind": "view", "style": ["background_color": [0.0, 0.0, 255.0, 255.0], "visibility": "hidden"]],
+            ["op": "create", "id": 4, "kind": "view", "style": ["background_color": [0.0, 0.0, 255.0, 255.0], "visibility": visibility]],
             ["op": "children", "id": 1, "ids": [2]],
             ["op": "children", "id": 2, "ids": [3, 4]],
             ["op": "roots", "ids": [1]],
@@ -223,20 +230,30 @@ final class VisibilityMacTests: XCTestCase {
         XCTAssertFalse(ownHit === parent)
     }
 
-    /// What e28279b3b left: a box hidden while focused gives the focus up
+    /// A box hidden while focused gives the focus up
     /// (on the next turn), and hidden text is no link or target while a
     /// visible run inside a hidden link still follows it, as a click bubbles.
     func testAHiddenBoxGivesUpFocusAndHiddenTextIsNoTarget() throws {
+        for visibility in ["hidden", "collapse"] {
+            try testAHiddenBoxGivesUpFocusAndHiddenTextIsNoTarget(visibility)
+        }
+    }
+
+    private func testAHiddenBoxGivesUpFocusAndHiddenTextIsNoTarget(_ visibility: String) throws {
         let p = presenter()
         let window = try XCTUnwrap(self.window)
+        defer { window.close(); self.window = nil }
         p.apply(wireBatch([
-            ["op": "create", "id": 1, "kind": "view", "props": ["tabIndex": "0"], "handlers": ["press"], "style": [:]],
+            ["op": "create", "id": 1, "kind": "view", "props": ["tabIndex": "0", "accessibilityRole": "button", "accessibilityLabel": "Press"], "handlers": ["press"], "style": [:]],
             ["op": "roots", "ids": [1]],
             ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 100.0, "h": 40.0],
         ]))
         let box = try XCTUnwrap(p.views[1])
+        XCTAssertTrue(box.isAccessibilityElement())
         XCTAssertTrue(window.makeFirstResponder(box))
-        p.apply(wireBatch([["op": "style", "id": 1, "style": ["visibility": "hidden"]]]))
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["visibility": visibility]]]))
+        XCTAssertFalse(box.isAccessibilityElement())
+        XCTAssertFalse(box.acceptsFirstResponder)
         XCTAssertTrue(window.firstResponder === box, "not inside the batch")
         let deadline = Date().addingTimeInterval(10)
         while window.firstResponder === box, Date() < deadline { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01)) }
@@ -252,7 +269,7 @@ final class VisibilityMacTests: XCTestCase {
         ]))
         let text = try XCTUnwrap(q.views[3])
         var hidden = InlineStyle(), shown = InlineStyle()
-        try hidden.set("visibility", .string("hidden"))
+        try hidden.set("visibility", .string(visibility))
         try shown.set("visibility", .string("visible"))
         text.props = [:]
         q.applyParagraph(3, [
@@ -268,6 +285,28 @@ final class VisibilityMacTests: XCTestCase {
                        "a visible run's click reaches the hidden link holding it")
         XCTAssertEqual(text.inlineActivationTarget(at: CGPoint(x: shownAt.midX, y: shownAt.midY))?.id, 10)
         XCTAssertTrue(q.inlineEnabled(10), "and activates it")
+    }
+
+    func testParagraphVisibilityHidesPlainAndMarkdownRuns() throws {
+        ExactMarkdown.install()
+        let p = presenter()
+        for markup in ["", "markdown"] {
+            p.apply(wireBatch([
+                ["op": "create", "id": 1, "kind": "text", "props": ["text": "Plain **bold**", "markup": markup]],
+                ["op": "roots", "ids": [1]],
+                ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 200, "h": 40],
+            ]))
+            let node = try XCTUnwrap(p.views[1])
+            for visibility in ["", "visible", "hidden", "collapse", "visible", ""] {
+                let style: [String: Any] = visibility.isEmpty ? [:] : ["visibility": visibility]
+                p.apply(wireBatch([["op": "style", "id": 1, "style": style]]))
+                let runs = node.paragraphSpec().runs
+                XCTAssertFalse(runs.isEmpty)
+                if markup == "markdown" { XCTAssertGreaterThan(runs.count, 1) }
+                XCTAssertTrue(runs.allSatisfy { $0.hidden == ["hidden", "collapse"].contains(visibility) }, "\(markup): \(visibility)")
+            }
+            p.apply(wireBatch([["op": "destroy", "id": 1]]))
+        }
     }
 }
 #endif

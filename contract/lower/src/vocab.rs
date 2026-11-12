@@ -6,7 +6,7 @@
 //! admits, so the list cannot claim a name the compiler refuses. The style
 //! names are a table, `style_names::STYLE_NAMES` (LLP 1081 D8), read whole. The rules
 //! no lookup lists (the `head` fields, the attributes admitted only on some
-//! tags, the two open sets) are named here beside them.
+//! tags, compile-time attributes, the two open sets) are named here beside them.
 
 use crate::tags::{self, AttrTarget, Tag};
 use contract_syntax::{Attr, Expr, Span};
@@ -76,6 +76,45 @@ pub fn detent_out_of_order<'a>(words: &[&'a str]) -> Option<&'a str> {
 
 include!(concat!(env!("OUT_DIR"), "/vocab.rs"));
 
+/// An attribute consumed before the tag/attribute lookup, with no runtime row of its own.
+pub struct CompileAttr {
+    /// The spelling on an element.
+    pub name: &'static str,
+    /// The authored value grammar, with an example.
+    pub accepts: &'static str,
+    /// Where the attribute applies.
+    pub only: &'static str,
+    /// Its effect and restrictions beyond the value grammar.
+    pub note: &'static str,
+}
+
+/// `class` (LLP 1017 P6), anatomy and the grouped row's look (LLP 1139).
+pub const COMPILE_ATTRS: &[CompileAttr] = &[
+    CompileAttr {
+        name: "class",
+        accepts: "a style name: `class=Card`, or `class=(cond ? A : B)`",
+        only: "an element",
+        note: "Names a `style` in this file. Its rows apply before the node's own attributes; the node's own attributes win within each state layer.",
+    },
+    CompileAttr {
+        name: contract_syntax::anatomy::PART,
+        accepts: "a non-empty string literal: `part=\"surface\"`",
+        only: "an element of the component's own view",
+        note: "Names a part declared in the component's `parts` section, with one node per part. The part's groups constrain the rows its classes bring; native controls take the control group alone. No part attribute reaches the runtime plan.",
+    },
+    CompileAttr {
+        name: crate::row_look::ROW_LOOK,
+        accepts: "`-exact-row-look=\"platform\"`",
+        only: "an element; takes effect when it is a grouped list's row",
+        note: "Yields background, border, padding and box-shadow rows to the grouped list's platform row. Elsewhere the element keeps its own look.",
+    },
+];
+
+/// An attribute consumed before the ordinary lookup, if this name is one.
+pub fn compile_attr(name: &str) -> Option<&'static CompileAttr> {
+    COMPILE_ATTRS.iter().find(|a| a.name == name)
+}
+
 /// Attributes restricted by tag or collection shape; the `head` fields
 /// are [`tags::HEAD_FIELDS`].
 pub const CONTEXTUAL: &[(&str, &str)] = &[
@@ -95,9 +134,9 @@ pub const CONTEXTUAL: &[(&str, &str)] = &[
     ),
     (
         "reachstart",
-        "`list virtualized=true` with one direct `each`",
+        "`list virtualized=true` with one direct `for`",
     ),
-    ("reachend", "`list virtualized=true` with one direct `each`"),
+    ("reachend", "`list virtualized=true` with one direct `for`"),
     ("text-transform", "any tag but `input` and `textarea`"),
     (
         "transform",
@@ -147,7 +186,7 @@ pub const CONTEXTUAL: &[(&str, &str)] = &[
 
 /// The compiler and target emitters share the collection-edge refusal.
 pub fn collection_edge_refusal(event: &str) -> String {
-    format!("`{event}` belongs to a virtualized list (LLP 1010): write `list virtualized=true` with one direct `each`. Only a non-empty collection has edges in its geometric window; a plain list lays out all its children and has no collection window to report an edge. For a plain feed or masonry, use the web's `intersect=` on a marker at the end of the content, after the columns (docs/reference.md, \"Intersection visibility\"):\nview intersect=loadMore intersect-margin=\"0px 0px 800px 0px\"\n  height=1")
+    format!("`{event}` belongs to a virtualized list (LLP 1010): write `list virtualized=true` with one direct `for`. Only a non-empty collection has edges in its geometric window; a plain list lays out all its children and has no collection window to report an edge. For a plain feed or masonry, use the web's `intersect=` on a marker at the end of the content, after the columns (docs/reference.md, \"Intersection visibility\"):\nview intersect=loadMore intersect-margin=\"0px 0px 800px 0px\"\n  height=1")
 }
 
 /// What `transform` is on a box (LLP 1055.000 D5), printed by `contract
@@ -170,7 +209,7 @@ pub const BUTTON_DEFAULT_NOTE: &str = button_default!();
 /// What a tag means beyond its node, where the hosts make more of it than
 /// the web: `contract vocab <tag>` prints it under the tag.
 pub const TAG_NOTES: &[(&str, &str)] = &[
-    ("time", "HTML time: `datetime` is an instant in epoch milliseconds, as `date(...)` returns. `format` is a literal named presentation: relative, timer, countdown, date-short, date-medium (default), date-long, date-full, time-short or time-medium. The platform formats it in the viewer locale and time zone. Relative time advances on minute boundaries; timer and countdown advance each second on the runner clock, with no app task. Apple timers use SwiftUI’s unpadded first field (`0:05`, `1:00:00`). A timer counts away from either side of its instant; countdown stops at zero. On snapshots, timer uses `Text(date, style: .timer)`, countdown uses `Text(timerInterval: entryDate...instant, countsDown: true)` to stop at zero, and calendar formats draw the kernel’s formatted string without ticking. Children are fallback content when the host cannot format the instant. A standalone live time reserves its box at its font: two localized units for relative time, one extra hour digit for timer, and the first displayed shape for countdown. An inline time among other runs in a text reflows as on the web. Ticking formats use tabular digits by default."),
+    ("time", "HTML time: `datetime` is an instant in epoch milliseconds from a source's numeric field, e.g. `datetime=event.at`. Parse date strings in the data module. For the current instant, use `datetime=(wall.epochAtZero + performanceNow())`, where `wall` is an `exactTime()` resource (see `contract vocab date`). `format` is a literal named presentation: relative, timer, countdown, date-short, date-medium (default), date-long, date-full, time-short or time-medium. The platform formats it in the viewer locale and time zone. Relative time advances on minute boundaries; timer and countdown advance each second on the runner clock, with no app task. Apple timers use SwiftUI’s unpadded first field (`0:05`, `1:00:00`). A timer counts away from either side of its instant; countdown stops at zero. On snapshots, timer uses `Text(date, style: .timer)`, countdown uses `Text(timerInterval: entryDate...instant, countsDown: true)` to stop at zero, and calendar formats draw the kernel’s formatted string without ticking. Children are fallback content when the host cannot format the instant. A standalone live time reserves its box at its font: two localized units for relative time, one extra hour digit for timer, and the first displayed shape for countdown. An inline time among other runs in a text reflows as on the web. Ticking formats use tabular digits by default."),
     ("head", "The document's metadata; it draws nothing. `title` is the whole document title (the app's name is not added to it), `description` the description meta, `image` the share image (og:image), `canonical` the canonical URL, `robots` the robots meta. A rendered page writes them as HTML with the OpenGraph and Twitter tags, `canonical` and `image` absolute against the manifest's `app.origin`. `status` is a literal 404, 410 or 503: a rendered page's HTTP status (a location the router sends to its notfound route is 404 unless its head says 410). `edited=true` says the document has unsaved changes. Put a head anywhere in a route's view, under an `if`, its fields bound or templates (head title=`${p.name} | Pokédex`): the innermost head of the shown route wins, field by field, and a covered route's head does not count. docs/contract-for-humans.md"),
     ("scroll", "A box whose content scrolls inside its bound: give it one (a `height`, or `flex=1 min-height=0` in a flex column that has one). In a route it is the navigation bar's scroller (`navigationScroll` on the route names another by its `id`). `scroll document` (or `document=(expr)`) makes it the web page's own scroll: the page scrolls, not the box, so the mobile browser's toolbar collapses and `#id` anchors, printing and scroll restoration work. A website's pages each use one; in a stack that keeps its routes mounted (`for e in stack(nav)`), each route keeps its own place in the page's scroll. Natively it scrolls as without `document`. docs/patterns/site/app.contract"),
     ("section", "In a `list`, a group of rows. In a grouped list (`listStyle=\"inset-grouped\"`) a `header` child holding one `text` is the section's title, drawn in the list's header style, and a `footer` child holding one `text` the note under its rows: `section` / `header` / `text \"Results\"`, then its `row`s, then `footer` / `text \"Tap an option to vote.\"`. A `header` in a section is never the navigation bar. Outside a list it is HTML's section. docs/recipes/grouped-form.md"),
@@ -216,7 +255,7 @@ fn sorted(names: &[&'static str]) -> Vec<&'static str> {
     names
 }
 
-/// Every built-in tag, by name.
+/// Tags handled by [`tags::tag`], by name; the parser expands headings before this lookup.
 pub fn tags() -> Vec<(&'static str, Tag)> {
     sorted(TAG_CANDIDATES)
         .into_iter()
@@ -224,8 +263,9 @@ pub fn tags() -> Vec<(&'static str, Tag)> {
         .collect()
 }
 
-/// Every attribute, by name: the scanned arms of `attr`, and the style
-/// names, which are a table (`style_names::STYLE_NAMES`, LLP 1081 D8).
+/// Attributes handled by [`tags::attr`]: its scanned arms and the style
+/// names (`style_names::STYLE_NAMES`, LLP 1081 D8). Attributes consumed
+/// earlier are [`COMPILE_ATTRS`].
 pub fn attrs() -> Vec<(&'static str, AttrTarget)> {
     // A part's declaration (`::placeholder color`) is no attribute to write:
     // `contract vocab ::placeholder` describes the block. Nor is lowering's
@@ -290,6 +330,37 @@ pub fn transition_properties() -> Vec<&'static str> {
     names
 }
 
+/// What a native host does with a style row other than draw it as written
+/// (LLP 1159.000 D2): the schema's `hosts` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleHost {
+    /// `ios`, `macos`, `linux`, `windows` or `android`.
+    pub host: &'static str,
+    /// `box` (an element outside an `svg`) or `svg` where the entry is
+    /// limited to one.
+    pub on: Option<&'static str>,
+    /// Not drawn at all, the node as if the row were unset; else drawn
+    /// differently, as `why` says.
+    pub none: bool,
+    /// The sentence an author reads.
+    pub why: &'static str,
+}
+
+/// A style row's entries in the `hosts` column, in the schema's order. None
+/// means no gap is recorded, which is not a measurement.
+pub fn style_hosts(row: StyleId) -> Vec<StyleHost> {
+    STYLE_HOSTS
+        .iter()
+        .filter(|(field, ..)| *field == row.name())
+        .map(|&(_, host, on, none, why)| StyleHost {
+            host,
+            on: (!on.is_empty()).then_some(on),
+            none,
+            why,
+        })
+        .collect()
+}
+
 /// A style row's default as the schema writes it, if it declares one; a
 /// colour's zero is `transparent`.
 pub fn default(row: StyleId) -> Option<&'static str> {
@@ -301,7 +372,7 @@ pub fn default(row: StyleId) -> Option<&'static str> {
     if matches!(row, StyleId::PressBackgroundColor | StyleId::PressColor) {
         return Some("none (the node's own)");
     }
-    let colour = matches!(row.codec(), StyleCodec::ColorValue | StyleCodec::Rgba8);
+    let colour = matches!(row.codec(), StyleCodec::ColorValue);
     Some(if colour && default == "0" {
         "transparent"
     } else {

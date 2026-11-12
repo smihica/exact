@@ -7,7 +7,7 @@
 //! stream refused after the frames already queued. A mutation's or a
 //! mapper call's batch ([`exact_runner::SocketSend`]) is checked whole,
 //! then sent in order.
-use super::super::{complete, failed, has_ready, wake, Completed, Core, Shared};
+use super::super::{complete, failed, has_ready, wake, Completed, Core, Quiet, Shared};
 use exact_runner::{FailureKind, Message, Outcome, SocketOp, SocketSend};
 use ibex2::stdlib::{
     abort::AbortController,
@@ -107,6 +107,7 @@ pub(super) fn read(
     mut socket: Box<dyn MessageSource>,
     limit: usize,
     abort: AbortController,
+    quiet: Option<Quiet>,
 ) {
     if let Some(sender) = socket.sender() {
         let socket = Socket {
@@ -159,6 +160,9 @@ pub(super) fn read(
                 }
                 Err(e) => return failed(FailureKind::Network, e.to_string()),
             };
+            if let Some(quiet) = &quiet {
+                quiet.heard();
+            }
             match frame(shared, ticket, m, limit) {
                 Frame::Queued => {}
                 // Released, its close on the way: frames are dropped, and the
@@ -176,6 +180,8 @@ pub(super) fn read(
         }
     }))
     .unwrap_or_else(|_| failed(FailureKind::Aborted, "the stream reader panicked"));
+    // Its end is settled before the socket is taken down, which may take a while.
+    let run = Quiet::finish(quiet.as_ref(), run);
     shared.sockets.lock().unwrap().remove(&ticket);
     drop(socket);
     complete(shared, ticket, run);

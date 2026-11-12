@@ -1,3 +1,4 @@
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { cpSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -139,6 +140,9 @@ test('the JS target refuses an upload where Hermes does, in its words', async ()
   writeFileSync(resolve(dir, 'source.js'), `export const appId = 'test.upload'; export const grants = '';
 import { fetch } from './ts-fetch.js';
 const url = 'https://example.test/upload', exactStream = e => e.type, post = { method: 'POST', exactStream };
+export const bodies = Array.from({ length: 4 }, () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])); c.close(); } }));
+export let stringified = false;
+for (const body of bodies) body.toString = () => { stringified = true; throw new Error('the stream was stringified'); };
 const inits = [
   [url, { ...post, exactUploadProgress: 'yes' }],
   [url, { method: 'POST', exactUploadProgress: true }],
@@ -149,25 +153,31 @@ const inits = [
   [url, { ...post, exactTimeout: 30000 }],
   [url, { ...post, exactUploadProgress: true, exactTimeout: 0 }],
   ['exact-native:', { ...post, exactUploadProgress: true }],
+  [url, { ...post, body: bodies[0] }],
+  [url, { ...post, body: bodies[1], duplex: 'half' }],
+  [url, { ...post, body: bodies[2], exactUploadProgress: true }],
+  [url, { ...post, body: bodies[3], exactUploadProgress: true, duplex: 'half' }],
 ];
 export function answer(name, args) { return fetch(...inits[args[0]]); }
 `);
   writeFileSync(resolve(dir, 'ts-data.js'), readFileSync(resolve(root, 'host/web-js/ts-data.js'), 'utf8')
     .replace('__APP_TS__', pathToFileURL(resolve(dir, 'source.js')).href).replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', '').replace("'__FETCH_MODULE__'", "'./ts-fetch.js'"));
-  writeFileSync(resolve(dir, 'rt.js'), 'export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n');
+  writeFileSync(resolve(dir, 'rt.js'), 'export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},time=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();\n');
   writeFileSync(resolve(dir, 'rt-link.js'), "import * as rt from './rt.js'; export { rt };\n");
   writeFileSync(resolve(dir, 'names.js'), 'export const sourceTypes={};\n');
   writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(root, 'host/web-js/admission.js'), 'utf8').replaceAll("'../web/grant-admission.js'", "'./grant-admission.js'").replaceAll("'../web/faults.js'", "'./faults.js'").replaceAll("'../web/address-space.js'", "'./address-space.js'"));
   writeFileSync(resolve(dir, 'admission-data.js'), "import {createGrantSet} from './admission.js';export const tsGrantSet=createGrantSet(null);\n");
-  for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js', 'storage-environment.js', 'http-body.js']) cpSync(resolve(root, 'host/web', name), resolve(dir, name));
+  for (const name of ['grant-admission.js', 'address-space.js', 'faults.js', 'navigation.js', 'storage-environment.js', 'http-body.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(root, 'host/web', name)));
   for (const name of ['ts-fetch.js', 'ts-stream.js', 'ts-body-from.js', 'shape.js', 'uploads.js']) cpSync(resolve(root, 'host/web-js', name), resolve(dir, name));
   try {
     const ts = await import(pathToFileURL(resolve(dir, 'ts-data.js')).href), data = { q: [] };
     ts.install(data);
     const said = [];
-    for (let i = 0; i < 9; i++) {
-      const r = data.answer('upload', [i], new Map());
-      said.push(r.stream ? (await r.stream(() => {}, new AbortController())).error : await r.promise.then(() => 'answered', e => e.name + ': ' + e.message));
+    for (let i = 0; i < 13; i++) {
+      try {
+        const r = data.answer('upload', [i], new Map());
+        said.push(r.stream ? (await r.stream(() => {}, new AbortController())).error : await r.promise.then(() => 'answered', e => e.name + ': ' + e.message));
+      } catch (e) { said.push(e.name + ': ' + e.message); }
     }
     expect(said).toEqual([
       'exactUploadProgress is true or false',
@@ -179,7 +189,14 @@ export function answer(name, args) { return fetch(...inits[args[0]]); }
       'TypeError: exactTimeout: a stream has no timeout',
       'exactTimeout must be an integer number of milliseconds from 1 to 3600000',
       'exactUploadProgress: an upload is an http: or https: request',
+      'fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first',
+      'fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first',
+      'TypeError: fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first',
+      'TypeError: fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first',
     ]);
+    const source = await import(pathToFileURL(resolve(dir, 'source.js')).href);
+    expect(source.stringified).toBe(false);
+    expect(source.bodies.map(body => body.locked)).toEqual([false, false, false, false]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -223,13 +240,13 @@ test('an untraced async tool handler keeps its origin for fetches and nested mod
 const ask = () => fetch('https://127.0.0.1/').then(() => 'sent', e => e.message);
 export const tools = { async probe() { const before = await ask(); await Promise.resolve(); const after = await ask(); const module = await globalThis.__exact_module({extension:'fixture', source:'ask'}); return {before, after, module}; }, throws() { throw new Error('handler failed'); } };`);
   writeFileSync(resolve(dir, 'ts-data.js'), readFileSync(resolve(root, 'host/web-js/ts-data.js'), 'utf8').replace('__APP_TS__', './source.js').replace('__AUTH_IMPORT__', '').replace('__AUTH_INSTALL__', '').replace("'__FETCH_MODULE__'", "'./ts-fetch.js'"));
-  writeFileSync(resolve(dir, 'rt.js'), 'export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();');
+  writeFileSync(resolve(dir, 'rt.js'), 'export const clock={agent:false,now:0},journal=[],Resources=[],inflight={n:0};export const drive=()=>{},time=()=>{},Origin={now:()=>"app"};export const checkpoint=()=>({kept:null});export const commit=f=>f();export const R=()=>{};export const painted=()=>Promise.resolve();');
   writeFileSync(resolve(dir, 'names.js'), 'export const sourceTypes={};');
   writeFileSync(resolve(dir, 'admission.js'), readFileSync(resolve(root, 'host/web-js/admission.js'), 'utf8').replace(/'\.\.\/web\/([a-z-]+\.js)'/g, "'./$1'"));
-  writeFileSync(resolve(dir, 'grant-admission.js'), `export {isLocalNetwork} from ${JSON.stringify(pathToFileURL(resolve(root, 'host/web/grant-admission.js')).href)};
+  writeFileSync(resolve(dir, 'grant-admission.js'), `export {isCloudMetadata, isLocalNetwork} from ${JSON.stringify(pathToFileURL(resolve(root, 'host/web/grant-admission.js')).href)};
 export const admitsNetwork=()=>true, admitsSecret=()=>false, coversPath=()=>false, createGrantSet=x=>x, grantError=()=>null, hasGrant=()=>false, rawGrantText=()=>'', scopedGrantSet=x=>x, unionGrantSets=x=>x, sameGrantDeclaration=()=>true;`);
   writeFileSync(resolve(dir, 'admission-data.js'), 'export const tsGrantSet={};');
-  for (const name of ['address-space.js', 'faults.js']) cpSync(resolve(root, 'host/web', name), resolve(dir, name));
+  for (const name of ['address-space.js', 'faults.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(root, 'host/web', name)));
   for (const name of ['ts-fetch.js', 'shape.js', 'uploads.js']) cpSync(resolve(root, 'host/web-js', name), resolve(dir, name));
   cpSync(resolve(dir, 'admission.js'), resolve(dir, 'landing.js'));
   try {

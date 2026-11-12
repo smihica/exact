@@ -135,15 +135,14 @@ pub fn denied(row: &str, value: &str) -> Option<String> {
     let keyword = || KEYWORDS.iter().any(|k| v.eq_ignore_ascii_case(k));
     match row {
         "display" | "visibility" => {
-            let hides = if row == "display" { "none" } else { "hidden" };
-            if v.eq_ignore_ascii_case(hides) {
+            let (hides, shows): (&[&str], &[&str]) = if row == "display" {
+                (&["none"], &DISPLAYS)
+            } else {
+                (&["hidden", "collapse"], &["visible"])
+            };
+            if hides.iter().any(|k| v.eq_ignore_ascii_case(k)) {
                 return Some(format!("`{row}: {v}` hides it"));
             }
-            let shows: &[&str] = if row == "display" {
-                &DISPLAYS
-            } else {
-                &["visible", "collapse"]
-            };
             match shows
                 .iter()
                 .chain(&["inherit", "initial", "unset", "revert"])

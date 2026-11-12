@@ -1,8 +1,9 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The driver's `post` on the web (LLP 1139.004 D1): the page's agent answers the wire's `type`
 // with a `message` through glue.js `postSurface`, the path the page's postMessage takes, into
 // the real gpu-glue.js (alone, and behind the GPU modules router) over a stand-in GPU module, in Chrome.
 import {test, expect} from 'bun:test';
-import {readFileSync} from 'node:fs';
+
 import {resolve} from 'node:path';
 import {cdpBrowser} from '../../../scripts/agent-launch.mjs';
 import {glueDeclarations} from './glue-fixture.mjs';
@@ -30,10 +31,11 @@ async function page(boot, run) {
     globalThis.inputs = [];
     // The tier is chosen from an adapter before the stub module loads (gpu-tier.js); a headless shell has none.
     Object.defineProperty(navigator, 'gpu', {configurable:true, value:{requestAdapter: async () => ({info:{}})}});
-    const host = document.getElementById('host');
-    globalThis.exact = {views:new Map([[1, host], [2, document.getElementById('frame')]]), root:document.body, now:()=>0, devAssets:[], generation:0, postBound:64, compat:{inputs:{gpuModules:{}}}};
+    const element = document.getElementById('host');
+    globalThis.exact = {views:new Map([[1, element], [2, document.getElementById('frame')]]), root:document.body, now:()=>0, devAssets:[], generation:0, postBound:64, compat:{inputs:{gpuModules:{}}}};
     ${boot}
     const views = exact.views, retiredViews = new WeakSet(), POST_BOUND = 64, incarnation = 0, now = () => 0, wasm = {}, tagged = x => x, ask = () => ({}), log = line => console.log(line), agentMode = false;
+    const host = { wasm, agentClock: 0 };
     ${adapter}
     globalThis.askAgent = agentReply; globalThis.ready = true;
   </script>`;
@@ -42,7 +44,7 @@ async function page(boot, run) {
     if (path === '/') return new Response(html, {headers:{'content-type':'text/html'}});
     if (path === '/gpu.js') return new Response(moduleSource, {headers:{'content-type':'text/javascript'}});
     if (path === '/favicon.ico') return new Response('', {status:404});
-    return new Response(Bun.file(resolve(web, path.slice(1))), {headers:{'content-type':'text/javascript'}});
+    return new Response(readFileSync(resolve(web, path.slice(1))), {headers:{'content-type':'text/javascript'}});
   }});
   const suite = await cdpBrowser(), {cdp} = suite, lines = [];
   let listener;

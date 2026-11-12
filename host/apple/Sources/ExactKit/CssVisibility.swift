@@ -1,5 +1,5 @@
-// CSS `visibility` (inherited). `hidden` keeps the box and turns off that
-// element's own painting, hit-testing and accessibility. A descendant that
+// CSS `visibility` (inherited). `hidden` and `collapse` keep the box and
+// turn off its own painting, hit-testing and accessibility. A descendant that
 // computes `visible` still paints and is hit. `display: none` is `isHidden`
 // and removes the subtree; this does not.
 #if os(macOS)
@@ -9,8 +9,8 @@ import UIKit
 #endif
 
 extension NodeView {
-    /// Computed `visibility: hidden`. Absent is the initial `visible`.
-    var cssVisibilityHidden: Bool { style["visibility"]?.string == "hidden" }
+    /// Computed visibility hides the box unless it is `visible`, the initial value.
+    var cssVisibilityHidden: Bool { (style["visibility"]?.string ?? "visible") != "visible" }
 
     /// A hidden paragraph that still has an inline run computing `visible`.
     /// A paragraph that is not hidden answers false without walking its runs,
@@ -106,7 +106,7 @@ extension NodeView {
 
     /// The glyph under `point` (this view's coordinates) belongs to an inline
     /// run whose computed visibility is `visible`. The host sends that
-    /// computed value on the run (`hidden` when it is hidden).
+    /// computed value on the run.
     func inlineRunShows(at point: CGPoint) -> Bool {
         guard isParagraph, let run = inlineTarget(at: point) else { return false }
         return !run.run(dark: drawsDark).hidden
@@ -114,7 +114,7 @@ extension NodeView {
 
     #if os(macOS)
     /// `pointer-events: none`, or this box's own hit while it is
-    /// `visibility: hidden`. A descendant node, and a visible inline run,
+    /// `visibility: hidden` or `collapse`. A descendant node, and a visible inline run,
     /// are not refused.
     func refusesOwnHit(_ hit: NSView, local: CGPoint) -> Bool {
         let events = style["pointer_events"]?.string == "none"

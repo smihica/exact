@@ -120,7 +120,8 @@ const params_ = (r, name) => stack_(r).map(e => e[4][Names.indexOf(name)]).filte
 /** `fragment(entry)` (LLP 1153 D5): reads any entry, as `searchParam` does. */
 export const x_fragment = e => e[5];
 export function x_searchParam(e, name) {
-  const q = e[2].split("?")[1]; if (!q) return "";
+  const at = e[2].indexOf("?"); if (at < 0) return "";
+  const q = e[2].slice(at + 1);
   for (const pair of q.split("#")[0].split("&").filter(Boolean)) { const [k, ...v] = pair.split("="); if (dec(k, true) === name) return dec(v.join("="), true); }
   return "";
 }

@@ -19,13 +19,20 @@ async function persist(storage: Storage) {
 }
 async function load(storage: Storage) {
   if (loaded) return;
+  let bytes: ArrayBuffer | null = null;
+  try { bytes = await storage.fs.readFile(path); } catch (e) {
+    // Only a missing file is a first launch, which has the baked reference conversation. Any other
+    // failure leaves the module unloaded, so no command saves the baked conversations over the file.
+    if ((e as { code?: string }).code !== 'ENOENT') { notice = `Could not read your conversations: ${errorText(e)}`; throw e; }
+  }
+  notice = '';
   try {
-    const data = JSON.parse(new TextDecoder().decode(await storage.fs.readFile(path)));
-    if (!loaded && data.version === 1 && Array.isArray(data.threads) && data.threads.every((t: Thread) => typeof t.id === 'string' && Array.isArray(t.messages))) {
+    const data = bytes && JSON.parse(new TextDecoder().decode(bytes));
+    if (!loaded && data?.version === 1 && Array.isArray(data.threads) && data.threads.every((t: Thread) => typeof t.id === 'string' && Array.isArray(t.messages))) {
       threads = data.threads; serial = Number(data.serial) || 0;
       for (const t of threads) for (const m of t.messages) m.fresh = false;
     }
-  } catch { /* First launch has the baked reference conversation. */ }
+  } catch { /* A damaged file keeps the baked conversations. */ }
   loaded = true;
 }
 async function api(route: string, method = 'GET', body?: unknown) {
@@ -69,7 +76,8 @@ async function start(t: Thread, user: Message, storage: Storage) {
   revision++; await persist(storage);
 }
 async function pulse(at: number, storage: Storage) {
-  await load(storage);
+  // A failed read is shown in the notice and tried again on the next pulse.
+  try { await load(storage); } catch { return change(); }
   const jobs = threads.filter(t => t.pending && t.job);
   await Promise.all(jobs.map(async t => {
     const turn = turns.get(t), id = t.job;

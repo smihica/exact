@@ -1,5 +1,6 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import {test, expect} from 'bun:test';
-import {mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import {resolve} from 'node:path';
 import {fixture} from './surface.mjs';
 import {open} from '../../../scripts/agent.mjs';
@@ -65,11 +66,12 @@ test('browser agent settling retains render traps and quarantines all later modu
   const html = `<div id="host"><canvas data-surface></canvas></div><script type="module">
     globalThis.entries=0; globalThis.armed=false;
     Object.defineProperty(Navigator.prototype,'gpu',{get(){return {requestAdapter:async()=>({info:{}})};},configurable:true}); // the stub module's adapter
-    const host=document.getElementById('host');
-    globalThis.exact={views:new Map([[1,host]]),root:document.body,now:()=>0,devAssets:[],generation:0};
+    const element=document.getElementById('host');
+    globalThis.exact={views:new Map([[1,element]]),root:document.body,now:()=>0,devAssets:[],generation:0};
     await import('/gpu-glue.js'); exact.gpu.surface(1,'world',[]); await exact.gpu.settled();
     const stageLoaded=()=>true, viewBox=()=>{}, agentMode=true, gpuInPlay=()=>true, loadGpuIfNeeded=()=>{}, gpuLoading=null;
     const wasm={}, ask=()=>({lines:[],from:0,next:0}), tagged=x=>x;
+    const host = { wasm, viewBox, gpuLoading, agentClock: 0 };
     ${adapter}
     globalThis.askAgent=agent; globalThis.ready=true;
   </script>`;
@@ -78,7 +80,8 @@ test('browser agent settling retains render traps and quarantines all later modu
     if(path==='/favicon.ico')return new Response('',{status:404});
     if(path==='/')return new Response(html,{headers:{'content-type':'text/html'}});
     if(path==='/gpu.js')return new Response(moduleSource,{headers:{'content-type':'text/javascript'}});
-    return new Response(Bun.file(path==='/panic.wasm'?resolve(profile,'panic.wasm'):path==='/gpu-glue.js' && process.env.E2B_GPU_SOURCE ? process.env.E2B_GPU_SOURCE : resolve(web,path.slice(1))));
+    const file=Bun.file(path==='/panic.wasm'?resolve(profile,'panic.wasm'):path==='/gpu-glue.js' && process.env.E2B_GPU_SOURCE ? process.env.E2B_GPU_SOURCE : resolve(web,path.slice(1)));
+    return new Response(readFileSync(file.name),{headers:{'content-type':file.type}});
   }});
   const suite=await cdpBrowser(),{cdp}=suite, hostLines=[];
   let listener;
@@ -141,7 +144,7 @@ async function noWebGPU(install, run) {
     <div id="sky" style="width:300px;height:200px;position:relative"><canvas data-surface></canvas><div id="content" style="position:absolute;inset:0"><button id="change">Change station</button></div></div><script type="module">
     Object.defineProperty(Navigator.prototype,'gpu',{get(){return undefined;},configurable:true});
     document.documentElement.setAttribute('data-exact-worlds','world arena');
-    const host=document.getElementById('host');
+    const element=document.getElementById('host');
     globalThis.exact={views:new Map([[1,host],[2,document.getElementById('sky')]]),root:document.body,devAssets:[],generation:0,pageFacts:{agent:false,read:()=>({}),tell(){},changed(){}},
       wasm:{exact_surface_record:()=>0},writeIn:x=>x,send(){}};
     await import('/gpu-glue.js'); exact.gpu.surface(1,'world',[]);
@@ -155,7 +158,8 @@ async function noWebGPU(install, run) {
     if(path==='/gpu.js'){globalThis.moduleFetched=true;return new Response('export default function(){}',{headers:{'content-type':'text/javascript'}});}
     if(path==='/.exact/install.json')return install();
     if(path==='/favicon.ico')return new Response('',{status:404});
-    return new Response(Bun.file(resolve(web,path.slice(1))));
+    const file=Bun.file(resolve(web,path.slice(1)));
+    return new Response(readFileSync(file.name),{headers:{'content-type':file.type}});
   }});
   const suite=await cdpBrowser(),{cdp}=suite, lines=[];
   let listener;

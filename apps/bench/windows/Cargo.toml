@@ -19,6 +19,7 @@ test = false
 bench = false
 
 [dependencies]
+ibex2-sqlite = { path = "../../../vendor/ibex/crates/ibex2-sqlite" }
 exact-logic = { path = "../../../logic" }
 exact-windows = { path = "../../../host/windows" }
 # The packages' Windows implementations name `exact_linux::package` (LLP 1133.022 D10 item 5).

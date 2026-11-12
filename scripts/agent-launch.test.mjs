@@ -2,13 +2,13 @@
 // defaults and overrides are host/web/agent.test.mjs's "launch setup" test.
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, resolve } from 'node:path';
 import { PINNED_RUST } from './app.mjs';
 import { Cdp, agentPage, chromium, chromiumBuilds, launchFacts, launchEnvironment, parseFlags, launchLog, launchFailure, webPort, pollUntil } from './agent-launch.mjs';
 import { PassThrough } from 'node:stream';
-import { placeReporter } from '../host/web/navigation.js';
+import { placeReporter } from '../host/web/navigation/environment.js';
 
 // Every browser carrier opens the page with the same query (LLP 1146 D4): the drive's auth fixture among it.
 test('a web drive opens its page with the facts, its auth fixture, storage and hatches', () => {
@@ -109,7 +109,7 @@ function stampedWasm(stamp = {format: 1, version: engineVersion(), capabilities:
   const body = Buffer.concat([leb(name.length), name, Buffer.isBuffer(stamp) ? stamp : Buffer.from(JSON.stringify(stamp))]);
   return Buffer.concat([Buffer.from([0,97,115,109,1,0,0,0,0]), leb(body.length), body]);
 }
-import { timeReporter } from '../host/web/navigation.js';
+import { timeReporter } from '../host/web/navigation/environment.js';
 // The Snapback device checks need the Snapback client (snapback4/), which this repository does not ship.
 const hasSnapback = existsSync(new URL('../snapback4/web/device-build.mjs', import.meta.url));
 
@@ -170,6 +170,106 @@ test('an ELF file\'s LOAD alignment is its smallest PT_LOAD p_align', async () =
     expect(loadAlignment(elf([[1, 0x4000], [1, 0x4000], [6, 8]]))).toBe(16384); // PT_PHDR's alignment is not a LOAD's
     expect(loadAlignment(elf([[1, 0x4000], [1, 0x1000], [2, 8], [1, 0x4000]]))).toBe(4096);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// The APK's Gradle step: `gradlew` where a POSIX shell runs it, the wrapper jar under the JDK on Windows, and a Gradle
+// that could not start said so rather than ending the build silently.
+test('the Android build starts Gradle on every host, and says when it could not', async () => {
+  const { gradleWrapper, jvmOptions, runGradle } = await import('./agent-android.mjs');
+  const reader = resolve(import.meta.dir, '../host/android');
+  for (const platform of ['darwin', 'linux']) expect(gradleWrapper(platform, {})).toEqual([resolve(reader, 'gradlew')]);
+  const jar = ['-Xmx64m', '-Xms64m', '-Dorg.gradle.appname=gradlew', '-jar', resolve(reader, 'gradle/wrapper/gradle-wrapper.jar')];
+  expect(gradleWrapper('win32', { JAVA_HOME: '/jdk' })).toEqual([resolve('/jdk', 'bin', 'java.exe'), ...jar]);
+  expect(gradleWrapper('win32', { JAVA_HOME: '"/jdk"' })[0]).toBe(resolve('/jdk', 'bin', 'java.exe'));
+  expect(gradleWrapper('win32', { JAVA_HOME: '""' })[0]).toBe('java.exe');
+  expect(gradleWrapper('win32', {})).toEqual(['java.exe', ...jar]);
+  expect(existsSync(jar.at(-1))).toBe(true);
+  // JAVA_OPTS, then GRADLE_OPTS, between the heap flags and the jar: a proxy for the distribution's download, a quoted
+  // value with a space, a Windows path's backslashes and an apostrophe, which quotes nothing on Windows.
+  const opts = { JAVA_HOME: '/jdk', JAVA_OPTS: '-Xmx2g  "-Djavax.net.ssl.trustStore=C:\\Program Files\\certs\\store" -Dtrust=C:\\Users\\O\'Brien\\certs\\corp.jks',
+    GRADLE_OPTS: '-Dhttps.proxyHost=proxy.example\t-Dhttps.proxyPort=8080 "-Dhttp.nonProxyHosts=localhost|*.lan" it\'s two\'s' };
+  expect(gradleWrapper('win32', opts)).toEqual([resolve('/jdk', 'bin', 'java.exe'), '-Xmx64m', '-Xms64m', '-Xmx2g',
+    '-Djavax.net.ssl.trustStore=C:\\Program Files\\certs\\store', "-Dtrust=C:\\Users\\O'Brien\\certs\\corp.jks",
+    '-Dhttps.proxyHost=proxy.example', '-Dhttps.proxyPort=8080', '-Dhttp.nonProxyHosts=localhost|*.lan', "it's", "two's", ...jar.slice(2)]);
+  // The C runtime's backslash and quote rules: `\"` is a literal quote, `\\"` a backslash and a quote that quotes, and
+  // `""` inside quotes one quote.
+  expect(jvmOptions('-Da=\\"x\\" "-Db=C:\\dir\\\\" -Dc=a\\\\\\"b "-Dd=say ""hi"""')).toEqual(['-Da="x"', '-Db=C:\\dir\\', '-Dc=a\\"b', '-Dd=say "hi"']);
+  expect(jvmOptions(undefined)).toEqual([]);
+  // A malformed value is named, never printed: it can hold a password.
+  const leaky = { GRADLE_OPTS: '-Dhttps.proxyPassword=hunter2 "-Xmx2g' };
+  expect(() => gradleWrapper('win32', leaky)).toThrow('GRADLE_OPTS has an unmatched " at character 31');
+  try { gradleWrapper('win32', leaky); } catch (e) { expect(e.message).not.toContain('hunter2'); }
+  const missing = resolve(tmpdir(), 'exact-no-such-jdk');
+  const said = [], error = console.error;
+  console.error = (line) => said.push(line);
+  try { expect(runGradle(['--version'], { env: { JAVA_HOME: missing, JAVA_OPTS: '-Dhttps.proxyPassword=hunter2' } }, 'win32')).toBe(false); }
+  finally { console.error = error; }
+  expect(said.join('\n')).not.toContain('hunter2');
+  expect(said).toEqual([expect.stringContaining(`could not start Gradle (${resolve(missing, 'bin', 'java.exe')}): `)]);
+});
+
+// The Windows launch gives Java what the POSIX gradlew gives it, in the same order, under a stand-in java that prints
+// its arguments. Double quotes only, where xargs and the Windows rules agree.
+test.skipIf(process.platform === 'win32')("the Windows Gradle launch passes the JVM options as gradlew does", async () => {
+  const { gradleWrapper } = await import('./agent-android.mjs');
+  const jdk = mkdtempSync(resolve(tmpdir(), 'exact-jdk-'));
+  try {
+    mkdirSync(resolve(jdk, 'bin'));
+    writeFileSync(resolve(jdk, 'bin/java'), '#!/bin/sh\nfor a; do printf "%s\\n" "$a"; done\n', { mode: 0o755 });
+    const env = { PATH: process.env.PATH, JAVA_HOME: jdk, JAVA_OPTS: '-Xmx2g "-Dtrust=/certs/my store"',
+      GRADLE_OPTS: '-Dhttps.proxyHost=proxy.example -Dhttps.proxyPort=8080 "-Dhttp.nonProxyHosts=localhost|*.lan"' };
+    const reader = resolve(import.meta.dir, '../host/android');
+    const posix = spawnSync(resolve(reader, 'gradlew'), [':app:assembleRelease', '-PappDir=/my apps/a b'], { cwd: reader, env, encoding: 'utf8' });
+    expect(posix.status).toBe(0);
+    const given = posix.stdout.trimEnd().split('\n');
+    const [, ...windows] = gradleWrapper('win32', env);
+    const jar = (args) => args.map((a) => a.endsWith('gradle-wrapper.jar') ? 'gradle-wrapper.jar' : a);
+    expect(jar(given)).toEqual(jar([...windows, ':app:assembleRelease', '-PappDir=/my apps/a b']));
+  } finally { rmSync(jdk, { recursive: true, force: true }); }
+});
+
+// What the APK build reads after packaging (LLP 1159.002 D2): AGP strips the library, and what it loads stays.
+test('an APK whose library loads other bytes than the staged one is refused', async () => {
+  const { loadedImage, keptLibrary } = await import('./agent-android.mjs');
+  // Two PT_LOADs (the first holds the ELF header, as a real one does) and a PT_NOTE; `tail` stands for what
+  // stripping removes and `shoff` for the header field it rewrites.
+  const elf = (code, { tail = 0, shoff = 0n } = {}) => {
+    const head = Buffer.alloc(64 + 56 * 3), text = Buffer.from(code);
+    head.writeBigUInt64LE(64n, 0x20); head.writeBigUInt64LE(shoff, 0x28); head.writeUInt16LE(56, 0x36); head.writeUInt16LE(3, 0x38);
+    const load = (i, offset, length) => { head.writeUInt32LE(1, 64 + 56 * i); head.writeBigUInt64LE(BigInt(offset), 64 + 56 * i + 0x08); head.writeBigUInt64LE(BigInt(length), 64 + 56 * i + 0x20); };
+    load(0, 0, head.length); load(1, head.length, text.length); head.writeUInt32LE(4, 64 + 56 * 2);
+    return Buffer.concat([head, text, Buffer.alloc(tail, 7)]);
+  };
+  const staged = elf('one build');
+  expect(loadedImage(staged)).toMatch(/^[0-9a-f]{64}$/);
+  expect(keptLibrary(staged, elf('one build', { shoff: 4096n }), ['app', 'canvas'])).toBe(null);
+  expect(keptLibrary(elf('one build', { tail: 4096 }), staged, ['app', 'canvas'])).toBe(null);
+  const kept = keptLibrary(staged, elf('another one'), ['app', 'canvas']);
+  expect(kept).toBe(`the APK holds a libexactcanvas.so that is not the one this build made (${loadedImage(elf('another one')).slice(0, 12)} in the APK, ${loadedImage(staged).slice(0, 12)} staged, by what each loads). Gradle kept an earlier build's: delete app and canvas and build again`);
+  expect(keptLibrary(staged, null, ['app', 'canvas'])).toBe("the APK holds no libexactcanvas.so. Gradle kept an earlier build's: delete app and canvas and build again");
+});
+
+test('a file is read out of a zip archive, stored or deflated, without unzip', async () => {
+  const { zipEntry } = await import('./agent-android.mjs');
+  const { deflateRawSync } = await import('node:zlib');
+  // Two entries: a stored one, then a deflated one behind a local extra field.
+  const files = [['assets/a.txt', Buffer.from('stored'), 0, 0], ['lib/arm64-v8a/libexactcanvas.so', Buffer.from('library '.repeat(40)), 8, 4]];
+  const locals = [], centrals = [];
+  let offset = 0;
+  for (const [name, bytes, method, extra] of files) {
+    const data = method ? deflateRawSync(bytes) : bytes, local = Buffer.alloc(30 + name.length + extra), central = Buffer.alloc(46 + name.length);
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(name.length, 26); local.writeUInt16LE(extra, 28); local.write(name, 30);
+    central.writeUInt32LE(0x02014b50, 0); central.writeUInt16LE(method, 10); central.writeUInt32LE(data.length, 20); central.writeUInt32LE(bytes.length, 24);
+    central.writeUInt16LE(name.length, 28); central.writeUInt32LE(offset, 42); central.write(name, 46);
+    locals.push(local, data); centrals.push(central); offset += local.length + data.length;
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 10); end.writeUInt32LE(offset, 16);
+  const zip = Buffer.concat([...locals, ...centrals, end]);
+  expect(zipEntry(zip, 'assets/a.txt')?.toString()).toBe('stored');
+  expect(zipEntry(zip, 'lib/arm64-v8a/libexactcanvas.so')?.toString()).toBe('library '.repeat(40));
+  expect(zipEntry(zip, 'lib/arm64-v8a/other.so')).toBe(null);
+  expect(zipEntry(Buffer.from('not a zip archive at all'), 'a')).toBe(null);
 });
 
 // An app's directory pins no toolchain, so the Android build asks rustup about the pinned one by name.
@@ -267,7 +367,7 @@ test("a Chrome that dies at launch is reported by its first fatal line, before t
 test.skipIf(!hasSnapback)('a web test run asks the backend its app fetches first', async () => {
   const { backendPreflight, loopbackOrigins, fetchOrigins } = await import('./agent-test.mjs');
   const { createServer } = await import('node:net');
-  const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import('node:fs');
+  const { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { resolve } = await import('node:path');
   const dist = mkdtempSync(resolve(tmpdir(), 'exact-preflight-')), server = createServer().listen(0, '127.0.0.1');
@@ -297,7 +397,7 @@ test.skipIf(!hasSnapback)('a web test run asks the backend its app fetches first
 test.skipIf(!hasSnapback)('device preflight refuses server skew, stale provenance and empty wasm before a drive', async () => {
   const { devicePreflight, deviceHash, readDeviceStamp, validateDevice } = await import('../snapback4/web/device-build.mjs');
   const { createServer } = await import('node:http');
-  const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import('node:fs');
+  const { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { resolve } = await import('node:path');
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-device-'));
@@ -381,7 +481,7 @@ test.skipIf(!hasSnapback)('Firefox and WebKit refuse missing and skewed devices 
   const { open } = await import('./agent.mjs');
   const { createApp, wireSnapback } = await import('../game/new.mjs');
   const { deviceHash } = await import('../snapback4/web/device-build.mjs');
-  const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import('node:fs');
+  const { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { resolve } = await import('node:path');
   const parent = mkdtempSync(resolve(tmpdir(), 'exact-carrier-preflight-'));
@@ -409,7 +509,7 @@ test.skipIf(!hasSnapback)('Firefox and WebKit refuse missing and skewed devices 
 test('fresh empties each snapback4 dev server through its reset door, and refuses one without it', async () => {
   const { resetBackends, freshRows } = await import('./agent-test.mjs');
   const { createServer } = await import('node:http');
-  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { mkdtempSync, rmSync, symlinkSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { resolve } = await import('node:path');
   const posted = [];
@@ -1101,11 +1201,15 @@ test('a native build is stale when a setting its module inlined has another valu
   try {
     writeFileSync(resolve(dir,'app.json'),JSON.stringify({name:'Native',app:{id:'com.exact.native',name:'Native'},env:[name]}));
     writeFileSync(resolve(dir,'app.contract'),'component App\n  view\n    text "x"\n');
+    // Separate file mtimes from the receipt's millisecond precision; only the setting changes.
+    const inputTime=new Date('2026-01-01T00:00:00Z'), builtTime=new Date('2026-01-01T00:01:00Z');
+    for (const file of ['app.json','app.contract']) utimesSync(resolve(dir,file),inputTime,inputTime);
     const app=resolveApp(dir), receipt=resolve(dir,'target/receipt.json');
     mkdirSync(dirname(receipt),{recursive:true});
     // As completeBuild records a Mac build whose bake inlined the setting from the environment.
-    writeFileSync(receipt,JSON.stringify({target:'aarch64-apple-darwin',started:new Date().toISOString(),
+    writeFileSync(receipt,JSON.stringify({target:'aarch64-apple-darwin',started:builtTime.toISOString(),
       build:{binary:{inputs:[],missing:[],directories:[]},settings:{dir,env:{[name]:{value:'http://a.example',source:'environment'}}}}}));
+    utimesSync(receipt,builtTime,builtTime);
     process.env[name]='http://a.example';
     try {
       expect(receiptChanges(receipt,app)).toEqual([]);
@@ -1118,6 +1222,30 @@ test('a native build is stale when a setting its module inlined has another valu
     if (before===undefined) delete process.env.EXACT_APP_DIR; else process.env.EXACT_APP_DIR=before;
     rmSync(dir,{recursive:true,force:true});
   }
+});
+
+test('a path a build script watches that was absent at build is unchanged while absent; appearing or going is a change', async () => {
+  const {receiptChanges}=await import('./agent-launch.mjs');
+  const dir=mkdtempSync(resolve(tmpdir(),'exact-watched-absent-'));
+  try {
+    // A path dependency beside the app whose build script watches `../../.env`, as Cargo's dep-info then names it.
+    const env=resolve(dir,'.env'), lib=resolve(dir,'vendor/watcher/src/lib.rs'), app=resolve(dir,'app');
+    for (const path of [lib, resolve(app,'app.contract')]) { mkdirSync(dirname(path),{recursive:true}); writeFileSync(path,''); }
+    const fixture={dir:app,workspace:app,target:resolve(app,'target'),manifest:{},crate:()=>'native-apple'};
+    const info=resolve(fixture.target,'aarch64-apple-darwin/debug/libnative_apple.d');
+    mkdirSync(dirname(info),{recursive:true});
+    writeFileSync(info,`${resolve(fixture.target,'aarch64-apple-darwin/debug/libnative_apple.a')}: ${lib} ${env}\n`);
+    const receipt=resolve(app,'receipt.json');
+    const write=(missing)=>writeFileSync(receipt,JSON.stringify({target:'aarch64-apple-darwin',started:new Date(Date.now()+1000).toISOString(),
+      build:{binary:{inputs:[],missing,directories:[]}}}));
+    write([env]);
+    expect(receiptChanges(receipt,fixture)).toEqual([]);
+    writeFileSync(env,'API=1\n');
+    expect(receiptChanges(receipt,fixture)).toEqual([env]);
+    // Present when the build ran (so not in `missing`), gone now.
+    write([]); rmSync(env);
+    expect(receiptChanges(receipt,fixture)).toEqual([env]);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
 test('a Linux or Android build is stale when a setting the executable holds has another value now, or none is bound to it', async () => {
@@ -1182,4 +1310,38 @@ test('permission and bind values do not occupy the gallery command word', async 
     expect(parsed.activity).toEqual({entry:'departure', placement:'lockScreen'});
     expect(parsed.argv).toEqual([flag, 'fixture', 'ios', 'state']);
   }
+});
+
+test('an APK with Maven libraries refuses missing locks before any native build work', async () => {
+  const { androidLockCommand, buildApk } = await import('./agent-android.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-maven-')), error = console.error, said = [];
+  try {
+    console.error = line => said.push(line);
+    mkdirSync(resolve(dir, 'node_modules/@exact'), { recursive: true });
+    symlinkSync(resolve(import.meta.dir, '../packages/in-app-browser'), resolve(dir, 'node_modules/@exact/in-app-browser'), 'dir');
+    writeFileSync(resolve(dir, 'package.json'), JSON.stringify({ dependencies: { '@exact/in-app-browser': '*' } }));
+    writeFileSync(resolve(dir, 'app.ts'), 'import { openBrowser } from "@exact/in-app-browser";');
+    const app = { dir, name: 'shop', crate() { throw new Error('native build reached'); } };
+    for (const game of [false, true]) {
+      app.manifest = game ? { game: {} } : {};
+      expect(buildApk(app, {}, 'release')).toBeNull();
+    }
+    const root = resolve(import.meta.dir, '..');
+    expect(said.at(-1)).toContain(`by running in '${root}': bun scripts/agent-android.mjs build 'shop' --apk --write-locks, with EXACT_APP_DIR set to '${dir}',`);
+    // An app inside the checkout that is not `apps/<name>` is named by its directory too.
+    expect(androidLockCommand({ dir: resolve(root, 'packages/camera/test/fixture'), name: 'fixture' })).toBe(`in '${root}': bun scripts/agent-android.mjs build 'fixture' --apk --write-locks, with EXACT_APP_DIR set to '${resolve(root, 'packages/camera/test/fixture')}'`);
+    expect(androidLockCommand({ dir: resolve(root, 'apps/caltrain'), name: 'caltrain' })).toBe(`in '${root}': bun scripts/agent-android.mjs build 'caltrain' --apk --write-locks`);
+    writeFileSync(resolve(dir, 'exact.mjs'), '');
+    expect(buildApk(app, {}, 'host-dev')).toBeNull();
+    expect(said.at(-1)).toContain(`by running in '${dir}': bun exact.mjs android --write-locks,`);
+    for (const file of ['gradle.lockfile', 'gradle-verification.xml']) {
+      writeFileSync(resolve(dir, file), 'locked');
+      if (file === 'gradle.lockfile') expect(buildApk(app, {}, 'release')).toBeNull();
+    }
+    expect(() => buildApk(app, {}, 'release')).toThrow('native build reached');
+    rmSync(resolve(dir, 'gradle.lockfile'));
+    expect(() => buildApk(app, {}, 'release', true)).toThrow('native build reached');
+    writeFileSync(resolve(dir, 'app.ts'), '');
+    expect(() => buildApk(app, {}, 'release')).toThrow('native build reached');
+  } finally { console.error = error; rmSync(dir, { recursive: true, force: true }); }
 });

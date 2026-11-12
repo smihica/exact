@@ -1,12 +1,14 @@
 //! Startup timestamps for the display path (a headless run reports none).
 //!
-//! All marks are seconds on `CLOCK_BOOTTIME`, the clock `/proc/self/stat`
+//! On Linux, marks are seconds on `CLOCK_BOOTTIME`, the clock `/proc/self/stat`
 //! counts the process start in (ticks of 1/`CLK_TCK`, usually 10 ms).
 //! A suspend during startup therefore counts toward the numbers.
 //! DRM flip timestamps are `CLOCK_MONOTONIC` and are converted on read.
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(unix)]
 fn clock(id: libc::clockid_t) -> f64 {
     let mut t = libc::timespec {
         tv_sec: 0,
@@ -20,24 +22,33 @@ fn clock(id: libc::clockid_t) -> f64 {
     t.tv_sec as f64 + t.tv_nsec as f64 / 1e9
 }
 
-/// Seconds on `CLOCK_BOOTTIME`.
+/// Seconds on `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other Unix hosts,
+/// or a process-local `Instant` origin on non-Unix hosts.
 pub fn boottime() -> f64 {
     #[cfg(target_os = "linux")]
     {
         clock(libc::CLOCK_BOOTTIME)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         clock(libc::CLOCK_MONOTONIC)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::{sync::OnceLock, time::Instant};
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64()
     }
 }
 
 /// Converts a `CLOCK_MONOTONIC` instant, such as a DRM flip's, to BOOTTIME seconds.
+#[cfg(target_os = "linux")]
 fn monotonic_to_boottime(t: Duration) -> f64 {
     t.as_secs_f64() + (boottime() - clock(libc::CLOCK_MONOTONIC))
 }
 
 /// The process start in seconds since boot, and the tick length in ms.
+#[cfg(target_os = "linux")]
 fn process_start() -> Option<(f64, f64)> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     // Field 22 (starttime). Count from the last ')' since the command name may contain spaces.
@@ -47,6 +58,11 @@ fn process_start() -> Option<(f64, f64)> {
     #[allow(unsafe_code)]
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     (hz > 0.0).then(|| (ticks / hz, 1000.0 / hz))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start() -> Option<(f64, f64)> {
+    None
 }
 
 /// The runner's outstanding work as `kind:name` items, named as on the Apple host.
@@ -114,6 +130,7 @@ impl LaunchMarks {
 
     /// A flip completed at `at` (`CLOCK_MONOTONIC`). If nothing is outstanding
     /// and the data module is active, TTI is this flip's time.
+    #[cfg(target_os = "linux")]
     pub fn flipped(&mut self, at: Duration, outstanding: &[String]) {
         self.changed = false;
         self.expire(boottime());
@@ -246,6 +263,45 @@ impl LaunchMarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_marks_share_a_monotonic_clock_on_every_host() {
+        let before = boottime();
+        let mut marks = LaunchMarks::new();
+        marks.launch_end();
+        marks.submitted(true);
+        marks.activated();
+        marks.turn(&[]);
+        let after = boottime();
+
+        let mut previous = before;
+        for at in [
+            marks.launch_end,
+            marks.commit,
+            marks.present,
+            marks.activated,
+            marks.interactive,
+            Some(after),
+        ] {
+            let at = at.unwrap();
+            assert!(at.is_finite() && at >= previous);
+            previous = at;
+        }
+        assert_eq!(marks.report()["tti"], "settled");
+        assert!(marks.take_done());
+        assert!(!marks.take_done());
+        assert_eq!(marks.timeout_ms(), None);
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(process_start(), None);
+            let report = marks.report();
+            assert!(report["marks"].as_object().unwrap().is_empty());
+            assert!(report["metrics"].get("coldLaunchTime").is_none());
+            assert!(report["metrics"]["timeToFirstRender"].is_number());
+            assert!(report["metrics"]["timeToInteractive"].is_number());
+        }
+    }
 
     #[test]
     fn pending_activation_and_resources_end_at_the_startup_deadline() {

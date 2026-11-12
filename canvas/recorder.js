@@ -420,7 +420,8 @@ function arcToSegs(p0, p1, p2, r) {
   if ((p0[0] === p1[0] && p0[1] === p1[1]) || (p1[0] === p2[0] && p1[1] === p2[1]) || r === 0) return null;
   const v1 = [p0[0] - p1[0], p0[1] - p1[1]], v2 = [p2[0] - p1[0], p2[1] - p1[1]];
   const cross = v1[0] * v2[1] - v1[1] * v2[0], l1 = Math.hypot(v1[0], v1[1]), l2 = Math.hypot(v2[0], v2[1]);
-  if (Math.abs(cross) <= 1e-12 * l1 * l2) return null;
+  // Skia's arcTo treats |sin(turn)| <= 1/4096 as collinear.
+  if (Math.abs(cross) <= (1 / 4096) * l1 * l2) return null;
   const u1 = [v1[0] / l1, v1[1] / l1], u2 = [v2[0] / l2, v2[1] / l2];
   const cos = Math.min(1, Math.max(-1, u1[0] * u2[0] + u1[1] * u2[1]));
   const half = Math.acos(cos) / 2, dist = r / Math.tan(half);
@@ -699,7 +700,8 @@ function svgPath(text, d) {
   for (;;) {
     skip(false);
     if (at >= s.length) return;
-    if (/[A-Za-z]/.test(s[at])) cmd = s[at++]; else if (!cmd || !more()) return;
+    // `Z` takes no numbers: one after it is the path's first error (SVG 2 §9.5.4), and repeating `Z` would never end.
+    if (/[A-Za-z]/.test(s[at])) cmd = s[at++]; else if (!cmd || cmd === "Z" || cmd === "z" || !more()) return;
     if (first && cmd !== "M" && cmd !== "m") return;
     first = false;
     const rel = cmd === cmd.toLowerCase(), base = rel ? cur : [0, 0];

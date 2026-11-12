@@ -646,34 +646,54 @@ export function developmentLaunchEnvironment(args, environment = process.env) {
   return { ...environment, EXACT_DEV_PLAN: url.href };
 }
 
+/** The environment a build signs under a profile that is (`debuggable`) or is not a development one: App Attest's
+ * and push's (LLP 1133.028 D15 item 1; LLP 1133.004 §9 P2). */
+export const signedEnvironment = (debuggable) => debuggable ? 'development' : 'production';
+
+/** Whether profile `p` allows entitlement `name` as the build signs it under `p`: the key, and for push's environment,
+ * which a profile carries as a value, the value the build writes there. The Live Activity path and the grant path
+ * both ask this. */
+export const allowsEntitlement = (p, name) => name === 'aps-environment' ? p.aps === signedEnvironment(p.dev) : p.entitlements.includes(name);
+
+/** What `p` lacks of `required`, each as a refusal names it. */
+export const lacks = (p, required = []) => required.filter((name) => !allowsEntitlement(p, name)).map((name) => name === 'aps-environment' && p.aps
+  ? `aps-environment ${signedEnvironment(p.dev)} (it allows ${p.aps ?? 'no value'}, and this build signs ${signedEnvironment(p.dev)} under a ${p.dev ? 'development' : 'distribution'} profile)`
+  : name);
+
 /** Whether a profile allows every entitlement in `required` (a grant's
  * signing entitlements, LLP 1069.008.000 D4). */
-export const allows = (p, required = []) => !!p && required.every((name) => p.entitlements.includes(name));
+export const allows = (p, required = []) => !!p && lacks(p, required).length === 0;
 
 /** What a profile that lacks a grant's entitlement needs, said once. */
 const missing = (bundle, required, why) => new Error(required.includes('com.apple.developer.web-browser')
   ? `browser-device-profile: ${required.join(', ')} required by ${bundle}, and ${why}. Request Apple's managed default-browser approval, enable it for this App ID, then install a profile that grants it (or name it with EXACT_PROFILE).`
   : `grant-device-profile: ${required.join(', ')} ${required.length > 1 ? 'are' : 'is'} needed by this app's grants, and ${why} (a team wildcard never allows HealthKit). In the Apple Developer portal, register the App ID ${bundle} with that capability, make a development profile for it that includes this phone, and install it (or name it with EXACT_PROFILE).`);
 
-/** A development profile on this Mac covering the phone and the bundle id (the team's wildcard or the id itself, under the profile's App ID prefix, which an older team's App IDs keep apart from its team id), unexpired; EXACT_PROFILE names one.
+/** A development profile on this Mac covering the phone and the bundle id (the team's wildcard or the id itself, under the profile's App ID prefix, which an older team's App IDs keep apart from its team id), unexpired; DEVELOPMENT_TEAM restricts the team, and EXACT_PROFILE overrides that choice.
  * With `required` (a grant's signing entitlements), only one that allows them all, which is one for the id itself. */
-export function profile(udid, bundle, required = [], { installed = installedProfiles(), named = process.env.EXACT_PROFILE ? decodeProfile(process.env.EXACT_PROFILE) : null } = {}) {
+export function profile(udid, bundle, required = [], { installed = installedProfiles(), named = process.env.EXACT_PROFILE ? decodeProfile(process.env.EXACT_PROFILE) : null, team = process.env.DEVELOPMENT_TEAM?.trim(), phoneName = udid } = {}) {
   if (named) {
     if (!iosProfile(named)) throw new Error(`EXACT_PROFILE (${named.name}) is not an iOS profile; its platform is ${named.platforms.join(', ')}`);
     if (!allows(named, required)) throw missing(bundle, required, `EXACT_PROFILE (${named.name}) does not allow ${required.length > 1 ? 'them' : 'it'}`);
     return named;
   }
-  const covering = coveringProfiles(udid, bundle, installed);
-  if (!covering.length) throw new Error(`no development provisioning profile on this Mac covers ${bundle} on this phone (${udid}); run any app on it from Xcode once with team signing, or name one with EXACT_PROFILE`);
+  const covering = coveringProfiles(udid, bundle, installed, team);
+  if (!covering.length) throw missingDevelopmentProfile(udid, bundle, team, phoneName);
   const found = covering.filter((p) => allows(p, required));
   if (!found.length) throw missing(bundle, required, `no development profile on this Mac for ${bundle} on this phone allows ${required.length > 1 ? 'them' : 'it'}`);
   return found[0];
 }
 
+/** A missing development profile, naming what Xcode must sign to create one. */
+export function missingDevelopmentProfile(udid, bundle, team, phoneName = udid) {
+  const phone = phoneName && phoneName !== udid ? `${phoneName}, ${udid}` : udid;
+  return new Error(`no development provisioning profile on this Mac${team ? ` for team ${team} (DEVELOPMENT_TEAM)` : ''} covers ${bundle} on this phone (${phone}); in Xcode, run a project with bundle ID ${bundle}${team ? ` and team ${team}` : ' and your team'} on that phone with Automatically manage signing enabled, then retry (or ${team ? "unset DEVELOPMENT_TEAM to take any team's profile, or " : ''}name a profile with EXACT_PROFILE)`);
+}
+
 /** The unexpired development profiles on this Mac that cover the phone and the bundle id (the team's wildcard or
  * the id itself), the longest-lived first. */
-export function coveringProfiles(udid, bundle, installed = installedProfiles()) {
-  return profilesFor(bundle, installed).filter((p) => iosProfile(p) && p.dev && !profileMisfit(p, udid)).sort(byExpiry);
+export function coveringProfiles(udid, bundle, installed = installedProfiles(), team = null) {
+  return profilesFor(bundle, installed).filter((p) => (!team || p.team === team) && iosProfile(p) && p.dev && !profileMisfit(p, udid)).sort(byExpiry);
 }
 /** The profile for a bundle the app embeds under an App ID of its own (its App Clip), chosen as `entryProfiles`
  * chooses the widget extension's: for `bundle` itself or the team's wildcard, of the app's profile's (`like`) team,
@@ -682,7 +702,7 @@ export function coveringProfiles(udid, bundle, installed = installedProfiles()) 
  * the longest-lived. Or a refusal naming what each profile for the id lacked. */
 export function embeddedProfile(udid, bundle, like, required = [], installed = installedProfiles()) {
   const candidates = profilesFor(bundle, installed).filter(iosProfile).sort(byExpiry);
-  const why = candidates.map((p) => [p, profileMisfit(p, udid, like) ?? (allows(p, required) ? null : `does not allow ${required.filter((name) => !p.entitlements.includes(name)).join(', ')}`)]);
+  const why = candidates.map((p) => [p, profileMisfit(p, udid, like) ?? (allows(p, required) ? null : `does not allow ${lacks(p, required).join(', ')}`)]);
   const found = why.find(([, reason]) => !reason)?.[0];
   if (found) return found;
   throw new Error(`host/apple: no ${METHODS[like.method]} profile on this Mac covers ${bundle} as the app's (${like.name}) does: ${why.length ? why.map(([p, reason]) => `"${p.name}" ${reason}`).join('; ') : 'none is for it'}. In the Apple Developer portal, register the App ID ${bundle}${required.length ? ` with ${required.join(', ')}` : ''}, make a ${METHODS[like.method]} profile for it of team ${like.team}${udid ? ' that includes this phone' : ''}, and install it.`);
@@ -736,12 +756,12 @@ export function decodeProfile(path) {
 }
 
 /** The Apple Development identity (its SHA-1) for a team, from the keychain; EXACT_IDENTITY names one. */
-export function identity(team) {
-  if (process.env.EXACT_IDENTITY) return process.env.EXACT_IDENTITY;
-  const valid = [...(read('security', ['find-identity', '-v', '-p', 'codesigning']).stdout ?? '').matchAll(/\d+\) ([0-9A-F]{40}) "(Apple Development: [^"]+)"/g)].map((m) => ({ sha1: m[1], name: m[2] }));
-  const pems = (read('security', ['find-certificate', '-a', '-c', 'Apple Development', '-p']).stdout ?? '').split('-----END CERTIFICATE-----').filter((c) => c.includes('BEGIN CERTIFICATE'));
+export function identity(team, { env = process.env, read: readSigning = read } = {}) {
+  if (env.EXACT_IDENTITY) return env.EXACT_IDENTITY;
+  const valid = [...(readSigning('security', ['find-identity', '-v', '-p', 'codesigning']).stdout ?? '').matchAll(/\d+\) ([0-9A-F]{40}) "(Apple Development: [^"]+)"/g)].map((m) => ({ sha1: m[1], name: m[2] }));
+  const pems = (readSigning('security', ['find-certificate', '-a', '-c', 'Apple Development', '-p']).stdout ?? '').split('-----END CERTIFICATE-----').filter((c) => c.includes('BEGIN CERTIFICATE'));
   for (const pem of pems) {
-    const x = read('openssl', ['x509', '-noout', '-subject', '-fingerprint', '-sha1'], { input: pem + '-----END CERTIFICATE-----\n' }).stdout ?? '';
+    const x = readSigning('openssl', ['x509', '-noout', '-subject', '-fingerprint', '-sha1'], { input: pem + '-----END CERTIFICATE-----\n' }).stdout ?? '';
     const sha1 = /Fingerprint=([0-9A-F:]+)/i.exec(x)?.[1].replace(/:/g, '');
     const ou = /OU\s*=\s*([A-Z0-9]+)/.exec(x)?.[1];
     const id = valid.find((v) => v.sha1 === sha1);

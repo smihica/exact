@@ -116,6 +116,11 @@ async function answer(source: string, args: any[]): Promise<unknown> {
       await sleep(400);
       return "chained";
     }
+    case "sleepThenFetch": {
+      await sleep(100);
+      await fetch("https://fixture.exact.test/after-sleep");
+      return "fetched after sleep";
+    }
     // Over the turn's budget, so the runner asks it again later.
     case "spin": {
       if (args[0] === 0) return "idle";
@@ -130,6 +135,6 @@ async function answer(source: string, args: any[]): Promise<unknown> {
 (globalThis as any).exact = {
   abi: 1,
   appId: "test.timers",
-  grants: "net.fetch https://fixture.exact.test\n",
+  grants: "net.fetch https://fixture.exact.test\nsecret.keep shared\n",
   answer,
 };

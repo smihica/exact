@@ -72,7 +72,26 @@ internal class Structure {
         19 -> i + 26; 20 -> i + 2; 21 -> i + 1; 23 -> i + 2; 24, 30, 31 -> i + 3 + b.get(i + 2); 25 -> i + 3 + b.get(i + 2); 43 -> i + 2 + b.get(i + 1); 44 -> i + 2
         26 -> i + 3 + (b.get(i + 2) + 3) / 4; 27 -> i + 14; 42 -> i + 14 + 2 * b.get(i + 1); 28 -> i + 16 + (b.get(i + 15) + 3) / 4; 29 -> i + 2
         32 -> i + 2; 33 -> i + 3; 40 -> i + 27; 41 -> fontAxesEnd(b, i)
+        45 -> i + 2 + b.get(i + 1)
+        46 -> i + 1
+        47 -> i + 2
+        48 -> i + 10
         else -> throw IllegalStateException("op ${b.get(i)} at $i")
+    }
+
+    /** The RESTORE that closes the group whose content starts at [from], or -1. */
+    fun layerEnd(b: IntBuffer, from: Int, n: Int): Int {
+        var depth = 0
+        var i = from
+        while (i < n) {
+            when (b.get(i)) {
+                4, 5, 7, 45, 46 -> depth++
+                6 -> { if (depth == 0) return i; depth-- }
+                20, 21 -> return -1
+            }
+            i = end(b, i)
+        }
+        return -1
     }
 
     /** [b]'s top-level signature (returned) and its groups' ([groups], [groupSigs]); [token] names a row's node. */

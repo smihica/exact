@@ -51,7 +51,7 @@ pub(super) struct State {
     at: (f32, f32),
     size: (f32, f32),
     phase: Phase,
-    edge_clock: f64,
+    edge_clock: Option<f64>,
 }
 
 impl<D: DataSource> Presenter<D> {
@@ -162,7 +162,7 @@ impl<D: DataSource> Presenter<D> {
             at,
             size: (frame.width, frame.height),
             phase: Phase::Active,
-            edge_clock: now,
+            edge_clock: None,
         });
         self.group_brush();
         self.dirty = true;
@@ -180,15 +180,18 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// The ghost follows the contact; its centre samples the lists.
-    pub(super) fn move_group(&mut self, point: (f32, f32), now: f64) -> Result<bool, String> {
+    pub(super) fn move_group(&mut self, point: (f32, f32)) -> Result<bool, String> {
         let Some(s) = self.group.as_mut().filter(|s| s.phase == Phase::Active) else {
             return Ok(false);
         };
         s.at = (point.0 - s.grab.0, point.1 - s.grab.1);
-        s.edge_clock = now;
         self.group_brush();
         self.dirty = true;
-        self.group_sample()
+        let accepted = self.group_sample()?;
+        if self.group_edge().is_none() {
+            self.group.as_mut().unwrap().edge_clock = None;
+        }
+        Ok(accepted)
     }
 
     /// The grouped list whose port holds the ghost's centre, the gap at
@@ -541,12 +544,17 @@ impl<D: DataSource> Presenter<D> {
     fn group_edges(&mut self, now: f64) {
         self.restore_scroll_anchors();
         let Some((id, vertical, speed)) = self.group_edge() else {
+            if let Some(s) = self.group.as_mut() {
+                s.edge_clock = None;
+            }
             return;
         };
         let s = self.group.as_mut().unwrap();
-        let dt = ((now - s.edge_clock) / 1000.).clamp(0., 0.05) as f32;
+        let dt = s
+            .edge_clock
+            .map_or(0., |last| ((now - last) / 1000.).clamp(0., 0.05) as f32);
         let owner = s.token;
-        s.edge_clock = now;
+        s.edge_clock = Some(now);
         let Some(node) = self.host.kernel().node(id) else {
             return;
         };
@@ -579,6 +587,11 @@ impl<D: DataSource> Presenter<D> {
         // After a scroll the gap is certified again where the ghost is.
         if let Err(e) = self.group_sample() {
             self.host.log(e);
+        }
+        if self.group_edge().is_none() {
+            if let Some(s) = self.group.as_mut() {
+                s.edge_clock = None;
+            }
         }
     }
 

@@ -80,11 +80,13 @@ export function implementation({ changed, agent, log, tracks, audioSession, fore
   /** Take the lease: the capture runs (D6). */
   async function activate(t) {
     t.active = true; t.used = true;
+    // This activation's lease: one given back and taken again while the device opens is another, whose own open adopts.
+    const lease = t.lease = (t.lease ?? 0) + 1;
     t.claim ??= audioSession?.claim();
     if (!agent && (!t.source || t.source.readyState === 'ended')) {
       try {
         const stream = await media.getUserMedia({ audio: t.constraints });
-        if (!t.active || t.readyState !== 'live') { for (const s of stream.getTracks()) s.stop(); return; }
+        if (!t.active || t.lease !== lease || t.readyState !== 'live') { for (const s of stream.getTracks()) s.stop(); return; }
         adopt(t, stream.getAudioTracks()[0]);
         say(`${t.id}: opened again`);
       } catch (e) {
@@ -99,7 +101,7 @@ export function implementation({ changed, agent, log, tracks, audioSession, fore
   }
   /** Give the lease back: the capture stops and the track is idle. */
   function deactivate(t) {
-    t.active = false;
+    t.active = false; t.lease = (t.lease ?? 0) + 1;
     if (!agent) stopSource(t);
     t.claim?.release(); t.claim = null;
     mute(t, 'idle');

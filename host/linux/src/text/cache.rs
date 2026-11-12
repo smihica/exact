@@ -12,7 +12,7 @@
 //! an oversized raw lookup result can remain cold and over target while idle.
 //! Handoffs and externally pinned snapshots are additional live storage; neither
 //! their bytes nor paragraph size are bounded by the cold target.
-//! Paragraph costs include current lazy CPU ink capacity in O(1); diagnostics and
+//! Paragraph costs include lazy CPU ink and stroke bands in O(1); diagnostics and
 //! maintenance run outside paint/build while its exclusive ink borrow is released.
 //! At most 256 payload-free stamp shortcuts refer to current canonical identities.
 //! They own neither text nor paragraph; revision replacement and cold eviction
@@ -123,6 +123,7 @@ struct Payloads {
     lines: HashSet<*const super::Lines>,
     baselines: HashSet<*const Vec<f32>>,
     indexes: HashSet<*const super::ink::Index>,
+    strokes: HashSet<*const Paragraph>,
 }
 impl Payloads {
     fn source(&mut self, source: &ShapedSource) -> usize {
@@ -140,6 +141,10 @@ impl Payloads {
     }
     fn width(&mut self, p: &Paragraph) -> usize {
         let mut bytes = 0;
+        let stroke_bytes = p.strokes.borrow().bytes();
+        if stroke_bytes != 0 && self.strokes.insert(p) {
+            bytes += stroke_bytes;
+        }
         if let Some(lines) = p.record.get() {
             if self.lines.insert(Arc::as_ptr(lines)) {
                 bytes += lines.capacity_bytes();

@@ -12,7 +12,9 @@ import android.view.SurfaceHolder
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import org.json.JSONObject
 import java.io.File
@@ -61,7 +63,9 @@ interface VideoPlayer {
     /** Plays into [view]; [size] gets the video's width, height and pixel aspect ratio as they become known, and
      * [first] is called when a source's first frame has been drawn into the view. */
     fun attach(view: TextureView, size: (Int, Int, Float) -> Unit, first: () -> Unit)
-    fun source(file: File)
+    /** The source to play: a file or an `http(s)` URL ([Sources.video]); null when the element's `src` was refused,
+     * after which the player shows and plays nothing until the next source. */
+    fun source(uri: Uri?)
     fun set(loop: Boolean, muted: Boolean, playing: Boolean)
     fun release()
 }
@@ -514,7 +518,11 @@ class Natives(
         0 -> videoPool.removeLastOrNull() ?: TextureView(context).apply { isOpaque = false }
         1 -> webPool.removeLastOrNull()?.apply { onResume() } ?: WebView(context).apply {
             settings.javaScriptEnabled = true
-            settings.allowFileAccess = true
+            // A guest's navigations stay in its frame, as in a browser's; a file only under the asset root.
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+                    !Sources.navigable(request.url.scheme, request.url.path, assets)
+            }
             isVerticalScrollBarEnabled = false; isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
             setBackgroundColor(Color.WHITE)
@@ -661,8 +669,6 @@ class Natives(
     private fun moduleProps(json: JSONObject): JSONObject =
         json.optString("props").takeIf { it.isNotEmpty() }?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject()
 
-    private fun file(src: String): File = if (src.startsWith("/")) File(src) else File(assets, src)
-
     private fun apply(e: Element, props: String) {
         val old = e.props.takeIf { it.isNotEmpty() }?.let { JSONObject(it) }
         val json = JSONObject(props)
@@ -683,7 +689,11 @@ class Natives(
                     // A lent view holds the last source's frame until this one's first.
                     if (sources.containsKey(view)) e.stale = true
                     sources[view] = src
-                    p.source(file(src))
+                    when (val s = Sources.video(src, assets) { Native.appFile(it)?.let(::File)?.takeIf { f -> Files.regular(f) } }) {
+                        is Source.Remote -> p.source(Uri.parse(s.url))
+                        is Source.Local -> p.source(Uri.fromFile(s.file))
+                        is Source.Refused -> { android.util.Log.w("exact", "video ${e.id}: ${s.why}"); p.source(null) }
+                    }
                 }
                 // The size the view's player last told (it tells again only when the next source's differs).
                 if (e.video !== sizes[view]) { e.video = sizes[view]; fitVideo(e) }
@@ -696,7 +706,17 @@ class Natives(
                 val src = json.optString("src")
                 if (old?.optString("src") != src) {
                     val web = e.view as WebView
-                    if (src.startsWith("http:") || src.startsWith("https:")) web.loadUrl(src) else web.loadUrl(Uri.fromFile(file(src)).toString())
+                    val s = Sources.frame(src, assets)
+                    // A remote page or the error page reads no file; a pooled view may have shown a local one.
+                    web.settings.allowFileAccess = s is Source.Local
+                    when (s) {
+                        is Source.Remote -> web.loadUrl(s.url)
+                        is Source.Local -> web.loadUrl(Uri.fromFile(s.file).toString() + s.suffix)
+                        is Source.Refused -> {
+                            android.util.Log.w("exact", "iframe ${e.id}: ${s.why}")
+                            web.loadDataWithBaseURL(null, Sources.errorPage(s.why), "text/html", "utf-8", null)
+                        }
+                    }
                 }
             }
             // A hatch gave the node another view.
@@ -708,7 +728,12 @@ class Natives(
                 byView[view] = e
                 if (e.w > 0 && e.h > 0) place(e)
             }
-            else -> modules[e.module]?.update(e.view, moduleProps(json))
+            else -> {
+                modules[e.module]?.update(e.view, moduleProps(json))
+                // An update that asked for a layout (an ImageView's scale type takes effect only at its next layout)
+                // is laid out before it is recorded: at an unchanged size nothing else lays the view out first.
+                if (e.view.isLayoutRequested && e.w > 0 && e.h > 0) place(e)
+            }
         }
         e.dirty = true
     }

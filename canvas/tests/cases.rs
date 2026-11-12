@@ -465,6 +465,51 @@ fn the_shared_cases_hold_for_the_rust_recorder() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[test]
+fn arc_to_near_collinear_turns_record_a_line_to_the_corner() {
+    use exact_canvas::{list::Op, Path2d};
+
+    for dy in [1e-7, 1e-4, 1e-2, 0.0244, 0.0245] {
+        for sign in [-1.0, 1.0] {
+            for x2 in [0.0, 200.0] {
+                for path2d in [false, true] {
+                    let ctx = Context2d::new();
+                    let (line, cubic) = if path2d {
+                        let path = Path2d::new();
+                        path.move_to(0.0, 50.0);
+                        path.arc_to(100.0, 50.0, x2, 50.0 + sign * dy, 5.0).unwrap();
+                        ctx.stroke_with_path(&path);
+                        (Op::PathLineTo, Op::PathCubicTo)
+                    } else {
+                        ctx.begin_path();
+                        ctx.move_to(0.0, 50.0);
+                        ctx.arc_to(100.0, 50.0, x2, 50.0 + sign * dy, 5.0).unwrap();
+                        ctx.stroke();
+                        (Op::LineTo, Op::CubicTo)
+                    };
+                    let lists = ctx.take_lists();
+                    assert_eq!(lists.len(), 1);
+                    list::check(&lists[0], &mut Vec::new()).unwrap();
+                    let records = list::records(&lists[0]).unwrap();
+                    let lines: Vec<Vec<f64>> = records
+                        .iter()
+                        .filter(|r| r.op == line)
+                        .map(|r| r.operands().collect())
+                        .collect();
+                    let curves = records.iter().filter(|r| r.op == cubic).count();
+                    if dy <= 0.0244 {
+                        assert_eq!(lines, [vec![100.0, 50.0]]);
+                        assert_eq!(curves, 0);
+                    } else {
+                        assert_ne!(lines, [vec![100.0, 50.0]]);
+                        assert!(curves > 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A palette cycled through more colours than the recorder keeps parsed
 /// records each paint's colour as a fresh context would.
 #[test]

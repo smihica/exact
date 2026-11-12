@@ -32,6 +32,7 @@ fn main() {
         "exact_data_host::Storage<calendar_data::Calendar>",
         "exact_data_host::Storage::new(calendar_data::Calendar::default())",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

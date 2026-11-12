@@ -649,4 +649,38 @@ mod tests {
             assert_eq!(&px[i..i + 4], &[0, 255, 0, 255]);
         }
     }
+
+    #[test]
+    fn turbulence_truncates_fractional_seeds() {
+        for fractal in [false, true] {
+            for stitch in [false, true] {
+                let render = |seed| {
+                    let mut px = square();
+                    run(
+                        &one(Op::Turbulence(0.033, 0.07, 2, seed, fractal, stitch), true),
+                        &mut px,
+                        20,
+                        20,
+                        SPACE,
+                    );
+                    px
+                };
+                assert_ne!(render(1.0), render(2.0));
+                assert_eq!(render(-1.0), render(2.0));
+                for (seed, integer) in [
+                    (1.5, 1.0),
+                    (-1.5, -1.0),
+                    (1.9, 1.0),
+                    (-1.9, -1.0),
+                    (0.9, 0.0),
+                    (-0.9, 0.0),
+                ] {
+                    assert!(
+                        render(seed) == render(integer),
+                        "seed={seed}, integer={integer}, fractal={fractal}, stitch={stitch}"
+                    );
+                }
+            }
+        }
+    }
 }

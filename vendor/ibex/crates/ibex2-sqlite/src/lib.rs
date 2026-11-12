@@ -2,7 +2,9 @@
 //! SQLite's maintained VFS owns journaling, locking and crash recovery.
 use ibex2::{
     boundary::HostError,
-    stdlib::sqlite::{self, Command, ExecuteResult, Location, Rows, StatementInfo, Value},
+    stdlib::sqlite::{
+        self, Command, ExecuteResult, ForeignKeys, Location, Rows, StatementInfo, Value,
+    },
 };
 use rusqlite::{
     config::DbConfig,
@@ -10,7 +12,7 @@ use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
     limits::Limit,
     types::{Value as SqlValue, ValueRef},
-    Batch, Connection, OpenFlags, TransactionBehavior,
+    Batch, Connection, OpenFlags, Transaction, TransactionBehavior,
 };
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -25,9 +27,17 @@ const MAX_ROWS: usize = 100_000;
 const MAX_COMMANDS: usize = 10_000;
 #[derive(Default)]
 pub struct SqliteProvider;
+/// Register this provider from an app shell that links SQL storage.
+pub fn link() {
+    sqlite::link(Arc::new(SqliteProvider));
+}
+
 struct Session {
     connection: Mutex<Option<Connection>>,
     internal_transaction: Arc<AtomicBool>,
+    /// A `ForeignKeys::Check` batch's statements are running: the
+    /// migrators' own `PRAGMA foreign_keys` lines are accepted as no-ops.
+    checking: Arc<AtomicBool>,
     /// After the connection, so a dropped session closes its file first.
     held: held::Count,
 }
@@ -52,6 +62,7 @@ const PRAGMAS: [&str; 10] = [
     "integrity_check",
     "quick_check",
 ];
+const FOREIGN_KEYS_CHECK: &str = "to rebuild a table other rows reference, run the batch as transaction(statements, { foreignKeys: \"check\" })";
 thread_local! {
     /// What the authorizer last refused, and why. SQLite calls the
     /// authorizer on the thread that prepares the statement, while it
@@ -146,6 +157,8 @@ impl sqlite::Provider for SqliteProvider {
             .map_err(sql_error)?;
         let internal_transaction = Arc::new(AtomicBool::new(false));
         let internal = internal_transaction.clone();
+        let checking = Arc::new(AtomicBool::new(false));
+        let checked = checking.clone();
         connection
             .authorizer(Some(move |ctx: AuthContext<'_>| {
                 let refused = match ctx.action {
@@ -168,6 +181,17 @@ impl sqlite::Provider for SqliteProvider {
                         "load_extension: extensions are not loaded".into()
                     }
                     AuthAction::Pragma { pragma_name, .. }
+                        if pragma_name.eq_ignore_ascii_case("foreign_keys") =>
+                    {
+                        if checked.load(Ordering::Relaxed) {
+                            return Authorization::Ignore;
+                        }
+                        format!(
+                            "PRAGMA {pragma_name}: the host sets the connection's options; app SQL may run only PRAGMA {}; {FOREIGN_KEYS_CHECK}",
+                            PRAGMAS.join(", ")
+                        )
+                    }
+                    AuthAction::Pragma { pragma_name, .. }
                         if !PRAGMAS.contains(&pragma_name.to_ascii_lowercase().as_str()) =>
                     {
                         format!(
@@ -187,6 +211,7 @@ impl sqlite::Provider for SqliteProvider {
         Ok(Arc::new(Session {
             connection: Mutex::new(Some(connection)),
             internal_transaction,
+            checking,
             held,
         }))
     }
@@ -280,7 +305,118 @@ fn in_statement(e: HostError, at: &str, sql: &str) -> HostError {
         e => e,
     }
 }
+/// Turns enforcement back on when a `ForeignKeys::Check` batch ends, on
+/// every path, an unwinding one included.
+struct Restore<'a> {
+    conn: &'a Connection,
+    checking: &'a AtomicBool,
+}
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        self.checking.store(false, Ordering::Relaxed);
+        let _ = self
+            .conn
+            .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true);
+    }
+}
+/// `PRAGMA foreign_key_check` over every schema the batch could write:
+/// `main` and `temp` (an unqualified check reads only `main`; nothing else
+/// can be attached). A row whose parent row or table is missing fails the
+/// batch. The rows are stepped through and counted; only the three to name
+/// are kept, so a large failure costs no more than a small one.
+fn check_foreign_keys(conn: &Connection) -> Result<(), HostError> {
+    const FAILED: &str = "foreign key check failed, the batch is rolled back";
+    let fail = |e: rusqlite::Error| match sql_error(e) {
+        HostError::Failed(m) => error(format!(
+            "{FAILED}: {}",
+            m.strip_prefix("SQLite: ").unwrap_or(&m)
+        )),
+        e => e,
+    };
+    let mut count = 0usize;
+    let mut named: Vec<(String, Option<i64>, String)> = Vec::with_capacity(4);
+    for schema in ["main", "temp"] {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA {schema}.foreign_key_check"))
+            .map_err(fail)?;
+        let mut rows = statement.query([]).map_err(fail)?;
+        while let Some(row) = rows.next().map_err(fail)? {
+            count += 1;
+            let rowid: Option<i64> = row.get(1).map_err(fail)?;
+            let table = row.get_ref(0).map_err(fail)?.as_str().map_err(error)?;
+            let parent = row.get_ref(2).map_err(fail)?.as_str().map_err(error)?;
+            if named.len() == 3
+                && (table, rowid, parent) >= (named[2].0.as_str(), named[2].1, named[2].2.as_str())
+            {
+                continue;
+            }
+            named.push((table.to_string(), rowid, parent.to_string()));
+            named.sort();
+            named.truncate(3);
+        }
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let named: Vec<String> = named
+        .iter()
+        .map(|(table, rowid, parent)| match rowid {
+            Some(rowid) => format!("{table} row {rowid} (references {parent})"),
+            None => format!("a {table} row (references {parent})"),
+        })
+        .collect();
+    let more = match count {
+        n if n > 3 => format!(", and {} more", n - 3),
+        _ => String::new(),
+    };
+    Err(error(match count {
+        1 => format!("{FAILED}: 1 foreign-key violation: {}", named[0]),
+        n => format!(
+            "{FAILED}: {n} foreign-key violations: {}{more}",
+            named.join(", ")
+        ),
+    }))
+}
 impl Session {
+    /// One transaction over `commands`; `check` runs `check_foreign_keys`
+    /// before the commit.
+    fn batch(
+        &self,
+        conn: &Connection,
+        commands: &[Command],
+        check: bool,
+    ) -> Result<Vec<ExecuteResult>, HostError> {
+        self.internal_transaction.store(true, Ordering::Relaxed);
+        let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+        self.internal_transaction.store(false, Ordering::Relaxed);
+        let transaction = transaction.map_err(sql_error)?;
+        self.checking.store(check, Ordering::Relaxed);
+        let results: Result<Vec<_>, _> = commands
+            .iter()
+            .enumerate()
+            .map(|(i, command)| {
+                execute(&transaction, &command.sql, &command.params).map_err(|e| {
+                    let at = format!("statement {} of {}", i + 1, commands.len());
+                    in_statement(e, &at, &command.sql)
+                })
+            })
+            .collect();
+        self.checking.store(false, Ordering::Relaxed);
+        let results = results.and_then(|values| match check {
+            true => check_foreign_keys(&transaction).map(|()| values),
+            false => Ok(values),
+        });
+        self.internal_transaction.store(true, Ordering::Relaxed);
+        let outcome = match results {
+            Ok(values) => transaction.commit().map(|()| values).map_err(sql_error),
+            Err(e) => {
+                drop(transaction);
+                Err(e)
+            }
+        };
+        self.internal_transaction.store(false, Ordering::Relaxed);
+        outcome
+    }
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T, HostError>) -> Result<T, HostError> {
         let guard = self
             .connection
@@ -347,7 +483,11 @@ impl sqlite::Connection for Session {
             Ok(Rows { columns, rows })
         })
     }
-    fn transaction(&self, commands: &[Command]) -> Result<Vec<ExecuteResult>, HostError> {
+    fn transaction(
+        &self,
+        commands: &[Command],
+        foreign_keys: ForeignKeys,
+    ) -> Result<Vec<ExecuteResult>, HostError> {
         if commands.len() > MAX_COMMANDS {
             return Err(error("transaction exceeds 10000 commands"));
         }
@@ -355,31 +495,33 @@ impl sqlite::Connection for Session {
             .connection
             .lock()
             .map_err(|_| error("connection lock poisoned"))?;
-        let conn = guard.as_mut().ok_or_else(|| error("database is closed"))?;
+        let conn = guard.as_ref().ok_or_else(|| error("database is closed"))?;
         REFUSED.take();
-        self.internal_transaction.store(true, Ordering::Relaxed);
-        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate);
-        self.internal_transaction.store(false, Ordering::Relaxed);
-        let transaction = transaction.map_err(sql_error)?;
-        let results: Result<Vec<_>, _> = commands
-            .iter()
-            .enumerate()
-            .map(|(i, command)| {
-                execute(&transaction, &command.sql, &command.params).map_err(|e| {
-                    let at = format!("statement {} of {}", i + 1, commands.len());
-                    in_statement(e, &at, &command.sql)
-                })
-            })
-            .collect();
-        self.internal_transaction.store(true, Ordering::Relaxed);
-        let outcome = match results {
-            Ok(values) => transaction.commit().map(|()| values).map_err(sql_error),
-            Err(e) => {
-                drop(transaction);
-                Err(e)
-            }
+        if foreign_keys == ForeignKeys::Enforce {
+            return self.batch(conn, commands, false);
+        }
+        // SQLite ignores a change to enforcement inside a transaction, so it
+        // goes off before BEGIN ("Making Other Kinds Of Table Schema
+        // Changes", https://sqlite.org/lang_altertable.html#otheralter).
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, false)
+            .map_err(sql_error)?;
+        let restore = Restore {
+            conn,
+            checking: &self.checking,
         };
-        self.internal_transaction.store(false, Ordering::Relaxed);
+        let outcome = self.batch(conn, commands, true);
+        drop(restore);
+        // The lock is held throughout, so no other batch on this connection
+        // ran without enforcement; one that cannot have it back never runs.
+        if !matches!(
+            conn.db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY),
+            Ok(true)
+        ) {
+            *guard = None;
+            return Err(error(
+                "foreign keys could not be turned back on, so the database is closed",
+            ));
+        }
         outcome
     }
     fn close(&self) -> Result<(), HostError> {

@@ -45,9 +45,11 @@ public final class Agent {
     /// Pick a visible fragment's midpoint; a wrapped link can have an earlier
     /// fragment offscreen while a later one is reachable. `box` carries canvas
     /// placement and presentation transforms into the viewport coordinates.
-    func tapPoint(_ request: [String: Any], node: NodeView) -> CGPoint? {
+    /// `drawn`: the box of what the host draws in the node's place (`drawnPlace`).
+    func tapPoint(_ request: [String: Any], node: NodeView, drawn: CGRect? = nil) -> CGPoint? {
         let bounds: CGRect
-        if let id = request["id"] as? UInt32, let run = presenter.inlineText(id) {
+        if let drawn { bounds = drawn }
+        else if let id = request["id"] as? UInt32, let run = presenter.inlineText(id) {
             let fragments = node.inlineRects(run).filter { !$0.isEmpty }.map { box(node, region: $0) }
             #if os(iOS) || os(tvOS)
             let reach = presenter.reach(of: node)
@@ -84,6 +86,9 @@ public final class Agent {
     weak var canvasContact: NodeView?
     /// The last point the agent's pointer sent its canvas (iOS), for its motion.
     var canvasPoint: CGPoint?
+    /// The canvas contact's own time (iOS), seconds on `CACurrentMediaTime`'s clock: a timed
+    /// move's samples and its lift are stamped at their pace, not at their arrival.
+    var canvasTime: Double?
     package var keyReleases: [String: () -> [String: Any]] = [:]
 
     /// Where replies go: the stream the requests came on.
@@ -809,7 +814,10 @@ public final class Agent {
     /// clock waited on (LLP 1016.000 D9): `held` and `heldTargets`, as the
     /// web hosts' do. An error reply is left as it is.
     func clock(_ req: [String: Any]) -> [String: Any] {
-        if session.frameHealth.liveCapture {
+        // An input's landing on the wall's clock takes nothing (`clockStep`),
+        // so a capture lets real input finish (LLP 1079.000 §7).
+        let landsOnWall = req["land"] as? Bool == true && session.clock == nil && !ExactEnv.agentFreezes
+        if session.frameHealth.liveCapture, !landsOnWall {
             return ["error": "Live frame capture requires the platform clock. Stop it with perf frames capture stop before using clock, held-clock or virtual-film operations.", "code": "frame-health-clock-takeover"]
         }
         var out = clockStep(req)
@@ -1305,7 +1313,7 @@ extension ExactSession {
         #if os(macOS)
         canvases.occlusionChanged()
         #endif
-        frames.run(frames.motion || frames.timerSoon || canvases.wantsFrames)
+        frames.run(frames.hasWork)
     }
     #if os(iOS) || os(tvOS)
     /// A hardware keyboard's Tab (or Shift-Tab) when no node of this session

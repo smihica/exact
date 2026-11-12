@@ -101,11 +101,25 @@ return function (field, retain) {
       return statement;
     }); }, database);
   };
-  Database.prototype.transaction = function (batch) {
+  // Absent (`undefined` or `null`), or `{ foreignKeys: "check" }`; anything
+  // else is a TypeError, so a misspelt option never runs a migration
+  // enforced. The web's storage-sqlite.js answers the same words.
+  function transactionMode(options) {
+    if (options === undefined || options === null) return undefined;
+    if (typeof options !== "object") throw new TypeError("SQLite transaction options must be an object");
+    var keys = Object.keys(options);
+    for (var i = 0; i < keys.length; i++)
+      if (keys[i] !== "foreignKeys") throw new TypeError("SQLite transaction options: unknown option " + keys[i] + "; the one option is foreignKeys");
+    var foreignKeys = options.foreignKeys;
+    if (foreignKeys !== undefined && foreignKeys !== "check") throw new TypeError("SQLite transaction options: foreignKeys is \"check\" or absent");
+    return foreignKeys;
+  }
+  Database.prototype.transaction = function (batch, options) {
     var state = own(databases, this, "database");
     try {
       if (!Array.isArray(batch)) throw new TypeError("SQLite transaction needs a statement batch");
-      var args = [state.handle, batch.length];
+      var foreignKeys = transactionMode(options);
+      var args = [state.handle, foreignKeys === "check" ? 1 : 0, batch.length];
       for (var i = 0; i < batch.length; i++) {
         var entry = batch[i];
         if (!entry || typeof entry !== "object") throw new TypeError("invalid SQLite batch entry");

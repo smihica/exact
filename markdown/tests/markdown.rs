@@ -23,35 +23,8 @@ fn hidden(source: &str, reveal: Option<Range>) -> Vec<String> {
         .collect()
 }
 
-/// Runs a command where `|` marks the selection and returns the same notation.
-fn run(marked: &str, command: Command) -> String {
-    let first = marked.find('|').expect("a caret");
-    let rest = marked[first + 1..].find('|');
-    let source: String = marked.replace('|', "");
-    let start = marked[..first].encode_utf16().count() as u32;
-    let end = rest.map_or(start, |r| {
-        start + marked[first + 1..first + 1 + r].encode_utf16().count() as u32
-    });
-    let edit = edit(&source, Range::new(start, end), command);
-    let after = edit.apply(&source);
-    let units: Vec<u16> = after.encode_utf16().collect();
-    let cut = |a: u32, b: u32| String::from_utf16(&units[a as usize..b as usize]).unwrap();
-    let sel = edit.selection;
-    if sel.start == sel.end {
-        format!(
-            "{}|{}",
-            cut(0, sel.start),
-            cut(sel.start, units.len() as u32)
-        )
-    } else {
-        format!(
-            "{}|{}|{}",
-            cut(0, sel.start),
-            cut(sel.start, sel.end),
-            cut(sel.end, units.len() as u32)
-        )
-    }
-}
+mod commands;
+use commands::run;
 
 #[test]
 fn reading_hides_every_marker() {
@@ -90,6 +63,34 @@ fn reading_hides_every_marker() {
         plain(source),
         "Title\n\nSome bold, italic, code, gone and a link."
     );
+}
+
+#[test]
+fn inline_delimiters_keep_matched_pairs_separate_from_literal_runs() {
+    for (source, expected) in [
+        ("😀 **x**", vec![(3, 5, 6, 8)]),
+        ("~~one~~~~two~~", vec![(0, 2, 12, 14)]),
+        ("``one````two``", vec![(0, 2, 12, 14)]),
+        ("~~x~~**later**", vec![(0, 2, 3, 5), (5, 7, 12, 14)]),
+        ("**`x`**", vec![(0, 2, 5, 7), (2, 3, 4, 5)]),
+        ("~~~\nx\n~~~", vec![]),
+        ("[x](u)", vec![]),
+    ] {
+        for reveal in [None, Some(Range::caret(0))] {
+            let mut pairs: Vec<_> = style(source, reveal)
+                .delimiters
+                .iter()
+                .map(|(open, close)| (open.start, open.end, close.start, close.end))
+                .collect();
+            pairs.sort_unstable();
+            assert_eq!(pairs, expected, "{source}");
+        }
+    }
+    let atoms = Atoms::parse(r#"[{"name":"citation","link":"cite:"}]"#, "[]");
+    let source = "**[**label**](cite:1)**";
+    let styled = style_with(source, None, &atoms);
+    assert_eq!(styled.atoms.len(), 1);
+    assert_eq!(styled.delimiters, [(Range::new(0, 2), Range::new(21, 23))]);
 }
 
 #[test]
@@ -433,97 +434,6 @@ fn adversarial_input_stays_linear() {
         start.elapsed()
     );
     assert_eq!(style(&marks, None).spans.len(), 20_000);
-}
-
-#[test]
-fn inline_commands_toggle() {
-    assert_eq!(
-        run("make |this| bold", Command::Bold),
-        "make **|this|** bold"
-    );
-    assert_eq!(run("make **th|is** bold", Command::Bold), "make th|is bold");
-    assert_eq!(
-        run("make **|this|** bold", Command::Bold),
-        "make |this| bold"
-    );
-    assert_eq!(run("caret |here", Command::Italic), "caret *|*here");
-    assert_eq!(run("caret *|*here", Command::Italic), "caret |here");
-    assert_eq!(run("pad | this |out", Command::Code), "pad  `|this|` out");
-    assert_eq!(run("a |b\nc| d", Command::Strike), "a ~~|b~~\n~~c|~~ d");
-    assert_eq!(run("***b|oth***", Command::Italic), "**b|oth**");
-    assert_eq!(
-        run("a |word| here", Command::Link(String::new())),
-        "a [word](|) here"
-    );
-    assert_eq!(
-        run("a |word| here", Command::Link("https://x.dev".into())),
-        "a [|word|](https://x.dev) here"
-    );
-    assert_eq!(
-        run(
-            "a [wo|rd](https://x.dev) here",
-            Command::Link(String::new())
-        ),
-        "a wo|rd here"
-    );
-}
-
-#[test]
-fn block_commands_toggle_lines() {
-    assert_eq!(run("a tit|le", Command::Heading(2)), "## a tit|le");
-    assert_eq!(run("## a tit|le", Command::Heading(2)), "a tit|le");
-    assert_eq!(run("## a tit|le", Command::Heading(1)), "# a tit|le");
-    assert_eq!(run("|one\n\ntwo|", Command::Bullet), "- |one\n\n- two|");
-    assert_eq!(run("- |one\n- two|", Command::Ordered), "1. |one\n2. two|");
-    assert_eq!(run("1. one|", Command::Task), "- [ ] one|");
-    assert_eq!(run("- [ ] one|", Command::ToggleTask), "- [x] one|");
-    assert_eq!(run("- [x] one|", Command::ToggleTask), "- [ ] one|");
-    assert_eq!(run("|", Command::Bullet), "- |");
-    assert_eq!(run("|a\nb|", Command::Quote), "> |a\n> b|");
-    assert_eq!(run("> a|\n> b", Command::Quote), "a|\n> b");
-    assert_eq!(run("- a|", Command::Indent), "  - a|");
-    assert_eq!(run("  - a|\n\t- b", Command::Outdent), "- a|\n\t- b");
-    assert_eq!(
-        run("x\n|let a;\nlet b;|\ny", Command::CodeBlock),
-        "x\n```\n|let a;\nlet b;|\n```\ny"
-    );
-    assert_eq!(
-        run("x\n```\nlet |a;\n```\ny", Command::CodeBlock),
-        "x\nlet |a;\ny"
-    );
-}
-
-#[test]
-fn return_continues_a_list_and_ends_it_on_an_empty_item() {
-    assert_eq!(run("- one|", Command::Newline), "- one\n- |");
-    assert_eq!(run("- one\n- |", Command::Newline), "- one\n|");
-    assert_eq!(run("  * a|b", Command::Newline), "  * a\n  * |b");
-    assert_eq!(run("- [x] done|", Command::Newline), "- [x] done\n- [ ] |");
-    assert_eq!(run("> said|", Command::Newline), "> said\n> |");
-    assert_eq!(run("> - item|", Command::Newline), "> - item\n> - |");
-    assert_eq!(
-        run("1. a|\n2. b\n   - x\n3. c\n\n1. other", Command::Newline),
-        "1. a\n2. |\n3. b\n   - x\n4. c\n\n1. other"
-    );
-    assert_eq!(run("9) nine|", Command::Newline), "9) nine\n10) |");
-    assert_eq!(run("plain|", Command::Newline), "plain\n|");
-    assert_eq!(
-        run("```\n    deep|\n```", Command::Newline),
-        "```\n    deep\n    |\n```"
-    );
-    assert_eq!(run("-| one", Command::Newline), "-\n| one");
-}
-
-#[test]
-fn a_footnote_command_numbers_itself_and_opens_its_definition() {
-    assert_eq!(
-        run("A claim|.", Command::Footnote),
-        "A claim[^1].\n\n[^1]: |"
-    );
-    assert_eq!(
-        run("A[^1] claim|.\n\n[^1]: one\n", Command::Footnote),
-        "A[^1] claim[^2].\n\n[^1]: one\n\n[^2]: |"
-    );
 }
 
 #[test]

@@ -56,8 +56,8 @@ final class NavigationCollapseIOSTests: XCTestCase {
         spin(0.3)
         let navigation = session.presenter.navigation
         let tabs = try XCTUnwrap(navigation.tabController)
-        _ = tabs.delegate?.tabBarController?(tabs, shouldSelect: tabs.viewControllers![1])
-        until("Second selected") { tabs.selectedIndex == 1 }
+        tapTab(tabs, 1)
+        XCTAssertEqual(tabs.selectedIndex, 1, "Second selected")
         return (session, try XCTUnwrap(tabs.selectedViewController as? UINavigationController))
     }
 
@@ -259,7 +259,7 @@ final class NavigationCollapseIOSTests: XCTestCase {
         let home = try node(session, "home-scroll"), sv = try XCTUnwrap(home.scroll)
         let bar = try XCTUnwrap(session.presenter.navigation.primaryNavigation).navigationBar
         let expanded = bar.frame.height
-        let reply = Agent(session: session).tap(["id": Int(home.id), "scrollDrag": [0.0, -100_000.0]])
+        let reply = Agent(session: session).tap(["id": Int(home.id), "scrollDrag": [0.0, -100_000.0], "ms": 100.0])
         XCTAssertNil(reply["error"], "\(reply)")
         spin(0.3)
         XCTAssertLessThan(bar.frame.height, expanded, "the title collapsed")
@@ -311,13 +311,55 @@ final class NavigationCollapseIOSTests: XCTestCase {
         let bar = try XCTUnwrap(session.presenter.navigation.primaryNavigation).navigationBar
         let expanded = bar.frame.height, start = sv.contentOffset.y
         let agent = Agent(session: session)
-        XCTAssertNil(agent.tap(["id": Int(home.id), "scrollDrag": [0.0, -300.0]])["error"])
+        XCTAssertNil(agent.tap(["id": Int(home.id), "scrollDrag": [0.0, -300.0], "ms": 100.0])["error"])
         XCTAssertLessThan(bar.frame.height, expanded, "the title collapsed")
-        let pull = agent.tap(["id": Int(home.id), "scrollDrag": [0.0, 1_000.0]])
+        let pull = agent.tap(["id": Int(home.id), "scrollDrag": [0.0, 1_000.0], "ms": 100.0])
         XCTAssertNil(pull["error"], "\(pull)")
         XCTAssertEqual(bar.frame.height, expanded, accuracy: 0.5, "the pull opened the title")
         XCTAssertEqual(sv.contentOffset.y, start, accuracy: 0.5, "at the top")
         XCTAssertEqual(try XCTUnwrap(pull["scrolledBy"] as? [Double])[1], -300, accuracy: 0.5, "the content moved back by the 300 it went")
+    }
+
+    /// An appearance, tint or text-size change that comes with a new size (an
+    /// iPhone Duo's snapshot of the app unfolded) applies the size in its
+    /// first batch, ahead of the change's own: every batch lays the
+    /// navigation out, and UIKit must not lay it out in the old size's frames
+    /// (ExactViewIOS's `fitAheadOfLayout`).
+    @MainActor
+    func testATraitOrTintChangeWithANewSizeAppliesTheSizeFirst() throws {
+        let session = try booted("EXACT_LARGE_TITLE_PLAN", label: "appearance-resize")
+        let view = try XCTUnwrap(session.view)
+        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        XCTAssertEqual(nav.view.bounds.width, 402, accuracy: 0.5)
+        // Fix the window's tint so the appearance change reaches the view
+        // through its trait callback alone: the system tint changes with the
+        // appearance, and its callback comes first.
+        let tint = UIColor(red: 0.8, green: 0.1, blue: 0.1, alpha: 1)
+        window?.tintColor = tint
+        window?.layoutIfNeeded()
+        func resize(to width: CGFloat, with change: String, _ make: () -> Void) {
+            XCTAssertFalse(session.ownerInFlight, "no owner work lands ahead of the \(change) change's first batch")
+            let before = session.appliedBatches
+            var resizedIn: Int?
+            let observation = nav.view.layer.observe(\.bounds, options: [.new]) { _, bounds in
+                if resizedIn == nil, let new = bounds.newValue?.width, abs(new - width) < 0.5 { resizedIn = session.appliedBatches - before }
+            }
+            defer { observation.invalidate() }
+            view.frame = CGRect(x: 0, y: 0, width: width, height: 700)
+            make()
+            XCTAssertEqual(resizedIn, 1, "the batch the navigation took the new size in, counted from the \(change) change")
+            XCTAssertGreaterThan(session.appliedBatches - before, 1, "the \(change) change applied a batch after the size")
+        }
+        resize(to: 600, with: "appearance") {
+            window?.overrideUserInterfaceStyle = view.traitCollection.userInterfaceStyle == .dark ? .light : .dark
+            window?.updateTraitsIfNeeded()
+        }
+        XCTAssertEqual(window?.tintColor, tint, "the tint the appearance change left alone")
+        resize(to: 500, with: "tint") { window?.tintColor = UIColor(red: 0.1, green: 0.5, blue: 0.2, alpha: 1) }
+        resize(to: 450, with: "text size") {
+            window?.traitOverrides.preferredContentSizeCategory = .accessibilityLarge
+            window?.updateTraitsIfNeeded()
+        }
     }
 
     /// LLP 1054 A4: the agent's drag pulls to refresh as a finger does. A
@@ -326,11 +368,11 @@ final class NavigationCollapseIOSTests: XCTestCase {
         let session = try booted("EXACT_PULL_REFRESH_PLAN", label: "pull-refresh")
         let agent = Agent(session: session)
         let feed = try node(session, "feed"), control = try XCTUnwrap(feed.scroll?.refreshControl)
-        let short = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, 150.0]])
+        let short = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, 180.0], "ms": 100.0])
         XCTAssertNil(short["error"], "\(short)")
         XCTAssertEqual(short["refreshed"] as? Bool, false, "short of the pull")
         XCTAssertFalse(control.isRefreshing)
-        let pull = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, 300.0]])
+        let pull = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, 200.0], "ms": 100.0])
         XCTAssertNil(pull["error"], "\(pull)")
         XCTAssertEqual(pull["refreshed"] as? Bool, true)
         XCTAssertTrue(control.isRefreshing, "the spinner shows until the app's `refreshing` says otherwise")
@@ -344,6 +386,140 @@ final class NavigationCollapseIOSTests: XCTestCase {
         until("the refresh ran the app's action") { (try? self.node(session, "pulls"))?.props["text"] == "1" }
     }
 
+    func testAnAgentScrollDragMovesThroughoutItsDurationUnderLiveCapture() throws {
+        guard UIApplication.shared.connectedScenes.first is UIWindowScene else {
+            throw missing("scene", "live capture of a timed scroll drag")
+        }
+        let session = try booted("EXACT_PULL_REFRESH_PLAN", label: "timed-scroll")
+        session.clock = nil
+        let agent = Agent(session: session)
+        let feed = try node(session, "feed"), scroll = try XCTUnwrap(feed.scroll)
+        let health = session.frameHealth
+        XCTAssertEqual(health.setAgentCapture("start")["capture"] as? Bool, true)
+        health.beginScroll(scroll, session: session)
+        let native = try XCTUnwrap(health.nativeHealth)
+        defer { health.stopScroll(); _ = health.setAgentCapture("stop") }
+        var offsets: [(time: Double, y: CGFloat)] = []
+        var firstFrame: UInt64?
+        let began = CACurrentMediaTime(), origin = scroll.contentOffset.y
+        let reads = Timer(timeInterval: 0.05, repeats: true) { _ in
+            offsets.append((CACurrentMediaTime() - began, scroll.contentOffset.y - origin))
+            let capture = native.snapshot()
+            if firstFrame == nil, capture.callbacks > 0 { firstFrame = capture.last_arrival_ns }
+        }
+        RunLoop.main.add(reads, forMode: .common)
+        defer { reads.invalidate() }
+        let reply = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, -300.0], "ms": 500.0])
+        let elapsed = CACurrentMediaTime() - began
+        XCTAssertNil(reply["error"], "\(reply)")
+        XCTAssertGreaterThanOrEqual(elapsed, 0.5)
+        XCTAssertEqual(scroll.contentOffset.y - origin, 300, accuracy: 0.5)
+        XCTAssertEqual((reply["scrolledBy"] as? [Double])?[1] ?? -1, 300, accuracy: 0.5)
+        for band in [0.05..<0.2, 0.2..<0.35, 0.35..<0.5] {
+            XCTAssertTrue(offsets.contains { band.contains($0.time) && $0.y > 0 && $0.y < 300 }, "no intermediate offset in \(band): \(offsets)")
+        }
+        XCTAssertTrue(zip(offsets, offsets.dropFirst()).allSatisfy { $0.y <= $1.y }, "the drag follows the finger")
+        let capture = native.snapshot()
+        XCTAssertGreaterThan(capture.callbacks, 5, "live capture observes the drag's frames")
+        // The passive observer has no cadence; its arrivals still span the gesture.
+        XCTAssertGreaterThan(capture.last_arrival_ns - (try XCTUnwrap(firstFrame)), 350_000_000)
+    }
+
+    func testATimedScrollDragStopsWhenItsScrollerIsDisabled() throws {
+        let session = try booted("EXACT_PULL_REFRESH_PLAN", label: "cancelled-scroll")
+        let agent = Agent(session: session)
+        let feed = try node(session, "feed"), scroll = try XCTUnwrap(feed.scroll)
+        let origin = scroll.contentOffset.y
+        var stopped: CGFloat?
+        let observation = scroll.observe(\.contentOffset, options: [.new]) { _, _ in
+            if stopped == nil, scroll.contentOffset.y - origin >= 60 {
+                stopped = scroll.contentOffset.y
+                scroll.isScrollEnabled = false
+            }
+        }
+        defer { observation.invalidate() }
+        let reply = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, -300.0], "ms": 500.0])
+        XCTAssertNil(reply["error"], "\(reply)")
+        XCTAssertEqual(reply["cancelled"] as? Bool, true)
+        XCTAssertEqual(scroll.contentOffset.y, try XCTUnwrap(stopped), accuracy: 0.5)
+        XCTAssertLessThan(scroll.contentOffset.y - origin, 300)
+        observation.invalidate()
+        scroll.isScrollEnabled = true
+        scroll.setContentOffset(CGPoint(x: 0, y: 100), animated: false)
+        let pullObservation = scroll.observe(\.contentOffset, options: [.new]) { _, _ in
+            if scroll.contentOffset.y <= 0 { scroll.isScrollEnabled = false }
+        }
+        defer { pullObservation.invalidate() }
+        let pull = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, 400.0], "ms": 500.0])
+        XCTAssertNil(pull["error"], "\(pull)")
+        XCTAssertEqual(pull["cancelled"] as? Bool, true)
+        XCTAssertEqual(pull["refreshed"] as? Bool, false, "a cancelled pull cannot refresh")
+        XCTAssertEqual(reply["refreshed"] as? Bool, false)
+        XCTAssertFalse(try XCTUnwrap(scroll.refreshControl).isRefreshing)
+        scroll.isScrollEnabled = true
+        for duration in [-1.0, 2001.0, .infinity, .nan] {
+            XCTAssertNotNil(agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, -300.0], "ms": duration])["error"])
+        }
+    }
+
+    func testATimedScrollDragHoldsScrollEndAndTimersUntilLiftOrCancellation() throws {
+        for mode in ["bound", "stationary", "cancelled"] {
+            let session = try booted("EXACT_PULL_REFRESH_PLAN", label: "scroll-end-\(mode)")
+            session.clock = nil
+            let p = session.presenter, agent = Agent(session: session)
+            let feed = try node(session, "feed"), scroll = try XCTUnwrap(feed.scroll)
+            let end = scroll.contentSize.height + scroll.adjustedContentInset.bottom - scroll.bounds.height
+            scroll.setContentOffset(CGPoint(x: 0, y: mode == "stationary" ? end : end - 100), animated: false)
+            feed.endScroll()
+            feed.handlers.formUnion(["scroll", "scrollend"])
+            var events: [String] = [], ended: [Double] = [], admitted: [Double] = []
+            let began = CACurrentMediaTime()
+            p.onScroll = { _, _ in events.append("scroll") }
+            p.onScrollend = { _ in
+                events.append("end")
+                ended.append(CACurrentMediaTime() - began)
+                scroll.isScrollEnabled = false
+            }
+            var cancelledAt: Double?
+            let observation = scroll.observe(\.contentOffset, options: [.new]) { _, _ in
+                if mode == "cancelled", cancelledAt == nil, scroll.contentOffset.y >= end - 50 {
+                    cancelledAt = CACurrentMediaTime() - began
+                    scroll.isScrollEnabled = false
+                }
+            }
+            let reads = Timer(timeInterval: 0.025, repeats: true) { _ in
+                if (try? self.node(session, "rests"))?.props["text"] == "1" {
+                    admitted.append(CACurrentMediaTime() - began)
+                }
+            }
+            RunLoop.main.add(reads, forMode: .common)
+            defer { observation.invalidate(); reads.invalidate() }
+            p.press(try node(session, "wait-for-rest").id)
+            let reply = agent.tap(["id": Int(feed.id), "scrollDrag": [0.0, -1000.0], "ms": 500.0])
+            let elapsed = CACurrentMediaTime() - began
+            XCTAssertNil(reply["error"], "\(mode): \(reply)")
+            XCTAssertEqual(reply["cancelled"] as? Bool ?? false, mode == "cancelled", "\(mode): \(reply)")
+            if mode == "cancelled" {
+                XCTAssertGreaterThanOrEqual(try XCTUnwrap(ended.first), try XCTUnwrap(cancelledAt))
+                XCTAssertLessThan(scroll.contentOffset.y, end)
+            } else {
+                XCTAssertGreaterThanOrEqual(elapsed, 0.5)
+                XCTAssertEqual(scroll.contentOffset.y, end, accuracy: 0.5)
+                XCTAssertTrue(ended.allSatisfy { $0 >= 0.5 }, "\(mode): ended during the drag: \(ended)")
+                XCTAssertTrue(admitted.allSatisfy { $0 >= 0.5 }, "\(mode): scrollend timer ran during the drag: \(admitted)")
+            }
+            XCTAssertEqual(ended.count, mode == "stationary" ? 0 : 1)
+            if !ended.isEmpty { XCTAssertEqual(events.suffix(2), ["scroll", "end"]) }
+            until("\(mode): the scrollend timer runs after the gesture") { (try? self.node(session, "rests"))?.props["text"] == "1" }
+            XCTAssertFalse(feed.scrollEnd?.live == true, "\(mode): the gesture released its hold")
+            observation.invalidate()
+            reads.invalidate()
+            session.destroy()
+            sessions.removeLast()
+            window?.isHidden = true
+        }
+    }
+
     /// A diagonal agent drag moves a scroller along the axes it scrolls
     /// alone, though its content overflows the other (the page is 800 wide,
     /// the strip's row 100 tall), and reports the drag's own distance while
@@ -355,12 +531,12 @@ final class NavigationCollapseIOSTests: XCTestCase {
         let strip = try node(session, "home-strip"), row = try XCTUnwrap(strip.scroll)
         XCTAssertEqual(page.scroll?.scrollsX, false)
         XCTAssertEqual(strip.scroll?.scrollsY, false)
-        let across = agent.tap(["id": Int(strip.id), "scrollDrag": [-240.0, -30.0]])
+        let across = agent.tap(["id": Int(strip.id), "scrollDrag": [-240.0, -30.0], "ms": 100.0])
         XCTAssertNil(across["error"], "\(across)")
         XCTAssertEqual(row.contentOffset.x, 240, accuracy: 0.5, "the strip scrolls sideways")
         XCTAssertEqual(row.contentOffset.y, 0, accuracy: 0.5, "and not down")
         let x = sv.contentOffset.x, y = sv.contentOffset.y
-        let down = agent.tap(["id": Int(page.id), "scrollDrag": [-40.0, -300.0]])
+        let down = agent.tap(["id": Int(page.id), "scrollDrag": [-40.0, -300.0], "ms": 100.0])
         XCTAssertNil(down["error"], "\(down)")
         XCTAssertEqual(sv.contentOffset.x, x, accuracy: 0.5, "the page scrolls down and not sideways")
         XCTAssertGreaterThan(sv.contentOffset.y, y + 299)

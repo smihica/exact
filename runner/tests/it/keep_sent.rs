@@ -56,6 +56,7 @@ struct Seen {
 struct Source {
     keeps: bool,
     seen: Arc<Mutex<Seen>>,
+    row_request: Request,
 }
 
 fn row(n: f64) -> Value {
@@ -75,10 +76,11 @@ impl DataSource for Source {
     ) -> Result<Answer, DataError> {
         match source {
             // Each argument its own request, so newer ones replace it.
-            "row" => Ok(Answer::Later(Request::post_json(
-                &format!("https://example.test/row/{:?}", args[0]),
-                "{}",
-            ))),
+            "row" => {
+                let mut request = self.row_request.clone();
+                request.url = format!("https://example.test/row/{:?}", args[0]);
+                Ok(Answer::Later(request))
+            }
             "bad" if args[1] == Value::Bool(true) => Err(DataError::UnknownSource("bad".into())),
             "bad" | "now" => Ok(Answer::Now(row(0.0))),
             "post" => Ok(Answer::Later(Request::post_json(
@@ -149,10 +151,15 @@ impl DataSource for Source {
 }
 
 fn boot(keeps: bool) -> (Runner<Source>, Arc<Mutex<Seen>>) {
+    boot_request(keeps, Request::post_json("https://example.test/row", "{}"))
+}
+
+fn boot_request(keeps: bool, row_request: Request) -> (Runner<Source>, Arc<Mutex<Seen>>) {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let source = Source {
         keeps,
         seen: seen.clone(),
+        row_request,
     };
     let plan = contract::compile(SOURCE).unwrap();
     let mut r = Runner::boot(
@@ -237,6 +244,44 @@ fn a_request_with_effects_is_in_flight_until_it_lands_kept_or_not() {
     assert!(r.holds(reader), "the GET is still out");
     assert!(!r.effects_in_flight(), "a GET has no effects");
     assert_eq!(background(&r), r#"{"mustFinish":false}"#);
+}
+
+#[test]
+fn a_held_mark_does_not_change_an_uploads_lifetime() {
+    for held in [false, true] {
+        let mut request =
+            Request::post_json("https://example.test/row", "").body_from("app:/data/a");
+        request.held = held;
+        let (mut r, seen) = boot_request(true, request);
+        let (upload, _) = first(&mut r);
+        let background = |r: &Runner<_>| exact_runner::agent::handle(r, r#"{"op":"background"}"#);
+        assert!(r.in_flight().contains(&("row".to_string(), upload)));
+        assert!(!r
+            .held_requests()
+            .iter()
+            .any(|(_, ticket)| *ticket == upload));
+        assert!(r.effects_in_flight(), "held mark: {held}");
+        assert_eq!(background(&r), r#"{"mustFinish":true}"#);
+
+        r.act("bump", vec![]).unwrap();
+        assert!(seen.lock().unwrap().offered.contains(&(1, false)));
+        assert!(r.holds(upload));
+        assert!(r.pending().contains(&("module work".to_string(), upload)));
+        let newer = r
+            .take_requests()
+            .into_iter()
+            .find(|o| o.request.url.contains("/row/"))
+            .unwrap()
+            .ticket;
+        r.fulfill(newer, ok()).unwrap();
+        assert!(r.effects_in_flight(), "the kept upload is still out");
+        assert_eq!(background(&r), r#"{"mustFinish":true}"#);
+        assert!(r.fulfill(upload, ok()).unwrap().is_some());
+        assert_eq!(seen.lock().unwrap().landed, [77]);
+        assert!(!r.holds(upload));
+        assert!(!r.effects_in_flight());
+        assert_eq!(background(&r), r#"{"mustFinish":false}"#);
+    }
 }
 
 /// A source that keeps nothing (a Rust data source's default): the host

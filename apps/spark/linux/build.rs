@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "spark_data::Profiles",
             "spark_data::Profiles",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

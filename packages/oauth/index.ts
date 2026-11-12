@@ -133,8 +133,6 @@ export class OAuthError extends Error {
   signedOut: boolean;
   constructor(code: string, message: string, status = 0, retryable = false, signedOut = false) {
     super(message);
-    // An own property: a native host's hardened realm freezes
-    // `Error.prototype`, whose `name` then refuses an assignment.
     Object.defineProperty(this, 'name', { value: 'OAuthError', writable: true, configurable: true });
     this.code = code;
     this.status = status;

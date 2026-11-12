@@ -44,7 +44,7 @@ fn main() {
         contract::linux_entry(
             "native_fixture_data::Fixture",
             "native_fixture_data::Fixture",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

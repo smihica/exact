@@ -193,17 +193,25 @@ export function implementation({ changed, agent, now, log, tracks, files }) {
     const t = now(), steps = Math.floor((t - m.at) / m.interval);
     let fresh = [];
     if (steps > 0) {
-      if (!m.running || m.muted) fresh = new Array(steps).fill(0);
-      else if (agent) for (let k = 1; k <= steps; k++) fresh.push(synthetic(Math.floor((m.at + k * m.interval) / STEP)));
-      else fresh = m.pending.splice(0).slice(-steps);
+      if (!m.running || m.muted) {
+        // Silence adds no energy: its time is counted, and only the levels the history keeps are made, so a meter
+        // left unread for hours (a hidden tab) answers at once rather than building one entry per interval.
+        m.duration += steps * m.interval / 1000;
+        m.last = 0;
+        fresh = new Array(Math.min(steps, m.history)).fill(0);
+      } else {
+        if (agent) for (let k = 1; k <= steps; k++) fresh.push(synthetic(Math.floor((m.at + k * m.interval) / STEP)));
+        else fresh = m.pending.splice(0).slice(-steps);
+        for (const level of fresh) {
+          m.energy += level * level * m.interval / 1000;
+          m.duration += m.interval / 1000;
+          m.last = level;
+        }
+      }
       m.at += steps * m.interval;
     }
-    for (const level of fresh) {
-      m.energy += level * level * m.interval / 1000;
-      m.duration += m.interval / 1000;
-      m.last = level;
-    }
-    m.levels.push(...fresh);
+    // Appended without a spread, which passes each level as an argument and fails past the engine's limit.
+    m.levels = m.levels.concat(fresh.slice(-m.history));
     if (m.levels.length > m.history) m.levels.splice(0, m.levels.length - m.history);
     return { audioLevel: m.last, totalAudioEnergy: m.energy, totalSamplesDuration: m.duration, levels: m.levels.slice() };
   }
@@ -308,7 +316,8 @@ class Waveform {
     this.element = element;
     this.bars = [];
     this.setProps(props);
-    const frame = () => { if (!this.gone) { this.draw(); this.raf = requestAnimationFrame(frame); } };
+    // The next frame is asked for first, so one that throws does not leave the view frozen.
+    const frame = () => { if (!this.gone) { this.raf = requestAnimationFrame(frame); this.draw(); } };
     this.raf = requestAnimationFrame(frame);
   }
   setProps(props) {

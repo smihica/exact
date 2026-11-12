@@ -19,6 +19,7 @@
 #![deny(missing_docs)]
 
 mod activation;
+mod best;
 mod compare;
 mod direct;
 mod encode;
@@ -303,9 +304,15 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
     let settled_tree = if direct {
         match page.runner.document_tree() {
             Ok(tree) => {
-                let (document, _) =
-                    exact_web::document::project_tree(&tree, &page.runner, Default::default())
-                        .map_err(|e| e.to_string())?;
+                let (document, _) = exact_web::document::project_tree(
+                    &tree,
+                    &page.runner,
+                    exact_web::document::Writing {
+                        prioritize_image: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
                 Some((document, tree.handlers(plan)))
             }
             // What the kernel-free fold doesn't cover, or a tree a kernel

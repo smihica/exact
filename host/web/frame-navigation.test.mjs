@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { hostFixtureFile } from './tests/glue-fixture.mjs';
 
 // LLP 1020.002 §11's web subset in real browsers: a same-origin guest's
 // navigations as FrameNavigation records, the commands a page has over its
@@ -11,7 +12,7 @@ const guest = (title, extra = '') => html(`<!doctype html><title>${title}</title
 function serve() {
   const same = Bun.serve({ port: SAME, hostname: '127.0.0.1', async fetch(request) {
     const path = new URL(request.url).pathname;
-    if (path === '/frame-navigation.js' || path === '/navigation.js') return new Response(Bun.file(new URL('.' + path, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
+    if (path === '/frame-navigation.js' || path === '/navigation.js') return new Response(hostFixtureFile(new URL('.' + path, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     if (path === '/g/a') return guest('A');
     if (path === '/g/b') return guest('B');
     if (path === '/g/redirect') return Response.redirect(`http://127.0.0.1:${SAME}/g/b`, 302);

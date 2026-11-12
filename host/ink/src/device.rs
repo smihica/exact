@@ -182,6 +182,8 @@ pub trait Device {
     fn trim(&mut self) -> Result<()>;
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod coverage_tests;
 #[cfg(test)]
 mod tests;
 

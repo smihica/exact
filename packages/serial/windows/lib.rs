@@ -1,17 +1,20 @@
 //! @exact/serial on the Windows host (LLP 1133.037 D7–D9, D14, D21): Win32's communications functions. The ports
 //! come from Configuration Manager (`CM_Get_Device_Interface_ListW` over the COM port interface class, each
 //! interface's `PortName` read from the device's registry key); a port is opened with `CreateFileW` and no sharing
-//! ("exclusive access", D5), its line set with `SetCommState`, its signals with `EscapeCommFunction` and read with
-//! `GetCommModemStatus`; a thread per connection reads it (`ReadFile` with a short `ReadIntervalTimeout`) into the
-//! bytes not yet delivered, stopping while they reach the retained bound (D8). `ClearCommError` names a break,
-//! framing, parity or overrun error at its offset (D9).
+//! ("exclusive access", D5) for overlapped I/O, its line set with `SetCommState`, its signals with `EscapeCommFunction`
+//! and read with `GetCommModemStatus`. A thread per connection reads it (`ReadFile` with a short `ReadIntervalTimeout`)
+//! into the bytes not yet delivered, stopping while they reach the retained bound (D8). `ClearCommError` names a break,
+//! framing, parity or overrun error at its offset (D9). A second thread writes the calls' bytes in call order and
+//! answers each once the device has taken it, as Web Serial's writable stream does; `close` cancels the write in
+//! flight and fails it and the ones queued behind it with `AbortError`. The I/O is overlapped because Windows runs one
+//! call at a time on a handle opened without it, so a write the device does not take would stop the reads.
 //!
 //! WinRT's `SerialDevice` needs a package capability the unpackaged host cannot declare (D14), so this is Win32's,
 //! declared here: the package names only `exact_linux` and `std`. Not built yet: the plug notifications; the list
 //! is read again at each ask. `requestPort` (the `DevicePicker`) fails `NotSupportedError`.
 
 use exact_linux::package::{json, Context, Json, Notifier, Package, Reply};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,6 +56,20 @@ struct Timeouts {
     write_multiplier: u32,
     write_constant: u32,
 }
+/// `OVERLAPPED` (minwinbase.h); a communications device ignores the offset.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: Handle,
+}
+impl Overlapped {
+    fn new(event: Handle) -> Overlapped {
+        Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event }
+    }
+}
 #[repr(C)]
 #[derive(Default)]
 struct ComStat {
@@ -64,8 +81,10 @@ struct ComStat {
 #[cfg_attr(windows, link(name = "kernel32"))]
 extern "system" {
     fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
-    fn ReadFile(file: Handle, buffer: *mut u8, len: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
-    fn WriteFile(file: Handle, buffer: *const u8, len: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+    fn ReadFile(file: Handle, buffer: *mut u8, len: u32, read: *mut u32, overlapped: *mut Overlapped) -> i32;
+    fn WriteFile(file: Handle, buffer: *const u8, len: u32, written: *mut u32, overlapped: *mut Overlapped) -> i32;
+    fn GetOverlappedResult(file: Handle, overlapped: *mut Overlapped, transferred: *mut u32, wait: i32) -> i32;
+    fn CreateEventW(security: *mut c_void, manual_reset: i32, initial: i32, name: *const u16) -> Handle;
     fn CloseHandle(h: Handle) -> i32;
     fn CancelIoEx(h: Handle, overlapped: *mut c_void) -> i32;
     fn GetCommState(h: Handle, dcb: *mut Dcb) -> i32;
@@ -102,6 +121,8 @@ const BUS_DESCRIPTION: PropertyKey = PropertyKey { guid: Guid(0x540B_947E, 0x8B4
 
 const GENERIC_READ_WRITE: u32 = 0xC000_0000;
 const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+const ERROR_IO_PENDING: u32 = 997;
 const KEY_READ: u32 = 0x2_0019;
 const SETRTS: u32 = 3;
 const CLRRTS: u32 = 4;
@@ -221,9 +242,23 @@ struct Stream {
 }
 
 struct Shared(Handle);
-// SAFETY: a Win32 file handle may be used from any thread; it is closed after the reader stops.
+// SAFETY: a Win32 handle may be used from any thread; the port's is closed after its reader and writer end.
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
+
+/// One `write` call: its bytes, how many the device has taken, and the call's answer.
+struct Outgoing {
+    bytes: Vec<u8>,
+    sent: usize,
+    reply: Reply,
+}
+
+/// What a connection's writer thread and the calls share: the writes not yet begun, in call order.
+#[derive(Default)]
+struct Outbox {
+    writes: VecDeque<Outgoing>,
+    closed: bool,
+}
 
 struct Connection {
     port: Port,
@@ -232,6 +267,8 @@ struct Connection {
     open: bool,
     stream: Arc<(Mutex<Stream>, Condvar)>,
     stop: Arc<AtomicBool>,
+    outbox: Arc<(Mutex<Outbox>, Condvar)>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 pub struct Serial {
@@ -241,20 +278,41 @@ pub struct Serial {
     remembered: Vec<String>,
 }
 
-fn read_loop(handle: Arc<Shared>, stream: Arc<(Mutex<Stream>, Condvar)>, stop: Arc<AtomicBool>, bound: usize, notifier: Notifier) {
+/// Whether an overlapped read or write began: `started` is what `ReadFile` or `WriteFile` returned. Called at once,
+/// before anything else can set the thread's last error.
+fn begun(started: i32) -> std::io::Result<()> {
+    // SAFETY: the calling thread's last error.
+    if started != 0 || unsafe { GetLastError() } == ERROR_IO_PENDING { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// Waits for the read or write `ov` began: the bytes it moved, or why it failed (cancelled by `close`, or the port
+/// gone).
+fn completed(handle: Handle, ov: &mut Overlapped) -> std::io::Result<u32> {
+    let mut n = 0u32;
+    // SAFETY: `ov` began an operation on `handle` and is not touched again until this returns.
+    if unsafe { GetOverlappedResult(handle, ov, &mut n, 1) } != 0 { Ok(n) } else { Err(std::io::Error::last_os_error()) }
+}
+
+fn read_loop(handle: Arc<Shared>, event: Shared, stream: Arc<(Mutex<Stream>, Condvar)>, stop: Arc<AtomicBool>, bound: usize, notifier: Notifier) {
     let mut buf = vec![0u8; 4096];
     let (lock, room) = &*stream;
-    while !stop.load(Ordering::Relaxed) {
-        let take = {
+    loop {
+        let mut ov = Overlapped::new(event.0);
+        let started = {
             let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
             while s.pending.len() >= bound && !stop.load(Ordering::Relaxed) {
                 s = room.wait_timeout(s, std::time::Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner()).0;
             }
-            bound.saturating_sub(s.pending.len()).clamp(1, buf.len())
+            // `close` sets `stop` under this lock and then cancels, so a read begun here is one its cancel ends.
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let take = bound.saturating_sub(s.pending.len()).clamp(1, buf.len());
+            // SAFETY: `buf` and `ov` outlive the read, which `completed` waits for; the timeouts `open` set bound it.
+            begun(unsafe { ReadFile(handle.0, buf.as_mut_ptr(), take as u32, std::ptr::null_mut(), &mut ov) })
         };
-        let mut read = 0u32;
-        // SAFETY: a synchronous read bounded by the timeouts `open` set; `close` cancels it.
-        let ok = unsafe { ReadFile(handle.0, buf.as_mut_ptr(), take as u32, &mut read, std::ptr::null_mut()) } != 0;
+        let result = started.and_then(|()| completed(handle.0, &mut ov));
+        let (ok, read) = (result.is_ok(), result.unwrap_or(0));
         let (mut errors, mut stat) = (0u32, ComStat::default());
         // SAFETY: the port's error state, read and cleared.
         unsafe { ClearCommError(handle.0, &mut errors, &mut stat) };
@@ -282,6 +340,58 @@ fn read_loop(handle: Arc<Shared>, stream: Arc<(Mutex<Stream>, Condvar)>, stop: A
             notifier.changed("serial.serialInput");
         }
     }
+    // SAFETY: this thread's event, closed once.
+    unsafe { CloseHandle(event.0) };
+}
+
+/// The connection's writer: writes each write in call order and answers it when the device has taken every byte.
+fn write_loop(handle: Arc<Shared>, event: Shared, outbox: Arc<(Mutex<Outbox>, Condvar)>) {
+    let (lock, ready) = &*outbox;
+    // The write in flight: its bytes stay here, out of the outbox `close` empties, until the write completes.
+    let mut current: Option<Outgoing> = None;
+    loop {
+        let mut ov = Overlapped::new(event.0);
+        let started = {
+            let mut o = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while current.is_none() && o.writes.is_empty() && !o.closed {
+                o = ready.wait(o).unwrap_or_else(|e| e.into_inner());
+            }
+            // `close` sets `closed` under this lock and then cancels, so a write begun here is one its cancel ends.
+            if o.closed {
+                break;
+            }
+            let w = current.get_or_insert_with(|| o.writes.pop_front().expect("a write waits"));
+            let rest = &w.bytes[w.sent..];
+            // SAFETY: the bytes and `ov` outlive the write, which `completed` waits for.
+            begun(unsafe { WriteFile(handle.0, rest.as_ptr(), rest.len() as u32, std::ptr::null_mut(), &mut ov) })
+        };
+        match started.and_then(|()| completed(handle.0, &mut ov)) {
+            Ok(n) => {
+                let w = current.as_mut().expect("the write in flight");
+                w.sent += n as usize;
+                if w.sent == w.bytes.len() {
+                    current.take().expect("the write in flight").reply.send(json!({}));
+                }
+            }
+            Err(e) => {
+                let mut o = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if o.closed {
+                    break;
+                }
+                // The port went away (D9): the writes queued behind this one fail with it.
+                let failed: Vec<Outgoing> = current.take().into_iter().chain(std::mem::take(&mut o.writes)).collect();
+                drop(o);
+                for w in failed {
+                    w.reply.send(json!({ "error": "NetworkError", "message": e.to_string() }));
+                }
+            }
+        }
+    }
+    if let Some(w) = current {
+        w.reply.send(json!({ "error": "AbortError" }));
+    }
+    // SAFETY: this thread's event, closed once.
+    unsafe { CloseHandle(event.0) };
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -343,7 +453,7 @@ impl Serial {
         }
         let name = wide(&port.path);
         // SAFETY: no sharing: "exclusive access" (CreateFile, D5).
-        let h = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ_WRITE, 0, std::ptr::null_mut(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+        let h = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ_WRITE, 0, std::ptr::null_mut(), OPEN_EXISTING, FILE_FLAG_OVERLAPPED, std::ptr::null_mut()) };
         if h == INVALID {
             // SAFETY: the calling thread's last error.
             let code = unsafe { GetLastError() };
@@ -354,30 +464,45 @@ impl Serial {
         let set = unsafe {
             GetCommState(h, &mut dcb) != 0 && {
                 dcb.baud = baud as u32;
-                // fBinary, and RTS/CTS handshaking for hardware flow control (fOutxCtsFlow, fRtsControl = 2).
-                dcb.flags = 1 | if options["flowControl"] == "hardware" { 0x4 | (2 << 12) } else { 1 << 12 };
+                // The DCB's bit fields (winbase.h): fBinary (bit 0); fParity (bit 1), so a parity error is reported;
+                // fDtrControl = DTR_CONTROL_ENABLE (bits 4-5), DTR raised on open as the terminal's open raises it on
+                // Linux and macOS and Chromium's Web Serial sets it on Windows; and fRtsControl (bits 12-13): enabled,
+                // or RTS/CTS handshaking with fOutxCtsFlow (bit 2) for hardware flow control.
+                dcb.flags = 1 | 1 << 1 | 1 << 4
+                    | if options["flowControl"] == "hardware" { 1 << 2 | 2 << 12 } else { 1 << 12 };
                 dcb.byte_size = options["dataBits"].as_u64().unwrap_or(8) as u8;
                 dcb.parity = match options["parity"].as_str() { Some("odd") => 1, Some("even") => 2, _ => 0 };
                 dcb.stop_bits = if options["stopBits"] == 2 { 2 } else { 0 };
                 SetCommState(h, &dcb) != 0
             } && SetCommTimeouts(h, &Timeouts { read_interval: 50, read_multiplier: 0, read_constant: 50, write_multiplier: 0, write_constant: 0 }) != 0
         };
-        if !set {
-            // SAFETY: closed once.
-            unsafe { CloseHandle(h) };
-            return failed();
-        }
+        // SAFETY: manual-reset events, one for each thread's overlapped calls, which that thread closes.
+        let events = set.then(|| unsafe { [CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()), CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null())] });
+        let Some([reads, writes]) = events.filter(|e| e.iter().all(|e| !e.is_null())) else {
+            let error = failed();
+            // SAFETY: each closed once.
+            unsafe {
+                for e in events.into_iter().flatten().filter(|e| !e.is_null()) {
+                    CloseHandle(e);
+                }
+                CloseHandle(h);
+            }
+            return error;
+        };
         let bound = ((baud as usize) / 10 * 2).max(options["bufferSize"].as_u64().unwrap_or(255) as usize).min(MOST);
         self.next += 1;
         let connection = format!("serial-{}", self.next);
         let (handle, stream, stop) = (Arc::new(Shared(h)), Arc::new((Mutex::new(Stream::default()), Condvar::new())), Arc::new(AtomicBool::new(false)));
-        let (hh, s, st, n) = (handle.clone(), stream.clone(), stop.clone(), self.context.notifier());
-        std::thread::spawn(move || read_loop(hh, s, st, bound, n));
+        let outbox = Arc::new((Mutex::new(Outbox::default()), Condvar::new()));
+        let (hh, e, s, st, n) = (handle.clone(), Shared(reads), stream.clone(), stop.clone(), self.context.notifier());
+        let reader = std::thread::spawn(move || read_loop(hh, e, s, st, bound, n));
+        let (hh, e, o) = (handle.clone(), Shared(writes), outbox.clone());
+        let writer = std::thread::spawn(move || write_loop(hh, e, o));
         if !self.remembered.contains(&port.id) {
             self.remembered.push(port.id.clone());
         }
         let answer = json!({ "connection": connection, "port": record(&port, true), "options": options });
-        self.connections.insert(connection, Connection { port, handle, options, open: true, stream, stop });
+        self.connections.insert(connection, Connection { port, handle, options, open: true, stream, stop, outbox, threads: vec![reader, writer] });
         self.context.changed("serial.getPorts");
         answer
     }
@@ -394,12 +519,28 @@ impl Serial {
             return json!({ "error": "InvalidStateError" });
         };
         c.open = false;
-        c.stop.store(true, Ordering::Relaxed);
+        // Set under the locks the threads begin their reads and writes under, so after these none begins.
+        {
+            let _s = c.stream.0.lock().unwrap_or_else(|e| e.into_inner());
+            c.stop.store(true, Ordering::Relaxed);
+        }
         c.stream.1.notify_all();
-        // SAFETY: the reader's read is cancelled; the handle closes once.
-        unsafe {
-            CancelIoEx(c.handle.0, std::ptr::null_mut());
-            CloseHandle(c.handle.0);
+        let queued = {
+            let mut o = c.outbox.0.lock().unwrap_or_else(|e| e.into_inner());
+            o.closed = true;
+            std::mem::take(&mut o.writes)
+        };
+        c.outbox.1.notify_all();
+        // SAFETY: the read and write in flight are cancelled, so both threads end promptly.
+        unsafe { CancelIoEx(c.handle.0, std::ptr::null_mut()) };
+        for thread in c.threads.drain(..) {
+            let _ = thread.join();
+        }
+        // SAFETY: closed once, after the threads that used it; closing it releases the port.
+        unsafe { CloseHandle(c.handle.0) };
+        // After the write that was in flight, which its thread failed as it ended.
+        for w in queued {
+            w.reply.send(json!({ "error": "AbortError" }));
         }
         self.context.changed("serial.serialConnection");
         self.context.changed("serial.serialInput");
@@ -413,6 +554,17 @@ impl Package for Serial {
     }
 
     fn later(&mut self, name: &str, args: &Json, _preferred: Option<&Json>, reply: Reply) {
+        if name == "write" {
+            // Queued for the connection's writer, which answers when the device has taken the bytes.
+            return match (self.connection(args), args["data"].as_str().and_then(unbase64)) {
+                (Err(e), _) => reply.send(e),
+                (_, None) => reply.send(json!({ "error": "TypeError" })),
+                (Ok(c), Some(bytes)) => {
+                    c.outbox.0.lock().unwrap_or_else(|e| e.into_inner()).writes.push_back(Outgoing { bytes, sent: 0, reply });
+                    c.outbox.1.notify_one();
+                }
+            };
+        }
         let answer = match name {
             "serialStatus" => json!({ "available": true, "attachedList": true, "state": "granted" }),
             "attachedPorts" => json!(ports().iter().filter(|p| matches(p, &args["filters"])).map(|p| record(p, true)).collect::<Vec<_>>()),
@@ -448,15 +600,6 @@ impl Package for Serial {
                         room.notify_all();
                         json!({ "data": base64(&bytes), "errors": errors, "done": done, "position": s.position })
                     }
-                }
-            },
-            "write" => match (self.connection(args), args["data"].as_str().and_then(unbase64)) {
-                (Err(e), _) => e,
-                (_, None) => json!({ "error": "TypeError" }),
-                (Ok(c), Some(bytes)) => {
-                    let mut written = 0u32;
-                    // SAFETY: a synchronous write of `bytes`, which outlives it.
-                    if unsafe { WriteFile(c.handle.0, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut()) } == 0 { failed() } else { Json::Null }
                 }
             },
             "setSignals" => match self.connection(args) {

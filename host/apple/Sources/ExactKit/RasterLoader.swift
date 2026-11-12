@@ -1022,11 +1022,10 @@ final class RasterLoader {
                 if !Self.mayShow(view) { park(viewID, &item, view); progress = true; continue }
                 if let plan, release(plan.peakBytes - available()) > 0 { progress = true; continue }
                 if item.requestedPixel <= 1 { continue }
-                // Nothing off screen to let go of: a lower resolution, in
-                // place. A worker's changed-budget notice, never a layout
+                // Nothing off screen to let go of: re-plan against the room
+                // left. A worker's changed-budget notice, never a layout
                 // callback, brought it here.
                 exact_raster_cancel(id, item.request); item.request = 0; progress = true
-                item.requestedPixel = max(1, item.requestedPixel / 2)
                 interests[viewID] = item
             }
             let (metadata, failure) = backend.metadata(item.source)
@@ -1060,10 +1059,21 @@ final class RasterLoader {
                     available = self.available(); plan = Self.fit(metadata, pixel: pixel, available: available, hdr: hdr, aspect: aspect)
                 }
             }
-            while pixel > 1 && (plan == nil || plan!.peakBytes > available) {
-                pixel = max(1, pixel / 2); plan = Self.fit(metadata, pixel: pixel, available: available, hdr: hdr, aspect: aspect)
+            if plan == nil || plan!.peakBytes > available {
+                // Aligned rows make cost a staircase: find the last side that
+                // fits, preserving the colour ladder at each candidate size.
+                var low = 1, high = pixel
+                while low < high {
+                    let middle = low + (high - low + 1) / 2
+                    if let candidate = Self.fit(metadata, pixel: middle, available: available, hdr: hdr, aspect: aspect),
+                       candidate.peakBytes <= available { low = middle } else { high = middle - 1 }
+                }
+                pixel = low; plan = Self.fit(metadata, pixel: pixel, available: available, hdr: hdr, aspect: aspect)
             }
             guard var plan else { item.failure = "decode plan too large"; settle(&item, view); interests[viewID] = item; continue }
+            if pixel < offered, item.offeredPixel != offered || item.requestedPixel != pixel {
+                view.presenter?.session?.log("image resolution reduced for budget: \(offered) to \(pixel) pixels on the longest side")
+            }
             if metadata.svg { plan.scale = Double(Self.displayScale(view)) }
             item.aspect = aspect.map { [$0.0, $0.1] } ?? []
             var demand = ExactRasterDemand()
@@ -1321,6 +1331,7 @@ final class RasterLoader {
             "images": interests.map { view, interest -> [String: Any] in
                 ["view": view, "source": String(interest.source.id), "offeredPixel": interest.offeredPixel,
                  "admittedPixel": interest.requestedPixel, "status": exact_raster_status(id, interest.request),
+                 "resolutionFallback": interest.requestedPixel > 0 && interest.requestedPixel < interest.offeredPixel ? "budget" : NSNull(),
                  "failure": interest.failure ?? "", "declines": interest.declines, "parked": interest.parked,
                  "held": interest.held, "retries": interest.retries, "retrying": interest.retrying, "pixels": [interest.view?.raster?.image.image.width ?? 0, interest.view?.raster?.image.image.height ?? 0],
                  "color": Self.colorFacts(interest), "timing": timings.stamps(view) ?? NSNull()]

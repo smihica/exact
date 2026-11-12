@@ -1,3 +1,4 @@
+import { hostFixtureFile } from './glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 
@@ -6,7 +7,7 @@ test('a data-word read includes literal and bound attributes in tree order', asy
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === '/dataset.js') return new Response(Bun.file(new URL('../../web-js/dataset.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     return new Response(`<main id="exact-root">
       <button id="save" data-paint="accent">Save</button>
       <div id="row-0"></div><div id="row-1"></div><div id="row-2"></div>

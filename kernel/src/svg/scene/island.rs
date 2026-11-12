@@ -13,7 +13,7 @@
 //! the referencing element's user space (a mask) or in pattern space (a
 //! pattern's tile). How the items become pixels is each host's.
 
-use super::{cascade, Item, Kind, Resolver, Transform, Viewport};
+use super::{Item, Kind, Resolver, Transform, Viewport};
 use crate::generated::{MaskType, NodeType, PropId, StyleId, StyleMask};
 use crate::kernel::NodeRef;
 use crate::style::Dimension;
@@ -84,10 +84,20 @@ impl Resolver<'_, '_> {
         let at = |s: StyleId, d: Dimension| rows(s).then_some(d);
         let coord = |d, default, obb, basis| vp.coord(d, default, if obb { 1.0 } else { basis });
         let raw = (
-            coord(at(StyleId::X, mask.style.x), -0.1, obb, vp.width),
-            coord(at(StyleId::Y, mask.style.y), -0.1, obb, vp.height),
-            coord(at(StyleId::Width, mask.style.width), 1.2, obb, vp.width),
-            coord(at(StyleId::Height, mask.style.height), 1.2, obb, vp.height),
+            coord(at(StyleId::X, mask.style.x.clone()), -0.1, obb, vp.width),
+            coord(at(StyleId::Y, mask.style.y.clone()), -0.1, obb, vp.height),
+            coord(
+                at(StyleId::Width, mask.style.width.clone()),
+                1.2,
+                obb,
+                vp.width,
+            ),
+            coord(
+                at(StyleId::Height, mask.style.height.clone()),
+                1.2,
+                obb,
+                vp.height,
+            ),
         );
         let bx = bbox.filter(|b| b.2 > 0.0 && b.3 > 0.0);
         let region = match (obb, bx) {
@@ -166,16 +176,26 @@ impl Resolver<'_, '_> {
         let content_obb = prop(PropId::PatternContentUnits) == Some("objectBoundingBox");
         let coord = |d, default, obb, basis| vp.coord(d, default, if obb { 1.0 } else { basis });
         let raw = (
-            coord(row(StyleId::X).map(|n| n.style.x), 0.0, obb, vp.width),
-            coord(row(StyleId::Y).map(|n| n.style.y), 0.0, obb, vp.height),
             coord(
-                row(StyleId::Width).map(|n| n.style.width),
+                row(StyleId::X).map(|n| n.style.x.clone()),
                 0.0,
                 obb,
                 vp.width,
             ),
             coord(
-                row(StyleId::Height).map(|n| n.style.height),
+                row(StyleId::Y).map(|n| n.style.y.clone()),
+                0.0,
+                obb,
+                vp.height,
+            ),
+            coord(
+                row(StyleId::Width).map(|n| n.style.width.clone()),
+                0.0,
+                obb,
+                vp.width,
+            ),
+            coord(
+                row(StyleId::Height).map(|n| n.style.height.clone()),
                 0.0,
                 obb,
                 vp.height,
@@ -219,10 +239,9 @@ impl Resolver<'_, '_> {
         let transform = prop(PropId::PatternTransform)
             .and_then(TransformList::parse)
             .map_or(tf::IDENTITY, |t| t.matrix());
-        let inherited = holder
+        let style = holder
             .arena
             .computed_rows(holder.slot, StyleMask::INHERITED);
-        let style = cascade(holder, &inherited);
         let inner = match vb {
             Some(b) => Viewport {
                 width: b.width,

@@ -1,0 +1,47 @@
+// data: completion-storm
+// Synthetic conformance plan: sends that run together (`mutation … parallel`,
+// LLP 1161.000 D2–D4) on both executors, on Completion Storm's sources.
+// `fixtureStats()` answers later, a loopback fetch whose failure (no fixture
+// on 127.0.0.1:4320) is the answer the source shapes; `lost(n, _)` sends a
+// request whose reply is never an answer for n > 0, and answers now, with how
+// many it has sent, for n = 0. Two sends with equal arguments are each asked
+// and each land, `pending` until both have. A send answered at once
+// concludes after one still in flight, whose failure then leaves the slot and
+// `failure` as the later send set them. Two failing sends leave the failure.
+// An assignment clears it and forgets no request. The root paints the page
+// white over the data app's manifest background.
+shape Control
+  message: string
+  received: number
+  issued: number
+  held: number
+
+component Parallel
+  mutation slow as shape Control parallel
+  mutation bare as shape number parallel
+  derive lostCount = match bare { case some(n) => n, case none => -1 }
+  derive why = match failure(bare) { case some(f) => f.code, case none => "none" }
+  action slowTwice
+    send slow = fixtureStats()
+    send slow = fixtureStats()
+  action lateFails
+    send bare = lost(1, 0)
+    send bare = lost(0, 1)
+  action bothFail
+    send bare = lost(1, 0)
+    send bare = lost(1, 0)
+  action clearBare
+    bare = none
+  view
+    column testId="root" height="100%" box-sizing="border-box" padding=10 gap=6 background-color="#ffffff"
+      text `slow ${pending(slow) ? "pending" : "settled"} ${match slow { case some(s) => s.received, case none => -1 }}` testId="slow"
+      text `bare ${lostCount} ${pending(bare) ? "pending" : "settled"} ${failed(bare) ? "failed" : "ok"} ${why}` testId="bare"
+      row gap=4 flex-wrap="wrap"
+        button press=slowTwice testId="slow-twice"
+          text "slow twice"
+        button press=lateFails testId="late-fails"
+          text "late fails"
+        button press=bothFail testId="both-fail"
+          text "both fail"
+        button press=clearBare testId="clear"
+          text "clear"

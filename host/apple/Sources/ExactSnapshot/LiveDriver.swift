@@ -227,6 +227,7 @@ struct LiveNodeView: View {
                 .modifier(Pressed(node: node.id, input: node.handlers.contains("press") ? input : nil))
                 .modifier(Followed(href: node.handlers.contains("press") ? nil : node.props["href"], input: input))
                 .modifier(Semantics(node: node))
+                .modifier(Accent(node: node))
         }
     }
 
@@ -235,6 +236,8 @@ struct LiveNodeView: View {
         switch node.kind {
         case "text", "time": SnapshotTextView(node: node, environment: environment)
         case "image": SnapshotImageView(node: node, environment: environment)
+        // A `progress` is the snapshot driver's leaf, not a native button.
+        case "control" where node.props["type"] == "progress": SnapshotProgressView(node: node, environment: environment)
         case "control", "input": LiveLeaf(node: node, input: input)
         default:
             if node.props["navigationKey"] != nil, node.children.contains(where: { tree.nodes[$0]?.props["navigationKey"] != nil }) {

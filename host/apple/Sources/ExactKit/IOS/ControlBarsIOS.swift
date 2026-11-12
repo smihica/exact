@@ -109,10 +109,10 @@ final class ControlBars {
         while x !== c {
             var up = x.superview
             // Between nodes, a host view that clips (a clip box) or scrolls cuts the band off.
-            while let v = up, !(v is NodeView) { if v is UIScrollView || v.clipsToBounds || v.layer.mask != nil { return nil }; up = v.superview }
+            while let v = up, !(v is NodeView) { if v is UIScrollView || v.clipsToBounds || v.layer.boxMask != nil { return nil }; up = v.superview }
             // The container clipping to its own box cuts nothing off: no band reaches past it (a route
             // written `overflow="hidden"` at `inset=0`, which looks the same on the web).
-            guard let p = up as? NodeView, !p.isHidden, !p.clipsToBounds || p === c, p.clipPath == nil, p.layer.mask == nil, p.transform.isIdentity,
+            guard let p = up as? NodeView, !p.isHidden, !p.clipsToBounds || p === c, p.clipPath == nil, p.layer.boxMask == nil, p.transform.isIdentity,
                   p.scrollView == nil || p === c else { return nil }
             let k = children(of: p)
             guard let i = k.at[ObjectIdentifier(x)] else { return nil }

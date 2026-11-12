@@ -58,8 +58,9 @@ async function load(storage: Storage): Promise<Saved> {
       try {
         text = decode(await storage.fs.readFile(FILE));
       } catch (error) {
-        if ((error as { code?: string }).code === 'bake') throw error;
-        text = null; // first launch: no file yet
+        // Only a missing file is a first launch. Any other failure (and the
+        // build's 'bake') fails the load, so no edit saves the seed over it.
+        if ((error as { code?: string }).code !== 'ENOENT') throw error;
       }
       let saved: Saved = { books: SEED.map((b) => ({ ...b })), goal: 12 };
       if (text) {

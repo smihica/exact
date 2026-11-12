@@ -48,15 +48,17 @@ const { freeSpace, ROOM_GB } = await import('./filesystem.mjs');
 const IOS_SDK = '27.1';
 import { basename, delimiter, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-const { cargoEnvironment, executableName, HERMES_INSTALLER, hermesBundle, hermesTarget, resolveApp, WEB_TOOLCHAIN, webToolchainEnv } = await import('./app.mjs');
+import { grantAdvice } from './grant-advice.mjs';
+export { grantAdvice, grantLines } from './grant-advice.mjs';
+const { cargoEnvironment, appleExecutableName, HERMES_INSTALLER, hermesBundle, hermesTarget, pathFrom, resolveApp, WEB_TOOLCHAIN, webToolchainEnv } = await import('./app.mjs');
 const { applyPattern, createApp, createGame, patternList, wireSnapback } = await import('../game/new.mjs');
 const { gameDefaults, sdkFetch } = await import('../game/app/shells.mjs');
-const { appleArtifacts, assertAppleIdentity, stripForDistribution } = await import('../host/apple/build.mjs');
+const { appleArtifacts, assertAppleIdentity } = await import('../host/apple/build.mjs');
 const { closeFilesystemReader } = await import('./filesystem.mjs');
 const { builtAppMatches, jsTargetBuild } = await import('../host/web/serve.mjs');
 const { signRelease } = await import('../host/apple/assets.mjs');
 const { chromium } = await import('./agent-launch.mjs');
-const { androidSdk } = await import('./agent-android.mjs');
+const { androidLockCommand, androidSdk, androidSdkPackages, androidSdkFix } = await import('./agent-android.mjs');
 const { hermesAndroidBundle } = await import('./hermes-android.mjs');
 const { guardFlags, helpText } = await import('./help.mjs');
 const { backendOrigin } = await import('../js/bake/src/typescript.mjs');
@@ -70,11 +72,11 @@ const APPLICATIONS = resolve(homedir(), 'Applications');
 /** The app's assembled bundle in this repo — `host/apple/build.mjs --bundle`'s one stable output. */
 export const bundleOf = (app) => appleArtifacts(app).bundle;
 /** The executable inside a bundle: what a terminal launches to keep stdio. */
-export const executableIn = (bundle, app) => resolve(bundle, 'Contents/MacOS', executableName(app));
+export const executableIn = (bundle, app) => resolve(bundle, 'Contents/MacOS', appleExecutableName(app));
 /** The name this app answers to on the command line (`app.command`, else its directory's name). */
 export const commandOf = (app) => app.manifest.app?.command ?? app.name;
 /** Where `install` puts the app. */
-export const installedAt = (app) => resolve(APPLICATIONS, `${executableName(app)}.app`);
+export const installedAt = (app) => resolve(APPLICATIONS, `${appleExecutableName(app)}.app`);
 
 /** The targets a Mac cross-compiles its Apple destinations for, each needing the pinned toolchain's Rust std and, for
  * TypeScript, a Hermes bundle; each is needed only for its destination (and only with Xcode). */
@@ -124,13 +126,26 @@ export function checkHermesBundles(env = process.env, execute = spawnSync, os = 
   return { ok: result.status === 0, message: message || `cargo exited ${result.status ?? 'without a status'}`, fix: install };
 }
 
-/** What to do when the `cargo` first on PATH is not rustup's (Homebrew's `rust` puts its own first), which refuses the
- * `+toolchain` every build passes; null when `cargo +<pin>` runs, or when rustup's own cargo is the one failing. */
-export function cargoProxyFault(pin, env = process.env, execute = spawnSync) {
-  if (execute('cargo', [`+${pin}`, '--version'], { env, encoding: 'utf8' }).status === 0) return null;
-  const cargo = Bun.which('cargo', { PATH: env.PATH ?? '' }), rustup = Bun.which('rustup', { PATH: env.PATH ?? '' });
-  if (!cargo || !rustup || dirname(cargo) === dirname(rustup)) return null;
-  return `${cargo} is not rustup's cargo and refuses +${pin}: put ${dirname(rustup)} before ${dirname(cargo)} on PATH`;
+/** Probe replacements: `rustup which cargo` names the toolchain's cargo, which also refuses +toolchain. */
+export function cargoProxyFault(pin, env = process.env, execute = spawnSync, os = process.platform) {
+  const args = [`+${pin}`, '--version'], options = { env, encoding: 'utf8' };
+  const output = r => `${r.stdout ?? ''}\n${r.stderr ?? ''}`, refuses = r => output(r).includes(`no such command: \`+${pin}\``);
+  const probe = execute('cargo', args, options);
+  if (probe.status === 0 || !refuses(probe)) return null;
+  const PATH = env.PATH ?? Object.entries(env).find(([key]) => key.toLowerCase() === 'path')?.[1] ?? '';
+  const names = name => os === 'win32' ? [`${name}.exe`, name] : [name];
+  const which = name => names(name).map(file => Bun.which(file, { PATH })).find(Boolean);
+  const cargo = which('cargo'), rustup = which('rustup');
+  if (!cargo || !rustup) return null;
+  const dirs = new Set([dirname(rustup), resolve(env.CARGO_HOME || resolve(env.HOME || env.USERPROFILE || homedir(), '.cargo'), 'bin'), dirname(realpathSync(rustup))]);
+  const fault = `${cargo} is not rustup's cargo and refuses +${pin}`;
+  for (const dir of dirs) {
+    if (dir === dirname(cargo)) continue;
+    const candidate = names('cargo').map(name => resolve(dir, name)).find(file => existsSync(file));
+    const result = candidate && execute(candidate, args, options);
+    if (result && !refuses(result) && (result.status === 0 || /toolchain '[^'\r\n]+' is not installed/.test(output(result)))) return `${fault}: put ${dir} before ${dirname(cargo)} on PATH`;
+  }
+  return `${fault}: no working rustup cargo proxy found (checked ${[...dirs].join(', ')}). Repair or install rustup's proxies, then put their directory first on PATH`;
 }
 
 /** The Android Hermes bundle a TypeScript app's library links: one `scripts/hermes-android.mjs` installed, which the
@@ -293,11 +308,12 @@ function release(app) {
   const out = resolve(app.target, 'dist', app.name);
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
-  const staged = resolve(out, `${executableName(app)}.app`);
+  const staged = resolve(out, `${appleExecutableName(app)}.app`);
   sh('/usr/bin/ditto', [bundle, staged]);
-  // What ships carries no local symbols; they stay here as a dSYM (before signing: stripping changes the bytes signed).
-  const symbols = stripForDistribution(executableIn(staged, app), resolve(out, `${app.displayName}.dSYM`));
-  console.log(`symbols: ${symbols.dsym} (${(symbols.saved / 1048576).toFixed(1)} MB off the executable)`);
+  // The production build already stripped the executable; keep its matching dSYM with the release.
+  const symbols = resolve(out, `${app.displayName}.dSYM`);
+  sh('/usr/bin/ditto', [`${appleArtifacts(app, { trust: 'production' }).binary}.dSYM`, symbols]);
+  console.log(`symbols: ${symbols}`);
 
   // Sign inside out, with the hardened runtime and a timestamp. Both are
   // notarisation's requirements, not preferences: a build without them is
@@ -340,7 +356,7 @@ function release(app) {
   sh('xcrun', ['stapler', 'staple', staged]);
   const dmg = resolve(out, `${app.displayName}.dmg`);
   const image = mkdtempSync(resolve(out, '.dmg-'));
-  sh('/usr/bin/ditto', [staged, resolve(image, `${executableName(app)}.app`)]);
+  sh('/usr/bin/ditto', [staged, resolve(image, `${appleExecutableName(app)}.app`)]);
   symlinkSync('/Applications', resolve(image, 'Applications'));
   sh('hdiutil', ['create', '-volname', app.displayName, '-srcfolder', image, '-ov', '-format', 'UDZO', '-quiet', dmg]);
   rmSync(image, { recursive: true, force: true });
@@ -498,15 +514,16 @@ export function setup({check = false} = {}) {
  * iOS its target's Rust std. */
 export function platformRowNames(platform, { os = process.platform, cpu = process.arch, device = false } = {}) {
   const host = `Hermes bundle (${hermesTarget(os, cpu)})`, ios = device ? 'aarch64-apple-ios' : appleCrossTargets(os, cpu)[0]?.target;
-  return ['rustup', 'Rust', ...({
+  const rows = platform === 'android' ? androidSdkPackages().map(p => p.name) : ({
     web: ['Bun', 'node_modules', 'Chrome'],
     ios: ['Xcode', 'iOS SDK', `Hermes bundle (${ios})`, `Rust ${ios}`],
     macos: ['Xcode', host],
     linux: [host],
-  }[platform] ?? [])];
+  }[platform] ?? []);
+  return ['rustup', 'Rust', ...rows];
 }
 /** The rows of `rows` a platform's build reads (`device`: an iOS build for a phone, whose Hermes bundle is the device's),
- * and for Android the two its toolchain needs: the Rust target and the NDK (scripts/agent-android.mjs finds it, or says
+ * and for Android its Rust target, NDK and Hermes bundle (scripts/agent-android.mjs finds them, or says
  * what to install). */
 export async function platformReport(platform, rows, { device = false } = {}) {
   const own = rows.filter(row => platformRowNames(platform, { device }).includes(row.name));
@@ -629,6 +646,12 @@ export function sdkReport(env = process.env, { only = null, device = false } = {
     rows.push(row(`Hermes bundle (${target})`, cross.ok ? 'verified by hermes-lean-sys' : 'not installed or invalid',
       'the pinned Ibex release', cross.ok, cross.fix, `${destination} TypeScript`));
   }
+  if (only === 'android' || (!only && existsSync(androidSdk(env)))) for (const pkg of androidSdkPackages()) {
+    if (want(pkg.name)) {
+      const installed = existsSync(resolve(androidSdk(env), pkg.path));
+      rows.push(row(pkg.name, installed ? pkg.version : '', pkg.version, installed, androidSdkFix(env, [pkg]), 'Android'));
+    }
+  }
   // Android, where its SDK is (LLP 1107), in the whole report: what `bun exact.mjs android` needs besides it
   // (`platformReport` checks the same for a first Android build).
   if (!only && existsSync(androidSdk(env))) {
@@ -671,7 +694,7 @@ function compilerCargo(verb, env = process.env) {
   const clean = cargoEnvironment(env);
   delete clean.RUSTUP_TOOLCHAIN;
   delete clean.CARGO_TARGET_DIR;
-  return { args: [`+${pin}`, verb, '-q', '--manifest-path', resolve(ROOT, 'Cargo.toml'), '-p', 'contract'], env: clean };
+  return { pin, args: [`+${pin}`, verb, '-q', '--manifest-path', resolve(ROOT, 'Cargo.toml'), '-p', 'contract'], env: clean };
 }
 const COMPILER = resolve(ROOT, 'target/debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
 
@@ -692,15 +715,23 @@ export function contract(args, env = process.env) {
   const json = args[0] === 'build' && args.includes('--json');
   const result = spawnSync('cargo', [...cargo.args, '--', ...args], {stdio: ['inherit', json ? 'pipe' : 'inherit', 'inherit'], env: cargo.env, encoding: 'utf8', maxBuffer: 1 << 26});
   if (result.error) throw new Error(`cargo: ${result.error.message} (install rustup from https://rustup.rs)`);
-  // A build of an app's `app.contract` refreshes the types its `app.ts` imports (LLP 1116.001 D4.5).
-  const input = args[0] === 'build' ? args.slice(1).find((arg, i, rest) => !arg.startsWith('-') && rest[i - 1] !== '-o') : null;
+  // Cargo's own failures exit 101; one that is not rustup's refuses `+<pin>` before the compiler runs.
+  if (result.status === 101) { const fault = cargoProxyFault(cargo.pin, cargo.env); if (fault) console.error(`exact contract: ${fault}`); }
+  // A build of an app's `app.contract` refreshes the types its `app.ts` imports (LLP 1116.001 D4.5); of unsaved text
+  // (`--stdin`), whose types no file holds, neither refreshes them nor type-checks app.ts.
+  const input = args[0] === 'build' && !args.includes('--stdin') ? args.slice(1).find((arg, i, rest) => !arg.startsWith('-') && rest[i - 1] !== '-o') : null;
   if (result.status === 0 && input && basename(input) === 'app.contract') {
     const dir = dirname(resolve(input));
     refreshTypes(dir, binary, {quiet: json});
-    const checked = checkTypes(dir, {capture: json});
+    // `--errors-only` leaves out the check's warnings in either form: captured, then said without them.
+    const errorsOnly = args.includes('--errors-only'), checked = checkTypes(dir, {capture: json || errorsOnly});
+    if (!json && errorsOnly) process.stderr.write(checked.report.split(/(?<=\n)/).filter((line) => !line.startsWith('warning: ') && !/^.+:\d+:\d+ warning \[[\w-]+\] /.test(line)).join(''));
     if (!json) return checked.status;
     const diagnostics = JSON.parse(result.stdout);
     if (checked.status) diagnostics.push(...typeDiagnostics(checked.report, dir));
+    // The check's warnings, after every refusal as the compiler's are (LLP 1116 D6), unless `--errors-only`.
+    if (!errorsOnly) diagnostics.push(...checkWarnings(checked.report, dir));
+    diagnostics.sort((a, b) => (a.severity === 'warning') - (b.severity === 'warning'));
     process.stdout.write(`${JSON.stringify(diagnostics)}\n`);
     return checked.status;
   }
@@ -728,6 +759,7 @@ export function checkTypes(dir, {capture = false, builder = resolve(ROOT, 'host/
 export function typeDiagnostics(report, dir) {
   const found = [], at = (file) => relative(process.cwd(), resolve(dir, file));
   for (const line of report.split(/\r?\n/)) {
+    if (line.startsWith('warning: ') || /^.+:\d+:\d+ warning \[[\w-]+\] /.test(line)) continue;
     const m = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$/.exec(line);
     if (m) found.push({id: `typescript-${m[4]}`, severity: 'error', message: m[5], file: at(m[1]), line: Number(m[2]), col: Number(m[3]), end_col: Number(m[3]), related: []});
     else if (line.trim() && !/^error: .*: app\.ts failed the type check/.test(line)) {
@@ -738,18 +770,29 @@ export function typeDiagnostics(report, dir) {
   return found.length ? found : [{id: 'typescript-check', severity: 'error', message: 'app.ts failed the type check every host\'s build runs', file: at('app.ts'), line: 0, col: 0, end_col: 0, related: []}];
 }
 
+/** The check's warnings as `build --json` diagnostics of severity `"warning"`: a diagnostic in the compiler's form,
+ * `file:line:col warning [id] text` (a use of `Function` or `eval`, #128), at its place, and a `warning: …` line (the
+ * backend's origin) on app.ts. */
+export function checkWarnings(report, dir) {
+  const at = (file) => relative(process.cwd(), resolve(dir, file));
+  return report.split(/\r?\n/).flatMap((line) => {
+    const m = /^(.+):(\d+):(\d+) warning \[([\w-]+)\] (.*)$/.exec(line);
+    if (m) return [{id: m[4], severity: 'warning', message: m[5], file: existsSync(resolve(dir, m[1])) ? at(m[1]) : m[1], line: Number(m[2]), col: Number(m[3]), end_col: Number(m[3]), related: []}];
+    return line.startsWith('warning: ') ? [{id: 'typescript-warning', severity: 'warning', message: line.slice('warning: '.length), file: at('app.ts'), line: 0, col: 0, end_col: 0, related: []}] : [];
+  });
+}
+
 /** The types `app.ts` imports, `contract types app.contract -o app.contract.d.ts`, rewritten
  * only when they changed: when a source's signature did (LLP 1116.001 D4.5). The web build and
  * the native development bake write the same file the same way, so a builder never runs the
- * step. A drawing app's carry the canvas seam, as both add it. Says so in one line on stderr,
- * so `--json` stays the build's reply; returns whether it wrote. */
+ * step. Reports a rewrite in one line on stderr, so `--json` stays the build's reply;
+ * returns whether it wrote. */
 export function refreshTypes(dir, binary = resolve(ROOT, 'target/debug', process.platform === 'win32' ? 'contract.exe' : 'contract'), {quiet = false} = {}) {
   const ts = resolve(dir, 'app.ts'), out = resolve(dir, 'app.contract.d.ts');
   if (!existsSync(ts) || !existsSync(binary)) return false;
   const types = spawnSync(binary, ['types', resolve(dir, 'app.contract')], {encoding: 'utf8', maxBuffer: 1 << 26});
   if (types.status !== 0) return false;
-  let text = types.stdout;
-  if (/export\s+(?:function|const|let)\s+draw\b|export\s*\{[^}]*\bdraw\b/.test(readFileSync(ts, 'utf8'))) text += readFileSync(resolve(ROOT, 'js/bake/src/canvas-types.d.ts'), 'utf8');
+  const text = types.stdout;
   const before = existsSync(out) ? readFileSync(out, 'utf8') : null;
   if (before === text) return false;
   writeFileSync(out, text);
@@ -850,6 +893,8 @@ release needs a "Developer ID Application" certificate and notarytool
 credentials in the keychain; it says how to get each if one is missing.
 EXACT_DEVELOPER_ID and EXACT_NOTARY_PROFILE name them explicitly.`;
 
+export const packageSpecifier = (dir, short, root = ROOT) => `file:${pathFrom(dir, resolve(root, 'packages', short))}`;
+
 /** `exact add <module> [<app>]` (LLP 1133.001 D8): the app depends on one of exact2's standard modules by a path into
  *  this checkout, as an app consumes exact2 by path, so the module never differs from the SDK it compiles against. */
 export function add(args, say = console.log) {
@@ -862,11 +907,13 @@ export function add(args, say = console.log) {
   if (!name && !process.env.EXACT_APP_DIR) throw new Error('add: name the app (exact add geolocation <app>), or run bun exact.mjs add in it');
   const app = resolveApp(name), at = resolve(app.dir, 'package.json'), manifest = read(at);
   if (!manifest) throw new Error(`add: ${app.dir} has no package.json; an app exact new made has one`);
-  const key = `@exact/${short}`, spec = `file:${resolve(ROOT, 'packages', short)}`;
+  const key = `@exact/${short}`, spec = packageSpecifier(app.dir, short);
   if (manifest.dependencies?.[key] !== spec) writeFileSync(at, JSON.stringify({ ...manifest, dependencies: { ...manifest.dependencies, [key]: spec } }, null, 2) + '\n');
   if (spawnSync(process.execPath, ['install'], { cwd: app.dir, stdio: 'inherit' }).status !== 0) throw new Error(`add: bun install failed in ${app.dir}`);
   const grants = read(resolve(ROOT, 'packages', short, 'exact.json'))?.grants ?? [];
-  say(`add: ${key} is ${spec}. Name what you use: use … from "${key}" in app.contract, or import from it in app.ts${grants.length ? `; and grant one of ${grants.join(', ')} with its purpose's strings key in app.ts (exact docs a capability that asks permission)` : ''}.`);
+  say(`add: ${key} is ${spec}. Name what you use: use … from "${key}" in app.contract, or import from it in app.ts${grants.length ? `; and in app.ts grant ${grantAdvice(grants)} (exact docs a capability that asks permission)` : ''}.`);
+  const maven = read(resolve(ROOT, 'packages', short, 'android/exact.json'))?.maven ?? [];
+  if (maven.length) say(`For Android, after importing the package, run: ${androidLockCommand(app)}`);
 }
 
 /** `exact hatch <word> [<app>]`, `exact hatch --app [<app>]`, `exact hatch --window [<app>]` (LLP 1075.003.000.001 §5):
@@ -893,7 +940,10 @@ export function hatch(args, say = console.log) {
     writeFileSync(path, text.slice(0, start) + line + '\n' + text.slice(start));
   };
   const platforms = [];
-  if (existsSync(resolve(dir, 'apple'))) {
+  // A platform is the app's when it has the crate (an app before LLP 1153 D1) or names the host in app.json, whose
+  // crates are generated (scripts/app-shells.mjs) and read the stubs from modules/ as an authored crate does.
+  const has = (crate, ...hosts) => existsSync(resolve(dir, crate)) || hosts.some(h => manifest.host?.[h]);
+  if (has('apple', 'ios', 'macos')) {
     platforms.push(...['ios', 'macos'].filter(p => !manifest.host || manifest.host[p]));
     const mod = resolve(dir, 'modules/apple'), has = existsSync(mod) && readdirSync(mod).some(f => f.endsWith('.swift'));
     const main = has ? readdirSync(mod).map(f => resolve(mod, f)).find(f => readFileSync(f, 'utf8').includes('// exact:element')) ?? resolve(mod, readdirSync(mod).find(f => f.endsWith('.swift'))) : resolve(mod, 'Hatches.swift');
@@ -985,7 +1035,7 @@ func ${scope}HatchEnded(_ ${scope}: ${type}) {
       mark(main, `// exact:${scope}\n`, `        ${scope}Hatch(${scope})`, `call it from your module's ${scope}(_:)`);
     }
   }
-  if (existsSync(resolve(dir, 'web'))) {
+  if (has('web', 'web')) {
     platforms.push('web');
     const mod = resolve(dir, 'modules/web'), main = resolve(mod, 'index.js');
     write(main, `// ${title}'s page module: its access hatches on the web. Written by \`exact hatch\`; yours from here.
@@ -1032,6 +1082,8 @@ export function ended(${scope[0]}) {
       mark(main, '// exact:hatches', `import * as ${scope}Hatch from './${file}';\nexport function ${scope}(x) { ${scope}Hatch.built(x); }\nexport function ${scope}Ended(x) { ${scope}Hatch.ended(x); }`, `import it and export ${scope} and ${scope}Ended from yours`);
     }
   }
+  // The generated Linux crate does not run Rust hatches yet; only an authored one includes them (its build.rs).
+  if (!existsSync(resolve(dir, 'linux')) && manifest.host?.linux) todo.push('Linux: the generated Linux crate runs no Rust hatches, so none is written for it; the app runs there without this one');
   if (existsSync(resolve(dir, 'linux'))) {
     // Linux, and Windows and Android over the same presenter: one file the app's Linux crate includes (its
     // build.rs, as apps/native-fixture/linux/build.rs: contract::native::rust_hatch_entry).
@@ -1110,7 +1162,7 @@ fn ${snake}_hatch_ended<H: Hatches>(_element: &Element, _context: &mut Context<'
       mark(main, '// exact:element ', `            ${JSON.stringify(word)} => ${snake}_hatch(element, context),`, 'call it from your element');
     }
   }
-  if (existsSync(resolve(dir, 'android'))) {
+  if (has('android', 'android')) {
     // Android's reader runs the app's Kotlin beside its Rust (LLP 1115.001.000 D4): one class, exact.app.Hatches,
     // compiled into the APK from modules/android. The app's Android crate writes its install (android_entry).
     platforms.push('android');
@@ -1158,12 +1210,13 @@ class Hatches : ExactHatches() {
       mark(main, '// exact:elementEnded', `            ${JSON.stringify(word)} -> ${camel}Ended(element)`, 'call it from your elementEnded');
       mark(main, '// exact:element ', `            ${JSON.stringify(word)} -> ${camel}(element)`, 'call it from your element');
     }
+    // The generated Android crate writes the install itself (js/bake/src/android.rs); an authored one must.
     const build = resolve(dir, 'android/build.rs');
-    if (!/\bandroid_entry\b/.test(existsSync(build) ? readFileSync(build, 'utf8') : '')) {
+    if (existsSync(resolve(dir, 'android')) && !/\bandroid_entry\b/.test(existsSync(build) ? readFileSync(build, 'utf8') : '')) {
       todo.push(`${build}: write the hatches' install, as apps/caltrain/android/build.rs does\n    contract::native::android_entry(&app_dir, &manifest, &plan, &out_dir), then canvas_jni!(Data, hatches = crate::exact_hatches())`);
     }
   }
-  if (!platforms.length) throw new Error(`hatch: ${app.name} builds no target a hatch can be written for (apple/, web/, linux/ or android/)`);
+  if (!platforms.length) throw new Error(`hatch: ${app.name} builds no target a hatch can be written for: name a host in app.json (web, ios, macos, android)`);
   if (scope === 'element') {
     // The declaration (§5): the word, with the platforms a stub was written for. A list means every platform.
     const had = manifest.hatches;
@@ -1295,9 +1348,10 @@ export function docs(words, say = console.log) {
       while (last < h.own && !(f.kinds[last] === 'text' && f.lines[last].trim() === '')) last++;
       const opens = res.every(re => f.lines.slice(first, last).some((line, i) => mentions(line, f.kinds[first + i], re)));
       const density = (counts.reduce((a, b) => a + b, 0) + 2 * joined) / (h.own - h.from + 8);
-      // A heading that is the words ("Tabular numbers") weighs more again; the query's own section comes first.
+      // A heading that is the words ("Tabular numbers") comes ahead of every section that only mentions them, one that
+      // links to it included; the query's own section comes first of all.
       const exact = own.map(singular).join(' ') === words.map(w => singular(w).toLowerCase()).filter(w => !STOP.has(w)).join(' ');
-      units.push({ f, h, titled, score: topic === h.title ? Infinity : density * (recipe ? 1.5 : 1) * (titled ? 3 : 1) * (exact ? 2 : 1) * (opens ? 1.5 : 1) * (joined ? 3 : 1) });
+      units.push({ f, h, titled, score: topic === h.title ? Infinity : density * (recipe ? 1.5 : 1) * (titled ? 3 : 1) * (exact ? 1e6 : 1) * (opens ? 1.5 : 1) * (joined ? 3 : 1) });
     }
   }
   if (!units.length) return say(`docs: no section of the guides holds ${words.map(w => `"${w}"`).join(' and ')} as words; try fewer, or bun exact.mjs contract vocab <name>`);

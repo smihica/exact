@@ -352,3 +352,26 @@ fn probe_view_pass_on_a_small_stack() {
         .join()
         .unwrap();
 }
+
+/// A component that uses itself, directly or through another, is refused at
+/// the use, before expansion: two such uses doubled the expansion for 32
+/// levels (gigabytes, never finishing). A component nested in its own slot's
+/// fill is not recursion and compiles.
+#[test]
+fn a_component_that_uses_itself_is_refused_at_once() {
+    let started = std::time::Instant::now();
+    let twice = "component App\n  view\n    Tree(n=1)\n\ncomponent Tree\n  props\n    n: number\n  view\n    column\n      text `${n}`\n      Tree(n=n + 1)\n      Tree(n=n + 2)\n";
+    let e = contract::compile(twice).expect_err("recursion is refused");
+    assert_eq!(e.id, "syntax-inline-depth");
+    assert!(e.message.contains("`Tree` uses itself"), "{}", e.message);
+    let mutual = "component App\n  view\n    A()\n\ncomponent A\n  view\n    column\n      B()\n      B()\n\ncomponent B\n  view\n    column\n      A()\n      A()\n";
+    let e = contract::compile(mutual).expect_err("a cycle is refused");
+    assert!(
+        e.message.contains("`A` uses itself (through `B`)"),
+        "{}",
+        e.message
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let nested = "component App\n  view\n    Card()\n      Card()\n        text \"inner\"\n\ncomponent Card\n  slot\n  view\n    column\n      children\n";
+    contract::compile(nested).expect("a component in its own fill is not recursion");
+}

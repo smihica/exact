@@ -261,6 +261,8 @@ import { chromium } from './scripts/agent-launch.mjs';
 const { executable: browserExecutable, unavailable: browserMissing } = chromium();
 if (browserMissing) { console.log(`missing chrome: ${browserMissing}`); process.exit(0); }
 import { webHostFiles } from './scripts/app.mjs';
+import { buildHostGlue } from './host/web-js/glue.mjs';
+await buildHostGlue(process.cwd());
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';

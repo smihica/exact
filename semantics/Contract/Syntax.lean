@@ -164,6 +164,9 @@ structure ResourceDecl where
   source : String
   args : List Expr
   each : Option ResourceEach := .none
+  /-- `when cond` (LLP 1161.002 D1): asked only while `cond` holds, idle
+  while it does not. A resource over a list has none. -/
+  gate : Option Expr := .none
   deriving Repr, Inhabited
 
 /-- `mutation name as shape ty`: a slot of type `option<ty>`. -/

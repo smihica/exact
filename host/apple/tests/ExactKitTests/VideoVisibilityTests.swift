@@ -34,6 +34,121 @@ final class VideoVisibilityTests: XCTestCase {
 }
 #endif
 
+#if os(macOS) || os(iOS)
+import Network
+import XCTest
+@testable import ExactKit
+
+final class VideoLoadingTests: XCTestCase {
+    func testRemoteMediaReportsStateBeforeTheServerAnswers() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        #endif
+        for tag in ["video", "audio"] {
+            let server = try HeldMediaServer()
+            defer { server.stop() }
+            let p = Presenter()
+            defer { p.reset() }
+            p.apply(wireBatch([
+                ["op": "create", "id": 1, "kind": "video", "props": [
+                    "semanticTag": tag, "controls": "true", "muted": "true",
+                    "paused": "true", "playsinline": "true",
+                ]],
+                ["op": "roots", "ids": [1]],
+            ]))
+            let player = try XCTUnwrap(p.views[1]?.video)
+            for request in 0..<3 {
+                let answered = server.answered
+                server.hold()
+                if request == 2 {
+                    player.command("load", seconds: 0)
+                } else {
+                    p.apply(wireBatch([["op": "props", "id": 1, "set": ["src": server.url + "?source=\(request)"]]]))
+                }
+                XCTAssertEqual(player.state()["hdr"] as? Bool, false)
+                p.apply(wireBatch([["op": "props", "id": 1, "set": ["volume": String(Double(request) / 2)]]]))
+                server.release()
+                waitFor("the media request") { server.answered > answered }
+                XCTAssertFalse(server.timedOut, "\(tag)'s update and snapshots must return before the server answers")
+                waitFor("the failed media load") { player.state()["error"] is String }
+            }
+        }
+    }
+
+    func testHDRStateFollowsTheCurrentSource() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        #endif
+        let p = Presenter()
+        defer { p.reset() }
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "video", "props": ["muted": "true", "paused": "true", "playsinline": "true"]],
+            ["op": "roots", "ids": [1]],
+        ]))
+        let player = try XCTUnwrap(p.views[1]?.video)
+        let fixtures = Bundle.module.url(forResource: "ColorFixtures", withExtension: nil)!
+        AppFiles.learn(["roots": ["video-fixtures": fixtures.path]])
+        for (name, hdr) in [("pq.mov", true), ("sdr.mp4", false), ("hlg.mov", true)] {
+            p.apply(wireBatch([["op": "props", "id": 1, "set": ["src": "app:/video-fixtures/\(name)"]]]))
+            waitFor("\(name)'s metadata", facts: { "\(player.state())" }) { player.state()["readyState"] as? Int == 4 }
+            waitFor("\(name)'s HDR report", facts: { "\(player.state())" }) { player.state()["hdr"] as? Bool == hdr }
+        }
+        p.apply(wireBatch([["op": "props", "id": 1, "set": ["src": ""]]]))
+        XCTAssertEqual(player.state()["hdr"] as? Bool, false)
+    }
+}
+
+/// The response waits for the main-thread update and state reads to return.
+/// Its deadline only breaks the deadlock if a read waits on the response.
+private final class HeldMediaServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "exact.test.held-media")
+    private let gate = NSCondition()
+    private var released = false
+    private var responses = 0
+    private var didTimeOut = false
+    var url: String { "http://127.0.0.1:\(listener.port!.rawValue)/movie.mp4" }
+    var answered: Int { gate.lock(); defer { gate.unlock() }; return responses }
+    var timedOut: Bool { gate.lock(); defer { gate.unlock() }; return didTimeOut }
+
+    init() throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        listener = try NWListener(using: parameters)
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.signal() }
+            if case .failed = state { ready.signal() }
+        }
+        listener.newConnectionHandler = { [weak self] connection in self?.serve(connection) }
+        listener.start(queue: queue)
+        guard ready.wait(timeout: .now() + 10) == .success, listener.port != nil else {
+            listener.cancel()
+            throw NSError(domain: "HeldMediaServer", code: 1)
+        }
+    }
+
+    private func serve(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [self] data, _, _, _ in
+            guard data != nil else { connection.cancel(); return }
+            let deadline = Date().addingTimeInterval(10)
+            gate.lock()
+            while !released, gate.wait(until: deadline) {}
+            didTimeOut = didTimeOut || !released
+            responses += 1
+            gate.unlock()
+            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in connection.cancel() })
+        }
+    }
+
+    func hold() { gate.lock(); released = false; gate.unlock() }
+    func release() { gate.lock(); released = true; gate.broadcast(); gate.unlock() }
+    func stop() { release(); listener.cancel() }
+}
+#endif
+
 #if os(iOS)
 import AVFoundation
 import UIKit

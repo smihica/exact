@@ -11,6 +11,13 @@ import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
+import java.nio.file.FileVisitResult
+import java.nio.file.Path
+import java.nio.file.LinkOption
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributes
 
 /**
  * The app's files as content URIs another app may read under a grant (LLP 1133.024 D22 item 2): what an intent carries
@@ -59,5 +66,35 @@ class Files : ContentProvider() {
 
         /** A file's type by its extension, as a receiver reads it. */
         fun type(f: File): String = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "application/octet-stream"
+
+        /** Removes [f] and, if it is a directory, everything in it, following no symbolic link: a link is removed, never
+         * what it names. A module empties a directory of the app's with this, never [File.deleteRecursively], which
+         * lists a linked directory and deletes its contents: a link the app's own code made under `app:/tmp` could name
+         * any of the app's files. What cannot be removed is left. */
+        fun removeTree(f: File) {
+            fun remove(p: Path) { try { java.nio.file.Files.deleteIfExists(p) } catch (e: IOException) { /* left */ } }
+            try {
+                // Without FOLLOW_LINKS the walk visits a link as a file and does not enter it.
+                java.nio.file.Files.walkFileTree(f.toPath(), object : SimpleFileVisitor<Path>() {
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult { remove(file); return FileVisitResult.CONTINUE }
+                    override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult { remove(file); return FileVisitResult.CONTINUE }
+                    override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult { remove(dir); return FileVisitResult.CONTINUE }
+                })
+            } catch (e: IOException) { /* what is left stays */ }
+        }
+
+        /** [f] open for writing, or appending, refusing with an [IOException] where [f] is a symbolic link
+         * (`O_NOFOLLOW`), as [File.outputStream] would open what it names. A module writes a file of the app's through
+         * this or [write]: the app's own code may have made the name a link, even after the context answered it. */
+        fun output(f: File, append: Boolean = false): java.io.OutputStream {
+            val mode = if (append) StandardOpenOption.APPEND else StandardOpenOption.TRUNCATE_EXISTING
+            return java.nio.file.Files.newOutputStream(f.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE, mode, LinkOption.NOFOLLOW_LINKS)
+        }
+
+        /** Writes [bytes] to [f], or appends them, through [output]. */
+        fun write(f: File, bytes: ByteArray, append: Boolean = false) = output(f, append).use { it.write(bytes) }
+
+        /** Whether [f] is a regular file, not a symbolic link to one. */
+        fun regular(f: File): Boolean = java.nio.file.Files.isRegularFile(f.toPath(), LinkOption.NOFOLLOW_LINKS)
     }
 }

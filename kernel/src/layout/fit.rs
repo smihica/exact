@@ -125,9 +125,12 @@ pub(super) fn settle(arena: &mut NodeArena, tree: &mut LayoutTree) -> Vec<NodeKe
     let mut moved = Vec::new();
     let slots: Vec<u32> = tree.fitting.iter().copied().collect();
     for slot in slots {
-        let node = arena
-            .taffy(slot)
-            .filter(|_| arena.is_live(slot) && fits(arena, slot));
+        if !arena.is_live(slot) {
+            tree.fitting.remove(&slot);
+            arena.fit_scales.remove(&slot);
+            continue;
+        }
+        let node = arena.taffy(slot).filter(|_| fits(arena, slot));
         let scale = match node {
             None => {
                 tree.fitting.remove(&slot);
@@ -163,10 +166,7 @@ pub(super) fn settle(arena: &mut NodeArena, tree: &mut LayoutTree) -> Vec<NodeKe
                     .unwrap_or(1.0)
             }
         };
-        if arena.fit_scale(slot).to_bits() == scale.to_bits() || !arena.is_live(slot) {
-            if !arena.is_live(slot) {
-                arena.fit_scales.remove(&slot);
-            }
+        if arena.fit_scale(slot).to_bits() == scale.to_bits() {
             continue;
         }
         if scale < 1.0 {

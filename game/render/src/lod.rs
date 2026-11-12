@@ -287,7 +287,7 @@ mod gpu_tests {
     use exact_game::{Mesh, ModelLod, Pose, Transform, World};
     use exact_gpu::wgpu;
     // A crowd member: a skinned near level, a static box far away.
-    fn draw(renderer: &mut crate::Renderer, camera: f32) {
+    fn draw(renderer: &mut crate::Renderer, camera: f32) -> wgpu::Texture {
         let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -299,7 +299,7 @@ mod gpu_tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let eye = glam::Vec3::new(0., 1., camera);
@@ -310,6 +310,7 @@ mod gpu_tests {
             ..Default::default()
         };
         renderer.draw(&texture.create_view(&Default::default()), (32, 32), &frame);
+        texture
     }
     #[test]
     fn far_levels_skip_their_skinning_and_direct_draws_keep_level_zero() {
@@ -359,7 +360,6 @@ mod gpu_tests {
         renderer.cull.indirect_execution = false;
         renderer.cull.epoch += 1;
         draw(&mut renderer, 50.);
-        draw(&mut renderer, 50.);
         assert!(renderer.cull.direct);
         assert!(!renderer.cull.groups.is_empty());
         assert!(renderer
@@ -367,5 +367,92 @@ mod gpu_tests {
             .groups
             .iter()
             .all(|g| renderer.batches[g.batch].level == 0));
+        assert_eq!(
+            renderer.models.skinning.as_ref().unwrap().active_jobs(),
+            near,
+            "direct draws must skin level zero even at the far distance"
+        );
+        draw(&mut renderer, 50.);
+        assert_eq!(
+            renderer.models.skinning.as_ref().unwrap().active_jobs(),
+            near
+        );
+        renderer.cull.indirect_execution = true;
+        renderer.cull.epoch += 1;
+        draw(&mut renderer, 50.);
+        assert!(!renderer.cull.direct);
+        assert_eq!(renderer.models.skinning.as_ref().unwrap().active_jobs(), 0);
+    }
+
+    #[test]
+    fn direct_lod_draws_the_current_pose_from_its_first_far_frame() {
+        let Some(gpu) = crate::test_device::device_or_skip(exact_gpu::fixture::device()) else {
+            return;
+        };
+        let model = crate::test_model::skinned_model();
+        let joint = model.skins[0].joints[0] as usize;
+        let make = || {
+            let mut r =
+                crate::Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
+            r.prepare_model("near.model", &model).unwrap();
+            r.prepare_model("far.model", &model).unwrap();
+            r.cull.indirect_execution = false;
+            r
+        };
+        let (mut reference, mut renderer) = (make(), make());
+        let mut w = World::new(60, 0);
+        let mut pose = Pose::default();
+        pose.local = exact_game::animation::bind_pose(&model);
+        pose.previous = pose.local.clone();
+        let entity = w.spawn((Transform::default(), Mesh::asset("near.model"), pose));
+        crate::Feed::default().feed(&w, &mut reference).unwrap();
+        w.insert(
+            entity,
+            ModelLod {
+                levels: vec![exact_game::LodLevel {
+                    distance: 2.,
+                    model: "far.model".into(),
+                }],
+                hide: Some(8.),
+            },
+        );
+        crate::Feed::default().feed(&w, &mut renderer).unwrap();
+        let mut previous = None;
+        for (x, camera) in [(0., 5.), (0.5, 5.), (1., 10.), (0., 3.)] {
+            {
+                let mut pose = w.get_mut::<Pose>(entity).unwrap();
+                pose.local[joint * 10] = x;
+                pose.previous = pose.local.clone();
+            }
+            let mut pixels = Vec::new();
+            for r in [&mut reference, &mut renderer] {
+                r.models
+                    .skinning
+                    .as_mut()
+                    .unwrap()
+                    .feed(&gpu.queue, &w, &[entity], false);
+                let target = draw(r, camera);
+                assert!(r.cull.direct);
+                assert!(r.cull.groups.iter().all(|g| r.batches[g.batch].level == 0));
+                let skin = r.models.skinning.as_ref().unwrap();
+                assert_eq!(skin.active_jobs(), 1, "only level zero skins");
+                let palette = crate::skinning::tests::read(&gpu, &skin.palette.raw, 64);
+                let expected = glam::Mat4::from_translation(glam::Vec3::new(x, 0., 0.));
+                assert_eq!(palette, crate::buffers::bytes(&expected.to_cols_array()));
+                pixels.push(exact_gpu::fixture::read(&gpu, &target).unwrap().data);
+            }
+            assert!(
+                pixels[0] == pixels[1],
+                "direct LOD must match the model without LOD"
+            );
+            if x == 0.5 {
+                assert_ne!(
+                    previous.as_ref(),
+                    Some(&pixels[0]),
+                    "the pose changes the picture"
+                );
+            }
+            previous = Some(pixels.remove(0));
+        }
     }
 }

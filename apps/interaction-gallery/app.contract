@@ -115,6 +115,18 @@ component InteractionGallery
   derive sheetNominal = sheetPx == sheetFull ? 640 : (sheetPx == sheetRead ? 360 : sheetPx)
   derive fullCollection = gallery.mode != "photos" and rendering != "manual"
   resource rows = galleryRows(gallery.revision, (fullCollection ? 0 : gallery.page), fullCollection) as shape Photo[]
+  // The token of the viewer a drag down dismissed.
+  state dismissing = 0
+  state dealt = 0
+  state thrown = false
+  // A dismissed photo and a thrown card are past their clips about 100 ms
+  // after the release, long before the spring rests: the root acts at 150.
+  // A viewer closed or replaced first has another token, and its timer goes
+  // with the gate.
+  task leave when gallery.viewerOpen and dismissing == gallery.viewerToken
+    after(150, closeDismissed)
+  task dealNext when thrown
+    after(150, deal)
 
   action chooseRendering(value: string)
     if value == "windowed" or value == "manual" or value == "eager"
@@ -158,6 +170,17 @@ component InteractionGallery
   action dropArrange(item: string, before: option<string>)
     send changed = galleryReorder(item, before, gallery.revision)
 
+  action dismiss(token: number)
+    dismissing = token
+  action closeDismissed
+    command("close", "", dismissing)
+    dismissing = 0
+  action throwCard
+    thrown = true
+  action deal
+    thrown = false
+    dealt = dealt + 1
+
   action edit(value)
     if value.length <= 512
       draft = value
@@ -195,7 +218,7 @@ component InteractionGallery
       if gallery.mode == "photos"
         if gallery.viewerOpen
           for viewer in gallery.viewer key=viewer.viewerToken
-            Viewer(viewer=viewer, gallery=gallery, command=command)
+            Viewer(viewer=viewer, gallery=gallery, command=command, dismiss=dismiss)
         else
           scroll testId="photos-scroll" flex=1 min-height=0 overflow-x="hidden"
             column padding=24 gap=20 width="100%" box-sizing="border-box"
@@ -211,7 +234,7 @@ component InteractionGallery
                 SwipeRow(n=2)
                 SwipeRow(n=3)
                 SwipeRow(n=4)
-              CardDeck()
+              CardDeck(dealt=dealt, deal=deal, thrown=throwCard)
               if gallery.total == 0
                 text "A clean slate. Add a study or reset your collection." font-size=(18 * k) color=theme.muted
       if gallery.mode == "reorder"
@@ -347,30 +370,35 @@ component SwipeRow
 // below. The card beneath, the top card's sibling, follows through the
 // clip's `timeline-scope`. A release past 120 points or 800 points a second
 // throws the card off on the release spring, carrying the fling; anything
-// less springs back.
+// less springs back. The root deals the next card after a throw. The top card
+// is keyed by its deal and reads the pan only of the deal that set it, so a
+// new top card is a new node at rest.
 component CardDeck
   inject
     theme: Theme
     k: number
+  props
+    dealt: number
+    deal: action
+    thrown: action
   state panX = 0
   state panY = 0
-  state dealt = 0
+  state panDeal = 0
   state clipWidth = 0
   action deckGeometry(bw: number, bh: number, pw: number, ph: number)
     clipWidth = pw
   action releaseCard(x: number, y: number, scale: number, vx: number, vy: number, vscale: number)
+    panDeal = dealt
     panX = 0
     panY = 0
     if x > 120 or vx > 800
       panX = clipWidth + 60
       panY = y
+      thrown()
     if x < -120 or vx < -800
       panX = 0 - clipWidth - 60
       panY = y
-  action deal
-    panX = 0
-    panY = 0
-    dealt = dealt + 1
+      thrown()
   view
     column gap=8 testId="deck"
       row gap=8 align-items="center"
@@ -380,10 +408,11 @@ component CardDeck
       box testId="deck-clip" timeline-scope="--fling" width="100%" height=320 flex-shrink=0 position="relative" overflow="hidden" padding=0 border-width=0 box-sizing="border-box" border-radius=12 background-color=theme.wash
         box testId="deck-next" position="absolute" left=40 right=40 top=20 bottom=20 border-radius=14 background-color=theme.card display="flex" align-items="center" justify-content="center" animation="deckRise 1s linear both" animation-timeline="--fling" animation-range="-300px 300px"
           text `Card ${dealt + 2}` font-size=(18 * k) font-weight=600 color=theme.ink
-        box id="deck-top" testId="deck-top" width="100%" height="100%" position="relative" padding=0 border-width=0 margin=0 box-sizing="border-box" translate=`${panX}px ${panY}px` transition="translate -exact-spring(300, 30, 1), scale -exact-spring(300, 30, 1)" -exact-drag-timeline="--fling x"
-          box testId="deck-face" position="absolute" left=40 right=40 top=20 bottom=20 border-radius=14 background-color=theme.accent display="flex" align-items="center" justify-content="center" transform-origin="50% 100%" animation="deckTilt 1s linear both" animation-timeline="--fling" animation-range="-300px 300px"
-            text `Card ${dealt + 1}` font-size=(18 * k) font-weight=600 color="#ffffff"
-          box transformDragFor="deck-top" transformgeometry=deckGeometry transformrelease=releaseCard touch-action="none" position="absolute" left=0 top=0 width="100%" height="100%" testId="deck-handle" aria-label="Throw the top card aside"
+        for n in [dealt] key=n
+          box id="deck-top" testId="deck-top" width="100%" height="100%" position="relative" padding=0 border-width=0 margin=0 box-sizing="border-box" translate=(panDeal == n ? `${panX}px ${panY}px` : "0px 0px") transition="translate -exact-spring(300, 30, 1), scale -exact-spring(300, 30, 1)" -exact-drag-timeline="--fling x"
+            box testId="deck-face" position="absolute" left=40 right=40 top=20 bottom=20 border-radius=14 background-color=theme.accent display="flex" align-items="center" justify-content="center" transform-origin="50% 100%" animation="deckTilt 1s linear both" animation-timeline="--fling" animation-range="-300px 300px"
+              text `Card ${n + 1}` font-size=(18 * k) font-weight=600 color="#ffffff"
+            box transformDragFor="deck-top" transformgeometry=deckGeometry transformrelease=releaseCard touch-action="none" position="absolute" left=0 top=0 width="100%" height="100%" testId="deck-handle" aria-label="Throw the top card aside"
 
 component Viewer
   inject
@@ -393,6 +422,7 @@ component Viewer
     viewer: ViewerState
     gallery: GalleryState
     command: action
+    dismiss: action
   state panX = 0
   state panY = 0
   state zoom = 1
@@ -436,9 +466,11 @@ component Viewer
     // LLP 1057.003 C1: at Fit, a drag down far or fast enough dismisses. The
     // photo leaves on the release spring, carrying the fling, well past the
     // 410-point clip; the backdrop reaches 0 on the same spring. Anything
-    // less springs back to centre, and the backdrop returns with it.
+    // less springs back to centre, and the backdrop returns with it. The
+    // root closes the dismissed viewer once the photo is out of sight.
     if photoZoom(scale) == 1 and (y > 120 or vy > 800)
       panY = 900
+      dismiss(viewer.viewerToken)
 
   view
     scroll flex=1 min-height=0 testId="viewer-scroll" overflow-x="hidden"

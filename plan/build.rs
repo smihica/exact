@@ -992,10 +992,27 @@ fn main() {
     let _ = writeln!(w, "    }}");
 
     // structure: the canonical bytes without the design's values
-    let _ = writeln!(w, "    /// The plan's structure (LLP 1121 stage 4, commit 3): its canonical bytes with the design's values left out (`theme` rows' `value`, `theme_slices`' `value`, but a profile colour's, which a host takes at boot; a role override's is a value too, LLP 1121 stage 5), so two plans that differ only in token values have equal structures (the builder interns the values after every other string, so none moves another's id). A dev loop compares them to send a value-only edit as a batch instead of a new plan.");
+    let _ = writeln!(
+        w,
+        "    /// The plan's structure (LLP 1121 stage 4): its canonical bytes without"
+    );
+    let _ = writeln!(
+        w,
+        "    /// token and role-override values; profile colours stay because hosts"
+    );
+    let _ = writeln!(
+        w,
+        "    /// take them at boot. Strings are sorted and references remapped, so"
+    );
+    let _ = writeln!(
+        w,
+        "    /// values cannot reorder strings the app pass interns after them."
+    );
+    let _ = writeln!(
+        w,
+        "    /// A dev loop compares structures to send value-only edits as batches."
+    );
     let _ = writeln!(w, "    pub fn structure(&self) -> Vec<u8> {{");
-    // Strings only the design's values name are left out of the pool; code
-    // names strings by id, so the rest stay, in place.
     let _ = writeln!(
         w,
         "        let design = |r: &ThemeRow| !self.str(r.value).contains(\"(--\");"
@@ -1025,12 +1042,43 @@ fn main() {
     }
     let _ = writeln!(w, "        for r in &self.theme {{ if !design(r) {{ values[r.value.0 as usize] = false; }} }}");
     // And every string the bytecode names: code that pushes a design value's
-    // text keeps it. Code that does not walk whole keeps every string.
-    let _ = writeln!(
-        w,
-        "        let mut r = Reader::new(&self.code); let mut whole = true;"
+    // text keeps it. Incomplete code keeps every string and its original id.
+    w.push_str(
+        r#"        let mut r = Reader::new(&self.code);
+        let mut whole = true;
+        let mut code_strings = Vec::new();
+        'code: while !r.is_empty() {
+            let Some(op) = r.u8().ok().and_then(Opcode::from_wire) else {
+                whole = false;
+                break;
+            };
+            for operand in op.operands() {
+                let at = r.position();
+                let ok = match operand {
+                    Operand::U8 | Operand::Enum(_) => r.u8().is_ok(),
+                    Operand::U16 => r.u16().is_ok(),
+                    Operand::U32 | Operand::Idx(_) => r.u32().is_ok(),
+                    Operand::F64 => r.f64().is_ok(),
+                    Operand::Str => match r.u32() {
+                        Ok(v) => match values.get_mut(v as usize) {
+                            Some(value) => {
+                                *value = false;
+                                code_strings.push((at, v as usize));
+                                true
+                            }
+                            None => false,
+                        },
+                        Err(_) => false,
+                    },
+                };
+                if !ok {
+                    whole = false;
+                    break 'code;
+                }
+            }
+        }
+"#,
     );
-    let _ = writeln!(w, "        'code: while !r.is_empty() {{ let Some(op) = r.u8().ok().and_then(Opcode::from_wire) else {{ whole = false; break; }}; for operand in op.operands() {{ let ok = match operand {{ Operand::U8 | Operand::Enum(_) => r.u8().is_ok(), Operand::U16 => r.u16().is_ok(), Operand::U32 | Operand::Idx(_) => r.u32().is_ok(), Operand::F64 => r.f64().is_ok(), Operand::Str => match r.u32() {{ Ok(v) => {{ if let Some(x) = values.get_mut(v as usize) {{ *x = false; }} true }} Err(_) => false }} }}; if !ok {{ whole = false; break 'code; }} }} }}");
     let _ = writeln!(
         w,
         "        if !whole {{ values.iter_mut().for_each(|v| *v = false); }}"
@@ -1048,13 +1096,26 @@ fn main() {
             );
         }
     }
-    let _ = writeln!(
-        w,
-        "        for (s, value) in self.strings.iter().zip(&values) {{ if !*value {{ w.string(s); }} }}"
-    );
-    let _ = writeln!(
-        w,
-        "        w.u32(self.code.len() as u32); w.bytes(&self.code);"
+    let _ = writeln!(w, "        let mut ids = vec![0u32; self.strings.len()];");
+    w.push_str(
+        r#"        let mut strings: Vec<_> = self.strings.iter().enumerate()
+            .filter(|(i, _)| !values[*i]).collect();
+        if whole {
+            strings.sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
+        }
+        for (rank, (id, text)) in strings.into_iter().enumerate() {
+            ids[id] = rank as u32;
+            w.string(text);
+        }
+        let mut code = self.code.to_vec();
+        if whole {
+            for (at, id) in code_strings {
+                code[at..at + 4].copy_from_slice(&ids[id].to_le_bytes());
+            }
+        }
+        w.u32(code.len() as u32);
+        w.bytes(&code);
+"#,
     );
     let _ = writeln!(
         w,
@@ -1084,7 +1145,7 @@ fn main() {
                 Codec::I32 => format!("w.i32(r.{});", f.name),
                 Codec::F64 => format!("w.f64(r.{});", f.name),
                 Codec::Bool => format!("w.u8(r.{} as u8);", f.name),
-                Codec::Str => format!("w.u32(r.{}.0);", f.name),
+                Codec::Str => format!("w.u32(ids[r.{}.0 as usize]);", f.name),
                 Codec::Enum(_) => format!("w.u8(r.{} as u8);", f.name),
                 Codec::Idx(_) => format!("w.u32(r.{}.0);", f.name),
                 Codec::Opt(_) => format!("w.u32(r.{}.map_or(u32::MAX, |v| v.0));", f.name),

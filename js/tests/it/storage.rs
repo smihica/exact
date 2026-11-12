@@ -10,7 +10,7 @@ use std::{
 };
 pub(crate) const HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/storage.hbc"));
 pub(crate) const APP: &str = "dev.exact.storage-test";
-pub(crate) const GRANTS: &str = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\n";
+pub(crate) const GRANTS: &str = "fs.read app:/data\nfs.write app:/data\nfs.write app:/cache/widget-hidden\nfs.write app:/cache/widget-copy\nfs.read doc:/\nfs.write doc:/\ndoc.keep\nsqlite.open app:/data/notes.db\nnet.fetch https://example.test\nsecret.keep session\nfs.read bundle:/Resources/shipped\n";
 pub(crate) fn plan() -> Plan {
     contract::compile(
         r#"
@@ -37,9 +37,13 @@ component App
     )
     .unwrap()
 }
+/// The `home:` and `bundle:` roots are the process's: a test that names them,
+/// or reads a path under them, takes this first.
+pub(crate) static NAMESPACES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) struct Root(pub(crate) PathBuf);
 impl Root {
     pub(crate) fn new() -> Self {
+        ibex2_sqlite::link();
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         Self(std::env::temp_dir().join(format!(
             "exact-storage-{}-{}",
@@ -222,6 +226,8 @@ fn storage_is_lazy_persistent_isolated_and_grant_checked() {
             && vacuum.contains("not authorized: PRAGMA foreign_keys: "),
         "{vacuum}"
     );
+    // A migration's rebuild under `foreignKeys: "check"`: the fixture's sql-migration.
+    assert_eq!(call(&mut m, &mut s, "sql-migration", ""), "ok|10:1,20:1,30:1,40:2|enforced|foreign key check failed, the batch is rolled back: 3 foreign-key violations: fk_gone row 20 (references fk_t), fk_nulled row 30 (references fk_t), fk_plain row 10 (references fk_t)|10:1,20:1,30:1,40:2|enforced|refused|failed|enforced|mismatch|enforced|ok|ok|unwritable|foreign key check failed, the batch is rolled back: 1 foreign-key violation: fk_tc row 1 (references fk_tp)|counted|enforced|enforced|enforced|Error/Unavailable/failed/SQLite transaction options: unknown option busy; the one option is foreignKeys|Error/Unavailable/failed/SQLite transaction options: unknown option foreignKey; the one option is foreignKeys|Error/Unavailable/failed/SQLite transaction options must be an object|Error/Unavailable/failed/SQLite transaction options: foreignKeys is \"check\" or absent|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: fk_big row 1 (references fk_t), fk_big row 9007199254740993 (references fk_t)|failed/foreign key check failed, the batch is rolled back: 1 foreign-key violation: a fk_wr row (references fk_t)|failed/foreign key check failed, the batch is rolled back: 4 foreign-key violations: fk_\u{E000}1 row 1 (references fk_t), fk_\u{E000}2 row 1 (references fk_t), fk_\u{E000}3 row 1 (references fk_t), and 1 more|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: busy row 1 (references fk_t), database is locked row 1 (references fk_t)|failed/foreign key check failed, the batch is rolled back: 2 foreign-key violations: fk_two row 1 (references fk_q), fk_two row 1 (references fk_t)|kept|kept|kept|kept|1/1|failed/SQLite transaction options: unknown option __proto__; the one option is foreignKeys|failed/SQLite transaction options: unknown option constructor; the one option is foreignKeys|kept|failed/SQLite transaction options: foreignKeys is \"check\" or absent|failed/SQLite transaction options: unknown option other; the one option is foreignKeys|failed/SQLite transaction options must be an object");
     assert!(!root.0.join("cache/no").exists());
     m.unload();
     m.activate().unwrap();
@@ -1031,6 +1037,17 @@ fn storage_refusals_carry_a_stable_code() {
     m.activate().unwrap();
     let mut s = Store::new(GRANTS, Vec::<(String, Vec<u8>)>::new());
     assert_eq!(call(&mut m, &mut s, "file", "x"), "x");
+    // No test here sets a bundle directory, as iOS sets none. (A process
+    // test in this binary may set the home directory.) Unix only: Windows's
+    // `home:` and `bundle:` are LLP 1133.007 stage 3, not absent (§8), and
+    // its unbuilt path answers otherwise.
+    #[cfg(unix)]
+    let _namespaces = NAMESPACES.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    assert_eq!(
+        call(&mut m, &mut s, "absent-namespace", ""),
+        "NotSupportedError Unavailable failed"
+    );
     let codes: Vec<String> = call(&mut m, &mut s, "codes", "")
         .lines()
         .map(|l| l.split(' ').take(2).collect::<Vec<_>>().join(" "))

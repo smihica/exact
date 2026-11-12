@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "svg_gallery_data::Gallery",
             "svg_gallery_data::Gallery",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

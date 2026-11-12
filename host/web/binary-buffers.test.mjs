@@ -46,3 +46,22 @@ test('copyBytes, as crypto.subtle takes its data, refuses a shared or resizable 
     [], [], [2, 3],
   ]);
 });
+
+test('a browser realm collects Response stream bodies and preserves their read and clone state', async () => {
+  const context = createContext({ Headers, URL, URLSearchParams, TextEncoder, TextDecoder, Response, ReadableStream });
+  runInContext(binary, context);
+  const result = await runInContext(`(async () => {
+    const { Response } = __exact_binary.responses();
+    const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('hello')); c.close(); } });
+    const response = new Response(stream), copy = response.clone();
+    const reading = response.text(), used = [response.bodyUsed, copy.bodyUsed];
+    const bytes = Array.from(new Uint8Array(await copy.arrayBuffer()));
+    const text = await reading;
+    const disturbed = new ReadableStream({ start(c) { c.close(); } });
+    await disturbed.cancel();
+    let refused;
+    try { new Response(disturbed); } catch (e) { refused = e.name; }
+    return [text, bytes, used, refused, response.headers.get('content-type')];
+  })()`, context);
+  expect(result).toEqual(['hello', [104, 101, 108, 108, 111], [true, false], 'TypeError', null]);
+});

@@ -126,6 +126,14 @@ fn text<'a>(t: &Token, lines: &[&'a str]) -> &'a str {
     &lines[t.span.line as usize - 1][t.span.col as usize - 1..t.span.end_col as usize - 1]
 }
 
+fn line_content(line: usize, raw: &str) -> &str {
+    if line == 0 {
+        raw.strip_prefix('\u{feff}').unwrap_or(raw)
+    } else {
+        raw
+    }
+}
+
 struct Layout<'a> {
     tokens: &'a [Token],
     lines: &'a [&'a str],
@@ -173,7 +181,8 @@ impl<'a> Layout<'a> {
                             .count();
                         levels[line] = depth;
                         indents[line] = depth + brackets.saturating_sub(leading_closes);
-                        let width = lines[line].len() - lines[line].trim_start().len();
+                        let content = line_content(line, lines[line]);
+                        let width = content.len() - content.trim_start().len();
                         widths.entry(width).or_default().push((line, indents[line]));
                     }
                     by_line[line].push(i);
@@ -189,8 +198,9 @@ impl<'a> Layout<'a> {
         // Comments do not participate in indentation grammar. Keep them at
         // the level of the nearest code line with their original indentation.
         for (line, raw) in lines.iter().enumerate() {
-            if by_line[line].is_empty() && !raw.trim().is_empty() {
-                let width = raw.len() - raw.trim_start().len();
+            let content = line_content(line, raw);
+            if by_line[line].is_empty() && !content.trim().is_empty() {
+                let width = content.len() - content.trim_start().len();
                 indents[line] = width / 2;
                 if let Some(nearby) = widths.get(&width) {
                     let at = nearby.partition_point(|(l, _)| *l < line);
@@ -335,25 +345,41 @@ impl<'a> Layout<'a> {
             }
             for resource in &component.resources {
                 self.ty(&resource.shape);
-                // A list's `key=`, tight as a `for` row's: the first `key`
-                // and `=` after its `for`.
-                let each = resource.each.as_ref().filter(|e| e.key.is_some());
-                if let Some(at) = each.and_then(|e| self.position(e.span)) {
-                    let word = (at..self.tokens.len()).find(|&j| {
-                        self.tokens[j].kind == TokenKind::Ident("key".into())
-                            && self.tokens.get(j + 1).map(|t| &t.kind)
-                                == Some(&TokenKind::Punct("="))
-                    });
-                    if let Some(j) = word {
-                        self.attributes.insert(self.tokens[j].span);
-                    }
+                if let Some(each) = &resource.each {
+                    self.keys(each.span);
                 }
             }
             for mutation in &component.mutations {
                 self.ty(&mutation.shape);
             }
+            for span in component
+                .tasks
+                .iter()
+                .map(|t| t.span)
+                .chain(component.sequences.iter().map(|s| s.span))
+            {
+                self.keys(span);
+            }
             self.nodes(&component.view);
         }
+    }
+
+    fn keys(&mut self, span: Span) {
+        let Some(start) = self.position(span) else {
+            return;
+        };
+        // A header can also contain named `key=` arguments; all stay tight.
+        // Stop at its logical newline so a body's `key = value` stays an assignment.
+        self.attributes.extend(
+            self.tokens[start..]
+                .windows(2)
+                .take_while(|pair| !matches!(pair[0].kind, TokenKind::Newline | TokenKind::Eof))
+                .filter(|pair| {
+                    matches!(&pair[0].kind, TokenKind::Ident(name) if name == "key")
+                        && pair[1].kind == TokenKind::Punct("=")
+                })
+                .map(|pair| pair[0].span),
+        );
     }
 
     fn ty(&mut self, ty: &TypeExpr) -> usize {
@@ -368,7 +394,12 @@ impl<'a> Layout<'a> {
                 self.type_angles.insert(self.tokens[end].span);
                 end + 1
             }
-            TypeExpr::List(inner, _) | TypeExpr::Option(inner, _) => {
+            TypeExpr::List(inner, _) => {
+                let end = self.ty(inner);
+                self.type_angles.insert(self.tokens[end].span);
+                end + 2
+            }
+            TypeExpr::Option(inner, _) => {
                 let end = self.ty(inner);
                 self.type_angles.insert(self.tokens[start + 1].span);
                 self.type_angles.insert(self.tokens[end].span);
@@ -436,7 +467,10 @@ impl<'a> Layout<'a> {
                     self.header(*span, args, true, None);
                     self.nodes(children);
                 }
-                Node::Each { body, .. } => self.nodes(body),
+                Node::Each { body, span, .. } => {
+                    self.keys(*span);
+                    self.nodes(body);
+                }
                 Node::When {
                     then, otherwise, ..
                 } => {
@@ -574,7 +608,8 @@ impl<'a> Layout<'a> {
                 || (a == ":"
                     && !self.ternary_colons.contains(&previous.span)
                     && self.lines.get(previous.span.line as usize - 1).is_some_and(|l| {
-                        l.len() - l.trim_start().len() + 1 == previous.span.col as usize
+                        let content = line_content(previous.span.line as usize - 1, l);
+                        l.len() - content.trim_start().len() + 1 == previous.span.col as usize
                     }));
             if !tight {
                 out.push(' ');
@@ -586,7 +621,11 @@ impl<'a> Layout<'a> {
     fn render(&self) -> String {
         let mut out = String::new();
         for (line, raw) in self.lines.iter().enumerate() {
-            if raw.trim().is_empty() {
+            let content = line_content(line, raw);
+            if content.len() != raw.len() {
+                out.push('\u{feff}');
+            }
+            if content.trim().is_empty() {
                 out.push('\n');
                 continue;
             }
@@ -611,7 +650,7 @@ impl<'a> Layout<'a> {
             let suffix = if let Some(last) = previous {
                 &raw[last.span.end_col as usize - 1..]
             } else {
-                raw
+                content
             };
             let comment = suffix.trim_start();
             if !comment.is_empty() {

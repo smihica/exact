@@ -271,25 +271,41 @@ pub struct Overlaid {
     pub keep: Vec<u64>,
 }
 
-/// What a request answers: a resource or a mutation, by its index in the
-/// plan. The runner keeps at most one request in flight per target (LLP
-/// 1016 D5), so an executor that parks a call until its reply comes keys
-/// it by target: two targets may ask one source with equal arguments.
+/// What a request answers: a runtime resource row, a plan mutation, or one
+/// send of a `parallel` mutation. The runner keeps at most one request in
+/// flight per target (LLP 1016 D5), so an executor that parks a call until
+/// its reply comes keys it by target: two targets may ask one source with
+/// equal arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
-    /// `plan.resources[i]`.
+    /// A declared resource or a runtime member of a resource over a list.
     Resource(usize),
     /// `plan.mutations[i]`.
     Mutation(usize),
+    /// Send `n` of `plan.mutations[m]`, a `parallel` mutation (LLP 1161.000
+    /// D5): numbered when the send is made, in send order, and the same
+    /// through its continuations. Each send is its own request in flight.
+    Sent(usize, u64),
 }
 
 impl Target {
-    /// `Resource(3)`, `Mutation(0)`: what `{:?}` writes, without `core::fmt`
-    /// (a module call's key carries it, on a first press's path).
+    /// `Resource(3)`, `Mutation(0)`, `Sent(0, 7)`: what `{:?}` writes,
+    /// without `core::fmt` (a module call's key carries it, on a first
+    /// press's path).
     pub fn text(self) -> String {
         match self {
             Target::Resource(i) => exact_num::text!("Resource({})", i),
             Target::Mutation(i) => exact_num::text!("Mutation({})", i),
+            Target::Sent(m, n) => exact_num::text!("Sent({}, {})", m, n),
+        }
+    }
+
+    /// The mutation a send answers, whether it is the mutation's one
+    /// request or one of a parallel mutation's.
+    pub fn mutation(self) -> Option<usize> {
+        match self {
+            Target::Mutation(m) | Target::Sent(m, _) => Some(m),
+            Target::Resource(_) => None,
         }
     }
 }
@@ -307,9 +323,100 @@ pub struct SnapshotModule<'a> {
     pub kind: &'a str,
 }
 
-/// The app's data source: the one seam through which computation enters
-/// (LLP 1004 D4). Implemented once, in Rust, by the app's data crate.
-pub trait DataSource {
+// Keep the leaf defaults and the complete wrapper contract in one declaration.
+macro_rules! data_source_self {
+    (mut $this:ident) => {
+        $this
+    };
+    ($this:ident) => {
+        $this
+    };
+}
+
+macro_rules! data_source {
+    (
+        required {
+            $(
+                $(#[$required_doc:meta])*
+                fn $required:ident(&$r_receiver:ident $($r_self:ident)?
+                    $(, $r_arg:ident: $r_type:ty)* $(,)?) -> $r_result:ty;
+            )*
+        }
+        $(
+            $(#[$doc:meta])*
+            fn $name:ident(&$receiver:ident $($this:ident)?
+                $(, $arg:ident: $arg_type:ty)* $(,)?) $(-> $result:ty)?
+                $(where Self: $bound:ident,)? $body:block
+        )*
+    ) => {
+        /// The app's data source: the one seam through which computation enters
+        /// (LLP 1004 D4). Leaves implement this trait; sources that wrap another
+        /// implement [`DataSourceWrapper`] so an omitted method cannot use a leaf default.
+        pub trait DataSource {
+            $(
+                $(#[$required_doc])*
+                fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result;
+            )*
+            $(
+                $(#[$doc])*
+                fn $name(&$receiver $($this)?, $($arg: $arg_type),*) $(-> $result)?
+                    $(where Self: $bound,)? $body
+            )*
+        }
+
+        /// A composing or forwarding source must handle every data-source method.
+        /// Implementations forward, translate, or explicitly refuse each call.
+        /// The method descriptions document the defaults available only to leaves.
+        ///
+        /// ```compile_fail,E0046
+        /// use exact_runner::{DataError, DataSourceWrapper, Value};
+        /// struct Incomplete;
+        /// impl DataSourceWrapper for Incomplete {
+        ///     fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+        ///         Ok(Value::Unit)
+        ///     }
+        /// }
+        /// ```
+        pub trait DataSourceWrapper {
+            $(
+                $(#[$required_doc])*
+                fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result;
+            )*
+            $(
+                $(#[$doc])*
+                fn $name(&$receiver $($this)?, $($arg: $arg_type),*) $(-> $result)?
+                    $(where Self: $bound,)?;
+            )*
+        }
+
+        impl<T: DataSourceWrapper + ?Sized> DataSource for T {
+            $(
+                fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result {
+                    <T as DataSourceWrapper>::$required(
+                        data_source_self!($r_receiver $($r_self)?), $($r_arg),*
+                    )
+                }
+            )*
+            $(
+                fn $name(&$receiver $($this)?, $($arg: $arg_type),*) $(-> $result)?
+                    $(where Self: $bound,)? {
+                    <T as DataSourceWrapper>::$name(
+                        data_source_self!($receiver $($this)?), $($arg),*
+                    )
+                }
+            )*
+        }
+    };
+}
+
+data_source! {
+    required {
+        /// Answer a resource's or a mutation's request now. `args` are the
+        /// resource's argument expressions evaluated against current state, or
+        /// a `send`'s arguments. Bake and every in-process source use this.
+        fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError>;
+    }
+
     /// Prepare a disposable, read-only snapshot refresh before activation.
     /// Bytecode and its receipt come from the app's pinned generation, never
     /// from a separately selected update (LLP 1126.000 WP5).
@@ -578,11 +685,6 @@ pub trait DataSource {
         ))
     }
 
-    /// Answer a resource's or a mutation's request now. `args` are the
-    /// resource's argument expressions evaluated against current state, or
-    /// a `send`'s arguments. Bake and every in-process source use this.
-    fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError>;
-
     /// The app identity, reverse-DNS (LLP 1023 D5) — the one declaration:
     /// bake writes it into the plan header, and boot refuses a plan whose
     /// header names a different app. Empty is unnamed — a fixture or a
@@ -811,6 +913,7 @@ pub trait DataSource {
     fn canvases_retired(&mut self, retired: &[(u64, u32)]) {
         let _ = retired;
     }
+
 }
 
 /// A Contract app without application data has no sources to answer.
@@ -870,7 +973,11 @@ mod target_tests {
     #[test]
     fn a_target_text_is_its_debug_text() {
         for i in [0, 1, 9, 10, 4_294_967_295, usize::MAX] {
-            for target in [Target::Resource(i), Target::Mutation(i)] {
+            for target in [
+                Target::Resource(i),
+                Target::Mutation(i),
+                Target::Sent(i, i as u64),
+            ] {
                 assert_eq!(target.text(), format!("{target:?}"));
             }
         }

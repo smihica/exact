@@ -16,7 +16,72 @@ import UIKit
 
 /// Every node view's layer. `display` decides whether UIKit allocates a
 /// backing store and calls `draw(_:)` at all.
+extension CALayer {
+    /// The mask its box asks for: a node's own (`NodeLayer.ownMask`), not
+    /// the empty one that hides a placed canvas child.
+    var boxMask: CALayer? { (self as? NodeLayer).map(\.ownMask) ?? mask }
+    /// Its opacity as it shows on screen: 0 for a placed canvas child, which
+    /// its surface draws and UIKit does not, as alpha 0 once said.
+    var shownOpacity: Float { (self as? NodeLayer)?.drawnElsewhere == true ? 0 : opacity }
+}
+
 final class NodeLayer: CALayer {
+    /// A canvas child its surface places and draws (LLP 1014 D5): Core
+    /// Animation draws nothing of it, its descendants and shadow included,
+    /// through an empty mask, and its opacity stays 1. Below a view at alpha
+    /// 0 UIKit stops applying its accessibility rules (the snapshot XCUITest
+    /// reads lists a leaf that is no element) and VoiceOver goes no deeper
+    /// than one that is not an element, so neither alpha 0 hides it nor an
+    /// author's `opacity: 0` (or a fade reaching it) may put it there. The
+    /// mask and opacity its writers ask for (`applyBoxMask`, its border's
+    /// clip, a filter's hide; the author's opacity, a press, a fade) are kept
+    /// aside, `ownMask` and `ownOpacity`, and are back when it is no longer
+    /// placed. The surface composites the child as captured, at opacity 1.
+    var drawnElsewhere = false {
+        didSet {
+            guard drawnElsewhere != oldValue else { return }
+            super.mask = drawnElsewhere ? CALayer() : keptMask
+            super.opacity = drawnElsewhere ? 1 : keptOpacity
+        }
+    }
+    private var keptMask: CALayer?
+    private var keptOpacity: Float = 1
+    /// The mask its writers asked for, whether or not it is drawn elsewhere.
+    var ownMask: CALayer? { drawnElsewhere ? keptMask : super.mask }
+    /// The opacity its writers asked for.
+    var ownOpacity: Float { drawnElsewhere ? keptOpacity : super.opacity }
+    override var mask: CALayer? {
+        get { super.mask }
+        set { keptMask = newValue; if !drawnElsewhere { super.mask = newValue } }
+    }
+    override var opacity: Float {
+        get { super.opacity }
+        set {
+            let was = keptOpacity
+            keptOpacity = newValue
+            if !drawnElsewhere { super.opacity = newValue }
+            if !passingWrites, (was < 0.01) != (newValue < 0.01) { (delegate as? NodeView)?.transparencyChanged() }
+        }
+    }
+    private var passingWrites = false
+    /// `body`'s writes to the layer's opacity as passing ones, put back by
+    /// the time it returns (a capture's or a filter's raise to 1): none asks
+    /// its canvas to list its children again, as an author's change does
+    /// (`transparencyChanged`), which would capture again, and again.
+    func passing(_ body: () -> Void) {
+        let was = passingWrites
+        passingWrites = true
+        body()
+        passingWrites = was
+    }
+    /// `body` with the layer as its writers asked for it: a render of the
+    /// child itself (its capture, its filter's input), not of the screen.
+    func asAsked(_ body: () -> Void) {
+        guard drawnElsewhere else { body(); return }
+        drawnElsewhere = false
+        body()
+        drawnElsewhere = true
+    }
     override func display() {
         guard let node = delegate as? NodeView else { super.display(); return }
         node.applyBoxLayer()
@@ -26,7 +91,9 @@ final class NodeLayer: CALayer {
         if node.drawsPaint { super.display(); return }
         contents = nil
         if node.isParagraph {
-            // Text's pixels are the raster layer's; this one keeps none.
+            // Text's pixels are the raster layer's; this one keeps none, and
+            // the Numerals capability, which drew it on one line, lets go.
+            if node.hasContentTransition { NumeralLink.installed?.hide(node) }
             node.presenter?.textRasters.ensure(node, urgent: node.presenter?.textIsVisible(node) == true)
             if node.textRasterFailed { super.display(); return }
         }
@@ -299,7 +366,7 @@ extension NodeView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         if let box = clipBox {
-            box.layer.cornerRadius = cornerRadius
+            box.layer.cornerRadius = clipsOneAxis ? 0 : cornerRadius
             box.layer.maskedCorners = corners
             box.layer.cornerCurve = curve
         }

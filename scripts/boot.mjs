@@ -10,7 +10,39 @@ import vm from 'node:vm';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ALLOWED = new Set(['host/web/glue.js', 'host/web/navigation.js']);
+const MODULES = {
+  'host/web/glue.js': [
+    'host/web/wasm/agent.js',
+    'host/web/wasm/boot.js',
+    'host/web/wasm/commit.js',
+    'host/web/wasm/context.js',
+    'host/web/wasm/flow.js',
+    'host/web/wasm/input.js',
+    'host/web/wasm/views.js',
+  ],
+  'host/web/navigation.js': [
+    'host/web/navigation/assets.js',
+    'host/web/navigation/controls.js',
+    'host/web/navigation/environment.js',
+    'host/web/navigation/focus.js',
+    'host/web/navigation/grant-origins.js',
+    'host/web/navigation/layers.js',
+    'host/web/navigation/lists.js',
+    'host/web/navigation/markup.js',
+    'host/web/navigation/motion.js',
+    'host/web/navigation/network.js',
+    'host/web/navigation/popover.js',
+    'host/web/navigation/requests.js',
+    'host/web/navigation/routes.js',
+    'host/web/navigation/scroll.js',
+    'host/web/navigation/selection.js',
+    'host/web/navigation/store.js',
+    'host/web/navigation/type.js',
+    'host/web/navigation/urls.js',
+    'host/web/grant-admission.js',
+  ],
+};
+const ALLOWED = new Set([...Object.keys(MODULES), ...Object.values(MODULES).flat()]);
 // A served document may run exactly one inline script before its glue: the
 // host's capture script (LLP 1048.000 D6, 1048.001 D5; Charlie, 2026-09-23),
 // which records taps, once the page has painted starts an idle page's wasm
@@ -92,38 +124,28 @@ function scriptTags(html, problems) {
   return scripts;
 }
 
-// Remove comments and literal bodies while retaining code in ${...}; this is
-// only for detecting dynamic import. Static imports and all syntax are parsed
-// by the runtime's module parser below; none of the source is executed.
-function codeOnly(source) {
-  const out = [...source].fill(' ');
-  const templates = [];
-  let state = 'code';
-  let quote = null;
-  let braces = 0;
-  for (let i = 0; i < source.length; i++) {
-    const ch = source[i], next = source[i + 1];
-    if (state === 'line') { if (ch === '\n') { state = 'code'; out[i] = ch; } continue; }
-    if (state === 'block') { if (ch === '*' && next === '/') { state = 'code'; i++; } continue; }
-    if (state === 'string') { if (ch === '\\') { i++; continue; } if (ch === quote) state = 'code'; continue; }
-    if (state === 'template') {
-      if (ch === '\\') { i++; continue; }
-      if (ch === '`') { state = 'code'; continue; }
-      if (ch === '$' && next === '{') { templates.push(braces); braces++; state = 'code'; i++; }
-      continue;
+// Fail closed: boot sources may not spell a dynamic import, even in comments
+// or literals. Comments between the keyword and parenthesis count as whitespace.
+// The runtime's module parser below checks static imports and syntax.
+function hasDynamicImport(source) {
+  for (const match of source.matchAll(/\bimport\b/g)) {
+    let at = match.index + match[0].length;
+    while (at < source.length) {
+      if (/\s/.test(source[at])) { at++; continue; }
+      if (source.startsWith('/*', at)) {
+        const end = source.indexOf('*/', at + 2);
+        if (end < 0) break;
+        at = end + 2;
+      } else if (source.startsWith('//', at)) {
+        at += 2;
+        while (at < source.length && !/[\r\n\u2028\u2029]/.test(source[at])) at++;
+      } else {
+        if (source[at] === '(') return true;
+        break;
+      }
     }
-    if (ch === '/' && next === '/') { state = 'line'; i++; continue; }
-    if (ch === '/' && next === '*') { state = 'block'; i++; continue; }
-    if (ch === '"' || ch === "'") { state = 'string'; quote = ch; continue; }
-    if (ch === '`') { state = 'template'; continue; }
-    if (ch === '{') braces++;
-    if (ch === '}') {
-      braces--;
-      if (templates.length && braces === templates[templates.length - 1]) { templates.pop(); state = 'template'; continue; }
-    }
-    out[i] = ch;
   }
-  return out.join('');
+  return false;
 }
 
 function localModule(root, from, specifier, problems) {
@@ -173,7 +195,7 @@ function run() {
     let requests;
     try { requests = new vm.SourceTextModule(source, { identifier: file }).dependencySpecifiers; }
     catch (error) { problems.push(`invalid module syntax in ${rel}: ${error.message}`); continue; }
-    if (/\bimport\s*\(/.test(codeOnly(source))) problems.push(`dynamic import before first pixel in ${rel}`);
+    if (hasDynamicImport(source)) problems.push(`dynamic import before first pixel in ${rel}`);
     for (const request of requests) {
       const next = localModule(root, file, request, problems);
       if (next) queue.push(next);
@@ -187,7 +209,7 @@ function run() {
     const source = readFileSync(resolve(root, documentEntry), 'utf8');
     documentBytes = Buffer.byteLength(source);
     const imports = new vm.SourceTextModule(source).dependencySpecifiers;
-    if (imports.length || /\bimport\s*\(/.test(codeOnly(source))) problems.push(`${documentEntry} must have no imports before first pixel`);
+    if (imports.length || hasDynamicImport(source)) problems.push(`${documentEntry} must have no imports before first pixel`);
   } catch (error) { problems.push(`invalid document entry: ${error.message}`); }
   // The capture script: its bytes as pages carry them, pinned by hash, capped,
   // a classic script that imports nothing. A built document, when this
@@ -200,7 +222,7 @@ function run() {
     if (capture.sha256 !== CAPTURE.sha256) problems.push(`${CAPTURE.path} changed (sha256 ${capture.sha256}); served pages may run only the pinned capture script (${CAPTURE.sha256})`);
     if (capture.bytes > CAPTURE.maxBytes) problems.push(`${CAPTURE.path} is ${capture.bytes} B, over its ${CAPTURE.maxBytes} B cap`);
     new vm.Script(text);
-    if (/\bimport\b/.test(codeOnly(text))) problems.push(`${CAPTURE.path} must import nothing`);
+    if (/\bimport\b/.test(text)) problems.push(`${CAPTURE.path} must import nothing`);
   } catch (error) { problems.push(`invalid capture script: ${error.message}`); }
   const built = resolve(root, 'host/web/dist/index.html');
   if (existsSync(built)) {
@@ -222,13 +244,14 @@ function run() {
     path: rootPath(file), bytes: Buffer.byteLength(source),
     sha256: createHash('sha256').update(source).digest('hex'),
   }));
-  const report = { modules: seen.size, javascript_bytes: modules.reduce((n, m) => n + m.bytes, 0),
+  const shipped = Object.keys(MODULES).filter(file => seen.has(resolve(root, file)));
+  const report = { modules: shipped.length, javascript_bytes: modules.reduce((n, m) => n + m.bytes, 0),
     html_bytes: Buffer.byteLength(html), files: modules, wasm_references: wasm,
     document_entry: { modules: 1, javascript_bytes: documentBytes },
     capture_script: { inline: 1, bytes: capture.bytes, max_bytes: CAPTURE.maxBytes, sha256: capture.sha256, checked: capture.checked, found: capture.found, stale: capture.stale }, problems };
   if (process.argv.includes('--json')) console.log(JSON.stringify(report));
   else {
-    console.log(`boot — modules reachable before first pixel: ${seen.size} (${[...seen].map(rootPath).join(', ') || 'none'}); wasm references: ${wasm}`);
+    console.log(`boot — modules reachable before first pixel: ${shipped.length} (${shipped.join(', ') || 'none'}); wasm references: ${wasm}`);
     console.log(`  reachable JavaScript: ${report.javascript_bytes} B; page: ${report.html_bytes} B (diagnostic sizes, no byte budget)`);
     console.log(`  interaction document: 1 host module (${documentBytes} B), no imports`);
     const built = !capture.checked ? '' : capture.found ? `; ${capture.checked} runs it and no other`

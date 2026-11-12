@@ -144,13 +144,39 @@ fn sun_visibility(world: vec3<f32>, normal: vec3<f32>) -> f32 {
     return mix(1.0, sun_visibility_filtered(world, normal), frame.shadow_filter.w);
 }
 
+// PCF-soft (see pcf_soft) in a local light's map.
+fn local_pcf_soft(uv: vec2<f32>, layer: i32, z: f32) -> f32 {
+    let size = f32(textureDimensions(local_shadow_map).x);
+    let f = fract(uv * size + 0.5);
+    let at = uv - f / size;
+    let lo = 2.0 - f;
+    let hi = 1.0 + f;
+    let a = at + (-1.0 + 1.0 / lo) / size;
+    let b = at + (1.0 + f / hi) / size;
+    return (textureSampleCompareLevel(local_shadow_map, shadow_sampler, a, layer, z) * lo.x * lo.y
+        + textureSampleCompareLevel(local_shadow_map, shadow_sampler, vec2(b.x, a.y), layer, z) * hi.x * lo.y
+        + textureSampleCompareLevel(local_shadow_map, shadow_sampler, vec2(a.x, b.y), layer, z) * lo.x * hi.y
+        + textureSampleCompareLevel(local_shadow_map, shadow_sampler, b, layer, z) * hi.x * hi.y) / 9.0;
+}
 // A local light's shadow at `world` (lights.wgsl record words 13-15: first layer,
-// matrix word offset, texel width per metre). A point light picks its cube face
-// by the major axis from the light; 3x3 PCF in that face's map.
+// matrix word offset, texel width per metre; 17-19: the filter). A point light
+// picks its cube face from the offset receiver so the projection stays inside
+// that face. Filter 0 is 3x3 PCF, word 18 texels apart; 1 is PCF-soft and 2 one
+// bilinear comparison, each with word 18's normalized depth bias and word 19's
+// normal bias in metres.
 fn light_visibility(at: u32, world: vec3<f32>, n: vec3<f32>, l: vec3<f32>) -> f32 {
     let layer = light_f(at + 13u);
     if layer < 0.0 { return 1.0; }
-    let from_light = -l;
+    let kind = light_f(at + 17u);
+    // Filter 0: a normal offset of one and a half texels at this distance, less
+    // towards the light.
+    let position = light_v(at);
+    let cosine = clamp(dot(n, l), 0.0, 1.0);
+    let texel = distance(world, position) * light_f(at + 15u);
+    var offset = n * texel * 1.5 * sqrt(max(1.0 - cosine * cosine, 0.0)) + l * texel * 0.5;
+    if kind > 0.5 { offset = n * light_f(at + 19u); }
+    let receiver = world + offset;
+    let from_light = receiver - position;
     var face = 0u;
     if light_f(at + 11u) < -1.5 {
         let a = abs(from_light);
@@ -164,21 +190,23 @@ fn light_visibility(at: u32, world: vec3<f32>, n: vec3<f32>, l: vec3<f32>) -> f3
         vec4(light_f(m + 4u), light_f(m + 5u), light_f(m + 6u), light_f(m + 7u)),
         vec4(light_f(m + 8u), light_f(m + 9u), light_f(m + 10u), light_f(m + 11u)),
         vec4(light_f(m + 12u), light_f(m + 13u), light_f(m + 14u), light_f(m + 15u)));
-    // Normal offset of one and a half texels at this distance, less towards the light.
-    let cosine = clamp(dot(n, l), 0.0, 1.0);
-    let texel = distance(world, light_v(at)) * light_f(at + 15u);
-    let offset = n * texel * 1.5 * sqrt(max(1.0 - cosine * cosine, 0.0)) + l * texel * 0.5;
-    let clip = view * vec4(world + offset, 1.0);
+    let clip = view * vec4(receiver, 1.0);
     if clip.w <= 0.0 { return 1.0; }
     let ndc = clip.xyz / clip.w;
     let uv = ndc.xy * vec2(0.5, -0.5) + 0.5;
     if any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || ndc.z > 1.0 { return 1.0; }
+    let index = i32(u32(layer) + face);
+    if kind > 1.5 {
+        return textureSampleCompareLevel(local_shadow_map, shadow_sampler, uv, index, ndc.z - light_f(at + 18u));
+    }
+    if kind > 0.5 { return local_pcf_soft(uv, index, ndc.z - light_f(at + 18u)); }
     let size = vec2<f32>(textureDimensions(local_shadow_map));
+    let spacing = light_f(at + 18u);
     var sum = 0.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
             sum += textureSampleCompareLevel(local_shadow_map, shadow_sampler,
-                uv + vec2(f32(x), f32(y)) / size, i32(u32(layer) + face), ndc.z - 0.00002);
+                uv + vec2(f32(x), f32(y)) * spacing / size, index, ndc.z - 0.00002);
         }
     }
     return sum / 9.0;

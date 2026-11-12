@@ -31,6 +31,7 @@ mod font_cache;
 mod fonts;
 mod lines;
 mod shaping;
+mod stroke;
 #[allow(dead_code)] // Private transfer proof; controller integration is a separate increment.
 pub(crate) mod transfer;
 #[cfg(test)]
@@ -307,6 +308,7 @@ pub struct Paragraph {
     /// Each wrapped line box's bottom (LLP 1093 D6): where a column may end.
     bottoms: Arc<Vec<f32>>,
     ink: RefCell<ink::Cache>,
+    pub(crate) strokes: RefCell<stroke::Cache>,
     ellipsized: RefCell<Option<(f32, Rc<Paragraph>)>>,
     // S + width scalars, excluding canonical key K. Shared S must be
     // deduplicated across snapshots; lazy lines and ink are read separately.
@@ -407,7 +409,10 @@ impl Paragraph {
     /// Current accessible capacity in O(1), without visiting shaped glyphs.
     /// Accounting/maintenance runs outside paint's exclusive ink borrow.
     fn owned_capacity_bytes(&self) -> usize {
-        self.resident_capacity_bytes + self.lines_capacity_bytes() + self.ink_capacity_bytes()
+        self.resident_capacity_bytes
+            + self.lines_capacity_bytes()
+            + self.ink_capacity_bytes()
+            + self.strokes.borrow().bytes()
     }
 
     /// CSS inline backgrounds (LLP 1053 §0): each run's `background-color`
@@ -581,6 +586,8 @@ pub struct GlyphRun {
 pub struct TextEngine {
     catalog: catalog::Lease,
     paragraphs: cache::Cache,
+    /// Hosted field files by this catalog's stack, weight and slant (LLP 1019 D4).
+    pub(crate) field_faces: HashMap<(u16, u16, bool), String>,
     /// Canonical shaped-source builds, independent of width layout.
     pub shape_calls: usize,
     layout_calls: usize,
@@ -638,6 +645,7 @@ impl TextEngine {
             held: HashMap::new(),
             catalog: Rc::new(RefCell::new(catalog)),
             paragraphs: cache::Cache::default(),
+            field_faces: HashMap::new(),
             shape_calls: 0,
             layout_calls: 0,
             measures: 0,
@@ -680,6 +688,13 @@ impl TextEngine {
     /// the plan-identity boundary on a dev reload (LLP 1019 D4).
     pub fn install_plan(&mut self, plan: &Plan, assets: &Path) {
         self.install_plan_assets(plan, &Assets::embedded(assets.to_path_buf()));
+    }
+
+    /// A picture owns its stack ids independently of the app's catalog.
+    pub(crate) fn for_svg(families: &[Vec<(bool, String)>]) -> Shared {
+        let mut catalog = catalog::Catalog::new();
+        catalog.install_picture(families);
+        Rc::new(RefCell::new(Self::with_catalog(catalog)))
     }
 
     /// Add newly interned installed-family lists before the next measure.

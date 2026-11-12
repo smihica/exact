@@ -1274,7 +1274,6 @@ pub fn style_row(id: u16, written: bool) -> Result<(String, String), String> {
         StyleCodec::Dimension
             | StyleCodec::Enum
             | StyleCodec::ColorValue
-            | StyleCodec::Rgba8
             | StyleCodec::KeywordColor
             | StyleCodec::F32
             | StyleCodec::U8

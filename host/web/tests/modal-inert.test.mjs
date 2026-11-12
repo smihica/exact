@@ -1,16 +1,15 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
-import { glueDeclarations } from './glue-fixture.mjs';
+import { glueDeclarations, glueNode } from './glue-fixture.mjs';
 
 const glue = readFileSync(new URL('../glue.js', import.meta.url), 'utf8');
 const gpuListen = glueDeclarations(readFileSync(new URL('../gpu-glue.js', import.meta.url), 'utf8'), ['listen', 'editable']);
 // Execute the wasm host's actual entry points with only the runner and unrelated
 // presenters stubbed. The browser owns dialog, popover, inert and scrolling behavior.
-const shown = glue.split('exact_geometry: { shown: ')[1].split(', read: ')[0];
-const agentStart = glue.indexOf('function agentReply(');
-const agent = glue.slice(agentStart, glue.indexOf('\n}', agentStart) + 2);
-const props = glue.slice(glue.indexOf('function applyProps('), glue.indexOf('function ensureMessageListener('));
+const shown = glueNode(glue, node => node.type === 'Property' && node.key.name === 'shown' && node.value);
+const agent = glueDeclarations(glue, ['agentReply']);
+const props = glueDeclarations(glue, ['applyProps']);
 const html = `<style>dialog { max-height: 240px; overflow: auto; }</style>
 <main id="exact-root">
   <button id="page" data-match>Page</button>
@@ -37,6 +36,7 @@ const html = `<style>dialog { max-height: 240px; overflow: auto; }</style>
   const root = document.getElementById('exact-root');
   const views = new Map([...root.querySelectorAll('[id]')].map(el => [el.id, el]));
   const wasm = {}, inputReady = true, agentMode = false, tagged = reply => reply, syncMedia = () => {}, syncMarkup = () => {};
+  const host = { wasm, inputReady, backButton, reveal };
   ${agent}
   ${props}
   let structuralModalLayers;
@@ -71,7 +71,7 @@ async function inBrowser(run) {
     const path = new URL(request.url).pathname;
     if (path === '/favicon.ico') return new Response(null, { status: 204 });
     return path === '/' ? new Response(html, { headers: { 'content-type': 'text/html' } })
-      : new Response(Bun.file(new URL('..' + path, import.meta.url)));
+      : new Response(readFileSync(new URL('..' + path, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
   } });
   let browser;
   try {

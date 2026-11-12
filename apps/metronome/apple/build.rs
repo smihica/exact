@@ -44,7 +44,8 @@ fn main() {
             contract::rust_entry(
                 "metronome_data::Metronome",
                 "metronome_data::Metronome",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

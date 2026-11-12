@@ -45,7 +45,23 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
     private val purchases: JSONArray get() = state.optJSONArray("purchases") ?: JSONArray().also { state.put("purchases", it) }
     private val applied: JSONArray get() = state.optJSONArray("applied") ?: JSONArray().also { state.put("applied", it) }
 
-    private fun save() { file.parentFile?.mkdirs(); file.writeText(state.toString()) }
+    /** Makes [change] and writes the store. Where it cannot be written the store is left as it was and the
+     * [java.io.IOException] goes on to the call, which answers it as any failure (`NotSupportedError`). */
+    private fun <T> kept(change: () -> T): T {
+        val before = state.toString()
+        val out = change()
+        try {
+            file.parentFile?.mkdirs()
+            dev.exact.canvas.Files.write(file, state.toString().toByteArray())
+        } catch (e: java.io.IOException) {
+            val was = JSONObject(before)
+            state.keys().asSequence().toList().forEach { state.remove(it) }
+            was.keys().forEach { state.put(it, was.get(it)) }
+            log("purchases: the store was not kept, so nothing changed: $e")
+            throw e
+        }
+        return out
+    }
     private fun rows(): List<JSONObject> = (0 until purchases.length()).map { purchases.getJSONObject(it) }
 
     fun item(id: String): JSONObject? = (0 until catalog.length()).map { catalog.getJSONObject(it) }.firstOrNull { it.optString("itemId") == id }
@@ -55,9 +71,8 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
     private fun refund(now: Double) {
         val gone = rows().filter { it.optString("state") == "purchased" && !it.optBoolean("acknowledged") && now - it.optDouble("since") >= REFUND }
         if (gone.isEmpty()) return
+        kept { state.put("purchases", JSONArray(rows().filter { it !in gone })) }
         gone.forEach { log("purchases: ${it.optString("token")} (${it.optString("itemId")}) refunded: unacknowledged three days after purchase, as Play does") }
-        state.put("purchases", JSONArray(rows().filter { it !in gone }))
-        save()
     }
 
     /** At a return to the foreground: each subscription whose private period has ended is dropped, as Play's next
@@ -65,9 +80,8 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
     fun resumed(now: Double) {
         val ended = rows().filter { it.has("end") && it.optDouble("end") <= now }
         if (ended.isEmpty()) return
+        kept { state.put("purchases", JSONArray(rows().filter { it !in ended })) }
         ended.forEach { log("purchases: ${it.optString("token")} (${it.optString("itemId")}) ended its period") }
-        state.put("purchases", JSONArray(rows().filter { it !in ended }))
-        save()
     }
 
     fun owned(now: Double): List<JSONObject> { refund(now); return rows().filter { it.optString("state") == "purchased" } }
@@ -75,27 +89,31 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
 
     fun buy(itemId: String, now: Double, account: String?, pending: Boolean): JSONObject? {
         if (rows().any { it.optString("itemId") == itemId }) return null
-        val n = state.optInt("counter") + 1
-        state.put("counter", n)
-        val row = JSONObject().put("token", "agent-play-token-$n").put("itemId", itemId).put("time", now).put("acknowledged", false)
-            .put("state", if (pending) "pending" else "purchased").put("since", now).put("account", account ?: JSONObject.NULL)
-        AgentStore.period(item(itemId)?.optString("subscriptionPeriod"))?.let { if (item(itemId)?.optString("type") == "subscription") row.put("end", now + it) }
-        purchases.put(row)
-        save()
+        val row = kept {
+            val n = state.optInt("counter") + 1
+            state.put("counter", n)
+            val row = JSONObject().put("token", "agent-play-token-$n").put("itemId", itemId).put("time", now).put("acknowledged", false)
+                .put("state", if (pending) "pending" else "purchased").put("since", now).put("account", account ?: JSONObject.NULL)
+            AgentStore.period(item(itemId)?.optString("subscriptionPeriod"))?.let { if (item(itemId)?.optString("type") == "subscription") row.put("end", now + it) }
+            purchases.put(row)
+            row
+        }
         log("purchases: ${row.optString("token")} for $itemId, ${row.optString("state")}, unacknowledged")
         return row
     }
 
     fun finish(token: String, consume: Boolean, now: Double): Boolean {
         val row = owned(now).firstOrNull { it.optString("token") == token } ?: return false
-        if (consume && consumable(row.optString("itemId"))) {
-            state.put("purchases", JSONArray(rows().filter { it.optString("token") != token }))
-            log("purchases: consumed $token")
-        } else if (!row.optBoolean("acknowledged")) {
-            row.put("acknowledged", true)
-            log("purchases: acknowledged $token")
+        val done = kept {
+            if (consume && consumable(row.optString("itemId"))) {
+                state.put("purchases", JSONArray(rows().filter { it.optString("token") != token }))
+                "consumed"
+            } else if (!row.optBoolean("acknowledged")) {
+                row.put("acknowledged", true)
+                "acknowledged"
+            } else null
         }
-        save()
+        done?.let { log("purchases: $it $token") }
         return true
     }
 
@@ -105,20 +123,25 @@ internal class AgentStore(private val file: File, private val log: (String) -> U
         val token = event.optString("purchaseToken").ifEmpty { null }
         val key = "$op ${token ?: ""} ${event.optString("itemId")}"
         if ((0 until applied.length()).any { applied.getString(it) == key }) return false
-        applied.put(key)
-        save()
-        val row = rows().firstOrNull { it.optString("token") == token }
-        when (op) {
-            "approve" -> { if (row == null || row.optString("state") != "pending") return false; row.put("state", "purchased").put("since", now); log("purchases: $token approved") }
-            // Play keeps the token and its acknowledgement across a renewal; nothing enters the queue.
-            "renew" -> { val p = AgentStore.period(item(row?.optString("itemId") ?: "")?.optString("subscriptionPeriod")); if (row == null || p == null) return false
-                row.put("end", maxOf(row.optDouble("end", now), now) + p); log("purchases: $token renewed, the same token") }
-            "revoke" -> { if (row == null) return false; state.put("purchases", JSONArray(rows().filter { it !== row })); log("purchases: $token revoked") }
-            "purchase" -> return buy(event.optString("itemId"), now, null, false) != null
-            else -> { log("purchases: storeEvent $op is not approve, renew, revoke or purchase"); return false }
+        // The event is recorded as applied in the same write as what it changes, or not at all.
+        if (op == "purchase") {
+            kept { applied.put(key) }
+            return buy(event.optString("itemId"), now, null, false) != null
         }
-        save()
-        return true
+        val said = kept {
+            applied.put(key)
+            val row = rows().firstOrNull { it.optString("token") == token }
+            when (op) {
+                "approve" -> if (row == null || row.optString("state") != "pending") null else { row.put("state", "purchased").put("since", now); "$token approved" }
+                // Play keeps the token and its acknowledgement across a renewal; nothing enters the queue.
+                "renew" -> { val p = AgentStore.period(item(row?.optString("itemId") ?: "")?.optString("subscriptionPeriod"))
+                    if (row == null || p == null) null else { row.put("end", maxOf(row.optDouble("end", now), now) + p); "$token renewed, the same token" } }
+                "revoke" -> if (row == null) null else { state.put("purchases", JSONArray(rows().filter { it !== row })); "$token revoked" }
+                else -> "storeEvent $op is not approve, renew, revoke or purchase"
+            }
+        }
+        said?.let { log("purchases: $it") }
+        return said != null && op in setOf("approve", "renew", "revoke")
     }
 
     fun details(row: JSONObject): JSONObject {

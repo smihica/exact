@@ -233,6 +233,61 @@ fn anchor_chain_layout_changes_and_out_of_flow_changes_suppress() {
 }
 
 #[test]
+fn scroller_layout_changes_suppress_anchoring() {
+    let source = r#"component App
+  state pad = 0
+  state top = 0
+  state tall = 300
+  state head = 0
+  state inner = 0
+  action headed
+    head = 50
+  action inset
+    inner = 50
+  action padded
+    pad = 50
+  action margined
+    top = 50
+    head = 50
+  action heightened
+    tall = 350
+    head = 50
+  view
+    column width=400 height=400
+      scroll testId="port" width=400 height=tall padding-top=pad margin-top=top
+        box height=head
+        column padding-top=inner
+          box testId="row" height=1000
+      button "head" testId="headed" press=headed
+      button "inner" testId="inset" press=inset
+      button "pad" testId="padded" press=padded
+      button "top" testId="margined" press=margined
+      button "tall" testId="heightened" press=heightened
+"#;
+    let cases = [
+        ("headed", 450.),
+        ("inset", 400.),
+        ("padded", 400.),
+        ("margined", 400.),
+        ("heightened", 400.),
+    ];
+    let actual: Vec<_> = cases
+        .iter()
+        .map(|&(action, _)| {
+            let mut p = boot_source(source);
+            let port = named(&p, "port");
+            assert_eq!(p.scroll_to(port, (0., 400.)), Some((0., 400.)));
+            let button = named(&p, action);
+            assert_eq!(p.host.dispatch_at(button, Event::Press, p.host.now()), None);
+            assert_eq!(p.after_commit(), None);
+            p.frame();
+            (action, p.scroll_of(port).1)
+        })
+        .collect();
+    assert_eq!(actual, cases);
+}
+
+#[test]
 fn consecutive_commits_keep_each_pictures_correction() {
     let source = source(false).replace("header = 0", "header = header - 24");
     let mut p = boot_source(&source);

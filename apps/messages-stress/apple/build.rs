@@ -45,9 +45,7 @@ fn main() {
         out_dir.join("entry.rs"),
         format!(
             "{}\n{}{host}::host!(AppData, PLAN, COMPAT; linked = EXACT_LINKED);\n",
-            source_factory
-                .entry(compat.inputs["rustMode"].as_str().unwrap())
-                .unwrap(),
+            source_factory.entry(&compat.inputs).unwrap(),
             linked
         ),
     )

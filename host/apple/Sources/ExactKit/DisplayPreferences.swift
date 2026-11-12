@@ -11,6 +11,20 @@ import AppKit
 import UIKit
 #endif
 
+#if os(macOS)
+extension ExactEnv {
+    /// The manifest's fixed `userInterfaceStyle` (`ExactUserInterfaceStyle`,
+    /// host/apple/plist.mjs `interfaceStyle`), or `nil` to follow the Mac.
+    /// AppKit has no layer beneath the application's appearance, so the app
+    /// sets it before its first window and `setScheme("system")` returns to it.
+    nonisolated(unsafe) public static let fixedAppearance: NSAppearance? = switch appMetadata["ExactUserInterfaceStyle"] as? String {
+    case "dark": NSAppearance(named: .darkAqua)
+    case "light": NSAppearance(named: .aqua)
+    default: nil
+    }
+}
+#endif
+
 enum DisplayPreferences {
     /// What an agent's `prefer` set, in place of the platform's settings.
     /// Under the agent it starts at `no-preference` for both, never the
@@ -130,8 +144,11 @@ enum DisplayPreferences {
     /// and while it sets one it is the system's as last read: a change the
     /// person makes in System Settings then is seen once the app follows
     /// the system again.
+    /// An app whose manifest fixes `userInterfaceStyle` sees it as the
+    /// system's, as UIKit's `UIUserInterfaceStyle` makes it on iOS.
     #if os(macOS)
     static var systemDark: Bool {
+        if let fixed = ExactEnv.fixedAppearance { return fixed.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua }
         if let agent = Agent.systemAppearance { return agent.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua }
         guard let app = NSApp else { return false }
         let dark = app.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua

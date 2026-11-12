@@ -9,6 +9,34 @@ use std::collections::BTreeMap;
 
 const NAMES: [&str; 4] = ["a", "b", "o", "p"];
 
+#[test]
+fn expansion_refuses_a_file_without_a_component() {
+    for src in [
+        "",
+        "shape Data\n  n: number\nfn one(): number = 1\n",
+        "always \"a is one\"\n  expect state a == 1\n",
+    ] {
+        let file = crate::parse(src).unwrap();
+        let expected = crate::SyntaxError {
+            id: "analyze-no-component",
+            message: "a file needs a component".into(),
+            span: Span::point(1, 1),
+        };
+        assert_eq!(super::expand(&file).unwrap_err(), expected);
+        assert_eq!(super::expand_mapped(&file).unwrap_err(), expected);
+        assert_eq!(super::inline(&file).unwrap_err(), expected);
+        for errors in [
+            super::expand_all(&file, false).1,
+            super::expand_all(&file, true).1,
+            super::expand_checked(&file, false).1,
+            super::expand_checked(&file, true).1,
+            super::expand_typed(&file).1,
+        ] {
+            assert_eq!(errors, vec![expected.clone()]);
+        }
+    }
+}
+
 struct Rng(u64);
 
 impl Rng {

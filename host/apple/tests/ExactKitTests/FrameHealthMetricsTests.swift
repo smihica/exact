@@ -765,10 +765,14 @@ final class FrameHealthMetricsTests: XCTestCase {
         let health = session.frameHealth
         health.setHUDVisible(true)
         _ = health.setAgentCapture("start")
-        for request: [String: Any] in [["take": true], ["data": true], ["settle": true], ["to": 500], ["land": true]] {
+        for request: [String: Any] in [["take": true], ["data": true], ["settle": true], ["to": 500]] {
             XCTAssertEqual(session.agentInstance.clock(request)["code"] as? String, "frame-health-clock-takeover")
             XCTAssertNil(session.clock)
         }
+        // An input's landing keeps the wall's clock, so real input lands under a capture.
+        let landed = session.agentInstance.clock(["land": true])
+        XCTAssertEqual(landed["code"] as? String, ExactEnv.agentFreezes ? "frame-health-clock-takeover" : nil)
+        XCTAssertNil(session.clock)
         _ = health.setAgentCapture("stop")
         XCTAssertNotEqual(health.captureID, 0, "closing an agent lease does not end the card's capture")
         health.setHUDVisible(false)

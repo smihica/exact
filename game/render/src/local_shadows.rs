@@ -7,9 +7,10 @@ use exact_gpu::wgpu;
 use glam::camera::rh::proj::directx;
 use glam::{Mat4, Vec3};
 
-pub(crate) const RESOLUTION: u32 = 1024;
 /// Shadow layers a frame: a shadowed point light takes six, a spot one.
 pub(crate) const MAX_VIEWS: usize = 8;
+/// Bytes the layers may take: eight at 2048², two at 4096².
+const BUDGET: u64 = 128 << 20;
 // Spots wider than this shadow only their central cone.
 const MAX_FOV: f32 = 170. * std::f32::consts::PI / 180.;
 
@@ -20,12 +21,18 @@ pub(crate) struct Plan {
     /// Per frame light: first layer, and a shadow texel's width per metre of
     /// distance (the normal offset's scale).
     pub layers: Vec<Option<(u32, f32)>>,
+    /// Width and height of every layer.
+    pub resolution: u32,
 }
 
 impl Plan {
-    pub fn of(&mut self, lights: &[LightInput]) {
+    pub fn of(&mut self, lights: &[LightInput], settings: &crate::LocalShadows) {
         self.views.clear();
         self.layers.clear();
+        let resolution = settings.resolution.clamp(128, 4096);
+        self.resolution = resolution;
+        let layer = 4 * u64::from(resolution) * u64::from(resolution);
+        let max_views = MAX_VIEWS.min((BUDGET / layer) as usize);
         for light in lights.iter().take(crate::MAX_LIGHTS) {
             let need = if light.cone.is_some() { 1 } else { 6 };
             if !light.shadows
@@ -34,7 +41,7 @@ impl Plan {
                 || light.range.is_nan()
                 || light.range <= 0.
                 || !light.position.is_finite()
-                || self.views.len() + need > MAX_VIEWS
+                || self.views.len() + need > max_views
             {
                 self.layers.push(None);
                 continue;
@@ -54,7 +61,7 @@ impl Plan {
                         directx::perspective(fov, 1., near, light.range)
                             * glam::camera::rh::view::look_to_mat4(light.position, direction, up),
                     );
-                    2. * (fov * 0.5).tan() / RESOLUTION as f32
+                    2. * (fov * 0.5).tan() / resolution as f32
                 }
                 None => {
                     let projection =
@@ -73,7 +80,7 @@ impl Plan {
                                 * glam::camera::rh::view::look_to_mat4(light.position, axis, up),
                         );
                     }
-                    2. / RESOLUTION as f32
+                    2. / resolution as f32
                 }
             };
             self.layers.push(Some((first, texel)));
@@ -85,6 +92,7 @@ impl Plan {
 /// layer's casters (`cull.rs`, four views each).
 pub(crate) struct LocalMaps {
     pub count: u32,
+    pub resolution: u32,
     pub layers: Vec<wgpu::TextureView>,
     pub sample: wgpu::TextureView,
     pub cameras: Vec<wgpu::BindGroup>,
@@ -92,12 +100,17 @@ pub(crate) struct LocalMaps {
 }
 
 impl LocalMaps {
-    pub fn new(device: &wgpu::Device, count: u32, camera_layout: &wgpu::BindGroupLayout) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        count: u32,
+        resolution: u32,
+        camera_layout: &wgpu::BindGroupLayout,
+    ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("game local shadows"),
             size: wgpu::Extent3d {
-                width: RESOLUTION,
-                height: RESOLUTION,
+                width: resolution,
+                height: resolution,
                 depth_or_array_layers: count,
             },
             mip_level_count: 1,
@@ -145,6 +158,7 @@ impl LocalMaps {
             .collect();
         Self {
             count,
+            resolution,
             layers,
             sample,
             cameras,
@@ -182,4 +196,69 @@ pub(crate) fn placeholder(device: &wgpu::Device) -> wgpu::TextureView {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Plan;
+    use crate::{LightInput, LocalShadows};
+    use glam::Vec3;
+
+    fn spot(x: f32) -> LightInput {
+        LightInput {
+            position: Vec3::new(x, 4., 0.),
+            color: Vec3::ONE,
+            intensity: 1.,
+            range: 10.,
+            direction: -Vec3::Y,
+            cone: Some([0.99, 0.95]),
+            shadows: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_local_resolution_sizes_the_layers_within_the_budget() {
+        let lights = [spot(0.), spot(1.), spot(2.)];
+        let mut plan = Plan::default();
+        let of = |plan: &mut Plan, resolution| {
+            let settings = LocalShadows {
+                resolution,
+                ..Default::default()
+            };
+            plan.of(&lights, &settings);
+            (
+                plan.resolution,
+                plan.views.len(),
+                plan.layers[0].map(|(_, texel)| texel),
+            )
+        };
+        let (resolution, views, texel) = of(&mut plan, 1024);
+        assert_eq!((resolution, views), (1024, 3));
+        let (_, _, half) = of(&mut plan, 2048);
+        assert_eq!(
+            half.unwrap() * 2.,
+            texel.unwrap(),
+            "a texel per metre halves"
+        );
+        assert_eq!(of(&mut plan, 9000).0, 4096);
+        assert_eq!(of(&mut plan, 16).0, 128);
+        // 64 MiB a layer at 4096²: two fit, the nearest lights first.
+        let (_, views, _) = of(&mut plan, 4096);
+        assert_eq!(views, 2);
+        assert!(plan.layers[2].is_none());
+        // A point light's six layers do not fit at 4096².
+        let point = [LightInput {
+            cone: None,
+            ..spot(0.)
+        }];
+        plan.of(
+            &point,
+            &LocalShadows {
+                resolution: 4096,
+                ..Default::default()
+            },
+        );
+        assert!(plan.views.is_empty());
+    }
 }

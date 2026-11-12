@@ -381,8 +381,6 @@ pub fn admits(kind: Kind, id: crate::StyleId) -> bool {
         id.codec(),
         C::ColorValue
             | C::KeywordColor
-            | C::Rgba8
-            | C::Color2
             | C::SymbolPalette
             | C::Paint
             | C::BackgroundImage

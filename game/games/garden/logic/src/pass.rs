@@ -848,6 +848,7 @@ fn mutation(
         material: 0,
         color: Some([color[0], color[1], color[2], 1.0]),
         emissive,
+        ..MaterialOverride::default()
     })
 }
 
@@ -1049,6 +1050,7 @@ fn fence(p: &mut World, l: &PassLook, now: u64) {
                         color: lantern.color,
                         intensity: lantern.candela,
                         range: lantern.range,
+                        ..Default::default()
                     },
                 );
                 return;

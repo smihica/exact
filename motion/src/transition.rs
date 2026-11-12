@@ -96,8 +96,8 @@ pub struct Transition {
 pub enum TransitionError {
     /// More declarations than [`MAX_TRANSITIONS`].
     TooMany,
-    /// A duration or delay was infinite or NaN.
-    NonFinite,
+    /// A duration or delay was infinite or NaN: which one.
+    NonFinite(&'static str),
     /// `transition-duration` was negative.
     NegativeDuration,
     /// A spring transition authored a duration; a spring's duration is derived.
@@ -108,6 +108,24 @@ pub enum TransitionError {
     Easing(EasingError),
     /// The spring parameters were invalid.
     Spring(SpringError),
+}
+
+impl std::fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransitionError::TooMany => {
+                write!(f, "a node takes at most {MAX_TRANSITIONS} transitions")
+            }
+            TransitionError::NonFinite(what) => write!(f, "a transition's {what} is finite"),
+            TransitionError::NegativeDuration => f.write_str("a duration is 0 or more"),
+            TransitionError::SpringDeclaresDuration => f.write_str(
+                "a spring's duration follows from its stiffness, damping and mass, and the first time beside `-exact-spring()` is a duration: write no time, or `0s` and then the delay (`opacity 0s -exact-spring() 200ms`)",
+            ),
+            TransitionError::SpringNegativeDelay => f.write_str("a spring's delay is 0 or more"),
+            TransitionError::Easing(e) => e.fmt(f),
+            TransitionError::Spring(e) => e.fmt(f),
+        }
+    }
 }
 
 impl Transition {
@@ -123,8 +141,11 @@ impl Transition {
 
     /// Check every rule the evaluator relies on.
     pub fn validate(&self) -> Result<(), TransitionError> {
-        if !self.duration.is_finite() || !self.delay.is_finite() {
-            return Err(TransitionError::NonFinite);
+        if !self.duration.is_finite() {
+            return Err(TransitionError::NonFinite("duration"));
+        }
+        if !self.delay.is_finite() {
+            return Err(TransitionError::NonFinite("delay"));
         }
         if self.duration < 0.0 {
             return Err(TransitionError::NegativeDuration);

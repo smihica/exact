@@ -6,6 +6,24 @@ android {
     compileSdk { version = release(37) { minorApiLevel = 2 } }
     defaultConfig { minSdk = 29; consumerProguardFiles("proguard-rules.pro") }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+    // A package's unit tests compile its Kotlin into this module's tests; the reader links none of it.
+    sourceSets {
+        getByName("test").kotlin.directories.addAll(listOf(
+            "../../../packages/alarms/android", "../../../packages/alarms/test",
+            "../../../packages/background/android", "../../../packages/background/test",
+            "../../../packages/calendar/android", "../../../packages/calendar/test",
+            "../../../packages/camera/android", "../../../packages/camera/test",
+            "../../../packages/contacts/android",
+            "../../../packages/media-capture/android", "../../../packages/media-capture/test",
+        ))
+    }
 }
 
-dependencies { testImplementation("junit:junit:4.13.2") }
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(libs.robolectric)
+    testImplementation("androidx.camera:camera-camera2:1.6.2")
+    testImplementation("androidx.camera:camera-lifecycle:1.6.2")
+    testImplementation("androidx.camera:camera-view:1.6.2")
+    testImplementation("androidx.lifecycle:lifecycle-runtime:2.9.4")
+}

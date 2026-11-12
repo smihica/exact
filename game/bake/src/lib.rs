@@ -53,7 +53,11 @@ fn sources(path: &Path) -> Result<(Model, ModelSources), String> {
     {
         if !matches!(
             extension,
-            "KHR_materials_emissive_strength" | "KHR_texture_transform"
+            "KHR_materials_clearcoat"
+                | "KHR_materials_emissive_strength"
+                | "KHR_materials_sheen"
+                | "KHR_materials_unlit"
+                | "KHR_texture_transform"
         ) {
             return Err(format!("unsupported extension {extension}"));
         }
@@ -628,14 +632,37 @@ pub fn bake_art(app: impl AsRef<Path>) -> Result<(), String> {
     if !art.exists() && !manifest.exists() {
         return Ok(());
     }
-    let previous: std::collections::BTreeMap<String, String> = match std::fs::read(&manifest) {
+    let lock_dir = app.join(".exact");
+    std::fs::create_dir_all(&lock_dir).map_err(|e| e.to_string())?;
+    // Keep the lock's inode: unlinking it could give waiting bakes different locks.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_dir.join("art-bake.lock"))
+        .map_err(|e| format!("art bake lock: {e}"))?;
+    lock.lock().map_err(|e| format!("art bake lock: {e}"))?;
+    if !art.exists() && !manifest.exists() {
+        return Ok(());
+    }
+    let previous: std::collections::BTreeMap<String, serde_json::Value> = match std::fs::read(&manifest) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!(
             "generated-output manifest: {e}; regenerate by removing .baked-assets.json and its generated outputs, then bake art again"
         ))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
         Err(e) => return Err(e.to_string()),
     };
-    if previous.keys().any(|n| !asset_name(n)) {
+    if previous.iter().any(|(name, value)| {
+        !asset_name(name)
+            || match value {
+                serde_json::Value::String(_) => false,
+                serde_json::Value::Array(digests) => {
+                    digests.len() != 2 || digests.iter().any(|v| !v.is_string())
+                }
+                _ => true,
+            }
+    }) {
         return Err("invalid generated-output manifest".into());
     }
     let outputs = if art.exists() {
@@ -644,23 +671,44 @@ pub fn bake_art(app: impl AsRef<Path>) -> Result<(), String> {
         Default::default()
     };
     let root = app.join("assets");
+    let mut pending = previous.clone();
     // Validate every mutation before writing or pruning anything.
     for name in previous.keys().chain(outputs.keys()) {
         let desired = outputs.get(name);
         if let Some(bytes) = desired {
             check_size(name, bytes.len())?;
         }
-        match std::fs::read(root.join(name)) {
-            Ok(current) if previous.get(name) == Some(&digest(&current)) => {}
-            Ok(_) => {
-                return Err(format!(
-                    "generated asset `{name}` collides with an authored asset"
-                ))
+        let current = match std::fs::read(root.join(name)) {
+            Ok(current) => {
+                let hash = digest(&current);
+                let owned = previous.get(name).is_some_and(|value| {
+                    value.as_str() == Some(&hash)
+                        || value.as_array().is_some_and(|digests| {
+                            digests.iter().any(|v| v.as_str() == Some(&hash))
+                        })
+                });
+                if !owned {
+                    return Err(format!(
+                        "generated asset `{name}` collides with an authored asset"
+                    ));
+                }
+                Some(hash)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("asset `{name}`: {e}")),
+        };
+        if let Some(bytes) = desired {
+            let next = digest(bytes);
+            let owned = match current {
+                Some(old) if old != next => serde_json::json!([old, next]),
+                _ => serde_json::json!(next),
+            };
+            pending.insert(name.clone(), owned);
         }
     }
+    // An interrupted atomic replacement leaves either digest owned. Keep removed
+    // names too, until every output has landed and pruning has finished.
+    write_changed(&manifest, &serde_json::to_vec(&pending).unwrap())?;
     for (name, bytes) in &outputs {
         let out = root.join(name);
         std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;

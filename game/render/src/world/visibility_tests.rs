@@ -277,6 +277,7 @@ fn sun_shadow_settings_survive_save_and_reach_the_renderer() {
             normal_bias: 0.6,
         },
         strength: 0.65,
+        ..Default::default()
     };
     w.insert_resource(settings);
     let mut restored = World::new(60, 0);

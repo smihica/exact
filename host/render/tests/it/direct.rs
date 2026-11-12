@@ -176,3 +176,176 @@ fn every_corpus_and_conformance_plan_is_the_same_without_a_kernel() {
         files.len()
     );
 }
+
+#[test]
+fn a_javascript_page_preloads_the_hero_from_a_default_render() {
+    let plan = contract::compile(
+        r#"
+component Hero
+  view
+    column
+      column inert=true
+        image "assets/hero.png?one=1&two=2" alt="Covered"
+      image "assets/hero.png?one=1&two=2" alt="Hero"
+"#,
+    )
+    .unwrap();
+    let rendered = exact_render::render(
+        &plan,
+        || Nowhere,
+        Default::default(),
+        "/",
+        &SITE,
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(!rendered.document.root.contains("fetchpriority"));
+    let page = exact_render::page(super::serve::JS_SHELL, &rendered).unwrap();
+    assert!(
+        page.contains(
+            "<link rel=\"preload\" as=\"image\" href=\"assets/hero.png?one=1&amp;two=2\">"
+        ),
+        "{page}"
+    );
+    assert!(
+        page.contains("<img fetchpriority=\"high\" alt=\"Hero\""),
+        "{page}"
+    );
+    assert_eq!(page.matches("fetchpriority=\"high\"").count(), 1);
+}
+
+#[test]
+fn streamed_and_buffered_pages_preload_the_same_hero_image() {
+    use super::serve::{dist, get, header, serving, JS_SHELL};
+    use exact_render::{Serve, Server};
+
+    warm_transport();
+    let dir = dist("hero");
+    std::fs::write(dir.join("shell.html"), JS_SHELL).unwrap();
+    let plan = contract::compile(
+        r#"
+routes nav
+  tab home "/" render=request
+    kept "/kept" render=cached
+  notfound render=build
+component Hero
+  view
+    column
+      head title="Hero"
+      image "data:image/png;base64,AA==" alt="Inline"
+      image "symbol:circle" alt="Symbol"
+      column inert=true
+        image "assets/inert.png" alt="Inert"
+      column visibility="hidden"
+        image "assets/hidden.png" alt="Hidden"
+      image "assets/hero.png?one=1&two=2" alt="Hero"
+      image "assets/second.png" alt="Second"
+"#,
+    )
+    .unwrap();
+    let served = serving(
+        Server::bind(
+            Serve {
+                dist: dir,
+                port: 0,
+                name: "Hero".into(),
+                origin: None,
+                deadline: Duration::from_secs(10),
+                renders: 2,
+                queue: 8,
+                viewport: Default::default(),
+                lifetime: Duration::from_secs(120),
+                generations: None,
+            },
+            plan,
+            "",
+        )
+        .unwrap(),
+        || Nowhere,
+    );
+    let check = |page: &str| {
+        let link = "<link rel=\"preload\" as=\"image\" href=\"assets/hero.png?one=1&amp;two=2\">";
+        let at = page.find(link).expect("the hero preload");
+        assert!(at < page.find("<div id=\"exact-root\">").unwrap());
+        assert!(
+            page.contains("<img fetchpriority=\"high\" alt=\"Hero\""),
+            "{page}"
+        );
+        assert_eq!(page.matches("fetchpriority=\"high\"").count(), 1);
+        assert_eq!(page.matches("as=\"image\"").count(), 1);
+    };
+    let (status, _, buffered) = get(served.addr, "/");
+    assert_eq!(status, 200);
+    check(&buffered);
+    let (streamed, _) = super::boot::navigate(served.addr, "/");
+    check(&streamed);
+    let (streamed, _) = super::boot::navigate(served.addr, "/kept");
+    check(&streamed);
+    let (status, headers, kept) = get(served.addr, "/kept");
+    assert_eq!(status, 200);
+    assert!(header(&headers, "age").is_some());
+    check(&kept);
+}
+
+#[test]
+fn hero_selection_skips_covered_routes_and_stops_at_lazy_rows() {
+    let source = r#"
+routes nav
+  home "/" render=request
+    detail "/detail" render=request
+  notfound render=build
+component Pages
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow
+      for e in stack(nav) key=e.id
+        column navigationKey=`${e.id}` position="absolute" inset=0
+          if e.name == "home"
+            for id in ["a", "b"] key=id
+              image `assets/${id}.png` alt=id
+            image "assets/after-rows.png" alt="After rows"
+          if e.name == "detail"
+            image "assets/hero.png" alt="Hero"
+"#;
+    let plan = contract::compile(source).unwrap();
+    for location in ["/", "/detail"] {
+        let render = |projection| {
+            render_with_at(
+                &plan,
+                &|| Nowhere,
+                Default::default(),
+                location,
+                &SITE,
+                Duration::from_secs(10),
+                Ids::Any,
+                projection,
+                1_700_000_000_000.0,
+            )
+            .unwrap()
+        };
+        let kernel = render(Projection::Kernel);
+        let direct = render(Projection::Direct);
+        same(&kernel, &direct, location);
+        let expected = (location == "/detail").then_some("assets/hero.png");
+        for rendered in [kernel, direct] {
+            assert_eq!(
+                rendered
+                    .document
+                    .hero_image
+                    .as_ref()
+                    .map(|image| image.src.as_str()),
+                expected
+            );
+            let page = exact_render::page(super::serve::JS_SHELL, &rendered).unwrap();
+            assert_eq!(
+                page.matches("fetchpriority=\"high\"").count(),
+                usize::from(expected.is_some())
+            );
+            assert_eq!(
+                page.matches("as=\"image\"").count(),
+                usize::from(expected.is_some())
+            );
+        }
+    }
+}

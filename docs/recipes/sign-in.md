@@ -50,3 +50,8 @@ the whole app and server to copy from.
 Under the agent a request holds a `credential` ticket naming the provider,
 audience and nonce; `packages/sign-in/test/idp.mjs` signs what a provider
 would, and `tap @t cancel` dismisses it.
+
+Apple-only native requests are implemented; Google on Apple and combined
+Apple/passkey requests are not. The `auth.apple` grant derives the signing
+entitlement when the profile allows it. See [native sign-in](../contract-for-agents.md#native-sign-in-exactsign-in)
+for signing, nonce handling, result fields and current limits.

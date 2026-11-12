@@ -6,9 +6,9 @@ import AppKit
 /// "available area of the title bar" (https://wicg.github.io/window-controls-overlay/),
 /// which excludes the area under the window's controls. AppKit's own
 /// geometry: the title bar's band where the page's view lies under it
-/// (`viewport-fit=cover`), less the traffic lights with the margin AppKit
-/// keeps before the first kept after the last, which is where macOS 26's
-/// horizontally corner-adapted safe area begins.
+/// (`viewport-fit=cover`), less the traffic lights with their outer margin
+/// repeated on the content side. `windowTitlebarLayoutDirection` determines
+/// which side holds the controls, independently of the page's direction.
 enum TitleBarAreaMac {
     /// x, y, width, height from the view's top left; all zero while the
     /// title bar is hidden (full screen) or a route's toolbar fills it (LLP
@@ -29,13 +29,19 @@ enum TitleBarAreaMac {
         guard !band.isNull, band.width > 0, band.height > 0 else { return nil }
         if window.toolbar?.isVisible == true, !overlay { return [0, 0, 0, 0] }
         var left = band.minX
+        var right = band.maxX
         let shown = buttons.filter { !$0.isHidden && $0.superview === bar }
         if let first = shown.map(\.frame.minX).min(), let last = shown.map(\.frame.maxX).max() {
-            let end = NSRect(x: last + first - bar.bounds.minX, y: bar.bounds.minY, width: 0, height: bar.bounds.height)
-            left = max(left, view.convert(end, from: bar).maxX)
+            if window.windowTitlebarLayoutDirection == .rightToLeft {
+                let end = NSRect(x: first - (bar.bounds.maxX - last), y: bar.bounds.minY, width: 0, height: bar.bounds.height)
+                right = min(right, view.convert(end, from: bar).minX)
+            } else {
+                let end = NSRect(x: last + first - bar.bounds.minX, y: bar.bounds.minY, width: 0, height: bar.bounds.height)
+                left = max(left, view.convert(end, from: bar).maxX)
+            }
         }
         let top = view.isFlipped ? band.minY - bounds.minY : bounds.maxY - band.maxY
-        return [left - bounds.minX, top, max(0, band.maxX - left), band.height]
+        return [left - bounds.minX, top, max(0, right - left), band.height]
     }
 }
 

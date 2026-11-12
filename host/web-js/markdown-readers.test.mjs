@@ -1,11 +1,12 @@
 import { test, expect } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import process from 'node:process';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 test('known Markdown is compiled before a hidden reader opens; new content alone loads the parser', async () => {
   const root = resolve(import.meta.dirname, '../..'), dir = mkdtempSync(resolve(root, 'target/markdown-agent-test-'));
+  const body = "A shell variable starts with `$`, as in `$HOME`. '$' `s/x/[$&]/` `$$` $5 </script>";
   let suite, server, release;
   let network = 0;
   const api = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() {
@@ -19,8 +20,11 @@ test('known Markdown is compiled before a hidden reader opens; new content alone
 shape Document
   chapter: Chapter
 component MarkdownLoad
+  state ids: number[] = [1, 2]
   state shown = false
   state changed = false
+  state body = ${JSON.stringify(body)}
+  resource items = item(id) for id in ids as shape string
   resource doc = document(changed) as shape Document
   resource remote = remoteDocument() as shape Document
   action show
@@ -33,6 +37,7 @@ component MarkdownLoad
         text "Read"
       button press=change testId="change"
         text "Change"
+      text body markup="markdown" testId="dollars"
       if shown
         text "# A literal" markup="markdown" testId="literal"
       if shown
@@ -45,6 +50,7 @@ component MarkdownLoad
 export const appId = 'test.markdown-load';
 export const grants = 'net.fetch ${api.url.origin}';
 export const answer: Answer = (source, args) => {
+  if (source === 'item') { return 'item ' + args[0]; }
   if (source === 'remoteDocument') { return fetch('${api.url.href}').then(() => ({ chapter: { body: 'Remote **answer**.' } })); }
   return { chapter: { body: (args[0] ? '## Changed' : '# Ready') + '\\n\\n' + 'A long **document** with paragraphs and lists.\\n\\n- First\\n- Second\\n\\n'.repeat(100) + '</script><script>globalThis.__injected=true</script>' } };
 };
@@ -54,6 +60,12 @@ export const answer: Answer = (source, args) => {
     });
     const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
     expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+    for (const file of ['index.html', 'shell.html']) {
+      const html = readFileSync(resolve(dist, file), 'utf8');
+      const data = html.match(/<script type="application\/vnd\.exact\.markdown">(.*?)<\/script>/s)?.[1];
+      expect(JSON.parse(data).map(([source]) => source), file).toContain(body);
+      expect(html.match(/<!doctype html>/gi), file).toHaveLength(1);
+    }
     expect(network).toBe(0);
     server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
       const path = new URL(req.url).pathname;
@@ -86,6 +98,7 @@ export const answer: Answer = (source, args) => {
     expect(first.text).toContain('Ready');
     expect(first.text).not.toContain('# Ready');
     expect(await page.getByTestId('literal').textContent()).toBe('A literal');
+    expect(await page.getByTestId('dollars').textContent()).toBe("A shell variable starts with $, as in $HOME. '$' s/x/[$&]/ $$ $5 </script>");
     await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
     expect(await read()).toEqual(first);
     expect(await page.evaluate(() => globalThis.shifts)).toEqual([]);

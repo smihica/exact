@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The derives of `c` that its view, states, or actions read, each with its
 /// resolved expression. A derive read only by other derives is resolved
 /// where they read it.
-pub(super) fn resolved_derives(c: &Component) -> Result<Vec<(&Binding, Expr)>, SyntaxError> {
+pub fn resolved_derives(c: &Component) -> Result<Vec<(&Binding, Expr)>, SyntaxError> {
     let mut indices = BTreeMap::new();
     for (i, derive) in c.derives.iter().enumerate() {
         if indices.insert(derive.name.as_str(), i).is_some() {

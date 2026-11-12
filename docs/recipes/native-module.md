@@ -1,73 +1,91 @@
 # Recipe: a native module in Swift
 
-**Sound and MIDI are built in** ([guide](../contract-for-agents.md#sound-midi-and-media),
-`apps/metronome`): write no module. Another platform API with no view (a hook) is the module `app.ts` asks: `modules/apple/*.swift`, one `ExactModule` subclass that `let exactModule` names.
-app.json needs nothing for it ([app-json](app-json.md)).
+Put an `ExactModule` in `modules/apple/*.swift`; `let exactModule` names its class.
+No app.json entry.
+
+**Kept answers:** a resource that reads `native.available` or calls `native.call`
+reads device state, so its answer can be kept across launches. Read launch
+configuration in a mount mutation and pass it to fetch resources; keep native
+access out of their sources:
 
 ```swift
 import Foundation
 
-final class Engine: ExactModule {
-    override func call(_ request: [String: Any]) throws -> [String: Any] {
-        switch request["op"] as? String {
-        case "flags": return ["autoPlay": UserDefaults.standard.bool(forKey: "AutoPlay")]
-        default: throw ExactNativeRefusal("engine answers flags")
-        }
+final class Launch: ExactModule {
+    override func call(_ request: [String: Any]) -> [String: Any] {
+        return ["url": ProcessInfo.processInfo.environment["API_BASE_URL"]
+            ?? "https://jsonplaceholder.typicode.com"]
     }
     override func later(_ request: [String: Any], reply: ExactReply) {
-        DispatchQueue.global().async { reply.send(["ok": true]) }
+        reply.send(call(request))
     }
 }
-let exactModule: ExactModule.Type = Engine.self
+let exactModule: ExactModule.Type = Launch.self
 ```
 
 ```contract
-shape Flags
-  autoPlay: bool
+shape Endpoint
+  url: string
 
-shape Reply
-  ok: bool
+shape Feed
+  posts: string[]
 
 component App
-  resource flags = engineFlags() as shape Flags else empty()
-  mutation played as shape Reply
-  action play
-    send played = enginePlay()
+  mutation endpoint as shape Endpoint
+  derive api = match endpoint { case some(e) => e.url, case none => "" }
+  resource feed = loadFeed(api) as shape Feed else empty()
+  task launch mount
+    after(1, configure)
+  action configure
+    send endpoint = launchEndpoint()
+  action retry
+    refresh feed
   view
-    button press=play testId="play"
-      text (flags.autoPlay ? "Playing" : "Play")
+    column
+      if api == "" or pending(feed)
+        progress aria-label="Loading"
+      if failed(endpoint) or failed(feed)
+        text "Couldn't load."
+      button press=retry testId="retry"
+        text "Retry"
+      for p in feed.posts key=p
+        text p
 ```
 
 ```ts
 import type { Answer, Result, Sources } from './app.contract.d.ts';
 
+export const grants = 'net.fetch https:';
 const sources: Sources = {
-  engineFlags: async (_args, _store, _storage, native) => {
-    if (!native?.available) return { autoPlay: false }; // the build, or no module here
-    native.watch('flags');
-    try { return native.call({ op: 'flags' }) as Result<'engineFlags'>; }
-    catch { return (await native.later({ op: 'flags' })) as Result<'engineFlags'>; } // the web
+  launchEndpoint: async (_args, _store, _storage, native) =>
+    native?.available ? await native.later({}) as Result<'launchEndpoint'>
+      : { url: 'https://jsonplaceholder.typicode.com' },
+  loadFeed: async ([api]) => {
+    if (!api) return { posts: [] };
+    const response = await fetch(`${api}/posts?_limit=10`);
+    if (!response.ok) throw new Error('Feed request failed.');
+    const posts = await response.json() as { title: string }[];
+    return { posts: posts.map(p => p.title) };
   },
-  enginePlay: async (_args, _store, _storage, native) =>
-    (await native!.later({ op: 'play' })) as Result<'enginePlay'>,
 };
 export const answer: Answer = (source, args, store, storage, native) =>
   sources[source](args, store, storage, native);
 ```
 
-- **`call`** runs on main within the answer's 100 ms; throw to refuse. **`later`** replies once,
-  `send` or `fail(_:)`, from any thread. Values are JSON's. The web has no `call`; it answers
-  `later` only from `modules/web/index.js`.
-- **`context`:** `changed("flags")` asks again every answer that called `native.watch("flags")`;
-  `now()` and `after(ms)` are the session's clock; `agent` is true under the agent. Files,
-  secrets: [files-and-grants](files-and-grants.md).
-- **Launch arguments:** Exact passes none. `xcrun simctl launch <udid> <bundle id> -AutoPlay
-  1` puts each `-Name value` in `UserDefaults`.
-- **Printing:** `print` shows in `agent ios logs`, `agent macos logs` and
-  `xcrun simctl launch --console`; `NSLog` not.
-- **`app.onLine`** (app hatch) is watched from its first read: read it once, even when
-  `isNew`, to hear changes.
-- **Exiting:** iOS has no quit. `exit(0)` skips pending writes: keep it to a measurement
-  hook, after `fflush(stdout)`.
-- **A Swift edit rebuilds** (`bun exact.mjs ios`, Swift 5 mode); views from the same module are
-  [native-views](native-views.md).
+`call` runs on main within 100 ms; mark it `throws` to refuse. `later(request)` awaits one
+`ExactReply.send` or `fail` from any thread. The web implements only `later`, in
+`modules/web/index.js`.
+
+Web drives use that module when present, otherwise the fallback; iOS calls Swift.
+Use `clock +1`, then `clock data`.
+Swift edits need `bun exact.mjs ios`. `print` reaches agent `logs`.
+
+Set the environment read above on an installed simulator build (`id` in app.json):
+
+```sh
+SIMCTL_CHILD_API_BASE_URL=https://jsonplaceholder.typicode.com xcrun simctl launch --terminate-running-process <udid> <bundle-id>
+```
+
+The app receives `API_BASE_URL`. Use the same prefix on
+`bun exact.mjs agent ios "clock +1" "clock data" state`.
+`-API_BASE_URL value` sets `UserDefaults`, which this example does not read.

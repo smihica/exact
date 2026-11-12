@@ -229,8 +229,21 @@ const SEED_1_UUID: &str = "deb201fb-035c-4c32-bbbf-3da08991a485";
 #[test]
 fn under_the_agent_two_runs_draw_the_same_stream_and_outside_it_the_os() {
     let run = |seed: Option<u64>| {
-        let mut module = module().with_agent_seed(seed);
+        // Seeded before it loads, as a host makes it: the prelude's own probe at load draws nothing.
+        let mut module = Module::new(HBC.to_vec(), APP, GRANTS).with_agent_seed(seed);
+        module.set_budget_ms(f64::INFINITY);
+        module.load().expect("the fixture loads");
+        module.bind(&plan());
+        let said = |module: &mut Module| {
+            (DataSource::take_logs(module).iter())
+                .filter(|line| {
+                    line.starts_with("crypto: the driver seeds this launch's randomness")
+                })
+                .count()
+        };
         let mut store = Store::new(GRANTS, vec![]);
+        text(module.answer(&mut store, "plain", &[]).unwrap());
+        assert_eq!(said(&mut module), 0, "nothing is said before a draw");
         let first = text(module.answer(&mut store, "uuid", &[]).unwrap());
         let bytes = text(
             module
@@ -240,6 +253,8 @@ fn under_the_agent_two_runs_draw_the_same_stream_and_outside_it_the_os() {
         let second = text(module.answer(&mut store, "uuid", &[]).unwrap());
         // Still a device read: bake behaves the same under the agent.
         assert_eq!(store.entropy_draws(), 3);
+        // The journal says once that the draws are seeded, and only when they are.
+        assert_eq!(said(&mut module), usize::from(seed.is_some()));
         (first, bytes, second)
     };
     let a = run(Some(1));

@@ -163,6 +163,69 @@ fn an_upload_waits_out_a_reply_past_the_portable_transports_own_limits() {
     );
 }
 
+/// LLP 1016.000 D11: an idle timeout out of range, or on anything but a
+/// WebSocket stream, is a TypeError before any request.
+#[test]
+fn an_idle_timeout_fetch_refuses_is_a_type_error_before_any_request() {
+    let root = Root::new();
+    let mut m = root.module();
+    m.activate().unwrap();
+    let mut s = Store::new(super::storage::GRANTS, Vec::<(String, Vec<u8>)>::new());
+    let refused = call(&mut m, &mut s, "idle-refusals", "");
+    let range =
+        "TypeError: exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000";
+    let socket = "TypeError: exactIdleTimeout: only a WebSocket stream takes an idle timeout";
+    assert_eq!(
+        refused.lines().collect::<Vec<_>>(),
+        [range, range, range, socket, socket, socket, socket],
+        "{refused}"
+    );
+    assert_eq!(m.in_flight(), 0);
+}
+
+/// A stream option the host refuses is marked at bake as storage's refusal
+/// is (`code: "bake"`), so a source that lets it through keeps its
+/// placeholder; in an answer it is the plain TypeError, and an option of a
+/// fetch that is no stream is never marked.
+#[test]
+fn a_refused_stream_option_is_marked_at_bake_and_plain_in_an_answer() {
+    let root = Root::new();
+    let mut m = root.module();
+    m.activate().unwrap();
+    let mut s = Store::new(super::storage::GRANTS, Vec::<(String, Vec<u8>)>::new());
+    let plain = "TypeError:undefined:undefined:exactTimeout: a stream has no timeout";
+    assert_eq!(call(&mut m, &mut s, "stream-option-refused", ""), plain);
+    // The bake's module (`Module::inspect`).
+    let mut bake = exact_js::Module::inspect(super::storage::HBC.to_vec()).unwrap();
+    bake.set_budget_ms(f64::INFINITY);
+    bake.bind(&super::storage::plan());
+    let baked = bake
+        .query("work", &super::storage::args("stream-option-refused", ""))
+        .unwrap();
+    assert_eq!(
+        super::storage::text(baked),
+        "TypeError:Unavailable:bake:exactTimeout: a stream has no timeout"
+    );
+    let own = bake
+        .query("work", &super::storage::args("own-error", ""))
+        .unwrap();
+    assert!(
+        super::storage::text(own).starts_with("TypeError:undefined:undefined:exactTimeout must be"),
+    );
+    // Let through, it is the bake's deferral, which keeps the resource's
+    // placeholder; the source's own TypeError fails the bake as before.
+    let deferred = bake.query("work", &super::storage::args("stream-option-uncaught", ""));
+    assert!(
+        matches!(&deferred, Err(exact_runner::DataError::DeferredAtBake(m)) if m.contains("a stream has no timeout")),
+        "{deferred:?}"
+    );
+    let fatal = bake.query("work", &super::storage::args("own-uncaught", ""));
+    assert!(
+        matches!(&fatal, Err(exact_runner::DataError::Unavailable(m)) if m.contains("the source's own")),
+        "{fatal:?}"
+    );
+}
+
 /// What `fetch` refuses itself, before any request: each a TypeError.
 #[test]
 fn an_upload_fetch_refuses_is_a_type_error_before_any_request() {

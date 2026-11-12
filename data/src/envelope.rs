@@ -182,6 +182,7 @@ fn request_json(request: &Request) -> Json {
             "cursor": p.cursor, "from": p.from, "same_cursor_event": p.same_cursor_event,
         })),
         "timeout_ms": request.timeout_ms,
+        "idle_timeout_ms": request.idle_timeout_ms,
         "body_from": request.body_from,
         "body_to": request.body_to,
         "redirect": (request.redirect != Redirect::Follow).then(|| request.redirect.name()),
@@ -271,6 +272,15 @@ fn request_from(json: &Json) -> Result<Request, DataError> {
                     },
                 }))
             }
+        },
+        idle_timeout_ms: match &json["idle_timeout_ms"] {
+            Json::Null => None,
+            value => Some(
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| unavailable("turn reply: an invalid idle timeout"))?,
+            ),
         },
         timeout_ms: match &json["timeout_ms"] {
             Json::Null => None,

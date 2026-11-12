@@ -1,4 +1,4 @@
-import {expect,test} from 'bun:test';
+import {expect,spyOn,test} from 'bun:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -83,6 +83,48 @@ test('the event-stream parser reads lines, fields and cursors as HTML does (LLP 
   // A multi-byte character split across reads is one character.
   const split = eventStream(64), bytes = enc('data: é\n\n');
   assert.deepEqual([...split(bytes.slice(0, 7)), ...split(bytes.slice(7))], [{ event: '', id: '', data: 'é' }]);
+  // The ceiling counts UTF-8 bytes, as the native parser does (host/apple/src/executor_stream.rs `EventStream`):
+  // an event's data and its line feeds, and any line up to the ceiling and 64 bytes more.
+  const accepts = (s) => { try { eventStream(16)(enc(s)); return true; } catch (e) { assert.match(e.message, /ceiling/); return false; } };
+  assert.deepEqual([
+    `data: ${'é'.repeat(7)}a\n\n`, `data: ${'é'.repeat(8)}\n\n`, `data: ${'語'.repeat(5)}\n\n`, `data: ${'😀'.repeat(4)}\n\n`,
+    `data: ${'é'.repeat(4)}\ndata: ${'é'.repeat(4)}\n\n`, `x: ${'語'.repeat(25)}\n`, `x: ${'語'.repeat(26)}\n`,
+  ].map(accepts), [true, false, true, false, false, true, false]);
+});
+
+test('the event-stream line ceiling counts a leading BOM before stripping it', async () => {
+  const { eventStream } = await import('./http-body.js');
+  const enc = s => new TextEncoder().encode(s);
+  for (const size of [77, 78]) {
+    const bytes = enc(`\ufeff${'a'.repeat(size)}\ndata: ok\n\n`);
+    for (const step of [1, bytes.length]) {
+      const parse = eventStream(16), out = [];
+      const run = () => { for (let i = 0; i < bytes.length; i += step) out.push(...parse(bytes.subarray(i, i + step))); };
+      if (size === 77) { run(); assert.deepEqual(out, [{ event: '', id: '', data: 'ok' }]); }
+      else assert.throws(run, /ceiling/);
+    }
+  }
+  assert.deepEqual(eventStream(16)(enc('\ufeffdata: ok\n\n')), [{ event: '', id: '', data: 'ok' }]);
+});
+
+test('the event-stream line ceiling counts invalid UTF-8 as received bytes', async () => {
+  const { eventStream } = await import('./http-body.js');
+  const enc = s => new TextEncoder().encode(s);
+  for (const size of [30, 79, 80]) {
+    const bytes = new Uint8Array([58, ...new Uint8Array(size).fill(0xff), ...enc('\r\ndata: ok\n\n')]);
+    for (const step of [1, bytes.length]) {
+      const parse = eventStream(16), out = [];
+      const run = () => { for (let i = 0; i < bytes.length; i += step) out.push(...parse(bytes.subarray(i, i + step))); };
+      if (size <= 79) { run(); assert.deepEqual(out, [{ event: '', id: '', data: 'ok' }]); }
+      else assert.throws(run, /ceiling/);
+    }
+  }
+  // Data still counts the decoded replacement characters and the joining LF.
+  for (const size of [5, 6]) {
+    const parse = eventStream(16), bytes = new Uint8Array([...enc('data: '), ...new Uint8Array(size).fill(0xff), 10, 10]);
+    if (size === 5) assert.deepEqual(parse(bytes), [{ event: '', id: '', data: '\ufffd'.repeat(5) }]);
+    else assert.throws(() => parse(bytes), /ceiling/);
+  }
 });
 
 test('a stream delivers each read as its newest event, then its end', async () => {
@@ -503,4 +545,53 @@ test('an upload goes by XMLHttpRequest: its bytes sent are messages, its reply t
     const late = await request({ ...op, timeoutMs: 20 }, host([]));
     assert.deepEqual([late.kind, decode(late)], [10, 'the request timed out after 20 ms']);
   } finally { globalThis.XMLHttpRequest = saved; }
+});
+
+test('a render upload keeps HTTP error replies and enforces its byte ceiling, abort and deadline', async () => {
+  const saved = { fetch: globalThis.fetch, render: Object.getOwnPropertyDescriptor(globalThis, '__exactRender') };
+  globalThis.__exactRender = true;
+  const grantSet = normalized('net.fetch https://example.test'), controllers = new Set(), sent = [];
+  const op = { method: 'POST', url: 'https://example.test/upload', headers: [], body: btoa('ab'), stream: true, upload: true, maxResponseBytes: 4 };
+  const host = { grantSet, controllers, message: m => sent.push([m.event, m.data]) };
+  const decode = o => new TextDecoder().decode(o.body);
+  try {
+    globalThis.fetch = async (_url, init) => {
+      expect([...init.body]).toEqual([97, 98]);
+      expect(init.redirect).toBe('follow');
+      return new Response('busy', { status: 503 });
+    };
+    const reply = await request(op, host);
+    expect([reply.kind, reply.status, decode(reply)]).toEqual([0, 503, 'busy']);
+    expect(sent).toEqual([['exact:sending', ''], ['exact:progress', '{"loaded":2,"total":2}']]);
+    sent.length = 0;
+    globalThis.fetch = async () => new Response('large');
+    const large = await request({ ...op, body: '' }, host);
+    expect([large.kind, decode(large)]).toEqual([2, 'HTTP response exceeds limit']);
+    expect(sent).toEqual([['exact:sending', '']]);
+
+    let started = Promise.withResolvers();
+    globalThis.fetch = (_url, { signal }) => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      started.resolve();
+    });
+    const controller = new AbortController(), aborted = request(op, { ...host, controller });
+    await started.promise;
+    controller.abort();
+    const stopped = await aborted;
+    expect([stopped.kind, decode(stopped)]).toEqual([4, 'request aborted']);
+    const deadline = new AbortController(), timeout = spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal);
+    try {
+      started = Promise.withResolvers();
+      const waiting = request({ ...op, timeoutMs: 20 }, host);
+      await started.promise;
+      expect(timeout).toHaveBeenCalledWith(20);
+      deadline.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+      const late = await waiting;
+      expect([late.kind, decode(late)]).toEqual([10, 'the request timed out after 20 ms']);
+    } finally { timeout.mockRestore(); }
+    expect(controllers.size).toBe(0);
+  } finally {
+    globalThis.fetch = saved.fetch;
+    if (saved.render) Object.defineProperty(globalThis, '__exactRender', saved.render); else delete globalThis.__exactRender;
+  }
 });

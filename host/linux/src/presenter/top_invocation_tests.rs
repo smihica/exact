@@ -57,6 +57,8 @@ component App
         button press=keep commandfor="dpm" command="show-modal" testId="to-confirm"
           text "Ask first"
       column id="sub" popover="auto" role="menu"
+        button disabled=true press=keep popovertarget="sub" popovertargetaction="hide"
+          text "Unavailable"
         button press=keep popovertarget="sub" popovertargetaction="hide" testId="sub-keep"
           text "Keep"
       column id="sub2" popover="auto" role="menu"
@@ -644,6 +646,98 @@ fn choose(p: &mut Presenter<()>, name: &str) {
         p.surface_event(serial, action, x + w / 2.0, y + h / 2.0, 0.0);
     }
     p.run_commands(|| ());
+}
+
+fn surface_key(p: &mut Presenter<()>, overlay: bool, name: &str) {
+    if overlay {
+        assert!(p.surface_key(name, 0.));
+    } else {
+        let event = match name {
+            "ArrowDown" => top::event::DOWN,
+            "ArrowUp" => top::event::UP,
+            "ArrowLeft" => top::event::LEFT,
+            "ArrowRight" => top::event::RIGHT,
+            " " => top::event::SPACE,
+            _ => panic!("unexpected key {name}"),
+        };
+        let serial = p.surface().unwrap().serial;
+        p.surface_event(serial, event, 0., 0., 0.);
+    }
+    p.run_commands(|| ());
+}
+
+fn menu_horizontal_arrows(overlay: bool) {
+    let mut p = windowed();
+    if overlay {
+        p.serve_overlays();
+    }
+    let focused = |p: &Presenter<()>| {
+        let open = p.top.open.as_ref().unwrap();
+        open.focused.map(|i| open.layout.targets[i].node)
+    };
+    invoke(&mut p, "native-cmd");
+    for _ in 0..2 {
+        surface_key(&mut p, overlay, "ArrowDown");
+    }
+    assert_eq!(focused(&p), Some(id(&p, "to-sub")));
+    surface_key(&mut p, overlay, "ArrowRight");
+    assert_eq!(open(&p).as_deref(), Some("sub"));
+    assert_eq!(focused(&p), Some(id(&p, "sub-keep")));
+    for key in ["ArrowLeft", "ArrowRight"] {
+        surface_key(&mut p, overlay, key);
+        assert_eq!(open(&p).as_deref(), Some("sub"));
+        assert_eq!(focused(&p), Some(id(&p, "sub-keep")));
+    }
+    surface_key(&mut p, overlay, " ");
+    assert!(p.surface().is_none());
+    assert_eq!(p.host().runner().slot("said"), Some(&Value::str("kept")));
+    assert_eq!(p.focus(), Some(id(&p, "native-cmd")));
+
+    invoke(&mut p, "native-cmd");
+    for key in ["ArrowLeft", "ArrowRight"] {
+        surface_key(&mut p, overlay, key);
+        assert_eq!(focused(&p), None);
+    }
+    surface_key(&mut p, overlay, "ArrowDown");
+    for key in ["ArrowRight", "ArrowLeft"] {
+        surface_key(&mut p, overlay, key);
+        assert_eq!(open(&p).as_deref(), Some("menu"));
+        assert_eq!(focused(&p), Some(id(&p, "menu-rename")));
+        assert_eq!(p.host().runner().slot("said"), Some(&Value::str("kept")));
+    }
+    surface_key(&mut p, overlay, "ArrowUp");
+    assert_eq!(focused(&p), Some(id(&p, "to-confirm")));
+    surface_key(&mut p, overlay, "ArrowDown");
+    assert_eq!(focused(&p), Some(id(&p, "menu-rename")));
+    surface_key(&mut p, overlay, "ArrowDown");
+    surface_key(&mut p, overlay, "ArrowLeft");
+    assert_eq!(focused(&p), Some(id(&p, "to-sub")));
+    surface_key(&mut p, overlay, "ArrowDown");
+    surface_key(&mut p, overlay, "ArrowRight");
+    assert_eq!(open(&p).as_deref(), Some("sub2"));
+    assert_eq!(focused(&p), Some(id(&p, "sub2-keep")));
+
+    invoke(&mut p, "native-cmd");
+    for _ in 0..4 {
+        surface_key(&mut p, overlay, "ArrowDown");
+    }
+    surface_key(&mut p, overlay, "ArrowRight");
+    assert_eq!(open(&p).as_deref(), Some("dpm"));
+    assert_eq!(focused(&p), Some(id(&p, "dpm-cancel")));
+    surface_key(&mut p, overlay, "ArrowRight");
+    assert_eq!(focused(&p), Some(id(&p, "dpm-keep")));
+    surface_key(&mut p, overlay, "ArrowLeft");
+    assert_eq!(focused(&p), Some(id(&p, "dpm-cancel")));
+}
+
+#[test]
+fn overlay_menu_horizontal_arrows_open_submenus_without_stepping_rows() {
+    menu_horizontal_arrows(true);
+}
+
+#[test]
+fn window_menu_horizontal_arrows_open_submenus_without_stepping_rows() {
+    menu_horizontal_arrows(false);
 }
 
 #[test]

@@ -388,15 +388,18 @@ async function observe(path, recursive, scope, changed) {
 // bytes, a folder's tree, or a name to save to.
 // They behave as the File System Access API's do: a name of the other kind
 // is TypeMismatchError, a missing one NotFoundError, a non-empty folder
-// can't be removed (InvalidModificationError).
+// can't be removed (InvalidModificationError). A file's `lastModified` changes
+// only when a write closes, later than the one it replaces, so a write that
+// expects what was read (`ECHANGED`) compares with something stable.
 function memoryFile(name, data = new Uint8Array()) {
-  return { kind: 'file', name, async getFile() { return new File([data], name); },
+  let modified = Date.now();
+  return { kind: 'file', name, async getFile() { return new File([data], name, { lastModified: modified }); },
     async createWritable({ keepExistingData = false } = {}) {
       let at = 0, next = keepExistingData ? data.slice() : new Uint8Array();
       return { async seek(n) { at = n; }, async write(d) {
         const b = new Uint8Array(await new Blob([d]).arrayBuffer()), out = new Uint8Array(Math.max(next.length, at + b.length));
         out.set(next); out.set(b, at); next = out; at += b.length;
-      }, async close() { data = next; } };
+      }, async close() { data = next; modified = Math.max(Date.now(), modified + 1); } };
     },
     async queryPermission() { return 'granted'; } };
 }

@@ -4,7 +4,7 @@
 import { test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { backendFetchPrefixes, churnLines, disabledExpectation, nativeFetchOrigins, NO_FAILURES, perfExpectation, propertyHolds, testMutationClock, refusalExpectation, refuseDisabled, runTests, serverRequest, testScope, textExpectation, treeExpectation, unarranged } from './agent-test.mjs';
@@ -112,6 +112,51 @@ test "boot only"
     expect(boot.failed).toBe(1);
     expect(boot.results[0].failures.join('\n')).toContain('at step 0: boot');
   } finally { server.close(); rmSync(dir, { recursive: true, force: true }); }
+}, 180_000);
+
+test('the fetch-loading-error recipe passes its own test', async () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const dir = mkdtempSync(join(root, 'target/fetch-recipe-'));
+  const previousApp = process.env.EXACT_APP_DIR;
+  const dist = join(dir, 'dist'), file = join(dir, 'app.test.contract');
+  const posts = Array.from({ length: 10 }, (_, i) => ({ title: `Post ${i}` }));
+  let requests = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/posts?_limit=10') {
+      requests++;
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(posts));
+    } else serveBuildTree(dist, req, res);
+  });
+  try {
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const recipe = readFileSync(join(root, 'docs/recipes/fetch-loading-error.md'), 'utf8')
+      .replaceAll('https://jsonplaceholder.typicode.com', origin);
+    for (const [language, name] of [['contract', 'app.contract'], ['ts', 'app.ts'], ['contract-test', 'app.test.contract']]) {
+      const blocks = [...recipe.matchAll(new RegExp('^```' + language + '\\n([\\s\\S]*?)^```$', 'gm'))];
+      expect(blocks.length, language).toBe(1);
+      writeFileSync(join(dir, name), blocks[0][1]);
+    }
+    writeFileSync(join(dir, 'app.json'), JSON.stringify({
+      name: 'Fetch Recipe', app: { id: 'test.fetch-recipe', name: 'Fetch Recipe' }, host: { web: {} }, rust: false,
+    }));
+    const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'fetch-recipe', '--out', dist, '--render', 'none'], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8',
+    });
+    expect(build.status, build.stdout + build.stderr).toBe(0);
+    const result = await runTests({
+      host: 'web', app: dir, file, webDist: dist, url: `${origin}/`, env: { XDG_CACHE_HOME: join(dir, 'cache') },
+    });
+    expect(result.results.map(t => t.failures)).toEqual([[]]);
+    expect([result.passed, result.failed]).toEqual([1, 0]);
+    expect(requests).toBe(2);
+  } finally {
+    if (previousApp === undefined) delete process.env.EXACT_APP_DIR;
+    else process.env.EXACT_APP_DIR = previousApp;
+    await new Promise(resolve => server.close(resolve));
+    rmSync(dir, { recursive: true, force: true });
+  }
 }, 180_000);
 
 test('a presented popover belongs to its AppKit modal for outside-modal findings', () => {
@@ -630,6 +675,8 @@ test('expect perf reads a resource\'s asks and a component\'s or a view\'s work'
   expect(at('built', 'Ghost', '==', 0)).toContain('names no component');
   expect(perfExpectation(null, { subject: 'query', target: 'a', compare: '==', value: 0 })).toContain('no `perf` block');
   expect(perfExpectation({ ...measured, whole: { sites: [] } }, { subject: 'query', target: 'a', compare: '==', value: 0 })).toContain('counts no resource asks');
+  measured.whole.resources = [1, 5].map((asked, i) => ({ name: 'channelList', member: `channelList[${i + 1}]`, asked }));
+  expect(at('query', 'channelList', '==', 6)).toBeNull();
 });
 
 test('a test scoped on macos runs under the mac alias and the sample host too', () => {

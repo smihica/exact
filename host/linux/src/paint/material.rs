@@ -575,8 +575,8 @@ pub(super) fn checkbox(
 /// box where the author sized it, as a page's checkbox grows with its box.
 fn drawn(node: &NodeRef<'_>, row: usize) -> f32 {
     let sized = |id, d| node.style.mask.has(id) && d != exact_kernel::Dimension::Auto;
-    let authored =
-        sized(StyleId::Width, node.style.width) || sized(StyleId::Height, node.style.height);
+    let authored = sized(StyleId::Width, node.style.width.clone())
+        || sized(StyleId::Height, node.style.height.clone());
     if authored {
         f32::INFINITY
     } else {
@@ -678,7 +678,7 @@ pub(crate) fn touch_box(rect: Rect4) -> Rect4 {
 }
 
 /// A 24-unit path drawn as a role's is: stroked, or filled even-odd.
-fn role_path(d: &str, filled: bool) -> exact_kernel::SymbolPath<'_> {
+pub(super) fn role_path(d: &str, filled: bool) -> exact_kernel::SymbolPath<'_> {
     exact_kernel::SymbolPath {
         d,
         filled,

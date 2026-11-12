@@ -94,6 +94,9 @@ impl<D: DataSource> Presenter<D> {
                 if self.pending_dev.as_ref().map(|g| &g.identity) != Some(&generation.identity) {
                     self.dev.as_mut().unwrap().held_since = None;
                 }
+                // Held, or refused below: the poll downloads it again only
+                // once the dev server publishes another.
+                self.dev.as_mut().unwrap().held = Some(generation.identity.clone());
                 self.pending_dev = Some(generation);
             }
             // A dev loop's status (its producers starting) once, not each tick.
@@ -115,6 +118,7 @@ impl<D: DataSource> Presenter<D> {
                     let waker = self.executor.waker();
                     let dev = self.dev.as_mut().unwrap();
                     dev.identity = Some(generation.identity);
+                    dev.held = None;
                     // A new executor, so its waker (and a new wake
                     // descriptor, which the Android reader watches again).
                     *dev.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
@@ -222,7 +226,7 @@ impl<D: DataSource> Presenter<D> {
         if self.display.blocked()
             || self.dirty
             || !self.last_frame_succeeded
-            || self.activation_failed
+            || self.activation_failed.is_some()
         {
             return;
         }
@@ -240,7 +244,13 @@ impl<D: DataSource> Presenter<D> {
     /// The deferred data module has yet to activate, and has not failed to:
     /// the agent's `clock data` waits for it.
     pub fn data_activating(&self) -> bool {
-        !self.activation_failed && self.host.data_pending()
+        self.activation_failed.is_none() && self.host.data_pending()
+    }
+
+    /// Why the data module did not activate, if it did not: `clock data`
+    /// answers it, so a drive's first step fails with the module's error.
+    pub fn activation_error(&self) -> Option<&str> {
+        self.activation_failed.as_deref()
     }
 
     /// A development generation or an update is being prepared: the display
@@ -251,7 +261,7 @@ impl<D: DataSource> Presenter<D> {
 
     /// Wake an idle display while an executable image is loading off-thread.
     pub fn module_pending(&self) -> bool {
-        (self.painted && !self.activation_failed && self.host.data_pending())
+        (self.painted && self.activation_failed.is_none() && self.host.data_pending())
             || self.pending_dev.is_some()
             || self.pending_update
     }
@@ -357,11 +367,17 @@ impl<D: DataSource> Presenter<D> {
             .map_err(HostError::Asset)?;
         self.updates.as_mut().unwrap().boot_started();
         self.host = host;
+        // The old executor lets go of everything, then says which uploads had
+        // begun to go out; the rest never left (LLP 1016.000 D10).
+        self.executor.forget(|_| false);
+        let started = self.executor.let_go_started(|_| false);
+        self.executor = self.host.executor();
+        self.host.runner_mut().uploads_started(&started);
         self.replaced();
         if self.display.new_session() {
             self.painted = false;
         }
-        self.activation_failed = false;
+        self.activation_failed = None;
         self.module = module;
         self.text = text.clone();
         self.brush.text = text;
@@ -369,12 +385,6 @@ impl<D: DataSource> Presenter<D> {
         images.enable_decode();
         images.fit(self.viewport, self.brush.scale);
         self.images = images;
-        // The old executor lets go of everything, then says which uploads had
-        // begun to go out; the rest never left (LLP 1016.000 D10).
-        self.executor.forget(|_| false);
-        let started = self.executor.let_go_started(|_| false);
-        self.executor = self.host.executor();
-        self.host.runner_mut().uploads_started(&started);
         self.parked.clear();
         self.scroll.clear();
         self.collection = collection::State::default();
@@ -414,7 +424,7 @@ impl<D: DataSource> Presenter<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::delivery::{Selection, Store};
     use exact_runner::{DataError, Value};
@@ -535,7 +545,8 @@ component App
         assert_first_facts(&facts);
     }
 
-    struct StagedPlan(Arc<[u8]>);
+    /// A store whose staged bundle is this plan.
+    pub(in crate::presenter) struct StagedPlan(pub(in crate::presenter) Arc<[u8]>);
 
     impl Store for StagedPlan {
         fn prepare_selected(&mut self) -> Option<Selection> {

@@ -4,14 +4,18 @@
 //
 // - Game controllers are `@exact/gamepad`'s (D11): the chooser excludes the pad usages, and a device holding a pad
 //   collection is never offered. WebHID applies its own blocklist.
-// - Input reports are a batch (D12): each connection keeps its recent reports, and each reader its cursor; the first
+// - Input reports are a batch (D12): each shared open keeps its recent reports, and each reader its cursor; the first
 //   answer is the latest, each later one every report since, at most `history`, `dropped` counting the rest.
 
 /** Generic Desktop's joystick, gamepad and multi-axis controller (HID Usage Tables §4). */
 export const PADS = [0x04, 0x05, 0x08].map(usage => ({ usagePage: 0x01, usage }));
 const KEPT = 1024;
 
-const b64 = bytes => btoa(String.fromCharCode(...bytes));
+const b64 = bytes => {
+  let text = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+};
 const unb64 = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
 const failure = (e, fallback = 'NetworkError') => ({ error: typeof e?.name === 'string' && e.name !== 'Error' ? e.name : fallback, message: String(e?.message ?? e) });
 const clean = f => Object.fromEntries(Object.entries(f ?? {}).filter(([, v]) => v != null));
@@ -35,32 +39,56 @@ export function implementation({ changed }) {
     hid.addEventListener('connect', announce);
     hid.addEventListener('disconnect', e => {
       for (const c of connections.values()) if (c.device === e.device) { c.unplugged = true; c.open = false; }
+      removeShared(e.device);
       announce();
       changed('hid.inputReports');
     });
   }
-  const connection = args => {
-    const c = connections.get(args?.connection);
-    if (!c) return { error: { error: 'InvalidStateError', message: 'no such connection' } };
-    if (!c.open) return { error: { error: c.unplugged ? 'NetworkError' : 'InvalidStateError' } };
-    return { c };
-  };
   /** The shared open of a device and its report log: one per device, a lease per connection (D5). */
-  const shared = new Map();
+  const shared = new Map(), pending = new Map();
+  // Lease changes and reports share a queue so neither can overtake the other.
+  function onDevice(d, operation) {
+    const result = (pending.get(d) ?? Promise.resolve()).then(operation, operation);
+    pending.set(d, result);
+    const done = () => { if (pending.get(d) === result) pending.delete(d); };
+    result.then(done, done);
+    return result;
+  }
+  function onConnection(args, operation) {
+    const c = connections.get(args?.connection);
+    if (!c) return { error: 'InvalidStateError', message: 'no such connection' };
+    return onDevice(c.device, async () => {
+      if (!c.open) return { error: c.unplugged ? 'NetworkError' : 'InvalidStateError' };
+      try { return await operation(c.device); } catch (e) { return failure(e, 'NotAllowedError'); }
+    });
+  }
   async function lease(d) {
     let s = shared.get(d);
     if (!s) {
       if (!d.opened) await d.open();
       s = { log: [], sequence: 0, leases: 0 };
-      d.addEventListener('inputreport', e => {
+      s.listener = e => {
         s.log.push({ sequence: ++s.sequence, reportId: e.reportId, data: b64(new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength)), at: performance.now() });
         if (s.log.length > KEPT) s.log.shift();
         changed('hid.inputReports');
-      });
+      };
+      d.addEventListener('inputreport', s.listener);
       shared.set(d, s);
     }
     s.leases++;
     return s;
+  }
+  function removeShared(d) {
+    const s = shared.get(d);
+    if (!s) return;
+    d.removeEventListener('inputreport', s.listener);
+    // Closed handles still need the bounded log for their final reads.
+    shared.delete(d);
+  }
+  async function closeConnection(c) {
+    c.open = false;
+    if (--c.shared.leases === 0) { removeShared(c.device); try { await c.device.close(); } catch { /* gone */ } }
+    announce();
   }
 
   return {
@@ -80,12 +108,14 @@ export function implementation({ changed }) {
     async open(args) {
       const d = devices.get(args?.device);
       if (!d || isPad(d)) return { error: 'NotFoundError' };
-      let s;
-      try { s = await lease(d); } catch (e) { return failure(e); }
-      const handle = `hid-${++nextConnection}`;
-      connections.set(handle, { device: d, shared: s, open: true, unplugged: false, readers: new Map() });
-      announce();
-      return { connection: handle, device: record(d) };
+      return onDevice(d, async () => {
+        let s;
+        try { s = await lease(d); } catch (e) { return failure(e); }
+        const handle = `hid-${++nextConnection}`;
+        connections.set(handle, { device: d, shared: s, open: true, unplugged: false, readers: new Map() });
+        announce();
+        return { connection: handle, device: record(d) };
+      });
     },
     hidConnection(args) {
       const c = connections.get(args?.connection);
@@ -103,42 +133,46 @@ export function implementation({ changed }) {
       return { reports: fresh.map(({ reportId, data, at }) => ({ reportId, data, at })), dropped, interrupted: c.unplugged };
     },
     async sendReport(args) {
-      const { c, error } = connection(args);
-      if (error) return error;
-      try { await c.device.sendReport(args.reportId, unb64(args.data)); return null; } catch (e) { return failure(e, 'NotAllowedError'); }
+      return onConnection(args, async d => { await d.sendReport(args.reportId, unb64(args.data)); return null; });
     },
     async sendFeatureReport(args) {
-      const { c, error } = connection(args);
-      if (error) return error;
-      try { await c.device.sendFeatureReport(args.reportId, unb64(args.data)); return null; } catch (e) { return failure(e, 'NotAllowedError'); }
+      return onConnection(args, async d => { await d.sendFeatureReport(args.reportId, unb64(args.data)); return null; });
     },
     async receiveFeatureReport(args) {
-      const { c, error } = connection(args);
-      if (error) return error;
-      try {
-        const view = await c.device.receiveFeatureReport(args.reportId);
+      return onConnection(args, async d => {
+        const view = await d.receiveFeatureReport(args.reportId);
         return { data: b64(new Uint8Array(view.buffer, view.byteOffset, view.byteLength)) };
-      } catch (e) {
-        return failure(e, 'NotAllowedError');
-      }
+      });
     },
     async close(args) {
       const c = connections.get(args?.connection);
-      if (!c || !c.open) return { error: 'InvalidStateError' };
-      c.open = false;
-      // The device closes with its last lease.
-      if (--c.shared.leases === 0) { shared.delete(c.device); try { await c.device.close(); } catch { /* gone */ } }
-      announce();
-      return null;
+      if (!c) return { error: 'InvalidStateError' };
+      return onDevice(c.device, async () => {
+        if (!c.open) return { error: 'InvalidStateError' };
+        await closeConnection(c);
+        return null;
+      });
     },
     async forget(args) {
       const d = devices.get(args?.device);
       if (!d) return null;
-      for (const c of connections.values()) if (c.device === d) c.open = false;
-      shared.delete(d);
-      try { await d.forget?.(); } catch (e) { return failure(e); }
-      announce();
-      return null;
+      return onDevice(d, async () => {
+        try { await d.forget?.(); } catch (e) { return failure(e); }
+        for (const c of connections.values()) if (c.device === d) c.open = false;
+        removeShared(d);
+        announce();
+        return null;
+      });
+    },
+    async dispose(ids) {
+      await Promise.all(ids.map(handle => {
+        const c = connections.get(handle);
+        if (!c) return;
+        return onDevice(c.device, async () => {
+          if (c.open) await closeConnection(c);
+          connections.delete(handle);
+        });
+      }));
     },
     release() {},
   };

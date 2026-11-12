@@ -1,6 +1,6 @@
 # Still · Interaction Gallery
 
-The Photos, Arrange and Read consumers for [LLP 1041 §8.5](../../llp/1041-graceful-overload.rfc.md).
+The Photos, Arrange and Read consumers for LLP 1041 §8.5.
 One Contract shell, one logical data owner, six local photographic illustrations.
 Arrange and Read now use the shared viewport collection over complete records.
 Photos retains explicit manual pages. Read authors a header-only numeric-height

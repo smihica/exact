@@ -70,6 +70,13 @@ extension TextEngine {
         return CTFontDescriptorCreateCopyWithVariation(descriptor, tag as CFNumber, CGFloat(min(max(Double(weight), low), high)))
     }
 
+    package func installedMember(_ name: String, generic: Bool) -> [RegisteredFace] {
+        let generics = ["system-ui", "ui-sans-serif", "sans-serif", "ui-serif", "serif", "ui-monospace", "monospace", "ui-rounded"]
+        guard generic, let index = generics.firstIndex(of: name.lowercased()) else { return Self.installedFaces(name) }
+        let descriptor = CTFontCopyFontDescriptor(font(size: 16, weight: 400, family: index, italic: false) as CTFont)
+        return [RegisteredFace(family: name, generic: index, weight: 0, italic: false, descriptor: descriptor)]
+    }
+
     /// The faces of an installed family at CSS's normal stretch, its default
     /// face first so it wins a tie (Iowan Old Style's Roman over Titling).
     /// Weight is the face's OS/2 `usWeightClass`, the number CSS matches.

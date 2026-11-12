@@ -32,6 +32,208 @@ fn tall(id: u32, height: f64) -> Op {
     }
 }
 
+fn relative_style(id: u32, rows: &[(StyleId, &str)]) -> Op {
+    let mut patch = StyleProps::default();
+    for &(row, value) in rows {
+        patch
+            .set_dynamic(row, &StyleValue::Text(value.into()))
+            .unwrap();
+    }
+    Op::SetStyle {
+        id,
+        patch: Box::new(patch),
+    }
+}
+
+fn relative_work(f: impl FnOnce()) -> usize {
+    super::relative::RESOLVED.with(|count| count.set(0));
+    f();
+    super::relative::RESOLVED.with(|count| count.get())
+}
+
+#[test]
+fn unrelated_commits_do_not_resolve_relative_rows() {
+    let mut ops = create(1..=1_001, NodeType::View);
+    let ramp = format!("-exact-{}", crate::LENGTH_RAMPS[0].0);
+    for id in 2..=1_001 {
+        let rows: &[(StyleId, &str)] = match id % 5 {
+            0 => &[
+                (StyleId::PaddingLeft, "1rem"),
+                (StyleId::MarginBottom, "1rem"),
+            ],
+            1 => &[(StyleId::FontSize, "2em"), (StyleId::Width, "1em")],
+            2 => &[(StyleId::FontSize, "-exact-body")],
+            3 => &[(StyleId::BorderWidthTop, "-exact-hairline")],
+            _ => &[(StyleId::Height, &ramp)],
+        };
+        ops.push(relative_style(id, rows));
+    }
+    ops.extend([
+        children(1, &(2..=1_001).collect::<Vec<_>>()),
+        Op::AttachRoot { id: 1 },
+    ]);
+    let mut k = kernel(&ops);
+    assert_eq!(
+        relative_work(|| {
+            k.apply(0, 2, &[prop(1, PropId::TestId, "renamed")])
+                .unwrap();
+            k.apply(0, 3, &[prop(1_001, PropId::TestId, "leaf")])
+                .unwrap();
+            k.apply(0, 4, &[]).unwrap();
+            k.set_bold_text(true);
+            k.apply(0, 5, &[]).unwrap();
+        }),
+        0
+    );
+    assert_eq!(
+        relative_work(|| {
+            k.apply(
+                0,
+                6,
+                &[relative_style(1_000, &[(StyleId::PaddingLeft, "2rem")])],
+            )
+            .unwrap();
+        }),
+        1
+    );
+    assert_eq!(
+        k.node(1_000).unwrap().style.padding_left,
+        crate::Dimension::Points(32.0)
+    );
+    assert_eq!(
+        relative_work(|| {
+            k.set_root_font_size(24.0).unwrap();
+            k.set_display_scale(2.0).unwrap();
+            k.apply(0, 7, &[]).unwrap();
+        }),
+        1_000
+    );
+    assert_eq!(
+        k.node(1_000).unwrap().style.padding_left,
+        crate::Dimension::Points(48.0)
+    );
+    assert_eq!(k.node(3).unwrap().style.border_width_top, 0.5);
+    assert_eq!(
+        relative_work(|| {
+            k.apply(0, 8, &[]).unwrap();
+        }),
+        0
+    );
+}
+
+#[test]
+fn relative_font_changes_resolve_only_the_dependent_branch_in_parent_order() {
+    let mut ops = create(1..=9, NodeType::View);
+    ops.extend([
+        relative_style(1, &[(StyleId::FontSize, "10px")]),
+        relative_style(3, &[(StyleId::FontSize, "2em")]),
+        relative_style(5, &[(StyleId::FontSize, "3em")]),
+        relative_style(6, &[(StyleId::Width, "1em")]),
+        relative_style(7, &[(StyleId::FontSize, "40px")]),
+        relative_style(8, &[(StyleId::FontSize, "2em")]),
+        relative_style(9, &[(StyleId::Width, "1em")]),
+        children(1, &[2, 7]),
+        children(2, &[3]),
+        children(3, &[4]),
+        children(4, &[5]),
+        children(5, &[6]),
+        children(7, &[8]),
+        children(8, &[9]),
+        Op::AttachRoot { id: 1 },
+    ]);
+    let mut k = kernel(&ops);
+    // The leaf is already queued when resolving 3 discovers that 5 needs
+    // resolving too. Its new font must reach 6 before 6 resolves its width.
+    assert_eq!(
+        relative_work(|| {
+            k.apply(
+                0,
+                2,
+                &[
+                    relative_style(6, &[(StyleId::Width, "2em")]),
+                    relative_style(1, &[(StyleId::FontSize, "12px")]),
+                ],
+            )
+            .unwrap();
+        }),
+        3
+    );
+    assert_eq!(k.node(3).unwrap().style.font_size, 24.0);
+    assert_eq!(k.node(5).unwrap().style.font_size, 72.0);
+    assert_eq!(
+        k.node(6).unwrap().style.width,
+        crate::Dimension::Points(144.0)
+    );
+    assert_eq!(
+        k.node(9).unwrap().style.width,
+        crate::Dimension::Points(80.0)
+    );
+    assert_eq!(
+        relative_work(|| {
+            k.apply(0, 3, &[children(7, &[8, 3])]).unwrap();
+        }),
+        3
+    );
+    assert_eq!(k.node(3).unwrap().style.font_size, 80.0);
+    assert_eq!(
+        k.node(6).unwrap().style.width,
+        crate::Dimension::Points(480.0)
+    );
+    assert_eq!(
+        relative_work(|| {
+            k.apply(0, 4, &[children(7, &[8]), Op::AttachRoot { id: 3 }])
+                .unwrap();
+        }),
+        3
+    );
+    assert_eq!(k.node(3).unwrap().style.font_size, 32.0);
+    assert_eq!(
+        k.node(6).unwrap().style.width,
+        crate::Dimension::Points(192.0)
+    );
+}
+
+#[test]
+fn pending_relative_rows_do_not_survive_removal_or_slot_reuse() {
+    let mut k = kernel(&create([1, 2], NodeType::View));
+    assert_eq!(
+        relative_work(|| {
+            k.apply(
+                0,
+                2,
+                &[
+                    relative_style(1, &[(StyleId::Width, "1em")]),
+                    Op::ClearStyle {
+                        id: 1,
+                        mask: crate::StyleMask::of(StyleId::Width),
+                        written: false,
+                    },
+                    relative_style(2, &[(StyleId::Width, "1em")]),
+                    Op::DestroyView { id: 2 },
+                    Op::CreateView {
+                        id: 3,
+                        node_type: NodeType::View,
+                    },
+                    relative_style(3, &[(StyleId::Width, "2rem")]),
+                ],
+            )
+            .unwrap();
+        }),
+        1
+    );
+    assert_eq!(k.node(1).unwrap().style.width, crate::Dimension::Auto);
+    assert_eq!(
+        k.node(3).unwrap().style.width,
+        crate::Dimension::Points(32.0)
+    );
+    assert_eq!(
+        relative_work(|| {
+            k.apply(0, 3, &[]).unwrap();
+        }),
+        0
+    );
+}
+
 /// `color` on `id`, written by its author or implied by the compiler.
 fn colour(id: u32, value: &str, written: bool) -> Op {
     let mut patch = StyleProps::default();

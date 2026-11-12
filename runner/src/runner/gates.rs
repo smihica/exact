@@ -78,7 +78,7 @@ impl<D: DataSource> Runner<D> {
                 .plan
                 .mutations
                 .iter()
-                .any(|m| m.then.is_some() || m.queue)
+                .any(|m| m.then.is_some() || m.mode == MutationMode::Queue)
     }
 
     /// Whether the plan has a frame task (LLP 1073 D4): a host keeps its

@@ -1,6 +1,6 @@
 //! Local light shadows: the frame's plan, its depth layers and their culls.
 use super::*;
-use crate::cull::{Cull, KEEP_ALL};
+use crate::cull::{Cull, KEEP_ALL, UNSORTED};
 
 /// A cull over up to four local shadow views and the scene groups over its lists.
 pub(crate) struct LocalCull {
@@ -11,17 +11,23 @@ pub(crate) struct LocalCull {
 impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     /// Plan this frame's local shadow layers and keep their maps and culls.
     pub(super) fn prepare_local(&mut self, frame: &FrameInput<'_>) {
-        self.local_plan.of(frame.lights);
+        self.local_plan.of(frame.lights, &frame.local_shadows);
         let views = self.local_plan.views.len() as u32;
         if views == 0 {
             return;
         }
-        // Grow only: a flashlight toggled off and on keeps its layers.
-        if self.local.as_ref().is_none_or(|l| l.count < views) {
+        let resolution = self.local_plan.resolution;
+        // Grow only at one size: a flashlight toggled off and on keeps its layers.
+        if self
+            .local
+            .as_ref()
+            .is_none_or(|l| l.count < views || l.resolution != resolution)
+        {
             self.texture_creations += 1;
             self.local = Some(crate::local_shadows::LocalMaps::new(
                 &self.device,
                 views,
+                resolution,
                 &self.pipelines.camera_layout,
             ));
             self.shadow_sample_stale = true;
@@ -104,7 +110,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             .iter()
             .any(|l| !l.cull.groups.is_empty() && l.cull.stale())
     }
-    /// Upload the main setup's words, with each group's view flags, to each local cull.
+    /// Reuse the main setup with local view flags and no camera depth sorting.
     pub(super) fn local_setups(&mut self, words: &[u32], items: u32, records: u32, skins: u32) {
         for local in &mut self.local_culls {
             if local.cull.groups.is_empty() {
@@ -113,9 +119,10 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             local.cull.begin_setup();
             local.cull.words.extend_from_slice(words);
             for (index, group) in local.cull.groups.iter().enumerate() {
-                let at = index * crate::cull::GROUP_WORDS + 7;
-                local.cull.words[at] =
-                    (local.cull.words[at] & !(15 | crate::cull::OUTLINE)) | (group.flags & 15);
+                let at = index * crate::cull::GROUP_WORDS;
+                local.cull.words[at + 7] =
+                    (local.cull.words[at + 7] & !(15 | crate::cull::OUTLINE)) | (group.flags & 15);
+                local.cull.words[at + 13] = UNSORTED;
             }
             local
                 .cull
@@ -169,6 +176,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
     }
 
     pub(super) fn encode_local_culls(&self, encoder: &mut wgpu::CommandEncoder) {
+        if self.cull.direct {
+            return;
+        }
         for local in &self.local_culls {
             if !local.cull.groups.is_empty() {
                 local.cull.encode(encoder, self.current, None);

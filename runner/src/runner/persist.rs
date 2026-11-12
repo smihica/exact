@@ -6,8 +6,9 @@
 //! string, a bool, an option as `null` or its value, a list as an array.
 //! At boot a stored value that decodes to the slot's type replaces the
 //! initializer's; anything else keeps it and is journaled. After every
-//! commit that stands — the boot's too — the store holds each persisted
-//! slot's value, so a host persists exactly the writes the store makes.
+//! commit that stands — the boot's too — changed values within the limit
+//! are kept. An oversized value leaves the store intact and is journaled
+//! only when it changes.
 
 use super::*;
 use exact_plan::{TypeKind, TypesId};
@@ -51,8 +52,8 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    /// Keep each persisted slot's value in the store, where it differs from
-    /// what the store holds: after a commit stands.
+    /// After a commit stands, keep changed persisted values and report
+    /// oversized ones once until they change.
     pub(super) fn persist_slots(&mut self) {
         for i in 0..self.plan.slots.len() {
             if !self.plan.slots[i].persist {
@@ -61,17 +62,22 @@ impl<D: DataSource> Runner<D> {
             let mut text = String::new();
             encode(&self.slots[i], &mut text);
             let name = self.plan.str(self.plan.slots[i].name);
-            let key = state_name(name);
-            if self.store.kept(&key) == Some(text.as_bytes()) {
-                continue;
-            }
             if text.len() > PERSIST_LIMIT {
+                if self.persist_oversized.get(&i) == Some(&text) {
+                    continue;
+                }
                 let line = format!(
                     "persisted state {name}: {} bytes is over the {PERSIST_LIMIT} a persisted \
                      value may hold: not kept (the store keeps its last value)",
                     text.len()
                 );
+                self.persist_oversized.insert(i, text);
                 self.log(line);
+                continue;
+            }
+            self.persist_oversized.remove(&i);
+            let key = state_name(name);
+            if self.store.kept(&key) == Some(text.as_bytes()) {
                 continue;
             }
             self.store.keep(&key, text.into_bytes());

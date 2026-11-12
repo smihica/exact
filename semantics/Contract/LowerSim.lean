@@ -35,7 +35,9 @@ def RefOk (env : Contract.Env) (inFn : Bool) (ls : Locals) (venv : Vm.Env) (L : 
   | .resource j, t => lookup x ls = none ∧ inFn = false ∧
       GlobalOk env.prog.shapes (env.global x) venv.resources[j]? t ∧
       env.prog.resources.any (·.name == x) = true ∧
-      ((lookup x env.resources).isSome = true ↔ ∃ v, venv.resources[j]? = some (some v))
+      ((lookup x env.resources).isSome = true ↔ ∃ v, venv.resources[j]? = some (some v)) ∧
+      -- `current(x)`: an answer unless idle (LLP 1161.001 D5).
+      venv.currentResources[j]?.getD false = !(env.idle.contains x)
   | .mutation s _, t => lookup x ls = none ∧ inFn = false ∧
       GlobalOk env.prog.shapes (env.global x) venv.slots[s]? t ∧
       env.prog.resources.any (·.name == x) = false

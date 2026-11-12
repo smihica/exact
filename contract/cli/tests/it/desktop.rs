@@ -15,7 +15,7 @@ use std::os::windows::fs::symlink_dir;
 use std::path::{Path, PathBuf};
 
 const APP: &str = r#"use loginItemStatus, registerLoginItem, unregisterLoginItem, LoginItemStatus from "@exact/login-item"
-use globalShortcut, checkGlobalShortcut, GlobalShortcut, GlobalShortcutCheck from "@exact/global-shortcuts"
+use globalShortcut, checkGlobalShortcut, globalshortcut, GlobalShortcut, GlobalShortcutCheck from "@exact/global-shortcuts"
 use requestAttention from "@exact/dock"
 
 component App
@@ -331,11 +331,15 @@ fn the_agent_lists_the_status_item_and_the_dock_menu() {
     assert_eq!(dock.len(), 1);
     assert_eq!(dock[0]["label"], "New Conversation");
     assert!(tree.contains("\"presented\":\"status\""), "{tree}");
-    // Where no status area is, the button is ordinary; the lists stay.
-    let r = boot(&app, "web");
-    let tree = agent::handle(&r, r#"{"op":"tree"}"#);
-    assert!(!tree.contains("\"presented\""), "{tree}");
-    assert_eq!(state(&r)["statusItems"].as_array().map(Vec::len), Some(1));
+    // Where no host places it, the button is ordinary; the lists stay.
+    // Windows' notification-area icon is not built, so Windows is such a host.
+    for target in ["web", "windows"] {
+        let r = boot(&app, target);
+        let tree = agent::handle(&r, r#"{"op":"tree"}"#);
+        assert!(!tree.contains("\"presented\""), "{target}: {tree}");
+        let items = state(&r)["statusItems"].as_array().map(Vec::len);
+        assert_eq!(items, Some(1), "{target}");
+    }
 }
 
 /// D5: a request for attention is the agent's to read, critical or not.

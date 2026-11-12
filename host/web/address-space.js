@@ -4,11 +4,14 @@
 // the browser answers it, and the rule a tool's, a wake's or a package
 // event's fetch or WebSocket open passes: the JS target's (host/web-js
 // admission.js) and the page module's (http-body.js `request`).
-import { isLocalNetwork } from './grant-admission.js';
+import { isCloudMetadata, isLocalNetwork } from './grant-admission.js';
 
 const RANK = { public: 0, local: 1, loopback: 2 };
-/** The space of `host` as written: `loopback`, `local` or `public`; a name the browser resolves is `public` here. */
-export const spaceOf = host => isLocalNetwork(host, true) ? (isLocalNetwork(host, false) ? 'local' : 'loopback') : 'public';
+/**
+ * The space of `host` as written: `loopback`, `local` or `public`; a name the browser resolves is `public` here. The
+ * cloud metadata address, which no grant admits as local, is in the browser's local space all the same.
+ */
+export const spaceOf = host => isLocalNetwork(host, true) ? (isLocalNetwork(host, false) ? 'local' : 'loopback') : isCloudMetadata(host) ? 'local' : 'public';
 
 // Each space's permission as the browser answers it (D8): `unknown` where it
 // answers neither name. `local-network-access` is Chrome's name before 145.

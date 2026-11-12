@@ -43,7 +43,8 @@ fn main() {
             contract::rust_entry(
                 "shared_elements_data::Shared",
                 "shared_elements_data::Shared",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

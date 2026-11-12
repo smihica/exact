@@ -183,6 +183,22 @@ impl GraphBase {
             path,
             origin: Origin::App,
         }));
+        // The strings tables, which every compile reads (LLP 1060 D3: the plan is
+        // a function of `strings/*.json` too).
+        let strings = self.app_root.join("strings");
+        let mut tables: Vec<PathBuf> = std::fs::read_dir(&strings)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tables.sort();
+        sources.extend(tables.into_iter().map(|path| Source {
+            path: path.canonicalize().unwrap_or(path),
+            origin: Origin::App,
+        }));
         // Each linked package's design too (D11); one not there yet is looked
         // for, so adding it rebuilds.
         let (designs, unmade) = packages::sources(&self.sources);

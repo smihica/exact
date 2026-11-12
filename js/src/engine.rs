@@ -9,12 +9,17 @@ mod real {
     /// The one door from the module into Rust: `(ctx, op, a, b, out)`; 0
     /// with `out` null is `undefined`, 0 with a string is that string, and
     /// anything else throws the string in the module.
+    /// `(ctx, op, a, a_len, b, b_len, out, out_len)`: each string with its
+    /// length, since a JavaScript string may hold U+0000.
     pub type HostFn = unsafe extern "C" fn(
         *mut c_void,
         u32,
         *const c_char,
+        usize,
         *const c_char,
+        usize,
         *mut *mut c_char,
+        *mut usize,
     ) -> i32;
 
     /// The door for byte input (`__exact_bytes`, LLP 1069.005 D1):
@@ -41,6 +46,8 @@ mod real {
             host: HostFn,
             bytes: BytesFn,
             ctx: *mut c_void,
+            console: *const u8,
+            console_len: usize,
             queue: *const c_void,
             bindings: *const c_void,
             grants: *const c_void,
@@ -87,7 +94,11 @@ mod real {
         ) -> i32;
         fn exact_js_drain(h: *mut c_void, out: *mut *mut c_char) -> i32;
         fn exact_js_interrupt(h: *mut c_void);
-        fn exact_js_take_log(h: *mut c_void, out: *mut *mut c_char);
+        fn exact_js_take_log(
+            h: *mut c_void,
+            ctx: *mut c_void,
+            record: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+        );
         fn exact_js_free(p: *mut c_char);
         fn exact_js_destroy(h: *mut c_void);
     }
@@ -159,15 +170,19 @@ mod real {
                     len: script.bytes.len(),
                 })
                 .collect::<Vec<_>>();
+            let console = include_bytes!(concat!(env!("OUT_DIR"), "/console.hbc"));
             // SAFETY: the shim returns null or a pointer we own until destroy;
             // `ctx` and Context outlive the engine. Installation consumes the
-            // script descriptors synchronously and retains its own JSI roots.
+            // script descriptors synchronously and retains its own JSI roots;
+            // the console bytecode is static.
             let h = unsafe {
                 exact_js_create(
                     max_heap_bytes,
                     host,
                     bytes,
                     ctx,
+                    console.as_ptr(),
+                    console.len(),
                     context.state_ptr(),
                     context.bindings_ptr().cast(),
                     context.grants_ptr(),
@@ -402,15 +417,25 @@ mod real {
         }
 
         pub fn take_log(&mut self) -> Vec<String> {
-            let mut out: *mut c_char = std::ptr::null_mut();
-            // SAFETY: `out` receives an owned string.
-            unsafe { exact_js_take_log(self.0, &mut out) };
-            let text = take(out);
-            if text.is_empty() {
-                Vec::new()
-            } else {
-                text.lines().map(str::to_string).collect()
+            unsafe extern "C" fn record(ctx: *mut c_void, bytes: *const u8, len: usize) {
+                // SAFETY: the shim borrows each record for this call, even when
+                // empty; `ctx` exclusively borrows the Vec until the drain returns.
+                let (logs, text) = unsafe {
+                    (
+                        &mut *ctx.cast::<Vec<String>>(),
+                        String::from_utf8_lossy(std::slice::from_raw_parts(bytes, len)),
+                    )
+                };
+                if text.is_empty() {
+                    logs.push(String::new());
+                } else {
+                    logs.extend(text.lines().map(str::to_string));
+                }
             }
+            let mut logs = Vec::<String>::new();
+            // SAFETY: the live engine calls `record` synchronously with this Vec.
+            unsafe { exact_js_take_log(self.0, (&mut logs as *mut Vec<String>).cast(), record) };
+            logs
         }
     }
 
@@ -427,12 +452,17 @@ mod real {
     use std::ffi::{c_char, c_void};
 
     /// The host door's signature, kept identical so `Module` is one type.
+    /// `(ctx, op, a, a_len, b, b_len, out, out_len)`: each string with its
+    /// length, since a JavaScript string may hold U+0000.
     pub type HostFn = unsafe extern "C" fn(
         *mut c_void,
         u32,
         *const c_char,
+        usize,
         *const c_char,
+        usize,
         *mut *mut c_char,
+        *mut usize,
     ) -> i32;
 
     /// The bytes door's signature, likewise.

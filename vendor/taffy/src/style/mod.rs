@@ -1245,6 +1245,10 @@ impl<S: CheapCloneStr> GridContainerStyle for Style<S> {
         self.grid_auto_flow
     }
     #[inline(always)]
+    fn grid_line_limit(&self) -> u16 {
+        self.rare.grid_line_limit
+    }
+    #[inline(always)]
     fn gap(&self) -> Size<LengthPercentage> {
         self.gap
     }
@@ -1351,6 +1355,10 @@ impl<T: GridContainerStyle> GridContainerStyle for &'_ T {
     #[inline(always)]
     fn grid_template_area_column_count(&self) -> u16 {
         (*self).grid_template_area_column_count()
+    }
+    #[inline(always)]
+    fn grid_line_limit(&self) -> u16 {
+        (*self).grid_line_limit()
     }
     #[cfg(feature = "grid")]
     #[inline(always)]

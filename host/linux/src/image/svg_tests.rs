@@ -93,7 +93,7 @@ const MARK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height
 </svg>"##;
 
 const LABEL: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
-  <text x="2" y="15" font-size="14" fill="#000">Hi</text>
+  <text x="2" y="15" font-size="14" font-family="MissingExactFont, monospace" font-weight="bold" fill="#000">Hi</text>
 </svg>"##;
 
 fn assets() -> Assets {
@@ -208,6 +208,28 @@ fn a_picture_with_text_waits_for_the_paint_thread_and_draws_with_its_fonts() {
     let p = bitmap.pixels();
     let inked = p.data().chunks(4).filter(|px| px[3] > 0).count();
     assert!(inked > 20 && inked < 40 * 20, "{inked} pixels inked");
+    let loaded = exact_svg_file::load(LABEL).unwrap();
+    let mut scene = loaded.scene(40.0, 20.0);
+    let exact_kernel::svg::scene::Kind::Text(item) = &mut scene.items[0].kind else {
+        panic!("text")
+    };
+    item.chunks[0].runs[0].style.font_family = 6;
+    let expected = super::svg_picture::paint(
+        crate::text::TextEngine::shared(),
+        &scene,
+        (40.0, 20.0),
+        1.0,
+        exact_raster::PixelSize {
+            width: 40,
+            height: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        p.data(),
+        expected.data(),
+        "the loader uses the image's monospace stack"
+    );
 }
 
 /// A file past a cost limit (LLP 1011.001 D2): the decode is refused, so
@@ -280,4 +302,22 @@ fn a_path_out_of_tiny_skias_reach_is_not_drawn() {
     );
     let blue = at(50, 50);
     assert_eq!((blue.red(), blue.blue(), blue.alpha()), (0, 255, 255));
+}
+
+#[test]
+fn svg_family_ids_resolve_in_the_pictures_own_catalog() {
+    let loaded = exact_svg_file::load(r#"<svg><text font-family="MissingExactFont, monospace">Mono</text><text font-family="serif">Serif</text></svg>"#).unwrap();
+    let scene = loaded.scene(200.0, 40.0);
+    let text = crate::text::TextEngine::for_svg(&loaded.document.fonts);
+    let mut text = text.borrow_mut();
+    for (item, generic) in scene.items.iter().zip([6, 4]) {
+        let exact_kernel::svg::scene::Kind::Text(item) = &item.kind else {
+            panic!("text")
+        };
+        let run = &item.chunks[0].runs[0];
+        let face = text
+            .resolved_face_id(run.style.font_family, 400, false)
+            .expect("installed generic face");
+        assert_eq!(Some(face), text.resolved_face_id(generic, 400, false));
+    }
 }

@@ -16,6 +16,7 @@
 // reach outside the shape); an explicit bitmap stretched to its box is
 // refused too. The policy is `Canvas2DHost.run`'s.
 import CoreGraphics
+import CoreText
 import Foundation
 import QuartzCore
 import ExactKit
@@ -46,6 +47,14 @@ struct Canvas2DReplayState {
 }
 
 extension Canvas2DReplayer {
+    /// The GPU callbacks resolve a style, including one restored from an
+    /// earlier list, without reading the session's text engine.
+    var resolvedFonts: [Canvas2DFont: CTFont] {
+        var fonts: [Canvas2DFont: CTFont] = [:]
+        for s in stack + [state] { fonts[s.font] = s.resolvedFont }
+        return fonts
+    }
+
     /// A tracker for a canvas `width`×`height` pixels at `scale`: its context
     /// is one pixel, and it paints nothing.
     convenience init(trackingWidth width: Int, height: Int, scale: Double, lifetime: UInt64, generation: UInt32) {
@@ -143,6 +152,8 @@ extension Canvas2DReplayer {
 final class Canvas2DKept {
     let tracker: Canvas2DReplayer
     var lists: [Data] = []
+    /// Only the fonts set by the kept lists; their starting state owns its fonts.
+    var fonts: [Canvas2DFont: CTFont] = [:]
     var bytes = 0
     /// Where `lists` start; nil when they cannot be replayed alone.
     var start: Canvas2DReplayState?
@@ -167,13 +178,17 @@ final class Canvas2DKept {
         let seen = tracker.track(data)
         if seen.covers {
             lists = [data]; bytes = data.count; start = before; refused = seen.refused
+            fonts.removeAll(keepingCapacity: true)
         } else if start != nil {
             lists.append(data); bytes += data.count; refused = refused || seen.refused
+        }
+        if start != nil {
+            for f in Canvas2DReplayer.fonts(in: data) { fonts[f] = tracker.env?.canvasFont(f) }
         }
     }
 
     /// Forget the kept lists: only a cover starts them again.
-    func drop() { lists = []; bytes = 0; start = nil; refused = false }
+    func drop() { lists = []; fonts = [:]; bytes = 0; start = nil; refused = false }
 }
 
 /// A recording of a canvas: the kept lists replayed into the layer's own

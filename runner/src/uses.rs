@@ -122,11 +122,14 @@ pub enum Capability {
     /// which an app links only for it (LLP 1115.001.000 D2). Every other
     /// host shows its platform's own picker and links nothing for it.
     Dates,
+    /// SQL storage, selected by a data module's `sqlite.open` grants or by
+    /// the manifest's `link`, since requests live below the plan.
+    Sqlite,
 }
 
 impl Capability {
     /// Every capability, in bit order.
-    pub const ALL: [Capability; 29] = [
+    pub const ALL: [Capability; 30] = [
         Capability::Markdown,
         Capability::Motion,
         Capability::Collections,
@@ -156,6 +159,7 @@ impl Capability {
         Capability::AuthSession,
         Capability::Numerals,
         Capability::Dates,
+        Capability::Sqlite,
     ];
 
     /// The name an entry, a refusal and a report use.
@@ -190,6 +194,7 @@ impl Capability {
             Capability::AuthSession => "auth_session",
             Capability::Numerals => "numerals",
             Capability::Dates => "dates",
+            Capability::Sqlite => "sqlite",
         }
     }
 
@@ -220,6 +225,22 @@ impl Uses {
     /// Whether the set holds `capability`.
     pub const fn has(self, capability: Capability) -> bool {
         self.0 & capability.bit() != 0
+    }
+
+    /// Include capabilities selected by a data module's grants.
+    pub fn with_grants(self, grants: &str) -> Uses {
+        let mut uses = self;
+        if !crate::io_grants(grants).is_empty() {
+            uses = uses.with(Capability::Io);
+        }
+        for line in grants.lines() {
+            uses = match line.split_whitespace().next() {
+                Some("sqlite.open") => uses.with(Capability::Sqlite),
+                Some("auth.session") => uses.with(Capability::AuthSession),
+                _ => uses,
+            };
+        }
+        uses
     }
 
     /// What this set holds that `linked` doesn't.
@@ -631,4 +652,30 @@ fn constant_str<'a>(plan: &'a Plan, code: &[u8]) -> Option<&'a str> {
 fn names_segment(s: &str) -> bool {
     const NAME: &[u8] = b"viewport-segment-";
     s.as_bytes().windows(NAME.len()).any(|w| w == NAME)
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::{Capability, Uses};
+
+    #[test]
+    fn sqlite_grants_select_sql_storage_apart_from_other_io() {
+        let fetch = Uses::NONE.with_grants("net.fetch https://example.test");
+        assert!(fetch.has(Capability::Io));
+        assert!(!fetch.has(Capability::Sqlite));
+        let files = Uses::NONE.with_grants("fs.read app:/data\nfs.write app:/data");
+        assert!(files.has(Capability::Io));
+        assert!(!files.has(Capability::Sqlite));
+        let sql = Uses::NONE.with_grants("  sqlite.open app:/data/notes.db\n");
+        assert!(sql.has(Capability::Io));
+        assert!(sql.has(Capability::Sqlite));
+        assert_eq!(sql.beyond(fetch).to_string(), "sqlite");
+        assert_eq!(Uses::NONE.with_grants(""), Uses::NONE);
+        assert!(Uses::NONE
+            .with_grants("auth.session https://example.test")
+            .has(Capability::AuthSession));
+        assert!(!Uses::NONE
+            .with_grants("auth.callback app:/oauth")
+            .has(Capability::AuthSession));
+    }
 }

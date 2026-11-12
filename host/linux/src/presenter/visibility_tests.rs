@@ -40,6 +40,95 @@ fn holds(rect: Rect4, point: (f32, f32)) -> bool {
 }
 
 #[test]
+fn a_fullscreen_background_composites_over_the_inert_page() {
+    for (presentation, background, hidden, pixel) in [
+        ("fullscreen", "", true, None),
+        (
+            "fullscreen",
+            "background-color=\"rgba(0, 0, 0, 0.5)\"",
+            false,
+            Some([127, 0, 0, 255]),
+        ),
+        (
+            "fullscreen",
+            "background-color=\"transparent\"",
+            false,
+            Some([255, 0, 0, 255]),
+        ),
+        (
+            "fullscreen",
+            "background-image=\"linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5))\"",
+            false,
+            Some([127, 0, 0, 255]),
+        ),
+        (
+            "fullscreen",
+            "background-color=\"#0000ff\"",
+            false,
+            Some([0, 0, 255, 255]),
+        ),
+        ("push", "background-color=\"transparent\"", true, None),
+    ] {
+        let source = format!(
+            r##"routes nav
+  home "/"
+    cover "/cover"
+component App
+  action open
+    nav = push(nav, "/cover")
+  action close
+    nav = back(nav)
+  view
+    main navigationKey=`${{top(nav).id}}` width="100%" height="100%"
+      for e in stack(nav).filter(x => x.name == "home") key=e.id
+        column navigationKey=`${{e.id}}` position="absolute" inset=0 background-color="#ffffff"
+          button "Open" testId="open" press=open
+          box testId="page" tabindex=0 position="absolute" left=40 top=100 width=200 height=200 background-color="#ff0000"
+      for e in stack(nav).filter(x => x.name == "cover") key=e.id
+        column navigationKey=`${{e.id}}` navigationPresentation="{presentation}" {background} position="absolute" inset=0
+          button "Close" testId="close" press=close
+"##
+        );
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan(&source),
+            (),
+            (400., 600.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert_eq!(error, None);
+        let tap = |p: &mut Presenter<()>, name| {
+            let target = id(p, name);
+            let (x, y) = p.box_of(target).unwrap().center();
+            let now = p.host.now();
+            p.pointer_down(x, y, now + 1.).unwrap();
+            p.pointer_up(x, y, now + 2.).unwrap();
+        };
+        let page = id(&p, "page");
+        assert_eq!(rgba(&mut p, 100., 150.), [255, 0, 0, 255]);
+        tap(&mut p, "open");
+        assert_eq!(
+            p.host.route_visibility(page),
+            (hidden, true),
+            "{presentation} {background}"
+        );
+        assert_eq!(p.box_of(page).is_none(), hidden);
+        if let Some(pixel) = pixel {
+            assert_eq!(rgba(&mut p, 100., 150.), pixel, "{background}");
+        }
+        assert!(p.host.runner().inactive(page));
+        assert_ne!(p.hit(100., 150.), Some(page));
+        tap(&mut p, "close");
+        assert_eq!(p.host.route_visibility(page), (false, false));
+        assert_eq!(rgba(&mut p, 100., 150.), [255, 0, 0, 255]);
+        assert!(!p.host.runner().inactive(page));
+        assert_eq!(p.hit(100., 150.), Some(page));
+    }
+}
+
+#[test]
 fn a_visible_descendant_of_a_hidden_box_paints_and_is_hit() {
     let mut p = boot();
     let (parent, shown, kept) = (id(&p, "parent"), id(&p, "shown"), id(&p, "kept"));
@@ -154,6 +243,74 @@ fn mouse_click_uses_the_common_ancestor_of_down_and_release() {
 #[test]
 fn mouse_click_common_ancestor_with_an_acknowledged_display() {
     common_ancestor_clicks(true);
+}
+
+#[test]
+fn a_wheel_during_a_mouse_press_keeps_the_click_if_the_button_stays_under_it() {
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+    for attached in [false, true] {
+        for (scrolls, wheel, offset, presses) in [
+            (false, None, 0., 1.),
+            (false, Some(40.), 0., 1.),
+            (true, Some(-40.), 0., 1.),
+            (true, Some(40.), 40., 1.),
+            (true, Some(300.), 300., 0.),
+        ] {
+            let source = format!(
+                r#"component App
+  state presses = 0
+  state ups = 0
+  action pressed
+    presses = presses + 1
+  action lifted
+    ups = ups + 1
+  view
+    column width=400
+      button press=pressed pointerup=lifted testId="button" width=200 height=200
+        text "Go"
+      box height={height} flex-shrink=0
+"#,
+                height = if scrolls { 2000 } else { 0 },
+            );
+            let (mut p, error) = Presenter::boot_with(
+                &crate::test_plan(&source),
+                (),
+                (400., 500.),
+                1.,
+                PathBuf::new(),
+                PainterChoice::Cpu,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            if attached {
+                let frame = p.display_frame().unwrap();
+                assert!(p.display_complete(&frame));
+            }
+            assert_eq!(p.hit(100., 150.), Some(id(&p, "button")));
+            p.pointer_down(100., 150., 1.).unwrap();
+            if let Some(dy) = wheel {
+                p.wheel_at(100., 150., 0., dy);
+            }
+            let ups_before_release = p.host.runner().slot("ups").cloned();
+            if attached {
+                let frame = p.display_frame().unwrap();
+                assert!(p.display_complete(&frame));
+            }
+            p.pointer_up(100., 150., 2.).unwrap();
+            let label = format!("attached={attached} scrolls={scrolls} wheel={wheel:?}");
+            actual.push((
+                label.clone(),
+                p.page(),
+                ups_before_release,
+                p.host.runner().slot("ups").cloned(),
+                p.host.runner().slot("presses").cloned(),
+            ));
+            let number = |n| Some(exact_runner::Value::Number(n));
+            expected.push((label, (0., offset), number(0.), number(1.), number(presses)));
+        }
+    }
+    assert_eq!(actual, expected);
 }
 
 fn common_ancestor_clicks(attached: bool) {

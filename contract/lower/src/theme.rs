@@ -44,6 +44,8 @@ pub(crate) struct ThemeEntry {
     pub slices: Vec<String>,
     /// Its kind (D3).
     pub kind: tamber::Kind,
+    /// Where the token was declared, including its design file.
+    pub span: Span,
 }
 
 /// The plan's `theme.kind` for a kind (LLP 1121 D3); `None` for a motion
@@ -309,7 +311,7 @@ impl Lowerer<'_> {
         let (d, k, i) = (&design, &kinded, &identities);
         let mut lines = crate::anatomy::param_lines(d, k, i, file);
         lines.extend(crate::params::entry_errors(d, k, i));
-        lines.extend(crate::params::written_ranges(d, k, i, &vocab()));
+        lines.extend(crate::params::written_ranges(d, k, i, &vocab(), None));
         for (line, col, e) in lines {
             let span = self.token_span(&origin, line, col);
             self.push(LowerError { span, ..e });

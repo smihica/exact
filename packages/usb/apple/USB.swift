@@ -272,9 +272,12 @@ public final class USBModule: ExactPackage {
         }
         var request = IOUSBDeviceRequest()
         request.bmRequestType = UInt8(requestType)
-        request.bRequest = UInt8(setup["request"] as? Int ?? 0)
-        request.wValue = UInt16(setup["value"] as? Int ?? 0)
-        request.wIndex = UInt16(index)
+        // WebIDL's `octet` and `unsigned short` without [EnforceRange] take a
+        // number modulo 2^8 and 2^16, as WebUSB does; the checked
+        // initializers trapped on 256 or 65536 and ended the app.
+        request.bRequest = UInt8(truncatingIfNeeded: setup["request"] as? Int ?? 0)
+        request.wValue = UInt16(truncatingIfNeeded: setup["value"] as? Int ?? 0)
+        request.wIndex = UInt16(truncatingIfNeeded: index)
         request.wLength = UInt16(data.length)
         var transferred = 0
         do {

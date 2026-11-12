@@ -1,0 +1,8 @@
+// SnapshotDriverTests' live tree (LLP 1126.002): a bar and a ring under an
+// ancestor's `accent-color`, which a watch app draws with the snapshot
+// driver's leaves.
+component App
+  view
+    column accent-color="#ff0000" width=200 height=60 background-color="#ffffff"
+      progress value=1 width=150
+      progress value=1 width=40 height=40 border-radius="50%"

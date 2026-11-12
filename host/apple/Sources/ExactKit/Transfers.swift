@@ -38,7 +38,8 @@ public enum TransferCarrier {
 
     struct Item: Codable {
         var index: Int, method: String
-        /// Without its query or fragment, which may carry a credential.
+        /// Without its user name, password, query or fragment, which may
+        /// carry a credential.
         var url: String
         var upload: Bool
         var ended = false
@@ -171,9 +172,12 @@ public enum TransferCarrier {
             var request = URLRequest(url: url)
             request.httpMethod = r["method"] as? String ?? (r["bodyFrom"] == nil ? "GET" : "POST")
             for (k, v) in r["headers"] as? [String: String] ?? [:] { request.setValue(v, forHTTPHeaderField: k) }
-            var shownURL = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            shownURL?.query = nil
-            shownURL?.fragment = nil
+            var shown = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            shown?.user = nil
+            shown?.password = nil
+            shown?.query = nil
+            shown?.fragment = nil
+            guard let shownURL = shown?.string else { return "TypeError" }
             let task: URLSessionTask
             var size: Int64?
             if let from = r["bodyFrom"] as? String {
@@ -185,7 +189,7 @@ public enum TransferCarrier {
                 task = s.downloadTask(with: request)
             }
             task.taskDescription = "\(id) \(index)"
-            var item = Item(index: index, method: request.httpMethod ?? "GET", url: shownURL?.string ?? text, upload: r["bodyFrom"] != nil)
+            var item = Item(index: index, method: request.httpMethod ?? "GET", url: shownURL, upload: r["bodyFrom"] != nil)
             item.saveTo = r["saveTo"] as? String
             item.size = size
             items.append(item)
@@ -198,7 +202,8 @@ public enum TransferCarrier {
         return nil
     }
 
-    /// What a package reads of a record: never a header or a query.
+    /// What a package reads of a record: never a header, a query or a
+    /// user name or password.
     private static func shown(_ r: Record) -> [String: Any] {
         var out: [String: Any] = ["id": r.id, "result": r.result, "failureReason": r.failureReason,
                                   "uploadTotal": r.requests.reduce(0) { $0 + ($1.size ?? 0) }, "uploaded": r.requests.reduce(0) { $0 + ($1.sent ?? 0) },

@@ -1,6 +1,8 @@
 // Starter: two tabs, each its own stack: a list that pushes a detail in each.
 // The root tablist is the iOS tab bar; a screen a tab pushed survives a visit to the other.
 // Each tab's list has the bar's search field, its own query (`contract vocab search`).
+// App-drawn bars have a different layout: run `bun exact.mjs contract vocab tabs`.
+// A native badge uses its box's inner text; XCUITest finds the tab by `tab-saved`.
 use EmptyState from "exact:content"
 
 routes nav
@@ -91,3 +93,6 @@ component App
           testId="tab-saved" flex=1
           image "symbol:bookmark"
           text "Saved"
+          if saved.length > 0
+            row background-color="-exact-system-red" border-radius=12
+              text `${saved.length}` font-variant-numeric="tabular-nums"

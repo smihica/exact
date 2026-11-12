@@ -1,4 +1,4 @@
-//! Opt-in, single-finger vertical scrolling for the direct KMS kiosk probe.
+//! Opt-in, single-finger vertical scrolling for the KMS kiosk probe.
 //! The presenter owns logical scrolling/virtualization; this shell owns touch physics.
 use crate::{input::InputEvent, Presenter};
 use exact_runner::DataSource;

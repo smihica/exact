@@ -2,6 +2,7 @@
 
 mod cli;
 mod collections;
+mod input;
 mod reading;
 mod screen;
 mod todo;

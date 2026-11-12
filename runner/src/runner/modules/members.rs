@@ -67,6 +67,21 @@ impl<D: DataSource> Runner<D> {
         (sub["ceremony"]["options"].as_str()).is_none_or(|o| !args[o].is_null())
     }
 
+    /// A single member-only call goes whole to its package. A combined
+    /// ceremony remains the owner's (LLP 1133.014 D10 item 2).
+    pub(super) fn member_forward(
+        &self,
+        row: &ModulesRow,
+        args: &Json,
+    ) -> Option<(String, ModulesRow)> {
+        if self.owns_ceremony(&self.substitute(row), args) {
+            return None;
+        }
+        let mut members = self.members_in(row, args).into_iter();
+        let member = members.next()?;
+        members.next().is_none().then_some(member)
+    }
+
     /// The member answering `answer`, by its `answer` fields.
     pub(super) fn member_answering(
         &self,
@@ -97,6 +112,21 @@ impl<D: DataSource> Runner<D> {
         if args["mediation"] == "silent" {
             let why = "mediation \"silent\": no target can promise no UI (LLP 1133.014 D1)";
             return Some(json!({ "error": "NotSupportedError", "message": why }));
+        }
+        if self.route(row) != super::Route::Substitute && !self.owns_ceremony(&sub, args) {
+            let carried = self.members_in(row, args);
+            if carried.len() > 1 {
+                return Some(
+                    json!({ "error": "NotSupportedError", "message": "multiple members need the owner's combined ceremony" }),
+                );
+            }
+            for (option, member) in carried {
+                if self.route(&member) == super::Route::Substitute {
+                    return Some(
+                        json!({ "error": "NotSupportedError", "message": format!("{option}: no implementation bound for {}", self.plan.str(member.extension)) }),
+                    );
+                }
+            }
         }
         let members = self.members_of(row);
         let keys: Vec<String> = args

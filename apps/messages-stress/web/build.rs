@@ -31,9 +31,7 @@ fn main() {
     let compat = exact_bake::compatibility_id(&app_dir, platform, &target, &manifest, Some(grants))
         .unwrap_or_else(|e| panic!("compatibility id: {e}"));
     std::fs::write(out_dir.join("compat.json"), compat.to_json()).unwrap();
-    let entry = source_factory
-        .entry(compat.inputs["rustMode"].as_str().unwrap())
-        .unwrap();
+    let entry = source_factory.entry(&compat.inputs).unwrap();
     // Dev includes the exact same compile-selected factory as the Wasm entry.
     std::fs::write(out_dir.join("factory.rs"), &entry).unwrap();
     std::fs::write(

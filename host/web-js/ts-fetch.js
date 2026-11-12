@@ -24,8 +24,17 @@ export function fetch(input, options) {
   const held = options?.exactHeld;
   if (held !== undefined && held !== true && held !== false) return Promise.reject(new TypeError('exactHeld is true or false'));
   if (held && options.exactStream !== undefined) return Promise.reject(new TypeError('exactHeld: a stream is never held; it stops counting at its first message'));
+  const idle = options?.exactIdleTimeout; // LLP 1016.000 D11
+  if (idle !== undefined) {
+    if (!Number.isInteger(idle) || idle < 1 || idle > 3600000) return Promise.reject(new TypeError('exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000'));
+    let url; try { url = input instanceof Request ? input.url : String(input); } catch (e) { return Promise.reject(e); }
+    if (options.exactStream === undefined || options.exactUploadProgress === true || options.exactLongPoll !== undefined || !/^wss?:/i.test(url))
+      return Promise.reject(new TypeError('exactIdleTimeout: only a WebSocket stream takes an idle timeout'));
+  }
   // A stream counts by its own rule (D5), never here.
   if (options?.exactStream !== undefined) return fetchNow(input, options);
+  // In a render a body from a file or to one is storage, refused there (ts-body-from.js): it is no work to count.
+  if (globalThis.__exactRender && (options?.exactBodyFrom !== undefined || options?.exactBodyTo !== undefined)) return fetchNow(input, options);
   // An upload or a download to a file is never held (Request::is_held).
   return counting(held && options.exactBodyFrom === undefined && options.exactBodyTo === undefined ? 'held' : 'plain', () => fetchNow(input, options));
 }
@@ -39,16 +48,18 @@ export const unfinishedIO = () => RenderIO > 0;
 function counting(kind, start) {
   if (globalThis.__exactRender) RenderIO++;
   const call = answering.call;
-  const end = () => { if (globalThis.__exactRender) RenderIO--; if (call) { call[kind]--; if (kind === 'held') answering.heldReply(call); call.recount?.(); } else answering.loose(-1); };
-  if (call) { call[kind] = (call[kind] ?? 0) + 1; call.recount?.(); } else answering.loose(1);
+  // The hook that counted the start counts the end, so the two always pair.
+  const loose = answering.loose;
+  const end = () => { if (globalThis.__exactRender) RenderIO--; if (call) { call[kind]--; if (kind === 'held') answering.heldReply(call); call.recount?.(); } else loose(-1); };
+  if (call) { call[kind] = (call[kind] ?? 0) + 1; call.recount?.(); } else loose(1);
   let out;
   try { out = start(); } catch (e) { end(); throw e; }
   return Promise.resolve(out).finally(end);
 }
 function fetchNow(input, options) {
   if (overlaying.on) return Promise.reject(inOverlay('fetch()'));
-  // A socket's mapper answering a frame makes no fetch (D7).
-  if (answering.mapper) return Promise.reject(new Error("fetch() is unavailable in a socket's mapper: it answers each frame now"));
+  // A mapper makes no fetch (D7), in any turn of its call.
+  if (answering.mapper || answering.mapperCall) return Promise.reject(new Error(answering.mapper ? "fetch() is unavailable in a socket's mapper: it answers each frame now" : "fetch() is unavailable in a stream's mapper: fetch in the answer that opens the stream"));
   const call = answering.call;
   if (call?.mutation) {
     if (call.socketConflict || call.socketOps?.length) { call.socketConflict = true; return Promise.reject(new Error(SOCKET_AND_FETCH)); }
@@ -66,7 +77,7 @@ function fetchNow(input, options) {
     }
     return fetchOf(input, options, call);
   }
-  return fetchOf(input, options);
+  return fetchOf(input, options, call);
 }
 // What `fetch` reads of its options, read now (inherited ones too), with
 // the headers and a body that can change copied.
@@ -108,6 +119,9 @@ function fetchOf(input, options, call) {
     } catch (e) { return Promise.reject(e); }
     const started = globalThis.performance.now();
     if (signal?.aborted) return Promise.reject(signal.reason ?? new FetchError('Aborted', 'the fetch was aborted'));
+    // A render has no storage: the file is refused (ts-body-from.js `refusedFile`) after the device's checks, with no
+    // deadline or later abort armed around a refusal that never answers.
+    if (globalThis.__exactRender) return import('./ts-body-from.js').then(m => m.refusedFile(input, init, call));
     // The signal's deadline covers the file work too, as natively, replacing an `exactTimeout` no earlier
     const armed = signalDeadline.arm(signal, ms);
     if (armed) init.exactTimeout = ms = undefined;
@@ -136,7 +150,11 @@ export const files = { appId: null };
 // (js/src/prelude.js): the stream is the answer's, so its fetch is made while
 // the answer is asked (`answering`, set by ts-data.js), which opens it. Its
 // promise never settles: the answer is what `exactStream` maps each event to.
-export const answering = { call: null, untraced: new Set(), sockets: false, mapper: null, loose: () => {}, heldReply: () => {}, ordinary: start => ordinary(start), page: null }; // the hooks: held.js's, set by the page's entry; `ordinary` for ts-data.js; `page`, the runtime's clock, journal and `drive`, set by ts-data.js
+// `mapper`: a socket's mapper answering a frame, in its call's synchronous part, where it may send on that socket.
+// `mapperCall`: the stream whose mapper call is running, in every turn of that call: ts-stream.js sets it for the
+// synchronous part, and the bundle's async helper puts it back at each step of an async function the call made
+// (ts-data.js `__exact_async_context`), as Hermes's prelude carries a mapper's `currentCall`.
+export const answering = { call: null, untraced: new Set(), sockets: false, mapper: null, mapperCall: null, loose: () => {}, heldReply: () => {}, ordinary: start => ordinary(start), page: null, entropy: null, later: null }; // the hooks: held.js's, set by the page's entry; `ordinary` for ts-data.js; `page`, the runtime's clock, journal, `drive` and `time`, set by ts-data.js
 function stream(input, init, redirect) {
   const call = answering.call;
   // Hermes also claims a stream started after an await; this page has no
@@ -165,8 +183,10 @@ let NextTimer = 1;
 function arm(api, run, ms, args) {
   if (overlaying.on) throw inOverlay(api);
   const call = answering.call;
-  if (answering.mapper || !call || !answers(call)) throw new Error(`${api} is unavailable here: a timer belongs to the answer that arms it, and none is running (module initialization, a stream's mapper, background work, or an answer that has given its value or was let go). A cache needs no timer to expire: fetch keeps each answer as long as its HTTP headers allow`);
-  const { clock, drive } = answering.page, id = NextTimer++;
+  if (answering.mapper || answering.mapperCall || !call || !answers(call)) throw new Error(`${api} is unavailable here: a timer belongs to the answer that arms it, and none is running (module initialization, a stream's mapper, background work, or an answer that has given its value or was let go). A cache needs no timer to expire: fetch keeps each answer as long as its HTTP headers allow`);
+  const { clock, drive, time } = answering.page, id = NextTimer++;
+  // An async continuation may run long after the page's last commit or timer.
+  time();
   // The action answers true, as every clock entry's does (rt.js `advance`: anything else stops the advance).
   // `live`: its answer has not answered nor been let go (the agent's `clock settle` goes only to those).
   const live = () => answers(call);
@@ -188,6 +208,8 @@ function runAs(call, run) {
   call.firing = (call.firing ?? 0) + 1; call.recount?.();
   globalThis.setTimeout(() => { call.firing--; call.recount?.(); });
   asCall(call, () => { try { run(); } catch (e) { journal.push(`t=${clock.now} data: a timer's callback threw: ${e?.message ?? e}`); } });
+  // What the callback sent on a socket goes now, before the next timer of the same advance (ts-stream.js `later`).
+  answering.later?.(call);
 }
 // `run`'s answer, with `call` the answer running while it runs
 function asCall(call, run) {
@@ -195,8 +217,10 @@ function asCall(call, run) {
   answering.call = call;
   try { return run(); } finally { answering.call = before; }
 }
+/** Whether `call`'s ticket was let go (new arguments, a refresh, a newer send, its view's end). rt.js ties the two as it makes the ticket. */
+export function letGo(call) { const t = call.ticket; return !!t && (t.owner.ticket !== t || t.owner.gone); }
 /** Whether `call` still answers: it has not answered, and its ticket was not let go. */
-function answers(call) { const t = call.ticket; return !call.settled && !(t && (t.owner.ticket !== t || t.owner.gone)); }
+export function answers(call) { return !call.settled && !letGo(call); }
 function disarm(id) {
   const armed = Armed.get(id);
   if (!armed) return;
@@ -220,6 +244,7 @@ export function ownSignal(signal) {
 // `Request`'s own signal gives none: it is the browser's, following the one the Request was given.
 signalDeadline.arm = (signal, before) => {
   const t = signal && !signal.aborted ? Deadlines.get(signal) : undefined;
+  if (t) answering.page.time();
   const left = t && Math.max(1, t.due - answering.page.clock.now);
   if (left === undefined || before < left) return undefined;
   // The signal aborts in the turn of the answer that fetched, as natively, while that answer still answers
@@ -349,8 +374,22 @@ const noIo = api => function () { throw new Error(`${api} is unavailable in data
 const pageYield = globalThis.scheduler?.yield?.bind(globalThis.scheduler) ?? (typeof MessageChannel === 'function'
   ? () => new Promise(resolve => { const { port1, port2 } = new MessageChannel(); port1.onmessage = () => { port1.close(); resolve(); }; port2.postMessage(null); })
   : () => Promise.resolve());
+// Code from a string runs on no host a data module runs on: Hermes compiles none, and throws `SyntaxError: Parsing
+// source code unsupported` at the call. `Function` and `eval` throw that here too, so a package's guarded probe (zod's
+// `allowsEval`) takes its fallback as it does on Hermes; `x instanceof Function`, `Function.prototype` and its `call`,
+// `apply` and `bind` are the page's. The constructor a function's own `constructor` names is still the page's, as
+// LLP 1027 D5 records. As host/web/storage-environment.js `refuseCodeFromStrings`, the wasm route's.
+const codeFromString = () => { throw new SyntaxError('Parsing source code unsupported: a data source runs no code from a string (Function, eval), as on Hermes'); };
+// Each has its own `constructor`, the stand-in, where a function inherits the page's real one from `Function.prototype`;
+// what reaches `Function.prototype.constructor` reaches the real one (LLP 1027 D5).
+const NoFunction = function Function(body) { return codeFromString(body); };
+// A method, since no function may be named `eval` in strict code; as `eval`, not a constructor.
+const noEval = { eval(source) { return codeFromString(source); } }.eval;
+Object.defineProperty(NoFunction, 'prototype', { value: globalThis.Function.prototype });
+// Fixed, so no `delete` or write uncovers the inherited one.
+for (const f of [NoFunction, noEval]) Object.defineProperty(f, 'constructor', { value: NoFunction, writable: false, configurable: false });
 const guarded = {
-  Date: GuardedDate, Math: GuardedMath,
+  Date: GuardedDate, Math: GuardedMath, Function: NoFunction, eval: noEval,
   XMLHttpRequest: noIo('XMLHttpRequest'), WebSocket: noIo('WebSocket'), EventSource: noIo('EventSource'),
   Intl: Object.freeze(Object.create(NativeIntl, { DateTimeFormat: { value: DateTimeFormat } })),
   setTimeout(callback, delay, ...args) {
@@ -370,13 +409,41 @@ const guarded = {
       const v = target[name];
       return typeof v !== 'function' ? v : (...a) => overlaying.on ? Promise.reject(inOverlay(`crypto.subtle.${String(name)}()`)) : ordinary(() => v.apply(target, a));
     } }),
-    getRandomValues: a => { if (overlaying.on) throw inOverlay('crypto.getRandomValues()'); return globalThis.crypto.getRandomValues(a); },
-    randomUUID: () => { if (overlaying.on) throw inOverlay('crypto.randomUUID()'); return globalThis.crypto.randomUUID(); } }),
+    getRandomValues: a => {
+      if (overlaying.on) throw inOverlay('crypto.getRandomValues()');
+      // The browser's call checks the view and its quota, as it always does.
+      const filled = globalThis.crypto.getRandomValues(a), bytes = seeded(filled.byteLength);
+      if (bytes) new Uint8Array(filled.buffer, filled.byteOffset, filled.byteLength).set(bytes);
+      return filled;
+    },
+    randomUUID: () => {
+      if (overlaying.on) throw inOverlay('crypto.randomUUID()');
+      const b = seeded(16);
+      if (!b) return globalThis.crypto.randomUUID();
+      // The v4 bits and text of js/src/prelude.js `formatUuid`: one seed draws one id on every host.
+      b[6] = b[6] & 0x0f | 0x40; b[8] = b[8] & 0x3f | 0x80;
+      return Array.from(b, (x, i) => (i === 4 || i === 6 || i === 8 || i === 10 ? '-' : '') + x.toString(16).padStart(2, '0')).join('');
+    } }),
 };
+// Under the driver, the launch seed's stream (LLP 1069.005 D2b), which the page's entry sets before the first
+// answer (`answering.entropy`); null outside it. The journal says so once, at the first draw of any bytes, as a
+// native module does (js/src/door.rs, op 11).
+function seeded(n) {
+  const stream = answering.entropy;
+  if (!stream) return null;
+  if (n > 0 && !stream.said) {
+    stream.said = true;
+    answering.page?.journal.push(`crypto: the driver seeds this launch's randomness (seed ${stream.seed}), so each launch at that seed draws the same bytes; --seed <n> draws others (LLP 1069.005 D2b)`);
+  }
+  return stream(n);
+}
 export const { Date, Math, Intl, setTimeout, setInterval, requestAnimationFrame, requestIdleCallback, clearTimeout, clearInterval,
   cancelAnimationFrame, cancelIdleCallback, performance, scheduler, XMLHttpRequest, WebSocket, EventSource, crypto } = guarded;
 // Not a binding of this module's own: its `fetch` keeps the page's `AbortSignal.timeout` for `exactTimeout`.
 export { GuardedAbortSignal as AbortSignal };
+// By name, since no binding of this module may be named `Function` or `eval` here; a module imports `eval` under
+// another name, since no import may bind that one (host/web-js/build.mjs `scopedModule`).
+export { NoFunction as Function, noEval as eval };
 
 // The usual browser global spellings share this app-local view. Computed
 // access, aliases and destructuring therefore get the same scoped fetch.
@@ -397,21 +464,33 @@ const page = globalThis;
 // The `fetch` a source's `globalThis.fetch` is: this module's, or, for sources with no network grant, the asset path and the
 // refusal alone (ts-fetch-refused.js); the data glue sets it (ts-data.js), so the request paths link only where they can be
 // reached (LLP 1047.002 D3).
-let Fetch = null; export const useFetch = f => { Fetch = f; };
-export const appGlobal = new Proxy(Object.create(null), {
-  has(_, name) { return !ABSENT.has(name) && Reflect.has(page, name); },
-  getOwnPropertyDescriptor(_, name) {
+let Fetch = null;
+// The module's own: `fetch` and `guarded`'s names (`Date`, `Function`, `eval`, …) are data properties of the proxy's
+// target, so a read, write, definition, descriptor or deletion of one behaves as on any object, and never reaches the
+// page, whose own code keeps its `Date` and `Function` (`globalThis.Function = globalThis.Function` would otherwise
+// install the stand-in as the page's). Deleting one defines the module's original again, so a read never falls through
+// to the page's; one the module made non-configurable cannot be deleted, as on any object.
+const target = Object.create(null), mine = new Set(['fetch', ...Object.keys(guarded)]);
+const original = name => Reflect.defineProperty(target, name, { value: name === 'fetch' ? Fetch : guarded[name], writable: true, enumerable: false, configurable: true });
+for (const name of mine) original(name);
+export const useFetch = f => { Fetch = f; original('fetch'); };
+export const appGlobal = new Proxy(target, {
+  has(own, name) { return mine.has(name) ? Reflect.has(own, name) : !ABSENT.has(name) && Reflect.has(page, name); },
+  getOwnPropertyDescriptor(own, name) {
+    if (mine.has(name)) return Reflect.getOwnPropertyDescriptor(own, name);
     const found = ABSENT.has(name) ? undefined : Reflect.getOwnPropertyDescriptor(page, name);
     return found && { ...found, configurable: true };
   },
-  ownKeys() { return Reflect.ownKeys(page).filter(name => !ABSENT.has(name)); },
+  ownKeys(own) { return [...new Set([...Reflect.ownKeys(own), ...Reflect.ownKeys(page).filter(name => !ABSENT.has(name))])]; },
   getPrototypeOf() { return Object.prototype; },
-  set(_, name, value) { return Reflect.set(page, name, value); },
-  defineProperty(_, name, descriptor) { return Reflect.defineProperty(page, name, descriptor); },
-  deleteProperty(_, name) { return Reflect.deleteProperty(page, name); },
-  get(_, name) {
-    if (name === 'fetch') return Fetch;
-    if (Object.hasOwn(guarded, name)) return guarded[name];
+  set(own, name, value, receiver) { return mine.has(name) ? Reflect.set(own, name, value, receiver) : Reflect.set(page, name, value); },
+  defineProperty(own, name, descriptor) { return Reflect.defineProperty(mine.has(name) ? own : page, name, descriptor); },
+  deleteProperty(own, name) {
+    if (!mine.has(name)) return Reflect.deleteProperty(page, name);
+    return Reflect.deleteProperty(own, name) && original(name);
+  },
+  get(own, name, receiver) {
+    if (mine.has(name)) return Reflect.get(own, name, receiver);
     if (ABSENT.has(name)) return undefined;
     if (name === 'globalThis') return appGlobal;
     const value = Reflect.get(page, name, page);

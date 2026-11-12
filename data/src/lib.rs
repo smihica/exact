@@ -50,5 +50,62 @@ fn parse<D: DataSource + ?Sized>(
     }
 }
 
+/// [`std::fs::File::try_lock`], which std implements with `flock(2)` only on
+/// the targets its `cfg` lists: on Android it answers `Unsupported`, so on
+/// every Unix this calls `flock` itself.
+pub(crate) fn try_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is this open file's, valid for the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(std::fs::TryLockError::WouldBlock);
+        }
+        Err(std::fs::TryLockError::Error(error))
+    }
+    #[cfg(not(unix))]
+    file.try_lock()
+}
+
 #[cfg(test)]
 mod mixed_tests;
+#[cfg(test)]
+mod try_lock_tests {
+    /// The lock excludes another open file description until its holder
+    /// closes, and agrees with std's where std has one.
+    #[test]
+    #[cfg(unix)]
+    fn try_lock_excludes_another_description_until_released() {
+        let dir = std::env::temp_dir().join(format!("exact-data-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .unwrap()
+        };
+        let held = open();
+        super::try_lock(&held).unwrap();
+        let other = open();
+        assert!(matches!(
+            super::try_lock(&other),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        #[cfg(not(target_os = "android"))]
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        super::try_lock(&other).unwrap();
+        drop(other);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

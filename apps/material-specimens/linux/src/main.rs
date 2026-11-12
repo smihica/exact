@@ -288,6 +288,26 @@ fn draw(
             texts.push(json!({"text": words, "box": rect(x, y, w, h), "lines": [line]}));
         }
     }
+    // A segmented group's labels are painted in its radios, one each.
+    if let Some(group) = specimen {
+        let radios = p
+            .host()
+            .kernel()
+            .node(group)
+            .map(|n| n.children())
+            .unwrap_or_default();
+        for radio in radios {
+            let Some(text) = p.field_texts(radio).and_then(|t| t.label) else {
+                continue;
+            };
+            let Some(words) = said(&p, radio) else {
+                continue;
+            };
+            let (x, y, w, h) = text.rect;
+            let line = json!({"top": y, "bottom": y + h, "baseline": text.baseline});
+            texts.push(json!({"text": words, "box": rect(x, y, w, h), "lines": [line]}));
+        }
+    }
     let facts = json!({
         "id": id, "scheme": scheme, "density": density,
         "layout": rect(layout[0], layout[1], layout[2], layout[3]),

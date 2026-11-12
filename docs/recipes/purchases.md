@@ -48,6 +48,9 @@ for (const p of await unfinishedPurchases()) {
 - Finish everything: Apple redelivers at every launch, Play refunds after
   three days.
 - Restore sits behind a button (Apple); `requestReview()` is never a button.
+- On Apple the package sets `SKIncludeConsumableInAppPurchaseHistory`, so
+  StoreKit keeps finished consumables in `Transaction.all` (iOS 18 and
+  macOS 15 on).
 
 Under the agent each purchase is a `purchase` ticket (`buy`, `cancel`,
 `pending`, `unavailable`, `fail`) over the catalogue `app.json` names

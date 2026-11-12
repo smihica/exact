@@ -90,6 +90,39 @@ test('a Rust request copies a document only into an app file it may write', asyn
   }
 });
 
+// A document the driver hands in (and a save without the browser's picker) is
+// held in memory: its modification time holds still until it is written, so a
+// write that expects what it read (LLP 1069.010.000 D2a) is taken, and one
+// that expects what an earlier write replaced is refused.
+test('a document held in memory keeps its modification time until it is written', async () => {
+  globalThis.exact = {};
+  const realNow = Date.now;
+  try {
+    await import(`./documents-glue.js?expect=${Date.now()}`);
+    let doc;
+    globalThis.exact.documents.install({ generation: () => 0, dispatch: (_, kind, payload) => { doc = payload; }, log() {}, openFile: () => false })
+      .answer({ node: 1 }, 'showOpenFilePicker', [{ name: 'notes.txt', bytes: btoa('hello') }]);
+    const fs = globalThis.exact.documents.files(normalized('fs.read doc:/\nfs.write doc:/'));
+    const later = () => new Promise((r) => setTimeout(r, 3)), bytes = (t) => new TextEncoder().encode(t);
+    const read = await fs.stat(doc);
+    await later();
+    expect((await fs.stat(doc)).modifiedMs).toBe(read.modifiedMs);
+    const frozen = realNow();
+    Date.now = () => frozen;
+    await fs.writeFile(doc, bytes('hello, world'), { expect: { modifiedMs: read.modifiedMs, size: read.size } });
+    const written = await fs.stat(doc);
+    expect([written.size, written.modifiedMs > read.modifiedMs]).toEqual([12, true]);
+    await expect(fs.writeFile(doc, bytes('x'), { expect: { modifiedMs: read.modifiedMs, size: read.size } })).rejects.toMatchObject({ code: 'ECHANGED' });
+    // Equal sizes and a frozen clock make the version depend on the monotonic step.
+    await fs.writeFile(doc, bytes('hello, again'), { expect: { modifiedMs: written.modifiedMs, size: written.size } });
+    const rewritten = await fs.stat(doc);
+    expect(rewritten.size).toBe(written.size);
+    expect(rewritten.modifiedMs).toBeGreaterThan(written.modifiedMs);
+    await expect(fs.writeFile(doc, bytes('hello, stale'), { expect: { modifiedMs: written.modifiedMs, size: written.size } })).rejects.toMatchObject({ code: 'ECHANGED' });
+    expect(new TextDecoder().decode(await fs.readFile(doc))).toBe('hello, again');
+  } finally { Date.now = realNow; delete globalThis.exact; }
+});
+
 // The real store in a browser: the File kept in IndexedDB reads back as the document's bytes.
 chromeTest('a chosen file copied into app:/data reads back from the page store', async () => {
   const grants = normalized('fs.read doc:/\nfs.read app:/data\nfs.write app:/data');

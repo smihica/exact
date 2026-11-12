@@ -558,7 +558,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             if name.isEmpty, props["symbolPath"] == nil, !source.hasPrefix("symbol:sf/"), source != "symbol:", symbolRefusal != source { symbolRefusal = source; presenter?.session?.log("image \(RasterRetry.withoutQuery(source)) refused: unknown symbol role") }
             if !name.isEmpty || source.hasPrefix("symbol:sf/") || source == "symbol:" { symbolRefusal = nil }
             let leaf = symbolView ?? UIImageView()
-            if symbolView == nil { symbolView = leaf; addSubview(leaf) }
+            if symbolView == nil { symbolView = leaf; (clipBox ?? self).addSubview(leaf) }
             // What the image says is its node's (`aria-label`), never the
             // name UIKit gives the symbol, which a cell gathering its
             // children's words would read ("checkmark.circle" is "selected").
@@ -882,11 +882,6 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         return convert(inChild, from: placed)
     }
 
-    /// The placement changed: accessibility sees the new box.
-    package func placementChanged() {
-        UIAccessibility.post(notification: .layoutChanged, argument: nil)
-    }
-
     /// Hit-testing through the surface's placements (LLP 1014 D5): a canvas
     /// whose children are placed maps the point through each child's
     /// inverse, topmost first — straight from the canvas to the child,
@@ -943,7 +938,9 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
                     guard holder !== self, holder === child || holder.isDescendant(of: child) else { return nil }
                     let chain = sequence(first: holder, next: { $0 === child ? nil : $0.superview })
                     guard !chain.contains(where: { $0.isHidden || !$0.isUserInteractionEnabled }) else { return nil }
-                    return NodeView.hitChildren(in: holder, at: self.convert(point, to: holder), with: event)
+                    return NodeView.hitChildren(in: holder, at: self.convert(point, to: holder), with: event, visit: {
+                        ($0 as? NodeView)?.hitTest(self.convert(point, to: $0), with: event)
+                    })
                 }
                 return child.hitTest(self.convert(point, to: child), with: event)
             }) { return hit }
@@ -1131,6 +1128,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         for k in clear { next.removeValue(forKey: k) }
         for (k, v) in set { next[k] = v }
         props = next
+        if isParagraph, set.keys.contains(where: Self.paragraphProps.contains) || clear.contains(where: Self.paragraphProps.contains) { invalidateText() }
         #if os(iOS)
         let nativeList = kind == "list" && next["listStyle"] != nil
         if groupedOwner != nativeList { groupedOwner = nativeList; syncScroll() }
@@ -1231,10 +1229,14 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         guard superview != nil else { f.remove(); return }
         setPaintPosition(paintZPosition)
         let shown = window.map { convert(bounds, to: $0).intersects($0.bounds) } ?? true
-        f.render(layer, clip: resolvedClipMask(), scale: window?.screen.scale ?? traitCollection.displayScale, dark: drawsDark,
-                 node: id, fresh: fresh, shown: shown) { [weak self] in
-            if let self { presenter?.boxFilters.landed(self) }
-        }
+        // A placed canvas child's picture is drawn from the box as asked, and shows only through its surface.
+        let render = { f.render(self.layer, clip: self.resolvedClipMask(), scale: self.window?.screen.scale ?? self.traitCollection.displayScale, dark: self.drawsDark,
+                                node: self.id, fresh: fresh, shown: shown) { [weak self] in if let self { self.presenter?.boxFilters.landed(self); self.filterPublished() } } }
+        let before = f.picture.sublayers?.first?.contents as AnyObject?
+        let draw = { if let box = self.layer as? NodeLayer, box.drawnElsewhere { box.asAsked(render); f.picture.isHidden = true } else { render() } }
+        // The filter's input raises the box's opacity and puts it back: no author's change (`passing`).
+        if let box = layer as? NodeLayer { box.passing(draw) } else { draw() }
+        if f.picture.sublayers?.first?.contents as AnyObject? !== before { filterPublished() }
     }
 
     /// Inside `GlassGroups.moving`: a container comes or goes under the
@@ -1338,7 +1340,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         fitScroll()
         let clips = overflowClips
         // A paragraph paints its own text, which a box would not clip.
-        syncClipBox(clips && kind != "text" && shadowColor != nil && scroll == nil && overlay == nil && materialKind != "glass")
+        syncClipBox(clips && kind != "text" && (shadowColor != nil || clipsOneAxis) && scroll == nil && overlay == nil && materialKind != "glass")
         clipsToBounds = clips && clipBox == nil
         // A scroll's children, back out, go where a material holds them.
         if materialView != nil, scroll == nil { rehomeMaterialChildren() }
@@ -1468,10 +1470,8 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             RasterGeometry.draw(ctx, AnimatedRasters.shared.frame(for: self) ?? bitmap.image, in: CGRect(origin: .zero, size: rect.size), tint: channels("tint_color").map { TextEngine.color($0).cgColor })
             ctx.restoreGState()
         }
-        if isParagraph, rollsNumerals, let engine = text {
-            dropTextRaster()
-            NumeralLink.installed?.show(self, attributed: engine.attributed(paragraphSpec()), box: contentBox(),
-                                        align: paragraphSpec().align, mode: style["content_transition"]?.string ?? "numeric")
+        if isParagraph, rollsNumerals {
+            showNumerals(ctx)
         } else if isParagraph {
             NumeralLink.installed?.hide(self)
             if canRasterText {

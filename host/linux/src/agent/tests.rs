@@ -244,8 +244,12 @@ fn a_password_value_is_masked_in_every_reply() {
         node.contains(r#""value":"•••""#) && !node.contains("hunter2"),
         "{node}"
     );
+    // `state` masks a slot a password field reads (LLP 1156.001 D6); asked
+    // with `reveal`, as `expect state` asks, it shows what the app keeps.
     let state = handle(&mut p, r#"{"op":"state"}"#);
-    assert!(state.contains(r#""secret":"hunter2""#), "{state}");
+    assert!(!state.contains("hunter2"), "{state}");
+    let revealed = handle(&mut p, r#"{"op":"state","reveal":true}"#);
+    assert!(revealed.contains(r#""secret":"hunter2""#), "{revealed}");
 }
 
 /// LLP 1061 D5: `prefer` sets what `exactViewport()` answers and the
@@ -457,6 +461,50 @@ fn clock_data_lands_the_replies_without_moving_the_clock() {
     let state = json(handle(&mut p, r#"{"op":"state"}"#));
     assert_eq!(state["resources"]["item"], 1, "the reply landed: {state}");
     assert_eq!(state["slots"]["count"], 0, "no timer fired: {state}");
+}
+
+/// A data module that does not load (a TypeScript module whose top level
+/// throws) fails `clock data`, and so a test's first step, with its own
+/// error, rather than settling as if its data had landed.
+#[test]
+fn clock_data_answers_a_module_that_did_not_load() {
+    #[derive(Default)]
+    struct Unloadable;
+    impl DataSource for Unloadable {
+        fn ready(&self) -> bool {
+            false
+        }
+        fn activate(&mut self) -> Result<(), DataError> {
+            Err(DataError::Unavailable(
+                "exact-js: the module did not load: Property 'Intl' doesn't exist".into(),
+            ))
+        }
+        fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::UnknownSource(source.into()))
+        }
+    }
+    let plan =
+        contract::compile("component App\n  view\n    text \"hi\" testId=\"log\" height=20\n")
+            .unwrap();
+    let (mut p, _) = Presenter::boot_with(
+        &plan.encode(),
+        Unloadable,
+        (300.0, 300.0),
+        1.0,
+        std::path::PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(&handle(&mut p, r#"{"op":"clock","data":true}"#)).unwrap();
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("clock data: activate data: Unavailable")
+            && error.contains("Property 'Intl' doesn't exist"),
+        "{reply}"
+    );
+    let logs = handle(&mut p, r#"{"op":"logs"}"#);
+    assert!(logs.contains("Property 'Intl' doesn't exist"), "{logs}");
 }
 
 /// LLP 1069.007 §5 item 4, with a synthetic capability standing in for

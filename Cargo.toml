@@ -72,10 +72,9 @@ panic = "abort"
 strip = false
 
 # A native production build that optimizes for size over speed (LLP 1047.001
-# D9): an app whose manifest says `host.<platform>.optimize: "size"`, and an
-# embed (`host/apple/build.mjs --embed`) unless it says otherwise. The web's
-# choices, natively; its own directory, so an app built for speed and another
-# built for size never rebuild each other.
+# D9): the default for iOS/tvOS apps and embeds, except games. Mac apps opt in with
+# `host.macos.optimize: "size"`; `--optimize` overrides the manifest. Its own
+# directory keeps builds for speed and size from rebuilding each other.
 [profile.size]
 inherits = "release"
 opt-level = "z"

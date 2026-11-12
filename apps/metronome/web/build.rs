@@ -30,6 +30,7 @@ fn main() {
         "metronome_data::Metronome",
         "metronome_data::Metronome",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

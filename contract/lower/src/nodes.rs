@@ -11,6 +11,8 @@ pub(super) struct ElementStep<'n> {
     pub(super) button_context: Option<&'static str>,
     pub(super) popover_child: bool,
     pub(super) bounded: bool,
+    /// Whether this element stacks its children top to bottom.
+    pub(super) stacks: bool,
     pub(super) horizontal_flex: Option<bool>,
     pub(super) nav_place: routes::NavPlace,
     /// How many element levels below this one a list's rows are (LLP 1121
@@ -60,7 +62,27 @@ impl Lowerer<'_> {
         // A `delete=` no list row expanded does nothing (`lower-delete-row`).
         let kept = swipe_rows::stray(attrs);
         let attrs = kept.as_ref().unwrap_or(attrs);
-        let (class_label, mut expanded) = self.class_rows(attrs)?.unzip();
+        // The props the tag's package declares, written on the tag, are the
+        // module's; nothing below sees them, so a class's rows of the same
+        // names stay its box's (LLP 1024 D1).
+        let split = native::split_declared(tag, attrs);
+        let (declared, attrs) = match &split {
+            Some((declared, rest)) => (declared.as_slice(), rest),
+            None => (&[][..], attrs),
+        };
+        // A class choice's side that sets no row leaves it as the node has
+        // it unwritten: its tag's fixed rows, then a link's colour.
+        let unwritten: Vec<(exact_kernel::StyleId, Expr)> = t
+            .fixed_styles
+            .iter()
+            .map(|(id, v)| (*id, Expr::Str(v.to_string(), *span)))
+            .chain(
+                self.link_colour(tag, parent_tag, attrs, children)
+                    .map(|e| (exact_kernel::StyleId::TextColor, e)),
+            )
+            .collect();
+        let styles = |name: &str| self.styles.get(name).map(Vec::as_slice);
+        let (class_label, mut expanded) = crate::class::rows(attrs, &styles, &unwritten)?.unzip();
         // The class's rows by their places: a rewrite below (an animation's
         // longhands composed, a grouped list's rows inserted) moves rows
         // across `class_len`, never their spans (LLP 1122 D6's address).
@@ -318,24 +340,13 @@ impl Lowerer<'_> {
         let expanded = back.as_deref().unwrap_or(expanded);
         values::check_glass_group(&t, expanded)?;
         let has = |names: &[&str]| expanded.iter().any(|a| names.contains(&a.name.as_str()));
-        let parent_stacks = !matches!(parent_tag, Some("row") | Some("canvas"));
-        let clips_y = expanded.iter().any(|a| {
-            a.name == "overflow-y" && matches!(&a.value, Expr::Str(v, _) if v == "hidden")
-        });
-        if tag == "scroll"
-            && !clips_y
-            && parent_stacks
-            && !has(&["height", "max-height"])
-            && !expanded
-                .iter()
-                .any(|a| a.name == "flex" && values::flex_bounds(&a.value))
-            && !values::shrinking_scroll(expanded, self.parent_bounded_column)
-        {
-            return err(
-                        "lower-scroll-unbounded",
-                        "`scroll` has no `height`, `max-height`, or `flex`, and its parent stacks it top to bottom, so it will grow with its content and never scroll",
-                        *span,
-                    );
+        if tag == "scroll" {
+            scroll_bounds::check(
+                expanded,
+                self.parent_stacks,
+                self.parent_bounded_column,
+                *span,
+            )?;
         }
         controls::check_zero_size(tag, expanded, children, *span)?;
         // @ref LLP 1116.007 D5 — a route that scrolls a grouped list is on
@@ -779,6 +790,7 @@ impl Lowerer<'_> {
             let rest: Vec<&Attr> = expanded
                 .iter()
                 .filter(|a| native::leftover(tag, a))
+                .chain(declared)
                 .collect();
             let made =
                 self.native_bindings(tag, &rest, scope, locals, &mut bindings, &mut handlers);
@@ -1053,7 +1065,8 @@ impl Lowerer<'_> {
                     .any(|(id, v)| *id == StyleId::PositionType && *v != "static"),
             button_context: controls::button_context(tag, control, self.popover_child),
             popover_child: expanded.iter().any(|a| a.name == "popover"),
-            bounded: values::bounded_column(tag, expanded, self.parent_bounded_column),
+            bounded: scroll_bounds::bounded_column(tag, expanded, self.parent_bounded_column),
+            stacks: scroll_bounds::stacks(tag, t.fixed_styles, expanded),
             horizontal_flex: if attrs
                 .iter()
                 .any(|a| a.name == "class" && !matches!(a.value, Expr::Ident(..)))

@@ -90,6 +90,7 @@ def encIns (pc : Usize) : Contract.Vm.Instr → Result machine.Instruction
   | .failureResource r => mkIns pc .FailureResource (operand 32 r) zero zero
   | .failedMutation k => mkIns pc .FailedMutation (operand 32 k) zero zero
   | .failureMutation k => mkIns pc .FailureMutation (operand 32 k) zero zero
+  | .currentResource r => mkIns pc .CurrentResource (operand 32 r) zero zero
 
 /-- Entry `i` of a table. -/
 def lookup {α} (xs : List α) (i : U64) : Option α := xs[i.val]?
@@ -148,6 +149,7 @@ def resourceFlag (h : LHost) (op : Op) (i : U64) (pc : Usize) :
   | Option.some (Option.some _) =>
     ok (.Ok (match op with
       | .FailedResource => (lookup h.env.failedResources i).getD false
+      | .CurrentResource => (lookup h.env.currentResources i).getD false
       | _ => (lookup h.env.pendingResources i).getD false))
   | _ => ok (.Err (.Pending pc))
 

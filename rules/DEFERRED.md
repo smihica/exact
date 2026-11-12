@@ -306,6 +306,14 @@ the runtime loads. Take: Messages as the Snapback4 consumer (above). Still
 refused: progressive forms (server actions without the runtime) and
 server-driven UI; no Node on the render path.
 
+**Expanded (James Ide, 2026-11-10: the app's own tags in a web page's head):**
+`app.json`'s `host.web.head` lists `script`, `link` and `meta` tags the web
+build writes into every document's `<head>` (LLP 1048.000 D3). jameside.com's
+port is the consumer: Google Analytics and its site-wide JSON-LD. Take: none
+offered; waived by Charlie. Still out: other tags,
+per-page tags (the Contract `head` element's), a field for structured data, and
+admitting these scripts under the render server's CSP.
+
 **Expanded (Charlie, 2026-09-23: "let's build it in exact2 and see how we
 stack up"):** RealWorld/Conduit (`apps/realworld`), the spec'd Medium clone,
 against its hosted API, measured for browser load against a React 19 build of
@@ -616,6 +624,17 @@ without it, its labels read a weight heavier than the original's. `none` and
 `subpixel-antialiased` stay refused. Take: waived (Daehyeon Mun, 2026-10-28):
 a paint-only row, no doing-list item in this area.
 
+**Expanded (James Ide, 2026-11-10; LLP 1121 D8):** `:hover` and
+`:focus-visible` take `color`, which reaches the node's text as its own
+`color` does: CSS's `a:hover { color }`. Consumer: jameside.com's port,
+whose nav, title and icon links change their text colour on hover. This
+amends D8's rule that a host look takes no inherited row. The web and the
+Apple host (a Mac's pointer, an iPad's) show it; Linux's looks paint the
+box alone. Take: waived (Charlie, 2026-11-10) on the condition that the Mac
+host applies the hover colour too: a look the author writes that a host
+with a pointer drops would be a tell. Still out: a look's `color` on
+Linux.
+
 **Runtime**
 
 **Expanded (Charlie, 2026-10-13, issue-program ruling 10):** runner-owned
@@ -624,7 +643,9 @@ sends ordered, never-coalesced protocol frames (LLP 1016.000 D7). T3 Code's
 subscribe/Ack/Ping protocol and queued Supabase/Convex consumers justify the
 expansion. No take named; the approved feature ruling admits it. Ambient
 WebSocket globals remain refused. TypeScript on the web JS target and the
-native hosts has it; D7 lists the host deviations and what remains. D7's
+native hosts has it; D7 lists the host deviations and what remains. Rust
+sources on the native hosts have it from a mutation and their own mapper
+(Charlie, 2026-11-11, "Fix it", on issue #92; LLP 1016.003). D7's
 amendments let the mapper answer its own frames (2026-10-16) and an answer
 in flight send its own requests (2026-10-18).
 
@@ -693,13 +714,19 @@ names no take; `:focus-within` remains out.
 - **Admitted (Daehyeon Mun, 2026-10-23, waived; LLP 1133.007):** desktop
   processes (`spawn`, `execFile`, supervision, the login environment) and
   `home:` and `bundle:` paths on macOS and Linux (Windows at stage 3,
-  unclaimed until it is driven), absent elsewhere; a password field's held
-  secret on every host with the field.
+  unclaimed until it is driven), `bundle:` on iOS, iPadOS and tvOS over the
+  app's declared resource trees; both absent elsewhere; a password field's
+  held secret on every host with the field.
   Consumer: the T3 Code clone's local server and SSH environments. Take:
   waived (Daehyeon Mun, 2026-10-23): nothing refuses processes by name, no
   doing-list item is in this area, and the change retires app Swift. Still
   refused: a pseudo-terminal, shell command lines, daemons that outlive
   the app, and processes on iOS, Android and the web.
+  **Amended (Charlie, 2026-11-11, issue #39):** iOS, iPadOS and tvOS name as
+  `bundle:/` the trees app.json's `host.ios.resources` declares and nothing
+  else of the bundle, read only, changed only by a new binary; `home:` stays
+  absent there, and Android has neither. Consumer: a data module reading a
+  file the app ships. Take: none; Charlie's ruling.
 - ~~Snapback / update economy.~~ Moved 2026-09-03 (Charlie: "you can pull out snapback
   for now"), in LLP 1026 D11's minimal form only: an installed app fetches a signed
   bundle of static files from a baked-in origin, after first pixel, into an on-disk
@@ -739,9 +766,9 @@ names no take; `:focus-within` remains out.
   by tag — under the existing `device.notifications` grant. Consumers: the Habits
   app's reminders (x2apps habits F13) and Dash's price alerts, both faked as
   in-app banners. Unblocks a reminder that reaches the person outside the window.
-  Take: none offered. Still refused: push delivery from a server, actions and
-  replies on a notification, badges, repeating schedules, and a readable
-  permission fact.
+  Take: none offered. Still refused: push delivery from a server (a visible
+  push on iOS and iPadOS admitted 2026-11-11, below), actions and replies on
+  a notification, badges, repeating schedules, and a readable permission fact.
   **Expanded (Charlie, 2026-10-11, notification click ruling; LLP 1114.001 D1):**
   a plain click on a local notification may open its `navigate=` location
   through the existing router (a warm `navigate` event, a cold launch location).
@@ -757,7 +784,8 @@ names no take; `:focus-within` remains out.
   the extension redraws it). Consumer: Interview's AI answer being written,
   which only its server can advance. Unblocks a Live Activity that stays true
   while its app is suspended. Still refused: push-to-start, remote
-  notifications, and everything the click ruling left refused. Take: none
+  notifications (a visible push admitted 2026-11-11, below; a data-only push
+  stays refused), and everything the click ruling left refused. Take: none
   named; the ruling stands as its own waiver.
   **Expanded (Charlie, 2026-10-18, "recs work, go for it", on LLP 1133.002
   §12 question 6):** a readable permission fact for geolocation,
@@ -775,8 +803,36 @@ names no take; `:focus-within` remains out.
   and the clone's notifications without app Swift. Take: waived: no doing-list
   item is a fair trade; the move is the roster's own wave-1 item (LLP 1133.000
   §5), and geolocation's matching move was waived (2026-10-18, above). Still
-  refused: push delivery, repeating schedules, and actions and replies until
+  refused: push delivery (a visible push on iOS and iPadOS admitted
+  2026-11-11, below), repeating schedules, and actions and replies until
   stage 2's ruling.
+  **Expanded (Charlie, 2026-11-11, expo/exact#127, after a three-seat panel
+  unanimous on direction; LLP 1133.004 §9):** a visible push on iOS and iPadOS.
+  Admitted: a package of its own, `@exact/push`, whose `subscribePush()` asks
+  for notification permission while `prompt` and answers the APNs device token,
+  and whose `pushSubscription()` reads the token and its rotation, registering
+  once per launch while permission is granted; the app sends it to its own
+  server, which sends to APNs, and exact2 sends nothing and relays nothing (LLP
+  1030.000 D6). Its grant, `device.push`, needs `device.notifications` beside it
+  and signs `aps-environment` by the signing profile (`development` on a
+  simulator and under a development profile, `production` otherwise). The system
+  shows the push, with the app in front too, and its tap opens the payload's
+  `navigate` location through the router as an untrusted deep link; nothing else
+  in a push's payload is read, and no app code runs when it arrives. An app with
+  Live Activities may register for remote notifications when it grants
+  `device.push`. Consumer: expo/exact#127's app, whose own server sends, with
+  Live Activities beside. Unblocks a notification from the app's own server, and
+  push beside Live Activities without a local patch. Take: none named; the
+  ruling stands as its own waiver. Built on iOS and iPadOS: all of it, run on a
+  simulator, which answered a registration with a token. Owed on a device:
+  delivery through APNs, the entitlement signed against a profile with Push
+  Notifications, and a production build (`packages/push/test/checklist.md`);
+  nothing is claimed for a device until that run. Not built: push on macOS (the
+  row is omitted there), on Android (after local notifications), and on the web
+  (Declarative Web Push or a host worker). Still refused: push-to-start; a
+  data-only push as a wake's trigger (`content-available`, the
+  `remote-notification` background mode); a notification service extension; an
+  event raised by a push.
 
 **Components** — roughly 15 built-in tags, not 40; roughly 12 Facet components, not 47.
 
@@ -1123,7 +1179,8 @@ reading. Nothing that isn't HTML is added by it.
   next chance, and a photo that finishes uploading after the person has
   left the app. Take: none named. Still refused (LLP 1133.017 §13): a
   runner in a service worker on the web, and with it periodic sync and
-  background fetch there; push and a data-only push's wake; wakes for an
+  background fetch there; a data-only push's wake (a visible push is the
+  notifications entry's, 2026-11-11); wakes for an
   app that is not running on macOS, Linux and Windows; Android's
   long-running workers and foreground services beyond a person-started
   transfer's; resuming an interrupted upload on Android; an app's own

@@ -210,7 +210,7 @@ pub fn read_after_assign(checked: &Checked<'_>) -> Vec<AnalyzeError> {
 }
 
 /// `analyze-send-assigned` (@ref LLP 1035.005.002 C1): each action that both
-/// sends a nonqueued mutation and assigns it on one path, in either order.
+/// sends a newest-wins mutation and assigns it on one path, in either order.
 /// Lowering reports them as warnings.
 pub fn send_assigned(checked: &Checked<'_>) -> Vec<AnalyzeError> {
     sends::send_assigned(&checked.expanded.root)
@@ -855,15 +855,13 @@ fn check_controls(nodes: &[Node], in_canvas: bool) -> Result<(), AnalyzeError> {
 /// State stops the dependency walk: an action samples it once, rather than every frame.
 /// @ref LLP 1086 D12 — EX7 resource freshness diagnostics.
 pub fn resource_clock_warnings(file: &File) -> Vec<AnalyzeError> {
-    fn live(expr: &Expr, names: &BTreeMap<String, bool>) -> bool {
+    fn live(expr: &Expr, names: &dyn Fn(&str) -> bool) -> bool {
         use contract_syntax::TemplatePart;
         match expr {
             Expr::Call(name, args, _) => {
-                name == "performanceNow"
-                    || names.get(name) == Some(&true)
-                    || args.iter().any(|e| live(e, names))
+                name == "performanceNow" || names(name) || args.iter().any(|e| live(e, names))
             }
-            Expr::Ident(name, _) => names.get(name) == Some(&true),
+            Expr::Ident(name, _) => names(name),
             Expr::List(args, _) => args.iter().any(|e| live(e, names)),
             Expr::Template(parts, _) => parts
                 .iter()
@@ -882,36 +880,34 @@ pub fn resource_clock_warnings(file: &File) -> Vec<AnalyzeError> {
                 none,
                 ..
             } => {
-                let mut inner = names.clone();
-                inner.remove(var);
-                live(subject, names) || live(some, &inner) || live(none, names)
+                live(subject, names)
+                    || live(some, &|name| name != var && names(name))
+                    || live(none, names)
             }
-            Expr::Arrow { params, body, .. } => {
-                let mut inner = names.clone();
-                for p in params {
-                    inner.remove(p);
-                }
-                live(body, &inner)
-            }
+            Expr::Arrow { params, body, .. } => live(body, &|name| {
+                !params.iter().any(|p| p == name) && names(name)
+            }),
             Expr::Let {
                 name, value, body, ..
             } => {
-                let mut inner = names.clone();
-                inner.insert(name.clone(), live(value, names));
-                live(body, &inner)
+                let value = live(value, names);
+                live(body, &|n| if n == name { value } else { names(n) })
             }
             Expr::Number(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None(..) => false,
         }
     }
     let mut functions = BTreeMap::new();
-    // Forward function references and derives settle in at most one pass per declaration.
+    // Forward references can need one round per declaration; stop once they settle.
     for _ in 0..=file.fns.len() {
+        let mut changed = false;
         for f in &file.fns {
-            let mut scope = functions.clone();
-            for param in &f.params {
-                scope.remove(&param.name);
-            }
-            functions.insert(f.name.clone(), live(&f.body, &scope));
+            let value = live(&f.body, &|name| {
+                !f.params.iter().any(|p| p.name == name) && functions.get(name) == Some(&true)
+            });
+            changed |= functions.insert(f.name.clone(), value).unwrap_or(false) != value;
+        }
+        if !changed {
+            break;
         }
     }
     let mut out = Vec::new();
@@ -921,12 +917,20 @@ pub fn resource_clock_warnings(file: &File) -> Vec<AnalyzeError> {
             scope.insert(binding.name.clone(), false);
         }
         for _ in 0..=c.derives.len() {
+            let mut changed = false;
             for binding in &c.derives {
-                scope.insert(binding.name.clone(), live(&binding.expr, &scope));
+                let value = live(&binding.expr, &|name| scope.get(name) == Some(&true));
+                changed |= scope.insert(binding.name.clone(), value).unwrap_or(false) != value;
+            }
+            if !changed {
+                break;
             }
         }
         for r in &c.resources {
-            if r.args.iter().any(|e| live(e, &scope)) {
+            if r.args
+                .iter()
+                .any(|e| live(e, &|name| scope.get(name) == Some(&true)))
+            {
                 out.push(AnalyzeError { id: "analyze-resource-clock", span: r.span, related: Vec::new(),
                     message: format!("resource `{}`: performanceNow() changes its arguments every frame and re-requests data; sample the clock into state in an action, then pass that state (or refresh on one shared timer)", r.name) });
             }

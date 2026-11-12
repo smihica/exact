@@ -5,9 +5,12 @@
 // A click on content a module posted (`@exact/notifications`) carries the
 // host's activation entry (`userInfo["exact"]`): it opens the entry's
 // `navigate` location, or raises the module's event on the session that
-// posted it, held until that session can hear it. A notification shows
-// with the app in front too, as a browser shows a page's, and sounds only
-// when its content has a sound (a silent post has none).
+// posted it, held until that session can hear it. A remote notification's
+// payload is its sender's: its click opens the payload's top-level
+// `navigate` as a local notification's opens, and nothing else of the
+// payload is read (LLP 1133.004 §9 P5). A notification shows with the app in front
+// too, as a browser shows a page's, and sounds only when its content has a
+// sound (a silent post has none).
 import Foundation
 #if !os(tvOS)
 import UserNotifications
@@ -40,11 +43,47 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         if center.delegate == nil || center.delegate === self { center.delegate = self }
     }
 
-    func deliver(_ response: UNNotificationResponse) {
+    func deliver(_ response: UNNotificationResponse, to chosen: ExactSession? = nil) {
         guard response.actionIdentifier == UNNotificationDefaultActionIdentifier else { return }
         let notification = response.notification
         let request = notification.request
+        // A remote notification's `userInfo` could name any session and
+        // module event: only a post of this app's own is read for an
+        // activation entry. The trigger is the system's, never the payload's.
+        if request.trigger is UNPushNotificationTrigger {
+            return deliverPush(id: request.identifier, date: notification.date, info: request.content.userInfo, to: chosen)
+        }
         deliver(id: request.identifier, date: notification.date, info: request.content.userInfo)
+    }
+
+    /// A push's tap: its top-level `navigate`, a string, opened as a local
+    /// notification's is (`openLocation`, the router's `location_of`), so it
+    /// reaches only the app's own routes; the app's link handlers are not the
+    /// sender's to pick. It opens in `chosen`, or the first live session when
+    /// none was chosen; a chosen session that is gone gets nothing, and no
+    /// other session stands in for it. Nothing else is read, no event is
+    /// raised, and without a location nothing is opened.
+    func deliverPush(id: String, date: Date, info: [AnyHashable: Any], to chosen: ExactSession?) {
+        guard let text = info["navigate"] as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, firstDelivery(id, date) else { return }
+        let session = chosen ?? app?.sessions.first { $0.state != .destroyed }
+        guard let session, session.state != .destroyed else {
+            let line = chosen == nil ? "no session is live" : "its session \(chosen!.label) is gone"
+            FileHandle.standardError.write(Data("notification click refused: \(line)\n".utf8))
+            return
+        }
+        session.openLocation(text)
+        activate?(session)
+    }
+
+    /// Whether this is the first delivery of a notification: the delegate
+    /// and a scene's launch options may both hand over one tap.
+    private func firstDelivery(_ id: String, _ date: Date) -> Bool {
+        let key = "\(id):\(date.timeIntervalSince1970)"
+        guard delivered.insert(key).inserted else { return false }
+        order.append(key)
+        if order.count > 128 { delivered.remove(order.removeFirst()) }
+        return true
     }
 
     /// A module's activation entry (LLP 1133.004 D6, D7): the session that
@@ -56,10 +95,7 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
               let label = entry["session"] as? String,
               let owner = entry["owner"] as? String else { return }
         let location = (entry["navigate"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let key = "\(id):\(date.timeIntervalSince1970)"
-        guard delivered.insert(key).inserted else { return }
-        order.append(key)
-        if order.count > 128 { delivered.remove(order.removeFirst()) }
+        guard firstDelivery(id, date) else { return }
         let sessions = app?.sessions.filter { $0.state != .destroyed } ?? []
         let sameProcess = (entry["process"] as? String).map { $0 == app?.notificationProcessID } ?? true
         let session: ExactSession?
@@ -80,13 +116,20 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        let handle = {
-            self.deliver(response)
-            completionHandler()
-        }
-        if Thread.isMainThread { handle() }
-        else { DispatchQueue.main.sync(execute: handle) }
+        receive(response, then: completionHandler)
     }
+
+    /// Every tap, the delegate's and an embedder's forwarded one, is delivered
+    /// here, on the main thread: a session's navigation reaches its views, and
+    /// the record of what was delivered is read and written on one thread.
+    func receive(_ response: UNNotificationResponse, to session: ExactSession? = nil, then done: (() -> Void)? = nil) {
+        let handle = {
+            self.deliver(response, to: session)
+            done?()
+        }
+        if Thread.isMainThread { handle() } else { DispatchQueue.main.async(execute: handle) }
+    }
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let silent = notification.request.content.sound == nil
@@ -98,11 +141,16 @@ extension ExactApp {
     /// Install at launch, before the system can deliver a launching tap.
     public func installNotificationClicks(activate: ((ExactSession) -> Void)? = nil) {
         NotificationPresenter.shared.install(on: self, activate: activate)
+        PushRegistration.listen()
     }
 
-    /// A scene's launch response may also reach the delegate; one request is delivered once.
-    public func openNotification(_ response: UNNotificationResponse) {
-        NotificationPresenter.shared.deliver(response)
+    /// A scene's launch response may also reach the delegate; one request is
+    /// delivered once. A push's tap opens in `session`, else the first live
+    /// one: an embedder that keeps the delegate itself forwards its taps here
+    /// and names the session (LLP 1031 D4, D5).
+    /// It may be called on any thread; the tap is delivered on the main one.
+    public func openNotification(_ response: UNNotificationResponse, session: ExactSession? = nil) {
+        NotificationPresenter.shared.receive(response, to: session)
     }
 }
 #endif

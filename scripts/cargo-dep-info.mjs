@@ -53,6 +53,33 @@ function watchedDigest(paths, outputs) {
   return hash.digest('hex');
 }
 
+/** A development receipt names four thousand inputs by SHA-256, on every build,
+ * and nearly all of them are the files they were at the last one: reading them
+ * again was 0.3 s of a 2.5 s build with nothing changed. Each hash is kept in
+ * the target directory with the size and time its file had, which is what
+ * Cargo goes by to say the unit built from it is fresh. A production receipt
+ * reads every byte. */
+export function inputHashes(app, env) {
+  const kept = resolve(app.target, 'bake-input-hashes.json'), production = env.EXACT_UPDATE_TRUST === 'production';
+  let known = {}, grew = false;
+  if (!production) try { known = JSON.parse(readFileSync(kept, 'utf8')); } catch { /* none yet */ }
+  const used = {};
+  return {
+    of(path, info) {
+      const was = known[path];
+      const now = was && was[0] === info.mtimeMs && was[1] === info.size ? was : [info.mtimeMs, info.size, createHash('sha256').update(readFileSync(path)).digest('hex')];
+      if (now !== was) grew = true;
+      used[path] = now;
+      return now[2];
+    },
+    save() {
+      if (production || !grew) return;
+      // Every app of a checkout shares the file; one that has grown past any of them starts again from this build's.
+      const next = Object.keys(known).length > 40_000 ? used : { ...known, ...used };
+      writeFileSync(`${kept}.${process.pid}.tmp`, JSON.stringify(next)); renameSync(`${kept}.${process.pid}.tmp`, kept);
+    },
+  };
+}
 /** Supply Cargo with a content revision for the selected bake, then retain
  * its actual watches after success. File watches still serve direct Cargo. */
 export function cargoBakeInputs(pkg, target, profile, env) {

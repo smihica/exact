@@ -7,8 +7,10 @@
 //! Neither read is made while the switch is off, so the person is asked for
 //! access only when they turn it on.
 
-use crate::dates::{self, DAY_MS};
+use crate::dates::{self, local_day};
+use crate::empty_store_answer as failed;
 use crate::modules::calendar;
+use chrono_tz::Tz;
 use exact_plan::Value;
 use exact_runner::{Answer, Outcome};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,10 +21,10 @@ const PAGE: f64 = 500.0;
 /// A walk over the module's pages for one reader, by its arguments.
 #[derive(Default)]
 pub(crate) struct Walk {
-    /// The range asked, ms since the epoch, and the reader's UTC offset in minutes.
+    /// The range asked, ms since the epoch, and the reader's zone.
     start: f64,
     end: f64,
-    offset: f64,
+    zone: Tz,
     /// Each calendar's colour, once `calendars()` answered (the day's walk only).
     colors: Option<BTreeMap<String, String>>,
     events: Vec<calendar::CalendarEvent>,
@@ -59,35 +61,33 @@ fn page(walk: &Walk, after: Option<String>) -> Result<Answer, String> {
         .map_err(|e| e.code)
 }
 
-/// `calendarDeviceDays(month, show, offset)` and `calendarDeviceAgenda(start,
-/// show, offset)`: nothing while `show` is false; else the first request.
+/// `calendarDeviceDays(month, show, zone)` and `calendarDeviceAgenda(day,
+/// show, zone)`, `zone` an IANA name: nothing while `show` is false; else the
+/// first request, for the days from local midnight to local midnight.
 pub(crate) fn answer(walks: &mut Walks, source: &str, args: &[Value]) -> Answer {
     let show = matches!(args.get(1), Some(Value::Bool(true)));
-    let number = |i: usize| args.get(i).and_then(Value::as_number).unwrap_or(0.0);
+    let number = |i: usize| args.get(i).and_then(Value::as_number).unwrap_or(0.0) as i32;
     if !show {
         walks.remove(&key(source, args));
         return Answer::Now(failed(source, "unread"));
     }
-    let offset = number(2);
-    let (start, end) = match source {
+    let zone = dates::zone(args.get(2).and_then(Value::as_str).unwrap_or(""));
+    let (from, to) = match source {
         "calendarDeviceDays" => {
-            let month = number(0) as i32;
+            let month = number(0);
             let first = dates::month_first(month);
-            let from = first - dates::weekday(first) as i32;
             let last = dates::month_first(month + 1) - 1;
-            let to = last + 6 - dates::weekday(last) as i32;
-            let shift = offset * 60_000.0;
             (
-                from as f64 * DAY_MS - shift,
-                (to + 1) as f64 * DAY_MS - shift,
+                first - dates::weekday(first) as i32,
+                last + 6 - dates::weekday(last) as i32,
             )
         }
-        _ => (number(0), number(0) + DAY_MS),
+        _ => (number(0), number(0)),
     };
     let walk = Walk {
-        start,
-        end,
-        offset,
+        start: dates::midnight(from, zone),
+        end: dates::midnight(to + 1, zone),
+        zone,
         ..Default::default()
     };
     let first = match source {
@@ -96,13 +96,6 @@ pub(crate) fn answer(walks: &mut Walks, source: &str, args: &[Value]) -> Answer 
     };
     walks.insert(key(source, args), walk);
     first.unwrap_or_else(|code| Answer::Now(failed(source, &code)))
-}
-
-fn failed(source: &str, code: &str) -> Value {
-    match source {
-        "calendarDeviceDays" => days(code, Vec::new()),
-        _ => agenda(code, Vec::new()),
-    }
 }
 
 /// A reply in a walk: the next request, or the answer.
@@ -146,22 +139,17 @@ pub(crate) fn parse(walks: &mut Walks, source: &str, args: &[Value], outcome: Ou
     })
 }
 
-/// The local day an instant falls on, at the reader's offset.
-fn local_day(ms: f64, offset: f64) -> i32 {
-    ((ms + offset * 60_000.0) / DAY_MS).floor() as i32
-}
-
 /// Each day of the range an event touches.
 fn marked(walk: &Walk) -> Vec<i32> {
-    let first = local_day(walk.start, walk.offset);
-    let last = local_day(walk.end - 1.0, walk.offset);
+    let first = local_day(walk.start, walk.zone);
+    let last = local_day(walk.end - 1.0, walk.zone);
     let mut out = BTreeSet::new();
     for e in &walk.events {
         let (Some(start), Some(end)) = (e.utc_start, e.utc_end) else {
             continue;
         };
-        let from = local_day(start, walk.offset).max(first);
-        let to = local_day((end - 1.0).max(start), walk.offset).min(last);
+        let from = local_day(start, walk.zone).max(first);
+        let to = local_day((end - 1.0).max(start), walk.zone).min(last);
         out.extend(from..=to);
     }
     out.into_iter().collect()
@@ -170,10 +158,7 @@ fn marked(walk: &Walk) -> Vec<i32> {
 /// The day's events as the agenda section shows them, in the module's order.
 fn rows(walk: &Walk) -> Vec<Value> {
     let colors = walk.colors.clone().unwrap_or_default();
-    let minute = |ms: f64| {
-        let local = ms + walk.offset * 60_000.0;
-        (local - (local / DAY_MS).floor() * DAY_MS) / 60_000.0
-    };
+    let minute = |ms: f64| dates::local_minute(ms, walk.zone);
     (walk.events.iter())
         .map(|e| {
             let start = e.utc_start.unwrap_or(walk.start);
@@ -183,8 +168,8 @@ fn rows(walk: &Walk) -> Vec<Value> {
             } else {
                 format!(
                     "{} – {}",
-                    dates::display_time(minute(start.max(walk.start)) as u16),
-                    dates::display_time(minute(end.min(walk.end - 60_000.0)) as u16)
+                    dates::display_time(minute(start.max(walk.start))),
+                    dates::display_time(minute(end.min(walk.end - 60_000.0)))
                 )
             };
             let id = format!("{}@{}", e.id.as_deref().unwrap_or(""), start);
@@ -205,6 +190,7 @@ fn rows(walk: &Walk) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dates::DAY_MS;
     use exact_runner::Response;
     use serde_json::{json, Value as Json};
 
@@ -237,13 +223,18 @@ mod tests {
     }
 
     const SEP_16: f64 = 20_712.0 * DAY_MS;
+    const JUL_4: f64 = 20_638.0;
     const HOUR: f64 = 3_600_000.0;
     const SEPTEMBER: f64 = (2026 * 12 + 8) as f64;
 
     #[test]
     fn the_day_walks_the_calendars_then_every_page() {
         let mut walks = Walks::new();
-        let args = [Value::Number(SEP_16), Value::Bool(true), Value::Number(0.0)];
+        let args = [
+            Value::Number(SEP_16 / DAY_MS),
+            Value::Bool(true),
+            Value::str("UTC"),
+        ];
         let source = "calendarDeviceAgenda";
         assert_eq!(
             asked(&answer(&mut walks, source, &args))["source"],
@@ -291,16 +282,16 @@ mod tests {
     fn a_module_error_answers_its_code_and_off_reads_nothing() {
         let mut walks = Walks::new();
         let off = [
-            Value::Number(SEP_16),
+            Value::Number(SEP_16 / DAY_MS),
             Value::Bool(false),
-            Value::Number(0.0),
+            Value::str("UTC"),
         ];
         let f = record(answer(&mut walks, "calendarDeviceAgenda", &off));
         assert_eq!(f[0], Value::str("unread"));
         let args = [
             Value::Number(SEPTEMBER),
             Value::Bool(true),
-            Value::Number(-420.0),
+            Value::str("America/Los_Angeles"),
         ];
         let first = answer(&mut walks, "calendarDeviceDays", &args);
         // The six weeks September 2026 shows begin Sunday 30 August, at UTC−7.
@@ -318,7 +309,7 @@ mod tests {
         let args = [
             Value::Number(SEPTEMBER),
             Value::Bool(true),
-            Value::Number(0.0),
+            Value::str("UTC"),
         ];
         answer(&mut walks, "calendarDeviceDays", &args);
         // One ending at midnight marks one day; one over two days marks both.
@@ -329,5 +320,57 @@ mod tests {
         let f = record(parse(&mut walks, "calendarDeviceDays", &args, reply(page)));
         let days = [20_712.0, 20_714.0, 20_715.0].map(Value::Number).to_vec();
         assert_eq!(f[1], Value::list(days));
+    }
+
+    /// A day in July read in Los Angeles, whose offset is then -7 hours
+    /// whatever the offset on the day it is read.
+    #[test]
+    fn a_summer_day_reads_at_the_summer_offset() {
+        let mut walks = Walks::new();
+        let la = Value::str("America/Los_Angeles");
+        let args = [Value::Number(JUL_4), Value::Bool(true), la.clone()];
+        let source = "calendarDeviceAgenda";
+        answer(&mut walks, source, &args);
+        let calendars = reply(json!({"calendars": []}));
+        let body = asked(&parse(&mut walks, source, &args, calendars));
+        let midnight = JUL_4 * DAY_MS + 7.0 * HOUR;
+        assert_eq!(body["args"]["start"], midnight);
+        assert_eq!(body["args"]["end"], midnight + DAY_MS);
+        let nine = event(
+            "a",
+            "x",
+            midnight + 9.0 * HOUR,
+            midnight + 10.0 * HOUR,
+            false,
+        );
+        let done = record(parse(
+            &mut walks,
+            source,
+            &args,
+            reply(json!({"events": [nine]})),
+        ));
+        let Value::List(rows) = &done[1] else {
+            panic!("rows")
+        };
+        let Value::Record(row) = &rows[0] else {
+            panic!("a row")
+        };
+        assert_eq!(row[2], Value::str("9:00 AM – 10:00 AM"));
+
+        // July's six weeks, from Sunday 28 June; 00:30 on 5 July marks 5 July.
+        let july = Value::Number((2026 * 12 + 6) as f64);
+        let args = [july, Value::Bool(true), la];
+        let body = asked(&answer(&mut walks, "calendarDeviceDays", &args));
+        assert_eq!(body["args"]["start"], 1_782_630_000_000.0);
+        let late = event(
+            "b",
+            "x",
+            midnight + 24.5 * HOUR,
+            midnight + 25.0 * HOUR,
+            false,
+        );
+        let page = reply(json!({"events": [late]}));
+        let f = record(parse(&mut walks, "calendarDeviceDays", &args, page));
+        assert_eq!(f[1], Value::list(vec![Value::Number(JUL_4 + 1.0)]));
     }
 }

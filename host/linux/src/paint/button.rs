@@ -10,6 +10,9 @@ use exact_kernel::{
 use std::rc::Rc;
 use tiny_skia::Transform;
 
+#[path = "segment.rs"]
+mod segment;
+
 pub(crate) fn look(name: &str) -> &'static str {
     exact_kernel::generated::button_style(name).map_or("ua", |s| s.look)
 }
@@ -56,7 +59,7 @@ pub(crate) fn material_filled(style: Option<&str>) -> bool {
 }
 
 /// A length of the Material look, dp.
-fn material_dp(index: usize) -> f32 {
+pub(super) fn material_dp(index: usize) -> f32 {
     exact_kernel::style::metrics::length_in(
         index,
         exact_kernel::style::metrics::Column::Material,
@@ -67,7 +70,7 @@ fn material_dp(index: usize) -> f32 {
 }
 
 /// A number of the Material look.
-fn material_number(index: usize) -> f32 {
+pub(super) fn material_number(index: usize) -> f32 {
     exact_kernel::style::metrics::number_in(index, exact_kernel::style::metrics::Column::Material)
         .expect("a Material row")
 }
@@ -126,23 +129,23 @@ fn typography(style: &StyleProps, scale: f32) -> StyleProps {
     out
 }
 
-struct FaceLayout {
-    title: Option<Rc<Paragraph>>,
-    subtitle: Option<Rc<Paragraph>>,
-    title_style: StyleProps,
-    subtitle_style: Option<StyleProps>,
-    symbol_style: StyleProps,
-    padding: [f32; 4],
-    text: (f32, f32),
-    symbol: f32,
-    gap: f32,
-    column: bool,
-    leading: bool,
-    width: f32,
-    height: f32,
+pub(super) struct FaceLayout {
+    pub(super) title: Option<Rc<Paragraph>>,
+    pub(super) subtitle: Option<Rc<Paragraph>>,
+    pub(super) title_style: StyleProps,
+    pub(super) subtitle_style: Option<StyleProps>,
+    pub(super) symbol_style: StyleProps,
+    pub(super) padding: [f32; 4],
+    pub(super) text: (f32, f32),
+    pub(super) symbol: f32,
+    pub(super) gap: f32,
+    pub(super) column: bool,
+    pub(super) leading: bool,
+    pub(super) width: f32,
+    pub(super) height: f32,
 }
 
-fn face_layout(
+pub(super) fn face_layout(
     engine: &mut TextEngine,
     face: &exact_kernel::PressFace,
     rows: &ButtonFaceStyle,
@@ -151,6 +154,10 @@ fn face_layout(
     bordered: bool,
 ) -> FaceLayout {
     let neutral = look::neutral();
+    // A radio of a segmented group (`exact_kernel::segmented`): Material's
+    // segmented button, or the neutral look's segment.
+    let segment = rows.segment.is_some() && look::material();
+    let neutral_segment = rows.segment.is_some() && neutral;
     let tab_root = rows.neutral_tab_root;
     let tab_length = |id, em| {
         exact_kernel::style::metrics::length_in(
@@ -162,12 +169,7 @@ fn face_layout(
         .expect("neutral tab metric")
     };
     let declared = |s: &StyleProps, id| s.mask.union(s.written).has(id);
-    let scale = match rows.button.control_size {
-        ControlSize::Mini => 0.75,
-        ControlSize::Small => 0.875,
-        ControlSize::Medium => 1.0,
-        ControlSize::Large => 1.125,
-    };
+    let scale = control_scale(rows.button.control_size);
     let said_size =
         rows.button
             .mask
@@ -178,7 +180,7 @@ fn face_layout(
                 ControlSize::Large => 18.0,
             });
     let type_of = |s: &StyleProps| {
-        if filled {
+        if filled || segment {
             material_typography(s, scale)
         } else if neutral {
             let mut style =
@@ -236,7 +238,7 @@ fn face_layout(
     // on that axis. The more specific narrow-tab rule keeps its rem padding
     // and minimum until those properties themselves are authored.
     let em = title_style.font_size;
-    let said = |id| (neutral || filled) && rows.button.written.has(id);
+    let said = |id| (neutral || filled || segment) && rows.button.written.has(id);
     let (said_width, said_height) = (said(StyleId::Width), said(StyleId::Height));
     let padding_block = neutral
         && !rows.neutral_role_floor
@@ -250,6 +252,10 @@ fn face_layout(
         tab_length(metric::TABBAR_PADDING_INLINE, em)
     } else if filled {
         material_dp(metric::FILLED_BUTTON_PADDING_INLINE) * scale
+    } else if segment {
+        material_dp(metric::SEGMENTED_BUTTON_PADDING_INLINE) * scale
+    } else if neutral_segment {
+        look::px(metric::SEGMENT_PADDING_INLINE, em)
     } else if said_width {
         0.0
     } else if lone_symbol {
@@ -261,6 +267,10 @@ fn face_layout(
         tab_length(metric::TABBAR_PADDING_BLOCK, em)
     } else if filled {
         material_dp(metric::FILLED_BUTTON_PADDING_BLOCK) * scale
+    } else if segment {
+        material_dp(metric::SEGMENTED_BUTTON_PADDING_BLOCK) * scale
+    } else if neutral_segment {
+        look::px(metric::SEGMENT_PADDING_BLOCK, em)
     } else if said_height {
         0.0
     } else {
@@ -274,20 +284,30 @@ fn face_layout(
         0.0
     };
     let padding = [
-        (StyleId::PaddingTop, rows.button.padding_top, 7.0, block),
+        (
+            StyleId::PaddingTop,
+            rows.button.padding_top.clone(),
+            7.0,
+            block,
+        ),
         (
             StyleId::PaddingRight,
-            rows.button.padding_right,
+            rows.button.padding_right.clone(),
             9.0,
             inline,
         ),
         (
             StyleId::PaddingBottom,
-            rows.button.padding_bottom,
+            rows.button.padding_bottom.clone(),
             7.0,
             block,
         ),
-        (StyleId::PaddingLeft, rows.button.padding_left, 9.0, inline),
+        (
+            StyleId::PaddingLeft,
+            rows.button.padding_left.clone(),
+            9.0,
+            inline,
+        ),
     ]
     .map(|(id, d, default, look)| {
         let edge = if !bordered
@@ -301,7 +321,7 @@ fn face_layout(
         };
         edge + if rows.button.mask.has(id) || (tab_root.is_some() && rows.button.written.has(id)) {
             points(d)
-        } else if neutral || filled {
+        } else if neutral || filled || segment {
             look
         } else {
             default * scale
@@ -349,13 +369,25 @@ fn face_layout(
             look::px(metric::CONTROL_HEIGHT, em)
         } else if filled && !said {
             material_dp(metric::FILLED_BUTTON_HEIGHT) * scale
+        } else if segment && !said {
+            material_dp(metric::SEGMENTED_BUTTON_HEIGHT) * scale
         } else {
             0.0
         }
     };
-    let min_width = match filled && !said_width {
-        true => material_dp(metric::FILLED_BUTTON_MIN_WIDTH) * scale,
-        false => floor(said_width || padding_inline),
+    let min_width = if filled && !said_width {
+        material_dp(metric::FILLED_BUTTON_MIN_WIDTH) * scale
+    } else if segment && !said_width {
+        material_dp(metric::SEGMENTED_BUTTON_MIN_WIDTH) * scale
+    } else {
+        floor(said_width || padding_inline)
+    };
+    // A Material segment keeps room for its check beside the label whether
+    // or not it shows, so it keeps its size as the choice moves.
+    let check = if segment {
+        segment::check_room(scale)
+    } else {
+        0.0
     };
     let min_height = if tab_root.is_some() {
         if declared(&rows.button, StyleId::MinHeight) {
@@ -363,6 +395,9 @@ fn face_layout(
         } else {
             tab_length(metric::TABBAR_HEIGHT, em)
         }
+    } else if neutral_segment && !said_height {
+        // The control's height less the track's padding either side.
+        look::px(metric::CONTROL_HEIGHT, em) - 2.0 * look::px(metric::SEGMENTED_PADDING, em)
     } else {
         floor(said_height || padding_block)
     };
@@ -374,8 +409,9 @@ fn face_layout(
     .filter_map(|(text, style)| text.zip(style))
     .map(|(t, s)| engine.paragraph(&super::text_spec(s, t), None).width)
     .fold(0.0f32, f32::max);
-    let room = offer
-        .map(|w| (w - padding[1] - padding[3] - if column { 0.0 } else { symbol + gap }).max(0.0));
+    let room = offer.map(|w| {
+        (w - padding[1] - padding[3] - check - if column { 0.0 } else { symbol + gap }).max(0.0)
+    });
     let room = room.map(|room| room.min(natural));
     let mut paragraph = |text: Option<&str>, style: &StyleProps| {
         text.map(|t| {
@@ -402,6 +438,7 @@ fn face_layout(
     } else {
         (tw + symbol + gap, th.max(symbol))
     };
+    let w = w + check;
     FaceLayout {
         title,
         subtitle,
@@ -455,6 +492,7 @@ impl Painter {
     /// hovers a wash of the ink lies over the fill, and a stronger one while
     /// pressed, except `fill` and `text`, which fade their ink (neutral.css);
     /// disabled, the ink is the grey and an accent fill a neutral.
+    #[allow(clippy::too_many_arguments)]
     fn neutral_face(
         &mut self,
         node: &NodeRef<'_>,
@@ -462,6 +500,7 @@ impl Painter {
         style: &str,
         gray: bool,
         menu_row: bool,
+        segment: bool,
         ts: Transform,
     ) -> [u8; 4] {
         use look::{fade, number, role};
@@ -479,8 +518,14 @@ impl Painter {
         );
         let background = active_background(node, dark, pressed);
         if let Some(palette) = look::contrast().filter(|_| authored.is_none()) {
-            let active = !disabled && (pressed || hover || style == "fill");
-            let ink = if disabled {
+            // A segment's checked radio is the selected item, disabled or
+            // not, and a pointer over one gives it none of that pair, as the
+            // web's sheet has it under forced colours (`SelectedItem`).
+            let chosen = segment && node.props.bool(PropId::AccessibilityChecked) == Some(true);
+            let active = chosen || (!segment && !disabled && (pressed || hover || style == "fill"));
+            let ink = if chosen {
+                palette.highlighted_text
+            } else if disabled {
                 palette.disabled
             } else if active {
                 palette.highlighted_text
@@ -502,6 +547,9 @@ impl Painter {
                 super::neutral::edge(self.backend.as_mut(), shape, 1., ink, ts);
             }
             return ink;
+        }
+        if segment {
+            return self.neutral_segment(node, shape, hover, background, ts);
         }
         let label = role("-exact-label", dark);
         if node.is_neutral_tab()
@@ -623,10 +671,16 @@ impl Painter {
         let neutral = look::neutral();
         let disabled = node.props.bool(PropId::Disabled) == Some(true);
         let filled = material_filled(node.props.str(PropId::ButtonStyle));
+        // A radio of a segmented group: this face with the segment's chrome.
+        let material_segment = rows.segment.filter(|_| look::material());
+        let checked = node.props.bool(PropId::AccessibilityChecked) == Some(true);
+        let rtl =
+            node.computed_row(StyleId::Direction, |s| s.direction) == exact_kernel::Direction::Rtl;
         // The neutral look's disabled button is the grey ink, not a fade;
         // Material's is its own colours (below).
         let dim = |mut c: [u8; 4]| {
-            if disabled && !neutral && !filled {
+            // A Material segment's disabled colours are its own (`segment.rs`).
+            if disabled && !neutral && !filled && material_segment.is_none() {
                 c[3] = (c[3] as f32 * 0.45) as u8;
             }
             c
@@ -641,19 +695,19 @@ impl Painter {
         let radii = [
             (
                 StyleId::BorderRadiusTopLeft,
-                rows.button.border_radius_top_left,
+                rows.button.border_radius_top_left.clone(),
             ),
             (
                 StyleId::BorderRadiusTopRight,
-                rows.button.border_radius_top_right,
+                rows.button.border_radius_top_right.clone(),
             ),
             (
                 StyleId::BorderRadiusBottomRight,
-                rows.button.border_radius_bottom_right,
+                rows.button.border_radius_bottom_right.clone(),
             ),
             (
                 StyleId::BorderRadiusBottomLeft,
-                rows.button.border_radius_bottom_left,
+                rows.button.border_radius_bottom_left.clone(),
             ),
         ]
         .map(|(id, radius)| {
@@ -683,9 +737,28 @@ impl Painter {
                 }
             }
         });
+        // A corner style the author wrote is theirs, as a radius is.
+        let cornered = rows.button.mask.has(StyleId::ControlCornerStyle);
+        let radii = match rows.segment.filter(|_| !cornered) {
+            Some(place) => {
+                let em = rows.button.font_size;
+                let own = segment::radii(place, rtl, rect.3, look::neutral(), em);
+                let said = [
+                    StyleId::BorderRadiusTopLeft,
+                    StyleId::BorderRadiusTopRight,
+                    StyleId::BorderRadiusBottomRight,
+                    StyleId::BorderRadiusBottomLeft,
+                ];
+                std::array::from_fn(|i| match rows.button.mask.has(said[i]) {
+                    true => radii[i],
+                    false => own[i],
+                })
+            }
+            None => radii,
+        };
         // Compose lays its button out in whole pixels: Material's is drawn
         // with its edges on the pixel grid.
-        let drawn = match filled {
+        let drawn = match filled || material_segment.is_some() {
             true => {
                 let grid = |v, vertical| super::material::on_grid(v, ts, vertical, self.scale);
                 let (x0, y0) = (grid(rect.0, false), grid(rect.1, true));
@@ -702,6 +775,9 @@ impl Painter {
             // disabled `onSurface` under `onSurfaceVariant`, each at its
             // `filled-button-disabled-` row's opacity
             // (`ButtonDefaults.buttonColors`).
+            _ if material_segment.is_some() => {
+                self.material_segment(node, &shape, checked, focused, background, ts)
+            }
             _ if filled && disabled && authored_accent.is_none() => {
                 let at = |role: &str, index: usize| {
                     let mut c = look::role(role, dark);
@@ -736,7 +812,8 @@ impl Painter {
                 look::role("GrayText", dark)
             }
             _ if neutral && !look.contains("glass") => {
-                self.neutral_face(node, &shape, look, name == "gray", menu_row, ts)
+                let segment = rows.segment.is_some();
+                self.neutral_face(node, &shape, look, name == "gray", menu_row, segment, ts)
             }
             "text" => {
                 if let Some(color) = background {
@@ -797,7 +874,14 @@ impl Painter {
         );
         let (x, y, w, h) = rect;
         let [pt, pr, pb, pl] = layout.padding;
-        let (cw, ch) = if layout.column {
+        // A checked Material segment's check, before the content in its
+        // line (after it, right to left), as Compose places its icon.
+        let scale = control_scale(rows.button.control_size);
+        let check = (material_segment.is_some() && checked).then(|| segment::check_room(scale));
+        let room = check.unwrap_or(0.0);
+        // The content (a line, or a stack in a column) and the check beside
+        // it, in one horizontal line.
+        let (stack, ch) = if layout.column {
             (
                 layout.text.0.max(layout.symbol),
                 layout.text.1 + layout.symbol + layout.gap,
@@ -808,18 +892,20 @@ impl Painter {
                 layout.text.1.max(layout.symbol),
             )
         };
+        let cw = stack + room;
         let free = (w - pl - pr - cw).max(0.0);
         let align = layout
             .title_style
             .text_align
             .physical(layout.title_style.direction);
-        let bx = x
+        let start = x
             + pl
             + match align {
                 TextAlign::Left | TextAlign::Start => 0.0,
                 TextAlign::Right | TextAlign::End => free,
                 _ => free / 2.0,
             };
+        let bx = start + if rtl { 0.0 } else { room };
         let tab = rows.neutral_tab_root.is_some();
         let vertical_free = (h - pt - pb - ch) / 2.0;
         let by = y
@@ -843,25 +929,26 @@ impl Painter {
         let text_shift = (text_room - layout.text.1) / 2.0;
         let (tx, ty, sx, sy) = if layout.column {
             (
-                bx + (cw - layout.text.0) / 2.0,
+                bx + (stack - layout.text.0) / 2.0,
                 by + text_shift
                     + if leading {
                         layout.symbol + layout.gap
                     } else {
                         0.0
                     },
-                bx + (cw - layout.symbol) / 2.0,
+                bx + (stack - layout.symbol) / 2.0,
                 by + if leading { 0.0 } else { text_room + layout.gap },
             )
         } else {
+            let symbol_left = leading != (rows.button.direction == exact_kernel::Direction::Rtl);
             (
-                bx + if leading {
+                bx + if symbol_left {
                     layout.symbol + layout.gap
                 } else {
                     0.0
                 },
                 by + (ch - layout.text.1) / 2.0,
-                bx + if leading {
+                bx + if symbol_left {
                     0.0
                 } else {
                     layout.text.0 + layout.gap
@@ -966,10 +1053,28 @@ impl Painter {
                 ts,
             );
         }
+        if check.is_some() {
+            let icon = material_dp(metric::SEGMENTED_BUTTON_ICON) * scale;
+            let cx = if rtl { start + cw - icon } else { start };
+            let cy = by + (ch - icon) / 2.0;
+            let tint = color(&layout.title_style, ink, presented_ink(texts.first()));
+            let style = layout.title_style.clone();
+            self.segment_check((cx, cy, icon, icon), &style, tint, ts);
+        }
         self.backend.pop_clip();
         if focused && !disabled && !super::control::ringless(node) {
             self.field_ring(&shape, accent, ts);
         }
+    }
+}
+
+/// A `controlSize`'s scale of the face's starting size.
+fn control_scale(size: ControlSize) -> f32 {
+    match size {
+        ControlSize::Mini => 0.75,
+        ControlSize::Small => 0.875,
+        ControlSize::Medium => 1.0,
+        ControlSize::Large => 1.125,
     }
 }
 
@@ -991,6 +1096,7 @@ mod tests {
                 symbol: StyleProps::default(),
                 button: StyleProps::default(),
                 image_gap: None,
+                segment: None,
             },
             button_style: None,
             width: AxisOffer::MaxContent,

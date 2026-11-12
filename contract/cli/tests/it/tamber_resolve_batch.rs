@@ -109,13 +109,10 @@ fn a_batch_past_its_bound_or_beside_token_is_refused_whole() {
 #[test]
 fn a_batch_whose_answers_pass_their_bytes_is_refused_whole() {
     // A family near the value bound (4,096 bytes), its answer twice that: 4,096 of it pass 16 MiB.
-    let stack: Vec<String> = (0..580).map(|i| format!("f{i:04}")).collect();
+    let family = format!("\"{}\"", "f".repeat(4058));
     let dir = app(
         "resolve-batch-bytes",
-        &format!(
-            "tamber t\n\ntheme\n  ink = #111111\n  face: family = {}\n",
-            stack.join(", ")
-        ),
+        &format!("tamber t\n\ntheme\n  ink = #111111\n  face: family = {family}\n"),
     );
     std::fs::write(
         dir.join("app.contract"),

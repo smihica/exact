@@ -32,6 +32,7 @@ pub(crate) struct PaintedField {
     masked: bool,
     origin: (f32, f32),
     scroll: (f32, f32),
+    right_caret_inset: f32,
     pub(crate) scroll_max: (f32, f32),
     pub(super) transform: Transform,
     decorations: Option<Rc<FieldDecorations>>,
@@ -82,14 +83,25 @@ impl PaintedField {
                     (content.3 - paragraph.height) / 2.
                 },
         );
+        let geometry = Geometry::new(
+            paragraph,
+            value,
+            masked,
+            if multiline { empty_x } else { 0. },
+            if multiline { first_x } else { 0. },
+        );
+        let (scroll_width, right_caret_inset) =
+            if !multiline && spec.direction == exact_kernel::Direction::Rtl {
+                // RTL trailing spaces can lie left of the paragraph's origin.
+                let (left, right) = geometry.horizontal_bounds();
+                let x = origin.0 - content.0;
+                let inset = (x + right + 1. - content.2).max(0.);
+                ((inset - x - left).max(0.), inset)
+            } else {
+                ((paragraph.width + 1. - content.2).max(0.), 0.)
+            };
         Self {
-            geometry: Geometry::new(
-                paragraph,
-                value,
-                masked,
-                if multiline { empty_x } else { 0. },
-                if multiline { first_x } else { 0. },
-            ),
+            geometry,
             value: value.to_owned(),
             spec,
             content,
@@ -97,10 +109,8 @@ impl PaintedField {
             masked,
             origin,
             scroll: (0., 0.),
-            scroll_max: (
-                (paragraph.width + 1. - content.2).max(0.),
-                (paragraph.height - content.3).max(0.),
-            ),
+            right_caret_inset,
+            scroll_max: (scroll_width, (paragraph.height - content.3).max(0.)),
             transform,
             decorations,
         }
@@ -134,19 +144,41 @@ impl PaintedField {
     }
 
     fn set_scroll(&mut self, scroll: (f32, f32)) {
-        let next = (
+        self.scroll = (
             scroll.0.clamp(0., self.scroll_max.0),
             scroll.1.clamp(0., self.scroll_max.1),
         );
-        self.origin.0 += self.scroll.0 - next.0;
-        self.origin.1 += self.scroll.1 - next.1;
-        self.scroll = next;
+    }
+
+    pub(crate) fn scrolls_from_right(&self) -> bool {
+        !self.multiline && self.spec.direction == exact_kernel::Direction::Rtl
+    }
+
+    fn scroll_translation(&self) -> (f32, f32) {
+        let x = if self.scrolls_from_right() {
+            self.scroll.0 - self.right_caret_inset
+        } else {
+            -self.scroll.0
+        };
+        (x, -self.scroll.1)
+    }
+
+    fn text_origin(&self) -> (f32, f32) {
+        let translation = self.scroll_translation();
+        (self.origin.0 + translation.0, self.origin.1 + translation.1)
     }
 
     pub(crate) fn reveal_cursor(&self, cursor: Cursor) -> (f32, f32) {
         let caret = self.geometry.caret(cursor);
-        let x = self.origin.0 + self.scroll.0 - self.content.0 + caret.0;
-        let y = self.origin.1 + self.scroll.1 - self.content.1 + caret.1;
+        let origin = self.text_origin();
+        let x = origin.0 - self.content.0 + caret.0;
+        let x = self.scroll.0
+            + if self.scrolls_from_right() {
+                self.content.2 - x - caret.2
+            } else {
+                x
+            };
+        let y = origin.1 + self.scroll.1 - self.content.1 + caret.1;
         let reveal = |at: f32, size: f32, offset: f32, port: f32, max: f32| {
             let next = if at < offset {
                 at
@@ -166,18 +198,17 @@ impl PaintedField {
     pub(crate) fn hit(&self, x: f32, y: f32) -> Option<Cursor> {
         let mut point = tiny_skia::Point::from_xy(x, y);
         self.transform.invert()?.map_point(&mut point);
-        Some(
-            self.geometry
-                .hit(point.x - self.origin.0, point.y - self.origin.1),
-        )
+        let origin = self.text_origin();
+        Some(self.geometry.hit(point.x - origin.0, point.y - origin.1))
     }
 
     pub(crate) fn hit_character(&self, x: f32, y: f32) -> Option<u32> {
         let mut point = tiny_skia::Point::from_xy(x, y);
         self.transform.invert()?.map_point(&mut point);
+        let origin = self.text_origin();
         Some(
             self.geometry
-                .hit_character(point.x - self.origin.0, point.y - self.origin.1),
+                .hit_character(point.x - origin.0, point.y - origin.1),
         )
     }
 
@@ -211,7 +242,8 @@ impl PaintedField {
     }
 
     pub(super) fn place(&self, r: Rect4) -> Rect4 {
-        (r.0 + self.origin.0, r.1 + self.origin.1, r.2, r.3)
+        let origin = self.text_origin();
+        (r.0 + origin.0, r.1 + origin.1, r.2, r.3)
     }
 }
 
@@ -412,8 +444,9 @@ impl Painter {
             decorations,
         );
         field.set_scroll(walk.scene.scroll.get(&node.id).copied().unwrap_or_default());
-        ox -= field.scroll.0;
-        oy -= field.scroll.1;
+        let translation = field.scroll_translation();
+        ox += translation.0;
+        oy += translation.1;
         self.backend.push_clip(outer, ts);
         let selection = walk.scene.selection.filter(|_| focused);
 
@@ -515,20 +548,32 @@ impl Painter {
             let painted = material::FieldText::painted(&paragraph, (ox, oy), ts);
             self.labels.value(node.id, painted);
         }
-        if field.decorations.is_some() {
-            self.text_decorations(
-                walk.scene.kernel,
-                &paragraph,
-                &palette,
+        let decorations = field
+            .decorations
+            .as_ref()
+            .map(|_| self.text_decorations(walk.scene.kernel, &paragraph, &palette, walk.reveal));
+        if let Some(decorations) = &decorations {
+            decorations.paint(
+                self.backend.as_mut(),
+                0..palette.len(),
                 (ox, oy),
                 ts,
-                walk.reveal,
+                exact_kernel::TextDecorationLine::Underline,
             );
         }
         {
             let mut engine = self.text.borrow_mut();
             self.backend
                 .text(&mut engine, &paragraph, &palette, (ox, oy), ts);
+        }
+        if let Some(decorations) = &decorations {
+            decorations.paint(
+                self.backend.as_mut(),
+                0..palette.len(),
+                (ox, oy),
+                ts,
+                exact_kernel::TextDecorationLine::LineThrough,
+            );
         }
         if let Some(composition) = &composition {
             let line = 1. / self.scale.max(1.);
@@ -624,4 +669,43 @@ pub fn effective_overflow(node: &NodeRef<'_>) -> (Overflow, Overflow) {
         Overflow::Visible
     };
     (x.computed(y), y.computed(x))
+}
+
+/// What a box whose outer shape is `outer` and whose border is `widths`
+/// (top, right, bottom, left) clips its children to, if anything: its
+/// padding box, with the padding box's radii (CSS Overflow 3 §3.2, the
+/// overflow clip edge), so its border paints over them. `clip` beside
+/// `visible` clips its own axis alone, without the radius (§3.1), so the
+/// rectangle reaches far past the box on the visible axis.
+pub(crate) fn overflow_clip(
+    outer: &Shape,
+    widths: [f32; 4],
+    (ox, oy): (Overflow, Overflow),
+) -> Option<Shape> {
+    const FAR: f32 = 1.0e6;
+    let padding = inset_sides(outer, widths);
+    let (x, y, w, h) = padding.rect;
+    match (ox == Overflow::Visible, oy == Overflow::Visible) {
+        (true, true) => None,
+        (false, false) => Some(padding),
+        (true, false) => Some(Shape::rect((x - FAR, y, w + 2.0 * FAR, h))),
+        (false, true) => Some(Shape::rect((x, y - FAR, w, h + 2.0 * FAR))),
+    }
+}
+
+/// `outer` inset by (top, right, bottom, left), each radius less the two
+/// sides it meets (CSS Backgrounds 3 §5.3: the padding and content edges).
+pub(crate) fn inset_sides(outer: &Shape, [t, r, b, l]: [f32; 4]) -> Shape {
+    let (x, y, w, h) = outer.rect;
+    let less = |(a, c): (f32, f32), dx: f32, dy: f32| ((a - dx).max(0.0), (c - dy).max(0.0));
+    Shape::elliptical(
+        (x + l, y + t, (w - l - r).max(0.0), (h - t - b).max(0.0)),
+        [
+            less(outer.radii[0], l, t),
+            less(outer.radii[1], r, t),
+            less(outer.radii[2], r, b),
+            less(outer.radii[3], l, b),
+        ],
+    )
+    .with_corners(outer.corners)
 }

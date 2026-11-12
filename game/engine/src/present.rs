@@ -210,6 +210,30 @@ impl<'w> Present<'w> {
         assert!(!C::PRESENTATION, "insert_each reads simulation components");
         self.world.present_each::<C, P>(&mut derive);
     }
+    /// Supply the content of a cosmetic model: an undeclared `.model` that a
+    /// `Mesh` names only for its look (a table theme, a dice skin), generated
+    /// when it is picked rather than in setup. Call it for each name a `Mesh`
+    /// shows, at every present. `build` runs only when the name is not resident:
+    /// the first time, and again after it retired. Its textures are requested
+    /// like a generated model's; it draws once they arrive.
+    ///
+    /// It is presentation residency, never simulation state: it is not declared,
+    /// has no save identity and is not hashed, so `World::model(name)` stays
+    /// `None` and load order never reaches a tick. It retires, freeing its CPU
+    /// and GPU memory, when no `Mesh` shows it and the renderer no longer draws
+    /// it. It survives a rebuild and a restore, and the present that follows
+    /// either registers again what the new world shows. A name is immutable
+    /// while registered (its build does not run), and may take new content once
+    /// it retired. A declared, generated or delivered model's name is refused.
+    /// The closure, rather than a `Model`, spares a present that runs at every
+    /// boundary from building and hashing a resident model each time.
+    pub fn cosmetic_model(
+        &mut self,
+        name: &str,
+        build: impl FnOnce() -> crate::asset::Model,
+    ) -> Result<(), String> {
+        self.world.cosmetic_model(name, build)
+    }
     /// Change a presentation component written earlier in this present.
     #[track_caller]
     pub fn get_mut<C: PresentationComponent>(&self, target: impl Target) -> Option<RefMut<'_, C>> {

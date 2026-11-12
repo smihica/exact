@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 // Keep Value's variants in saves: Record and List have the same JSON shape but
 // different Contract types. The message envelope deliberately strips these tags.
-#[derive(Clone, Default, PartialEq, Data)]
+#[derive(Clone, Default, Data)]
 pub(crate) enum Stored {
     #[default]
     Unit,
@@ -14,6 +14,22 @@ pub(crate) enum Stored {
     List(Vec<Stored>),
     Record(Vec<Stored>),
     Object(std::collections::BTreeMap<String, Stored>),
+}
+impl PartialEq for Stored {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit, Self::Unit) => true,
+            (Self::Number(a), Self::Number(b)) => {
+                crate::data::f64_bits(*a) == crate::data::f64_bits(*b)
+            }
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Option(a), Self::Option(b)) => a == b,
+            (Self::List(a), Self::List(b)) | (Self::Record(a), Self::Record(b)) => a == b,
+            (Self::Object(a), Self::Object(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 impl From<Value> for Stored {
     fn from(value: Value) -> Self {

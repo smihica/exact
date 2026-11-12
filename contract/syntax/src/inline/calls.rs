@@ -600,8 +600,7 @@ impl Cx<'_> {
     }
 }
 
-/// An action's name as its author wrote it: a lifted one's without its
-/// use's number.
+/// A name as its author wrote it, without its component or view suffix.
 pub fn shown(name: &str) -> &str {
     name.split('#').next().unwrap_or(name)
 }

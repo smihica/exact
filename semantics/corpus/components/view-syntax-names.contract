@@ -1,0 +1,49 @@
+style Card
+  color="#ff0000"
+style Other
+  color="#0000ff"
+
+component App
+  view
+    column
+      for Card in [true, false] key=Card.toString()
+        text Card.toString() class=Card testId=`direct-${Card}`
+        text Card.toString() class=(Card ? Card : Other) testId=`choice-${Card}`
+      for switch in ["toggle"] key=switch
+        input switch type="checkbox" checked=true testId=switch
+      for multiple in ["files"] key=multiple
+        input multiple type="file" testId=multiple
+      for document in ["page"] key=document
+        scroll document height=10 testId=document
+          text document testId="page-label"
+      Child()
+
+component Child
+  state Card = false
+  state switch = "unused"
+  state multiple = "unused"
+  state document = "unused"
+  view
+    column
+      for Card in [true, false] key=Card.toString()
+        text Card.toString() class=Card testId=`child-direct-${Card}`
+        text Card.toString() class=(Card ? Other : Card) testId=`child-choice-${Card}`
+      for switch in ["child-toggle"] key=switch
+        input switch type="checkbox" checked=true testId=switch
+      for multiple in ["child-files"] key=multiple
+        input multiple type="file" testId=multiple
+      for document in ["child-page"] key=document
+        scroll document height=10 testId=document
+          text document testId="child-page-label"
+
+test "style names and positional words keep their syntax meaning"
+  expect text "direct-true" == "true"
+  expect text "direct-false" == "false"
+  expect text "choice-true" == "true"
+  expect text "choice-false" == "false"
+  expect text "page-label" == "page"
+  expect text "child-direct-true" == "true"
+  expect text "child-direct-false" == "false"
+  expect text "child-choice-true" == "true"
+  expect text "child-choice-false" == "false"
+  expect text "child-page-label" == "child-page"

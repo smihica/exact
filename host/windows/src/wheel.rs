@@ -1,12 +1,17 @@
 //! Mouse notches use Windows preferences; precision deltas already name pixels.
-use exact_linux::{presenter::Scroller, Presenter};
+use exact_linux::presenter::Scroller;
+#[cfg(windows)]
+use exact_linux::Presenter;
+#[cfg(windows)]
 use exact_runner::DataSource;
+#[cfg(windows)]
 use winit::event::MouseScrollDelta;
 
 // WinUI ScrollPresenter's line-sized change, in logical pixels.
 // https://github.com/microsoft/microsoft-ui-xaml/blob/main/controls/dev/ScrollPresenter/ScrollPresenter.cpp
 const LINE: f32 = 16.;
 
+#[cfg(windows)]
 pub(super) fn dispatch<D: DataSource>(
     presenter: &mut Presenter<D>,
     at: (f32, f32),
@@ -24,11 +29,13 @@ pub(super) fn dispatch<D: DataSource>(
     presenter.wheel_at(at.0, at.1, dx, dy);
 }
 
+#[cfg(windows)]
 fn pixels(at: winit::dpi::PhysicalPosition<f64>, scale: f64) -> (f32, f32) {
     ((-at.x / scale) as f32, (-at.y / scale) as f32)
 }
 
 #[allow(unsafe_code)]
+#[cfg(windows)]
 fn preferences() -> [u32; 2] {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         SystemParametersInfoW, SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES,
@@ -62,7 +69,8 @@ fn notches(
     let port = chain
         .iter()
         .find(|s| {
-            takes(s.axes.0, delta.0, s.offset.0, s.max.0)
+            let dx = if s.from_right { -delta.0 } else { delta.0 };
+            takes(s.axes.0, dx, s.offset.0, s.max.0)
                 || takes(s.axes.1, delta.1, s.offset.1, s.max.1)
         })
         .map_or(viewport, |s| (s.port[2], s.port[3]));
@@ -87,6 +95,7 @@ mod tests {
             axes: (max.0 > 0., max.1 > 0.),
             max,
             offset,
+            from_right: false,
             port: [0., 0., port.0, port.1],
             node: false,
         }
@@ -131,6 +140,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rtl_field_page_notches_use_the_receiver_at_each_physical_edge() {
+        use exact_linux::{presenter::PainterChoice, Presenter};
+
+        let source = format!(
+            r#"component App
+  view
+    column testId="outer" width=800 height=160 overflow-x="auto"
+      box width=3200 height=100
+        input testId="editor" direction="rtl" overflow-x="auto" value="{}" margin-left=1400 width=200 height=64 appearance="none" font-size=16
+"#,
+            "אבגדהוזחטי ".repeat(12)
+        );
+        let plan = contract::compile(&source).unwrap().encode();
+        let (mut p, error) = Presenter::boot_with(
+            &plan,
+            (),
+            (1000., 200.),
+            1.,
+            Default::default(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let k = p.host().kernel();
+        let id = k.node_by_key(k.find_by_test_id("editor")[0]).unwrap().id;
+        let outer = k.node_by_key(k.find_by_test_id("outer")[0]).unwrap().id;
+        p.scroll_to(outer, (1000., 0.));
+        p.frame();
+        let max = p.scrollers_at(420., 20.).chain[0].max.0;
+        assert!(max > 500.);
+        for (start, direction, step, field, parent) in [
+            (0., 1., 800., 0., 1800.),
+            (0., -1., -200., 200., 1000.),
+            (max, -1., -800., max, 200.),
+            (max, 1., 200., max - 200., 1000.),
+        ] {
+            p.scroll_to(id, (start, 0.));
+            p.scroll_to(outer, (1000., 0.));
+            p.frame();
+            let chain = p.scrollers_at(420., 20.).chain;
+            assert_eq!(chain[0].id, id);
+            let delta = notches((direction, 0.), [u32::MAX; 2], &chain, p.viewport());
+            assert_eq!(delta, (step, 0.), "start={start}, direction={direction}");
+            p.wheel_at(420., 20., delta.0, delta.1);
+            p.frame();
+            assert_eq!(p.scroll_of(id), (field, 0.));
+            assert_eq!(p.scroll_of(outer), (parent, 0.));
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn precision_wheels_preserve_distance_at_each_display_scale() {
         for scale in [1., 1.25, 1.5, 2.] {

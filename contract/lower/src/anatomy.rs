@@ -219,7 +219,7 @@ fn classes(attrs: &[Attr]) -> Vec<(&str, Span)> {
 
 /// The style rows an attribute writes, a state part's as its row's
 /// (`:disabled background-color` is `background-color`'s).
-fn rows_of(a: &Attr) -> Vec<StyleId> {
+pub(crate) fn rows_of(a: &Attr) -> Vec<StyleId> {
     let row = contract_syntax::state::state_of(&a.name).map_or(a.name.as_str(), |(_, row)| row);
     tags::rows(&Attr {
         name: row.to_string(),

@@ -41,7 +41,9 @@ Keyboard Navigation off, Tab from the date: first responder is the select true
 
 ## Direction
 
-Decide which holds and make the other records say it. For D7.2: the select's control answers `acceptsFirstResponder && owner?.tabStop == true`, `Presenter.tabbable` tests a select as it tests a button, and the guide's sentence and the comment at `ValueControlsMac.swift:126` change. For the guide: the closed issue's resolution and the test's comment change, and D7.2 records the exception. LLP 1115.000's status row for D7.2 ("Date, time and select are skipped in both modes") is true of neither and changes either way.
+D7.2 holds: with Keyboard Navigation off a `select` is no Tab stop, as `NSPopUpButton` is none (Claude, 2026-11-11; three models asked separately each chose it; no person has ruled). The author wrote a `select`, not a stop, so the stop is the platform's to decide, and a `tabindex` the author writes still makes it one (`KeyViewLoopMac.swift:34`).
+
+The select's control answers `acceptsFirstResponder && owner?.tabStop == true`, and `Presenter.tabbable` tests a select as it tests a button. The guide's sentence and the comment at `ValueControlsMac.swift:126` change, and `KeyboardNavigationMacTests` asserts the setting off as well as on. A date or time input stays a stop in both modes, as `NSDatePicker` is. LLP 1115.000's status row for D7.2 ("Date, time and select are skipped in both modes") is true of neither mode and is corrected.
 
 ## Related
 

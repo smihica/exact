@@ -216,6 +216,15 @@ globalThis.exact.canvas2dGlue = function canvas2dGlue(o) {
   let settle = null, frames = false, framing = false;
   const agentMode = AGENT_ADMITTED && new URL(location.href).searchParams.has("agent");
   const surfaceOf = (el) => el && [...el.children].find(c => c.dataset && c.dataset.surface !== undefined);
+  function forget(id) {
+    const el = watched.get(id);
+    if (el) observer.unobserve(el);
+    watched.delete(id);
+    canvases.delete(id);
+    reported.delete(id);
+    waiting.delete(id);
+    if (!waiting.size && settle) { settle.resolve(); settle = null; }
+  }
   function report(id, el, width, height) {
     const scale = devicePixelRatio || 1, key = `${width} ${height} ${scale}`;
     waiting.delete(id);
@@ -250,7 +259,7 @@ globalThis.exact.canvas2dGlue = function canvas2dGlue(o) {
   // as the observer's entry gives it, in a vertical writing mode.
   function firstGeometry(id, el) {
     if (!waiting.has(id) || watched.get(id) !== el) return;
-    if (o.views.get(id) !== el) { waiting.delete(id); watched.delete(id); observer.unobserve(el); }
+    if (o.views.get(id) !== el) forget(id);
     else if (!el.getClientRects().length) report(id, el, 0, 0);
     else {
       const cs = getComputedStyle(el), px = v => parseFloat(v) || 0, edge = cs.boxSizing === "border-box";
@@ -314,6 +323,7 @@ globalThis.exact.canvas2dGlue = function canvas2dGlue(o) {
   document.fonts?.addEventListener("loadingdone", () => exact.send(exact.wasm.exact_canvas_fonts()));
   return {
     op(op) {
+      if (op.forget) { forget(op.id); return; }
       if (op.images) { for (const src of op.images) load(src); return; }
       if (op.frames !== undefined && op.id === undefined) {
         frames = op.frames;

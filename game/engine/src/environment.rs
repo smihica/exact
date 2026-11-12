@@ -420,8 +420,10 @@ impl Default for ShadowBox {
     }
 }
 
-/// Sun shadow quality and reach. Up to three depth layers.
-#[derive(Debug, Clone, Copy, PartialEq, Resource)]
+/// Shadow quality and reach: the sun's (up to three depth layers), then the
+/// settings every shadowed `PointLight` and `SpotLight` shares (`local_*`).
+/// Render state only: nothing here reaches the simulation.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shadows {
     /// One fixed sun box instead of camera-fitted cascades (default none).
     pub fixed_box: Option<ShadowBox>,
@@ -440,6 +442,39 @@ pub struct Shadows {
     pub filter: ShadowFilter,
     /// Shadow darkness, clamped to 0–1 (default 1).
     pub strength: f32,
+    /// Width and height of each local light's depth layer, clamped to 128–4096
+    /// (default 1024). A layer costs `4 × local_resolution²` bytes (4 MiB at
+    /// 1024², 16 MiB at 2048²); the Low quality rung takes at most 1024 and
+    /// Mid 2048, and a frame holds only the layers that fit in 128 MiB (two at
+    /// 4096²), the nearest lights first.
+    pub local_resolution: u32,
+    /// Local light filtering. `ReceiverPlane` (the default) takes 3×3 PCF,
+    /// `local_softness` texels apart, behind a normal offset of one and a half
+    /// texels; a local map's perspective has no single receiver plane, so its
+    /// taps are not corrected along one. `PcfSoft` and `Bilinear` are the sun's,
+    /// with their depth bias in the light's normalized depth and their normal
+    /// bias in world metres.
+    pub local_filter: ShadowFilter,
+    /// Spacing of the default local filter's taps in shadow texels (default 1);
+    /// larger is softer. The other filters ignore it.
+    pub local_softness: f32,
+}
+crate::data::opt_in_record!(Shadows {
+    fixed_box,
+    cache_static,
+    resolution,
+    distance,
+    cascades,
+    softness,
+    filter,
+    strength,
+} opt_in {
+    local_resolution,
+    local_filter,
+    local_softness,
+});
+impl Resource for Shadows {
+    const NAME: &'static str = "Shadows";
 }
 impl Default for Shadows {
     fn default() -> Self {
@@ -452,6 +487,9 @@ impl Default for Shadows {
             softness: 1.5,
             filter: ShadowFilter::default(),
             strength: 1.,
+            local_resolution: 1024,
+            local_filter: ShadowFilter::default(),
+            local_softness: 1.,
         }
     }
 }

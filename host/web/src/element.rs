@@ -34,10 +34,10 @@ pub(super) fn host_css(kernel: &Kernel, node: &NodeRef<'_>, css: String, tag: &s
 
 /// Whether a text is its box's text content on the web, not an element box of
 /// its own (LLP 1007.001): the only child of a box or a button, with no style
-/// row, no prop but its text and no handler — nothing a box of its own could
-/// show or hear. Its element stays (the runtime writes its text, the agent
-/// reads its node) as `display: contents`, so it makes no box (an inline
-/// box under a box that restricts touch, [`contents`]), and a flex
+/// row or state look, no prop but its text and no handler — nothing a box of
+/// its own could show or hear. Its element stays (the runtime writes its
+/// text, the agent reads its node) as `display: contents`, so it makes no
+/// box (an inline box under a box that restricts touch, [`contents`]), and a flex
 /// box holding it is a block ([`blocks`]): its text is the box's own line
 /// boxes, laid out and painted as a stretched style-less block child's are.
 /// Only where the two lay out alike — a block, or a flex column that
@@ -52,6 +52,7 @@ pub fn folds(
 ) -> bool {
     only_child
         && !handled
+        && !text.has_looks
         && text.node_type == NodeType::Text
         && !text.is_inline_run()
         && text.style.mask == exact_kernel::StyleMask::EMPTY
@@ -115,7 +116,6 @@ fn lays_out_as_block(b: &NodeFacts<'_>) -> bool {
 /// [`folds`] for a node of `kernel`, as its tree stands.
 pub(super) fn folded(kernel: &Kernel, node: &NodeRef<'_>, handled: bool) -> bool {
     node.node_type == NodeType::Text
-        && node.looks().is_empty() // a look paints its own box (LLP 1121 D8)
         && node.parent.and_then(|p| kernel.node(p)).is_some_and(|p| {
             let outer = p.parent.and_then(|o| kernel.node(o)).map(|o| o.facts());
             folds(
@@ -139,7 +139,6 @@ pub(super) fn holds_folded(
     children.len() == 1
         && kernel.node(children[0]).is_some_and(|c| {
             c.node_type == NodeType::Text
-                && c.looks().is_empty()
                 && folds(
                     &c.facts(),
                     &node.facts(),
@@ -258,7 +257,7 @@ pub fn host_css_of(
         // percentage is of the containing block's width, which a background
         // cannot reach: the line then stands at the content box's foot.
         let mut bottom = String::new();
-        crate::css::dimension(&mut bottom, node.style.padding_bottom);
+        crate::css::dimension(&mut bottom, node.style.padding_bottom.clone());
         if bottom.contains('%') || bottom == "auto" {
             bottom = "0px".into();
         }

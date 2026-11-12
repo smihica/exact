@@ -68,6 +68,7 @@ pub(super) fn end(b: &[u32], i: usize) -> Option<usize> {
     let words = |len: usize| len.div_ceil(4);
     Some(match *b.get(i)? {
         MATRIX => i + 7,
+        MATRIX3 => i + 10,
         RRECT => i + 14,
         PATH => path(i + 3)?,
         CLIP_RRECT => i + 13,
@@ -85,6 +86,9 @@ pub(super) fn end(b: &[u32], i: usize) -> Option<usize> {
         STROKE => path(i + 5)?,
         IMAGE_RRECT => i + 18,
         DASH => i + 3 + at(2)?,
+        clip::CLIP_UNION => i + 2 + at(1)?,
+        clip::MASK_LAYER => i + 1,
+        picture::IMAGE_TINT => i + 2,
         gradient::SHADER => i + 2 + at(1)?,
         glyphs::BLUR => i + 2,
         ANIMATED => i + 3 + words(at(2)?),
@@ -246,6 +250,102 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turned_boxes_record_shapes_without_cpu_pictures() {
+        use crate::presenter::{PainterChoice, Presenter};
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan("component App\n  view\n    view perspective=600 width=200 height=100 margin=100\n      view rotate=\"y 40deg\" width=200 height=100 background-color=\"#ff0000\"\n        text \"Turned card\" font-size=18 color=\"white\" margin=12\n"),
+            (), (400., 400.), 3., std::path::PathBuf::new(), PainterChoice::Canvas,
+        ).unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let ops = FINISHED.with(|f| f.borrow_mut().take()).unwrap();
+        let mut at = 0;
+        let mut shapes = 0;
+        let mut glyphs = 0;
+        let mut planes = 0;
+        while at < ops.len() {
+            assert_ne!(
+                ops[at], IMAGE_DEF,
+                "a turned solid box must not rasterize a CPU picture"
+            );
+            shapes += usize::from(ops[at] == RRECT);
+            glyphs += usize::from(ops[at] == GLYPHS);
+            planes += usize::from(ops[at] == MATRIX3);
+            at = end(&ops, at).expect("valid stream");
+        }
+        assert!(shapes > 0, "the turned box records its fill");
+        assert!(glyphs > 0, "the turned box records its text");
+        assert!(planes > 0, "the draws use a projective matrix");
+    }
+
+    #[test]
+    fn rows_first_walked_at_zero_opacity_are_recorded_when_shown() {
+        use crate::presenter::{PainterChoice, Presenter};
+
+        fn rows() -> (Vec<u32>, Vec<u32>) {
+            let ops = FINISHED
+                .with(|f| f.borrow_mut().take())
+                .expect("finished frame");
+            let (mut recorded, mut drawn) = (Vec::new(), Vec::new());
+            let mut at = 0;
+            while at < ops.len() {
+                match ops[at] {
+                    ROW_BEGIN => recorded.push(ops[at + 1]),
+                    ROW_DRAW => drawn.push(ops[at + 1]),
+                    _ => {}
+                }
+                at = end(&ops, at).expect("valid stream");
+            }
+            (recorded, drawn)
+        }
+
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan(
+                r##"component App
+  state shown = false
+  action toggle
+    shown = !shown
+  view
+    column
+      button "Show" press=toggle testId="show" height=40
+      box opacity=(shown ? 1 : 0) width=300 height=300
+        scroll width=200 height=200
+          column
+            box height=50 width=200 background-color="#2468ac" testId="row"
+            box height=50 width=200 background-color="#2468ac"
+            box height=50 width=200 background-color="#2468ac"
+"##,
+            ),
+            (),
+            (400., 500.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.brush.replace_backend(Box::new(Recorder::new()));
+        let k = p.host.kernel();
+        let show = k.node_by_key(k.find_by_test_id("show")[0]).unwrap().id;
+        let row = k.node_by_key(k.find_by_test_id("row")[0]).unwrap().id;
+        for _ in 0..2 {
+            p.frame();
+            assert_eq!(rows(), (vec![], vec![]), "transparent rows draw nothing");
+            assert!(p.boxes().iter().any(|b| b.id == row && b.pointer_hit));
+            p.tap(show).unwrap();
+            p.frame();
+            let (recorded, drawn) = rows();
+            assert_eq!(recorded.len(), 3, "each revealed row must be recorded");
+            assert!(recorded.iter().all(|id| *id != 0));
+            assert_eq!(drawn, recorded, "draw the recordings just defined");
+            p.repaint();
+            p.frame();
+            assert_eq!(rows(), (vec![], drawn), "unchanged rows replay");
+            p.tap(show).unwrap();
+        }
+    }
 
     #[test]
     fn definitions_apart() {

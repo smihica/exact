@@ -10,13 +10,18 @@
 //! the reader asks for that, with the colour behind the page and the
 //! scheme its bar icons follow ([`CanvasHost::chrome`]).
 
+#[cfg(target_os = "android")]
 use super::CanvasHost;
+use crate::presenter::Chrome;
+#[cfg(target_os = "android")]
 use crate::presenter::{Device, Window};
+#[cfg(target_os = "android")]
 use exact_runner::DataSource;
 
 /// A window as the reader tells it: its size in pixels, the pixels a point,
 /// and four insets in pixels (top, right, bottom, left) each for the system
 /// bars, the display cutout, the software keyboard and the system's gestures.
+#[cfg(target_os = "android")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Told {
     /// Width and height, pixels.
@@ -27,6 +32,7 @@ pub struct Told {
     pub insets: [i32; 16],
 }
 
+#[cfg(target_os = "android")]
 impl Told {
     /// The window in points.
     fn window(&self) -> Window {
@@ -59,17 +65,21 @@ impl Told {
 }
 
 /// What the reader last said, for a host that boots after it said so.
+#[cfg(target_os = "android")]
 static DEVICE: std::sync::Mutex<Option<Device>> = std::sync::Mutex::new(None);
+#[cfg(target_os = "android")]
 static WINDOW: std::sync::Mutex<Option<Told>> = std::sync::Mutex::new(None);
 
 /// Keep `device` for the host that boots next (the reader's `configure`,
 /// from any thread; a running host is told on its own, by
 /// [`CanvasHost::configure`]).
+#[cfg(target_os = "android")]
 pub fn configure(device: &Device) {
     *DEVICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(device.clone());
 }
 
 /// What the reader last said of the device, if it has said anything.
+#[cfg(target_os = "android")]
 pub(super) fn configured() -> Option<Device> {
     DEVICE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -77,18 +87,21 @@ pub(super) fn configured() -> Option<Device> {
 /// Keep the window for the host that boots next (the reader's `window`,
 /// from any thread; a running host is told on its own, by
 /// [`CanvasHost::set_window`]).
+#[cfg(target_os = "android")]
 pub fn window(told: Told) {
     *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(told);
 }
 
 /// The window the reader last told, when it is `size` pixels at `scale`: a
 /// reader that boots or adopts a host names the window it then has.
+#[cfg(target_os = "android")]
 pub(super) fn windowed(size: (u32, u32), scale: f32) -> Option<Told> {
     (*WINDOW.lock().unwrap_or_else(|e| e.into_inner()))
         .filter(|told| told.size == size && told.scale == scale)
 }
 
 /// What a host keeps of its reader's window.
+#[cfg(target_os = "android")]
 #[derive(Default)]
 pub(super) struct Shell {
     /// Whether the reader tells its window: the presenter then places the
@@ -98,11 +111,13 @@ pub(super) struct Shell {
     chrome: Option<[i32; 6]>,
 }
 
+#[cfg(target_os = "android")]
 impl<D: DataSource + Default> CanvasHost<D> {
     /// The device's settings changed, or are told for the first time: the
     /// presenter takes them through its doors
     /// ([`crate::presenter::Presenter::set_device`]) and the next frame is
     /// a paint.
+    #[cfg(target_os = "android")]
     pub fn configure(&mut self, device: &Device) {
         if let Some(e) = self.p.set_device(device) {
             eprintln!("exact: device: {e}");
@@ -163,24 +178,55 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// What the reader draws around the page, when that is not what it was
     /// last given: where the page is in the window (x, y, width, height, in
     /// pixels), the colour behind it and in the edges it keeps out of
-    /// (ARGB), and 1 when its scheme is dark (the bars' icons are then
-    /// light). `None` while nothing changed.
+    /// (ARGB), and two bits: bit 0 is the dark scheme (light navigation
+    /// icons); bit 1 requests light status bar icons (LLP 1105 D7).
+    /// `None` while nothing changed.
     pub fn chrome(&mut self) -> Option<[i32; 6]> {
-        let c = self.p.chrome();
-        let px = |v: f32| (v * self.scale).round() as i32;
-        let [r, g, b, a] = c.background;
-        let now = [
-            px(c.frame[0]),
-            px(c.frame[1]),
-            px(c.frame[2]),
-            px(c.frame[3]),
-            i32::from_be_bytes([a, r, g, b]),
-            i32::from(c.dark),
-        ];
+        let now = pack_chrome(self.p.chrome(), self.scale);
         if self.shell.chrome == Some(now) {
             return None;
         }
         self.shell.chrome = Some(now);
         Some(now)
+    }
+}
+
+/// The JNI array keeps six words; the bars have independent appearance bits.
+fn pack_chrome(c: Chrome, scale: f32) -> [i32; 6] {
+    let px = |v: f32| (v * scale).round() as i32;
+    let [r, g, b, a] = c.background;
+    [
+        px(c.frame[0]),
+        px(c.frame[1]),
+        px(c.frame[2]),
+        px(c.frame[3]),
+        i32::from_be_bytes([a, r, g, b]),
+        i32::from(c.dark) | (i32::from(c.status_light_icons) << 1),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_keeps_geometry_and_argb_and_packs_independent_bar_bits() {
+        for (dark, status_light_icons, flags) in [
+            (false, false, 0),
+            (true, false, 1),
+            (false, true, 2),
+            (true, true, 3),
+        ] {
+            let chrome = Chrome {
+                frame: [1.25, 2.5, 100., 200.],
+                background: [0x12, 0x34, 0x56, 0xff],
+                dark,
+                status_light_icons,
+            };
+            assert_eq!(
+                pack_chrome(chrome, 2.),
+                [3, 5, 200, 400, 0xff123456u32 as i32, flags]
+            );
+        }
     }
 }

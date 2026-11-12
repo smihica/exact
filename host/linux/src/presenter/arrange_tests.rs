@@ -735,25 +735,91 @@ fn a_cross_list_drag_drops_on_the_target_and_the_ghost_lands_then_goes() {
 }
 
 #[test]
-fn a_drag_at_the_board_edge_scrolls_the_board() {
-    let mut p = board();
-    let board = p
-        .host
-        .kernel()
-        .node_by_key(p.host.kernel().find_by_test_id("board")[0])
-        .unwrap()
-        .id;
+fn grouped_edge_scroll_keeps_its_speed_while_the_pointer_moves() {
+    let mut distances = Vec::new();
+    for lead in [None, Some(8.), Some(1.), Some(0.)] {
+        let mut p = board();
+        let board = id(&p, "board");
+        let r = p.rect_of(board).unwrap();
+        let (x, y) = (r.0 + r.2 - 8., r.1 + 30.);
+        carry(&mut p, "a2", (x - 62., y), 0.);
+        p.pointer_move(x, y, 30.).unwrap();
+        assert!(p.needs_animation_frame(), "an edge band pumps");
+        p.tick(30.);
+        let before = p.scroll_of(board).0;
+        for n in 1..=12 {
+            let at = 30. + n as f64 * 1000. / 60.;
+            if let Some(lead) = lead {
+                // Move along the edge so its depth, and thus speed, stays fixed.
+                p.pointer_move(x, y + (n % 2) as f32, at - lead).unwrap();
+            }
+            p.tick(at);
+        }
+        distances.push((lead, p.scroll_of(board).0 - before));
+        p.pointer_up(x, y, 240.).unwrap();
+    }
+    assert!(
+        distances.iter().all(|(_, d)| (d - 40.).abs() < 0.001),
+        "200 points per second for 0.2 seconds, regardless of move timing: {distances:?}"
+    );
+}
+
+#[test]
+fn grouped_edge_scroll_restarts_its_clock_after_leaving_the_band() {
+    for frame_outside in [false, true] {
+        let mut p = board();
+        let board = id(&p, "board");
+        let r = p.rect_of(board).unwrap();
+        let (x, y) = (r.0 + r.2 - 8., r.1 + 30.);
+        carry(&mut p, "a2", (x - 62., y), 0.);
+        p.tick(30.);
+        for entered in [100., 1000.] {
+            let before = p.scroll_of(board).0;
+            p.pointer_move(x, y, entered).unwrap();
+            p.tick(entered + 10.);
+            assert_eq!(
+                p.scroll_of(board).0,
+                before,
+                "the first frame in the band starts the clock"
+            );
+            p.tick(entered + 30.);
+            assert!((p.scroll_of(board).0 - before - 4.).abs() < 0.001);
+            p.pointer_move(x - 62., y, entered + 40.).unwrap();
+            assert!(p.group_edge().is_none());
+            if frame_outside {
+                p.tick(entered + 50.);
+            }
+            assert!((p.scroll_of(board).0 - before - 4.).abs() < 0.001);
+        }
+        p.pointer_cancel(1100.).unwrap();
+        let before = p.scroll_of(board).0;
+        p.tick(1200.);
+        assert_eq!(p.scroll_of(board).0, before);
+    }
+}
+
+#[test]
+fn grouped_edge_scroll_can_remove_the_dragged_row() {
+    let source = BOARD
+        .replace(
+            "  state log = \"\"",
+            "  state hidden = false\n  action hide(x: number, y: number)\n    hidden = true\n  state log = \"\"",
+        )
+        .replace("scroll testId=\"board\"", "scroll scroll=hide testId=\"board\"")
+        .replace(
+            "cards.filter(k => k.col == col)",
+            "cards.filter(k => k.col == col and not (hidden and k.id == \"a2\"))",
+        );
+    let mut p = board_source(&source);
+    let board = id(&p, "board");
     let r = p.rect_of(board).unwrap();
-    // Into b, then to the board's right edge band.
     carry(&mut p, "a2", (r.0 + r.2 - 70., r.1 + 30.), 0.);
     p.pointer_move(r.0 + r.2 - 8., r.1 + 30., 30.).unwrap();
-    assert!(p.needs_animation_frame(), "an edge band pumps");
-    let before = p.scroll_of(board).0;
-    for t in [50., 66., 82., 98., 114.] {
-        p.tick(t);
-    }
-    assert!(p.scroll_of(board).0 > before, "the board scrolls toward c");
-    p.pointer_up(r.0 + r.2 - 8., r.1 + 30., 120.).unwrap();
+    p.tick(30.);
+    p.tick(50.);
+    assert!(p.scroll_of(board).0 > 0.);
+    assert!(p.host.kernel().find_by_test_id("grip-a2").is_empty());
+    assert!(p.group.is_none());
 }
 
 #[test]

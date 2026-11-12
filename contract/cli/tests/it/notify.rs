@@ -93,7 +93,7 @@ const GRANTED: &str = "device.notifications purpose.notifications\n";
 fn boot(grants: &'static str) -> (App, Runner<Grants>) {
     let app = App::new("runner");
     let plan = app.compile(APP).unwrap_or_else(|e| panic!("{e:?}"));
-    let r = Runner::boot(
+    let mut r = Runner::boot(
         plan,
         Grants(grants),
         exact_kernel::Kernel::with_monospace(),
@@ -101,6 +101,12 @@ fn boot(grants: &'static str) -> (App, Runner<Grants>) {
         "/",
     )
     .unwrap();
+    // The package has no implementation on Linux or Windows; the status is
+    // asked again for the target.
+    r.set_module_target("macos");
+    let at = r.now_ms();
+    r.advance(at).unwrap();
+    r.apply_announced();
     (app, r)
 }
 

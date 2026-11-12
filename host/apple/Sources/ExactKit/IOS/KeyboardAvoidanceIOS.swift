@@ -121,7 +121,7 @@ extension Presenter {
         guard port.height > 1, port.width > 1 else { return 0 }
         var top = port.maxY
         func consider(_ box: NodeView) {
-            guard !box.isHidden, box.alpha > 0.01, box !== sv, box.window === window, !node.isDescendant(of: box),
+            guard !box.isHidden, box.alpha > 0.01, !box.drawnBySurface, box !== sv, box.window === window, !node.isDescendant(of: box),
                   box.style["pointer_events"]?.string != "none" else { return }
             let frame = box.convert(box.bounds, to: window)
             let across = min(frame.maxX, port.maxX) - max(frame.minX, port.minX)

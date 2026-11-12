@@ -9,6 +9,7 @@
 
 use crate::generated::TextTransform;
 use crate::NodeRef;
+use icu_properties::{props::WordBreak, CodePointMapData};
 use std::borrow::Cow;
 
 impl<'a> NodeRef<'a> {
@@ -40,8 +41,8 @@ static UPPERCASE: std::sync::OnceLock<CaseMapping> = std::sync::OnceLock::new();
 pub type CaseMapping = fn(&str, usize) -> Option<String>;
 
 /// Link `text-transform`'s case mapping (LLP 1047 D2, linked by use): its
-/// Unicode case tables are ~3–6 KiB of a web core, and an app's `<option>`
-/// label reaches them through its runs. A web artifact links it when its
+/// Unicode case and word-boundary tables are also reached by an app's
+/// `<option>` labels through their runs. A web artifact links it when its
 /// plan binds the row or calls `toLowerCase` or `toUpperCase` (LLP 1088 D2), and a plan that
 /// does either unlinked is refused at boot (D6), so an unlinked artifact
 /// never holds a transform but `none`. Native artifacts and the compiler map
@@ -160,14 +161,17 @@ impl WordBoundary {
 }
 
 /// The first letter of each word in titlecase, everything else untouched.
-/// A word is what UAX #29 would keep together for ordinary prose: letters,
-/// digits, marks and `_`, joined across an apostrophe, `.`, `:` or `·` that
-/// sits between two letters — so "don't", "e.g." and "3d" each stay one word
-/// ("3d", as Chromium leaves it) and "hello-world" is two.
+/// Chrome joins letters across apostrophes and `·`, but breaks at `.` and
+/// `:`. Digits and `_` keep a word together; UAX #29 WB4 characters preserve
+/// the preceding context within a run, including around a joiner.
 fn capitalize(text: &str, boundary: WordBoundary) -> String {
     let mut out = String::with_capacity(text.len());
-    let (mut last, mut prior) = (boundary.0, None::<char>);
+    let (mut last, mut prior) = (boundary.0.filter(|c| !word_ignored(*c)), None::<char>);
     for c in text.chars() {
+        if word_ignored(c) {
+            out.push(c);
+            continue;
+        }
         let joined = match (prior, last) {
             (_, Some(l)) if word(l) => true,
             (Some(p), Some(l)) => joiner(l) && p.is_alphabetic() && c.is_alphabetic(),
@@ -184,21 +188,18 @@ fn capitalize(text: &str, boundary: WordBoundary) -> String {
 }
 
 fn word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || mark(c)
+    c.is_alphanumeric() || c == '_'
 }
 
 fn joiner(c: char) -> bool {
-    matches!(c, '\'' | '\u{2019}' | '.' | ':' | '\u{b7}')
+    matches!(c, '\'' | '\u{2019}' | '\u{b7}')
 }
 
-/// The combining-mark blocks: a decomposed `é` is one letter.
-fn mark(c: char) -> bool {
-    matches!(c,
-        '\u{300}'..='\u{36f}'
-        | '\u{1ab0}'..='\u{1aff}'
-        | '\u{1dc0}'..='\u{1dff}'
-        | '\u{20d0}'..='\u{20ff}'
-        | '\u{fe20}'..='\u{fe2f}')
+fn word_ignored(c: char) -> bool {
+    matches!(
+        CodePointMapData::<WordBreak>::new().get(c),
+        WordBreak::Format | WordBreak::Extend | WordBreak::ZWJ
+    )
 }
 
 /// Unicode's titlecase mapping: the uppercase one, except where
@@ -320,12 +321,66 @@ mod tests {
     }
 
     #[test]
+    fn capitalize_breaks_at_periods_and_colons() {
+        for (text, want) in [
+            ("u.s.a. at 9 a.m.", "U.S.A. At 9 A.M."),
+            ("example.com", "Example.Com"),
+            ("re:invent", "Re:Invent"),
+        ] {
+            assert_eq!(t(TextTransform::Capitalize, text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn capitalize_keeps_words_across_ignored_characters() {
+        use TextTransform::Capitalize;
+        // Chrome's word iterator ignores WB4 characters within a run, but
+        // only the last source character supplies context to the next run.
+        for ignored in [
+            '\u{ad}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{fe0f}',
+            '\u{483}',
+            '\u{301}',
+            '\u{200c}',
+            '\u{903}',
+            '\u{e0100}',
+        ] {
+            for (text, want) in [
+                (
+                    format!("hello{ignored}world"),
+                    format!("Hello{ignored}world"),
+                ),
+                (format!("{ignored}hello"), format!("{ignored}Hello")),
+                (format!(" {ignored}hello"), format!(" {ignored}Hello")),
+                (
+                    format!("don{ignored}'{ignored}t"),
+                    format!("Don{ignored}'{ignored}t"),
+                ),
+                (
+                    format!("foo{ignored}.{ignored}bar"),
+                    format!("Foo{ignored}.{ignored}Bar"),
+                ),
+            ] {
+                assert_eq!(t(Capitalize, &text), want, "{text:?}");
+            }
+            assert_eq!(Capitalize.apply("lo", &format!("hel{ignored}")), "Lo");
+            assert_eq!(
+                Capitalize.apply(&format!("{ignored}lo"), "hel"),
+                format!("{ignored}lo")
+            );
+        }
+    }
+
+    #[test]
     fn capitalize_titlecases_the_first_letter_of_each_word() {
         use TextTransform::Capitalize;
         for (text, want) in [
             ("hello world", "Hello World"),
             ("hello-world (again)", "Hello-World (Again)"),
-            ("don't stop, e.g. now", "Don't Stop, E.g. Now"),
+            ("don't stop, e.g. now", "Don't Stop, E.G. Now"),
+            ("l’amour l·l", "L’amour L·l"),
             ("3d printing", "3d Printing"),
             ("snake_case mIXED", "Snake_case MIXED"),
             ("e\u{301}te\u{301}", "E\u{301}te\u{301}"),

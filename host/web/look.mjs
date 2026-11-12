@@ -25,3 +25,20 @@ export function appleColors() {
   const own = roles.filter(([name, alias]) => alias && !name.endsWith('background')).map(([name, alias]) => `  @supports (color: ${alias}) { :root { --exact-apple-${name}: ${alias}; } }\n`);
   return `  :root { ${pairs} --exact-apple-roles: "${roles.map(([name]) => name).join(' ')}"; }\n${own.join('')}`;
 }
+
+/** The manifest's fixed `userInterfaceStyle` (`light` or `dark`), or null for `automatic` or none. */
+export const interfaceStyle = (manifest) => (['light', 'dark'].includes(manifest?.userInterfaceStyle) ? manifest.userInterfaceStyle : null);
+
+/** The page's `color-scheme` before its first paint: the shell's `light dark`, or a fixed `style` (`interfaceStyle`), which
+ * then also leads the head as `<meta name="color-scheme">` so the browser's canvas is in it before any style is read. The
+ * scheme is the page's, as the device's would be: `setScheme("system")` returns to it, and the runner's
+ * `prefers-color-scheme` reads it from the meta (navigation.js `preferences`). */
+export function withInterfaceStyle(shell, style) {
+  if (!style) return shell;
+  const rule = 'html { color-scheme: light dark; }';
+  if (!shell.includes(rule)) throw new Error(`the shell has no \`${rule}\` to fix as ${style}`);
+  return shell.replace(rule, `html { color-scheme: ${style}; }`).replace(/(<meta name="viewport"[^>]*>\n)/, `$1${colorSchemeMeta(style)}`);
+}
+
+/** The head's `<meta name="color-scheme">` for a fixed `style`; nothing for none. */
+export const colorSchemeMeta = (style) => (style ? `<meta name="color-scheme" content="${style}">\n` : '');

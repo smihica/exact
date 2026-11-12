@@ -43,6 +43,7 @@ fn main() {
         "caltrain_data::Caltrain",
         "caltrain_data::Caltrain",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

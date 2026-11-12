@@ -6,16 +6,18 @@
 //! An app's `scrollIntoView("element-id", block=, inline=)` (minesweeper F3)
 //! walks the same containers, aligning by CSSOM View's rules.
 use super::*;
+use crate::paint::space::mul3;
+use crate::placement::inverse;
 
 pub(super) enum Cause {
     InsetAdjustment,
     FieldNavigation,
-    /// A remote's arrow moved the focus (LLP 1115.001.003 D4).
+    /// Tab or a remote's arrow moved the focus (LLP 1115.001.003 D4).
     FocusMove,
 }
 
 impl<D: DataSource> Presenter<D> {
-    /// `{"revealed":id,"scrolled":…}`, with where the middle moved from and to.
+    /// `{"revealed":id,"scrolled":…}`, with the observed middle before and after the request.
     pub fn reveal(&mut self, id: ViewId) -> Result<String, String> {
         // The page under an open box is not scrolled: a tap there dismisses
         // a light-dismiss box where it lands, and is refused under any other.
@@ -40,8 +42,8 @@ impl<D: DataSource> Presenter<D> {
             .ok_or_else(|| format!("no view {id} on screen"))?;
         let from = middle(&b);
         let (vw, vh) = self.display.viewport().unwrap_or(self.viewport);
-        // (Cleared of a sticky box: scrolled, whatever an attached display's boxes say before its next frame.)
-        let cleared = if inside(from, (0.0, 0.0, vw, vh)) && b.clip.is_none_or(|c| inside(from, c))
+        // Offsets can move before an attached display acknowledges their new boxes.
+        let scrolled = if inside(from, (0.0, 0.0, vw, vh)) && b.clip.is_none_or(|c| inside(from, c))
         {
             // In view, but perhaps under a sticky box of its own scroller: scrolled clear of it, as a person would.
             if !self.clear_of_sticky(id, from) {
@@ -49,14 +51,14 @@ impl<D: DataSource> Presenter<D> {
             }
             true
         } else {
-            self.scroll_into(id, false, true, delta);
+            let moved = self.scroll_into(id, false, true, delta);
             let at = self.box_of(id).map_or(from, |b| middle(&b));
-            self.clear_of_sticky(id, at)
+            self.clear_of_sticky(id, at) || moved
         };
         let to = self.box_of(id).map_or(from, |b| middle(&b));
         Ok(format!(
             "{{\"revealed\":{id},\"scrolled\":{},\"from\":[{},{}],\"to\":[{},{}]}}",
-            to != from || cleared,
+            to != from || scrolled,
             num(r2(from.0)),
             num(r2(from.1)),
             num(r2(to.0)),
@@ -359,10 +361,20 @@ impl<D: DataSource> Presenter<D> {
         });
         let scrolls = |o| matches!(o, Overflow::Scroll | Overflow::Auto);
         let (ox, oy) = bounds.axes;
+        let dx = if self
+            .brush
+            .field_text
+            .get(&id)
+            .is_some_and(|field| field.scrolls_from_right())
+        {
+            -by(1)
+        } else {
+            by(1)
+        };
         let off = self.scroll.get(&id).copied().unwrap_or((0.0, 0.0));
         let next = (
             if scrolls(ox) {
-                (off.0 + by(1)).clamp(0.0, bounds.max.0)
+                (off.0 + dx).clamp(0.0, bounds.max.0)
             } else {
                 off.0
             },
@@ -398,16 +410,20 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// Each scroll container above `id`, innermost first, then the page,
-    /// moves by what `by(target, port)` asks (viewport coordinates), clamped
-    /// to its travel.
+    /// moves by what `by(target, port)` asks in its scroll coordinates, clamped
+    /// to its travel. Returns whether any offset moved.
     fn scroll_into(
         &mut self,
         id: ViewId,
         spacing: bool,
         completion: bool,
         by: impl Fn(Rect4, Rect4) -> (f32, f32),
-    ) {
+    ) -> bool {
         self.restore_scroll_anchors();
+        if self.box_of(id).is_none() {
+            return false;
+        }
+        let mut scrolled = false;
         let (vw, vh) = self.display.viewport().unwrap_or(self.viewport);
         // The scroll containers above it, innermost first, with their axes and travel.
         let mut scrollers = Vec::new();
@@ -418,10 +434,10 @@ impl<D: DataSource> Presenter<D> {
             .map(|n| {
                 let r = &n.style.rare;
                 [
-                    r.scroll_margin_top,
-                    r.scroll_margin_right,
-                    r.scroll_margin_bottom,
-                    r.scroll_margin_left,
+                    r.scroll_margin_top.clone(),
+                    r.scroll_margin_right.clone(),
+                    r.scroll_margin_bottom.clone(),
+                    r.scroll_margin_left.clone(),
                 ]
                 .map(|d| d.at_basis(kernel.arena().env(), 0.0))
             })
@@ -443,10 +459,10 @@ impl<D: DataSource> Presenter<D> {
             if scrolls(ox) || scrolls(oy) {
                 let r = &node.style.rare;
                 let padding = [
-                    r.scroll_padding_top,
-                    r.scroll_padding_right,
-                    r.scroll_padding_bottom,
-                    r.scroll_padding_left,
+                    r.scroll_padding_top.clone(),
+                    r.scroll_padding_right.clone(),
+                    r.scroll_padding_bottom.clone(),
+                    r.scroll_padding_left.clone(),
                 ];
                 scrollers.push((
                     a,
@@ -463,10 +479,18 @@ impl<D: DataSource> Presenter<D> {
             at = self.scroll_parent(a);
         }
         for (a, sx, sy, max, padding, borders) in scrollers {
-            let (Some(target), Some(scroller)) = (self.box_of(id), self.box_of(a)) else {
+            let (Some((target_map, target)), Some((port_map, port))) =
+                (self.reveal_geometry(id), self.reveal_geometry(a))
+            else {
                 continue;
             };
-            let port = inset(self.brush.split_port(a, scroller.rect), borders);
+            let Some(to_port) = inverse(port_map) else {
+                continue;
+            };
+            let Some(target) = target.scroll_bounds(&mul3(&to_port, &target_map)) else {
+                continue;
+            };
+            let port = inset(self.brush.split_port(a, port.scroll_rect()), borders);
             let basis = [port.3, port.2, port.3, port.2];
             let padding = std::array::from_fn(|i| {
                 padding[i]
@@ -474,12 +498,12 @@ impl<D: DataSource> Presenter<D> {
                     .max(0.0)
             });
             let off = self.scroll.get(&a).copied().unwrap_or((0.0, 0.0));
-            let (target, port) = if spacing {
-                (inset(target.rect, margin.map(|n| -n)), inset(port, padding))
+            let (area, port) = if spacing {
+                (inset(target, margin.map(|n| -n)), inset(port, padding))
             } else {
-                (target.rect, port)
+                (target, port)
             };
-            let (dx, dy) = by(target, port);
+            let (dx, dy) = by(area, port);
             let next = (
                 if sx {
                     (off.0 + dx).clamp(0.0, max.0)
@@ -494,6 +518,7 @@ impl<D: DataSource> Presenter<D> {
             );
             let moved = self.anchor_input(a, off, if sy { dy } else { 0. }, next);
             if next != off || moved.is_some_and(|dy| dy != 0.) {
+                scrolled = true;
                 self.scroll.insert(a, next);
                 if completion {
                     self.scroll_end_input(a, off, Completion::Instant);
@@ -503,15 +528,15 @@ impl<D: DataSource> Presenter<D> {
             }
         }
         if self.alert_inert() {
-            return;
+            return scrolled;
         }
-        if let Some(target) = self.box_of(id) {
+        if let Some(target) = self.reveal_rect(id) {
             let doc = self.document();
             let max = ((doc.0 - vw).max(0.0), (doc.1 - vh).max(0.0));
             let target = if spacing {
-                inset(target.rect, margin.map(|n| -n))
+                inset(target, margin.map(|n| -n))
             } else {
-                target.rect
+                target
             };
             let (dx, dy) = by(target, (0.0, 0.0, vw, vh));
             let next = (
@@ -520,6 +545,7 @@ impl<D: DataSource> Presenter<D> {
             );
             let moved = self.anchor_input(PAGE, self.page, dy, next);
             if next != self.page || moved.is_some_and(|dy| dy != 0.) {
+                scrolled = true;
                 self.page = next;
                 self.dirty = true;
             }
@@ -527,7 +553,90 @@ impl<D: DataSource> Presenter<D> {
         if let Some(error) = self.refresh_transform_geometry() {
             self.host.log(error);
         }
+        scrolled
     }
+
+    /// Geometry for a new scroll intent, projected through offsets already queued
+    /// by earlier input. Hit testing keeps the acknowledged picture.
+    fn reveal_rect(&mut self, id: ViewId) -> Option<Rect4> {
+        let (mapping, b) = self.reveal_geometry(id)?;
+        b.scroll_bounds(&mapping)
+    }
+
+    fn reveal_geometry(&mut self, id: ViewId) -> Option<([f32; 9], PaintedBox)> {
+        let b = self.box_of(id)?;
+        let mut mapping = b.scroll_mapping()?;
+        let page = self.boxes_page;
+        let mut page_shift = (page.0 - self.page.0, page.1 - self.page.1);
+        let mut at = self.scroll_parent(id);
+        while let Some(a) = at {
+            at = self.scroll_parent(a);
+            let Some(scroller) = self.box_of(a) else {
+                continue;
+            };
+            if let Some(before) = scroller.scroll {
+                let after = self.scroll_of(a);
+                if before != after {
+                    mapping = self.reveal_shift(
+                        id,
+                        a,
+                        mapping,
+                        scroller.scroll_mapping()?,
+                        before,
+                        after,
+                    )?;
+                }
+            } else if at.is_none() && page != self.page {
+                mapping = self.reveal_shift(id, a, mapping, IDENTITY, page, self.page)?;
+                page_shift = (0., 0.);
+            }
+        }
+        mapping = shifted(mapping, IDENTITY, page_shift)?;
+        Some((mapping, b))
+    }
+
+    fn reveal_shift(
+        &mut self,
+        id: ViewId,
+        scroller: ViewId,
+        mut mapping: [f32; 9],
+        space: [f32; 9],
+        before: (f32, f32),
+        after: (f32, f32),
+    ) -> Option<[f32; 9]> {
+        let mut at = Some(id);
+        while let Some(id) = at.filter(|id| *id != scroller) {
+            let kernel = self.host.kernel();
+            let constraint = kernel
+                .node(id)
+                .and_then(|n| kernel.sticky_constraint(n.key));
+            at = self.scroll_parent(id);
+            if let Some(c) = constraint.filter(|c| c.scroller == scroller) {
+                let old = c.offset(before);
+                let new = c.offset(after);
+                // Sticky placement precedes the box's own transform in the painter.
+                let parent = at
+                    .and_then(|parent| self.box_of(parent))
+                    .map_or(Some(IDENTITY), |b| b.scroll_mapping())?;
+                mapping = shifted(mapping, parent, (new.0 - old.0, new.1 - old.1))?;
+            }
+        }
+        shifted(mapping, space, (before.0 - after.0, before.1 - after.1))
+    }
+}
+
+const IDENTITY: [f32; 9] = [1., 0., 0., 0., 1., 0., 0., 0., 1.];
+
+/// Move in the scroller's plane, then return to the viewport, retaining perspective.
+fn shifted(mapping: [f32; 9], space: [f32; 9], (x, y): (f32, f32)) -> Option<[f32; 9]> {
+    if x == 0. && y == 0. {
+        return Some(mapping);
+    }
+    let translation = [1., 0., x, 0., 1., y, 0., 0., 1.];
+    Some(mul3(
+        &space,
+        &mul3(&translation, &mul3(&inverse(space)?, &mapping)),
+    ))
 }
 
 /// How far a port's offset moves to show `target`'s middle, as the web's

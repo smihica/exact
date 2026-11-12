@@ -1,23 +1,29 @@
 //! The one door from the module into Rust (`__exact_host`), and the
 //! malloc'd strings it hands back.
 use super::{crypto, pure, wire, HostState};
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void};
 
 /// The one door from the module into Rust (`__exact_host` in the prelude).
 ///
 /// # Safety
 /// Called by the shim on the engine's thread with `ctx` the `HostState` the
-/// engine was created with, and `a`/`b` NUL-terminated for the call.
+/// engine was created with, and `a`/`b` valid for `a_len`/`b_len` bytes for
+/// the call. The strings carry their lengths, not a terminator: a JavaScript
+/// string may hold U+0000.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn host_door(
     ctx: *mut c_void,
     op: u32,
     a: *const c_char,
+    a_len: usize,
     b: *const c_char,
+    b_len: usize,
     out: *mut *mut c_char,
+    out_len: *mut usize,
 ) -> i32 {
     let state = &mut *(ctx as *mut HostState);
-    let a = CStr::from_ptr(a).to_string_lossy();
-    let b = CStr::from_ptr(b).to_string_lossy();
+    let a = String::from_utf8_lossy(std::slice::from_raw_parts(a as *const u8, a_len));
+    let b = String::from_utf8_lossy(std::slice::from_raw_parts(b as *const u8, b_len));
     let reply: Result<Option<String>, String> = match op {
         op if state.refused_ops.contains(&op) => Err(format!("__exact_host: no op {op}")),
         1 => match a.parse::<u64>() {
@@ -162,17 +168,29 @@ pub(crate) unsafe extern "C" fn host_door(
         9 => wire::canvas_measure(state.canvas.as_ref(), &a).map(Some),
         // Under the agent, `b` bytes of its repeatable stream as hex; else
         // nothing, and the draw is the OS's (LLP 1069.005 D2b).
-        11 => Ok(state.agent.as_mut().map(|stream| {
-            let mut bytes = vec![0; b.parse::<usize>().unwrap_or(0).min(65_536)];
-            stream.fill(&mut bytes);
-            crypto::hex(&bytes)
-        })),
+        11 => {
+            let wanted = b.parse::<usize>().unwrap_or(0).min(65_536);
+            // Said once, at the first draw of any bytes (the prelude's probe at load asks for none): a
+            // drive against a server that remembers a client (a session id it drew) meets the same
+            // client at every launch, and nothing else shows why.
+            if let Some(seed) = state.agent_unsaid.take_if(|_| wanted > 0) {
+                state.journal.push(format!("crypto: the driver seeds this launch's randomness (seed {seed}), so each launch at that seed draws the same bytes; --seed <n> draws others (LLP 1069.005 D2b)"));
+            }
+            Ok(state.agent.as_mut().map(|stream| {
+                let mut bytes = vec![0; wanted];
+                stream.fill(&mut bytes);
+                crypto::hex(&bytes)
+            }))
+        }
         10 => Ok(wire::canvas_image(state.canvas.as_ref(), &a)),
         // Whether this host listens (LLP 1133.005 §8): the desktop's, where
         // the prelude installs `exactListen`.
         12 if a == "listen" => {
             Ok(cfg!(any(target_os = "macos", target_os = "linux")).then(|| "1".into()))
         }
+        // Whether this is a bake: the prelude marks a stream's refused
+        // options there, as storage's refusal is (LLP 1016.000 D11).
+        12 if a == "bake" => Ok(state.baking.then(|| "1".into())),
         12 => Ok(crypto::auth_callback(state, &a)),
         // A journal line the runtime writes (LLP 1097 D8): a failed or
         // refused storage operation, an unhandled rejection. `logs` reads
@@ -265,17 +283,15 @@ pub(crate) unsafe extern "C" fn host_door(
         other => Err(format!("__exact_host: no op {other}")),
     };
     *out = std::ptr::null_mut();
-    match reply {
-        Ok(None) => 0,
-        Ok(Some(text)) => {
-            *out = c_string(&text);
-            0
-        }
-        Err(text) => {
-            *out = c_string(&text);
-            1
-        }
-    }
+    *out_len = 0;
+    let (status, text) = match reply {
+        Ok(None) => return 0,
+        Ok(Some(text)) => (0, text),
+        Err(text) => (1, text),
+    };
+    *out = c_string(&text);
+    *out_len = text.len();
+    status
 }
 
 /// Why a store operation is refused where the executor offers no store:

@@ -1,10 +1,10 @@
 //! A button's presentations past the window (LLP 1133.025 D4, D5): a
-//! `-exact-menu="status"` button is the app's status item on macOS and
-//! Windows, and one with `dock` among its ids an item of the Dock menu.
+//! `-exact-menu="status"` button is the app's status item on macOS, and one
+//! with `dock` among its ids an item of the Dock menu. Windows'
+//! notification-area icon is accepted and not built (LLP 1133.025 §14).
 //! The agent reads both from the session's tree on every host, as
-//! `state.statusItems` and `state.dockMenu`, so a drive sees what a Mac or
-//! Windows host would place, and the buttons stay ordinary where no host
-//! places them.
+//! `state.statusItems` and `state.dockMenu`, so a drive sees what a Mac
+//! would place, and the buttons stay ordinary where no host places them.
 
 use crate::{DataSource, Runner};
 use exact_kernel::{Display, Kernel, NodeType, PropId, PropList, ViewId};

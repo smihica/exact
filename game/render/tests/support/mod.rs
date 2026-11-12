@@ -61,6 +61,7 @@ pub(super) fn frame() -> FrameInput<'static> {
         sun: None,
         fill: None,
         lights: &[],
+        local_shadows: Default::default(),
         lights_dropped: 0,
         environment: Environment {
             tone_mapping: exact_game::ToneMapping::Aces,

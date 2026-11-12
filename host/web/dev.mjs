@@ -3,7 +3,7 @@
 // LAN clients can read plans, errors and generations (LLP 1023 D8); the agent
 // carrier and installer stay loopback-only. Games serve HTTP during the first build.
 import { buildingServer } from '../../game/dev.mjs';
-import { failedPhase, phased } from './dev-phase.mjs';
+import { acceptModuleReply, failedPhase, phased } from './dev-phase.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 let tuning = null;
 import { createHash, randomBytes } from 'node:crypto';
@@ -230,7 +230,7 @@ applyShaderTreeChange(app, resolve(dist,'shaders'), candidate => { for (const [n
 const clients = new Set();
 let seq = 0;
 const pending = new Map(); // seq -> { saved, ready }
-const push = (data) => { if (data.error) failedPhase(data.error); for (const res of clients) res.write(`data: ${JSON.stringify(data)}\n\n`); };
+const push = (data) => { if (data.error) { failedPhase(data.error); push.refused = true; } else if (data.generation) push.refused = false; for (const res of clients) res.write(`data: ${JSON.stringify(data)}\n\n`); };
 // The live table (LLP 1121 stage 4): a value-only design edit publishes no
 // plan; its batch goes to every build, and its snapshot is kept for a build
 // that connects (or missed a batch) until the next plan.
@@ -725,10 +725,6 @@ function startModuleCompiler() {
   child.stdout.on('data', chunk => {
     if (dev !== child) return;
     buffered += chunk;
-    if (buffered.length > 1024 * 1024) {
-      console.error('module producer response exceeds 1 MiB');
-      killCompiler(); process.exit(1);
-    }
     const lines = buffered.split('\n'); buffered = lines.pop();
     for (const line of lines) {
       let response = null;
@@ -736,11 +732,8 @@ function startModuleCompiler() {
       if (typeof response?.id === 'string' && scrubAsks.has(response.id)) { scrubAsks.get(response.id)(response); continue; }
       const request = active, produced = Date.now();
       try {
-        const reply = JSON.parse(line);
-        if (!request || reply.id !== request.id) throw new Error('unexpected module producer response');
-        // An edit arriving during compilation supersedes its entire candidate.
-        if (request.id !== moduleRun) continue;
-        if (!reply.ok) throw new Error(reply.error || 'module producer refused the candidate');
+        const reply = acceptModuleReply(line, request, moduleRun);
+        if (!reply) continue;
         early?.phase('typescript','ready'); contractReady(request.contract);
         const candidate = new Map(['app.plan', 'app.plan.map.json', ...Object.values(MODULE_FILES)].map(name => [name, readFileSync(resolve(request.output, name))]));
         for (const [name, body] of captureAssets(request.output)) candidate.set(name, body);
@@ -926,9 +919,9 @@ function produceRustNow() {
           if(reply.id!==rustRun||!rustActive||typeof reply.ok!=='boolean')throw new Error('invalid Rust producer reply');
           rustActive=false;clearInterval(rustHeartbeat);rustHeartbeat=null;
           if(!reply.ok){early?.phase('rust','failed');console.error(reply.error);push({error:reply.error});}
-          // The reply follows the pointer's rename; the directory watch would
-          // see it a filesystem event later and then finds it current.
-          else try{readRustGeneration();early?.phase('rust','ready');contractReady();}catch(error){console.error(error.message);push({error:error.message});}
+          // The reply follows the pointer's rename; the directory watch would see it a filesystem event later and then finds it current.
+          // A repair that makes the running generation again publishes nothing new: it is announced once more, so a client showing the save's error takes it down (LLP 1159.001).
+          else try{readRustGeneration();early?.phase('rust','ready');contractReady();if(push.refused&&current)push(announcement());}catch(error){console.error(error.message);push({error:error.message});}
           if(rustDirty && rebuildOn.rust==='save') rustPending = true;
           drainBuilds();
         } catch(error){failed(error);return;}

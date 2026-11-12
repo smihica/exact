@@ -159,6 +159,28 @@ strokeStyle = g
 globalCompositeOperation = "copy"
 globalCompositeOperation = "xor"
 
+## arcTo nearly doubles back to the corner
+moveTo(0, 50)
+arcTo(100, 50, 0, 50.0000001, 5)
+stroke()
+beginPath()
+moveTo(0, 50)
+arcTo(100, 50, 0, 50.0001, 5)
+stroke()
+beginPath()
+moveTo(0, 50)
+arcTo(100, 50, 0, 50.01, 5)
+stroke()
+beginPath()
+moveTo(0, 50)
+arcTo(100, 50, 0, 50.0244, 5)
+stroke()
+
+## arcTo outside the collinear tolerance keeps the arc
+moveTo(0, 50)
+arcTo(100, 50, 0, 50.0245, 5)
+stroke()
+
 ## stage 2: every compositing operator is accepted
 globalCompositeOperation = "source-in"
 ? globalCompositeOperation => source-in

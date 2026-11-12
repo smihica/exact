@@ -527,6 +527,56 @@ fn hue_methods_go_round_as_css_says() {
     assert!((hue(m) - 264.0).abs() < 0.5, "{}", hue(m));
 }
 
+/// Hues exactly 180° apart take no adjustment under `shorter` or `longer`
+/// (CSS Color 4 §12.4), so the hue rises from the first to the second.
+#[test]
+fn opposite_hues_go_round_from_the_first() {
+    let in_space = |space, hue| Interpolation { space, hue };
+    let lch = |h: f64| Wide {
+        space: Space::Lch,
+        c: [70.0, 30.0, h],
+        alpha: 1.0,
+    };
+    let lch_hue = |v: [f64; 3]| crate::mix::MixSpace::Lch.from_linear_srgb(v)[2];
+    for method in [HueMethod::Shorter, HueMethod::Longer] {
+        let how = in_space(crate::mix::MixSpace::Lch, method);
+        for (a, b) in [(0.0, 180.0), (180.0, 0.0), (90.0, 270.0), (270.0, 90.0)] {
+            let (m, _) = mix(&lch(a), &lch(b), 0.5, how);
+            let want = (a + b) / 2.0;
+            assert!(
+                (lch_hue(m) - want).abs() < 0.01,
+                "lch {a} to {b}, {method:?}: {}",
+                lch_hue(m)
+            );
+        }
+        // Legacy colours mix in hsl after a conversion, whose rounding must
+        // not pick the arc: cyan and red, and #fff000 and #000fff.
+        let how = in_space(crate::mix::MixSpace::Hsl, method);
+        let (m, _) = mix(
+            &srgb(0.0, 1.0, 1.0, 1.0),
+            &srgb(1.0, 0.0, 0.0, 1.0),
+            0.5,
+            how,
+        );
+        assert!(
+            close(m.map(linear_to_srgb), [0.5, 1.0, 0.0], 1e-9),
+            "cyan to red, {method:?}: {:?}",
+            m.map(linear_to_srgb)
+        );
+        let (m, _) = mix(
+            &srgb(1.0, 240.0 / 255.0, 0.0, 1.0),
+            &srgb(0.0, 15.0 / 255.0, 1.0, 1.0),
+            0.5,
+            how,
+        );
+        let hsl_hue = crate::mix::MixSpace::Hsl.from_linear_srgb(m)[0];
+        assert!(
+            (hsl_hue - 146.470588).abs() < 0.001,
+            "#fff000 to #000fff, {method:?}: {hsl_hue}"
+        );
+    }
+}
+
 #[test]
 fn interpolation_methods_parse_and_serialise() {
     let (how, n) = Interpolation::parse(&["in", "oklch", "longer", "hue", "45deg"]).unwrap();

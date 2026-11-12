@@ -107,6 +107,88 @@ final class PressPaintTests: XCTestCase {
         XCTAssertEqual(keeps.style["text_color"], ink(green))
     }
 
+    func testABatchUnderTheReleasedNodeEndsItsCrossFade() throws {
+        try XCTSkipIf(ExactEnv.agentFreezes, "the agent's frozen clock shows the paint at once")
+        let (p, v) = try fixture(["press_background_color": navy])
+        p.apply(wireBatch([
+            ["op": "create", "id": 4, "kind": "view", "style": ["background_color": green]],
+            ["op": "roots", "ids": [1, 4]],
+            ["op": "frame", "id": 4, "x": 50.0, "y": 200.0, "w": 200.0, "h": 40.0],
+        ]))
+        v.pressed = true
+        v.press.start -= 1; v.pressPaint.at -= 1 // released a moment later
+        v.pressed = false
+        XCTAssertNotNil(layer(v)?.animation(forKey: kCATransition), "the colours fade back")
+        p.apply(wireBatch([["op": "frame", "id": 4, "x": 50.0, "y": 210.0, "w": 200.0, "h": 40.0]]))
+        XCTAssertNotNil(layer(v)?.animation(forKey: kCATransition), "a batch elsewhere leaves it")
+        p.apply(wireBatch([
+            ["op": "props", "id": 2, "props": ["text": "Following"]],
+        ]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "the new content shows at once")
+    }
+
+    private func releaseWithFade(_ node: NodeView) throws {
+        try XCTSkipIf(ExactEnv.agentFreezes, "the frozen clock shows paint at once")
+        node.pressed = true
+        node.press.start -= 1; node.pressPaint.at -= 1
+        node.pressed = false
+        XCTAssertNotNil(layer(node)?.animation(forKey: kCATransition))
+    }
+
+    func testAnOriginOnlyMoveKeepsTheFadeButAResizeEndsIt() throws {
+        let (p, v) = try fixture(["press_background_color": navy])
+        try releaseWithFade(v)
+        p.apply(wireBatch([["op": "frame", "id": 1, "x": 30.0, "y": 80.0, "w": 200.0, "h": 100.0]]))
+        XCTAssertNotNil(layer(v)?.animation(forKey: kCATransition), "the snapshot moves with the unchanged button")
+        p.apply(wireBatch([["op": "frame", "id": 1, "x": 30.0, "y": 80.0, "w": 220.0, "h": 100.0]]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "the old size must not ghost")
+    }
+
+    func testAnOriginOnlyChildMoveEndsOnlyTheAncestorFade() throws {
+        let (p, v) = try fixture(["press_background_color": navy])
+        p.apply(wireBatch([
+            ["op": "create", "id": 4, "kind": "view", "handlers": ["press"],
+             "style": ["background_color": blue, "press_background_color": navy]],
+            ["op": "children", "id": 1, "ids": [2, 3, 4]],
+            ["op": "frame", "id": 4, "x": 0.0, "y": 40.0, "w": 20.0, "h": 20.0],
+        ]))
+        let child = try XCTUnwrap(p.views[4])
+        try releaseWithFade(v)
+        try releaseWithFade(child)
+        p.apply(wireBatch([["op": "frame", "id": 4, "x": 40.0, "y": 40.0, "w": 20.0, "h": 20.0]]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "the ancestor snapshot holds the child's old position")
+        XCTAssertNotNil(layer(child)?.animation(forKey: kCATransition), "the child's snapshot moves with it")
+    }
+
+    func testAnSVGOnlyChangeEndsTheAncestorFade() throws {
+        let (p, v) = try fixture(["press_background_color": navy])
+        func scene(_ color: [Double]) -> [String: Any] {
+            ["op": "svg", "id": 4, "scene": ["box": [0, 0, 20, 20], "t": [1, 0, 0, 1, 0, 0],
+                "els": [["id": 5, "n": 5, "h": true, "o": 1, "p": [0, 0, 0, 1, 20, 0, 1, 20, 20, 1, 0, 20, 3], "f": color]]]]
+        }
+        p.apply(wireBatch([["op": "create", "id": 4, "kind": "svg"],
+            ["op": "children", "id": 1, "ids": [2, 3, 4]], scene(blue)]))
+        try releaseWithFade(v)
+        p.apply(wireBatch([scene(green)]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "an icon-only update must not ghost")
+    }
+
+    #if os(iOS)
+    func testAFlatChildOnlyChangeEndsTheAncestorFade() throws {
+        let (p, v) = try fixture(["press_background_color": navy])
+        p.apply(wireBatch([["op": "create", "id": 4, "kind": "view", "style": ["background_color": blue]],
+            ["op": "children", "id": 1, "ids": [2, 3, 4]],
+            ["op": "frame", "id": 4, "x": 0.0, "y": 40.0, "w": 20.0, "h": 20.0]]))
+        XCTAssertNil(p.views[4]); XCTAssertTrue(p.flats.isFlat(4))
+        try releaseWithFade(v)
+        p.apply(wireBatch([["op": "style", "id": 4, "style": ["background_color": green]]]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "the old indicator must not ghost")
+        try releaseWithFade(v)
+        p.apply(wireBatch([["op": "frame", "id": 4, "x": 40.0, "y": 40.0, "w": 20.0, "h": 20.0]]))
+        XCTAssertNil(layer(v)?.animation(forKey: kCATransition), "moving a flat indicator invalidates its host's snapshot")
+    }
+    #endif
+
     func testADroppedPressColourTakesTheHeldAncestorsColour() throws {
         let (p, outer) = try fixture(["press_color": yellow])
         p.apply(wireBatch([

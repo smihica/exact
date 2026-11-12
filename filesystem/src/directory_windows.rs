@@ -156,8 +156,10 @@ impl Directory {
     pub fn root(path: &str, create: bool) -> io::Result<Self> {
         let mut parts = Path::new(path).components();
         let drive = match parts.next() {
+            // `\\?\C:\…`, as `std::fs::canonicalize` spells a drive path, is the same path. The walk below
+            // refuses the `.`, `..` and `/` that the verbatim spelling leaves unnormalized.
             Some(Component::Prefix(prefix)) => match prefix.kind() {
-                Prefix::Disk(drive) => drive as char,
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive as char,
                 _ => return Err(refuse("root requires an absolute local drive path")),
             },
             _ => return Err(refuse("root must be absolute")),
@@ -306,29 +308,6 @@ impl Directory {
         }
         names.sort();
         Ok(names)
-    }
-    pub fn visit_files(
-        &self,
-        prefix: &str,
-        visit: &mut impl FnMut(&str, &Directory, &str) -> io::Result<()>,
-    ) -> io::Result<()> {
-        for leaf in self.names()? {
-            let path = format!("{prefix}{leaf}");
-            match self.kind(&leaf)? {
-                Kind {
-                    directory: true, ..
-                } => self
-                    .child(&leaf, false)?
-                    .visit_files(&format!("{path}/"), visit)?,
-                Kind { regular: true, .. } => visit(&path, self, &leaf)?,
-                _ => {
-                    return Err(refuse(
-                        "static app files must be regular files or directories",
-                    ))
-                }
-            }
-        }
-        Ok(())
     }
     pub fn unlink(&self, leaf: &str) -> io::Result<()> {
         let file = open(&self.0, leaf, DELETE, FILE_OPEN, false)?;

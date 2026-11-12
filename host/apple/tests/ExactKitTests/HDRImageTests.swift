@@ -42,10 +42,8 @@ final class HDRImageTests: XCTestCase {
     }
     private func decode(_ file: String, variant: UInt32?) throws -> (RasterMetadata, RasterDecodePlan, RasterImage) {
         let (bytes, metadata) = try header(file)
-        var pixel = Int(max(metadata.naturalSize.width, metadata.naturalSize.height))
-        var plan = try? RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant)
-        while plan == nil, pixel > 1 { pixel /= 2; plan = try? RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant) }
-        let fitted = try XCTUnwrap(plan)
+        let pixel = min(1024, Int(max(metadata.naturalSize.width, metadata.naturalSize.height)))
+        let fitted = try RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant)
         return (metadata, fitted, try RasterImage.decode(bytes, metadata: metadata, plan: fitted, charge: HDRTestCharge()))
     }
 
@@ -245,15 +243,17 @@ final class HDRImageTests: XCTestCase {
     }
     #endif
 
-    /// The budget's ladder: an HDR plan costs 8 bytes a pixel; the 4096²
-    /// fixture can't have one at full size, and its SDR rendition is 4.
+    /// An HDR plan costs 8 bytes a pixel and its SDR rendition 4. Planning
+    /// computes their costs; admission holds them to the session's budget.
     func testAnHDRPlanCostsEightBytesAPixel() throws {
         let metadata = try header("gainmap-huge.jpg").1
         let hdr = try RasterDecodePlan(metadata: metadata, maxPixel: 1024, variant: RasterVariant.hdr)
         let sdr = try RasterDecodePlan(metadata: metadata, maxPixel: 1024)
         XCTAssertEqual(hdr.bytesPerPixel, 8)
         XCTAssertEqual(sdr.bytesPerPixel, 4)
-        XCTAssertThrowsError(try RasterDecodePlan(metadata: metadata, maxPixel: 4096, variant: RasterVariant.hdr))
+        let full = try RasterDecodePlan(metadata: metadata, maxPixel: 4096, variant: RasterVariant.hdr)
+        XCTAssertEqual(full.outputBytes, 4096 * 4096 * 8)
+        XCTAssertGreaterThan(full.peakBytes, 192 * 1024 * 1024)
     }
 }
 

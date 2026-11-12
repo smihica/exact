@@ -79,7 +79,7 @@ fn shade(input: Surface, visibility: f32) -> vec4<f32> {
     let roughness = clamp(input.material.y, 0.045, 1.0);
     let emissive = input.emissive;
     let n = normalize(input.normal);
-    let v = normalize(frame.camera_alpha.xyz - input.world);
+    let v = view_direction(input.world);
     // The colour in `shading` (frame.wgsl): f16 where the device has it.
     let albedo = vec3<shading>(base);
     var color = ambient(n, v, albedo, metallic, roughness) + vec3<shading>(emissive);

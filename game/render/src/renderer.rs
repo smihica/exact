@@ -84,6 +84,10 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     /// Timestamp pairs this frame wrote (`timing::GPU_PASS_NAMES` bits), so a
     /// readback never reports a pass that did not run.
     pub(crate) timed: std::cell::Cell<u64>,
+    /// The last frame's shared model pipeline key bits (`Game::PREPARE`'s
+    /// warm-up reads them), and the keys that warm-up prepared.
+    pub(crate) model_frame: std::cell::Cell<Option<crate::models::ModelFrame>>,
+    pub(crate) warmed: std::collections::BTreeSet<(u8, usize)>,
     pub(crate) local: Option<crate::local_shadows::LocalMaps>,
     pub(crate) local_plan: crate::local_shadows::Plan,
     pub(crate) local_culls: Vec<local::LocalCull>,
@@ -104,8 +108,8 @@ pub struct RendererWithAssets<const ASSETS: bool> {
     viewmodels: bool,
     /// Levels of detail: one per entity per frame.
     pub(crate) levels: crate::lod::Levels,
-    // Soft particles have drawn: keep the forward depth retained.
-    soft_retained: bool,
+    // Soft particles or water shafts have drawn: keep the forward depth retained.
+    effects_retained: bool,
     // This frame's visible environment map is resident.
     pub(crate) sky_ready: bool,
     pub(crate) targets: Targets,
@@ -403,6 +407,8 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             environment,
             lights,
             timed: std::cell::Cell::new(0),
+            model_frame: std::cell::Cell::new(None),
+            warmed: Default::default(),
             local: None,
             local_plan: Default::default(),
             local_culls: Vec::new(),
@@ -419,7 +425,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             batch_coverage: Vec::new(),
             viewmodels: false,
             levels: Default::default(),
-            soft_retained: false,
+            effects_retained: false,
             sky_ready: false,
             targets,
             direct_targets: None,

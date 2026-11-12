@@ -124,18 +124,17 @@ impl<D: DataSource> Runner<D> {
     /// Tell the runner its delivery facts. Every resource reading
     /// [`crate::delivery::SOURCE`] is answered again in one commit; `None`
     /// when the facts did not change, or when no resource reads them.
+    /// A refused commit keeps the previous facts.
     pub fn set_delivery(
         &mut self,
         delivery: Delivery,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
-        if delivery == self.delivery {
-            return Ok(None);
-        }
-        self.delivery = delivery;
-        let which: Vec<usize> = (0..self.plan.resources.len())
-            .filter(|i| self.plan.str(self.plan.resources[*i].source) == SOURCE)
-            .collect();
-        self.recommit(which, "delivery")
+        self.replace_fact(
+            |r| &mut r.delivery,
+            delivery,
+            SOURCE,
+            |r, _, readers| r.recommit(readers, "delivery"),
+        )
     }
 
     /// [`Runner::set_delivery`] with the binary's own three facts read out
@@ -154,7 +153,7 @@ impl<D: DataSource> Runner<D> {
     /// shape names its fields. A field the runner does not know is a
     /// refusal — bake catches it first, as `bake-delivery-field`.
     pub(super) fn delivery_answer(&self, i: usize) -> Result<Value, DataError> {
-        let row = &self.plan.resources[i];
+        let row = self.resource_row(i);
         if row.args.len > 0 {
             return Err(DataError::BadArguments(format!(
                 "{SOURCE} takes no arguments"

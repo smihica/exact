@@ -451,9 +451,12 @@ impl Parser {
                 parts.push(TemplatePart::Text(std::mem::take(&mut text)));
             }
             let inner = &after[..end];
+            // Leading spaces in an expression fragment are not file indentation.
+            let leading = inner.len() - inner.trim_start_matches(' ').len();
+            let inner = &inner[leading..];
             // `raw` starts after the backtick. Keep byte offsets through Unicode
             // prefixes, repeated interpolations, and recursively nested templates.
-            let col = span.col + 1 + (raw.len() - after.len()) as u32;
+            let col = span.col + 1 + (raw.len() - after.len() + leading) as u32;
             let mut tokens = Lexer::tokenize_at(
                 inner,
                 Span {

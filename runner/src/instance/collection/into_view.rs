@@ -94,9 +94,7 @@ impl IntoViewStatus {
             IntoViewStatus::Unconverged => "unconverged",
             IntoViewStatus::Cancelled => "cancelled",
             IntoViewStatus::Refused(why) => {
-                out.push_str("\"refused: ");
-                out.push_str(&why.replace('"', "'"));
-                out.push('"');
+                crate::agent::quote(&format!("refused: {why}"), out);
                 return;
             }
         };

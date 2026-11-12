@@ -1060,6 +1060,16 @@ test('a declared check refuses a send on the JS target, and leaves its state', a
   clock.agent = false;
 });
 
+// LLP 1133.021 §12: a send with nothing preferred answers its declared default, as the runner's `decide`.
+test('a send with nothing preferred answers its declared default, a copy each time', async () => {
+  const { modules } = await import(resolve(dir, 'modules.js'));
+  modules({ read: ['dflt.read', true, { default: { token: null, status: 0 } }, 'u', 'never', null, false], find: ['dflt.find', true, { default: [] }, 'u', 'never', null, false],
+    bare: ['dflt.bare', true, {}, 'u', 'never', null, false] }, {});
+  const call = send => globalThis.exact.extensions.call({ extension: 'dflt', send, args: {} });
+  (await call('read')).status = 1;
+  expect([await call('read'), await call('find'), await call('bare')]).toEqual([{ token: null, status: 0 }, [], { error: 'NotSupportedError' }]);
+});
+
 // LLP 1133.004 D6, LLP 1133.002 D12: a module event's origin on the JS target.
 test('a command keeps the origin of the commit that queued it, whenever its tail runs', async () => {
   const { commit, C, Hosts, Origin } = await import(resolve(dir, 'rt.js'));
@@ -1294,7 +1304,7 @@ test('translation expansion stops when its output exceeds the byte budget', asyn
 
 test('an argument or a write past MAX_STRING is refused by name, and a trapping argument is a trap, poisoned or not', async () => {
   const { act, sig, W, effect, journal } = await import(resolve(dir, 'rt.js'));
-  const { Trap, tg } = await import(resolve(dir, 'budget.js'));
+  const { Trap, tg, x_encodeRouteSegment } = await import(resolve(dir, 'budget.js'));
   const last = () => journal.at(-1).replace(/^t=\S+ /, '');
   const t = sig('', 's', 't');
   const put = act(v => W(t, v), ['s'], 0, ['v']);
@@ -1313,22 +1323,29 @@ test('an argument or a write past MAX_STRING is refused by name, and a trapping 
   expect(last()).toBe('refused action: Trap(IterationLimit { pc: 17 })');
   // A prop or style binding's trap unsets its row and the commit goes on (LLP 1017.003 D3), with one journal line however
   // many writes read it (here two, as a painted flag and its row), until it evaluates to a value again.
-  const m = sig(0, 'm');
-  const el = {}, text = () => { if (m() > 0) throw new Trap('IterationLimit', 5); return 'x'; };
-  const lines = () => journal.filter(l => l.endsWith('site 4: text trapped Trap(IterationLimit { pc: 5 }); unset')).length;
-  let shown = 'x', painted = 'x';
-  effect(() => { shown = tg(el, 4, 'text', text)(); });
-  effect(() => { painted = tg(el, 4, 'text', text)(); });
-  const set = v => { act(() => W(m, v))(); globalThis.heldTail?.(); };
-  set(1);
-  expect(lines()).toBe(1);
-  expect([shown, painted]).toEqual([null, null]);
-  set(2);
-  expect(lines()).toBe(1);
-  set(0);
-  expect([shown, painted]).toEqual(['x', 'x']);
-  set(1);
-  expect(lines()).toBe(2);
+  const bindings = [
+    ['text', v => { if (v > 0) throw new Trap('IterationLimit', 5); return 'x'; }, 'IterationLimit'],
+    ...['', '.', '..'].map(invalid => ['href', v => `/chat/${x_encodeRouteSegment(v > 0 ? invalid : 'a/b', 5)}`, 'PathParameter']),
+  ];
+  for (const [row, binding, trap] of bindings) {
+    const m = sig(0, 'm'), start = journal.length;
+    const el = {}, text = () => binding(m());
+    const lines = () => journal.slice(start).filter(l => l.endsWith(`site 4: ${row} trapped Trap(${trap} { pc: 5 }); unset`)).length;
+    let shown, painted;
+    effect(() => { shown = tg(el, 4, row, text)(); });
+    effect(() => { painted = tg(el, 4, row, text)(); });
+    const set = v => { act(() => W(m, v))(); globalThis.heldTail?.(); };
+    set(1);
+    expect(lines()).toBe(1);
+    expect([shown, painted]).toEqual([null, null]);
+    set(2);
+    expect(m()).toBe(2);
+    expect(lines()).toBe(1);
+    set(0);
+    expect([shown, painted]).toEqual(row === 'href' ? ['/chat/a%2Fb', '/chat/a%2Fb'] : ['x', 'x']);
+    set(1);
+    expect(lines()).toBe(2);
+  }
   // Any other trap while the tree updates (a subject's, a key's) poisons, as the runner's InstanceError; an argument still traps first.
   const n = sig(0, 'n');
   effect(() => { if (n() > 0) throw new Trap('IterationLimit', 9); });

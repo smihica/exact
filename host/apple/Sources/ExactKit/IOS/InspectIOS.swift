@@ -188,7 +188,7 @@ enum InspectHost {
     /// native bar or control stands in for is hidden in the content).
     static func shown(_ view: UIView) -> Bool {
         var at: UIView? = view
-        while let v = at { if v.isHidden || v.alpha < 0.01 { return false }; at = v.superview }
+        while let v = at { if v.isHidden || v.alpha < 0.01 || (v as? NodeView)?.drawnBySurface == true { return false }; at = v.superview }
         return true
     }
 

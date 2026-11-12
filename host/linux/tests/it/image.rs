@@ -169,3 +169,62 @@ fn raster_tint_preserves_alpha_background_and_border_in_both_painters() {
     std::fs::remove_dir_all(dir).unwrap();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn a_bordered_rounded_picture_ends_at_the_borders_inner_curve() {
+    use exact_linux::{presenter::PainterChoice, Presenter};
+
+    use std::time::Duration;
+    // CSS Backgrounds 3 §5.3: replaced content is clipped to the content
+    // edge's curve, each radius less the border beside it. The ring is
+    // 24 to 30 points from the centre, on the diagonals too.
+    let dir = std::env::temp_dir().join(format!("exact-picture-ring-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut pixels = tiny_skia::Pixmap::new(48, 48).unwrap();
+    pixels.fill(tiny_skia::Color::from_rgba8(0, 0, 255, 255));
+    pixels.save_png(dir.join("blue.png")).unwrap();
+    let plan = contract::compile(
+        r##"component App
+  view
+    column align-items="flex-start"
+      image "blue.png" width=60 height=60 box-sizing="border-box" border-style="solid" border-width=6 border-color="#ff0000" border-radius="50%"
+"##,
+    )
+    .unwrap();
+    let mut choices = vec![PainterChoice::Cpu];
+    if exact_linux::gpu::Gpu::new().is_ok() {
+        choices.push(PainterChoice::Gpu);
+    }
+    if exact_linux::ink::Ink::new().is_ok() {
+        choices.push(PainterChoice::Ink);
+    }
+    let mut failures = Vec::new();
+    for choice in choices {
+        let (mut p, error) =
+            Presenter::boot_with(&plan.encode(), (), (80., 80.), 1., dir.clone(), choice).unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.wait_images(Duration::from_secs(3));
+        let frame = p.frame();
+        for ((x, y), expected) in [
+            ((30, 3), [255, 0, 0]),
+            ((3, 30), [255, 0, 0]),
+            ((11, 11), [255, 0, 0]),
+            ((49, 11), [255, 0, 0]),
+            ((48, 48), [255, 0, 0]),
+            ((14, 14), [0, 0, 255]),
+            ((30, 30), [0, 0, 255]),
+        ] {
+            let pixel = frame.pixel(x, y).unwrap().demultiply();
+            let actual = [pixel.red(), pixel.green(), pixel.blue()];
+            if actual
+                .into_iter()
+                .zip(expected)
+                .any(|(a, b)| a.abs_diff(b) > 8)
+            {
+                failures.push(format!("{choice:?} ({x},{y}): {actual:?} != {expected:?}"));
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

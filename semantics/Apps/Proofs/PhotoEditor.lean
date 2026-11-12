@@ -1,7 +1,6 @@
 /-
-Photo Editor (apps/photo-editor/app.contract): a native editor module
-reports gestures; two buttons rotate and reset; `ready` records that the
-photo loaded.
+Photo Editor (apps/photo-editor/app.contract): the native editor reports
+when a photo loads; `ready` records that it has loaded at least once.
 -/
 import Apps.PhotoEditor
 open Contract
@@ -17,7 +16,9 @@ theorem keeps_ready {c name args rows} :
     BodyKeeps photoEditor "ready" (· = .bool true) c name args rows := by
   refine BodyKeeps.of_wp fun a ha _ => ?_
   simp only [photoEditor, List.mem_cons, List.mem_nil_iff, or_false] at ha
-  rcases ha with rfl | rfl | rfl | rfl | rfl <;> simp [wp, assignPre, Keeps, Effects.write, Effects.rowWrite]
+  repeat' first | (rcases ha with rfl | ha) | subst ha
+  all_goals simp [wp, assignPre, Keeps, Assn.outer, Effects.write, Effects.rowWrite,
+    Effects.send, Effects.command]
 
 /-- **Once ready, always ready.** From any configuration where the photo
 has loaded, no event — a gesture, a tap, a payload of any shape, a clock

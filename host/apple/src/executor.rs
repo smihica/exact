@@ -16,6 +16,26 @@ pub type WakeFn = extern "C" fn(ctx: *mut c_void);
 pub struct Executor {
     core: core::Core,
 }
+
+/// What the process an executor starts in is (LLP 1133.007 §8, D6).
+pub struct Launch {
+    /// It starts programs for data code: the Mac.
+    pub processes: bool,
+    /// Its executable, beside which an iOS or tvOS bundle keeps its
+    /// declared resources (`declared_resources`).
+    pub executable: Option<std::path::PathBuf>,
+}
+
+impl Launch {
+    /// This process.
+    pub fn here() -> Self {
+        Self {
+            processes: cfg!(target_os = "macos"),
+            executable: std::env::current_exe().ok(),
+        }
+    }
+}
+
 impl Executor {
     /// Start one ordered owner and six independent HTTP owners. Bindings are
     /// never shared between owners. Retired but unfinished workers remain
@@ -24,6 +44,15 @@ impl Executor {
         bindings: Option<ibex2::host::Bindings>,
         grants: &str,
         wake: Option<(WakeFn, *mut c_void)>,
+    ) -> Self {
+        Self::start_as(bindings, grants, wake, Launch::here())
+    }
+    /// [`Executor::start`] as `launch` says the process is.
+    pub fn start_as(
+        bindings: Option<ibex2::host::Bindings>,
+        grants: &str,
+        wake: Option<(WakeFn, *mut c_void)>,
+        launch: Launch,
     ) -> Self {
         exact_runner::local_network::launch_once(local_network_prompts);
         let wake = wake.map(|(f, ctx)| (f, ctx as usize));
@@ -36,9 +65,16 @@ impl Executor {
                 }
             }),
         );
-        // The Mac starts programs for data code; iOS and tvOS do not (LLP 1133.007 §8).
-        if cfg!(target_os = "macos") {
+        // The Mac starts programs for data code; iOS and tvOS do not (LLP
+        // 1133.007 §8). There `bundle:/` is the trees the app declared and
+        // `home:` is absent (D6).
+        if launch.processes {
             core.allow_processes();
+        } else {
+            ibex2::stdlib::fs::set_roots(ibex2::stdlib::fs::Roots {
+                home: None,
+                bundle: declared_resources(launch.executable),
+            });
         }
         Self { core }
     }
@@ -293,4 +329,47 @@ pub fn start_io(
     wake: Option<(WakeFn, *mut c_void)>,
 ) -> Box<dyn Io> {
     Box::new(Executor::start(bindings, grants, wake))
+}
+
+/// The folder of an iOS or tvOS bundle that holds the trees
+/// `host.ios.resources` declares (`IOS_RESOURCE_ROOT` in
+/// `host/apple/assets.mjs`), beside the app's executable; `None` when the app
+/// declared none, so `bundle:` paths refuse as unsupported. A link there is
+/// not taken for it. An extension has none: a widget's refresh reads `app:`
+/// only (`js/src/lib.rs`, a snapshot's endowment).
+fn declared_resources(executable: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let root = executable?.parent()?.join("ExactResources");
+    let folder = std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir());
+    folder.then_some(root)
+}
+
+#[cfg(all(test, unix))]
+mod resource_tests {
+    use super::declared_resources;
+
+    #[test]
+    fn the_declared_resources_are_the_bundle_folder_beside_the_executable() {
+        let app = std::env::temp_dir().join(format!("exact-resources-{}.app", std::process::id()));
+        let _ = std::fs::remove_dir_all(&app);
+        std::fs::create_dir_all(&app).unwrap();
+        let executable = Some(app.join("App"));
+        assert_eq!(
+            declared_resources(executable.clone()),
+            None,
+            "nothing declared"
+        );
+        std::os::unix::fs::symlink(std::env::temp_dir(), app.join("ExactResources")).unwrap();
+        assert_eq!(declared_resources(executable.clone()), None, "a link");
+        std::fs::remove_file(app.join("ExactResources")).unwrap();
+        std::fs::create_dir(app.join("ExactResources")).unwrap();
+        assert_eq!(
+            declared_resources(executable),
+            Some(app.join("ExactResources"))
+        );
+        // A widget extension's executable has no folder of its own.
+        let widget = app.join("PlugIns/ExactWidgets.appex/ExactWidgets");
+        std::fs::create_dir_all(widget.parent().unwrap()).unwrap();
+        assert_eq!(declared_resources(Some(widget)), None);
+        std::fs::remove_dir_all(&app).unwrap();
+    }
 }

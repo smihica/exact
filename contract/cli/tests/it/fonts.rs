@@ -687,6 +687,68 @@ fn unsupported_css_generics_are_diagnosed_and_quoted_names_stay_local() {
 }
 
 #[test]
+fn literal_family_quotes_preserve_the_name_and_fallback() {
+    for (family, name) in [
+        (r#""O'Brien", serif"#, "O'Brien"),
+        (r#""'Missing'", serif"#, "'Missing'"),
+        (r#"'Say "hi" again', serif"#, r#"Say "hi" again"#),
+    ] {
+        let literal = serde_json::to_string(family).unwrap();
+        let plan = contract::compile(&format!(
+            "component App\n  view\n    text \"x\" testId=\"text\" font-family={literal}\n"
+        ))
+        .unwrap();
+        let stack = exact_runner::bridge::plan_stack(&plan, family).unwrap();
+        let members: Vec<_> = plan
+            .stack(exact_plan::StacksId(stack.into()))
+            .members
+            .iter()
+            .map(|id| {
+                let member = plan.stack_member(id);
+                (
+                    member.kind,
+                    member.family.map(|f| plan.str(plan.familie(f).name)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                (exact_plan::StackMemberKind::Family, Some(name)),
+                (exact_plan::StackMemberKind::Serif, None),
+            ],
+            "{family}"
+        );
+        let r = Runner::boot(
+            plan,
+            NoData,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        let k = r.kernel();
+        let node = k.node_by_key(k.find_by_test_id("text")[0]).unwrap();
+        assert_eq!(node.style.font_family, stack, "{family}");
+    }
+
+    for family in [
+        r#"'"Missing"', monospace"#,
+        r#"'"Missing', monospace"#,
+        r#"'Missing"', monospace"#,
+        r#"'Say "hi"', serif"#,
+    ] {
+        let literal = serde_json::to_string(family).unwrap();
+        let error = contract::compile(&format!(
+            "component App\n  view\n    text \"x\" font-family={literal}\n"
+        ))
+        .unwrap_err();
+        assert_eq!(error.id, "lower-font-family-list", "{error}");
+        assert!(error.message.contains("quote"), "{error}");
+    }
+}
+
+#[test]
 fn css_quoted_commas_do_not_alias_lists_and_family_matching_ignores_case() {
     let plan = contract::compile("component App\n  view\n    column\n      text \"a\" font-family=\"'Comma, Family'\"\n      text \"b\" font-family=\"Comma, Family\"\n      text \"c\" font-family=\"Inter\"\n      text \"d\" font-family=\"inter\"\n").unwrap();
     assert_eq!(

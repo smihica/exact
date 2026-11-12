@@ -24,11 +24,9 @@ final class RasterColorTests: XCTestCase {
     private func decode(_ file: String, variant: UInt32? = nil, maxPixel: Int? = nil) throws -> (RasterMetadata, RasterDecodePlan, RasterImage) {
         let bytes = try Data(contentsOf: Self.dir.appendingPathComponent(file))
         let metadata = try RasterMetadata.read(prefix: bytes.prefix(RasterMetadata.headerLimit), encodedBytes: bytes.count)
-        // Full size, or as the loader does past the 32 MiB ceiling, half until it fits.
-        var pixel = maxPixel ?? Int(max(metadata.naturalSize.width, metadata.naturalSize.height))
-        var fitted = try? RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant)
-        while fitted == nil, pixel > 1 { pixel /= 2; fitted = try? RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant) }
-        let plan = try XCTUnwrap(fitted)
+        // Colour comparisons need only a thumbnail of the large fixture.
+        let pixel = maxPixel ?? min(1024, Int(max(metadata.naturalSize.width, metadata.naturalSize.height)))
+        let plan = try RasterDecodePlan(metadata: metadata, maxPixel: pixel, variant: variant)
         return (metadata, plan, try RasterImage.decode(bytes, metadata: metadata, plan: plan, charge: ColorTestCharge()))
     }
     /// The image's pixels as Core Graphics converts them to extended linear

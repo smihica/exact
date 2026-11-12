@@ -187,9 +187,82 @@ fn the_paging_columns_recipe_ignores_leave_and_loads_until_the_last_page() {
 }
 
 #[test]
+fn the_long_list_recipe_appends_pages_and_stops_at_the_last() {
+    use exact_kernel::Kernel;
+    use exact_plan::Value;
+    use exact_runner::{DataError, DataSource, Runner};
+
+    struct Pager(usize);
+    impl DataSource for Pager {
+        fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+            match source {
+                "loadCatalog" => Ok(Value::record(vec![
+                    Value::list(
+                        (0..self.0 * 10)
+                            .map(|row| {
+                                Value::record(vec![
+                                    Value::str(&(row * 2 + 1).to_string()),
+                                    Value::list(
+                                        (row * 2 + 1..=row * 2 + 2)
+                                            .map(|id| {
+                                                Value::record(vec![
+                                                    Value::str(&id.to_string()),
+                                                    Value::str(&format!("Product {id}")),
+                                                ])
+                                            })
+                                            .collect(),
+                                    ),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                    Value::Bool(self.0 < 3),
+                ])),
+                "nextPage" => {
+                    self.0 += 1;
+                    Ok(Value::record(vec![Value::Bool(true)]))
+                }
+                _ => Err(DataError::UnknownSource(source.into())),
+            }
+        }
+    }
+    let source = blocks()
+        .into_iter()
+        .find(|b| b.doc.ends_with("recipes/long-lists.md") && b.info == "contract")
+        .expect("long list example")
+        .body;
+    let mut runner = Runner::boot(
+        contract::compile(&source).unwrap(),
+        Pager(1),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(runner.collections()[0].count, 10);
+    for pages in [2, 3, 3] {
+        runner.act("loadMore", vec![]).unwrap();
+        assert_eq!(runner.data().0, pages);
+        assert_eq!(runner.collections()[0].count, pages * 10);
+    }
+}
+
+#[test]
 fn every_contract_example_in_the_guides_compiles_and_every_test_parses() {
     let dir = std::env::temp_dir().join(format!("exact-docs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let package = dir.join("node_modules/@exact/in-app-browser");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/in-app-browser");
+    for file in [
+        "package.json",
+        "exact.json",
+        "apple/exact.json",
+        "android/exact.json",
+        "web/exact.json",
+    ] {
+        std::fs::create_dir_all(package.join(file).parent().unwrap()).unwrap();
+        std::fs::copy(source.join(file), package.join(file)).unwrap();
+    }
     let path = dir.join("app.contract");
     let (mut compiled, mut parsed) = (0, 0);
     let mut failures = Vec::new();

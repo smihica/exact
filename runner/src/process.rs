@@ -98,6 +98,7 @@ impl Request {
             upload_progress: false,
             long_poll: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,

@@ -66,12 +66,12 @@ struct TabFace: Equatable {
     static func filled(_ base: String) -> UIImage? {
         FaceSymbol.isPath(base) ? nil : UIImage(systemName: base + ".fill")
     }
-    /// The raster at `url` as a tab bar item's glyph: fitted in `points`
-    /// square at the screen's scale and template-rendered, so the bar tints
-    /// it as it tints an SF Symbol (UIKit renders a tab's image as a
-    /// template whatever its mode). Nil for a file that is no image.
-    static func rasterImage(at url: URL, points: CGFloat) -> UIImage? {
-        guard points > 0, let image = UIImage(contentsOfFile: url.path), image.size.width > 0, image.size.height > 0 else { return nil }
+    /// `image` as a tab bar item's glyph: fitted in `points` square at the
+    /// screen's scale and template-rendered, so the bar tints it as it tints
+    /// an SF Symbol (UIKit renders a tab's image as a template whatever its
+    /// mode). Nil for an empty image.
+    static func rasterImage(_ image: UIImage, points: CGFloat) -> UIImage? {
+        guard points > 0, image.size.width > 0, image.size.height > 0 else { return nil }
         let fit = min(points / image.size.width, points / image.size.height)
         let size = CGSize(width: (image.size.width * fit).rounded(), height: (image.size.height * fit).rounded())
         let format = UIGraphicsImageRendererFormat.default()

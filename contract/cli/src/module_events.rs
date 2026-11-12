@@ -8,30 +8,29 @@
 
 use crate::modules::{error, same, written};
 use crate::CompileError;
+use contract_syntax::scope::{Kind, Scope};
 use contract_syntax::{Attr, Expr, File, ModuleKind, Node};
+use std::collections::HashMap;
 
-/// Bind each imported event to the action its root attribute names, and
-/// refuse the attribute anywhere else.
-pub(crate) fn bind(file: &mut File, errors: &mut Vec<CompileError>) {
-    let events: Vec<(usize, String)> = (file.modules.iter().enumerate())
+/// Resolve event attributes through their file's scope (LLP 1091 D1/D2),
+/// bind each to its root action, and refuse the attribute on any other element.
+pub(crate) fn bind(file: &mut File, scopes: &[Scope], errors: &mut Vec<CompileError>) {
+    let events: HashMap<String, usize> = (file.modules.iter().enumerate())
         .filter(|(_, m)| m.kind == ModuleKind::Event)
-        .map(|(i, m)| (i, m.name.clone()))
+        .map(|(i, m)| (m.name.clone(), i))
         .collect();
     if events.is_empty() {
         return;
     }
-    let names: Vec<&str> = events.iter().map(|(_, n)| n.as_str()).collect();
-    let mut found: Vec<(String, Attr)> = Vec::new();
+    let mut found: Vec<(usize, Attr)> = Vec::new();
     for (ci, c) in file.components.iter_mut().enumerate() {
         for node in c.view.iter_mut() {
             let outermost = ci == 0 && matches!(node, Node::Element { .. });
-            take(node, &names, outermost, &mut found, errors);
+            take(node, &events, scopes, outermost, &mut found, errors);
         }
     }
-    for (name, attr) in found {
-        let Some(&(mi, _)) = events.iter().find(|(_, n)| *n == name) else {
-            continue;
-        };
+    for (mi, attr) in found {
+        let name = &attr.name;
         let Expr::Ident(action, _) = &attr.value else {
             errors.push(error(
                 "contract-event-handler",
@@ -102,16 +101,17 @@ pub(crate) fn bind(file: &mut File, errors: &mut Vec<CompileError>) {
 /// the root's outermost node, refused from every other.
 fn take(
     node: &mut Node,
-    names: &[&str],
+    events: &HashMap<String, usize>,
+    scopes: &[Scope],
     outermost: bool,
-    found: &mut Vec<(String, Attr)>,
+    found: &mut Vec<(usize, Attr)>,
     errors: &mut Vec<CompileError>,
 ) {
     let (attrs, children): (Option<&mut Vec<Attr>>, Vec<&mut Vec<Node>>) = match node {
         Node::Element {
             attrs, children, ..
         } => (Some(attrs), vec![children]),
-        Node::Use { args, children, .. } => (Some(args), vec![children]),
+        Node::Use { children, .. } => (None, vec![children]),
         Node::Children { .. } => (None, Vec::new()),
         Node::When {
             then, otherwise, ..
@@ -122,13 +122,18 @@ fn take(
     if let Some(attrs) = attrs {
         let mut i = 0;
         while i < attrs.len() {
-            if !names.contains(&attrs[i].name.as_str()) {
+            let attr = &attrs[i];
+            let event = scopes[attr.span.source_id as usize]
+                .names
+                .get(&(Kind::Call, attr.name.clone()))
+                .and_then(|name| events.get(name));
+            let Some(&event) = event else {
                 i += 1;
                 continue;
-            }
+            };
             let attr = attrs.remove(i);
             if outermost {
-                found.push((attr.name.clone(), attr));
+                found.push((event, attr));
             } else {
                 errors.push(error(
                     "contract-event-root",
@@ -143,7 +148,7 @@ fn take(
     }
     for list in children {
         for child in list.iter_mut() {
-            take(child, names, false, found, errors);
+            take(child, events, scopes, false, found, errors);
         }
     }
 }

@@ -117,7 +117,7 @@ test('generated commands run from an external author directory with quoted paths
     mkdirSync(resolve(sdk, 'js/bake/src'), { recursive: true });
     cpSync(resolve(import.meta.dir, '../js/bake/src/__exact_env.mjs'), resolve(sdk, 'js/bake/src/__exact_env.mjs'));
     writeFileSync(resolve(sdk,'host/windows/build.mjs'),`console.log(JSON.stringify({args:process.argv.slice(2),app:process.env.EXACT_APP_DIR}));`);
-    const windows=spawnSync(process.execPath,['exact.mjs','windows','--release','--run'],{cwd:app,env:{...process.env,EXACT2:sdk},encoding:'utf8'});
+    const windows=spawnSync(process.execPath,['exact.mjs','windows','--release','--run'],{cwd:app,env:{...process.env,EXACT:sdk},encoding:'utf8'});
     assert.equal(windows.status,0,windows.stderr);
     const forwarded=JSON.parse(windows.stdout);
     assert.deepEqual(forwarded.args,['outside-game','--release','--run']);
@@ -945,8 +945,14 @@ test('SDK graph drift is repaired by the async lock refresh before locked consum
   const {sdkLock} = await import('./app/shells.mjs');
   const root = mkdtempSync(resolve(tmpdir(), 'sdk-drift-')), sdk = resolve(root, 'sdk'), dep = resolve(root, 'dep');
   mkdirSync(resolve(sdk, 'app'), {recursive:true}); mkdirSync(dep);
-  const manifest = version => `[package]\nname = "sdk-drift-dependency"\nversion = "${version}"\nedition = "2021"\n[lib]\npath = "lib.rs"\n`;
+  const manifest = (version, name = 'sdk-drift-dependency') => `[package]\nname = "${name}"\nversion = "${version}"\nedition = "2021"\n[lib]\npath = "lib.rs"\n`;
   try {
+    for (const [path, name] of [['logic', 'exact-logic'], ['vendor/ibex/crates/ibex2-sqlite', 'ibex2-sqlite']]) {
+      const dir = resolve(root, path);
+      mkdirSync(dir, {recursive:true});
+      writeFileSync(resolve(dir, 'Cargo.toml'), manifest('0.1.0', name));
+      writeFileSync(resolve(dir, 'lib.rs'), '');
+    }
     writeFileSync(resolve(dep, 'lib.rs'), ''); writeFileSync(resolve(dep, 'Cargo.toml'), manifest('0.1.0'));
     writeFileSync(resolve(sdk, 'Cargo.toml'), `[workspace]\nresolver = "2"\n[workspace.package]\nedition = "2021"\n[workspace.dependencies]\nsdk-drift-dependency = { path = "../dep" }\n`);
     sdkLock(sdk, {update:true}); sdkLock(sdk);

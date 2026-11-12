@@ -1,0 +1,30 @@
+component App
+  view
+    Child()
+
+component Child
+  state item = "state"
+  state index = 9
+  state items = ["a", "b"]
+  state option = some("bound")
+  derive label = `${item}!${index}`
+  view
+    column
+      text label testId="outside"
+      for item, index in items key=item
+        text label testId=`in-${item}-${index}`
+      match option
+        case some(item)
+          text label testId=`match-${item}`
+        case none
+          text label testId="none"
+      for label in items key=label
+        text label testId=`direct-${label}`
+
+test "a child derive keeps its defining scope under view binders"
+  expect text "outside" == "state!9"
+  expect text "in-a-0" == "state!9"
+  expect text "in-b-1" == "state!9"
+  expect text "match-bound" == "state!9"
+  expect text "direct-a" == "a"
+  expect text "direct-b" == "b"

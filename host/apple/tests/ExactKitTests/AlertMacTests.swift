@@ -82,6 +82,31 @@ final class AlertMacTests: XCTestCase {
                          characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
     }
 
+    func testCommandPeriodUsesTheCommandLayoutThroughAppKit() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        let p = fixture(field: true, session: session)
+        defer { p.alerts.reset() }
+        for (code, ignoring) in [(UInt16(14), "."), (UInt16(47), "v")] {
+            p.press(2)
+            let sheet = try XCTUnwrap(p.alerts.sheet)
+            let field = try XCTUnwrap(p.views[51]?.field)
+            XCTAssertTrue(sheet.makeFirstResponder(field))
+            func send(_ code: UInt16, _ characters: String, _ ignoring: String) {
+                NSApp.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: sheet.windowNumber,
+                    context: nil, characters: characters, charactersIgnoringModifiers: ignoring,
+                    isARepeat: false, keyCode: code)!)
+                turn()
+            }
+            send(14, "e", ".")
+            XCTAssertTrue(p.alerts.sheet === sheet, "Dvorak - QWERTY Command-E leaves the alert open")
+            send(code, ".", ignoring)
+            XCTAssertNil(p.alerts.presented, "Command-period presses Cancel in either layout")
+        }
+    }
+
     /// The rule itself is the kernel's, asked through the C ABI
     /// (`exact_confirmation_is_alert`): one rule for lowering, Linux and here.
     func testTheShapeAndItsWordsAreTheRuleIOSFollows() {

@@ -178,13 +178,15 @@ final class RouteSheetMacTests: XCTestCase {
             else if done() { return }
         }
     }
-    private func keyEvent(_ code: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags = [], _ type: NSEvent.EventType = .keyDown, in window: NSWindow) -> NSEvent {
+    private func keyEvent(_ code: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags = [], _ type: NSEvent.EventType = .keyDown, ignoring: String? = nil, in window: NSWindow) -> NSEvent {
         NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                         context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: code)!
+                         context: nil, characters: characters, charactersIgnoringModifiers: ignoring ?? characters, isARepeat: false, keyCode: code)!
     }
-    /// A key the session takes in its front window, as its monitor routes one.
-    private func key(_ code: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags = [], in f: SheetFixture) -> Bool {
-        let taken = f.presenter.routeKey(keyEvent(code, characters, flags, in: f.front), focused: true, in: f.front)
+    /// Route the key, then let AppKit deliver any key the session leaves alone.
+    private func key(_ code: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags = [], ignoring: String? = nil, in f: SheetFixture) -> Bool {
+        let event = keyEvent(code, characters, flags, ignoring: ignoring, in: f.front)
+        let taken = f.presenter.routeKey(event, focused: true, in: f.front)
+        if !taken { NSApp.sendEvent(event) }
         f.settle()
         return taken
     }
@@ -595,29 +597,38 @@ final class RouteSheetMacTests: XCTestCase {
         XCTAssertNil(f.window.attachedSheet, "Escape dismisses it")
         XCTAssertTrue(f.status.contains("cancelled 1"), "as its Back control does: \(f.status)")
         try f.press("open-add")
-        XCTAssertTrue(key(47, ".", .command, in: f))
+        XCTAssertFalse(key(47, "v", .command, in: f), "Dvorak Command-V stays with the field")
+        XCTAssertNotNil(f.window.attachedSheet)
+        XCTAssertTrue(key(14, ".", .command, in: f))
         XCTAssertNil(f.window.attachedSheet, "Command-period dismisses it")
         XCTAssertTrue(f.status.contains("cancelled 2"), f.status)
+        try f.press("open-add")
+        XCTAssertFalse(key(14, "e", .command, ignoring: ".", in: f), "Dvorak - QWERTY Command-E stays with the field")
+        XCTAssertNotNil(f.window.attachedSheet)
+        XCTAssertTrue(f.status.contains("cancelled 2"), f.status)
+        XCTAssertTrue(key(47, ".", .command, ignoring: "v", in: f))
+        XCTAssertNil(f.window.attachedSheet, "Dvorak - QWERTY Command-period dismisses it")
+        XCTAssertTrue(f.status.contains("cancelled 3"), f.status)
 
         // `none`: neither key, and its Cancel has no Escape; its own button still closes it.
         try f.press("open-none")
         XCTAssertEqual(try sheet(f).chrome.cancel.keyEquivalent, "")
         XCTAssertTrue(key(53, "\u{1b}", in: f), "the key is the sheet's all the same")
-        _ = key(47, ".", .command, in: f)
+        XCTAssertTrue(key(47, ".", .command, ignoring: "v", in: f))
         XCTAssertFalse(clickBehind(f))
         XCTAssertNotNil(f.window.attachedSheet, "only its own buttons close it")
-        XCTAssertTrue(f.status.contains("cancelled 2"), f.status)
+        XCTAssertTrue(f.status.contains("cancelled 3"), f.status)
         XCTAssertEqual(p.navigation.agentBack()?.refused, "its closedby is \"none\"")
         try sheet(f).chrome.cancel.performClick(nil)
         f.settle()
         XCTAssertNil(f.window.attachedSheet)
-        XCTAssertTrue(f.status.contains("cancelled 3"), f.status)
+        XCTAssertTrue(f.status.contains("cancelled 4"), f.status)
 
         // `any`: a click on the window behind it too.
         try f.press("open-any")
         XCTAssertTrue(clickBehind(f))
         XCTAssertNil(f.window.attachedSheet, "a click on the window behind dismisses it")
-        XCTAssertTrue(f.status.contains("cancelled 4"), f.status)
+        XCTAssertTrue(f.status.contains("cancelled 5"), f.status)
     }
 
     /// Tab goes round the route's own stops, and with Keyboard Navigation

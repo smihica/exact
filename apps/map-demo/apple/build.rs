@@ -42,7 +42,8 @@ fn main() {
             contract::rust_entry(
                 "map_demo_data::Map",
                 "map_demo_data::Map",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

@@ -18,7 +18,7 @@ pub const STARTUP_TIMER_WINDOW_MS: f64 = 1000.0;
 pub struct Outstanding {
     /// Requests in flight for resources showing no answer yet.
     pub requests: Vec<String>,
-    /// Streams for resources showing no answer, before their first message.
+    /// Streams for resources showing no answer, before their first value commits.
     pub streams: Vec<String>,
     /// Resources showing a placeholder until their source can answer.
     pub awaiting: Vec<String>,
@@ -89,7 +89,7 @@ impl<D: DataSource> Runner<D> {
             let Target::Resource(i) = p.target else {
                 continue;
             };
-            if matches!(&self.resources[i], Some(s) if !s.placeholder) {
+            if matches!(&self.resources[i].state, Some(s) if !s.placeholder) {
                 continue;
             }
             let name = self.target_name(p.target);
@@ -99,12 +99,12 @@ impl<D: DataSource> Runner<D> {
                 out.requests.push(name);
             }
         }
-        for i in 0..self.plan.resources.len() {
-            let name = || self.plan.str(self.plan.resources[i].name).to_string();
-            if matches!((&self.failed_args[i], &self.resources[i]), (Some(f), Some(s)) if f == &s.args)
+        for i in 0..self.resources.len() {
+            let name = || self.plan.str(self.resource_row(i).name).to_string();
+            if matches!((&self.resources[i].failed_args, &self.resources[i].state), (Some(f), Some(s)) if f == &s.args)
             {
                 out.failed.push(name());
-            } else if self.awaiting[i] {
+            } else if self.resources[i].awaiting {
                 out.awaiting.push(name());
             }
         }

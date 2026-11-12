@@ -60,6 +60,8 @@ struct SnapshotStyle {
     init(_ node: HeadlessSession.Node) { rows = node.style }
 
     func has(_ key: String) -> Bool { rows[key] != nil }
+    /// Whether the author wrote row `key` on this node, not only inherited it (LLP 1115.000 D2).
+    func wrote(_ key: String) -> Bool { rows["written"]?.array?.contains(.string(key)) ?? false }
     func number(_ key: String) -> CGFloat? { rows[key]?.number.map { CGFloat($0) } }
     func string(_ key: String) -> String? { rows[key]?.string }
     /// Points, or a percentage against a basis; a calculation is refused by
@@ -84,6 +86,57 @@ struct SnapshotStyle {
         let style = string("border_style_top") ?? "none"
         guard style != "none", style != "hidden" else { return 0 }
         return number("border_width_top") ?? 0
+    }
+}
+
+/// The tint an authored `accent-color` set around a view (`Accent`); nil
+/// is the platform's accent, which a widget's tint is.
+/// SwiftUI resolves its own tint for no one (`TintShapeStyle` resolves to
+/// `Never`, and a tint made from `.tint` recurses), so the snapshot keeps it.
+private struct SnapshotTintKey: EnvironmentKey { static let defaultValue: Color? = nil }
+extension EnvironmentValues {
+    var snapshotTint: Color? {
+        get { self[SnapshotTintKey.self] }
+        set { self[SnapshotTintKey.self] = newValue }
+    }
+}
+
+/// A colour row where a tint is in effect (LLP 1116.001 D2), as the iOS
+/// host draws it: a tint role (`AccentColor`; `Highlight`, `@tint/0.2` on
+/// iOS) is the tint in effect at its share, never the wire's fallback.
+@available(iOS 17.0, macOS 14.0, watchOS 10.0, visionOS 26.0, *)
+enum SnapshotTint {
+    /// The tint `row` gives a view in place of the tint in effect, `around`
+    /// (nil: the platform's): nil where it leaves that tint (none, `auto`,
+    /// the tint itself); a role's share of it; any other colour as written.
+    static func given(_ row: ColorRow?, around: Color?, dark: Bool) -> Color? {
+        if let share = share(row) { return share < 1 ? (around ?? platform(dark: dark)).opacity(share) : nil }
+        return SnapshotColor.color(row, dark: dark)
+    }
+    /// The colour `row` draws where no view's tint reaches (the system's
+    /// tint of a Live Activity) and `around` is the tint (nil: the platform's).
+    static func color(_ row: ColorRow?, around: Color?, dark: Bool) -> Color? {
+        if let share = share(row) { return (around ?? platform(dark: dark)).opacity(share) }
+        return SnapshotColor.color(row, dark: dark)
+    }
+    /// The colour an `accent-color` row makes its subtree's tint: one of its
+    /// own, not `auto` and not a tint role, which leave the tint in effect,
+    /// as UIKit's `tintColor` nil does (`NodeView.applyAccentTint`).
+    static func accent(_ row: ColorRow?, dark: Bool) -> Color? {
+        share(row) == nil ? SnapshotColor.color(row, dark: dark) : nil
+    }
+    /// The platform's accent as a fixed colour in the appearance drawn:
+    /// `Color.accentColor` given as a tint resolves by the tint, itself, and
+    /// never returns.
+    private static func platform(dark: Bool) -> Color {
+        var environment = EnvironmentValues()
+        environment.colorScheme = dark ? .dark : .light
+        return Color(Color.accentColor.resolve(in: environment))
+    }
+    /// A tint role's share of the tint.
+    private static func share(_ row: ColorRow?) -> Double? {
+        guard case .platform(let name, _)? = row, name.hasPrefix("@tint") else { return nil }
+        return name.contains("/") ? Double(name.split(separator: "/").last ?? "") ?? 1 : 1
     }
 }
 
@@ -133,7 +186,8 @@ enum SnapshotColor {
     private static func named(_ name: String, context: Context) -> AnyShapeStyle? {
         if name.hasPrefix("@tint") {
             let alpha = name.contains("/") ? Double(name.split(separator: "/").last ?? "") ?? 1 : 1
-            return AnyShapeStyle(Color.accentColor.opacity(alpha))
+            // The environment's tint, which an `accent-color` around the node sets.
+            return AnyShapeStyle(TintShapeStyle.tint.opacity(alpha))
         }
         switch (context, name) {
         case (.ink, "labelColor"), (.ink, "textColor"): return AnyShapeStyle(.primary)

@@ -638,6 +638,11 @@ internal object Exact {
         if (o != null) o.call { Native.answer(id, answer) } else Native.answer(id, answer)
     }
 
+    /** A package calls an app handler on the host's thread and publishes what it changed. */
+    fun invoke(body: String): Int = owner?.sync {
+        try { Native.invoke(body) } catch (e: UnsatisfiedLinkError) { -1 }
+    } ?: Native.invoke(body).also { turned() }
+
     /** What the extensions tell exact2 ([Native.changed], [Native.bindExtensions]): on exact2's thread, in order. */
     fun changed(topic: String) { val o = owner; if (o != null) o.call { Native.changed(topic) } else Native.changed(topic) }
     /** A turn on exact2's thread, which asks for a display frame while a canvas input's samples wait. */

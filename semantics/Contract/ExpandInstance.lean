@@ -31,7 +31,7 @@ open Contract Components CompSem CompSemFacts Expand ExpandSubst ExpandFrame
 theorem Same.trans {e₁ e₂ e₃ : Env} (h₁ : Same e₁ e₂) (h₂ : Same e₂ e₃) : Same e₁ e₃ :=
   ⟨h₁.fns.trans h₂.fns, h₁.shapes.trans h₂.shapes, h₁.routes.trans h₂.routes,
     h₁.strings.trans h₂.strings, h₁.now.trans h₂.now, h₁.resources.trans h₂.resources,
-    h₁.resVals.trans h₂.resVals⟩
+    h₁.resVals.trans h₂.resVals, h₁.idle.trans h₂.idle⟩
 
 /-- The frame's names read, in the flat environment and locals, what their
 replacements in `cs` read. -/

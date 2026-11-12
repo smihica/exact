@@ -238,6 +238,129 @@ fn a_refusal_is_not_said_again_as_the_capture_it_left_untyped() {
 }
 
 #[test]
+fn an_untyped_none_in_a_derive_is_refused_at_the_literal() {
+    for expr in ["none", "true ? none : none", "[none]", "some([])"] {
+        let source = format!("component App\n  derive first = {expr}\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+        let e = &errors[0];
+        assert_eq!(e.id, "type-cannot-infer", "{source}\n{errors:?}");
+        let (literal, context) = if expr.contains("none") {
+            ("none", "an `option<T>`")
+        } else {
+            ("[]", "a `T[]`")
+        };
+        assert_eq!(
+            e.message,
+            format!("cannot infer what `{literal}` holds in `first`: pair it with a typed arm (`match`/`?:`) or write it where {context} is declared")
+        );
+        assert_eq!(
+            (e.span.line, e.span.col),
+            (2, 18 + expr.find(literal).unwrap() as u32)
+        );
+    }
+}
+
+#[test]
+fn an_incomplete_derives_dependents_do_not_repeat_its_refusal() {
+    for expr in [
+        "none",
+        "true ? none : none",
+        "[]",
+        "true ? [] : []",
+        "missing",
+    ] {
+        for declarations in [
+            format!("  derive first = {expr}\n  derive second = first\n  derive third = second\n"),
+            format!("  derive third = second\n  derive second = first\n  derive first = {expr}\n"),
+        ] {
+            let source = format!("component App\n{declarations}  view\n    text \"x\"\n");
+            let file = contract_syntax::parse(&source).unwrap();
+            let errors = crate::check_all(&file, false, |_| false, None)
+                .err()
+                .unwrap();
+            assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+            let id = if expr == "missing" {
+                "type-unknown-name"
+            } else {
+                "type-cannot-infer"
+            };
+            assert_eq!(errors[0].id, id, "{source}\n{errors:?}");
+        }
+    }
+}
+
+#[test]
+fn derives_reading_an_untyped_state_leave_its_refusal_to_the_state() {
+    for expr in ["none", "[]"] {
+        let source = format!("component App\n  state picked = {expr}\n  derive later = current\n  derive current = picked\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+        assert_eq!(errors[0].id, "type-cannot-infer");
+        assert_eq!(
+            errors[0].message,
+            "cannot infer the type of `picked`: nothing writes a value into it"
+        );
+        assert_eq!((errors[0].span.line, errors[0].span.col), (2, 3));
+    }
+}
+
+#[test]
+fn incomplete_derive_diagnostics_keep_cycles_and_independent_causes() {
+    for expr in ["second", "true ? second : none", "true ? second : []"] {
+        let source = format!("component App\n  derive first = {expr}\n  derive second = first\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 2, "{source}\n{errors:?}");
+        assert!(
+            errors.iter().all(|e| e.id == "type-derive-cycle"),
+            "{errors:?}"
+        );
+    }
+    for expr in [
+        "none",
+        "on ? none : none",
+        "match some(1) { case some(picked) => none, case none => none }",
+    ] {
+        let source = format!("component App\n  state picked = none\n  derive on = picked == none\n  derive first = {expr}\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 2, "{source}\n{errors:?}");
+        assert!(
+            errors.iter().all(|e| e.id == "type-cannot-infer"),
+            "{errors:?}"
+        );
+        assert!(errors[0].message.contains("in `first`"), "{errors:?}");
+        assert!(errors[1].message.contains("of `picked`"), "{errors:?}");
+    }
+}
+
+#[test]
+fn typed_arms_and_state_writes_still_complete_derives() {
+    for expr in [
+        "true ? none : some(1)",
+        "match some(1) { case some(n) => some(n), case none => none }",
+        "true ? [] : [1]",
+        "picked",
+    ] {
+        let source = format!("component App\n  state picked = none\n  derive first = {expr}\n  derive second = first\n  action pick\n    picked = some(1)\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let result = crate::check_all(&file, false, |_| false, None);
+        assert!(result.is_ok(), "{source}\n{:?}", result.err());
+    }
+}
+
+#[test]
 fn a_refused_build_types_the_roots_uses_with_one_scope() {
     // A refusal re-checks the root's uses against its declarations alone
     // (`provisional_scope`); a scope built again for each state made that
@@ -257,4 +380,200 @@ fn a_refused_build_types_the_roots_uses_with_one_scope() {
     assert_eq!(errors[0].id, "type-unknown-name", "{errors:?}");
     let builds = crate::component::SCOPE_BUILDS.with(|count| count.get());
     assert!(builds < 100, "{builds} declaration scopes for 400 states");
+}
+
+#[test]
+fn incomplete_derives_are_checked_after_handler_writes_type_states() {
+    for (expr, refused) in [("(picked == none) ? [] : []", true), ("picked", false)] {
+        let source = format!("component App\n  state picked = none\n  derive first = {expr}\n  derive second = first\n  action pick(v)\n    picked = some(v)\n  view\n    button \"Go\" press=pick(1)\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let result = crate::check_all(&file, false, |_| false, None);
+        if refused {
+            let errors = result.err().expect("untyped list refused before lowering");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].id, "type-cannot-infer", "{errors:?}");
+            assert_eq!((errors[0].span.line, errors[0].span.col), (3, 37));
+        } else {
+            let checked = result.unwrap();
+            assert_eq!(
+                checked.types.components[0].derives,
+                vec![Ty::Option(Box::new(Ty::Number)); 2]
+            );
+        }
+    }
+}
+
+#[test]
+fn handler_typed_derives_are_checked_before_assignments() {
+    for actions in [
+        "  action pick(v)\n    picked = some(v)\n  action copy\n    target = first\n",
+        "  action copy\n    target = first\n  action pick(v)\n    picked = some(v)\n",
+        "  action pick(v)\n    picked = some(v)\n    target = first\n",
+    ] {
+        let source = format!("component App\n  state picked = none\n  state target = some(\"text\")\n  derive first = picked\n{actions}  view\n    button \"Pick\" press=pick(1)\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .expect("a number option cannot be assigned to a string option");
+        assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+        assert_eq!(errors[0].id, "type-assign", "{source}\n{errors:?}");
+        assert!(errors[0].message.contains("option<number>"), "{errors:?}");
+        let assignment_line = source
+            .lines()
+            .position(|line| line.trim() == "target = first")
+            .unwrap()
+            + 1;
+        assert_eq!(errors[0].span.line, assignment_line as u32);
+    }
+}
+
+#[test]
+fn handler_typed_writes_and_derives_settle_before_source_signatures() {
+    let source = "component App\n  state first = none\n  state second = none\n  state third = none\n  derive a = first\n  derive b = second\n  derive c = third\n  mutation changed as shape string\n  action publish\n    send changed = out(c)\n  action copyLast\n    third = b\n  action copyFirst\n    second = a\n  action pick(v)\n    first = some(v)\n  view\n    button \"Pick\" press=pick(1)\n";
+    let file = contract_syntax::parse(source).unwrap();
+    let checked = crate::check_all(&file, false, |_| false, None)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    let ct = &checked.types.components[0];
+    assert_eq!(ct.slots, vec![Ty::Option(Box::new(Ty::Number)); 3]);
+    assert_eq!(ct.derives, ct.slots);
+    assert_eq!(ct.sources["out"].0, vec![Ty::Option(Box::new(Ty::Number))]);
+}
+
+#[test]
+fn a_typed_cycle_does_not_hide_an_untyped_literal() {
+    let source =
+        "component App\n  derive a = a == a\n  derive d = a ? [] : []\n  view\n    text \"x\"\n";
+    let file = contract_syntax::parse(source).unwrap();
+    let errors = crate::check_all(&file, false, |_| false, None)
+        .err()
+        .expect("the untyped list is refused before lowering");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].id, "type-cannot-infer", "{errors:?}");
+    assert_eq!((errors[0].span.line, errors[0].span.col), (3, 18));
+}
+
+#[test]
+fn a_derive_cause_precedes_its_readers_in_either_declaration_order() {
+    for declarations in [
+        "  derive first = []\n  derive second = first.map(x => x.n)\n",
+        "  derive second = first.map(x => x.n)\n  derive first = []\n",
+    ] {
+        let source = format!("component App\n{declarations}  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+        assert_eq!(errors[0].id, "type-cannot-infer", "{errors:?}");
+        assert!(errors[0].message.contains("in `first`"), "{errors:?}");
+        assert_eq!(errors[0].span.col, 18);
+    }
+}
+
+#[test]
+fn derive_dependencies_exclude_call_heads_and_local_bindings() {
+    for expr in [
+        "first([])",
+        "[].map(first => first)",
+        "match some([]) { case some(first) => first, case none => [] }",
+    ] {
+        let source = format!("component App\n  derive first = {expr}\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:?}");
+        assert_eq!(errors[0].id, "type-cannot-infer", "{source}\n{errors:?}");
+        assert_eq!(
+            (errors[0].span.line, errors[0].span.col),
+            (2, 18 + expr.find("[]").unwrap() as u32)
+        );
+    }
+}
+
+#[test]
+fn a_local_binding_does_not_propagate_an_unrelated_derive_refusal() {
+    let source = "component App\n  derive ok = [].map(bad => bad)\n  derive bad = missing\n  view\n    text \"x\"\n";
+    let file = contract_syntax::parse(source).unwrap();
+    let errors = crate::check_all(&file, false, |_| false, None)
+        .err()
+        .unwrap();
+    let ids: Vec<_> = errors.iter().map(|e| e.id).collect();
+    assert_eq!(
+        ids,
+        ["type-cannot-infer", "type-unknown-name"],
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn incomplete_derive_cycles_are_reported_only_for_their_members() {
+    for (declarations, mut expected) in [
+        (
+            "  state picked = none\n  derive first = (picked == none) ? second : second\n  derive second = first\n",
+            vec![("type-derive-cycle", 3), ("type-derive-cycle", 4), ("type-cannot-infer", 2)],
+        ),
+        (
+            "  derive c = a\n  derive a = b\n  derive b = a\n",
+            vec![("type-derive-cycle", 3), ("type-derive-cycle", 4)],
+        ),
+        (
+            "  derive a = true ? b : c\n  derive b = a\n  derive c = b\n  derive d = a\n",
+            vec![("type-derive-cycle", 2), ("type-derive-cycle", 3), ("type-derive-cycle", 4)],
+        ),
+        (
+            "  derive xs = xs.map(x => x)\n",
+            vec![("type-derive-cycle", 2)],
+        ),
+    ] {
+        let source = format!("component App\n{declarations}  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None).err().unwrap();
+        let mut actual: Vec<_> = errors.iter().map(|e| (e.id, e.span.line)).collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "{source}\n{errors:?}");
+    }
+}
+
+#[test]
+fn an_incomplete_derive_does_not_blame_literals_with_typed_context() {
+    for expr in [
+        "(true ? none : some(1)) == none ? [] : []",
+        "match (true ? none : some(1)) { case some(n) => [], case none => [] }",
+        "[1].map(n => (true ? none : some(n)) == none ? [] : [])",
+    ] {
+        let source = format!("component App\n  derive first = {expr}\n  view\n    text \"x\"\n");
+        let file = contract_syntax::parse(&source).unwrap();
+        let errors = crate::check_all(&file, false, |_| false, None)
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].id, "type-cannot-infer", "{errors:?}");
+        assert!(errors[0].message.contains("`[]`"), "{errors:?}");
+        assert_eq!(
+            (errors[0].span.line, errors[0].span.col),
+            (2, 18 + expr.find("[]").unwrap() as u32)
+        );
+    }
+}
+
+#[test]
+fn a_derive_dependency_in_a_let_initializer_is_outside_its_binding() {
+    for (value, id) in [("[]", "type-cannot-infer"), ("first", "type-derive-cycle")] {
+        let source = format!("component App\n  derive first = {value}\n  view\n    text \"x\"\n");
+        let mut file = contract_syntax::parse(&source).unwrap();
+        let d = &mut file.components[0].derives[0];
+        // Inlining generates expression lets; there is no surface syntax.
+        d.expr = contract_syntax::Expr::Let {
+            name: "first".into(),
+            value: Box::new(d.expr.clone()),
+            body: Box::new(contract_syntax::Expr::Ident("first".into(), d.span)),
+            span: d.span,
+        };
+        let mut sink = Sink::default();
+        crate::component::check_component(&file.components[0], &Types::default(), None, &mut sink);
+        assert_eq!(sink.errors.len(), 1, "{:?}", sink.errors);
+        assert_eq!(sink.errors[0].id, id, "{:?}", sink.errors);
+    }
 }

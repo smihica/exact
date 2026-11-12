@@ -118,6 +118,26 @@ fn a_page_is_rendered_for_its_reader_s_viewport_and_kept_per_class() {
     let safari = "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15\r\n";
     let (_, _, body) = get(addr, "/", safari);
     assert!(body.contains(">wide<"), "{body}");
+    // A 304 sends every `Vary` its 200 sends (RFC 9110 §15.4.5): a cache that
+    // updates its copy from the 304 keeps the page keyed by the viewport.
+    let tag = header(&headers, "etag")
+        .expect("the kept page's tag")
+        .to_string();
+    let (status, headers, _) = get(
+        addr,
+        "/plain",
+        &format!("Sec-CH-UA-Mobile: ?0\r\nIf-None-Match: {tag}\r\n"),
+    );
+    assert_eq!(status, 304, "{headers:?}");
+    let vary: Vec<_> = headers
+        .iter()
+        .filter(|(n, _)| n == "vary")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert!(
+        vary.contains(&"Sec-CH-Viewport-Width, Sec-CH-UA-Mobile, User-Agent"),
+        "{vary:?}"
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { need } from '../../../scripts/coverage.mjs';
-import { grantOrigins } from '../navigation.js';
+import { grantOrigins } from '../navigation/grant-origins.js';
 import { createTimerScheduler } from '../timer-glue.js';
 import { fileURLToPath } from 'node:url';
 

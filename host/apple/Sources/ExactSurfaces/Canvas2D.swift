@@ -1,5 +1,5 @@
 // @ref LLP 1056 D7 — Canvas 2D on Apple: the recorded lists replayed into a
-// Core Graphics bitmap per canvas, on the main thread, and shown as a layer's
+// Core Graphics bitmap per canvas, on the replay queue, and shown as a layer's
 // contents in the canvas's content box, under its children. The list's
 // geometry is resolved (canvas/src/list.rs): paths arrive in canvas
 // coordinates, so fills and clips draw them under the base transform (the
@@ -93,6 +93,7 @@ struct Canvas2DState {
     var shadowColor = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0), shadowBlur: CGFloat = 0, shadowOffset = CGSize.zero
     var smoothing = true, quality = 0
     var font = Canvas2DFont()
+    var resolvedFont: CTFont?
 }
 
 let canvas2DSRGB = CGColorSpace(name: CGColorSpace.sRGB)!
@@ -231,6 +232,20 @@ final class Canvas2DReplayer {
     /// canvas drawn every frame (3,000 arcs a list, F2).
     static func fonts(in data: Data) -> [Canvas2DFont] {
         var out: [Canvas2DFont] = []
+        readFontState(data) { op, n, count in
+            if op == .font { out.append(Canvas2DFont(record: n, count: count)) }
+        }
+        return out
+    }
+
+    /// The GPU keeps its own drawing state; only its font callbacks need
+    /// the host's resolved fonts and saved levels.
+    func trackFonts(_ data: Data) {
+        guard let context else { return }
+        Self.readFontState(data) { op, n, count in step(context, op, n, count) }
+    }
+
+    private static func readFontState(_ data: Data, _ record: (Canvas2DOp, [Double], Int) -> Void) {
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard raw.count >= 8, raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian == 0x4432_4345,
                   raw.loadUnaligned(fromByteOffset: 4, as: UInt32.self).littleEndian == 1 else { return }
@@ -242,12 +257,13 @@ final class Canvas2DReplayer {
                 guard count >= 0, at + count * 8 <= raw.count else { return }
                 if code == Canvas2DOp.font.rawValue {
                     let n = (0..<count).map { Double(bitPattern: raw.loadUnaligned(fromByteOffset: at + $0 * 8, as: UInt64.self).littleEndian) }
-                    out.append(Canvas2DFont(record: n, count: count))
+                    record(.font, n, count)
+                } else if let op = Canvas2DOp(rawValue: code), op == .save || op == .restore || op == .reset {
+                    record(op, [], 0)
                 }
                 at += count * 8
             }
         }
-        return out
     }
 
     /// Apply one list; false when it is not one this reader can read.
@@ -345,7 +361,9 @@ final class Canvas2DReplayer {
             c.addRect(rect(n))
             c.fillPath()
             c.restoreGState()
-        case .font: state.font = Canvas2DFont(record: n, count: count)
+        case .font:
+            state.font = Canvas2DFont(record: n, count: count)
+            state.resolvedFont = env?.canvasFont(state.font)
         case .fillText, .strokeText:
             guard count >= 4 else { break }
             drawText(c, fill: op == .fillText, x: n[0], y: n[1], scaleX: n[2], rtl: n[3] != 0, text: text(n, from: 4, count: count))

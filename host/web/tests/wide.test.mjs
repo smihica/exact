@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1116.004 D1 in a real browser at a phone's width (390) and a desktop's (1280): the shell's stylesheet and the
 // navigation glue's projection (navigation.js, which both web targets run) over nodes as the hosts write them. A root
 // tab bar whose placement is unsaid is a sidebar on a wide window and a bar on a phone; an arrangement the app wrote
@@ -7,7 +8,6 @@
 // `navigationSplit` opts out or names the width; a sheet stays a sheet; a resize changes nothing else. At a
 // desktop width `check` advises (D1.3) on a tab bar left along the bottom and on a list that pushes unsplit.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

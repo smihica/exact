@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // `orientationlock` on the web (LLP 1133.029 D3, D7), orientationlock-glue.js
 // in a real browser over a stand-in `screen.orientation` that records what it
 // is asked: the counted holders follow the runner's three rules
@@ -8,7 +9,6 @@
 // DOMException name. The JS target's orientationlock.js journals a bad word
 // as the runner does.
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

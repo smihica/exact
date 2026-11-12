@@ -288,7 +288,11 @@ pub fn symbols_json(path: &Path, name: Option<&str>) -> Result<String, PartialSy
             related: Box::new([]),
         }])
     };
-    let src = std::fs::read_to_string(path).map_err(unreadable)?;
+    // The text `with_contract_texts` holds for the file (an editor's unsaved
+    // buffer, `symbols --stdin`), else the file's.
+    let src = sources::contract_text(path)
+        .map_or_else(|| std::fs::read_to_string(path), Ok)
+        .map_err(unreadable)?;
     let root = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1103,8 +1107,10 @@ pub(crate) fn authored_action_hint(file: &File, mut error: CompileError) -> Comp
         for candidate in names {
             if shadowed.contains(&candidate)
                 || (call
-                    && (matches!(candidate, "pending" | "failed" | "failure" | "path")
-                        || file.fns.iter().any(|f| f.name == candidate)))
+                    && (matches!(
+                        candidate,
+                        "pending" | "failed" | "failure" | "current" | "path"
+                    ) || file.fns.iter().any(|f| f.name == candidate)))
                 || !contract_syntax::one_spelling_edit(name.as_bytes(), candidate.as_bytes())
             {
                 continue;

@@ -515,16 +515,27 @@ final class VideoCapture: NSObject, ExactVideoSource {
 
     /// Interruptions as `muteReason` (D3); after any but the background, the session runs again while leased.
     private func listen() {
-        let center = NotificationCenter.default
-        for name in [AVCaptureSession.didStartRunningNotification, AVCaptureSession.didStopRunningNotification] {
-            observers.append(center.addObserver(forName: name, object: session, queue: .main) { [weak self] _ in
-                guard let self else { return }
-                self.log("camera: running=\(self.session.isRunning), interrupted=\(self.session.interrupted)")
-            })
-        }
-        let tell = { [weak self] (reason: String?) in
+        observers = Self.listen(session, queue: queue, log: { [weak self] in self?.log($0) },
+                                leased: { [weak self] in self?.holders.isEmpty == false }) { [weak self] reason in
             guard let self else { return }
             for get in self.holders.values { if let t = get() { t.tracks?.interrupted(t, reason) } }
+        }
+    }
+
+    /// `session`'s notifications, observed on the main queue: `tell` is given the reason the capture is interrupted,
+    /// or nil when no interruption is in force, and while `leased` a stopped session is started again on `queue`.
+    static func listen(_ session: AVCaptureSession, queue: DispatchQueue, log: @escaping (String) -> Void,
+                       leased: @escaping () -> Bool, tell: @escaping (String?) -> Void) -> [NSObjectProtocol] {
+        let center = NotificationCenter.default
+        var observers: [NSObjectProtocol] = []
+        // A runtime error is told as an interruption, but AVFoundation posts no interruption's end after one
+        // (`runtimeErrorNotification`): its reason is cleared once the restarted session runs, unless an
+        // interruption has begun since.
+        var erred = false
+        for name in [AVCaptureSession.didStartRunningNotification, AVCaptureSession.didStopRunningNotification] {
+            observers.append(center.addObserver(forName: name, object: session, queue: .main) { _ in
+                log("camera: running=\(session.isRunning), interrupted=\(session.interrupted)")
+            })
         }
         observers.append(center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { note in
             var reason = "interrupted"
@@ -539,21 +550,31 @@ final class VideoCapture: NSObject, ExactVideoSource {
                 }
             }
             #endif
+            erred = false
             tell(reason)
         })
-        observers.append(center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
+        observers.append(center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { _ in
+            erred = false
             tell(nil)
-            guard let self, !self.holders.isEmpty else { return }
-            let session = self.session
-            self.queue.async { if !session.isRunning { session.startRunning() } }
+            guard leased() else { return }
+            queue.async { if !session.isRunning { session.startRunning() } }
         })
-        observers.append(center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] note in
-            self?.log("camera: runtime error \((note.userInfo?[AVCaptureSessionErrorKey] as? Error).map { "\($0)" } ?? "")")
+        observers.append(center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { note in
+            log("camera: runtime error \((note.userInfo?[AVCaptureSessionErrorKey] as? Error).map { "\($0)" } ?? "")")
+            erred = true
             tell("interrupted")
-            guard let self, !self.holders.isEmpty else { return }
-            let session = self.session
-            self.queue.async { session.startRunning() }
+            guard leased() else { return }
+            queue.async {
+                session.startRunning()
+                guard session.isRunning else { return }
+                DispatchQueue.main.async {
+                    guard erred, !session.interrupted else { return }
+                    erred = false
+                    tell(nil)
+                }
+            }
         })
+        return observers
     }
 
     // MARK: ExactVideoSource

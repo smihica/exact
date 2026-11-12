@@ -268,15 +268,15 @@ statuses:
 
 | Status | When |
 |---|---|
-| 400 | malformed; refused by the checker; an unknown inverse; a `commit` refused |
+| 400 | malformed; refused by the checker; an unknown inverse; a `commit` refused; `canvas` with the local token |
 | 401 | a paired token revoked or expired, also a request whose client ended while it sent its body (*1.13*) |
 | 403 | above the client's scope (*1.13*): `{message, scope, needs}` in `error`, on a request or a change stream path alike |
-| 404 | an unknown proposal or commit |
+| 404 | an unknown proposal or commit; `canvas` without a gateway or canvas port |
 | 409 | a conflict (`conflict: true`); a revert refused; a hold from a client below `write` with 64 held and none its own (*1.13*); a commit while a write is in flight (no `conflict` field); a commit whose `scope` is stale (`stale: true`) |
 | 413 | too large |
-| 429 | too many pairing attempts from one peer (`retry-after`, *1.13*) |
+| 429 | too many pairing attempts from one peer (`retry-after`, *1.13*); too many canvas grants for one client (*1.13*, no `retry-after`) |
 | 500 | reading git failed (`history`, `revert`, a write's baseline) |
-| 503 | the design server is down |
+| 503 | the design server is down; the canvas gateway is closed |
 | 504 | the design server didn't answer within 120 s |
 
 - **A 504 doesn't cancel a write.** A `transaction`, `undo` or `accept` the server answers later is
@@ -466,7 +466,7 @@ client's scope is 403 with `{message, scope, needs}` in `error`, the change stre
 
 | Scope | Requests |
 |---|---|
-| `read` | `hello`, `describe`, `resolve`, `explain`, `uses`, `history`, `export`, `inspect` (read-only below `write`: `refresh` only), and the change stream (`/__tamber/subscribe`, `/__tamber/events`) |
+| `read` | `hello`, `describe`, `resolve`, `explain`, `uses`, `history`, `export`, `canvas` (paired clients only), `inspect` (read-only below `write`: `refresh` only), and the change stream (`/__tamber/subscribe`, `/__tamber/events`) |
 | `propose` | `propose` (held or not), `import`, `revert`, and `drop`, `edit-held` and `choose` (*1.18*) of the client's own held proposal |
 | `write` | `transaction`, `undo`, `commit`, `accept`, `drop`, `edit-held` and `choose` (*1.18*) of another client's proposal, `pin`, `preview`, `outline`, `hold`, `navigate`, `scrub`, `scrub-release`, `scrub-cancel` |
 | the local token only | `pair-code`, `clients`, `revoke` (a paired `write` client may not) |
@@ -783,6 +783,37 @@ The app's build failing is an error (`the app does not build: …`).
 **A design that doesn't check** answers `{"message": "the design is refused", "diagnostics":
 [{file, line, col, id, message}]}`.
 
+### `canvas` (*1.13*, LLP 1121 stage 10 C, LLP 1122 D12)
+
+A paired client sends this request with its token in `x-exact-tamber-token`:
+
+```json
+{"method": "canvas"}
+```
+
+It needs `read` (`propose` and `write` may also ask) and answers `{url, grant, expires}`
+inside `ok`:
+
+- `url` is the entry URL, `<canvas origin>/canvas/<encoded client>/`. Through the TLS door
+  it names that door's canvas gateway; through the relay it names the relay session's canvas.
+- `grant` is a single-use secret, 32 random bytes encoded as base64url, bound to the paired
+  client and valid for 30 s. A grant from one gateway cannot enter another.
+- `expires` is the grant's expiry as a numeric Unix timestamp in milliseconds.
+
+The tool frames `url + "#g=" + grant`. The entry page removes the fragment from its address
+and history entry before posting `{"grant": "…"}` as JSON to its own URL. Only the canvas's
+own Origin may make that POST. Success sets a Secure, HttpOnly session cookie, answers 204,
+and the page tells the tool `{type: "exact-canvas-entered"}` before navigating to `/`.
+The tool drops its copy of the grant when it receives that message. Revocation or expiry of
+the paired token ends the canvas session and its open streams too.
+
+Minting allows a burst of 6 grants per client, refilled at 6 a minute, shared across the TLS
+and relay gateways. When exhausted, `canvas` answers 429 with no `retry-after` header.
+The local token gets 400: the local tool frames the dev loop itself. A server with no
+gateway for the request's door, or whose canvas port is not open, answers 404. A revoked or
+expired paired token gets 401; a closed gateway gets 503. The wire's usual authentication
+and scope refusals apply.
+
 ### Operations
 
 `ops` is a list of objects, each `{"op": "…", "file"?, …}`, where `file` defaults to the app's
@@ -855,7 +886,12 @@ design (a `set-state` or `unset-state`: the Contract source that declares its `s
   the first `set-param` restores absence. A param's value is `live` where the plan folds it, as a
   token's is, `rebuild` for a duration or easing param (a motion param is written into its rows at
   build, wherever its component is used), and a live one can be scrubbed. A token's rename renames
-  the `params` values naming it.
+  the `params` values, their `pair=` references and `.tamber` component defaults naming it,
+  keeping kind annotations. A rename that changes a folded value is refused, including a
+  component default that an override hides or that belongs to a standalone design
+  (for example, a literal font family or icon source selector that shares a token's name).
+  A default in a `.contract` file is not rewritten; if it still names the old token,
+  the rename is refused with the checker's diagnostic at that default.
 - **`set-row`'s places** (*1.12*): several in one file are spliced together into the file as the
   tool saw it, from the last up, before the transaction's other writes to it, then laid out once.
   Every refusal says why and where to edit instead (the source, the node, a param's or token's
@@ -1150,10 +1186,13 @@ list is unchanged: it keeps its own.
   - each file is `{file, status, diff, edits, refused?}`, and a rename shows as a deletion plus an
     addition.
 - **Each edit** is `{what, name, when: [{axis, value}], before, after}`:
-  - `what` is `token`, `dial`, `axis`, `other`, `state` or `row` (a `.contract` file's, below);
+  - `what` is `token`, `param`, `dial`, `axis`, `other`, `state` or `row` (a `.contract` file's, below);
   - `before` and `after` are source text, or null;
   - they come from comparing the two versions' parsed declarations, so a version the checker
     would refuse still gives edits.
+- A design's `params` block gives a `param` edit for each changed default or `when` value,
+  named as its line is written. A changed `component Name` block gives an `other` edit named
+  `component Name`, with the declaration before and after.
 - **`edits` is null, with `refused`,** when a side doesn't parse, declares a name or `when` twice,
   or the two versions together are over 1 MiB.
 - **The app's own Contract sources** (*1.11*, stage 8 D) are among the design's files: their
@@ -1180,8 +1219,12 @@ list is unchanged: it keeps its own.
   `unset-state`, and a style's own row's value with `set-row` (*1.12*: one the commit added or
   removed is refused, `set-row` adding or taking away none); its other lines are left as they are, and `code` lists the files where the
   commit changed some (*1.11*).
+- A design's `params` values are set back with `set-param` or `unset-param`, including their
+  `when` lines. Removing a param added by the commit requires its whole declaration to match.
 - **Refused (409)** with `refused: [{file, edit, now, why}]` when an edit can't be inverted:
   - the file has moved on it since;
+  - a selection restores a removed param's `when` line without its default;
+  - a param's spelling differs between its short and full names across the commit and current file;
   - the commit created or removed a design file (a `.contract` file's state rows included; one
     whose code alone changed is left alone);
   - a `.contract` row put back last would paint over a border row of its block it came before,
@@ -1192,7 +1235,7 @@ list is unchanged: it keeps its own.
   - the `.contract` file is not one of the app's own Contract sources now;
   - it added or removed a dial;
   - it added an axis, reordered an axis's values, or changed an axis's `under`;
-  - it changed a kind, a range, metadata, the design's name or its exports.
+  - it changed a kind, a range, metadata, the design's name, exports, icons or a `component` block.
 
   A removed axis is restored with `add-axis`.
 - **Other refusals:**
@@ -1200,7 +1243,8 @@ list is unchanged: it keeps its own.
   - a commit that touched no design file, or only a Contract source's code: 400;
   - an unknown commit: 404.
 - **Accepted after the files move,** it is planned again from the commit. A partial accept keeps
-  its selection when planned again.
+  its selection when planned again, including each param's default or conditional value.
+  If a removed param has reappeared with different values, each selected restoration is refused.
 
 ### `import` (*1.1*, LLP 1122 T1a)
 
@@ -1890,5 +1934,3 @@ The tool drives no input into an app; a command changes only what `prefer` would
   candidate).
 - **LLP 1121 stage 4's gate also names `resolve-on`.** LLP 1122 defers it to T2b, where a build's
   `selected` report carries the value it resolved.
-- **Later stages:** stage 10's canvas gateway (C) and the design tool's remote mode (D, LLP 1122
-  T6); a hosted relay (stage 10c).

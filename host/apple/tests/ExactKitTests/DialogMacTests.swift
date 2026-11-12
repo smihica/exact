@@ -45,9 +45,9 @@ class DialogMacTests: XCTestCase {
         ]))
         return p
     }
-    private func key(_ code: UInt16, modifiers: NSEvent.ModifierFlags = [], character: String = "", up: Bool = false) -> NSEvent {
+    private func key(_ code: UInt16, modifiers: NSEvent.ModifierFlags = [], character: String = "", ignoring: String? = nil, up: Bool = false) -> NSEvent {
         NSEvent.keyEvent(with: up ? .keyUp : .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0,
-            windowNumber: front.windowNumber, context: nil, characters: character, charactersIgnoringModifiers: character, isARepeat: false, keyCode: code)!
+            windowNumber: front.windowNumber, context: nil, characters: character, charactersIgnoringModifiers: ignoring ?? character, isARepeat: false, keyCode: code)!
     }
     private func click(_ node: NodeView, clicks: Int = 1) {
         let point = node.convert(NSPoint(x: node.bounds.midX, y: node.bounds.midY), to: nil)
@@ -352,6 +352,33 @@ class DialogMacTests: XCTestCase {
         XCTAssertFalse(tracked)
         XCTAssertFalse(p.menus.isOpen(try XCTUnwrap(p.views[6])))
     }
+    func testCommandPeriodUsesTheLayoutsCharacter() throws {
+        let p = fixture(), dialog = try XCTUnwrap(p.views[3]), field = try XCTUnwrap(p.views[4]?.field)
+        let cases: [(String, UInt16, String, String, Bool)] = [
+            ("ANSI Command-V", 9, "v", "v", false),
+            ("ANSI Command-period", 47, ".", ".", true),
+            ("Dvorak Command-V", 47, "v", "v", false),
+            ("Dvorak Command-period", 14, ".", ".", true),
+            ("Dvorak - QWERTY Command-period", 47, ".", "v", true),
+            ("Dvorak - QWERTY Command-E", 14, "e", ".", false),
+            ("French Command-colon", 47, ":", ":", false),
+            ("Turkish Q Command-ç", 47, "ç", "ç", false),
+            ("Turkish Q Command-period", 44, ".", ".", true),
+        ]
+        var cancelled: [UInt32] = []
+        dialog.handlers.insert("cancel")
+        p.dialogs.onCancel = { cancelled.append($0) }
+        for (layout, code, character, ignoring, dismisses) in cases {
+            cancelled.removeAll()
+            p.press(2)
+            XCTAssertTrue(p.dialogs.active === dialog, layout)
+            XCTAssertTrue(field.currentEditor() === front.firstResponder, layout)
+            XCTAssertEqual(p.routeKey(key(code, modifiers: .command, character: character, ignoring: ignoring), focused: true), dismisses, layout)
+            XCTAssertEqual(p.dialogs.active == nil, dismisses, layout)
+            XCTAssertEqual(cancelled, dismisses ? [dialog.id] : [], layout)
+            p.dialogs.close(dialog)
+        }
+    }
     func testDismissalPoliciesAndBackgroundPointerBlocking() {
         let p = fixture()
         let modal = p.views[3]!
@@ -362,6 +389,10 @@ class DialogMacTests: XCTestCase {
             XCTAssertEqual(p.dialogs.active == nil, policy == "any")
             if policy == "any" { p.press(2) }
             XCTAssertTrue(p.dialogs.key(key(53)))
+            XCTAssertEqual(p.dialogs.active == nil, policy != "none")
+            p.dialogs.close(modal)
+            p.press(2)
+            XCTAssertTrue(p.dialogs.key(key(14, modifiers: .command, character: ".")))
             XCTAssertEqual(p.dialogs.active == nil, policy != "none")
             p.dialogs.close(modal)
         }

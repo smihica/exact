@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "interaction_gallery_data::Gallery",
             "interaction_gallery_data::Gallery::default()",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

@@ -34,6 +34,7 @@ component Chat
   resource messages = messages(channel, live.rev) as shape Message[] else empty()
   mutation sent as shape Reply then afterSend
   // A closed socket is opened again after 1, 2, 4, 8, then every 16 seconds.
+  // The host closes one that carries nothing for a minute.
   state waited = 0
   state wait = 1
   task reconnect when live.status == "closed"
@@ -61,5 +62,5 @@ component Chat
 - **Shape a result in the same call,** `cx.query`'s fourth argument: `(b) => ({
   tiles: b.cells.map(…) })`. An `async` wrapper makes every change a pending
   frame.
-- **A native drive against a real deployment** takes a new `--seed` each
+- **A drive against a real deployment** takes a new `--seed` each
   launch, or Convex answers the second launch's writes without running them.

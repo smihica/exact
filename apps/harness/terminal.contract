@@ -191,7 +191,8 @@ component Harness
               preventDefault()
             else
               if key == "ArrowDown" and back >= 0 and not draft.includes("\n")
-                draft = match history.at(back - 1) { case some(h) => h, case none => "" }
+                // At the newest entry the draft is empty again: `at(-1)` would be the oldest.
+                draft = back > 0 ? (match history.at(back - 1) { case some(h) => h, case none => "" }) : ""
                 back = back - 1
                 preventDefault()
               else

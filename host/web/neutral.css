@@ -41,8 +41,9 @@
      the system red (Apple's is lighter). An author's `accent-color` is the nearer `--exact-accent`, on its node, and
      is drawn as written, as is a theme's red (`--exact-system-red-said`, roles.rs `theme_css`). */
   @supports (color: oklch(from AccentColor l c h)) { :root { --exact-accent: light-dark(oklch(from AccentColor min(l, .53) c h), oklch(from AccentColor max(l, .72) c h)); accent-color: var(--exact-accent); } #exact-root button[data-button-style][data-destructive="true"] { --exact-accent: var(--exact-system-red-said, light-dark(oklch(from var(--exact-system-red) min(l, .53) c h), oklch(from var(--exact-system-red) max(l, .72) c h))); } }
-  /* The page and its text: one ground in every browser, where each engine's dark `Canvas` is its own. */
-  html { background-color: var(--exact-background); color: var(--exact-label); }
+  /* The page and its text: one ground in every browser, where each engine's dark `Canvas` is its own. An opaque background
+     on the app's root is the canvas (`--exact-root-background`, web-js canvas.rs). */
+  html { background-color: var(--exact-root-background, var(--exact-background)); color: var(--exact-label); }
 
   /* Buttons. One box: 36 px (44 on a touch device) in every engine, so a line's height is said (`normal` is each
      engine's own, 18 px or 20 for the system font), and a 1 px edge every style keeps so they line up. `bordered` and
@@ -487,6 +488,22 @@
   #exact-root :is([role="menu"], [data-exact-chooser]) button[data-button-style]:enabled[data-pressed] { background-color: transparent; background-image: linear-gradient(var(--exact-fill) 0 0); }
   @media not (forced-colors: active) { #exact-root :is([role="menu"], [data-exact-chooser]) button[data-button-style]:enabled:focus-visible { outline: none; } }
   @media (any-pointer: coarse) { #exact-root :is([role="menu"], [data-exact-chooser]) button[data-button-style] { min-height: 44px; } }
+  /* A menu with a row of its own that can be checked (`aria-checked`, any role) gives each of its own rows a leading
+     column for the mark, as UIMenu and NSMenu do: the row's `::after`, in a grid track before the face's first line,
+     so it leads whatever template the face's direction makes, and the label follows it after whatever padding the row
+     has (a written width takes the look's). The labels stay aligned. A checked row paints the checkbox's checkmark
+     there in its own ink, a 1em square centred on the face: the mark's box spans the face's rows with no height of its
+     own, and the row centres those rows rather than stretching them (an empty subtitle row would take half the
+     slack). Its own rows are its children, or a List's items; a menu written inside it has its own. Under forced
+     colours the mark opts out of forcing, which would take its fill, and is drawn in the system's colour for a
+     button's text, GrayText when disabled: its `currentColor` would be the row's unforced colour. */
+  #exact-root :is([role="menu"]:has(> button[data-button-style][aria-checked], > [data-exact-list-item] > button[data-button-style][aria-checked]) > button[data-button-style], [role="menu"]:has(> button[data-button-style][aria-checked], > [data-exact-list-item] > button[data-button-style][aria-checked]) > [data-exact-list-item] > button[data-button-style]) {
+    align-content: center;
+    &::after { content: ""; grid-column: span 1 / 1; grid-row: 1 / -1; align-self: stretch; width: 1em; margin-inline-end: .5em; forced-color-adjust: none; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 1em 1em no-repeat; }
+    &[aria-checked="true"]::after { background-color: currentColor; }
+    @media (forced-colors: active) { &[aria-checked="true"]::after { background-color: ButtonText; } &[aria-checked="true"]:disabled::after { background-color: GrayText; } }
+  }
+
 
   /* A modal route is a sheet (D4.8): the page's ground over a scrim, above its siblings and the tab bar (`z-index`:
      WebKit paints a sidebar that scrolls over the scrim otherwise). Narrow, it is iOS's sheet, from 12 px below the

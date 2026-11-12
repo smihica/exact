@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "sparkline_data::Spark",
             "sparkline_data::Spark",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

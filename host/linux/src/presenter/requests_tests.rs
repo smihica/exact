@@ -314,7 +314,7 @@ fn the_shell_is_told_when_back_has_somewhere_to_go_and_a_field_holds_the_focus()
             .collect()
     };
     // At the first screen Back has nowhere to go, and no field is focused.
-    assert_eq!(told(&mut p), [(5, 0), (6, 0)]);
+    assert_eq!(told(&mut p), [(5, 0), (6, 0), (14, 0)]);
     assert_eq!(told(&mut p), [], "told once, while nothing changes");
     tap(&mut p, "open");
     assert_eq!(told(&mut p), [(5, 1)], "a route was pushed");
@@ -336,7 +336,7 @@ fn the_shell_is_told_when_back_has_somewhere_to_go_and_a_field_holds_the_focus()
     p.requests_reset();
     assert_eq!(says(&p, "share: dismissed"), 1);
     assert!(!p.answer_request(share, Some("shared")));
-    assert_eq!(told(&mut p), [(5, 0), (6, 1)]);
+    assert_eq!(told(&mut p), [(5, 0), (6, 1), (14, 0)]);
 }
 
 /// A date control and a time control, bound.

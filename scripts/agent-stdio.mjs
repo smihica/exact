@@ -95,8 +95,11 @@ export async function openStdio({ host, plan, world, size, app, env: extra = {},
   if (device) child.stdout.on('data', (d) => { for (const l of String(d).split('\n')) if (l) hostLines.push('app: ' + l); });
   let lines = device ? null : jsonLines(child.stdout, child.stdin, hostLines);
   const fail = (why) => { lines?.fail(why); bridge?.fail(new Error(why)); };
-  child.on('error', (e) => fail(`launch failed: ${e.message}`));
-  const exited = new Promise((r) => child.on('exit', (code, signal) => { r(code ?? signal); fail(closing ? 'the app was closed' : hangup({ what: 'the app exited', exit: { code, signal }, hostLines, reports: device || droid ? [] : crashReports(basename(bin), launched) })); }));
+  const exited = new Promise((r) => {
+    // A failed spawn may emit error without exit, so cleanup must finish on either.
+    child.on('error', (e) => { fail(`launch failed: ${e.message}`); r(); });
+    child.on('exit', (code, signal) => { r(code ?? signal); fail(closing ? 'the app was closed' : hangup({ what: 'the app exited', exit: { code, signal }, hostLines, reports: device || droid ? [] : crashReports(basename(bin), launched) })); });
+  });
   const close = async () => { closing = true; bridge?.close(); try { child.stdin.end(); if (device) child.kill('SIGTERM'); } catch {} await waitAtMost(exited, 2000); if (child.exitCode === null && child.signalCode === null) { try { child.kill('SIGKILL'); } catch {} } await exited; };
   let readyTimeout;
   try {

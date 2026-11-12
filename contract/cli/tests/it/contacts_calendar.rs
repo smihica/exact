@@ -127,6 +127,9 @@ fn boot(name: &str, source: &str, grants: &'static str) -> (App, Runner<Grants>,
             }));
         })));
     r.bind_extensions(&[], &["contacts", "calendar"]);
+    // Both packages are unsupported on Linux and Windows; a test that wants
+    // another target sets its own.
+    r.set_module_target("macos");
     (app, r, calls)
 }
 

@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1116.005 D8 in a real browser: the form chrome a well-made web form has, as a default build's stylesheet
 // (index.html and the neutral look's sheet after it, look.mjs; both web targets) and the JS target's runtime
 // (rt.js) draw it. focus-timer lost partly on its
@@ -7,7 +8,6 @@
 // outlined in the system red, its focus ring red, unless its border is authored. Enter in a single-line
 // field with a `submit` submits once. The nodes are as the hosts write them.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

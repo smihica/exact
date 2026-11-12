@@ -80,6 +80,7 @@ theorem cmono_aux : ∀ n,
           next => exact ihP hm h
           next => exact ihP hm h
           next => exact ihP hm h
+          next => exact ihP hm h
           next =>
             simp only [Except.bind_ok_iff] at h ⊢
             obtain ⟨vs, h1, h2⟩ := h

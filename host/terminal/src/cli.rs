@@ -20,6 +20,7 @@
 //! `wheel` refuse a node that is not on it.
 
 use crate::host::{Host, Key, Mode};
+use crate::term;
 use exact_runner::DataSource;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,9 +32,12 @@ fn parse_size(s: &str) -> Option<(usize, usize)> {
     Some((c.parse().ok()?, r.parse().ok()?))
 }
 
-/// A key named as the agent names it: `Enter`, `Control+c`, `Shift+Enter`, `a`.
-pub fn key_of(name: &str) -> Key {
-    const NAMED: [&str; 14] = [
+/// A key named as the agent names it, in Playwright's spelling: `Enter`,
+/// `Control+c`, `Shift+Enter`, `a`, with the modifiers in any order. It is
+/// the key the terminal's decoder makes of the same chord, or `None` for a
+/// name that is no key.
+pub fn key_of(name: &str) -> Option<Key> {
+    const NAMED: [&str; 13] = [
         "Enter",
         "Tab",
         "Escape",
@@ -47,23 +51,29 @@ pub fn key_of(name: &str) -> Key {
         "End",
         "PageUp",
         "PageDown",
-        "Space",
     ];
-    if let Some(c) = name.strip_prefix("Control+") {
-        return Key::Ctrl(c.chars().next().unwrap_or('c').to_ascii_lowercase());
+    let (mut mods, mut rest) = (0, name);
+    // `+` itself is a key: `+`, `Shift++`.
+    while let Some((word, key)) = rest.split_once('+').filter(|(_, key)| !key.is_empty()) {
+        mods |= match word {
+            "Shift" => 1,
+            "Alt" => 2,
+            "Control" => 4,
+            "Meta" => 8,
+            _ => return None,
+        };
+        rest = key;
     }
-    if name == "Shift+Tab" {
-        return Key::BackTab;
+    if rest == "Space" {
+        return Some(term::text_with_mods(' ', mods));
     }
-    if name.contains('+') {
-        return Key::Chord(name.to_string());
+    if let Some(n) = NAMED.iter().find(|n| **n == rest) {
+        return Some(term::with_mods(n, mods));
     }
-    if name == "Space" {
-        return Key::Char(' ');
-    }
-    match NAMED.iter().find(|n| **n == name) {
-        Some(n) => Key::Named(n),
-        None => Key::Char(name.chars().next().unwrap_or(' ')),
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(term::text_with_mods(c, mods)),
+        _ => None,
     }
 }
 
@@ -172,10 +182,10 @@ fn layout<D: DataSource>(host: &Host<D>) -> String {
         }
         let (f, c) = (n.frame, host.cells_of(id).expect("a node"));
         let radius = [
-            n.style.border_radius_top_left,
-            n.style.border_radius_top_right,
-            n.style.border_radius_bottom_right,
-            n.style.border_radius_bottom_left,
+            n.style.border_radius_top_left.clone(),
+            n.style.border_radius_top_right.clone(),
+            n.style.border_radius_bottom_right.clone(),
+            n.style.border_radius_bottom_left.clone(),
         ]
         // As a host sizes a corner: a percentage of the box's width across
         // and of its height down (`at_basis`), none below 0, one length where
@@ -449,7 +459,12 @@ fn run_plan<D: DataSource>(
                 }
             }
             "key" => {
-                if host.key(key_of(&arg())) == crate::host::After::Quit {
+                let name = arg();
+                let Some(key) = key_of(&name) else {
+                    eprintln!("key: {name:?} is not a key");
+                    return ExitCode::FAILURE;
+                };
+                if host.key(key) == crate::host::After::Quit {
                     break;
                 }
             }

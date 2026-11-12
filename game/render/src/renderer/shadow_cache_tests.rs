@@ -311,3 +311,58 @@ fn cached_casters_match_redrawing_after_scene_changes() {
     r.draw(&view, (128, 128), &f);
     assert!(r.shadows.as_ref().unwrap().cached.is_none());
 }
+
+/// A shadow distance at or before the camera's near plane shadows nothing the
+/// camera sees: the frame draws with no cascades instead of asserting (an
+/// abort, under the games' `panic = "abort"`).
+#[test]
+fn a_shadow_distance_inside_the_near_plane_draws_no_shadow() {
+    let Some(gpu) = crate::test_device::device_or_skip(fixture::device()) else {
+        return;
+    };
+    let mut r = Renderer::configured(
+        &gpu.device,
+        &gpu.queue,
+        wgpu::TextureFormat::Rgba8Unorm,
+        SceneSamples::One,
+        true,
+    );
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 32,
+            height: 32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    for (near, distance) in [(0.1, 0.05), (80., 60.)] {
+        let f = FrameInput {
+            view: glam::camera::rh::view::look_at_mat4(
+                Vec3::new(0., 100., 100.),
+                Vec3::ZERO,
+                Vec3::Y,
+            ),
+            proj: glam::camera::rh::proj::directx::perspective(1., 1., near, 400.),
+            sun: Some(Sun {
+                direction: Vec3::new(1., -2., 0.5),
+                color: Vec3::ONE,
+                illuminance: 1.,
+                shadows: Some(Shadows {
+                    distance,
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(Cascades::reach(&f, f.sun.unwrap().shadows.unwrap()).is_none());
+        r.draw(&view, (32, 32), &f);
+        assert!(r.shadows.is_none(), "near {near}, distance {distance}");
+    }
+}

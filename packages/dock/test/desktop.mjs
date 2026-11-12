@@ -15,7 +15,7 @@
 //  6. `--bind login-item`: SMAppService's registration of this fixture
 //     bundle, and its unregistration (the item is never left registered).
 //  7. `--bind global-shortcuts`: Carbon registers the chord, and a check of
-//     another answers without keeping it.
+//     another answers without keeping it; new keys register and release the old.
 //  8. An accessory app (`host.macos.activationPolicy`): no window at launch,
 //     the status item placed, the window shown by Open.
 //
@@ -29,6 +29,7 @@ import { checker } from '../../camera/test/fixture.mjs';
 import { texts } from '../../photos/test/fixture.mjs';
 import { root, run } from '../../contacts/test/fixture.mjs';
 import { build, launch } from '../../tracking-consent/test/fixture.mjs';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 import { cpSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename } from 'node:path';
@@ -43,7 +44,7 @@ const { check, failed } = checker();
 function makeFixture({ accessory = false } = {}) {
   const here = resolve(import.meta.dir, 'fixture');
   const dir = mkdtempSync(join(tmpdir(), 'exact-desktop-')), app = join(dir, accessory ? 'menubarfixture' : 'desktopfixture');
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'mac,linux'], root);
   for (const f of ['app.contract', 'app.ts']) cpSync(join(here, f), join(app, f));
   rmSync(join(app, 'app.test.contract'), { force: true });
   const manifestPath = join(app, 'app.json'), appJson = JSON.parse(readFileSync(manifestPath, 'utf8'));
@@ -54,6 +55,9 @@ function makeFixture({ accessory = false } = {}) {
   for (const name of ['login-item', 'global-shortcuts', 'dock']) (pkg.dependencies ??= {})[`@exact/${name}`] = `file:${resolve(root, 'packages', name)}`;
   writeFileSync(join(app, 'package.json'), JSON.stringify(pkg, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, name: basename(app), id: appJson.app.id, remove: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -161,6 +165,11 @@ async function drives(fixture) {
       await s.tap('check');
       await s.clock('+1000 real');
       check(host, '7: a check of another answers', (await texts(s)).checked === 'Check: true ', (await texts(s)).checked);
+      await s.tap('rebind');
+      await s.clock('+1000 real');
+      check(host, '7: new keys register', /^Shortcut Control\+Alt\+Meta\+J: registered/.test((await texts(s)).snap), (await texts(s)).snap);
+      check(host, '7: and the old chord is released', /Control\+Alt\+Meta\+K for snap: released/.test(await logs(s)),
+        (await logs(s)).split('\n').filter((l) => /global-shortcuts|globalShortcut/.test(l)).slice(-6).join('\n'));
     } finally { await s.close(); }
   }
 }

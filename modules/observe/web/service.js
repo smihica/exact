@@ -1,6 +1,9 @@
 // Observe's web service, loaded by the host's marks.js after startup. It queues journal
 // events as Observe rows in localStorage until the server accepts them, and sends them
 // in expo-observe's OTLP/JSON with its retry rules.
+// Every tab of the app shares the stored queue. A tab adds its rows to what is stored, and
+// sends while holding a Web Lock named for the queue, so one tab at a time sends and each
+// row is sent once (https://w3c.github.io/web-locks/).
 // On page hide it flushes with fetch(keepalive), limiting each signal's JSON length
 // to 60 * 1024 UTF-16 code units. The browser's shared byte limit may still reject
 // a request; those rows stay queued for retry.
@@ -55,11 +58,29 @@ function rulesAttributes(raw) {
   return { kept, dropped };
 }
 
+/** `stored` without one row equal to each of `sent`, matched from the front. */
+function without(stored, sent) {
+  const left = new Map();
+  for (const row of sent) { const k = JSON.stringify(row); left.set(k, (left.get(k) ?? 0) + 1); }
+  return stored.filter(row => {
+    const k = JSON.stringify(row), n = left.get(k);
+    if (!n) return true;
+    left.set(k, n - 1);
+    return false;
+  });
+}
+
 export function start(config, { boot = 0 } = {}) {
   const key = `exact-observe:${config['app.CFBundleIdentifier'] ?? location.host}`;
   const clientId = localStorage.getItem('expo.eas-client-id') ?? uuid();
   localStorage.setItem('expo.eas-client-id', clientId);
   const session = uuid();
+  const meta = {
+    osName: navigator.userAgentData?.platform ?? navigator.platform, language: navigator.language, clientVersion: '0.1.0',
+    appIdentifier: config['app.CFBundleIdentifier'], appName: config['app.CFBundleName'],
+    environment: config.environment ?? (config['fact.development'] ? 'development' : 'production'),
+  };
+  const load = () => (() => { try { return JSON.parse(localStorage.getItem(key)); } catch {} })() ?? { sessions: {}, metrics: [], logs: [] };
   const save = q => {
     q.metrics = q.metrics.slice(-MAX_ROWS); q.logs = q.logs.slice(-MAX_ROWS);
     const live = new Set([session, ...q.metrics.map(r => r.session), ...q.logs.map(r => r.session)]);
@@ -68,17 +89,15 @@ export function start(config, { boot = 0 } = {}) {
     }
     try { localStorage.setItem(key, JSON.stringify(q)); } catch {}
   };
-  const q = (() => { try { return JSON.parse(localStorage.getItem(key)); } catch {} })() ?? { sessions: {}, metrics: [], logs: [] };
-  q.sessions[session] = {
-    osName: navigator.userAgentData?.platform ?? navigator.platform, language: navigator.language, clientVersion: '0.1.0',
-    appIdentifier: config['app.CFBundleIdentifier'], appName: config['app.CFBundleName'],
-    environment: config.environment ?? (config['fact.development'] ? 'development' : 'production'),
-  };
-  save(q);
+  // A read-modify-write of the stored queue. The session's metadata goes with each change,
+  // since another tab's save drops it while this session has no queued rows.
+  const update = change => { const q = load(); q.sessions[session] = meta; change(q); save(q); };
+  const queued = () => { const q = load(); return q.metrics.length > 0 || q.logs.length > 0; };
+  update(() => {});
   let globals = {}, gate = { after: 0, failures: 0 }, sending = false, timer = null, launchRoute = null, navigated = false;
   const params = extra => ({ ...globals, ...extra });
-  const metric = (category, name, value, wall, route, p) => { q.metrics.push({ session, time: wall / 1000, category, name, value, route, params: JSON.stringify(p) }); save(q); schedule(); };
-  const log = (severity, name, body, attributes, dropped, wall) => { q.logs.push({ session, time: wall / 1000, severity, name, body, attributes, dropped }); save(q); schedule(); };
+  const metric = (category, name, value, wall, route, p) => { update(q => q.metrics.push({ session, time: wall / 1000, category, name, value, route, params: JSON.stringify(p) })); schedule(); };
+  const log = (severity, name, body, attributes, dropped, wall) => { update(q => q.logs.push({ session, time: wall / 1000, severity, name, body, attributes, dropped })); schedule(); };
 
   function startup(e) {
     const m = e.marks ?? {}, from = m.activation ?? 0;
@@ -108,11 +127,11 @@ export function start(config, { boot = 0 } = {}) {
     return { attributes: a.filter(([, v]) => v != null).map(([k, v]) => stringAttr(k, String(v))) };
   };
   /** `{outer: [{resource, inner: [{scope, list: items}], schemaUrl}]}`, one resource per session. */
-  const envelope = (by, outer, inner, list) => ({ [outer]: Object.keys(by).filter(s => q.sessions[s]).map(s => ({
-    resource: resource(q.sessions[s]), [inner]: [{ scope: { name: 'expo-observe', version: q.sessions[s].clientVersion ?? '0' }, [list]: by[s] }], schemaUrl: SCHEMA_URL })) });
+  const envelope = (sessions, by, outer, inner, list) => ({ [outer]: Object.keys(by).filter(s => sessions[s]).map(s => ({
+    resource: resource(sessions[s]), [inner]: [{ scope: { name: 'expo-observe', version: sessions[s].clientVersion ?? '0' }, [list]: by[s] }], schemaUrl: SCHEMA_URL })) });
   // A JSON number, as expo-observe sends it.
   const nanos = s => Math.round(s * 1000) * 1e6;
-  function metricsBody(rows) {
+  function metricsBody(rows, sessions) {
     const by = {};
     for (const r of rows) {
       const attrs = [stringAttr('session.id', r.session)];
@@ -120,9 +139,9 @@ export function start(config, { boot = 0 } = {}) {
       if (r.params && r.params !== '{}') attrs.push(stringAttr('expo.custom_params', r.params));
       (by[r.session] ??= []).push({ unit: 's', name: NAMES[`${r.category}/${r.name}`] ?? `expo.unknown.${r.name}`, gauge: { dataPoints: [{ timeUnixNano: nanos(r.time), asDouble: r.value, attributes: attrs }] } });
     }
-    return envelope(by, 'resourceMetrics', 'scopeMetrics', 'metrics');
+    return envelope(sessions, by, 'resourceMetrics', 'scopeMetrics', 'metrics');
   }
-  function logsBody(rows) {
+  function logsBody(rows, sessions) {
     const by = {};
     for (const r of rows) {
       const attrs = [stringAttr('session.id', r.session), stringAttr('event.name', r.name)];
@@ -132,7 +151,7 @@ export function start(config, { boot = 0 } = {}) {
       if (dropped) rec.droppedAttributesCount = dropped;
       (by[r.session] ??= []).push(rec);
     }
-    return envelope(by, 'resourceLogs', 'scopeLogs', 'logRecords');
+    return envelope(sessions, by, 'resourceLogs', 'scopeLogs', 'logRecords');
   }
 
   const inSample = () => uniform(clientId) < Math.min(Math.max(config.sampleRate ?? 1, 0), 1);
@@ -145,9 +164,10 @@ export function start(config, { boot = 0 } = {}) {
   async function send(signal, url, keepalive) {
     if (Date.now() < gate.after) return;
     let limit = CHUNK, budget = KEEPALIVE_BUDGET;
-    while (q[signal].length) {
-      const rows = q[signal].slice(0, limit);
-      const body = JSON.stringify(signal === 'metrics' ? metricsBody(rows) : logsBody(rows));
+    for (;;) {
+      const q = load(), rows = q[signal].slice(0, limit);
+      if (!rows.length) return;
+      const body = JSON.stringify(signal === 'metrics' ? metricsBody(rows, q.sessions) : logsBody(rows, q.sessions));
       if (keepalive && body.length > budget) {
         if (rows.length > 1) { limit = rows.length >> 1; continue; }
         return; // Keep a row over the JSON-length budget for a normal fetch
@@ -162,10 +182,9 @@ export function start(config, { boot = 0 } = {}) {
       if (status === 413 && rows.length > 1) { gate.failures = 0; limit = rows.length >> 1; continue; }
       if (status !== null && ![429, 502, 503, 504].includes(status)) {
         gate.failures = 0;
-        // Remove only this request's rows when capacity trimming changed the queue during fetch
-        const processed = new Set(rows);
-        q[signal] = q[signal].filter(row => !processed.has(row));
-        save(q);
+        // Remove only this request's rows: this tab or another may have added rows, and
+        // the capacity trim dropped old ones, during the fetch.
+        update(q => { q[signal] = without(q[signal], rows); });
         limit = CHUNK;
         continue;
       }
@@ -173,18 +192,24 @@ export function start(config, { boot = 0 } = {}) {
       return;
     }
   }
-  async function dispatch(keepalive = false) {
-    if (sending || (!q.metrics.length && !q.logs.length)) return;
-    if (Date.now() < gate.after) { schedule(gate.after - Date.now()); return; }
-    if (!shouldDispatch() || !config.projectId) { q.metrics.length = 0; q.logs.length = 0; save(q); return; }
-    sending = true;
+  async function drain(keepalive) {
+    if (!shouldDispatch() || !config.projectId) { update(q => { q.metrics = []; q.logs = []; }); return; }
     const base = String(config.endpoint ?? 'https://o.expo.dev').replace(/\/+$/, '');
+    await send('metrics', `${base}/${config.projectId}/v1/metrics`, keepalive);
+    await send('logs', `${base}/${config.projectId}/v1/logs`, keepalive);
+  }
+  // Without Web Locks (a page that is not a secure context) each tab sends alone, and a
+  // row two tabs read before either removes it is sent twice.
+  const exclusive = work => navigator.locks ? navigator.locks.request(key, work) : work();
+  async function dispatch(keepalive = false) {
+    if (sending || !queued()) return;
+    if (Date.now() < gate.after) { schedule(gate.after - Date.now()); return; }
+    sending = true;
     try {
-      await send('metrics', `${base}/${config.projectId}/v1/metrics`, keepalive);
-      await send('logs', `${base}/${config.projectId}/v1/logs`, keepalive);
+      await exclusive(() => drain(keepalive));
     } finally {
       sending = false;
-      if (q.metrics.length || q.logs.length) schedule(Math.max(0, gate.after - Date.now()));
+      if (queued()) schedule(Math.max(0, gate.after - Date.now()));
     }
   }
   function schedule(delay = 5000) { if (timer === null) timer = setTimeout(() => { timer = null; return dispatch(); }, delay); }
@@ -208,6 +233,6 @@ export function start(config, { boot = 0 } = {}) {
         case 'app.error': log('error', 'js.exception', undefined, { 'expo.error.source': e.source ?? 'reportedByUser', 'expo.error.is_fatal': false, 'exception.type': e.type ?? 'Error', 'exception.message': e.message ?? '', ...(e.stack ? { 'exception.stacktrace': e.stack } : {}) }, 0, e.wall); break;
       }
     },
-    background() { dispatch(true); },
+    background() { return dispatch(true); },
   };
 }

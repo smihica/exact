@@ -69,13 +69,19 @@ pub enum Input {
 pub struct Decoder {
     out: Vec<Input>,
     paste: Option<String>,
-    /// A lone ESC ended the last read.
-    escape: bool,
+    /// A lone ESC ended the last read: when it becomes the Escape key, in
+    /// milliseconds on the caller's clock.
+    escape: Option<f64>,
 }
 
 impl Decoder {
     fn key(&mut self, k: Key) {
         self.out.push(Input::Key(k));
+    }
+
+    /// When a held ESC becomes the Escape key, if one is held.
+    pub fn escape_due(&self) -> Option<f64> {
+        self.escape
     }
 }
 
@@ -90,22 +96,93 @@ fn ctrl_of(byte: u8) -> Option<Key> {
     }
 }
 
-/// A named key with modifiers (xterm/kitty: 1 + shift 1, alt 2, ctrl 4).
-fn with_mods(name: &'static str, mods: u16) -> Key {
+/// The modifiers a key's modifier parameter holds. The parameter is 1 plus
+/// the sum of shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32, caps_lock
+/// 64 and num_lock 128 (the kitty keyboard protocol, "Modifiers",
+/// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#modifiers>; xterm's
+/// PC-style function keys use the first three alike, ctlseqs,
+/// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-PC-Style-Function-Keys>).
+/// The locks are state, not part of a chord, and come with every key that
+/// types no text while they are on, so they are dropped here.
+fn modifiers(param: u16) -> u16 {
+    param.saturating_sub(1) & !(64 | 128)
+}
+
+/// The chord's modifier words, in Playwright's spelling. Super (the Command
+/// or Windows key), hyper and meta are all `Meta`: a key event has one such
+/// modifier, as DOM's `metaKey`.
+fn chord_words(mods: u16) -> String {
+    let mut chord = String::new();
+    for (bits, word) in [(4, "Control+"), (2, "Alt+"), (1, "Shift+"), (56, "Meta+")] {
+        if mods & bits != 0 {
+            chord.push_str(word);
+        }
+    }
+    chord
+}
+
+/// A named key with modifiers (bits as [`modifiers`] returns them), as the
+/// decoder and a drive's `key` both make it.
+pub(crate) fn with_mods(name: &'static str, mods: u16) -> Key {
     if mods == 0 {
         return Key::Named(name);
     }
     if mods == 1 && name == "Tab" {
         return Key::BackTab;
     }
-    let mut chord = String::new();
-    for (bit, word) in [(4, "Control+"), (2, "Alt+"), (1, "Shift+")] {
-        if mods & bit != 0 {
-            chord.push_str(word);
-        }
+    Key::Chord(chord_words(mods) + name)
+}
+
+/// A text key with modifiers. The protocol sends the unshifted key with
+/// Shift as a modifier, so Shift alone capitalizes a letter; Control with
+/// or without Shift is the control key.
+pub(crate) fn text_with_mods(c: char, mods: u16) -> Key {
+    match mods & !1 {
+        0 if mods == 1 => Key::Char(c.to_ascii_uppercase()),
+        0 => Key::Char(c),
+        4 => Key::Ctrl(c.to_ascii_lowercase()),
+        m => Key::Chord(chord_words(m) + c.encode_utf8(&mut [0; 4])),
     }
-    chord.push_str(name);
-    Key::Chord(chord)
+}
+
+/// The key a kitty keyboard protocol key number names, with modifiers, or
+/// `None` for a key that types nothing here. The keypad's keys and the
+/// other functional keys have numbers in the Private Use Area, 57344 to
+/// 63743 (the protocol's "Functional key definitions"; under "Disambiguate
+/// escape codes" each keypad key that types no text is sent as its number:
+/// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions>).
+fn kitty_key(number: u16, mods: u16) -> Option<Key> {
+    let name = match number {
+        27 => "Escape",
+        13 | 57414 => "Enter",
+        9 => "Tab",
+        127 => "Backspace",
+        57417 => "ArrowLeft",
+        57418 => "ArrowRight",
+        57419 => "ArrowUp",
+        57420 => "ArrowDown",
+        57421 => "PageUp",
+        57422 => "PageDown",
+        57423 => "Home",
+        57424 => "End",
+        57426 => "Delete",
+        _ => {
+            let c = match number {
+                57399..=57408 => (b'0' + (number - 57399) as u8) as char,
+                57409 => '.',
+                57410 => '/',
+                57411 => '*',
+                57412 => '-',
+                57413 => '+',
+                57415 => '=',
+                57416 => ',',
+                57344..=63743 => return None,
+                n => char::from_u32(n as u32).filter(|c| !c.is_control())?,
+            };
+            return Some(text_with_mods(c, mods));
+        }
+    };
+    Some(with_mods(name, mods))
 }
 
 impl Perform for Decoder {
@@ -143,7 +220,7 @@ impl Perform for Decoder {
             .map(|p| p.first().copied().unwrap_or(0))
             .collect();
         let first = p.first().copied().unwrap_or(0);
-        let mods = p.get(1).copied().unwrap_or(1).saturating_sub(1);
+        let mods = modifiers(p.get(1).copied().unwrap_or(1));
         if action == '~' && (first == 200 || first == 201) {
             if first == 200 {
                 self.paste = Some(String::new());
@@ -163,8 +240,11 @@ impl Perform for Decoder {
                     p.get(2).copied().unwrap_or(1) as i32 - 1,
                 );
                 if b & 64 != 0 {
-                    self.out
-                        .push(Input::Wheel(x, y, if b & 1 == 0 { -3 } else { 3 }));
+                    // Buttons 6 and 7 are horizontal; this host scrolls only rows.
+                    if b & 2 == 0 {
+                        self.out
+                            .push(Input::Wheel(x, y, if b & 1 == 0 { -3 } else { 3 }));
+                    }
                 } else if action == 'M' && b & 32 == 0 && b & 3 == 0 {
                     self.out.push(Input::Click(x, y));
                 }
@@ -189,23 +269,8 @@ impl Perform for Decoder {
             },
             // The kitty keyboard protocol: a code point and its modifiers.
             (_, 'u') => {
-                let named = match first {
-                    27 => Some("Escape"),
-                    13 => Some("Enter"),
-                    9 => Some("Tab"),
-                    127 => Some("Backspace"),
-                    _ => None,
-                };
-                if let Some(name) = named {
-                    self.key(with_mods(name, mods));
-                } else if let Some(c) = char::from_u32(first as u32) {
-                    if mods & 4 != 0 && mods & !5 == 0 {
-                        self.key(Key::Ctrl(c.to_ascii_lowercase()));
-                    } else if mods & 2 != 0 {
-                        self.key(Key::Chord(format!("Alt+{c}")));
-                    } else {
-                        self.key(Key::Char(c));
-                    }
+                if let Some(k) = kitty_key(first, mods) {
+                    self.key(k);
                 }
             }
             _ => {}
@@ -213,12 +278,32 @@ impl Perform for Decoder {
     }
 }
 
-/// Decode a read: DEL by hand (a terminal parser ignores it), everything
-/// else through vte. A read ending in a lone ESC is held: it is the Escape
-/// key only if nothing follows within [`ESC_WAIT_MS`] (`flush_escape`), and
-/// otherwise the start of a sequence split across reads.
-pub fn decode(parser: &mut Parser, decoder: &mut Decoder, bytes: &[u8]) -> Vec<Input> {
-    let held = std::mem::take(&mut decoder.escape);
+/// The legacy Alt+key for an ESC followed by this byte, when the byte is
+/// DEL or a C0 key: xterm's `metaSendsEscape` prefixes the key's own byte
+/// with ESC (ctlseqs, "Alt and Meta Keys",
+/// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Alt-and-Meta-Keys>).
+fn alt_of(byte: u8) -> Option<Key> {
+    let key = if byte == 0x7f {
+        Key::Named("Backspace")
+    } else {
+        ctrl_of(byte)?
+    };
+    Some(match key {
+        Key::Named(name) => with_mods(name, 2),
+        Key::Ctrl(c) => text_with_mods(c, 6),
+        other => other,
+    })
+}
+
+/// Decode a read: DEL, and ESC before DEL or a C0 key, by hand, everything
+/// else through vte. vte ignores DEL, and it executes a C0 byte inside an
+/// escape sequence without leaving it, which would make the key after it
+/// Alt+key. A read ending in a lone ESC is held: it is the Escape key only
+/// if nothing follows within [`ESC_WAIT_MS`] of `now`, the read's time
+/// (`flush_escape`), and otherwise the start of a sequence split across
+/// reads.
+pub fn decode(parser: &mut Parser, decoder: &mut Decoder, bytes: &[u8], now: f64) -> Vec<Input> {
+    let held = decoder.escape.take().is_some();
     let joined;
     let bytes = if held {
         joined = [&[0x1b][..], bytes].concat();
@@ -227,34 +312,57 @@ pub fn decode(parser: &mut Parser, decoder: &mut Decoder, bytes: &[u8]) -> Vec<I
         bytes
     };
     let mut start = 0;
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == 0x7f {
-            parser.advance(decoder, &bytes[start..i]);
-            if decoder.paste.is_none() {
-                decoder.key(Key::Named("Backspace"));
-            }
+    let mut i = 0;
+    while i < bytes.len() {
+        let (key, len) = match bytes[i] {
+            0x7f => (Some(Key::Named("Backspace")), 1),
+            0x1b => match bytes.get(i + 1).and_then(|b| alt_of(*b)) {
+                Some(k) => (Some(k), 2),
+                None => (None, 1),
+            },
+            _ => (None, 1),
+        };
+        let Some(key) = key else {
+            i += 1;
+            continue;
+        };
+        parser.advance(decoder, &bytes[start..i]);
+        if decoder.paste.is_none() {
+            decoder.key(key);
+            start = i + len;
+        } else if len == 1 {
+            // A paste keeps no DEL.
             start = i + 1;
+        } else {
+            // A paste's ESC and control byte are vte's, as any other text.
+            start = i;
         }
+        i += len;
     }
     let rest = &bytes[start..];
     if rest.last() == Some(&0x1b) && decoder.paste.is_none() {
         parser.advance(decoder, &rest[..rest.len() - 1]);
-        decoder.escape = true;
+        decoder.escape = Some(now + ESC_WAIT_MS);
     } else {
         parser.advance(decoder, rest);
     }
     std::mem::take(&mut decoder.out)
 }
 
-/// How long a lone ESC waits for the rest of a sequence.
+/// How long a lone ESC waits for the rest of a sequence, timed from the
+/// ESC whatever else wakes the loop, as ncurses' `ESCDELAY` and tmux's
+/// `escape-time` are.
 pub const ESC_WAIT_MS: f64 = 25.0;
 
-/// The held ESC, now that nothing followed it: the Escape key.
-pub fn flush_escape(decoder: &mut Decoder) -> Vec<Input> {
-    if std::mem::take(&mut decoder.escape) {
-        vec![Input::Key(Key::Named("Escape"))]
-    } else {
-        Vec::new()
+/// The held ESC, once nothing has followed it for [`ESC_WAIT_MS`]: the
+/// Escape key. Before then, nothing.
+pub fn flush_escape(decoder: &mut Decoder, now: f64) -> Vec<Input> {
+    match decoder.escape {
+        Some(due) if now >= due => {
+            decoder.escape = None;
+            vec![Input::Key(Key::Named("Escape"))]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -522,6 +630,18 @@ impl Inline {
         }
     }
 
+    /// The shell may have moved the cursor. Repaint the live region below it,
+    /// retaining the transcript already printed into scrollback.
+    #[cfg(unix)]
+    fn resume(&mut self) {
+        self.live = 0;
+        self.cursor_row = 0;
+        self.shown = None;
+        self.last = None;
+        self.mouse = false;
+        self.queries.clear();
+    }
+
     /// Leave the screen with the last frame in place and the cursor below it.
     #[cfg(unix)]
     fn finish(&self, out: &mut String) {
@@ -654,7 +774,7 @@ mod tests {
     }
 
     fn keys(bytes: &[u8]) -> Vec<Input> {
-        decode(&mut Parser::new(), &mut Decoder::default(), bytes)
+        decode(&mut Parser::new(), &mut Decoder::default(), bytes, 0.0)
     }
 
     #[test]
@@ -682,14 +802,23 @@ mod tests {
             vec![Input::Key(Key::Chord("Control+ArrowUp".into()))]
         );
         let (mut p, mut d) = (Parser::new(), Decoder::default());
-        assert_eq!(decode(&mut p, &mut d, b"\x1b"), vec![]);
-        assert_eq!(flush_escape(&mut d), vec![Input::Key(Key::Named("Escape"))]);
-        // An arrow split across reads stays an arrow.
-        assert_eq!(decode(&mut p, &mut d, b"\x1b"), vec![]);
+        // A lone ESC is the Escape key once ESC_WAIT_MS passed, not before.
+        assert_eq!(decode(&mut p, &mut d, b"\x1b", 100.0), vec![]);
+        assert_eq!(d.escape_due(), Some(100.0 + ESC_WAIT_MS));
+        assert_eq!(flush_escape(&mut d, 110.0), vec![]);
         assert_eq!(
-            decode(&mut p, &mut d, b"[A"),
+            flush_escape(&mut d, 100.0 + ESC_WAIT_MS),
+            vec![Input::Key(Key::Named("Escape"))]
+        );
+        assert_eq!(d.escape_due(), None);
+        // An arrow split across reads stays an arrow.
+        assert_eq!(decode(&mut p, &mut d, b"\x1b", 200.0), vec![]);
+        assert_eq!(flush_escape(&mut d, 210.0), vec![]);
+        assert_eq!(
+            decode(&mut p, &mut d, b"[A", 215.0),
             vec![Input::Key(Key::Named("ArrowUp"))]
         );
+        assert_eq!(d.escape_due(), None);
         assert_eq!(
             keys(b"\x1b[200~x\ny\x1b[201~"),
             vec![Input::Paste("x\ny".into())]
@@ -697,11 +826,86 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_wheel_reports_do_not_become_vertical_input() {
+        for modifiers in [0, 4, 8, 16, 28] {
+            for (button, rows) in [(64, Some(-3)), (65, Some(3)), (66, None), (67, None)] {
+                let report = format!("\x1b[<{};3;2M", button + modifiers);
+                let expected = rows.map(|rows| Input::Wheel(2, 1, rows));
+                assert_eq!(
+                    keys(report.as_bytes()),
+                    expected.into_iter().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kitty_lock_modifiers_and_keypad_keys_decode_as_the_keys_they_are() {
+        let key = |bytes: &[u8]| match &keys(bytes)[..] {
+            [Input::Key(k)] => Some(k.clone()),
+            [] => None,
+            other => panic!("{bytes:?}: {other:?}"),
+        };
+        // Caps Lock (64) and Num Lock (128) ride on every key that types no text.
+        assert_eq!(key(b"\x1b[99;69u"), Some(Key::Ctrl('c')));
+        assert_eq!(key(b"\x1b[99;133u"), Some(Key::Ctrl('c')));
+        assert_eq!(key(b"\x1b[92;133u"), Some(Key::Ctrl('\\')));
+        assert_eq!(key(b"\x1b[27;65u"), Some(Key::Named("Escape")));
+        assert_eq!(key(b"\x1b[9;66u"), Some(Key::BackTab));
+        assert_eq!(key(b"\x1b[1;129B"), Some(Key::Named("ArrowDown")));
+        assert_eq!(key(b"\x1b[3;129~"), Some(Key::Named("Delete")));
+        assert_eq!(
+            key(b"\x1b[1;133A"),
+            Some(Key::Chord("Control+ArrowUp".into()))
+        );
+        // Super, hyper and meta make a chord, never text.
+        assert_eq!(key(b"\x1b[99;9u"), Some(Key::Chord("Meta+c".into())));
+        assert_eq!(key(b"\x1b[13;9u"), Some(Key::Chord("Meta+Enter".into())));
+        assert_eq!(key(b"\x1b[99;7u"), Some(Key::Chord("Control+Alt+c".into())));
+        // The keypad's own numbers are the keys they stand for.
+        assert_eq!(key(b"\x1b[57414u"), Some(Key::Named("Enter")));
+        assert_eq!(key(b"\x1b[57419u"), Some(Key::Named("ArrowUp")));
+        assert_eq!(key(b"\x1b[57426;129u"), Some(Key::Named("Delete")));
+        assert_eq!(key(b"\x1b[57400;5u"), Some(Key::Ctrl('1')));
+        // Another functional key (here Caps Lock itself) types nothing.
+        assert_eq!(key(b"\x1b[57358u"), None);
+    }
+
+    #[test]
+    fn legacy_alt_with_backspace_or_a_control_key_is_one_chord() {
+        let chord = |c: &str| Input::Key(Key::Chord(c.into()));
+        let (mut p, mut d) = (Parser::new(), Decoder::default());
+        for (bytes, alt) in [
+            (&b"\x1b\x7f"[..], "Alt+Backspace"),
+            (b"\x1b\x08", "Alt+Backspace"),
+            (b"\x1b\r", "Alt+Enter"),
+            (b"\x1b\t", "Alt+Tab"),
+            (b"\x1b\x01", "Control+Alt+a"),
+        ] {
+            assert_eq!(decode(&mut p, &mut d, bytes, 0.0), vec![chord(alt)]);
+            // The key after it is itself, not Alt+key.
+            assert_eq!(
+                decode(&mut p, &mut d, b"a", 0.0),
+                vec![Input::Key(Key::Char('a'))]
+            );
+        }
+        // Split across reads: the held ESC and the key that follows it.
+        assert_eq!(
+            decode(&mut p, &mut d, b"x\x1b", 0.0),
+            vec![Input::Key(Key::Char('x'))]
+        );
+        assert_eq!(
+            decode(&mut p, &mut d, b"\x7fa", 0.0),
+            vec![chord("Alt+Backspace"), Input::Key(Key::Char('a'))]
+        );
+    }
+
+    #[test]
     fn a_paste_split_across_reads_stays_a_paste() {
         let (mut p, mut d) = (Parser::new(), Decoder::default());
-        assert_eq!(decode(&mut p, &mut d, b"\x1b[200~line one\r"), vec![]);
+        assert_eq!(decode(&mut p, &mut d, b"\x1b[200~line one\r", 0.0), vec![]);
         assert_eq!(
-            decode(&mut p, &mut d, b"q\x7fline two\x1b[201~"),
+            decode(&mut p, &mut d, b"q\x7fline two\x1b[201~", 0.0),
             vec![Input::Paste("line one\nqline two".into())]
         );
     }

@@ -536,11 +536,11 @@ fn failed_playback_contributes_no_stale_motion_or_events() {
 
 #[test]
 fn reverse_loop_markers_include_landing_exclude_departure_and_span_loops() {
-    assert!(crossed(0.3, 0.4, 0.3, 1., true));
-    assert!(!crossed(0.3, 0.3, 0.2, 1., true));
-    assert!(crossed(0.3, 0.4, -2.7, 1., true));
-    assert!(crossed(0., 0.1, 0., 1., true));
-    assert!(!crossed(0., 0., -0.1, 1., true));
+    assert!(crossed(0.3, 0.4, 0.3, 1., true, false));
+    assert!(!crossed(0.3, 0.3, 0.2, 1., true, false));
+    assert!(crossed(0.3, 0.4, -2.7, 1., true, false));
+    assert!(crossed(0., 0.1, 0., 1., true, false));
+    assert!(!crossed(0., 0., -0.1, 1., true, false));
 }
 #[test]
 fn standalone_reverse_once_starts_at_end() {
@@ -1417,4 +1417,5 @@ fn standalone_layers_require_fresh_sockets_and_carry_authored_edits() {
 }
 
 mod layers;
+mod markers;
 mod sockets_cursor;

@@ -3,11 +3,206 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync, statSync, utimesSync } from 'node:fs';
 import { createServer, get as httpGet } from 'node:http';
 import { tmpdir } from 'node:os';
-import { brotliDecompressSync } from 'node:zlib';
+import { brotliCompressSync, brotliDecompressSync, constants } from 'node:zlib';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { moduleGrants, webCompiler, fresh, freshCompiler } from './module.mjs';
+import { buildModule, moduleGrants, webCompiler, fresh, freshCompiler } from './module.mjs';
 import { spawnOwned } from '../../scripts/test-children.mjs';
+import { open } from '../../scripts/agent.mjs';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+
+test('the production starter stays within its 45 KiB budget and its header button works', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/starter-bytes-'));
+  const app = resolve(dir, 'starter'), dev = resolve(dir, 'development'), dist = resolve(dir, 'production');
+  let browser, server;
+  try {
+    const run = (args, env = {}) => {
+      const result = spawnSync(process.execPath, args, { cwd: root, env: { ...process.env, ...env }, encoding: 'utf8' });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    };
+    run(['scripts/exact.mjs', 'new', app, '--bundle-id', 'com.example.starter']);
+    run(['host/web/build.mjs', 'starter-web'], { EXACT_APP_DIR: app, EXACT_WEB_DIST: dev });
+    run(['host/web-js/build.mjs', 'starter', '--plan', resolve(dev, 'app.plan'), '--out', dist, '--production'], { EXACT_APP_DIR: app });
+    const entry = readFileSync(resolve(dist, 'app.js'));
+    const bytes = brotliCompressSync(entry, { params: {
+      [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: entry.length,
+    } }).length;
+    // scripts/metrics.mjs JS_TARGET_KIB: the production artifact, compressed as it ships.
+    expect(bytes).toBeLessThanOrEqual(45 * 1024);
+    expect(entry.toString()).not.toContain('focus window');
+    expect(entry.toString()).not.toContain('clipboard');
+    expect(entry.toString()).not.toContain('vibrate');
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      const path = new URL(request.url).pathname;
+      return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1))));
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage(), errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(server.url.href + '?agent&epoch=1&seed=3');
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    expect(await page.evaluate(() => exact.clock.agent)).toBe(false);
+    await page.waitForFunction(() => document.querySelector('[data-testid=greeting]')?.textContent === 'Hello from Starter.');
+    await page.getByTestId('like').click();
+    expect(await page.getByTestId('like').getAttribute('aria-label')).toBe('Unlike');
+    await page.getByTestId('like').click();
+    expect(await page.getByTestId('like').getAttribute('aria-label')).toBe('Like');
+    expect(errors).toEqual([]);
+  } finally {
+    await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
+test.each([false, true])('named focus, blur, scheme, clipboard and haptic commands work (production: %s)', async production => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/linked-commands-'));
+  const dist = resolve(dir, 'dist');
+  let browser, server;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Commands', app: { id: 'test.linked-commands', name: 'Commands' } }));
+    writeFileSync(resolve(dir, 'app.contract'), `component Commands
+  action apply
+    focus("field")
+    blur("other")
+    setScheme("dark")
+    copyText("copied")
+    haptic("selection")
+  action clear
+    blur("field")
+    setScheme("system")
+  action windowFocus
+    focus()
+    blur()
+    haptic("success")
+  view
+    column
+      input id="field" testId="field"
+      input id="other"
+      button "Apply" press=apply testId="apply"
+      button "Clear" press=clear testId="clear"
+      button "Window" press=windowFocus testId="window"
+`);
+    const built = spawnSync(process.execPath, ['host/web-js/build.mjs', 'commands', '--out', dist, '--render', 'none',
+      ...(production ? ['--production'] : [])], { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8' });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      const path = new URL(request.url).pathname;
+      return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1))));
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage(), errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      globalThis.calls = [];
+      window.focus = () => calls.push('window');
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText: text => calls.push(text) } });
+      Object.defineProperty(navigator, 'vibrate', { value: ms => calls.push(ms) });
+    });
+    // Production refuses agent mode even when the URL asks for it.
+    await page.goto(server.url.href + '?agent');
+    await page.getByTestId('apply').waitFor();
+    await page.getByTestId('apply').dispatchEvent('click');
+    expect(await page.evaluate(() => [document.activeElement.id, document.documentElement.style.colorScheme, calls]))
+      .toEqual(['field', 'dark', production ? ['copied', 5] : [5]]);
+    await page.getByTestId('clear').dispatchEvent('click');
+    expect(await page.evaluate(() => [document.activeElement === document.body, document.documentElement.style.colorScheme]))
+      .toEqual([true, '']);
+    await page.getByTestId('field').focus();
+    await page.getByTestId('window').dispatchEvent('click');
+    expect(await page.evaluate(() => [document.activeElement === document.body, calls]))
+      .toEqual([true, production ? ['copied', 5, 'window', 12] : [5, 12]]);
+    if (!production) expect(await page.evaluate(() => exact.journal.some(line => line.endsWith(' focus window')))).toBe(true);
+    await page.evaluate(() => { exact.held = { scheme: true }; });
+    await page.getByTestId('apply').dispatchEvent('click');
+    expect(await page.evaluate(() => [document.documentElement.style.colorScheme, exact.asked.scheme.value])).toEqual(['', 'dark']);
+    await page.evaluate(() => exact.asked.scheme.apply());
+    expect(await page.evaluate(() => document.documentElement.style.colorScheme)).toBe('dark');
+    expect(errors).toEqual([]);
+  } finally {
+    await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
+test.each([
+  ['empty list first', [], false],
+  ['two elements first', [1, 2], false],
+  ['title before one element', [1], true],
+  ['title before two elements', [1, 2], true],
+  ['two open elements', [1, 2], false, true],
+  ['kept answers with no arguments', [1, 2], false, false, true],
+  ['title alone', null, true],
+])('rendered checkpoints keep the declared resource types: %s', async (_label, ids, titleFirst, streaming = false, keeps = false) => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/resource-render-'));
+  const previousApp = process.env.EXACT_APP_DIR, itemText = id => keeps ? 'item' : `item ${id}`;
+  let server, browser;
+  try {
+    const title = '  resource title = title() as shape string\n';
+    const each = ids === null ? '' : `  resource each = item(${keeps ? '' : 'id'}) for id in ids as shape R\n`;
+    const dist = resolve(dir, 'dist');
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+      const url = new URL(req.url), path = url.pathname;
+      if (path === '/events') return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: item ${url.searchParams.get('id')}\n\n`));
+      } }), { headers: { 'content-type': 'text/event-stream' } });
+      const file = Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1)));
+      return await file.exists() ? new Response(file) : new Response(null, { status: 404 });
+    } });
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Resource Render', app: { id: 'test.resource-render', name: 'Resource Render' }, host: { web: {} } }));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/" render=build
+shape R
+  text: string
+component Probe
+  state ids: number[] = ${JSON.stringify(ids ?? [])}
+${titleFirst ? title + each : each + title}  view
+    column
+      text title testId="title"
+${ids === null ? '' : '      for r in each key=r.text\n        text r.text\n'}`);
+    writeFileSync(resolve(dir, 'app.ts'), streaming ? `export const grants = 'net.fetch ${server.url.origin}';
+export const answer = (source: string, [id]: number[]): any => source === 'item' ? fetch('${server.url.origin}/events?id=' + id, {
+  exactStream: (event: any) => ({ text: event.data }),
+} as RequestInit) : 'Hello';
+` : keeps ? `export const grants = '';
+const saved = new Map<string, any>();
+export const kept = (source: string, args: any[], value: any) => saved.set(source + JSON.stringify(args), value);
+export const answer = (source: string, args: any[]): any => saved.get(source + JSON.stringify(args)) ?? (source === 'item' ? { text: 'item' } : 'Hello');
+` : `export const grants = '';
+export const answer = ${ids === null ? "() => 'Hello'" : "(source: string, [id]: number[]) => source === 'item' ? { text: 'item ' + id } : 'Hello'"};
+`);
+    const result = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'resource-render', '--out', dist], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([result.exited, new Response(result.stdout).text(), new Response(result.stderr).text()]);
+    expect(status, stdout + stderr).toBe(0);
+    const html = readFileSync(resolve(dist, 'index.html'), 'utf8');
+    const checkpoint = JSON.parse(html.match(/<script type="application\/vnd\.exact\.checkpoint"[^>]*>(.*?)<\/script>/s)[1]);
+    expect(checkpoint.open ?? []).toEqual(streaming ? ['each'] : []);
+    const titleAnswer = ['title', 'title', [], 'Hello'];
+    const listAnswers = ids === null ? [] : [['each', 'item', [], ids.map(id => ({ r: [itemText(id)] }))]];
+    expect(checkpoint.answers).toEqual(titleFirst ? [titleAnswer, ...listAnswers] : [...listAnswers, titleAnswer]);
+    for (const id of ids ?? []) expect(html).toContain(itemText(id));
+    browser = await open({ host: 'web', app: dir, webDist: dist, url: server.url.href });
+    await browser.clock('settle');
+    const state = await browser.state();
+    expect(state.resources).toEqual({ title: 'Hello', ...(ids === null ? {} : { each: ids.map(id => ({ text: itemText(id) })) }) });
+    expect(state.resourceStatus.title.resource).toBe(titleFirst ? 0 : 1);
+    const members = Object.entries(state.resourceStatus).filter(([name]) => name.startsWith('each['));
+    expect(members).toHaveLength(ids?.length ?? 0);
+    for (const [, status] of members) expect(status.resource).toBe(titleFirst ? 1 : 0);
+    expect(await browser.carrier.evaluate('document.querySelector("[data-testid=title]").textContent')).toBe('Hello');
+    for (const id of ids ?? []) expect(await browser.carrier.evaluate('document.getElementById("exact-root").textContent')).toContain(itemText(id));
+  } finally {
+    try {
+      await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+    } finally {
+      if (previousApp === undefined) delete process.env.EXACT_APP_DIR;
+      else process.env.EXACT_APP_DIR = previousApp;
+    }
+  }
+  expect(process.env.EXACT_APP_DIR).toBe(previousApp);
+}, 60000);
 
 test.each([
   ['empty', ''],
@@ -21,14 +216,14 @@ test.each([
   const memory = new WebAssembly.Memory({ initial: 1 }), out = 1024, bytes = [];
   const u32 = n => bytes.push(n & 255, n >>> 8 & 255, n >>> 16 & 255, n >>> 24 & 255);
   const string = s => { const b = new TextEncoder().encode(s); u32(b.length); bytes.push(...b); };
-  u32(4); bytes.push(0); string('test.grants'); string(grants);
+  u32(6); bytes.push(0); string('test.grants'); string(grants);
   new Uint8Array(memory.buffer, out, bytes.length).set(bytes);
   const output = mock(() => out);
   const instantiate = spyOn(WebAssembly, 'instantiate').mockResolvedValue({ instance: { exports: {
-    memory, exact_logic_abi: () => 4, exact_logic_create: () => 1, exact_logic_alloc: () => 0,
+    memory, exact_logic_abi: () => 6, exact_logic_create: () => 1, exact_logic_alloc: () => 0,
     exact_logic_call(_session, pointer, length) {
       const request = new DataView(memory.buffer, pointer, length);
-      return length === 5 && request.getUint32(0, true) === 4 && request.getUint8(4) === 0 ? 0 : 1;
+      return length === 5 && request.getUint32(0, true) === 6 && request.getUint8(4) === 0 ? 0 : 1;
     },
     exact_logic_output: output, exact_logic_output_len: () => bytes.length,
   } } });
@@ -68,12 +263,11 @@ export const answer = () => value as never;
     const stderr = result.stderr.replace(/\x1b\[[0-9;]*m/g, '');
     if (authored) {
       for (const name of ['kept', 'overlay', 'other']) {
-        expect(stderr).toContain(`BuildMessage: Import "${name}" will always be undefined`);
         expect(stderr).toContain(`[IMPORT_IS_UNDEFINED] Import \`${name}\` will always be undefined`);
       }
       expect(stderr).toContain('.gen/typescript/ts-data.js:');
       expect(stderr).not.toContain('.gen/ts-data.js:');
-      expect(stderr.match(/BuildMessage: Import /g)).toHaveLength(3);
+      expect(stderr.match(/\[IMPORT_IS_UNDEFINED\] Import /g)).toHaveLength(6);
     } else {
       expect(stderr).not.toContain('IMPORT_IS_UNDEFINED');
       expect(stderr).not.toContain('will always be undefined');
@@ -82,6 +276,107 @@ export const answer = () => value as never;
     rmSync(dir, { recursive: true, force: true });
   }
 }, 30000);
+
+test('web validation drops unused package exports before refusing their environment reads', () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/web-unused-exports-'));
+  const pkg = resolve(dir, 'node_modules/debug-helper'), out = resolve(dir, 'dist');
+  try {
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Unused', app: { id: 'test.unused', name: 'Unused' } }));
+    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  resource message = message() as shape string\n  view\n    column\n      text message\n      canvas surface=spark() width=10 height=10\n');
+    writeFileSync(resolve(pkg, 'package.json'), JSON.stringify({ name: 'debug-helper', version: '1.0.0', type: 'module', exports: './index.js', types: './index.d.ts' }));
+    writeFileSync(resolve(pkg, 'index.js'), 'export const debug = () => import.meta.env.DEBUG;\n');
+    writeFileSync(resolve(pkg, 'index.d.ts'), 'export declare const debug: () => string;\n');
+    const build = () => spawnSync(process.execPath, ['host/web-js/build.mjs', dir, '--out', out, '--render', 'none'],
+      { cwd: root, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir } });
+    const base = "export const grants = '';\nexport const surfaces = { spark: 0 };\nexport const draw = () => false;\n";
+    writeFileSync(resolve(dir, 'app.ts'), base + "export const answer = () => 'ready';\nexport { debug } from 'debug-helper';\n");
+    const built = build();
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    expect(readFileSync(resolve(out, 'app.js'), 'utf8')).not.toContain('import.meta.env');
+    for (const source of [
+      base + 'export const answer = () => debug();\n',
+      base.replace('() => false', '() => !!debug()') + "export const answer = () => 'ready';\n",
+    ]) {
+      writeFileSync(resolve(dir, 'app.ts'), "import { debug } from 'debug-helper';\n" + source);
+      const refused = build();
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('debug-helper@1.0.0 (index.js:1:28) reads import.meta.env');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30000);
+
+test('the web build resolves drawing exports through the module graph', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..');
+  const dir = mkdtempSync(resolve(root, 'target/web-js-exports-')), out = resolve(dir, 'dist');
+  const base = "export const grants = '';\nexport const answer = () => 'answer';\n";
+  const contract = 'component App\n  resource message = message() as shape string\n  view\n    column\n      text message\n';
+  const optional = "import type { Draw } from './app.contract.d.ts';\n"
+    + "export const surfaces = { spark: 0 };\nexport const draw: Draw = (_surface, _args, ctx) => { ctx.fillRect(0, 0, 1, 1); return false; };\n";
+  const build = () => spawnSync(process.execPath, ['host/web-js/build.mjs', dir, '--out', out, '--render', 'none'],
+    { cwd: root, encoding: 'utf8', env: { ...process.env, EXACT_APP_DIR: dir } });
+  let browser, server;
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Optional', app: { id: 'test.optional', name: 'Optional' }, rust: false }));
+    writeFileSync(resolve(dir, 'app.contract'), contract + '      canvas surface=spark() width=10 height=10\n');
+    writeFileSync(resolve(dir, 'optional.ts'), optional);
+    writeFileSync(resolve(dir, 'drawing.cjs'), "exports.surfaces = { spark: 0 }; exports.draw = (_surface, _args, ctx) => { ctx.fillRect(0, 0, 1, 1); return false; };");
+    for (const declaration of [
+      "export * from './optional';",
+      "export { draw, surfaces } from './optional';",
+      "import * as made from './optional'; export var draw = made.draw, surfaces = made.surfaces;",
+      "import * as made from './optional'; export const { draw, surfaces } = made;",
+      "export\n{ draw, surfaces } from './optional';",
+      "export { draw } from './drawing.cjs'; export * from './drawing.cjs';",
+    ]) {
+      writeFileSync(resolve(dir, 'app.ts'), base + declaration);
+      const built = build();
+      expect(built.status, declaration + '\n' + built.stdout + built.stderr).toBe(0);
+      expect(readFileSync(resolve(out, '.gen/draw.js'), 'utf8')).toContain("export { drawer }");
+    }
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      const path = new URL(request.url).pathname;
+      return new Response(Bun.file(resolve(out, path === '/' ? 'index.html' : path.slice(1))));
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(server.url.href);
+    await page.waitForFunction(() => {
+      const canvas = document.querySelector('canvas');
+      return canvas?.getContext('2d').getImageData(0, 0, 1, 1).data[3] === 255;
+    });
+    expect(await page.locator('body').innerText()).toContain('answer');
+    writeFileSync(resolve(dir, 'app.contract'), contract);
+    writeFileSync(resolve(dir, 'helper.cjs'), 'exports.helper = 1;');
+    for (const declaration of [
+      "/* export function draw() {} */\n// export const surfaces = {};\n",
+      "export * from './helper.cjs';",
+      "export type { draw, surfaces } from './optional';",
+    ]) {
+      writeFileSync(resolve(dir, 'app.ts'), base + declaration);
+      const absent = build();
+      expect(absent.status, absent.stdout + absent.stderr).toBe(0);
+      expect(readFileSync(resolve(out, '.gen/draw.js'), 'utf8')).toContain('drawer = null');
+    }
+    for (const declaration of ["export { draw } from './optional';", "export { surfaces } from './optional';"]) {
+      writeFileSync(resolve(dir, 'app.ts'), base + declaration);
+      const refused = build();
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain('exports `draw` and `surfaces` together');
+    }
+    // A `draw` that is not a function fails the type check, as the native bake's seam does.
+    writeFileSync(resolve(dir, 'app.contract'), contract + '      canvas surface=spark() width=10 height=10\n');
+    writeFileSync(resolve(dir, 'number.ts'), 'export const surfaces = { spark: 0 };\nexport const draw = 42;\n');
+    for (const declaration of ['export var draw = 42; export var surfaces = { spark: 0 };', "export * from './number';"]) {
+      writeFileSync(resolve(dir, 'app.ts'), base + declaration);
+      const refused = build();
+      expect(refused.status, declaration + '\n' + refused.stdout + refused.stderr).toBe(1);
+      expect(refused.stderr).toContain('not assignable');
+    }
+  } finally { await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true }); }
+}, 60000);
 
 test('a mount whose own tsconfig.json extends a file outside it builds for the web', () => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
@@ -108,14 +403,24 @@ test('a mount whose own tsconfig.json extends a file outside it builds for the w
   }
 }, 30000);
 
-test('production lazy host modules ignore agent storage and entropy parameters', async () => {
+test('production pages and lazy host modules ignore agent facts, storage and entropy parameters', async () => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
   mkdirSync(resolve(root, 'target'), { recursive: true });
   const dir = mkdtempSync(resolve(root, 'target/web-js-agent-'));
   try {
     writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Agent gate', id: 'test.agent-gate', app: { id: 'test.agent-gate', name: 'Agent gate' } }));
-    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  view\n    input type="file"\n');
+    writeFileSync(resolve(dir, 'app.contract'), `shape Time
+  epochAtZero: number
+  locale: string
+component App
+  resource time = exactTime() as shape Time
+  view
+    column
+      input type="file"
+      text time.epochAtZero.toString() testId="epoch"
+      text time.locale testId="locale"
+`);
     const build = (out, args = []) => {
       const result = spawnSync(process.execPath, ['host/web-js/build.mjs', 'agent-gate', '--out', out, '--render', 'none', ...args], {
         cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8',
@@ -127,6 +432,33 @@ test('production lazy host modules ignore agent storage and entropy parameters',
     build(dev);
     build(prod, ['--production', '--plan', resolve(dev, 'app.plan')]);
     build(webOnly, ['--production']);
+    const browser = await suiteBrowser();
+    try {
+      for (const dist of [dev, prod, webOnly]) {
+        const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+          const path = new URL(request.url).pathname;
+          return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1))));
+        } });
+        const page = await browser.newPage();
+        try {
+          await page.goto(server.url.href + '?agent&epoch=1&seed=3&locale=zz');
+          await page.waitForFunction(() => globalThis.exact?.ready);
+          const epoch = Number(await page.getByTestId('epoch').textContent());
+          const locale = await page.getByTestId('locale').textContent();
+          if (dist === dev) {
+            expect([epoch, locale]).toEqual([1, 'zz']);
+          } else {
+            expect(epoch).toBeGreaterThan(1e12);
+            expect(locale).toBe(await page.evaluate(() => navigator.language));
+          }
+        } finally {
+          await page.close();
+          server.stop(true);
+        }
+      }
+    } finally {
+      await browser.close();
+    }
     const development = await import(pathToFileURL(resolve(dev, 'storage-environment.js')).href);
     const appId = 'test.agent-gate', own = development.storageKey(appId, 'https://example.test/');
     expect(own).toMatch(/^test\.agent-gate@[a-f0-9]{12}$/);
@@ -144,7 +476,7 @@ test('production lazy host modules ignore agent storage and entropy parameters',
       const shipped = readdirSync(release, { recursive: true }).filter(name => /\.m?js$/.test(name));
       expect(shipped).toContain('picker-glue.js');
       expect(shipped).toContain('storage-environment.js');
-      expect(shipped).toContain('navigation.js');
+      expect(shipped).toContain('.gen/navigation.js');
       for (const name of shipped) {
         expect(readFileSync(resolve(release, name), 'utf8'), name).not.toContain('const AGENT_ADMITTED = true;');
       }
@@ -240,6 +572,29 @@ test('the web build refuses, by name, a canvas surface that nothing draws and a 
     rmSync(dir, { recursive: true, force: true });
   }
 }, 60000);
+
+// Issue #104: `web-build --json` names the build it made. The JS target is a release under `--out` alone, so the trust
+// it reports is that, never an inherited EXACT_UPDATE_TRUST the page did not build under.
+test('web-build --json reports the trust the JS target built under, not the environment\'s', () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-json-trust-')));
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Trust', app: { id: 'test.exact.trust', name: 'Trust' }, rust: false }));
+    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  view\n    text "hello"\n');
+    const build = (...args) => {
+      const r = spawnSync(process.execPath, ['host/web/build.mjs', 'trust', '--render', 'none', '--json', ...args], { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir, EXACT_WEB_DIST: resolve(dir, 'target/web-dist'), EXACT_UPDATE_TRUST: 'production' }, encoding: 'utf8' });
+      expect(r.status, r.stderr).toBe(0);
+      // Run alone, the object is stdout's last line, after the build's own.
+      return JSON.parse(r.stdout.trim().split('\n').at(-1));
+    };
+    const development = build();
+    expect(development).toEqual({ path: resolve(dir, 'target/web-dist'), target: 'web', trust: 'development' });
+    expect(readdirSync(development.path).some((name) => name.startsWith('agent-')), 'a development page carries agent support').toBe(true);
+    expect(build('--out', resolve(dir, 'dist'))).toEqual({ path: resolve(dir, 'dist'), target: 'web', trust: 'production' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 120000);
 
 // LLP 1153 D3: `web-build --out` writes a site any static host serves (its pages, the shell, the route table and
 // 404.html, none of the build's intermediates but the server bundle), ends saying how a host serves it, and serve.mjs
@@ -397,10 +752,13 @@ test.each(['request', 'cached'])('serve renders home "/" render=%s and a notfoun
 test('serve preserves the retry delay for unfinished pages, request and cached, GET and HEAD', async () => {
   const root = resolve(import.meta.dir, '../..');
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-site-retry-')), app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  // A fetch its server never answers: work still in flight at the deadline. (A promise nothing settles holds no page,
+  // as the render host settles: render-storage.test.mjs.)
+  const silent = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Promise(() => {}) });
   let serve;
   try {
     site(app, 'shape Note\n  text: string\n\nroutes nav\n  home "/" render=request\n  feed "/feed" render=cached\n\ncomponent App\n  resource note = note("waiting") as shape Note\n  view\n    text note.text\n');
-    writeFileSync(resolve(app, 'app.ts'), "export const grants = '';\nexport const answer = () => new Promise<never>(() => {});\n");
+    writeFileSync(resolve(app, 'app.ts'), `export const grants = 'net.fetch ${silent.url.origin}';\nexport const answer = (): any => fetch('${silent.url.origin}/').then(r => r.json());\n`);
     const built = spawnSync(process.execPath, ['host/web/build.mjs', app, '--out', out], { cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8' });
     expect(built.status, built.stdout + built.stderr).toBe(0);
     serve = await serving(root, out);
@@ -410,12 +768,262 @@ test('serve preserves the retry delay for unfinished pages, request and cached, 
     const head = await fetch(`http://127.0.0.1:${serve.port}/feed`, { method: 'HEAD', headers: { accept: 'text/html', 'accept-encoding': 'gzip' } });
     expect([head.status, head.headers.get('retry-after'), head.headers.get('content-encoding'), await head.text()]).toEqual([503, '1', 'gzip', '']);
   } finally {
-    await serve?.stop();
+    await serve?.stop(); silent.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
 }, 60000);
 
 /** The test app `site` in `app` with `source` as its app.contract and a data source `note`. */
+test('host.web.head is in the head of the shell, a page built ahead, one rendered per request and the 404 page, once', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-site-head-')), app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  let serve;
+  try {
+    site(app, 'shape Note\n  text: string\n\nroutes nav\n  home "/" render=build\n  live "/live" render=request\n  notfound render=build\n\n'
+      + 'component App\n  resource note = note("rendered") as shape Note\n  view\n    column\n      text top(nav).url\n      text note.text\n');
+    writeFileSync(resolve(app, 'app.json'), JSON.stringify({ name: 'Site', app: { id: 'test.site', name: 'Site' }, host: { web: { head: [
+      { link: { rel: 'preconnect', href: 'https://analytics.example' } },
+      { script: { async: true, src: 'https://analytics.example/tag.js?id=1&x=2' } },
+      { script: { text: "for (let i = 0; i<scripts.length; i++); window.seen = '\\x3C/SCRIPT>\\x3C!--';" } },
+      { script: { type: 'application/ld+json', text: { '@type': 'Person', name: '</script>' } } },
+      // Text that spells the shell's root and a preload line: the renderers find the shell's own places, not these.
+      { script: { text: 'const root = \'<div id="exact-root"></div>\', preload = `<link rel="modulepreload" href="./x.js">\n`;' } },
+    ] } } }));
+    const head = '<link rel="preconnect" href="https://analytics.example">\n<script async src="https://analytics.example/tag.js?id=1&amp;x=2"></script>\n'
+      + "<script>for (let i = 0; i<scripts.length; i++); window.seen = '\\x3C/SCRIPT>\\x3C!--';</script>\n<script type=\"application/ld+json\">{\"@type\":\"Person\",\"name\":\"\\u003C/script>\"}</script>\n"
+      + '<script>const root = \'<div id="exact-root"></div>\', preload = `<link rel="modulepreload" href="./x.js">\n`;</script>\n';
+    const built = spawnSync(process.execPath, ['host/web/build.mjs', app, '--out', out], { cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8' });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    // Once, and before the root: only head elements come before it.
+    const placed = (html) => [html.split(head).length - 1, html.indexOf(head) + head.length <= html.lastIndexOf('<div id="exact-root"')];
+    for (const name of ['shell.html', 'index.html', '404.html']) expect([name, ...placed(readFileSync(resolve(out, name), 'utf8'))]).toEqual([name, 1, true]);
+    serve = await serving(root, out);
+    const live = await serve.get('/live');
+    expect([live.status, live.body.includes('The note, rendered.'), ...placed(live.body)]).toEqual([200, true, 1, true]);
+  } finally {
+    await serve?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 300_000);
+
+// An `--inline` shell holds the bundle in its entry's place, after the root, and the bundle carries the app's text: a
+// text and a head script that spell the root are both outside the shell's own places (render.mjs `blanked`).
+test('a page built from an --inline shell is composed in the shell\'s own root and entry, whatever its scripts spell', () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-site-inline-')), app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  try {
+    site(app, 'shape Note\n  text: string\n\nroutes nav\n  home "/" render=build\n\n'
+      + 'component App\n  resource note = note("rendered") as shape Note\n  view\n    column\n      text note.text\n      text "<div id=\\"exact-root\\"></div>"\n');
+    const entry = '<script>const r = \'<div id="exact-root"></div>\';</script>\n';
+    writeFileSync(resolve(app, 'app.json'), JSON.stringify({ name: 'Site', app: { id: 'test.site', name: 'Site' },
+      host: { web: { head: [{ script: { text: "const r = '<div id=\"exact-root\"></div>';" } }] } } }));
+    const built = spawnSync(process.execPath, ['host/web-js/build.mjs', app, '--out', out, '--inline'], { cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8' });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    const shell = readFileSync(resolve(out, 'shell.html'), 'utf8'), page = readFileSync(resolve(out, 'index.html'), 'utf8');
+    expect(shell.includes('<script type="module">') && shell.indexOf('<script type="module">') > shell.lastIndexOf(entry)).toBe(true);
+    // The head entry once and before the document; the document in the root; the checkpoint in the entry's place,
+    // which the capture script loads `./app.js` for, so the bundle is not in the page, once or twice.
+    const document = page.indexOf('The note, rendered.'), checkpoint = page.indexOf('<script type="application/vnd.exact.checkpoint"');
+    expect([page.split(entry).length - 1, page.indexOf(entry) < document, document < checkpoint, page.includes('<script type="module">'),
+      page.split('<script type="application/vnd.exact.checkpoint"').length - 1]).toEqual([1, true, true, false, 1]);
+    expect(page.slice(0, document).lastIndexOf('<div id="exact-root">')).toBeGreaterThan(page.indexOf(entry) + entry.length - 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 300_000);
+
+// A title holds text, not tags: an app named "Learn <script> tags" is written `&lt;script>` in the shell's title, and a
+// head entry's attribute value holding `<script>` is escaped too; the renderers find the shell's own root and entry.
+test('an app whose name or head entry spells a script tag renders its pages in the shell\'s own root', () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-site-title-')), app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  try {
+    site(app, 'shape Note\n  text: string\n\nroutes nav\n  home "/" render=build\n\ncomponent App\n  resource note = note("rendered") as shape Note\n  view\n    column\n      text note.text\n');
+    writeFileSync(resolve(app, 'app.json'), JSON.stringify({ name: 'Learn <script> tags', app: { id: 'test.site', name: 'Site' },
+      host: { web: { head: [{ meta: { name: 'keywords', content: '<script>, </script>' } }] } } }));
+    const built = spawnSync(process.execPath, ['host/web/build.mjs', app, '--out', out], { cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8' });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    const shell = readFileSync(resolve(out, 'shell.html'), 'utf8'), page = readFileSync(resolve(out, 'index.html'), 'utf8');
+    expect(shell).toContain('<title>Learn &lt;script> tags</title>');
+    expect(shell).toContain('<meta name="keywords" content="&lt;script>, &lt;/script>">');
+    const document = page.indexOf('The note, rendered.');
+    expect([document > page.lastIndexOf('<div id="exact-root">'), page.split('<div id="exact-root">').length - 1, page.includes('<title>Learn &lt;script&gt; tags</title>')]).toEqual([true, 1, true]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 300_000);
+
+// The build puts its compiled Markdown before the shell's own entry: not before a head entry that is a module script,
+// nor inside a head script's text that spells one (render.mjs `markdownAt`).
+test("compiled Markdown goes before the shell's own entry, whatever the head's scripts are or spell", async () => {
+  const { markdownAt } = await import('./render.mjs');
+  const entry = '<script type="module" src="./app.js"></script>', inline = '<script type="module">const a = "<script type=\\"module\\">";</script>';
+  const head = '<script type="module" src="https://cdn.example/x.js"></script>\n<script>const s = \'<script type="module" src="./app.js">\';</script>\n';
+  for (const tail of [entry, inline]) {
+    const shell = `<!doctype html>\n<html lang="en">\n<title>T</title>\n<meta name="viewport" content="x">\n<style>p{}</style>\n${head}<div id="exact-root"></div>\n${tail}\n`;
+    expect(markdownAt(shell)).toBe(shell.lastIndexOf(tail));
+  }
+});
+
+// The render realm runs no code from a string by any route (#128): the module's `Function` and `eval` throw Hermes's
+// error, and a function's own `constructor` throws the realm's EvalError, as under the render server's CSP.
+test('a page rendered at build runs no code from a string, by any name or through a function\'s constructor', () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const dir = mkdtempSync(resolve(root, 'target/site-strings-')), app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  try {
+    site(app, 'shape Note\n  text: string\n\nroutes nav\n  home "/" render=build\n\ncomponent App\n  resource note = note("x") as shape Note\n  view\n    column\n      text note.text\n');
+    // A module that names only `eval`, never `globalThis`: its `eval` is the stand-in all the same (build.mjs `scopedModule`).
+    // A parameter named `globalThis` stands between no `eval` and the stand-in.
+    writeFileSync(resolve(app, 'evals.ts'), "export const direct = () => eval('6*7'), indirect = () => (0, eval)('6*7');\n"
+      + "export function captured(globalThis: { eval(source: string): unknown }) { return eval('1'); }\n"
+      + "export function probe(globalThis: null) { return typeof eval; }\n");
+    // CommonJS permits a binding named `eval`; its call must stay local.
+    const local = resolve(app, 'node_modules/local-eval');
+    mkdirSync(local, { recursive: true });
+    writeFileSync(resolve(local, 'package.json'), JSON.stringify({ name: 'local-eval', version: '1.0.0', main: 'index.cjs', types: 'index.d.ts' }));
+    writeFileSync(resolve(local, 'index.cjs'), `exports.probe = function(eval) { return eval('1'); };`);
+    writeFileSync(resolve(local, 'index.d.ts'), 'export function probe(evaluate: (source: string) => number): number;\n');
+    writeFileSync(resolve(app, 'app.ts'), "import type { Answer, Result, Sources } from './app.contract.d.ts';\nimport { captured, direct, indirect, probe } from './evals';\nimport { probe as local } from 'local-eval';\nexport const appId = 'test.site';\nexport const grants = '';\n"
+      + "const tried = (f: () => unknown) => { try { return `ran ${String(f())}`; } catch (e) { return (e as Error).name; } };\n"
+      + "const F = Function;\n"
+      + "const sources: Sources = { note: (): Result<'note'> => ({ text: [tried(() => new Function('return 1')()), tried(() => new F('return 1')()), tried(() => Reflect.construct(Function, ['return 1'])), tried(() => globalThis.Function('return 1')),\n"
+      + "  tried(direct), tried(indirect), tried(() => globalThis.eval('1')), tried(() => captured({ eval: () => 1 })), String(Function instanceof Function), String(eval instanceof Function),\n"
+      + "  tried(() => probe(null)), tried(() => local(() => 42)),\n"
+
+      + "  tried(() => new ((function () {}).constructor as FunctionConstructor)('return 1')())].join(' ') }) };\n"
+      + 'export const answer: Answer = (source, args, store, storage, native) => sources[source](args, store, storage, native);\n');
+    const built = spawnSync(process.execPath, ['host/web/build.mjs', app, '--out', out], { cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8' });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    // Free uses of `Function` and `eval` reach the module's stand-ins; a bound `eval` stays local.
+    expect(readFileSync(resolve(out, 'index.html'), 'utf8')).toContain(`>${Array(8).fill('SyntaxError').join(' ')} true true ran function ran 42 EvalError<`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 300_000);
+
+test('authored names cannot capture the eval stand-in in rendered pages or the page bundle', async () => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/eval-bindings-'));
+  const app = resolve(dir, 'site'), out = resolve(app, 'dist');
+  let browser, server;
+  try {
+    site(app, `shape Note
+  text: string
+
+routes nav
+  home "/" render=build
+
+component App
+  state phase: string = "build"
+  resource note = note(phase) as shape Note
+  action probe
+    phase = "page"
+  view
+    column
+      text note.text testId="result"
+      button "Probe" press=probe testId="probe"
+`);
+    const probes = {
+      'parameter.js': `export function probe(__exact_eval) { try { return eval('1'); } catch { return -1; } }`,
+      'module.js': `const __exact_eval = () => 42;
+export function probe() { try { return eval('1'); } catch { return -1; } }`,
+      'nested.js': `export function probe() {
+  const __exact_eval = () => 42;
+  return ((__exact_eval1) => {
+    const __exact_eval2 = () => 44;
+    try { return (0, eval)('1'); } catch { return -1; }
+  })(() => 43);
+}`,
+      'escaped.js': `export function probe(\\u005f_exact_eval, \\u005f_exact_eval1) {
+  try { return eval('1'); } catch { return -1; }
+}`,
+      'reference.js': `export function probe() {
+  try { eval('1'); } catch {}
+  return typeof __exact_eval;
+}`,
+      'jsx-member.jsx': `/** @jsx createElement */
+/** @jsxRuntime classic */
+const createElement = type => typeof type;
+export function probe(__exact_eval) {
+  try { eval('1'); } catch {}
+  try { return <__exact_eval1.Child />; } catch (e) { return e.name; }
+}`,
+      'jsx-bare.jsx': `/** @jsx createElement */
+/** @jsxRuntime classic */
+const createElement = type => typeof type;
+export function probe(__exact_eval) {
+  try { eval('1'); } catch {}
+  try { return <__exact_eval1 />; } catch (e) { return e.name; }
+}`,
+      'jsx-unsuffixed.jsx': `/** @jsx createElement */
+/** @jsxRuntime classic */
+const createElement = type => typeof type;
+export function probe() {
+  try { eval('1'); } catch {}
+  try { return <__exact_eval.Child />; } catch (e) { return e.name; }
+}`,
+      'jsx-factory.jsx': `/** @jsx __exact_eval1 */
+/** @jsxRuntime classic */
+export function probe(__exact_eval) {
+  try { return <div />; } catch (e) { return e.name; }
+}`,
+      'jsx-fragment.jsx': `/** @jsx createElement */
+/** @jsxFrag __exact_eval1 */
+/** @jsxRuntime classic */
+const createElement = type => typeof type;
+export function probe(__exact_eval) {
+  try { return <></>; } catch (e) { return e.name; }
+}`,
+    };
+    for (const [name, code] of Object.entries(probes)) {
+      if (!name.endsWith('.jsx')) { writeFileSync(resolve(app, name), code); continue; }
+      const pkg = name.slice(0, -4), at = resolve(app, 'node_modules', pkg);
+      mkdirSync(at, { recursive: true });
+      writeFileSync(resolve(at, 'package.json'), JSON.stringify({ name: pkg, version: '1.0.0', main: 'index.jsx', types: 'index.d.ts' }));
+      writeFileSync(resolve(at, 'index.jsx'), code);
+      writeFileSync(resolve(at, 'index.d.ts'), 'export function probe(evaluate?: () => number): string;\n');
+    }
+    writeFileSync(resolve(app, 'app.ts'), `import type { Answer } from './app.contract.d.ts';
+import { probe as parameter } from './parameter.js';
+import { probe as module } from './module.js';
+import { probe as nested } from './nested.js';
+import { probe as escaped } from './escaped.js';
+import { probe as reference } from './reference.js';
+import { probe as jsxMember } from 'jsx-member';
+import { probe as jsxBare } from 'jsx-bare';
+import { probe as jsxUnsuffixed } from 'jsx-unsuffixed';
+import { probe as jsxFactory } from 'jsx-factory';
+import { probe as jsxFragment } from 'jsx-fragment';
+export const appId = 'test.site';
+export const grants = '';
+export const answer: Answer = (_source, [phase]) => ({ text: [phase, parameter(() => 42), module(), nested(),
+  escaped(() => 42, () => 43), reference(), jsxMember(() => 42), jsxBare(() => 42), jsxUnsuffixed(),
+  jsxFactory(() => 42), jsxFragment(() => 42)].join(' ') });
+`);
+    const built = spawnSync(process.execPath, ['host/web-js/build.mjs', app, '--out', out], {
+      cwd: root, env: { ...process.env, EXACT_APP_DIR: app }, encoding: 'utf8',
+    });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    const result = '-1 -1 -1 -1 undefined ReferenceError ReferenceError ReferenceError ReferenceError ReferenceError';
+    const html = readFileSync(resolve(out, 'index.html'), 'utf8');
+    expect(/data-testid="result"[^>]*>([^<]*)</.exec(html)?.[1]).toBe(`build ${result}`);
+    server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+      const path = new URL(request.url).pathname;
+      return new Response(Bun.file(resolve(out, path === '/' ? 'index.html' : path.slice(1))));
+    } });
+    browser = await suiteBrowser();
+    const page = await browser.newPage(), errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(server.url.href + '?agent=1');
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    await page.evaluate(async () => { await exact.ready; });
+    expect(errors).toEqual([]);
+    await page.getByTestId('probe').click();
+    await page.waitForFunction(expected => document.querySelector('[data-testid=result]')?.textContent === expected, `page ${result}`);
+    expect(errors).toEqual([]);
+  } finally {
+    await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
+  }
+}, 60000);
+
 function site(app, source) {
   mkdirSync(app, { recursive: true });
   writeFileSync(resolve(app, 'app.json'), JSON.stringify({ name: 'Site', app: { id: 'test.site', name: 'Site' } }));
@@ -512,6 +1120,45 @@ export const answer: Answer = (name) => sources[name]();
   } finally {rmSync(dir, {recursive: true, force: true});}
 }, 30_000);
 
+
+test('package declarations over the cap are named by package, size and the captured file that reached them', async () => {
+  const { stagePackages } = await import('../../js/bake/src/typescript.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-declarations-cap-')), app = resolve(dir, 'app'), stage = resolve(dir, 'stage');
+  const write = (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); };
+  try {
+    // A web page's source beside app.ts imports a package whose declarations import a heavy one.
+    write(resolve(app, 'node_modules/diagram/package.json'), '{"name":"diagram","version":"1.0.0","types":"index.d.ts"}');
+    write(resolve(app, 'node_modules/diagram/index.d.ts'), "export * from 'heavy';\n");
+    write(resolve(app, 'node_modules/heavy/package.json'), '{"name":"heavy","version":"1.0.0","types":"index.d.ts"}');
+    write(resolve(app, 'node_modules/heavy/index.d.ts'), 'export type Heavy = 1;\n'.repeat(3 << 20));
+    for (const root of [app, stage]) write(resolve(root, 'page/main.ts'), "import { Heavy } from 'diagram';\nexport const h: Heavy = 1;\n");
+    write(resolve(stage, '__exact_paths.json'), JSON.stringify({ app, mounts: [] }));
+    expect(() => stagePackages(stage)).toThrow(/^package declarations exceed 64 MiB: heavy 69\.0 MiB \(through diagram, from page\/main\.ts\), diagram 0\.0 MiB \(from page\/main\.ts\)\. .*whose name starts with a dot$/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a web build.rs whose data source the module cannot copy is named, with the forms it copies and the way for any other', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-module-source-'));
+  const script = (text) => writeFileSync(resolve(dir, 'web/build.rs'), `fn main() {\n${text}\n}\n`);
+  const fails = () => { try { buildModule('mail', resolve(dir, 'out'), false, dir); } catch (e) { return e.message; } return null; };
+  try {
+    mkdirSync(resolve(dir, 'web'));
+    writeFileSync(resolve(dir, 'app.json'), '{}');
+    // A source built with arguments, and the call rustfmt writes across lines with a comma after the source.
+    for (const text of ['    let baked = contract::bake(plan, mail_data::Mail::new(true)).unwrap();', '    let baked = contract::bake(\n        plan,\n        mail_data::Mail::default(),\n    )\n    .unwrap();']) {
+      script(text);
+      const said = fails();
+      expect(said).toContain(`${resolve(dir, 'web/build.rs')} passes contract::bake a source the web build does not copy`);
+      expect(said).toContain('`contract::bake(plan, <data crate>::<Type>)`, `<data crate>::<Type>::default()` or `<data crate>::<Type>::new()` with no arguments, written with no comma after the source (rustfmt adds one when it breaks the call across lines)');
+      expect(said).toContain("name it in app.json's rust.module.package");
+    }
+    // A call only in a comment is no call: the build has no Rust source to copy and says that.
+    for (const text of ['    // let baked = contract::bake(plan, mail_data::Mail::new(true));', '    /* contract::bake(plan, mail_data::Mail::new(true)) */', '']) {
+      script(text);
+      expect(fails()).toContain('its web build bakes with no Rust data source');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('compiler reuse is invalidated by dependency manifests and the workspace lockfile', () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-compiler-fresh-'));

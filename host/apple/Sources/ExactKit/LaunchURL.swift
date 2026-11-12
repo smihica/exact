@@ -95,11 +95,10 @@ extension ExactSession {
         apply(batch)
     }
 
-    /// The platform's Forward under a root with no `navigate` handler: the
-    /// runner's own `go` to the location ahead (LLP 1115.000 D5.5).
-    func hostGo(_ location: String) {
-        guard state != .destroyed, booted else { return }
-        apply(runtime.hostGo(location, now: now()))
+    /// The platform's Forward, keeping its direction through the commit.
+    func hostForward(at root: NodeView) {
+        guard state != .destroyed, booted, presenter.views[root.id] === root else { return }
+        apply(runtime.hostForward(root.id, now: now()))
     }
 
     /// Complete a native history jump without intermediate route commits.

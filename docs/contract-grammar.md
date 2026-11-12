@@ -35,6 +35,8 @@ count as entries. Most bodies may be empty (a shape, a style, `props`, an action
 a `for` body, a `case` arm, a test). The bodies of `if`/`else`,
 a `keyframes` or `font` block, and a component need at least one entry.
 
+- A UTF-8 file may begin with one byte order mark (U+FEFF). Formatting preserves
+  it; source spans count its three bytes in the first line's columns.
 - A name starts with `[A-Za-z_]`, followed by ASCII alphanumerics/underscores or
   a hyphen immediately followed by an ASCII letter. Thus `font-size` is a name,
   `a-b` is a name, and `a - b` is subtraction.
@@ -53,7 +55,8 @@ a `keyframes` or `font` block, and a component need at least one entry.
   and a Unicode code point in hex, as JavaScript and Swift write it: `\u{2011}`
   (one to six digits; `\u{1F600}`, never a surrogate pair) or `\u2011` (four).
   Any other is refused, naming these. Single quotes are not delimiters.
-- Templates use backticks and `${expression}`. Interpolation scanning balances
+- Templates use backticks and `${expression}`. Spaces around the expression are
+  optional: `${ a }` and `${a}` mean the same. Interpolation scanning balances
   nested braces, strings, and templates. A template is one physical source line.
   Template text takes a string's escapes (`` `${a}\t${b}` `` is a tab), and
   `\${` is literal text, not an interpolation.
@@ -152,7 +155,7 @@ and `-exact-tint-color`, and fold into the node's own rows, `:checked` under
 `:disabled`; `:active` takes `background-color`, `color`, `opacity` and
 `-exact-press-scale` and lowers to the press paint (LLP 1061 D7: its `opacity` an
 absolute target), `:hover` and `:focus-visible` take `background-color`,
-`border-color`, `opacity` and `box-shadow`. Active targets may compute or clear
+`color`, `border-color`, `opacity` and `box-shadow`. Active targets may compute or clear
 with `none`; hover and focus targets are literals (`lower-state-literal`; a
 token's name is one). Another row is `lower-state-row`;
 native buttons and list rows accept `:active` and keep their other native states.
@@ -183,7 +186,8 @@ The title-bar area is
 [Window Controls Overlay](https://wicg.github.io/window-controls-overlay/)'s: the part
 of the title bar beside the window's controls. On the Mac, under `viewport-fit="cover"`,
 it is AppKit's title bar less the traffic lights and their margins (`78 0 822×32` in a
-900-point window); all zero in full screen and while a toolbar fills the title bar (an
+900-point window with a left-to-right title bar, `0 0 822×32` with a right-to-left one);
+all zero in full screen and while a toolbar fills the title bar (an
 app with routes has one, LLP 1115.002 D2). An app without routes whose manifest's
 `display_override` puts `window-controls-overlay` first gets the platform's tall title row,
 an empty unified toolbar over the page, whatever its `viewport-fit`, and the area is that
@@ -289,9 +293,9 @@ member        = "state" IDENT [ ":" type ] "=" expr [ "persist" ] NL
 provider      = FIELD [ "=" expr ] NL ;
 resource      = "resource" IDENT "=" source-call
                 [ "for" IDENT "in" expr [ "key" "=" expr ] ]
-                [ "with" expr { "," expr } ] "as" "shape" type
-                [ "else" source-call ] NL ;
-mutation      = "mutation" IDENT "as" "shape" type [ "queue" ]
+                [ "with" expr { "," expr } ] [ "when" expr ] "as" "shape" type
+                [ "else" source-call ] [ "transient" ] NL ;
+mutation      = "mutation" IDENT "as" "shape" type [ "queue" | "parallel" ]
                 [ "refreshes" IDENT { "," IDENT } ]
                 [ "then" IDENT ] NL ;
 action        = "action" IDENT [ "(" [ action-params ] ")" ] block(statement) ;
@@ -452,8 +456,9 @@ frequent pushes are false. A first demand enumerates existing activities,
 including after a relaunch without a send; later token, state and content
 updates re-answer the source. A token is absent until ActivityKit supplies
 it, and exists only for an entry declaring `push: true`. The data module
-sends it to its own backend. Push-to-start, remote notification registration
-and the `remote-notification` background mode stay refused.
+sends it to its own backend. Push-to-start and the `remote-notification`
+background mode stay refused; an app with activities registers for remote
+notifications only when it grants `device.push`.
 
 ### MIDI: `exactMIDI`, `sendMIDI`, `midimessage`
 
@@ -521,8 +526,19 @@ can still appear in an ordinary assignment.
 A resource's optional `with` supplies one or more request context expressions,
 after its call arguments and before `as shape`. The source receives both lists
 in order; a change to either asks again. Only admission of an eligible persisted
-answer at boot compares the call arguments alone (LLP 1027.005). An empty call
-is valid; an empty `with` is not. `else` keeps its place after the shape.
+answer at boot compares the call arguments alone (LLP 1027.005), and so does
+`current` (below). An empty call is valid; an empty `with` is not. `else` keeps
+its place after the shape.
+
+A resource's optional `when cond`, before `as shape`, asks it only while `cond`, a
+`bool`, holds (LLP 1161.002; `type-when-not-bool`). While it is false the resource
+is idle: nothing is asked, a request in flight is let go (an upload's goes on),
+`pending` and `failed` are false and `failure` is `none`, and `refresh` asks
+nothing. It keeps the value it showed, which is no longer an answer: `current` is
+false. When `cond` turns true the resource is asked again, forced, even at the
+arguments it had, and is current once that answer lands. A resource idle at boot
+shows its placeholder. A resource over a list takes no `when`
+(`syntax-resource-for-when`).
 
 A resource over a list, `resource r = source(x) for x in list as shape S`,
 asks its source once for each element (LLP 1017.000 P4c, amended
@@ -534,18 +550,33 @@ request go, and the others go on. `r` reads as `S[]` in the list's order,
 each element its shape's zero until its answer; an element whose key
 repeats an earlier one's reads that one's answer. `pending(r)` and
 `failed(r)` are true when any element's request is pending or has failed,
-and `failure(r)` is the first failure. It takes no `with` or `else`
+`current(r)` when every element's is, and `failure(r)` is the first failure. It takes no `with` or `else`
 (`syntax-resource-for-with`, `syntax-resource-for-else`), and asks a data
 source, not one the runner answers (`lower-resource-for-source`). A
-mutation's `refreshes r` asks every element again.
+mutation's `refreshes r` shows the source's overlay over each element from
+the send, and asks every element again when the reply lands. Each element
+retires the write independently once its answer was asked after the landing,
+unless its overlay keeps it; leaving the list also retires it.
 
 A resource's `else` is a placeholder. `else empty()` is the resource type's zero,
 with `field=constant` overrides for a record. `else source(values…)` names a source
 whose arguments are plain values, not state; it is answered once at build.
+`transient`, last on the line, keeps the answer out of the device's storage: no
+launch shows it before the source answers, and an answer kept before is
+forgotten (LLP 1156.005 D4).
 A mutation's `then` names a parameterless action and follows `refreshes` when
 both are present. `queue`, right after the shape, makes every send of the
 mutation wait its turn (LLP 1092): one request in flight, later sends asked in
-order, each after the reply before it and its `then`. The clauses after the shape
+order, each after the reply before it and its `then`. `parallel`, in the same
+place, asks every send when it is made (LLP 1161.000): each is its own request
+in flight, at most 64 at once (the 65th refuses its action, `QueueFull`), and its
+reply lands whatever else is out. A reply lands in the slot unless a later send
+has already concluded (answered or failed), `pending(m)` is true while any send
+is out, and an assignment forgets no request. A `parallel` mutation takes no
+`then` (`type-parallel-then`): its replies land in any order. Its source is
+called once per send and may have several calls outstanding; a source that reads
+local storage, changes it and writes it back orders its own work or is `queue`.
+With neither, a send forgets the one in flight: the newest wins. The clauses after the shape
 may continue onto deeper-indented lines, each starting with its keyword, in the
 same order (`mutation edited as shape Jump refreshes page`, then `then followEdit`
 indented under it). Action effects are inferred: `writes` clauses are refused.
@@ -942,7 +973,7 @@ on a date, time or range input it sets the value in HTML's format; on a checkbox
 it takes `true` or `false`, on a radio `true`. A target out of view is scrolled into view first.
 An input step ends with what it settled (an answer given in the input's turn,
 and its mutation's `then`; on a native host, not one given while another
-answer's storage is in flight, [LLP 1097](../llp/1097-storage-that-finishes-after-the-answer.rfc.md)); otherwise the clock stands still between steps:
+answer's storage is in flight, LLP 1097); otherwise the clock stands still between steps:
 what an input starts (a reply on real time, a transition) lands at a `clock`
 step, as `clock settle` (or `clock data`, which lands replies and their `then`s
 without moving the clock); a timer fires when the clock reaches or passes its time
@@ -978,8 +1009,8 @@ every stamp exact); `expect midi sent "OP-XY" 99 4c 7f at 500` passes when the
 runner queued that message for that output and has not taken it back (at
 that time, when given), `missing` the negation. Each byte is two hex digits.
 `tap "audio" mediasession "seekforward"` calls the
-handler the platform would call for that media session action ([LLP
-1098](../llp/1098-the-media-session.rfc.md) D10): `play`, `pause` or one of the
+handler the platform would call for that media session action (LLP
+1098 D10): `play`, `pause` or one of the
 six; its number is a seek's `seekOffset` (absent: the element's own) and
 `seekto`'s time (required there). It is never a press, needs no box, and is
 refused when the element does not own the session or does not offer the action.
@@ -1067,7 +1098,7 @@ says. Every roster function has a row and an example, and each example written
 | `params(router, parameterName)` | `string[]`: that parameter's non-empty values over the selected stack, bottom first, duplicates kept (one entry's own value is `entry.params.<name>`, `""` where its route does not bind it; the name must be a parameter of some route) | `params(push(nav, "/item/7"), "id")` is `["7"]` |
 | `searchParam(entry, name)` | String | `searchParam(top(push(nav, "/item/7?tab=notes")), "tab")` is `"notes"` |
 | `fragment(entry)` | String: what the entry's location had after `#`, fragment-encoded as the browser's `hash` is, `""` when none. It is no part of the screen: `/item/7#moves` is the visit to `/item/7`, and a `push`, `replace` or `go` that changes only the fragment changes it on that visit. Written as `path("item", id) + "#moves"`, or `href="#moves"` on a `link` to the screen shown. Once the route's content has arrived, each host scrolls to the element with that `id` in the entry's route, as a browser scrolls to a fragment (`top`, or no such element: the route's top) (LLP 1153 D5) | `fragment(top(push(nav, "/item/7#moves")))` is `"moves"` |
-| `sharedFiles(entry, name)` | `SharedFiles`: `{files: Picked[], dropped, pending}`, the files a received share carried, by the token in the entry's `name` parameter; `pending` counts those still being copied, and a token the host did not set this launch answers no files ([receiving shares](../llp/1133.024-share-browser-compose-print.rfc.md), D3) | `sharedFiles(top(nav), "files").files.length` is the count of shared files that have landed |
+| `sharedFiles(entry, name)` | `SharedFiles`: `{files: Picked[], dropped, pending}`, the files a received share carried, by the token in the entry's `name` parameter; `pending` counts those still being copied, and a token the host did not set this launch answers no files (LLP 1133.024 D3) | `sharedFiles(top(nav), "files").files.length` is the count of shared files that have landed |
 | `t("key", name=value, …)` | Localized string; validates tables/placeholders | `t("greeting", name=user.name)` is the `greeting` string of the app's locale with `{name}` filled |
 | `frame(id)` | `Geometry`, actions only; last layout where the viewer sees it, as `getBoundingClientRect`: in the viewport, every scroll offset and transform applied | `frame("card").height`, in an action, is the card's height as drawn |
 | `rangeFrame(id, start, end)` | `Geometry`, actions only; a textarea's UTF-16 range as `Range.getBoundingClientRect()` (on a `text markup="markdown"`, the union of the atom pills the range meets, [inline atoms](#inline-atoms-atom-atoms-atomfaces-atompress)): collapsed, the caret's rectangle; unavailable past the text, while composing, or with no host reader ([decorations](#plain-textarea-decorations), LLP 1114.007) | `rangeFrame("composer", caret, caret)`, in an action, is where a mention popover goes |
@@ -1129,11 +1160,12 @@ Compiler intrinsics and special forms additionally include:
 
 | Form | Meaning | Example |
 | --- | --- | --- |
-| `pending(resourceOrMutationName)` | Boolean; request is in flight | `pending(saved)` is `true` from `send saved = …` until its reply |
-| `failed(resourceOrMutationName)` | Boolean; current resource request failed without an answer | `failed(weather)` is `true` once the weather request fails |
-| `failure(resourceOrMutationName)` | `option<Failure>`: `none` until the current request fails without an answer, then `some({ code, message, reason })` (LLP 1109 D3); `code` is the nonempty source `reason` when supplied, otherwise the infrastructure vocabulary below, the same on every host; `message` is what the agent's `state.failed` shows, and says more and differs by host; `reason` is the source error’s string `reason` (a Snapback refusal’s code such as `SLOT_FULL` or `E_RULE`), else `""`, on every host | `match failure(weather)` with `case some(f)` reads `f.code`, `"offline"` with no connection |
-| `path("routeName", args…)` | Checked encoded route location | `path("item", "7")` is `"/item/7"` |
-| `empty(field=constant, …)` | Resource placeholder's zero record with overrides | `resource days = loadDays() as shape Days else empty()` shows `Days`' zero until the answer |
+| `pending(resourceOrMutation)` | Boolean; request is in flight | `pending(saved)` is `true` from `send saved = …` until its reply |
+| `current(resource)` | Boolean; it shows an answer to its current call arguments: not its placeholder, not an answer kept from other call arguments or across idleness (`when`). A refresh of the same arguments, or a changed `with` value, leaves it true (LLP 1161.001) | `if not current(detail)` shows "loading" for a newly selected item, and not after a refresh |
+| `failed(resourceOrMutation)` | Boolean; current resource request failed without an answer | `failed(weather)` is `true` once the weather request fails |
+| `failure(resourceOrMutation)` | `option<Failure>`: `none` until the current request fails without an answer, then `some({ code, message, reason })` (LLP 1109 D3); `code` is the nonempty source `reason` when supplied, otherwise the infrastructure vocabulary below, the same on every host; `message` is what the agent's `state.failed` shows, and says more and differs by host; `reason` is the source error’s string `reason` (a Snapback refusal’s code such as `SLOT_FULL` or `E_RULE`), else `""`, on every host | `match failure(weather)` with `case some(f)` reads `f.code`, `"offline"` with no connection |
+| `path("route", args…)` | Checked encoded route location | `path("item", "7")` is `"/item/7"` |
+| `empty(field=value, …)` | Resource placeholder's zero record with overrides | `resource days = loadDays() as shape Days else empty()` shows `Days`' zero until the answer |
 | `some(expr)` | Construct an option | `some(3)` is an `option<number>` holding 3 |
 | `DeclaredShape(field=value, …)` | Construct a record | `Day(key="mon", ml=0)` is a `Day` |
 | `DeclaredShape(base, field=value, …)` | Copy a record | `Day(d, ml=d.ml + 250)` is `d` with `ml` changed |
@@ -1165,7 +1197,10 @@ new code is a breaking change; branch with a default case.
 
 `failure(x).reason` retains the domain string as well, empty when none was supplied.
 For a mutation, failure belongs to its latest send: a new send, a successful answer,
-or an explicit assignment clears it. A failed request retains its previous value,
+or an explicit assignment clears it. A `parallel` mutation's belongs to its latest
+send to conclude: a send's failure shows unless a later send has already answered
+or failed, and an earlier send's success, which does not land in the slot then,
+leaves a later send's failure standing. A failed request retains its previous value,
 does not retry, and does not run `then`. A synchronous throw that refuses the sending
 action still rolls that action back; only an admitted request's failure persists.
 
@@ -1209,15 +1244,23 @@ its unknown attributes, and an SVG element's own props, pass to the module as on
 object. A known attribute binds to the module's box, and the box takes only layout,
 box and paint rows, handlers, `testId`, `id`, `class`, `data-*`, `role`, ARIA,
 `disabled` and `inert`; any other known name (`color`, `value`, `command`, `href`)
-is `lower-native-attr` (LLP 1024 D1, LLP 1088 D7.2). A capitalized name is a component use, not a
+is `lower-native-attr` (LLP 1024 D1, LLP 1088 D7.2). A package cannot declare a
+view prop whose name writes a layout row (`width`, `padding`, `flex`): the bake
+refuses the declaration with `bake-view-prop-layout`, naming the package, view
+and prop. Other declared props go to the view when written on the tag, even
+under a known name (`exact-camera`'s `object-fit`). A class's rows style only
+the box: `object-fit` in a class never configures the camera's viewfinder;
+write it on `exact-camera` for that. A renamed spelling (`fontSize`) is refused
+whatever is declared. A capitalized name is a component use, not a
 built-in tag. Platform support can further restrict an admitted tag, notably
 native `foreignObject`.
 
-`contract vocab` lists every tag, style and prop name the compiler admits,
+`contract vocab` lists every tag and attribute the compiler admits, including
+`h1`–`h6` and the compile-time attributes `class`, `part` and `-exact-row-look`,
 with each style row's codec, values and default, the renamed spellings and the
 contextual restrictions: `cargo run -q -p contract -- vocab padding` for one
 name, no name for the card (what an app writes, at most 8 KB), `--all` for everything,
-`--json` for a document. From an app made by
+`--json` for the same entries as JSON. From an app made by
 `exact new`, run `bun exact.mjs contract vocab`.
 `padding`, `margin`, `inset`, `border-width`, `border-style` and `border-color` take
 CSS's one to four values (`padding="12px 40px"`: top and bottom 12, sides 40), and
@@ -1248,7 +1291,7 @@ and `subpixel-antialiased` are refused. It changes how glyphs paint, never how
 text measures (LLP 1019 D12).
 
 `-exact-hairline` is a length every length row takes but a font's size and line
-height ([LLP 1115.000](../llp/1115.000-no-tells-on-every-host.rfc.md) D10.3): one
+height (LLP 1115.000 D10.3): one
 device pixel, 1 px over the display's scale, which each host tells the kernel as
 it tells it the root font size (UIKit's `displayScale`, AppKit's
 `backingScaleFactor`, the browser's `devicePixelRatio`, the pixels a point a
@@ -1263,7 +1306,7 @@ included), with no margin of its own. Its `color`, `border-*` and `margin` are
 yours to write.
 
 `-exact-accessory-checkmark-width` and `-exact-accessory-checkmark-height` are
-length ramps ([LLP 1137](../llp/1137-length-ramps.rfc.md)): UIKit's list-cell
+length ramps (LLP 1137): UIKit's list-cell
 checkmark at the root font size, growing with the text size as a text style
 does (19 × 17.33 at the default size, 48 × 43.33 at the largest). They are
 taken where `-exact-hairline` is; a grouped list's checkmark in a row of your
@@ -1274,18 +1317,25 @@ UIKit's cells do (a grouped row's title and value already take it on iOS).
 
 `-exact-row-look="platform"` on an element says its box's look (its
 `background`, `border`, `padding` and `box-shadow` rows) is its own where it stands
-alone and the platform's row where it is a grouped list's row ([LLP
-1139](../llp/1139-a-row-look-that-yields.rfc.md)): there those rows are dropped
+alone and the platform's row where it is a grouped list's row (LLP
+1139): there those rows are dropped
 and the list draws the row, as Exact Content's `AnswerTile` is a tile in a quiz and a
 list's cell in a poll. Elsewhere it does nothing. A grouped row's edge or background
 image its author wrote otherwise stays the author's on every host, iOS's carried row
 included.
 
-A `button` is the platform's own control by default ([LLP
-1104](../llp/1104-the-platforms-controls-by-default.rfc.md) D1). Your bare box
+An `image` takes no `loading` attribute: Exact decides when its picture is fetched
+(LLP 1048.007 D5). On the web a lone image loads with the page, and the page's first
+one is preloaded. An image a `for` repeats is written `loading="lazy"`, the first
+screen's rows included: the browser fetches those at the page's first layout, not
+while it parses the document, and the rest as they come near. Native hosts fetch the
+picture of every image that is mounted.
+
+A `button` is the platform's own control by default (LLP
+1104 D1). Your bare box
 (`appearance="none"`, or a button given a background, border, radius or rich
-children) lays out as Chrome's `<button>` does with Exact's reset ([LLP
-1001](../llp/1001-kernel-v1.spec.md) §1): a block that shrinks to fit, whose
+children) lays out as Chrome's `<button>` does with Exact's reset (LLP
+1001 §1): a block that shrinks to fit, whose
 content is centred in its height (safely: content taller than the button
 starts at the top) and whose text is `text-align: center`. `align-items`,
 `justify-content` and `gap` do nothing on it, as on any block. Write
@@ -1323,13 +1373,13 @@ schema's `buttonStyles` table. Unsaid, a button is the platform's default: plain
 tinted text on iOS, a push button on macOS, bordered on the web and on the hosts
 that paint their own (`contract vocab button`). This adds no tag or new
 expression grammar. Platform looks and stand-ins are documented in
-[LLP 1069.011](../llp/1069.011-native-buttons.rfc.md).
+LLP 1069.011.
 
 ### Plain textarea decorations
 
 `decorations` colours ranges of a plain `textarea`'s text that the app computes, as a
 Bluesky composer colours @mentions, links and #tags: CSS's Custom Highlight API
-([LLP 1114.007](../llp/1114.007-highlights-in-a-text-field.rfc.md)). Each range names a
+(LLP 1114.007). Each range names a
 `decoration` declaration, the app's `::highlight(name)` rule. The value stays a plain
 string, and a decoration paints only: the field measures, wraps, edits and undoes exactly
 as it does without one, so a declaration takes only what `::highlight()` admits, `color`,
@@ -1381,7 +1431,7 @@ not yet measured.
 ### Markdown: `markup`, `format`, `select`
 
 `markup="markdown"` on a `text` or a `textarea` styles the node's own string as
-Markdown ([LLP 1045](../llp/1045-markdown-editor.rfc.md)); `none` is the
+Markdown (LLP 1045); `none` is the
 default. It is not CSS: CSS has nothing for this. The value stays the Markdown
 source, so storage, search and export are the string.
 
@@ -1436,7 +1486,7 @@ comes before the editor's own handling: a Return it cancels continues no list.
 macOS and iOS; each `setRangeText` is one undo step, as a `format` is, and
 both are refused while an input method composes. On the web, where hidden
 syntax is not drawn, a caret put inside it is drawn at its visible edge and
-reads back there ([LLP 1045](../llp/1045-markdown-editor.rfc.md) D6).
+reads back there (LLP 1045 D6).
 
 `paragraphDirs` gives the editor's lines their base direction: one word per
 source line, HTML's `dir` (`ltr`, `rtl` or `auto`), the first word the first
@@ -1455,13 +1505,13 @@ takes the word above it. A line without a word takes the field's `direction`;
 web, macOS and iOS draw it, a right-to-left line's list marker and quote on
 its right (the web's quote bar; on Apple the quote's indent and its dimmed
 `>`); Linux, Windows and Android, which show the source, ignore it
-([LLP 1045](../llp/1045-markdown-editor.rfc.md) D11).
+(LLP 1045 D11).
 
 ### Inline atoms: `atom`, `atoms`, `atomFaces`, `atompress`
 
 An atom is a span of a Markdown source that the editor and the reader show as
 one pill: a label that is not its source, an optional icon, a tooltip
-([LLP 1045.000](../llp/1045.000-inline-atoms.rfc.md)). A caret cannot stand
+(LLP 1045.000). A caret cannot stand
 inside it, a selection takes it whole, Backspace at its end (Delete at its start)
 removes its whole source as one undo step, ⌥⌫ takes it with the spaces before
 the caret, and a press selects it and then is the node's `atompress`. The value
@@ -1573,7 +1623,7 @@ left, where `tap <node> at <x> <y>` presses it.
 ### Keep-awake: `wakelock`
 
 `wakelock` on any element takes `"screen"` or `"none"` (the default), literal
-or bound ([LLP 1125](../llp/1125-a-transport-midi-and-the-small-pieces.rfc.md)
+or bound (LLP 1125
 D11). While an element that is mounted and displayed (no ancestor
 `display: none`, under no unselected tab and no screen a stack keeps under
 its top; the one a sheet covers is shown) says `"screen"`, the display does
@@ -1589,7 +1639,7 @@ has each host's lock.
 (`"portrait"`, `"landscape"`, `"portrait-primary"`, `"portrait-secondary"`,
 `"landscape-primary"`, `"landscape-secondary"`, `"natural"`, `"any"`),
 `"current"` or `"none"` (the default), literal or bound
-([LLP 1133.029](../llp/1133.029-screen.rfc.md)). It holds while the element
+(LLP 1133.029). It holds while the element
 is displayed, by `wakelock`'s rule, and outside every `dialog` and popover.
 Any other literal is refused (`lower-attr-value`, naming the words); a
 computed one is journaled and holds nothing. The bake refuses a lock inside
@@ -1651,7 +1701,7 @@ opens no menu.
 A text field, a checkbox or another form control takes a tap or a click
 itself, so an ancestor's `press` does not fire, in the page or in a dialog.
 That is the platform's rule on macOS and iOS (a hand-built screen's control
-consumes its touch, [LLP 1115](../llp/1115-write-the-web-ship-the-platform.principle.md));
+consumes its touch, LLP 1115);
 on the web the click bubbles from the control to the ancestor. A `press`
 written on the control itself gives the same result on every host. A
 `button` with no `press` of its own presses the nearest ancestor's on every
@@ -1673,7 +1723,7 @@ host.
 | One `MarkdownSelection` | `select` on the Markdown editor (`textarea markup="markdown"`) |
 | One `InputEvent` | `select` on a text field or any other `textarea` ([form controls](#form-controls-radio-inputevent-setselectionrange)) |
 | Two numbers | `pan`, `panrelease`, `heightrelease` |
-| A string, an `option<string>`, then optionally a `ReorderEvent` | `reorderdrop`, on a vertical `list virtualized=true` only: the dragged row's key, then the key it lands before (`none` at the end); an action taking one more parameter also hears `ReorderEvent { from, to }`, the two lists' `id`s (equal within one list; [LLP 1094](../llp/1094-dropping-across-lists.rfc.md) D2) |
+| A string, an `option<string>`, then optionally a `ReorderEvent` | `reorderdrop`, on a vertical `list virtualized=true` only: the dragged row's key, then the key it lands before (`none` at the end); an action taking one more parameter also hears `ReorderEvent { from, to }`, the two lists' `id`s (equal within one list; LLP 1094 D2) |
 | Four numbers | `transformgeometry` |
 | Six numbers | `transformrelease` |
 | Special: zero or one location string, no captured args | `navigate` |
@@ -1706,19 +1756,19 @@ resetting the session does not fire `close`.
 An `audio` is HTML's: `video`'s props and events without `poster`, `playsinline`
 or `playbackVisibilityThreshold`; no box unless `controls` (then Chrome's 300×54,
 which `width`/`height` override), whatever `display` says
-([LLP 1042](../llp/1042-video.spec.md) §8).
+(LLP 1042 §8).
 A `video`'s or `audio`'s `error` appends a stable code, never the engine's text: MediaError's
 `aborted`, `network`, `decode` and `src-not-supported` (a source that never loaded),
 `not-allowed` (the browser refused to start playing) or `invalid-value` (a number out
 of range). A play interrupted by a pause or a new source is no error. A `video` the
 tree removed reports nothing more, on every host
-([LLP 1042](../llp/1042-video.spec.md) §3).
+(LLP 1042 §3).
 
 ### Media session
 
 `metadata=MediaMetadata(title=…, artist=…, album=…, artwork=…)` on an `audio`
 or `video` claims the platform's media session (Now Playing, the media keys, the
-lock screen; [LLP 1098](../llp/1098-the-media-session.rfc.md)). `MediaMetadata`
+lock screen; LLP 1098). `MediaMetadata`
 is a compiler shape an app builds as it builds its own records (every field a
 string, each named once; `artwork` is one image's source), so a `fn` may return
 one; an app's own `shape MediaMetadata` or `fn MediaMetadata` is refused. The
@@ -1769,8 +1819,11 @@ A key the list does not hold is passed over; another value keeps none and
 says so in the journal (LLP 1010 §6.11).
 
 `scroll-padding` (or its four physical sides) insets any scroll container’s
-alignment port. `scroll-margin` expands the target element’s border box for
+alignment port. It takes nonnegative lengths and percentages; negative literals
+are refused. A calculation's negative result clamps to zero.
+`scroll-margin` expands the target element’s border box for
 `scrollIntoView`; its signed lengths change neither layout nor scroll range.
+Scroll margins refuse percentages, including inside `calc()`, `min()`, `max()` and `clamp()`.
 Padding percentages use the corresponding scrollport dimension on ordinary
 scrollers; a virtual list still requires resolvable main-axis lengths.
 Negative offsets preserve padding showing before the row. With `row=`, only
@@ -1865,7 +1918,7 @@ the first one since the press, so their sum is the drag's offset from the press.
 anywhere inside it, a nested `button` or `press` node included: past the slop
 the pan takes the contact and the press does not fire, while a tap still
 presses. A nested text input or control keeps its own drags, and the innermost
-recognizer wins ([LLP 1057.001](../llp/1057.001-gesture-precedence-and-pinch.spec.md) §1).
+recognizer wins (LLP 1057.001 §1).
 The compiler validates arity and
 available payload types; tags and hosts constrain where events make sense.
 `navigate` belongs on the first root element, outside any region, which must
@@ -1873,7 +1926,7 @@ also carry `navigationKey` (the navigation root; its `navigationBack`, naming th
 Back control, is optional). `historyswipe` belongs there too: on macOS it
 hears the two-finger swipe back or forward as AppKit tracks it, so an app can
 draw its own sign of the swipe (an arrow at the window's edge) while the step
-stays the platform's ([LLP 1115.000](../llp/1115.000-no-tells-on-every-host.rfc.md)
+stays the platform's (LLP 1115.000
 D5.5). Its `HistorySwipeEvent` has `phase` (`"began"`, `"changed"`, then
 `"ended"` just before the step or `"cancelled"` when the lift goes nowhere),
 `direction` (`"back"` or `"forward"`, the way the swipe set out), `amount`,
@@ -1918,10 +1971,10 @@ that scrolls is cancelled.
 A mouse's back and forward buttons go Back and Forward at their release, as
 Chrome's do, after their `pointerdown` and `pointerup` (`button` 3 and 4); a
 `pointerup` handler's `preventDefault()` keeps the page where it is
-([LLP 1115.000](../llp/1115.000-no-tells-on-every-host.rfc.md) D5.5).
+(LLP 1115.000 D5.5).
 
 An action that takes one more parameter than the binding captures gets a
-`PointerEvent` (DOM's names, [LLP 1056](../llp/1056-canvas-2d.rfc.md) §8.6):
+`PointerEvent` (DOM's names, LLP 1056 §8.6):
 
 | Field | Meaning |
 | --- | --- |
@@ -1931,7 +1984,7 @@ An action that takes one more parameter than the binding captures gets a
 | `pressure` | 0 to 1: a pen's or a pressed touch's force where the platform measures one, else 0.5 while down and 0 while not |
 | `pointerType` | `mouse`, `pen` or `touch` |
 | `pointerId` | 1 for the mouse; a touch or pen has its own while down |
-| `clientX`, `clientY` | The point from the viewport, CSS px: `frame()`'s space, so a hit test against `frame` needs no scroll bookkeeping ([LLP 1094](../llp/1094-dropping-across-lists.rfc.md) D11) |
+| `clientX`, `clientY` | The point from the viewport, CSS px: `frame()`'s space, so a hit test against `frame` needs no scroll bookkeeping (LLP 1094 D11) |
 | `shiftKey`, `ctrlKey`, `altKey`, `metaKey` | The modifier keys held (a hardware keyboard's, on iPadOS) |
 
 ```text
@@ -1985,7 +2038,7 @@ scroll wheel=wheeled …
 `drop` is DOM's `drop` of files dragged in from outside the app (Finder, the
 desktop) onto the innermost node that declares it: its `DragEvent` is
 `offsetX`, `offsetY`, `files` (a `string[]` of `doc:` handles minted as a
-picker's are, [LLP 1069.010](../llp/1069.010-the-mac-as-a-document-platform.rfc.md)
+picker's are, LLP 1069.010
 D1, readable under `fs.read doc:/`) and the modifiers. Files of any type are
 taken, and a dropped folder is a folder's handle (`fs.stat` says
 `isDirectory`, `fs.readdir` lists it); the app never learns an absolute
@@ -2171,7 +2224,7 @@ platform's activity indicator: `UIActivityIndicatorView` on iOS (`.medium`,
 `.large` where the box's shorter side is 37 points or more), a spinning
 `NSProgressIndicator` on macOS (small, regular from 32 points), and on the web
 and Linux a spinner the host draws, since HTML's own indeterminate progress is
-a bar (the one deliberate divergence, [LLP 1069.001](../llp/1069.001-form-controls.rfc.md)).
+a bar (the one deliberate divergence, LLP 1069.001).
 It is a 20 × 20 box until `width` or `height` sizes it, and the indicator is
 centred in it. Its own `color` colours it on iOS, the web, Linux and Android's
 reader, else an authored `accent-color` (on it or around it, or the design's
@@ -2200,7 +2253,8 @@ unchecks the rest at once, then fires `input` and `change` on it, carrying its
 `value` (`on` when it has none); choosing the checked one fires nothing. With
 a radio focused, ArrowDown and ArrowRight move the focus and the check to the
 next enabled radio of its group, ArrowUp and ArrowLeft to the previous,
-wrapping, each move an `input` and a `change`; Space checks the focused one.
+wrapping. Left and Right reverse when the radio's parent group is right to
+left. Each move fires `input` and `change`; Space checks the focused one.
 `checked` is controlled as a checkbox's: after the action, every radio shows
 its bound `checked` again, so an action that writes nothing snaps the group
 back. The driver's `type <radio> true` checks it as a click does; `false` is
@@ -2559,7 +2613,7 @@ the virtual clock).
   Removing the root declaration restores the items; the policy follows the
   active window. It never removes an app button; `develop` takes the Develop
   menu off the bar and leaves its chords (Save Trace's ⌥⌘T among them);
-  other hosts ignore it ([LLP 1021 §5.3](../llp/1021-menus.rfc.md#53-contract-extensions-to-the-mac-menu-bar-2026-10-12)).
+  other hosts ignore it (LLP 1021 §5.3).
 
   On a top-level root, `-exact-menu-keys="close-window=none"` keeps File ▸
   Close Window (built with ⌘W) in its place with no chord, so ⌘W reaches the
@@ -2572,22 +2626,39 @@ the virtual clock).
   removes ⌘W declares `-exact-menu-remove="close-all"` too. An app command
   with the same chord still takes it from the item; removing the declaration
   gives it ⌘W back. Other hosts ignore it
-  ([LLP 1021 §5.3.3](../llp/1021-menus.rfc.md#533-close-windows-chord-2026-10-28)).
+  (LLP 1021 §5.3.3).
 
-  The Dock menu and the status item ([LLP 1133.025](../llp/1133.025-desktop.rfc.md)
+  The Dock menu and the status item (LLP 1133.025
   D4, D5): `dock` beside one menu id, or alone, files the button in the Dock
   menu too, above AppKit's own items, in declaration order, from the key
   window's session. `-exact-menu="status"` stands alone (with another id it
   fails `lower-menu-status`) and presents the button as the app's
-  `NSStatusItem` on macOS and its notification-area icon on Windows, taking
-  its place in the page; its `popovertarget` menu is the item's menu. A click
-  on macOS opens the menu when there is one and runs `press` when there is
-  none; on Windows the left button runs `press` (or opens the menu with no
-  `press`) and the right one opens the menu. With
+  `NSStatusItem` on macOS, taking its place in the page; its `popovertarget`
+  menu is the item's menu. A click opens the menu when there is one and runs
+  `press` when there is none. Windows' notification-area icon is accepted and
+  not built (LLP 1133.025 §14): there, as on every other host, the button
+  stays an ordinary button in the window. With
   `host.macos.activationPolicy: "accessory"` the app has no Dock tile and
   opens no window at launch. Bare `focus()` is the window's, as the web's
-  `window.focus()`: it shows the session's window if hidden, brings it
-  forward and activates the app; `focus(id)` stays an element's.
+  `window.focus()`: on macOS it shows the session's window if hidden, brings
+  it forward and activates the app; Windows and Linux bring no window forward
+  yet and log it as unsupported. `focus(id)` stays an element's.
+  Windows opens a window on every launch and exits when it closes; it has no
+  `keepRunning` setting. The login package stores `hidden`, but Windows does
+  not yet honor it at launch (LLP 1133.025 §14).
+
+  `@exact/global-shortcuts` on Windows accepts `PrintScreen` and modified
+  chords such as `Control+PrintScreen`. Bare `PrintScreen` answers
+  `registered: false, reason: "reserved"` when the Snipping Tool keyboard
+  setting (`HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled`)
+  is a nonzero DWORD, unreadable or of the wrong type. A missing value is
+  reserved on Windows 11 (build 22000 or later), or if the build cannot be
+  read. An explicit DWORD 0, or a missing value before build 22000, lets
+  `RegisterHotKey` decide. Registration and checks of an already-held chord
+  apply the same rule; modified chords are unaffected by this refusal.
+  Turn off "Use the Print screen key to open screen capture" in
+  Settings › Accessibility › Keyboard, or choose another chord. The host
+  does not monitor setting changes or intercept the key with a keyboard hook.
 
   View holds Actual Size ⌘0, Zoom In ⌘+ (⌘= too) and Zoom Out ⌘-, as Safari's
   and Preview's View does, stepping through Safari's zoom levels (50% to 300%)
@@ -2611,7 +2682,7 @@ the virtual clock).
 
 ### Focus order: `tabindex`
 
-HTML's `tabindex` (no `tabIndex` alias; [LLP 1088](../llp/1088-what-the-app-diaries-ask-of-contract.rfc.md)
+HTML's `tabindex` (no `tabIndex` alias; LLP 1088
 D7.3), on any element and a module tag's box, a number or bound to state. Present, it
 makes the element focusable — a click, `focus(id)` and `autofocus` reach it, and the
 `key` handlers above it hear its keys; absent is never `0`, so a plain box is no stop.
@@ -2653,7 +2724,7 @@ An `autofocus` mounted later takes the focus only when nothing holds it, as in C
 `tabindex` button a tap focused keeps it when a timer remounts an `autofocus` element.
 The tap's own work is the exception on the web and iOS: a field it shows, or the
 `autofocus` field of a sheet, dialog or popover it opens, takes the focus from the control
-tapped ([LLP 1035.000](../llp/1035.000-dependable-host-semantics.rfc.md) D9). On macOS and
+tapped (LLP 1035.000 D9). On macOS and
 iOS a click or touch whose press mounts an `autofocus` text field or textarea begins editing
 it as the platform's click-to-edit does: on the Mac the field takes the focus from any field
 that held it, and on both the caret goes under the press (the end below the text). The web
@@ -2687,8 +2758,8 @@ argument validation. Use the working implementation when selecting arguments:
 | Operation | Starting point |
 | --- | --- |
 | `observe(name)`, `observe(name, Attributes(...), severity)`, `observeAttributes(Attributes(...))`, `observeError(message)` or `observeError(message, type)`: optional Observe events, attributes merged into later events, and error reports. Attributes use a shape constructor. Event names contain 1–256 characters and do not start with `expo.`; severity recognizes `trace`, `debug`, `info`, `warn`, `error` and `fatal`, defaulting to `info`. Declare the `observe` launch module and its project configuration to dispatch them. | [Observe configuration](../modules/observe/README.md), [compiler tests](../contract/cli/tests/it/observe_commands.rs) |
-| `postMessage(text, target)`: ordered messages to a canvas by literal surface name, or string replies and host updates to a live iframe by `id` on Apple and both web executors; iframe targets may compute. Missing, ambiguous, replaced or navigation-revoked iframe targets are dropped without entering the canvas queue. | [LLP 1020 §11](../llp/1020-webview.rfc.md#11-addressed-string-replies-and-host-updates-2026-10-19), [iframe fixture](../scripts/fixtures/iframe-post-messages.contract), [compiler tests](../contract/cli/tests/it/post_message.rs) |
-| `navigate(id, url)`, `traverseHistory(id, delta)`, `reload(id)` or `reload(id, ignoreCache=true)`, `stopLoading(id)`: move the mounted `iframe` with that `id`, by the Navigation API's and WebDriver BiDi's names; bare `reload()` stays the development host's reboot. The frame reports with `navigate=`, `currententrychange=`, `navigatesuccess=` and `navigateerror=`, each with a `FrameNavigation` record as the action's optional last parameter. On Apple a frame with `partition=` is a top-level page in that partition's own storage (`persist:` names last across launches) and takes them all; an unpartitioned frame refuses the commands (`navigateerror`, `NotSupportedError`). The web honours no `partition` (`exactPage().iframePartition` is false) and gives a same-origin frame what the browser lets a page see. A literal id no `iframe` carries is refused here; `partition` beside `sandbox` (`lower-iframe-partition-sandbox`), beside `message=` or a `postMessage` to it (`lower-iframe-partition-message`), or with a literal `src` that is not a web page (`lower-iframe-partition-src`) is refused. A partition is cleared with `clearSiteData` from `@exact/browser`: `send m = clearSiteData(partition=…, types=[…])`, or from data code `await clearSiteData({ partition, types })` once the Contract names the send (LLP 1133.002 D14). On Apple any frame that handles `newwindow=` asks for windows, with a `FrameNewWindow`: a `new-window` (`window.open` with features) from a partitioned frame has already opened as the platform's popup in the same partition; a `foreground-tab` or `background-tab` (`target=_blank`, ⌘-click), or a `new-window` from an unpartitioned frame (part of the app's page), opened nothing and is the app's; `download=` reports a download with a `FrameDownload`. Dialogs, file inputs, a download's destination and another app's scheme are the platform's sheets and panels, and `requests` under the agent (`dialog`, `open-file`, `save-file`). A guest's `window.print()` prints its own frame (a PDF frame the PDF's pages): on macOS the print panel, a sheet on the window, and the `print` request under the agent, for a web view's main frame or a PDF in a frame below it (another frame below it does not print: no public API prints it); the web prints as the browser does; iOS does not print yet. `captureScreenshot(id, "app:/tmp/shot.png")` writes a PNG of any frame's guest, and `clip=DOMRect(x=…, y=…, width=…, height=…)` a part of it in the guest's CSS pixels, as a pinch or pan leaves it; the frame answers with `capture=` and a `FrameCapture` (`path`, `width`, `height`, or `error` and `message`); a literal path outside `app:/data`, `app:/cache` and `app:/tmp` is refused here (`lower-frame-capture-path`); the web answers `NotSupportedError`. On Apple an unpartitioned, unsandboxed frame of a local PDF (`app:/` or `assets/`) shows it in PDFKit's `PDFView`, `#page=N` opening at that page. Data code that holds the grant `browser.automation` drives a partitioned frame with `@exact/browser-automation` (WebDriver BiDi's `evaluate`, `callFunction`, `addPreloadScript`, `performActions`, `handleUserPrompt`, `setDownloadBehavior`, `captureScreenshot`); while it drives one, the frame's dialogs fire `userpromptopened=` with a `FrameUserPrompt` instead of showing a sheet, until a person's input takes the frame back. `openDevTools(id)` opens the platform's inspector for a frame's guest, as Electron's `<webview>.openDevTools()`: on macOS Safari's Web Inspector in a window of its own (brought to the front when open), through WebKit's private `_inspector`; iOS makes the frame inspectable from a Mac's Safari › Develop; the web refuses it in the log | [LLP 1020.002](../llp/1020.002-a-browser-shell.rfc.md), [fixture](../scripts/fixtures/iframe-partition.contract), [windows](../scripts/fixtures/iframe-windows.contract) |
+| `postMessage(text, target)`: ordered messages to a canvas by literal surface name, or string replies and host updates to a live iframe by `id` on Apple and both web executors; iframe targets may compute. Missing, ambiguous, replaced or navigation-revoked iframe targets are dropped without entering the canvas queue. | LLP 1020 §11, [iframe fixture](../scripts/fixtures/iframe-post-messages.contract), [compiler tests](../contract/cli/tests/it/post_message.rs) |
+| `navigate(id, url)`, `traverseHistory(id, delta)`, `reload(id)` or `reload(id, ignoreCache=true)`, `stopLoading(id)`: move the mounted `iframe` with that `id`, by the Navigation API's and WebDriver BiDi's names; bare `reload()` stays the development host's reboot. The frame reports with `navigate=`, `currententrychange=`, `navigatesuccess=` and `navigateerror=`, each with a `FrameNavigation` record as the action's optional last parameter. On Apple a frame with `partition=` is a top-level page in that partition's own storage (`persist:` names last across launches) and takes them all; an unpartitioned frame refuses the commands (`navigateerror`, `NotSupportedError`). The web honours no `partition` (`exactPage().iframePartition` is false) and gives a same-origin frame what the browser lets a page see. A literal id no `iframe` carries is refused here; `partition` beside `sandbox` (`lower-iframe-partition-sandbox`), beside `message=` or a `postMessage` to it (`lower-iframe-partition-message`), or with a literal `src` that is not a web page (`lower-iframe-partition-src`) is refused. A partition is cleared with `clearSiteData` from `@exact/browser`: `send m = clearSiteData(partition=…, types=[…])`, or from data code `await clearSiteData({ partition, types })` once the Contract names the send (LLP 1133.002 D14). On Apple any frame that handles `newwindow=` asks for windows, with a `FrameNewWindow`: a `new-window` (`window.open` with features) from a partitioned frame has already opened as the platform's popup in the same partition; a `foreground-tab` or `background-tab` (`target=_blank`, ⌘-click), or a `new-window` from an unpartitioned frame (part of the app's page), opened nothing and is the app's; `download=` reports a download with a `FrameDownload`. Dialogs, file inputs, a download's destination and another app's scheme are the platform's sheets and panels, and `requests` under the agent (`dialog`, `open-file`, `save-file`). A guest's `window.print()` prints its own frame (a PDF frame the PDF's pages): on macOS the print panel, a sheet on the window, and the `print` request under the agent, for a web view's main frame or a PDF in a frame below it (another frame below it does not print: no public API prints it); the web prints as the browser does; iOS does not print yet. `captureScreenshot(id, "app:/tmp/shot.png")` writes a PNG of any frame's guest, and `clip=DOMRect(x=…, y=…, width=…, height=…)` a part of it in the guest's CSS pixels, as a pinch or pan leaves it; the frame answers with `capture=` and a `FrameCapture` (`path`, `width`, `height`, or `error` and `message`); a literal path outside `app:/data`, `app:/cache` and `app:/tmp` is refused here (`lower-frame-capture-path`); the web answers `NotSupportedError`. On Apple an unpartitioned, unsandboxed frame of a local PDF (`app:/` or `assets/`) shows it in PDFKit's `PDFView`, `#page=N` opening at that page. Data code that holds the grant `browser.automation` drives a partitioned frame with `@exact/browser-automation` (WebDriver BiDi's `evaluate`, `callFunction`, `addPreloadScript`, `performActions`, `handleUserPrompt`, `setDownloadBehavior`, `captureScreenshot`); while it drives one, the frame's dialogs fire `userpromptopened=` with a `FrameUserPrompt` instead of showing a sheet, until a person's input takes the frame back. `openDevTools(id)` opens the platform's inspector for a frame's guest, as Electron's `<webview>.openDevTools()`: on macOS Safari's Web Inspector in a window of its own (brought to the front when open), through WebKit's private `_inspector`; iOS makes the frame inspectable from a Mac's Safari › Develop; the web refuses it in the log | LLP 1020.002, [fixture](../scripts/fixtures/iframe-partition.contract), [windows](../scripts/fixtures/iframe-windows.contract) |
 | `focus(id)` | [Markdown Stress](../apps/markdown-stress/app.contract) |
 | `format(id, command[, argument])`: a Markdown editor's toolbar command ([Markdown](#markdown-markup-format-select)) | [Markdown Stress](../apps/markdown-stress/app.contract) |
 | `blur()`, `blur(id)` | [Messages](../apps/messages/app.contract), [keyboard-bar corpus](../contract/corpus/keyboard-bar.contract) |
@@ -2697,7 +2768,7 @@ argument validation. Use the working implementation when selecting arguments:
 | `setRangeText(id, text[, start, end[, selectionMode]])`: a field's range replacement, one `input`, preserve selection by default; one undo step on macOS and on the Markdown editor, none on a plain field elsewhere ([form controls](#form-controls-radio-inputevent-setselectionrange)) | [Chrome comparison](../host/web/tests/field-range.test.mjs) |
 | `copyText(text)` | [Messages](../apps/messages/app.contract) |
 | `startTrace_EXPERIMENTAL()`, `stopTrace_EXPERIMENTAL()`: experimental, so named while the trace's fields may still change; a recording of each UI update UIKit makes, observed without asking for one or for a frame rate (iOS and tvOS 18 and later), elsewhere of each display-link callback, from which it estimates the frames the display showed again, from an app's own control and in any build, a production one included; `stopTrace_EXPERIMENTAL()` puts the trace on the clipboard as compact JSON and in a `trace-recording-*.json` file in the app's temporary directory; `stopTrace_EXPERIMENTAL(maxBytes)` copies it cut to that many bytes (its totals and scroll segments as rows, then the frames late the longest first, as many as fit), for a conversation that limits a message (a budget too small for its totals gets a note naming the size that fits them; that note can exceed the requested budget), and still saves the whole trace. On iOS it splits each scroll a person makes of an element's scroller, a route's page or the document into its drag and its glide, with its frame rate and delay relative to the display’s fastest rate; a Mac recording follows no scroller. It lists each late frame with its cause, its scroll offset, its update's phases, the main thread's busy time, its overrun and commit time, batches and host phases; [Frame trace fields](#frame-trace-fields) says what each field means. Apple hosts (tvOS, with no clipboard, only saves the file); the web and Linux refuse it in the journal | [`TraceRecording.swift`](../host/apple/Sources/ExactKit/TraceRecording.swift) |
-| `openURL(url)`: an absolute `http`, `https`, `mailto` or `tel` URL, or one of a scheme app.json's `open_url.schemes` declares (`"open_url": {"schemes": ["vscode", "zed"]}`, an editor's deep link), opened by whatever the system registered for it; the web's JS target, macOS and iOS open declared schemes (a browser asks first) and journal one nothing could open, and under the agent journal them instead (`openURL vscode: …`). `openURL(url, id)` also says whether it opened, as Electron's `shell.openExternal` does: `change` at the element `id` names hears `opened` when the system took the URL, or `failed` when it was refused or nothing could open it (no app registered for its scheme, a host with no browser). The web hears `opened` for any URL it hands the browser, which does not say what opened it. Where the agent's drive journals an open instead, macOS answers whether an app is registered for the URL and the other hosts answer `opened` A link's `href` of a declared scheme opens on macOS and iOS, which hand followed links to `openURL`; the web writes no such `href` (its link policy keeps the four schemes). `file`, `javascript`, `data` and the other schemes that run or read content cannot be declared. Any other scheme is refused in the journal ([LLP 1133.000](../llp/1133.000-the-roster.rfc.md) §2) | No Contract fixture; the hosts' dispatch, such as [`host/web-js/commands.js`](../host/web-js/commands.js), [`OpenURL.swift`](../host/apple/Sources/ExactKit/OpenURL.swift) |
+| `openURL(url)`: an absolute `http`, `https`, `mailto` or `tel` URL, or one of a scheme app.json's `open_url.schemes` declares (`"open_url": {"schemes": ["vscode", "zed"]}`, an editor's deep link), opened by whatever the system registered for it; the web's JS target, macOS and iOS open declared schemes (a browser asks first) and journal one nothing could open, and under the agent journal them instead (`openURL vscode: …`). `openURL(url, id)` also says whether it opened, as Electron's `shell.openExternal` does: `change` at the element `id` names hears `opened` when the system took the URL, or `failed` when it was refused or nothing could open it (no app registered for its scheme, a host with no browser). The web hears `opened` for any URL it hands the browser, which does not say what opened it. Where the agent's drive journals an open instead, macOS answers whether an app is registered for the URL and the other hosts answer `opened` A link's `href` of a declared scheme opens on macOS and iOS, which hand followed links to `openURL`; the web writes no such `href` (its link policy keeps the four schemes). `file`, `javascript`, `data` and the other schemes that run or read content cannot be declared. Any other scheme is refused in the journal (LLP 1133.000 §2) | No Contract fixture; the hosts' dispatch, such as [`host/web-js/commands.js`](../host/web-js/commands.js), [`OpenURL.swift`](../host/apple/Sources/ExactKit/OpenURL.swift) |
 | `setScheme(scheme)`: the app's scheme, `"light"`, `"dark"` or `"system"` (follow the system's appearance) | [Caltrain](../apps/caltrain/app.contract), [Markdown](../apps/markdown/app.contract) |
 | `setRootFontSize(px)`, `setRootFontSize("125%")`, `setRootFontSize("medium")`: CSS's `:root { font-size }`, the root font size every `rem` follows, in px above 0, laid out in the action's own commit; `px` lengths stay. It stands over the host's own size (the browser's setting, iOS Dynamic Type, 16 on macOS and Linux), as an author's `html { font-size: 20px }` stands over a browser's font-size setting, and `"medium"` hands the size back to the host. A percentage (CSS's number syntax, above 0) is that share of the host's size and follows it as the host's changes (LLP 1121 D6). A literal of 0 or less is refused here, a computed one in the log when it runs. Not kept across a launch: set it again from a mount task (LLP 1069.000 D3) | [rem tests](../contract/cli/tests/it/rem.rs) |
 | `setPageZoom(factor)`: the window's page zoom, as View ▸ Zoom In sets it and Electron's `webContents.setZoomFactor`: a CSS px is `factor` points, so the viewport, media queries, `px` and `rem` all follow; `setPageZoom(1)` is Actual Size, and a factor is clamped to 0.25–5. For an app whose own ⌘0, ⌘= and ⌘- commands keep their own steps ([The Mac's menu bar](#keys)). The Mac's; iOS, Linux, Windows and the web refuse it in the journal (LLP 1021 §5.3.1) | [`PageZoomMacTests`](../host/apple/tests/ExactKitTests/PageZoomMacTests.swift) |
@@ -2710,10 +2781,10 @@ argument validation. Use the working implementation when selecting arguments:
 | `requestPermission(id, path, mode)`: a kept document's access asked for again, `mode` `"read"` or `"readwrite"`, from a press (the web asks the browser under its activation; a native host answers `granted` for a document that resolves); `change` at `id` hears `granted` or `denied` ([documents kept across launches](reference.md#documents-the-person-chose-doc)) | No app fixture; [the web's kept documents test](../host/web/documents-kept.test.mjs) |
 | `scrollIntoView(id, block=, inline=, behavior=)`: `Element.scrollIntoView()` on any element by its `id` (a string, dynamic as `focus`'s): every scroll container above it, innermost first, then the page, align it by the web's `ScrollIntoViewOptions` (`block` default `start`, `inline` `nearest`). `scrollIntoView("list-id", key, …, row=, offset=)`: a virtualized list's row by key, built and measured first (LLP 1070.000). macOS, iOS and tvOS animate the element form with the platform's scroll animation unless `behavior="instant"` (LLP 1115.000 D8.4), landing immediately under reduced motion; `scrollend` comes once the animation ends. Linux lands element jumps at once, including smooth requests (LLP 1070.000 §14) | [collection tests](../contract/cli/tests/it/collection_into_view.rs) |
 | `scrollBy(id, x, y)`: `Element.scrollBy(x, y)` on a scroll container by its `id`, in pixels (a terminal's row is 16, its column 8), clamped to its travel; an element that does not scroll does not move. A reader's `j` and `k`. The terminal, Linux and the web's JS target take it; Apple and the wasm web host do not yet | [the LLP terminal reader](../apps/llp/terminal.contract), [`reading.rs`](../host/terminal/tests/it/reading.rs) |
-| `showPopover(id, source="trigger")`, `hidePopover(id)`, `togglePopover(id, source="trigger")`: HTML's methods by element id. `popover=(expanded ? some("manual") : none)` adds or removes that property on the same node; removing it closes the top layer and restores inline placement. `source=` is optional and explicit; it need not carry `popovertarget`, and the key handler's node is not inferred. Repeated show/hide is a no-op. Visibility changes immediately in command order, including hide then show during native dismissal. Bad targets or sources are refused in the journal. A popover's `toggle=changed` action may take `e: ToggleEvent`, with `oldState` and `newState` (`"open"` or `"closed"`); events follow logical visibility, coalescing changes in one turn. Without a source the popover has no invoker. A following `focus(id)` in the opening action selects a native menu row on macOS and windowed Linux; AppKit refuses changing the highlight once native tracking begins. UIKit navigation-bar menus still lack command dismissal and toggle observation (issue #319 remaining work). Desktop/headless Linux reports unsupported; windowed Linux uses its existing supported menu/alert shapes. | [menus](../llp/1021-menus.rfc.md) |
+| `showPopover(id, source="trigger")`, `hidePopover(id)`, `togglePopover(id, source="trigger")`: HTML's methods by element id. `popover=(expanded ? some("manual") : none)` adds or removes that property on the same node; removing it closes the top layer and restores inline placement. `source=` is optional and explicit; it need not carry `popovertarget`, and the key handler's node is not inferred. Repeated show/hide is a no-op. Visibility changes immediately in command order, including hide then show during native dismissal. Bad targets or sources are refused in the journal. A popover's `toggle=changed` action may take `e: ToggleEvent`, with `oldState` and `newState` (`"open"` or `"closed"`); events follow logical visibility, coalescing changes in one turn. Without a source the popover has no invoker. A following `focus(id)` in the opening action selects a native menu row on macOS and windowed Linux; AppKit refuses changing the highlight once native tracking begins. UIKit navigation-bar menus still lack command dismissal and toggle observation (issue #319 remaining work). Desktop/headless Linux reports unsupported; windowed Linux uses its existing supported menu/alert shapes. | LLP 1021 |
 | `showModal(id)`, `close(id)`: `HTMLDialogElement.showModal()` and `close()` on a dialog by its `id`, from an action (bare `close()` is the window's). The terminal takes them (LLP 1101.001 P5); iOS presents a `dialog` or `role="alertdialog"` popover by its id as its confirmation (an alert or action sheet, with no invoker) and any other `dialog` as a sheet as tall as its content (LLP 1115.000 D11.5), the web shows the dialog (or the alertdialog popover), macOS the dialog in its top layer, or a `role="alertdialog"` one in the alert's shape as `NSAlert`, a sheet on the window (LLP 1115 D6, LLP 1115.000 D7.6) | [the harness](../apps/harness/terminal.contract), [the native fixture](../apps/native-fixture/app.contract) (`askClear`) |
 | `fastSeek(id, seconds)`, `load(id)`: a `video` or `audio`, by HTML's method names (LLP 1042 §3). `fastSeek` seeks each time it runs, where a bound `currentTime` seeks only when its value changes; every host seeks to the exact time, which HTML's approximate-for-speed allows. `load` loads the source again, as a changed `src` does: the bound `currentTime` waits for its metadata and a bound `paused` false plays | [media tests](../contract/cli/tests/it/media.rs), [media conformance plan](../host/web-js/conformance/media.contract) |
-| `requestPictureInPicture(id)`, `exitPictureInPicture()`: the `image` with that `id` floats in the platform's picture-in-picture window, which shows each picture its `src` names next, live (HTML has it only on `video`; this stands for the canvas `captureStream()` and hidden video a page builds). The image hears `enterpictureinpicture`, `leavepictureinpicture` (the person closed the window, or `exitPictureInPicture()`), and `pictureinpictureerror` with the reason when the request fails, as HTML's promise rejects; an image that leaves the document closes it with no event. One image floats in that window at a time, so `exitPictureInPicture()` takes no id, as HTML's `document.exitPictureInPicture()`. macOS (AVKit's sample-buffer source) and the web's JS target (`captureStream()` into `requestPictureInPicture()`) float it; iOS, tvOS, the wasm target, Linux and Windows refuse it in the journal and with the event. `requestPictureInPicture(id, presentation="window", title=…, width=…, height=…)` asks for a window Exact draws instead, by name as `scrollIntoView` takes its options: `"window"` a browser's picture-in-picture window as Chromium draws it on the Mac (bottom right, its title, Minimize, Back to tab and Close shown while the pointer moves over it), `"panel"` a floating panel with the platform's title bar, one per image beside the picture-in-picture window, which `exitPictureInPicture()` leaves open (LLP 1042 §9.2); `title`, `width` and `height` go only with `presentation`. The web shows either in Document Picture-in-Picture's window where the browser has it, else floats the default way; iOS and tvOS refuse it. The agent reads each window in `tree` (`pictureInPicture` on its image's row), presses it with `tap <image> pictureinpicture minimize\|back\|close\|hover` and pictures it with `screenshot <png> window pictureinpicture [<image>]` | [LLP 1042 §9](../llp/1042-video.spec.md#9-an-images-pictures-in-picture-in-picture-daehyeon-mun-2026-10-31), [§9.1](../llp/1042-video.spec.md#91-exacts-own-window-as-the-author-asks-daehyeon-mun-2026-11-02), [compiler tests](../contract/cli/tests/it/picture_in_picture.rs), [web test](../host/web-js/picture-in-picture.test.mjs), [window tests](../host/apple/Tests/ExactKitTests/PictureInPictureWindowMacTests.swift) |
+| `requestPictureInPicture(id)`, `exitPictureInPicture()`: the `image` with that `id` floats in the platform's picture-in-picture window, which shows each picture its `src` names next, live (HTML has it only on `video`; this stands for the canvas `captureStream()` and hidden video a page builds). The image hears `enterpictureinpicture`, `leavepictureinpicture` (the person closed the window, or `exitPictureInPicture()`), and `pictureinpictureerror` with the reason when the request fails, as HTML's promise rejects; an image that leaves the document closes it with no event. One image floats in that window at a time, so `exitPictureInPicture()` takes no id, as HTML's `document.exitPictureInPicture()`. macOS (AVKit's sample-buffer source) and the web's JS target (`captureStream()` into `requestPictureInPicture()`) float it; iOS, tvOS, the wasm target, Linux and Windows refuse it in the journal and with the event. `requestPictureInPicture(id, presentation="window", title=…, width=…, height=…)` asks for a window Exact draws instead, by name as `scrollIntoView` takes its options: `"window"` a browser's picture-in-picture window as Chromium draws it on the Mac (bottom right, its title, Minimize, Back to tab and Close shown while the pointer moves over it), `"panel"` a floating panel with the platform's title bar, one per image beside the picture-in-picture window, which `exitPictureInPicture()` leaves open (LLP 1042 §9.2); `title`, `width` and `height` go only with `presentation`. The web shows either in Document Picture-in-Picture's window where the browser has it, else floats the default way; iOS and tvOS refuse it. The agent reads each window in `tree` (`pictureInPicture` on its image's row), presses it with `tap <image> pictureinpicture minimize\|back\|close\|hover` and pictures it with `screenshot <png> window pictureinpicture [<image>]` | LLP 1042 §9 and §9.1, [compiler tests](../contract/cli/tests/it/picture_in_picture.rs), [web test](../host/web-js/picture-in-picture.test.mjs), [window tests](../host/apple/Tests/ExactKitTests/PictureInPictureWindowMacTests.swift) |
 | `deliveryCheck`, `deliveryActivate` | [delivery corpus](../contract/corpus/delivery.contract) |
 | `playSound(src, at=, gain=, group=, playbackRate=, pan=)`: a new voice of a declared sound (a literal `src` must be declared, `type-sound-undeclared`), starting at `at` on the runner's clock (`performanceNow()`'s milliseconds; the past and the default are the commit's time), at a linear `gain` 0–1 (default 1; a literal outside is refused, a computed one clamped), in a `group` that is monophonic by start time, read at `playbackRate` 0.25–4 (default 1; pitch and length move together, so the voice lasts its file's length divided by it) and placed at `pan` −1 to 1 (default 0, centred; Web Audio's equal-power `StereoPannerNode`), each refused as a literal outside its range and clamped when computed, as `gain` is (LLP 1125 D10). `playSounds(hits)`: one voice per item of a list of a shape whose fields are, in order, `src: string`, `at: number`, `gain: number`, `group: string`, then optionally `playbackRate: number` and then `pan: number`. `stopSounds()`, `stopSounds(group=)`: what sounds stops, what waits is cancelled. The runner keeps the voice table (`state sounds`); the web and Apple play it, Linux and Windows keep the record (LLP 1096) | [sound tests](../contract/cli/tests/it/sound.rs), [sounds conformance](../host/web-js/conformance/sounds/app.contract) |
 | `requestMIDIAccess()`, `sendMIDI(output, data, at=)`: ask for the MIDI ports `exactMIDI()` answers; send whole MIDI 1.0 messages to an output by `id` at `at` on the runner's clock. The runner keeps the queue (`state midi`); a host hands each message to its output 50 ms before it is due ([MIDI](#midi-exactmidi-sendmidi-midimessage), LLP 1125 D6, D7) | [MIDI tests](../contract/cli/tests/it/midi.rs), [MIDI conformance](../host/web-js/conformance/midi/app.contract), [Metronome](../apps/metronome/app.contract) |
@@ -2817,10 +2888,13 @@ Syntax is only the first layer. In particular:
   `type-persist-child`, a derive `syntax-persist-derive`.
 - An action sends one mutation at most once on any path: a second send forgets
   the first's reply (LLP 1016 D5), so it is `analyze-send-twice` — unless the
-  mutation is `queue`, whose sends each wait their turn (LLP 1092 D6). Exclusive
+  mutation is `queue`, whose sends each wait their turn (LLP 1092 D6), or
+  `parallel`, whose sends each land (LLP 1161.000 D2). Exclusive
   `if`/`match` arms, and sequential `if`s testing one unchanged name against
-  different literals, are separate paths (LLP 1088 D8). The walk reads the root's
-  actions with every call expanded, where a caller and its callees are one commit.
+  different literals, are separate paths (LLP 1088 D8). A `match` binder and an
+  outer name it shadows are different values; their tests do not prove separate
+  paths. The walk reads the root's actions with every call expanded, where a caller
+  and its callees are one commit.
 - A read of a state or mutation slot that the action assigned earlier on the
   same path sees the starting value, since writes land when the action ends: it
   is the warning `analyze-read-after-assign` (LLP 1116.003 D6; LLP 1035.005.002
@@ -2834,13 +2908,14 @@ Syntax is only the first layer. In particular:
   and `pending(m)` read settled values. In 1,029 bake-off builds the body's read
   was met in 86 and the call's in 2, which is why the call's is no longer a
   refusal. `pending`/`failed` operate on declarations, not arbitrary values.
-- An action that both sends a nonqueued mutation and assigns it on one path, in
+- An action that both sends a newest-wins mutation and assigns it on one path, in
   either order and through calls, is warned of (`analyze-send-assigned`, LLP
   1035.005.002 C1): a send is asked when the action runs; once the writes land,
   a request still in flight for a mutation the action assigned is forgotten and
   its reply dropped, and the slot keeps the assigned value (LLP 1016 D5). The
-  message names the three intents' spellings; a `queue` mutation's assignment
-  drops no queued work (LLP 1092 D4) and is not named. No bake-off build wrote
+  message names the three intents' spellings; a `queue` or `parallel`
+  mutation's assignment forgets no request (LLP 1092 D4, LLP 1161.000 D4) and
+  is not named. No bake-off build wrote
   the combination; Weird Castle's logout means it.
 - View roots cannot be conditional/repeated regions. Tags, attributes, and
   children must fit their lowering rules. Class application is not a CSS cascade.

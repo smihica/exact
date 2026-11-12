@@ -67,8 +67,9 @@ mod snapshot;
 mod source;
 mod tabs;
 pub use source::{
-    Announce, BackgroundState, DataError, DataSource, InFlight, Interrupt, Native, NativeCall,
-    NativeHandler, Overlaid, PreloadWake, SnapshotModule, Target, Write, BACKGROUND,
+    Announce, BackgroundState, DataError, DataSource, DataSourceWrapper, InFlight, Interrupt,
+    Native, NativeCall, NativeHandler, Overlaid, PreloadWake, SnapshotModule, Target, Write,
+    BACKGROUND,
 };
 mod delivery;
 mod links;
@@ -83,8 +84,10 @@ pub mod picker;
 pub use picker::{Picked, PickerRequest, PICKED};
 mod dated;
 mod each;
+mod facts;
 mod fragments;
 mod gates;
+pub(crate) mod resources;
 mod waits;
 pub use waits::{
     frame_at_or_after, virtual_frame, Admitted, IdleObservation, TaskTiming, Wait, WaitKinds, Waits,
@@ -99,6 +102,7 @@ mod media_session;
 pub mod outstanding;
 mod overrun;
 mod page;
+mod parallel;
 mod perf;
 pub mod persist;
 mod query;
@@ -141,7 +145,7 @@ use crate::request::{Answer, Dispatch, Outcome, Request, RequestOut};
 use crate::store::{Store, StoreWrite};
 use crate::vm::{self, Env, Frame, RowSlots};
 use exact_kernel::{CommitReceipt, Kernel, ViewId};
-use exact_plan::{ActionsId, Code, EventKind, MutationsId, NodesId, Plan, Value};
+use exact_plan::{ActionsId, Code, EventKind, MutationMode, MutationsId, NodesId, Plan, Value};
 
 /// A host-facing effect an action asked for; executed after commit, in order.
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +209,12 @@ struct ResourceState {
     /// for a compiled answer standing in for newer arguments until the
     /// source can answer. An overlay lays writes over it for these.
     answered_for: Option<Vec<Value>>,
+    /// Its `when` was false at the last settlement: idle, asked nothing
+    /// (LLP 1161.002 D2).
+    asleep: bool,
+    /// The value was kept across idleness: no answer to the arguments it
+    /// has now until a fresh one lands (LLP 1161.001 D1).
+    slept: bool,
 }
 
 impl ResourceState {
@@ -249,7 +259,7 @@ struct PendingReq {
     keepable: Option<Request>,
     /// An answer that keeps coming (LLP 1016.000): what it has delivered.
     stream: Option<StreamCount>,
-    /// An upload's stream ([`Request::upload_progress`]): in flight until its reply.
+    /// An upload's answer ([`Request::upload_progress`]), including its reply's later turns.
     upload: bool,
     /// The upload has begun to go out (`UPLOAD_SENDING`, or its first bytes
     /// sent): a failure before that never reached the network (D10).
@@ -283,11 +293,11 @@ struct PendingReq {
     reasks: usize,
 }
 
-/// An open stream's messages so far, and those the host coalesced away
+/// An open stream's committed messages, and those the host coalesced away
 /// (LLP 1016.000 D4, D5). One message landed ends its `pending`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamCount {
-    /// Messages delivered to the runner.
+    /// Messages whose mapped values committed.
     pub messages: u64,
     /// Messages the host dropped for a newer one before delivery.
     pub coalesced: u64,
@@ -296,7 +306,7 @@ pub struct StreamCount {
 }
 
 impl PendingReq {
-    /// In flight: every request, a stream until its first message, and an
+    /// In flight: every request, a stream until its first value commits, and an
     /// upload until its reply. What `pending(…)` reads, held requests included.
     fn in_flight(&self) -> bool {
         self.upload || self.stream.is_none_or(|s| s.messages == 0)
@@ -319,11 +329,13 @@ impl PendingReq {
 
 type FocusPath = Vec<(ViewId, NodesId, Vec<Frame>)>;
 
-/// A send made before the data source was ready: its mutation, source and
+/// A send made before the data source was ready: its target, source and
 /// arguments, and the origin and invocation of the commit that made it,
 /// which `data_ready` sends it under (LLP 1133.002 D12), as a queue's
 /// waiting send keeps them (`queue.rs`).
-type Unsent = (usize, String, Vec<Value>, (CallOrigin, u64));
+type Unsent = (Target, String, Vec<Value>, (CallOrigin, u64));
+/// A send's request this commit hands out once it stands.
+type Later = (Target, String, Vec<Value>, Request);
 
 /// One plan, one data source, one kernel.
 pub struct Runner<D: DataSource> {
@@ -340,10 +352,7 @@ pub struct Runner<D: DataSource> {
     kernel: Kernel,
     slots: Vec<Value>,
     derives: Vec<Option<Value>>,
-    resources: Vec<Option<ResourceState>>,
-    resource_values: Vec<Option<crate::held::Held>>,
-    /// The elements' requests of resources over lists, as rows after the plan's.
-    members: each::Members,
+    resources: Vec<resources::ResourceRow>,
     tree: Option<Tree>,
     reorder_owner: Option<exact_kernel::NodeKey>,
     reorder_ops: Vec<exact_kernel::Op>,
@@ -410,24 +419,18 @@ pub struct Runner<D: DataSource> {
     /// Requests let go while still running, by module fetch ticket and
     /// runner ticket, until their reply ([`Runner::note_retired`]).
     retired_fetches: Vec<(u64, u64)>,
-    /// Failed arguments suppress another ask until they change or refresh.
-    failed_args: Vec<Option<Vec<Value>>>,
     /// The uploads asked and how each stands (LLP 1016.000 D10): none is
     /// asked again at its arguments.
     uploads: uploads::Uploads,
-    /// Why each resource last failed, shown in `state.failed` while
-    /// `failed_args` holds (app farm round 1: a refusal only in the journal).
-    failed_why: Vec<Option<crate::failure::Failure>>,
     /// The re-ask being committed, and the reply being landed (`overrun.rs`).
     overrun: overrun::Overrun,
-    /// `pending` as flags, by resource and by mutation, for expressions.
-    pending_res: Vec<bool>,
     pending_mut: Vec<bool>,
     failed_mut: Vec<Option<crate::failure::Failure>>,
     /// Mutations whose answer landed in the commit being made; their `then` actions are armed once it stands (LLP 1016.001).
     landed: Vec<usize>,
-    /// Sends made before the data source was ready, by mutation, sent at
-    /// `data_ready` (LLP 1027 D4): pending meanwhile, one per mutation.
+    /// Sends made before the data source was ready, sent at `data_ready`
+    /// (LLP 1027 D4): pending meanwhile, one per mutation but a parallel
+    /// one, which keeps each.
     unsent: Vec<Unsent>,
     /// When each mutation's `then` action is due, as a one-shot timer: infinite until an answer lands.
     then_due: Vec<f64>,
@@ -460,39 +463,23 @@ pub struct Runner<D: DataSource> {
     /// Sends to mutations that declare `refreshes`, shown over the answers
     /// of the resources they change until they end or are answered.
     writes: writes::Writes,
-    /// Each resource's last overlay, by what it was computed from.
-    overlays: Vec<Option<writes::OverlayCache>>,
     /// Resources asked again after a write ended, or asked at `data_ready`
     /// in place of a stand-in: a refusal of that ask marks the resource
     /// failed instead of refusing the commit.
     reconciling: Vec<usize>,
     /// Sends made before the source was ready that it refused when sent, by
-    /// mutation and write: a refused commit does not bring them back.
-    refused_unsent: Vec<(usize, Option<u64>)>,
+    /// target and write: a refused commit does not bring them back.
+    refused_unsent: Vec<(Target, Option<u64>)>,
     /// Durable client state (LLP 1018 D1): the host's snapshot, and the
     /// writes since for the host to persist.
     store: Store,
-    /// Which resources consulted the store when they settled (bake gives
-    /// them no compiled value, LLP 1018 D4).
-    store_readers: Vec<bool>,
-    /// Which resources drew secure randomness when they settled, since boot
-    /// (LLP 1069.005 D2): bake compiles no value for them at all.
-    entropy_readers: Vec<bool>,
-    /// The device topics each resource's current answer watches (LLP
-    /// 1016.002): an announced topic asks exactly these again.
-    watching: Vec<Vec<String>>,
+    persist_oversized: std::collections::BTreeMap<usize, String>,
     /// Topics the source's native module announced since the host last
     /// applied them, from any thread ([`Runner::listen`]).
     announced: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// The native slot for a source that has none of its own (a Rust source):
     /// the host installs the app module here too (LLP 1067.000 Q9).
     native: Native,
-    /// Deferred resources shown from a placeholder — a kept answer or
-    /// the compiled empty-store value — to ask again at `data_ready`.
-    stale: Vec<bool>,
-    /// Resources showing their placeholder because their source can't
-    /// answer yet (LLP 1048.003 D6): `pending(x)` is true for them.
-    awaiting: Vec<bool>,
     /// Whether fresh answers of store-reading resources are kept for the
     /// next boot: only for a source that may not be ready at boot.
     keeping: kept::Keeping,
@@ -745,12 +732,14 @@ impl<D: DataSource> Runner<D> {
                                 .iter()
                                 .any(|(n, s)| n == resource && s == plan.str(r.source))
                     });
-                if private || !compatible {
+                let transient =
+                    (plan.resources.iter()).any(|r| r.transient && plan.str(r.name) == resource);
+                if private || !compatible || transient {
                     store.forget_kept(name);
                 }
             }
         }
-        let store_readers = plan
+        let store_readers: Vec<bool> = plan
             .resources
             .iter()
             .map(|resource| {
@@ -791,9 +780,13 @@ impl<D: DataSource> Runner<D> {
             kernel,
             slots: Vec::new(),
             derives: Vec::new(),
-            resources: Vec::new(),
-            resource_values: Vec::new(),
-            members: Default::default(),
+            resources: store_readers
+                .into_iter()
+                .map(|store_reader| resources::ResourceRow {
+                    store_reader,
+                    ..Default::default()
+                })
+                .collect(),
             tree: None,
             reorder_owner: None,
             reorder_ops: Vec::new(),
@@ -827,11 +820,9 @@ impl<D: DataSource> Runner<D> {
             reuse: false,
             canvases: links.canvas.map(|engine| engine()),
             pending: Vec::new(),
-            pending_res: Vec::new(),
             pending_mut: Vec::new(),
             announced: Default::default(),
             native: Native::default(),
-            watching: Vec::new(),
             landed: Vec::new(),
             unsent: Vec::new(),
             then_due: Vec::new(),
@@ -846,9 +837,7 @@ impl<D: DataSource> Runner<D> {
             module_aborts: Vec::new(),
             explicit_aborts: Vec::new(),
             retired_fetches: Vec::new(),
-            failed_args: Vec::new(),
             uploads: Default::default(),
-            failed_why: Vec::new(),
             overrun: Default::default(),
             deferred_edges: Vec::new(),
             held_edges: Vec::new(),
@@ -859,14 +848,10 @@ impl<D: DataSource> Runner<D> {
             mutation_requests: 0,
             refresh_next: Vec::new(),
             writes: writes::Writes::default(),
-            overlays: Vec::new(),
             reconciling: Vec::new(),
             refused_unsent: Vec::new(),
             store,
-            entropy_readers: Vec::new(),
-            store_readers,
-            stale: Vec::new(),
-            awaiting: Vec::new(),
+            persist_oversized: Default::default(),
             keeping: Default::default(),
             churn: Default::default(),
             activities: activities::Activities::default(),
@@ -908,7 +893,7 @@ impl<D: DataSource> Runner<D> {
         runner.derives = vec![None; runner.plan.derives.len()];
         // Resources: carry only the same named source and a value that still
         // fits the declared shape; a carried value can refuse nothing.
-        runner.resources = (0..runner.plan.resources.len())
+        let carried_resources = (0..runner.plan.resources.len())
             .map(|i| {
                 let name = runner.plan.str(runner.plan.resources[i].name);
                 let source = runner.plan.str(runner.plan.resources[i].source);
@@ -928,10 +913,15 @@ impl<D: DataSource> Runner<D> {
                         placeholder: false,
                         kept_seed: false,
                         answered_for: None,
+                        asleep: false,
+                        slept: false,
                         origin: 0,
                     })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for (row, state) in runner.resources.iter_mut().zip(carried_resources) {
+            row.state = state;
+        }
         // @ref LLP 1016.000 D10 — the uploads asked, carried by resource,
         // source and arguments whatever the data module; a launch starts with none.
         runner.carry_uploads_in(carried.map_or(&[][..], |c| &c.uploads));
@@ -953,9 +943,6 @@ impl<D: DataSource> Runner<D> {
         // again at `data_ready`.
         let ready = runner.data.ready();
         runner.keeping.on = !private && (!ready || carried.is_some_and(|c| c.keeps_answers));
-        runner.stale = vec![false; runner.plan.resources.len()];
-        runner.entropy_readers = vec![false; runner.plan.resources.len()];
-        runner.awaiting = vec![false; runner.plan.resources.len()];
         runner.seed_at_boot(&seeded, device_state, ready, private);
         if ready && device_state {
             // … and asked now when it can answer, showing the rendered
@@ -968,18 +955,12 @@ impl<D: DataSource> Runner<D> {
         // again, answers: now when its source can, else at `data_ready`.
         for i in open {
             if !ready {
-                runner.stale[i] = true;
+                runner.resources[i].stale = true;
             } else if !runner.refresh_next.contains(&i) {
                 runner.refresh_next.push(i);
             }
         }
-        runner.resource_values = vec![None; runner.plan.resources.len()];
-        runner.pending_res = vec![false; runner.plan.resources.len()];
         runner.pending_mut = vec![false; runner.plan.mutations.len()];
-        runner.watching = vec![Vec::new(); runner.plan.resources.len()];
-        runner.failed_args = vec![None; runner.plan.resources.len()];
-        runner.overlays = vec![None; runner.plan.resources.len()];
-        runner.failed_why = vec![None; runner.plan.resources.len()];
         runner.then_due = vec![f64::INFINITY; runner.plan.mutations.len()];
         runner.queues = queue::Queues::new(runner.plan.mutations.len());
         // A carried boot never takes compiled data: it was baked for the
@@ -1189,11 +1170,16 @@ impl<D: DataSource> Runner<D> {
     /// Each resource whose last request failed, by name, with why: what
     /// `failed(x)` reads, for the agent's `state.failed`.
     pub fn failed_resources(&self) -> Vec<(&str, &str)> {
-        let failed = self.failed_args.iter().zip(&self.failed_why).enumerate();
+        let failed = self
+            .resources
+            .iter()
+            .take(self.plan.resources.len())
+            .map(|row| (&row.failed_args, &row.failed_why))
+            .enumerate();
         failed
             .filter(|(_, (args, _))| args.is_some())
             .map(|(i, (_, why))| {
-                let name = self.plan.str(self.plan.resources[i].name);
+                let name = self.plan.str(self.resource_row(i).name);
                 (
                     name,
                     why.as_ref().map_or("it failed", |w| w.message.as_str()),
@@ -1204,11 +1190,14 @@ impl<D: DataSource> Runner<D> {
 
     /// A resource's answer by name: what its source answered, without the writes laid over it.
     pub fn resource(&self, name: &str) -> Option<&Value> {
-        self.plan
-            .resources
-            .iter()
+        self.resource_rows()
             .position(|r| self.plan.str(r.name) == name)
-            .and_then(|i| self.resources[i].as_ref().map(|r| r.value.get(&self.plan)))
+            .and_then(|i| {
+                self.resources[i]
+                    .state
+                    .as_ref()
+                    .map(|r| r.value.get(&self.plan))
+            })
     }
 
     /// The clock, in milliseconds.
@@ -1333,22 +1322,18 @@ impl<D: DataSource> Runner<D> {
     /// or SQLite). Bake marks its compiled value as a placeholder, refreshed
     /// when the data source becomes ready (LLP 1018 D4 / LLP 1027 D4).
     pub fn resource_reads_store(&self, name: &str) -> bool {
-        self.plan
-            .resources
-            .iter()
+        self.resource_rows()
             .position(|r| self.plan.str(r.name) == name)
-            .is_some_and(|i| self.store_readers[i])
+            .is_some_and(|i| self.resources[i].store_reader)
     }
 
     /// Whether resource `name` drew secure randomness (LLP 1069.005 D2):
     /// a device read whose value bake leaves out of the plan, so no random
     /// value is shared by every install; the device asks it.
     pub fn resource_draws_entropy(&self, name: &str) -> bool {
-        self.plan
-            .resources
-            .iter()
+        self.resource_rows()
             .position(|r| self.plan.str(r.name) == name)
-            .is_some_and(|i| self.entropy_readers[i])
+            .is_some_and(|i| self.resources[i].entropy_reader)
     }
 
     /// Deterministic instance work counters, separate from layout and host costs.
@@ -1390,17 +1375,33 @@ impl<D: DataSource> Runner<D> {
             geometry: None,
             slots: &self.slots,
             derives: &self.derives,
-            resources: &self.resource_values,
+            resources: crate::vm::Column::rows(
+                &self.resources[..self.plan.resources.len()],
+                |row| &row.value,
+            ),
             params,
             frames,
             now_ms: self.now_ms,
-            pending_resources: &self.pending_res,
-            failed_resources: &self.failed_args,
-            failed_why: &self.failed_why,
+            pending_resources: crate::vm::Column::rows(
+                &self.resources[..self.plan.resources.len()],
+                |row| &row.pending,
+            ),
+            current_resources: crate::vm::Column::rows(
+                &self.resources[..self.plan.resources.len()],
+                |row| &row.current,
+            ),
+            failed_resources: crate::vm::Column::rows(
+                &self.resources[..self.plan.resources.len()],
+                |row| &row.failed_args,
+            ),
+            failed_why: crate::vm::Column::rows(
+                &self.resources[..self.plan.resources.len()],
+                |row| &row.failed_why,
+            ),
             pending_mutations: &self.pending_mut,
             failed_mutations: &self.failed_mut,
             store_dependent_derives: &[],
-            store_dependent_resources: &[],
+            store_dependent_resources: (&[]).into(),
         }
     }
     fn eval(&self, code: Code, params: &[Value], frames: &[Frame]) -> Result<Value, RunnerError> {

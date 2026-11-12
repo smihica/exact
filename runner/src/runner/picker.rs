@@ -165,10 +165,14 @@ pub fn mime_for(name: &str) -> &'static str {
         "heif" => "image/heif",
         "avif" => "image/avif",
         "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/vnd.microsoft.icon",
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "m4v" => "video/x-m4v",
         "webm" => "video/webm",
+        "pdf" => "application/pdf",
         "json" => "application/json",
         "md" | "markdown" => "text/markdown",
         "txt" | "log" => "text/plain",
@@ -335,6 +339,48 @@ impl<D: DataSource> Runner<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_picker_accepts_svg_bmp_and_ico_by_type() {
+        for (name, mime) in [
+            ("logo.svg", "image/svg+xml"),
+            ("scan.BMP", "image/bmp"),
+            ("icon.ico", "image/vnd.microsoft.icon"),
+            ("photo.png", "image/png"),
+            ("scan.tiff", "image/tiff"),
+        ] {
+            for accept in ["image/*", mime] {
+                let source = format!(
+                    "component App\n  view\n    input type=\"file\" accept=\"{accept}\" id=\"one\"\n"
+                );
+                let mut runner = Runner::boot(
+                    contract::compile(&source).unwrap(),
+                    (),
+                    exact_kernel::Kernel::with_monospace(),
+                    Default::default(),
+                    "/",
+                )
+                .unwrap();
+                let ticket = runner.hold_picker("one").unwrap();
+                assert!(runner
+                    .answer_hold(ticket, &crate::HoldAnswer::Value("/a/notes.txt".into()))
+                    .is_err());
+                runner
+                    .answer_hold(ticket, &crate::HoldAnswer::Value(format!("/a/{name}")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(mime_for(name), mime);
+                assert!(runner.device_holds().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_pdf_has_its_mime_type_and_is_not_an_image() {
+        let mime = mime_for("report.PDF");
+        assert_eq!(mime, "application/pdf");
+        assert!(accepts(&["application/pdf".into()], "report.PDF", mime));
+        assert!(!accepts(&["image/*".into()], "report.PDF", mime));
+    }
 
     #[test]
     fn a_payload_round_trips_and_refuses_a_path_outside_picked() {

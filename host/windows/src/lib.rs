@@ -21,7 +21,7 @@ mod edit_menu;
 mod ime;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod jump_list;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod keyboard;
 #[cfg(windows)]
 mod modal;
@@ -39,7 +39,7 @@ mod probe;
 mod timers;
 #[cfg(windows)]
 mod url;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod wheel;
 #[cfg(windows)]
 mod window;
@@ -88,7 +88,8 @@ pub fn run<D: exact_runner::DataSource + Default + 'static>(
 
 /// [`run`] with what the app's build composed: its hatches and its
 /// packages' Windows implementations (`exact_linux::package`, LLP 1133.022
-/// D10 item 5), whose calls run on the window's thread.
+/// D10 item 5). The host owns an 8 MiB thread for the window, runner and
+/// package calls; the caller waits until it exits.
 pub fn run_composed<D: exact_runner::DataSource + Default + 'static>(
     name: &str,
     window: Window,
@@ -98,13 +99,34 @@ pub fn run_composed<D: exact_runner::DataSource + Default + 'static>(
 ) -> i32 {
     #[cfg(windows)]
     {
-        window::run::<D>(name, window, plan, compat, composed)
+        on_desktop_stack(|| window::run::<D>(name, window, plan, compat, composed))
     }
     #[cfg(not(windows))]
     {
         let _ = (name, window, plan, compat, composed);
         refuse()
     }
+}
+
+/// Match the Apple host's runner thread (`ExactCore/Owner.swift`).
+const DESKTOP_STACK: usize = 8 << 20;
+
+/// Runs `body` on a thread with [`DESKTOP_STACK`] and answers what it
+/// returns, resuming its panic. A Windows main thread defaults to a 1 MiB
+/// reservation ([Thread stack size](https://learn.microsoft.com/windows/win32/procthread/thread-stack-size)),
+/// which the app's linker controls. Keep the generic entry and the window
+/// loop on this stack even when the caller compiles them without optimization.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn on_desktop_stack<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("exact-windows".into())
+            .stack_size(DESKTOP_STACK)
+            .spawn_scoped(scope, body)
+            .expect("cannot start the host's thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// [`run`] with the app's hatches (LLP 1075.003.000.001 §5): `H` is the one
@@ -134,4 +156,26 @@ pub fn run_with_hatches<
 fn refuse() -> i32 {
     eprintln!("exact-windows requires a Windows target");
     1
+}
+
+#[cfg(test)]
+mod tests {
+    /// Keep 6 MiB of frames live: beyond the default Windows main stack
+    /// and Rust test stack. Reading each frame after recursion prevents
+    /// an optimized test build from turning the recursion into a loop.
+    #[test]
+    fn the_host_stack_holds_unoptimized_startup_frames() {
+        #[inline(never)]
+        fn deep(n: u32) -> u32 {
+            let mut frame = [0u8; 64 << 10];
+            std::hint::black_box(&mut frame);
+            let result = match n {
+                0 => 0,
+                _ => 1 + deep(n - 1),
+            };
+            std::hint::black_box(&frame);
+            result
+        }
+        assert_eq!(super::on_desktop_stack(|| deep(96)), 96);
+    }
 }

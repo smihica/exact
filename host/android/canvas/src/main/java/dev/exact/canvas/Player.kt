@@ -76,11 +76,21 @@ internal class Player(private val fonts: Map<Int, Font>) {
     var group: ((Int) -> android.graphics.RenderNode)? = null
     /** What is drawn in place of a scroller's own node, for one whose edge the reader stretches ([Scrolling]). */
     var holder: ((Int) -> android.graphics.RenderNode?)? = null
-    private var grouped = 0
     var width = 0
     var height = 0
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var imageTint: Int? = null
+    private val clipUnion = Path()
+    private val maskPaint = Paint().apply {
+        xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.DST_IN)
+    }
+    private fun tintImage() {
+        imagePaint.colorFilter = imageTint?.let {
+            android.graphics.PorterDuffColorFilter(it, android.graphics.PorterDuff.Mode.SRC_IN)
+        }
+        imageTint = null
+    }
     private val imagePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val src = RectF()
@@ -114,8 +124,13 @@ internal class Player(private val fonts: Map<Int, Font>) {
      * `AnimatedImageDrawable` drew a strip of its frames, or nothing, at bounds away from the origin. */
     private fun drawAnimated(c: Canvas, anim: android.graphics.drawable.Drawable) {
         c.save(); c.translate(bounds.left.toFloat(), bounds.top.toFloat())
-        anim.setBounds(0, 0, bounds.width(), bounds.height()); anim.draw(c)
-        c.restore()
+        anim.colorFilter = imagePaint.colorFilter
+        try {
+            anim.setBounds(0, 0, bounds.width(), bounds.height()); anim.draw(c)
+        } finally {
+            anim.colorFilter = null
+            c.restore()
+        }
     }
 
     /**
@@ -162,7 +177,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
         val sx = shiftX; val sy = shiftY
         shiftX = sx + l; shiftY = sy + t
         val inner = node.beginRecording()
-        replay(inner, b, from, at)
+        replay(inner, b, from, at, reuseGroups = true)
         node.endRecording()
         shiftX = sx; shiftY = sy
         current.set(here)
@@ -193,27 +208,12 @@ internal class Player(private val fonts: Map<Int, Font>) {
     private val layerRect = RectF()
     private val layerMatrix = Matrix()
 
-    /** The RESTORE that closes the group whose content starts at [from], or -1. */
-    private fun layerEnd(b: IntBuffer, from: Int, n: Int): Int {
-        var depth = 0
-        var i = from
-        while (i < n) {
-            when (b.get(i)) {
-                4, 5, 7 -> depth++
-                6 -> { if (depth == 0) return i; depth-- }
-                20, 21 -> return -1
-            }
-            i = walker.end(b, i)
-        }
-        return -1
-    }
-
     /** Whether [from, to) is one rect fill (op 2) and matrices. */
     private fun singleFill(b: IntBuffer, from: Int, to: Int): Boolean {
         var fills = 0
         var i = from
         while (i < to) {
-            when (b.get(i)) { 1 -> {}; 2 -> fills++; else -> return false }
+            when (b.get(i)) { 1, 48 -> {}; 2 -> fills++; else -> return false }
             i = walker.end(b, i)
         }
         return fills == 1
@@ -225,7 +225,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
         var fills = 0
         var i = from
         while (i < to) {
-            when (b.get(i)) { 1 -> {}; 2, 3 -> fills++; else -> return false }
+            when (b.get(i)) { 1, 48 -> {}; 2, 3 -> fills++; else -> return false }
             i = walker.end(b, i)
         }
         return fills == 1
@@ -507,7 +507,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
         current.getValues(iconValues)
         val v = iconValues
         val sx = v[0]; val sy = v[4]
-        if (v[1] != 0f || v[3] != 0f || sx <= 0f || sy <= 0f) return false
+        if (v[1] != 0f || v[3] != 0f || v[6] != 0f || v[7] != 0f || v[8] != 1f || sx <= 0f || sy <= 0f) return false
         path.computeBounds(iconBounds, true)
         val grow = if (paint.style == Paint.Style.STROKE) paint.strokeWidth * (if (paint.strokeJoin == Paint.Join.MITER) 2f else 0.5f) else 0f
         val l = Math.floor(((iconBounds.left - grow) * sx + v[2]).toDouble()).toFloat() - 1f
@@ -630,7 +630,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
         if (readRRect(b, i + 15)) c.clipOutRect(rect) else { path.rewind(); path.addRoundRect(rect, radii, Path.Direction.CW); c.clipOutPath(path) }
         val square = readRRect(b, i + 3)
         // Under a scale and translation: the mask made once on the CPU ([Shadows]), not a GPU blur.
-        if (values[1] == 0f && values[3] == 0f && values[0] > 0f && Math.abs(values[0] - values[4]) < 1e-3f && sigma > 0.5f / values[0]) {
+        if (values[1] == 0f && values[3] == 0f && values[6] == 0f && values[7] == 0f && values[8] == 1f && values[0] > 0f && Math.abs(values[0] - values[4]) < 1e-3f && sigma > 0.5f / values[0]) {
             val mf = shadowPaint.maskFilter
             shadowPaint.maskFilter = null
             val drawn = Shadows.draw(c, shadowPaint, rect, radii, sigma, values[0])
@@ -678,8 +678,9 @@ internal class Player(private val fonts: Map<Int, Font>) {
         }
     }
 
-    fun replay(canvas: Canvas, b: IntBuffer, from: Int, n: Int) {
+    fun replay(canvas: Canvas, b: IntBuffer, from: Int, n: Int, reuseGroups: Boolean = false) {
         tint = 1f; tintEnd = -1
+        imageTint = null
         val base = canvas.save()
         val matrixBase = matrixDepth
         // Each recording starts locally; stream matrices supply the device coordinates.
@@ -687,6 +688,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
         var c: Canvas = canvas
         var outer: Canvas? = null
         var node: android.graphics.RenderNode? = null
+        var grouped = 0
         var i = from
         while (i < n) {
             when (b.get(i)) {
@@ -698,6 +700,14 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     current.set(matrix)
                     c.setMatrix(matrix)
                     i += 7
+                }
+                48 -> {
+                    for (k in 0 until 9) values[k] = f(b, i + 1 + k)
+                    matrix.setValues(values)
+                    if (shiftX != 0f || shiftY != 0f) matrix.postTranslate(-shiftX, -shiftY)
+                    current.set(matrix)
+                    c.setMatrix(matrix)
+                    i += 10
                 }
                 27 -> { backdrop(c, b, from, i); i += 14 }
                 42 -> { backdrop(c, b, from, i); i += 14 + 2 * b.get(i + 1) }
@@ -750,6 +760,28 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     i = readPath(b, i + 2, b.get(i + 1) == 1)
                     c.clipPath(path)
                 }
+                45 -> {
+                    saveMatrix()
+                    c.save()
+                    val end = i + 2 + b.get(i + 1)
+                    val count = b.get(i + 2)
+                    var at = i + 3
+                    clipUnion.rewind()
+                    repeat(count) { child ->
+                        at = readPath(b, at + 1, b.get(at) == 1)
+                        if (child == 0) clipUnion.set(path)
+                        else check(clipUnion.op(path, Path.Op.UNION)) { "invalid clip union" }
+                    }
+                    c.clipPath(clipUnion)
+                    i = end
+                }
+                46 -> {
+                    saveMatrix()
+                    // The transparent area outside the mask must erase the isolated content too.
+                    c.saveLayer(null, maskPaint)
+                    i += 1
+                }
+                47 -> { imageTint = b.get(i + 1); i += 2 }
                 6 -> {
                     if (i == tintEnd) { tint = 1f; tintEnd = -1 }
                     c.restore(); restoreMatrix(); i += 1
@@ -758,7 +790,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     // saveLayer bounds use the current Canvas space, including earlier restores.
                     saveMatrix()
                     val alpha = f(b, i + 1)
-                    val end = layerEnd(b, i + 2, n)
+                    val end = walker.layerEnd(b, i + 2, n)
                     if (end > 0 && singleFill(b, i + 2, end)) {
                         // One fill cannot overlap itself: its colour carries the opacity, with no offscreen surface.
                         c.save(); tint = alpha; tintEnd = end
@@ -768,6 +800,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                     i += 2
                 }
                 8 -> {
+                    tintImage()
                     rect.set(f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5))
                     val anim = animated(b.get(i + 1))
                     if (anim != null) {
@@ -799,6 +832,7 @@ internal class Player(private val fonts: Map<Int, Font>) {
                 11 -> i += 4
                 12 -> i += 2
                 14 -> {
+                    tintImage()
                     // A picture drawn within a (rounded) rect.
                     val anim = animated(b.get(i + 1))
                     if (anim != null) {
@@ -885,30 +919,49 @@ internal class Player(private val fonts: Map<Int, Font>) {
                 20 -> {
                     // A scroller's rows: their own node, so a move only translates it.
                     val g = group!!(b.get(i + 1))
-                    g.setPosition(0, 0, width, height)
                     node = g
                     grouped = b.get(i + 1)
-                    outer = c
-                    saveMatrix()
-                    c = g.beginRecording()
-                    current.reset(); c.setMatrix(current)
                     i += 2
+                    if (reuseGroups) {
+                        // A backdrop references the page's group; recording it again would move the page's rows.
+                        while (i < n && b.get(i) != 21) i = walker.end(b, i)
+                    } else {
+                        g.setPosition(0, 0, width, height)
+                        outer = c
+                        saveMatrix()
+                        c = g.beginRecording()
+                        current.reset(); c.setMatrix(current)
+                    }
                 }
                 21 -> {
                     node?.let { g ->
-                        g.endRecording()
-                        c = outer!!
-                        restoreMatrix()
+                        if (!reuseGroups) {
+                            g.endRecording()
+                            c = outer!!
+                            restoreMatrix()
+                        }
                         c.save(); matrix.setTranslate(-shiftX, -shiftY); c.setMatrix(matrix); c.drawRenderNode(holder?.invoke(grouped) ?: g); c.restore()
                     }
                     node = null
                     i += 1
                 }
-                else -> break
+                else -> {
+                    // The library and these classes were built from different sources (LLP 1159.002 D3).
+                    if (!saidUnknownOp) {
+                        saidUnknownOp = true
+                        android.util.Log.e("exact", "exact canvas: unknown op ${b.get(i)} at $i of $n; the frame stops here")
+                    }
+                    break
+                }
             }
         }
         canvas.restoreToCount(base)
         matrixDepth = matrixBase
+    }
+
+    private companion object {
+        /** Whether an unknown op was logged: once a process. */
+        var saidUnknownOp = false
     }
 }
 

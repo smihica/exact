@@ -6,11 +6,15 @@ import { cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Cdp } from '../../../scripts/agent.mjs';
 import { serveStatic } from '../serve.mjs';
+import { buildHostGlue, webHostFiles } from '../../web-js/glue.mjs';
 import { chromium } from '../../../scripts/agent-launch.mjs';
 const dir=process.env.EXACT_MOTION_TEST,dist=resolve(dir,'dist');
 assert(process.env.EXACT_MOTION_DIST,'set EXACT_MOTION_DIST to a current pure Rust web dist built with EXACT_WEB_LINK=all');
 cpSync(process.env.EXACT_MOTION_DIST,dist,{recursive:true});
-for(const name of ['glue.js','navigation.js','motion-glue.js','collection-glue.js'])cpSync('host/web/'+name,dist+'/'+name);
+await buildHostGlue(process.cwd());
+for (const name of ['glue.js', 'navigation.js', 'motion-glue.js', 'collection-glue.js']) {
+  cpSync(webHostFiles()[name], resolve(dist, name));
+}
 function fixture(plan) {
   const instantiate=WebAssembly.instantiateStreaming;
   globalThis.motionSmoke={requests:[],plan};

@@ -130,7 +130,10 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   const decidePermission = (row, send, p = row.sub.permission) => {
     if (!p || row.sub.admission === "none") return null;
     const state = stateOf(p.name);
-    if (!send && isStatus(row)) return { now: { ...(valueOf(row) ?? {}), [p.field]: row.sub.web?.[p.field] ?? state } };
+    // A target that makes the module absent keeps its own answer (`unknown`), as the runner's.
+    if (!send && isStatus(row)) return { now: row.sub.targets?.web?.available === false ? valueOf(row) : { ...(valueOf(row) ?? {}), [p.field]: row.sub.web?.[p.field] ?? state } };
+    // A source that reads a value of its own until the permission is granted (`ungranted`), as the runner's.
+    if (!send && "ungranted" in row.sub && state !== "granted") return { now: structuredClone(row.sub.ungranted) };
     if (state === "denied" && row.sub.admission !== "request") return { now: { error: p.denied } };
     return state === "prompt" && asks(row, send) ? { hold: "permission" } : null;
   };
@@ -147,7 +150,8 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
     if (send && row.sub.ceremony) return ceremonies.decide(row, args);
     if (send && row.sub.records) return { now: null }; // a signal the substitute records (LLP 1133.011 §9)
     if (send && row.sub.shortcuts === "pin") return { now: rc.pin(row, args) };
-    if (!send) return { now: valueOf(row) ?? { error: "NotSupportedError" } };
+    // A `default` written `null` is a value: an option source's none, as the runner's `value_of`.
+    if (!send) return { now: valueOf(row) ?? ("default" in row.sub ? null : { error: "NotSupportedError" }) };
     // A send that answers another source's value, raising it when it matches `raise.when` (D10).
     const answers = sibling(row, row.sub.answers);
     if (answers) {
@@ -158,6 +162,8 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
     const from = sibling(row, row.sub.from), v = from && prefers(from);
     if (v !== undefined) return { now: v };
     if (row.sub.ticket && from) return { hold: "value" };
+    // With nothing preferred, its declared default (LLP 1133.021 §12: a geocode answers `[]`), as the runner's.
+    if (row.sub.default != null) return { now: structuredClone(row.sub.default) };
     return { now: { error: "NotSupportedError" } };
   };
   const answer = (row, json) => {

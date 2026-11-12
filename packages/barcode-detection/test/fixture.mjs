@@ -7,6 +7,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 export const here = import.meta.dir, pkg = resolve(here, '..'), root = resolve(pkg, '../..');
 /** Each fixture image by name, in the package that carries it. */
@@ -33,7 +34,7 @@ const kept = process.env.EXACT_VISION_FIXTURE;
 /** The fixture app's directory and its bundle id. `dependencies` replace or add the app's packages by spec. */
 export function makeFixture({ dependencies = {} } = {}) {
   const app = kept && existsSync(join(kept, 'app.json')) ? resolve(kept) : join(mkdtempSync(join(tmpdir(), 'exact-vision-')), 'visionfixture');
-  if (app !== resolve(kept ?? '')) run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  if (app !== resolve(kept ?? '')) run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac'], root);
   else rmSync(join(app, 'node_modules/@exact'), { recursive: true, force: true });
   for (const f of ['app.contract', 'app.ts', 'strings']) cpSync(join(here, 'fixture', f), join(app, f), { recursive: true });
   rmSync(join(app, 'app.test.contract'), { force: true });
@@ -50,6 +51,9 @@ export function makeFixture({ dependencies = {} } = {}) {
   };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, id };
 }
 

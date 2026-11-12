@@ -31,6 +31,7 @@ fn main() {
         "textflow_data::Textflow",
         "textflow_data::Textflow::default()",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

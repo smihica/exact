@@ -1,4 +1,9 @@
-// Info.plist rows that `build.mjs`'s `infoPlist` and `macInfoPlist` write from the manifest and the grants.
+// Info.plist rows that `build.mjs`'s `infoPlist` and `macInfoPlist` write from the manifest, the grants and the app's
+// packages.
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { appleImplementations } from '../../js/bake/src/typescript.mjs';
 
 // The global exceptions narrower than `NSAllowsArbitraryLoads`: ATS ignores that key when any of them is present
 // (Apple, "NSAllowsArbitraryLoads"), and it already allows what each of them would.
@@ -34,6 +39,13 @@ export const startLocation = ({ manifest: { start_url: at }, origin: declared })
   return url.origin === origin && place !== '/' ? { ExactStartURL: place } : {};
 };
 
+/** The manifest's `userInterfaceStyle` (Expo's key): a fixed `light` or `dark` is UIKit's `UIUserInterfaceStyle`,
+ * which the launch screen, every window and the system's own chrome take as the device's appearance; `automatic` or
+ * none writes nothing. AppKit has no key that fixes dark (`NSRequiresAquaSystemAppearance` fixes only light), so the
+ * Mac's row is Exact's `ExactUserInterfaceStyle`, which ExactMac sets as `NSApp.appearance` before its first window. */
+export const interfaceStyle = ({ manifest: { userInterfaceStyle: style } }, mac = false) =>
+  style === 'light' || style === 'dark' ? (mac ? { ExactUserInterfaceStyle: style } : { UIUserInterfaceStyle: style === 'dark' ? 'Dark' : 'Light' }) : {};
+
 /** When a downloaded update applies and how often the app checks (`deploy.activate`, `deploy.check.interval`). */
 export const updateActivation = (app) => ({ ...(app.manifest.deploy?.activate ? { ExactUpdateActivate: app.manifest.deploy.activate } : {}),
   ...(app.manifest.deploy?.check?.interval != null ? { ExactUpdateCheckInterval: app.manifest.deploy.check.interval } : {}) });
@@ -61,4 +73,65 @@ export function nfcKeys(ios, tv) {
     ...(nfc.iso7816Identifiers?.length ? { 'com.apple.developer.nfc.readersession.iso7816.select-identifiers': nfc.iso7816Identifiers } : {}),
     ...(nfc.felicaSystemCodes?.length ? { 'com.apple.developer.nfc.readersession.felica.systemcodes': nfc.felicaSystemCodes } : {}),
   };
+}
+
+/** The Info.plist keys a package's Apple implementation may declare in its `exact.json` `"plistKeys"`, by name, with
+ * the one value each may take and the platforms whose plist takes it, as Android's `METADATA`
+ * (scripts/android-manifest.mjs) bounds a manifest fragment's meta-data. Only a named key passes, so a package can set
+ * no key the build writes, no usage string and nothing that changes trust. A package that needs another key amends
+ * this list. */
+export const PLIST_KEYS = new Map([
+  // StoreKit then keeps finished consumables in `Transaction.all`, `Transaction.latest(for:)` and
+  // `Product.latestTransaction` (Apple, "SKIncludeConsumableInAppPurchaseHistory": iOS 18, macOS 15, tvOS 18), so
+  // `@exact/purchases`' `finish`, which looks in `Transaction.all`, answers a consumable finished before.
+  ['SKIncludeConsumableInAppPurchaseHistory', { value: true, platforms: ['ios', 'macos', 'tvos'] }],
+]);
+
+/** The keys the implementations `bound` (`appleImplementations`' list) declare in `"plistKeys"`, as
+ * `{ extension, key, value }`, those `target`'s plist takes. Throws, naming the package, for a key or value not on
+ * [PLIST_KEYS]. */
+export function packageKeys(bound, target) {
+  const allowed = [...PLIST_KEYS].map(([key, { value }]) => `${key}: ${JSON.stringify(value)}`).join(', ');
+  const keys = [];
+  for (const impl of bound) {
+    const declared = impl.plistKeys;
+    if (declared == null) continue;
+    const refuse = (what) => { throw new Error(`${impl.extension}'s Apple implementation: its plistKeys ${what} (the list allows only ${allowed}; host/apple/plist.mjs PLIST_KEYS)`); };
+    if (typeof declared !== 'object' || Array.isArray(declared)) refuse('is not an object');
+    for (const [key, value] of Object.entries(declared)) {
+      const entry = PLIST_KEYS.get(key);
+      if (!entry) refuse(`names ${key}, which is not on the list`);
+      if (entry.value !== value) refuse(`gives ${key} = ${JSON.stringify(value)}, which is not on the list`);
+      if (entry.platforms.includes(target)) keys.push({ extension: impl.extension, key, value });
+    }
+  }
+  return keys;
+}
+
+/** `reach` with what the app's packages' implementations for `target` add to Info.plist (`packages`, as
+ * `{ extension, key, value }`), whether or not the app grants a device: each `"plistKeys"` key, and each `"plist"`
+ * dictionary, keyed by the strings keys the app passes and valued by their base text (LLP 1133.002 D10). A key two
+ * packages declare is written once. */
+export const modulePlist = (app, reach, target, extensions, contractSources = []) => {
+  const bound = appleImplementations(app.dir, target, extensions, contractSources);
+  const dictionaries = bound.flatMap((p) => p.plist.map((d) => ({ ...d, extension: p.extension })));
+  const packages = packageKeys(bound, target).filter((k, i, all) => all.findIndex((o) => o.key === k.key) === i);
+  if (dictionaries.length) {
+    const base = reach?.base ?? 'en', strings = JSON.parse(readFileSync(resolve(app.dir, `strings/${base}.json`), 'utf8'));
+    for (const { extension, key, keys } of dictionaries) packages.push({ extension, key, value: Object.fromEntries(keys.map((k) => {
+      if (typeof strings[k] !== 'string') throw new Error(`host/apple: ${key} names "${k}", which strings/${base}.json lacks`);
+      return [k, strings[k]];
+    })) });
+  }
+  return packages.length ? { ...reach, packages } : reach;
+};
+
+/** `dict`, the plist the build wrote, with `reach.packages` (from [modulePlist]) added. Throws, naming the package,
+ * for a key the build already wrote. */
+export function withPackageKeys(dict, reach) {
+  for (const { extension, key, value } of reach?.packages ?? []) {
+    if (Object.hasOwn(dict, key)) throw new Error(`${extension}'s Apple implementation declares the Info.plist key ${key}, which the build writes`);
+    dict[key] = value;
+  }
+  return dict;
 }

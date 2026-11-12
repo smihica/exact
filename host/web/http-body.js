@@ -15,19 +15,22 @@ export async function boundedHttpBody(response, limit) {
 // rules as the native executor's: lines end at CR, LF or CRLF even across
 // chunks; `data` lines join with LF; `id` persists as the cursor; comments
 // and `retry` are dropped (the host never reconnects, LLP 1069.004). One
-// event or line over `limit` bytes is refused, never truncated.
+// event over `limit` bytes, or line over `limit + 64`, is refused, never
+// truncated: received bytes for lines, decoded UTF-8 bytes for event data.
+const utf8Length = (s) => { let n = 0; for (const c of s) n += charBytes(c); return n; };
+const charBytes = (c) => { const p = c.codePointAt(0); return p < 0x80 ? 1 : p < 0x800 ? 2 : p < 0x10000 ? 3 : 4; };
 export function eventStream(limit) {
-  const decoder = new TextDecoder();
-  let line = '', afterCr = false, started = false, event = '', data = '', hasData = false, id = '';
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+  let line = '', lineBytes = 0, afterCr = false, started = false, event = '', data = '', dataBytes = 0, hasData = false, id = '';
   const done = (out) => {
     if (!started) { started = true; if (line.startsWith('\ufeff')) line = line.slice(1); }
     const text = line; line = '';
     if (text === '') {
       const type = event; event = '';
-      if (!hasData) { data = ''; return; }
+      if (!hasData) { data = ''; dataBytes = 0; return; }
       hasData = false;
       out.push({ event: type, id, data: data.endsWith('\n') ? data.slice(0, -1) : data });
-      data = '';
+      data = ''; dataBytes = 0;
       return;
     }
     if (text.startsWith(':')) return;
@@ -36,17 +39,24 @@ export function eventStream(limit) {
     let value = colon < 0 ? '' : text.slice(colon + 1);
     if (value.startsWith(' ')) value = value.slice(1);
     if (field === 'data') {
-      if (data.length + value.length + 1 > limit) throw Error('an event exceeds the response ceiling');
-      data += value + '\n'; hasData = true;
+      const bytes = utf8Length(value);
+      if (dataBytes + bytes + 1 > limit) throw Error('an event exceeds the response ceiling');
+      data += value + '\n'; dataBytes += bytes + 1; hasData = true;
     } else if (field === 'event') event = value;
     else if (field === 'id' && !value.includes('\0')) id = value;
   };
   return (bytes, end = false) => {
+    // Count before decoding: a BOM occupies three received bytes, and an
+    // invalid byte may decode to a three-byte replacement character.
+    for (const byte of bytes ?? []) {
+      if (byte === 13 || byte === 10) lineBytes = 0;
+      else if (++lineBytes > limit + 64) throw Error('an event exceeds the response ceiling');
+    }
     const text = decoder.decode(bytes, { stream: !end }), out = [];
     for (const c of text) {
       if (afterCr) { afterCr = false; if (c === '\n') continue; }
       if (c === '\r' || c === '\n') { afterCr = c === '\r'; done(out); }
-      else { if (line.length >= limit + 64) throw Error('an event exceeds the response ceiling'); line += c; }
+      else line += c;
     }
     return out;
   };
@@ -128,11 +138,32 @@ async function readBytes(response, limit, message, controller) {
   } finally { reader.releaseLock?.(); }
 }
 
-// An upload by XMLHttpRequest (LLP 1016.000 D10):
+// Fetch exposes no incremental sent-byte count. A render reports the whole body at the reply's headers,
+// then waits for the reply's body, within the upload's ceiling (LLP 1016.000 D10).
+async function renderUpload(url, method, headers, body, limit, message, signal, admits) {
+  const encoder = new TextEncoder(), failed = (kind, text) => ({ kind, status: 0, headers: '', body: encoder.encode(String(text)) });
+  if (signal.aborted) return failed(4, 'request aborted');
+  try {
+    message({ event: 'exact:sending', id: '\0', data: '', coalesced: 0, received: performance.now() });
+    const response = await fetch(url, { method, headers, body, signal, redirect: 'follow' });
+    if (body?.byteLength) message({ event: 'exact:progress', id: '\0', data: JSON.stringify({ loaded: body.byteLength, total: body.byteLength }), coalesced: 0, received: performance.now() });
+    if (response.url && !admits(response.url)) {
+      await response.body?.cancel();
+      return failed(2, `outside the app's grants (net.fetch): redirected to ${new URL(response.url).origin}`);
+    }
+    return { kind: 0, status: response.status, headers: [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\n'), body: await boundedHttpBody(response, limit) };
+  } catch (error) {
+    if (signal.aborted) return failed(4, 'request aborted');
+    return failed(error?.kind === 'Refused' ? 2 : 1, error?.message ?? error);
+  }
+}
+
+// A browser's upload by XMLHttpRequest (LLP 1016.000 D10):
 // each `upload` progress event is a message of the bytes sent, and the reply,
 // any status, read whole within `limit`, is the outcome, as `request` gives
 // one. A reply whose last hop the grants do not admit is refused.
 function upload(url, method, headers, body, limit, message, signal, admits) {
+  if (globalThis.__exactRender) return renderUpload(url, method, headers, body, limit, message, signal, admits);
   const encoder = new TextEncoder(), failed = (kind, text) => ({ kind, status: 0, headers: '', body: encoder.encode(String(text)) });
   return new Promise(resolve => {
     const xhr = new globalThis.XMLHttpRequest(), abort = () => xhr.abort();
@@ -280,11 +311,13 @@ export async function readLongPoll(op, init, limit, message, controller, admits)
 // The transport belongs to the resource's abort controller (LLP 1016.000).
 // `protocol` opts the JS TypeScript adapter into D7: ordered frames and a
 // private transport handle; the other adapters still take snapshot delivery.
-export function readSocket(url, limit, message, controller, protocol) {
+// `idleMs` (LLP 1016.000 D11): the socket ends as a Timeout (kind 10) when nothing has arrived for that long, in real
+// time, its opening and each complete message counting, from the moment it is asked.
+export function readSocket(url, limit, message, controller, protocol, idleMs) {
   const encoder = new TextEncoder(), MAX_BYTES = 1048576, MAX_FRAMES = 256;
   const failed = (kind, text) => ({ kind, status: 0, headers: '', body: encoder.encode(text) });
   return new Promise((resolve) => {
-    let socket, opened = false, ended = false, newest = null, coalesced = 0, timer = null, queue = [], stamps = [], bytes = 0, sent = 0;
+    let socket, opened = false, ended = false, newest = null, coalesced = 0, timer = null, queue = [], stamps = [], bytes = 0, sent = 0, quiet = null;
     const flush = () => {
       clearTimeout(timer); timer = null;
       if (ended) return;
@@ -298,16 +331,19 @@ export function readSocket(url, limit, message, controller, protocol) {
     };
     const end = (outcome) => {
       if (ended) return;
-      ended = true; clearTimeout(timer); queue = []; newest = null; bytes = 0;
+      ended = true; clearTimeout(timer); clearTimeout(quiet); queue = []; newest = null; bytes = 0;
       controller.signal.removeEventListener('abort', abort);
       try { socket?.close(1000); } catch {}
       resolve(outcome);
     };
     const abort = () => end(failed(4, 'request aborted'));
+    // What it had accepted is delivered first; the timeout then ends it, before the close this end sends is answered.
+    const heard = () => { if (idleMs === undefined || ended) return; clearTimeout(quiet); quiet = setTimeout(() => { flush(); end(failed(10, `nothing arrived for ${idleMs} ms`)); }, idleMs); };
     if (controller.signal.aborted) return abort();
     try { socket = new WebSocket(url); } catch (error) { return end(failed(1, String(error?.message ?? error))); }
     socket.binaryType = 'arraybuffer';
     controller.signal.addEventListener('abort', abort);
+    heard();
     const check = size => {
       if (ended || socket.readyState !== 1) throw new DOMException('the socket is not open', 'InvalidStateError');
       if (!protocol.admit()) throw new Error("outside the app's grants (net.websocket)");
@@ -331,11 +367,12 @@ export function readSocket(url, limit, message, controller, protocol) {
     }));
     socket.onopen = () => {
       if (ended) return;
-      opened = true;
+      opened = true; heard();
       if (protocol) message({ event: 'open', id: '', data: '', coalesced: 0 });
     };
     socket.onmessage = (e) => {
       if (ended) return;
+      heard();
       if (!protocol && typeof e.data !== 'string') return end(failed(2, "a binary message: a socket's messages are text"));
       const size = typeof e.data === 'string' ? encoder.encode(e.data).length : e.data.byteLength;
       if (size > limit) {
@@ -401,6 +438,9 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
   const effective = scopedGrantSet(grantSet, op.scope), invalid = grantError(effective);
   const asset = method === 'GET' && !body && !bytes && Object.keys(headers).length === 0 && /^\/assets\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.[A-Za-z0-9]+$/.test(url);
   const socket = op.stream && /^wss?:/i.test(url), capability = socket ? 'net.websocket' : 'net.fetch';
+  // An idle timeout is a WebSocket stream's (LLP 1016.000 D11), refused before any other path is taken.
+  if (op.idleTimeoutMs !== undefined && (!socket || op.longPoll || op.upload)) return failed(2, 'only a WebSocket stream takes an idle timeout');
+  if (op.idleTimeoutMs !== undefined && (!Number.isInteger(op.idleTimeoutMs) || op.idleTimeoutMs < 1 || op.idleTimeoutMs > 3600000)) return failed(2, 'an idle timeout must be 1 to 3600000 ms');
   if (invalid) return failed(2, invalid);
   if (!native && !asset) try { new URL(url); } catch (error) { return failed(1, error); }
   const grant = native || asset ? null : admittingGrant(effective, url, socket ? 'websocket' : 'fetch');
@@ -435,7 +475,7 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
   // A socket is a stream whose URL is `ws:` or `wss:` (its grant was
   // `net.websocket`, above); its method, headers and body are not sent.
   if (socket && op.bodyFrom != null) return failed(2, 'exactBodyFrom: a WebSocket sends no body');
-  if (socket) return readSocket(url, op.maxResponseBytes ?? 1024 * 1024, message, controller, protocol && { ...protocol, admit: () => active() && admitsNetwork(scopedGrantSet(grantSet, op.scope), url, 'websocket') });
+  if (socket) return readSocket(url, op.maxResponseBytes ?? 1024 * 1024, message, controller, protocol && { ...protocol, admit: () => active() && admitsNetwork(scopedGrantSet(grantSet, op.scope), url, 'websocket') }, op.idleTimeoutMs);
   let decodedBody = bytes ?? undefined;
   try { if (body && !bytes) decodedBody = Uint8Array.from(atob(body), c => c.charCodeAt(0)); }
   catch (error) { return failed(4, `invalid request body: ${error}`); }
@@ -443,6 +483,21 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
   // passes (9 is an auth session's delivery, glue.js). A body read from a file
   // counts against it.
   if (op.timeoutMs !== undefined && (!Number.isInteger(op.timeoutMs) || op.timeoutMs < 1 || op.timeoutMs > 3600000)) return failed(2, 'a request timeout must be 1 to 3600000 ms');
+  // `exactBodyFrom`'s checks, made before anything is read: a refusal, or null.
+  const fileBodyRefusal = () => {
+    if (!bodyFile) return failed(3, `exactBodyFrom ${op.bodyFrom}: this host has no app files (no storage here)`);
+    if (body || bytes) return failed(2, 'fetch: a request has one body: body or exactBodyFrom');
+    if (/^(GET|HEAD)$/i.test(method)) return failed(2, 'fetch: a GET or HEAD request cannot have a body');
+    if (typeof op.bodyFrom !== 'string' || !op.bodyFrom.startsWith('app:/')) return failed(2, 'exactBodyFrom must be an app:/ path');
+    if (new TextEncoder().encode(op.bodyFrom).length > 4096 || /(^|\/)\.\.?(\/|$)|\0/.test(op.bodyFrom.slice(5))) return failed(2, `exactBodyFrom ${op.bodyFrom.slice(0, 256)}: an app:/ path has no . or .. segment, and is at most 4096 bytes`);
+    // Refused before the storage adapters load, which an app without file grants does not ship.
+    if (!coversPath(effective, 'fs.read', op.bodyFrom))
+      return failed(2, `exactBodyFrom ${op.bodyFrom}: denied: fs.read ${op.bodyFrom}: no grant covers it; grant \`fs.read ${op.bodyFrom}\``);
+    return null;
+  };
+  // A render has no storage: after the same checks, and an abort already made, the file is refused (ts-body-from.js)
+  // before any timer, signal or controller is made, so nothing outlives the render on its account.
+  if (globalThis.__exactRender && op.bodyFrom != null) return fileBodyRefusal() ?? (controller.signal.aborted ? failed(4, 'request aborted') : bodyFile(op.bodyFrom, effective));
   const deadline = op.timeoutMs === undefined ? null : AbortSignal.timeout(op.timeoutMs);
   // The same deadline as an instant, checked by the clock just before the request goes out:
   // a body read or grant work that held the event loop past it fires no timer first.
@@ -455,14 +510,8 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
   // File, never copied into a string), or refused before anything is sent.
   let fileBody;
   if (op.bodyFrom != null) {
-    if (!bodyFile) return failed(3, `exactBodyFrom ${op.bodyFrom}: this host has no app files (no storage here)`);
-    if (body || bytes) return failed(2, 'fetch: a request has one body: body or exactBodyFrom');
-    if (/^(GET|HEAD)$/i.test(method)) return failed(2, 'fetch: a GET or HEAD request cannot have a body');
-    if (typeof op.bodyFrom !== 'string' || !op.bodyFrom.startsWith('app:/')) return failed(2, 'exactBodyFrom must be an app:/ path');
-    if (new TextEncoder().encode(op.bodyFrom).length > 4096 || /(^|\/)\.\.?(\/|$)|\0/.test(op.bodyFrom.slice(5))) return failed(2, `exactBodyFrom ${op.bodyFrom.slice(0, 256)}: an app:/ path has no . or .. segment, and is at most 4096 bytes`);
-    // Refused before the storage adapters load, which an app without file grants does not ship.
-    if (!coversPath(effective, 'fs.read', op.bodyFrom))
-      return failed(2, `exactBodyFrom ${op.bodyFrom}: denied: fs.read ${op.bodyFrom}: no grant covers it; grant \`fs.read ${op.bodyFrom}\``);
+    const refused = fileBodyRefusal();
+    if (refused) return refused;
     // The read yields to the deadline and to letting go: nothing is sent once either has ended it.
     if (expired()) return failed(10, `the request timed out after ${op.timeoutMs} ms`);
     if (signal.aborted) return failed(4, 'request aborted');
@@ -494,8 +543,7 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
     const ended = expired() ? failed(10, `the request timed out after ${op.timeoutMs} ms`) : signal.aborted ? failed(4, 'request aborted') : !active() ? failed(4, 'request source unloaded') : null;
     if (ended) { target?.close(); return ended; }
   }
-  // An upload's progress (LLP 1016.000 D10): Fetch tells no bytes sent, so it goes by
-  // XMLHttpRequest, which follows every redirect; where a hop might ask the person (D6) it is not sent.
+  // Uploads follow every redirect; where a hop might ask the person (D6), none is sent.
   if (op.stream && op.upload) {
     try {
       if (redirectFor(op.origin, 'follow', op.reachState) !== 'follow') return failed(2, 'NotAllowedError: an upload follows its redirects, and one could reach a less public address space before the person answers');
@@ -545,7 +593,7 @@ export async function request(op, { grantSet, loadPageNative, moduleLoader, loca
 // Only the TypeScript adapter opts into ordered protocol frames (D7) and
 // byte streams. An inline body goes as its bytes, copied once.
 export function streamed(req, grantSet, message, controller, bodyFile, protocol) {
-  return request({ method: req.method ?? 'GET', url: req.url, headers: req.headers ?? [], body: '', bodyBytes: req.raw?.length ? Uint8Array.from(req.raw) : undefined, bodyFrom: req.bodyFrom, redirect: req.redirect, longPoll: req.longPoll, upload: req.upload, timeoutMs: req.timeoutMs, stream: true, maxResponseBytes: req.maxResponseBytes, scope: req.scope },
+  return request({ method: req.method ?? 'GET', url: req.url, headers: req.headers ?? [], body: '', bodyBytes: req.raw?.length ? Uint8Array.from(req.raw) : undefined, bodyFrom: req.bodyFrom, redirect: req.redirect, longPoll: req.longPoll, upload: req.upload, timeoutMs: req.timeoutMs, idleTimeoutMs: req.idleTimeoutMs, stream: true, maxResponseBytes: req.maxResponseBytes, scope: req.scope },
     { grantSet, controllers: new Set(), controller, message, bodyFile, protocol, localAssetURL: url => new URL(url, location.href).href,
       loadPageNative: () => Promise.reject(new Error('a stream is not a page-module request')) });
 }

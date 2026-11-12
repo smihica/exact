@@ -42,7 +42,8 @@ fn main() {
             contract::rust_entry(
                 "hello_data::Hello",
                 "hello_data::Hello",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

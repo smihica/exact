@@ -25,6 +25,64 @@ fn an_old_spelling_is_refused_with_the_css_name() {
     assert!(e.message.contains("`aria-label`"), "{e}");
 }
 
+#[test]
+fn activity_placements_do_not_add_lint_errors() {
+    let source = r#"component App
+  state n = 1
+  view
+    text "x"
+
+component Departure
+  props
+    train: number
+  view
+    view slot="lockScreen"
+      text `${train}`
+    view slot="minimal"
+      text `${train}`
+"#;
+    contract::compile(source).unwrap_or_else(|e| panic!("{e}"));
+    let errors = |src: &str| {
+        let Err(errors) =
+            contract::compile_path_source_all(std::path::Path::new("app.contract"), src, false)
+        else {
+            panic!("the unrelated error must refuse the app");
+        };
+        errors.into_iter().map(|e| e.id).collect::<Vec<_>>()
+    };
+    let broken = source.replace("state n = 1", "state n = 1 + \"a\"");
+    assert_eq!(errors(&broken), ["type-operand"]);
+    let analyzed = source.replace(
+        "  state n = 1",
+        "  mutation saved as shape string\n  action go\n    send saved = command(\"one\")\n    send saved = command(\"two\")",
+    );
+    assert_eq!(errors(&analyzed), ["analyze-send-twice"]);
+
+    // A placement's other attributes and its children still get checked.
+    let invalid = broken
+        .replace("slot=\"minimal\"", "slot=\"minimal\" width=true")
+        .replace("text `${train}`", "text `${train}` color=\"bleu\"");
+    assert_eq!(
+        errors(&invalid),
+        [
+            "type-operand",
+            "lower-attr-value",
+            "lower-attr-value",
+            "lower-attr-value"
+        ]
+    );
+
+    // Ordinary lowering still refuses a placement attribute in the app's view.
+    for src in [
+        "component App\n  view\n    view slot=\"lockScreen\"\n      text \"x\"\n".into(),
+        source.replace("text \"x\"", "view\n      Departure(train=1)"),
+    ] {
+        let error = contract::compile(&src).unwrap_err();
+        assert_eq!(error.id, "lower-unknown-attr");
+        assert!(error.message.contains("`slot`"), "{error}");
+    }
+}
+
 /// A state part on an element (LLP 1121 D8, `:hover` then its rows) is linted
 /// as lowering folds it: a row its state takes passes, checked as the row it
 /// lowers to (`:active`'s colour as the press's, which inherits nothing); a
@@ -46,6 +104,8 @@ fn an_elements_state_part_is_linted_as_lowering_folds_it() {
         ("hover", "opacity = 1"),
         ("active", "opacity=0.5"),
         ("active", "color=\"#000000\""),
+        ("hover", "color=\"#000000\""),
+        ("focus-visible", "color=\"#000000\""),
     ] {
         assert!(
             lint(state, row).is_empty(),
@@ -62,7 +122,7 @@ fn an_elements_state_part_is_linted_as_lowering_folds_it() {
     for (state, row, id) in [
         ("hover", "opacty=1", "lower-state-row"),
         ("hover", "width=10", "lower-state-row"),
-        ("hover", "color=\"#000000\"", "lower-state-row"),
+        ("hover", "-exact-tint-color=\"#000000\"", "lower-state-row"),
         ("active", "-exact-press-opacity-to=0.5", "lower-state-row"),
         ("active", "color=\"inherit\"", "lower-attr-value"),
     ] {
@@ -365,16 +425,59 @@ fn a_horizontal_scroll_can_grow_vertically_with_its_contents() {
 
 #[test]
 fn bake_refuses_a_pressable_with_zero_area() {
-    let src = "component A\n  state n = 0\n  action go\n    n = 1\n  view\n    column\n      button press=go width=0 height=0 testId=\"go\"\n";
-    let plan = contract::compile(src).unwrap();
-    let e = contract::bake(plan, NoData).unwrap_err();
-    match e {
-        BakeError::Lint { id, message, .. } => {
-            assert_eq!(id, "bake-zero-size");
-            assert!(message.contains("testId=\"go\""), "{message}");
+    for attrs in ["width=0 height=0", "flex-grow=0", "flex-basis=0"] {
+        let src = format!("component A\n  state n = 0\n  action go\n    n = 1\n  view\n    row height=44\n      button press=go {attrs} testId=\"go\"\n");
+        let plan = contract::compile(&src).unwrap();
+        let e = contract::bake(plan, NoData).unwrap_err();
+        match e {
+            BakeError::Lint { id, message, .. } => {
+                assert_eq!(id, "bake-zero-size", "{attrs}: {message}");
+                assert!(message.contains("testId=\"go\""), "{message}");
+            }
+            other => panic!("{attrs}: {other:?}"),
         }
-        other => panic!("{other:?}"),
     }
+}
+
+fn empty_controls_sized_by_flex(attrs: &str, width: f32) {
+    for control in ["button press=go", "link href=\"/close\""] {
+        for applied in [attrs, "class=Size"] {
+            let src = format!(
+                "style Size\n  {attrs}\ncomponent App\n  action go\n  view\n    column width=300\n      row height=44\n        {control} {applied} aria-label=\"Close\" testId=\"close\"\n"
+            );
+            let plan = contract::compile(&src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+            contract::check(&plan).unwrap();
+            let plan = contract::bake(plan, NoData).unwrap();
+            let mut runner = exact_runner::Runner::boot(
+                plan,
+                NoData,
+                exact_kernel::Kernel::with_monospace(),
+                Default::default(),
+                "/",
+            )
+            .unwrap();
+            let root = runner.kernel().roots()[0];
+            runner
+                .kernel_mut()
+                .compute_layout(root, exact_kernel::Offer::definite(300.0, 100.0))
+                .unwrap();
+            let kernel = runner.kernel();
+            let key = kernel.find_by_test_id("close")[0];
+            let frame = kernel.node_by_key(key).unwrap().frame;
+            assert_eq!((frame.width, frame.height), (width, 44.0), "{src}");
+        }
+    }
+}
+
+#[test]
+fn empty_controls_can_take_their_size_from_flex_grow() {
+    empty_controls_sized_by_flex("flex=1", 300.0);
+    empty_controls_sized_by_flex("flex-grow=1", 300.0);
+}
+
+#[test]
+fn empty_controls_can_take_their_size_from_flex_basis() {
+    empty_controls_sized_by_flex("flex-basis=40", 40.0);
 }
 
 /// Ledger2 Rough 4: an absolutely positioned button is sized by its insets
@@ -397,18 +500,38 @@ fn an_inset_sized_button_has_area() {
     assert!(format!("{e}").contains("zero area"), "{e}");
 }
 
-/// The web's JS target bakes nothing; `contract::check` refuses there what
-/// every native bake would, before the page's module answers (files diary
-/// F13). Hidden controls and descendants have no pressable layout until shown.
+/// The web's JS target checks layout before the page's module answers.
+/// Hidden controls and descendants have no pressable layout until shown.
 #[test]
 fn check_refuses_without_data_what_no_answer_could_change() {
     let hidden = "component A\n  state n = 0\n  action go\n    n = 1\n  view\n    column\n      button \"Down\" press=go display=\"none\" aria-keyshortcuts=\"Shift+ArrowDown\" testId=\"down\"\n";
-    contract::check(&contract::compile(hidden).unwrap()).unwrap();
     let nested = hidden
         .replace("    column\n", "    column display=\"none\"\n")
         .replace(" display=\"none\" aria-keyshortcuts", " aria-keyshortcuts");
-    contract::check(&contract::compile(&nested).unwrap()).unwrap();
-    contract::bake(contract::compile(&nested).unwrap(), NoData).unwrap();
+    for src in [hidden, nested.as_str()] {
+        let plan = contract::compile(src).unwrap();
+        contract::check(&plan).unwrap();
+        contract::bake(plan, NoData).unwrap();
+    }
+    for dimension in ["width", "height"] {
+        let src = hidden.replace(
+            "display=\"none\"",
+            &format!("{dimension}=0 padding=0 border-width=0"),
+        );
+        let plan = contract::compile(&src).unwrap();
+        for result in [
+            contract::check(&plan),
+            contract::bake(plan, NoData).map(|_| ()),
+        ] {
+            match result.unwrap_err() {
+                BakeError::Lint { id, message, .. } => {
+                    assert_eq!(id, "bake-zero-size", "{dimension}: {message}");
+                    assert!(message.contains("testId=\"down\""), "{message}");
+                }
+                other => panic!("{dimension}: {other:?}"),
+            }
+        }
+    }
     // A label the module answers is empty until it does: not this check's
     // to judge, nor a `scroll` that only its answered rows reach the bound
     // of (unanswered, it is exactly as tall as its header).
@@ -488,7 +611,7 @@ fn conditional_style_checks_preserve_computation_and_match_bindings() {
     let top = |runner: &exact_runner::Runner<NoData>| {
         let kernel = runner.kernel();
         let key = kernel.find_by_test_id("branch")[0];
-        kernel.node_by_key(key).unwrap().style.top
+        kernel.node_by_key(key).unwrap().style.top.clone()
     };
     assert_eq!(top(&runner), exact_kernel::Dimension::Points(20.0));
     runner.act("toggle", vec![]).unwrap();

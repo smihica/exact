@@ -144,7 +144,7 @@ pub(super) struct Extensions {
     calls: calls::Calls,
     /// Each bound live source's Contract readers, by resource, with the
     /// arguments each last asked with (`bound.rs`).
-    readers: BTreeMap<String, BTreeMap<usize, String>>,
+    pub(super) readers: BTreeMap<String, BTreeMap<usize, String>>,
     /// The argument groups each bound live source's implementation was
     /// asked for and not yet told are gone.
     groups: BTreeMap<String, BTreeSet<String>>,
@@ -156,8 +156,8 @@ pub(super) struct Extensions {
     arrived: handles::Arrived,
     /// Each polled source's last ask, on the session's clock (`poll.rs`).
     polls: BTreeMap<String, f64>,
-    /// When each live source's last answer goes stale, on the session's
-    /// clock; infinite once asked (`stale.rs`).
+    /// When each live source's last answer goes stale, as Unix milliseconds;
+    /// infinite once asked (`stale.rs`).
     stale: BTreeMap<String, f64>,
     /// What each package view's implementation was told (`views.rs`).
     views: views::Views,
@@ -341,25 +341,28 @@ impl<D: DataSource> Runner<D> {
         source: &str,
         args: &[Value],
     ) -> Result<Answer, RunnerError> {
-        let resource = self.plan.str(self.plan.resources[i].name).to_string();
+        let resource = self.plan.str(self.resource_row(i).name).to_string();
         let key = self.key(&self.module_row(source));
         // The readers of a module's source are asked again when what it
         // answers changes (`announce`, or the bound module's own topic).
         self.store.observe_topic(&key);
-        let ty = self.plan.resources[i].ty;
+        let ty = self.resource_row(i).ty;
         self.module_target(Target::Resource(i), source, args, ty)
             .map_err(|error| RunnerError::Data { resource, error })
     }
 
-    /// What answers a send of mutation `m` to `source`, a module's name.
+    /// What answers a send (`target`) to `source`, a module's name.
     pub(super) fn module_send(
         &mut self,
-        m: usize,
+        target: Target,
         source: &str,
         args: &[Value],
     ) -> Result<Answer, DataError> {
+        let m = target
+            .mutation()
+            .expect("a send's target names its mutation");
         let ty = self.plan.mutations[m].ty;
-        self.module_target(Target::Mutation(m), source, args, ty)
+        self.module_target(target, source, args, ty)
     }
 
     /// A Contract read or send of a module's name: admitted (D14), then
@@ -376,12 +379,12 @@ impl<D: DataSource> Runner<D> {
         let mut args = self.args_json(&row, args);
         self.clamp_bounds(&row, &mut args);
         self.resolve_of(&row, &mut args);
-        let send = matches!(target, Target::Mutation(_));
+        let send = target.mutation().is_some();
         let timeout = send.then(|| self.timeout(&row, &args)).flatten();
         let origin = self.origin_for(Some(target));
         let reader = match target {
             Target::Resource(i) => Some(samples::Reader::Resource(i)),
-            Target::Mutation(_) => None,
+            Target::Mutation(_) | Target::Sent(..) => None,
         };
         // A sampled source's reader is known to its answer (`samples.rs`).
         self.extensions.samples.asking = reader.map(|r| (r, origin));
@@ -417,12 +420,14 @@ impl<D: DataSource> Runner<D> {
         } = called;
         let (row, key, route) = (row.clone(), self.key(row), self.route(row));
         let what = match target {
-            Target::Resource(i) => format!("query {}", self.plan.str(self.plan.resources[i].name)),
-            Target::Mutation(m) => format!("send {}", self.plan.str(self.plan.mutations[m].name)),
+            Target::Resource(i) => format!("query {}", self.plan.str(self.resource_row(i).name)),
+            Target::Mutation(m) | Target::Sent(m, _) => {
+                format!("send {}", self.plan.str(self.plan.mutations[m].name))
+            }
         };
         let reader = match target {
             Target::Resource(i) => Some(i),
-            Target::Mutation(_) => None,
+            Target::Mutation(_) | Target::Sent(..) => None,
         };
         let feeds = !self.substitute(&row)["feeds"].is_null();
         match decision {
@@ -648,6 +653,11 @@ impl<D: DataSource> Runner<D> {
         // A request that answers the status answers it denied too (WebKit's
         // `requestPermission` resolves `denied`, LLP 1133.013 D11).
         let answers_denied = send && sub["deniedAnswers"] == true;
+        // A source that reads a value of its own until the permission is
+        // granted (`ungranted`: a push subscription's none, LLP 1133.004 §9 P3).
+        if let (false, true, Some(value)) = (send, state != "granted", sub.get("ungranted")) {
+            return Some(Decision::Now(value.clone()));
+        }
         if state == "denied" && self.denial_fails(&sub, args) && !answers_denied {
             return Some(Decision::Now(json!({ "error": permission["denied"] })));
         }
@@ -784,9 +794,12 @@ impl<D: DataSource> Runner<D> {
         if let Some(listed) = self.listed_value(row, &sub) {
             return Some(listed);
         }
-        let default = (!sub["default"].is_null()).then(|| {
-            let mut default = sub["default"].clone();
-            if let Some(restricted) = sub["targets"].get(self.host_target()) {
+        // A `default` written `null` is a value: an option source's none.
+        let default = sub.get("default").map(|default| {
+            let mut default = default.clone();
+            if let (Some(restricted), true) =
+                (sub["targets"].get(self.host_target()), default.is_object())
+            {
                 admit::overlay(&mut default, restricted);
             }
             default
@@ -1138,6 +1151,14 @@ impl<D: DataSource> Runner<D> {
                 let mut body = self.as_origin(origin, |r| r.forward_body(&row, args, None));
                 if let Some(n) = v["request"].as_u64() {
                     body = numbered(&body, n);
+                    let ticket = self
+                        .extensions
+                        .sent
+                        .iter()
+                        .find_map(|(t, (_, sent))| (*sent == n).then_some(*t));
+                    if let Some(ticket) = ticket {
+                        self.note_send(ticket, &body);
+                    }
                 }
                 let anchored = self.anchor_body(&row, &body, origin);
                 // A reply carrying handles grants them the handlers its call

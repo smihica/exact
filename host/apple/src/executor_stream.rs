@@ -17,7 +17,7 @@
 //! and then its reply, read whole, as the one answer that ends it.
 use super::{
     check_headers, complete, failed, fetch_failure, fetch_request, has_ready, wake, Completed,
-    Deadline, Shared, MAX_BODY,
+    Deadline, Quiet, Shared, MAX_BODY,
 };
 use exact_runner::{FailureKind, HttpScheduling, Message, Outcome, Request, Response};
 use ibex2::stdlib::{
@@ -95,6 +95,14 @@ fn opened(
         Ok(deadline) => deadline,
         Err(why) => return complete(shared, ticket, failed(FailureKind::Refused, why)),
     };
+    // A socket's idle timeout counts from here, its opening included (LLP 1016.000 D11).
+    let quiet = match (request.idle_timeout_ms)
+        .map(|ms| Quiet::arm(ms, &abort))
+        .transpose()
+    {
+        Ok(quiet) => quiet,
+        Err(why) => return complete(shared, ticket, failed(FailureKind::Refused, why)),
+    };
     let sent = (request.upload_progress).then(|| progress(shared, ticket, abort.signal()));
     let two_way = request.socket;
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -143,7 +151,12 @@ fn opened(
     .unwrap_or_else(|_| Err(failed(FailureKind::Aborted, "the stream opener panicked")));
     drop(held);
     let passed = deadline.as_ref().is_some_and(Deadline::passed);
-    let opened = opened.map_err(|end| timed_out(end, passed, timeout.unwrap_or(0)));
+    let opened = opened
+        .map_err(|end| timed_out(end, passed, timeout.unwrap_or(0)))
+        .map_err(|end| Quiet::finish(quiet.as_ref(), end));
+    if let (Ok(_), Some(quiet)) = (&opened, &quiet) {
+        quiet.heard();
+    }
     match opened {
         // The bindings live as long as the body they opened.
         Ok((Opened::Events(response, limit), _bindings)) => {
@@ -153,9 +166,11 @@ fn opened(
             bytes::read(shared, ticket, response, limit, abort)
         }
         Ok((Opened::Socket(socket, limit), _bindings)) if two_way => {
-            socket::read(shared, ticket, socket, limit, abort)
+            socket::read(shared, ticket, socket, limit, abort, quiet)
         }
-        Ok((Opened::Socket(socket, _), _bindings)) => read_socket(shared, ticket, socket, abort),
+        Ok((Opened::Socket(socket, _), _bindings)) => {
+            read_socket(shared, ticket, socket, abort, quiet)
+        }
         Ok((Opened::LongPoll(request, limit), bindings)) => {
             long_poll::run(shared, ticket, request, forced, &bindings, limit, abort)
         }
@@ -185,9 +200,14 @@ fn read_socket(
     ticket: u64,
     mut socket: Box<dyn MessageSource>,
     abort: AbortController,
+    quiet: Option<Quiet>,
 ) {
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
-        match socket.next() {
+        let next = socket.next();
+        if let (Ok(Incoming::Text(_)), Some(quiet)) = (&next, &quiet) {
+            quiet.heard();
+        }
+        match next {
             Ok(Incoming::Text(data)) => {
                 let m = Message {
                     data,
@@ -219,6 +239,8 @@ fn read_socket(
         }
     }))
     .unwrap_or_else(|_| failed(FailureKind::Aborted, "the stream reader panicked"));
+    // Its end is settled before the socket is dropped, which may take a while.
+    let run = Quiet::finish(quiet.as_ref(), run);
     drop(socket);
     complete(shared, ticket, run);
 }

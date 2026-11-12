@@ -8,6 +8,7 @@
 //    none`) zoom from where `moveend` last left the camera.
 // 4. Plain tiles: a screenshot, kept for a person to read.
 // 5. A missing source: the web build without `tiles` fails `maps-tiles-missing`.
+// 6. Web panning: an arrow key and a drag with three moves keep the camera near its start.
 //
 // usage: bun packages/maps/test/map-demo.mjs <web|macos|ios> [--browser chromium|firefox|webkit] [--sim <udid>] [--out <dir>]
 //   (Map Demo built for that host first: host/web/build.mjs map-demo, or host/apple/build.mjs [--ios] map-demo-apple)
@@ -104,6 +105,19 @@ if (host === 'web') {
     const said = `${r.stdout}\n${r.stderr}`;
     check('5: the web build without tiles fails maps-tiles-missing', r.status !== 0 && said.includes('maps-tiles-missing'), said.slice(-800));
   } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+if (host === 'web') {
+  for (const [name, input, longitude] of [
+    ['ArrowRight pans 80 px east', 'type map key ArrowRight', -122.400567],
+    ['a three-move drag pans 9 px east', 'tap map drag -9 0 mouse over 48', -122.403614],
+  ]) {
+    const r = drive(['clock settle', 'tap map', input,
+      `clock until state extensions.maps.implementation.maps.0.camera.longitude == ${longitude} within 3000`,
+      'state extensions']);
+    const camera = maps(r)?.[0]?.camera;
+    check(`6: ${name}`, camera?.longitude === longitude && camera?.latitude === 37.7946 && camera?.zoom === 15,
+      JSON.stringify(camera ?? r));
+  }
 }
 console.log(failures ? `${failures} failed` : 'all passed');
 process.exit(failures ? 1 : 0);

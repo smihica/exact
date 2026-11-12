@@ -11,10 +11,11 @@ import AppKit
 
 /// What the core asks of the Numerals capability.
 package protocol NumeralCapability: AnyObject {
-    /// Show `node`'s paragraph, `attributed` in its content box aligned as
-    /// `align` says (0 left, 1 centre, 2 right), rolling its numerals as they
+    /// Show `node`'s paragraph, `attributed`, in `box` aligned as `align`
+    /// says (0 left, 1 centre, 2 right), its baseline `baseline` below the
+    /// box's top (nil: centred down the box), rolling its numerals as they
     /// change; `mode` is `numeric` or `numeric-countdown`.
-    func show(_ node: NodeView, attributed: NSAttributedString, box: CGRect, align: Int, mode: String)
+    func show(_ node: NodeView, attributed: NSAttributedString, box: CGRect, baseline: CGFloat?, align: Int, mode: String)
     /// `node` no longer rolls: its paragraph draws as any other.
     func hide(_ node: NodeView)
 }

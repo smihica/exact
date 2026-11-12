@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // A Canvas 2D canvas's first geometry without ResizeObserver (canvas2d-glue.js
 // `firstGeometry`): a page in a frame scrolled out of view gets no observer
 // entries, and readiness waits on every watched canvas's first geometry
@@ -7,8 +8,8 @@
 // always sent (LLP 1122 queue item (3)'s QUEUE follow-up, review round 2).
 // The module runs in a vm with stand-in browser globals.
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { glueDeclarations } from './glue-fixture.mjs';
 
 const source = readFileSync(new URL('../canvas2d-glue.js', import.meta.url), 'utf8');
 
@@ -120,4 +121,48 @@ test('a canvas gone before its second waits for nothing; a newer watch of its id
   s.fire();
   await s.flush();
   expect([late.done, s.sent.length]).toEqual([true, 1]);
+});
+
+test('forgetting a canvas ends its first-size wait and ignores queued geometry for its old element', async () => {
+  for (const agent of [false, true]) {
+    const w = glue({ agent }), a = w.el(7), b = w.el(8);
+    w.views.set(7, a); w.views.set(8, b);
+    w.g.op({ id: 7, watch: true }); w.g.op({ id: 8, watch: true });
+    const ready = w.waiter();
+    w.views.delete(7);
+    w.g.op({ id: 7, forget: true });
+    await w.flush();
+    expect([ready.done, w.observed.has(a)]).toEqual([false, false]);
+    w.views.delete(8);
+    w.g.op({ id: 8, forget: true });
+    w.g.op({ id: 8, forget: true });
+    await w.flush();
+    expect([ready.done, w.observed.size]).toEqual([true, 0]);
+    w.deliver(a, 100, 50); w.deliver(b, 100, 50); w.fire();
+    expect(w.sent).toEqual([]);
+    const replacement = w.el(7);
+    w.views.set(7, replacement);
+    w.g.op({ id: 7, watch: true });
+    w.deliver(a, 0, 0); w.deliver(replacement, 100, 50);
+    expect(w.sent).toEqual([{ id: 7, w: 100, h: 50, scale: 2 }]);
+  }
+});
+
+test('removal loads no Canvas 2D piece and a removal queued during loading releases its watch', async () => {
+  const source = readFileSync(new URL('../navigation.js', import.meta.url), 'utf8').replace(/^export /gm, '');
+  const frames = [], w = glue({ agent: true });
+  const make = new Function('requestAnimationFrame', `${glueDeclarations(source, ['afterPaint', 'afterPaintPieces'])}; return afterPaintPieces;`)(fn => frames.push(fn));
+  let loads = 0;
+  const pieces = make(async () => { loads++; return () => w.g; }, { views: w.views, agent: () => true });
+  pieces.canvas2d({ id: 7, forget: true });
+  expect([pieces.pending(), frames.length, loads]).toEqual([null, 0, 0]);
+  const el = w.el(7);
+  w.views.set(7, el);
+  pieces.canvas2d({ id: 7, watch: true });
+  pieces.canvas2d({ id: 7, forget: true });
+  // An exit animation can keep the element in the tree while the piece finishes loading.
+  const pending = pieces.pending();
+  frames.shift()(); frames.shift()();
+  await pending;
+  expect([loads, w.observed.size, w.sent]).toEqual([1, 0, []]);
 });

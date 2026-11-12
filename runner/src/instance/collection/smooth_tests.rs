@@ -2,6 +2,84 @@
 //! animate.
 use super::*;
 
+#[test]
+fn bound_scroll_behavior_can_enable_smooth_end_follow() {
+    check_bound_scroll_behavior(true);
+}
+
+#[test]
+fn bound_scroll_behavior_can_disable_smooth_end_follow() {
+    check_bound_scroll_behavior(false);
+}
+
+fn check_bound_scroll_behavior(calm: bool) {
+    let source = format!(
+        r#"component App
+  state n = 100
+  state calm = {calm}
+  action grow
+    n = n + 1
+  action flip
+    calm = not calm
+  action flipAndGrow
+    calm = not calm
+    n = n + 1
+  view
+    list virtualized=true height=320 estimated-item-height=32 scrollFollowEnd=true scroll-behavior=(calm ? "auto" : "smooth")
+      for x in range(n) key=x
+        text `${{x}}` height=32
+"#
+    );
+    let mut r = crate::Runner::boot(
+        contract::compile(&source).unwrap(),
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let report = |r: &mut crate::Runner<NoData>, offset| {
+        let mut f = runner_feedback(r);
+        f.offset = offset;
+        f.measurements = r.collections()[0]
+            .rows
+            .iter()
+            .map(|row| RowMeasurement {
+                view: row.view,
+                epoch: row.epoch,
+                size: 32.0,
+            })
+            .collect();
+        let result = r.collection_feedback(f).unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+    };
+    report(&mut r, 2880.0);
+    for (action, offset, smooth) in [
+        ("grow", 2912.0, !calm),
+        ("grow", 2944.0, calm),
+        ("flipAndGrow", 2976.0, !calm),
+    ] {
+        let sequence = r.collections()[0].scroll_sequence;
+        r.act(action, vec![]).unwrap();
+        let c = &r.collections()[0];
+        assert_eq!(
+            r.kernel().node(c.view).unwrap().style.scroll_behavior
+                == exact_kernel::ScrollBehavior::Smooth,
+            smooth
+        );
+        let correction = c.correction.expect("the appended row is followed");
+        assert_eq!(correction.offset, offset);
+        assert_eq!(correction.scroll_sequence, sequence);
+        assert!(correction.from.is_none());
+        assert_eq!(correction.smooth, smooth, "after {action} to {offset}");
+        report(&mut r, offset);
+        if offset == 2912.0 {
+            r.act("flip", vec![]).unwrap();
+            report(&mut r, offset);
+        }
+    }
+}
+
 /// LLP 1070.000 §6.2: a `scroll-behavior: smooth` list following its end
 /// asks the host to animate the follow; one that is not smooth, or an
 /// anchor kept in place, does not.

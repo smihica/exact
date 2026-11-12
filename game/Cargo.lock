@@ -650,6 +650,7 @@ dependencies = [
  "exact-num",
  "exact-svg-filter",
  "exact-textflow",
+ "icu_properties",
  "serde",
  "serde_json",
  "sha2",
@@ -709,6 +710,7 @@ dependencies = [
 name = "exact-svg-file"
 version = "0.1.0"
 dependencies = [
+ "cssparser",
  "exact-kernel",
  "exact-motion",
  "exact-num",
@@ -725,6 +727,7 @@ dependencies = [
  "exact-color",
  "exact-motion",
  "exact-num",
+ "exact-plan",
  "serde",
  "serde_json",
 ]

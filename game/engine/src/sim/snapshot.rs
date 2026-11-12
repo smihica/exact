@@ -9,8 +9,12 @@ impl<G: Game> Sim<G> {
             let mut sprites = self.world.query::<&crate::Sprite>();
             let mut needed = std::collections::BTreeSet::new();
             for (_, mesh) in meshes.iter() {
-                if let crate::Mesh::Asset(name) = mesh {
-                    needed.insert(name);
+                // A cosmetic model is presentation: its readiness never gates a save.
+                match mesh {
+                    crate::Mesh::Asset(name) if !assets.cosmetic.contains(name) => {
+                        needed.insert(name);
+                    }
+                    _ => {}
                 }
             }
             needed.extend(sprites.iter().map(|(_, s)| &s.texture));

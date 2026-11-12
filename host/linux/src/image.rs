@@ -86,8 +86,8 @@ struct View {
     resized: bool,
     /// The request is for a part of the picture.
     part: bool,
-    /// How many times this showing has asked again for a URL whose download
-    /// failed in a way asking again may mend, and when it next does
+    /// Retries this showing has made or joined for a URL whose download
+    /// failed in a way asking again may mend, and when it next asks
     /// ([`RETRY_AFTER`]): from nothing whenever it leaves the screen or its
     /// source changes.
     retries: usize,
@@ -619,7 +619,10 @@ impl Images {
                 let prepared = self.backend.prepared(source);
                 if prepared.is_none() {
                     // Another view of the same URL asked again: this one joins
-                    // that download, with no retry of its own counted or due.
+                    // that download and spends a retry too while on screen.
+                    if view.on_screen {
+                        view.retries += 1;
+                    }
                     view.source_id = None;
                     view.retry_at = None;
                 } else if view.retry_at.is_some_and(|at| Instant::now() >= at) {

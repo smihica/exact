@@ -111,9 +111,7 @@ fn region(
             } else {
                 match (&row.kind, u.eval(row.subject, frames)?) {
                     (RegionKind::When, Value::Bool(true)) => (Some(0), Frame::default()),
-                    (RegionKind::When, Value::Bool(false)) => {
-                        ((row.arms.len > 1).then_some(1), Frame::default())
-                    }
+                    (RegionKind::When, Value::Bool(false)) => (Some(1), Frame::default()),
                     (RegionKind::Match, Value::Option(Some(v))) => (
                         Some(0),
                         Frame {
@@ -122,9 +120,7 @@ fn region(
                             ..Default::default()
                         },
                     ),
-                    (RegionKind::Match, Value::Option(None)) => {
-                        ((row.arms.len > 1).then_some(1), Frame::default())
-                    }
+                    (RegionKind::Match, Value::Option(None)) => (Some(1), Frame::default()),
                     _ => return Err(kind_error),
                 }
             };

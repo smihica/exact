@@ -4,6 +4,42 @@ import XCTest
 @testable import ExactKit
 
 final class CollectionPageBandIOSTests: XCTestCase {
+    func testAnAuthoredOffsetWinsAfterTheListInsetChangesInABatch() throws {
+        let p = Presenter()
+        p.viewport.frame = CGRect(x: 0, y: 0, width: 300, height: 200)
+        defer { p.onViewportFit = nil; p.reset() }
+        p.apply(wireBatch([
+            ["op": "collections", "items": [["view": 1, "revision": 1, "scrollSequence": 0, "count": 20,
+                "totalExtent": 1000, "rows": [["view": 2, "root": 2, "epoch": 1]], "correction": NSNull()]]],
+            ["op": "create", "id": 1, "kind": "list", "style": ["overflow_y": "scroll"]],
+            ["op": "create", "id": 2, "kind": "view"],
+            ["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0, "y": 0, "w": 300, "h": 200],
+            ["op": "frame", "id": 2, "x": 0, "y": 0, "w": 300, "h": 50],
+            ["op": "content", "id": 1, "w": 300, "h": 1000]
+        ]))
+        let node = try XCTUnwrap(p.views[1]), scroll = try XCTUnwrap(node.scroll)
+        scroll.contentInsetAdjustmentBehavior = .always
+        XCTAssertTrue(p.collections.owns(1))
+        XCTAssertEqual(scroll.contentOffset.y + node.scrollTopInset(scroll), 0, accuracy: 0.5)
+        var nested = 0
+        p.onViewportFit = {
+            XCTAssertTrue(p.applying)
+            scroll.contentInset.top = 40
+            p.afterBatch {
+                nested += 1
+                XCTAssertFalse(p.applying)
+                XCTAssertEqual(scroll.contentOffset.y + node.scrollTopInset(scroll), 100, accuracy: 0.5,
+                               "closing work sees the authored offset after collection finalization")
+                p.apply(wireBatch([["op": "props", "id": 2, "set": ["testId": "nested-row"]]]))
+            }
+        }
+        p.apply(wireBatch([["op": "props", "id": 1, "set": ["viewportFit": "cover", "scrollTop": "100"]]]))
+        XCTAssertEqual(nested, 1)
+        XCTAssertEqual(scroll.adjustedContentInset.top, 40)
+        XCTAssertEqual(scroll.contentOffset.y + node.scrollTopInset(scroll), 100, accuracy: 0.5)
+    }
+
     func testThePhysicalPortAndEveryOffsetConversionIncludeThePageBands() throws {
         let p = Presenter()
         p.viewport.frame = CGRect(x: 0, y: 0, width: 300, height: 200)

@@ -16,9 +16,15 @@ export const grants = `device.microphone purpose.microphone\ndevice.microphone-b
 type Kept = { name: string; seconds: number; level: number };
 type Info = { id: string; transcript: string | null; finalCount: number; files: number; error: string | null };
 
+// A missing file reads as `none`, as does the build's ('bake'), which writes nothing. Any other failed
+// read throws, so no answer writes an index started from `none` over the file.
 async function json<T>(storage: Storage, path: string, none: T): Promise<T> {
+  const bytes = await storage.fs.readFile(path).catch((e: { code?: string }) => {
+    if (e.code === 'ENOENT' || e.code === 'bake') return null;
+    throw e;
+  });
   try {
-    return JSON.parse(new TextDecoder().decode(await storage.fs.readFile(path))) as T;
+    return bytes ? JSON.parse(new TextDecoder().decode(bytes)) as T : none;
   } catch {
     return none;
   }

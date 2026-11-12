@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { presenceLoader } from '../navigation.js';
+import { presenceLoader } from '../navigation/motion.js';
 
 test('a failed presence load releases held and later batches once, in order', async () => {
   let fail, calls = 0;

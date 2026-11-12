@@ -222,13 +222,13 @@ public final class PurchasesModule: ExactPackage {
                 let now = Date().timeIntervalSince1970 * 1000
                 for await result in Transaction.currentEntitlements {
                     guard case .verified(let t) = result, t.productType != .consumable else { continue }
-                    let row = await Self.details(t, acknowledged: !unfinished.contains(t.id))
+                    let row = await Self.details(t, result.jwsRepresentation, acknowledged: !unfinished.contains(t.id))
                     if let end = row["expirationTime"] as? Double, end > now { stale = min(stale ?? end, end) }
                     rows.append(row)
                 }
                 for await result in Transaction.unfinished {
                     guard case .verified(let t) = result, t.productType == .consumable, t.revocationDate == nil else { continue }
-                    rows.append(await Self.details(t, acknowledged: false))
+                    rows.append(await Self.details(t, result.jwsRepresentation, acknowledged: false))
                 }
                 var out: [String: Any] = ["exact:answer": rows]
                 if let stale { out["exact:stale"] = stale }
@@ -237,7 +237,7 @@ public final class PurchasesModule: ExactPackage {
                 var rows: [[String: Any]] = []
                 for await result in Transaction.unfinished {
                     guard case .verified(let t) = result, t.revocationDate == nil else { continue }
-                    rows.append(await Self.details(t, acknowledged: false))
+                    rows.append(await Self.details(t, result.jwsRepresentation, acknowledged: false))
                 }
                 watchForgotten()
                 return ["exact:answer": rows]
@@ -248,7 +248,7 @@ public final class PurchasesModule: ExactPackage {
                 var rows: [[String: Any]] = []
                 let unfinished = await Shared.unfinishedIDs()
                 for await result in Transaction.currentEntitlements {
-                    if case .verified(let t) = result { rows.append(await Self.details(t, acknowledged: !unfinished.contains(t.id))) }
+                    if case .verified(let t) = result { rows.append(await Self.details(t, result.jwsRepresentation, acknowledged: !unfinished.contains(t.id))) }
                 }
                 return ["exact:answer": rows]
             case "acknowledge", "consume": return await finish(args["purchaseToken"] as? String ?? "")
@@ -285,14 +285,17 @@ public final class PurchasesModule: ExactPackage {
         result = try await product.purchase(confirmIn: anchor.scene, options: options)
         #endif
         switch result {
-        case .success(.verified(let t)):
-            say("transaction \(t.id) for \(t.productID), unfinished")
-            Shared.changed()
-            return await Self.details(t, acknowledged: false)
-        case .success(.unverified(let t, let why)):
-            say("transaction \(t.id) failed verification (\(why)); left unfinished")
-            Shared.unverified.insert(String(t.id))
-            return ["error": "VERIFICATION_FAILED", "message": "\(why)"]
+        case .success(let verification):
+            switch verification {
+            case .verified(let t):
+                say("transaction \(t.id) for \(t.productID), unfinished")
+                Shared.changed()
+                return await Self.details(t, verification.jwsRepresentation, acknowledged: false)
+            case .unverified(let t, let why):
+                say("transaction \(t.id) failed verification (\(why)); left unfinished")
+                Shared.unverified.insert(String(t.id))
+                return ["error": "VERIFICATION_FAILED", "message": "\(why)"]
+            }
         case .pending:
             return ["itemId": itemId, "purchaseToken": "", "purchaseState": "pending", "purchaseTime": Date().timeIntervalSince1970 * 1000,
                     "acknowledged": false, "willAutoRenew": NSNull(), "quantity": args["quantity"] ?? 1, "expirationTime": NSNull(),
@@ -386,7 +389,7 @@ public final class PurchasesModule: ExactPackage {
 
     /// A verified transaction as `PurchaseDetails`. A subscription's
     /// `expirationTime` is its grace period's end while it is in one (D7).
-    static func details(_ t: Transaction, acknowledged: Bool) async -> [String: Any] {
+    static func details(_ t: Transaction, _ jws: String, acknowledged: Bool) async -> [String: Any] {
         var end = ms(t.expirationDate), renews: Any = NSNull()
         if t.productType == .autoRenewable, let group = t.subscriptionGroupID,
            let statuses = try? await Product.SubscriptionInfo.status(for: group),
@@ -403,7 +406,7 @@ public final class PurchasesModule: ExactPackage {
         }
         return ["itemId": t.productID, "purchaseToken": String(t.id), "purchaseState": "purchased", "purchaseTime": ms(t.purchaseDate),
                 "acknowledged": acknowledged, "willAutoRenew": renews, "quantity": t.purchasedQuantity, "expirationTime": end, "android": NSNull(),
-                "apple": ["jwsRepresentation": NSNull(), "originalID": String(t.originalID),
+                "apple": ["jwsRepresentation": jws, "originalID": String(t.originalID),
                           "ownershipType": t.ownershipType == .familyShared ? "familyShared" : "purchased", "environment": environment,
                           "revocationDate": ms(t.revocationDate), "isUpgraded": t.isUpgraded,
                           "appAccountToken": t.appAccountToken?.uuidString ?? NSNull()] as [String: Any]]

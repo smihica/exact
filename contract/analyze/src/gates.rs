@@ -13,7 +13,7 @@ pub(super) fn check(c: &Component, fns: &[FnDecl]) -> Vec<AnalyzeError> {
         for (what, e) in [("gate", &t.gate), ("key", &t.key)] {
             let Some(e) = e else { continue };
             let mut seen = BTreeSet::new();
-            if let Some(at) = clock(e, c, fns, &mut seen) {
+            if let Some(at) = clock(e, c, fns, &mut seen, &BTreeSet::new()) {
                 errors.push(AnalyzeError {
                     id: "analyze-task-gate-clock",
                     message: format!(
@@ -44,7 +44,7 @@ pub(super) fn check(c: &Component, fns: &[FnDecl]) -> Vec<AnalyzeError> {
         for (what, e) in gates.into_iter().chain(play) {
             let Some(e) = e else { continue };
             let mut seen = BTreeSet::new();
-            let Some(at) = clock(e, c, fns, &mut seen) else {
+            let Some(at) = clock(e, c, fns, &mut seen, &BTreeSet::new()) else {
                 continue;
             };
             let gate = matches!(what, "gate" | "key");
@@ -80,17 +80,9 @@ fn clock<'a>(
     e: &'a Expr,
     c: &'a Component,
     fns: &'a [FnDecl],
-    seen: &mut BTreeSet<&'a str>,
+    seen: &mut BTreeSet<(&'static str, &'a str)>,
+    bound: &BTreeSet<&'a str>,
 ) -> Option<Through> {
-    let via = |name: &'a str, seen: &mut BTreeSet<&'a str>| -> Option<Through> {
-        if !seen.insert(name) {
-            return None;
-        }
-        if let Some(d) = c.derives.iter().find(|d| d.name == name) {
-            return clock(&d.expr, c, fns, seen).map(|_| Through::Derive(shown(name)));
-        }
-        None
-    };
     match e {
         Expr::Call(name, args, _)
             if name == "performanceNow"
@@ -101,40 +93,67 @@ fn clock<'a>(
         }
         Expr::Call(name, args, _) => {
             if let Some(f) = fns.iter().find(|f| &f.name == name) {
-                if seen.insert(&f.name) && clock(&f.body, c, fns, seen).is_some() {
-                    return Some(Through::Fn(shown(name)));
+                if seen.insert(("fn", &f.name)) {
+                    let locals = f.params.iter().map(|p| p.name.as_str()).collect();
+                    if clock(&f.body, c, fns, seen, &locals).is_some() {
+                        return Some(Through::Fn(shown(name)));
+                    }
                 }
             }
-            args.iter().find_map(|a| clock(a, c, fns, seen))
+            args.iter().find_map(|a| clock(a, c, fns, seen, bound))
         }
-        Expr::Ident(name, _) => via(name, seen),
+        Expr::Ident(name, _) if !bound.contains(name.as_str()) => {
+            if seen.insert(("derive", name)) {
+                if let Some(d) = c.derives.iter().find(|d| d.name == *name) {
+                    // A derive's inputs belong to its declaration, not the caller's locals.
+                    return clock(&d.expr, c, fns, seen, &BTreeSet::new())
+                        .map(|_| Through::Derive(shown(name)));
+                }
+            }
+            None
+        }
         Expr::Template(parts, _) => parts.iter().find_map(|p| match p {
-            TemplatePart::Expr(e) => clock(e, c, fns, seen),
+            TemplatePart::Expr(e) => clock(e, c, fns, seen, bound),
             TemplatePart::Text(_) => None,
         }),
         Expr::Some(a, _)
         | Expr::Member(a, _, _)
         | Expr::NamedArg(_, a, _)
         | Expr::Unary(_, a, _)
-        | Expr::Typed(a, _, _) => clock(a, c, fns, seen),
-        Expr::Arrow { body, .. } => clock(body, c, fns, seen),
-        Expr::Binary(_, a, b, _) => clock(a, c, fns, seen).or_else(|| clock(b, c, fns, seen)),
-        Expr::Let { value, body, .. } => {
-            clock(value, c, fns, seen).or_else(|| clock(body, c, fns, seen))
+        | Expr::Typed(a, _, _) => clock(a, c, fns, seen, bound),
+        Expr::Arrow { params, body, .. } => {
+            let mut locals = bound.clone();
+            locals.extend(params.iter().map(String::as_str));
+            clock(body, c, fns, seen, &locals)
         }
-        Expr::Ternary(a, b, d, _) => clock(a, c, fns, seen)
-            .or_else(|| clock(b, c, fns, seen))
-            .or_else(|| clock(d, c, fns, seen)),
+        Expr::Binary(_, a, b, _) => {
+            clock(a, c, fns, seen, bound).or_else(|| clock(b, c, fns, seen, bound))
+        }
+        Expr::Let {
+            name, value, body, ..
+        } => clock(value, c, fns, seen, bound).or_else(|| {
+            let mut locals = bound.clone();
+            locals.insert(name);
+            clock(body, c, fns, seen, &locals)
+        }),
+        Expr::Ternary(a, b, d, _) => clock(a, c, fns, seen, bound)
+            .or_else(|| clock(b, c, fns, seen, bound))
+            .or_else(|| clock(d, c, fns, seen, bound)),
         Expr::Match {
             subject,
+            var,
             some,
             none,
             ..
-        } => clock(subject, c, fns, seen)
-            .or_else(|| clock(some, c, fns, seen))
-            .or_else(|| clock(none, c, fns, seen)),
-        Expr::List(items, _) => items.iter().find_map(|e| clock(e, c, fns, seen)),
-        Expr::Number(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None(_) => None,
+        } => clock(subject, c, fns, seen, bound)
+            .or_else(|| {
+                let mut locals = bound.clone();
+                locals.insert(var);
+                clock(some, c, fns, seen, &locals)
+            })
+            .or_else(|| clock(none, c, fns, seen, bound)),
+        Expr::List(items, _) => items.iter().find_map(|e| clock(e, c, fns, seen, bound)),
+        Expr::Ident(..) | Expr::Number(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None(_) => None,
     }
 }
 

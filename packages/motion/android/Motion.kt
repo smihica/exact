@@ -142,11 +142,14 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
     }
 
     private fun key(args: JSONObject) =
-        "${args.optDouble("frequency", 0.0)} ${args.optString("referenceFrame", "device")} ${args.optInt("history", 0)}"
+        "${args.optDouble("frequency", 0.0)} ${args.optString("referenceFrame", "device")} ${args.optInt("history", 0)} ${args.optBoolean("absolute")}"
+
+    /** The sensor type a reader of [name] with [args] reads: an absolute `deviceOrientation` the rotation vector. */
+    private fun sensorType(name: String, args: JSONObject) =
+        if (name == "deviceOrientation" && args.optBoolean("absolute")) Sensor.TYPE_ROTATION_VECTOR else TYPES.getValue(name)
 
     private fun read(name: String, args: JSONObject, reply: (JSONObject) -> Unit) {
-        val type = TYPES.getValue(name)
-        if (!has(type)) return reply(JSONObject().put("error", "NotSupportedError"))
+        if (!has(sensorType(name, args))) return reply(JSONObject().put("error", "NotSupportedError"))
         val asked = JSONObject(args.toString()).apply { remove("after") }
         val group = groups.getOrPut(name) { mutableMapOf() }.getOrPut(key(asked)) { Group(asked) }
         restart()
@@ -247,7 +250,7 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
         val wanted = mutableMapOf<Int, Double>()
         if (shown) for ((name, byKey) in groups) for (g in byKey.values) {
             val types = if (name == "deviceMotion") listOf(Sensor.TYPE_ACCELEROMETER, Sensor.TYPE_LINEAR_ACCELERATION, Sensor.TYPE_GYROSCOPE)
-                else listOf(TYPES.getValue(name))
+                else listOf(sensorType(name, g.args))
             val asked = g.args.optDouble("frequency", 0.0).takeIf { it > 0 && name != "deviceMotion" }
             val f = (asked ?: GAME_HZ).let { if (high) it else minOf(MOST_HZ, it) }
             for (t in types) if (has(t)) wanted[t] = maxOf(wanted[t] ?: 0.0, f)
@@ -283,14 +286,14 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
         latest[type] = event.values.clone()
         val at = stamp(event.timestamp)
         for ((name, byKey) in groups) {
-            val feeds = if (name == "deviceMotion") type == Sensor.TYPE_ACCELEROMETER else TYPES[name] == type
-            if (!feeds) continue
             for (g in byKey.values) {
+                val feeds = if (name == "deviceMotion") type == Sensor.TYPE_ACCELEROMETER else sensorType(name, g.args) == type
+                if (!feeds) continue
                 if (g.period > 0 && at < g.next - g.period / 2) continue
                 g.next = maxOf(g.next + g.period, at + g.period / 2)
                 g.sequence += 1
                 val screen = if (g.args.optString("referenceFrame") == "screen") angle() else 0
-                g.ring.addLast(Sample(g.sequence, fields(name, event.values, at, screen)))
+                g.ring.addLast(Sample(g.sequence, fields(name, event.values, at, screen, type == Sensor.TYPE_ROTATION_VECTOR)))
                 val bound = maxOf(1, minOf(RING, g.args.optInt("history", 0)))
                 while (g.ring.size > bound) g.ring.removeFirst()
                 val waiting = g.waiting.toList()
@@ -343,7 +346,7 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
         return JSONArray(listOf(x, y, z, w))
     }
 
-    private fun fields(name: String, v: FloatArray, at: Double, deg: Int): JSONObject = when (name) {
+    private fun fields(name: String, v: FloatArray, at: Double, deg: Int, absolute: Boolean): JSONObject = when (name) {
         "absoluteOrientationSensor", "relativeOrientationSensor" ->
             JSONObject().put("quaternion", quaternion(v, deg)).put("timestamp", at).put("apple", JSONObject.NULL)
         "deviceMotion" -> {
@@ -354,12 +357,13 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
                 .put("rotationRate", rate?.let { JSONObject().put("alpha", it[2] * d).put("beta", it[0] * d).put("gamma", it[1] * d) } ?: JSONObject.NULL)
                 .put("interval", registered[Sensor.TYPE_ACCELEROMETER]?.second?.let { it / 1000.0 } ?: 0.0).put("timeStamp", at)
         }
-        "deviceOrientation" -> orientation(v, at)
+        "deviceOrientation" -> orientation(v, at, absolute)
         else -> xyz(v, at, deg)
     }
 
-    /** Device Orientation's alpha, beta and gamma from a rotation vector, as Chromium computes them from the matrix. */
-    private fun orientation(v: FloatArray, at: Double): JSONObject {
+    /** Device Orientation's alpha, beta and gamma from a rotation vector, as Chromium computes them from the matrix;
+     * [absolute] when it is `TYPE_ROTATION_VECTOR`'s, of the Earth frame's magnetic north. */
+    private fun orientation(v: FloatArray, at: Double, absolute: Boolean): JSONObject {
         val m = FloatArray(9)
         SensorManager.getRotationMatrixFromVector(m, v)
         var alpha: Double
@@ -390,7 +394,7 @@ class MotionModule(context: ExtensionContext) : ExactExtension(context) {
         }
         if (alpha < 0) alpha += 2 * PI
         val d = 180 / PI
-        return JSONObject().put("alpha", alpha * d).put("beta", beta * d).put("gamma", gamma * d).put("absolute", false)
+        return JSONObject().put("alpha", alpha * d).put("beta", beta * d).put("gamma", gamma * d).put("absolute", absolute)
             .put("timeStamp", at).put("apple", JSONObject.NULL)
     }
 }

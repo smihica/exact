@@ -51,31 +51,6 @@ fn open(parent: &File, value: &str, flags: i32) -> io::Result<File> {
 
 pub struct Directory(pub File);
 impl Directory {
-    /// Visit each regular file through its owned parent, refusing links and special files.
-    pub fn visit_files(
-        &self,
-        prefix: &str,
-        visit: &mut impl FnMut(&str, &Directory, &str) -> io::Result<()>,
-    ) -> io::Result<()> {
-        for leaf in self.names()? {
-            let path = format!("{prefix}{leaf}");
-            match self.kind(&leaf)? {
-                Kind {
-                    directory: true, ..
-                } => self
-                    .child(&leaf, false)?
-                    .visit_files(&format!("{path}/"), visit)?,
-                Kind { regular: true, .. } => visit(&path, self, &leaf)?,
-                _ => {
-                    return Err(refuse(
-                        "static app files must be regular files or directories",
-                    ))
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub fn root(path: &str, create: bool) -> io::Result<Self> {
         let mut path = path.to_owned();
         // macOS's fixed system aliases are normalized without consulting a

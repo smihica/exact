@@ -271,6 +271,39 @@ fn a_partial_initial_dev_plan_falls_back_without_counting_the_store() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Two launches over one store: the second boots the update the first runs.
+#[test]
+fn a_second_instance_boots_the_update_the_first_runs() {
+    let baked = contract::compile("component App\n  view\n    text \"baked\"\n")
+        .unwrap()
+        .encode();
+    let selected = contract::compile("component App\n  view\n    text \"selected\"\n")
+        .unwrap()
+        .encode();
+    let dir = std::env::temp_dir().join(format!(
+        "exact-linux-second-instance-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let staged = stage(&dir, &baked, &selected, &[]);
+    let mut first = selected_config(&dir, &baked, staged);
+    let (mut first, error) = boot_presenter::<Named>(&mut first, (390.0, 844.0)).unwrap();
+    assert!(error.is_none(), "{error:?}");
+    assert!(exact_linux::agent::handle(&mut first, "{\"op\":\"tree\"}").contains("selected"));
+
+    let second = Client::open_at(&dir, &dir, UPDATE_COMPAT, &baked, Some(ORIGIN)).unwrap();
+    let mut second = selected_config(&dir, &baked, second);
+    let (mut second, error) = boot_presenter::<Named>(&mut second, (390.0, 844.0)).unwrap();
+    assert!(error.is_none(), "{error:?}");
+    assert!(exact_linux::agent::handle(&mut second, "{\"op\":\"tree\"}").contains("selected"));
+    let delivery = second.host().runner().delivery();
+    assert_eq!(delivery.stream, "prod/fixture00000000");
+    assert_eq!(delivery.seq, 1);
+    drop((first, second));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_selected_image_loads_from_its_verified_generation() {
     let baked = contract::compile("component App\n  view\n    text \"baked\"\n")

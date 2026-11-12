@@ -93,7 +93,7 @@ export function commit(tail, queue, inflight, after) {
   // take the focus from the pressed control.
   const deferred = () => {
     const held = hold(), run = () => { run.ran = true; return within(held, tail); };
-    run.release = () => held?.release();
+    run.release = () => { held?.release(); tail.unrun?.(); };
     return run;
   };
   if (pending) { pending.push(deferred()); return true; }

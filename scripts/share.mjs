@@ -65,6 +65,18 @@ export function plan(record, { branch, source, newLink = false, force = false })
   return { action: 'update', ...link };
 }
 
+/** Why `share` cannot build `manifest`'s app, or null. A tester's build starts the app's own update stream when it
+ *  has an update store, and a production build with an update store needs a key to verify what it takes
+ *  (bake/src/compat.rs): an app with neither keys nor `deploy.store.ios: "0"` would fail minutes into the build. */
+export function unsignedStore(manifest) {
+  const keys = manifest.deploy?.signing?.keys;
+  if (manifest.deploy?.store?.ios === '0' || (keys && typeof keys === 'object' && Object.keys(keys).length)) return null;
+  return 'share: this app takes over-the-air updates on iPhone (it says nothing of deploy.store.ios), and a shared '
+    + 'build of one needs a key to verify them, which app.json does not name. For a build that takes no updates, add '
+    + '"deploy": { "store": { "ios": "0" } } to app.json; to keep updates, name a verification key in '
+    + 'deploy.signing.keys.';
+}
+
 /** The refusal for a link another branch published, as the agent reads it. */
 export const mismatch = (p, branch) => `This app's AppDrop link, ${p.url}, was last shared from ${p.from}; this checkout is on ${branch}. `
   + `Pass --new-link to give ${branch} its own link, or --force to publish over ${p.from}'s.`;
@@ -92,6 +104,9 @@ async function main(argv) {
     console.log(json ? JSON.stringify({ url: step.url, revision: step.revision, branch, action: 'current' }) : step.url);
     return 0;
   }
+
+  const unsigned = unsignedStore(app.manifest);
+  if (unsigned) return fail('update_keys_missing', unsigned);
 
   // AppDrop refuses a build number it already published: the next one is its revision + 1.
   let revision = 0;

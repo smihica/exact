@@ -43,6 +43,7 @@ struct Seen {
 struct Picture {
     paint: Presentation,
     boxes: Vec<PaintedBox>,
+    page: (f32, f32),
     witness: Witness,
     /// The runner it was painted for (`rangeFrame`'s reader).
     session: u64,
@@ -56,7 +57,7 @@ pub(crate) struct SubmittedFrame {
     identity: Rc<Identity>,
     picture: RefCell<Option<Picture>>,
 }
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 impl SubmittedFrame {
     pub(crate) fn fixture(value: u8) -> Self {
         let mut pixels = Pixmap::new(1, 1).unwrap();
@@ -80,6 +81,8 @@ pub(crate) struct State {
     rendering: bool,
     pending: Option<Rc<Identity>>,
     acknowledged: Option<Witness>,
+    /// Menu geometry retained while the acknowledged boxes are out for painting.
+    pub(crate) menu: Option<crate::paint::control::MenuPaint>,
 }
 impl State {
     pub(super) fn blocked(&self) -> bool {
@@ -203,12 +206,15 @@ impl<D: DataSource> Presenter<D> {
         // Keep A's owners alive for replay/failure during B's paint; swapping
         // afterward moves B into its receipt, without deep-copying any payload.
         let old_paint = self.brush.presentation();
+        self.display.menu = self.menu_paint();
         let old_boxes = std::mem::take(&mut self.boxes);
+        let old_page = self.boxes_page;
         let old_shown = self.ranges.shown.get();
         self.boxes_serial += 1;
         self.display.active = true;
         self.display.rendering = true;
         let pixels = self.frame();
+        self.display.menu = None;
         self.display.rendering = false;
         let identity = Rc::new(Identity {
             origin: self.display.origin.clone(),
@@ -249,12 +255,27 @@ impl<D: DataSource> Presenter<D> {
                     if n.node_type == NodeType::Svg {
                         witness_svg(kernel, &n, &mut witness);
                     }
+                    // Inline descendants have no boxes of their own; their
+                    // identities were captured with the painted paragraph.
+                    if let Some(paragraph) = self.brush.inline_text.get(&b.id) {
+                        for id in paragraph.views() {
+                            if let Some(node) = kernel.node(id) {
+                                witness.nodes.entry(id).or_insert(Seen {
+                                    key: node.key,
+                                    parent: node.parent,
+                                    scroll_parent: self.geometry_parent(id),
+                                    scroll: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
         let picture = Picture {
             paint: self.brush.replace_presentation(old_paint),
             boxes: std::mem::replace(&mut self.boxes, old_boxes),
+            page: std::mem::replace(&mut self.boxes_page, old_page),
             witness,
             session: self.ranges.session(),
         };
@@ -288,6 +309,7 @@ impl<D: DataSource> Presenter<D> {
                 let model_scroll = std::mem::take(&mut picture.witness.model_scroll);
                 self.brush.replace_presentation(picture.paint);
                 self.boxes = picture.boxes;
+                self.boxes_page = picture.page;
                 self.boxes_serial += 1;
                 self.ranges.shown.set(picture.session);
                 self.publish_ranges();
@@ -318,11 +340,22 @@ impl<D: DataSource> Presenter<D> {
         self.display.pending = None;
         if Rc::ptr_eq(&self.display.origin, &frame.identity.origin)
             && frame.identity.activatable
-            && !self.activation_failed
+            && self.activation_failed.is_none()
         {
             self.activate_first_pixel();
         }
         true
+    }
+
+    /// The data module did not activate: a failure line (LLP 1142 D4), in the
+    /// journal and, while the runner measures, on stderr (logcat on Android)
+    /// now, as a failed request's is; `clock data` answers it.
+    fn activation_refused(&mut self, error: String) {
+        self.host.runner_mut().alert(error.clone());
+        for line in self.host.runner().take_alerts() {
+            eprintln!("exact: {line}");
+        }
+        self.activation_failed = Some(error);
     }
 
     pub(super) fn activate_first_pixel(&mut self) {
@@ -331,14 +364,12 @@ impl<D: DataSource> Presenter<D> {
         match self.host.activate_data() {
             Ok(true) => {
                 if let Some(error) = self.after_commit() {
-                    self.activation_failed = true;
-                    self.host.log(error);
+                    self.activation_refused(error);
                     return;
                 }
             }
             Err(error) => {
-                self.activation_failed = true;
-                self.host.log(error);
+                self.activation_refused(error);
                 return;
             }
             Ok(false) if self.host.data_pending() => return,

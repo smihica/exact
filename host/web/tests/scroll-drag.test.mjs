@@ -4,10 +4,8 @@
 // offset grows. The function is read from the source and run against stand-in
 // listeners and events, each with the timeStamp the browser would give it.
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
 
-const navigation = readFileSync(new URL('../navigation.js', import.meta.url), 'utf8');
-const scrollDrag = new Function(`${navigation.match(/^export (function scrollDrag\(el, listen, began, ended\) \{.*?\}) \/\//m)[1]}; return scrollDrag;`)();
+import { scrollDrag } from '../navigation/scroll.js';
 
 const scroller = () => {
   const el = { scrollLeft: 0, scrollTop: 0 }, heard = {}, said = [], options = [];

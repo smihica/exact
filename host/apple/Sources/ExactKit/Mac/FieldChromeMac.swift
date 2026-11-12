@@ -140,7 +140,7 @@ extension TextEngine {
         let id = platformControlID ?? UInt16((catalog.keys.max() ?? 7) + 1)
         platformControlID = id; platformControlFont = font
         platformControlName = (font.familyName ?? font.fontName).data(using: .utf8)! as NSData
-        fonts.removeAll(keepingCapacity: true)
+        clearFonts()
         return id
     }
     func controlFont(size: CGFloat, weight: Int, family: Int, italic: Bool) -> NSFont? {
@@ -148,16 +148,14 @@ extension TextEngine {
         let key = "control/\(family)/\(size)/\(weight)/\(italic)"
         if let font = fonts[key] { return font }
         if size == base.pointSize, weight == Self.controlWeight(base), italic == base.fontDescriptor.symbolicTraits.contains(.italic) {
-            fonts[key] = base
-            return base
+            return cacheFont(base, for: key)
         }
         let font = TextEngine.cssWeight(weight, size: size) { stop in
             var descriptor = base.fontDescriptor.addingAttributes([.traits: [NSFontDescriptor.TraitKey.weight: TextEngine.namedWeight(stop).rawValue]])
             if italic { descriptor = descriptor.withSymbolicTraits(descriptor.symbolicTraits.union(.italic)) }
             return NSFont(descriptor: descriptor, size: size) ?? self.font(size: size, weight: stop, family: 0, italic: italic)
         }
-        fonts[key] = font
-        return font
+        return cacheFont(font, for: key)
     }
     static func controlWeight(_ font: NSFont) -> Int {
         if let weight = TextEngine.cssWeight(of: font) { return weight }

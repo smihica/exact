@@ -671,7 +671,7 @@ impl<D: DataSource> Host<D> {
                 }
             }
         }
-        Self::stage_native_paragraphs(&candidate.nodes, &mut staged);
+        self.stage_native_paragraphs(&candidate.nodes, &mut staged);
         // Styles intentionally omit the four native presentation rows. Sample
         // this qualified current key at promotion so newly created controls get
         // their real opacity/transform too; do not reconstruct from an old ID.

@@ -42,7 +42,8 @@ fn main() {
             contract::rust_entry(
                 "sparkline_data::Spark",
                 "sparkline_data::Spark",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

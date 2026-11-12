@@ -57,6 +57,13 @@ struct Formed {
     anon: Option<NodeId>,
 }
 
+/// The highest line a table's grid places a part at (Taffy's
+/// `grid_line_limit`, Exact's patch 70). A part's line is its row from 1, an
+/// `i16` ([`place`]), so each row to `i16::MAX` has a track of its own, as in
+/// Chrome. An authored grid keeps the engine's 10,000, past which its values
+/// are refused (LLP 1001 §1).
+const LINES: u16 = i16::MAX as u16;
+
 /// The engine style of an anonymous table (CSS 2.2 §17.2.1): a grid of
 /// `columns` `auto` tracks, shrink-to-fit, spaced as HTML's UA sheet
 /// spaces a table's cells, or as the table's `border-spacing` does.
@@ -83,6 +90,7 @@ fn anonymous(
     };
     let track = GridTemplateComponent::Single(auto());
     s.rare.grid_template_columns = vec![track; columns as usize];
+    s.rare.grid_line_limit = LINES;
     s
 }
 
@@ -159,6 +167,7 @@ impl Tables {
                     if laid {
                         let track = GridTemplateComponent::Single(auto());
                         s.rare.grid_template_columns = vec![track; formed.columns as usize];
+                        s.rare.grid_line_limit = LINES;
                         if formed.padding.as_ref() != Some(&s.padding) {
                             self.stale.insert(slot);
                         }
@@ -441,7 +450,7 @@ impl LayoutTree {
         for slot in left.collect::<Vec<u32>>() {
             if let Some(node) = node_for(slot) {
                 let before = self.alert_prefixes.get(&slot).copied();
-                let ids = order::laid_out(arena, slot, &self.taffy, node, before, node_for);
+                let ids = order::laid_out(arena, slot, before, node_for);
                 self.set_children(node, &ids);
                 self.restyle_with(arena, slot, node);
             }

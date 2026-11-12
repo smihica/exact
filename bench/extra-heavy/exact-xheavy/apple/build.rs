@@ -33,7 +33,8 @@ fn main() {
             contract::rust_entry(
                 "exact_xheavy_data::XHeavy",
                 "exact_xheavy_data::XHeavy::default()",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

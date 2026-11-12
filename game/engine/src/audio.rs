@@ -4,7 +4,7 @@ use crate::{math, Component, Data, Entity, Resource, Vec3, World};
 use std::collections::BTreeMap;
 mod sound;
 mod spatial;
-pub use sound::{Fade, Sample, Sound};
+pub use sound::{Fade, Playback, Sample, Sound};
 pub use spatial::{DistanceModel, Spatial};
 
 /// Oscillator shape. Noise uses a fixed local integer stream, never the world's RNG.
@@ -307,8 +307,12 @@ pub struct Voice {
     pub at: At,
     /// Per-play gain.
     pub gain: f32,
-    /// Playback rate, saved with the voice.
+    /// Playback rate. Raw writes take effect at the next `audio::step` boundary.
     pub pitch: f32,
+    // The public field may change before housekeeping checkpoints elapsed time.
+    pub(crate) integrated_pitch: f32,
+    /// Progress checkpoint, present only after a live pitch change.
+    pub playback: Option<Playback>,
     /// Last observed world position, retained after despawn.
     pub position: Option<Vec3>,
     /// Definition at play time; edits affect subsequent plays. Saved as `synth`.
@@ -327,9 +331,24 @@ pub struct Voice {
     pub spatial: Option<Spatial>,
 }
 impl Voice {
+    fn source_end(&self, now: u64, hz: u32) -> u64 {
+        if self.looping() {
+            return u64::MAX;
+        }
+        let rate = self.integrated_pitch;
+        // Preserve the builder's f32 expression before subtracting elapsed ticks.
+        let left = ((self.definition.duration() - self.offset) / rate * hz as f32) as f64
+            - self.playback_ticks(now) / rate as f64;
+        now.saturating_add(math::ceil(left.max(0.0) as f32) as u64)
+    }
     /// Whether this voice repeats its definition.
     pub fn looping(&self) -> bool {
         self.definition.looping()
+    }
+    /// Source progress in rate-weighted ticks, excluding the authored offset.
+    pub fn playback_ticks(&self, tick: u64) -> f64 {
+        let (at, progress) = self.playback.map_or((self.began, 0.0), |p| (p.at, p.ticks));
+        progress + tick.saturating_sub(at) as f64 * self.integrated_pitch as f64
     }
     /// Gain multiplier from its fade at a world tick.
     pub fn fade_at(&self, tick: u64) -> f32 {
@@ -510,6 +529,52 @@ pub fn fade(world: &mut World, id: VoiceId, seconds: f32) {
         ));
     }
 }
+/// Set a playing voice's rate at this tick boundary, bounded like `Play::pitch`.
+/// Outputs smooth changes over about 10 ms; simulation progress uses the tick's rate.
+/// Missing and finished voices are unchanged. Call each tick to follow a gesture.
+/// @ref LLP 1046.003 (game audio)
+pub fn pitch(world: &mut World, id: VoiceId, rate: f32) {
+    if !world.has_audio() {
+        return;
+    }
+    let now = world.audio_boundary();
+    let rate = playback_rate(rate);
+    let mut voices = world.resource_mut::<Voices>();
+    let Some(voice) = voices
+        .voices
+        .iter_mut()
+        .find(|v| v.id == id && v.ends > now)
+    else {
+        return;
+    };
+    voice.retarget(now, world.hz(), rate);
+}
+impl Voice {
+    fn retarget(&mut self, now: u64, hz: u32, rate: f32) {
+        let rate = playback_rate(rate);
+        self.pitch = rate;
+        if self.integrated_pitch == rate {
+            return;
+        }
+        self.playback = Some(Playback {
+            at: now,
+            ticks: self.playback_ticks(now),
+        });
+        self.integrated_pitch = rate;
+        self.ends = self.source_end(now, hz);
+        if let Some(fade) = self.fade.filter(|f| f.end == 0.0) {
+            self.ends = self.ends.min(fade.to);
+        }
+    }
+}
+
+fn playback_rate(rate: f32) -> f32 {
+    if rate.is_finite() {
+        rate.clamp(0.01, 16.0)
+    } else {
+        1.0
+    }
+}
 /// The ears. audio::step refuses extra listeners, keeping the lowest entity index.
 #[derive(Component, Default, Clone)]
 pub struct AudioListener;
@@ -583,6 +648,8 @@ impl World {
                 at: At::Ui,
                 gain: 1.0,
                 pitch: 1.0,
+                integrated_pitch: 1.0,
+                playback: None,
                 position: None,
                 definition,
                 began: self.audio_boundary(),
@@ -639,11 +706,7 @@ impl Play<'_> {
     }
     /// Playback rate (1 is authored pitch), bounded to 0.01..16.
     pub fn pitch(mut self, rate: f32) -> Self {
-        self.voice.pitch = if rate.is_finite() {
-            rate.clamp(0.01, 16.0)
-        } else {
-            1.0
-        };
+        self.voice.pitch = playback_rate(rate);
         self
     }
     /// Balance from -1 (left only) through 0 (unchanged) to 1 (right only).
@@ -686,14 +749,8 @@ impl Play<'_> {
     /// Commit now and return the voice handle.
     pub fn start(self) -> VoiceId {
         let mut voice = self.voice;
-        voice.ends = if voice.looping() {
-            u64::MAX
-        } else {
-            let remaining = voice.definition.duration() - voice.offset;
-            voice
-                .began
-                .saturating_add(math::ceil(remaining / voice.pitch * self.world.hz() as f32) as u64)
-        };
+        voice.integrated_pitch = voice.pitch;
+        voice.ends = voice.source_end(voice.began, self.world.hz());
         let mut voices = self.world.resource_mut::<Voices>();
         voice.id = voices.next_id;
         voices.next_id = voices.next_id.checked_add(1).expect("voice ids exhausted");
@@ -750,10 +807,12 @@ pub fn step(world: &mut World) {
         return;
     }
     let tick = world.audio_boundary();
-    world
-        .resource_mut::<Voices>()
-        .voices
-        .retain(|v| v.ends > tick);
+    world.resource_mut::<Voices>().voices.retain_mut(|v| {
+        if v.ends > tick {
+            v.retarget(tick, world.hz(), v.pitch);
+        }
+        v.ends > tick
+    });
     for voice in &mut world.resource_mut::<Voices>().voices {
         if let At::Entity(e) = voice.at {
             if let Some(pose) = world.global(e) {

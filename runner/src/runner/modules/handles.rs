@@ -38,8 +38,8 @@ pub(super) struct Provisional {
 /// The requests let go and not yet run whose replies are still watched for.
 const UNRUN: usize = 64;
 
-/// Replies that carried handles, as they left the implementation: each
-/// request's ticket, the extension and the ids.
+/// Completed replies, as they left the implementation: each request's
+/// ticket, the extension and any handle ids.
 pub(super) type Arrived = Arc<Mutex<Vec<(u64, String, Vec<String>)>>>;
 
 impl<D: DataSource> Runner<D> {
@@ -131,8 +131,13 @@ impl<D: DataSource> Runner<D> {
     pub(super) fn watched(&self, body: Vec<u8>, ticket: u64) -> Dispatch {
         let source = &self.extensions.provisional[&ticket].source;
         let row = self.module_row(source);
-        let extension = self.plan.str(row.extension).to_owned();
-        let paths: Vec<String> = (self.substitute(&row)["handles"].as_object())
+        let sent: Json = serde_json::from_slice(&body).unwrap_or_default();
+        let implementation = self
+            .member_forward(&row, &sent["args"])
+            .map(|(_, member)| member)
+            .unwrap_or_else(|| row.clone());
+        let extension = self.plan.str(implementation.extension).to_owned();
+        let paths: Vec<String> = (self.substitute(&implementation)["handles"].as_object())
             .map(|h| h.keys().cloned().collect())
             .unwrap_or_default();
         let (handler, arrived, native) = (
@@ -141,7 +146,6 @@ impl<D: DataSource> Runner<D> {
             self.native_slot(),
         );
         // The handlers its call listed, for the handles it carries (`invoke.rs`).
-        let sent: Json = serde_json::from_slice(&body).unwrap_or_default();
         let (grant, granted) = (self.handler_grant(&row, &sent), self.granted());
         Dispatch::Run(Work::Later(Box::new(move |reply| {
             let watched = Reply::new(move |outcome: Outcome| {
@@ -149,12 +153,10 @@ impl<D: DataSource> Runner<D> {
                 if let Some(grant) = &grant {
                     super::invoke::grant_handles(&granted, &ids, grant);
                 }
-                if !ids.is_empty() {
-                    let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
-                    arrived.push((ticket, extension, ids));
-                    drop(arrived);
-                    native.changed("");
-                }
+                let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
+                arrived.push((ticket, extension, ids));
+                drop(arrived);
+                native.changed("");
                 reply.send(outcome);
             });
             match handler {
@@ -209,6 +211,9 @@ impl<D: DataSource> Runner<D> {
     /// implementation disposes of them.
     pub(in crate::runner) fn dispose(&mut self, handles: (String, Vec<String>), why: &str) {
         let (extension, ids) = handles;
+        if ids.is_empty() {
+            return;
+        }
         self.log(format!("dispose {extension} {}: {why}", ids.join(", ")));
         if let Some(handler) = self.native_slot().handler() {
             let body = json!({ "extension": extension, "dispose": ids });

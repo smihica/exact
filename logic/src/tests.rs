@@ -2,6 +2,7 @@ use super::*;
 use exact_plan::bytes::Writer;
 use exact_runner::Dispatch;
 use serde_json::json;
+use std::sync::Arc;
 
 struct Fixture;
 impl DataSource for Fixture {
@@ -20,9 +21,45 @@ impl DataSource for Fixture {
             None => Dispatch::Missing,
         }
     }
+    fn host_continuation(&self, token: u64) -> bool {
+        token == 7
+    }
+    fn keeps_sent(&self, fetch: u64) -> bool {
+        fetch == 9
+    }
+    fn module_delivery(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<Option<exact_runner::Request>, DataError> {
+        let Outcome::Response(response) = outcome else {
+            panic!("a kept reply")
+        };
+        store.set_durable("token", std::str::from_utf8(&response.body).unwrap())?;
+        Ok(Some(exact_runner::Request::continuation(token + 1)))
+    }
 }
 
 crate::configured!(ConfiguredFixture, Fixture, || Swappable::off(Fixture));
+
+#[test]
+fn configured_entry_preserves_a_kept_delivery_continuation() {
+    let mut source = ConfiguredFixture::default();
+    let mut store = Store::new(source.grants(), []);
+    let outcome = Outcome::Response(exact_runner::Response {
+        status: 200,
+        headers: vec![],
+        body: b"renewed".to_vec(),
+    });
+    let request = source
+        .module_delivery(&mut store, 7, outcome)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.continuation, Some(8));
+    assert_eq!(store.get("token"), Some("renewed"));
+    assert!(store.take_writes()[0].durable);
+}
 
 #[test]
 fn configured_embedded_executor_preserves_browser_continuation_routing() {
@@ -35,6 +72,60 @@ fn configured_embedded_executor_preserves_browser_continuation_routing() {
     ));
     assert_eq!(source.placement(), exact_runner::Placement::Main);
 }
+
+#[test]
+fn configured_entry_preserves_host_continuations_and_kept_fetches() {
+    let source = ConfiguredFixture::default();
+    assert!(source.host_continuation(7));
+    assert!(!source.host_continuation(8));
+    assert!(source.keeps_sent(9));
+    assert!(!source.keeps_sent(10));
+}
+
+#[test]
+fn configured_entry_passes_the_shared_secret_backend_and_configuration_errors() {
+    #[derive(Default)]
+    struct Source(Option<Arc<dyn exact_runner::SharedSecrets>>);
+    impl DataSource for Source {
+        fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+            Ok(Value::Bool(self.0.is_some()))
+        }
+        fn configure_secrets(
+            &mut self,
+            secrets: Arc<dyn exact_runner::SharedSecrets>,
+        ) -> Result<(), DataError> {
+            if self.0.is_some() {
+                return Err(DataError::Unavailable("already configured".into()));
+            }
+            self.0 = Some(secrets);
+            Ok(())
+        }
+    }
+    struct Secrets;
+    impl exact_runner::SharedSecrets for Secrets {
+        fn acquire(
+            &self,
+            _: &str,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> Box<dyn exact_runner::SecretWait> {
+            panic!("configuration must not acquire a secret")
+        }
+    }
+    crate::configured!(Entry, Source, || Swappable::off(Source::default()));
+    let mut source = Entry::default();
+    let secrets: Arc<dyn exact_runner::SharedSecrets> = Arc::new(Secrets);
+    source.configure_secrets(secrets.clone()).unwrap();
+    assert_eq!(source.query("configured", &[]).unwrap(), Value::Bool(true));
+    assert!(Arc::ptr_eq(
+        source.0.embedded.as_ref().unwrap().0.as_ref().unwrap(),
+        &secrets,
+    ));
+    assert!(matches!(
+        source.configure_secrets(secrets),
+        Err(DataError::Unavailable(message)) if message == "already configured"
+    ));
+}
+
 fn encoded(op: u8, f: impl FnOnce(&mut Writer)) -> Vec<u8> {
     let mut w = Writer::default();
     w.u32(abi::ABI);
@@ -60,6 +151,10 @@ pub(crate) fn wasm_with_contract(call: &str, stateless: bool) -> Vec<u8> {
         w.string("token");
         w.u8(1);
         w.string("new");
+        // No socket operation, no overload (LLP 1016.003 D5).
+        w.u32(0);
+        w.u8(0);
+        w.string("");
         w.u8(0);
         Value::Number(42.).encode(w)
     });
@@ -238,6 +333,44 @@ fn wasm_fuel_memory_imports_and_export_bounds_are_enforced() {
     let excessive = wasm("i32.const 0 global.set $out i32.const 0 global.set $len");
     let mut executor = crate::wasm::load(&excessive).unwrap();
     assert!(executor.call(&vec![0; abi::MAX_MESSAGE + 1]).is_err());
+}
+
+// A trap leaves the instance's memory as the call left it. The module keeps
+// the pages in use at address 1024: "x" needs 600 free pages above them,
+// "leaky" takes 300 and traps before it frees them. Of the 1,024 pages the
+// executor allows, one instance runs out on the second round.
+#[test]
+fn a_call_after_a_trap_runs_in_a_fresh_instance() {
+    let store = Store::new("secret.keep token", []);
+    let good = abi::call_request(&store, "x", &[], None).unwrap().len();
+    let used = "i32.const 1024 i32.load";
+    let reach = |pages: u32| {
+        format!(
+            "(block $done (loop $grow memory.size {used} i32.const {pages} i32.add \
+            i32.ge_u br_if $done i32.const 1 memory.grow drop br $grow))"
+        )
+    };
+    let module = wasm(&format!(
+        "local.get 2 i32.const {good} i32.gt_u
+        if {} i32.const 1024 {used} i32.const 300 i32.add i32.store unreachable end
+        {}",
+        reach(301),
+        reach(601),
+    ));
+    let plan = plan();
+    let mut candidate = Swappable::wasm(Fixture)
+        .replacement(&plan, &receipt(&plan, &module), module)
+        .unwrap();
+    candidate.activate().unwrap();
+    for _ in 0..3 {
+        assert_eq!(candidate.query("x", &[]).unwrap(), Value::Number(42.));
+        let trapped = candidate.query("leaky", &[]).unwrap_err();
+        assert!(
+            matches!(&trapped, DataError::Interface(e) if e.contains("unreachable")),
+            "{trapped:?}"
+        );
+        assert_eq!(candidate.query("x", &[]).unwrap(), Value::Number(42.));
+    }
 }
 
 // This crate's dev-dependencies compile wasmi's `simd` and `memory64` in, as

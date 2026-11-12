@@ -61,8 +61,9 @@ embedding stale when it is added.
 **Differential testing.** For each case, `difftest` compiles the program to a
 plan and boots it on the runner, delivers the script's events, and prints a
 canonical observation after every step: the outcome, the commits attempted, every root slot, derive
-and resource, the commands issued to a host (not `setMode`, which the
-runner takes and applies itself: `hostCommands`), and the text of every
+and resource, the commands issued to a host (`hostCommands` leaves out
+`setMode` and the seven-argument list-row form of `scrollIntoView`, which
+the runner consumes itself; the element form stays), and the text of every
 element with a `testId`. Then it emits the program with the Lean backend, and runs many cases
 in one generated Lean module whose `main` prints `Contract.Observe.run` for
 each. The two texts must match line for line. Data sources are a seeded oracle
@@ -494,8 +495,9 @@ runner never made is noted (`# js: the oracle has no answer…`) and shows as
 the refusal it causes. It prints `Contract.Observe`'s format from the
 module's own state (names.js) and the DOM: a `testId`'s text is a text's,
 an inline run's, an option's or an SVG text's, as `agent.js` reads them.
-A tap goes to the element's `press` listener and a `type` to its `change`;
-an element without one is refused, as the runner refuses (NoHandler), and so
+A tap goes to the element's `press` listener. A `type` prefers its `input`
+listener, falling back to `change`. An element without the listener is
+refused, as the runner refuses (NoHandler), and so
 is a value a browser could not deliver (a select's unknown or disabled
 option, a checkbox's text, a date outside HTML's format or its bounds).
 A press on a disabled control is outside the JS comparison: the runner's
@@ -532,6 +534,8 @@ source as it is.
    and that it is not refused (geometry reads are outside the semantics,
    below). From then on `difftest apps`, in the
    async lane, fails when the source moves and the embedding did not.
+   After editing an app or its imports, regenerate the embeddings and run
+   `lake build Apps` in `semantics/` to recheck their proofs.
 2. **State.** Write the property in `Apps/Proofs/<Module>.lean` over the
    embedding: of every reachable configuration (`Reachable <name> c`), of
    every event from any configuration (`Event.step`), or of one committed
@@ -651,8 +655,9 @@ by that loop over the bound list, then the call.
 for each generated program it takes the plan `contract::compile` made, and
 in one Lean process per batch decodes every derive, root slot initializer,
 resource argument and action body, runs it on the VM model in every
-configuration the semantics reaches along the script (actions with sample
-arguments, inside a row instance) and compares the result with `eval`'s (or
+configuration the semantics reaches along the script, including after
+landings of mutation continuations and queued sends (actions with sample
+arguments, inside a row instance), and compares the result with `eval`'s (or
 `exec`'s effects); and compares the body with `Contract.Lower`'s,
 instruction for instruction. A divergence or an undecodable body fails the
 run and keeps the program under `target/difftest/failures/`; a structural
@@ -703,15 +708,17 @@ to those resources.
 **The expander** (`Contract.Expand`) transcribes inline.rs and its
 submodules step for step, numbering and spelling included: capture-avoiding
 substitution renaming a binder `x@k` when a replacement mentions it, view
-binders `x#n`, derive resolution (freshened binders `x@bk`, a dependency
-read twice on every path bound once by a `let`), lifted states and actions
-`x#n` with their owners, a slot's fill inlined afresh at each `children`
-node under that node's region arms, props and injects captured as hidden
+binders `x#viewN` (0 for the root), derive resolution (freshened binders
+`x@bk`, a dependency read twice on every path bound once by a `let`), lifted
+states and actions `x#n` with their owners, a slot's fill inlined afresh at
+each `children` node under that node's region arms, props and injects captured as hidden
 parameters `@capture:n:i`, tail calls resolved (`p@ck`, `x@bk`, `p@tailk`; the
 `@check:` statement the flat embedding drops is not emitted). Device resources
 are hoisted once per declaration, including unused components, in file order.
 Their value reads and refresh targets are renamed; same-named function calls
-keep their heads.
+keep their heads. Style names, surface names and positional syntax words stay
+unchanged; only a conditional `class`'s condition and a surface's arguments
+are substituted.
 
 **`difftest expansion`** checks the real expander on each program:
 
@@ -731,16 +738,17 @@ argument's hidden parameter, `?` in both expansions until the checker types
 it from its handler, need only be at least the expansion's, `Ty.le`); (b) the
 component-level semantics of the unexpanded file against the flat
 semantics of Rust's expansion over the case's script, the oracle the
-runner's transcript, every observation line compared but the slots the
-expansion lifts out of children (`slot name#n …`), which the
-component-level semantics keeps per instance. A disagreement is kept under
+runner's transcript. It compares outcomes and configurations, omitting commit
+traces (`ran …`), which the component-level semantics does not emit, and the
+slots the expansion lifts out of children (`slot name#n …`), which it keeps
+per instance. A disagreement is kept under
 `target/difftest/expansion/`, its script shrunk.
 
 **What is proved** (no `sorry`, no axioms beyond Lean's own):
 
 - `ExpandSubst.subst_iff`: the expander's substitution commutes with
   evaluation. For an expression of the fragment (`Plain`: no
-  `pending`/`failed`, no `sortBy` (not yet carried through these proofs;
+  `pending`/`failed`/`failure`/`current`, no `sortBy` (not yet carried through these proofs;
   `difftest expansion` checks it), callbacks of at most two parameters, no binder named
   like a call in its scope), a substitution whose replacements are
   callbacks of at most two parameters and never a callback, and no call
@@ -849,7 +857,9 @@ All without `sorry` or axioms beyond Lean's own (`propext`,
   component scope without the states lifted from children (`lifted`: late
   or arm-owned), whose names (`x#N`) the root's source cannot write;
   `pending(x)`/`failed(x)` name a resource in scope (the checker's
-  `scope.lookup`), so a root initializer cannot ask after one.
+  `scope.lookup`), so a root initializer cannot ask after one;
+  `current(x)` names a resource, never a mutation; a resource's `when` is
+  typed where its arguments are, and a resource over a list has none.
 - `reachable_slotsOK` and `reachable_valTy` (`TypeInvariant.lean`, over
   `Contract.Reachable`): in every configuration a well-typed program
   reaches, each root slot is a state or mutation holding a value of its
@@ -1033,6 +1043,34 @@ What it does not carry, as restrictions:
   mutation's, whose answers an advance lands (`QUEUE.md`).
 - The component-level semantics (`Contract.CompSem`) refuses both, so
   `difftest expansion` writes and reads programs without them.
+
+## Whether an answer is current, and a resource's `when` (LLP 1161.001, 1161.002)
+
+A resource may carry a gate (`ResourceDecl.gate`, `resource r = s(args)
+when cond`). `settle` reads it before the arguments (`gateOpen`; a value
+other than `true` closes it, as the runner reads it). Closed, the resource
+is idle: its arguments are not read, nothing is asked even when the commit
+refreshes it, it keeps its previous value (`idleValue`; before any value,
+its type's zero, `zeroOf`), it has no `Settled.args` entry, and its name is
+in `Settled.idle`. With no arguments kept, the settlement that opens the
+gate asks again, at the same arguments or new ones. `current(r)` reads
+`Env.idle`: every settled answer here answers its arguments, so it is true
+unless `r` is idle; the VM reads the runner's flag (`Vm.Env.currentResources`,
+`CurrentResource`), and the lowering proof takes the two to agree (`RefOk`).
+The corpus has `resources/current` and `resources/gate`.
+
+What it does not carry:
+
+- A placeholder: a resource idle before its first answer holds its type's
+  zero, where the runner shows its `else`. A program that gates a resource
+  with an `else` placeholder disagrees until the first answer, and a string
+  enum's zero here is `""` (the embedding types an enum `string`) where the
+  runner's is its first member.
+- A request in flight when the gate closes, an upload's or a stream's, and
+  the window between waking and the forced ask's answer, when the runner's
+  `current` is false: answers here are synchronous. The runner's tests
+  (`contract/cli/tests/it/when.rs`, `current.rs`) and the conformance plan
+  (`host/web-js/conformance/gate.contract`) check these.
 
 ## Persisted state (LLP 1116 D5)
 

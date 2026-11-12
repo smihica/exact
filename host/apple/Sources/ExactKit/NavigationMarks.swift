@@ -17,9 +17,9 @@ final class NavigationMarks: NSObject {
     static let shared = NavigationMarks()
     /// The last input's timestamp, in seconds on the `CACurrentMediaTime` clock.
     private var lastInput: Double?
-    private var seen: [ObjectIdentifier: Set<UInt64>] = [:]
-    private var launched: Set<ObjectIdentifier> = []
     private var pending: Pending?
+    /// An evaluation is queued: one per turn, as each reads the ledger on the owner.
+    private var evaluateScheduled = false
     private(set) var link: CADisplayLink?
     private var deadline: DispatchWorkItem?
     /// Recent measurements for `state.observe`, newest last.
@@ -84,19 +84,19 @@ final class NavigationMarks: NSObject {
 
     func routerChanged(_ session: ExactSession, payload: [String: Any]) {
         guard let top = (payload["top"] as? NSNumber)?.uint64Value else { return }
-        let key = ObjectIdentifier(session)
         let now = CACurrentMediaTime()
         var fields: [String: Any] = ["route": payload["pattern"] as? String ?? "", "url": payload["url"] as? String ?? "",
                                      "routeParams": payload["params"] as? [String: Any] ?? [:]]
-        let cold = seen[key, default: []].insert(top).inserted
         // The first route is the launch route, which startup metrics cover.
-        if launched.insert(key).inserted {
+        if session.seenNavigationEntries == nil {
+            session.seenNavigationEntries = [top]
             fields["entry"] = Int(top)
             ExactJournal.shared.record("navigation.launch", fields)
             note("launch \(fields["route"] ?? "")")
             return
         }
-        for removed in payload["removed"] as? [NSNumber] ?? [] { seen[key]?.remove(removed.uint64Value) }
+        let cold = session.seenNavigationEntries?.insert(top).inserted == true
+        for removed in payload["removed"] as? [NSNumber] ?? [] { session.seenNavigationEntries?.remove(removed.uint64Value) }
         let start: Double
         if let input = lastInput, input <= now, now - input <= 1.0 {
             start = input
@@ -159,10 +159,15 @@ final class NavigationMarks: NSObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + ExactLaunch.ttiTimeout, execute: item)
     }
 
-    /// Re-checks outstanding work after a batch, once the change is shown.
-    func applied(_ session: ExactSession) {
-        guard let p = pending, p.session === session, p.presented != nil else { return }
-        DispatchQueue.main.async { [weak self] in self?.evaluate() }
+    /// Work ended (`ExactSession.workEnded`): re-checks outstanding work once
+    /// the change is shown.
+    func workEnded(_ session: ExactSession) {
+        guard let p = pending, p.session === session, p.presented != nil, !evaluateScheduled else { return }
+        evaluateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.evaluateScheduled = false
+            self?.evaluate()
+        }
     }
 
     private func stop() {
@@ -172,7 +177,7 @@ final class NavigationMarks: NSObject {
 
     @objc private func tick(_ link: CADisplayLink) {
         guard let p = pending, let ended = p.turnEnded, p.presented == nil, let g = Vsync(link).next(after: ended) else { return }
-        // Only the first frame needs a link; later batches re-check TTI
+        // Only the first frame needs a link; work that ends later re-checks TTI
         stop()
         p.presented = g
         var f = p.fields

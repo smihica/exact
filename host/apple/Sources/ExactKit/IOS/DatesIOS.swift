@@ -26,6 +26,16 @@ extension ControlHost {
     @objc func dateBegan(_ picker: UIDatePicker) {
         guard let owner = presenter.views[UInt32(picker.tag)] else { return }
         owner.focusForPress(target: owner)?.dispatched()
+        // What a tap requires once its own callback has run (`activate`):
+        // the focus handler may have replaced, detached or disabled the picker.
+        guard let picker = picker as? BoundDatePicker, picker.empty,
+              presenter.views[owner.id] === owner, controls[owner.id] === picker,
+              picker.window != nil, picker.isEnabled, !owner.disabled, !owner.inert,
+              let kind = kinds[owner.id] else { return }
+        // UIKit sends no valueChanged for a tap on the selected day. Accept
+        // the initial value on opening an empty picker, as Safari does.
+        picker.setDate(DateValue.initial(kind, minimum: picker.minimumDate, maximum: picker.maximumDate), animated: false)
+        dateChanged(picker)
     }
 
     func configureDate(_ picker: UIDatePicker, _ owner: NodeView) {
@@ -41,8 +51,7 @@ extension ControlHost {
         }
         let value = DateValue.parse(kind, bound)
         // No date is a state a picker cannot show: it is recorded, and read
-        // back as "" until a value is applied or chosen (b6 review B7; the
-        // Mac's `DateField.empty`).
+        // back as "" until a value is applied or the picker opens.
         (picker as? BoundDatePicker)?.empty = value == nil
         if let value, picker.date != value {
             picker.setDate(value, animated: false)
@@ -90,7 +99,7 @@ extension ControlHost {
 /// (Chrome's `mm/dd/yyyy`, or the locale's own) is a browser's empty field
 /// drawn on a control that has none. The pill is layers, not a view, so it
 /// takes no touch and no part in Auto Layout or the picker's measured size.
-/// Opening it starts at today, and only a choice commits it.
+/// Opening an empty picker accepts the wall clock's value within its bounds.
 final class BoundDatePicker: UIDatePicker {
     var applied: String?
     /// The author's `placeholder`, "" when there is none.

@@ -27,6 +27,15 @@ impl App {
         .unwrap();
         Self(path.canonicalize().unwrap())
     }
+    fn compile_for_rust(
+        &self,
+        body: &str,
+    ) -> Result<(exact_plan::Plan, std::collections::BTreeSet<String>), Vec<contract::CompileError>>
+    {
+        let path = self.0.join("app.contract");
+        std::fs::write(&path, format!("{HEAD}{body}")).unwrap();
+        contract::compile_path_for_rust(&path)
+    }
     fn compile(&self, body: &str) -> Result<exact_plan::Plan, Vec<contract::CompileError>> {
         let path = self.0.join("app.contract");
         std::fs::write(&path, format!("{HEAD}{body}")).unwrap();
@@ -621,6 +630,231 @@ fn a_synchronous_form_answers_from_the_substitute_until_its_module_is_bound() {
 }
 
 #[test]
+fn rust_shapes_exclude_module_call_records() {
+    let app = App::new("rust-shapes");
+    for body in [APP, "component App\n  view\n    text \"unused import\"\n"] {
+        let (plan, call_records) = app
+            .compile_for_rust(&format!(
+                "shape Local__options\n  position: GeolocationPosition\nshape getCurrentPosition__custom\n  value: number\n{body}"
+            ))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+        let rust = contract::rust(&plan, &call_records).unwrap();
+        for call in [
+            "getCurrentPosition",
+            "watchPosition",
+            "requestPreciseLocation",
+        ] {
+            for suffix in ["options", "apple", "android"] {
+                assert!(
+                    !rust.contains(&format!("/// Contract `shape {call}__{suffix}`.")),
+                    "{call}__{suffix}\n{rust}"
+                );
+            }
+        }
+        for name in [
+            "GeolocationPosition",
+            "GeolocationCoordinates",
+            "GeolocationStatus",
+            "LocalOptions",
+            "GetCurrentPositionCustom",
+        ] {
+            assert!(
+                rust.contains(&format!("pub struct {name} {{")),
+                "{name}\n{rust}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rust_shapes_preserve_scoped_names_that_look_like_call_records() {
+    let app = App::new("rust-scoped-options");
+    std::fs::write(
+        app.0.join("options.contract"),
+        "shape geolocationStatus\n  value: number\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.0.join("web.contract"),
+        "shape getCurrentPosition\n  value: number\n",
+    )
+    .unwrap();
+    let (plan, call_records) = app
+        .compile_for_rust(&format!(
+            "use geolocationStatus as StatusRow from \"./options.contract\"\nuse getCurrentPosition as PositionRow from \"./web.contract\"\n{APP}"
+        ))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+    let rust = contract::rust(&plan, &call_records).unwrap();
+    for (module, suffix, name) in [
+        ("geolocationStatus", "options", "GeolocationStatusOptions"),
+        ("getCurrentPosition", "web", "GetCurrentPositionWeb"),
+    ] {
+        assert!(plan.module_named(module).is_some());
+        let scoped = format!("{module}__{suffix}");
+        assert!(plan.types.iter().any(|row| plan.str(row.name) == scoped));
+        assert!(!call_records.contains(&scoped));
+        assert!(rust.contains(&format!("pub struct {name} {{")), "{rust}");
+    }
+    assert!(call_records.contains("getCurrentPosition__options"));
+    assert!(call_records.contains("getCurrentPosition__android"));
+    assert!(
+        !rust.contains("pub struct GetCurrentPositionOptions {"),
+        "{rust}"
+    );
+    assert!(
+        !rust.contains("pub struct GetCurrentPositionAndroid {"),
+        "{rust}"
+    );
+}
+
+#[test]
+fn rust_shapes_preserve_authored_module_option_records() {
+    let app = App::new("rust-authored-options");
+    let package = app.0.join("node_modules/@scratch/records");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"@scratch/records","exports":{".":"./exact.json"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("exact.json"),
+        r#"{
+  "kind": "interface", "name": "@scratch/records", "version": "1.0.0",
+  "shapes": {
+    "Fetch__input": {"value": "string"},
+    "Fetch__unused": {"count": "number"},
+    "Fetch__android": {"quality": "option<number>"},
+    "Envelope": {"input": "Fetch__input"}
+  },
+  "names": [{"source": "Fetch", "options": {
+    "input": "option<Fetch__input>", "unused": "option<Fetch__unused>",
+    "android": "option<Fetch__android>"
+  }, "answers": "Envelope"}]
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app.0.join("app.contract"),
+        "use Fetch, Envelope from \"@scratch/records\"\ncomponent App\n  resource result = Fetch() as shape Envelope\n  view\n    text result.input.value\n",
+    )
+    .unwrap();
+    let (plan, call_records) = contract::compile_path_for_rust(&app.0.join("app.contract"))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+    let rust = contract::rust(&plan, &call_records).unwrap();
+    for name in ["Envelope", "FetchInput", "FetchUnused", "FetchAndroid"] {
+        assert!(
+            rust.contains(&format!("pub struct {name} {{")),
+            "{name}\n{rust}"
+        );
+    }
+    assert!(rust.contains("pub input: FetchInput,"), "{rust}");
+    assert!(!rust.contains("pub struct FetchOptions {"), "{rust}");
+}
+
+#[test]
+fn rust_shapes_include_call_records_reached_from_authored_shapes() {
+    let app = App::new("rust-reached-options");
+    for ty in [
+        "getCurrentPosition__options",
+        "option<getCurrentPosition__options>[]",
+        "option<getCurrentPosition__apple>[]",
+    ] {
+        let (plan, call_records) = app
+            .compile_for_rust(&format!("shape Saved\n  options: {ty}\n{APP}"))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+        let rust = contract::rust(&plan, &call_records).unwrap();
+        assert!(rust.contains("pub struct Saved {"), "{rust}");
+        assert!(
+            rust.contains("pub struct GetCurrentPositionApple {"),
+            "{rust}"
+        );
+        let options = ty.contains("__options");
+        for name in ["GetCurrentPositionOptions", "GetCurrentPositionAndroid"] {
+            assert_eq!(
+                rust.contains(&format!("pub struct {name} {{")),
+                options,
+                "{rust}"
+            );
+        }
+        assert!(
+            !rust.contains("pub struct WatchPositionOptions {"),
+            "{rust}"
+        );
+        let collision = if options {
+            "GetCurrentPositionOptions"
+        } else {
+            "GetCurrentPositionApple"
+        };
+        let (plan, call_records) = app
+            .compile_for_rust(&format!(
+                "shape {collision}\n  unrelated: string\nshape Saved\n  options: {ty}\n{APP}"
+            ))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let error = contract::rust(&plan, &call_records).unwrap_err();
+        assert!(
+            error.contains(collision) && error.contains("both become Rust"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn rust_shapes_include_call_records_used_as_data_results() {
+    let app = App::new("rust-result-options");
+    let (plan, call_records) = app
+        .compile_for_rust(
+            "component App\n  resource options = loadOptions() as shape getCurrentPosition__options\n  view\n    text \"options\"\n",
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+    let rust = contract::rust(&plan, &call_records).unwrap();
+    for expected in [
+        "pub struct GetCurrentPositionOptions {",
+        "pub struct GetCurrentPositionApple {",
+        "pub struct GetCurrentPositionAndroid {",
+        "impl ContractValue for GetCurrentPositionOptions {",
+        "impl ::core::convert::From<&GetCurrentPositionOptions> for ::exact_runner::Value {",
+        "impl ::core::convert::TryFrom<&::exact_runner::Value> for GetCurrentPositionOptions {",
+    ] {
+        assert!(rust.contains(expected), "{expected}\n{rust}");
+    }
+    assert!(
+        !rust.contains("pub struct WatchPositionOptions {"),
+        "{rust}"
+    );
+}
+
+#[test]
+fn rust_shapes_include_call_records_used_as_data_parameters() {
+    let app = App::new("rust-parameter-options");
+    let (plan, call_records) = app
+        .compile_for_rust(
+            "component App\n  state options: option<getCurrentPosition__options>[] = []\n  resource saved = saveOptions(options) as shape bool\n  view\n    text \"options\"\n",
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let plan = exact_plan::Plan::decode(&plan.encode()).unwrap();
+    let rust = contract::rust(&plan, &call_records).unwrap();
+    for expected in [
+        "pub struct GetCurrentPositionOptions {",
+        "pub struct GetCurrentPositionApple {",
+        "pub struct GetCurrentPositionAndroid {",
+        "pub apple: ::core::option::Option<GetCurrentPositionApple>,",
+        "pub android: ::core::option::Option<GetCurrentPositionAndroid>,",
+    ] {
+        assert!(rust.contains(expected), "{expected}\n{rust}");
+    }
+    assert!(
+        !rust.contains("pub struct WatchPositionOptions {"),
+        "{rust}"
+    );
+}
+
+#[test]
 fn the_rust_binding_is_the_plans_modules_with_their_wire_names() {
     let app = App::new("rust");
     let plan = app.compile(APP).unwrap_or_else(|e| panic!("{e:?}"));
@@ -670,20 +904,23 @@ fn a_modules_shapes_may_take_names_rust_predefines() {
   "name": "@scratch/prelude",
   "version": "1.0.0",
   "shapes": {
+    "Input": {"value": "string"},
     "Option": {"values": "string[]", "result": "option<Result>"},
     "Result": {"items": "Vec[]", "mode": "enum<a|b>"},
     "Vec": {"first": "option<String>", "all": "String[]"},
     "String": {"count": "number", "flag": "bool"},
     "ModuleValue": {"inner": "option<Option>"}
   },
-  "names": [{"send": "fetch", "request": true, "options": {"limit": "option<number>"}, "answers": "ModuleValue"}]
+  "names": [{"send": "fetch", "request": true, "options": {"limit": "option<number>", "input": "option<Input>"}, "answers": "ModuleValue"}]
 }"#,
     )
     .unwrap();
     let source = "use fetch, ModuleValue from \"@scratch/prelude\"\ncomponent App\n  mutation got as shape ModuleValue\n  action go\n    send got = fetch(limit=3)\n  view\n    text \"x\"\n";
     std::fs::write(app.0.join("app.contract"), source).unwrap();
-    let (plan, _) = contract::compile_path_all(&app.0.join("app.contract"), false)
+    let (plan, call_records) = contract::compile_path_for_rust(&app.0.join("app.contract"))
         .unwrap_or_else(|e| panic!("{e:?}"));
+    let shapes = contract::rust(&plan, &call_records).unwrap();
+    assert!(shapes.contains("pub struct Input {"), "{shapes}");
     let rust = contract::module_rust(&plan).unwrap();
     for name in ["Option", "Result", "Vec", "String", "ModuleValue"] {
         assert!(

@@ -202,3 +202,44 @@ fn code_and_existing_links_are_left_alone() {
     assert!(linked[0].href.is_empty(), "a code span is code");
     assert_eq!(linked[1].href, "https://example.com");
 }
+
+/// A citation names a document three or four levels deep by its whole
+/// number: the longest prefix the corpus knows wins, and a sentence's final
+/// dot is never taken.
+#[test]
+fn a_deep_citation_links_the_document_it_names() {
+    let find = |n: &str| match n {
+        "1012.001" => Some("1012.001-agentic-usability-review.research.md".to_string()),
+        "1012.001.000" => Some("1012.001.000-trustworthy-agent-drives.rfc.md".to_string()),
+        "1053.000.000.001" => Some("1053.000.000.001-glass-morph.rfc.md".to_string()),
+        _ => None,
+    };
+    let runs = link_references(
+        vec![Run::text(
+            "A stale build (LLP 1012.001.000). See LLP 1053.000.000.001, LLP 1012.001.",
+        )],
+        &find,
+    );
+    let links: Vec<(&str, &str)> = runs
+        .iter()
+        .filter(|r| !r.href.is_empty())
+        .map(|r| (r.text.as_str(), r.href.as_str()))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (
+                "LLP 1012.001.000",
+                "1012.001.000-trustworthy-agent-drives.rfc.md"
+            ),
+            (
+                "LLP 1053.000.000.001",
+                "1053.000.000.001-glass-morph.rfc.md"
+            ),
+            (
+                "LLP 1012.001",
+                "1012.001-agentic-usability-review.research.md"
+            ),
+        ]
+    );
+}

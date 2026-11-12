@@ -867,6 +867,7 @@ impl ShapedSource {
             bottoms: Arc::new(bottoms),
             ink: RefCell::new(ink::Cache::default()),
             ellipsized: RefCell::new(None),
+            strokes: RefCell::new(super::stroke::Cache::default()),
             resident_capacity_bytes: 0,
             private_text_bytes_estimate: 0,
         };

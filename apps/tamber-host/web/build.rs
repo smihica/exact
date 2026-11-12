@@ -30,6 +30,7 @@ fn main() {
         "tamber_host_data::TamberHost",
         "tamber_host_data::TamberHost",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

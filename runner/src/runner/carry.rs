@@ -57,16 +57,16 @@ impl<D: super::DataSource> super::Runner<D> {
                 .collect(),
             panels: self.carry_panels(),
             resources: self
-                .plan
-                .resources
-                .iter()
-                .zip(&self.resources)
+                .resource_rows()
+                .zip(self.resources.iter().map(|row| &row.state))
                 .take(self.declared_resources().len())
                 .enumerate()
                 // A request in flight or a placeholder shown until the
                 // source is ready is not an answer to carry, nor one a
                 // write affects: the replacement runner asks it.
-                .filter(|(i, _)| !self.pending_res[*i] && !self.stale[*i] && !self.written(*i))
+                .filter(|(i, _)| {
+                    !self.resources[*i].pending && !self.resources[*i].stale && !self.written(*i)
+                })
                 .filter(|(_, (_, s))| s.as_ref().is_none_or(|s| !s.placeholder))
                 .filter_map(|(_, (r, s))| {
                     s.as_ref().map(|s| {
@@ -80,12 +80,10 @@ impl<D: super::DataSource> super::Runner<D> {
                 })
                 .collect(),
             store_readers: self
-                .plan
-                .resources
-                .iter()
+                .resource_rows()
                 .take(self.declared_resources().len())
                 .enumerate()
-                .filter(|(i, _)| self.store_readers[*i])
+                .filter(|(i, _)| self.resources[*i].store_reader)
                 .map(|(_, resource)| {
                     (
                         self.plan.str(resource.name).to_string(),
@@ -244,6 +242,43 @@ mod tests {
             assert_eq!(reloaded.data().queries, usize::from(!reused));
             assert_eq!(reloaded.resource_reads_store("answer"), reused);
         }
+    }
+
+    /// A reload that makes a kept reader `transient` forgets what it kept
+    /// (LLP 1156.005 D4), though its source and logic are unchanged.
+    #[test]
+    fn a_reload_into_a_transient_resource_forgets_its_kept_answer() {
+        let mut original_plan = plan("remember", false);
+        original_plan.resources[0].reader = true;
+        let mut original = Runner::boot_stored(
+            original_plan,
+            Source {
+                deferred: true,
+                ..Default::default()
+            },
+            Kernel::with_monospace(),
+            vec![("token".into(), "stored answer".into())],
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        original.data.deferred = false;
+        original.data_ready().unwrap();
+        let carried = original.carry();
+        assert!(carried.store.iter().any(|(n, _)| n == "exact.kept.answer"));
+        let mut next = plan("remember", true);
+        next.resources[0].reader = true;
+        next.resources[0].transient = true;
+        let reloaded = Runner::boot_carrying(
+            next,
+            Source::default(),
+            Kernel::with_monospace(),
+            &carried,
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        assert_eq!(reloaded.store.kept("exact.kept.answer"), None);
     }
 
     #[test]

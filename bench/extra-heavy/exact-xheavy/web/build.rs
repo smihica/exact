@@ -19,7 +19,7 @@ fn main() {
         .unwrap_or_else(|e| panic!("compatibility id: {e}"));
     std::fs::write(out_dir.join("compat.json"), compat.to_json()).unwrap();
     // The host entry (as exact2's apps/caltrain/web/build.rs): the data type and the capabilities the plan links.
-    let entry = contract::rust_entry("exact_xheavy_data::XHeavy", "exact_xheavy_data::XHeavy::default()", contract::web_rust_mode(&compat.inputs)).unwrap();
+    let entry = contract::rust_entry("exact_xheavy_data::XHeavy", "exact_xheavy_data::XHeavy::default()", contract::web_rust_mode(&compat.inputs), &compat.inputs).unwrap();
     std::fs::write(
         out_dir.join("entry.rs"),
         format!("{entry}\n{}exact_web::host!(AppData, PLAN, COMPAT, app_data);\n", contract::web_linked(&baked, &compat.inputs)),

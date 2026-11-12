@@ -77,13 +77,14 @@ component Calendar
   resource agenda = calendarDay(day, revision, clock.today) as shape Agenda
   // The person's calendars beside the app's own (LLP 1133.018 §11), read by the
   // data crate through the module only while the switch is on: the day's
-  // events, and the days of the six weeks shown that have one.
+  // events, and the days of the six weeks shown that have one. Each day is
+  // read at its own offset in the zone, not today's.
   state showMine = false persist
   resource calStatus = calendarStatus() as shape CalendarStatus
   derive mineOn = showMine and calStatus.available
   derive mineRead = mineOn and calStatus.state != "denied"
-  resource mineAgenda = calendarDeviceAgenda(day * 86400000 - time.utcOffset * 60000, mineRead, time.utcOffset) as shape DeviceAgenda
-  resource mineDays = calendarDeviceDays(month, mineRead, time.utcOffset) as shape DeviceDays
+  resource mineAgenda = calendarDeviceAgenda(day, mineRead, time.timeZone) as shape DeviceAgenda
+  resource mineDays = calendarDeviceDays(month, mineRead, time.timeZone) as shape DeviceDays
   // The person's activity (LLP 1133.026 §12), read by the data crate only
   // while the switch is on and Health has been asked: the six weeks' daily
   // steps and the day's workouts. Turning the switch on asks.
@@ -91,8 +92,8 @@ component Calendar
   resource health = healthStatus(read=["steps", "workouts"]) as shape HealthStatus
   mutation healthAsked as shape HealthStatus
   derive activityRead = showActivity and health.available and health.state != "prompt"
-  resource activityAgenda = calendarActivityAgenda(day * 86400000 - time.utcOffset * 60000, activityRead, time.utcOffset) as shape ActivityAgenda
-  resource activityDays = calendarActivityDays(month, activityRead, time.utcOffset) as shape ActivityDays
+  resource activityAgenda = calendarActivityAgenda(day, activityRead, time.timeZone) as shape ActivityAgenda
+  resource activityDays = calendarActivityDays(month, activityRead, time.timeZone) as shape ActivityDays
   // Guests picked from the person's contacts, the app's own copy in its
   // storage; and an item handed to the system's calendar editor.
   resource contactFields = getContactProperties() as shape ContactProperties

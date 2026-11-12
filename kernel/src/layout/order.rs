@@ -5,17 +5,15 @@
 //! painting and focus follow (LLP 1001 §2 declares the paint half).
 
 use crate::arena::NodeArena;
-use taffy::prelude::{NodeId, TaffyTree};
+use crate::{Display, StyleId};
+use taffy::prelude::NodeId;
 
 /// `parent`'s children's engine handles in the order its layout takes them;
-/// `node` is `parent`'s own handle, whose style says whether it is a flex or
-/// grid container; `before` is generated content before its authored children;
+/// `before` is generated content before its authored children;
 /// `handle` is a child slot's handle in that engine tree.
-pub(super) fn laid_out<T>(
+pub(super) fn laid_out(
     arena: &NodeArena,
     parent: u32,
-    taffy: &TaffyTree<T>,
-    node: NodeId,
     before: Option<NodeId>,
     handle: impl Fn(u32) -> Option<NodeId>,
 ) -> Vec<NodeId> {
@@ -32,9 +30,11 @@ pub(super) fn laid_out<T>(
                 .filter_map(|&c| Some((arena.style(c).order, handle(c)?))),
         )
         .collect();
-    let orders = taffy
-        .style(node)
-        .is_ok_and(|s| matches!(s.display, taffy::Display::Flex | taffy::Display::Grid));
+    // A newly mounted parent's engine style may not have been derived yet.
+    let orders = matches!(
+        arena.computed_source(parent, StyleId::Display).display,
+        Display::Flex | Display::Grid
+    );
     if orders && items.iter().any(|(order, _)| *order != 0) {
         // A stable sort: equal `order`s keep document order.
         items.sort_by_key(|(order, _)| *order);

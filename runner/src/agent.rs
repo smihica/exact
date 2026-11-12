@@ -16,7 +16,7 @@
 
 use crate::instance::InstanceStep;
 use crate::runner::{DataSource, Runner};
-use exact_kernel::{NodeRef, PropValue, RowValue, StyleId};
+use exact_kernel::{Frame, Kernel, NodeRef, PropValue, RowValue, StyleId};
 use exact_plan::{BindingKind, Plan, TypeKind, TypesId, Value};
 use std::fmt::Write as _;
 
@@ -122,6 +122,20 @@ pub fn tags<D: DataSource>(runner: &Runner<D>) -> String {
     )
 }
 
+fn relative_frame(kernel: &Kernel, node: &NodeRef<'_>) -> Frame {
+    // A block's root is in its block's space, not its parent's.
+    let (px, py) = node
+        .parent
+        .filter(|_| kernel.host_block(node.id).is_none())
+        .and_then(|p| kernel.node(p))
+        .map_or((0.0, 0.0), |p| (p.frame.x, p.frame.y));
+    Frame {
+        x: node.frame.x - px,
+        y: node.frame.y - py,
+        ..node.frame
+    }
+}
+
 /// The kernel's half of `layout agree` (LLP 1080.001 D2), a private
 /// message: `{"op":"frames","limit":N}` answers every live node in preorder
 /// as `[id, parent|null, x, y, w, h, bits]` — the parent-relative frame a
@@ -173,13 +187,7 @@ pub fn frames<D: DataSource>(
             s.push(',');
         }
         count += 1;
-        let f = node.frame;
-        // A block's root is in its block's space, not its parent's.
-        let (px, py) = node
-            .parent
-            .filter(|_| kernel.host_block(id).is_none())
-            .and_then(|p| kernel.node(p))
-            .map_or((0.0, 0.0), |p| (p.frame.x, p.frame.y));
+        let f = relative_frame(kernel, &node);
         let mut bits = 0u32;
         if matches!(node.style.get(StyleId::Display), RowValue::Enum("none")) {
             bits |= 1;
@@ -206,8 +214,8 @@ pub fn frames<D: DataSource>(
         let _ = write!(
             s,
             ",{},{},{},{},{bits}]",
-            num((f.x - px) as f64),
-            num((f.y - py) as f64),
+            num(f.x as f64),
+            num(f.y as f64),
             num(f.width as f64),
             num(f.height as f64)
         );
@@ -530,8 +538,9 @@ pub(super) fn token_fields(
 /// `style` or `heading` that gives it (LLP 1115.000 D12.2), or `initial`
 /// ([`source::write`]) — its props, the plan site it was instantiated from with the
 /// instance path to it (D6), and the kernel's frames: `frame` relative to
-/// the parent, `absolute` in the root's space or the viewport when the host
-/// places its block (as `frame()` reports it), `content` when it scrolls.
+/// the parent (a block's root in its own block), `absolute` in the root's
+/// space or the viewport when the host places its block (as `frame()`
+/// reports it), `content` when it scrolls.
 /// Observations of the runner's memory, tagged with the epoch and
 /// incarnation; a host adds the spaces and what it mounted. An id that is
 /// not a live node in this incarnation is refused by name.
@@ -634,17 +643,14 @@ pub fn node<D: DataSource>(runner: &Runner<D>, id: u32) -> String {
     props_json(&node, &mut s);
     let f = node.frame;
     let absolute = runner.top_layer_open().agent_frame(kernel, node.id, f);
-    let (px, py) = node
-        .parent
-        .and_then(|p| kernel.node(p))
-        .map_or((0.0, 0.0), |p| (p.frame.x, p.frame.y));
+    let frame = relative_frame(kernel, &node);
     let _ = write!(
         s,
         "}},\"frame\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}},\"absolute\":{{\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
-        num((f.x - px) as f64),
-        num((f.y - py) as f64),
-        num(f.width as f64),
-        num(f.height as f64),
+        num(frame.x as f64),
+        num(frame.y as f64),
+        num(frame.width as f64),
+        num(frame.height as f64),
         num(absolute.x),
         num(absolute.y),
         num(absolute.width),

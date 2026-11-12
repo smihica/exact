@@ -46,8 +46,10 @@ pub struct Scroller {
     pub axes: (bool, bool),
     /// The farthest offset on each axis.
     pub max: (f32, f32),
-    /// Where it is.
+    /// Where it is, measured from the right on x when `from_right` is true.
     pub offset: (f32, f32),
+    /// Whether horizontal offsets increase toward the left (a painted RTL input).
+    pub from_right: bool,
     /// The box it shows in, in the viewport: x, y, width, height.
     pub port: [f32; 4],
     /// Whether the painter keeps its rows apart, so a shell that replays
@@ -97,6 +99,7 @@ impl Reader {
 const X: i32 = 1;
 const Y: i32 = 2;
 const NODE: i32 = 4;
+const BARLESS: i32 = 8;
 
 fn scrolls(o: Overflow) -> bool {
     matches!(o, Overflow::Scroll | Overflow::Auto)
@@ -113,6 +116,7 @@ impl<D: DataSource> Presenter<D> {
             axes: (max.0 > 0.0, max.1 > 0.0),
             max,
             offset: self.page,
+            from_right: false,
             port: [0.0, 0.0, viewport.0, viewport.1],
             node: false,
         }
@@ -144,6 +148,11 @@ impl<D: DataSource> Presenter<D> {
             axes: (scrolls(ox) && max.0 > 0.0, scrolls(oy) && max.1 > 0.0),
             max,
             offset: self.scroll.get(&id).copied().unwrap_or((0.0, 0.0)),
+            from_right: self
+                .brush
+                .field_text
+                .get(&id)
+                .is_some_and(|field| field.scrolls_from_right()),
             port: [0.0; 4],
             node: self.brush.row_groups().iter().any(|g| g.0 == id),
         })
@@ -374,7 +383,8 @@ impl<D: DataSource> Presenter<D> {
             .scroller(id, &limits)
             .ok_or_else(|| format!("view {id} is not a scroller"))?;
         let revision = self.reader_revision(&s);
-        self.reader_scrolled(id, (dx, dy), revision)
+        let by = (if s.from_right { -dx } else { dx }, dy);
+        self.reader_scrolled(id, by, revision)
             .ok_or_else(|| format!("view {id} refused the reader sample"))?;
         Ok(format!(
             "{{\"tapped\":{id},\"wheel\":[{},{}],\"gesture\":true}}",
@@ -453,8 +463,8 @@ impl<D: DataSource> Presenter<D> {
     /// hosted text field the touch is for (0: none; LLP 1115.001 D8), and
     /// eleven words a scroller: id, flags (bit 0 it takes a sideways drag
     /// from here, bit 1 one up or down, bit 2 it has rows the reader can
-    /// move), revision, then as float bits its offset (x, y), its farthest
-    /// offset (x, y) and its port (x, y, width, height). The reader is told
+    /// move, bit 3 no scrollbar), revision, then as float bits its offset
+    /// (x, y), its farthest offset (x, y) and its port (x, y, width, height). The reader is told
     /// of each from now on ([`Presenter::reader_scrollers`]).
     pub fn reader_under(&mut self, x: f32, y: f32, scale: f32) -> Vec<i32> {
         let under = self.scrollers_at(x / scale, y / scale);
@@ -465,7 +475,7 @@ impl<D: DataSource> Presenter<D> {
         ];
         for s in &under.chain {
             let rev = self.reader_revision(s);
-            out.extend([s.id as i32, flags(s), rev as i32]);
+            out.extend([s.id as i32, self.reader_flags(s), rev as i32]);
             let px = [s.offset.0, s.offset.1, s.max.0, s.max.1];
             out.extend(px.iter().chain(&s.port).map(|v| bits(v * scale)));
         }
@@ -501,7 +511,7 @@ impl<D: DataSource> Presenter<D> {
             let painted = drawn.iter().find(|g| g.0 == id).map(|g| g.1);
             s.node = painted.is_some();
             let at = painted.unwrap_or(s.offset);
-            out.extend([id as i32, flags(&s), rev as i32]);
+            out.extend([id as i32, self.reader_flags(&s), rev as i32]);
             let px = [s.offset.0, s.offset.1, at.0, at.1, s.max.0, s.max.1];
             out.extend(px.iter().map(|v| bits(v * scale)));
         }
@@ -511,12 +521,22 @@ impl<D: DataSource> Presenter<D> {
         self.reader.last.clone_from(&out);
         Some(out)
     }
-}
 
-fn flags(s: &Scroller) -> i32 {
-    (if s.axes.0 { X } else { 0 })
-        | (if s.axes.1 { Y } else { 0 })
-        | (if s.node { NODE } else { 0 })
+    fn reader_flags(&self, s: &Scroller) -> i32 {
+        // The synthetic page has no node: its scrollbar policy is the root's.
+        let id = if s.id == PAGE {
+            self.host.roots().first().copied()
+        } else {
+            Some(s.id)
+        };
+        let barless = id
+            .and_then(|id| self.host.kernel().node(id))
+            .is_some_and(|n| n.style.scrollbar_width == exact_kernel::ScrollbarWidth::None);
+        (if s.axes.0 { X } else { 0 })
+            | (if s.axes.1 { Y } else { 0 })
+            | (if s.node { NODE } else { 0 })
+            | (if barless { BARLESS } else { 0 })
+    }
 }
 
 /// A box within its clip: x, y, width, height.

@@ -74,6 +74,46 @@ final class IframeEmbedTests: XCTestCase {
         ]))
     }
 
+    func testEmptySourcesLoadBlankAndPathlessSourcesShowMissingFiles() throws {
+        let session = try session("frame-empty-source")
+        let sources: [String?] = ["", "#", "?", "#missing.html", "?missing.html", "", nil]
+        for (index, source) in sources.enumerated() {
+            let loaded = expectation(description: "loaded source \(String(describing: source))")
+            session.presenter.onLoad = { id in
+                if id == 7001 { loaded.fulfill() }
+            }
+            if index == 0 {
+                mount(session, ["src": ""])
+                try XCTUnwrap(session.presenter.views[7001]).handlers.insert("load")
+            } else {
+                let node = try XCTUnwrap(session.presenter.views[7001])
+                node.props["src"] = source
+                session.webviews.update(node)
+            }
+            wait(for: [loaded], timeout: 30)
+            let web = try XCTUnwrap(session.presenter.views[7001]?.web as? WKWebView)
+            let checked = expectation(description: "source document checked")
+            let readText = """
+                const frame = document.getElementById('exact-frame');
+                (frame ? frame.contentDocument : document).body.innerText;
+                """
+            web.evaluateJavaScript(readText, in: nil, in: .page) { result in
+                switch result {
+                case .success(let value):
+                    let text = value as? String
+                    if let source, !source.isEmpty {
+                        XCTAssertTrue(text?.hasPrefix("\(source) is not a file under ") == true, "\(text ?? "no text")")
+                    } else {
+                        XCTAssertEqual(text, "")
+                    }
+                case .failure(let error): XCTFail("\(error)")
+                }
+                checked.fulfill()
+            }
+            wait(for: [checked], timeout: 30)
+        }
+    }
+
     /// `visibility: hidden` at create, before the web view exists, hides it
     /// once made, held or not.
     func testAHiddenFramesWebViewStaysHidden() throws {

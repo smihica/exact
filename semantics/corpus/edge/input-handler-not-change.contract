@@ -1,4 +1,4 @@
-// `type` delivers a change event; an input with only an `input=` handler.
+// `type` prefers `input`, falling back to `change` when no input handler exists.
 component App
   state q = ""
   state changes = 0

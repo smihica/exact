@@ -324,7 +324,10 @@ class MediaCaptureModule(context: ExtensionContext) : ExactExtension(context), T
         ids.forEach(cameras::dispose)
     }
 
-    override fun resumed() { context.changed("media-capture.microphoneStatus") }
+    override fun resumed() {
+        context.changed("media-capture.microphoneStatus")
+        context.changed("media-capture.cameraStatus")
+    }
 
     override fun destroy(done: () -> Unit) {
         tracks.values.toList().forEach { end(it, "the session ended") }
@@ -352,9 +355,9 @@ class MediaCaptureModule(context: ExtensionContext) : ExactExtension(context), T
     }
 
     private fun ask(done: () -> Unit) {
-        context.requestPermissions(arrayOf(PERMISSION)) {
+        context.requestPermissions(arrayOf(PERMISSION)) { answered ->
             val activity = context.activity
-            if (!granted() && activity != null && !activity.shouldShowRequestPermissionRationale(PERMISSION)) {
+            if (PERMISSION in answered && !granted() && activity != null && !activity.shouldShowRequestPermissionRationale(PERMISSION)) {
                 history.edit().putBoolean("permanent", true).apply()
             }
             context.changed("media-capture.microphoneStatus")

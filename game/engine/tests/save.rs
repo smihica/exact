@@ -164,3 +164,112 @@ fn engine_scene_components_first_spawned_mid_game_restore_unregistered() {
         exact_game::Vec3::new(1.0, 2.0, 0.0).into()
     );
 }
+
+#[test]
+fn a_light_at_the_default_decay_keeps_the_encoding_it_had_without_one() {
+    use exact_game::data::{bin, hash, json};
+    use exact_game::{PointLight, SpotLight};
+    // The records as they were before `decay`.
+    #[derive(Data, Default)]
+    struct Point {
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+    }
+    #[derive(Data, Default)]
+    struct Spot {
+        color: [f32; 3],
+        intensity: f32,
+        range: f32,
+        inner: f32,
+        outer: f32,
+    }
+    let point = PointLight::default();
+    let old = Point {
+        color: point.color,
+        intensity: point.intensity,
+        range: point.range,
+    };
+    assert_eq!(bin::to_vec(&point), bin::to_vec(&old));
+    assert_eq!(hash::of(&point), hash::of(&old));
+    let spot = SpotLight::default();
+    let old = Spot {
+        color: spot.color,
+        intensity: spot.intensity,
+        range: spot.range,
+        inner: spot.inner,
+        outer: spot.outer,
+    };
+    assert_eq!(bin::to_vec(&spot), bin::to_vec(&old));
+    assert_eq!(hash::of(&spot), hash::of(&old));
+    assert_eq!(PointLight::TYPE_ID, "table:exact_game::scene::PointLight");
+
+    // Another decay is saved and restored, and changes the hash.
+    let flat = SpotLight { decay: 0., ..spot };
+    assert_ne!(hash::of(&flat), hash::of(&spot));
+    let mut w = World::new(60, 0);
+    let lamp = w.spawn((Transform::default(), flat));
+    let bytes = w.save();
+    let mut fresh = World::new(60, 0);
+    fresh.load(&bytes).unwrap();
+    assert_eq!(fresh.get::<SpotLight>(lamp).unwrap().decay, 0.);
+    assert_eq!(fresh.hash(), w.hash());
+    // A record without it is the default decay, even over a light that had another.
+    let mut patched = flat;
+    json::read_into(&json::to_string(&spot).unwrap(), &mut patched).unwrap();
+    assert_eq!(patched, spot);
+    assert!(!json::to_string(&spot).unwrap().contains("decay"));
+    assert!(json::to_string(&flat).unwrap().contains("\"decay\""));
+}
+
+#[test]
+fn shadows_at_the_default_local_settings_keep_their_encoding() {
+    use exact_game::data::{bin, hash};
+    use exact_game::{ShadowBox, ShadowFilter, Shadows};
+    // The record as it was before the local settings.
+    #[derive(Data, Default)]
+    struct Old {
+        fixed_box: Option<ShadowBox>,
+        cache_static: bool,
+        resolution: u32,
+        distance: f32,
+        cascades: u32,
+        softness: f32,
+        filter: ShadowFilter,
+        strength: f32,
+    }
+    let shadows = Shadows {
+        resolution: 4096,
+        ..Default::default()
+    };
+    let old = Old {
+        fixed_box: shadows.fixed_box,
+        cache_static: shadows.cache_static,
+        resolution: shadows.resolution,
+        distance: shadows.distance,
+        cascades: shadows.cascades,
+        softness: shadows.softness,
+        filter: shadows.filter,
+        strength: shadows.strength,
+    };
+    assert_eq!(bin::to_vec(&shadows), bin::to_vec(&old));
+    assert_eq!(hash::of(&shadows), hash::of(&old));
+    let local = Shadows {
+        local_resolution: 2048,
+        local_filter: ShadowFilter::PcfSoft {
+            depth_bias: 0.0001,
+            normal_bias: 0.01,
+        },
+        ..shadows
+    };
+    assert_ne!(hash::of(&local), hash::of(&shadows));
+    assert_eq!(
+        bin::from_slice::<Shadows>(&bin::to_vec(&local)).unwrap(),
+        local
+    );
+    let mut w = World::new(60, 0);
+    w.insert_resource(local);
+    let mut fresh = World::new(60, 0);
+    fresh.load(&w.save()).unwrap();
+    assert_eq!(*fresh.resource::<Shadows>(), local);
+}

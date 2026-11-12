@@ -45,6 +45,18 @@ pub struct Body {
     /// value: reading a serialized body without CCD into one with CCD leaves CCD
     /// on. To turn it off, write the field.
     pub ccd: bool,
+    /// A world-space force at the centre of mass in newtons, applied in every step
+    /// until it is written back to zero. Contacts still act on the body, as they do
+    /// under gravity. Ignored on static and kinematic bodies. Writing a non-zero
+    /// force wakes the body; a body at rest under a constant force may sleep, as
+    /// under gravity. Saved, hashed and serialized only when non-zero, with the
+    /// omission rule of `ccd`.
+    pub force: Vec3,
+    /// Principal moments of inertia in kg·m² about the centre of mass, along the
+    /// body's local axes. All zero (the default) derives them from the collider;
+    /// otherwise all three must be positive. Saved, hashed and serialized only when
+    /// set, with the omission rule of `ccd`.
+    pub inertia: Vec3,
 }
 impl Default for Body {
     fn default() -> Self {
@@ -58,33 +70,49 @@ impl Default for Body {
             spin_damping: 0.0,
             asleep: false,
             ccd: false,
+            force: Vec3::ZERO,
+            inertia: Vec3::ZERO,
         }
     }
 }
-/// The derive's encoding, except that `ccd` is written only when set: a world
-/// without CCD keeps the saves and hashes it has. Reading keeps the record rule:
-/// an omitted `ccd` keeps its value, which is false when decoding a new body.
-macro_rules! body_record {
-    ($($field:ident),* $(,)?) => {
-        impl Data for Body {
-            const TYPE_ID: &'static str = concat!("table:", module_path!(), "::Body");
+/// The derive's record, plus fields written only when they differ from the type's
+/// default, so a value that never sets them keeps the saves and hashes it has.
+/// Reading keeps the record rule: an omitted field keeps its current value, which
+/// is the default when decoding a new value. The first list is always written; the
+/// second is `Body::ccd`, which predates the third; the third is named in the hash
+/// as well (`Writer::key`), since a hash does not name fields and two of them
+/// written alone could otherwise collide.
+macro_rules! record {
+    ($ty:ident { $($field:ident),* $(,)? } unnamed { $($bare:ident),* $(,)? } named { $($opt:ident),* $(,)? }) => {
+        impl exact_game::Data for $ty {
+            const TYPE_ID: &'static str = concat!("table:", module_path!(), "::", stringify!($ty));
             fn set_field(&mut self, field: &str, text: &str) -> Result<(), exact_game::DataError> {
                 match field {
                     $(stringify!($field) => exact_game::data::edit_field(&mut self.$field, text),)*
-                    "ccd" => exact_game::data::edit_field(&mut self.ccd, text),
+                    $(stringify!($bare) => exact_game::data::edit_field(&mut self.$bare, text),)*
+                    $(stringify!($opt) => exact_game::data::edit_field(&mut self.$opt, text),)*
                     _ => Err(exact_game::DataError::new(format!("unknown field {field}"))),
                 }
             }
             fn write(&self, w: &mut dyn exact_game::Writer) {
+                let default = <$ty as Default>::default();
                 w.begin_struct();
                 $(
                     w.field(stringify!($field));
-                    Data::write(&self.$field, w);
+                    exact_game::Data::write(&self.$field, w);
                 )*
-                if self.ccd {
-                    w.field("ccd");
-                    self.ccd.write(w);
-                }
+                $(
+                    if self.$bare != default.$bare {
+                        w.field(stringify!($bare));
+                        exact_game::Data::write(&self.$bare, w);
+                    }
+                )*
+                $(
+                    if self.$opt != default.$opt {
+                        w.key(stringify!($opt));
+                        exact_game::Data::write(&self.$opt, w);
+                    }
+                )*
                 w.end_struct();
             }
             fn read(&mut self, r: &mut dyn exact_game::Reader) -> Result<(), exact_game::DataError> {
@@ -96,9 +124,12 @@ macro_rules! body_record {
                         seen[i] = true;
                     }
                     match field.as_str() {
-                        $(stringify!($field) => Data::read(&mut self.$field, r)
+                        $(stringify!($field) => exact_game::Data::read(&mut self.$field, r)
                             .map_err(|e| e.at(stringify!($field)))?,)*
-                        "ccd" => self.ccd.read(r).map_err(|e| e.at("ccd"))?,
+                        $(stringify!($bare) => exact_game::Data::read(&mut self.$bare, r)
+                            .map_err(|e| e.at(stringify!($bare)))?,)*
+                        $(stringify!($opt) => exact_game::Data::read(&mut self.$opt, r)
+                            .map_err(|e| e.at(stringify!($opt)))?,)*
                         _ => r.skip().map_err(|e| e.at(&field))?,
                     }
                 }
@@ -110,7 +141,7 @@ macro_rules! body_record {
         }
     };
 }
-body_record!(
+record!(Body {
     kind,
     velocity,
     spin,
@@ -118,8 +149,9 @@ body_record!(
     gravity,
     damping,
     spin_damping,
-    asleep
-);
+    asleep,
+} unnamed { ccd } named { force, inertia });
+pub(crate) use record;
 impl Component for Body {
     const NAME: &'static str = "Body";
 }
@@ -187,8 +219,24 @@ impl Default for Shape {
     }
 }
 
+/// How a pair combines its two `bounce` values. A pair whose colliders choose
+/// different rules takes the one listed later (Rapier's priority: Average, Min,
+/// Multiply, Max), so Average applies only when both colliders choose it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Data)]
+pub enum BounceCombine {
+    /// The mean of the two values.
+    Average,
+    /// The smaller value.
+    Min,
+    /// The product of the two values.
+    Multiply,
+    /// The larger value.
+    #[default]
+    Max,
+}
+
 /// Collision material and filtering; a collider without a Body is static.
-#[derive(Clone, Debug, PartialEq, Component)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Collider {
     /// Local geometry.
     pub shape: Shape,
@@ -196,7 +244,8 @@ pub struct Collider {
     pub offset: Vec3,
     /// Coulomb coefficient; pair coefficients combine geometrically. Default 0.6.
     pub friction: f32,
-    /// Restitution in [0, 1]; a pair uses the larger value. Default zero.
+    /// Restitution in [0, 1], combined with the other collider's by
+    /// `bounce_combine`. Default zero.
     pub bounce: f32,
     /// Report touches but never apply impulses.
     pub sensor: bool,
@@ -204,6 +253,15 @@ pub struct Collider {
     pub layer: u32,
     /// Accepted membership bits; defaults to all bits.
     pub mask: u32,
+    /// How this collider's pairs combine restitution; defaults to the larger
+    /// value. Saved, hashed and serialized only when not the default.
+    pub bounce_combine: BounceCombine,
+    /// More shapes on the same Body. They add no mass: the Body's mass and
+    /// inertia are the primary shape's (or authored). A touch with one reports
+    /// this entity. Queries (rays, sweeps, overlaps, capsules) see the primary
+    /// shape only, for now. Needs a Body. Saved, hashed and serialized only when
+    /// not empty.
+    pub extra: Vec<ExtraShape>,
 }
 impl Default for Collider {
     fn default() -> Self {
@@ -215,8 +273,71 @@ impl Default for Collider {
             sensor: false,
             layer: 1,
             mask: u32::MAX,
+            bounce_combine: BounceCombine::Max,
+            extra: Vec::new(),
         }
     }
+}
+record!(Collider {
+    shape,
+    offset,
+    friction,
+    bounce,
+    sensor,
+    layer,
+    mask,
+} unnamed {} named { bounce_combine, extra });
+
+/// One more shape on a collider's Body (`Collider::extra`), with its own
+/// material and filtering, and no mass. It may not be a mesh or a heightfield.
+#[derive(Clone, Debug, PartialEq, Data)]
+pub struct ExtraShape {
+    /// Local geometry.
+    pub shape: Shape,
+    /// Shape displacement in local metres, before Transform scale.
+    pub offset: Vec3,
+    /// As `Collider::friction`. Default 0.6.
+    pub friction: f32,
+    /// As `Collider::bounce`. Default zero.
+    pub bounce: f32,
+    /// As `Collider::bounce_combine`.
+    pub bounce_combine: BounceCombine,
+    /// Membership bits; defaults to bit one.
+    pub layer: u32,
+    /// Accepted membership bits; defaults to all bits.
+    pub mask: u32,
+}
+impl Default for ExtraShape {
+    fn default() -> Self {
+        let c = Collider::default();
+        Self {
+            shape: c.shape,
+            offset: c.offset,
+            friction: c.friction,
+            bounce: c.bounce,
+            bounce_combine: c.bounce_combine,
+            layer: c.layer,
+            mask: c.mask,
+        }
+    }
+}
+impl ExtraShape {
+    // The solid collider this shape is built as.
+    pub(crate) fn collider(&self) -> Collider {
+        Collider {
+            shape: self.shape.clone(),
+            offset: self.offset,
+            friction: self.friction,
+            bounce: self.bounce,
+            bounce_combine: self.bounce_combine,
+            layer: self.layer,
+            mask: self.mask,
+            ..Collider::default()
+        }
+    }
+}
+impl Component for Collider {
+    const NAME: &'static str = "Collider";
 }
 
 /// Opt a collider into begin/end journal messages. No per-tick samples are logged.
@@ -224,6 +345,7 @@ impl Default for Collider {
 pub struct Announce;
 
 /// One begin/end transition, ordered by (a.index, b.index).
+/// Transitions of the same pair keep the order they occurred within the step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Data)]
 pub struct Touch {
     /// First entity, possibly despawned for an end event.
@@ -234,15 +356,56 @@ pub struct Touch {
     pub began: bool,
 }
 
-/// World-owned Rapier state, lazily serialized by the engine's Data writer.
-#[derive(Clone, Debug, Data)]
+/// World-owned Rapier state, lazily serialized by the engine's Data writer. The
+/// solver settings are Rapier's integration parameters, applied at every step and
+/// saved, hashed and serialized only when they differ from their defaults.
+#[derive(Clone, Debug)]
 pub struct Physics {
     /// World-space acceleration; defaults to (0, -9.81, 0) m/s².
     pub gravity: Vec3,
     /// This tick's sorted begin/end transitions, including sensors.
     pub events: Vec<Touch>,
     pub(crate) executor: crate::state::Executor,
+    /// Solver substeps per tick, at least one; defaults to Rapier's four.
+    pub solver_iterations: u32,
+    /// Natural frequency in hertz of the spring that corrects a contact between
+    /// two moving bodies; defaults to Rapier's 30.
+    pub contact_frequency: f32,
+    /// The same for a contact with a fixed body (a static collider, a Static
+    /// body); defaults to Rapier's 60.
+    pub static_contact_frequency: f32,
+    /// Damping ratio of both contact springs, positive; defaults to Rapier's 10.
+    pub contact_damping_ratio: f32,
+    /// One friction constraint per contact point (Rapier's Coulomb model) instead
+    /// of one per group of four plus a twist constraint (its default, faster).
+    pub coulomb_friction: bool,
+    /// Weight-bounded friction, as cannon-es has it; needs `coulomb_friction`. A
+    /// contact point touching when a step starts may take a friction impulse of
+    /// friction × `friction_gravity` × the pair's reduced mass × the substep's
+    /// duration in each substep of that step, whatever its normal load: a point
+    /// lifting off keeps its friction until the step ends, and a flicked box trips
+    /// over its edge instead of sliding. Contacts with multibodies keep Coulomb
+    /// friction. In m/s²; zero (the default) keeps Coulomb friction everywhere.
+    pub friction_gravity: f32,
+    /// Below this contact-point speed in m/s, along the normal and across it, a
+    /// point keeps Coulomb friction under `friction_gravity`, so resting and
+    /// rolling contacts settle flat. Zero applies the weight bound to every
+    /// touching point.
+    pub friction_slip_speed: f32,
 }
+crate::types::record!(Physics {
+    gravity,
+    events,
+    executor,
+} unnamed {} named {
+    solver_iterations,
+    contact_frequency,
+    static_contact_frequency,
+    contact_damping_ratio,
+    coulomb_friction,
+    friction_gravity,
+    friction_slip_speed,
+});
 impl exact_game::Resource for Physics {
     const NAME: &'static str = "Physics";
     const AMBIENT: bool = true;
@@ -253,6 +416,13 @@ impl Default for Physics {
             gravity: Vec3::new(0.0, -9.81, 0.0),
             events: Vec::new(),
             executor: Default::default(),
+            solver_iterations: 4,
+            contact_frequency: 30.0,
+            static_contact_frequency: 60.0,
+            contact_damping_ratio: 10.0,
+            coulomb_friction: false,
+            friction_gravity: 0.0,
+            friction_slip_speed: 0.0,
         }
     }
 }

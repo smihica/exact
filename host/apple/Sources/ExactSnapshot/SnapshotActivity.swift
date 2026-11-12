@@ -230,9 +230,13 @@ public enum SnapshotActivity {
     /// StandBy), a `background-image`'s gradients paint full bleed behind
     /// the margins over that tint, as a widget's container background does;
     /// both unsaid leaves the system's material.
-    public static func background(of laid: ActivityRender.Laid, dark: Bool) -> ActivityBackground {
-        let style = SnapshotStyle(laid.root)
-        let tint = SnapshotColor.color(style.color("background_color"), dark: dark)
+    public static func background(of laid: ActivityRender.Laid, dark: Bool) -> ActivityBackground { background(of: laid.root, dark: dark) }
+
+    public static func background(of root: HeadlessSession.Node, dark: Bool) -> ActivityBackground {
+        let style = SnapshotStyle(root)
+        // The system draws this colour outside the view, so a tint role in it is resolved against the root's accent here
+        let accent = SnapshotTint.accent(style.color("accent_color"), dark: dark)
+        let tint = SnapshotTint.color(style.color("background_color"), around: accent, dark: dark)
         let gradients = style.gradients("background_image").isEmpty ? nil : SnapshotPaint(style: style, dark: dark)
         return ActivityBackground(tint: tint, gradients: gradients)
     }

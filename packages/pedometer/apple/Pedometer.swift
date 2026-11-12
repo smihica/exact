@@ -24,15 +24,19 @@ import CoreMotion
 import ExactPackage
 import Foundation
 
+func pedometerBoundary(start: Double?) -> Date {
+    let asked = Date().timeIntervalSince1970 * 1000
+    // Core Motion keeps only the past seven days (D12).
+    let kept = 7 * 86_400_000.0
+    return Date(timeIntervalSince1970: max(start ?? asked, asked - kept) / 1000)
+}
+
 #if os(iOS)
 public final class PedometerModule: ExactPackage {
     /// The app's access hatch (D17): given the pedometer once, before its first start.
     public static var hatch: ((CMPedometer) -> Void)?
     /// Every update the module receives, on the main queue, after the module's own handling.
     public static var forward: ((CMPedometerData) -> Void)?
-
-    /// What Core Motion keeps (D12): "only the past seven days".
-    private static let kept = 7 * 86_400_000.0
 
     private final class Group {
         let boundary: Date
@@ -131,8 +135,7 @@ public final class PedometerModule: ExactPackage {
         if let g = groups[key] {
             group = g
         } else {
-            let asked = context.now()
-            group = Group(boundary: Date(timeIntervalSince1970: max(start ?? asked, asked - Self.kept) / 1000))
+            group = Group(boundary: pedometerBoundary(start: start))
             groups[key] = group
             if streaming == nil { stream(key, group) }
         }

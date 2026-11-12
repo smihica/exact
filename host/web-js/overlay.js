@@ -1,7 +1,8 @@
 // Optimistic writes on the JS target, as the runner's `writes.rs`: a record per send to a mutation that
 // declares `refreshes`, shown over each refreshed resource's answer by the source's `overlay`. A record is
 // pending until its final reply lands, then landed until each refreshed resource has an answer asked after
-// the landing that the overlay does not keep it over. One that ends without landing goes.
+// the landing that the overlay does not keep it over. One that ends without landing goes. A newer send to a
+// newest-wins mutation ends its older pending ones; a queue's and a parallel one's keep theirs (LLP 1161.000 D3).
 import { conforms, equal } from "./shape.js";
 import { data, say } from "./rt.js";
 
@@ -16,20 +17,20 @@ const inFlight = m => { const p = Writes.list.filter(w => w.m === m && !w.landed
 const pending = (m, id) => id ? Writes.list.find(w => w.id === id && !w.landed) ?? null : inFlight(m);
 /** The id of the write a send to `m` asked now carries on its ticket. */
 export const asked = m => inFlight(m)?.id;
-/** A send to `m` accepted; a newer send to a non-queue mutation ends its older pending ones (newest wins).
+/** A send to `m` accepted; a newer send to a newest-wins mutation ends its older pending ones.
  * The resources to ask again to reconcile. */
 export function accept(m, source, args) {
   if (!m.refreshes.length) return [];
   // Recorded before the older sends end, so ending them does not ask their resources again while this one shows in them
   const w = { id: tick(), m, source, args, landed: null };
   Writes.list.push(w);
-  return m.queue ? [] : endPending(m, w);
+  return m.queue || m.parallel ? [] : endPending(m, w);
 }
 /** `m`'s send (`write`, its ticket's) landed with `reply`; a stream's later messages land nothing more. */
 export function land(m, reply, write) {
   const w = pending(m, write); if (!w) return;
   // The runner's own resources show their facts, never a write (`owned`, from the plan's `RUNNER_OWNED_SOURCES`)
-  const showing = m.refreshes.filter(r => !r.owned);
+  const showing = m.refreshes.flatMap(r => r.each ? r.members() : [r]).filter(r => !r.owned);
   // Shown nowhere, it has nothing to wait for
   if (showing.length) w.landed = { reply, at: tick(), showing }; else Writes.list.splice(Writes.list.indexOf(w), 1);
 }
@@ -39,7 +40,19 @@ export function end(m, write) { const w = pending(m, write); if (!w) return null
 export function endPending(m, except) { const n = Writes.list.length; Writes.list = Writes.list.filter(w => w.m !== m || w.landed || w === except); return n === Writes.list.length ? [] : reconcile(m); }
 // Each refreshed resource no other pending write shows in (that one's own end asks).
 const reconcile = m => m.refreshes.filter(r => !Writes.list.some(w => !w.landed && w.m.refreshes.includes(r)));
-const showing = r => Writes.list.filter(w => w.landed ? w.landed.showing.includes(r) : w.m.refreshes.includes(r));
+// In the order an overlay sees them (LLP 1161.000 D3): those landed, in the order they landed, then those still out, in
+// send order. Only a parallel mutation's land out of send order.
+const showing = r => Writes.list.filter(w => w.landed ? w.landed.showing.some(x => x === r || x.family === r) : w.m.refreshes.includes(r.family ?? r))
+  .sort((a, b) => (a.landed ? 0 : 1) - (b.landed ? 0 : 1) || (a.landed ? a.landed.at - b.landed.at : a.id - b.id));
+/** While a list still shows a landed write, its joining members show it too. */
+export function join(r) {
+  for (const w of Writes.list) if (w.landed?.showing.some(x => x.family === r.family)) w.landed.showing.push(r);
+}
+/** A removed member no longer holds a landed write over its answer. */
+export function forget(r) {
+  for (const w of Writes.list) if (w.landed) w.landed.showing = w.landed.showing.filter(x => x !== r);
+  Writes.list = Writes.list.filter(w => !w.landed || w.landed.showing.length);
+}
 /** Whether any write shows in `r`. */
 export const written = r => showing(r).length > 0;
 /** What `r` shows: `answer` (asked at `origin`, for `args`), or its source's overlay of the writes showing in

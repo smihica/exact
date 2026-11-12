@@ -40,9 +40,13 @@ The only required reading; the rest is lookup. A website reads [start-here-site.
 
 ```sh
 bun <exact2>/scripts/exact.mjs new ~/groceries && cd ~/groceries
-bun exact.mjs pattern      # lists the starters; `pattern <name>` writes one
-bun exact.mjs ios --prebuild  # the first iOS build: minutes, in the background; it names iOS in app.json
+bun exact.mjs pattern      # lists the starters; `pattern <name>` writes one; source: docs/patterns/<name>/app.contract in exact2
+bun exact.mjs ios --prebuild  # the first iOS build: ten to fifteen minutes, in the background; it names iOS in app.json
 ```
+
+`new` also takes `--name Groceries --bundle-id com.yourcompany.groceries --with ios,android`. The folder's name is lowercase with hyphens, not `exact` or ending `-web`, `-apple`, `-linux`, `-gpu`.
+`bun <exact2>/scripts/exact.mjs setup` takes a few minutes, a first macOS or iOS build ten to fifteen on a laptop, later builds a minute or two.
+Run each once and let it finish, in the background with a completion notification if your tool has one, rather than polling its log.
 
 Start from the nearest pattern. The screen `exact new` writes, and its tests in
 `app.test.contract`, are placeholders: replace both. `exact.mjs` runs from any
@@ -98,7 +102,7 @@ bun exact.mjs contract vocab timers dates-and-days task        # a timer, a day'
 |`one-screen`|a tracker: a total, quick-add buttons, a dated log in a file|
 |`dashboard`|a summary, bars, dated rows, an add sheet that validates, two columns|
 |`list-detail`|search, a detail, an add sheet, a delete alert, empty states, a file; split when wide|
-|`tabs`|two tabs, a stack in each, a saved set kept with `persist`|
+|`tabs`|tabs with a badge, a stack in each, a saved set kept with `persist`|
 |`rest`|its own server, polled; a signed-in person (`rest-backend`, `fetch-loading-error`, `after-a-write`)|
 |`site`|a website: a sortable `table` built ahead and filtered by a `select` in the query, a page per item rendered per request with a `dl`, a not-found page, a footer, an API's origin as a setting (`website`)|
 
@@ -113,6 +117,7 @@ bun exact.mjs contract vocab timers dates-and-days task        # a timer, a day'
 |a number field, a stepper's `step`|`number-field`, `stepper`|
 |a pick from six or more options (a picker)|`select`|
 |a chat that opens at its newest message|`chat-thread`|
+|a long list or grid that loads more|`long-lists`|
 |a welcome at first launch|`first-launch`|
 |records kept across launches, a saved library (`state` holds values, not records): a JSON file, SQLite, grants|`files-and-grants`|
 |dice, a shuffle, a random pick or name (Contract has no `random()`: copy the recipe's `roll`)|`random-rolls`, `random-and-shuffle`|
@@ -120,18 +125,22 @@ bun exact.mjs contract vocab timers dates-and-days task        # a timer, a day'
 |another wide layout, a chart|`web-look`, `responsive-columns`, `content-design`|
 |a video, a looping hero clip, a song (the `video` and `audio` elements, with a `poster`)|["Sound, MIDI and media"](contract-for-agents.md#sound-midi-and-media)|
 |a map, the camera (drawing is boxes and SVG, not Swift)|`native-views`|
+|opening a web page over the app (a checkout, a help page)|`in-app-browser`|
 |a shared server (Snapback): wiring, tests, sign-in|`snapback`, `snapback-tests`, `snapback-auth`|
 |sign in with Google, Microsoft, Auth0, Okta or another OAuth provider|`oauth`|
 |a Convex backend: live queries, mutations, actions|`convex`|
 |a website: serving it (`serve`, which renders a `render=request` page per request), a setting, a deep link|`website`|
 |ports, Bun, Chrome and its stores|`ports-and-browsers`|
 |porting an app, a release build, helpers sharing a port|`porting-and-release`|
+|a release build for a phone: the commands, signing, where the artifact lands|`mobile-build`|
 |a metronome, drum machine, sequencer or MIDI app: sound, MIDI, a transport (built in; write no native audio module)|`sequencer`; ["Sound, MIDI and media"](contract-for-agents.md#sound-midi-and-media); `apps/metronome`|
 |transitions, keyframes, exit and layout animation|`motion`|
 |brand colours, light and dark, icon tokens|`theme`, `tamber`|
 |an icon: in a button, a tab, beside a label (a symbol, never a character such as ▦ ☏ ★ or an emoji)|`symbols`|
-|a module in Swift that `app.ts` asks; launch arguments|`native-module`|
+|a module in Swift that `app.ts` asks; a value from the launch environment (a resource that reads `native.available` or calls `native.call` keeps its answer across launches)|`native-module`|
+|a canvas drawn in Rust on the GPU (a `Surface`); Rust of the app's own, in its own Cargo workspace|`gpu-module`|
 |app.json keys, `assets/`, the `modules` folder|`app-json`|
+|a phone manifest: orientation, appearance, HTTP, a public setting|`phone-manifest`|
 |a section of the long guides, whole, by its heading|`bun exact.mjs docs <heading words>`|
 
 The others are named for their topic (`timers`, `money`…).
@@ -227,13 +236,18 @@ component Groceries
   arguments, then the payload (`toggle(i.id)` gets the bool). Its writes land when it ends, so a
   later line reads the old value: bind the new one (`let n = go(nav, url)`, `nav = n`, read `n`).
 - **Data.** A `resource` is a reactive read (`pending(x)`, `failed(x)`); a `mutation` a
-  write (`queue` keeps them in order, `refreshes` re-reads, `then` runs an action: clear
-  the field only on an ok reply, as `afterAdd` does). Only the root declares them;
-  children take `props`. For a mutation without `queue`, the action that sends it must
-  not also assign its slot to `none`: assignments commit after sends and can discard its
-  new reply. Hide an old error with `pending(added)`. `none` means the slot contains no
-  reply, not failure; use `failure(added)` to show request failures and match the reply
-  to handle a domain refusal.
+  write (`refreshes` re-reads, `then` runs an action: clear the field only on an ok
+  reply, as `afterAdd` does). A send is newest-wins, for a value whose late reply should
+  be dropped; `queue` sends one at a time, in order, for a log; `parallel` sends each at
+  once, for independent writes. Only the root declares them; children take `props`. For
+  a newest-wins mutation, the action that sends it must not also assign its slot to
+  `none`: assignments commit after sends and can discard its new reply. Hide an old error
+  with `pending(added)`. `none` means the slot contains no reply, not failure; use
+  `failure(added)` to show request failures and match the reply to handle a domain refusal.
+- **Loading.** Show "loading" on `not current(x)`, which is false while `x` shows an answer to
+  other arguments, not on `pending(x)`, which a refresh sets too. `resource x = src(id) when
+  id != ""` asks nothing until its condition holds (nothing selected, a page not open), and asks
+  again each time it turns true.
 - **Refreshes.** Include every resource the write changes (`refreshes groceries, counts`).
 
 **The data module** answers each source with exactly its declared shape: an extra

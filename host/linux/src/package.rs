@@ -118,15 +118,25 @@ impl Reply {
 /// one of its interface's events happened.
 #[derive(Clone)]
 pub struct Notifier {
-    native: exact_runner::Native,
+    native: Slot,
     extension: &'static str,
     seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// The session's current runner's native slot. A reload or an activated
+/// update replaces the runner, and the presenter points this at the new
+/// one's, so an instance made before announces to the runner now running.
+pub(crate) type Slot = std::sync::Arc<std::sync::Mutex<exact_runner::Native>>;
+
 impl Notifier {
     /// The readers of `topic` (`extension.name`) are asked again (LLP 1016.002).
     pub fn changed(&self, topic: &str) {
-        self.native.changed(topic);
+        let native = self
+            .native
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        native.changed(topic);
     }
 
     /// Raise the interface's event `name` with `args`, a JSON array (LLP
@@ -134,7 +144,7 @@ impl Notifier {
     pub fn emit(&self, name: &str, args: Json) {
         let seq = (self.seq).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let body = json!({ "extension": self.extension, "event": name, "args": args, "seq": seq });
-        self.native.changed(&format!("exact-event:{body}"));
+        self.changed(&format!("exact-event:{body}"));
     }
 }
 
@@ -159,7 +169,7 @@ impl Context {
     pub(crate) fn new(
         extension: &'static str,
         agent: bool,
-        native: exact_runner::Native,
+        native: Slot,
         now: Rc<Cell<f64>>,
         lines: Rc<RefCell<Vec<String>>>,
     ) -> Context {

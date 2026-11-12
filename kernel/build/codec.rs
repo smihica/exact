@@ -73,11 +73,9 @@ enum Codec {
     U16,
     U32,
     I32,
-    Rgba8,
     ColorValue,
     KeywordColor(&'static str),
     Vec2,
-    Color2,
     Tracks,
     Placement,
     Transitions,
@@ -98,12 +96,10 @@ fn parse_codec(s: &str) -> Codec {
         "u16" => Codec::U16,
         "u32" => Codec::U32,
         "i32" => Codec::I32,
-        "rgba8" => Codec::Rgba8,
         "color" => Codec::ColorValue,
         "auto-color" => Codec::KeywordColor("auto"),
         "current-color" => Codec::KeywordColor("currentcolor"),
         "vec2" => Codec::Vec2,
-        "color2" => Codec::Color2,
         "tracks" => Codec::Tracks,
         "placement" => Codec::Placement,
         "transitions" => Codec::Transitions,
@@ -255,11 +251,9 @@ impl Codec {
             Codec::U16 => "u16".into(),
             Codec::U32 => "u32".into(),
             Codec::I32 => "i32".into(),
-            Codec::Rgba8 => "Color".into(),
             Codec::ColorValue => "ColorValue".into(),
             Codec::KeywordColor(_) => "Option<ColorValue>".into(),
             Codec::Vec2 => "Vec2".into(),
-            Codec::Color2 => "[Color; 2]".into(),
             Codec::Tracks => "GridTracks".into(),
             Codec::Placement => "GridPlacement".into(),
             Codec::Transitions => "Transitions".into(),
@@ -277,11 +271,9 @@ impl Codec {
             Codec::U16 => "U16",
             Codec::U32 => "U32",
             Codec::I32 => "I32",
-            Codec::Rgba8 => "Rgba8",
             Codec::ColorValue => "ColorValue",
             Codec::KeywordColor(_) => "KeywordColor",
             Codec::Vec2 => "Vec2",
-            Codec::Color2 => "Color2",
             Codec::Tracks => "Tracks",
             Codec::Placement => "Placement",
             Codec::Transitions => "Transitions",
@@ -322,7 +314,6 @@ impl Codec {
             Codec::U16 => format!("{}u16", int(value, 0.0, u16::MAX as f64)),
             Codec::U32 => format!("{}u32", int(value, 0.0, u32::MAX as f64)),
             Codec::I32 => format!("{}i32", int(value, i32::MIN as f64, i32::MAX as f64)),
-            Codec::Rgba8 => format!("Color({}u32)", int(value, 0.0, u32::MAX as f64)),
             Codec::ColorValue => format!(
                 "ColorValue::Fixed(Color({}u32))",
                 int(value, 0.0, u32::MAX as f64)
@@ -342,16 +333,6 @@ impl Codec {
                     .as_array()
                     .unwrap_or_else(|| panic!("schema: vec2 default on `{field}` must be [x, y]"));
                 format!("Vec2 {{ x: {}f32, y: {}f32 }}", num(&arr[0]), num(&arr[1]))
-            }
-            Codec::Color2 => {
-                let arr = value.as_array().unwrap_or_else(|| {
-                    panic!("schema: color2 default on `{field}` must be [a, b]")
-                });
-                format!(
-                    "[Color({}u32), Color({}u32)]",
-                    num(&arr[0]) as u32,
-                    num(&arr[1]) as u32
-                )
             }
             Codec::Tracks => {
                 assert!(
@@ -412,11 +393,9 @@ impl Codec {
             Codec::U16 => "r.u16()?".into(),
             Codec::U32 => "r.u32()?".into(),
             Codec::I32 => "r.i32()?".into(),
-            Codec::Rgba8 => "r.color()?".into(),
             Codec::ColorValue => "r.color_value()?".into(),
             Codec::KeywordColor(_) => "r.optional_color()?".into(),
             Codec::Vec2 => "r.vec2()?".into(),
-            Codec::Color2 => "r.color2()?".into(),
             Codec::Tracks => "r.tracks_for_style()?".into(),
             Codec::Placement => "r.placement_for_style()?".into(),
             Codec::Transitions => "r.transitions()?".into(),
@@ -429,18 +408,16 @@ impl Codec {
     }
     fn encode_stmt(&self, access: &str) -> String {
         match self {
-            Codec::Dimension => format!("w.dimension({access});"),
+            Codec::Dimension => format!("w.dimension({access}.clone());"),
             Codec::LineHeight => format!("w.line_height({access});"),
             Codec::F32 => format!("w.f32({access});"),
             Codec::U8 => format!("w.u8({access});"),
             Codec::U16 => format!("w.u16({access});"),
             Codec::U32 => format!("w.u32({access});"),
             Codec::I32 => format!("w.i32({access});"),
-            Codec::Rgba8 => format!("w.color({access});"),
             Codec::ColorValue => format!("w.color_value({access});"),
             Codec::KeywordColor(_) => format!("w.optional_color({access});"),
             Codec::Vec2 => format!("w.vec2({access});"),
-            Codec::Color2 => format!("w.color2({access});"),
             Codec::Tracks => format!("w.tracks(&{access});"),
             Codec::Placement => format!("w.placement(&{access});"),
             Codec::Transitions => format!("w.transitions(&{access});"),
@@ -460,7 +437,8 @@ impl Codec {
     fn is_copy(&self) -> bool {
         !matches!(
             self,
-            Codec::Tracks
+            Codec::Dimension
+                | Codec::Tracks
                 | Codec::Placement
                 | Codec::Transitions
                 | Codec::Animations

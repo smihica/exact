@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // `wakelock="screen"` on the web (LLP 1125 D11), wakelock-glue.js in a real
 // browser over a stand-in `navigator.wakeLock` that counts what it is asked:
 // the holders are the displayed elements that say `screen` (not under a
@@ -6,7 +7,6 @@
 // visible page lost it, and a missing API or a refused request is journaled
 // once. The JS target's wakelock.js journals a bad word as the runner does.
 import { test, expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

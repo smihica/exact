@@ -8,6 +8,7 @@ import { chromium as playwright } from 'playwright-core';
 import { chromium } from '../../../../scripts/agent-launch.mjs';
 import { renderer } from '../../../web-js/render.mjs';
 import { stageHostGlue } from '../../../web-js/glue.mjs';
+import { hostFixtureFile } from '../glue-fixture.mjs';
 
 const work = process.argv[2], root = resolve(import.meta.dir, '../../../..');
 const { executable, unavailable } = chromium();
@@ -31,7 +32,7 @@ try {
       mkdirSync(gen, { recursive: true });
       // The same runtime files the app build copies, with JS target modules
       // taking precedence over the host's glue.
-      for (const folder of ['host/web', 'host/web-js']) for (const file of readdirSync(resolve(root, folder)).filter(f => f.endsWith('.js'))) copyFileSync(resolve(root, folder, file), resolve(gen, file));
+      for (const folder of ['host/web', 'host/web-js']) for (const file of readdirSync(resolve(root, folder)).filter(f => f.endsWith('.js'))) writeFileSync(resolve(gen, file), hostFixtureFile(resolve(root, folder, file)));
       stageHostGlue(root, gen);
       for (const f of ['app.js', 'names.js', 'paint.js']) copyFileSync(resolve(dir, f), resolve(gen, f));
       writeFileSync(resolve(gen, 'entry.js'), `import app from './app.js'; import { journal } from './rt.js'; app(); globalThis.journal=journal; globalThis.ready=true;`);

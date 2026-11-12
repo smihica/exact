@@ -219,6 +219,32 @@ static ACTIONS: LazyLock<StyleProps> = LazyLock::new(|| {
     s
 });
 impl NodeArena {
+    /// An alert's defaults read its children: whether it is grouped or a
+    /// part box empty (its own and, for its actions' margin, its
+    /// siblings'), and a row's place among them. Restyle them when
+    /// `parent`'s children change.
+    pub(crate) fn alert_children_changed(
+        &self,
+        layout: &mut dyn crate::layout::LayoutMirror,
+        parent: u32,
+        node: taffy::NodeId,
+    ) {
+        if !self.neutral_alert(parent) && !self.alert_group(parent) {
+            return;
+        }
+        layout.restyle(self, parent, node);
+        let siblings = match self.parent(parent) {
+            Some(alert) if self.alert_group(parent) => self.children(alert),
+            _ => &[],
+        };
+        for child in self.children(parent).iter().chain(siblings) {
+            if let Some(node) = self.taffy(*child) {
+                layout.restyle(self, *child, node);
+                layout.mark_dirty(node);
+            }
+        }
+    }
+
     pub(crate) fn alert_title_style(&self, slot: u32) -> StyleProps {
         let mut title = self.computed_style(slot, StyleMask::INHERITED);
         title.font_size = metrics::length_in(

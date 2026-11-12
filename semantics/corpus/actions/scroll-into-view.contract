@@ -1,0 +1,30 @@
+component App
+  state items = ["a", "b", "c"]
+  action go
+    scrollIntoView("rows", "c", block="end")
+  action element
+    scrollIntoView("go", block="nearest")
+  action mixed
+    copyText("before")
+    scrollIntoView("rows", "a", offset=0)
+    scrollIntoView("go", block="nearest")
+    scrollIntoView("rows", "c", block="end")
+    copyText("after")
+  view
+    column
+      button "Go" id="go" press=go testId="go"
+      button "Element" press=element testId="element"
+      button "Mixed" press=mixed testId="mixed"
+      list id="rows" virtualized=true height=100
+        for i in items key=i
+          text i
+
+test "a list row scroll is consumed by the runner"
+  tap "go"
+
+test "an element scroll reaches the host"
+  tap "element"
+
+test "host commands around row scrolls keep their order"
+  tap "mixed"
+  tap "mixed"

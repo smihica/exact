@@ -24,6 +24,7 @@ mod stickers;
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {
+        ibex2_sqlite::link();
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

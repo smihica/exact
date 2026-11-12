@@ -1,20 +1,10 @@
-// @exact/sign-in on iOS and macOS (LLP 1133.014 D3, D5, D7): the capabilities
-// this build can offer and the providers' buttons. The identity member's
-// requests (Apple's in passkeys' controller through the session's request
-// table, Google's through the host's auth session, D10 items 2 and 3) are
-// stage 2's and not built: a request reaching this implementation fails
-// `NotSupportedError`. Under the agent the substitute answers it.
-//
-// - `getIdentityCapabilities`: Apple where the build carries
-//   `com.apple.developer.applesignin` (on macOS only a build whose profile
-//   authorizes it, D7; read with `SecTaskCopyValueForEntitlement`), active,
-//   passive and beside a passkey; Google active, through a browser session.
-// - `exact-sign-in-button`: Apple's `ASAuthorizationAppleIDButton`, its
-//   type from `context` and its style from the appearance (black in light,
-//   white in dark, the HIG's); Google's standard button, its "G" drawn here.
+// @exact/sign-in on Apple (LLP 1133.014): an identity-only Apple request
+// and the provider buttons. Combined passkey requests still belong to
+// passkeys; Google and getCredentialState are not implemented here.
 import AuthenticationServices
 import ExactPackage
 import Foundation
+import Security
 #if os(macOS)
 import AppKit
 #else
@@ -23,22 +13,26 @@ import UIKit
 
 public final class SignInModule: NSObject, ExactPackage {
     let context: ExactPackageContext
+    private var ceremony: AppleSignInCeremony?
+    static let appleConfig = "https://appleid.apple.com"
 
     public init(context: ExactPackageContext) { self.context = context }
 
     private var apple: Bool {
         #if os(macOS)
         guard let task = SecTaskCreateFromSelf(nil) else { return false }
-        return SecTaskCopyValueForEntitlement(task, "com.apple.developer.applesignin" as CFString, nil) != nil
+        let values = SecTaskCopyValueForEntitlement(task, "com.apple.developer.applesignin" as CFString, nil) as? [String]
+        return values?.contains("Default") == true
         #else
+        // iOS has no public entitlement query. AuthenticationServices
+        // checks the signed entitlement when it performs the request.
         return true
         #endif
     }
 
     private func capabilities() -> [String: Any] {
-        let a = apple
-        return ["available": true, "providers": [
-            "apple": ["active": a, "passive": a, "withPublicKey": a],
+        ["available": true, "providers": [
+            "apple": ["active": apple, "passive": apple, "withPublicKey": apple],
             "google": ["active": true, "passive": false, "withPublicKey": false],
         ]]
     }
@@ -46,13 +40,106 @@ public final class SignInModule: NSObject, ExactPackage {
     public func later(_ name: String, _ args: [String: Any], preferred: Any?, reply: @escaping ([String: Any]) -> Void) {
         switch name {
         case "getIdentityCapabilities": reply(capabilities())
-        case "preventSilentAccess": reply([:]) // neither Apple provider signs in without UI (D1)
+        case "preventSilentAccess": reply([:])
+        case "identity": signIn(args, reply)
         default: reply(["error": "NotSupportedError", "message": "\(name) is not built on Apple yet (LLP 1133.014 §11 stage 2)"])
         }
     }
 
     public func call(_ name: String, _ args: [String: Any]) throws -> [String: Any] {
         name == "getIdentityCapabilitiesSync" ? capabilities() : ["error": "NotSupportedError"]
+    }
+
+    private func signIn(_ args: [String: Any], _ reply: @escaping ([String: Any]) -> Void) {
+        guard context.origin == "app", context.foreground else { return reply(["error": "NotAllowedError", "message": "person-required"]) }
+        guard apple else { return reply(["error": "NotSupportedError", "message": "this build has no Sign in with Apple entitlement"]) }
+        let request: ASAuthorizationAppleIDRequest
+        do { request = try Self.request(args) }
+        catch let failure as SignInFailure { return reply(failure.json) }
+        catch { return reply(["error": "TypeError"]) }
+        let passive = (args["identity"] as? [String: Any])?["mode"] as? String != "active"
+        present(request, passive: passive, reply)
+    }
+
+    func present(_ request: ASAuthorizationAppleIDRequest, passive: Bool, _ reply: @escaping ([String: Any]) -> Void) {
+        guard let anchor = context.presentation?.window else { return reply(["error": "NotAllowedError", "message": "the session has no presentation window"]) }
+        if let held = ceremony {
+            guard held.passive && !passive else { return reply(["error": "NotAllowedError", "message": "busy"]) }
+            held.abort()
+        }
+        let current = AppleSignInCeremony(request: request, number: context.request, passive: passive, anchor: anchor)
+        ceremony = current
+        current.done = { [weak self, weak current] answer in
+            if self?.ceremony === current { self?.ceremony = nil }
+            reply(answer)
+        }
+        current.start()
+    }
+
+    public func cancel(_ request: Int) {
+        if ceremony?.number == request { ceremony?.abort() }
+    }
+
+    public func foreground(_ shown: Bool) {
+        if !shown { ceremony?.abort() }
+    }
+
+    public func destroy(_ done: @escaping () -> Void) {
+        ceremony?.abort()
+        done()
+    }
+
+    /// The raw nonce is passed unchanged, as in the web authorization URL.
+    /// Apple returns the supplied nonce in the ID token; hashing only this
+    /// host's request would give the server two verification rules.
+    static func request(_ args: [String: Any]) throws -> ASAuthorizationAppleIDRequest {
+        let options = args["identity"] as? [String: Any] ?? [:]
+        let providers = options["providers"] as? [[String: Any]] ?? []
+        let mode = options["mode"] as? String ?? "passive"
+        let mediation = args["mediation"] as? String ?? "optional"
+        guard args["publicKey"] == nil, ["active", "passive"].contains(mode),
+              ["optional", "required"].contains(mediation),
+              let provider = providers.first(where: { $0["configURL"] as? String == appleConfig }),
+              mode != "active" || providers.count == 1 else {
+            throw SignInFailure(["error": "NotSupportedError", "message": "this implementation offers Apple identity requests alone"])
+        }
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.nonce = (provider["params"] as? [String: Any])?["nonce"] as? String
+        request.state = UUID().uuidString
+        let fields = provider["fields"] as? [String] ?? ["name", "email", "picture"]
+        request.requestedScopes = [ASAuthorization.Scope.fullName, .email].filter { fields.contains($0 == .fullName ? "name" : "email") }
+        return request
+    }
+
+    static func answer(token: Data?, code: Data?, state: String?, user: String, name: PersonNameComponents?,
+                       email: String?, status: ASUserDetectionStatus, scopes: [ASAuthorization.Scope]) -> [String: Any] {
+        guard let token, let tokenText = String(data: token, encoding: .utf8), !tokenText.isEmpty,
+              let code, let codeText = String(data: code, encoding: .utf8), !codeText.isEmpty else {
+            return ["error": "IdentityCredentialError", "message": "Apple returned no identity token or authorization code"]
+        }
+        var authorization = ["id_token": tokenText, "code": codeText]
+        if let state { authorization["state"] = state }
+        var body: [String: Any] = ["authorization": authorization]
+        var person: [String: Any] = [:]
+        if let name, name.givenName != nil || name.familyName != nil {
+            person["name"] = ["firstName": name.givenName ?? "", "lastName": name.familyName ?? ""]
+        }
+        if let email { person["email"] = email }
+        if !person.isEmpty { body["user"] = person }
+        return ["type": "identity", "id": "", "configURL": appleConfig, "isAutoSelected": false,
+                "token": body, "handle": UUID().uuidString,
+                "apple": ["user": user, "realUserStatus": status == .likelyReal ? "likelyReal" : status == .unknown ? "unknown" : "unsupported",
+                          "authorizedScopes": scopes.map { $0 == .fullName ? "name" : $0 == .email ? "email" : $0.rawValue }]]
+    }
+
+    static func failure(_ error: Error) -> [String: Any] {
+        let ns = error as NSError
+        let code = ns.domain == ASAuthorizationError.errorDomain ? ns.code : -1
+        let words = [1000: "unknown", 1001: "canceled", 1002: "invalidResponse", 1003: "notHandled", 1004: "failed", 1005: "notInteractive"]
+        let name = code == ASAuthorizationError.canceled.rawValue ? "NetworkError"
+            : code == ASAuthorizationError.notInteractive.rawValue ? "NotAllowedError" : "IdentityCredentialError"
+        return ["error": name, "message": ns.localizedDescription,
+                "apple": ["code": words[code] ?? "\(ns.domain) \(ns.code)"]]
     }
 
     public func view(_ tag: String, id: String, props: [String: String], events: ExactPackageEvents) throws -> ExactPackageView {
@@ -62,6 +149,60 @@ public final class SignInModule: NSObject, ExactPackage {
         events.load()
         return button
     }
+}
+
+struct SignInFailure: Error {
+    let json: [String: Any]
+    init(_ json: [String: Any]) { self.json = json }
+}
+
+/// One request, anchored to the calling session, with exactly one reply.
+final class AppleSignInCeremony: NSObject, ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
+    let controller: ASAuthorizationController
+    let number: Int?
+    let passive: Bool
+    let anchor: ASPresentationAnchor
+    let state: String?
+    var done: (([String: Any]) -> Void)?
+
+    init(request: ASAuthorizationAppleIDRequest, number: Int?, passive: Bool, anchor: ASPresentationAnchor) {
+        controller = ASAuthorizationController(authorizationRequests: [request])
+        self.number = number; self.passive = passive; self.anchor = anchor; state = request.state
+        super.init()
+        controller.delegate = self
+        controller.presentationContextProvider = self
+    }
+
+    func start() {
+        if passive { controller.performRequests(options: .preferImmediatelyAvailableCredentials) }
+        else { controller.performRequests() }
+    }
+
+    func finish(_ answer: [String: Any]) {
+        let reply = done
+        done = nil
+        reply?(answer)
+    }
+
+    func abort() {
+        finish(["error": "AbortError"])
+        controller.cancel()
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential, credential.state == state else {
+            return finish(["error": "IdentityCredentialError", "message": "Apple returned an unexpected credential or state"])
+        }
+        finish(SignInModule.answer(token: credential.identityToken, code: credential.authorizationCode, state: credential.state,
+                                  user: credential.user, name: credential.fullName, email: credential.email,
+                                  status: credential.realUserStatus, scopes: credential.authorizedScopes))
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        finish(SignInModule.failure(error))
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor { anchor }
 }
 
 /// The provider's button: Apple's system button, or Google's standard one.

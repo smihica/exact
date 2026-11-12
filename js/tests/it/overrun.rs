@@ -203,3 +203,58 @@ fn a_mutations_overrun_is_not_asked_again() {
     assert_eq!(r.timer_due_ms(), None);
     assert!(!r.journal().any(|l| l.contains("asked again in")));
 }
+
+#[test]
+fn an_overrun_first_turn_releases_its_fetch_before_the_retry() {
+    use exact_runner::{Outcome, Response};
+    use std::time::Duration;
+    let grants = "net.fetch https://outlive.test\nnet.fetch local-network development\nsecret.keep outlive.token\n";
+    for mode in ["flag", "memo"] {
+        let plan = contract::compile(&format!(
+            "component App\n  state go = false\n  resource r = guarded(go, \"{mode}\") as shape string\n  resource cleanup = cleanup() as shape string\n  action start\n    go = true\n  view\n    text r\n"
+        )).unwrap();
+        let mut module = Module::loaded(
+            include_bytes!(concat!(env!("OUT_DIR"), "/outlive.hbc")).to_vec(),
+            "test.outlive",
+            grants,
+        )
+        .unwrap();
+        module.set_turn_step(Duration::from_millis(1));
+        let mut r = Runner::boot(
+            plan,
+            module,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        r.data().set_turn_step(Duration::from_millis(150));
+        r.act("start", vec![]).unwrap();
+        assert_eq!(r.data().overruns(), 1, "{mode}");
+        assert!(r.take_requests().is_empty());
+        assert_eq!(r.data().calls_open(), Some(0), "{mode}: the call is let go");
+        assert_eq!(r.data().unsent(), 0, "{mode}: its request is withdrawn");
+        r.data().set_turn_step(Duration::from_millis(1));
+        assert_eq!(
+            r.data().query("cleanup", &[]).unwrap(),
+            Value::str("false/true/Aborted")
+        );
+        r.advance(250.0).unwrap();
+        let requests = r.take_requests();
+        assert_eq!(requests.len(), 1, "{mode}: the retry fetches");
+        assert_eq!(requests[0].request.url, "https://outlive.test/guarded");
+        r.fulfill(
+            requests[0].ticket,
+            Outcome::Response(Response {
+                status: 200,
+                headers: vec![],
+                body: b"DATA".to_vec(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(r.resource("r"), Some(&Value::str("DATA")));
+        assert!(r.pending().is_empty());
+        assert_eq!(r.data().calls_open(), Some(0));
+        assert_eq!(r.data().unsent(), 0);
+    }
+}

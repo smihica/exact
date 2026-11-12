@@ -135,6 +135,31 @@ final class PaintMotionMacTests: XCTestCase {
         XCTAssertEqual(node.paragraphSpec().runs.map(\.color), [[0, 0, 0, 255], [255, 0, 0, 255]])
     }
 
+    /// A run has no layer, so its `opacity` (its enclosing runs' times its
+    /// own, as the host sends it) is the alpha of everything it paints.
+    func testAnInlineRunsOpacityFadesItsPaint() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "paint-run-opacity-mac")
+        defer { session.destroy() }
+        let p = session.presenter
+        let black = [0.0, 0.0, 0.0, 255.0]
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "text", "style": ["font_size": 16.0, "text_color": black]],
+            ["op": "paragraph", "id": 1, "runs": [
+                ["id": 2, "parent": 1, "paint": true, "props": ["text": "Posted "], "style": ["text_color": black]],
+                ["id": 3, "parent": 1, "paint": true, "props": ["text": "yesterday"], "opacity": 0.3,
+                 "style": ["text_color": black, "background_color": [255.0, 255.0, 0.0, 255.0],
+                           "text_stroke_width": 1.0, "text_stroke_color": [255.0, 0.0, 0.0, 128.0]]],
+            ]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 300.0, "h": 40.0],
+        ]))
+        let runs = try XCTUnwrap(p.views[1]).paragraphSpec().runs
+        XCTAssertEqual(runs.map(\.color), [black, [0, 0, 0, 255 * 0.3]])
+        XCTAssertEqual(runs[1].background, [255, 255, 0, 255 * 0.3])
+        XCTAssertEqual(runs[1].stroke, [1, 255, 0, 0, 128 * 0.3])
+    }
+
     func testAViewInItsOwnAppearanceIsNotedOnceUntilItAgreesAgain() throws {
         _ = NSApplication.shared
         let session = ExactApp.shared.makeSession(label: "paint-view-scheme-mac")

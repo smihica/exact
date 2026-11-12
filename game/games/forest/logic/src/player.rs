@@ -146,6 +146,7 @@ pub fn spawn(w: &mut World, colliders: bool, children: u32) {
                 range: FLASH_RANGE,
                 inner: 0.25,
                 outer: 0.5,
+                ..Default::default()
             },
             LightShadows,
         ),

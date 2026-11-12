@@ -147,6 +147,7 @@ pub fn build(w: &mut World) {
                 color: [1.0, 0.55, 0.2],
                 intensity: 0.0,
                 range: 1.0,
+                ..Default::default()
             },
             LightShadows,
         ),
@@ -226,6 +227,7 @@ pub fn torches(w: &mut World, count: u32) {
                 color: [1.0, 0.6, 0.25],
                 intensity: 50_000.0,
                 range: 8.0,
+                ..Default::default()
             },
         ));
     }

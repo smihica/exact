@@ -186,6 +186,44 @@ mod tests {
         assert_eq!(timed.timeout_refusal(), Some("a stream has no timeout"));
     }
 
+    /// LLP 1016.000 D11: only a WebSocket stream takes an idle timeout, on
+    /// every host, since each asks `timeout_refusal`.
+    #[test]
+    fn only_a_websocket_stream_takes_an_idle_timeout() {
+        let stream = |url: &str| {
+            let crate::Answer::Later(request) = crate::Answer::stream(Request::get(url)) else {
+                unreachable!()
+            };
+            request.idle_timeout(60_000)
+        };
+        let only = Some("only a WebSocket stream takes an idle timeout");
+        assert_eq!(stream("wss://example.test/feed").timeout_refusal(), None);
+        assert_eq!(stream("WS://example.test/feed").timeout_refusal(), None);
+        assert_eq!(
+            stream("https://example.test/events").timeout_refusal(),
+            only
+        );
+        assert_eq!(
+            Request::get("wss://example.test/feed")
+                .idle_timeout(60_000)
+                .timeout_refusal(),
+            only,
+            "not a stream"
+        );
+        assert_eq!(
+            upload("https://example.test/up")
+                .idle_timeout(60_000)
+                .timeout_refusal(),
+            only
+        );
+        let range = Some("an idle timeout must be 1 to 3600000 ms");
+        let mut out = stream("wss://example.test/feed");
+        out.idle_timeout_ms = Some(0);
+        assert_eq!(out.timeout_refusal(), range);
+        out.idle_timeout_ms = Some(3_600_001);
+        assert_eq!(out.timeout_refusal(), range);
+    }
+
     #[test]
     fn a_progress_message_carries_the_bytes_sent_and_the_length() {
         let m = Message::upload_progress(65_536, 4_194_304);

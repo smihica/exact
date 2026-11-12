@@ -305,9 +305,14 @@ def compile : Nat → Program → Nat → Scope → Nat → Expr → Except Stri
         match scopeLookup x sc with
         | .some (.resource i, _) => .ok ([.failureResource i], .option (.record "Failure"))
         | _ => .error s!"`{x}` is not a resource"
+      | "current", [.var x] =>
+        match scopeLookup x sc with
+        | .some (.resource i, _) => .ok ([.currentResource i], .bool)
+        | _ => .error s!"`{x}` is not a resource"
       | _, _ =>
         if name = "map" ∨ name = "filter" ∨ name = "pending" ∨ name = "failed" ∨ name = "failure"
-          ∨ name = "sortBy" ∨ name = "t" ∨ name = "path" then .error s!"`{name}` as written"
+          ∨ name = "current" ∨ name = "sortBy" ∨ name = "t" ∨ name = "path" then
+          .error s!"`{name}` as written"
         else if !roster.contains name then .error s!"`{name}` is not in the roster"
         else do
           let (c, ts) ← compileArgs fuel p depth sc n args

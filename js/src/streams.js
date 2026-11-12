@@ -19,6 +19,8 @@
   // (prelude.js takes and deletes both after this file has captured them)
   var door = global.__exact_bytes, keep = global.__exact_key;
   var defineProperty = Object.defineProperty, PromiseC = Promise, then = Promise.prototype.then;
+  var typedName = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+  var readables = new WeakSet();
   function noop() {}
   function resolved(v) { return PromiseC.resolve(v); }
   function rejected(e) { return PromiseC.reject(e); }
@@ -48,7 +50,9 @@
   }
   function tag(C, name) { defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true }); }
   function illegal() { throw new TypeError("Illegal constructor"); }
-  function brand(x, C, what) { if (!(x instanceof C)) throw new TypeError("Illegal invocation: not a " + what); }
+  function brand(x, C, what) {
+    if (C === ReadableStream ? !isReadable(x) : !(x instanceof C)) throw new TypeError("Illegal invocation: not a " + what);
+  }
 
   // --- queue-with-sizes and strategies ---------------------------------------
   function resetQueue(c) { c._queue = []; c._queueTotalSize = 0; }
@@ -90,7 +94,7 @@
 
   // --- ReadableStream ----------------------------------------------------------
   function ReadableStream(source, strategy) {
-    if (!(this instanceof ReadableStream)) throw new TypeError("Constructor requires 'new'");
+    if (!new.target) throw new TypeError("Constructor requires 'new'");
     if (source === undefined) source = null;
     if (source !== null && typeof source !== "object" && typeof source !== "function") throw new TypeError("ReadableStream: the underlying source must be an object");
     var type = source == null ? undefined : source.type;
@@ -108,7 +112,10 @@
       cancel ? function (r) { return promiseCall(cancel, source, [r]); } : function () { return resolved(); },
       hwm, size);
   }
-  function initializeReadableStream(s) { s._state = "readable"; s._reader = undefined; s._storedError = undefined; s._disturbed = false; }
+  function initializeReadableStream(s) {
+    readables.add(s);
+    s._state = "readable"; s._reader = undefined; s._storedError = undefined; s._disturbed = false;
+  }
   function createReadableStream(start, pull, cancel, hwm, size) {
     var s = Object.create(ReadableStream.prototype);
     initializeReadableStream(s);
@@ -223,7 +230,7 @@
     clearReadableAlgorithms(c);
     return upon(result, noop);
   }
-  function isReadable(x) { return x instanceof ReadableStream; }
+  function isReadable(x) { return readables.has(x); }
 
   function ReadableStreamDefaultReader(stream) {
     if (!(this instanceof ReadableStreamDefaultReader)) throw new TypeError("Constructor requires 'new'");
@@ -274,8 +281,8 @@
   });
   tag(ReadableStreamDefaultReader, "ReadableStreamDefaultReader");
 
-  // ReadableStreamDefaultTee, without cloning.
-  function tee(stream) {
+  // ReadableStreamDefaultTee; Fetch clones the second branch's chunks.
+  function tee(stream, cloneForBranch2) {
     var reader = new ReadableStreamDefaultReader(stream);
     var reading = false, readAgain = false, canceled1 = false, canceled2 = false, reason1, reason2, branch1, branch2;
     var cancelled = deferred();
@@ -286,8 +293,18 @@
         chunk: function (chunk) {
           global.queueMicrotask(function () {
             readAgain = false;
+            var second = chunk;
+            if (!canceled2 && cloneForBranch2) {
+              try { second = global.structuredClone(chunk); }
+              catch (e) {
+                readableControllerError(branch1._controller, e);
+                readableControllerError(branch2._controller, e);
+                cancelled.resolve(readableStreamCancel(stream, e));
+                return;
+              }
+            }
             if (!canceled1) readableControllerEnqueue(branch1._controller, chunk);
-            if (!canceled2) readableControllerEnqueue(branch2._controller, chunk);
+            if (!canceled2) readableControllerEnqueue(branch2._controller, second);
             reading = false;
             if (readAgain) pull();
           });
@@ -958,6 +975,55 @@
     });
     tag(C, name);
   });
+
+  // Fetch's stream-body operations for binary.js, which takes and deletes this
+  // handoff. Browser realms use their native Response for the same operations.
+  function StreamBody(stream) {
+    if (stream._reader || stream._disturbed) throw new TypeError("Response: the ReadableStream is locked or was read already");
+    this._body = stream;
+  }
+  getters(StreamBody.prototype, {
+    body: function () { return this._body; },
+    bodyUsed: function () { return this._body._disturbed; },
+  });
+  methods(StreamBody.prototype, {
+    arrayBuffer: function () {
+      var stream = this._body;
+      if (stream._reader || stream._disturbed) return rejected(new TypeError("Response: the ReadableStream is locked or was read already"));
+      var reader = new ReadableStreamDefaultReader(stream), chunks = [], length = 0, result = deferred();
+      function next() {
+        readerRead(reader, {
+          chunk: function (chunk) {
+            try {
+              if (typedName.call(chunk) !== "Uint8Array") throw new TypeError("Response: a ReadableStream chunk must be a Uint8Array");
+              // Fetch snapshots a chunk before the next pull can reuse its buffer.
+              var copy = new Uint8Array(chunk);
+              chunks.push(copy); length += copy.byteLength;
+              upon(resolved(), next, result.reject);
+            } catch (e) { result.reject(e); }
+          },
+          close: function () {
+            try {
+              var all = new Uint8Array(length), at = 0;
+              chunks.forEach(function (chunk) { all.set(chunk, at); at += chunk.byteLength; });
+              result.resolve(all.buffer);
+            } catch (e) { result.reject(e); }
+          },
+          error: result.reject,
+        });
+      }
+      next();
+      return result.promise;
+    },
+    clone: function () {
+      var stream = this._body;
+      if (stream._reader || stream._disturbed) throw new TypeError("Response.clone(): the ReadableStream is locked or was read already");
+      var branches = tee(stream, true);
+      this._body = branches[0];
+      return new StreamBody(branches[1]);
+    },
+  });
+  global.__exact_stream_body = StreamBody;
 
   [["ReadableStream", ReadableStream], ["ReadableStreamDefaultReader", ReadableStreamDefaultReader],
     ["ReadableStreamDefaultController", ReadableStreamDefaultController], ["WritableStream", WritableStream],

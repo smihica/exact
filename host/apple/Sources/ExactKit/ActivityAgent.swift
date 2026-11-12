@@ -5,6 +5,67 @@ import ImageIO
 import UniformTypeIdentifiers
 import ExactCore
 import ExactSnapshot
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
+
+/// A gallery view's pixels as a hosting view draws them, at the size it
+/// takes when offered `width` and `height` (none: as tall as it needs), at
+/// `scale` pixels a point, as `ImageRenderer`'s `proposedSize` sizes it. `ImageRenderer` draws a view UIKit or AppKit provides (a
+/// progress bar, a link on the Mac) as a placeholder, so it does not draw
+/// what the widget and the Live Activity show.
+@MainActor
+enum GalleryCapture {
+    static func image<V: View>(_ content: V, width: CGFloat, height: CGFloat?, scale: CGFloat) -> CGImage? {
+        let view = Offer(proposal: ProposedViewSize(width: width, height: height)) { content }
+        #if os(iOS)
+        // UIKit draws a hosted control only in a window: one of the content's size, for the one draw, with no
+        // safe-area inset (it sits under the status bar) and not key, so the app's key window stays key.
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return nil }
+        let host = UIHostingController(rootView: view)
+        host.safeAreaRegions = []
+        host.view.backgroundColor = .clear
+        let size = host.sizeThatFits(in: .zero)
+        guard size.width >= 1, size.height >= 1 else { return nil }
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(origin: .zero, size: size)
+        window.backgroundColor = .clear
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale; format.opaque = false; format.preferredRange = .standard
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            _ = window.drawHierarchy(in: CGRect(origin: .zero, size: size), afterScreenUpdates: true)
+        }.cgImage
+        #else
+        let host = NSHostingView(rootView: view)
+        let size = host.fittingSize
+        host.frame = CGRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+        guard size.width >= 1, size.height >= 1,
+              let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int((size.width * scale).rounded()), pixelsHigh: Int((size.height * scale).rounded()),
+                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        bitmap.size = size
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        return bitmap.cgImage
+        #endif
+    }
+
+    /// Its content at the size the content takes under `proposal`, whatever it is offered itself.
+    private struct Offer: Layout {
+        let proposal: ProposedViewSize
+        func sizeThatFits(proposal _: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+            subviews.first?.sizeThatFits(proposal) ?? .zero
+        }
+        func placeSubviews(in bounds: CGRect, proposal _: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+            subviews.first?.place(at: bounds.origin, proposal: proposal)
+        }
+    }
+}
 
 @MainActor
 struct ActivityAddressView: View {
@@ -86,9 +147,8 @@ enum ActivityAgent {
                     result["roots"] = roots; result["nodes"] = nodes
                 case "screenshot":
                     guard let path = request["path"] as? String else { throw HeadlessSession.Failure(description: "screenshot needs a path") }
-                    let renderer = ImageRenderer(content: ActivityAddressView(preview: preview, placement: placement, width: width))
-                    renderer.scale = scale; renderer.proposedSize = ProposedViewSize(width: width, height: nil)
-                    guard let image = renderer.cgImage, let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+                    guard let image = GalleryCapture.image(ActivityAddressView(preview: preview, placement: placement, width: width), width: width, height: nil, scale: scale),
+                          let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
                         throw HeadlessSession.Failure(description: "could not render activity screenshot")
                     }
                     CGImageDestinationAddImage(destination, image, nil)

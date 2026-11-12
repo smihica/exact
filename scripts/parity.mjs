@@ -4,9 +4,23 @@
 // SVG smoke keeps its own copy until the SVG stages 8–10 lane lands (QUEUE);
 // the canvas smoke (scripts/canvasparity.mjs) uses this one.
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { crop, decodePng } from './png.mjs';
+
+const ROOT = resolve(import.meta.dir, '..');
+
+/** A gallery's web build, the JS target the app ships (LLP 1071), in its own dist (`target/web-dist-js/<app>`) so a
+ * smoke leaves `host/web/dist` alone; built when missing, and again under `EXACT_PARITY_REBUILD=1`. */
+export function webBuild(app) {
+  const dist = resolve(ROOT, 'target/web-dist-js', app);
+  if (process.env.EXACT_PARITY_REBUILD === '1' || !existsSync(resolve(dist, '.exact-build.json'))) {
+    mkdirSync(dirname(dist), { recursive: true });
+    const b = spawnSync('bun', [resolve(ROOT, 'host/web/build.mjs'), `${app}-web`, '--js'], { cwd: ROOT, env: { ...process.env, EXACT_WEB_DIST: dist }, stdio: 'inherit' });
+    if (b.status !== 0) throw new Error(`the ${app} web build failed`);
+  }
+  return dist;
+}
 
 /** An RGBA image averaged down by an integer factor. */
 export function shrink(img, k) {

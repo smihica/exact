@@ -1,5 +1,7 @@
+import { glueDeclarations } from './tests/glue-fixture.mjs';
+import { hostFixtureFile as readFileSync } from './tests/glue-fixture.mjs';
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+
 import { runInNewContext } from 'node:vm';
 
 const source = readFileSync(new URL('./native-glue.js', import.meta.url), 'utf8');
@@ -74,19 +76,19 @@ test('announcements coalesce until the host drains and retired generations canno
 
 test('the page loader clears its rejected cache and activation connects without a request', async () => {
   const glue = readFileSync(new URL('./glue.js', import.meta.url), 'utf8');
-  const loaderSource = glue.slice(glue.indexOf('let pageNativeModule'), glue.indexOf('let rustLoader'));
+  const loaderSource = glueDeclarations(glue, ['loadPageNative']);
   let attempts = 0;
   const native = { drain() {} };
-  const load = Function('loadAfterPaint', 'pageNative', 'inputReady', 'incarnation', 'afterNativePaint', 'agentMode', 'now', `${loaderSource}; return loadPageNative;`)(
+  const load = Function('loadAfterPaint', 'pageNative', 'inputReady', 'incarnation', 'afterNativePaint', 'agentMode', 'now', `const host = { pageNativeModule: null, inputReady, incarnation }; ${loaderSource}; return loadPageNative;`)(
     async () => { if (++attempts === 1) throw Error('transient load failure'); return async () => native; }, true, true, 1, async () => {}, false, () => 0);
   await expect(load()).rejects.toThrow('transient load failure');
   expect(await load()).toBe(native);
   expect(await load()).toBe(native);
   expect(attempts).toBe(2);
-  const activationSource = glue.slice(glue.indexOf('function activateData()'), glue.indexOf('// Boot the app'));
+  const activationSource = glueDeclarations(glue, ['activateData']);
   const calls = [];
   const activate = Function('wasm', 'readOut', 'page', 'applyBatch', 'setInputReady', 'collections', 'root', 'pageNative', 'loadPageNative', 'pieces', 'log',
-    `${activationSource}; return activateData;`)(
+    `const host = { wasm, page }; ${activationSource}; return activateData;`)(
       { exact_data_ready: () => 0 }, () => '{}', null, () => {}, () => calls.push('ready'), { dataReady() {} }, { dataset: {} }, true,
       async () => { calls.push('connect'); return { drain: () => calls.push('drain') }; }, { pending: () => null }, () => {});
   await activate();

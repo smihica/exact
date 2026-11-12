@@ -14,6 +14,7 @@ license = "MIT"
 # exact2's vendored patches, the root Cargo.toml's [patch.crates-io] (scripts/app.mjs refuses a
 # workspace whose patches differ from the checkout's).
 [patch.crates-io]
+accesskit_windows = { path = "../../../vendor/accesskit-windows" }
 taffy = { path = "../../../vendor/taffy" }
 parley = { path = "../../../vendor/parley" }
 fontique = { path = "../../../vendor/fontique" }

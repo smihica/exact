@@ -1,3 +1,4 @@
+import { hostFixtureFile } from './tests/glue-fixture.mjs';
 // The page's module realm (module-glue.js) over the real prelude, in a vm
 // context standing in for its iframe, and its worker placement on a Worker,
 // each with a scripted file store.
@@ -11,6 +12,52 @@ const ROOT = resolve(import.meta.dir, '../..');
 // The runner's normalized set for `net.fetch https://api.castle.test` (as tests/it/request.rs's batch carries it).
 const GRANTS = {version:1,entries:[[1,'net.fetch https://api.castle.test',['fetch','https','api.castle.test',443],null]],error:null,seal:'825ec7a8503217b3'};
 
+test('image writes notify only for a successful widget-readable destination', async () => {
+  const realm = vm.createContext({ URL, TextEncoder, TextDecoder, AbortController, AbortSignal, crypto,
+    __exact_host: () => '', console: { error() {} } });
+  vm.runInContext(readFileSync(resolve(ROOT, 'js/src/binary.js'), 'utf8'), realm);
+  vm.runInContext(readFileSync(resolve(ROOT, 'js/src/prelude.js'), 'utf8'), realm);
+  vm.runInContext(`
+    exact = { grants: 'fs.read app:/data/output.jpg', answer(source, args, store, storage) {
+      return globalThis.result = storage.fs[args[0]](args[1], args[2], {
+        maxDimension: 32, maxBytes: 10000, rotate: 90
+      });
+    } };
+    function image(from, to, transform) {
+      if (from === 'app:/data/missing.jpg') throw new Error('missing image');
+      const path = transform ? to + '.jpg' : to;
+      return nativeReply
+        ? (transform ? '32\\t32\\t100\\t' + path + '\\t{"type":"image/jpeg"}' : '32\\t32\\t100')
+        : { path, type: 'image/jpeg', width: 32, height: 32, size: 100 };
+    }
+    __exact_storage = { fs: {
+      compressImage: (from, to) => Promise.resolve(image(from, to, false)),
+      transformImage: (from, to) => Promise.resolve(image(from, to, true))
+    } };
+    __exact_install_storage();
+  `, realm);
+  let writes = 0;
+  for (const nativeReply of [false, true]) {
+    realm.nativeReply = nativeReply;
+    for (const method of ['compressImage', 'transformImage']) {
+      const destination = method === 'transformImage' ? 'app:/data/output' : 'app:/data/output.jpg';
+      for (const [from, to, changed, ok] of [
+        ['app:/data/input.jpg', destination, true, true],
+        ['app:/data/output.jpg', 'app:/cache/hidden', false, true],
+        ['app:/data/missing.jpg', destination, false, false],
+      ]) {
+        const call = JSON.parse(realm.__exact_call('image', JSON.stringify([method, from, to]), 'answer'));
+        await realm.result.catch(() => {});
+        const reply = JSON.parse(realm.__exact_settle(String(call.call)));
+        expect(reply.tag).toBe(ok ? 0 : 2);
+        if (ok) expect(reply.value.path).toBe(method === 'transformImage' ? to + '.jpg' : to);
+        if (changed) writes++;
+        expect(JSON.parse(realm.__exact_background()).writes).toBe(writes);
+      }
+    }
+  }
+});
+
 // An answer's storage operation queued behind another answer's parks; when
 // that answer delivers its own (after its fetch came back), the parked one's
 // operation is in flight and it is asked again (prelude.js `settle`, LLP 1097
@@ -20,10 +67,11 @@ test('a parked answer is asked again after another answer delivers its storage',
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-module-storage-'));
   const saved = Object.fromEntries(['fetch', 'document', 'location'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   try {
-    for (const name of ['module-glue.js', 'storage.js', 'grant-admission.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+    for (const name of ['module-glue.js', 'storage.js', 'grant-admission.js', 'faults.js', 'navigation.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(ROOT, 'host/web', name)));
     writeFileSync(resolve(dir, 'storage-environment.js'), `export const directories = Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' });
 export const storageKey = () => 'k'; export const agentStorageRefusal = 'no store'; export const agentReads = []; export const emptyRead = () => []; export const agentSeed = () => null;
-export const agentStream = () => null; export const keyStore = () => ({}); export const now = () => 0;`);
+export const agentStream = () => null; export const keyStore = () => ({}); export const now = () => 0;
+export { refuseCodeFromStrings } from ${JSON.stringify(resolve(ROOT, 'host/web/storage-environment.js'))};`);
     // Each read lands when the test says, in the order issued.
     writeFileSync(resolve(dir, 'storage-fs.js'), `export const createFileSystem = () => ({
   readFile: path => new Promise(ok => globalThis.reads.push(() => ok(new TextEncoder().encode(path)))), dispose() {} });`);
@@ -39,7 +87,7 @@ export const agentStream = () => null; export const keyStore = () => ({}); expor
     const win = vm.createContext({ console: { log() {}, info() {}, warn() {}, error() {}, debug() {} }, TextEncoder, TextDecoder, structuredClone, setTimeout, clearTimeout,
       queueMicrotask, URL, Headers, DOMException, crypto, indexedDB: null, MessageChannel, Uint8Array, ArrayBuffer, addEventListener() {} });
     win.window = win;
-    for (const name of ['Promise', 'Error', 'Object', 'Array', 'JSON', 'Symbol']) win[name] = vm.runInContext(name, win); // what storage.js builds in the realm
+    for (const name of ['Promise', 'Error', 'SyntaxError', 'Object', 'Array', 'JSON', 'Symbol', 'Function', 'eval']) win[name] = vm.runInContext(name, win); // what storage.js builds in the realm
     win.document = { createElement: () => ({}), head: { append: el => vm.runInContext(el.textContent, win) } };
     const frame = { contentWindow: win, setAttribute() {}, remove() {} };
     Object.defineProperties(globalThis, {
@@ -88,10 +136,11 @@ async function moduleRealm(script, { placement = 'worker', key = 'k', top = '', 
     rmSync(dir, { recursive: true, force: true });
   };
   try {
-    for (const name of ['module-glue.js', 'module-worker.js', 'storage.js', 'grant-admission.js', 'faults.js', 'navigation.js']) cpSync(resolve(ROOT, 'host/web', name), resolve(dir, name));
+    for (const name of ['module-glue.js', 'module-worker.js', 'storage.js', 'grant-admission.js', 'faults.js', 'navigation.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(ROOT, 'host/web', name)));
     writeFileSync(resolve(dir, 'storage-environment.js'), `export const directories = Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' });
 export const storageKey = () => ${JSON.stringify(key)}; export const agentStorageRefusal = 'no store'; export const agentReads = ['readdir']; export const emptyRead = () => []; export const agentSeed = () => null;
-export const agentStream = () => null; export const keyStore = () => ({}); export const now = () => 0;`);
+export const agentStream = () => null; export const keyStore = () => ({}); export const now = () => 0;
+export { refuseCodeFromStrings } from ${JSON.stringify(resolve(ROOT, 'host/web/storage-environment.js'))};`);
     writeFileSync(resolve(dir, 'storage-fs.js'), `export const createFileSystem = () => {
   const files = new Map();
   return { readFile: async path => files.get(path) ?? new TextEncoder().encode(path), readdir: async () => [],
@@ -115,7 +164,7 @@ ${top}`);
       const win = vm.createContext({ console: { log() {}, info() {}, warn() {}, error() {}, debug() {} }, TextEncoder, TextDecoder, structuredClone, setTimeout, clearTimeout,
         queueMicrotask, URL, Headers, DOMException, crypto, indexedDB: null, MessageChannel, Uint8Array, ArrayBuffer, AbortController, AbortSignal, addEventListener() {} });
       win.window = win;
-      for (const name of ['Promise', 'Error', 'Object', 'Array', 'JSON', 'Symbol']) win[name] = vm.runInContext(name, win);
+      for (const name of ['Promise', 'Error', 'SyntaxError', 'Object', 'Array', 'JSON', 'Symbol', 'Function', 'eval']) win[name] = vm.runInContext(name, win);
       win.document = { createElement: () => ({}), head: { append: el => vm.runInContext(el.textContent, win) } };
       const frame = { contentWindow: win, setAttribute() {}, remove() {} };
       Object.defineProperty(globalThis, 'document', { configurable: true, value: { createElement: () => frame, body: { append() {} } } });
@@ -142,6 +191,25 @@ ${top}`);
   } catch (error) { done(); throw error; }
 }
 const race = p => Promise.race([p.then(v => v, e => `rejected: ${e.message}`), new Promise(r => setTimeout(() => r('STILL WAITING'), 1500))]);
+
+// #128: the module's realm, the iframe's (module-glue.js `prepare`) and the worker's (module-worker.js `init`), runs no
+// code from a string, as Hermes runs none, and keeps what a function needs of `Function` (storage-environment.js
+// `refuseCodeFromStrings`). The worker still evaluates the prelude and the module with its own `eval`.
+test.each(['main', 'worker'])('code from a string throws in the %s module realm as on Hermes', async (placement) => {
+  const w = await moduleRealm(`const thrown = f => { try { f(); return 'ran'; } catch (e) { return e.name + ': ' + e.message; } };
+  for (const name of ['Function', 'eval']) globalThis[name] = globalThis[name];
+  const F = Function;
+  const key = 'constructor';
+  try { delete Function[key]; } catch {}
+  return JSON.stringify([thrown(() => Object.getOwnPropertyDescriptor(globalThis, 'Function').value('return 1')), thrown(() => Function[key]('return 1')),thrown(() => Function('return 1')), thrown(() => new F('return 1')), thrown(() => globalThis.Function('return 1')),
+    thrown(() => eval('1')), thrown(() => (0, eval)('1')), thrown(() => globalThis.eval('1')), thrown(() => eval.constructor('return 1')), thrown(() => Function.constructor('return 1')),
+    Function instanceof Function, eval instanceof Function, typeof Function, ((a, b) => a + b).call(null, 1, 2), Function.prototype.bind.call((a) => a * 2, null)(3)]);`, { placement });
+  try {
+    const answered = await race(w.ask('code'));
+    const refused = 'SyntaxError: Parsing source code unsupported: a data source runs no code from a string (Function, eval), as on Hermes';
+    expect(JSON.parse(answered.value)).toEqual([...Array(10).fill(refused), true, true, 'function', 3, 6]);
+  } finally { w.done(); }
+});
 
 test('background storage counters survive a turn after an answer abandons its read', async () => {
   const w = await moduleRealm(`if (source === 'abandoned') {

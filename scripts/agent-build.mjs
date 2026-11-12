@@ -298,6 +298,8 @@ export async function makeOverride(host, app, state, { bake = bakePlan, log } = 
 
 // ---------------------------------------------------------------- a background build's end
 
+// Content, rather than mtimes: a prebuild can fail while the author edits its plan or manifest.
+const prebuildSources = app => ({ ...planSources(app), [resolve(app.dir, 'app.json')]: digestOf(resolve(app.dir, 'app.json')) });
 const prebuildHost = args => args.includes('--tvos') ? 'tvos' : args.includes('--ios') || args.includes('--device') ? 'ios' : 'macos';
 /** Where `prebuild` records the build it started: its `id`, its arguments, its
  * start, the pid of the shell running it, and, once it has ended, its exit code
@@ -323,7 +325,8 @@ const claimed = app => { try { return claimLive(readFileSync(appleArtifacts(app)
  * `args` build for failed, with its log's `failureLines`: nothing else would, since
  * it ended apart from every shell (the euxy port's edit during a `--prebuild
  * --release` failed it, and only the log said so). Run by a foreground Apple build
- * and by a drive's build check, after any build running has ended. */
+ * and by a drive's build check, after any build running has ended. Changed plan
+ * or manifest content is named before the failure; the caller checks the current build. */
 export async function reportPrebuild(app, args, say = line => console.error(line)) {
   if (process.env.EXACT_PREBUILD_RECORD) return; // the background build itself
   const host = prebuildHost(args), record = prebuildRecord(app, host), read = () => readRecord(record);
@@ -338,13 +341,14 @@ export async function reportPrebuild(app, args, say = line => console.error(line
     return;
   }
   if (!take(record, ended.id) || !ended.exit) return; // another said it, or it built
+  const changed = ended.sources && JSON.stringify(ended.sources) !== JSON.stringify(prebuildSources(app));
   // Its part of the log, kept apart: the build this command may run next writes the log anew.
   const log = resolve(app.dir, '.exact', `${host}-prebuild-failed.log`);
   let output = ''; try { output = readFileSync(resolve(app.dir, '.exact', `${host}-build.log`)).subarray(0, ended.bytes).toString('utf8'); } catch {}
   writeFileSync(log, output);
   const what = host === 'ios' ? 'iOS' : host === 'tvos' ? 'tvOS' : 'macOS';
   const command = ['--prebuild', ...ended.args.filter(arg => arg !== app.crate('apple'))].join(' ');
-  say([...failureLines(output), `the background ${what} build (${command}, started ${ended.started}) failed (exit ${ended.exit}); its whole log: ${shown(log)}`].join('\n'));
+  say([...(changed ? ["This failure is from a background build started before the app's sources last changed; the current sources are checked now."] : []), ...failureLines(output), `the background ${what} build (${command}, started ${ended.started}) failed (exit ${ended.exit}); its whole log: ${shown(log)}`].join('\n'));
 }
 
 /** A build of this app already running (one started in the background) ends
@@ -450,11 +454,12 @@ export async function prebuild(app, args, { timeout = 30_000, say = line => cons
   writeFileSync(mine, JSON.stringify({ id, pid: process.pid }) + '\n');
   if (before) take(record, before.id); // ended, said, or its shell gone
   try { linkSync(mine, record); } catch { return busy(); } finally { rmSync(mine, { force: true }); }
+  const sources = prebuildSources(app);
   const out = openSync(log, 'w');
   const build = [resolve(ROOT, 'host/apple/build.mjs'), ...built];
   const child = spawn('/bin/sh', ['-c', '"$0" "$@"; built=$?; "$0" "$TOOL" --tool "$built"; exit $built', process.execPath, ...build],
     { detached: true, stdio: ['ignore', out, out], env: { ...process.env, TOOL: fileURLToPath(import.meta.url), EXACT_PREBUILD_RECORD: record, EXACT_PREBUILD_LOG: log, EXACT_PREBUILD_ID: id } });
-  publish(record, { id, args: built, started: new Date().toLocaleTimeString('en-GB'), pid: child.pid });
+  publish(record, { id, args: built, sources, started: new Date().toLocaleTimeString('en-GB'), pid: child.pid });
   closeSync(out);
   let ended = null;
   child.on('exit', code => { ended = code ?? 1; });

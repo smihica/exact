@@ -3,7 +3,7 @@
 //! rather than inside the component it was substituted into.
 
 use super::{checks, err, infer, ComponentTypes, Ref, Scope, Sink, Ty, TypeError, Types};
-use contract_syntax::{Component, File, Node};
+use contract_syntax::{Component, Expr, File, Node, Span};
 
 /// Every use names only the used component's props (before expansion, which
 /// would otherwise report the prop a misspelling left missing).
@@ -162,9 +162,8 @@ pub(crate) fn check_uses(
     walk_uses(nodes, scope, types, file, true, sink)
 }
 
-/// `actions: false` checks only data arguments: an action argument (or a
-/// provider's value) is refused where the child invokes it, which is what
-/// its correction hints are built to follow (LLP 1006 §3).
+/// `actions: false` checks only data arguments. Action bindings are checked
+/// by the full walk; their errors do not suppress independent child errors.
 fn walk_uses(
     nodes: &[Node],
     scope: &Scope,
@@ -218,8 +217,17 @@ fn walk_use(
                             *span,
                         );
                     };
-                    if !actions && matches!(target_t.props[i], Ty::Action(_)) {
-                        continue;
+                    if matches!(target_t.props[i], Ty::Action(_)) {
+                        if !actions {
+                            continue;
+                        }
+                        check_action_binding(
+                            &p.name,
+                            &arg.value,
+                            arg.span,
+                            computed_action(&arg.value, scope, types, file),
+                            false,
+                        )?;
                     }
                     let t = infer(&arg.value, scope, &types.shapes)?;
                     if !checks::accepts_expr(
@@ -295,4 +303,136 @@ fn walk_use(
         }
     }
     Ok(())
+}
+
+/// Props and injects substitute the supplied expression into a handler.
+pub(super) fn check_action_binding(
+    name: &str,
+    mut value: &Expr,
+    span: Span,
+    computed: bool,
+    provided: bool,
+) -> Result<(), TypeError> {
+    while let Expr::Typed(inner, ..) = value {
+        value = inner;
+    }
+    if !computed && matches!(value, Expr::Ident(..) | Expr::Call(..)) {
+        return Ok(());
+    }
+    let (id, kind) = if provided {
+        ("type-action-provide-shape", "inject")
+    } else {
+        ("type-action-prop-shape", "prop")
+    };
+    let remedy = if computed || matches!(value, Expr::Ternary(..)) {
+        "; write one action that chooses, and pass its name"
+    } else {
+        ""
+    };
+    err(
+        id,
+        format!(
+            "`{name}` is an `action` {kind} and needs an action name or `action(args)`{remedy}"
+        ),
+        span,
+    )
+}
+
+/// Child derives substitute their resolved expressions; root derives remain
+/// values that lowering cannot bind as action targets.
+pub(super) fn computed_action(mut value: &Expr, scope: &Scope, types: &Types, file: &File) -> bool {
+    while let Expr::Typed(inner, ..) = value {
+        value = inner;
+    }
+    match value {
+        Expr::Ident(target, _)
+            if matches!(scope.lookup(target), Some((Ref::Derive(_), Ty::Action(_)))) =>
+        {
+            let Some((i, c)) = file
+                .components
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, c)| c.name == scope.component())
+            else {
+                return true;
+            };
+            let Ok(derives) = contract_syntax::inline::resolved_derives(c) else {
+                return true;
+            };
+            let Some((_, resolved)) = derives.iter().find(|(d, _)| &d.name == target) else {
+                return true;
+            };
+            let declared = types.component_scope(c, &types.components[i]);
+            check_action_binding(
+                target,
+                resolved,
+                value.span(),
+                computed_action(resolved, &declared, types, file),
+                false,
+            )
+            .is_err()
+        }
+        Expr::Ident(target, _) | Expr::Call(target, ..) => matches!(
+            scope.lookup(target),
+            Some((r, Ty::Action(_))) if !matches!(r, Ref::Action(_) | Ref::Prop(_))
+        ),
+        _ => false,
+    }
+}
+
+/// Prefer refusals at bindings over consequences in the expanded view.
+/// Misspelled props precede missing-prop errors; invalid action and data
+/// bindings precede errors inside callees. Action-binding errors affect ordering
+/// only; the data-argument and prop-name checks may suppress expanded child
+/// errors. Standalone child checks, their uses and expansion errors stay.
+/// Only refused builds pay for this walk.
+pub(crate) fn prefer_call_sites(
+    errors: Vec<TypeError>,
+    independent: usize,
+    file: &File,
+    types: &Types,
+    expanded: &contract_syntax::Expanded,
+) -> Vec<TypeError> {
+    let mut sites = Sink::default();
+    // Uses whose missing prop is the one a misspelling there was meant as.
+    let mut explained = Vec::new();
+    for c in &file.components {
+        check_prop_names(&c.view, file, &mut sites, &mut explained);
+    }
+    check_root_uses(&file.components[0], &expanded.root, types, file, &mut sites);
+    let call_site_fault = !sites.errors.is_empty();
+    for id in [
+        "syntax-call-target",
+        "type-action-prop-shape",
+        "type-action-provide-shape",
+    ] {
+        for e in errors.iter().filter(|e| e.id == id) {
+            sites.push(e.clone());
+        }
+    }
+    if sites.errors.is_empty() {
+        return errors;
+    }
+    for (i, e) in errors.into_iter().enumerate() {
+        if i < independent || !call_site_fault || !in_child(file, e.span) {
+            sites.push(e);
+        }
+    }
+    sites.errors.retain(|e| {
+        !(matches!(e.id, "syntax-missing-prop" | "type-missing-prop")
+            && explained.contains(&e.span))
+    });
+    sites.errors
+}
+
+/// Whether `span` lies in a child component's own lines: each component runs
+/// from its header to the next component's header in the same file.
+fn in_child(file: &File, span: Span) -> bool {
+    file.components
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.span.source_id == span.source_id && c.span.line <= span.line)
+        .max_by_key(|(_, c)| c.span.line)
+        .is_some_and(|(i, _)| i > 0)
 }

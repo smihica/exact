@@ -70,6 +70,9 @@ inductive Instr where
   | failureResource (r : Nat)
   | failedMutation (m : Nat)
   | failureMutation (m : Nat)
+  /-- `current(x)` (LLP 1161.001 D1): whether resource `r` shows an answer
+  to its current call arguments. -/
+  | currentResource (r : Nat)
   deriving Repr, BEq, Inhabited, DecidableEq
 
 abbrev Code := List Instr
@@ -123,6 +126,9 @@ structure Env where
   mutationSlots : List Nat := []
   pendingResources : List Bool := []
   failedResources : List Bool := []
+  /-- Whether each resource shows an answer to its current call arguments
+  (the runner's `current_resources`). -/
+  currentResources : List Bool := []
   /-- Why each failed resource failed, (code, message, reason), as the
   runner's `failed_why`: read only while `failedResources` holds. -/
   failures : List (Option (String × String × String)) := []
@@ -392,6 +398,10 @@ def exec (size : Nat) (env : Env) (i : Instr) (m : Machine) : Out :=
     match env.resources[r]? with
     | Option.some (Option.some _) => push (.bool (env.failedResources[r]?.getD false))
     | _ => .error .pending
+  | .currentResource r =>
+    match env.resources[r]? with
+    | Option.some (Option.some _) => push (.bool (env.currentResources[r]?.getD false))
+    | _ => .error .pending
   | .failureResource r =>
     match env.resources[r]? with
     | Option.some (Option.some _) => push (failureValue env r)
@@ -511,7 +521,8 @@ def opcodes : List (String × List Operand) :=
    ("DropLocal", []), ("Return", []), ("Send", [.idx, .str, .u16]), ("Refresh", [.idx]),
    ("PendingResource", [.idx]), ("PendingMutation", [.idx]), ("FailedResource", [.idx]),
    ("NativeProps", [.u32]), ("LoadIndex", [.u16]), ("Map", [.u32]), ("Filter", [.u32]),
-   ("FailureResource", [.idx]), ("FailedMutation", [.idx]), ("FailureMutation", [.idx])]
+   ("FailureResource", [.idx]), ("FailedMutation", [.idx]), ("FailureMutation", [.idx]),
+   ("CurrentResource", [.idx])]
 
 /-- What decoding needs from the plan besides the bytes: its string pool,
 each type's (name, field count), and the roster in wire order with each
@@ -625,6 +636,7 @@ def decode (pool : Pool) (bs : ByteArray) : Except String Code := do
       | "FailureResource" => pure (.failureResource a0)
       | "FailedMutation" => pure (.failedMutation a0)
       | "FailureMutation" => pure (.failureMutation a0)
+      | "CurrentResource" => pure (.currentResource a0)
       | "NativeProps" => pure (.nativeProps a0)
       | "Map" => do pure (.map (← off a0))
       | "Filter" => do pure (.filter (← off a0))
@@ -660,5 +672,6 @@ def Instr.text : Instr → String
   | .failureResource r => s!"FailureResource {r}"
   | .failedMutation m => s!"FailedMutation {m}"
   | .failureMutation m => s!"FailureMutation {m}"
+  | .currentResource r => s!"CurrentResource {r}"
 
 end Contract.Vm

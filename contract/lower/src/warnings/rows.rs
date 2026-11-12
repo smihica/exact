@@ -13,6 +13,7 @@
 //! it is one evaluation, and passes the bound at 1,000 × 1,000.
 
 use crate::LowerError;
+use contract_syntax::inline::calls::shown;
 use contract_syntax::{Expr, Node, Span, TemplatePart};
 use contract_types::{infer, Checked, Ref, Scope, Shapes, Ty};
 use std::collections::BTreeSet;
@@ -292,43 +293,200 @@ fn reads(e: &Expr, name: &str) -> bool {
     }
 }
 
-/// `lower-key-position` (LLP 1142 D6): a `for` whose `key=` reads its
-/// position variable. After an insertion or a removal before them, rows keep
-/// a key that now names another record: what an instance holds (its state, a
-/// field's text, its motion) goes with the position, not the record, and rows
-/// may be built again. An append-only list keyed so is correct, so it warns.
+/// `lower-key-position` (LLP 1142 D6, as LLP 1156.005 D2 narrows it): a
+/// `for` whose `key=` reads its position variable, over rows that hold
+/// something ([`holds`]). After an insertion or a removal before them, rows
+/// keep a key that now names another record: what an instance holds goes with
+/// the position, not the record. A row that holds nothing (a waveform's bars,
+/// text over plain values) has nothing to follow, and its position may be all
+/// the identity its items have.
 fn key_position(checked: &Checked<'_>) -> Vec<LowerError> {
-    fn walk(nodes: &[Node], out: &mut Vec<LowerError>) {
+    let held = Held::new(checked);
+    let walk = |nodes: &[Node], out: &mut Vec<LowerError>| held.walk(nodes, out);
+    let mut out = Vec::new();
+    walk(&checked.expanded.root.view, &mut out);
+    out
+}
+
+/// What makes a row's identity matter: state the row owns, a control
+/// that keeps focus or its own value, motion, a scroll offset. Conservative:
+/// a tag or a component it cannot see into holds.
+struct Held<'c> {
+    /// The tags of the regions owning state (`Owner::Arm`).
+    owning: BTreeSet<u32>,
+    /// The `style` declarations whose rows hold.
+    styles: BTreeSet<&'c str>,
+}
+
+/// Elements that keep nothing of their own: layout, text, images, vector
+/// drawing. Every other tag holds.
+const PLAIN: &[&str] = &[
+    "view",
+    "box",
+    "column",
+    "row",
+    "hr",
+    "main",
+    "header",
+    "nav",
+    "section",
+    "footer",
+    "article",
+    "aside",
+    "time",
+    "text",
+    "span",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "u",
+    "s",
+    "small",
+    "code",
+    "mark",
+    "sub",
+    "sup",
+    "br",
+    "image",
+    "img",
+    "figure",
+    "figcaption",
+    "svg",
+    "g",
+    "path",
+    "polyline",
+    "polygon",
+    "circle",
+    "ellipse",
+    "line",
+    "rect",
+    "defs",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+    "clipPath",
+    "tspan",
+];
+
+/// An attribute that gives its element something to keep: a handler, a
+/// Tab stop, editing, motion (CSS's, and Exact's `-exact-` motion rows such
+/// as `-exact-layout-transition` and `-exact-symbol-effect`), a scroll
+/// offset.
+fn holding_attr(name: &str) -> bool {
+    let name = contract_syntax::state::state_of(name).map_or(name, |(_, row)| row);
+    let name = name.strip_prefix("-exact-").unwrap_or(name);
+    exact_plan::EventKind::from_name(name).is_some()
+        || matches!(
+            name,
+            "tabindex" | "contenteditable" | "autofocus" | "popover"
+        )
+        || name.contains("transition")
+        || name.contains("animation")
+        || name.ends_with("effect")
+        || name.starts_with("overflow")
+        || name.starts_with("scroll-snap")
+}
+
+impl<'c> Held<'c> {
+    fn new(checked: &'c Checked<'_>) -> Self {
+        let owning = (checked.expanded.owners.iter())
+            .filter_map(|o| match o {
+                contract_syntax::Owner::Arm { tag, .. } => Some(*tag),
+                _ => None,
+            })
+            .collect();
+        let styles = (checked.file.styles.iter())
+            .filter(|s| s.attrs.iter().any(|a| holding_attr(&a.name)))
+            .map(|s| s.name.as_str())
+            .collect();
+        Held { owning, styles }
+    }
+
+    /// Whether any of `nodes` holds something.
+    fn holds(&self, nodes: &[Node]) -> bool {
+        nodes.iter().any(|node| match node {
+            Node::Element {
+                tag,
+                attrs,
+                children,
+                ..
+            } => {
+                !PLAIN.contains(&tag.as_str())
+                    || attrs.iter().any(|a| {
+                        holding_attr(&a.name) || a.name == "class" && self.class_holds(&a.value)
+                    })
+                    || self.holds(children)
+            }
+            Node::When {
+                tag,
+                then,
+                otherwise,
+                ..
+            } => self.owning.contains(tag) || self.holds(then) || self.holds(otherwise),
+            Node::Each { tag, body, .. } => self.owning.contains(tag) || self.holds(body),
+            Node::Match {
+                tag, some, none, ..
+            } => self.owning.contains(tag) || self.holds(&some.1) || self.holds(none),
+            Node::Use { .. } | Node::Children { .. } => true,
+        })
+    }
+
+    /// `class=Name` or `class=(cond ? A : B)` naming a style that holds.
+    fn class_holds(&self, value: &Expr) -> bool {
+        match value {
+            Expr::Ident(name, _) => self.styles.contains(name.as_str()),
+            Expr::Ternary(_, a, b, _) => self.class_holds(a) || self.class_holds(b),
+            _ => !self.styles.is_empty(),
+        }
+    }
+
+    fn walk(&self, nodes: &[Node], out: &mut Vec<LowerError>) {
         for node in nodes {
             match node {
-                Node::Element { children, .. } | Node::Use { children, .. } => walk(children, out),
+                Node::Element { children, .. } | Node::Use { children, .. } => {
+                    self.walk(children, out)
+                }
                 Node::When {
                     then, otherwise, ..
                 } => {
-                    walk(then, out);
-                    walk(otherwise, out);
+                    self.walk(then, out);
+                    self.walk(otherwise, out);
                 }
                 Node::Each {
-                    index, key, body, ..
+                    tag,
+                    index,
+                    key,
+                    body,
+                    ..
                 } => {
-                    if let Some(i) = index.as_deref().filter(|i| reads(key, i)) {
+                    if let Some(i) = index
+                        .as_deref()
+                        .filter(|i| reads(key, i))
+                        .filter(|_| self.owning.contains(tag) || self.holds(body))
+                    {
+                        let i = shown(i);
                         out.push(LowerError {
                             id: "lower-key-position",
-                            message: format!("this key reads `{i}`, the row's position: after a row is inserted or removed before others, their keys name other records, so what a row holds (its state, a field's text, its motion) follows the position and rows may be built again; key by something the record keeps, such as its id"),
+                            message: format!("this key reads `{i}`, the row's position: after a row is inserted or removed before others, their keys name other records, so what a row holds (its state, a field's focus or text, its motion) follows the position; key by something the record keeps, such as its id"),
                             span: key.span(),
                         });
                     }
-                    walk(body, out);
+                    self.walk(body, out);
                 }
                 Node::Match { some, none, .. } => {
-                    walk(&some.1, out);
-                    walk(none, out);
+                    self.walk(&some.1, out);
+                    self.walk(none, out);
                 }
                 Node::Children { .. } => {}
             }
         }
     }
-    let mut out = Vec::new();
-    walk(&checked.expanded.root.view, &mut out);
-    out
 }

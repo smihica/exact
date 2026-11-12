@@ -41,7 +41,7 @@ fn main() {
         contract::linux_entry(
             "exact_live_data::Live",
             "exact_live_data::Live::default()",
-            compat.inputs["rustMode"].as_str().unwrap(),
+            &compat.inputs,
             host,
             &hatches,
             run,

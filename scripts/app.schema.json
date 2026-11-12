@@ -241,6 +241,10 @@
         "portrait-secondary"
       ]
     },
+    "userInterfaceStyle": {
+      "description": "The app's appearance from launch, as the device's appearance would be (Expo's key): automatic (the default) follows the device; light or dark fixes it on iOS and tvOS (Info.plist's UIUserInterfaceStyle), macOS (the application's appearance, set before the first window) and the web (the page's color-scheme). A color-scheme a node sets still wins in its subtree. Android, Linux and Windows follow the device.",
+      "enum": ["automatic", "light", "dark"]
+    },
     "theme_color": { "type": "string" },
     "background_color_dark": {
       "type": "string",
@@ -259,9 +263,9 @@
     },
     "link": {
       "type": "array",
-      "items": { "enum": ["markdown", "motion", "collections", "drag", "surfaces", "router", "format", "materials", "backdrop", "share", "documents", "picker", "timelines", "text_transform", "effects", "animations", "gradients", "grid", "geometry", "segments", "dataset", "tabs", "grouped_lists", "io", "transitions", "media_picker", "auth_session", "numerals", "dates"] },
+      "items": { "enum": ["markdown", "motion", "collections", "drag", "surfaces", "router", "format", "materials", "backdrop", "share", "documents", "picker", "timelines", "text_transform", "effects", "animations", "gradients", "grid", "geometry", "segments", "dataset", "tabs", "grouped_lists", "io", "transitions", "media_picker", "auth_session", "numerals", "dates", "sqlite"] },
       "uniqueItems": true,
-      "description": "Capabilities a native production build links before any plan uses them (LLP 1047 D8; LLP 1047.001), so a later bundle may: an archive otherwise links what its plan uses (and `auth_session` what its grants name) and nothing else, and a bundle that needs more is a new binary. Development links every capability but `media_picker` and `auth_session`, which it links as production would (LLP 1047.001.000 F). Names are the runner's (`exact_runner::Capability::name`)."
+      "description": "Capabilities a native production build links before any plan uses them (LLP 1047 D8; LLP 1047.001), so a later bundle may: an archive otherwise links what its plan uses (plus `auth_session` from `auth.session` grants and `sqlite` from `sqlite.open` grants) and nothing else, and a bundle that needs more is a new binary. Linking sqlite without sqlite.open only adds unused code: an update that adds the grant changes the compatibility identity and requires a new binary even when sqlite was linked. Development links every capability but `media_picker` and `auth_session`, which it links as production would (LLP 1047.001.000 F). Names are the runner's (`exact_runner::Capability::name`)."
     },
     "icons": {
       "description": "The app's raster icons, as the web manifest spells them (`src`, `sizes`, `type`, `purpose`). Apple bakes derive their icon sets from these unless host.ios.icon or host.macos.icon selects an Icon Composer project; an iOS distribution build requires either that project or a square raster of at least 512 px.",
@@ -672,6 +676,19 @@
           "description": "iOS: `minimumOS` (default 17.0), `deviceFamily` (iphone, ipad), and the keys below.",
           "type": "object",
           "properties": {
+            "resources": {
+              "description": "Resource trees a data module reads through `bundle:/` (LLP 1133.007 D6), on iOS, iPadOS and tvOS: copied, modes kept, into the bundle's `ExactResources/` folder before it is signed, which then holds them and nothing else. Read only, through `fs.read bundle:/<to>` (`fs.read bundle:/Resources/data-files`), the line the Mac's `host.macos.resources` takes for the same `to`. A tree holds no links and no Mach-O code; changing it requires a new binary, never an update.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["from", "to"],
+                "additionalProperties": false,
+                "properties": {
+                  "from": { "type": "string", "description": "Separate directory relative to app.json, for example data-files. Not assets, source or output roots." },
+                  "to": { "type": "string", "description": "Private destination under Resources/, for example Resources/data-files: `bundle:/Resources/data-files`, as on the Mac." }
+                }
+              }
+            },
             "webBrowser": {
               "type": "boolean",
               "description": "Opt in to Apple's managed default-browser role for the iOS app. Requires http and https in protocol_handlers and Apple's approval of com.apple.developer.web-browser in its provisioning profile. Extensions, App Clips and tvOS never inherit this role. distribution_only on the pair also limits the entitlement to distributed builds. Absent or false: no browser entitlement and no HTTP/HTTPS registration on iOS."
@@ -697,7 +714,7 @@
             },
             "optimize": {
               "enum": ["speed", "size"],
-              "description": "What a production build optimizes the Rust archive and ExactKit for (LLP 1047.001 D9): \"speed\" (opt-level 3, Swift -O) or \"size\" (opt-level z, Swift -Osize -internalize-at-link; on 2026-10-06 a one-text app's 9.8 MB was 6.2). Absent: speed for an app, size for an embed (`build.mjs --embed`). `build.mjs --optimize` overrides it."
+              "description": "What a production build optimizes the Rust archive and ExactKit for (LLP 1047.001 D9): \"speed\" (opt-level 3, Swift -O) or \"size\" (opt-level z, Swift -Osize -internalize-at-link; on 2026-10-06 a one-text app's 9.8 MB was 6.2). Absent: size for an iOS or tvOS app and for an embed (`build.mjs --embed`); a game keeps speed. Games refuse size because their generated Cargo workspace has no size profile. tvOS shares this iOS setting. `build.mjs --optimize` overrides it."
             },
             "designRequiresCompatibility": {
               "type": "boolean",
@@ -744,7 +761,7 @@
               "items": {
                 "type": "string",
                 "pattern": "^(?!(remote-notification|fetch|processing)$).*$",
-                "description": "remote-notification is refused; ActivityKit update tokens need no background mode (LLP 1126.001 WP9). fetch and processing come from the grant lines device.background-sync and device.periodic-background-sync (LLP 1133.017 D14)."
+                "description": "remote-notification is refused: a visible push and ActivityKit update tokens need no background mode, and a data-only push is refused (LLP 1133.004 §9 P8). fetch and processing come from the grant lines device.background-sync and device.periodic-background-sync (LLP 1133.017 D14)."
               }
             },
             "associatedDomains": {
@@ -843,7 +860,7 @@
             },
             "optimize": {
               "enum": ["speed", "size"],
-              "description": "What a production build optimizes the Rust archive and ExactKit for (LLP 1047.001 D9): \"speed\" (opt-level 3, Swift -O) or \"size\" (opt-level z, Swift -Osize -internalize-at-link; on 2026-10-06 a one-text app's 9.8 MB was 6.2). Absent: speed for an app, size for an embed (`build.mjs --embed`). `build.mjs --optimize` overrides it."
+              "description": "What a production build optimizes the Rust archive and ExactKit for (LLP 1047.001 D9): \"speed\" (opt-level 3, Swift -O) or \"size\" (opt-level z, Swift -Osize -internalize-at-link; on 2026-10-06 a one-text app's 9.8 MB was 6.2). Absent: speed for a Mac app, size for an embed (`build.mjs --embed`); a game keeps speed. Games refuse size because their generated Cargo workspace has no size profile. `build.mjs --optimize` overrides it."
             },
             "oneTimeCodeAutofill": {
               "enum": ["marked"],
@@ -958,8 +975,7 @@
                 "width": { "type": "number", "minimum": 1, "maximum": 16384 },
                 "height": { "type": "number", "minimum": 1, "maximum": 16384 },
                 "minWidth": { "type": "number", "minimum": 1, "maximum": 16384 },
-                "minHeight": { "type": "number", "minimum": 1, "maximum": 16384 },
-                "keepRunning": { "type": "boolean", "description": "Closing the window hides it while a `-exact-menu=\"status\"` button is placed in the notification area, as a tray app's does (LLP 1133.025 D4); with none placed, closing ends the app. Absent: false." }
+                "minHeight": { "type": "number", "minimum": 1, "maximum": 16384 }
               },
               "additionalProperties": false
             }
@@ -967,9 +983,16 @@
           "additionalProperties": false
         },
         "web": {
-          "description": "The web host has no settings yet; an empty object.",
+          "description": "The web host's settings.",
           "type": "object",
-          "additionalProperties": false
+          "additionalProperties": false,
+          "properties": {
+            "head": {
+              "description": "Tags the web build writes into the <head> of every document: the shell, each pre-rendered page and the 404 page. Each entry is one tag, {\"script\": {...}}, {\"link\": {...}} or {\"meta\": {...}}, whose value is its attributes (a string, or true for a bare one such as async); a script's `text` is its content. For what a site says once to the browser (an analytics script, a preconnect, site-wide JSON-LD); a page's own title and metas are the Contract `head` element's. The same on every page and web only.",
+              "type": "array",
+              "items": { "$ref": "#/$defs/webHeadEntry" }
+            }
+          }
         }
       },
       "additionalProperties": false
@@ -1186,7 +1209,7 @@
       "description": "Rust live replacement, enabled by default in dev and prod. Resolve root, environment, platform, then platform environment. false/off removes replacement support at bake; true/auto uses browser Wasm, iOS Wasm interpreter, native desktop, Android native dev / Wasm prod. Android and Windows hosts remain future work."
     },
     "commands": {
-      "description": "The app's own verbs for the exact.mjs `exact new` generates, by name: each a command as argv, run in the app's directory with the arguments after the verb, EXACT_APP_DIR and EXACT2 set. `\"verify\": [\"bun\", \"verify.mjs\"]` makes `bun exact.mjs verify web` run `bun verify.mjs web`. `bun exact.mjs update` rewrites exact.mjs and keeps these; a name exact.mjs already uses (test, agent, web, …) is refused.",
+      "description": "The app's own verbs for the exact.mjs `exact new` generates, by name: each a command as argv, run in the app's directory with the arguments after the verb, EXACT_APP_DIR and EXACT (and EXACT2) set. `\"verify\": [\"bun\", \"verify.mjs\"]` makes `bun exact.mjs verify web` run `bun verify.mjs web`. `bun exact.mjs update` rewrites exact.mjs and keeps these; a name exact.mjs already uses (test, agent, web, …) is refused.",
       "type": "object",
       "additionalProperties": {
         "type": "array",
@@ -1195,7 +1218,7 @@
       }
     },
     "before_build": {
-      "description": "A command, as argv, that prepares files the app's builds read and its repository does not hold, such as a script that fetches photos into a folder Git ignores (`[\"bun\", \"scripts/fetch.mjs\"]`; `bun` is the Bun that runs exact.mjs, so it runs on every host). The exact.mjs `exact new` generates runs it in the app's directory, with EXACT_APP_DIR and EXACT2 set, no input and its output on stderr, before each of its verbs that builds, runs, compiles or checks the app (app-cli.mjs lists them), and before test and agent where they build first; a failure stops the verb. It runs that often, so make it finish at once when its files are there.",
+      "description": "A command, as argv, that prepares files the app's builds read and its repository does not hold, such as a script that fetches photos into a folder Git ignores (`[\"bun\", \"scripts/fetch.mjs\"]`; `bun` is the Bun that runs exact.mjs, so it runs on every host). The exact.mjs `exact new` generates runs it in the app's directory, with EXACT_APP_DIR and EXACT (and EXACT2) set, no input and its output on stderr, before each of its verbs that builds, runs, compiles or checks the app (app-cli.mjs lists them), and before test and agent where they build first; a failure stops the verb. It runs that often, so make it finish at once when its files are there.",
       "type": "array",
       "minItems": 1,
       "items": { "type": "string", "minLength": 1 }
@@ -1337,6 +1360,17 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "webHeadEntry": {
+      "oneOf": [
+        { "type": "object", "required": ["script"], "additionalProperties": false, "properties": { "script": { "type": "object", "properties": { "text": { "type": ["string", "object", "array"], "description": "The script's content; an object or list is written as JSON (application/ld+json, importmap, speculationrules). In JSON, `<!--`, and `</script` before whitespace, `/` or `>`, are written as `\\u003C…`, which JSON reads alike. A string is written as it is, and one holding either is refused: write `\\x3C!--` or '<' + '!--' inside a string, or a space after `<` in code." } }, "additionalProperties": { "$ref": "#/$defs/webHeadAttribute" } } } },
+        { "type": "object", "required": ["link"], "additionalProperties": false, "properties": { "link": { "type": "object", "additionalProperties": { "$ref": "#/$defs/webHeadAttribute" } } } },
+        { "type": "object", "required": ["meta"], "additionalProperties": false, "properties": { "meta": { "type": "object", "additionalProperties": { "$ref": "#/$defs/webHeadAttribute" } } } }
+      ]
+    },
+    "webHeadAttribute": {
+      "description": "An attribute's value, or true for a bare attribute such as async.",
+      "oneOf": [{ "type": "string" }, { "enum": [true] }]
+    },
     "cadence": {
       "oneOf": [
         {

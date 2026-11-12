@@ -61,6 +61,7 @@ fn sun_and_camera(w: &mut World, camera: Camera) {
             color: [1., 0.6, 0.2],
             intensity: 40. / crate::PHOTOMETRIC_SCALE,
             range: 12.,
+            ..Default::default()
         },
     ));
 }
@@ -560,6 +561,122 @@ fn devices_without_indirect_execution_draw_the_same_pixels_directly() {
     let (direct, _) = fixture::render(&gpu, &mut surface, &frame).unwrap();
     assert!(surface.renderer_for_test().unwrap().cull.direct);
     assert!(culled.data == direct.data, "the direct path changed pixels");
+}
+
+#[derive(Default, Args)]
+struct LocalShadowArgs {
+    cubes: u32,
+}
+
+struct LocalShadowField;
+impl Game for LocalShadowField {
+    const ID: &'static str = "cull-local-shadow-field";
+    type Args = LocalShadowArgs;
+    fn setup(w: &mut World, args: &LocalShadowArgs) {
+        w.insert_resource(Environment {
+            fog: None,
+            bloom: None,
+            ..Default::default()
+        });
+        w.spawn((
+            Transform::at(0., 9., 9.).looking_at(Vec3::ZERO, Vec3::Y),
+            Camera::default(),
+        ));
+        w.spawn((
+            Transform::default(),
+            Mesh::plane(60., 60.),
+            Material::rgb(0.6, 0.6, 0.6),
+        ));
+        for i in 0..args.cubes {
+            let (x, z) = ((i % 40) as f32, (i / 40) as f32);
+            w.spawn((
+                Transform::at(x * 0.6 - 11.7, 1., z * 0.6 - 8.),
+                Mesh::cube(0.3),
+                Material::rgb(0.8, 0.3, 0.2),
+            ));
+        }
+        // Identical views across two culls exercise both first layers (0 and 4).
+        for _ in 0..6 {
+            w.spawn((
+                Transform::at(0., 6., 0.).looking_at(Vec3::ZERO, Vec3::Z),
+                SpotLight {
+                    intensity: 40_000.,
+                    range: 14.,
+                    inner: 0.5,
+                    outer: 0.6,
+                    ..Default::default()
+                },
+                LightShadows,
+            ));
+        }
+    }
+    fn tick(_: &mut World, _: &Input, _: &LocalShadowArgs) {}
+}
+
+#[test]
+fn local_shadow_culling_preserves_large_groups_in_every_view() {
+    let Some(gpu) = gpu() else { return };
+    let frame = Frame {
+        width: 320.,
+        height: 180.,
+        scale: 1.,
+        now_ms: 0.,
+        seekable: true,
+        period_ms: 0.,
+        children_generation: 0,
+        shader_generation: 0,
+        headroom: 1.0,
+    };
+    // The camera starts sorting at sixteen 64-instance chunks (961 instances).
+    for cubes in [960, 961, 1100] {
+        let mut surface = WorldSurface::<LocalShadowField>::default();
+        surface.bind(&[Value::Number(cubes as f64)], None).unwrap();
+        let (culled, _) = fixture::render(&gpu, &mut surface, &frame).unwrap();
+        let r = surface.renderer_for_test().unwrap();
+        assert!(!r.cull.direct, "this regression requires GPU culling");
+        assert_eq!(r.local_plan.views.len(), 6);
+        assert_eq!(r.local_culls.len(), 2);
+        let group = r
+            .cull
+            .groups
+            .iter()
+            .position(|g| g.range.end - g.range.start == cubes)
+            .expect("cubes share one draw group");
+        let words = |buffer: &exact_gpu::wgpu::Buffer| {
+            crate::skinning::tests::read(&gpu, buffer, buffer.size())
+                .chunks_exact(4)
+                .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let mut views = Vec::new();
+        for (index, local) in r.local_culls.iter().enumerate() {
+            assert!(!local.cull.direct);
+            let draws = words(&local.cull.indirect.raw);
+            let slots = words(&local.cull.compacted.raw);
+            for view in 0..(6 - index * 4).min(4) {
+                let (region, draw) = local.cull.offsets(view as u32, group);
+                let count = draws[draw as usize / 4 + 1] as usize;
+                let start = region as usize / 4;
+                views.push(slots[start..start + count].to_vec());
+            }
+        }
+        let counts: Vec<_> = views.iter().map(Vec::len).collect();
+        eprintln!("{cubes} cubes: local shadow counts {counts:?}");
+        assert_eq!(counts, [144; 6], "{cubes} cubes");
+        for (layer, slots) in views.iter().enumerate() {
+            assert_eq!(slots, &views[1], "{cubes} cubes, layer {layer}");
+        }
+        r.cull.indirect_execution = false;
+        r.cull.epoch += 1;
+        let (direct, _) = fixture::render(&gpu, &mut surface, &frame).unwrap();
+        let differing = culled
+            .data
+            .chunks_exact(4)
+            .zip(direct.data.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 0, "{cubes} cubes: culling changed pixels");
+    }
 }
 
 #[test]

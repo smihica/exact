@@ -3,7 +3,7 @@
 //! rather than under the natural size, parsed and resolved by
 //! `exact-svg-file` on the decode worker, and painted as an island is
 //! (`Painter::svg_picture`): on the worker when the picture has no text,
-//! on the paint thread, where the session's fonts are, when it has (D3).
+//! on the paint thread, where the host shapes text, when it has (D3).
 use super::png_decode::{DecodePlan, Header};
 use crate::text::Shared;
 use exact_kernel::svg::Scene;
@@ -157,10 +157,11 @@ pub(super) fn resize_changes(
 }
 
 /// A picture parsed and resolved on the worker, waiting for the paint
-/// thread to draw it (D3: its text takes the session's fonts).
+/// thread to draw it with its own font stacks (D3).
 pub(super) struct Pending {
     pub permit: DecodePermit,
     pub scene: Scene,
+    pub fonts: Vec<Vec<(bool, String)>>,
     pub css: (f32, f32),
     pub scale: f32,
     pub natural: (u32, u32),
@@ -172,7 +173,7 @@ pub(super) enum Decoded {
     /// Painted, on the worker.
     Pixels(Pixmap),
     /// Resolved; the paint thread paints it.
-    Later(Scene),
+    Later(Scene, Vec<Vec<(bool, String)>>),
 }
 
 /// Parse `bytes` and resolve the scene at the CSS size the plan's pixels
@@ -223,7 +224,7 @@ pub(super) fn decode(
         return Err(Refusal::DecodeFailed);
     }
     if loaded.document.text {
-        return Ok(Decoded::Later(scene));
+        return Ok(Decoded::Later(scene, loaded.document.fonts));
     }
     WORKER_TEXT
         .with(|engine| paint(engine.clone(), &scene, css, scale, plan.pixels))
@@ -261,12 +262,13 @@ pub(super) fn paint(
 }
 
 /// Finish a pending picture on the paint thread: paint it with the
-/// session's text engine and complete its permit as the worker completes a
+/// image's font stacks and complete its permit as the worker completes a
 /// raster's.
 pub(super) fn finish(text: &Shared, pending: Pending) {
     let Pending {
         permit,
         scene,
+        fonts,
         css,
         scale,
         natural,
@@ -279,7 +281,12 @@ pub(super) fn finish(text: &Shared, pending: Pending) {
     let pixels = permit.key().pixels;
     // This charge precedes the painter's allocation of the picture.
     let charge = permit.allocation_charge();
-    match paint(text.clone(), &scene, css, scale, pixels) {
+    let text = if fonts.is_empty() {
+        text.clone()
+    } else {
+        crate::text::TextEngine::for_svg(&fonts)
+    };
+    match paint(text, &scene, css, scale, pixels) {
         Ok(drawn) => {
             let bitmap = Arc::new(super::Bitmap::from_source(
                 drawn.into(),

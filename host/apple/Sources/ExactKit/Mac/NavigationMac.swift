@@ -32,6 +32,15 @@ final class NavigationHost {
     private(set) var root: (node: NodeView, tabs: NavigationTabs?, at: Int?)?
     /// Whether that root has no routes, in any of its stacks (BackMac.swift `routerRoot`).
     private(set) var routeless = false
+    /// Whether the app's route table declares one location, asked of the
+    /// runtime once a session (BackMac.swift `backPossible`).
+    var oneLocation: Bool {
+        if let asked = oneLocationAsked { return asked }
+        guard let asked = presenter.session?.runtime.routeOneLocation() else { return false }
+        oneLocationAsked = asked
+        return asked
+    }
+    private var oneLocationAsked: Bool?
     /// @ref LLP 1115.002 D7.1 — the ground under each modal route that
     /// paints none of its own, by the route's id (`ModalGround`).
     private var grounds: [UInt32: ModalGround] = [:]
@@ -64,7 +73,7 @@ final class NavigationHost {
     func groundChanged() { for ground in grounds.values { ground.needsDisplay = true }; split.groundChanged() }
     func reset() {
         refused.removeAll(); gates.removeAll(); panels.removeAll(); shown.removeAll(); selection = nil; barRoute = false; root = nil; routeless = false
-        sheets = []; keptSheets.removeAll(); split.reset()
+        oneLocationAsked = nil; sheets = []; keptSheets.removeAll(); split.reset()
         for ground in grounds.values { ground.removeFromSuperview() }
         grounds.removeAll()
     }

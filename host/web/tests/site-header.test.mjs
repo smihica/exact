@@ -11,8 +11,10 @@ import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 import { createDocument } from '../../web-js/dom.js';
-import { markBars } from '../navigation.js';
+import { markBars } from '../navigation/routes.js';
 
+import { bundleHostModule } from '../../web-js/glue.mjs';
+const navigationModule = await bundleHostModule(resolve(import.meta.dir, '../../..'), 'navigation.js');
 const ROOT = resolve(import.meta.dir, '../../..');
 const heading = '<h2 role="heading" data-exact-text>Pokédex</h2>';
 const add = '<button type="button" data-exact-on="press" aria-label="Add"><span data-exact-text>Add</span></button>';
@@ -46,7 +48,7 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a site'
   const content = Object.entries(CASES).map(([id, [inner, header, before]]) => stack(id, inner, header, before)).join('');
   const html = withLook(readFileSync(resolve(ROOT, 'host/web/index.html'), 'utf8'))
     .replace('<div id="exact-root"></div>', () => `<div id="exact-root">${content}</div>`)
-    .replace('<script type="module" src="./glue.js"></script>', () => `<script type="module">${readFileSync(resolve(ROOT, 'host/web/navigation.js'), 'utf8')}
+    .replace('<script type="module" src="./glue.js"></script>', () => `<script type="module">${navigationModule}
       const shell = document.getElementById('exact-root'); navigation.connect(shell, () => false, () => {}); navigation.project(shell, () => {}); globalThis.projected = true;</script>`);
   const suite = await suiteBrowser(engine, { timeout: 10000 });
   try {

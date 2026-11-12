@@ -15,6 +15,7 @@ mod reorder_group;
 mod reorder_tests;
 mod reuse;
 pub(crate) mod shown;
+mod snap;
 use shown::in_collection_row;
 mod start;
 #[cfg(test)]
@@ -39,8 +40,10 @@ pub(super) fn update_collection(
     u: &mut Update<'_>,
     frames: &[Frame],
     follow: bool,
+    smooth: bool,
     keep: Option<&Value>,
 ) -> Result<(), InstanceError> {
+    c.smooth = smooth;
     c.follow_end(follow);
     let remount = c.keep_mounted(keep);
     c.update_data(u, frames, false, remount)
@@ -182,8 +185,8 @@ pub(crate) struct Collection {
     geometry: Option<CollectionFeedback>,
     correction: Option<AnchorCorrection>,
     follow_end: bool,
-    /// The list's `scroll-behavior: smooth`: its end-follow and its smooth
-    /// `scrollIntoView` corrections ask the host to animate (LLP 1070.000 §6.2).
+    /// Whether the list's current `scroll-behavior` asks the host to animate
+    /// its end-follow corrections (LLP 1070.000 §11).
     smooth: bool,
     edge_handlers: [bool; 2],
     reorderable: bool,

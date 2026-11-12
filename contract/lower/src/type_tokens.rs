@@ -33,7 +33,7 @@ impl Lowerer<'_> {
     /// type or family token's family as the stack it declares here (`#12`),
     /// every tuple's declared so the runner finds each in the plan.
     pub(super) fn theme_stacks(&mut self) -> Vec<String> {
-        let entries: Vec<(tamber::Kind, Vec<String>)> = self
+        let entries: Vec<(tamber::Kind, Vec<String>, Span)> = self
             .theme
             .iter()
             .map(|e| {
@@ -43,12 +43,13 @@ impl Lowerer<'_> {
                         .chain(&e.slices)
                         .cloned()
                         .collect(),
+                    e.span,
                 )
             })
             .collect();
         let mut stacks: Vec<(String, u16)> = Vec::new();
         let mut out = Vec::new();
-        for (kind, values) in entries {
+        for (kind, values, span) in entries {
             let kernel = match kind {
                 tamber::Kind::Type => exact_kernel::style::theme::Kind::Type,
                 tamber::Kind::Family => exact_kernel::style::theme::Kind::Family,
@@ -66,7 +67,7 @@ impl Lowerer<'_> {
                 if stacks.iter().any(|(f, _)| f == family) {
                     continue;
                 }
-                let mut stack = Expr::Str(family.to_string(), Span::default());
+                let mut stack = Expr::Str(family.to_string(), span);
                 match self.replace_family(&mut stack) {
                     Ok(()) => {
                         if let Expr::Number(n, _) = stack {

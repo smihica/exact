@@ -16,7 +16,7 @@
 //!   `layout.env["keyboard-inset-height"]` either way.
 //! - **What the shell draws.** Where the page is in the window, the colour
 //!   behind it and into the edges it keeps out of, and whether the scheme is
-//!   dark, which the shell's bar icons follow ([`Chrome`]).
+//!   dark, plus the status bar's independent icon appearance ([`Chrome`]).
 //!
 //! Desktop Linux has no shell that calls this: its viewport is the display,
 //! and its insets stay zero.
@@ -50,8 +50,10 @@ pub struct Chrome {
     /// browser carries the root's background over the whole canvas; else the
     /// platform's surface for the scheme (`Canvas`, LLP 1115 D2).
     pub background: [u8; 4],
-    /// Whether the page's scheme is dark: the bars' icons are light then.
+    /// Whether the page's scheme is dark: the navigation bar's icons are light then.
     pub dark: bool,
+    /// Light status bar icons, resolved independently of the scheme (LLP 1105 D7).
+    pub status_light_icons: bool,
 }
 
 /// What a software keyboard does to the page (`interactive-widget`).
@@ -67,6 +69,7 @@ enum Keyboard {
 /// What the presenter keeps of the window.
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) status_bar: status_bar::State,
     window: Option<Window>,
     /// The page's frame in the window as last fitted.
     frame: Option<[f32; 4]>,
@@ -236,6 +239,7 @@ impl<D: DataSource> Presenter<D> {
                 .unwrap_or([0.0, 0.0, self.viewport.0, self.viewport.1]),
             background: authored.unwrap_or_else(|| crate::paint::page_color(dark)),
             dark,
+            status_light_icons: self.status_bar().light_icons,
         }
     }
 

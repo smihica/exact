@@ -1,7 +1,7 @@
 //! Fixed native-image limits and integer metadata; no source strings or bytes.
 
 /// Unique decoded allocations plus in-flight output/scratch/copy reservations,
-/// for a session made without a budget of its own; one decode's peak, always.
+/// for a session made without a budget of its own, and the minimum budget.
 pub const SESSION_BYTES: u64 = 32 * 1024 * 1024;
 pub const RUNNING_DECODES: usize = 2;
 pub const DELIVERY_CELLS: usize = 2;

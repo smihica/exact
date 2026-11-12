@@ -381,6 +381,13 @@ impl ContactPair {
         }
     }
 
+    /// Exact2: whether the last `CollisionEvent` of this pair was `Started`, the
+    /// touching state its events report.
+    pub fn start_event_emitted(&self) -> bool {
+        self.event_status
+            .contains(PairEventStatus::START_EVENT_EMITTED)
+    }
+
     /// Is there any active contact in this contact pair?
     pub fn has_any_active_contact(&self) -> bool {
         self.solver_manifolds()

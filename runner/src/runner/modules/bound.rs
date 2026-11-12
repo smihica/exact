@@ -171,9 +171,14 @@ impl<D: DataSource> Runner<D> {
             }
         }
         let key = self.key(row);
-        let mut body = json!({ "extension": self.plan.str(row.extension), verb: self.plan.str(row.declared), "args": args });
-        if self.route(row) == Route::Agent {
-            if let Some(preferred) = self.extensions.preferred.get(&key) {
+        let member = self.member_forward(row, &args);
+        let (name, implementation) = member
+            .as_ref()
+            .map(|(option, member)| (option.as_str(), member))
+            .unwrap_or((self.plan.str(row.declared), row));
+        let mut body = json!({ "extension": self.plan.str(implementation.extension), verb: name, "args": args });
+        if self.route(implementation) == Route::Agent {
+            if let Some(preferred) = self.extensions.preferred.get(&self.key(implementation)) {
                 body["preferred"] = preferred.clone();
             }
         }
@@ -391,7 +396,7 @@ impl<D: DataSource> Runner<D> {
             }
             let resources = &self.resources;
             let readers = self.extensions.readers.entry(key.clone()).or_default();
-            readers.retain(|i, _| resources.get(*i).is_some_and(Option::is_some));
+            readers.retain(|i, _| resources.get(*i).is_some_and(|row| row.state.is_some()));
             let current: BTreeSet<String> = readers.values().cloned().collect();
             let told = self.extensions.groups.entry(key.clone()).or_default();
             let gone: Vec<String> = told.difference(&current).cloned().collect();
@@ -446,8 +451,9 @@ impl<D: DataSource> Runner<D> {
             return false;
         };
         let source = self.plan.sources[row.source.0 as usize].name;
-        (0..self.plan.resources.len()).any(|i| {
-            self.plan.resources[i].source == source || self.watching[i].iter().any(|t| t == key)
+        (0..self.resources.len()).any(|i| {
+            self.resource_row(i).source == source
+                || self.resources[i].watching.iter().any(|t| t == key)
         }) || self.pending.iter().any(|p| {
             (p.keepable.as_ref())
                 .and_then(|r| self.module_topic(&r.body))
@@ -457,10 +463,39 @@ impl<D: DataSource> Runner<D> {
     }
 }
 
-/// `value` without its `null`s, at every depth: what the call wrote.
+/// `value` without its `null` fields, at every depth, records inside lists
+/// included: what the call wrote. A list's own `null` elements stay, since
+/// their places are meaningful.
 fn written(value: &mut Json) {
-    if let Json::Object(map) = value {
-        map.retain(|_, v| !v.is_null());
-        map.values_mut().for_each(written);
+    match value {
+        Json::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            map.values_mut().for_each(written);
+        }
+        Json::Array(items) => items.iter_mut().for_each(written),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod written_tests {
+    use super::written;
+    use serde_json::json;
+
+    /// A record inside a list loses its `null` fields as a top-level one does,
+    /// so a platform reads an option the call left out as absent: Android's
+    /// `optString` reads a `null` it is handed as the text "null".
+    #[test]
+    fn null_fields_are_dropped_inside_lists_and_null_elements_kept() {
+        let mut call = json!({
+            "shortcuts": [{ "name": "Open", "short_name": null, "icons": [{ "src": "a", "sizes": null }] }],
+            "records": [null, { "id": null }],
+            "limit": null,
+        });
+        written(&mut call);
+        assert_eq!(
+            call,
+            json!({ "shortcuts": [{ "name": "Open", "icons": [{ "src": "a" }] }], "records": [null, {}] })
+        );
     }
 }

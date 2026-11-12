@@ -36,7 +36,8 @@ fn main() {
             contract::rust_entry(
                 "exact_listbench_data::ListBench",
                 "exact_listbench_data::ListBench::default()",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

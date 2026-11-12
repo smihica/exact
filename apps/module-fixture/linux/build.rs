@@ -46,7 +46,8 @@ fn main() {
             contract::rust_entry(
                 "module_fixture_data::Fixture",
                 "module_fixture_data::Fixture",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap()
         ),

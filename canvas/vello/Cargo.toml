@@ -29,6 +29,11 @@ wgpu-hal = { version = "29", default-features = false, features = ["metal"] }
 objc2 = "0.6"
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLTypes", "MTLAllocation"] }
 
+[dev-dependencies]
+# Scene encoding tests run without the Apple module or a GPU.
+exact-canvas = { path = ".." }
+vello = { package = "exact-vello", path = "../../vendor/vello", default-features = false }
+
 [build-dependencies]
 # Build time only: vello's WGSL, preprocessed and validated, then MSL.
 vello_shaders = { version = "0.10", default-features = false, features = ["compile", "msl"] }

@@ -215,22 +215,28 @@ public struct SnapshotView: View {
 /// mode): its colour and gradients painted full bleed on the container's
 /// real bounds, which the system shapes (a hand-built `containerBackground`
 /// has no radius of its own; the root's stays on its border and content
-/// inside the margins). Unsaid, it is the system's background.
+/// inside the margins). Unsaid, it is the system's background. The root's
+/// `accent-color` is its tint, as it is the root's content's.
 @available(iOS 17.0, macOS 14.0, watchOS 10.0, visionOS 26.0, *)
-struct ContainerBackground: View {
+package struct ContainerBackground: View {
     let root: HeadlessSession.Node?
     @Environment(\.colorScheme) private var scheme
 
-    var body: some View {
+    package init(root: HeadlessSession.Node?) { self.root = root }
+
+    package var body: some View {
         let paint = root.map { SnapshotPaint(style: SnapshotStyle($0), dark: scheme == .dark) }
-        if let paint, paint.hasBackground {
-            GeometryReader { proxy in
-                let bounds = CGRect(origin: .zero, size: proxy.size)
-                paint.fill(in: bounds, positioned: bounds, rounded: false)
+        Group {
+            if let paint, paint.hasBackground {
+                GeometryReader { proxy in
+                    let bounds = CGRect(origin: .zero, size: proxy.size)
+                    paint.fill(in: bounds, positioned: bounds, rounded: false)
+                }
+            } else {
+                Rectangle().fill(.background)
             }
-        } else {
-            Rectangle().fill(.background)
         }
+        .modifier(Accent(node: root))
     }
 }
 

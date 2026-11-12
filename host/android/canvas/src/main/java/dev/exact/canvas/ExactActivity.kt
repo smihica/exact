@@ -60,9 +60,10 @@ open class ExactActivity : Activity() {
     /** The process's gamepads ([Pads]): every key and motion event is offered to them first. */
     private val pads: Pads get() = Pads.attach(this)
 
-    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean = pads.key(event) || super.dispatchKeyEvent(event)
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean =
+        pads.key(event, requests.padInput) || super.dispatchKeyEvent(event)
     override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean =
-        pads.motion(event) || super.dispatchGenericMotionEvent(event)
+        pads.motion(event, requests.padInput) || super.dispatchGenericMotionEvent(event)
 
     override fun onCreate(state: Bundle?) {
         // An activity made again in a process whose host runs (LLP 1115.001 D15.1: a configuration change this
@@ -401,8 +402,7 @@ open class ExactActivity : Activity() {
 
     /** What the host says to draw around the page ([Native.chrome]): the page's place in the window (x, y, width and
      * height in pixels), where the view and the hosted views under it are put; the colour behind the page and in the
-     * edges it keeps out of, which is the window's background; and whether its scheme is dark, which the bars' icons
-     * follow (light icons over a dark page). */
+     * edges it keeps out of, which is the window's background; and the two bars' icon appearances (LLP 1105 D7). */
     private fun chrome(c: IntArray) {
         for (child in listOfNotNull<View>(view, natives ?: return, fields)) {
             child.layoutParams = FrameLayout.LayoutParams(c[2], c[3]).apply {
@@ -411,10 +411,12 @@ open class ExactActivity : Activity() {
             }
         }
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(c[4]))
-        if (Build.VERSION.SDK_INT < 30) { Legacy.lightBars(window, c[5] == 0); return }
-        val light = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
-            android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-        window.insetsController?.setSystemBarsAppearance(if (c[5] != 0) 0 else light, light)
+        val bars = barAppearance(c[5])
+        if (Build.VERSION.SDK_INT < 30) { Legacy.lightBars(window, bars.statusLight, bars.navigationLight); return }
+        val status = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+        val navigation = android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        window.insetsController?.setSystemBarsAppearance(
+            (if (bars.statusLight) status else 0) or (if (bars.navigationLight) navigation else 0), status or navigation)
     }
 
     /** The device's settings as the host was last told them. */
@@ -502,7 +504,7 @@ open class ExactActivity : Activity() {
     /** A permission an extension asked for ([ExtensionContext.requestPermissions], LLP 1133.002 D9). */
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        Extensions.permissionsResult(requestCode)
+        Extensions.permissionsResult(requestCode, permissions, grantResults)
     }
 
     /** An activity an extension started for its result ([ExtensionContext.startActivityForResult], LLP 1133.018 D13
@@ -573,7 +575,7 @@ open class ExactActivity : Activity() {
         listOf("mi_purge_delay", "mi_eager_commit", "mi_arena_eager_commit").forEach { k ->
             intent.getStringExtra(k)?.let { android.system.Os.setenv("MIMALLOC_" + k.removePrefix("mi_").uppercase(), it, true) }
         }
-        listOf("x_agent", "x_hatches", "x_agent_storage", "x_agent_storage_fresh", "x_plan", "x_dev_plan", "x_store",
+        listOf("x_agent", "x_auth_fixture", "x_hatches", "x_agent_storage", "x_agent_storage_fresh", "x_plan", "x_dev_plan", "x_store",
             "x_agent_epoch", "x_agent_seed", "x_agent_locale", "x_agent_format_locale", "x_agent_time_zone",
             "x_agent_fail_fetch", "x_agent_process", "x_agent_home", "x_agent_login_env",
             "x_agent_share", "x_agent_bind", "x_agent_pads", "x_agent_timing", "x_agent_presentation", "x_agent_chrome",

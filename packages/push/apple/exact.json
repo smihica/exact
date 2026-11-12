@@ -1,0 +1,20 @@
+{
+  "kind": "implementation",
+  "implements": "@exact/push@^1.0",
+  "platform": "apple",
+  "targets": [
+    "ios"
+  ],
+  "shapes": {},
+  "options": {},
+  "names": [],
+  "views": [],
+  "hatches": [],
+  "sources": {
+    "swift": [
+      "Push.swift"
+    ]
+  },
+  "artifacts": [],
+  "class": "PushModule"
+}

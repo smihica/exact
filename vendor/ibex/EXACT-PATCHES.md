@@ -377,8 +377,11 @@ unpublished removes it. The stub for other platforms refuses. Replay on a refres
 `net.websocket local-network`, with the word `development` for loopback too. It
 admits a host the URL writes as an RFC 1918, link-local or unique-local
 address (an IPv4-mapped IPv6 address by its IPv4), a link-local IPv6 address,
-or a `.local` name; never a name that merely resolves to one. exact2's
-`grants` crate holds the same test. Replay on a refresh.
+or a `.local` name; never a name that merely resolves to one, and never the
+cloud metadata service, 169.254.169.254 (its IPv4-mapped spelling included)
+or `fd00:ec2::254`. exact2's `grants` crate holds the same rule, and its
+`tests/parity.rs` holds the two to `host/web/tests/fixtures/grants.json`.
+Replay on a refresh.
 
 ## Local patch 21, a host's check at every fetch hop and WebSocket open
 
@@ -456,7 +459,12 @@ links followed only until a directory an `fs.write` line (native or
 (`reach`), and every name below that opened `O_NOFOLLOW`; a link on the
 way that the running user owns, or that sits in a directory the user
 owns or can write, is refused, naming it (`made_by_this_user`), so only
-links such as macOS's `/var` and `/tmp` are followed; `access` checks its leaf with `AT_SYMLINK_NOFOLLOW`;
+links such as macOS's `/var` and `/tmp` are followed; a line whose last
+name the walk finds is a regular file (`fstatat` on the walk's descriptor,
+`AT_SYMLINK_NOFOLLOW`, after `ENOTDIR`) is refused as `denied`, saying a
+native line names a directory and to replace the line with itself less
+that name, printed as `PathPrefix` prints a target (the file's directory
+when that name is a link to it; `NamesAFile`); `access` checks its leaf with `AT_SYMLINK_NOFOLLOW`;
 `open_read` opens a path to read it the same way, for a child's stdin; and `stat`
 reads `mode` and `isSymbolicLink`; `fs_more.rs` adds `lstat`, `readlink`,
 `access`, `chmod`, `symlink`, `digest` and `flock`/`unlock`, host opcodes
@@ -466,7 +474,10 @@ reads `mode` and `isSymbolicLink`; `fs_more.rs` adds `lstat`, `readlink`,
 shutdown releases them all. The process lines are exact2's own and never
 reach `grant.rs`. Bionic's `faccessat` refuses every flag, so on Android
 `crate::AT_EACCESS` is none and `access` checks its leaf without
-`AT_SYMLINK_NOFOLLOW`, after the `fstatat` that found it no link. Replay on a refresh.
+`AT_SYMLINK_NOFOLLOW`, after the `fstatat` that found it no link. On iOS and
+tvOS the host roots `bundle:` at a folder holding only the app's declared
+resource trees and leaves `home:` unset (`fs_namespaces_tests.rs` checks
+that a root of that shape confines its paths). Replay on a refresh.
 
 ## Local patch 25, a database file held by one SQLite library at a time
 
@@ -505,6 +516,37 @@ failure SQLite reports as busy or locked begins `SQLite EBUSY: ` and any
 other `SQLite: `, and exact2's prelude reads the code from that prefix
 alone. exact2's web worker (`host/web/storage-worker.js`) answers the same
 words and sets the code from SQLite's result. Replay on a refresh.
+
+## Local patch 28, a `net.websocket` line is `ws` or `wss`
+
+`grant.rs` refuses a plain `net.websocket` line whose origin has another
+scheme (`net.websocket https://example.com`), as its subdomain and
+scheme-wide forms already were: no socket has that origin, so the line
+admitted nothing. exact2's `grants` crate refuses the same lines, and the
+shared corpus (`host/web/tests/fixtures/grants.json`) holds them. Replay on a
+refresh.
+
+## Local patch 29, a batch that checks foreign keys at commit
+
+`stdlib::sqlite::Connection::transaction` takes a `ForeignKeys` mode, and
+`Database::transaction_with` passes it; the JS binding's
+`transaction(batch, { foreignKeys: "check" })` sends it as the operation's
+second argument (`sqlite_abi`); `undefined` or `null` options are none,
+and any other key or value is a `TypeError` (exact2's prelude gives a
+binding's `TypeError` or `RangeError` the code `failed`). In `Check`, `ibex2-sqlite` turns enforcement
+off (`SQLITE_DBCONFIG_ENABLE_FKEY`) before `BEGIN`, runs the batch with the
+batch's own `PRAGMA foreign_keys` lines authorized as no-ops
+(`Authorization::Ignore`), runs `PRAGMA main.foreign_key_check` and
+`PRAGMA temp.foreign_key_check` before `COMMIT` (unqualified, the pragma
+reads only `main`), stepping through the rows and keeping the three to
+name, ordered by table (by code point), rowid and referenced table,
+and rolls back on any, and turns enforcement
+back on in a drop guard on every path; a connection that cannot have it
+back is closed. The connection's lock is held throughout. exact2's web
+worker does the same, and exact2's bake moves `typescriptRuntime` to 10 for
+a module whose grants admit `sqlite.open`, as an older prelude drops the
+option and the options may be data.
+Replay on a refresh.
 
 ## Qualification boundaries
 
@@ -650,7 +692,7 @@ iOS 27.0.1 (24A446), using production codec and vendored job code from Exact
 transforms, RGBA16 input, predecode refusal, cancellation, owner close, and
 cancellation after commit starts. The largest observed process resident peak
 was 195,837,952 bytes; sampled physical footprint peaked at 118,916,840 bytes.
-[LLP 1069.002](../../llp/1069.002-media-picker.rfc.md) records the fixtures,
+LLP 1069.002 records the fixtures,
 source hashes, retained receipts and limits. This finite workload does not prove
 a whole-app memory limit or behavior under memory pressure.
 
@@ -672,3 +714,27 @@ LLP 1120 §5 records the original baseline and remaining measured gate. Async
 remains off by default. Independent stage-1 code review, controlled TLS
 setup-stall diagnostics, Mac smoke, and the bounded image tests do not replace
 that campaign.
+
+## Local patch 29, assignments over inherited intrinsic properties
+
+`crates/ibex2/src/bindings/harden.js` replaces configurable, writable prototype
+properties with accessors before freezing. Assigning on an inheriting object
+creates its own property; the intrinsic stays fixed. SQLite verifies its captured
+identities before this trusted transformation, then pins the resulting accessors.
+The adapter's value conversions, integrity checks and bootstrap primitives live in
+separate internal headers to keep each source under 1,500 lines.
+Exact's `js/tests/it/pure.rs` covers shadowing and the frozen descriptors;
+its storage tests exercise the SQLite integrity check after hardening.
+
+## Local patch 30, SQLite provider registration by the app shell
+
+`stdlib::sqlite` holds an optional process provider. `ibex2_sqlite::link`
+installs it before any storage session is created. Exact's generated native
+entry calls it only when its composition names `sqlite`; the TypeScript and
+Rust storage executors read the same slot. File reservations still share the
+provider's registry. SQL grants and the manifest's link-ahead select it;
+development and unknown compositions keep it.
+
+An absent provider in `sqlite_abi` (JavaScript) or `host::Sqlite` (Rust)
+refuses an admitted open with `Unlinked("sqlite")`, matching Exact's portable
+storage executor and bake. Replay these refusals on a refresh.

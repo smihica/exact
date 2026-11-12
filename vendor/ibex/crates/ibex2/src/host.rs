@@ -695,7 +695,7 @@ impl Sqlite {
         let provider = self
             .provider
             .as_ref()
-            .ok_or_else(|| HostError::Failed("SQLite provider is not installed".into()))?;
+            .ok_or_else(|| HostError::Failed("Unlinked(\"sqlite\")".into()))?;
         Ok(crate::stdlib::sqlite::Database::new(
             provider.open(crate::stdlib::sqlite::Location { path })?,
         ))

@@ -1,18 +1,17 @@
 // The real glue.js run with host doubles, for the agent tests (agent.test.mjs): its clock, its replies
 // and the public object, no browser.
-import { readFileSync } from 'node:fs';
+import { wasmSource, glueDeclarations } from './tests/glue-fixture.mjs';
 import vm from 'node:vm';
-import { focusController, placeReporter, timeReporter, launchLocation } from './navigation.js';
+import { focusController } from './navigation/focus.js';
+import { placeReporter, timeReporter, launchLocation } from './navigation/environment.js';
 import { backButton } from './input-glue.js';
 import { viewBox, layoutBoxes, scrollRange } from './agent-input.js';
 
 // Like http-body/request-refusal.test.mjs, run the actual glue with host doubles.
 // Include the real public object and nodeDetail so registration and flow facts
 // are covered too. No browser geometry or scheduling is simulated as evidence.
-export const source = readFileSync(new URL('./glue.js', import.meta.url), 'utf8');
-// A one-line declaration is the whole line (with any state it declares first).
-export const declaration = name => (source.match(new RegExp(`^(?:let [^;\\n]+; )?(?:async )?function ${name}\\(.*\\}$`, 'm'))
-  ?? source.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`)))[0];
+export const source = wasmSource;
+export const declaration = name => glueDeclarations(source, [name]);
 export const publicObject = source.match(/globalThis.exact = \{[^]*?\n\};/)[0];
 export function deferred() {
   let resolve, reject;
@@ -36,7 +35,7 @@ export function fixture(agentMode = true) {
     foldBits: () => 0 /* no fold posture (LLP 1078 D6) */,
     document: { activeElement: null, body: {}, querySelector: () => null, getElementById: () => null, documentElement: { scrollWidth: 0, clientWidth: 0, scrollHeight: 0, clientHeight: 0 } }, // boot's last plan's theme: none; a page with nothing to scroll
     innerWidth: 300, innerHeight: 200, devicePixelRatio: 1, scrollX: 0, scrollY: 0,
-    INHERITED_CSS: {}, getComputedStyle: () => ({}), inertAncestor: () => false,
+    routeFlags: () => () => 0, INHERITED_CSS: {}, getComputedStyle: () => ({}), inertAncestor: () => false,
     viewBox: element => element.getBoundingClientRect(),
     navigation: { observation: () => ({ location: '/' }), reset() {} },
     presence: { live: null, pending: () => null, landed: async () => true },
@@ -58,7 +57,7 @@ export function fixture(agentMode = true) {
     prepareFonts: async () => [], commitFonts() {}, releaseAssets() {}, appRootFontSize() {} /* no app root rule to drop (LLP 1069.000 D3) */, incarnation: 0,
     // Ordinary boot tests model an already-loaded post-paint scheduler.
     timerFactory: () => ({ update() { events.push('ticker'); }, dispose() {} }),
-    ticker: null, motion: { reset() {} }, arrange: { reset() {} }, pieces: { pending: () => null }, retiredViews: new WeakSet(), followedScrolls: new Map(),
+    ticker: null, motion: { reset() {} }, arrange: { reset() {} }, pieces: { pending: () => null, canvas2d() {} }, retiredViews: new WeakSet(), followedScrolls: new Map(),
     pendingScrolls: new Set(), collections: { reset() {} }, messageFrames: new Map(),
     storageRequests: null, controllers: new Set(), grants: [],
     commitTurns: [],
@@ -72,7 +71,12 @@ export function fixture(agentMode = true) {
     preferences: () => '{}', localAssetURL: source => source, pageFacts: {} /* `globalThis.exact` exposes it (LLP 1139.003 D2) */, sizes: new Set(), mediaAttached: (deadline, set = context.mediaAttaching) => Promise.all(set).then(() => true) /* glue.js's, unbounded */,
     launchLocation: () => launchLocation(context), // the launch path less the drive's facts (feed F16)
   });
-  vm.runInContext(`let toldOffset = null; const folded = () => false; /* no folded text here (LLP 1007.001) */ const backButton = ${backButton}; const viewBox = ${viewBox}; const layoutBoxes = ${layoutBoxes}; const scrollRange = ${scrollRange};\n` + ['let gpuLoading', 'const POST_BOUND', 'let frameSampler', 'const followOffset', 'const shownValue'].map(head => source.match(new RegExp(`^${head} = .*$`, 'm'))[0]).join('\n') + '\n' + source.match(/const heldNamed = r => \{.*? : r; \};/)[0] + '\n' + ['nodeDetail', 'agentInputReady', 'agent', 'agentNow', 'agentReply', 'settleGpu', 'gpuPendingReply', 'agentSettled', 'tagged', 'clock', 'startClock', 'mutate', 'boot', 'bootNow'].map(declaration).join('\n') + '\n' + publicObject, context);
+  context.host = context;
+  context.mutation = Promise.resolve();
+  context.gpuInPlay = () => Boolean(context.gpuLoading || context.exact?.gpu || context.exact?.pendingSurfaces?.length);
+  context.gpuLoading = null;
+  context.frameSampler = null;
+  vm.runInContext(`let toldOffset = null; const folded = () => false; /* no folded text here (LLP 1007.001) */ const backButton = ${backButton}; const viewBox = ${viewBox}; const layoutBoxes = ${layoutBoxes}; const scrollRange = ${scrollRange}; Object.assign(host, { backButton, viewBox, layoutBoxes, scrollRange });\n` + glueDeclarations(source, ['POST_BOUND', 'followOffset', 'shownValue', 'heldNamed']) + '\n' + ['nodeDetail', 'agentInputReady', 'agent', 'agentNow', 'agentReply', 'settleGpu', 'gpuPendingReply', 'agentSettled', 'tagged', 'clock', 'startClock', 'mutate', 'boot', 'bootNow'].map(declaration).join('\n') + '\n' + publicObject, context);
   context.reportPlace = placeReporter(new URLSearchParams(agentMode ? 'agent=1' : ''), context);
   context.reportTime = timeReporter(new URLSearchParams(agentMode ? 'agent=1' : ''), context);
   return context;

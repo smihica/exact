@@ -53,7 +53,7 @@ fn a_render_holds_no_scheme_wide_or_local_network_line() {
     assert_eq!(held(spec), "net.fetch https://api.test");
 }
 
-impl<D: DataSource> DataSource for Anonymous<D> {
+impl<D: DataSource> exact_runner::DataSourceWrapper for Anonymous<D> {
     fn prepare_snapshot(
         &mut self,
         module: Option<exact_runner::SnapshotModule<'_>>,
@@ -63,6 +63,35 @@ impl<D: DataSource> DataSource for Anonymous<D> {
     }
     fn take_storage_changed(&mut self) -> bool {
         self.inner.take_storage_changed()
+    }
+
+    fn note_storage_changed(&mut self) {
+        self.inner.note_storage_changed();
+    }
+
+    // A render acquires no host storage, secrets or document handles.
+    fn set_document_owner(&mut self, _: u64) {}
+
+    fn configure_storage(
+        &mut self,
+        _: std::path::PathBuf,
+        _: std::path::PathBuf,
+        _: std::path::PathBuf,
+    ) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn configure_secrets(
+        &mut self,
+        _: std::sync::Arc<dyn exact_runner::SharedSecrets>,
+    ) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn replacement(&self, _: &[u8], _: &str, _: Vec<u8>) -> Result<Self, DataError> {
+        Err(DataError::Unavailable(
+            "a render cannot replace its data source".into(),
+        ))
     }
 
     fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError> {
@@ -125,6 +154,16 @@ impl<D: DataSource> DataSource for Anonymous<D> {
     fn canvas_surfaces(&self) -> Vec<(String, usize)> {
         self.inner.canvas_surfaces()
     }
+    fn draw_2d(
+        &mut self,
+        surface: &str,
+        args: &[Value],
+        ctx: &exact_runner::exact_canvas::Context2d,
+        frame: &exact_runner::exact_canvas::Frame,
+    ) -> Result<bool, exact_runner::exact_canvas::DrawError> {
+        self.inner.draw_2d(surface, args, ctx, frame)
+    }
+
     fn draw(
         &mut self,
         request: &exact_runner::DrawRequest<'_>,
@@ -149,6 +188,9 @@ impl<D: DataSource> DataSource for Anonymous<D> {
     }
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
         self.inner.continuation(token)
+    }
+    fn host_continuation(&self, token: u64) -> bool {
+        self.inner.host_continuation(token)
     }
     fn placement(&self) -> Placement {
         self.inner.placement()
@@ -201,6 +243,17 @@ impl<D: DataSource> DataSource for Anonymous<D> {
         refused: bool,
     ) -> Vec<Option<u64>> {
         self.inner.keep_sent(store, let_go, refused)
+    }
+    fn keeps_sent(&self, fetch: u64) -> bool {
+        self.inner.keeps_sent(fetch)
+    }
+    fn module_delivery(
+        &mut self,
+        store: &mut Store,
+        token: u64,
+        outcome: Outcome,
+    ) -> Result<Option<exact_runner::Request>, DataError> {
+        self.inner.module_delivery(store, token, outcome)
     }
     fn timer_before_reply(
         &mut self,

@@ -13,7 +13,7 @@ import { HELP, helpText, indexText, knownFlags } from './help.mjs';
 import { scriptFlags } from './help-parity.mjs';
 
 const ROOT = resolve(import.meta.dir, '..');
-const APP_VERBS = ['status', 'web', 'web-build', 'serve', 'test', 'agent', 'verify', 'ios', 'mac', 'share', 'linux', 'windows', 'android', 'update', 'lock', 'contract', 'tamber', 'hatch', 'snapback', 'backend', 'pattern', 'docs', 'feedback'];
+const APP_VERBS = ['status', 'web', 'web-build', 'serve', 'test', 'agent', 'verify', 'ios', 'mac', 'share', 'linux', 'windows', 'android', 'update', 'lock', 'add', 'contract', 'tamber', 'hatch', 'snapback', 'backend', 'pattern', 'docs', 'feedback'];
 const timed = (args, options) => {
   const t = performance.now(), r = spawnSync(process.execPath, args, { encoding: 'utf8', timeout: 15_000, ...options });
   return { ...r, ms: performance.now() - t };
@@ -34,7 +34,7 @@ test('each verb of a new app\'s exact.mjs, and no verb, answers help from exact2
       mkdirSync(resolve(sdk, file, '..'), { recursive: true });
       writeFileSync(resolve(sdk, file), `require('node:fs').appendFileSync(${JSON.stringify(started)}, ${JSON.stringify(file)} + '\\n');`);
     }
-    const exact = (...args) => timed([resolve(dir, 'exact.mjs'), ...args], { cwd: dir, env: { ...process.env, EXACT2: sdk } });
+    const exact = (...args) => timed([resolve(dir, 'exact.mjs'), ...args], { cwd: dir, env: { ...process.env, EXACT: sdk } });
     for (const verb of APP_VERBS) {
       const lead = verb === 'test' || verb === 'verify' ? ['ios'] : verb === 'agent' ? ['web', 'tree'] : [];
       for (const args of [[verb, '--help'], [verb, ...lead, '-h'], ['help', verb], [verb, '--help', 'all']]) {
@@ -97,12 +97,28 @@ test('the scripts a verb runs answer --help and refuse a flag they do not take, 
   }
 });
 
+test('tamber help lists every binding language', () => {
+  assert.match(helpText('tamber'), /gen ts\|rust\|swift\|kotlin <app>/);
+});
+
 test('each verb\'s help names exactly the flags its script parses, in a short text', () => {
   // The verbs' scripts and the flags each parses, read as caps.mjs reads them before a push (help-parity.mjs).
   for (const [verb, flags] of scriptFlags(ROOT)) assert.deepEqual([...knownFlags(verb).keys()].sort(), flags, `${verb}: the help's flags (documented and internal) against its script's`);
   for (const verb of Object.keys(HELP)) {
     const lines = helpText(verb, { all: true }).split('\n').length;
     assert.ok(lines <= 36, `${verb}'s help is ${lines} lines; it is replayed in an agent's context, so keep it short`);
+  }
+});
+
+test('contract help names the build and verify flags with their arguments and restrictions', () => {
+  const text = helpText('contract');
+  for (const [command, flags] of [
+    ['build', ['[--stdin]', '[-o <file.plan>]', '[--json]', '[--errors-only]', '[--map (requires -o)]', '[--entry <kind> (requires -o; no --map or --stdin)]']],
+    ['verify', ['[--runner-only]', '[--js]', '[--walks N]', '[--steps M]', '[--walk-seed N]', '[--confirm N]', '[--types]', '[--prove <Module>]']],
+  ]) {
+    const line = text.split('\n').find(line => line.startsWith(`  ${command} <file.contract>`));
+    assert.ok(line, `contract help names ${command}`);
+    for (const flag of flags) assert.ok(line.includes(flag), `${command} help omits ${flag}: ${line}`);
   }
 });
 

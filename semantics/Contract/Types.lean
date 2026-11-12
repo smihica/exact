@@ -318,6 +318,11 @@ inductive HasTy (p : Program) (G : Scope) : Scope → Expr → Ty → Prop
   | failure : p.fns.find? (·.name == "failure") = .none → (isResource p x || isMutation p x) = true →
       lookupTy x Γ = .none → (lookupTy x G).isSome = true →
       HasTy p G Γ (.call "failure" [.var x]) (.option (.record "Failure"))
+  /-- `current(x)` names a resource in scope, not a mutation (LLP 1161.001
+  D2). -/
+  | current : p.fns.find? (·.name == "current") = .none → isResource p x = true →
+      lookupTy x Γ = .none → (lookupTy x G).isSome = true →
+      HasTy p G Γ (.call "current" [.var x]) .bool
   | roster : p.fns.find? (·.name == name) = .none → ListTy p G Γ args ts → rosterTy name ts = .some t →
       HasTy p G Γ (.call name args) t
   /-- `path("route", args…)` (as the compiler expands it): a declared
@@ -506,6 +511,9 @@ structure WellTyped (p : Program) : Prop where
   /-- A gated task's gate and key are well typed (the compiler's
   `type-task-gate`, `type-task-key`; LLP 1092 D9). -/
   taskGates : ∀ t ∈ p.tasks, ∀ e ∈ t.gate.toList ++ t.key.toList, ∃ u, HasTy p (compScope p) [] e u
+  /-- A resource's `when` is well typed where its arguments are (the
+  compiler's `type-when-not-bool`; LLP 1161.002 D1). -/
+  resourceGates : ∀ r ∈ p.resources, ∀ g, r.gate = .some g → ∃ u, HasTy p (settleScope p) [] g u
   /-- A mutation's `then` names an action that takes no parameters: the
   clock runs it with none. -/
   thenActions : ∀ m ∈ p.mutations, ∀ a, m.andThen = .some a →

@@ -52,6 +52,9 @@ fn main() {
 
     let headers = required_path("DEP_HERMES_LEAN_INCLUDE_DIR");
     println!("cargo:rerun-if-changed=src/bindings/install.cc");
+    println!("cargo:rerun-if-changed=src/bindings/install_values.h");
+    println!("cargo:rerun-if-changed=src/bindings/install_integrity.h");
+    println!("cargo:rerun-if-changed=src/bindings/install_primitives.h");
     println!("cargo:rerun-if-changed=include/ibex2_jsi.h");
     let mut installer = cc::Build::new();
     installer

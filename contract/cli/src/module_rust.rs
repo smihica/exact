@@ -10,7 +10,7 @@
 //! rows, the runner would refuse a Rust call of it, and so it has no binding
 //! either. Rust has no synchronous form (D14).
 
-use crate::rust::{check_fields, field_name, type_name};
+use crate::rust::{check_fields, field_name, reach, type_name};
 use exact_plan::{ModulesRow, Plan, TypeKind, TypesId};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -42,7 +42,7 @@ pub fn module_rust(plan: &Plan) -> Result<String, String> {
                     .into_iter()
                     .flatten()
                     .filter_map(|f| f.as_str());
-                let name = record_name(plan.str(plan.types[p.0 as usize].name));
+                let name = type_name(plan.str(plan.types[p.0 as usize].name));
                 whole
                     .entry(name)
                     .or_default()
@@ -73,59 +73,10 @@ pub fn module_rust(plan: &Plan) -> Result<String, String> {
     Ok(out)
 }
 
-/// A desugared record's name in Rust's form: `getCurrentPosition__options`
-/// is `GetCurrentPositionOptions`; a shape's own name stays.
-fn record_name(name: &str) -> String {
-    if !name.contains("__") {
-        return type_name(name);
-    }
-    let upper = |part: &str| {
-        let mut chars = part.chars();
-        chars.next().unwrap().to_ascii_uppercase().to_string() + chars.as_str()
-    };
-    type_name(
-        &name
-            .split("__")
-            .filter(|p| !p.is_empty())
-            .map(upper)
-            .collect::<String>(),
-    )
-}
-
 fn params<'a>(plan: &'a Plan, row: &ModulesRow) -> impl Iterator<Item = TypesId> + 'a {
     let source = &plan.sources[row.source.0 as usize];
     let range = source.params.start as usize..(source.params.start + source.params.len) as usize;
     plan.source_params[range].iter().map(|p| p.ty)
-}
-
-/// Every record `ty` holds, by its Rust name.
-fn reach(plan: &Plan, ty: TypesId, out: &mut BTreeMap<String, TypesId>) -> Result<(), String> {
-    let row = plan.types.get(ty.0 as usize).ok_or("a type out of range")?;
-    match row.kind {
-        TypeKind::Option | TypeKind::List => {
-            reach(plan, row.elem.ok_or("a type with no element")?, out)
-        }
-        TypeKind::Record => {
-            let name = plan.str(row.name);
-            let rust = record_name(name);
-            if let Some(previous) = out.get(&rust) {
-                let previous = plan.str(plan.types[previous.0 as usize].name);
-                return if previous == name {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "shapes `{previous}` and `{name}` both become Rust `{rust}`"
-                    ))
-                };
-            }
-            out.insert(rust, ty);
-            for f in fields(plan, ty) {
-                reach(plan, f.ty, out)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 fn fields(plan: &Plan, ty: TypesId) -> &[exact_plan::FieldsRow] {
@@ -149,7 +100,7 @@ fn rust_type(plan: &Plan, ty: TypesId) -> Result<String, String> {
         TypeKind::String => "::std::string::String".into(),
         TypeKind::Option => format!("::core::option::Option<{}>", elem()?),
         TypeKind::List => format!("::std::vec::Vec<{}>", elem()?),
-        TypeKind::Record => record_name(plan.str(row.name)),
+        TypeKind::Record => type_name(plan.str(row.name)),
         // A signal answers nothing (LLP 1133.011 D1).
         TypeKind::Unit => "()".into(),
     })

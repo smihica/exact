@@ -6,11 +6,12 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnOwned, stopAll } from '../../scripts/test-children.mjs';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const sha = text => createHash('sha256').update(text).digest('hex');
@@ -43,6 +44,42 @@ async function devLoop(dir, env = {}) {
   } catch (e) { await stop(); throw e; }
   return { base: `http://127.0.0.1:${port}`, stop, said: () => out, dist };
 }
+
+test('the JS loop carries dollar patterns literally in a checkpoint', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-checkpoint-dollars-'));
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Checkpoint', app: { id: 'test.checkpoint', name: 'Checkpoint' } }));
+  writeFileSync(join(dir, 'app.contract'), 'component App\n  state body = "initial"\n  view\n    text body testId="body"\n');
+  const body = "$` $' $& $$ $5 $HOME </script><script>globalThis.__injected=true</script>";
+  let loop, browser;
+  try {
+    loop = await devLoop(dir);
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(loop.base);
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    const checkpoint = await page.evaluate(() => ({ time: 0, carryAnswers: false, answers: [],
+      slots: globalThis.exact.state[0].map(s => [s.n.devName, s.n.devType, s()]),
+    }));
+    checkpoint.slots.find(([name]) => name === 'body')[2] = body;
+    const post = () => fetch(`${loop.base}/__dev/checkpoint?id=1-2-3-4&seq=1`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(checkpoint),
+    });
+    expect((await post()).status).toBe(204);
+    const html = await (await fetch(`${loop.base}/?__exactDev=1-2-3-4`)).text();
+    const data = html.match(/<script type="application\/vnd\.exact\.dev-checkpoint"[^>]*>(.*?)<\/script>/s)?.[1];
+    expect(JSON.parse(data)).toEqual(checkpoint);
+    expect(html.match(/<!doctype html>/gi)).toHaveLength(1);
+    expect((await post()).status).toBe(204);
+    await page.goto(`${loop.base}/?__exactDev=1-2-3-4`);
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    expect(await page.getByTestId('body').textContent()).toBe(body);
+    expect(await page.evaluate(() => globalThis.__injected)).toBeUndefined();
+  } finally {
+    await browser?.close();
+    await loop?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 180000);
 
 test('the JS loop: a build an edit lands during is set aside, never published, and the newer files build', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-superseded-'));
@@ -285,3 +322,31 @@ test('the JS loop: two loops on two apps under one target/ build at once, each i
     for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   }
 }, 1_200_000);
+
+
+test('the JS loop rebuilds when a navigation source or grant admission changes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-navigation-watch-'));
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Navigation watch', app: { id: 'test.navigation-watch', name: 'Navigation watch' } }));
+  writeFileSync(join(dir, 'app.contract'), 'component App\n  view\n    text "Ready"\n');
+  const sources = ['host/web/navigation/routes.js', 'host/web/grant-admission.js'].map(file => resolve(ROOT, file));
+  const stamps = sources.map(path => statSync(path));
+  let loop;
+  try {
+    loop = await devLoop(dir);
+    for (const source of sources) {
+      const before = loop.said().length;
+      const now = new Date();
+      utimesSync(source, now, now);
+      const deadline = performance.now() + 30_000;
+      while (!loop.said().slice(before).includes('edit → plan ready')) {
+        if (performance.now() > deadline) throw new Error(`no rebuild after ${source}: ${loop.said().slice(before)}`);
+        await Bun.sleep(50);
+      }
+      expect(loop.said().slice(before)).toContain('edit → plan ready');
+    }
+  } finally {
+    await loop?.stop();
+    sources.forEach((path, i) => utimesSync(path, stamps[i].atime, stamps[i].mtime));
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 180_000);

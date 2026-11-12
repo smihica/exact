@@ -27,7 +27,7 @@ work. The starting revision is `fe4632ed1800ce58f3bcfa880e95f834395d77d9`.
 | GPU limits | Use the selected adapter's limits for wgpu Ink and Linux Vello. |
 | Ink shaders | Specialize wgpu primitive/brush/flag classes on every platform; retain `EXACT_INK_GENERIC` for comparisons. |
 | Direct presentation | Vulkan display surface, GPU portrait rotation, and Pi render/display-device matching in vendored wgpu-hal. |
-| Touch | Hide the cursor for BTN_TOUCH input; direct-KMS vertical drag, fling, catch and rubber-band overscroll. |
+| Touch | Hide the cursor for BTN_TOUCH input; KMS vertical drag, fling, catch and rubber-band overscroll. |
 | Dialog | Optional fixed black 72% comparison scrim follows the dialog's transition; it replaces the authored/platform scrim. |
 | Camera | Explicitly enabled `rpicam-vid` preview through the Linux image path; latest frame only. |
 | Shadows | Reuse a blurred-alpha texture for fixed geometry, with optional outer-band drawing. |

@@ -51,13 +51,15 @@ impl BudgetAccount {
     }
     pub fn available(&self) -> u64 {
         let s = self.usage.lock().unwrap();
-        self.budget
-            .load(Ordering::Relaxed)
+        self.budget()
             .saturating_sub(s.resident_bytes + s.reserved_bytes)
+    }
+    pub fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
     }
     pub fn reserve(self: &Arc<Self>, bytes: u64) -> Result<AllocationReservation, Refusal> {
         let mut usage = self.usage.lock().unwrap();
-        let budget = self.budget.load(Ordering::Relaxed);
+        let budget = self.budget();
         if bytes > budget {
             return Err(Refusal::TooLarge);
         }

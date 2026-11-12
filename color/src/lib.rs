@@ -8,7 +8,7 @@
 
 mod mix;
 mod named;
-pub use mix::{mix, HueMethod, Interpolation, MixSpace};
+pub use mix::{hue_arc, mix, HueMethod, Interpolation, MixSpace};
 
 /// A legacy colour: sRGB channels 0–255 and alpha 0–1, non-premultiplied.
 #[derive(Debug, Clone, Copy, PartialEq)]

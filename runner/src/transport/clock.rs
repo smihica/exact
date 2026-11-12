@@ -13,7 +13,8 @@
 //!   later than the tick before: ticks CoreMIDI coalesced into one packet
 //!   share a stamp) once [`MIN_TICKS`] are in it. A stamp earlier than the
 //!   last, or more than [`GAP`] after it, empties the window. Until the
-//!   first estimate the tempo is `bpm=` (120 when omitted).
+//!   first estimate the tempo is `bpm=` (120 when omitted). Estimates above
+//!   clock out's [`TICKS_PER_SECOND`] bound leave that tempo unchanged.
 //! - **Position counts ticks** (rulings #11): the `k`th tick after Start is
 //!   beat `from + k / 24`. Start puts beat `from` at the tick it predicts
 //!   next (the last tick plus one interval, when one came within [`GAP`],
@@ -57,7 +58,7 @@
 
 use super::{Fill, Out, Segment, State, Transport};
 use crate::agent::num;
-use crate::midi::HOLD;
+use crate::midi::{HOLD, TICKS_PER_SECOND};
 use crate::sound::{By, Cut};
 use exact_plan::Plan;
 use std::collections::VecDeque;
@@ -180,7 +181,10 @@ impl Follow {
         let elapsed = at - self.stamps[0];
         let leading = prev.is_none_or(|p| at > p);
         if leading && n >= MIN_TICKS && elapsed > 0.0 {
-            self.estimate = Some(60000.0 * (n - 1) as f64 / (elapsed * 24.0));
+            let bpm = 60000.0 * (n - 1) as f64 / (elapsed * 24.0);
+            if bpm * 24.0 / 60.0 <= TICKS_PER_SECOND {
+                self.estimate = Some(bpm);
+            }
         }
     }
 

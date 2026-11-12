@@ -74,13 +74,14 @@ impl<D: DataSource> Runner<D> {
                 ))
             }
             // A date control reports HTML's value format, within its `min`
-            // and `max` (which a picker never passes), or empty when cleared.
+            // and `max`, or empty when cleared.
             (
                 Some(kind @ (ControlKind::Date | ControlKind::Time | ControlKind::DateTimeLocal)),
                 ControlValue::Text(text),
             ) => {
                 let node = self.kernel.node(view).expect("a control");
-                if !kind.valid_value(text) {
+                let number = kind.date_value(text);
+                if !text.is_empty() && number.is_none() {
                     return Err(invalid(format!(
                         "{text:?} is not a {} value (HTML's format: {})",
                         node.props.str(exact_kernel::PropId::Type).unwrap_or(""),
@@ -94,18 +95,28 @@ impl<D: DataSource> Runner<D> {
                 let bound = |id| {
                     node.props
                         .str(id)
-                        .filter(|b| kind.valid_value(b) && !b.is_empty())
+                        .and_then(|text| kind.date_value(text).map(|number| (text, number)))
                 };
-                if !text.is_empty() {
-                    if let Some(min) =
-                        bound(exact_kernel::PropId::Min).filter(|m| text.as_str() < *m)
-                    {
-                        return Err(invalid(format!("{text:?} is before min {min:?}")));
-                    }
-                    if let Some(max) =
-                        bound(exact_kernel::PropId::Max).filter(|m| text.as_str() > *m)
-                    {
-                        return Err(invalid(format!("{text:?} is after max {max:?}")));
+                if let Some(number) = number {
+                    let min = bound(exact_kernel::PropId::Min);
+                    let max = bound(exact_kernel::PropId::Max);
+                    match (kind, min, max) {
+                        // HTML's time domain wraps at midnight.
+                        (ControlKind::Time, Some((min, lo)), Some((max, hi))) if lo > hi => {
+                            if number < lo && number > hi {
+                                return Err(invalid(format!(
+                                    "{text:?} is outside reversed range {min:?} to {max:?}"
+                                )));
+                            }
+                        }
+                        _ => {
+                            if let Some((min, _)) = min.filter(|(_, lo)| number < *lo) {
+                                return Err(invalid(format!("{text:?} is before min {min:?}")));
+                            }
+                            if let Some((max, _)) = max.filter(|(_, hi)| number > *hi) {
+                                return Err(invalid(format!("{text:?} is after max {max:?}")));
+                            }
+                        }
                     }
                 }
                 Ok(value.value())

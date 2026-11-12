@@ -6,6 +6,7 @@ import { viewChildren } from "./navigation.js";
 import names, { types } from './names.js';
 import { pieces, pageHistory, Head, navigateRoot, Tasks, journal, unopened, busy as busyIds } from './rt.js';
 import * as perf from './perf.js';
+import { resourceKey } from './resource-inspection.js';
 import { cap } from './timer-observations.js';
 // LLP 1133.003 §9's gate, under the agent only (ts-stream.js calls in):
 // `perf streams` reads, per stream, each message from its receipt to the
@@ -619,7 +620,7 @@ export function install(exact) {
         const timerOf = t => { const c = t?.call; if (!(c?.timers > 0) || c.plain) return undefined; const due = Math.min(...exact.clock.timers.filter(e => e.data && e.call === c).map(e => e.due)); return Number.isFinite(due) ? due : undefined; };
         const marked = t => held.has(t.id) ? { held: true } : timerOf(t) !== undefined ? { timer: timerOf(t) } : {};
         const pending = [...exact.resources.filter(r => r.ticket && (!r.ticket.messages || r.ticket.upload || held.has(r.ticket.id)) && !r.gone).map(r => ({ name: r.name, ticket: r.ticket.id, ...marked(r.ticket) })),
-          ...(exact.mutations ?? []).filter(m => m.ticket && (held.has(m.ticket.id) || timerOf(m.ticket) !== undefined)).map(m => ({ name: m.name, ticket: m.ticket.id, ...marked(m.ticket) })), ...holds()];
+          ...(exact.mutations ?? []).flatMap(m => (m.ticket ? [m.ticket] : m.tickets ?? []).filter(t => held.has(t.id) || timerOf(t) !== undefined).map(t => ({ name: m.name, ticket: t.id, ...marked(t) }))), ...holds()]; // a parallel mutation's every send (LLP 1161.000 D6)
         const streams = exact.resources.filter(r => r.ticket?.ctl).map(r => ({ name: r.name, ticket: r.ticket.id, messages: r.ticket.messages, coalesced: r.ticket.coalesced, ...(r.ticket.ctl.grant ? { grant: r.ticket.ctl.grant } : {}), ...(r.ticket.ctl.socket ? { readyState: r.ticket.ctl.socket.readyState, bufferedAmount: r.ticket.ctl.socket.bufferedAmount, sent: r.ticket.ctl.socket.sent } : {}), ...(r.ticket.ctl.retrying ? { retrying: { attempt: r.ticket.ctl.retrying.attempt, inMs: Math.max(0, Math.round(r.ticket.ctl.retrying.at - performance.now())), error: r.ticket.ctl.retrying.error } } : {}) }));
         // The painted surface of views with presence rows, exit ghosts included (glue.js `st.presence`).
         // Focus, the keyboard's overlap and the document's language, as glue.js's `state` adds them.
@@ -647,8 +648,8 @@ export function install(exact) {
         const background = exact.data?.background?.();
         const faults = faultsJson();
         // Why each failed resource failed, as the runner's `state.failed` (app farm round 1).
-        const observed = exact.resources.map((r, i) => [r.name, r.observation?.(i)]).filter(([, v]) => v), resourceStatus = Object.fromEntries(observed), failures = Object.fromEntries(exact.resources.filter(r => r.failures).map(r => [r.name, { ...r.failures }]));
-        const failed = Object.fromEntries(exact.resources.filter(r => r.failed).map(r => [r.name, r.error ?? 'it failed']));
+        const observed = exact.resources.map(r => [resourceKey(r), r.observation?.(names[2].indexOf(r.name))]).filter(([, v]) => v), resourceStatus = Object.fromEntries(observed), failures = Object.fromEntries(exact.resources.filter(r => r.failures).map(r => [resourceKey(r), { ...r.failures }]));
+        const failed = Object.fromEntries(exact.resources.filter(r => r.failed).map(r => [resourceKey(r), r.error ?? 'it failed']));
         const mutationFailures = Object.fromEntries(exact.mutations.flatMap(m => { const failure = m.e(); return failure ? [[m.name, {code: failure[0], message: failure[1]}]] : []; }));
         // The writes shown over resources until they end or are answered (overlay.js), as the runner's `state.writes`.
         const writes = exact.writes?.() ?? [];

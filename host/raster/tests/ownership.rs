@@ -858,6 +858,36 @@ fn blocked_waiter_skips_full_mailbox_when_another_session_becomes_runnable() {
 }
 
 #[test]
+fn a_decodes_peak_uses_the_sessions_current_budget() {
+    let gate = Gate::new();
+    let session = gate.session();
+    let large = demand(1, 1, 4, 44);
+    assert_eq!(session.request(large), Err(Refusal::TooLarge));
+    session.set_budget(64 * MIB);
+    let first = session.request(large).unwrap();
+    let permit = gate.next_decode().unwrap();
+    assert_eq!(total(&session), 48 * MIB);
+    let second = session.request(demand(2, 2, 4, 44)).unwrap();
+    assert!(gate.next_decode().is_none());
+    assert_eq!(session.status(second), Some(RequestStatus::WaitingBudget));
+    assert_eq!(session.request(demand(2, 3, 4, 61)), Err(Refusal::TooLarge));
+    assert_eq!(session.status(second), Some(RequestStatus::WaitingBudget));
+    session.set_budget(32 * MIB);
+    session.cancel(first);
+    drop(permit);
+    assert_eq!(total(&session), 0);
+    assert!(gate.next_decode().is_none());
+    session.set_budget(64 * MIB);
+    let permit = gate.next_decode().unwrap();
+    assert_eq!(permit.cost(), large.cost);
+    assert_eq!(total(&session), 48 * MIB);
+    session.cancel(second);
+    drop(permit);
+    assert_eq!(total(&session), 0);
+    assert!(session.stats().peak_bytes <= 64 * MIB);
+}
+
+#[test]
 fn viewport_budget_shrink_preserves_backings_and_growth_wakes_queued_decodes() {
     let gate = Gate::new();
     let session = gate.session_with_budget(64 * MIB);

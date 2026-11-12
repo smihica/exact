@@ -3,11 +3,78 @@
 //! `.json` beside it; one that is refused has a `.err`, one diagnostic a
 //! line. `BLESS=1 cargo test -p exact-tamber` rewrites them.
 
-use common::vocab;
+use crate::common::vocab;
 use exact_tamber::check;
-
-use crate::common;
 use std::path::Path;
+
+#[test]
+fn family_stacks_are_refused_at_the_design_value() {
+    let vocab = vocab();
+    for family in [
+        "\"Comic Sans MS\", cursive",
+        "Inter, fantasy",
+        "Inter, math",
+        "Inter, emoji",
+        "Inter, fangsong",
+        "\"\", system-ui",
+        "''",
+        "\"a;b\", system-ui",
+        "\"a{b}\", system-ui",
+        "\"a\\b\", system-ui",
+        "Inter, inherit",
+        "Inter, initial",
+        "Inter, unset",
+        "Inter, revert",
+        "Inter, revert-layer",
+        "default",
+        "-1font",
+        "serif extra",
+        "\"Inter\" \"Extra\"",
+        r#"'"Missing"', monospace"#,
+        r#"'"Missing', monospace"#,
+        r#"'Missing"', monospace"#,
+        r#"'Say "hi"', serif"#,
+        r#"'"monospace"', monospace"#,
+        &vec!["Inter"; 65].join(", "),
+    ] {
+        for (kind, value) in [
+            ("family", family.to_string()),
+            ("type", format!("16px/1.4 {family}")),
+        ] {
+            let source = format!("tamber t\n\ntheme\n  {kind}.text = {value}\n");
+            let errors = check(&source, &vocab).expect_err(&source);
+            assert!(
+                errors.iter().any(|e| e.line == 4 && e.col > 0),
+                "{errors:?}"
+            );
+        }
+    }
+    let source = "tamber t\n\naxes\n  density = regular | compact\n\ntheme\n  family.text = system-ui, sans-serif\n    when density=compact: Inter, fantasy\n  type.body = 16px/1.4 family.text\n";
+    let errors = check(source, &vocab).unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.line == 8 && e.message.contains("fantasy")),
+        "{errors:?}"
+    );
+
+    for family in [
+        "\"O'Brien\", serif",
+        r#""'Missing'", serif"#,
+        r#"'Say "hi" again', serif"#,
+        "\"cursive\", 'inherit', \"monospace\"",
+        "\"Acme, Display\", Times New Roman, serif",
+        "-apple-system, SYSTEM-UI, ui-rounded",
+        "serif\u{a0}extra, system-ui",
+        &vec!["Inter"; 64].join(", "),
+    ] {
+        let source = format!(
+            "tamber t\n\ntheme\n  family.text = {family}\n  type.body = 16px/1.4 family.text\n"
+        );
+        let folding = check(&source, &vocab).unwrap_or_else(|e| panic!("{source}: {e:?}"));
+        exact_tamber::family_names(&folding.tokens[0].values[0].css()).unwrap();
+    }
+}
 
 #[test]
 fn corpus() {

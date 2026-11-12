@@ -29,7 +29,7 @@ impl Source {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
-    pub fn entry(self, rust_mode: &str) -> Result<String, String> {
+    pub fn entry(self, inputs: &serde_json::Value) -> Result<String, String> {
         let (source, constructor) = match self {
             Self::Reuse => (
                 "messages_stress_data::ReusableMessagesStress",
@@ -40,6 +40,11 @@ impl Source {
                 "messages_stress_data::MessagesStress",
             ),
         };
-        contract::rust_entry(source, constructor, rust_mode)
+        contract::rust_entry(
+            source,
+            constructor,
+            inputs["rustMode"].as_str().unwrap(),
+            inputs,
+        )
     }
 }

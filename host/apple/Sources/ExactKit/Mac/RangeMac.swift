@@ -1,6 +1,6 @@
 // @ref LLP 1069.001 D5 — `input type="range"` is an `NSSlider`: HTML's
-// `input` as the knob moves, `change` as the mouse lifts, each value clamped
-// and snapped to `step` as HTML sanitizes it, and the knob with it. The bound
+// `input` as the knob moves, `change` on release or a discrete step, each value
+// clamped and snapped to `step` as HTML sanitizes it, and the knob with it. The bound
 // value is written into it when it changes, as the web build writes an
 // input's `value`: an action that has not written it leaves the knob where
 // the person put it (LLP 1069.001 D4, amended 2026-10-04).
@@ -29,19 +29,20 @@ extension ControlHost {
         slider.setAccessibilityValue(RangeSpec.format(range.sanitize(slider.doubleValue)))
     }
 
-    /// A move or a release: `input` while the mouse is down, `change` when it lifts.
+    /// Mouse tracking defers `change` until release; keyboard and accessibility steps commit at once.
     func rangeChanged(_ slider: NSSlider) {
         let id = UInt32(slider.tag)
         guard let owner = presenter.views[id] else { return }
         let value = RangeSpec.format(RangeSpec(owner.props).sanitize(slider.doubleValue))
         // Snap the knob here: AppKit's own stepping draws a tick mark for every step
         if let snapped = Double(value), slider.doubleValue != snapped { slider.doubleValue = snapped }
-        let released = NSApp.currentEvent.map { $0.type == .leftMouseUp || $0.type == .keyDown } ?? true
+        // Accessibility actions have no event of their own: currentEvent may be unrelated.
+        let tracking = NSApp.currentEvent.map { $0.type == .leftMouseDown || $0.type == .leftMouseDragged } ?? false
         if value != lastRange[id] {
             lastRange[id] = value
             presenter.controlValue(id, value, input: true, change: false)
         }
-        if released {
+        if !tracking {
             lastRange[id] = nil
             presenter.controlValue(id, value, input: false, change: true)
             if let owner = presenter.views[id] { configureRange(slider, owner) }

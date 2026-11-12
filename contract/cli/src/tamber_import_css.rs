@@ -135,10 +135,10 @@ pub fn run(args: &[String]) -> ExitCode {
         true => contract::tamber_params::params_of(&built),
         false => contract::tamber_params::AppParams::default(),
     };
-    let (text, kinds, outside) = loop {
+    let (text, folded, outside) = loop {
         let (text, first) = render(&base, at, &start, &tokens);
         let block = first..first + tokens.len();
-        let (said, kinds) = match checked(&text, &path, &built, &dir, &app) {
+        let (said, folded) = match checked(&text, &path, &built, &dir, &app) {
             Ok(checked) => checked,
             Err(why) => {
                 eprintln!("contract tamber import css: {why}; nothing written");
@@ -169,7 +169,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
         if !dropped.contains(&true) && !unmarked {
-            break (text, kinds, outside);
+            break (text, folded, outside);
         }
         let mut k = 0;
         tokens.retain(|_| {
@@ -209,12 +209,17 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     );
     for t in &tokens {
-        let kind = kinds
+        let checked = folded
             .iter()
-            .find(|(n, _)| *n == t.name)
-            .map_or("", |(_, k)| k);
+            .find(|f| exact_tamber::exports_names(&t.name, &f.name, f.role.as_deref()))
+            .expect("an imported token has been checked");
+        let kind = checked.kind.name();
+        let role = checked
+            .role
+            .as_ref()
+            .map_or(String::new(), |r| format!("  (overrides role {r})"));
         let note = t.note.map_or(String::new(), |n| format!("  ({n})"));
-        println!("  {} = {}{}  {kind}{note}", t.name, t.value, mark(t));
+        println!("  {} = {}{}  {kind}{role}{note}", t.name, t.value, mark(t));
     }
     let fixed = tokens.iter().filter(|t| t.fixed).count();
     if fixed > 0 {
@@ -244,22 +249,24 @@ struct Refusal {
 
 /// Every refusal of `text` as the design at `path`, as `contract tamber
 /// check` makes them: the evaluator's fold with the app's params and its
-/// packages' designs, then the compiler's build; and each token's kind when
-/// it folds. An `Err` when the build could not be made.
-#[allow(clippy::type_complexity)]
+/// packages' designs, then the compiler's build; and the folded tokens.
+/// An `Err` when the build could not be made.
 fn checked(
     text: &str,
     path: &Path,
     built: &Path,
     dir: &Path,
     app: &contract::tamber_params::AppParams,
-) -> Result<(Vec<Refusal>, Vec<(String, &'static str)>), String> {
+) -> Result<(Vec<Refusal>, Vec<exact_tamber::Checked>), String> {
     let vocab = contract_lower::tamber_vocab();
+    let file = contract::tamber_uses::shown(path, dir);
     let folded = match (app.tokens.is_empty(), app.packages.is_empty()) {
         (true, true) => exact_tamber::check(text, &vocab),
-        (_, false) => contract::tamber_params::fold_with(text, app, &vocab).map(|(f, _)| f),
+        (_, false) => {
+            contract::tamber_params::fold_with(text, app, &vocab, Some(&file)).map(|(f, _)| f)
+        }
         (false, true) => exact_tamber::parse(text).and_then(|d| {
-            exact_tamber::check_design(contract::tamber_params::laid(&d, app), &vocab)
+            exact_tamber::check_design(contract::tamber_params::laid(&d, app, Some(&file)), &vocab)
         }),
     };
     let folding = match folded {
@@ -274,9 +281,6 @@ fn checked(
             return Ok((said.collect(), Vec::new()));
         }
     };
-    let kinds = (folding.tokens.iter())
-        .map(|t| (t.name.clone(), t.kind.name()))
-        .collect();
     let svgs = crate::tamber::svgs(&folding, Some(dir), app);
     // An app with params or packages' designs is admitted by its own build,
     // which reads this text in place of the file's.
@@ -300,7 +304,7 @@ fn checked(
             message,
         }
     });
-    Ok((said.collect(), kinds))
+    Ok((said.collect(), folding.tokens))
 }
 
 /// One custom property declaration read: its name, its value, whether only

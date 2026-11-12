@@ -2,6 +2,11 @@
 use crate::{err, LowerError};
 use contract_syntax::{Attr, Expr, Span};
 
+pub(crate) const INSTANT_REFUSAL: &str = "`datetime` is an instant in epoch milliseconds; \
+    bind a source's numeric field, e.g. `datetime=event.at` (parse date strings in the data module). \
+    For the current instant, use `datetime=(wall.epochAtZero + performanceNow())`, \
+    where `wall` is an `exactTime()` resource (see `contract vocab date`)";
+
 pub(crate) fn check(tag: &str, attrs: &[Attr], span: Span) -> Result<(), LowerError> {
     let has = |name: &str| attrs.iter().any(|a| a.name == name);
     for a in attrs {
@@ -23,7 +28,7 @@ pub(crate) fn check(tag: &str, attrs: &[Attr], span: Span) -> Result<(), LowerEr
             );
         }
         if a.name == "datetime" && matches!(&a.value, Expr::Str(_, _)) {
-            return err("lower-time-instant", "`datetime` is an instant in epoch milliseconds; write `datetime=date(\"2026-10-17T12:00:00Z\")` to parse an ISO date", a.span);
+            return err("lower-time-instant", INSTANT_REFUSAL, a.span);
         }
         if a.name == "format"
             && !matches!(&a.value, Expr::Str(v, _) if exact_kernel::time::FORMATS.contains(&v.as_str()))

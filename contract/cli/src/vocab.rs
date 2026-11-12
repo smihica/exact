@@ -234,12 +234,15 @@ fn event(name: &str) -> Option<Event> {
 }
 
 fn entry(name: &str) -> Option<Entry> {
-    let tag = tags::tag(name).map(|t| tag_json(name, &t));
+    let tag = tags::tag(name)
+        .map(|t| tag_json(name, &t))
+        .or_else(|| heading_json(name));
     // Lowering's own row for `:active`'s opacity is no attribute (LLP 1121 D8).
     let attr = (name != contract_lower::PRESS_OPACITY_TO)
         .then(|| tags::attr(name))
         .flatten()
-        .map(|a| attr_json(name, &a));
+        .map(|a| attr_json(name, &a))
+        .or_else(|| vocab::compile_attr(name).map(compile_attr_json));
     let value_of: Vec<&'static str> = vocab::attrs()
         .into_iter()
         .filter(|(n, a)| rows_of(n, a).iter().any(|r| r.enum_names().contains(&name)))
@@ -382,15 +385,6 @@ fn one_json(name: &str) -> (Value, bool) {
 /// One name as text, printed (a refusal on stderr), and whether it was
 /// known; a concept or recipe already in `shown` is named, not printed again.
 fn one_text(name: &str, shown: &mut Shown) -> bool {
-    // LLP 1116.017 D1: the parser reads `h1`-`h6` as headings, so no table has them.
-    if let Some(level) = name
-        .strip_prefix('h')
-        .and_then(|n| n.parse::<u8>().ok())
-        .filter(|n| (1..=6).contains(n))
-    {
-        println!("{name}: a heading of level {level}: `{name} \"Title\"` is `text \"Title\" role=\"heading\" aria-level={level}`; a level the app computes is written that way");
-        return true;
-    }
     if let Some(e) = event(name) {
         let fields: Vec<String> = e.fields.iter().map(|(f, t)| format!("{f}: {t}")).collect();
         println!("{name}: an event record, its fields {}", fields.join(", "));
@@ -441,6 +435,12 @@ fn one_text(name: &str, shown: &mut Shown) -> bool {
         if let Some(note) = vocab::tag_note(name) {
             println!("  {note}");
         }
+    } else if let Some(tag) = &tag {
+        println!("{name}: {}", tag["note"].as_str().unwrap());
+    }
+    if let Some(a) = vocab::compile_attr(name) {
+        println!("{name}: compile-time attribute");
+        println!("  {}\n  {}\n  only on {}", a.accepts, a.note, a.only);
     }
     // A symbol refused at compile time points here for the roles (LLP 1116.021 D3).
     if name == "symbol" {
@@ -947,12 +947,21 @@ fn rows_of(name: &str, a: &AttrTarget) -> &'static [StyleId] {
 }
 
 fn row_json(row: StyleId) -> Value {
-    json!({
+    let mut doc = json!({
         "row": row.name(),
         "codec": vocab::codec(row),
         "values": row.enum_names(),
         "default": vocab::default(row),
-    })
+    });
+    // Only a row with entries has the key: none recorded is not "every host draws it".
+    let hosts = vocab::style_hosts(row);
+    if !hosts.is_empty() {
+        doc["hosts"] = hosts
+            .iter()
+            .map(|e| json!({ "host": e.host, "on": e.on, "fidelity": if e.none { "none" } else { "best-effort" }, "why": e.why }))
+            .collect();
+    }
+    doc
 }
 
 fn tag_json(name: &str, t: &Tag) -> Value {
@@ -968,6 +977,30 @@ fn tag_json(name: &str, t: &Tag) -> Value {
         doc["note"] = note.into();
     }
     doc
+}
+
+// LLP 1116.017 D1: the parser consumes these before the tag lookup.
+const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+
+fn heading_json(name: &str) -> Option<Value> {
+    let level = HEADINGS.iter().position(|n| *n == name)? + 1;
+    let mut doc = tag_json(name, &tags::tag("text").unwrap());
+    doc["fixedProps"] = json!([
+        { "prop": PropId::AccessibilityRole.name(), "value": "heading" },
+        { "prop": PropId::AccessibilityHeadingLevel.name(), "value": level.to_string() },
+    ]);
+    doc["note"] = format!("a heading of level {level}: `{name} \"Title\"` is `text \"Title\" role=\"heading\" aria-level={level}`; a level the app computes is written that way").into();
+    Some(doc)
+}
+
+fn compile_attr_json(a: &vocab::CompileAttr) -> Value {
+    json!({
+        "name": a.name,
+        "kind": "compile-time",
+        "accepts": a.accepts,
+        "only": a.only,
+        "note": a.note,
+    })
 }
 
 const GRID_TRACKS: &str = "CSS track lists: none, px, rem, %, fr, auto, min-content, max-content, named lines, fit-content(px or %), minmax(), and repeat() with a count, auto-fill or auto-fit. Lengths accept calc(), min(), max() and clamp() over px, rem and %, including in minmax() and valid repetitions. Percentages use the grid's content box in that axis; negative calculated results clamp to zero. Example: repeat(auto-fill, minmax(min(100%, 12rem), 1fr)). Calculated fit-content(), other length units (em among them), a design token (`var(--name)`) and env() are unsupported; grid-auto-columns/rows are not yet attributes.";
@@ -1073,8 +1106,10 @@ fn attr_json(name: &str, a: &AttrTarget) -> Value {
 
 fn everything() -> Value {
     json!({
-        "tags": vocab::tags().iter().map(|(n, t)| tag_json(n, t)).collect::<Vec<_>>(),
-        "attributes": vocab::attrs().iter().map(|(n, a)| attr_json(n, a)).collect::<Vec<_>>(),
+        "tags": vocab::tags().iter().map(|(n, t)| tag_json(n, t))
+            .chain(HEADINGS.iter().filter_map(|n| heading_json(n))).collect::<Vec<_>>(),
+        "attributes": vocab::attrs().iter().map(|(n, a)| attr_json(n, a))
+            .chain(vocab::COMPILE_ATTRS.iter().map(compile_attr_json)).collect::<Vec<_>>(),
         "renamed": vocab::renamed().iter().map(|(n, r)| json!({"name": n, "use": r})).collect::<Vec<_>>(),
         "html": vocab::html_tags().iter().map(|(n, h)| json!({"name": n, "hint": h})).collect::<Vec<_>>(),
         "head": tags::HEAD_FIELDS,
@@ -1120,6 +1155,43 @@ fn row_text(row: StyleId) -> String {
     text
 }
 
+/// What the schema's `hosts` column records for the rows (LLP 1159.000 D3):
+/// a line an entry, hosts that share a scope and a reason together, and what
+/// the absence of the others means. Nothing for rows with no entry, which is
+/// no claim that every host draws them.
+fn host_lines(rows: &[StyleId]) -> Vec<String> {
+    let mut lines: Vec<(Vec<&str>, vocab::StyleHost)> = Vec::new();
+    for entry in rows.iter().flat_map(|row| vocab::style_hosts(*row)) {
+        match lines
+            .iter_mut()
+            .find(|(_, e)| (e.on, e.none, e.why) == (entry.on, entry.none, entry.why))
+        {
+            Some((hosts, _)) => {
+                if !hosts.contains(&entry.host) {
+                    hosts.push(entry.host);
+                }
+            }
+            None => lines.push((vec![entry.host], entry)),
+        }
+    }
+    let mut out: Vec<String> = lines
+        .iter()
+        .map(|(hosts, e)| {
+            let scope = match e.on {
+                Some("box") => ", on a box",
+                Some(_) => ", inside an `svg`",
+                None => "",
+            };
+            let what = if e.none { "not drawn" } else { "differs" };
+            format!("{}{scope}: {what}: {}", hosts.join(", "), e.why)
+        })
+        .collect();
+    if !out.is_empty() {
+        out.push("no gap is recorded for the other hosts".into());
+    }
+    out
+}
+
 /// An attribute's detail lines: a style's rows (shared description once),
 /// a prop's type, a handler's event.
 fn attr_detail(name: &str, a: &AttrTarget) -> Vec<String> {
@@ -1152,9 +1224,7 @@ fn attr_detail(name: &str, a: &AttrTarget) -> Vec<String> {
                     vocab::transition_properties().join(", ")
                 ));
             }
-            if name == "backdrop-filter" {
-                lines.push("macOS samples only the parent's subtree; make the glass a sibling of what it covers (LLP 1053.000 §3)".into());
-            }
+            lines.extend(host_lines(rows));
             if matches!(name, "width" | "font-size") {
                 lines.push(TEXT_PX_WIDTH.into());
             }
@@ -1259,10 +1329,14 @@ fn listing() -> String {
     let tags = vocab::tags();
     out += &format!(
         "tags ({}): name  node (family); fixed rows and props\n",
-        tags.len()
+        tags.len() + HEADINGS.len()
     );
     for (name, t) in &tags {
         out += &format!("  {name:<20} {}\n", tag_text(t));
+    }
+    for name in HEADINGS {
+        let doc = heading_json(name).unwrap();
+        out += &format!("  {name:<20} {}\n", doc["note"].as_str().unwrap());
     }
     let attrs = vocab::attrs();
     let of = |k: &'static str| attrs.iter().filter(move |(_, a)| kind(a) == k);
@@ -1311,6 +1385,13 @@ fn listing() -> String {
     }
     out += &format!("\nhandlers ({}):\n", of("handler").count());
     wrapped(&mut out, of("handler").map(|(n, _)| n.to_string()));
+    out += "\ncompile-time attributes: name  accepted value; rule\n";
+    for a in vocab::COMPILE_ATTRS {
+        out += &format!(
+            "  {:<28} {}; {}; only on {}\n",
+            a.name, a.accepts, a.note, a.only
+        );
+    }
     out += "\nrenamed (refused, with the name to write):\n";
     wrapped(
         &mut out,

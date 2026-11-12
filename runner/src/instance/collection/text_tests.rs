@@ -1,6 +1,107 @@
 use super::*;
 
 #[test]
+fn clearing_typography_remounts_zero_height_rows() {
+    check_clearing_typography(false);
+}
+
+#[test]
+fn clearing_typography_remounts_zero_height_rows_without_a_kernel() {
+    check_clearing_typography(true);
+}
+
+fn check_clearing_typography(detached: bool) {
+    for property in ["font-size", "line-height"] {
+        for plain in ["opacity=1".to_owned(), format!("{property}=\"unset\"")] {
+            let source = format!(
+                r#"style Shut
+  {property}=0
+style Plain
+  {plain}
+component App
+  state shut = false
+  action flip
+    shut = not shut
+  view
+    column
+      button press=flip testId="flip"
+        text "flip"
+      list class=(shut ? Shut : Plain) virtualized=true estimated-item-height=20 height=100
+        for x in range(200) key=x
+          text "row"
+"#
+            );
+            let kernel = if detached {
+                Kernel::detached()
+            } else {
+                Kernel::with_monospace()
+            };
+            let mut r = crate::Runner::boot(
+                contract::compile(&source).unwrap(),
+                NoData,
+                kernel,
+                Default::default(),
+                "/",
+            )
+            .unwrap();
+            let open = settle_text_rows(&mut r, detached.then_some(20.0));
+            assert!(open.total_extent > 0.0 && !open.rows.is_empty());
+            r.act("flip", vec![]).unwrap();
+            let shut = settle_text_rows(&mut r, detached.then_some(0.0));
+            assert_eq!(shut.total_extent, 0.0, "{property}, {plain}");
+            assert!(shut.rows.is_empty());
+            r.act("flip", vec![]).unwrap();
+            let restored = &r.collections()[0];
+            assert!(
+                !restored.rows.is_empty(),
+                "clearing {property} with {plain} must remount a measurable window"
+            );
+            assert!(restored.rows.iter().all(|row| !row.measured));
+            let reopened = settle_text_rows(&mut r, detached.then_some(20.0));
+            assert_eq!(reopened.total_extent, open.total_extent);
+            assert_eq!(reopened.rows.len(), open.rows.len());
+            assert!(reopened
+                .rows
+                .iter()
+                .all(|row| row.measured && row.size > 0.0));
+        }
+    }
+}
+
+fn settle_text_rows(
+    r: &mut crate::Runner<NoData>,
+    reported_size: Option<f64>,
+) -> CollectionSnapshot {
+    for _ in 0..100 {
+        let snapshot = r.collections()[0].clone();
+        if reported_size.is_none() {
+            let root = r.kernel().roots()[0];
+            r.kernel_mut()
+                .compute_layout(root, exact_kernel::Offer::definite(640.0, 320.0))
+                .unwrap();
+        }
+        let mut feedback = runner_feedback(r);
+        feedback.port_main = 100.0;
+        feedback.measurements = snapshot
+            .rows
+            .iter()
+            .map(|row| RowMeasurement {
+                view: row.view,
+                epoch: row.epoch,
+                size: reported_size
+                    .unwrap_or_else(|| r.kernel().node(row.view).unwrap().frame.height as f64),
+            })
+            .collect();
+        r.collection_feedback(feedback).unwrap();
+        let after = r.collections()[0].clone();
+        if after.revision == snapshot.revision {
+            return after;
+        }
+    }
+    panic!("text row measurements did not settle");
+}
+
+#[test]
 fn logical_copy_omits_control_labels_in_unmounted_rows() {
     let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
     let enabled = b.constant(&Value::Bool(true));

@@ -138,6 +138,8 @@ export function gameShells(dir, game, workspace) {
   const root = resolve(dir, '.shells');
   const source = existsSync(resolve(workspace, 'Cargo.toml')) ? workspace : gameRoot;
   const cargo = Bun.TOML.parse(readFileSync(resolve(source, 'Cargo.toml'), 'utf8'));
+  cargo.workspace.dependencies['ibex2-sqlite'] = { path: relative(source, resolve(source, '../vendor/ibex/crates/ibex2-sqlite')) };
+  cargo.workspace.dependencies['exact-logic'] = { path: relative(source, resolve(source, '../logic')) };
   if (render) {
     // Reflection emits ::exact_gpu paths. Expose the existing SDK crates to
     // an authored render crate without changing a hookless workspace declaration.
@@ -283,8 +285,8 @@ fn main() {
     const dependencies = kind === 'gpu'
       ? `exact-game-render.workspace = true\n${app.game.audio === true ? "exact-game-audio.workspace = true\n" : ""}${renderDependency}game-logic = { package = "${crate}", path = ${JSON.stringify(relative(shell, logicDir))} }\n\n[target.'cfg(target_arch = "wasm32")'.dependencies]\nwasm-bindgen.workspace = true\nwasm-bindgen-futures.workspace = true\nweb-sys.workspace = true\n\n[build-dependencies]\nexact-game.workspace = true\nserde_json = "1"\ngame-logic = { package = "${crate}", path = ${JSON.stringify(relative(shell, logicDir))} }\n${bakeArt ? 'exact-game-bake.workspace = true\n' : ''}`
       // Android's Canvas host is the Linux host's (exact_linux::canvas_jni!), linked only on Android.
-      : kind === 'android' ? `\n[target.'cfg(target_os = "android")'.dependencies]\nexact-runner.workspace = true\nexact-linux.workspace = true\n${dataDependency}\n[build-dependencies]\nexact-game-app.workspace = true\n${dataBuildDependency}`
-      : `exact-runner.workspace = true\nexact-${kind}.workspace = true\n${kind === 'web' ? 'exact-web-capabilities.workspace = true\n' : kind === 'windows' ? 'exact-linux.workspace = true\n' : ''}${dataDependency}\n[build-dependencies]\nexact-game-app.workspace = true\n${dataBuildDependency}`;
+      : kind === 'android' ? `\n[target.'cfg(target_os = "android")'.dependencies]\nibex2-sqlite.workspace = true\nexact-logic.workspace = true\nexact-runner.workspace = true\nexact-linux.workspace = true\n${dataDependency}\n[build-dependencies]\nexact-game-app.workspace = true\n${dataBuildDependency}`
+      : `${kind === 'web' ? '' : 'ibex2-sqlite.workspace = true\nexact-logic.workspace = true\n'}exact-runner.workspace = true\nexact-${kind}.workspace = true\n${kind === 'web' ? 'exact-web-capabilities.workspace = true\n' : kind === 'windows' ? 'exact-linux.workspace = true\n' : ''}${dataDependency}\n[build-dependencies]\nexact-game-app.workspace = true\n${dataBuildDependency}`;
     const files = {
       ...(kind === 'web' && data ? { [`src/bin/${name}-dev.rs`]: `//! The resident dev driver for the game's web shell: \`${name}-dev <source> <out>\`, baking with its data.\n\nfn main() -> std::process::ExitCode {\n    exact_web::dev::main::<app_data::${data.type}>()\n}\n` } : {}),
       'Cargo.toml': header + dependencies,
@@ -652,6 +654,8 @@ function sdkStage(source, lock, use) {
   const stage = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-game-lock-')));
   try {
     const cargo = Bun.TOML.parse(readFileSync(resolve(source, 'Cargo.toml'), 'utf8'));
+    cargo.workspace.dependencies['ibex2-sqlite'] = { path: relative(source, resolve(source, '../vendor/ibex/crates/ibex2-sqlite')) };
+    cargo.workspace.dependencies['exact-logic'] = { path: relative(source, resolve(source, '../logic')) };
     for (const deps of [cargo.workspace.dependencies, ...Object.values(cargo.patch ?? {})])
       for (const dep of Object.values(deps ?? {})) if (dep.path) dep.path = relative(stage, resolve(source, dep.path));
     const toml = value => value && typeof value === 'object' && !Array.isArray(value)

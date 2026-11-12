@@ -1,5 +1,5 @@
-//! `contract verify <file.contract> [--runner-only] [--walks N] [--steps M] [--walk-seed N] [--confirm N] [--types] [--prove <Module>]`: the app
-//! against the Lean semantics (semantics/README.md, "Using it day to day").
+//! `contract verify`: the app against the Lean semantics
+//! (semantics/README.md, "Using it day to day").
 //! The work is `difftest verify`'s; this runs it through Cargo from the
 //! exact2 checkout this binary was built from, so the compiler never
 //! depends on the tester and nothing but this command needs Lean.
@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: contract verify <file.contract> [--runner-only] [--js] [--walks N] [--steps M] [--walk-seed N] [--confirm N] [--types] [--prove <Module>]
+pub(crate) const USAGE: &str = "usage: contract verify <file.contract> [--runner-only] [--js] [--walks N] [--steps M] [--walk-seed N] [--confirm N] [--types] [--prove <Module>]
 
 Runs delivered test prefixes, an explore script and adaptive walks on the runner,
 including seeded stores. Shrinks findings before Lean confirms the tests, explore,

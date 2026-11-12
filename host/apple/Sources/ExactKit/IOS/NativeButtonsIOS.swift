@@ -230,7 +230,7 @@ final class NativeButtonIOS: UIButton {
     override var canBecomeFocused: Bool {
         #if os(tvOS)
         return isEnabled && isUserInteractionEnabled && owner?.inert != true && owner?.cssVisibilityHidden != true
-            && (owner?.explicitTabIndex ?? 0) >= 0
+            && (owner?.explicitTabIndex ?? 0) >= 0 && owner?.placedAncestor == nil
         #else
         return false
         #endif

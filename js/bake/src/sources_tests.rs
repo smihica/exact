@@ -301,6 +301,63 @@ fn native_resource_trees_are_not_captured_as_typescript_or_assets() {
     assert!(captured.contains_key(std::path::Path::new("app.json")));
 }
 
+/// A tree only iOS declares (`host.ios.resources`) is not captured either:
+/// a file in it over the capture's per-file cap does not fail the bake.
+#[test]
+fn an_ios_resource_tree_is_not_captured_as_typescript() {
+    let app = Scratch::new(&std::env::temp_dir()).unwrap();
+    std::fs::create_dir_all(app.0.join("shipped")).unwrap();
+    std::fs::write(
+        app.0.join("app.json"),
+        r#"{"host":{"ios":{"resources":[{"from":"shipped","to":"Resources/shipped"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(app.0.join("shipped/catalog.json"), vec![b' '; 17 << 20]).unwrap();
+    let captured = sources(&app.0).unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "{:?}",
+        captured.keys().collect::<Vec<_>>()
+    );
+}
+
+/// A declared tree is known by identity, not by spelling: where the volume
+/// resolves a `from` in another case or Unicode normalization to the
+/// directory (macOS's, by default), the tree is excluded; a sibling directory
+/// is never taken for it.
+#[test]
+fn a_resource_tree_is_excluded_by_identity_not_spelling() {
+    let nfd = "cafe\u{301}";
+    for (on_disk, declared) in [("Shipped", "shipped"), (nfd, "caf\u{e9}")] {
+        let app = Scratch::new(&std::env::temp_dir()).unwrap();
+        std::fs::create_dir_all(app.0.join(on_disk)).unwrap();
+        std::fs::create_dir_all(app.0.join("sibling")).unwrap();
+        std::fs::write(app.0.join("sibling/kept.json"), b"{}").unwrap();
+        std::fs::write(
+            app.0.join("app.json"),
+            format!(r#"{{"host":{{"ios":{{"resources":[{{"from":"{declared}","to":"Resources/shipped"}}]}}}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            app.0.join(on_disk).join("catalog.json"),
+            vec![b' '; 17 << 20],
+        )
+        .unwrap();
+        if !app.0.join(declared).exists() {
+            continue; // This volume does not resolve the declared name to the directory.
+        }
+        let captured = sources(&app.0).unwrap();
+        let names: Vec<_> = captured.keys().collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "{on_disk:?} declared {declared:?}: {names:?}"
+        );
+        assert!(captured.contains_key(std::path::Path::new("sibling/kept.json")));
+    }
+}
+
 /// A Cargo bake reruns on each package's installed paths and on each
 /// captured file where it was read: a package reached through a file link
 /// has no installed path, and its files are still watched.

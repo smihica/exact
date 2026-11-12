@@ -13,9 +13,32 @@
 //! quadrilateral covers all of the corner's border. Sides that share a colour
 //! are one fill, so no seam shows where they meet.
 
-use super::{Rect4, Shape};
+use super::{BoxGeometry, BoxPaint, Rect4, Shape};
 use exact_kernel::corner::CornerShape;
 use exact_kernel::{BorderStyle, Dimension};
+
+impl BoxPaint {
+    /// Where the background paints: the border box, the padding box or the
+    /// content box, each with its radii less what it is inset by; `None` for
+    /// `text`, which the paragraph paints (`text_clip`).
+    pub(super) fn background_shape(&self, geometry: &BoxGeometry) -> Option<Shape> {
+        use exact_kernel::BackgroundClip;
+        match self.clip {
+            BackgroundClip::BorderBox => Some(geometry.outer),
+            BackgroundClip::Text => None,
+            BackgroundClip::PaddingBox => {
+                Some(super::field::inset_sides(&geometry.outer, self.widths))
+            }
+            BackgroundClip::ContentBox => Some(self.content_shape(geometry)),
+        }
+    }
+
+    pub(super) fn content_shape(&self, geometry: &BoxGeometry) -> Shape {
+        let (w, p) = (self.widths, self.padding);
+        let inset = [w[0] + p[0], w[1] + p[1], w[2] + p[2], w[3] + p[3]];
+        super::field::inset_sides(&geometry.outer, inset)
+    }
+}
 
 pub(crate) fn resolve_radii(
     radii: [Dimension; 4],
@@ -79,21 +102,53 @@ pub type Ring = ((Rect4, [(f32, f32); 4]), (Rect4, [(f32, f32); 4]));
 /// Circle-to-cubic control distance for a quarter arc.
 const K: f32 = 0.552_284_8;
 
+impl Shape {
+    /// This curve carried in to `inner`, a box within it: each radius less
+    /// the insets beside it, as CSS draws the padding and content edges
+    /// (CSS Backgrounds 3 §5.3). A zero radius stays zero.
+    pub fn within(&self, inner: Rect4) -> Shape {
+        let (x, y, w, h) = self.rect;
+        let l = (inner.0 - x).max(0.0);
+        let t = (inner.1 - y).max(0.0);
+        let r = (x + w - inner.0 - inner.2).max(0.0);
+        let b = (y + h - inner.1 - inner.3).max(0.0);
+        let less = |(a, c): (f32, f32), dx: f32, dy: f32| ((a - dx).max(0.0), (c - dy).max(0.0));
+        let [tl, tr, br, bl] = self.radii;
+        let radii = [
+            less(tl, l, t),
+            less(tr, r, t),
+            less(br, r, b),
+            less(bl, l, b),
+        ];
+        Shape::elliptical(inner, radii).with_corners(self.corners)
+    }
+}
+
 /// CSS's radius reduction: every corner scaled by the one factor that keeps
 /// two neighbours from overlapping an edge. Radii are (horizontal,
 /// vertical), top-left, top-right, bottom-right, bottom-left.
 pub fn reduced(radii: [(f32, f32); 4], w: f32, h: f32) -> [(f32, f32); 4] {
+    // In `f64`: two radii near `f32::MAX` (a `3e38px` pill) sum past what an
+    // `f32` holds, and an infinite sum made the factor 0, every corner square.
+    let sum = |a: f32, b: f32| f64::from(a) + f64::from(b);
     let sums = [
-        (radii[0].0 + radii[1].0, w),
-        (radii[3].0 + radii[2].0, w),
-        (radii[0].1 + radii[3].1, h),
-        (radii[1].1 + radii[2].1, h),
+        (sum(radii[0].0, radii[1].0), w),
+        (sum(radii[3].0, radii[2].0), w),
+        (sum(radii[0].1, radii[3].1), h),
+        (sum(radii[1].1, radii[2].1), h),
     ];
     let factor = sums
         .iter()
         .filter(|(sum, _)| *sum > 0.0)
-        .fold(1.0_f32, |f, (sum, edge)| f.min(edge.max(0.0) / sum));
-    radii.map(|(x, y)| ((x * factor).max(0.0), (y * factor).max(0.0)))
+        .fold(1.0_f64, |f, (sum, edge)| {
+            f.min(f64::from(edge.max(0.0)) / sum)
+        });
+    radii.map(|(x, y)| {
+        (
+            (f64::from(x) * factor).max(0.0) as f32,
+            (f64::from(y) * factor).max(0.0) as f32,
+        )
+    })
 }
 
 fn normalized_radii(radii: [(f32, f32); 4], w: f32, h: f32) -> [(f32, f32); 4] {

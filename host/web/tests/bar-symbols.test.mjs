@@ -1,3 +1,5 @@
+import { symbolSheet } from './glue-fixture.mjs';
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1115.000 D4.15: a symbol alone on a bar item's face is the bar's symbol size, the neutral look's
 // `bar-symbol-size` (UIKit's 22 points over its 17-point body, times the web's body), over any size written on it or
 // on the item: a symbol drawn for an SF Symbol in its `symbol-scale` box, on a native button's face too, which stays
@@ -9,7 +11,6 @@
 // `refreshSymbols`, symbols.js `refresh`) runs under the shell, the neutral sheet and the navigation glue, in each
 // engine, measured from the screen.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
@@ -86,7 +87,7 @@ for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) test(`symbol
 
 for (const engine of ['chromium', 'firefox', 'webkit']) for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) test(`${engine}: a bar item's symbol is the bar's size (${file})`, async () => {
   const source = readFileSync(resolve(ROOT, file), 'utf8');
-  const style = source.match(/'(@property --exact-tint[^']*)'/)[1];
+  const style = symbolSheet(source);
   const html = withLook(readFileSync(resolve(ROOT, 'host/web/index.html'), 'utf8'))
     .replace('<div id="exact-root"></div>', () => `<style>${style} #exact-root img { --exact-tint: rgb(255, 0, 0) !important; }</style><div id="exact-root">${content}</div>`)
     .replace('<script type="module" src="./glue.js"></script>', () => `<script>${stand} ${glueDeclarations(source, names)} globalThis.paint = () => { ${run} };</script>

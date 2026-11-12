@@ -101,7 +101,6 @@ async function refusedLater(): Promise<Session> {
 async function refusedWhy(offline: string): Promise<Session> {
   await fetch("https://api.castle.xyz/ping");
   const code = offline ? "E_OFFLINE" : "SLOT_FULL", error = Object.assign(new Error(`${code}: no`), { code, reason: code });
-  // `name` is defined, not assigned: Error.prototype's is read-only here (frozen intrinsics).
   throw offline ? Object.defineProperties(error, { name: { value: "FetchError" }, kind: { value: "Network" } }) : error;
 }
 
@@ -300,6 +299,28 @@ function answer(source: string, args: unknown[], store: Store): unknown {
       const body = args[0] === "buffer" ? all.buffer : args[0] === "dataview" ? new DataView(all.buffer, 1, 6) : all.subarray(1, 7);
       const sent = fetch("https://api.castle.xyz/blob", { method: "POST", headers: { "content-type": "image/png" }, body });
       all[1] = 7; // a write after the call changes nothing sent
+      return sent.then(r => r.text());
+    }
+    case "typedUpload": {
+      const forms = new URLSearchParams({ code: "a b" });
+      Object.defineProperty(forms, "toString", { value: () => "wrong" });
+      const bodies: Record<string, BodyInit | null | undefined> = {
+        string: "hello", empty: "",
+        form: new URLSearchParams({ grant_type: "authorization_code", code: "a b" }),
+        emptyForm: new URLSearchParams(), formOwnString: forms,
+        view: new Uint8Array([0, 255]), buffer: new Uint8Array([0, 255]).buffer,
+        dataview: new DataView(new Uint8Array([0, 255]).buffer),
+        emptyBytes: new Uint8Array(0), null: null, undefined: undefined,
+      };
+      const headers = args[2] === "record" ? { "CoNtEnT-TyPe": "application/custom" }
+        : args[2] === "pairs" ? [["CONTENT-TYPE", "application/custom"]] as [string, string][]
+        : args[2] === "other" ? new Headers({ "X-Test": "kept" })
+        : args[2] === "headers" ? new Headers({ "Content-Type": "" }) : undefined;
+      const before = JSON.stringify(Array.from(new Headers(headers)));
+      const sent = fetch("https://api.castle.xyz/token", {
+        method: text(args, 1), headers, body: bodies[text(args, 0)],
+      });
+      if (JSON.stringify(Array.from(new Headers(headers))) !== before) throw new Error("fetch changed init.headers");
       return sent.then(r => r.text());
     }
     // Fetch's refusals of a body, before any request: any body on a GET or

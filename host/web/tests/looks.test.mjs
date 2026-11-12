@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // State looks in a real browser (LLP 1121 D8, stage 8 B): a `:hover` look as the
 // host writes it into the page's looks sheet (src/host/looks.rs), over a node's
 // inline base, at once; `:active` lowered to the press paint (LLP 1061 D7), whose
@@ -5,7 +6,6 @@
 // whose paint goes over the hover; a hover look replaces the unsaid wash; rows neither names show the base, also a base
 // that moves while pressed; a disabled node takes no look.
 import { expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';

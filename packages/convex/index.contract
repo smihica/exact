@@ -7,8 +7,6 @@ shape ConvexLive
   status: string
   // Rises when a query's answer may have changed: every query takes it.
   rev: number
-  // Rises with every frame Convex sends, its 15-second Ping included.
-  beat: number
   // Why the socket ended; "" otherwise.
   error: string
   // Convex's words when it refused the token; "" otherwise.

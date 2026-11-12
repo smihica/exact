@@ -47,7 +47,8 @@ fn main() {
             contract::rust_entry(
                 "exact_data_host::Storage<markdown_data::Markdown>",
                 "exact_data_host::Storage::new(markdown_data::Markdown::new())",
-                compat.inputs["rustMode"].as_str().unwrap()
+                compat.inputs["rustMode"].as_str().unwrap(),
+                &compat.inputs,
             )
             .unwrap(),
             linked

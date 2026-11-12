@@ -111,7 +111,7 @@ fn boot(name: &str) -> (App, Runner<Data>) {
     let plan = contract::compile_path_all(&app.0.join("app.contract"), false)
         .map(|(plan, _)| plan)
         .unwrap_or_else(|e| panic!("{e:?}"));
-    let r = Runner::boot(
+    let mut r = Runner::boot(
         plan,
         Data,
         exact_kernel::Kernel::with_monospace(),
@@ -119,6 +119,8 @@ fn boot(name: &str) -> (App, Runner<Data>) {
         "/",
     )
     .unwrap();
+    // The package is unsupported on Linux and Windows.
+    r.set_module_target("macos");
     (app, r)
 }
 

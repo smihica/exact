@@ -408,6 +408,73 @@ fn the_file_opens_with_what_app_ts_writes_one_line_each() {
 }
 
 #[test]
+fn the_summary_preserves_enum_members_and_array_precedence() {
+    for (field_type, summary_type) in [
+        (r#"enum<"open", "done">"#, r#""open" | "done""#),
+        (r#"enum<"open", "done">[]"#, r#"("open" | "done")[]"#),
+        (
+            r#"option<enum<"open", "done">>"#,
+            r#""open" | "done" | null"#,
+        ),
+        (
+            r#"option<enum<"open", "done">[]>"#,
+            r#"("open" | "done")[] | null"#,
+        ),
+        (
+            r#"option<enum<"open", "done">>[]"#,
+            r#"("open" | "done" | null)[]"#,
+        ),
+        (r#"enum<"open", "done">[][]"#, r#"("open" | "done")[][]"#),
+        (r#"enum<"open">[]"#, r#""open"[]"#),
+        (
+            r#"enum<"say \"hi\"", "back\\slash">"#,
+            r#""say \"hi\"" | "back\\slash""#,
+        ),
+        ("enum<\"a\u{2028}b\">", r#""a\u2028b""#),
+        ("enum<\"a\u{2029}b\">", r#""a\u2029b""#),
+    ] {
+        let source = format!(
+            "shape Item\n  id: string\n  kind: {field_type}\n\n\
+             component App\n  resource item = load() as shape Item\n  view\n    text \"hi\"\n"
+        );
+        let declaration = contract::typescript(&contract::compile(&source).unwrap()).unwrap();
+        let summary = declaration.split("\n\n").next().unwrap();
+        let expected = format!("//   Item = {{ id: string; kind: {summary_type} }}");
+        assert!(
+            summary.lines().any(|line| line == expected),
+            "{expected} is missing for {field_type}:\n{summary}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "async lane: typechecks enum line separators with tsc; bun scripts/async.mjs runs it"]
+fn enum_line_separators_remain_inside_summary_comments() {
+    let source = "shape Item\n  kind: enum<\"a\u{2028}b\", \"a\u{2029}b\">\n\n\
+                  component App\n  resource item = load() as shape Item\n  view\n    text \"hi\"\n";
+    let fixture = Fixture::new();
+    fixture.write(
+        "app.contract.d.ts",
+        &contract::typescript(&contract::compile(source).unwrap()).unwrap(),
+    );
+    let output = fixture.check(
+        r#"
+import type { Result } from './app.contract.d.ts';
+const line: Result<'load'> = { kind: "a\u2028b" };
+const paragraph: Result<'load'> = { kind: "a\u2029b" };
+// @ts-expect-error escaping preserves the literal value, not a backslash followed by u2028
+const escaped: Result<'load'> = { kind: "a\\u2028b" };
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn a_contract_without_sources_has_no_summary() {
     let declaration = contract::typescript(
         &contract::compile("component App\n  view\n    text \"hi\"\n").unwrap(),
@@ -459,6 +526,44 @@ function mutation() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn build_names_a_missing_bun_without_blame_on_app_ts() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "app.contract",
+        "component App\n  view\n    text \"Hello\"\n",
+    );
+    fixture.write("app.ts", "export const answer = () => 7;\n");
+    for explicit in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_contract"));
+        command
+            .args(["build", "app.contract", "--json"])
+            .current_dir(&fixture.0)
+            .env("HOME", &fixture.0)
+            .env("USERPROFILE", &fixture.0)
+            .env("PATH", &fixture.0)
+            .env_remove("BUN");
+        let program = if explicit {
+            let missing = fixture.0.join("missing-bun");
+            command.env("BUN", &missing);
+            missing.to_string_lossy().into_owned()
+        } else {
+            "bun".into()
+        };
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let found: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0]["id"], "analyze-ambient-api");
+        assert_eq!(
+            found[0]["message"],
+            format!("ambient API check: {program}: not found; the bake runs Bun (install it, put ~/.bun/bin on PATH, or name it with BUN)"),
+            "{found:?}"
+        );
+        assert!(found[0]["file"].is_null(), "{found:?}");
+    }
 }
 
 #[test]

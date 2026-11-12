@@ -81,7 +81,14 @@ extension NavigationHost {
     /// `navigationBack`, named or empty).
     var hasStack: Bool { !presenter.carrying("navigationBack").isEmpty }
 
-    /// Whether the window's toolbar shows the chevron: the selected route,
+    /// Whether the stack has anywhere Back could go: its route table
+    /// declares more than one location, or the window's route is pushed.
+    /// A one-screen app has no chevron, as a hand-built one has none, until something
+    /// pushes onto its stack (its one location with another query, or a
+    /// location nothing matches); its toolbar is not held for Back until then.
+    var backPossible: Bool { !oneLocation || windowRoute?.pushed == true }
+
+    /// Whether the window's toolbar shows the chevron: the window's route,
     /// pushed or the first of its stack, did not ask for a screen with no
     /// bar (`navigationBar="none"`, LLP 1115.000 D5.2). At the root of a
     /// stack it is there and disabled (`canGoBack`), as Finder's and
@@ -93,11 +100,14 @@ extension NavigationHost {
     /// Q10) the chevron comes with a push inside the detail and goes with
     /// it, as SwiftUI's does: a list beside its detail has no Back to show,
     /// and a chevron that is never enabled is not in a hand-built window.
+    /// Nor is one in an app with nowhere to go back to (`backPossible`).
     var backInToolbar: Bool {
-        guard hasStack else { return false }
+        guard hasStack, backPossible else { return false }
         guard let selection, selection.stack.indices.contains(selection.at) else { return true }
-        guard presenter.views[selection.stack[selection.at]]?.props["navigationBar"] != "none" else { return false }
-        return !split.active || pushedRoute != nil
+        let route = windowRoute
+        let owner = route?.route ?? presenter.views[selection.stack[selection.at]]
+        guard owner?.props["navigationBar"] != "none" else { return false }
+        return !split.active || route?.pushed == true
     }
 
     /// The first navigation root when it has no routes, as an app whose one
@@ -171,13 +181,11 @@ extension NavigationHost {
         return (root, route)
     }
 
-    /// Where Forward goes (LLP 1115.000 D5.5): the nearest location Back
-    /// left on the selected stack, which the runner keeps as a browser's
-    /// session history does, and the navigation root that hears it.
-    private var ahead: (root: NodeView, location: String)? {
+    /// The root that hears Forward while the runner has a location ahead.
+    private var ahead: NodeView? {
         guard let root = selection.flatMap({ presenter.views[$0.root] }) ?? routerRoot,
-              let location = presenter.session?.runtime.locationAhead() else { return nil }
-        return (root, location)
+              presenter.session?.runtime.locationAhead() != nil else { return nil }
+        return root
     }
 
     /// Whether Forward goes now: somewhere ahead the root offers, and nothing
@@ -192,9 +200,8 @@ extension NavigationHost {
     /// 1038 D7): the root's `navigate` with the location ahead, else the
     /// runner's own `go`.
     @discardableResult func goForward() -> Bool {
-        guard canGoForward, let (root, location) = ahead else { return false }
-        if root.handlers.contains("navigate") { presenter.session?.navigate(location, at: root) }
-        else { presenter.session?.hostGo(location) }
+        guard canGoForward, let root = ahead else { return false }
+        presenter.session?.hostForward(at: root)
         return true
     }
 

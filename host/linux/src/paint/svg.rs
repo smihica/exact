@@ -1,6 +1,6 @@
 //! An `svg`'s content in the paint walk (LLP 1055 D4, LLP 1055.000 D1): the
-//! kernel resolves the scene, and this paints it inside the content box,
-//! clipped to the box when the `svg`'s overflow is not visible, each shape
+//! kernel resolves the scene, and this maps it into the content box,
+//! clipping to that box when overflow is not visible. Each shape paints
 //! through [`Backend::svg_path`]; group opacity is a group, as in CSS.
 
 use super::{effective_overflow, rgba, Painter, Rect4, Shape, Walk};
@@ -11,6 +11,9 @@ use exact_kernel::{NodeKey, NodeRef, Overflow};
 use exact_motion::{Property, Value};
 use tiny_skia::Transform;
 
+#[cfg(test)]
+#[path = "filter_tests.rs"]
+mod filter_tests;
 #[path = "island.rs"]
 mod island;
 #[cfg(test)]
@@ -327,11 +330,10 @@ impl Painter {
         &mut self,
         walk: &mut Walk<'_, '_>,
         node: &NodeRef<'_>,
-        rect: Rect4,
-        content: Rect4,
+        content: Shape,
         ts: Transform,
     ) {
-        let scene = resolve_svg(walk.scene, node, content);
+        let scene = resolve_svg(walk.scene, node, content.rect, self.dark);
         if let Some(refusal) = scene.refused {
             // @ref LLP 1055.000 D13 — refused by name, once.
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -353,7 +355,7 @@ impl Painter {
                 stack.extend(children);
             }
         }
-        self.paint_svg(&scene, clips, rect, content, ts);
+        self.paint_svg(&scene, clips, content, ts);
         self.svg_layers.clear();
     }
 
@@ -372,28 +374,27 @@ impl Painter {
         painter.viewport = css;
         painter.backend.begin(css.0, css.1, scale);
         let rect: Rect4 = (0.0, 0.0, css.0, css.1);
-        painter.paint_svg(scene, scene.clip, rect, rect, Transform::identity());
+        painter.paint_svg(scene, scene.clip, Shape::rect(rect), Transform::identity());
         painter.backend.finish()
     }
 
-    /// A resolved `svg` scene inside its box: clipped to the border box
-    /// `rect` when `clips`, its view box mapped into `content`. A retained
-    /// region replays a scene it resolved at capture.
+    /// A resolved `svg` scene mapped into `content` and clipped to its
+    /// inner corner curves when `clips`. A retained region replays a scene
+    /// it resolved at capture.
     pub(super) fn paint_svg(
         &mut self,
         scene: &exact_kernel::svg::Scene,
         clips: bool,
-        rect: Rect4,
-        content: Rect4,
+        content: Shape,
         ts: Transform,
     ) {
         if scene.view.is_none() {
             return;
         }
         if clips {
-            self.backend.push_clip(&Shape::rect(rect), ts);
+            self.backend.push_clip(&content, ts);
         }
-        let origin = ts.pre_translate(content.0, content.1);
+        let origin = ts.pre_translate(content.rect.0, content.rect.1);
         let space = origin.pre_concat(affine(
             scene.view.unwrap_or(exact_kernel::svg::transform::IDENTITY),
         ));
@@ -412,8 +413,9 @@ pub(super) fn resolve_svg(
     walk: &super::Scene<'_>,
     node: &NodeRef<'_>,
     content: Rect4,
+    dark: bool,
 ) -> exact_kernel::svg::Scene {
-    resolve_with(walk.kernel, node, content, walk.presented, walk.paths)
+    resolve_with(walk.kernel, node, content, walk.presented, walk.paths, dark)
 }
 
 /// [`resolve_svg`] with the host's presented values and paths by view.
@@ -423,6 +425,7 @@ pub fn resolve_with(
     content: Rect4,
     presented: &dyn Fn(exact_kernel::ViewId) -> super::Presented,
     paths: &dyn Fn(exact_kernel::ViewId) -> Option<exact_motion::PathValue>,
+    dark: bool,
 ) -> exact_kernel::svg::Scene {
     /// The host's values by node, as the scene asks for them.
     struct ByNode<'a, V> {
@@ -468,6 +471,7 @@ pub fn resolve_with(
                 value,
                 paths,
             },
+            dark,
         )
     }
 }

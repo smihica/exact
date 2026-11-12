@@ -1,8 +1,10 @@
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { expect, test } from 'bun:test';
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 // A data module's `scheduler` on the JS target (LLP 1141.001 D10), ts-fetch.js as it is: with no
 // browser `scheduler.yield` (Bun has none, nor has Safari), a yield resolves in a task of its own, after
@@ -114,3 +116,68 @@ export const time=()=>{if(!clock.agent)clock.now=Math.max(clock.now,wall.now)};\
     expect(calls.called(driven.call).outcome).toBe('timeout');
   } finally { globalThis.exact = old; rmSync(dir, { recursive: true, force: true }); }
 });
+
+test.each([false, true])('a wake after an idle spell has its full budget (agent: %s)', async agent => {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/') return new Response('<div id="exact-root"></div>', { headers: { 'content-type': 'text/html' } });
+    if (path.endsWith('/names.js')) return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
+    if (path === '/host/web-js/wakes.js') return new Response(Bun.file(resolve(ROOT, 'host/web-js/wakes.js')));
+    const local = resolve(ROOT, '.' + path);
+    const file = existsSync(local) ? local : resolve(ROOT, 'host/web', path.split('/').at(-1));
+    return existsSync(file) ? new Response(hostFixtureFile(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+  } });
+  let browser;
+  try {
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.clock.install({ time: 1000 });
+    await page.clock.pauseAt(1100);
+    await page.goto(server.url.href);
+    // Mount after navigation's zero timestamp, as on a page with a running clock.
+    await page.clock.runFor(1);
+    await page.evaluate(async agent => {
+      const rt = await import('/host/web-js/rt.js');
+      const { wakes } = await import('/host/web-js/wakes.js');
+      let reply, done = 0, pulled;
+      rt.data.answer = () => ({ promise: new Promise(resolve => { reply = resolve; }) });
+      rt.mount(() => {
+        pulled = rt.mut('pulled', rt.sig(null), [], 's');
+        pulled.then = () => { done++; };
+      });
+      rt.clock.agent = agent;
+      const wk = wakes({
+        events: { 'background.sync': [() => () => rt.M(pulled, 'pull', []), 'wake', 16, [], 'heard', 30000] },
+        say: rt.say, value: v => v, run: rt.commit, toEpoch: ms => ms,
+        onLine: () => true, lists: new Map(), changed() {},
+      });
+      window.fixture = { rt, wk, done: () => done, reply: () => reply('ok'),
+        raise: () => { fixture.outcome = wk.raise('background.sync', []); } };
+    }, agent);
+
+    // Move only the browser's time: the idle page has made no commit to sample it.
+    await page.clock.runFor(35000);
+    expect(await page.evaluate(() => fixture.rt.clock.now)).toBe(0);
+    await page.evaluate(() => fixture.raise());
+    await page.clock.runFor(500);
+    if (agent) await page.evaluate(() => fixture.rt.advance(500, false));
+    await page.evaluate(() => fixture.reply());
+    if (agent) await page.evaluate(() => fixture.rt.advance(500, false));
+    else await page.clock.runFor(1);
+    const finished = await page.evaluate(async () => ({
+      outcome: await fixture.outcome, done: fixture.done(), state: fixture.wk.state(),
+    }));
+    expect(finished).toMatchObject({ outcome: 'completed', done: 1,
+      state: { started: agent ? 0 : 35000, deadline: agent ? 30000 : 65000 } });
+
+    // Unfinished work still expires at the budget, on the clock that owns the page.
+    await page.evaluate(() => fixture.raise());
+    const deadline = await page.evaluate(() => fixture.wk.state().deadline);
+    if (agent) await page.evaluate(to => fixture.rt.advance(to, false), deadline - 1);
+    else await page.clock.fastForward(29999);
+    expect(await page.evaluate(() => fixture.wk.state().invocations[0].state)).toBe('running');
+    if (agent) await page.evaluate(to => fixture.rt.advance(to, false), deadline);
+    else await page.clock.runFor(1);
+    expect(await page.evaluate(() => fixture.outcome)).toBe('expired');
+  } finally { await browser?.close(); server.stop(true); }
+}, 30000);

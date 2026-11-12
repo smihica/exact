@@ -6,6 +6,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 export const here = import.meta.dir, pkg = resolve(here, '..'), root = resolve(pkg, '../..');
 
@@ -18,7 +19,7 @@ export const run = (cmd, args, cwd, env = process.env) => {
 /** The fixture app's directory and its bundle id; each package is its `package.json` spec. */
 export function makeFixture({ pedometer = `file:${pkg}`, altimeter = `file:${resolve(root, 'packages/altimeter')}` } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'exact-pedometer-')), app = join(dir, 'stepfixture');
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'linux'], root);
   for (const f of ['app.contract', 'app.ts', 'strings']) cpSync(join(here, 'fixture', f), join(app, f), { recursive: true });
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -27,6 +28,9 @@ export function makeFixture({ pedometer = `file:${pkg}`, altimeter = `file:${res
   manifest.dependencies = { ...manifest.dependencies, '@exact/pedometer': pedometer, '@exact/altimeter': altimeter };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, id };
 }
 

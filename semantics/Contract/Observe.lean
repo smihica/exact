@@ -106,7 +106,7 @@ def dispatchTrace (p : Program) (o : Oracle) (c : Config) (target : String) (eve
         ((c, .refused (.unsupported s!"a payload for a `{n.control.getD ""}` control")), []) else
       let env : Env := { prog := p, slots := c.slots, derives := c.settled.derives,
                          resources := c.settled.resources, rows := rowSlots c.store n.rows,
-                         now := c.now }
+                         now := c.now, idle := c.settled.idle }
       match evalList fuel env false n.locals args with
       | .error e => ((c, .refused e), [⟨"handler", a, .refused (.refused ("arguments refused: " ++ why e))⟩])
       | .ok vs =>

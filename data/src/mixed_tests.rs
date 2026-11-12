@@ -440,6 +440,7 @@ use exact_runner::{Dispatch, Placement, Reply, Work};
 use std::sync::{Arc, Mutex};
 
 mod keep_sent;
+mod timers;
 
 /// A worker child's proxy, without a thread: it records at `answer`, and at
 /// `dispatch` runs the call against a scoped snapshot and answers at once

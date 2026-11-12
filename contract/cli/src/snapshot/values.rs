@@ -208,6 +208,7 @@ pub(crate) fn attribute(a: &Attr, errors: &mut Vec<CompileError>, live: bool) {
             BorderStyleTop | BorderStyleRight | BorderStyleBottom | BorderStyleLeft => Some((words(&value, &["solid", "dashed", "dotted", "none", "hidden"]), "snapshot-border", BORDER)),
             BorderRadiusTopLeft | BorderRadiusTopRight | BorderRadiusBottomLeft | BorderRadiusBottomRight => Some((choices(&value, &radius), "snapshot-radius", RADIUS)),
             BackgroundColor | TextColor | BorderColorTop | BorderColorRight | BorderColorBottom | BorderColorLeft => Some((choices(&value, &|e| matches!(e, Expr::Str(s, _) if color(s) || live && !parsed_color(s))), "snapshot-color", COLOR)),
+            AccentColor => Some((choices(&value, &|e| matches!(e, Expr::Str(s, _) if s == "auto" || color(s) || live && !parsed_color(s))), "snapshot-color", COLOR)),
             BackgroundImage => Some((choices(&value, &|e| matches!(e, Expr::Str(s, _) if gradient(s) || live && unparsed_gradient(s))), "snapshot-gradient", GRADIENT)),
             _ => None,
         };

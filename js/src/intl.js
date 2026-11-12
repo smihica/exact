@@ -43,8 +43,8 @@
   // Apple's engine makes an NSDateFormatter for every DateTimeFormat and
   // every Date `toLocale…String` call, which a module labelling a few
   // hundred rows a turn pays for each (500 dates twice: 130 ms, 7 ms kept).
-  // A formatter made with locales and options that read the same whenever
-  // they are read (`formatKey`) is made once; each `new` is still an object
+  // A formatter with an explicit timeZone and locales and options that read
+  // the same (`formatKey`) is made once; each `new` is still an object
   // of its own, which the prototype's methods read through to the one made
   // (`shared`; the prelude's guarded `format` and `formatToParts` too).
   function dates(guard) {
@@ -55,7 +55,9 @@
     guard.engineOf(engineOf);
     var madeFor = function (prefix, locales, options) {
       var key = formatKey(locales, options);
-      if (key === null) return null;
+      // An omitted zone is the system's at construction (ECMA-402
+      // CreateDateTimeFormat); argument equality cannot establish that it stayed.
+      if (key === null || options === undefined || options.timeZone === undefined) return null;
       var format = made.get(prefix + key);
       if (!format) {
         if (made.size >= 64) made.clear();

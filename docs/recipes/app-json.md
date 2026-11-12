@@ -27,7 +27,7 @@ component App
         text "Tick"
 ```
 
-- **`assets/`** ships whole on every host. Contract names a file by its path from the app
+- **`assets/` and `deck/`** ship except `.DS_Store` files. Contract paths start at the app
   (no leading slash): `image "assets/logo.png"`, a `sound` and `playSound`, a `font` block's
   `400 = "assets/Inter-Regular.ttf"` (then `font-family="Inter"`).
 - **`modules/apple/*.swift`** (or `*.xcframework`) is the app's native module;
@@ -44,11 +44,11 @@ component App
 - **`protocol_handlers`**: `euxy://p/abc` is `/p/euxy%3A%2F%2Fp%2Fabc` (whole at `%s`).
   A cold launch opens it in its route's tab: declare it (`p "/p/:d"`). Running, `go`
   pushes it on the selected tab; `open` uses its route's (`vocab navigate`).
-- **Other keys:** `icons`, `data` (the `data-*` words a hatch reads), `tamber` (the design's
-  file), `strings` (string tables), `typescript.sources` (outside directories `app.ts`
-  imports), `commands` (the app's own `exact.mjs` verbs), `env` (settings read at build and
-  inlined into the module on every host, so a secret does not belong there:
-  [rest-backend](rest-backend.md)).
+- **Other keys:** `userInterfaceStyle` (`dark`/`light`), `data` (the `data-*` words a hatch
+  reads), `tamber` (the design file), `strings`, `typescript.sources` (outside directories
+  `app.ts` imports), `commands` (the app's `exact.mjs` verbs), `env` (settings inlined at
+  build, so never a secret: [rest-backend](rest-backend.md)), `host.web.head`
+  ([website](website.md)).
 - **`host.ios.appClip`** `{}`: the app as an App Clip too (`id` defaults to `<app id>.Clip`;
   each `applinks:` domain is its `appclips:` one).
 - **Not here:** grants (in `app.ts`), fonts and sounds (Contract).

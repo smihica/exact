@@ -475,6 +475,13 @@ impl GrantSet {
                     let port = url.port_or_known_default().ok_or_else(|| {
                         format!("line {}: no default port for `{}`", index + 1, url.scheme())
                     })?;
+                    // A socket's origin is `ws` or `wss`: a line with another scheme would admit none.
+                    if capability == "net.websocket" && !matches!(url.scheme(), "ws" | "wss") {
+                        return Err(format!(
+                            "line {}: `{target}`: a `net.websocket` line needs `ws` or `wss`",
+                            index + 1
+                        ));
+                    }
                     let origin = Origin::new(url.scheme(), host, port);
                     if capability == "net.fetch" {
                         Grant::Fetch(origin)
@@ -608,11 +615,15 @@ mod quoted_tests;
 /// it, is on the local network: an RFC 1918, link-local IPv4, unique-local
 /// or link-local IPv6 literal (an IPv4-mapped address judged by the IPv4
 /// address it carries) or a name ending in `.local`; with `loopback`, also
-/// 127.0.0.0/8, `[::1]` and `localhost`. Mirrors
+/// 127.0.0.0/8, `[::1]` and `localhost`. Never the cloud metadata service,
+/// 169.254.169.254 or `[fd00:ec2::254]`. Mirrors
 /// `exact_grants::is_local_network`.
 pub fn is_local_network(host: &str, loopback: bool) -> bool {
     use std::net::{Ipv4Addr, Ipv6Addr};
-    let v4 = |a: Ipv4Addr| a.is_private() || a.is_link_local() || loopback && a.is_loopback();
+    let v4 = |a: Ipv4Addr| {
+        a != Ipv4Addr::new(169, 254, 169, 254)
+            && (a.is_private() || a.is_link_local() || loopback && a.is_loopback())
+    };
     let host = host.to_ascii_lowercase();
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         return inner
@@ -621,9 +632,10 @@ pub fn is_local_network(host: &str, loopback: bool) -> bool {
                 Some(mapped) => v4(mapped),
                 None => {
                     let first = a.segments()[0];
-                    (first & 0xfe00) == 0xfc00
-                        || (first & 0xffc0) == 0xfe80
-                        || loopback && a.is_loopback()
+                    a != Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+                        && ((first & 0xfe00) == 0xfc00
+                            || (first & 0xffc0) == 0xfe80
+                            || loopback && a.is_loopback())
                 }
             });
     }
@@ -698,6 +710,22 @@ fn has_userinfo(url: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_local_network_excludes_cloud_metadata() {
+        for host in ["169.254.3.4", "[fd00:ec2::253]", "[::ffff:a9fe:a903]"] {
+            assert!(is_local_network(host, false), "{host}");
+        }
+        for host in [
+            "169.254.169.254",
+            "[::ffff:a9fe:a9fe]",
+            "[::ffff:169.254.169.254]",
+            "[fd00:ec2::254]",
+        ] {
+            assert!(!is_local_network(host, false), "{host}");
+            assert!(!is_local_network(host, true), "{host}");
+        }
+    }
 
     fn origin(host: &str) -> Origin {
         Origin::new("https", host, 443)

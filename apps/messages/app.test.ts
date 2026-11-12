@@ -4,10 +4,15 @@ import { fixtures, presentation, reveal } from './model';
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 let moduleId = 0;
-async function app(saved?: Uint8Array) {
+async function app(saved?: Uint8Array, failure?: () => Error | undefined) {
   let bytes = saved;
   const storage = { fs: {
-    readFile: async () => { if (!bytes) throw new Error('ENOENT'); return bytes; },
+    readFile: async () => {
+      const failed = failure?.();
+      if (failed) throw failed;
+      if (!bytes) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return bytes;
+    },
     atomicWriteFile: async (_path: string, next: Uint8Array) => { bytes = next.slice(); },
   } };
   const source = await import(`./app.ts?case=${++moduleId}`);
@@ -37,6 +42,23 @@ test('drafts and reactions survive a new module without leaking between conversa
   expect((await b.call('snapshot', '', 'ai-1', 1)).draft).toBe('Only Claude gets this draft');
   expect((await b.call('snapshot', '', 'ai-2', 1)).draft).toBe('');
   expect((await b.call('snapshot', '', 'demo', 1)).messages[0].reaction).toBe('❤️');
+});
+// Only a missing file is a first launch. Any other failed read saves nothing,
+// so the baked conversations never replace the stored ones.
+test('a failed read is not a first launch, and no command saves over the stored conversations', async () => {
+  const thread = { ...fixtures()[0], id: 'ai-9', messages: [] };
+  const stored = new TextEncoder().encode(JSON.stringify({ version: 1, threads: [thread], serial: 0 }));
+  let failing = true;
+  const a = await app(stored, () => failing ? Object.assign(new Error('failed filesystem: Input/output error (os error 5)'), { code: 'failed' }) : undefined);
+  globalThis.fetch = (async () => Response.json({ connected: true })) as typeof fetch;
+  await expect(a.call('command', 'read', 'demo', '', 100)).rejects.toThrow('Input/output error');
+  expect(a.saved()).toBe(stored);
+  await a.call('pulse', 200);
+  expect((await a.call('snapshot', '', 'demo', 1)).notice).toContain('Input/output error');
+  failing = false;
+  await a.call('command', 'read', 'ai-9', '', 300);
+  const state = await a.call('snapshot', '', 'ai-9', 1);
+  expect([state.threads.map((t: any) => t.id), state.notice]).toEqual([['ai-9'], '']);
 });
 test('stream snapshots replace text, preserve context, and keep simultaneous models separate', async () => {
   const requests: any[] = [];

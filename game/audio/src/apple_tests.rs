@@ -442,6 +442,9 @@ fn player_reserves_pcm_before_synthesis_and_walks_past_refused_voices() {
         fn set(&mut self, id: u64, l: f32, r: f32) {
             self.0.set(id, l, r);
         }
+        fn set_pitch(&mut self, id: u64, pitch: f32) {
+            self.0.set_pitch(id, pitch);
+        }
         fn stop(&mut self, id: u64) {
             self.0.stop(id);
         }
@@ -536,6 +539,9 @@ fn preferred_source_waits_for_stop_ack_without_restarting_the_loser() {
         }
         fn set(&mut self, id: u64, l: f32, r: f32) {
             self.0.set(id, l, r);
+        }
+        fn set_pitch(&mut self, id: u64, pitch: f32) {
+            self.0.set_pitch(id, pitch);
         }
         fn stop(&mut self, id: u64) {
             self.0.stop(id);
@@ -767,4 +773,197 @@ fn an_unreported_device_rate_falls_back_to_the_client_rate() {
     for unreported in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(client_rate(unreported), CLIENT_RATE);
     }
+}
+
+#[test]
+fn live_pitch_ramps_the_resampler_without_a_phase_jump() {
+    let (mut pending, mut mixer) = Pending::new();
+    let pcm: Arc<[f32]> = (0..48000)
+        .map(|i| (std::f32::consts::TAU * i as f32 / 480.0).sin() * 0.5)
+        .collect();
+    start(&mut pending, 1, &pcm, 48000);
+    pending.flush();
+    mixer.commands();
+    let before: Vec<_> = (0..4937).map(|_| mixer.frame().0).collect();
+    pending.set_pitch(1, 3.0);
+    pending.set_pitch(1, 2.0);
+    assert_eq!(
+        pending.pitches.len(),
+        1,
+        "latest rate wins before publication"
+    );
+    pending.flush();
+    mixer.commands();
+    let mut after = Vec::new();
+    for i in 0..4800 {
+        after.push(mixer.frame().0);
+        if i == 239 {
+            assert!((mixer.voices[0].unwrap().step - 1.5).abs() < 1e-12);
+        }
+    }
+    assert_eq!(mixer.voices[0].unwrap().pitch_ramp, 0);
+    assert_eq!(mixer.voices[0].unwrap().step, 2.0);
+    let period = |samples: &[f32]| {
+        let crossings: Vec<_> = samples
+            .windows(2)
+            .enumerate()
+            .filter(|(_, s)| s[0] < 0.0 && s[1] >= 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        (crossings.last().unwrap() - crossings[0]) as f64 / (crossings.len() - 1) as f64
+    };
+    assert!((period(&before[960..]) - 480.0).abs() < 1.0);
+    assert!((period(&after[960..]) - 240.0).abs() < 1.0);
+    // At amplitude 0.5 and at most 200 Hz, adjacent samples differ by <= 2π/480.
+    let joined: Vec<_> = before.iter().chain(&after).copied().collect();
+    assert!(joined[4936..5418]
+        .windows(2)
+        .all(|s| (s[1] - s[0]).abs() <= 0.014));
+    // Retarget inside a ramp from its current step, never from the previous target.
+    pending.set_pitch(1, 0.5);
+    pending.flush();
+    mixer.commands();
+    for _ in 0..120 {
+        mixer.frame();
+    }
+    let current = mixer.voices[0].unwrap().step;
+    pending.set_pitch(1, 1.0);
+    pending.flush();
+    mixer.commands();
+    mixer.frame();
+    assert!((mixer.voices[0].unwrap().step - (current + (1.0 - current) / 480.0)).abs() < 1e-12);
+    pending.set_pitch(1, 4.0);
+    pending.stop(1);
+    assert!(pending.pitches.is_empty());
+}
+
+struct PitchDevice(Pending);
+impl crate::Output for PitchDevice {
+    fn capacity(&self) -> usize {
+        32
+    }
+    fn flush(&mut self) {
+        self.0.flush();
+    }
+    fn owns_pcm(&self, pcm: &Pcm) -> bool {
+        self.0.retained.contains_key(&pcm.address())
+    }
+    fn start(
+        &mut self,
+        id: u64,
+        pcm: &Pcm,
+        rate: u32,
+        looping: bool,
+        offset: usize,
+        pitch: f32,
+    ) -> bool {
+        self.0.start(id, pcm, rate, looping, offset, pitch)
+    }
+    fn set(&mut self, id: u64, l: f32, r: f32) {
+        self.0.set(id, l, r);
+    }
+    fn set_pitch(&mut self, id: u64, pitch: f32) {
+        self.0.set_pitch(id, pitch);
+    }
+    fn finished(&self, id: u64) -> bool {
+        self.0.finished(id)
+    }
+    fn stop(&mut self, id: u64) {
+        self.0.stop(id);
+    }
+}
+
+#[test]
+fn native_completions_survive_a_full_ring_and_do_not_finish_a_reused_id() {
+    let (mut pending, mut mixer) = Pending::new();
+    let pcm = Pcm::F32(Arc::from([0.5f32]));
+    assert!(pending.start(1, &pcm, 48000, false, 0, 1.));
+    pending.flush();
+    mixer.commands();
+    for sequence in 0..CAPACITY {
+        mixer.finished.push((999, sequence as u64)).unwrap();
+    }
+    mixer.frame();
+    assert!(mixer.voices[0].is_some(), "a full ring retries completion");
+    pending.flush();
+    assert!(!pending.finished(1));
+    assert_eq!(mixer.frame(), (0., 0.));
+    pending.flush();
+    assert!(pending.finished(1));
+    assert!(pending.start(1, &pcm, 48000, true, 0, 1.));
+    assert!(!pending.finished(1));
+    pending.flush();
+    mixer.commands();
+    pending.flush();
+    mixer.commands();
+    pending.flush();
+    assert!(!pending.finished(1));
+    mixer.finished.push((1, 1)).unwrap();
+    pending.flush();
+    assert!(
+        !pending.finished(1),
+        "a stale generation cannot retire its replacement"
+    );
+    pending.stop(1);
+    pending.flush();
+    mixer.commands();
+    pending.flush();
+    assert!(pending.retained.is_empty());
+    assert!(pending.starts.is_empty());
+}
+
+#[test]
+fn downward_pitch_completion_frees_a_full_native_mix() {
+    use exact_game::{
+        audio::{self, Synth, Voices},
+        Clock, Game, Input, Sim, World,
+    };
+    struct Full;
+    impl Game for Full {
+        const ID: &'static str = "full-pitch-mix";
+        type Args = ();
+        fn setup(w: &mut World, _: &()) {
+            w.sounds([
+                ("finite", Synth::sine(100.).seconds(1.)),
+                ("loop", Synth::sine(200.).seconds(1.).looped()),
+            ]);
+            w.play("finite").pitch(16.).start();
+            for _ in 0..31 {
+                w.play("loop").start();
+            }
+        }
+        fn tick(w: &mut World, _: &Input, _: &()) {
+            audio::step(w);
+        }
+    }
+    let (pending, mut mixer) = Pending::new();
+    let mut player = crate::Player::new(PitchDevice(pending), 48000);
+    let mut sim = Sim::<Full>::new(()).unwrap();
+    sim.advance(0., Clock::Seekable);
+    player.sync(sim.world(), None, Default::default());
+    let output_id = player.active[&crate::Key::Voice(0)].output_id;
+    mixer.commands();
+    for _ in 0..2400 {
+        mixer.frame();
+    }
+    sim.advance(50., Clock::Seekable);
+    audio::pitch(sim.world_mut(), 0, 0.01);
+    player.sync(sim.world(), None, Default::default());
+    mixer.commands();
+    for _ in 0..610000 {
+        mixer.frame();
+    }
+    assert_eq!(mixer.voices.iter().flatten().count(), 31);
+    sim.advance(12750., Clock::Seekable);
+    assert_eq!(sim.world().resource::<Voices>().voices.len(), 32);
+    player.sync(sim.world(), None, Default::default());
+    assert!(!player.output.0.live.contains_key(&output_id));
+    assert!(!player.output.0.sent.contains_key(&output_id));
+    assert_eq!(player.cached_sounds(), 1);
+    assert_eq!(player.output.0.retained.len(), 1);
+    sim.world_mut().play("finite").start();
+    player.sync(sim.world(), None, Default::default());
+    mixer.commands();
+    assert_eq!(mixer.voices.iter().flatten().count(), 32);
+    assert_eq!(player.next_id, 33, "completed voice must not restart");
 }

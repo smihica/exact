@@ -230,7 +230,7 @@ class SpeechRecognitionModule(context: ExtensionContext) : ExactExtension(contex
                 return reply(error(e.code))
             }
         }
-        args.optString("transcript").takeIf { it.isNotEmpty() }?.let { path -> context.file(path)?.let { r.transcript = path to it } }
+        args.optString("transcript").takeIf { it.isNotEmpty() }?.let { path -> (context.directory(path) ?: context.file(path))?.let { r.transcript = path to it } }
         r.prepareTranscript()
         recognitions[r.id] = r
         say("${r.id}: ${if (input == "track") "on ${args.getString("track")}" else if (input == "file") "of ${args.getString("path")}" else "on the microphone"}" +
@@ -441,7 +441,7 @@ internal class Recognition(private val module: SpeechRecognitionModule, val id: 
     /** The directory, emptied as the recognition starts, so a replacement leaves no stale file. */
     fun prepareTranscript() {
         val dir = transcript?.second ?: return
-        writer.execute { dir.deleteRecursively(); dir.mkdirs() }
+        writer.execute { dev.exact.canvas.Files.removeTree(dir); dir.mkdirs() }
     }
 
     private fun write(result: JSONObject) {
@@ -451,7 +451,7 @@ internal class Recognition(private val module: SpeechRecognitionModule, val id: 
         fileSize += line.size
         val file = File(dir, String.format("%05d.jsonl", files - 1))
         writer.execute {
-            try { file.appendBytes(line) } catch (e: Exception) { main.post { module.say("$id: ${file.name} not written: ${e.message}") } }
+            try { dev.exact.canvas.Files.write(file, line, append = true) } catch (e: Exception) { main.post { module.say("$id: ${file.name} not written: ${e.message}") } }
         }
     }
 

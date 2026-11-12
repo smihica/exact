@@ -48,6 +48,7 @@ import { homedir, hostname, tmpdir, userInfo } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildRust, publishedSignature, rustBundle, rustPackage, tieredNative } from './rust.mjs';
+import { appleProduction } from '../host/apple/link.mjs';
 import { assertOwnTarget, cargoReproducibilityFlags, readManifest, buildBake, bakeTarget, readBuilds, cohortReceipt, classifyArtifacts, resolveApp, shaderWatchRoots } from './app.mjs';
 import { gameShells } from "../game/app/shells.mjs";
 import { blobPath, channelOrigin, openOrigin, OriginUnavailable, sha256, streamPath, parseWebRoot, webRootPath, webRootStream, webReleasePath, validateChannel } from './origin.mjs';
@@ -95,7 +96,7 @@ function canonicalPath(path) {
     return parent === absolute ? absolute : resolve(canonicalPath(parent), basename(absolute));
   }
 }
-/** Only actual build outputs are absent from a source snapshot: explicit root paths, not recursive basename patterns
+/** A source snapshot omits build outputs and Exact's design corpus at explicit roots, not recursive basename patterns
  * (`assets/dist/a.png` and `fixtures/target/input.rs` remain inputs when the app carries them). */
 export function sourcePathspec(repo, app, exactRoot) {
   const workspace = canonicalPath(app.workspace ?? app.dir);
@@ -103,7 +104,7 @@ export function sourcePathspec(repo, app, exactRoot) {
   const outputs = [resolve(repo, 'target'), resolve(repo, 'node_modules'),
     resolve(repo, '.agent-skill-sources'), resolve(repo, '.agent-skill-backups'), resolve(repo, '.llp/ship-runs'),
     canonicalPath(app.target ?? resolve(workspace, 'target')), resolve(workspace, 'target'), resolve(workspace, 'node_modules'), resolve(workspace, '.shells'), resolve(app.dir, '.shells'),
-    resolve(exactRoot, 'target'), resolve(exactRoot, 'node_modules'), ...dist.map((name) => resolve(exactRoot, 'host/web', name)),
+    resolve(exactRoot, 'target'), resolve(exactRoot, 'node_modules'), resolve(exactRoot, 'llp'), ...dist.map((name) => resolve(exactRoot, 'host/web', name)),
     resolve(exactRoot, 'host/apple/.build'),
     resolve(exactRoot, 'host/apple/macos/.build'), resolve(exactRoot, '.claude/worktrees')];
   // Each game owns generated products. A sibling app's cache is no more
@@ -335,7 +336,7 @@ function captureRepository(source, sources, captureRoot, stagedRoot, common, app
     addCapturedPaths(source.repo, env, [...committed, ...present], true, 'could not capture tracked and untracked source');
     // Gitignore is not a source/output declaration: build.rs or another
     // committed tool can read beneath an ignored directory. Capture every
-    // ignored file except the precise generated roots in sourcePathspec.
+    // ignored file except the precise roots in sourcePathspec.
     const ignored = gitText(source.repo, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--',
       ...pathspec], 'could not inventory ignored source inputs').split('\0').filter((path) => path && allowed(path));
     addCapturedPaths(source.repo, env, ignored, true, 'could not capture ignored source inputs');
@@ -368,8 +369,8 @@ function captureRepository(source, sources, captureRoot, stagedRoot, common, app
 }
 
 /** The snapshot (LLP 1030.000 D3 item 1): capture every repository and every
- * dirty source byte the bake can read. Ignored files are source too unless
- * they are under a precise generated-output root. */
+ * dirty source byte the bake can read. Ignored files are source too, outside
+ * the precise roots sourcePathspec excludes. */
 export function snapshotOf(app, opts, exactRoot = ROOT) {
   app.prepare?.(true);
   const compiler = opts.compiler ? resolve(opts.compiler) : contractCompiler(exactRoot);
@@ -675,33 +676,33 @@ function buildFor(app, platform, sourceRoot, run) {
   if (apple) {
     const sdk = spawnSync('xcrun', ['--sdk', apple === 'ios' ? 'iphoneos' : 'macosx', '--show-sdk-path'], {encoding:'utf8'});
     if (sdk.status !== 0) refuse(`the ${apple} SDK is unavailable: ${sdk.stderr}`);
-    env.SDKROOT = sdk.stdout.trim();
     env[apple === 'ios' ? 'IPHONEOS_DEPLOYMENT_TARGET' : 'MACOSX_DEPLOYMENT_TARGET'] = apple === 'ios' ? '17.0' : '14.0';
     env.EXACT_APPLE_LINK = 'plan'; // a compatibility input: link as the production archive does (host/apple/link.mjs)
-    if (apple === 'ios') env.HOST_CXXFLAGS = `${process.env.HOST_CXXFLAGS ?? ''} -isysroot ${spawnSync('xcrun', ['--sdk', 'macosx', '--show-sdk-path'], {encoding:'utf8'}).stdout.trim()}`; // the build scripts' Objective-C++ for the Mac takes the Mac SDK, not SDKROOT's (cc-rs inherits it), as host/apple/build.mjs gives it
   }
-  return buildBake(app, platform, target, {env, analysis:true});
+  return buildBake(app, platform, target, {env, analysis:true, profile: ['ios', 'macos'].includes(platform) ? appleProduction(app, platform).profile : 'release'});
 }
 
 export { classifyArtifacts, cohortReceipt } from './app.mjs';
 
 // --------------------------------------------------------------- classifying
 
-/** The channel the manifest bakes in: `deploy.channel`, else the only key of `deploy.channels`, else `prod` — the same rule as `bake/src/compat.rs`. */
-function channelOf(manifest) {
+/** The channel the manifest bakes in: `deploy.channel`, else the only key of `deploy.channels`, else `prod` — the same rule as `Manifest::channel` in contract/cli. */
+export function channelOf(manifest) {
   const deploy = manifest.deploy ?? {};
-  if (deploy.channel) return deploy.channel;
+  if (deploy.channel != null) return deploy.channel;
   const names = Object.keys(deploy.channels ?? {});
   return names.length === 1 ? names[0] : 'prod';
 }
 
-/** Native deployment targets, including binary-only L=0: what `deploy.store` and `deploy.binaries` name, else what `host` names (LLP 1153 D1.1). Classification decides the carrier before touching a stream. */
-export function nativePlatforms(manifest) {
+/** Native deployment targets, including binary-only L=0: what `deploy.store` and `deploy.binaries` name, else what `host` names (LLP 1153 D1.1). An explicit selection omits unselected targets before validation. */
+export function nativePlatforms(manifest, selection = []) {
   const deploy = manifest.deploy ?? {};
   const named = [...new Set([...Object.keys(deploy.store ?? {}), ...Object.keys(deploy.binaries ?? {})])].filter((p) => p !== 'web');
-  const unknown = named.filter((p) => !PLATFORMS.includes(p));
+  const candidates = named.length ? named : Object.keys(manifest.host ?? {});
+  const selected = candidates.filter((p) => !selection.length || selection.includes(p));
+  const unknown = named.filter((p) => selected.includes(p) && !PLATFORMS.includes(p));
   if (unknown.length) refuse(`app.json names the platform${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')} under deploy; this repo builds ${PLATFORMS.join(', ')}`);
-  return PLATFORMS.filter((p) => p !== 'web' && (named.length ? named : Object.keys(manifest.host ?? {})).includes(p));
+  return PLATFORMS.filter((p) => p !== 'web' && selected.includes(p));
 }
 /** Whether the manifest names a native platform, under `host` or `deploy`; one that names none ships the web root alone, with no stream and no envelope, and its deploy bakes nothing (LLP 1153 D1.5, D3.6). */
 export const namesNative = (manifest) => [manifest.host, manifest.deploy?.store, manifest.deploy?.binaries].some((table) => Object.keys(table ?? {}).some((p) => p !== 'web'));
@@ -1317,7 +1318,7 @@ async function deployCaptured(opts, capsule) {
   // An origin that holds only update streams (AppDrop) publishes no web root.
   if (origin.servesWeb === false && (opts.only === 'origin' || opts.platform.includes('web'))) refuse(`${origin.describe()} holds update streams, not a web app: publish the web root to another origin`);
   const wantOrigin = origin.servesWeb !== false && opts.only !== 'bundle' && (!opts.platform.length || opts.platform.includes('web'));
-  const platforms = opts.only === 'origin' ? [] : nativePlatforms(app.manifest).filter((p) => !opts.platform.length || opts.platform.includes(p));
+  const platforms = opts.only === 'origin' ? [] : nativePlatforms(app.manifest, opts.platform);
   if (!wantOrigin && !platforms.length) refuse(`nothing to classify: ${opts.only ? `--only ${opts.only}` : ''} ${opts.platform.length ? `--platform ${opts.platform.join(',')}` : ''} leaves no row`);
   const log = (text) => process.stderr.write(`${text}\n`);
 

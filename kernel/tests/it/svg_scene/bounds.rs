@@ -48,6 +48,46 @@ fn use_doubling_stops_at_the_expansion_limit() {
 }
 
 #[test]
+fn a_use_box_stops_at_the_expansion_limit() {
+    use NodeType::*;
+    let mut d = Doc::new();
+    let defs = d.node(SvgDefs, &[], &[]);
+    let below = d.node(
+        SvgRect,
+        &[(StyleId::Width, "1"), (StyleId::Height, "1")],
+        &[(PropId::Id, "l0")],
+    );
+    let mut levels = vec![below];
+    // Each level uses the one below four times: 4^12 copies of the rect.
+    for k in 1..=12 {
+        let g = d.node(SvgGroup, &[], &[(PropId::Id, &format!("l{k}"))]);
+        let href = format!("#l{}", k - 1);
+        let uses: Vec<u32> = (0..4)
+            .map(|_| d.node(SvgUse, &[], &[(PropId::Href, &href)]))
+            .collect();
+        d.children(g, &uses);
+        levels.push(g);
+    }
+    d.children(defs, &levels);
+    // Its box is asked for before its instance is walked.
+    let top = d.node(
+        SvgUse,
+        &[
+            (StyleId::TransformBox, "fill-box"),
+            (StyleId::Rotate, "10"),
+            (StyleId::Filter, "blur(1px)"),
+        ],
+        &[(PropId::Href, "#l12")],
+    );
+    let svg = svg(&mut d, &[defs, top]);
+    let k = d.kernel(&[svg], 800.0);
+    let started = std::time::Instant::now();
+    let s = resolve(&k, svg);
+    assert_eq!(s.over, Some(Limit::Expansion));
+    assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+}
+
+#[test]
 fn dashes_and_surfaces_have_limits_and_an_ordinary_svg_passes() {
     use NodeType::*;
     let dashed = |dasharray: &str| {

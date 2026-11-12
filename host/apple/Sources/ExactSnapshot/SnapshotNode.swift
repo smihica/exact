@@ -59,6 +59,7 @@ struct SnapshotNodeView: View {
             .modifier(Privacy(word: environment.placeholder || !leaf ? nil : privateContent ? "private" : "public"))
             .modifier(Semantics(node: node))
             .modifier(Linked(url: link))
+            .modifier(Accent(node: node))
     }
 
     @ViewBuilder
@@ -84,6 +85,33 @@ enum SnapshotData {
     static func words(_ node: HeadlessSession.Node) -> [String: String] {
         guard let json = node.props["dataset"]?.data(using: .utf8), let words = try? JSONSerialization.jsonObject(with: json) as? [String: String] else { return [:] }
         return words
+    }
+}
+
+/// An `accent-color` as its subtree's tint (LLP 1116.001 D2), as the iOS
+/// host sets a view's `tintColor` (`NodeView.applyAccentTint`): a bar, an
+/// indicator and the tint's roles (`AccentColor`, `LinkText`) beneath take
+/// it. `auto`, or an accent that is a tint role, leaves the tint in effect.
+@available(iOS 17.0, macOS 14.0, watchOS 10.0, visionOS 26.0, *)
+struct Accent: ViewModifier {
+    let node: HeadlessSession.Node?
+    @Environment(\.colorScheme) private var scheme
+
+    func body(content: Content) -> some View {
+        if let node, let color = SnapshotTint.accent(SnapshotStyle(node).color("accent_color"), dark: scheme == .dark) {
+            content.tint(color).environment(\.snapshotTint, color)
+        } else {
+            content
+        }
+    }
+}
+
+/// A tint that replaces the one in effect, where there is one: none leaves
+/// that tint (`.tint(nil)` would clear it).
+struct OwnTint: ViewModifier {
+    let color: Color?
+    func body(content: Content) -> some View {
+        if let color { content.tint(color) } else { content }
     }
 }
 

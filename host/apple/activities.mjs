@@ -1,30 +1,35 @@
 // @ref LLP 1126.001 WP9 — ActivityKit stays outside the app's load commands.
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { copyFileSync, existsSync, readdirSync, readFileSync } from 'node:fs';
 import { wrapFramework } from './assets.mjs';
 import { activityEntries } from './widgets.mjs';
+// The checkout's root: an app outside it builds from its own directory.
+const root = fileURLToPath(new URL('../..', import.meta.url));
 export function packageActivityArm({ app, bundle, directory, triple, sdk, device, runApple }) {
   const binary = resolve(directory, 'libexact_activity.dylib');
   // The system identifies the attributes by their module and type name. Compile the
   // existing envelope in ExactSnapshot, without linking its driver or ExactCore.
   runApple('xcrun', ['--sdk', device ? 'iphoneos' : 'iphonesimulator', 'swiftc', '-parse-as-library', '-emit-library', '-O', '-module-name', 'ExactSnapshot', '-target', triple, '-sdk', sdk,
     '-module-cache-path', resolve(directory, 'cache'),
-    resolve('host/apple/Sources/ExactSnapshot/ActivityEnvelope.swift'), resolve('host/apple/activityarm/ActivityArm.swift'), '-o', binary]);
+    resolve(root, 'host/apple/Sources/ExactSnapshot/ActivityEnvelope.swift'), resolve(root, 'host/apple/activityarm/ActivityArm.swift'), '-o', binary]);
   const frameworks = resolve(bundle, 'Frameworks');
   copyFileSync(binary, resolve(frameworks, 'libexact_activity.dylib'));
   wrapFramework(frameworks, 'libexact_activity.dylib', 'ExactActivity', app, device ? 'iPhoneOS' : 'iPhoneSimulator');
 }
 
-/** The activity update-token ruling admits neither push-to-start nor ordinary remote notifications.
+/** The activity update-token ruling admits no push-to-start, and no data-only push's background mode; an app
+ * registers for remote notifications only when its grant ceiling has `device.push` (LLP 1133.004 §9 P8).
  * Run on archives and the async lane's built iOS app and extension. */
-export function assertActivityRefusals(bundle, runApple, app) {
+export function assertActivityRefusals(bundle, runApple, app, ceiling = '') {
   if (!activityEntries(app).length) return 0;
-  const forbidden = ['pushToStartTokenUpdates', 'registerForRemoteNotifications'];
+  const pushes = String(ceiling).split('\n').some((line) => line.trim().split(/\s+/)[0] === 'device.push');
+  const forbidden = ['pushToStartTokenUpdates', ...(pushes ? [] : ['registerForRemoteNotifications'])];
   const executables = [];
   const visit = directory => {
     const plist = resolve(directory, 'Info.plist');
     if (existsSync(plist)) {
-      const info = JSON.parse(runApple('plutil', ['-convert', 'json', '-o', '-', plist], { cargoMessages: true }).stdout);
+      const info = JSON.parse(runApple('plutil', ['-convert', 'json', '-o', '-', plist], { read: true }).stdout);
       if (info.UIBackgroundModes?.includes('remote-notification')) throw new Error(`${directory}: remote-notification background mode is refused (LLP 1126.001 WP9)`);
       if (info.CFBundleExecutable) executables.push(resolve(directory, info.CFBundleExecutable));
     }
@@ -39,7 +44,7 @@ export function assertActivityRefusals(bundle, runApple, app) {
   visit(bundle);
   for (const binary of executables) {
     const bytes = readFileSync(binary);
-    const symbols = runApple('xcrun', ['nm', '-u', binary], { cargoMessages: true }).stdout;
+    const symbols = runApple('xcrun', ['nm', '-u', binary], { read: true }).stdout;
     const found = forbidden.filter(name => bytes.includes(Buffer.from(name)) || symbols.includes(name));
     if (found.length) throw new Error(`${binary}: ${found.join(', ')} refused (LLP 1126.001 WP9)`);
   }

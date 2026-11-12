@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "digest": "9275534e962af038",
+  "digest": "21809138eb5b4137",
   "name": "mix",
   "tuples": 1,
   "axes": [],
@@ -14,7 +14,9 @@
     {"name": "faded", "kind": "color", "role": null, "values": ["color(srgb 0.6 0.6 0.6 / 0.5)"], "entries": null, "dials": [], "fallback": ["#99999980", "#99999980"]},
     {"name": "over.pair", "kind": "color", "role": null, "values": ["light-dark(color(srgb 0.7509803921568627 0.7509803921568627 0.7509803921568627), color(srgb 0.25098039215686274 0.25098039215686274 0.25098039215686274))"], "entries": null, "dials": [], "fallback": ["#c0c0c0ff", "#404040ff"]},
     {"name": "zero", "kind": "color", "role": null, "values": ["color(srgb 0.5 0 0.5 / 0)"], "entries": null, "dials": [], "fallback": ["#80008000", "#80008000"]},
-    {"name": "with.transparent", "kind": "color", "role": null, "values": ["color(srgb 0.06274509803921569 0.5137254901960784 0.996078431372549 / 0.4)"], "entries": null, "dials": [], "fallback": ["#1083fe66", "#1083fe66"]}
+    {"name": "with.transparent", "kind": "color", "role": null, "values": ["color(srgb 0.06274509803921569 0.5137254901960784 0.996078431372549 / 0.4)"], "entries": null, "dials": [], "fallback": ["#1083fe66", "#1083fe66"]},
+    {"name": "opposite.longer", "kind": "color", "role": null, "values": ["lch(70 30 90)"], "entries": null, "dials": [], "fallback": ["#baaa74ff", "#baaa74ff"]},
+    {"name": "opposite.hsl", "kind": "color", "role": null, "values": ["color(srgb 0 0.9999999999999999 0.44117647058823545)"], "entries": null, "dials": [], "fallback": ["#00ff71ff", "#00ff71ff"]}
   ],
   "exports": null
 }

@@ -64,7 +64,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
     init {
         if (!emptied) {
             emptied = true
-            context.file("app:/tmp/photos/x")?.parentFile?.deleteRecursively()
+            context.directory("app:/tmp/photos")?.let { dev.exact.canvas.Files.removeTree(it) }
         }
         if (context.agent) library.missing?.let { say(it) }
     }
@@ -153,11 +153,11 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val location = listOf(Manifest.permission.ACCESS_MEDIA_LOCATION).filter { it in declared }
         val asked = (reads + location).toTypedArray()
         val first = reads.first()
-        context.requestPermissions(asked) {
+        context.requestPermissions(asked) { answered ->
             // A refusal with no rationale owed after it is permanent: the history `permission` reads, as
             // `askPermission` keeps it for one permission.
             val activity = context.activity
-            if (status().getString("state") != "granted" && activity != null && !activity.shouldShowRequestPermissionRationale(first)) {
+            if (first in answered && status().getString("state") != "granted" && activity != null && !activity.shouldShowRequestPermissionRationale(first)) {
                 app.getSharedPreferences("exact.permissions", android.content.Context.MODE_PRIVATE).edit().putBoolean(first, true).apply()
             }
             context.changed("photos.photoLibraryStatus")
@@ -282,7 +282,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val size = try {
             file.parentFile?.mkdirs()
             app.contentResolver.openInputStream(if (original) MediaStore.setRequireOriginal(uri) else uri)?.use { input ->
-                file.outputStream().use { input.copyTo(it) }
+                dev.exact.canvas.Files.output(file).use { input.copyTo(it) }
             } ?: return error("NotFoundError")
         } catch (e: SecurityException) { return error("NotAllowedError") } catch (e: java.io.IOException) { return error("UnknownError") }
         return JSONObject()
@@ -293,7 +293,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
 
     private fun add(args: JSONObject): JSONObject {
         val path = args.optString("path")
-        val file = context.file(path)?.takeIf { it.isFile } ?: return error("NotFoundError")
+        val file = context.fileToRead(path) ?: return error("NotFoundError")
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.path, bounds)
         val type = bounds.outMimeType ?: return error("DataError")
@@ -380,7 +380,7 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
         val file = context.file(path) ?: return error("UnknownError")
         try {
             file.parentFile?.mkdirs()
-            file.writeBytes(asset.bytes)
+            dev.exact.canvas.Files.write(file, asset.bytes)
         } catch (e: java.io.IOException) { return error("UnknownError") }
         say("copied $id to $path sha256 ${AgentLibrary.sha256(asset.bytes)}")
         return JSONObject().put("path", path).put("name", asset.name).put("type", asset.type).put("size", asset.bytes.size)
@@ -390,9 +390,8 @@ class PhotosModule(context: ExtensionContext) : ExactExtension(context) {
 
     private fun agentAdd(args: JSONObject): JSONObject {
         val path = args.optString("path")
-        val bytes = context.file(path)?.takeIf { it.isFile }?.readBytes() ?: return error("NotFoundError")
-        val directory = context.file("app:/tmp/photos-library/x")?.parentFile ?: return error("DataError")
-        val asset = library.add(bytes, directory, context.now()) ?: return error("DataError")
+        val bytes = context.fileToRead(path)?.readBytes() ?: return error("NotFoundError")
+        val asset = library.add(bytes, context.now()) { context.file("app:/tmp/photos-library/$it") } ?: return error("DataError")
         say("added ${asset.id} from $path sha256 ${AgentLibrary.sha256(bytes)} ${asset.width}x${asset.height} ${asset.type}")
         context.changed("photos.photoAssets")
         // The app reads its own photo whatever its read permission (D6).

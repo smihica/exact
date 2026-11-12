@@ -244,6 +244,7 @@ export function engine(rt) {
     gone(c) {
       for (const [id, r] of records) if (r.c === c) {
         records.delete(id);
+        glue.op({ id, forget: true });
         module?.retire(r.lifetime);
         if (r.waiting) inflight.n--;
       }

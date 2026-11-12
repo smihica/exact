@@ -50,7 +50,9 @@
 //!   a declared limit.
 //! - **Clock in** (D9): `clock=` follows an input's MIDI clock instead
 //!   ([`clock`]): the sequence is `waiting` until Start, its segments come
-//!   from the ticks, and it fills only as deliveries arrive.
+//!   from the ticks, and it fills only as deliveries arrive. Before a fill,
+//!   tracks over [`LOOPS_PER_SECOND`] at its segment's tempo are dropped
+//!   and journaled, including after an edit.
 //!
 //! @ref LLP 1125 D2–D5, D7, D9
 
@@ -157,6 +159,8 @@ struct Step {
 
 #[derive(Clone, Debug)]
 struct Track {
+    /// Its position in the authored list, kept when another track drops.
+    id: usize,
     length: f64,
     loops: f64,
     offset: f64,
@@ -309,6 +313,7 @@ impl Play {
                 })
                 .collect();
             tracks.push(Track {
+                id: i + 1,
                 length,
                 loops,
                 offset,
@@ -388,6 +393,7 @@ impl Play {
             && self.tracks.len() == other.tracks.len()
             && self.tracks.iter().zip(&other.tracks).all(|(a, b)| {
                 n(a.length, b.length)
+                    && a.id == b.id
                     && n(a.loops, b.loops)
                     && n(a.offset, b.offset)
                     && a.output == b.output
@@ -771,7 +777,8 @@ impl Transport {
     }
 
     /// Apply a gate step's reading at `t`, the commit that read it having
-    /// stood: arm, restart, edit or stop, in plan order.
+    /// stood: stop an owner whose gate is false, then arm, restart or edit
+    /// in plan order.
     pub(crate) fn stood(
         &mut self,
         plan: &Plan,
@@ -781,6 +788,9 @@ impl Transport {
         seen: Vec<Seen>,
         log: &mut Vec<String>,
     ) {
+        if self.owner.is_some_and(|i| !seen[i].on) {
+            self.stop(plan, out, t, "gate", log);
+        }
         for (i, s) in seen.into_iter().enumerate() {
             let (was_on, was_key) = std::mem::replace(&mut self.gates[i], (s.on, s.key.clone()));
             let rising = s.on && (!was_on || s.key != was_key);
@@ -792,9 +802,7 @@ impl Transport {
                 .map_or("", |v| v.text());
             let refollow = self.play.as_ref().is_some_and(|p| p.clock != clock);
             if self.owner == Some(i) {
-                if !s.on {
-                    self.stop(plan, out, t, "gate", log);
-                } else if s.key != was_key || refollow {
+                if s.key != was_key || refollow {
                     // A restart: Stop, then Start at its new beat 0 (rulings #9).
                     out.sounds
                         .batch(|so| so.retract_seq(t, Cut::At(t), By::Edit, log));
@@ -1121,6 +1129,15 @@ impl Transport {
         let mut dropped = false;
         if let Some(play) = self.play.as_mut() {
             play.tracks.retain(|t| {
+                if seg.bpm / 60.0 / t.length > LOOPS_PER_SECOND {
+                    log.push(format!(
+                        "sequence {name}: track {} dropped: it would loop more than {} times a second",
+                        t.id,
+                        num(LOOPS_PER_SECOND)
+                    ));
+                    dropped = true;
+                    return false;
+                }
                 let k = (end / t.length).abs();
                 let far = (t.loops == 0.0 || t.loops - 1.0 >= EXACT) && (k.is_nan() || k >= EXACT);
                 if far {
@@ -1136,6 +1153,11 @@ impl Transport {
         // What is left may now end: every track finite, or none.
         if dropped {
             self.timing(at);
+            if self.follow.is_some() {
+                // The retained hit identities, not a count including dropped
+                // tracks, decide what a followed refill has already issued.
+                self.skip = 0;
+            }
         }
         let Some(play) = self.play.take() else {
             return;
@@ -1196,7 +1218,12 @@ impl Transport {
         let mut fresh = Vec::new();
         let full = out.sounds.batch(|s| {
             for (k, hit) in hits.iter().enumerate() {
-                let id = (hit.beat, hit.track, hit.step);
+                let track = if hit.track == 0 {
+                    0
+                } else {
+                    play.tracks[hit.track - 1].id
+                };
+                let id = (hit.beat, track, hit.step);
                 if following && (hit.beat < floor || kept.iter().any(|e| (e.0, e.1, e.2) == id)) {
                     continue;
                 }

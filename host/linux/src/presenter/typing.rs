@@ -113,6 +113,24 @@ impl<D: DataSource> Presenter<D> {
             .kernel()
             .node(target)
             .and_then(|n| exact_kernel::control::text_maxlength(n.props));
+        // A number field keeps what its editor takes (`number.rs`); text
+        // with nothing it takes leaves the field as it was.
+        let typed = text;
+        let numeric;
+        let text = match (self.host.kernel().node(target))
+            .is_some_and(|n| number::Number::of(n.props).is_some())
+        {
+            true => {
+                let (start, end) = (
+                    field::byte_at(&value, selection.start),
+                    field::byte_at(&value, selection.end),
+                );
+                numeric = number::insertion(text, &value, start, end);
+                numeric.as_str()
+            }
+            false => text,
+        };
+        let refused = text.is_empty() && !typed.is_empty();
         // `beforeinput` carries the whole text; what is inserted, and what
         // `input` carries, is cut to the room left. An empty insertion still
         // deletes a selected range (Chrome's insertText).
@@ -123,7 +141,7 @@ impl<D: DataSource> Presenter<D> {
             cancelable: true,
             is_composing: false,
         };
-        if self.before_input(target, &edit, now)? {
+        if !refused && self.before_input(target, &edit, now)? {
             // Chromium advances an endpoint inside a surrogate pair past
             // the character before fitting or replacing the selection.
             let boundary = |offset| {
@@ -472,17 +490,17 @@ impl<D: DataSource> Presenter<D> {
         Some(prevented)
     }
 
-    /// A Tab stop (LLP 1088 D7.3): focusable, and an explicit `tabindex` ≥ 0
-    /// or none at all — a negative one is focusable but skipped — shown,
-    /// not inert, with a box (display: none and `hidden` have none).
+    /// A Tab stop (LLP 1088 D7.3), with radio groups, tablists and alert
+    /// messages choosing their stops.
     pub(super) fn tabbable(&self, id: ViewId, boxed: &BTreeSet<ViewId>) -> bool {
-        self.focus_stop(id, boxed)
+        self.tab_stop(id, boxed)
             && self.radio_tab_stop(id)
             && (!self.alert_message(id) || self.alert_message_overflows(id))
     }
 
-    /// A Tab stop but for HTML's one stop to a radio group: every enabled
-    /// radio is one. A TV remote's stops (LLP 1115.001.003 D4).
+    /// A focus candidate before radio groups and tablists reduce to one
+    /// Tab stop. A TV remote uses every candidate (LLP 1115.001.003 D4).
+    /// An authored negative `tabindex` excludes a candidate.
     pub(super) fn focus_stop(&self, id: ViewId, boxed: &BTreeSet<ViewId>) -> bool {
         let explicit = self
             .host
@@ -498,12 +516,19 @@ impl<D: DataSource> Presenter<D> {
     /// Tab's default action, HTML's sequential focus navigation (LLP 1088
     /// D7.3): the Tab stops in tree order, positive `tabindex` values first
     /// in ascending order; from the focus to the next (Shift: the previous),
-    /// wrapping, and from no focus, or one out of the order, to the first
-    /// (Shift: the last), or from the starting point a fragment set, to the
-    /// next stop in tree order (Shift: the one before it; LLP 1153 D5). A
-    /// `key` handler's `preventDefault()` keeps Tab.
+    /// wrapping, and from no focus to the first (Shift: the last). A focused
+    /// non-stop or a fragment's starting point chooses the next stop in
+    /// tree order within its scope (Shift: the one before it; LLP 1153 D5).
+    /// A `key` handler's `preventDefault()` keeps Tab. The new focus is
+    /// scrolled into view, as the browser's is and WinUI's
+    /// `BringIntoViewOnFocusChange` has it.
     pub(crate) fn move_focus(&mut self, backward: bool, now_ms: f64) -> Option<String> {
-        self.move_focus_filtered(backward, now_ms, |_, _| true)
+        let before = self.focus;
+        let error = self.move_focus_filtered(backward, now_ms, |_, _| true);
+        if let Some(id) = self.focus.filter(|f| Some(*f) != before) {
+            self.keep_in_view(id, reveal::Cause::FocusMove);
+        }
+        error
     }
 
     pub(super) fn move_focus_filtered(
@@ -528,14 +553,24 @@ impl<D: DataSource> Presenter<D> {
     ) -> Option<String> {
         let mut order: Vec<(i64, usize, ViewId)> = Vec::new();
         let mut start = None;
+        let scope = self.alert_tab_scope();
+        // A focused candidate that is no stop is the starting point: a box
+        // among `boxed`, or an inline node whose paragraph is. One outside
+        // them (the page's focus, when a dialog popover opens) is not: that
+        // search starts from the first stop.
+        let focused = (self.focus).filter(|f| {
+            let candidate = boxed.contains(f)
+                || self.inline_box(*f).is_some()
+                    && self.inline_block(*f).is_some_and(|b| boxed.contains(&b));
+            candidate && !self.tabbable(*f, boxed)
+        });
+        // An empty popover scope still needs a position in the flattened order.
+        let placed = focused.filter(|f| scope.is_some() && self.in_popover(*f));
         for (at, id) in self.host.preorder().into_iter().enumerate() {
-            if Some(id) == self.focus_start {
-                start = Some(at);
+            if Some(id) == self.focus_start || Some(id) == focused {
+                start = Some((at, id));
             }
-            // A focused node inside an open popover that is no stop goes on
-            // from its place in tree order, within the popover's scope
-            // (HTML's sequential navigation starting point).
-            if Some(id) == self.focus && !self.tabbable(id, boxed) && self.in_popover(id) {
+            if Some(id) == placed {
                 order.push((i64::MAX, at, id));
                 continue;
             }
@@ -553,29 +588,58 @@ impl<D: DataSource> Presenter<D> {
         order.sort_unstable();
         let order = self.alert_tab_order(order);
         let n = order.len();
-        let placed = self
-            .focus
-            .filter(|f| !self.tabbable(*f, boxed) && self.in_popover(*f));
         // From a starting point out of the order, the stop nearest it in tree
         // order, whatever its tabindex, as browsers search (HTML's
         // "sequential navigation search algorithm").
-        let after = |s: usize| {
-            (0..n)
-                .filter(|&i| order[i].1 > s)
-                .min_by_key(|&i| order[i].1)
+        let nearest = |(at, id): (usize, ViewId)| {
+            let inside = scope.is_some() && self.in_popover(id);
+            let position = |i: usize| {
+                // From the page, the scope follows its invoker's tree slot;
+                // its own tabindex order determines which end is entered.
+                if !inside && self.alert_holds(order[i].2) {
+                    if let Some((_, slot)) = scope {
+                        return (slot, true, i);
+                    }
+                }
+                (order[i].1, false, 0)
+            };
+            let candidates = (0..n)
+                .filter(|&i| Some(order[i].2) != placed)
+                .filter(|&i| !inside || self.alert_holds(order[i].2))
+                .map(|i| (position(i), i));
+            let start = (at, false, 0);
+            if backward {
+                candidates.filter(|&(p, _)| p < start).max()
+            } else {
+                candidates.filter(|&(p, _)| p > start).min()
+            }
+            .map(|(_, i)| i)
         };
-        let before = |s: usize| {
-            (0..n)
-                .filter(|&i| order[i].1 < s)
-                .max_by_key(|&i| order[i].1)
+        let advance = |i: usize| (i + if backward { n - 1 } else { 1 }) % n;
+        // A popover's stops are one run of the flattened order, empty at its
+        // invoker's slot when it holds none. A search from inside that finds
+        // no stop in the scope leaves through the run's edge.
+        let leave = || {
+            let slot = scope.map_or(0, |s| order.partition_point(|o| (o.0, o.1) <= s));
+            if backward {
+                let first = order.iter().position(|o| self.alert_holds(o.2));
+                (first.unwrap_or(slot) + n - 1) % n
+            } else {
+                let last = order.iter().rposition(|o| self.alert_holds(o.2));
+                last.map_or(slot, |i| i + 1) % n
+            }
         };
-        let next = match self.focus.and_then(|f| order.iter().position(|o| o.2 == f)) {
+        let from = |s: (usize, ViewId)| {
+            nearest(s).or_else(|| (scope.is_some() && self.in_popover(s.1)).then(leave))
+        };
+        let mut next = match self.focus.and_then(|f| order.iter().position(|o| o.2 == f)) {
             _ if n == 0 || n == 1 && placed.is_some() => return None,
-            Some(i) if backward => (i + n - 1) % n,
-            Some(i) => (i + 1) % n,
-            None if backward => start.and_then(before).unwrap_or(n - 1),
-            None => start.and_then(after).unwrap_or(0),
+            Some(i) if placed.is_none() => advance(i),
+            _ => (start.and_then(from)).unwrap_or(if backward { n - 1 } else { 0 }),
         };
+        if Some(order[next].2) == placed {
+            next = advance(next);
+        }
         self.set_focus(Some(order[next].2), now_ms)
     }
 
@@ -605,7 +669,7 @@ impl<D: DataSource> Presenter<D> {
     /// A key down at the focused node, by the web's name (`e.key`). Every
     /// `key` handler at or above it hears it first, as a keydown bubbles;
     /// then, unless one called `preventDefault()`, its default action: Enter or Space presses a button and
-    /// Enter a link; Enter submits a single-line input (its `submit`) or
+    /// Enter a link; Space toggles a checkbox; Enter submits a single-line input (its `submit`) or
     /// breaks a textarea's line; Backspace deletes; a character is typed —
     /// each an edit the runner hears as one `change`.
     pub(crate) fn key_down(&mut self, name: &str, now_ms: f64) {
@@ -650,6 +714,10 @@ impl<D: DataSource> Presenter<D> {
         // A held Select chooses nothing in a surface it opened either
         // (LLP 1115.001.003 D3).
         if repeat && code == "Select" && self.page_inert() {
+            return;
+        }
+        // An open select's menu takes the keys it uses (`select.rs`).
+        if self.menu_key(name) {
             return;
         }
         // An open surface of the top layer takes every key (`top.rs`).
@@ -736,6 +804,9 @@ impl<D: DataSource> Presenter<D> {
         if self.remote_key(id, (name, code, repeat), now_ms) {
             return;
         }
+        if self.key_click(id, name, now_ms) {
+            return;
+        }
         let Some(node) = self.host.kernel().node(id) else {
             return;
         };
@@ -760,7 +831,11 @@ impl<D: DataSource> Presenter<D> {
             return;
         }
         // A radio's arrows and Space (x2apps survey #2).
-        if self.radio_key(id, name, now_ms) {
+        if self.radio_key(id, name, now_ms) || self.range_key(id, name) || self.select_key(id, name)
+        {
+            return;
+        }
+        if self.tab_key(id, name, now_ms) {
             return;
         }
         if self.desktop_scroll_key(name) {
@@ -850,3 +925,7 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "keyboard_tests.rs"]
+mod keyboard_tests;

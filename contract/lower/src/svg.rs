@@ -335,12 +335,12 @@ fn shared(attr: &str) -> bool {
 /// A named refusal for an SVG tag outside the subset (LLP 1055 D12).
 pub(crate) fn refused_tag(tag: &str) -> Option<&'static str> {
     Some(match tag {
-        "text" | "tspan" | "textPath" => {
-            "text inside `svg` is refused (LLP 1055 D12); put a `text` beside the `svg`"
+        "textPath" => {
+            "`textPath` (text on a path) is not in exact2's SVG yet \
+             (LLP 1055.000 §4, stage 11); use `text` with `x` and `y` inside `svg`, \
+             with `tspan` for runs"
         }
-        "image" | "feImage" => {
-            "not in exact2's SVG yet: LLP 1055.000 §4 builds it in a later stage"
-        }
+        "feImage" => "not in exact2's SVG yet: LLP 1055.000 §4 builds it in a later stage",
         "hatch" | "hatchpath" | "mesh" | "meshgradient" | "solidcolor" => {
             "refused (LLP 1055.000 §7): Chrome does not implement it"
         }
@@ -501,18 +501,7 @@ impl Lowerer<'_> {
                 }
                 Err(e) => errors.push(LowerError {
                     id: "lower-keyframes",
-                    message: match e {
-                        // @ref LLP 1019 §13 D10 — the axes interpolate one by one.
-                        exact_motion::ParseError::InvalidAnimation(
-                            exact_motion::AnimationError::NotAnimatable(
-                                Property::FontVariationSettings,
-                            ),
-                        ) => format!(
-                            "`keyframes {}`: every keyframe that sets `font-variation-settings` names the same axes, which interpolate one by one",
-                            decl.name
-                        ),
-                        e => format!("`keyframes {}`: {e:?}", decl.name),
-                    },
+                    message: format!("`keyframes {}`: {e}", decl.name),
                     span: decl.span,
                 }),
             }
@@ -690,7 +679,7 @@ impl Lowerer<'_> {
         };
         let base: Vec<Animation> = match short {
             Some(s) if literal(&s.value) => Animations::parse(&text(&s.value))
-                .map_err(|e| bad(s.span, format!("`animation`: {e:?}")))?
+                .map_err(|e| bad(s.span, format!("`animation`: {e}")))?
                 .0,
             Some(s) => {
                 return Err(bad(
@@ -721,7 +710,7 @@ impl Lowerer<'_> {
                 for (i, entry) in list.iter_mut().enumerate() {
                     entry
                         .set_longhand(&a.name, &items[i % items.len()])
-                        .map_err(|e| bad(a.span, format!("`{}`: {e:?}", a.name)))?;
+                        .map_err(|e| bad(a.span, format!("`{}`: {e}", a.name)))?;
                 }
             }
             list.retain(|a| a.name != "none");
@@ -729,6 +718,12 @@ impl Lowerer<'_> {
         } else {
             // One animation, its parts in shorthand order; a literal list
             // cannot be combined with a computed part.
+            if let Some(s) = short.filter(|_| base.len() > 1) {
+                return Err(bad(
+                    s.span,
+                    "`animation` is a list, and another part is computed: a computed animation is one animation".into(),
+                ));
+            }
             let defaults = base.into_iter().next().unwrap_or_default();
             let mut parts = Vec::new();
             for (i, name) in LONGHANDS.iter().enumerate() {
@@ -740,7 +735,10 @@ impl Lowerer<'_> {
                         return Err(bad(a.span, format!("`{}` is a list, and another part is computed: a computed animation is one animation", a.name)))
                     }
                     Some(a) if literal(&a.value) => parts.push(TemplatePart::Text(text(&a.value))),
-                    Some(a) => parts.push(TemplatePart::Expr(a.value.clone())),
+                    // A class choice's arm that does not set the longhand is
+                    // `none` (class.rs): it is the longhand's initial value
+                    // here, as the shorthand writes it, not text to format.
+                    Some(a) => parts.push(TemplatePart::Expr(unset_as(&a.value, &default_part(&defaults, i)))),
                     None => parts.push(TemplatePart::Text(default_part(&defaults, i))),
                 }
             }
@@ -758,6 +756,21 @@ impl Lowerer<'_> {
             written: longs.iter().chain(short.iter()).any(|a| a.written),
         });
         Ok(Some(out))
+    }
+}
+
+/// `value` with each `none` among its choice's arms, at any depth, read as
+/// `initial`: a class choice unsets on one side the rows the other sets.
+fn unset_as(value: &Expr, initial: &str) -> Expr {
+    match value {
+        Expr::None(span) => Expr::Str(initial.to_string(), *span),
+        Expr::Ternary(cond, yes, no, span) => Expr::Ternary(
+            cond.clone(),
+            Box::new(unset_as(yes, initial)),
+            Box::new(unset_as(no, initial)),
+            *span,
+        ),
+        other => other.clone(),
     }
 }
 
@@ -1310,5 +1323,15 @@ fn default_part(a: &Animation, index: usize) -> String {
         5 => a.direction.name().into(),
         6 => a.fill.name().into(),
         _ => if a.paused { "paused" } else { "running" }.into(),
+    }
+}
+
+/// The motion grammar's own sentence for a literal `animation` it refuses.
+pub(crate) fn animation_reason(e: &exact_kernel::StyleValueError, value: &Expr) -> Option<String> {
+    match (e, value) {
+        (exact_kernel::StyleValueError::BadAnimation { .. }, Expr::Str(t, _)) => {
+            Animations::parse(t).err().map(|e| e.to_string())
+        }
+        _ => None,
     }
 }

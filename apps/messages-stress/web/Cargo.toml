@@ -18,6 +18,7 @@ exact-web-capabilities = { path = "../../../host/web-capabilities" }
 messages-stress-data = { path = "../data" }
 
 [build-dependencies]
+serde_json = "1.0"
 contract = { path = "../../../contract/cli" }
 exact-bake = { path = "../../../bake" }
 messages-stress-data = { path = "../data" }

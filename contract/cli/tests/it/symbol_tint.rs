@@ -5,6 +5,71 @@ use crate::warnings::warned;
 
 const TINT: &str = "lower-symbol-tint";
 
+#[test]
+fn a_symbol_tint_repair_keeps_the_authored_param_name() {
+    let src = r##"component App
+  params
+    ink: color = "#333333"
+  view
+    column
+      image "symbol:add" -exact-tint-color="param.ink" aria-label="a"
+"##;
+    let (result, warnings) = contract::compile_warned(src);
+    result.unwrap();
+    let warning = warnings.iter().find(|w| w.id == TINT).unwrap();
+    assert_eq!((warning.span.line, warning.span.col), (6, 26));
+    assert!(
+        warning
+            .message
+            .contains("write `color=\"param.ink\"` instead"),
+        "{}",
+        warning.message
+    );
+    let repaired = src.replace("-exact-tint-color=", "color=");
+    let (result, warnings) = contract::compile_warned(&repaired);
+    result.unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_symbol_tint_repair_keeps_params_in_expressions_classes_and_state_rows() {
+    for (style, image, value) in [
+        (
+            "",
+            "image \"symbol:add\" -exact-tint-color=\"color-mix(in oklab, param.ink 50%, red)\"",
+            "color-mix(in oklab, param.ink 50%, red)",
+        ),
+        (
+            "style Tint\n  -exact-tint-color=\"param.ink\"\n",
+            "image \"symbol:add\" class=Tint",
+            "param.ink",
+        ),
+        (
+            "",
+            "image \"symbol:add\"\n        :disabled\n          -exact-tint-color=\"param.ink\"",
+            "param.ink",
+        ),
+    ] {
+        let src = format!(
+            "{style}component App\n  params\n    ink: color = \"#333333\"\n  view\n    column\n      {image}\n"
+        );
+        let (result, warnings) = contract::compile_warned(&src);
+        result.unwrap();
+        let warning = warnings.iter().find(|w| w.id == TINT).unwrap();
+        assert!(
+            warning
+                .message
+                .contains(&format!("color=\"{value}\"` instead")),
+            "{}",
+            warning.message
+        );
+        let (result, warnings) =
+            contract::compile_warned(&src.replace("-exact-tint-color=", "color="));
+        result.unwrap();
+        assert!(!warnings.iter().any(|w| w.id == TINT), "{warnings:?}");
+    }
+}
+
 fn app(image: &str) -> String {
     format!("component App\n  view\n    column\n      {image}\n")
 }

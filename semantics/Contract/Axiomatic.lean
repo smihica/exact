@@ -378,7 +378,7 @@ theorem triple_read_prestate {x y e₁ v₀ fx₀} :
 /-- The state an action reads: the configuration as the event found it. -/
 def actionEnv (p : Program) (c : Config) (rows : List RowId) : Env :=
   { prog := p, slots := c.slots, derives := c.settled.derives, resources := c.settled.resources,
-    rows := rowSlots c.store rows, now := c.now }
+    rows := rowSlots c.store rows, now := c.now, idle := c.settled.idle }
 
 /-- An action's parameters bound to its arguments. -/
 def actionLocals (a : ActionDecl) (args : List Value) : Locals := ((a.params.map (·.1)).zip args).reverse

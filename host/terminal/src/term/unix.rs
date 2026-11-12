@@ -1,9 +1,12 @@
 //! Unix raw mode, terminal signals and the interactive event loop.
 
-use super::{decode, flush_escape, record, Decoder, Inline, Input, ESC_WAIT_MS};
+mod output;
+
+use super::{decode, flush_escape, record, Decoder, Inline, Input};
 use crate::host::{After, Host, Mode};
 use crate::image::Protocol;
 use exact_runner::DataSource;
+use output::write as write_output;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, Termios};
 use std::io::{Read, Write};
@@ -29,7 +32,10 @@ struct Signals {
 #[allow(unsafe_code)]
 extern "C" fn received(signal: libc::c_int) {
     if SIGNAL
-        .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+            // Termination takes precedence over a pending suspend.
+            (pending == 0 || pending == libc::SIGTSTP).then_some(signal)
+        })
         .is_ok()
     {
         let fd = SIGNAL_FD.load(Ordering::SeqCst);
@@ -53,7 +59,13 @@ impl Signals {
         };
         SIGNAL.store(0, Ordering::SeqCst);
         SIGNAL_FD.store(guard._writer.as_raw_fd(), Ordering::SeqCst);
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        for signal in [
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+        ] {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             action.sa_sigaction = received as *const () as libc::sighandler_t;
             unsafe { libc::sigemptyset(&mut action.sa_mask) };
@@ -64,6 +76,36 @@ impl Signals {
             guard.previous.push((signal, previous));
         }
         Ok(guard)
+    }
+
+    #[allow(unsafe_code)]
+    fn termination_handler(&self, handler: libc::sighandler_t) -> std::io::Result<()> {
+        for &(signal, _) in &self.previous {
+            if signal == libc::SIGTSTP {
+                continue;
+            }
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = handler;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&self) -> std::io::Result<()> {
+        // The terminal is restored. A termination arriving after the pending
+        // check must take effect immediately, rather than wait behind SIGSTOP.
+        self.termination_handler(libc::SIG_DFL)?;
+        let signal = SIGNAL.swap(0, Ordering::SeqCst);
+        if signal != 0 && signal != libc::SIGTSTP {
+            terminate_from_signal(signal);
+        }
+        // SIGSTOP also stops an orphaned process group. Execution resumes here
+        // on SIGCONT; the next pass captures the shell's current termios.
+        signal_hook::low_level::raise(libc::SIGSTOP)?;
+        self.termination_handler(received as *const () as libc::sighandler_t)
     }
 }
 
@@ -103,30 +145,9 @@ impl Drop for OutputFlags {
     }
 }
 
-fn write_output(mut bytes: &[u8], signal_rx: &UnixStream) -> std::io::Result<()> {
-    let stdout = rustix::stdio::stdout();
-    while !bytes.is_empty() {
-        if SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Err(std::io::ErrorKind::Interrupted.into());
-        }
-        match rustix::io::write(stdout, bytes) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = &bytes[n..],
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::AGAIN) => {
-                let mut fds = [
-                    PollFd::new(&stdout, PollFlags::OUT),
-                    PollFd::new(signal_rx, PollFlags::IN),
-                ];
-                match poll(&mut fds, None) {
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+fn drain_signals(mut signal_rx: &UnixStream) {
+    let mut sink = [0; 64];
+    while matches!(signal_rx.read(&mut sink), Ok(n) if n > 0) {}
 }
 
 #[allow(unsafe_code)]
@@ -173,51 +194,7 @@ fn restore_output_flags() {
     }
 }
 
-fn leave_output(mut bytes: &[u8]) -> std::io::Result<()> {
-    let stdout = rustix::stdio::stdout();
-    let deadline = Instant::now() + std::time::Duration::from_secs(2);
-    while !bytes.is_empty() {
-        match rustix::io::write(stdout, bytes) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => bytes = &bytes[n..],
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::AGAIN) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                let timeout = Timespec {
-                    tv_sec: remaining.as_secs() as i64,
-                    tv_nsec: remaining.subsec_nanos() as i64,
-                };
-                let mut fds = [PollFd::new(&stdout, PollFlags::OUT)];
-                match poll(&mut fds, Some(&timeout)) {
-                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-
-#[allow(unsafe_code)]
-fn write_leave_blocking(bytes: &[u8]) -> std::io::Result<()> {
-    let fd = std::io::stdout().as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // Flush before termios and the signal handlers go back: the leave bytes
-    // hold no newline, so stdout's line buffer would otherwise keep them until
-    // process exit, where a signal can drop them.
-    let mut out = std::io::stdout().lock();
-    out.write_all(bytes)?;
-    out.flush()
-}
-
-fn restore(signal: bool) -> std::io::Result<()> {
+fn restore(signal_rx: Option<&UnixStream>) -> std::io::Result<()> {
     let saved = SAVED.lock().ok().and_then(|mut s| s.take());
     let result = if let Some((termios, mode)) = saved {
         let leave = if mode == Mode::Fullscreen {
@@ -225,16 +202,9 @@ fn restore(signal: bool) -> std::io::Result<()> {
         } else {
             LEAVE_INLINE
         };
-        if signal {
-            // A stopped PTY cannot accept the leave bytes: recover the shell's
-            // input first, then give output a bounded chance to drain.
-            let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &termios);
-            leave_output(leave.as_bytes())
-        } else {
-            let result = write_leave_blocking(leave.as_bytes());
-            let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &termios);
-            result
-        }
+        output::restore(leave.as_bytes(), signal_rx, || {
+            tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &termios).map_err(Into::into)
+        })
     } else {
         Ok(())
     };
@@ -266,7 +236,7 @@ mod restoration_tests {
                 unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
                 0
             );
-            restore(true).unwrap();
+            restore(None).unwrap();
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, before);
             std::mem::forget(flags);
             return;
@@ -311,43 +281,24 @@ fn open_outbound<D: DataSource>(host: &mut Host<D>) {
 /// Run the host in this terminal until the app or the user quits.
 pub fn run<D: DataSource>(host: &mut Host<D>) -> std::io::Result<()> {
     host.set_colors(host.colors.unwrap_or_else(crate::color::ColorDepth::detect));
-    let stdin = rustix::stdio::stdin();
-    let saved = tcgetattr(stdin)?;
     let signals = Signals::install()?;
-    let output_flags = OutputFlags::nonblocking()?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore(true);
+        let _ = restore(None);
         hook(info);
     }));
-    let mut raw = saved.clone();
-    raw.make_raw();
-    // Keep output post-processing: "\n" still returns the carriage, so a
-    // panic message is readable.
-    *SAVED.lock().expect("saved") = Some((saved, host.mode));
-    tcsetattr(stdin, OptionalActions::Now, &raw)?;
-    let result = run_raw(host, &signals.reader);
-    let restored = restore(SIGNAL.load(Ordering::SeqCst) != 0);
-    drop(output_flags);
+    let result = run_raw(host, &signals);
     drop(signals);
     let signal = SIGNAL.swap(0, Ordering::SeqCst);
     if signal != 0 {
         terminate_from_signal(signal);
     }
-    result.and(restored)
+    result
 }
 
-fn run_raw<D: DataSource>(host: &mut Host<D>, signal_rx: &UnixStream) -> std::io::Result<()> {
+fn run_raw<D: DataSource>(host: &mut Host<D>, signals: &Signals) -> std::io::Result<()> {
+    let signal_rx = &signals.reader;
     let mode = host.mode;
-    write_output(
-        if mode == Mode::Fullscreen {
-            ENTER_FULL
-        } else {
-            ENTER_INLINE
-        }
-        .as_bytes(),
-        signal_rx,
-    )?;
     // The data module's threads wake the loop through a socket.
     let (mut wake_rx, wake_tx) = UnixStream::pair()?;
     wake_rx.set_nonblocking(true)?;
@@ -370,132 +321,184 @@ fn run_raw<D: DataSource>(host: &mut Host<D>, signal_rx: &UnixStream) -> std::io
     let mut buf = [0u8; 8192];
     host.publish(&record(mode, inline.protocol, host.colors(), 0, ""));
     loop {
-        if SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Ok(());
-        }
-        if let Some((cols, rows)) = size() {
-            host.resize(cols, rows);
-        }
-        host.tick(now());
-        if SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Ok(());
-        }
-        let mut out = String::new();
-        match mode {
-            Mode::Fullscreen => {
-                let grid = &host.frame().grid;
-                if shown.as_ref() != Some(grid) {
-                    out = grid.diff(shown.as_ref());
-                    shown = Some(grid.clone());
-                }
-            }
-            Mode::Inline => inline.frame(host, &mut out),
-        }
-        if host.quitting() {
-            if mode == Mode::Inline {
-                inline.finish(&mut out);
-            }
-            write_output(out.as_bytes(), signal_rx)?;
-            return Ok(());
-        }
-        if !out.is_empty() {
-            write_output(out.as_bytes(), signal_rx)?;
-            host.frames += 1;
-        }
-        // Tell the app what is in scrollback now that the bytes are out,
-        // so it can let go (LLP 1101.001 P1; 1101.002 §0 P5).
-        if mode == Mode::Inline {
-            if let Some(r) = inline.printed(mode, host.colors()) {
-                host.publish(&r);
-            }
-        }
-        // Admit idle work only after checking for input already queued
-        let idle_stdin = rustix::stdio::stdin();
-        let mut input = [PollFd::new(&idle_stdin, PollFlags::IN)];
-        let zero = Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        if poll(&mut input, Some(&zero)).is_ok_and(|ready| ready == 0) {
-            host.idle_timer(now());
-        }
-        // Sleep until input, a wake, the next timer, or a size check.
-        let wait = host
-            .timer_due_ms()
-            .map(|due| (due - now()).clamp(0.0, 250.0))
-            .unwrap_or(250.0);
-        let wait = if decoder.escape {
-            wait.min(ESC_WAIT_MS)
-        } else {
-            wait
-        };
-        let timeout = Timespec {
-            tv_sec: 0,
-            tv_nsec: (wait * 1_000_000.0) as i64,
-        };
         let stdin = rustix::stdio::stdin();
-        let mut fds = [
-            PollFd::new(&stdin, PollFlags::IN),
-            PollFd::new(&wake_rx, PollFlags::IN),
-            PollFd::new(signal_rx, PollFlags::IN),
-        ];
-        let ready = match poll(&mut fds, Some(&timeout)) {
-            Ok(ready) => ready,
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        if !fds[2].revents().is_empty() || SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Ok(());
-        }
-        if ready == 0 {
-            for input in flush_escape(&mut decoder) {
-                if let Input::Key(k) = input {
-                    if host.key(k) == After::Quit {
-                        return Ok(());
-                    }
+        let saved = tcgetattr(stdin)?;
+        let output_flags = OutputFlags::nonblocking()?;
+        let mut raw = saved.clone();
+        raw.make_raw();
+        *SAVED.lock().expect("saved") = Some((saved, mode));
+        let mut result = (|| {
+            tcsetattr(stdin, OptionalActions::Now, &raw)?;
+            write_output(
+                if mode == Mode::Fullscreen {
+                    ENTER_FULL
+                } else {
+                    ENTER_INLINE
                 }
-            }
-            continue;
-        }
-        let (input_ready, woken) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
-        if woken {
-            let mut sink = [0u8; 256];
-            while matches!(wake_rx.read(&mut sink), Ok(n) if n > 0) {}
-            host.announced();
-        }
-        if !input_ready {
-            continue;
-        }
-        let n = match rustix::io::read(stdin, &mut buf) {
-            Ok(n) => n,
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if n == 0 {
-            return Ok(());
-        }
-        // These keys were typed against what the terminal showed by now.
-        host.read_at = host.frames;
-        for input in decode(&mut parser, &mut decoder, &buf[..n]) {
-            match input {
-                Input::Key(k) => {
-                    if host.key(k) == After::Quit {
-                        let mut out = String::new();
-                        if mode == Mode::Inline {
-                            inline.frame(host, &mut out);
-                            inline.finish(&mut out);
+                .as_bytes(),
+                signal_rx,
+            )?;
+            loop {
+                if SIGNAL.load(Ordering::SeqCst) != 0 {
+                    return Ok(());
+                }
+                if let Some((cols, rows)) = size() {
+                    host.resize(cols, rows);
+                }
+                host.tick(now());
+                if SIGNAL.load(Ordering::SeqCst) != 0 {
+                    return Ok(());
+                }
+                let mut out = String::new();
+                match mode {
+                    Mode::Fullscreen => {
+                        let grid = &host.frame().grid;
+                        if shown.as_ref() != Some(grid) {
+                            out = grid.diff(shown.as_ref());
+                            shown = Some(grid.clone());
                         }
-                        write_output(out.as_bytes(), signal_rx)?;
-                        return Ok(());
+                    }
+                    Mode::Inline => inline.frame(host, &mut out),
+                }
+                if host.quitting() {
+                    if mode == Mode::Inline {
+                        inline.finish(&mut out);
+                    }
+                    write_output(out.as_bytes(), signal_rx)?;
+                    return Ok(());
+                }
+                if !out.is_empty() {
+                    write_output(out.as_bytes(), signal_rx)?;
+                    host.frames += 1;
+                }
+                // Tell the app what is in scrollback now that the bytes are out,
+                // so it can let go (LLP 1101.001 P1; 1101.002 §0 P5).
+                if mode == Mode::Inline {
+                    if let Some(r) = inline.printed(mode, host.colors()) {
+                        host.publish(&r);
                     }
                 }
-                Input::Click(x, y) => host.click(x, y),
-                Input::CursorAt(row, _) => inline.answered(host, row),
-                Input::Wheel(x, y, rows) => host.wheel(x, y, rows),
-                Input::Paste(text) => host.paste(&text),
+                // Admit idle work only after checking for input already queued
+                let idle_stdin = rustix::stdio::stdin();
+                let mut input = [PollFd::new(&idle_stdin, PollFlags::IN)];
+                let zero = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                if poll(&mut input, Some(&zero)).is_ok_and(|ready| ready == 0) {
+                    host.idle_timer(now());
+                }
+                // Sleep until input, a wake, the next timer, a held ESC's time, or
+                // a size check.
+                let wait = host
+                    .timer_due_ms()
+                    .map(|due| (due - now()).clamp(0.0, 250.0))
+                    .unwrap_or(250.0);
+                let wait = match decoder.escape_due() {
+                    Some(due) => wait.min((due - now()).max(0.0)),
+                    None => wait,
+                };
+                let timeout = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: (wait * 1_000_000.0) as i64,
+                };
+                let stdin = rustix::stdio::stdin();
+                let mut fds = [
+                    PollFd::new(&stdin, PollFlags::IN),
+                    PollFd::new(&wake_rx, PollFlags::IN),
+                    PollFd::new(signal_rx, PollFlags::IN),
+                ];
+                let interrupted = match poll(&mut fds, Some(&timeout)) {
+                    Ok(_) => false,
+                    Err(rustix::io::Errno::INTR) => true,
+                    Err(e) => return Err(e.into()),
+                };
+                if !fds[2].revents().is_empty() {
+                    drain_signals(signal_rx);
+                }
+                if SIGNAL.load(Ordering::SeqCst) != 0 {
+                    return Ok(());
+                }
+                let input_ready = !interrupted && !fds[0].revents().is_empty();
+                let woken = !interrupted && !fds[1].revents().is_empty();
+                // However the poll ended (a timer, a wake, a signal), a held ESC
+                // with nothing after it is the Escape key once its time is up. With
+                // input waiting, the input is read first: it may be the rest of
+                // the sequence.
+                if !input_ready {
+                    for input in flush_escape(&mut decoder, now()) {
+                        if let Input::Key(k) = input {
+                            if host.key(k) == After::Quit {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                if woken {
+                    let mut sink = [0u8; 256];
+                    while matches!(wake_rx.read(&mut sink), Ok(n) if n > 0) {}
+                    host.announced();
+                }
+                if !input_ready {
+                    continue;
+                }
+                let n = match rustix::io::read(stdin, &mut buf) {
+                    Ok(n) => n,
+                    Err(rustix::io::Errno::INTR) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if n == 0 {
+                    return Ok(());
+                }
+                // These keys were typed against what the terminal showed by now.
+                host.read_at = host.frames;
+                for input in decode(&mut parser, &mut decoder, &buf[..n], now()) {
+                    match input {
+                        Input::Key(k) => {
+                            let after = host.key(k);
+                            if after == After::Suspend {
+                                received(libc::SIGTSTP);
+                                return Ok(());
+                            }
+                            if after == After::Quit {
+                                let mut out = String::new();
+                                if mode == Mode::Inline {
+                                    inline.frame(host, &mut out);
+                                    inline.finish(&mut out);
+                                }
+                                write_output(out.as_bytes(), signal_rx)?;
+                                return Ok(());
+                            }
+                        }
+                        Input::Click(x, y) => host.click(x, y),
+                        Input::CursorAt(row, _) => inline.answered(host, row),
+                        Input::Wheel(x, y, rows) => host.wheel(x, y, rows),
+                        Input::Paste(text) => host.paste(&text),
+                    }
+                }
+                open_outbound(host);
             }
+        })();
+        let suspend = SIGNAL
+            .compare_exchange(libc::SIGTSTP, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if suspend && mode == Mode::Inline {
+            let mut out = String::new();
+            inline.finish(&mut out);
+            result = result.and_then(|()| write_output(out.as_bytes(), signal_rx));
         }
-        open_outbound(host);
+        let restored = restore(Some(signal_rx));
+        drop(output_flags);
+        if !suspend {
+            return result.and(restored);
+        }
+        result.and(restored)?;
+        drain_signals(signal_rx);
+        signals.stop()?;
+        shown = None;
+        inline.resume();
+        parser = Parser::new();
+        decoder = Decoder::default();
     }
 }
 

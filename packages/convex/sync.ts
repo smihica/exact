@@ -86,8 +86,6 @@ export class Sync {
   status: 'connecting' | 'open' | 'ready' | 'closed' | 'failed' = 'connecting';
   /** Rises when an answer a query gave may have changed: a `Transition` applied, or the identity changed. */
   rev = 0;
-  /** Rises with every frame the server sends, a `Ping` included: a connection that is alive moves it. */
-  beat = 0;
   /** Why the socket last ended; "" while it is open. */
   error = '';
   /** The server's words when it refused the token; "" otherwise. */
@@ -159,6 +157,8 @@ export class Sync {
    *  the npm client (`request_manager.ts`, `restart`), this sends no mutation again on the next connection.
    *  One the server acknowledged succeeded; any other may have run. */
   closed(reason: string, fatal = false) {
+    // The close that follows a fatal end is that end's, not a new one: `failed` and its reason stand.
+    if (this.status === 'failed') return;
     this.status = fatal ? 'failed' : 'closed';
     this.error = reason;
     this.lastCloseReason = reason;
@@ -172,7 +172,6 @@ export class Sync {
    *  the caller ends the socket with its words. */
   frame(text: string) {
     const message = JSON.parse(text) as Frame;
-    this.beat += 1;
     if (this.chunks.length && message.type !== 'TransitionChunk') throw new ProtocolError(`Convex sent ${String(message.type)} inside a chunked Transition`);
     switch (message.type) {
       case 'Ping': return;

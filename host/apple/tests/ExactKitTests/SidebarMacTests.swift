@@ -78,12 +78,19 @@ final class SidebarMacTests: XCTestCase {
 
     private func boot(size: CGSize, scrollingTabs: Bool = false) throws -> ExactSession {
         _ = NSApplication.shared
+        let source = scrollingTabs ? app.replacingOccurrences(of: "row role=\"tablist\"", with: "row overflow-x=\"auto\" role=\"tablist\"") : app
+        let session = ExactApp.shared.makeSession(label: "sidebar-" + UUID().uuidString)
+        self.session = session
+        XCTAssertNil(session.boot(plan: try compile(source), size: size).error)
+        return session
+    }
+
+    private func compile(_ source: String) throws -> Data {
         let dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("../../target/sidebar-test-" + UUID().uuidString).standardizedFileURL
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let contract = dir.appendingPathComponent("app.contract"), plan = dir.appendingPathComponent("app.plan")
-        let source = scrollingTabs ? app.replacingOccurrences(of: "row role=\"tablist\"", with: "row overflow-x=\"auto\" role=\"tablist\"") : app
         try source.write(to: contract, atomically: true, encoding: .utf8)
         let compiler = Process(), said = Pipe()
         compiler.executableURL = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_CONTRACT"]))
@@ -91,10 +98,7 @@ final class SidebarMacTests: XCTestCase {
         compiler.standardError = said
         try compiler.run(); compiler.waitUntilExit()
         XCTAssertEqual(compiler.terminationStatus, 0, String(decoding: said.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
-        let session = ExactApp.shared.makeSession(label: "sidebar-" + UUID().uuidString)
-        self.session = session
-        XCTAssertNil(session.boot(plan: try Data(contentsOf: plan), size: size).error)
-        return session
+        return try Data(contentsOf: plan)
     }
 
     private func node(_ testId: String) throws -> NodeView {
@@ -133,6 +137,69 @@ final class SidebarMacTests: XCTestCase {
     private func choose(_ split: ExactSidebarController, _ row: Int) {
         // A person's choice of a row, as the table asks its delegate on the way down.
         XCTAssertEqual(split.table.delegate?.tableView?(split.table, shouldSelectRow: row), false, "the table never selects by itself")
+    }
+
+    func testRestartRecomposesTheWindowWhenTheNewPlanNeedsNoSidebar() throws {
+        let session = try boot(size: CGSize(width: 700, height: 500))
+        let view = ExactView(session: session)
+        var split: ExactSidebarController? = compose(view)
+        let window = try XCTUnwrap(self.window)
+        var changes: [Bool] = []
+        view.onWindowSidebar = {
+            let wanted = view.wantsWindowSidebar
+            changes.append(wanted)
+            if wanted, split == nil {
+                window.contentView = NSView()
+                let next = ExactSidebarController(view: view, autosaveName: nil, minimumPageWidth: 320)
+                split = next
+                next.install(in: window)
+            } else if !wanted, let old = split {
+                old.release()
+                split = nil
+                window.contentViewController = nil
+                window.contentView = view
+            }
+        }
+        defer { view.onWindowSidebar = nil; split?.release() }
+        XCTAssertTrue(view.wantsWindowSidebar)
+        XCTAssertEqual(split?.table.numberOfRows, 2)
+        let tabs = try compile(app)
+        let authored = try compile(app.replacingOccurrences(of: "appearance=(mode == \"authored\" ? \"none\" : \"auto\")", with: "appearance=\"none\""))
+        let placed = try compile(app.replacingOccurrences(of: "flex-direction=(mode == \"placed\" ? \"row\" : \"column\")", with: "flex-direction=\"row\""))
+        let plain = try compile("""
+        component App
+          view
+            main width="100%" height="100%"
+              text "No tabs"
+
+        """)
+        for (label, plan, wanted) in [
+            ("same tabs", tabs, true), ("appearance none", authored, false),
+            ("tabs restored", tabs, true), ("authored placement", placed, false),
+            ("tabs restored again", tabs, true), ("no tabs", plain, false),
+            ("still no tabs", plain, false),
+        ] {
+            let was = view.wantsWindowSidebar, previous = split
+            changes.removeAll()
+            XCTAssertTrue(session.apply(plan, label: label), label)
+            window.layoutIfNeeded()
+            XCTAssertEqual(view.wantsWindowSidebar, wanted, label)
+            XCTAssertEqual(changes, was == wanted ? [] : [wanted], label)
+            XCTAssertEqual(session.presenter.sidebar.installed, wanted, label)
+            if wanted {
+                let current = try XCTUnwrap(split, label)
+                if was { XCTAssertTrue(current === previous, label) }
+                XCTAssertTrue(window.contentViewController === current, label)
+                XCTAssertEqual(current.table.numberOfRows, 2, label)
+                XCTAssertEqual(try cell(current, 0).textField?.stringValue, "Today", label)
+                XCTAssertTrue(try node("tabs").isHidden, label)
+            } else {
+                XCTAssertNil(window.contentViewController, label)
+                XCTAssertTrue(window.contentView === view, label)
+                XCTAssertEqual(view.bounds.width, 700, accuracy: 1, label)
+                if plan != plain { XCTAssertFalse(try node("tabs").isHidden, label) }
+            }
+        }
     }
 
     func testAScrollingTablistLeavesLayoutWhileTheSidebarReplacesIt() throws {

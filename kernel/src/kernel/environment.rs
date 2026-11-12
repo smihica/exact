@@ -242,6 +242,7 @@ impl Kernel {
         let mut unmirrored = Unmirrored;
         let layout = self.layout.as_deref_mut().unwrap_or(&mut unmirrored);
         for (slot, old, old_family) in before {
+            self.arena.relative.invalidate(slot);
             let changed = old.changed_mask(&self.arena.computed_inherited(slot));
             let family_changed = !self.arena.style(slot).mask.has(StyleId::FontFamily)
                 && old_family.as_deref()

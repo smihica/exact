@@ -67,8 +67,12 @@ package enum Capture {
         ctx.scaleBy(x: scale, y: -scale)
         // A subtree painted through its canvas composites at alpha 0; paint
         // it opaque into the bitmap regardless.
-        let alpha = view.alpha
-        view.alpha = 1
+        // A placed canvas child is drawn as its writers asked (`asAsked`).
+        let elsewhere = (view.layer as? NodeLayer)?.drawnElsewhere ?? false
+        (view.layer as? NodeLayer)?.drawnElsewhere = false
+        // Its alpha raised to 1 and put back is no author's change (`passing`).
+        let alpha = view.alpha, node = view.layer as? NodeLayer
+        if let node { node.passing { view.alpha = 1 } } else { view.alpha = 1 }
         // A canvas nested under this one that is painted through its own
         // surface: its picture comes by readback (its draw), not from its
         // overlay's views, which the render would paint regardless of their
@@ -89,11 +93,21 @@ package enum Capture {
         hide(view)
         capturing = true
         UIGraphicsPushContext(ctx)
-        paintOrderLayer(of: view, root: view.layer).render(in: ctx)
+        // A filtered box shows as its picture (`BoxFilter`), drawn here as
+        // the box is, shown and opaque (a placed canvas child's is hidden).
+        if let picture = (view as? NodeView)?.filterPicture {
+            let (hidden, opacity) = (picture.isHidden, picture.opacity)
+            (picture.isHidden, picture.opacity) = (false, 1)
+            picture.render(in: ctx)
+            (picture.isHidden, picture.opacity) = (hidden, opacity)
+        } else {
+            paintOrderLayer(of: view, root: view.layer).render(in: ctx)
+        }
         UIGraphicsPopContext()
         capturing = false
         for o in hidden { o.isHidden = false }
-        view.alpha = alpha
+        if let node { node.passing { view.alpha = alpha } } else { view.alpha = alpha }
+        node?.drawnElsewhere = elsewhere
     }
 }
 

@@ -36,6 +36,43 @@ fn at(p: &Pixmap, x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn zero_dash_lists_stroke_solid_paths_and_rectangles() {
+    let ink = |p: &Pixmap| p.pixels().iter().filter(|p| p.alpha() != 0).count();
+    for rectangle in [false, true] {
+        let draw = |dash: &[f64], offset| {
+            replay(200, 100, 1.0, |c| {
+                c.set_line_width(4.0);
+                c.set_line_dash(dash).unwrap();
+                c.set_line_dash_offset(offset);
+                if rectangle {
+                    c.stroke_rect(10.0, 10.0, 180.0, 80.0);
+                } else {
+                    c.begin_path();
+                    c.move_to(10.0, 50.0);
+                    c.line_to(190.0, 50.0);
+                    c.stroke();
+                }
+            })
+        };
+        let solid = draw(&[], 0.0);
+        assert_eq!(ink(&solid), if rectangle { 2080 } else { 720 });
+        for dash in [&[0.0][..], &[0.0, 0.0], &[0.0, -0.0, 0.0]] {
+            for offset in [0.0, 3.0, -3.0] {
+                let actual = draw(dash, offset);
+                assert!(
+                    actual.data() == solid.data(),
+                    "rectangle={rectangle}, dash={dash:?}, offset={offset}: {} ink pixels, expected {}",
+                    ink(&actual),
+                    ink(&solid)
+                );
+            }
+        }
+        let dashed = draw(&[4.0, 4.0], 0.0);
+        assert!(ink(&dashed) > 0 && ink(&dashed) < ink(&solid));
+    }
+}
+
+#[test]
 fn a_clockwise_arc_bulges_down_in_canvas_space() {
     // arc(50, 50, 40, 0, π): clockwise from +x through +y (down).
     let p = replay(100, 100, 1.0, |c| {

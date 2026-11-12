@@ -107,8 +107,12 @@ impl<D: DataSource> Presenter<D> {
                 .iter_mut()
                 .filter(|f| f.mime.starts_with("image/"))
             {
-                let size = crate::picker::resolve(&f.path)
-                    .and_then(|p| std::fs::read(p).ok())
+                let size = crate::picker::open(&f.path)
+                    .and_then(|mut file| {
+                        let mut bytes = Vec::new();
+                        std::io::Read::read_to_end(&mut file, &mut bytes).ok()?;
+                        Some(bytes)
+                    })
                     .and_then(|b| crate::picker::dimensions(&b));
                 (f.width, f.height) = size.map_or((None, None), |(w, h)| (Some(w), Some(h)));
             }

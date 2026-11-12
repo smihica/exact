@@ -159,23 +159,20 @@ fn calculated_radii_clamp_at_zero_as_the_window_resizes() {
                         draw(&control),
                         "{kind:?} {radius:?} {value} at {width}"
                     );
-                    for literal in [
-                        "-10px",
-                        "-10%",
-                        "-10vw",
-                        "env(viewport-segment-width 1 0, -10px)",
-                    ] {
-                        control
+                    for literal in ["-10px", "-10%", "-10vw"] {
+                        assert!(control
                             .set_dynamic(radius, &StyleValue::Text(literal.into()))
-                            .unwrap();
-                        let negative = draw(&control);
-                        control.set_dynamic(radius, &StyleValue::Auto).unwrap();
-                        assert_eq!(
-                            negative,
-                            draw(&control),
-                            "a negative literal remains invalid: {literal}"
-                        );
+                            .is_err());
                     }
+                    control
+                        .set_dynamic(
+                            radius,
+                            &StyleValue::Text("env(viewport-segment-width 1 0, -10px)".into()),
+                        )
+                        .unwrap();
+                    let negative = draw(&control);
+                    control.set_dynamic(radius, &StyleValue::Auto).unwrap();
+                    assert_eq!(negative, draw(&control), "a negative fallback is invalid");
                 }
             }
         }

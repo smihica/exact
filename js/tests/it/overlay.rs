@@ -88,6 +88,95 @@ fn every_effect_in_an_overlay_refuses_by_name() {
     assert_eq!(store.reads(), 0, "nothing was read");
 }
 
+const NUMBERS: &[f64] = &[
+    985.6906946328695,
+    212.91890726713459,
+    479.60756426982596,
+    -985.6906946328695,
+    f64::MAX,
+    f64::MIN_POSITIVE,
+    f64::from_bits(1),
+];
+
+fn numeric_module() -> Module {
+    let plan = contract::compile(
+        r#"
+shape Numeric
+  n: number
+  big: string
+
+component App
+  resource value = numeric(0, 0) as shape Numeric
+  view
+    text "fixture"
+"#,
+    )
+    .expect("numeric fixture compiles");
+    let mut module = Module::loaded(HBC.to_vec(), "test.overlay", GRANTS).expect("loads");
+    module.set_budget_ms(f64::INFINITY);
+    module.bind(&plan);
+    module
+}
+
+fn numeric_answer(module: &mut Module, store: &mut Store, n: f64, length: usize) -> Value {
+    match module
+        .answer(
+            store,
+            "numeric",
+            &[Value::Number(n), Value::Number(length as f64)],
+        )
+        .expect("numeric answer")
+    {
+        Answer::Now(value) => value,
+        Answer::Later(_) => panic!("expected an answer now"),
+    }
+}
+
+fn assert_numeric_reply(value: &Value, n: f64, length: usize) {
+    let Value::Record(fields) = value else {
+        panic!("expected a record");
+    };
+    assert_eq!(
+        fields[0].as_number().unwrap().to_bits(),
+        n.to_bits(),
+        "{n} beside a string of {length} characters"
+    );
+    assert_eq!(fields[1].as_str(), Some("x".repeat(length).as_str()));
+}
+
+#[test]
+fn answers_preserve_number_bits_with_and_without_captured_strings() {
+    let mut module = numeric_module();
+    let mut store = Store::new(GRANTS, vec![]);
+    for &n in NUMBERS {
+        for length in [0, 65_535, 65_536, 70_000, 0] {
+            let value = numeric_answer(&mut module, &mut store, n, length);
+            assert_numeric_reply(&value, n, length);
+        }
+    }
+}
+
+#[test]
+fn overlays_preserve_number_bits() {
+    let mut module = numeric_module();
+    let mut store = Store::new(GRANTS, vec![]);
+    for &n in NUMBERS {
+        let answer = numeric_answer(&mut module, &mut store, n, 0);
+        assert_numeric_reply(&answer, n, 0);
+        let shown = module
+            .overlay(
+                "numeric",
+                &[Value::Number(n), Value::Number(0.0)],
+                &answer,
+                &[],
+            )
+            .expect("overlay ran")
+            .expect("overlay returned the answer");
+        assert_numeric_reply(&shown.value, n, 0);
+        assert!(shown.keep.is_empty());
+    }
+}
+
 const NONE_HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay-none.hbc"));
 const SOME_HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay-some.hbc"));
 const ODD_HBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay-odd.hbc"));

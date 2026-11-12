@@ -130,5 +130,121 @@ async function codecs() {
 }
 
 export async function streams(): Promise<string> {
-  return JSON.stringify({ order: await order(), pipes: await pipes(), codecs: await codecs() });
+  return JSON.stringify({ order: await order(), pipes: await pipes(), codecs: await codecs(), bodies: await responseBodies() });
+}
+
+async function responseBodies() {
+  const source = (...chunks: unknown[]) => new ReadableStream({ start(c) { chunks.forEach(chunk => c.enqueue(chunk)); c.close(); } });
+  const said = (f: () => unknown) => { try { f(); return 'ok'; } catch (e) { return errorName(e); } };
+  const encoded = new TextEncoder().encode('\ufeff{"text":"hé😀"}');
+  const stream = source(...Array.from(encoded, b => new Uint8Array([0, b, 0]).subarray(1, 2)));
+  const response = new Response(stream), clone = response.clone();
+  const before = [response.bodyUsed, clone.bodyUsed, stream.locked, response.headers.get('content-type')];
+  const reading = response.json();
+  const during = [response.bodyUsed, clone.bodyUsed, said(() => response.clone())];
+  const value = await reading, cloneText = await clone.text();
+  const repeated = await settles(response.arrayBuffer());
+  const empty = await new Response(source(new Uint8Array(0))).arrayBuffer();
+  const invalid = [];
+  for (const method of ['text', 'json', 'arrayBuffer'] as const) {
+    for (const chunk of ['text', new ArrayBuffer(1), new Uint16Array([1]), new DataView(new ArrayBuffer(1))]) {
+      const r = new Response(source(chunk));
+      invalid.push([await settles(r[method]()), r.bodyUsed]);
+    }
+  }
+  const failure = new Error('source failed'), errors = [];
+  for (const method of ['text', 'json', 'arrayBuffer'] as const) {
+    const r = new Response(new ReadableStream({ pull(c) { c.error(failure); } }));
+    // Chrome replaces the source's error with a TypeError; both readers must reject.
+    errors.push(await r[method]().then(() => false, () => true));
+  }
+  const locked = source(encoded), holder = locked.getReader();
+  const lockedConstructor = said(() => new Response(locked));
+  holder.releaseLock();
+  const heldResponse = new Response(locked), heldReader = locked.getReader();
+  const held = [await settles(heldResponse.text()), heldResponse.bodyUsed, said(() => heldResponse.clone())];
+  heldReader.releaseLock();
+  const afterRelease = await heldResponse.text();
+  const disturbed = source(encoded), prior = new Response(disturbed), reader = disturbed.getReader();
+  await reader.read(); reader.releaseLock();
+  const used = [prior.bodyUsed, said(() => new Response(disturbed)), await settles(prior.text()), said(() => prior.clone())];
+  const canceled = source(encoded), canceledResponse = new Response(canceled);
+  await canceled.cancel();
+  const cancelled = [canceledResponse.bodyUsed, said(() => new Response(canceled)), await settles(canceledResponse.text())];
+  const chunk = new Uint8Array([1, 2, 3]), original = new Response(source(chunk)), copy = original.clone();
+  const originalBytes = Array.from(new Uint8Array(await original.arrayBuffer()));
+  chunk[0] = 9;
+  const copyBytes = Array.from(new Uint8Array(await copy.arrayBuffer()));
+  let number = 0;
+  const buffer = new Uint8Array(1);
+  const reused = new ReadableStream({ pull(c) {
+    if (number === 3) { c.close(); return; }
+    buffer[0] = ++number; c.enqueue(buffer);
+  } }, { highWaterMark: 1 });
+  const snapshots = Array.from(new Uint8Array(await new Response(reused).arrayBuffer()));
+  return { collected: JSON.parse(await streamBody()), brands: JSON.parse(await streamBodyBrands()), before, during, value, cloneText, repeated, empty: empty.byteLength,
+    invalid, errors, lockedConstructor, held, afterRelease, used, cancelled, originalBytes, copyBytes, snapshots };
+}
+
+export async function streamBodyBrands(): Promise<string> {
+  const results = [];
+  const chunks = [
+    Object.setPrototypeOf(new Uint16Array([257]), Uint8Array.prototype),
+    Object.defineProperty(new Uint16Array([257]), Symbol.toStringTag, { value: 'Uint8Array' }),
+    Object.setPrototypeOf(new Uint8Array([1, 2]), Uint16Array.prototype),
+    Object.defineProperty(new Uint8Array([3, 4]), Symbol.toStringTag, { value: 'Uint16Array' }),
+  ];
+  for (const chunk of chunks) {
+    const response = new Response(new ReadableStream({ start(c) { c.enqueue(chunk); c.close(); } }));
+    results.push(await response.arrayBuffer().then(b => Array.from(new Uint8Array(b)), errorName));
+  }
+  const bodies = [];
+  const bytes = Object.setPrototypeOf(new Uint8Array([65]), ReadableStream.prototype);
+  bodies.push(await new Response(bytes).text().then(v => v, errorName));
+  for (const prototype of [null, Uint8Array.prototype]) {
+    const stream = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([66])); c.close(); } });
+    Object.setPrototypeOf(stream, prototype);
+    stream.toString = () => { throw new Error('the stream was stringified'); };
+    try {
+      const reader = ReadableStream.prototype.getReader.call(stream);
+      reader.releaseLock();
+      const response = new Response(stream), clone = response.clone();
+      bodies.push([await response.text(), await clone.text()]);
+    } catch (e) { bodies.push(errorName(e)); }
+  }
+  return JSON.stringify({ chunks: results, bodies });
+}
+
+export async function streamBody(): Promise<string> {
+  const encoded = new TextEncoder().encode('hello');
+  const source = () => new ReadableStream({ start(c) { c.enqueue(encoded); c.close(); } });
+  const viaResponse = await new Response(source()).text();
+  if (viaResponse !== 'hello') throw new Error(`Response read ${viaResponse}`);
+  const cs = new CompressionStream('gzip'), writer = cs.writable.getWriter();
+  const writes = Promise.all([writer.write(encoded), writer.close()]);
+  const packed = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+  await writes;
+  const unpacked = await new Response(new ReadableStream({ start(c) { c.enqueue(packed); c.close(); } })
+    .pipeThrough(new DecompressionStream('gzip'))).text();
+  return JSON.stringify({ viaResponse, magic: Array.from(packed.subarray(0, 2)), unpacked });
+}
+
+export async function streamUpload(): Promise<string> {
+  const results = [];
+  const locked = Object.getOwnPropertyDescriptor(ReadableStream.prototype, 'locked')!.get!;
+  for (const prototype of [ReadableStream.prototype, null, Uint8Array.prototype]) {
+    for (const duplex of ['half', undefined]) {
+      const stream = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])); c.close(); } });
+      Object.setPrototypeOf(stream, prototype);
+      let stringified = false;
+      stream.toString = () => { stringified = true; return 'wrong'; };
+      try {
+        await fetch('https://fixture.exact.test/up', { method: 'POST', body: stream, duplex } as RequestInit);
+        results.push('sent');
+      } catch (e) {
+        results.push(`${errorName(e)}: ${(e as Error).message}; locked=${locked.call(stream)}; stringified=${stringified}`);
+      }
+    }
+  }
+  return JSON.stringify(results);
 }

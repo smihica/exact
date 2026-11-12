@@ -214,6 +214,22 @@ fn pointercancel_names_the_pointerup_that_ends_a_hold() {
     );
 }
 
+/// An agent who knows CSS writes `animationend=`: the refusal names the timer.
+#[test]
+fn a_motion_end_handler_names_the_gated_timer() {
+    for name in ["animationend", "transitionend"] {
+        let e = contract::compile(&format!(
+            "component App\n  state shown = true\n  action hide\n    shown = false\n  view\n    view {name}=hide\n      text \"Toast\"\n",
+        ))
+        .unwrap_err();
+        assert_eq!(e.id, "lower-unknown-attr");
+        assert!(
+            e.message.contains("a gated task's `after(ms, action)`"),
+            "{e}"
+        );
+    }
+}
+
 #[test]
 fn a_vendor_prefixed_name_is_an_attribute_before_its_equals_and_a_negation_elsewhere() {
     // LLP 1077 D7: glued to `=` or spaced from it, as any attribute may be.

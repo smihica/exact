@@ -544,6 +544,11 @@ fn run<D: DataSource + Default>(
         if stop {
             break;
         }
+        // Each turn, a second at most apart (the poll's timeout below), so
+        // the first turn after a resume or a clock change retells the date.
+        if let Some(e) = p.follow_local_offset() {
+            log(&format!("exact: {e}"));
+        }
         let now = wall();
         // A timer due when a frame is about to paint (a list's live tick in
         // a fling) runs once that frame is out, as a scrolled list's

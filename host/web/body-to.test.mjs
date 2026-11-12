@@ -4,7 +4,9 @@
 // 2xx body into the app's store (storage-fs.js `bodyTarget`), whole or not
 // at all, and read any other reply as usual.
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { hostFixtureFile as readFileSync, glueCase } from './tests/glue-fixture.mjs';
+import { request } from './http-body.js';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -13,6 +15,41 @@ import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 const ROOT = resolve(import.meta.dirname, '../..');
 const BIG = (17 << 20) + 5;
 const byte = i => (i * 31 ^ i >> 9) & 255;
+
+test('a wasm request uses the module host and retires with its incarnation', async () => {
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('reply') });
+  try {
+    const host = { incarnation: 7, grantSet: normalized(`net.fetch ${server.url.origin}`), moduleLoader: {} };
+    const replies = [], tracked = [], controllers = new Set(), byTicket = new Map(), forgettable = new Map();
+    let options;
+    const bindings = {
+      host, controllers, byTicket, forgettable, heldAsks: new Map(),
+      loadPageNative: () => {}, localAssetURL: url => url, pageFile: () => null,
+      encoder: new TextEncoder(),
+      safelyFulfill: (...args) => replies.push(args),
+      track: promise => tracked.push(promise),
+      httpHelpers: async () => ({ request(op, context) {
+        options = context;
+        expect(context.active()).toBe(true);
+        return request(op, context);
+      } }),
+    };
+    const arm = glueCase(readFileSync(new URL('./glue.js', import.meta.url), 'utf8'), 'request');
+    const apply = new Function(...Object.keys(bindings), 'op', `switch (op.op) { ${arm} }`);
+    apply(...Object.values(bindings), { op: 'request', ticket: 9, method: 'GET', url: server.url.href, headers: [] });
+    await Promise.all(tracked);
+    expect(options.grantSet).toBe(host.grantSet);
+    expect(options.moduleLoader).toBe(host.moduleLoader);
+    expect(options.active()).toBe(true);
+    host.incarnation++;
+    expect(options.active()).toBe(false);
+    expect(replies[0].slice(0, 4)).toEqual([7, 9, 0, 200]);
+    expect(new TextDecoder().decode(replies[0][5])).toBe('reply');
+    expect([controllers.size, byTicket.size, forgettable.size]).toEqual([0, 0, 0]);
+  } finally {
+    server.stop(true);
+  }
+});
 
 // The grant set as the build makes it (the exact-web-js normalizer).
 function normalized(spec) {

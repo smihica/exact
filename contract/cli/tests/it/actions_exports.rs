@@ -196,7 +196,6 @@ fn an_app_recolours_the_primary_fill_and_ink_by_full_name_and_not_the_overlay() 
         }
         match node.computed(row) {
             RowValue::ColorValue(c) => c,
-            RowValue::Color(c) => ColorValue::Fixed(c),
             other => panic!("{id} {path:?}: {other:?}"),
         }
     };

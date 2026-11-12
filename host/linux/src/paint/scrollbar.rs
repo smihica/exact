@@ -1,4 +1,4 @@
-//! Desktop scroll thumbs use the same extent and offset as the painted content.
+//! Desktop scroll thumbs show the physical position within the painted content.
 use super::*;
 
 pub(crate) const WIDTH: f32 = 12.;
@@ -12,7 +12,9 @@ pub(crate) struct Bar {
     pub track: Rect4,
     pub thumb: Rect4,
     pub max: f32,
+    /// Physical offset from the left or top edge.
     pub offset: f32,
+    pub from_right: bool,
 }
 
 pub(crate) fn contains(r: Rect4, x: f32, y: f32) -> bool {
@@ -48,6 +50,14 @@ impl Bar {
         }
         ((point - grab - self.start(self.track)) / travel).clamp(0., 1.) * self.max
     }
+
+    pub fn scroll_offset(&self, physical: f32) -> f32 {
+        if self.from_right {
+            self.max - physical
+        } else {
+            physical
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +90,8 @@ impl Painter {
                 &node,
                 self.scrollbars.limits.get(&b.id).copied(),
             );
-            if let Some(field) = walk.fields.get(&b.id) {
+            let field = walk.fields.get(&b.id);
+            if let Some(field) = field {
                 bounds.max = field.scroll_max;
             }
             let axes = [bounds.axes.0, bounds.axes.1];
@@ -118,6 +129,8 @@ impl Painter {
                 }
                 let size = (length * visible / (visible + max[i])).max(24.).min(length);
                 let offset = if vertical { offset.1 } else { offset.0 };
+                let from_right = !vertical && field.is_some_and(|f| f.scrolls_from_right());
+                let offset = if from_right { max[i] - offset } else { offset };
                 let start = offset.clamp(0., max[i]) / max[i] * (length - size);
                 let thumb = if vertical {
                     (track.0, track.1 + start, WIDTH, size)
@@ -133,6 +146,7 @@ impl Painter {
                     thumb,
                     max: max[i],
                     offset,
+                    from_right,
                 });
             }
         }

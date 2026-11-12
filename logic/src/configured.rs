@@ -10,7 +10,7 @@ macro_rules! configured {
                 Self(($factory)())
             }
         }
-        impl $crate::exact_runner::DataSource for $name {
+        impl $crate::exact_runner::DataSourceWrapper for $name {
             fn prepare_snapshot(
                 &mut self,
                 module: Option<$crate::exact_runner::SnapshotModule<'_>>,
@@ -20,6 +20,9 @@ macro_rules! configured {
             }
             fn take_storage_changed(&mut self) -> bool {
                 $crate::exact_runner::DataSource::take_storage_changed(&mut self.0)
+            }
+            fn note_storage_changed(&mut self) {
+                $crate::exact_runner::DataSource::note_storage_changed(&mut self.0)
             }
             fn set_document_owner(&mut self, owner: u64) {
                 $crate::exact_runner::DataSource::set_document_owner(&mut self.0, owner)
@@ -39,6 +42,15 @@ macro_rules! configured {
             }
             fn canvas_surfaces(&self) -> Vec<(String, usize)> {
                 $crate::exact_runner::DataSource::canvas_surfaces(&self.0)
+            }
+            fn draw_2d(
+                &mut self,
+                surface: &str,
+                args: &[$crate::exact_plan::Value],
+                ctx: &$crate::exact_runner::exact_canvas::Context2d,
+                frame: &$crate::exact_runner::exact_canvas::Frame,
+            ) -> Result<bool, $crate::exact_runner::exact_canvas::DrawError> {
+                $crate::exact_runner::DataSource::draw_2d(&mut self.0, surface, args, ctx, frame)
             }
             fn draw(
                 &mut self,
@@ -74,6 +86,15 @@ macro_rules! configured {
                 token: u64,
             ) -> Option<Box<dyn FnOnce() -> $crate::exact_runner::Outcome + Send>> {
                 $crate::exact_runner::DataSource::continuation(&mut self.0, token)
+            }
+            fn configure_secrets(
+                &mut self,
+                secrets: std::sync::Arc<dyn $crate::exact_runner::SharedSecrets>,
+            ) -> Result<(), $crate::exact_runner::DataError> {
+                $crate::exact_runner::DataSource::configure_secrets(&mut self.0, secrets)
+            }
+            fn host_continuation(&self, token: u64) -> bool {
+                $crate::exact_runner::DataSource::host_continuation(&self.0, token)
             }
             fn placement(&self) -> $crate::exact_runner::Placement {
                 $crate::exact_runner::DataSource::placement(&self.0)
@@ -142,6 +163,9 @@ macro_rules! configured {
             ) -> Vec<Option<u64>> {
                 $crate::exact_runner::DataSource::keep_sent(&mut self.0, store, let_go, refused)
             }
+            fn keeps_sent(&self, fetch: u64) -> bool {
+                $crate::exact_runner::DataSource::keeps_sent(&self.0, fetch)
+            }
             fn timer_before_reply(
                 &mut self,
                 store: &$crate::exact_runner::Store,
@@ -156,6 +180,20 @@ macro_rules! configured {
                 outcome: $crate::exact_runner::Outcome,
             ) -> Result<(), $crate::exact_runner::DataError> {
                 $crate::exact_runner::DataSource::module_landed(&mut self.0, store, token, outcome)
+            }
+            fn module_delivery(
+                &mut self,
+                store: &mut $crate::exact_runner::Store,
+                token: u64,
+                outcome: $crate::exact_runner::Outcome,
+            ) -> Result<Option<$crate::exact_runner::Request>, $crate::exact_runner::DataError>
+            {
+                $crate::exact_runner::DataSource::module_delivery(
+                    &mut self.0,
+                    store,
+                    token,
+                    outcome,
+                )
             }
             fn take_logs(&mut self) -> Vec<String> {
                 $crate::exact_runner::DataSource::take_logs(&mut self.0)

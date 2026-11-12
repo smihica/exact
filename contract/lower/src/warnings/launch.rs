@@ -174,7 +174,8 @@ impl<'a> Names<'a> {
 
 pub(super) fn launch_identity(root: &Component, fns: &[FnDecl], out: &mut Vec<LowerError>) {
     let names = Names::of(root, fns);
-    for r in &root.resources {
+    // A `transient` resource keeps no answer to show (LLP 1156.005 D4).
+    for r in root.resources.iter().filter(|r| !r.transient) {
         let identity = &r.args[..r.identity.unwrap_or(r.args.len())];
         for (k, arg) in identity.iter().enumerate() {
             if names.of_launch(arg, &[], 4) {

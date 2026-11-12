@@ -670,6 +670,8 @@ final class RecognizerEngine: RecognitionEngine {
     private var tap: ExactSubscription?
     private var stopping = false, aborted = false
     private let lock = NSLock()
+    /// Under `lock`: the reader reads no further once the recognition stops, aborts or ends.
+    private var halted = false
     private var segmentStart = 0.0
 
     init(_ r: Recognition, _ args: [String: Any], file: URL?) {
@@ -711,20 +713,29 @@ final class RecognizerEngine: RecognitionEngine {
             if result.isFinal { segmentEnded() }
         } else if let error {
             let code = (error as NSError).code
-            // 1110: no speech detected; 301: the request was canceled.
-            if code == 1110, r.continuous, !stopping { return segmentEnded() }
-            r.engineEnded(code == 1110 ? "no-speech" : code == 301 ? "aborted" : r.leavesDevice ? "network" : "audio-capture", error.localizedDescription)
+            // 1110: no speech detected; 301: the request was canceled. A file runs to its end (D9), so a silent request of one is a seam.
+            if code == 1110, r.continuous || file != nil, !stopping { return segmentEnded() }
+            end(code == 1110 ? "no-speech" : code == 301 ? "aborted" : r.leavesDevice ? "network" : "audio-capture", error.localizedDescription)
         }
     }
 
     /// A request ended: the recognition goes on in a new one, or ends.
     private func segmentEnded() {
         guard let r, r.state != "ended" else { return }
-        if stopping || (!r.continuous && file == nil) { return r.engineEnded(nil) }
-        if file != nil, readDone { return r.engineEnded(nil) }
+        if stopping || (!r.continuous && file == nil) { return end(nil) }
+        lock.lock(); let readDone = readDone; lock.unlock()
+        if file != nil, readDone { return end(nil) }
         r.seam("the request ended")
         begin()
     }
+
+    private func end(_ error: String?, _ text: String? = nil) {
+        halt()
+        r?.engineEnded(error, text)
+    }
+
+    private func halt() { lock.lock(); halted = true; lock.unlock() }
+    private var isHalted: Bool { lock.lock(); defer { lock.unlock() }; return halted }
 
     // The file, read in segments of under a minute each (D9).
     private var readDone = false
@@ -734,7 +745,7 @@ final class RecognizerEngine: RecognitionEngine {
         }
         let format = f.processingFormat, chunk = AVAudioFrameCount(format.sampleRate)
         var inSegment = 0.0
-        while !aborted, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk), (try? f.read(into: buffer)) != nil, buffer.frameLength > 0 {
+        while !isHalted, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk), (try? f.read(into: buffer)) != nil, buffer.frameLength > 0 {
             lock.lock(); let request = request; lock.unlock()
             request?.append(buffer)
             inSegment += Double(buffer.frameLength) / format.sampleRate
@@ -743,11 +754,10 @@ final class RecognizerEngine: RecognitionEngine {
                 segmentStart += inSegment * 1000
                 inSegment = 0
                 request?.endAudio()
-                while !aborted { lock.lock(); let same = self.request === request; lock.unlock(); if !same { break }; usleep(20000) }
+                while !isHalted { lock.lock(); let same = self.request === request; lock.unlock(); if !same { break }; usleep(20000) }
             }
         }
-        readDone = true
-        lock.lock(); let request = request; lock.unlock()
+        lock.lock(); readDone = true; let request = request; lock.unlock()
         request?.endAudio()
     }
 
@@ -762,6 +772,7 @@ final class RecognizerEngine: RecognitionEngine {
 
     func stop() {
         stopping = true
+        halt()
         tap?.cancel(); tap = nil
         lock.lock(); let request = request; lock.unlock()
         request?.endAudio()
@@ -769,6 +780,7 @@ final class RecognizerEngine: RecognitionEngine {
 
     func abort() {
         aborted = true
+        halt()
         tap?.cancel(); tap = nil
         task?.cancel()
     }

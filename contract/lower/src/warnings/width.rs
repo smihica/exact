@@ -10,7 +10,7 @@
 //!
 //! Only what is certain is named. The width is exactly `100%` (a smaller
 //! percentage may fit); the box is a container; its parent takes the
-//! percentage of its own content (a block, or a column: a row's items
+//! percentage of its own content (the window, a block, or a column: a row's items
 //! shrink to fit, a grid's resolve against a cell); a padding or border
 //! that is written with a positive size. A computed value, a `class` the
 //! compiler would have to look through for an unnamed style, a positioned
@@ -21,11 +21,11 @@ use crate::LowerError;
 use contract_syntax::{Attr, Expr, Node, Span, StyleDecl};
 use std::collections::BTreeSet;
 
-/// How a node lays out the children the walk gives it.
+/// How the containing box lays out the children the walk gives it.
 #[derive(Clone, Copy, PartialEq)]
 enum Parent {
-    /// A block, or a column that stretches its items: a child's percentage
-    /// width is of this box's content.
+    /// The window, a block, or a column that stretches its items: a child's
+    /// percentage width is of this box's content.
     Fills,
     /// Anything else, or nothing known: a row, a grid, a component's slot.
     Other,
@@ -197,7 +197,7 @@ fn inset(rows: &[&Attr]) -> bool {
 /// `lower-width-padding` over the whole view.
 pub(super) fn width_padding(view: &[Node], styles: &[StyleDecl], out: &mut Vec<LowerError>) {
     let mut seen = BTreeSet::new();
-    walk(view, Parent::Other, false, styles, &mut seen, out);
+    walk(view, Parent::Fills, false, styles, &mut seen, out);
 }
 
 fn walk(

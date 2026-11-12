@@ -1,3 +1,4 @@
+import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
 
@@ -6,7 +7,7 @@ test('relaunch reloads the browser document and keeps committed storage', async 
     const path = new URL(request.url).pathname;
     if (path === '/commands.js') return new Response(Bun.file(new URL('./commands.js', import.meta.url)));
     if (path === '/frame-messages.js') return new Response(Bun.file(new URL('../web/frame-messages.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../web/navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../web/navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     if (path === '/prompt-glue.js') return new Response(Bun.file(new URL('../web/prompt-glue.js', import.meta.url)));
     if (path === '/alert-message.js') return new Response(Bun.file(new URL('../web/alert-message.js', import.meta.url)));
     if (path === '/menu-rows.js') return new Response(Bun.file(new URL('../web/menu-rows.js', import.meta.url)));
@@ -48,7 +49,7 @@ test("a prompt's Return commits its field, then presses its action", async () =>
     const path = new URL(request.url).pathname;
     if (path === '/commands.js') return new Response(Bun.file(new URL('./commands.js', import.meta.url)));
     if (path === '/frame-messages.js') return new Response(Bun.file(new URL('../web/frame-messages.js', import.meta.url)));
-    if (path === '/navigation.js') return new Response(Bun.file(new URL('../web/navigation.js', import.meta.url)));
+    if (path === '/navigation.js') return new Response(hostFixtureFile(new URL('../web/navigation.js', import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     if (path === '/prompt-glue.js') return new Response(Bun.file(new URL('../web/prompt-glue.js', import.meta.url)));
     if (path === '/alert-message.js') return new Response(Bun.file(new URL('../web/alert-message.js', import.meta.url)));
     if (path === '/menu-rows.js') return new Response(Bun.file(new URL('../web/menu-rows.js', import.meta.url)));
@@ -110,7 +111,7 @@ test('openURL opens a declared scheme, refuses the rest, and journals under the 
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     for (const [name, file] of [['commands.js', './commands.js'], ['frame-messages.js', '../web/frame-messages.js'], ['navigation.js', '../web/navigation.js'], ['prompt-glue.js', '../web/prompt-glue.js'], ['alert-message.js', '../web/alert-message.js'], ['menu-rows.js', '../web/menu-rows.js']]) {
-      if (path === `/${name}`) return new Response(Bun.file(new URL(file, import.meta.url)));
+      if (path === `/${name}`) return new Response(hostFixtureFile(new URL(file, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     }
     return new Response(`<script type="module">
         import { openURL } from '/commands.js';
@@ -154,7 +155,7 @@ test('openDevTools is refused on the web', async () => {
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     for (const [name, file] of [['commands.js', './commands.js'], ['frame-messages.js', '../web/frame-messages.js'], ['navigation.js', '../web/navigation.js'], ['prompt-glue.js', '../web/prompt-glue.js'], ['alert-message.js', '../web/alert-message.js'], ['menu-rows.js', '../web/menu-rows.js']]) {
-      if (path === `/${name}`) return new Response(Bun.file(new URL(file, import.meta.url)));
+      if (path === `/${name}`) return new Response(hostFixtureFile(new URL(file, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     }
     return new Response(`<iframe id="tab"></iframe><script type="module">
         import { openDevTools } from '/commands.js';
@@ -181,7 +182,7 @@ test('the trace commands are refused in the journal', async () => {
   const server = Bun.serve({ port: 0, fetch(request) {
     const path = new URL(request.url).pathname;
     for (const [name, file] of [['commands.js', './commands.js'], ['frame-messages.js', '../web/frame-messages.js'], ['navigation.js', '../web/navigation.js'], ['prompt-glue.js', '../web/prompt-glue.js'], ['alert-message.js', '../web/alert-message.js'], ['menu-rows.js', '../web/menu-rows.js']]) {
-      if (path === `/${name}`) return new Response(Bun.file(new URL(file, import.meta.url)));
+      if (path === `/${name}`) return new Response(hostFixtureFile(new URL(file, import.meta.url)), { headers: { 'content-type': 'text/javascript' } });
     }
     return new Response(`<script type="module">
         import { startTrace_EXPERIMENTAL, stopTrace_EXPERIMENTAL } from '/commands.js';

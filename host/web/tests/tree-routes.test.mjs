@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1153 D8, in Chrome, Firefox and WebKit: the wasm runtime's agent `tree` (glue.js `tree`) flags a node `inactive`,
 // and `hidden` too, as the navigation glue's projection left the page (navigation.js `routeFlags`, which the JS target's
 // tree reads too), not as the runner flags it: the runner knows no pane on the web, so it would hide a split's list
@@ -5,7 +6,6 @@
 // sheet the page shows, wide the list too, inert; whatever the runner said, the page's flags are the reply's. A
 // flowed paragraph's runs, held off the page while its fragments paint (textflow-glue.js), take their paragraph's.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';

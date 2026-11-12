@@ -1,3 +1,4 @@
+use crate::keyboard::key_names;
 use exact_ink::counters;
 use exact_linux::{
     app::{self, Config},
@@ -15,7 +16,6 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, MouseButton, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{Key, PhysicalKey},
     platform::windows::{EventLoopBuilderExtWindows, WindowAttributesExtWindows},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{CursorIcon, Fullscreen, Theme, Window, WindowId},
@@ -82,19 +82,6 @@ impl<D: DataSource> Drop for App<D> {
         self.presenter.take();
         self.caret.clear();
     }
-}
-
-fn key_names(physical: PhysicalKey, logical: &Key, text: Option<&str>) -> (String, String) {
-    let code = match physical {
-        PhysicalKey::Code(code) => format!("{code:?}").replace("Super", "Meta"),
-        PhysicalKey::Unidentified(_) => "Unidentified".into(),
-    };
-    let key = match logical {
-        Key::Character(s) => s.to_string(),
-        Key::Named(k) => format!("{k:?}"),
-        _ => text.unwrap_or("Unidentified").to_owned(),
-    };
-    (code, key)
 }
 
 fn system_theme<D: DataSource>(p: &mut Presenter<D>, theme: Theme) {
@@ -277,6 +264,8 @@ pub(super) fn run<D: DataSource + Default + 'static>(
         config.size = (opening.width, opening.height);
     }
     let mut builder = EventLoop::<crate::accessibility::Event>::with_user_event();
+    // `crate::on_desktop_stack`'s thread, not the process's first.
+    builder.with_any_thread(true);
     let ime = crate::ime::InputMethod::default();
     let desktop = crate::desktop::Desktop::install(name);
     let ime_message = ime.message_hook();
@@ -881,7 +870,7 @@ impl<D: DataSource + Default + 'static> App<D> {
         };
         let picked = crate::edit_menu::show(handle.hwnd.get(), &menu, self.scale as f32);
         p.advance(self.started.elapsed().as_secs_f64() * 1000.);
-        crate::keyboard::sync(p);
+        crate::keyboard::sync(p, None);
         match picked {
             Ok(Some(action)) => p.edit_menu_action(&menu, action),
             Ok(None) => {}
@@ -894,10 +883,8 @@ impl<D: DataSource + Default + 'static> App<D> {
 
 impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility::Event> for App<D> {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if counters::enabled() {
-                self.service_causes |= counters::TIMER;
-            }
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) && counters::enabled() {
+            self.service_causes |= counters::TIMER;
         }
         let _span = crate::probe::Span::new("run loop wake", self.service_causes);
     }
@@ -1157,7 +1144,9 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
         match event {
             WindowEvent::ThemeChanged(theme) => system_theme(p, theme),
             WindowEvent::Moved(_) => self.ime.reposition(),
-            WindowEvent::ModifiersChanged(_) => crate::keyboard::sync(p),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                crate::keyboard::sync(p, Some(modifiers.state()))
+            }
             WindowEvent::Focused(focused) => {
                 self.clicks.clear();
                 if !focused {
@@ -1166,7 +1155,7 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
                 if focused {
                     p.refresh_scrollbar_preferences();
                     p.set_window_active(true);
-                    crate::keyboard::sync(p);
+                    crate::keyboard::sync(p, None);
                 }
                 self.focused = focused;
                 p.surface_lifecycle(self.minimized || self.occluded, !focused);
@@ -1368,6 +1357,9 @@ impl<D: DataSource + Default + 'static> App<D> {
         if let Some(p) = self.presenter.as_mut() {
             p.windows_field_edits(self.started.elapsed().as_secs_f64() * 1000.);
             p.timer_visibility(self.minimized || self.occluded);
+            if let Some(e) = p.follow_local_offset() {
+                eprintln!("exact-windows: {e}");
+            }
             let now = self.started.elapsed().as_secs_f64() * 1000.0;
             if p.wake_due_ms().is_some_and(|due| due <= now) {
                 if let Some(e) = p.advance(now) {

@@ -576,6 +576,204 @@ final class PresenceIOSTests: XCTestCase {
         XCTAssertTrue(v.transform.isIdentity)
     }
 
+    func testAResizingBorderedBoxClipsChildrenInsideItsBorder() throws {
+        let p = fixture()
+        let card = try XCTUnwrap(p.views[2])
+        p.apply(wireBatch([
+            ["op": "create", "id": 5, "kind": "view", "style": ["background_color": [0, 0, 255, 255]]],
+            ["op": "children", "id": 2, "ids": [3, 5]],
+            ["op": "frame", "id": 5, "x": 6.0, "y": 6.0, "w": 188.0, "h": 100.0],
+            ["op": "style", "id": 2, "style": ["background_color": [255, 255, 255, 255],
+                "border_width": 6, "border_color_top": [255, 0, 0, 255], "border_radius": 40,
+                "corner_shape": ["apple", "apple", "apple", "apple"],
+                "overflow_x": "hidden", "overflow_y": "hidden"]],
+            ["op": "style", "id": 3, "style": ["background_color": [0, 255, 0, 255]]],
+            ["op": "frame", "id": 2, "x": 0.0, "y": 0.0, "w": 200.0, "h": 200.0],
+            ["op": "frame", "id": 3, "x": 6.0, "y": 6.0, "w": 188.0, "h": 288.0],
+        ]))
+        let flat = try XCTUnwrap(p.flats.leaves[5])
+        for height in [100.0, 300.0] {
+            p.apply(wireBatch([["op": "present", "id": 2, "property": "layout",
+                               "x": 0.0, "y": 0.0, "w": 0.0, "h": height - 200]]))
+            let surface = try XCTUnwrap(card.surface)
+            XCTAssertTrue(flat.layer.superlayer === card.container.layer, "flat children follow the animated clip")
+            let clip = try XCTUnwrap(surface.clip.path)
+            XCTAssertEqual(clip.boundingBoxOfPath, CGRect(x: 6, y: 6, width: 188, height: height - 12))
+            XCTAssertFalse(clip.contains(CGPoint(x: 100, y: height - 3)), "children cannot cover the bottom border")
+            XCTAssertFalse(clip.contains(CGPoint(x: 7, y: 7)), "children follow the inner corner")
+            XCTAssertFalse(surface.clipped === card.layer, "the child mask must not cut off the surface's border")
+            let outer = try XCTUnwrap(card.layer.mask as? CAShapeLayer)
+            XCTAssertEqual(outer.path?.boundingBoxOfPath, CGRect(x: 0, y: 0, width: 200, height: height), "the node's own paint still clips")
+            XCTAssertFalse(surface.clipped?.masksToBounds ?? true, "a shrinking clip can exceed the laid-out bounds")
+        }
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout",
+                           "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0]]))
+        XCTAssertNil(card.surface)
+        XCTAssertTrue(card.clipsToBounds)
+        XCTAssertNil(card.clipBox)
+        XCTAssertTrue(p.views[3]?.superview === card)
+        XCTAssertTrue(flat.layer.superlayer === card.layer, "flat children return with the views")
+    }
+
+    func testAPlacedBoxKeepsItsSurfaceClipsWhileResizingAndChangingTargets() throws {
+        for border in [0, 6] {
+            let p = fixture(), card = try XCTUnwrap(p.views[2])
+            defer { p.reset(); window.isHidden = true }
+            var style: [String: Any] = ["border_width": border, "border_radius": 20,
+                "overflow_x": "hidden", "overflow_y": "hidden"]
+            p.apply(wireBatch([["op": "style", "id": 2, "style": style]]))
+            card.placement = [1, 0, 100, 0, 1, 0, 0, 0, 1, 0]
+            let placementMask = try XCTUnwrap(card.layer.mask)
+            for height in [100.0, 150.0] {
+                p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": height - 50]]))
+                let surface = try XCTUnwrap(card.surface)
+                XCTAssertTrue(card.layer.mask === placementMask, "the empty placement mask stays installed")
+                XCTAssertEqual(card.alpha, 1)
+                XCTAssertTrue(surface.clipped?.boxMask === surface.clip, "the requested clip survives the next frame")
+                XCTAssertTrue(card.layer.boxMask === (border == 0 ? surface.clip : surface.ownClip))
+                XCTAssertEqual(surface.clip.path?.boundingBoxOfPath.height ?? 0, height - CGFloat(2 * border), accuracy: 1e-9)
+            }
+            let surface = try XCTUnwrap(card.surface), oldTarget = try XCTUnwrap(surface.clipped)
+            style["overflow_y"] = "auto"
+            p.apply(wireBatch([["op": "style", "id": 2, "style": style]]))
+            let scroll = try XCTUnwrap(card.scroll)
+            XCTAssertFalse(oldTarget.boxMask === surface.clip, "the old target releases the requested clip")
+            XCTAssertTrue(scroll.layer.mask === surface.clip)
+            XCTAssertTrue(card.layer.mask === placementMask)
+            p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 0.0]]))
+            XCTAssertNil(card.surface)
+            XCTAssertFalse(card.layer.boxMask === surface.clip || card.layer.boxMask === surface.ownClip)
+            XCTAssertNil(scroll.layer.mask)
+            XCTAssertTrue(scroll.clipsToBounds)
+            XCTAssertTrue(card.layer.mask === placementMask, "ending the resize does not end placement")
+            let restored = card.layer.boxMask
+            card.placement = nil
+            XCTAssertTrue(card.layer.mask === restored, "unplacing restores the box's current mask")
+        }
+    }
+
+    func testALayoutBatchGivesTheSiblingAndSurfaceMatchingModelEdges() throws {
+        let p = fixture(), card = try XCTUnwrap(p.views[2]), sibling = try XCTUnwrap(p.views[4])
+        for offset in [-30.0, 100.0, 60.0, 0.0] {
+            p.apply(wireBatch([
+                ["op": "present", "id": 2, "property": "layout", "h": offset],
+                ["op": "present", "id": 4, "property": "layout", "y": offset],
+            ]))
+            let height = card.surface?.bounds.height ?? card.bounds.height
+            let bottom = card.convert(CGPoint(x: 0, y: height), to: p.root).y
+            XCTAssertEqual(sibling.convert(.zero, to: p.root).y, bottom, accuracy: 1e-6)
+        }
+    }
+
+    func testAResizingClipHandsItsChildrenToANewScroller() throws {
+        let p = fixture(), card = try XCTUnwrap(p.views[2])
+        var style: [String: Any] = ["border_width": 6, "border_color_top": [255, 0, 0, 255], "border_radius": 40,
+            "overflow_x": "hidden", "overflow_y": "hidden"]
+        p.apply(wireBatch([["op": "style", "id": 2, "style": style],
+            ["op": "present", "id": 2, "property": "layout", "h": 100.0]]))
+        let oldClip = try XCTUnwrap(card.clipBox)
+        style["overflow_y"] = "auto"
+        p.apply(wireBatch([["op": "style", "id": 2, "style": style]]))
+        let scroll = try XCTUnwrap(card.scroll), child = try XCTUnwrap(p.views[3])
+        XCTAssertTrue(child.superview === scroll, "the child must scroll during the transition")
+        XCTAssertNil(card.clipBox)
+        XCTAssertNil(oldClip.layer.mask, "the former clip releases its surface mask")
+        XCTAssertTrue(oldClip.clipsToBounds, "the former clip restores its bounds clipping")
+        XCTAssertTrue(card.surface?.clipped === scroll.layer)
+        XCTAssertFalse(card.clipsToBounds, "the shrinking surface extends beyond the laid-out box")
+        let surface = try XCTUnwrap(card.surface)
+        XCTAssertEqual(surface.bounds.height, 150)
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 400, height: 160, bitsPerComponent: 8,
+            bytesPerRow: 1600, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 400, height: 160), format: format).image {
+            p.root.layer.render(in: $0.cgContext)
+        }
+        ctx.draw(try XCTUnwrap(image.cgImage), in: CGRect(x: 0, y: 0, width: 400, height: 160))
+        let bytes = try XCTUnwrap(ctx.data).assumingMemoryBound(to: UInt8.self)
+        XCTAssertEqual((0..<4).map { Int(bytes[(147 * 400 + 200) * 4 + $0]) }, [255, 0, 0, 255],
+                       "the bottom border draws beyond the node's 50-point bounds")
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 0.0]]))
+        XCTAssertTrue(child.superview === scroll, "the child must still scroll after the transition")
+        XCTAssertTrue(scroll.clipsToBounds)
+        XCTAssertNil(scroll.layer.mask)
+        XCTAssertTrue(card.clipsToBounds, "the laid-out clip returns when the surface ends")
+    }
+
+    func testRemovingScrollingDuringAResizeRestoresVisibleOverflow() throws {
+        let p = fixture(), card = try XCTUnwrap(p.views[2]), child = try XCTUnwrap(p.views[3])
+        p.apply(wireBatch([
+            ["op": "style", "id": 2, "style": ["border_radius": 20,
+                "overflow_x": "auto", "overflow_y": "auto"]],
+            ["op": "frame", "id": 3, "x": 380.0, "y": 0.0, "w": 100.0, "h": 50.0],
+            ["op": "present", "id": 2, "property": "layout", "h": 100.0],
+        ]))
+        let surface = try XCTUnwrap(card.surface), scroll = try XCTUnwrap(card.scroll)
+        XCTAssertTrue(scroll.layer.mask === surface.clip)
+        p.apply(wireBatch([["op": "style", "id": 2, "style": ["border_radius": 20,
+            "overflow_x": "visible", "overflow_y": "visible"]]]))
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 75.0]]))
+        XCTAssertNotNil(card.surface, "the resize is still active")
+        XCTAssertNil(card.scroll)
+        XCTAssertTrue(child.superview === card)
+        XCTAssertGreaterThan(child.frame.maxX, card.bounds.maxX)
+        XCTAssertNil(scroll.layer.mask, "the detached scroller releases the mask")
+        XCTAssertNil(surface.clipped, "visible overflow has no clipping target")
+        XCTAssertNil(card.layer.mask, "the surface must not fall back to masking the host")
+        XCTAssertFalse(card.clipsToBounds)
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "layout", "h": 0.0]]))
+        XCTAssertNil(card.surface)
+        XCTAssertNil(card.layer.mask)
+        XCTAssertFalse(card.clipsToBounds)
+    }
+
+    func testNativeContentClipsInsideAResizingBorder() throws {
+        let p = fixture()
+        for (id, kind, props) in [(10, "textarea", ["value": "Content"]),
+                                  (12, "input", ["value": "Content"]),
+                                  (11, "image", ["imageSource": "symbol:sf/square.fill", "symbolName": "square.fill"])] {
+            p.apply(wireBatch([
+                ["op": "create", "id": id, "kind": kind, "props": props,
+                 "style": ["appearance": "none", "border_width": 6, "border_radius": 40,
+                           "overflow_x": "hidden", "overflow_y": "hidden"]],
+                ["op": "roots", "ids": [1, id]],
+                ["op": "frame", "id": id, "x": 0.0, "y": 0.0, "w": 200.0, "h": 200.0],
+                ["op": "present", "id": id, "property": "layout", "h": -100.0],
+            ]))
+            let node = try XCTUnwrap(p.views[UInt32(id)])
+            let native = try XCTUnwrap(kind == "input" ? node.field : (kind == "textarea" ? node.textArea : node.symbolView))
+            let surface = try XCTUnwrap(node.surface)
+            XCTAssertTrue(native.superview === node.clipBox, "\(kind) belongs inside the padding-edge clip")
+            XCTAssertTrue(native.superview?.layer.mask === surface.clip)
+            XCTAssertFalse(try XCTUnwrap(surface.clip.path).contains(CGPoint(x: 7, y: 7)))
+            if kind == "input" {
+                node.field?.removeFromSuperview()
+                node.makeField()
+                XCTAssertTrue(node.field?.superview === node.clipBox, "a field created during the resize enters the clip")
+                node.props["type"] = "search"
+                p.apply(wireBatch([["op": "style", "id": id, "style": ["appearance": "auto",
+                    "border_width": 6, "border_radius": 40, "overflow_x": "hidden", "overflow_y": "hidden"]]]))
+                node.styleNativeField()
+                XCTAssertTrue(try XCTUnwrap(node.searchChrome).superview === node.clipBox,
+                              "search chrome stays beside the field")
+            }
+            let replacement = try XCTUnwrap(kind == "input" ? node.field : native)
+            p.apply(wireBatch([["op": "present", "id": id, "property": "layout", "h": 0.0]]))
+            XCTAssertTrue(replacement.superview === node, "native content returns when the surface ends")
+            if kind == "input" {
+                let chrome = try XCTUnwrap(node.searchChrome)
+                XCTAssertTrue(chrome.superview === node)
+                p.apply(wireBatch([["op": "present", "id": id, "property": "layout", "h": -100.0]]))
+                XCTAssertTrue(chrome.superview === node.clipBox, "existing search chrome enters the clip with its field")
+                XCTAssertTrue(replacement.superview === node.clipBox)
+                p.apply(wireBatch([["op": "present", "id": id, "property": "layout", "h": 0.0]]))
+                XCTAssertTrue(chrome.superview === node)
+                XCTAssertTrue(replacement.superview === node)
+            }
+        }
+    }
+
     func testASurfaceTheLayerCannotSayIsDrawnUprightAtTheShownSize() throws {
         let p = fixture()
         let v = try XCTUnwrap(p.views[3])

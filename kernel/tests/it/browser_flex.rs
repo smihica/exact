@@ -382,6 +382,58 @@ fn order_lays_items_out_in_order_modified_document_order() {
     assert_eq!([y(2), y(3), y(4)], [0.0, 10.0, 20.0]);
 }
 
+#[test]
+fn a_new_block_with_only_paint_style_ignores_child_order() {
+    use exact_kernel::{Kernel, MonospaceMeasurer, NodeType, Offer, Op};
+
+    for parent_rows in [vec![], vec![(BackgroundColor, t("#ffffff"))]] {
+        let mut ops = Vec::new();
+        for (id, rows) in [
+            (1, vec![]),
+            (2, parent_rows),
+            (3, vec![(Height, n(10.0)), (Order, n(2.0))]),
+            (4, vec![(Height, n(20.0)), (Order, n(1.0))]),
+        ] {
+            ops.extend([
+                Op::CreateView {
+                    id,
+                    node_type: NodeType::View,
+                },
+                Op::SetStyle {
+                    id,
+                    patch: Box::new(props(&rows)),
+                },
+            ]);
+        }
+        ops.extend([
+            Op::SetChildren {
+                id: 2,
+                children: vec![3, 4],
+            },
+            Op::SetChildren {
+                id: 1,
+                children: vec![2],
+            },
+            Op::AttachRoot { id: 1 },
+        ]);
+        let mut k = Kernel::with_monospace();
+        k.apply(0, 1, &ops).unwrap();
+        let offer = Offer::definite(402.0, 874.0);
+        k.compute_layout(1, offer).unwrap();
+        let failures = mismatches(
+            "a newly mounted block ignores order",
+            &k,
+            &[(3, [0.0, 0.0, 402.0, 10.0]), (4, [0.0, 10.0, 402.0, 20.0])],
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        let mut rebuilt = k.rehydrate(Box::new(MonospaceMeasurer::default()));
+        rebuilt.compute_layout(1, offer).unwrap();
+        for id in 1..=4 {
+            assert_eq!(k.node(id).unwrap().frame, rebuilt.node(id).unwrap().frame);
+        }
+    }
+}
+
 /// A flex container in a column that does not stretch it is sized at
 /// fit-content, and its main size (height) is found at that width (CSS
 /// Flexbox §9.2 3E). Measured under the available width alone, a wrapping

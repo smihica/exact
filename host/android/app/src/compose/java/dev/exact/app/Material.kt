@@ -1,14 +1,17 @@
 package dev.exact.app
 
 import android.app.Activity
-import android.content.res.ColorStateList
+import android.content.Context
 import android.content.res.Configuration
+import android.content.res.Resources
+import android.os.Build
 import android.text.format.DateFormat
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDefaults
 import androidx.compose.material3.DatePickerDialog
@@ -23,8 +26,10 @@ import androidx.compose.material3.TimePicker
 import androidx.compose.material3.TimePickerDialog
 import androidx.compose.material3.TimePickerDialogDefaults
 import androidx.compose.material3.TimePickerDisplayMode
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
@@ -39,6 +44,7 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.ColorUtils
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.setViewTreeLifecycleOwner
@@ -56,9 +62,9 @@ import java.time.ZoneOffset
 internal val materialPickers: Pickers? = MaterialPickers
 
 /**
- * Material 3's `DatePickerDialog` and `TimePickerDialog`, as a Compose app shows them, on the device's dynamic
- * colours. Each opens in a `ComposeView` added to the activity for as long as it is up; the dialog is a window of
- * its own above the page. `datetime-local` asks for the day, then the time.
+ * Material 3's `DatePickerDialog` and `TimePickerDialog`, as a Compose app shows them. Each opens in a
+ * `ComposeView` added to the activity for as long as it is up; the dialog is a window of its own above the page.
+ * `datetime-local` asks for the day, then the time.
  */
 private object MaterialPickers : Pickers {
     /** The reader's activity is a plain Activity: Compose looks for a lifecycle and a saved state on the view tree.
@@ -97,21 +103,28 @@ private object MaterialPickers : Pickers {
     }
 }
 
-/**
- * The device's dynamic colours, with the primary roles made from the control's `accent-color` where it has one:
- * Material's tones of that colour (its hue and chroma at each role's lightness, `ColorStateList.withLStar`), as a
- * scheme made from a source colour has them.
- */
 @Composable
 private fun Theme(activity: Activity, accent: Int?, content: @Composable () -> Unit) {
     val dark = activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-    val device = if (dark) dynamicDarkColorScheme(activity) else dynamicLightColorScheme(activity)
-    val scheme = if (accent == null) device else {
-        val tone = { t: Float -> Color(ColorStateList.valueOf(accent).withLStar(t).defaultColor) }
+    MaterialTheme(colorScheme = pickerColorScheme(activity, dark, accent), content = content)
+}
+
+/** Dynamic colours where available, else Material's baseline, as the page's Palette reads (LLP 1115.001.003 D2).
+ * An authored accent supplies the primary roles' hue and chroma at Material's tones, including before API 31. */
+internal fun pickerColorScheme(context: Context, dark: Boolean, accent: Int?): ColorScheme {
+    val dynamic = if (Build.VERSION.SDK_INT < 31) null else try {
+        if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    } catch (_: Resources.NotFoundException) {
+        null
+    }
+    val device = dynamic ?: if (dark) darkColorScheme() else lightColorScheme()
+    return if (accent == null) device else {
+        val hct = FloatArray(3)
+        ColorUtils.colorToM3HCT(accent, hct)
+        val tone = { t: Float -> Color(ColorUtils.M3HCTToColor(hct[0], hct[1], t)) }
         if (dark) device.copy(primary = tone(80f), onPrimary = tone(20f), primaryContainer = tone(30f), onPrimaryContainer = tone(90f), inversePrimary = tone(40f), surfaceTint = tone(80f))
         else device.copy(primary = tone(40f), onPrimary = tone(100f), primaryContainer = tone(90f), onPrimaryContainer = tone(10f), inversePrimary = tone(80f), surfaceTint = tone(40f))
     }
-    MaterialTheme(colorScheme = scheme, content = content)
 }
 
 @Composable

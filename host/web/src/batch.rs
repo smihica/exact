@@ -34,6 +34,10 @@ pub(crate) fn request_refusal(request: &exact_runner::Request) -> Option<&'stati
             return Some("only HTTP may opt into independent transport");
         }
     }
+    // This host's sockets carry no idle timeout (LLP 1016.000 D11).
+    if request.idle_timeout_ms.is_some() {
+        return Some("an idle timeout is unavailable on the web's wasm host");
+    }
     (request.ceiling_refusal())
         .or(request.timeout_refusal())
         .or(request.body_from_refusal())

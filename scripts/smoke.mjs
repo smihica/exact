@@ -14,10 +14,10 @@ import { basename, resolve } from 'node:path';
 import { browserDiagnosticNoise, open as openAgent, render, runTests as runAgentTests } from './agent.mjs';
 import { driveStore, pollUntil } from './agent-launch.mjs';
 import { HOST_DEV, authoredTests, resolveApp, withAppFixture } from './app.mjs';
-import { agree, explainNode, hostSections, httpFrameSmoke, formControlsSmoke, poolingDrive, messageKeys, rebooted } from './smoke-inspect.mjs';
+import { agree, explainNode, hostSections, httpFrameSmoke, formControlsSmoke, poolingDrive, messageKeys, rebooted, isDeckURL } from './smoke-inspect.mjs';
 import { DirectoryOrigin, parseWebRoot, webReleasePath, webRootPath } from './origin.mjs';
 import { jsTargetBuild, readStaticFile, serveStatic } from '../host/web/serve.mjs';
-import { canonicalBytes, publicKeyFromRaw, webRelease } from './deploy.mjs';
+import { canonicalBytes, channelOf, publicKeyFromRaw, webRelease } from './deploy.mjs';
 import { crop, decodePng, diff, encodePng } from './png.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -118,7 +118,7 @@ if (host === 'svg') {
   const hosts = argv.includes('--hosts') ? argv[argv.indexOf('--hosts') + 1].split(',') : ['linux', ...(process.platform === 'darwin' ? ['macos', 'ios'] : [])];
   await svgParity({ open: (o) => openAgent({ device, phone, ...o }), check, hosts });
   console.log(`svg smoke: ${failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  if (failures.length) { for (const f of failures) console.error('  ' + f); process.exit(1); }
+  if (failures.length) { for (const f of failures) console.error('FAIL ' + f); process.exit(1); }
   process.exit(0);
 }
 
@@ -130,7 +130,7 @@ if (host === 'motion') {
   const hosts = argv.includes('--hosts') ? argv[argv.indexOf('--hosts') + 1].split(',') : ['linux', ...(process.platform === 'darwin' ? ['macos', 'ios'] : [])];
   await motionParity({ open: (o) => openAgent({ device, phone, ...o }), check, hosts });
   console.log(`motion smoke: ${failures.length ? `${failures.length} failure(s)` : 'ok'} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-  for (const f of failures) console.error('  ' + f); process.exit(failures.length ? 1 : 0);
+  for (const f of failures) console.error('FAIL ' + f); process.exit(failures.length ? 1 : 0);
 }
 
 // Canvas 2D parity (LLP 1056 §4): apps/canvas-gallery on each native host
@@ -181,7 +181,7 @@ if (host === 'deploy') {
   manifest.deploy.signing.keys[keyId] ??= Buffer.alloc(32).toString('base64');
   writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   fixture.git(['add', '-A']); fixture.git(['commit', '--allow-empty', '-qm', 'Diagnostic publishing policy']);
-  const channel = manifest.deploy?.channel ?? 'prod';
+  const channel = channelOf(manifest);
   const assetName = existsSync(resolve(fixtureApp, 'assets')) ? readdirSync(resolve(fixtureApp, 'assets')).find((n) => statSync(resolve(fixtureApp, 'assets', n)).isFile()) : null;
   const assetPath = assetName ? resolve(fixtureApp, 'assets', assetName) : null;
   const asset0 = assetPath ? readFileSync(assetPath) : null;
@@ -578,7 +578,8 @@ try {
     }, ({ frameNode, deckState }) => frameNode?.loading === false && deckState.slots.deckLoaded === true && deckState.slots.deckMessage === 'deck-ready');
     tree = loaded.tree;
     let { frameNode, deckState } = loaded;
-    check(frameNode?.type === 'WebView' && frameNode.url === '/deck/index.html', `the iframe tree node is ${JSON.stringify(frameNode)}`);
+    const frameBase = host === 'web' ? await s.carrier.evaluate('document.baseURI') : null;
+    check(frameNode?.type === 'WebView' && isDeckURL(frameNode.url, frameBase), `the iframe tree node is ${JSON.stringify(frameNode)}`);
     check(frameNode?.loading === false, `the iframe is still loading: ${JSON.stringify(frameNode)}`);
     check(deckState?.slots.deckLoaded === true, `load did not record its flag: ${JSON.stringify(deckState?.slots)}`);
     check(deckState?.slots.deckMessage === 'deck-ready', `message recorded ${JSON.stringify(deckState?.slots.deckMessage)}, not "deck-ready"`);

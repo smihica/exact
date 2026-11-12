@@ -50,6 +50,33 @@ final class FrameAdvanceMacTests: XCTestCase {
         return try XCTUnwrap(midi?["sent"] as? [Any]).count
     }
 
+    func testOcclusionChangesKeepTheLinkWhileOnlyACanvas2dWantsFrames() throws {
+        _ = NSApplication.shared
+        let session = ExactApp.shared.makeSession(label: "canvas-occlusion")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = ExactView(session: session)
+        defer { window.close(); session.destroy() }
+        session.clock = nil
+        session.frames.canvas2d = true
+        XCTAssertFalse(session.frames.motion)
+        XCTAssertFalse(session.frames.timerSoon)
+        XCTAssertFalse(session.canvases.wantsFrames)
+        session.frames.run(session.frames.hasWork)
+        let link = try XCTUnwrap(session.frames.link)
+
+        for _ in 0..<2 {
+            session.occlusionChanged()
+            XCTAssertTrue(session.frames.hasWork)
+            XCTAssertTrue(session.frames.link === link, "occlusion must preserve the canvas's frame request")
+        }
+
+        session.frames.canvas2d = false
+        session.occlusionChanged()
+        XCTAssertFalse(session.frames.hasWork)
+        XCTAssertNil(session.frames.link)
+    }
+
     func testAFrameAdvanceThatShowsNothingSkipsThePass() throws {
         _ = NSApplication.shared
         let session = ExactApp.shared.makeSession(label: "frame-advance")

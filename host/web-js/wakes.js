@@ -11,7 +11,7 @@
 //
 // Registrations (§10): a keyed list declared with a `kind` keeps, beside each entry's options, its runs, attempts and
 // backoff, by the web's rules (D1) as `modules/declared/wake_list.rs` keeps them.
-import { clock, inflight, After, Clocked, Mutations, drive, data } from "./rt.js";
+import { clock, inflight, After, Clocked, Mutations, drive, data, time } from "./rt.js";
 import { Counting, heldTickets } from "./held.js";
 
 const BACKOFF = 5 * 60_000, LONGEST = 60 * 60_000, ATTEMPTS = 3;
@@ -63,6 +63,7 @@ export function wakes({ events, say, value, run, toEpoch, onLine, lists, changed
   };
   const deliver = inv => {
     const [action, , , types, name] = events[inv.key];
+    time();
     current.started ??= clock.now;
     if (!clock.agent && !timer) timer = setTimeout(expire, current.budget);
     inv.state = "running";

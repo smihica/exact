@@ -227,6 +227,16 @@
           "name": "each",
           "codec": "range:args",
           "_comment": "@ref LLP 1017.000 P4c (amended 2026-11-04): empty for one request; for `resource r = source(args) for x in list [key=k] as shape S`, two entries: the list, read as a derive is, then the key, which reads the element as its one parameter (the element itself when no `key=` is written). `args` then read the element as their one parameter too; the source is asked once for each element, keyed as a `for` row is; `ty` is `S[]`, and each request answers `S`."
+        },
+        {
+          "name": "transient",
+          "codec": "bool",
+          "_comment": "@ref LLP 1156.005 D4: `resource ... transient`. The runner neither keeps this resource's answer in the device's store nor seeds a launch from one, and a boot forgets an entry an earlier build kept. It is still asked again at `data_ready` as any store reader is."
+        },
+        {
+          "name": "gate",
+          "codec": "range:args",
+          "_comment": "@ref LLP 1161.002 D1: empty for a resource asked whenever its arguments are ready; for `resource r = source(args) when cond as shape S`, one entry, `cond`, read as a derive is. While it is false the resource is idle: nothing is asked, a request in flight is let go (an upload's goes on), `pending` and `failed` are false, the value it showed stays and is not current. When it turns true the resource is asked, forced."
         }
       ]
     },
@@ -256,9 +266,9 @@
           "_comment": "The action a `mutation … then action` runs after each answer lands, as its own commit (LLP 1016.001). None: nothing runs."
         },
         {
-          "name": "queue",
-          "codec": "bool",
-          "_comment": "@ref LLP 1092 D1, D2: `mutation m as shape T queue` — one send in flight; a later send waits, with its send-time arguments, until the one before it is answered or let go and its `then` has run. False: the newest send wins (LLP 1016 §4)."
+          "name": "mode",
+          "codec": "enum:MutationMode",
+          "_comment": "How its sends overlap. `newest`: a send forgets the one in flight (LLP 1016 §4). `queue` (@ref LLP 1092 D1, D2): one send in flight; a later send waits, with its send-time arguments, until the one before it is answered or let go and its `then` has run. `parallel` (@ref LLP 1161.000 D2-D4): every send is asked when it is made, each its own target at the data seam, and its reply lands whatever else is out."
         }
       ]
     },
@@ -310,6 +320,10 @@
           "codec": "str"
         },
         {
+          "name": "package",
+          "codec": "str"
+        },
+        {
           "name": "declared",
           "codec": "str"
         },
@@ -341,6 +355,10 @@
       "fields": [
         {
           "name": "extension",
+          "codec": "str"
+        },
+        {
+          "name": "package",
           "codec": "str"
         },
         {
@@ -959,6 +977,10 @@
           "codec": "str"
         },
         {
+          "name": "package",
+          "codec": "str"
+        },
+        {
           "name": "displayed",
           "codec": "bool"
         },
@@ -1004,6 +1026,7 @@
   "_enums": "Wire ordinal is the 0-based index. An unknown ordinal is a typed decode rejection.",
   "enums": {
     "SurfaceArgsMode": ["named", "positional"],
+    "MutationMode": ["newest", "queue", "parallel"],
     "TypeKind": [
       "number",
       "bool",
@@ -1409,7 +1432,14 @@
       "_comment": "@ref LLP 1109 D3: `failure(x)`: once the resource settled, `none` while its latest request for its current arguments has not failed, else `some` of the compiler's `Failure` record, `{ code, message }` by position."
     },
     { "name": "FailedMutation", "operands": ["idx:mutations"] },
-    { "name": "FailureMutation", "operands": ["idx:mutations"] }
+    { "name": "FailureMutation", "operands": ["idx:mutations"] },
+    {
+      "name": "CurrentResource",
+      "operands": [
+        "idx:resources"
+      ],
+      "_comment": "@ref LLP 1161.001 D1: `current(x)`: once the resource settled, whether the value it shows answers its current call arguments: not its placeholder, and not an answer kept from other call arguments (`with` values aside)."
+    }
   ],
   "_stdlib": "The enumerated roster (LLP 1004 D2/D4): every callable an expression may name, with its parameter types and return type (`any` = one of number, string, bool, list). The compiler checks calls against this table; the runner's VM implements each entry once; entries are added by fixture, never by speculation. LLP 1038 D3: Router and Entry name reserved record shapes; list<Router>, list<Entry>, and list<string> are typed lists.",
   "stdlib": [

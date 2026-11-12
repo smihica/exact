@@ -1,8 +1,8 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // LLP 1115.000 D4 part B: one neutral web presentation in Chrome, Firefox and WebKit.
 // The role and metric censuses hold the sheet to the schema; the browser oracle
 // keeps the same geometry, colours and author precedence in all three engines.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { withLook, appleColors } from '../look.mjs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { glueDeclarations } from './glue-fixture.mjs';
@@ -11,7 +11,7 @@ import { decodePng } from '../../../scripts/png.mjs';
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const shell = read('../index.html'), neutral = read('../neutral.css');
 // How both runtimes draw a symbol: its mask in its tint, `--exact-tint`.
-const symbolStyle = read('../glue.js').match(/symbolStyle\.textContent = '([^']*)'/)[1];
+const symbolStyle = JSON.parse(read('../glue.js').match(/symbolStyle\.textContent = ("(?:[^"\\]|\\.)*")/)[1]);
 // The neutral look alone, its roles the neutral column's: the Apple colours a build lays over it, in every
 // browser, are apple-colors.test.mjs's
 const sheet = () => withLook(shell).match(/<style>([\s\S]*?)<\/style>/)[1].replace(appleColors(), '');
@@ -80,7 +80,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
     'alert-width': ['width'], 'alert-margin': ['width'], 'alert-padding': ['padding'], 'alert-gap': ['gap'], 'alert-action-gap': ['gap'],
     'alert-title': ['font-size'], 'alert-message-gap': ['margin-bottom', 'margin-top'], 'alert-scroll-gutter': ['padding-inline-end'],
     'menu-min-width': ['min-width'], 'menu-max-width': ['max-width'], 'menu-margin': ['max-width'], 'menu-padding': ['padding'], 'menu-offset': ['margin'], 'popover-padding': ['padding'], 'popover-margin': ['margin', 'margin-left'],
-    'menu-row-height': ['min-height'], 'menu-row-padding-block': ['padding'], 'menu-row-padding-inline': ['padding'], 'menu-row-gap': ['--exact-button-space-width'],
+    'menu-row-height': ['min-height'], 'menu-row-padding-block': ['padding'], 'menu-row-padding-inline': ['padding'], 'menu-row-gap': ['--exact-button-space-width', 'margin-inline-end'],
     'sheet-wide': ['@media'], 'sheet-width': ['width'], 'sheet-height': ['height', 'max-height'], 'sheet-margin': ['width', 'height', 'max-height'], 'sheet-top': ['inset'],
     'sheet-padding': ['padding', 'margin', 'margin-inline-end', 'padding-inline-end'], 'sheet-gap': ['padding', 'margin'], 'sheet-action-gap': ['margin'],
     'list-row-inset': ['padding-left', 'padding-right'],
@@ -103,6 +103,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
     'margin': ['.5em', '1rem', '1em'], '--exact-symbol-away': ['.5em'], '--exact-symbol-toward': ['.5em'], // a button's symbol overhangs its 1em place by half its growth (a bar item's, its 1rem place)
     'padding-block': ['.125em'], // a written height keeps room for a titled button's symbol's ink past its place
     'width': ['1em'], 'height': ['1em'], // a bar item's symbol is its em square times its scale, as a button face's is
+    'mask': ['1em'], // a checked menu row's checkmark is drawn in its font's em square
   };
   const lengths = (text) => [...text.matchAll(/(?<![\w.#])(\d*\.?\d+)(px|rem|em)\b/g)].map((m) => m[0]).filter((token) => parseFloat(token) !== 0);
   const declarations = (css) => [...css.replace(/\/\*[\s\S]*?\*\//g, '').replace(/url\("[^"]*"\)/g, '').matchAll(/\{([^{}]*)\}/g)]
@@ -215,6 +216,84 @@ const fixture = `
   <div popover="auto" role="menu" id="menu" style="display:flex;flex-direction:column"><button type="button" data-native data-button-style="bordered" id="item" style="display:grid"><span data-exact-text>Rename</span></button><button type="button" data-native data-button-style="bordered" data-destructive="true" id="item-delete" style="display:grid"><span data-exact-text>Delete</span></button></div>
   <dialog id="alert" role="alertdialog" aria-label="Sure?"><div data-exact-text>It cannot be undone.</div><button type="button" data-native data-button-style="bordered" data-destructive="true" id="delete" style="display:grid"><span data-exact-text>Delete</span></button><button type="button" data-native data-button-style="bordered" id="cancel" style="display:grid"><span data-exact-text>Cancel</span></button></dialog>
 </div>`;
+// A menu whose own rows can be checked (LLP 1021 D3's checkmark): a leading column on each of its rows, a mark painted
+// in a checked row's ink, and labels aligned past a written width or padding; a nested menu's rows are its own.
+// host/web/tests/menu-checks.test.mjs runs the same through both runtimes, with the rows the host writes.
+const checkRow = (id, role, label, attrs = '', style = '') => `<button type="button" role="${role}" data-native data-button-style="bordered" ${attrs} id="${id}" style="display:grid;${style}"><span data-exact-text>${label}</span></button>`;
+const radio = (id, label, attrs, style) => checkRow(id, 'menuitemradio', label, attrs, style);
+const checkMenus = `
+<div id="exact-root">
+  <div popover="manual" role="menu" id="checks" style="display:flex;flex-direction:column;top:8px;left:8px;margin:0;width:15rem">${radio('on', 'All', 'aria-checked="true"')}${radio('off', 'Active', 'aria-checked="false"')}${checkRow('box', 'menuitemcheckbox', 'Archived', 'aria-checked="true" data-destructive="true"')}<button type="button" data-native data-button-style="bordered" id="plain" style="display:grid"><span data-exact-text>Clear</span></button>${radio('dim', 'Dimmed', 'aria-checked="true" disabled')}${radio('wide-on', 'Wide', 'aria-checked="true" data-exact-said="width"', 'width:100%')}${radio('wide-off', 'Wider', 'aria-checked="false" data-exact-said="width"', 'width:100%')}${radio('padded', 'Padded', 'aria-checked="true"', 'padding-inline-start:4px')}</div>
+  <div popover="manual" role="menu" id="outer" style="display:flex;flex-direction:column;top:8px;left:320px;margin:0"><button type="button" data-native data-button-style="bordered" id="outer-row" style="display:grid"><span data-exact-text>Rename</span></button><div popover="manual" role="menu" id="inner" style="display:flex;flex-direction:column;top:120px;left:320px;margin:0">${radio('inner-on', 'Inner', 'aria-checked="true"')}</div></div>
+  <div popover="manual" role="menu" id="outer2" style="display:flex;flex-direction:column;top:220px;left:320px;margin:0">${radio('outer2-on', 'Outer', 'aria-checked="true"')}<div role="presentation" data-exact-list-item="" style="display:contents">${radio('item-off', 'Listed', 'aria-checked="false"')}</div><div popover="manual" role="menu" id="inner2" style="display:flex;flex-direction:column;top:340px;left:320px;margin:0"><button type="button" data-native data-button-style="bordered" id="inner2-row" style="display:grid"><span data-exact-text>Plain</span></button></div></div>
+</div>`;
+// Each row's label offset from its border edge in ems of its font, and its mark as painted: the row is shot with
+// its face hidden, so the only ink left is the mark's. `pixels` counts [ink, ground] in the ink's bounds (a pixel
+// nearer the mark's colour, else the row's, than the menu's surface, and one at the surface); `painted`: some ink with ground among it (a check, not
+// a block); `before`: the ink ends before the label starts.
+const checkLook = async (page, ids) => {
+  const rows = await page.evaluate((ids) => ids.map((id) => {
+    const b = document.getElementById(id), l = b.querySelector('[data-exact-text]').getBoundingClientRect(), r = b.getBoundingClientRect();
+    const mark = getComputedStyle(b, '::after');
+    return { id, fs: parseFloat(getComputedStyle(b).fontSize), offset: Math.round((l.x - r.x) / parseFloat(getComputedStyle(b).fontSize) * 1000) / 1000, label: l.x, at: { x: r.x, y: r.y, width: r.width, height: r.height }, ink: rgba(mark.backgroundColor)[3] ? rgba(mark.backgroundColor) : rgba(getComputedStyle(b).color), ground: rgba(getComputedStyle(b.closest('[popover]')).backgroundColor) };
+  }), ids);
+  await page.addStyleTag({ content: '#exact-root [popover] :is([data-exact-text], img) { visibility: hidden !important; }' });
+  for (const row of rows) {
+    const { width, height, data } = decodePng(await page.screenshot({ clip: row.at }));
+    const far = (c, i) => Math.abs(data[i] - c[0]) + Math.abs(data[i + 1] - c[1]) + Math.abs(data[i + 2] - c[2]);
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -1, -1];
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) if (far(row.ink, (y * width + x) * 4) < far(row.ground, (y * width + x) * 4)) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    row.pixels = [0, 0];
+    for (let y = Math.max(0, y0); y <= y1; y++) for (let x = Math.max(0, x0); x <= x1; x++) { const i = (y * width + x) * 4; if (far(row.ink, i) < far(row.ground, i)) row.pixels[0]++; else if (far(row.ground, i) < 30) row.pixels[1]++; }
+    row.painted = row.pixels[0] > 4 && row.pixels[1] > row.pixels[0] / 4 && x1 - x0 < row.fs && y1 - y0 < row.fs;
+    row.before = x1 < 0 || row.at.x + x1 + 1 <= row.label;
+    delete row.at; delete row.label; delete row.fs;
+  }
+  await page.evaluate(() => document.querySelector('head > style:last-of-type').remove());
+  return Object.fromEntries(rows.map(({ id, ...row }) => [id, row]));
+};
+for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a menu whose rows can be checked marks the checked ones in a column of its own`, async () => {
+  const browser = await launch(engine);
+  try {
+    for (const scheme of ['light', 'dark']) {
+      const page = await (await browser.newContext({ viewport: { width: 700, height: 500 }, colorScheme: scheme })).newPage();
+      await page.setContent(`<style>${sheet()}</style>${checkMenus}<script>${helpers}</script><script>for (const id of ['checks', 'outer', 'inner', 'outer2', 'inner2']) document.getElementById(id).showPopover(); window.ready = true;</script>`);
+      await page.waitForFunction('window.ready === true');
+      const at = (name) => [engine, scheme, name];
+      // The rows are a radio's and a checkbox's, each with one role.
+      expect([at('roles'), await page.evaluate(() => ['on', 'box'].map((id) => [document.getElementById(id).getAttribute('role'), document.getElementById(id).outerHTML.split(' role=').length - 1]))])
+        .toEqual([at('roles'), [['menuitemradio', 1], ['menuitemcheckbox', 1]]]);
+      const look = await checkLook(page, ['on', 'off', 'box', 'plain', 'dim', 'wide-on', 'wide-off', 'padded', 'outer-row', 'inner-on', 'outer2-on', 'item-off', 'inner2-row']);
+      const pick = (key) => Object.fromEntries(Object.entries(look).map(([id, row]) => [id, row[key]]));
+      // A checked row paints a check in its ink (the destructive row's red); an unchecked one paints none.
+      expect([at('painted'), pick('painted')]).toEqual([at('painted'), { on: true, off: false, box: true, plain: false, dim: true, 'wide-on': true, 'wide-off': false, padded: true, 'outer-row': false, 'inner-on': true, 'outer2-on': true, 'item-off': false, 'inner2-row': false }]);
+      expect([at('destructive ink'), look.box.ink]).toEqual([at('destructive ink'), RED[scheme]]);
+      // Its own rows keep the column, a List's items too, and the mark ends before the label wherever the row's padding
+      // came from: the look's, a written width's none, or the author's. A menu inside it, or around it, does not take
+      // its column.
+      expect([at('offsets'), pick('offset')]).toEqual([at('offsets'), { on: 2.125, off: 2.125, box: 2.125, plain: 2.125, dim: 2.125, 'wide-on': 1.5, 'wide-off': 1.5, padded: look.padded.offset, 'outer-row': 0.625, 'inner-on': 2.125, 'outer2-on': 2.125, 'item-off': 2.125, 'inner2-row': 0.625 }]);
+      expect([at('padded'), look.padded.offset > 1.5 && look.padded.offset < 2.125, Object.entries(look).filter(([, row]) => !row.before).map(([id]) => id)]).toEqual([at('padded'), true, []]);
+      // The mark moves with the checked row.
+      await page.evaluate(() => { document.getElementById('on').setAttribute('aria-checked', 'false'); document.getElementById('off').setAttribute('aria-checked', 'true'); });
+      const moved = await checkLook(page, ['on', 'off']);
+      expect([at('moved'), moved.on.painted, moved.off.painted, moved.off.before]).toEqual([at('moved'), false, true, true]);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+});
+// Under forced colours (a contrast theme) the mark keeps the system's colour for its row: ButtonText, and a disabled
+// row's GrayText.
+test('chromium: a checked menu row keeps its mark under forced colours', async () => {
+  const browser = await launch('chromium');
+  try {
+    const page = await (await browser.newContext({ viewport: { width: 700, height: 500 }, forcedColors: 'active' })).newPage();
+    await page.setContent(`<style>${sheet()}</style>${checkMenus}<script>${helpers}</script><script>document.getElementById('checks').showPopover(); window.ready = true;</script>`);
+    await page.waitForFunction('window.ready === true');
+    const look = await checkLook(page, ['on', 'off', 'dim']);
+    expect([look.on.painted, look.off.painted, look.dim.painted]).toEqual([true, false, true]);
+    expect([look.on.ink, look.dim.ink]).toEqual(await page.evaluate(() => [rgba('ButtonText'), rgba('GrayText')]));
+  } finally { await browser.close(); }
+});
 // What the page answers with: a colour as the engine paints it (each serializes `color-mix()` its own way), a box.
 const helpers = `
   const ink = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
@@ -632,6 +711,7 @@ const glueApply = `(() => {
   const views = window.glueViews = new Map(), retiredViews = new WeakSet(), root = document.getElementById('exact-root'), log = () => {};
   const presence = { live: null }, listSelection = null, page = null, agentMode = false, agentKeepsStore = false, inputReady = false, inputHandlers = null;
   const motion = { destroy() {} }, arrange = { destroy() {} }, collections = { commit() {}, restyled() {}, jump() {} };
+  const pieces = { canvas2d() {} };
   const followedScrolls = new Map(), pendingScrolls = new Map(), lists = new WeakSet(), messageFrames = new WeakMap(), messageViews = new Map();
   const viewFor = (_, id) => views.get(id), prepareContexts = () => {}, forgetList = () => {}, followScroll = () => {}, settleFollow = () => {}, settleValue = () => {};
   const refreshSymbols = () => {}, syncLists = () => {}, focusAutofocus = () => {}, positionContexts = () => {}, markScrollDocument = () => {}, rememberScroll = () => {};

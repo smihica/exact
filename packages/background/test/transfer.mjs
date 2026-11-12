@@ -24,6 +24,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { checker } from '../../camera/test/fixture.mjs';
 import { until } from '../../photos/test/fixture.mjs';
+import { ensureShells } from '../../../scripts/app-shells.mjs';
 
 const here = import.meta.dir, probe = resolve(here, 'probe'), root = resolve(here, '../../..');
 const argv = process.argv.slice(2), sim = argv.includes('--sim') ? argv[argv.indexOf('--sim') + 1] : process.env.EXACT_SIM;
@@ -55,7 +56,7 @@ const origin = `http://127.0.0.1:${server.port}`;
 
 function makeFixture() {
   const dir = mkdtempSync(join(tmpdir(), 'exact-transfer-')), app = join(dir, 'probefixture');
-  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app], root);
+  run('bun', [resolve(root, 'scripts/exact.mjs'), 'new', app, '--with', 'ios,mac'], root);
   for (const f of ['app.contract', 'app.ts']) cpSync(join(probe, 'fixture', f), join(app, f));
   rmSync(join(app, 'app.test.contract'), { force: true });
   const id = JSON.parse(readFileSync(join(app, 'app.json'), 'utf8')).app.id;
@@ -64,6 +65,9 @@ function makeFixture() {
   manifest.dependencies = { ...manifest.dependencies, '@fixture/transfer-probe': `file:${probe}` };
   writeFileSync(join(app, 'package.json'), JSON.stringify(manifest, null, 2));
   run('bun', ['install'], app);
+  // The native workspace written before the build starts: one the build wrote
+  // is newer than the build, and the driver refuses the build as stale.
+  ensureShells(app);
   return { app, id, remove: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
@@ -71,7 +75,7 @@ for (const host of hosts.length ? hosts : ['macos']) {
   const where = host === 'ios' ? 'ios-simulator' : 'macos';
   if (host === 'ios' && !sim) throw new Error('ios: name a simulator you booted (--sim <udid>)');
   const fixture = makeFixture();
-  Object.assign(process.env, { EXACT_APP_DIR: fixture.app, EXACT2: root, EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
+  Object.assign(process.env, { EXACT_APP_DIR: fixture.app, EXACT: root, EXACT_IDENTITY: process.env.EXACT_IDENTITY ?? '-' });
   if (sim) process.env.EXACT_SIM = sim;
   try {
     run('bun', [resolve(root, 'host/apple/build.mjs'), ...(host === 'ios' ? ['--ios', '--sim', sim] : []), 'probefixture-apple'], root);

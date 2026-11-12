@@ -12,7 +12,10 @@ pub fn excerpt(error: &CompileError) -> String {
     let Some(index) = (line as usize).checked_sub(1) else {
         return String::new();
     };
-    let Ok(text) = std::fs::read_to_string(file) else {
+    // An unsaved text held for the file (`build --stdin`) is the one quoted.
+    let read =
+        crate::sources::contract_text(file).map_or_else(|| std::fs::read_to_string(file), Ok);
+    let Ok(text) = read else {
         return String::new();
     };
     match text.lines().nth(index) {
@@ -48,10 +51,14 @@ fn quoted(source: &str, line: u32, col: u32, end: u32) -> String {
         .chain(
             all[start..from]
                 .iter()
+                .filter(|&&c| c != '\u{feff}')
                 .map(|&c| if c == '\t' { '\t' } else { ' ' }),
         )
         .collect();
-    let width = to.min(stop.max(from + 1)) - from;
+    let width = all[from..to.min(stop)]
+        .iter()
+        .filter(|&&c| c != '\u{feff}')
+        .count();
     let gutter = " ".repeat(line.to_string().len());
     format!(
         "\n {line} | {before}{shown}{after}\n {gutter} | {pad}{}",
@@ -62,6 +69,18 @@ fn quoted(source: &str, line: u32, col: u32, end: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::quoted;
+
+    #[test]
+    fn a_byte_order_mark_takes_no_column_in_the_caret_line() {
+        assert_eq!(
+            quoted("\u{feff}bad", 1, 4, 7),
+            "\n 1 | \u{feff}bad\n   | ^^^"
+        );
+        assert_eq!(quoted("a\u{feff}b", 2, 5, 6), "\n 2 | a\u{feff}b\n   |  ^");
+        assert_eq!(quoted("a\u{feff}b", 2, 1, 6), "\n 2 | a\u{feff}b\n   | ^^");
+        assert_eq!(quoted("a\u{feff}b", 2, 2, 5), "\n 2 | a\u{feff}b\n   |  ^");
+        assert_eq!(quoted("\u{feff}", 1, 4, 4), "\n 1 | \u{feff}\n   | ^");
+    }
 
     #[test]
     fn the_caret_is_under_the_columns_and_a_long_line_is_trimmed_around_it() {

@@ -46,6 +46,8 @@ function feed(id: string): unknown {
   const controller = new AbortController();
   controllers.set(id, controller);
   return fetch("wss://echo.test/" + id, {
+    // The side socket asks the host to end it when it goes quiet (LLP 1016.000 D11).
+    exactIdleTimeout: id === "side" ? 60000 : undefined,
     signal: controller.signal,
     exactStream(e: Event, socket?: Socket) {
       if (socket) sockets.set(id, socket);

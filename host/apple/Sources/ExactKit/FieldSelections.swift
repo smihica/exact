@@ -339,6 +339,13 @@ final class FieldSelections {
     }
 
     #if os(macOS)
+    /// An editor replacement keeps the selection's direction and whether
+    /// a script last set it. Restoring the range is no script command.
+    func restore(_ node: NodeView, _ selection: FieldSelection) {
+        quietly { _ = node.showSelection(selection.range) }
+        last[node.id] = selection
+    }
+
     /// The event the field took the focus in, when it is a press: for that
     /// press's `pressing` (the window makes a pressed view first responder
     /// before its `mouseDown`), which alone matches its timestamp.

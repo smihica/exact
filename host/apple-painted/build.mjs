@@ -1,8 +1,10 @@
 // Benchmark-only bundle. The shipping Apple presenter remains native. @ref LLP 1149 D12.
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { cargoReproducibilityFlags, executableName, injectedProfiles } from '../../scripts/app.mjs';
+import { cargoReproducibilityFlags, appleExecutableName, injectedProfiles } from '../../scripts/app.mjs';
+import { reportBuilt } from '../../scripts/help.mjs';
+import { syncStaticTree } from '../web/serve.mjs';
 
 const root = resolve(import.meta.dir, '../..');
 const run = (command, args, options = {}) => {
@@ -19,8 +21,8 @@ export function buildPainted(app, args, { macInfoPlist }) {
   const profile = args.includes('--release') ? 'release' : 'host-dev';
   const target = resolve(root, 'target');
   const out = resolve(target, 'apple-painted', app.name, profile);
-  const bundle = resolve(out, `${executableName(app)} benchmark carrier.app`);
-  const executable = resolve(bundle, 'Contents/MacOS', executableName(app));
+  const bundle = resolve(out, `${appleExecutableName(app)} benchmark carrier.app`);
+  const executable = resolve(bundle, 'Contents/MacOS', appleExecutableName(app));
   mkdirSync(resolve(bundle, 'Contents/MacOS'), { recursive: true });
   mkdirSync(resolve(bundle, 'Contents/Resources'), { recursive: true });
   const probe = process.env.EXACT_PAINTED_PROBE;
@@ -37,8 +39,10 @@ export function buildPainted(app, args, { macInfoPlist }) {
   copyFileSync(resolve(target, profile, bin), executable);
   chmodSync(executable, 0o755);
   writeFileSync(resolve(bundle, 'Contents/Info.plist'), macInfoPlist(app));
-  if (existsSync(resolve(app.dir, 'assets'))) cpSync(resolve(app.dir, 'assets'), resolve(bundle, 'Contents/Resources/assets'), { recursive: true });
+  syncStaticTree(resolve(app.dir, 'assets'), resolve(bundle, 'Contents/Resources/assets'));
   run('codesign', ['--force', '--deep', '--sign', '-', bundle]);
   console.log(executable);
+  // Its bake reads EXACT_UPDATE_TRUST, which `--release` sets to production (host/apple/build.mjs).
+  if (args.includes('--json')) reportBuilt({ path: bundle, target: 'macos', trust: process.env.EXACT_UPDATE_TRUST ?? 'development', signing: 'ad-hoc' });
   if (args.includes('--run')) run(executable, [], { env: { ...process.env, EXACT_ASSETS: app.dir } });
 }

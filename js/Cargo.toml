@@ -38,6 +38,7 @@ hermes-lean-sys = { path = "../vendor/ibex/crates/hermes-lean-sys", default-feat
 caltrain-data = { path = "../apps/caltrain/data" }
 # The storage composer a host stacks over the module (LLP 1097 D5).
 exact-data-host = { path = "../data/host" }
+exact-logic = { path = "../logic" }
 contract = { path = "../contract/cli" }
 exact-kernel = { path = "../kernel" }
 # Holds a database's lock from outside the module (tests/it/storage.rs);

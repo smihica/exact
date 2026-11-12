@@ -83,6 +83,7 @@ leaves!(
     BinOp,
     UnOp,
     TaskKind,
+    MutationMode,
     TapForm,
     PropertyKind,
     PropertyForm,
@@ -145,10 +146,10 @@ structs! {
     Sequence { name, gate, key, tracks, options, ended, span }
     Persist { name, span }
     Binding { name, expr, span }
-    ResourceDecl { name, source, args, identity, shape, placeholder, each, span }
+    ResourceDecl { name, source, args, identity, shape, placeholder, each, transient, gate, span }
     ResourceEach { item, list, key, span }
     Placeholder { source, args, span }
-    MutationDecl { name, shape, queue, refreshes, then, span }
+    MutationDecl { name, shape, mode, refreshes, then, span }
     Param { name, ty, span }
     Action { name, params, body, span }
     Task { name, kind, gate, key, timer, options, span }

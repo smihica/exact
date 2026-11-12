@@ -218,6 +218,9 @@ class RecordingModule(context: ExtensionContext) : ExactExtension(context) {
         var reason: String? = null
         var error: String? = null
         var result: JSONObject? = null
+        /** What every stop is answered once it has finished: [result], or the error that kept the file from being
+         * written. */
+        private var answer: JSONObject? = null
         var leave: (() -> Unit)? = null
         private var recorded = 0.0
         private var since: Double? = context.now()
@@ -286,7 +289,7 @@ class RecordingModule(context: ExtensionContext) : ExactExtension(context) {
         override fun ended() = finish("track-ended", null) {}
 
         fun finish(why: String, failure: String?, done: (JSONObject) -> Unit) {
-            result?.let { return done(it) }
+            answer?.let { return done(it) }
             waiting += done
             if (state == "inactive") return
             recorded = duration; since = null; taking = false
@@ -296,13 +299,21 @@ class RecordingModule(context: ExtensionContext) : ExactExtension(context) {
             announce()
             val duration = recorded
             writer.post {
-                if (context.agent) { file.parentFile?.mkdirs(); file.writeBytes(tone(spans)) }
+                val unwritten = if (!context.agent) null else try {
+                    file.parentFile?.mkdirs(); dev.exact.canvas.Files.write(file, tone(spans)); null
+                } catch (e: java.io.IOException) { "the file was not written: $e" }
                 encoder?.finish()
                 main.post {
                     leave?.invoke(); leave = null
-                    val out = JSONObject().put("path", path).put("mimeType", type).put("duration", duration).put("size", file.length())
-                    result = out
-                    context.log("recording: $id stopped ($why), $path, ${file.length()} bytes")
+                    val out = if (unwritten != null) {
+                        reason = "error"; error = unwritten
+                        context.log("recording: $id stopped ($why), $path not written: $unwritten")
+                        JSONObject().put("error", "UnknownError").put("message", unwritten)
+                    } else {
+                        context.log("recording: $id stopped ($why), $path, ${file.length()} bytes")
+                        JSONObject().put("path", path).put("mimeType", type).put("duration", duration).put("size", file.length()).also { result = it }
+                    }
+                    answer = out
                     announce()
                     waiting.forEach { it(out) }
                     waiting.clear()

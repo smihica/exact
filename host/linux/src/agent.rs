@@ -539,8 +539,8 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
                 let phase = field_str(line, "phase");
                 let up = phase.as_deref() == Some("up");
                 let repeat = field_bool(line, "repeat") && !up;
-                // The modifiers pressed so far; a failed edge releases them and
-                // stops. A modifier's keyup no longer carries its own bit (#140).
+                // A failed edge releases only modifiers this request pressed.
+                // A modifier's keyup no longer carries its own bit (#140).
                 // Only a modifier still held comes up: a failed down already let
                 // its modifiers go, and a later `up` must not release them twice.
                 let release = |p: &mut Presenter<D>, pressed: &[(&str, &str)]| {
@@ -558,26 +558,39 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
                         }
                     }
                 };
+                let mut pressed = Vec::new();
                 // A held key's repeat finds its modifiers down already.
                 if !up && !repeat {
-                    for (i, (held, name)) in modifiers.iter().enumerate() {
+                    for (held, name) in &modifiers {
+                        let before = p.held;
                         p.hold_modifier(held, true);
+                        let changed = p.held != before;
                         if let Err(e) = p.type_key(id, held, name, true, false) {
-                            release(p, &modifiers[..=i]);
+                            p.held = before;
+                            release(p, &pressed);
                             return error(&e);
+                        }
+                        if changed {
+                            pressed.push((*held, *name));
                         }
                     }
                 }
                 // A modifier's own key holds it while down, as a keyboard's does: Meta's keydown
                 // says `metaKey`, its keyup no longer does (#140). A held key's later down is a repeat.
+                let before = p.held;
                 p.hold_modifier(code, !up);
                 let r = p.type_key(id, code, logical, !up, repeat);
+                if r.is_err() && !up {
+                    p.held = before;
+                }
                 if phase.is_none() && r.is_ok() {
                     p.hold_modifier(code, false);
                     let _ = p.type_key(id, code, logical, false, false);
                 }
                 // A held key keeps its modifiers down until its `up`.
-                if phase.as_deref() != Some("down") || (r.is_err() && !repeat) {
+                if r.is_err() && !up {
+                    release(p, &pressed);
+                } else if phase.as_deref() != Some("down") {
                     release(p, &modifiers);
                 }
                 return r.unwrap_or_else(|e| error(&e));
@@ -1035,6 +1048,11 @@ fn land_data<D: DataSource>(p: &mut Presenter<D>, bound: std::time::Duration) ->
             num(p.host().now())
         )
     };
+    let refused = |p: &Presenter<D>, error: &str| {
+        let mut s = String::from("{\"error\":");
+        exact_runner::agent::quote(&format!("clock data: {error}"), &mut s);
+        format!("{s},\"clock\":{}}}", num(p.host().now()))
+    };
     for _ in 0..16 {
         while p.data_activating() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1042,6 +1060,9 @@ fn land_data<D: DataSource>(p: &mut Presenter<D>, bound: std::time::Duration) ->
                 let _ = p.frame();
             }
             p.first_pixel();
+        }
+        if let Some(error) = p.activation_error() {
+            return refused(p, error);
         }
         if p.data_activating() {
             return unsettled(p, "data");

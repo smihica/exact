@@ -81,9 +81,6 @@ private final class ShareInboxPing {
 nonisolated(unsafe) private var coldInboxShare: URL?
 
 extension ExactSession {
-    /// The sessions that claim at each foreground and on the ping, once each.
-    nonisolated(unsafe) private static var claiming = Set<ObjectIdentifier>()
-
     /// The agent's `share` op: `{"id": <navigation root>, "target", "share"}`.
     func receiveShare(_ req: [String: Any]) -> [String: Any] {
         guard booted, let root = navigationRoot else { return ["error": "share: the app has no navigation root to deliver it to"] }
@@ -122,19 +119,20 @@ extension ExactSession {
     /// frame (LLP 1038 D8's order), and the foreground and the ping from
     /// now on.
     func landColdShare() {
+        guard state != .destroyed else { return }
         if (ExactEnv.agentMode && ExactEnv.environment["EXACT_AGENT_SHARE"] != nil) || coldInboxShare != nil {
             apply(runtime.landShare())
         }
         if let dir = coldInboxShare { try? FileManager.default.removeItem(at: dir); coldInboxShare = nil }
         guard ShareInbox.main != nil else { return }
         claimInbox()
-        guard Self.claiming.insert(ObjectIdentifier(self)).inserted else { return }
+        guard shareInboxObserver == nil else { return }
         #if canImport(UIKit)
         let foreground = UIApplication.willEnterForegroundNotification
         #else
         let foreground = NSApplication.didBecomeActiveNotification
         #endif
-        NotificationCenter.default.addObserver(forName: foreground, object: nil, queue: .main) { [weak self] _ in self?.claimInbox() }
+        shareInboxObserver = NotificationCenter.default.addObserver(forName: foreground, object: nil, queue: .main) { [weak self] _ in self?.claimInbox() }
         if let id = Bundle.main.object(forInfoDictionaryKey: "ExactAppIdentifier") as? String ?? Bundle.main.bundleIdentifier {
             ShareInboxPing.shared.listen("\(id).shares", for: self)
         }

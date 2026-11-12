@@ -547,8 +547,10 @@ if (es) {
     // the runner's `prefers-color-scheme` reads (navigation.js
     // `preferences`), told as the browser's change is.
     const sheet = document.getElementById("exact-dev-pin") ?? document.head.appendChild(Object.assign(document.createElement("style"), { id: "exact-dev-pin" }));
-    sheet.textContent = p?.scheme ? `:root{color-scheme:${p.scheme}${copy ? "!important" : ""}}` : "";
-    if ((x.systemScheme ?? null) !== (p?.scheme ?? null)) { x.systemScheme = p?.scheme ?? null; dispatchEvent(new Event("resize")); }
+    // An app whose manifest fixes `userInterfaceStyle` ignores the system's, as on iOS; a copy still shows its pin.
+    const scheme = p?.scheme && (copy || !["light", "dark"].includes(document.querySelector('meta[name="color-scheme"]')?.content)) ? p.scheme : null;
+    sheet.textContent = scheme ? `:root{color-scheme:${scheme}${copy ? "!important" : ""}}` : "";
+    if ((x.systemScheme ?? null) !== scheme) { x.systemScheme = scheme; dispatchEvent(new Event("resize")); }
     // The root font size as `prefer` sets it (navigation.js): the size an
     // app's percentage is of, too.
     // (In a copy, over the app's own: its `!important` rule gives way to the root's own.)

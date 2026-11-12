@@ -167,6 +167,8 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     /// Whether the current item reached readyToPlay: a failure before it is
     /// HTML's "source not supported", one after it a network or decode error.
     var itemReady = false
+    var hdrItem = false
+    var hdrTask: Task<Void, Never>?
     var naturalSize = CGSize.zero
     var wantsPlay = false
     /// The item played to its end (HTML's "ended playback"): the next play
@@ -478,6 +480,8 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     }
     func loadSource() {
         generation += 1
+        hdrTask?.cancel(); hdrTask = nil
+        hdrItem = false
         lastError = nil
         observations.removeAll()
         notifications.forEach(NotificationCenter.default.removeObserver)
@@ -501,6 +505,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
                     self.fail(Self.code(item.error, ready: self.itemReady), item.error?.localizedDescription ?? "Media could not be loaded")
                 }
                 if item.status == .readyToPlay {
+                    if !self.itemReady { self.loadHDR(item, generation: token) }
                     self.itemReady = true
                     self.naturalSize = item.presentationSize
                     self.emit(self.listeners.contains("loadedmetadata") ? "loadedmetadata" : "snapshot")
@@ -634,8 +639,23 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
         }
     }
 
-    var hdrItem: Bool {
-        player.currentItem?.asset.tracks(withMediaType: .video).contains { $0.hasMediaCharacteristic(.containsHDRVideo) } ?? false
+    /// Snapshots read only the cached flag: unloaded track properties can wait on the network.
+    func loadHDR(_ item: AVPlayerItem, generation token: Int) {
+        hdrTask = Task { @MainActor [weak self] in
+            var hdr = false
+            if let tracks = try? await item.asset.loadTracks(withMediaType: .video) {
+                for track in tracks {
+                    if let characteristics = try? await track.load(.mediaCharacteristics), characteristics.contains(.containsHDRVideo) {
+                        hdr = true
+                        break
+                    }
+                }
+            }
+            guard !Task.isCancelled, let self, !self.invalidated, self.generation == token else { return }
+            self.hdrTask = nil
+            self.hdrItem = hdr
+            self.emit()
+        }
     }
 
     /// Read the presentation objects, so diagnostics can catch a missed update.
@@ -823,6 +843,7 @@ private final class VideoArm: NSObject, NowPlayingPlayer {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true; generation += 1; posterGeneration += 1
+        hdrTask?.cancel(); hdrTask = nil
         NowPlaying.shared.left(self)
         player.pause()
         if let tick { player.removeTimeObserver(tick) }; tick = nil

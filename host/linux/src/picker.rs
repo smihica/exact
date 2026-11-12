@@ -243,13 +243,85 @@ fn roots() -> [PathBuf; 3] {
     r
 }
 
-/// The file an `app:/data|cache|tmp/…` path names (D7): `None` for any
-/// other scheme, root, or a `..`.
+/// Where an `app:/data|cache|tmp/…` path names (D7), for a file the host
+/// writes there: `None` for any other scheme, root, or a `..`. A file the
+/// app names is read through [`open`] or [`file`], never through this.
 pub fn resolve(path: &str) -> Option<PathBuf> {
     resolve_from(path, roots)
 }
 
-fn resolve_from(path: &str, roots: impl FnOnce() -> [PathBuf; 3]) -> Option<PathBuf> {
+/// The regular file an `app:/` path names, opened as the data module's
+/// `readFile` opens it (ibex2's `AppDirectories`): below its root's handle,
+/// following no symbolic link at any part (on Windows, no reparse point).
+/// An `image`, a picked or shared file's size, a saved copy and an
+/// extension's file read through this, so a link the app's own code made
+/// in its directories reads nothing outside them.
+pub fn open(path: &str) -> Option<std::fs::File> {
+    open_from(path, roots)
+}
+
+/// The place of the file [`open`] finds, for a reader that needs a path (a
+/// player's animation): `None` where `open` refuses.
+pub fn file(path: &str) -> Option<PathBuf> {
+    let roots = roots();
+    open_from(path, || roots.clone())?;
+    resolve_from(path, || roots)
+}
+
+/// The place an `app:/` path names for an extension, which may write it
+/// (`ExtensionContext.file`): the file [`file`] answers, or, where nothing
+/// is there yet or a directory is, the place itself when every part of it
+/// that exists is a directory reached through no symbolic link. A writer
+/// makes what is missing; nothing below a missing part can be a link.
+/// That holds when this answers; it checks only the path's own parts, so a
+/// caller that walks a directory it answers must not follow links in it.
+pub fn place(path: &str) -> Option<PathBuf> {
+    place_from(path, roots())
+}
+
+fn place_from(path: &str, roots: [PathBuf; 3]) -> Option<PathBuf> {
+    if open_from(path, || roots.clone()).is_some() {
+        return resolve_from(path, || roots);
+    }
+    let (index, parts) = parse(path)?;
+    let mut at = roots.into_iter().nth(index)?;
+    // The root is the host's, opened as `open_from` opens it: its own
+    // links followed.
+    match std::fs::metadata(&at) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(parts.iter().fold(at, |p, part| p.join(part)))
+        }
+        _ => return None,
+    }
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_dir() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some(parts[i + 1..].iter().fold(at, |p, part| p.join(part)))
+            }
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
+fn open_from(path: &str, roots: impl FnOnce() -> [PathBuf; 3]) -> Option<std::fs::File> {
+    static READ: std::sync::LazyLock<ibex2::grant::GrantSet> = std::sync::LazyLock::new(|| {
+        ibex2::grant::GrantSet::parse("fs.read app:/data\nfs.read app:/cache\nfs.read app:/tmp")
+            .expect("the app roots' read grants parse")
+    });
+    let (index, _) = parse(path)?;
+    let root = roots().into_iter().nth(index)?;
+    // The named root stands for all three: another may not exist yet (a
+    // picked photo's `app:/tmp` before any storage request made `app:/data`).
+    let directories = ibex2::stdlib::app_fs::AppDirectories::new(&root, &root, &root).ok()?;
+    directories.open_file(&READ, path).ok()
+}
+
+/// The root an `app:/` path is under, by index, and its names below it.
+fn parse(path: &str) -> Option<(usize, Vec<&str>)> {
     let rest = path.strip_prefix("app:/")?;
     let (dir, rest) = rest.split_once('/')?;
     let index = match dir {
@@ -259,9 +331,11 @@ fn resolve_from(path: &str, roots: impl FnOnce() -> [PathBuf; 3]) -> Option<Path
         _ => return None,
     };
     let parts: Vec<&str> = rest.split('/').collect();
-    if parts.iter().any(|p| !leaf(p)) {
-        return None;
-    }
+    parts.iter().all(|p| leaf(p)).then_some((index, parts))
+}
+
+fn resolve_from(path: &str, roots: impl FnOnce() -> [PathBuf; 3]) -> Option<PathBuf> {
+    let (index, parts) = parse(path)?;
     let root = roots().into_iter().nth(index)?;
     Some(parts.iter().fold(root, |p, part| p.join(part)))
 }
@@ -532,6 +606,115 @@ mod tests {
         assert_eq!(resolve("app:/tmp/../x"), None);
         assert_eq!(resolve("app:/etc/passwd"), None);
         assert_eq!(resolve("/etc/passwd"), None);
+    }
+
+    /// An app file opens below its root, and a symbolic link the app's own
+    /// code planted there (a file's or a directory's) opens nothing, as
+    /// `readFile` refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn app_files_open_below_their_roots_through_no_link() {
+        let base = std::env::temp_dir().join(format!("exact-linux-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let roots = [
+            base.join("data"),
+            base.join("cache"),
+            base.join("temporary"),
+        ];
+        std::fs::create_dir_all(roots[0].join("photos")).unwrap();
+        std::fs::create_dir_all(base.join("private")).unwrap();
+        std::fs::write(base.join("private/secret.png"), "outside").unwrap();
+        std::fs::write(roots[0].join("photos/a.png"), "inside").unwrap();
+        std::os::unix::fs::symlink(base.join("private/secret.png"), roots[0].join("x.png"))
+            .unwrap();
+        std::os::unix::fs::symlink(base.join("private"), roots[0].join("linked")).unwrap();
+        let read = |path: &str| {
+            open_from(path, || roots.clone()).map(|mut f| {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+                s
+            })
+        };
+        let joined = resolve_from("app:/data/x.png", || roots.clone()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(joined).unwrap(),
+            "outside",
+            "the place a host writes reaches through the link, so no reader opens it"
+        );
+        assert_eq!(read("app:/data/photos/a.png").as_deref(), Some("inside"));
+        assert_eq!(read("app:/data/x.png"), None, "a linked file");
+        assert_eq!(
+            read("app:/data/linked/secret.png"),
+            None,
+            "a linked directory"
+        );
+        assert_eq!(read("app:/data/photos"), None, "a directory");
+        assert_eq!(read("app:/tmp/absent.png"), None, "a root not made yet");
+        assert_eq!(read("app:/data/../private/secret.png"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An extension's file may be one it is about to write: a regular file,
+    /// a directory or nothing yet answers, at its place below the root, and
+    /// a link at any part of the path answers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_extension_place_may_be_absent_but_is_reached_through_no_link() {
+        let base = std::env::temp_dir().join(format!("exact-linux-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let roots = [
+            base.join("data"),
+            base.join("cache"),
+            base.join("temporary"),
+        ];
+        std::fs::create_dir_all(roots[0].join("photos")).unwrap();
+        std::fs::create_dir_all(base.join("private")).unwrap();
+        std::fs::write(roots[0].join("photos/a.png"), "inside").unwrap();
+        std::os::unix::fs::symlink(base.join("private/new.png"), roots[0].join("dangling.png"))
+            .unwrap();
+        std::os::unix::fs::symlink(base.join("private"), roots[0].join("linked")).unwrap();
+        let place = |path: &str| place_from(path, roots.clone());
+        let under = |rest: &str| Some(roots[0].join(rest));
+        assert_eq!(place("app:/data/photos/a.png"), under("photos/a.png"));
+        assert_eq!(
+            place("app:/data/shot-1.jpg"),
+            under("shot-1.jpg"),
+            "a file not written yet"
+        );
+        assert_eq!(
+            place("app:/data/camera/day/1.jpg"),
+            under("camera/day/1.jpg"),
+            "a file in directories not made yet"
+        );
+        assert_eq!(place("app:/data/photos"), under("photos"), "a directory");
+        // Only the path's own parts are checked: a link beside an absent
+        // name leaves it answered, so a caller that walks the directory
+        // must not follow links (`Files.removeTree` on Android).
+        std::os::unix::fs::symlink(base.join("private"), roots[0].join("photos/out")).unwrap();
+        assert_eq!(place("app:/data/photos/x"), under("photos/x"));
+        // A link at the last part is refused, so a module empties a
+        // directory by asking for the directory, never a name inside it.
+        std::os::unix::fs::symlink(base.join("private"), roots[0].join("photos/x")).unwrap();
+        assert_eq!(place("app:/data/photos/x"), None);
+        assert_eq!(place("app:/data/photos"), under("photos"));
+        assert_eq!(
+            place("app:/tmp/shot-1.jpg"),
+            Some(roots[2].join("shot-1.jpg")),
+            "a root not made yet"
+        );
+        assert_eq!(
+            place("app:/data/dangling.png"),
+            None,
+            "a link to nothing yet"
+        );
+        assert_eq!(
+            place("app:/data/linked/new.png"),
+            None,
+            "a linked directory"
+        );
+        assert_eq!(place("app:/data/photos/a.png/x"), None, "below a file");
+        assert_eq!(place("app:/data/../private/new.png"), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// An `app:/data` image resolves before storage is configured, with

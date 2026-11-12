@@ -143,3 +143,22 @@ fn a_request_has_effects_only_when_its_method_is_unsafe_over_http() {
     assert!(!with(|r| r.surface = Request::capture_surface("x").surface));
     assert!(!Request::continuation(7).has_effects());
 }
+
+#[test]
+fn a_held_mark_does_not_remove_a_file_transfers_effects() {
+    let post = Request::post_json("https://example.test/x", "");
+    for request in [
+        post.clone().body_from("app:/data/a"),
+        post.clone().body_to("app:/data/b"),
+        post.body_from("app:/data/a").body_to("app:/data/b"),
+    ] {
+        assert!(request.has_effects());
+        let request = request.held();
+        assert!(!request.is_held());
+        assert!(request.has_effects(), "{request:?}");
+    }
+    assert!(!Request::get("https://example.test/x")
+        .body_to("app:/data/b")
+        .held()
+        .has_effects());
+}

@@ -395,8 +395,7 @@ fn styled(
                             && rows.iter().all(|r| {
                                 matches!(
                                     r.codec(),
-                                    StyleCodec::Rgba8
-                                        | StyleCodec::ColorValue
+                                    StyleCodec::ColorValue
                                         | StyleCodec::KeywordColor
                                         | StyleCodec::Paint
                                 )

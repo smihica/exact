@@ -1,0 +1,10 @@
+component App
+  view
+    column padding=16 align-items="flex-start"
+      row role="radiogroup" aria-label="Choice" testId="specimen"
+        button role="radio" aria-checked=false
+          text "One"
+        button role="radio" aria-checked=true
+          text "Two"
+        button role="radio" aria-checked=false
+          text "Three"

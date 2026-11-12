@@ -203,6 +203,42 @@ fn only_a_navigation_assigned_to_the_router_scrolls() {
     assert_eq!(fragment_scrolls(&mut r), [scroll(&visit, "moves", 2)]);
 }
 
+/// A table counts its locations without the `notfound` row; a push of the
+/// one location it declares is no new visit.
+#[test]
+fn a_table_of_one_location_says_so() {
+    let route = |name: &str, pattern: &str, notfound: bool| Route {
+        name: name.into(),
+        pattern: pattern.into(),
+        parent: None,
+        tab: false,
+        notfound,
+    };
+    let one = |routes: Vec<Route>| boot(fixture::plan(&Table { routes }), "/").route_one_location();
+    assert!(one(vec![route("home", "/", false)]));
+    assert!(!one(vec![
+        route("home", "/", false),
+        route("add", "/add", false)
+    ]));
+    assert!(one(vec![
+        route("home", "/", false),
+        route("notfound", "", true)
+    ]));
+    assert!(!boot(fixture::plan(&table()), "/").route_one_location());
+    let mut r = boot(
+        fixture::plan(&Table {
+            routes: vec![route("home", "/", false)],
+        }),
+        "/",
+    );
+    act(&mut r, "push", "/");
+    assert_eq!(
+        nav(&r).tabs[0].stack.len(),
+        1,
+        "a push of the one location is no visit"
+    );
+}
+
 #[test]
 fn launch_fallback_is_journaled_and_notfound_preserves_the_location() {
     let mut table = table();
@@ -987,4 +1023,109 @@ fn a_host_go_goes_to_a_location_as_its_own_commit() {
             .count(),
         1
     );
+}
+
+#[test]
+fn a_refused_forward_keeps_history_and_does_not_mark_the_next_commit() {
+    for handler in ["goAndTrap", "peek"] {
+        let mut b = fixture::builder(&table());
+        let action = b
+            .plan()
+            .actions
+            .iter()
+            .position(|a| b.plan().str(a.name) == handler)
+            .unwrap();
+        b.node(
+            exact_kernel::NodeType::View as u8,
+            Some(exact_plan::NodesId(0)),
+            None,
+            1,
+            &[],
+            &[(
+                exact_plan::EventKind::Navigate,
+                exact_plan::ActionsId(action as u32),
+                &[],
+            )],
+            None,
+        );
+        let mut r = boot(b.finish().unwrap(), "/");
+        for location in ["/t/a", "/t/b", "/t/a"] {
+            act(&mut r, "push", location);
+        }
+        act(&mut r, "back", "");
+        let before = nav(&r);
+        let root = r.roots()[0];
+        let target = r.kernel().node(root).unwrap().children()[0];
+        let result = r.host_forward(target);
+        assert_eq!(result.is_err(), handler == "goAndTrap", "{result:?}");
+        assert_eq!(nav(&r), before);
+        assert_eq!(r.location_ahead().as_deref(), Some("/t/a"));
+        // This is an ordinary Back to the same URL the refused Forward named.
+        act(&mut r, "go", "/t/a");
+        assert_eq!(r.location_ahead().as_deref(), Some("/t/b"));
+        let fallback_root = r.roots()[0];
+        r.host_forward(fallback_root).unwrap();
+        assert_eq!(r.location_ahead().as_deref(), Some("/t/a"));
+        r.host_forward(fallback_root).unwrap();
+        assert_eq!(r.location_ahead(), None);
+        assert!(r.host_forward(fallback_root).unwrap().is_none());
+
+        act(&mut r, "push", "/t/a");
+        act(&mut r, "push", "/t/b");
+        act(&mut r, "back", "");
+        act(&mut r, "replace", "/t/b#draft");
+        let before = nav(&r);
+        let result = r.host_forward(target);
+        assert_eq!(result.is_err(), handler == "goAndTrap", "{result:?}");
+        assert_eq!(nav(&r), before);
+        assert_eq!(r.location_ahead().as_deref(), Some("/t/b"), "{handler}");
+    }
+}
+
+#[test]
+fn forward_to_the_current_location_consumes_one_destination() {
+    for handler in [None, Some("go")] {
+        let mut b = fixture::builder(&table());
+        if let Some(handler) = handler {
+            let action = b
+                .plan()
+                .actions
+                .iter()
+                .position(|a| b.plan().str(a.name) == handler)
+                .unwrap();
+            b.node(
+                exact_kernel::NodeType::View as u8,
+                Some(exact_plan::NodesId(0)),
+                None,
+                1,
+                &[],
+                &[(
+                    exact_plan::EventKind::Navigate,
+                    exact_plan::ActionsId(action as u32),
+                    &[],
+                )],
+                None,
+            );
+        }
+        let mut r = boot(b.finish().unwrap(), "/");
+        for location in ["/t/a", "/t/b"] {
+            act(&mut r, "push", location);
+        }
+        act(&mut r, "replace", "/t/a");
+        act(&mut r, "push", "/t/b");
+        act(&mut r, "back", "");
+        act(&mut r, "back", "");
+        let before = nav(&r);
+        let root = r.roots()[0];
+        let target = match handler {
+            Some(_) => r.kernel().node(root).unwrap().children()[0],
+            None => root,
+        };
+        assert!(r.host_forward(target).unwrap().is_some(), "{handler:?}");
+        assert_eq!(nav(&r), before);
+        assert_eq!(r.location_ahead().as_deref(), Some("/t/b"));
+        r.host_forward(target).unwrap();
+        assert_eq!(exact_route::top(&nav(&r)).unwrap().url, "/t/b");
+        assert_eq!(r.location_ahead(), None);
+    }
 }

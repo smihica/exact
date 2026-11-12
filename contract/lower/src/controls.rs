@@ -1115,6 +1115,8 @@ pub(crate) fn check_zero_size(
         "width",
         "height",
         "flex",
+        "flex-grow",
+        "flex-basis",
         "padding",
         "padding-top",
         "padding-right",

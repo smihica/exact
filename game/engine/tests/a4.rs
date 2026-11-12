@@ -81,6 +81,44 @@ fn sim() -> Sim<Probe> {
     s.advance(0.0, Clock::Seekable);
     s
 }
+#[test]
+fn stamped_live_argument_changes_do_not_add_world_time() {
+    for (hz, jitter) in [(90.0, 0.0), (144.0, 0.0), (60.0, 0.0), (60.0, 1.0)] {
+        for offset in [-0.5, 0.0, 0.4] {
+            let period = 1000.0 / hz;
+            let mut baseline = sim();
+            let mut bound = sim();
+            for s in [&mut baseline, &mut bound] {
+                s.frame_period(period);
+                s.advance(0.0, Clock::Live);
+            }
+            for frame in 1..=hz as usize * 10 {
+                let now = frame as f64 * period + if frame % 2 == 0 { jitter } else { 0.0 };
+                baseline.advance(now, Clock::Live);
+                bound.advance(now, Clock::Live);
+                assert!(
+                    baseline.world().tick().abs_diff(bound.world().tick()) <= 1,
+                    "{hz} Hz, jitter {jitter}, offset {offset}, frame {frame}: {} vs {}",
+                    baseline.world().tick(),
+                    bound.world().tick()
+                );
+                let drawn = |s: &Sim<Probe>| s.world().tick() as f64 - 1.0 + s.alpha() as f64;
+                assert!(
+                    (drawn(&baseline) - drawn(&bound)).abs() < 0.002,
+                    "{hz} Hz, jitter {jitter}, offset {offset}, frame {frame}: pose {} vs {}",
+                    drawn(&baseline),
+                    drawn(&bound)
+                );
+                bound
+                    .bind(
+                        &args(7.0, 0.0, false, frame as f64 * 0.001),
+                        Some(now + period * offset),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+}
 fn key<G: Game>(s: &mut Sim<G>, down: bool, at_ms: f64) {
     s.input(InputEvent::Key {
         code: "KeyE".into(),

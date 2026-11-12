@@ -89,9 +89,9 @@ final class ReorderGroupMacTests: XCTestCase {
         let ghost = try XCTUnwrap(hold.ghost)
         XCTAssertTrue(ghost.view.superview != nil, "the ghost is in the window's top layer")
         // Over the second list: its port takes the ghost's centre.
-        text.mouseDragged(with: event(.leftMouseDragged, text, down: 10, right: 220))
+        NSApp.sendEvent(event(.leftMouseDragged, text, down: 10, right: 220))
         XCTAssertEqual(calls.log.last, "into 5")
-        text.mouseUp(with: event(.leftMouseUp, text, down: 10, right: 220))
+        NSApp.sendEvent(event(.leftMouseUp, text, down: 10, right: 220))
         XCTAssertEqual(calls.log.suffix(2), ["into 5", "drop"])
         XCTAssertEqual(hold.state.phase, "holding")
         XCTAssertTrue(p.reorderGroup === hold, "a hold keeps the ghost and the pin")
@@ -107,6 +107,48 @@ final class ReorderGroupMacTests: XCTestCase {
         XCTAssertEqual(calls.log.last, "finish")
         XCTAssertNil(p.reorderGroup)
         XCTAssertNil(ghost.view.superview, "the ghost is gone")
+    }
+
+    func testADropReleasesThePointerWhileTheReorderHolds() throws {
+        let calls = ReorderGroupRecorder()
+        let (p, text) = fixture(calls)
+        defer { p.reorderGroup?.abandon() }
+        let parent = try XCTUnwrap(p.views[9])
+        let target = try XCTUnwrap(p.views[5])
+        parent.handlers = ["pointerdown", "pointermove", "pointerup"]
+        target.handlers = ["hover"]
+        var heard: [String] = [], hovered: [UInt32] = []
+        p.onPointer = { id, phase, _ in heard.append("\(phase) \(id)") }
+        p.onHover = { id, inside in if inside { hovered.append(id) } }
+
+        text.mouseDown(with: event(.leftMouseDown, text, down: 0))
+        text.mouseDragged(with: event(.leftMouseDragged, text, down: 0, right: 20))
+        XCTAssertEqual(heard, ["down 9", "move 9"])
+        XCTAssertEqual(p.pointerHeld, 9)
+        XCTAssertTrue(p.pointerSource === text)
+        let hold = try XCTUnwrap(p.reorderGroup)
+        // The grouped contact's monitor consumes the up before any view sees it.
+        NSApp.sendEvent(event(.leftMouseDragged, text, down: 10, right: 220))
+        NSApp.sendEvent(event(.leftMouseUp, text, down: 10, right: 220))
+        XCTAssertEqual(heard, ["down 9", "move 9", "up 9"])
+        XCTAssertNil(p.pointerHeld)
+        XCTAssertNil(p.pointerSource)
+        XCTAssertTrue(p.pointerPath.isEmpty)
+        XCTAssertEqual(hold.state.phase, "holding")
+        XCTAssertTrue(p.reorderGroup === hold)
+        XCTAssertNotNil(hold.ghost?.view.superview)
+
+        heard = []
+        p.trackPointer(event(.mouseMoved, target, down: 0))
+        p.flushHoverMove()
+        XCTAssertEqual(heard, ["move 9"])
+        XCTAssertTrue(hovered.contains(5), "hover resumes before another click")
+
+        heard = []
+        target.mouseDown(with: event(.leftMouseDown, target, down: 0))
+        target.mouseUp(with: event(.leftMouseUp, target, down: 0))
+        XCTAssertEqual(heard, ["down 9", "up 9"])
+        XCTAssertNil(p.pointerHeld)
     }
 
     func testTheKeysLiftStepAndDropWithoutAGhost() throws {

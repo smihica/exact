@@ -7,6 +7,63 @@ import CExact
 @testable import ExactKit
 
 final class RasterLoaderTests: XCTestCase {
+    func testScreenSizedPicturesUseTheSessionBudget() throws {
+        for fit in ["fill", "cover"] {
+            for (width, height, decodedWidth, decodedHeight) in [
+                (1179, 1179, 1179, 1179), (1179, 1572, 1179, 1572), (1080, 1350, 1080, 1350),
+                (1320, 2868, 2151, 2868), (2064, 2752, 2064, 2752), (2880, 1800, 2702, 3602),
+            ] {
+                try autoreleasepool {
+                    let (root, resolver, presenter, node, loader, window) = try fixture()
+                    defer {
+                        loader.shutdown(); node.raster = nil; window.close()
+                        try? FileManager.default.removeItem(at: root)
+                        withExtendedLifetime(presenter) {}
+                    }
+                    loader.fit(size: CGSize(width: 4096, height: 4096), scale: 1)
+                    let sourceWidth = width == height ? 2048 : width == 1080 ? 1080 : 3024
+                    let sourceHeight = width == height ? 2048 : width == 1080 ? 1350 : 4032
+                    try png(root, "photo.png", width: sourceWidth, height: sourceHeight, identity: 1)
+                    let scale = window.backingScaleFactor
+                    node.frame = CGRect(x: 0, y: 0, width: CGFloat(width) / scale, height: CGFloat(height) / scale)
+                    node.style["object_fit"] = .string(fit); node.loadGeneration = 1
+                    XCTAssertTrue(loader.load(node, source: "photo.png", resolver: resolver))
+                    settle { node.raster != nil || self.images(loader).first?["failure"] as? String != "" }
+                    let image = try XCTUnwrap(node.raster?.image.image)
+                    XCTAssertEqual(image.width, decodedWidth, "\(width)×\(height), \(fit)")
+                    XCTAssertEqual(image.height, decodedHeight, "\(width)×\(height), \(fit)")
+                    if width == 2880 {
+                        // Filling this wide box from a portrait needs more
+                        // than 192 MiB; one more pixel must exceed the budget.
+                        let metadata = try RasterMetadata.validated(width: sourceWidth, height: sourceHeight,
+                            orientation: 1, encodedBytes: 100, headerBytes: 100)
+                        let larger = try RasterDecodePlan(metadata: metadata, maxPixel: decodedHeight + 1)
+                        XCTAssertGreaterThan(larger.peakBytes, Int(loader.budget))
+                    }
+                    XCTAssertLessThanOrEqual(exact_raster_stats(loader.id).peak_bytes, loader.budget)
+                }
+            }
+        }
+    }
+
+    func testAResolutionReductionKeepsTheLargestSizeTheBudgetHolds() throws {
+        let (root, resolver, presenter, node, loader, window) = try fixture()
+        defer {
+            loader.shutdown(); node.raster = nil; window.close()
+            try? FileManager.default.removeItem(at: root)
+            withExtendedLifetime(presenter) {}
+        }
+        try png(root, "photo.png", width: 1080, height: 1350, identity: 1)
+        let scale = window.backingScaleFactor
+        node.frame = CGRect(x: 0, y: 0, width: 1080 / scale, height: 1350 / scale); node.loadGeneration = 1
+        XCTAssertTrue(loader.load(node, source: "photo.png", resolver: resolver))
+        settle { node.raster != nil }
+        XCTAssertEqual(node.raster?.image.image.width, 1079)
+        XCTAssertEqual(node.raster?.image.image.height, 1348)
+        XCTAssertEqual(images(loader).first?["resolutionFallback"] as? String, "budget")
+        XCTAssertLessThanOrEqual(exact_raster_stats(loader.id).peak_bytes, loader.budget)
+    }
+
     func testQueueFullRequestAdmissionRemainsRetryable() {
         XCTAssertTrue(RasterLoader.transientRequestRefusal(8))
         for permanent in [1, 2, 6, 7, 9, 12, 15] {

@@ -66,7 +66,7 @@ class ComposeModule(context: ExtensionContext) : ExactExtension(context) {
         val subject = args.optString("subject")
         val body = args.optString("body")
         val paths = list(args, "attachments")
-        val files = paths.map { context.file(it) ?: return reply(error("NotFoundError", "an attachment names no app file")) }
+        val files = paths.map { context.fileToRead(it) ?: return reply(error("NotFoundError", "an attachment names no app file")) }
         val types = files.map { dev.exact.canvas.Files.type(it) }
         val line = { action: String -> "$kind $action, ${to.size + cc.size + bcc.size} recipients, ${files.size} attachments" + if (types.isEmpty()) "" else " (${types.joinToString()})" }
         if (!(if (kind == "email") mail || context.agent else sms || context.agent)) return reply(error("NotSupportedError", "no app on this device composes a $kind; check composeStatus()"))

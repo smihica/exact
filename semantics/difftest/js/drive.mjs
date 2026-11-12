@@ -19,7 +19,7 @@ import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { createDocument } from '../../../host/web-js/dom.js';
-import { driverRuntime, localImports } from '../../../host/web-js/glue.mjs';
+import { bundleHostModule, driverRuntime, localImports } from '../../../host/web-js/glue.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../../..');
@@ -91,10 +91,15 @@ const fire = (e, type) => { for (const f of [...(e.$listeners?.[type] ?? [])]) f
 
 // ---------------------------------------------------------------- the runtime
 // Every file the bundle may reach, as host/web-js/build.mjs lays them out.
-function runtime(dir) {
+async function runtime(dir) {
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  for (const f of driverRuntime(root)) cpSync(resolve(root, f), resolve(dir, basename(f)));
+  for (const f of driverRuntime(root)) {
+    if (f.startsWith('host/web/navigation/') || ['host/web/navigation.js', 'host/web/grant-admission.js'].includes(f)) continue;
+    cpSync(resolve(root, f), resolve(dir, basename(f)));
+  }
+  writeFileSync(resolve(dir, 'navigation.js'), await bundleHostModule(root, 'navigation.js', { grants: true }));
+  writeFileSync(resolve(dir, 'grant-admission.js'), await bundleHostModule(root, 'grant-admission.js'));
   // `sin` and `cos` answer the runner's bits (`trig` below), not `Math`'s.
   const roster = resolve(dir, 'roster.js'), engine = 'export const x_sin = Math.sin, x_cos = Math.cos;';
   const text = readFileSync(roster, 'utf8');
@@ -197,6 +202,12 @@ async function drive(code, c, hostSources) {
   // `setMode` is the runtime's own, as the runner's (LLP 1121 D5): no host is
   // told, and the window's mode selects presentation, which no line shows.
   Hosts.setMode = () => {};
+  // So is the row form of `scrollIntoView`, seven arguments (list.js; LLP
+  // 1070.000 §12–13); an element's, four, is a host's (`hostCommands` in the
+  // Lean semantics).
+  const rowScroll = (name, args) => name === 'scrollIntoView' && args.length === 7;
+  const toldScroll = record('scrollIntoView');
+  Hosts.scrollIntoView = (...args) => { if (!rowScroll('scrollIntoView', args)) toldScroll(...args); };
   // The voice table's commands are the runtime's own (rt.js `Sounds.own`): they reach `Sounds.apply`
   // with the commit's whole command list, in order, not `Hosts`. Record the list as the runner does:
   // the host commands just recorded from it are replaced by the whole of it.
@@ -204,8 +215,8 @@ async function drive(code, c, hostSources) {
   Object.defineProperty(Sounds, 'apply', {
     configurable: true,
     get: () => cmds => {
-      // `setMode` was never recorded (above), and the runner tells no host of it.
-      const shown = cmds.filter(([name]) => name !== 'setMode');
+      // `setMode` and a row's `scrollIntoView` were never recorded (above), and the runner tells no host of them.
+      const shown = cmds.filter(([name, args]) => name !== 'setMode' && !rowScroll(name, args));
       if (shown.some(([name]) => Sounds.own.has(name))) {
         const hosts = shown.filter(([name]) => !Sounds.own.has(name)).length;
         commands.splice(commands.length - hosts, hosts, ...shown.map(([name, args]) => `command ${name}${args.map(a => ' ' + untyped(a)).join('')}`));
@@ -214,7 +225,11 @@ async function drive(code, c, hostSources) {
     },
     set: f => { applySounds = f; },
   });
-  Object.setPrototypeOf(Hosts, new Proxy({}, { get: (_, name) => typeof name === 'string' ? record(name) : undefined }));
+  Object.setPrototypeOf(Hosts, new Proxy({}, {
+    get: (_, name) => typeof name === 'string' ? record(name) : undefined,
+    // Commands linked at boot must keep the recorder instead of running their host effects.
+    set: () => true,
+  }));
 
   const out = ['== boot'];
   const mark = () => journal.start + journal.length;
@@ -322,7 +337,7 @@ async function drive(code, c, hostSources) {
 process.on('unhandledRejection', () => {});
 const quiet = process.env.DIFFTEST_JS_DEBUG ? console : { ...console, error() {}, warn() {} };
 const batch = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-runtime(batch.work);
+await runtime(batch.work);
 for (const c of batch.cases) {
   let result;
   try {

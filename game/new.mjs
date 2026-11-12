@@ -6,6 +6,8 @@ import { basename, dirname, relative, resolve } from 'node:path';
 import { capturedLockDrift, gameDefaults, gameShells, prepareGame } from './app/shells.mjs';
 import { cargoEnvironment, lockedMetadata, pathFrom, patchLines } from '../scripts/app.mjs';
 import { PLATFORMS, authoredCrate, copiedBuildScripts, namePlatform, withoutPlatformKeys } from '../scripts/app-shells.mjs';
+import { updateManifests } from './update-manifests.mjs';
+export { exact2Placeholders } from './update-manifests.mjs';
 import { APP_CRATES, NO_WORKSPACE } from '../scripts/cargo-check.mjs';
 import { APPLE_BUILD_SCRIPT, EARLIER_APPLE_BUILD_SCRIPT } from '../scripts/linked-plan.mjs';
 // Snapback's client (snapback4/) is optional: a checkout without it builds every app that does not mount it.
@@ -150,7 +152,7 @@ export function createApp(destination, options = {}) {
     throw new Error('Usage: exact new <path> [--update | --snapback [--port <n>]] (the last part names the app: lowercase-hyphenated, no host suffix)');
   }
   const taken = ['apple', 'linux', 'web'].map(host => `${name}-${host}`).filter(crate => SDK_CRATES.has(crate));
-  if (taken.length) throw new Error(`exact new ${destination}: the folder's name ${name} would make the crate ${taken[0]}, which is one of exact2's own; name the folder after the app (my-${name}, ${name}-app)`);
+  if (taken.length) throw new Error(`exact new ${destination}: the folder's name ${name} would make the crate ${taken[0]}, which is one of exact2's own; name the app directory something else, e.g. exact new ${resolve(dir, '..', `${name}-app`)}`);
   if (options.update) return updateApp(dir, name, options);
   if (options.id !== undefined && !BUNDLE_ID.test(options.id)) throw new Error(`exact new --bundle-id ${options.id}: not a reverse-DNS id; write two or more dot-separated parts of letters, digits and hyphens, each starting with a letter, as com.yourcompany.${name.replaceAll('-', '')}`);
   if (options.title !== undefined && (!options.title.trim() || /[\x00-\x1f\x7f]/.test(options.title))) throw new Error('exact new --name: give the name people see, on one line, as --name "Field Log"');
@@ -195,7 +197,7 @@ export function createApp(destination, options = {}) {
 
 /** The crates an app's own depend on by path (`writeApp`, `linuxCrate`): a
  * folder named `exact` would write an `exact-apple` beside the SDK's. */
-const SDK_CRATES = new Set(['exact-logic', 'exact-apple', 'exact-apple-update', 'exact-js', 'exact-js-bake', 'exact-linux', 'exact-web', 'exact-web-capabilities', 'exact-js-web']);
+const SDK_CRATES = new Set(['ibex2-sqlite', 'exact-logic', 'exact-apple', 'exact-apple-update', 'exact-js', 'exact-js-bake', 'exact-linux', 'exact-web', 'exact-web-capabilities', 'exact-js-web']);
 
 const rosterRule = body => {
   const insert = /^[ \t]+insert[ \t]*<-[ \t]*([^\n]*)/m.exec(body);
@@ -871,21 +873,22 @@ function agentNotes(dir, name, {game = false} = {}) {
   return `${BEGIN}
 # ${name}: an Exact app
 
-\`app.contract\` is the view, \`app.ts\` its data module, \`app.test.contract\` its tests, \`app.json\`
-the manifest: set its \`app.name\` and \`app.id\` before the first build. The app uses the exact2
-checkout at \`${pathFrom(from, ROOT)}\` by path (\`EXACT2\` overrides it).
+\`app.contract\` is the view, \`app.ts\` the data module, \`app.test.contract\` the tests, \`app.json\`
+the manifest: set \`app.name\` and \`app.id\` before building. The app uses Exact at
+\`${pathFrom(from, ROOT)}\` by path (\`EXACT\` overrides it).
 
 This file is already in your instructions. Start from the nearest pattern: \`bun exact.mjs
 pattern\` lists them and \`pattern <name>\` writes one, tested. ${doc('start-here-site.md')} (a site) or
 ${doc('start-here.md')} is the only required reading. \`bun exact.mjs contract vocab <name>\` answers a
 name (none: the card); \`bun exact.mjs docs <heading words>\` a guide's
 section. Run \`bun exact.mjs verify\` when the features work, and \`verify ios|android\` at the end for a
-phone app. When an iPhone app is ready for the person to try, run \`bun exact.mjs share\` and give
-them the link it prints; run it again after each change they should see. \`bun exact.mjs help\` lists the verbs, and your own in app.json \`"commands"\`.
+phone app. When an iPhone app is ready to try, run \`bun exact.mjs share\` and send its link;
+repeat for each change the person should see. \`bun exact.mjs help\` lists the verbs, including
+app.json's \`"commands"\`.
 \`bun exact.mjs update\` refreshes files.${authoredApp(dir) ? ` \`bun exact.mjs lock\` repairs Cargo lock drift.
-\`bun exact.mjs update --without linux\` stops shipping Linux.` : ` A native verb (\`ios\`, \`mac\`, \`linux\`, \`android\`,
-\`windows\`) names its platform in app.json the first time it runs and builds it in a generated
-workspace; \`update --without <platform>\` stops it.`}
+\`bun exact.mjs update --without linux\` stops shipping Linux.` : ` Native verbs (\`ios\`, \`mac\`, \`linux\`, \`android\`, \`windows\`)
+name their platform in app.json on first use and build in a generated workspace;
+\`update --without <platform>\` stops shipping it.`}
 \`bun ${sdk('scripts/exact.mjs')} setup --check\` names what a native build lacks.
 ${snapbackNotes(dir, from)}
 
@@ -922,7 +925,7 @@ controls are \`app.contract\` (Contract). \`app.json\` is optional and holds onl
 you author (a title, \`game.audio\`, \`game.assets\`, a data crate). The bake generates
 the hosts under \`.shells/\` (ignored; never edit it), and so does \`bun exact.mjs test-rust\`:
 run that once before \`cargo\` in \`render/\` or a render example, whose workspace it is. The game uses the exact2 checkout
-at \`${pathFrom(from, ROOT)}\` by path (\`EXACT2\` overrides it).
+at \`${pathFrom(from, ROOT)}\` by path (\`EXACT\` overrides it).
 
 Look things up in this order before reading engine source:
 
@@ -1042,7 +1045,7 @@ function appHome(dir) {
   return existsSync(home) ? home : dir;
 }
 
-/** The app's command runner: a launcher that finds the checkout (EXACT2 names it once, D3; the default
+/** The app's command runner: a launcher that finds the checkout (EXACT names it once, else EXACT2, LLP 1036.001 D3; the default
  * is the one that created the app, so a sibling checkout needs nothing) and hands the verb to its
  * scripts/app-cli.mjs, which holds the verbs (LLP 1116.006 D7), so a builder reading it reads a few lines. */
 function commandsFor(dir, name, {game = false} = {}) {
@@ -1053,27 +1056,27 @@ function commandsFor(dir, name, {game = false} = {}) {
   return `#!/bin/sh
 ':' //; if [ -n "$BUN" ]; then exec "$BUN" "$0" "$@"; elif [ -x "$HOME/${pinned}" ]; then exec "$HOME/${pinned}" "$0" "$@"; else exec ${creator} "$0" "$@"; fi
 // ${name}'s commands: \`bun exact.mjs --help\` lists the verbs, \`bun exact.mjs <verb> --help\` a verb's flags.
-// They live in the exact2 checkout named by EXACT2 (default ${pathFrom(from, ROOT)}), in its
+// They live in the Exact checkout named by EXACT, else EXACT2 (default ${pathFrom(from, ROOT)}), in its
 // scripts/app-cli.mjs. Generated by \`exact new\`; \`bun exact.mjs update\` rewrites this file, the crates.io
 // patches, the toolchain and the exact2 dependency paths. The app's own verbs are app.json's \`commands\`.
 import { spawnSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, relative, resolve } from 'node:path';
 
-const path = process.env.EXACT2 ?? ${JSON.stringify(pathFrom(from, ROOT))};
+const path = process.env.EXACT ?? process.env.EXACT2 ?? ${JSON.stringify(pathFrom(from, ROOT))};
 const found = (base) => existsSync(resolve(base, path, 'scripts/app-cli.mjs'));
 // In a linked git worktree the path is from the app's folder in the main working tree, as \`update\` writes it there. Only
 // a common dir that is <main>/.git names that tree; a bare repository's, a submodule's or a --separate-git-dir one does not.
-const git = process.env.EXACT2 || found(import.meta.dir) ? null : spawnSync('git', ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'], { cwd: import.meta.dir, encoding: 'utf8', env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))) });
+const git = process.env.EXACT || process.env.EXACT2 || found(import.meta.dir) ? null : spawnSync('git', ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir'], { cwd: import.meta.dir, encoding: 'utf8', env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))) });
 const [top, common] = git?.status === 0 ? git.stdout.trim().split('\\n').map((line) => realpathSync(line.trim())) : [];
 const main = basename(common ?? '') === '.git' ? resolve(dirname(common), relative(top, realpathSync(import.meta.dir))) : null;
-const EXACT2 = resolve(main && found(main) ? main : import.meta.dir, path);
-const cli = resolve(EXACT2, 'scripts/app-cli.mjs');
-if (!existsSync(cli)) { console.error(\`no exact2 at \${EXACT2} (no scripts/app-cli.mjs): EXACT2 names the checkout\`); process.exit(1); }
-const { ensureBun } = await import(resolve(EXACT2, 'scripts/bun.mjs'));
+const EXACT = resolve(main && found(main) ? main : import.meta.dir, path);
+const cli = resolve(EXACT, 'scripts/app-cli.mjs');
+if (!existsSync(cli)) { console.error(\`no Exact checkout at \${EXACT} (no scripts/app-cli.mjs): EXACT names the checkout\`); process.exit(1); }
+const { ensureBun } = await import(resolve(EXACT, 'scripts/bun.mjs'));
 ensureBun(${JSON.stringify(JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')).packageManager.replace('bun@', ''))});
 const { run } = await import(cli);
-process.exit(await run({ dir: import.meta.dir, name: ${JSON.stringify(name)},${game ? ' game: true,' : ''} exact2: EXACT2, args: process.argv.slice(2) }));
+process.exit(await run({ dir: import.meta.dir, name: ${JSON.stringify(name)},${game ? ' game: true,' : ''} exact2: EXACT, args: process.argv.slice(2) }));
 `;
 }
 
@@ -1293,13 +1296,10 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
   // The app's crates name it, not its folder: a renamed folder keeps `<name>-web`, `<name>-apple`
   // (authoring bench: `exact.mjs ios` asked Cargo for `todo-apple` in a `todo/` holding `todo-list-*`).
   name = ['web', 'apple', 'linux'].map(kind => resolve(dir, kind, 'Cargo.toml')).filter(existsSync)
-    .map(path => String(Bun.TOML.parse(readFileSync(path, 'utf8')).package?.name ?? '').match(/^(.+)-(?:web|apple|linux)$/)?.[1]).find(Boolean) ?? name;
-  const manifest = readFileSync(resolve(dir, 'Cargo.toml'), 'utf8');
-  const block = `[patch.crates-io]\n${patchLines(dir).join('\n')}\n`;
-  // The table runs from its header to the next header; its trailing blank line stays.
-  const section = /^\[patch\.crates-io\]\n(?:(?!\[)[^\n]*\n?)*/m, at = manifest.search(section);
-  writeFileSync(resolve(dir, 'Cargo.toml'), at < 0 ? `${manifest.trimEnd()}\n\n${block}`
-    : manifest.replace(section, table => block + (at + table.length < manifest.length ? '\n' : '')));
+    .map(path => {
+      try { return String(Bun.TOML.parse(readFileSync(path, 'utf8')).package?.name ?? '').match(/^(.+)-(?:web|apple|linux)$/)?.[1]; }
+      catch { return undefined; } // Cargo reports an invalid authored manifest below.
+    }).find(Boolean) ?? name;
   writeFileSync(resolve(dir, 'rust-toolchain.toml'), readFileSync(resolve(ROOT, 'rust-toolchain.toml')));
   mkdirSync(resolve(dir, '.cargo'), { recursive: true });
   writeFileSync(resolve(dir, '.cargo/config.toml'), readFileSync(resolve(ROOT, '.cargo/config.toml')));
@@ -1315,6 +1315,12 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
     if (p === 'linux') return named('android') ? withoutPlatformKeys(d, p) : dropPlatform(d, p);
     return withoutPlatformKeys(d, p);
   });
+  const manifest = readFileSync(resolve(dir, 'Cargo.toml'), 'utf8');
+  const block = `[patch.crates-io]\n${patchLines(dir).join('\n')}\n`;
+  // The table runs from its header to the next header; its trailing blank line stays.
+  const section = /^\[patch\.crates-io\]\n(?:(?!\[)[^\n]*\n?)*/m, at = manifest.search(section);
+  let rootText = at < 0 ? `${manifest.trimEnd()}\n\n${block}`
+    : manifest.replace(section, table => block + (at + table.length < manifest.length ? '\n' : ''));
   // An app made before the scaffold wrote a Linux host gains one (LLP 1086), unless it has its own or ships
   // neither Linux nor Android (the crate serves both, LLP 1107): app.json's `host` keys, or the store key the
   // scaffold wrote for Linux, say which.
@@ -1327,9 +1333,8 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
       mkdirSync(dirname(resolve(dir, path)), { recursive: true });
       writeFileSync(resolve(dir, path), text);
     }
-    const workspace = readFileSync(resolve(dir, 'Cargo.toml'), 'utf8');
-    writeFileSync(resolve(dir, 'Cargo.toml'), workspace.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
-      /"linux"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"linux"'].sort().join(', ')}]`));
+    rootText = rootText.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
+      /"linux"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"linux"'].sort().join(', ')}]`);
   }
   // And one that names Android gains the library its APK loads (LLP 1107), as the generated workspace has it.
   const addedAndroid = named('android') && !existsSync(resolve(dir, 'android'));
@@ -1339,9 +1344,8 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
       mkdirSync(dirname(resolve(dir, path)), { recursive: true });
       writeFileSync(resolve(dir, path), text);
     }
-    const workspace = readFileSync(resolve(dir, 'Cargo.toml'), 'utf8');
-    writeFileSync(resolve(dir, 'Cargo.toml'), workspace.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
-      /"android"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"android"'].sort().join(', ')}]`));
+    rootText = rootText.replace(/^members\s*=\s*\[([^\]]*)\]/m, (line, list) =>
+      /"android"/.test(list) ? line : `members = [${[...list.split(',').map(m => m.trim()).filter(Boolean), '"android"'].sort().join(', ')}]`);
   }
   const notes = updateNotes(dir, name);
   if (editorTasks(dir)) notes.push('.vscode/tasks.json');
@@ -1367,14 +1371,9 @@ function updateApp(dir, name, { without = null, with: platforms = [] } = {}) {
   const metadata = spawnSync('cargo', ['metadata', '--no-deps', '--offline', '--format-version', '1'], { cwd: ROOT, env: cargoEnvironment(), encoding: 'utf8', maxBuffer: 1 << 26 });
   if (metadata.status !== 0) throw new Error(`cargo metadata in ${ROOT}:\n${metadata.stderr}`);
   const crates = new Map(JSON.parse(metadata.stdout).packages.map(p => [p.name, dirname(p.manifest_path)]));
-  const changed = [];
-  for (const file of readdirSync(dir, { recursive: true }).filter(f => basename(f) === 'Cargo.toml' && !/^(target|dist)\//.test(f))) {
-    const path = resolve(dir, file), text = readFileSync(path, 'utf8');
-    const next = text.replace(/^(exact-[a-z0-9-]+)(\s*=\s*\{[^}\n]*\bpath\s*=\s*)"[^"]*"/gm, (line, crate, head) =>
-      crates.has(crate) ? `${crate}${head}${JSON.stringify(pathFrom(dirname(path), crates.get(crate)))}` : line);
-    if (next !== text) { writeFileSync(path, next); changed.push(file); }
-  }
-  const said = `Updated ${dir}: patches, toolchain, exact.mjs${addedLinux ? ', a linux/ host crate' : ''}${addedAndroid ? ', an android/ crate (bun exact.mjs android builds the APK)' : ''}${edits.length ? `, ${edits.join(', ')}` : ''}${without && ['linux', 'android'].includes(without) ? ', Cargo.lock' : ''}${notes.length ? `, ${notes.join(', ')}` : ''}${changed.length ? `, exact2 paths in ${changed.join(', ')}` : ''}`;
+  crates.set('ibex2-sqlite', resolve(ROOT, 'vendor/ibex/crates/ibex2-sqlite'));
+  const { changed, unresolved } = updateManifests(dir, crates, rootText);
+  const said = `Updated ${dir}: patches, toolchain, exact.mjs${addedLinux ? ', a linux/ host crate' : ''}${addedAndroid ? ', an android/ crate (bun exact.mjs android builds the APK)' : ''}${edits.length ? `, ${edits.join(', ')}` : ''}${without && ['linux', 'android'].includes(without) ? ', Cargo.lock' : ''}${notes.length ? `, ${notes.join(', ')}` : ''}${changed.length ? `, exact2 paths in ${changed.join(', ')}` : ''}${unresolved.length ? `\n<exact2> left unresolved in ${unresolved.join(', ')}: a path into exact2 is written \`<exact2>/\` and then forward slashes` : ''}`;
   // Whether the workspace loads: every member's manifest read, nothing resolved or fetched, so only the app's files can
   // fail it. One that does not load builds nothing, so the update failed, though its files are written.
   const loads = spawnSync('cargo', ['metadata', '--no-deps', '--offline', '--format-version', '1'], { cwd: dir, env: cargoEnvironment(), stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });

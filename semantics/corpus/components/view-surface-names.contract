@@ -1,0 +1,15 @@
+component Scene
+  state world = 9
+  view
+    column
+      canvas surface=world
+      canvas surface=world(seed=world)
+      for world in [1] key=world
+        canvas surface=world
+        canvas surface=world(seed=world)
+      match some(2)
+        case some(world)
+          canvas surface=world
+          canvas surface=world(seed=world)
+        case none
+          text "None"

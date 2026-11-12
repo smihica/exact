@@ -66,6 +66,29 @@ pub(crate) fn leftover(tag: &str, a: &Attr) -> bool {
         && tags::renamed(&a.name).is_none()
 }
 
+/// Whether `a`, written on module tag `tag`, is a prop the tag's package
+/// declares for its view: the module's even where the table names it too
+/// (`exact-camera` declares `object-fit`, which its viewfinders read, LLP
+/// 1133.008 D2). Only where written on the tag: a class's rows are its
+/// box's style. A renamed spelling is refused whatever is declared.
+pub(crate) fn declared(tag: &str, a: &Attr) -> bool {
+    is_module_tag(tag)
+        && a.name != "class"
+        && crate::dataset::word(&a.name).is_none()
+        && tags::renamed(&a.name).is_none()
+        && crate::native_typed::declares_prop(tag, &a.name)
+}
+
+/// `attrs`, written on module tag `tag`, split into the declared props
+/// ([`declared`]) and the rest, which lower as any module tag's do; `None`
+/// when there are no declared props among them.
+pub(crate) fn split_declared(tag: &str, attrs: &[Attr]) -> Option<(Vec<Attr>, Vec<Attr>)> {
+    attrs
+        .iter()
+        .any(|a| declared(tag, a))
+        .then(|| attrs.iter().cloned().partition(|a| declared(tag, a)))
+}
+
 /// A known attribute a module tag cannot use, refused by name. The table
 /// binds before the module (LLP 1024 D1), so a known word on a module tag
 /// binds to its box, and the box uses only what any leaf box uses: layout,
@@ -79,7 +102,7 @@ pub(crate) fn leftover(tag: &str, a: &Attr) -> bool {
 /// `class` and `data-*` never reach here, and an SVG element's own props
 /// (`svg_only_prop`, `mode`) stay the module's.
 pub(crate) fn refused(tag: &str, a: &Attr) -> Option<LowerError> {
-    if !is_module_tag(tag) || leftover(tag, a) {
+    if !is_module_tag(tag) || leftover(tag, a) || declared(tag, a) {
         return None;
     }
     let what = match tags::attr(&a.name)? {

@@ -208,6 +208,12 @@ impl Output for WindowsOutput {
     fn set(&mut self, id: u64, left: f32, right: f32) {
         self.pending.set(id, left, right);
     }
+    fn set_pitch(&mut self, id: u64, pitch: f32) {
+        self.pending.set_pitch(id, pitch);
+    }
+    fn finished(&self, id: u64) -> bool {
+        self.pending.finished(id)
+    }
     fn stop(&mut self, id: u64) {
         self.pending.stop(id);
     }

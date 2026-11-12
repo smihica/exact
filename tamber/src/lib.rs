@@ -46,7 +46,7 @@ pub use component::{Component, Param};
 pub use css::{MAX_VALUE_BYTES, MAX_VALUE_DEPTH};
 pub use edit::{apply, apply_all, apply_all_with, undo, Edited, Op, WhenLine};
 pub use fmt::format;
-pub use fold::{Folded, Half, Host};
+pub use fold::{FoldError, Folded, Half, Host};
 pub use icon::Icon;
 pub use ir::FORMAT;
 pub use lex::is_name;
@@ -56,7 +56,7 @@ pub use session::{plan, Class, Planned, Refused, Retention, Synthetic};
 pub use shadow::{Shadow, ShadowLength, Shadows};
 pub use syntax::{parse, At, Axis, Design, Dial, DialKind, Token, When};
 pub use trace::{traced, ByTuple};
-pub use typeface::Type;
+pub use typeface::{family_names, Type};
 
 /// A refusal, at a line and column of the source.
 #[derive(Debug, Clone, PartialEq, Eq)]

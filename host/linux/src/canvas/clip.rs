@@ -9,15 +9,26 @@
 use super::*;
 
 /// A clip the walk pushed: the shape in its transform, and whether it has
-/// been written into the stream (as `CLIP_RRECT` after a save).
+/// been written into the stream after a save.
 #[derive(Clone)]
 pub(super) struct Clip {
-    shape: Shape,
+    geometry: Geometry,
     ts: Transform,
     /// Page-space rect and radii, when the transform is a scale and translate.
     page: Option<(Rect4, [(f32, f32); 4])>,
     emitted: bool,
 }
+
+#[derive(Clone)]
+enum Geometry {
+    Rect(Shape),
+    Paths(Vec<(bool, Vec<PathOp>)>),
+}
+
+/// Independently filled paths unioned before they clip.
+pub(super) const CLIP_UNION: u32 = 45;
+/// A layer whose alpha masks the isolated content below it.
+pub(super) const MASK_LAYER: u32 = 46;
 
 /// `ts` as (sx, sy, tx, ty) when it only scales and translates.
 fn axis(ts: Transform) -> Option<(f32, f32, f32, f32)> {
@@ -98,7 +109,7 @@ impl Recorder {
         props: &str,
         direct: bool,
     ) {
-        let bounds = map(shape.rect, ts);
+        let bounds = self.on_page(shape.rect, ts);
         if self.culled(bounds) {
             return;
         }
@@ -133,13 +144,98 @@ impl Recorder {
         self.string(props);
     }
 
+    fn paths_clip(&mut self, paths: Vec<(bool, Vec<PathOp>)>, ts: Transform) {
+        self.clips.push(Clip {
+            geometry: Geometry::Paths(paths),
+            ts,
+            page: None,
+            emitted: false,
+        });
+        self.materialize(self.clips.len() - 1);
+    }
+
+    pub(super) fn css_clip(&mut self, css: &exact_kernel::clip::ClipPath, ts: Transform) -> bool {
+        if css.commands().is_empty() {
+            return false;
+        }
+        let path = css
+            .commands()
+            .iter()
+            .map(|(op, v)| match op {
+                'M' => PathOp::Move(v[0], v[1]),
+                'L' => PathOp::Line(v[0], v[1]),
+                'C' => PathOp::Cubic(v[0], v[1], v[2], v[3], v[4], v[5]),
+                'Z' => PathOp::Close,
+                _ => unreachable!("validated CSS path"),
+            })
+            .collect();
+        self.paths_clip(
+            vec![(css.rule() == exact_kernel::FillRule::Evenodd, path)],
+            ts,
+        );
+        true
+    }
+
+    pub(super) fn svg_clip(
+        &mut self,
+        clip: &exact_kernel::svg::scene::Clip,
+        ts: Transform,
+    ) -> usize {
+        let mut level = Some(clip);
+        let mut pushed = 0;
+        while let Some(c) = level {
+            let paths = c
+                .shapes
+                .iter()
+                .map(|s| {
+                    let path = s
+                        .path
+                        .0
+                        .iter()
+                        .map(|seg| match *seg {
+                            exact_kernel::svg::Seg::Move(x, y) => PathOp::Move(x, y),
+                            exact_kernel::svg::Seg::Line(x, y) => PathOp::Line(x, y),
+                            exact_kernel::svg::Seg::Cubic(a, b, c, d, x, y) => {
+                                PathOp::Cubic(a, b, c, d, x, y)
+                            }
+                            exact_kernel::svg::Seg::Close => PathOp::Close,
+                        })
+                        .collect();
+                    (s.even_odd, path)
+                })
+                .collect();
+            self.paths_clip(paths, ts);
+            pushed += 1;
+            level = c.then.as_deref();
+        }
+        pushed
+    }
+
+    pub(super) fn mask_end(
+        &mut self,
+        shape: &Shape,
+        mask: &Result<GradientPaint, [u8; 4]>,
+        ts: Transform,
+    ) {
+        self.need(None);
+        self.ops.push(MASK_LAYER);
+        match mask {
+            Ok(gradient) => self.fill_gradient(shape, gradient, ts),
+            Err(color) => self.fill(shape, *color, ts),
+        }
+        // Composite the entire mask layer, including transparency outside the border box.
+        self.ops.push(RESTORE);
+        self.matrix = None;
+        self.pop_opacity();
+    }
+
     pub(super) fn clip_push(&mut self, s: &Shape, ts: Transform) {
-        let page = map(s.rect, ts).map(|r| {
+        let page = self.on_page(s.rect, ts).map(|r| {
             let (sx, sy, _, _) = axis(ts).expect("mapped");
             (r, s.radii.map(|(x, y)| (x * sx, y * sy)))
         });
         self.clips.push(Clip {
-            shape: *s,
+            geometry: Geometry::Rect(*s),
             ts,
             page,
             emitted: false,
@@ -164,10 +260,31 @@ impl Recorder {
             if self.clips.is_empty() || self.clips[i].emitted {
                 continue;
             }
-            let (shape, ts) = (self.clips[i].shape, self.clips[i].ts);
+            let (geometry, ts) = (self.clips[i].geometry.clone(), self.clips[i].ts);
             self.transform(ts);
-            self.ops.push(CLIP_RRECT);
-            self.rect_radii(&shape);
+            match geometry {
+                Geometry::Rect(shape) => {
+                    self.ops.push(CLIP_RRECT);
+                    self.rect_radii(&shape);
+                }
+                Geometry::Paths(paths) => {
+                    if paths.len() <= 1 {
+                        let (rule, ops) = paths
+                            .first()
+                            .map_or((false, &[][..]), |(r, p)| (*r, &p[..]));
+                        self.ops.extend([CLIP_PATH, u32::from(rule)]);
+                        self.path(ops);
+                    } else {
+                        let at = self.ops.len();
+                        self.ops.extend([CLIP_UNION, 0, paths.len() as u32]);
+                        for (rule, ops) in paths {
+                            self.ops.push(u32::from(rule));
+                            self.path(&ops);
+                        }
+                        self.ops[at + 1] = (self.ops.len() - at - 2) as u32;
+                    }
+                }
+            }
             self.clips[i].emitted = true;
         }
     }
@@ -219,8 +336,11 @@ impl Recorder {
         dst: Rect4,
         own: &[Shape],
         ts: Transform,
+        tint: Option<[u8; 4]>,
     ) -> bool {
-        let Some(d) = map(dst, ts) else { return false };
+        let Some(d) = self.on_page(dst, ts) else {
+            return false;
+        };
         let (sx, sy, _, _) = axis(ts).expect("mapped");
         let mut region = d;
         let mut shapes: Vec<(Rect4, [(f32, f32); 4])> = Vec::new();
@@ -258,6 +378,7 @@ impl Recorder {
         }
         // Page space; inside a row, the matrix moves it to the row's origin.
         self.transform(Transform::identity());
+        self.image_tint(tint);
         self.ops.extend([IMAGE_RRECT, id]);
         for v in [d.0, d.1, d.2, d.3, region.0, region.1, region.2, region.3] {
             self.f(v);
@@ -267,6 +388,189 @@ impl Recorder {
             self.f(y);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::super::stream::end;
+    use super::*;
+    use exact_kernel::clip::ClipPath;
+    use exact_kernel::svg::scene::{Clip as SvgClip, ClipShape};
+
+    #[test]
+    fn css_clip_records_the_path_and_restores_its_scope() {
+        let mut r = Recorder::new();
+        let ts = Transform::from_translate(12.0, 9.0);
+        let css = ClipPath::parse("path(evenodd, 'M0 0 L100 0 L0 100 Z')").unwrap();
+        assert!(r.push_css_clip(&css, ts));
+        r.fill(&Shape::rect((0., 0., 100., 100.)), [255; 4], ts);
+        r.pop_clip();
+        let (ops, _) = super::super::stream::drawing(&r.ops).unwrap();
+        assert_eq!(ops[7..10], [CLIP_PATH, 1, 4]);
+        assert_eq!(ops.last(), Some(&RESTORE));
+        assert!(r.clips.is_empty());
+    }
+
+    #[test]
+    fn svg_clip_records_its_shapes() {
+        let mut r = Recorder::new();
+        let clip = SvgClip {
+            shapes: vec![ClipShape {
+                path: exact_kernel::svg::parse_d_whole("M0 0 L100 0 L0 100 Z").unwrap(),
+                even_odd: false,
+            }],
+            then: None,
+        };
+        assert_eq!(r.push_svg_clip(&clip, Transform::identity()), 1);
+        assert!(!r.ops.is_empty());
+        r.pop_clip();
+        assert_eq!(r.ops.last(), Some(&RESTORE));
+    }
+
+    #[test]
+    fn svg_clip_unions_each_child_rule_before_intersecting_its_own_clip() {
+        let shape = |data, even_odd| ClipShape {
+            path: exact_kernel::svg::parse_d_whole(data).unwrap(),
+            even_odd,
+        };
+        let clip = SvgClip {
+            shapes: vec![
+                shape("M0 0 L80 0 L0 80 Z", false),
+                shape("M0 0 L0 80 L80 0 Z", true),
+            ],
+            then: Some(Box::new(SvgClip {
+                shapes: vec![],
+                then: None,
+            })),
+        };
+        let mut r = Recorder::new();
+        let ts = Transform::identity();
+        r.push_clip(&Shape::new((0., 0., 100., 100.), [8.; 4]), ts);
+        assert_eq!(r.push_svg_clip(&clip, ts), 2);
+        // The pending rounded ancestor is outside the union. Reversing the
+        // second child's winding must not subtract it from the first child.
+        let union = end(&r.ops, end(&r.ops, 0).unwrap()).unwrap();
+        assert_eq!(r.ops[7], CLIP_RRECT);
+        assert_eq!(r.ops[union..union + 4], [CLIP_UNION, 25, 2, 0]);
+        assert_eq!(r.ops[union + 15], 1, "the second child's evenodd rule");
+        let empty = end(&r.ops, union).unwrap();
+        assert_eq!(
+            r.ops[empty..],
+            [CLIP_PATH, 0, 0],
+            "empty SVG clips hide all content"
+        );
+        for _ in 0..3 {
+            r.pop_clip();
+        }
+        assert_eq!(&r.ops[r.ops.len() - 3..], &[RESTORE; 3]);
+        assert!(super::super::stream::drawing(&r.ops).is_some());
+    }
+
+    #[test]
+    fn css_curves_and_pending_clips_survive_nested_scopes() {
+        let mut r = Recorder::new();
+        let ts = Transform::from_translate(12., 9.);
+        assert!(!r.push_css_clip(&ClipPath::default(), ts));
+        assert!(r.ops.is_empty());
+        r.push_clip(&Shape::rect((0., 0., 120., 120.)), Transform::identity());
+        let css = ClipPath::parse("path('M0 0 Q50 100 100 0 Z')").unwrap();
+        assert!(r.push_css_clip(&css, ts));
+        r.push_clip(&Shape::rect((10., 10., 20., 20.)), ts);
+        r.fill(&Shape::rect((0., 0., 100., 100.)), [255; 4], ts);
+        for _ in 0..3 {
+            r.pop_clip();
+        }
+        r.fill(
+            &Shape::rect((0., 0., 4., 4.)),
+            [255; 4],
+            Transform::identity(),
+        );
+        let mut at = 0;
+        let mut codes = Vec::new();
+        while at < r.ops.len() {
+            codes.push(r.ops[at]);
+            at = end(&r.ops, at).unwrap();
+        }
+        assert_eq!(
+            codes,
+            [
+                MATRIX, CLIP_RRECT, MATRIX, CLIP_PATH, CLIP_RRECT, RRECT, RESTORE, RESTORE,
+                RESTORE, MATRIX, RRECT
+            ]
+        );
+    }
+
+    #[test]
+    fn mask_alpha_changes_the_recorded_composite() {
+        let record = |alpha| {
+            let mut r = Recorder::new();
+            let s = Shape::rect((0., 0., 100., 100.));
+            let ts = Transform::identity();
+            r.push_mask(&s, ts);
+            r.fill(&s, [255, 0, 0, 255], ts);
+            r.pop_mask(&s, &Err([0, 0, 0, alpha]), ts);
+            r.ops
+        };
+        assert_ne!(record(255), record(0));
+    }
+
+    #[test]
+    fn gradient_mask_is_isolated_from_its_siblings_and_uses_its_own_transform() {
+        use exact_kernel::{gradient::Geometry, Color};
+        let mut r = Recorder::new();
+        let s = Shape::rect((0., 0., 100., 100.));
+        let ts = Transform::from_translate(20., 30.);
+        let gradient = GradientPaint {
+            geometry: Geometry::Linear {
+                start: (0., 0.),
+                end: (0., 100.),
+            },
+            repeat: false,
+            stops: vec![(0., Color::rgba(0, 0, 0, 255)), (1., Color::TRANSPARENT)],
+        };
+        r.fill(&s, [0, 0, 255, 255], Transform::identity());
+        r.push_mask(&s, ts);
+        r.push_mask(&s, ts);
+        r.fill(&s, [255, 0, 0, 255], Transform::identity());
+        r.pop_mask(&s, &Ok(gradient), ts);
+        r.pop_mask(&s, &Err([0, 0, 0, 128]), ts);
+        r.fill(&s, [0, 255, 0, 255], Transform::identity());
+        let mut at = 0;
+        let mut codes = Vec::new();
+        while at < r.ops.len() {
+            codes.push(r.ops[at]);
+            if r.ops[at] == super::super::gradient::SHADER {
+                assert_eq!(r.ops[at + 18] >> 24, 255);
+                assert_eq!(r.ops[at + 20] >> 24, 0);
+            }
+            at = end(&r.ops, at).unwrap();
+        }
+        assert_eq!(
+            codes,
+            [
+                MATRIX,
+                RRECT,
+                LAYER,
+                LAYER,
+                RRECT,
+                MASK_LAYER,
+                MATRIX,
+                super::super::gradient::SHADER,
+                RRECT,
+                RESTORE,
+                RESTORE,
+                MASK_LAYER,
+                MATRIX,
+                RRECT,
+                RESTORE,
+                RESTORE,
+                MATRIX,
+                RRECT
+            ]
+        );
+        assert_eq!(r.direct.isolation, 0);
+        assert_eq!(r.matrix.unwrap()[4..], [0., 0.]);
     }
 }
 

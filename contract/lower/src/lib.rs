@@ -67,6 +67,8 @@ mod root_names;
 mod routes;
 mod row_look;
 mod scale;
+mod scroll_bounds;
+mod shape_types;
 mod shorthands;
 mod sites;
 mod sounds;
@@ -74,6 +76,7 @@ mod spelling;
 mod states;
 mod stmts;
 mod strings;
+mod style_hosts;
 pub mod style_names;
 mod svg;
 mod swipe_rows;
@@ -96,7 +99,7 @@ pub use error::LowerError;
 pub(crate) use error::{err, err_one};
 pub use fields::Profile;
 pub use identity::compiler_identity;
-pub use lint::lint;
+pub use lint::{lint, lint_unused};
 use lint::{unknown_attr, unknown_tag};
 pub use native::{is_module_tag, module_tags};
 pub use native_typed::{DeclaredView, DeclaredViews, EVENT_MARKER};
@@ -292,6 +295,7 @@ pub(crate) struct Lowerer<'a> {
     /// parent): the node a site is placed under, as a page's tree has it (`NodeSite::parent`, stage 15 D3).
     site_parent: Option<u32>,
     parent_bounded_column: bool,
+    parent_stacks: bool,
     parent_horizontal_flex: Option<bool>,
     /// Where a native button may not be, from the nearest ancestor that says.
     pub(crate) button_context: Option<&'static str>,
@@ -438,6 +442,7 @@ fn lower_with_sites(
         parent_positioned: true,
         site_parent: None,
         parent_bounded_column: false,
+        parent_stacks: true,
         parent_horizontal_flex: Some(false),
         button_context: None,
         popover_child: false,
@@ -572,10 +577,7 @@ fn lower_body(
     l.check_anatomy(file);
     let refused = l.declare_keyframes(file);
     l.errors.extend(refused);
-    // Shapes first, in declaration order, so type ids are stable.
-    for s in &file.shapes {
-        l.ty_id(&Ty::Record(s.name.clone()))?;
-    }
+    l.declare_shapes(file)?;
     // Ids for every declaration before any body, so bodies may reference any
     // of them; each starts with the one placeholder body its own replaces.
     let placeholder = l.b.constant(&Value::Unit);
@@ -594,6 +596,9 @@ fn lower_body(
     for (i, r) in root.resources.iter().enumerate() {
         let ty = l.ty_id(&root_types.resources[i])?;
         let id = l.b.resource(&r.name, &r.source, &[], ty, None);
+        if r.transient {
+            l.b.set_resource_transient(id);
+        }
         l.resources.push(id);
     }
     // The seam's signatures (LLP 1027 D2), in name order; a native module's
@@ -660,7 +665,7 @@ fn lower_body(
         if let Some(m) = file.modules.iter().find(|m| m.name == *name) {
             l.b.module(
                 id,
-                &m.extension,
+                (&m.extension, &m.package),
                 &m.declared,
                 m.kind == contract_syntax::ModuleKind::Send,
                 m.live,
@@ -775,9 +780,12 @@ fn lower_body(
         l.b.set_action_body(l.actions[i], code);
     }
     for (i, m) in root.mutations.iter().enumerate() {
-        if m.queue {
-            l.b.set_mutation_queue(l.mutations[i]);
-        }
+        let mode = match m.mode {
+            contract_syntax::MutationMode::Newest => exact_plan::MutationMode::Newest,
+            contract_syntax::MutationMode::Queue => exact_plan::MutationMode::Queue,
+            contract_syntax::MutationMode::Parallel => exact_plan::MutationMode::Parallel,
+        };
+        l.b.set_mutation_mode(l.mutations[i], mode);
         if let Some((name, _)) = &m.then {
             let action = l.actions[l.action_names[name.as_str()]];
             l.b.set_mutation_then(l.mutations[i], action);
@@ -790,7 +798,7 @@ fn lower_body(
             continue;
         };
         l.b.module_event(
-            &m.extension,
+            (&m.extension, &m.package),
             &m.declared,
             l.actions[i],
             &m.raised,
@@ -1010,6 +1018,7 @@ impl<'a> Lowerer<'a> {
                     std::mem::replace(&mut self.button_context, new_button_context);
                 let popover_child = std::mem::replace(&mut self.popover_child, step.popover_child);
                 let bounded = std::mem::replace(&mut self.parent_bounded_column, step.bounded);
+                let stacks = std::mem::replace(&mut self.parent_stacks, step.stacks);
                 let nav_place = std::mem::replace(&mut self.nav_place, step.nav_place);
                 let parent_axis =
                     std::mem::replace(&mut self.parent_horizontal_flex, step.horizontal_flex);
@@ -1038,6 +1047,7 @@ impl<'a> Lowerer<'a> {
                 self.nav_place = nav_place;
                 self.row_depth = row_depth;
                 self.parent_bounded_column = bounded;
+                self.parent_stacks = stacks;
                 self.button_context = button_context;
                 self.popover_child = popover_child;
                 self.parent_positioned = parent_positioned;

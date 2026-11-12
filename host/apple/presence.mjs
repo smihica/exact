@@ -6,7 +6,7 @@
 // built, since no Mac it was built on had one: a build says it keeps no
 // locked secret, and why, and a release build whose grants say a name must
 // be locked is refused.
-import { installedProfiles, decodeProfile, profilesFor, byExpiry } from './devices.mjs';
+import { installedProfiles, decodeProfile, profilesFor, byExpiry, signedEnvironment } from './devices.mjs';
 
 const POLICIES = ['user-presence', 'biometry-any', 'biometry-current-set', 'device-credential'];
 
@@ -57,18 +57,30 @@ export function associatedDomains(auth, debuggable) {
   return (auth?.associatedDomains ?? []).map((d) => debuggable && passkeys.has(d) ? `${d}?mode=developer` : d);
 }
 
-/** Sign in with Apple's entitlement, which follows the signing, not the grant (LLP 1133.014 D7): a simulator takes it;
- * a device's profile must authorize it, and reading that from the profile is not built, so a device build signs none. */
-export function signInEntitlement(auth, simulator) {
-  return (auth?.signIn?.apple ?? []).length && simulator ? { 'com.apple.developer.applesignin': ['Default'] } : {};
+/** Sign in with Apple's entitlement, which follows the signing, not the grant (LLP 1133.014 D7, D8): a simulator
+ * takes it, and a device build takes it when its profile's entitlements (`allows`) include it. A development profile
+ * and a distribution one carry it alike, when the App ID has the capability. Elsewhere it is left out, since an
+ * entitlement the profile does not authorize stops the app installing. */
+export function signInEntitlement(auth, { simulator = false, team = null, allows = [] } = {}) {
+  const signable = (simulator && !team) || allows.includes('com.apple.developer.applesignin');
+  return (auth?.signIn?.apple ?? []).length && signable ? { 'com.apple.developer.applesignin': ['Default'] } : {};
 }
 
 /** A grant's entitlement's value (`reach.entitlements`): `true`, or the string the build chooses (LLP 1133.028 D15
- * item 1). App Attest's environment is `development` for a debuggable build and `production` for a release; Apple
- * uses production for TestFlight and App Store builds whatever it says. */
+ * item 1). An environment follows the signing, not the compiler: `debuggable` is the signing profile's
+ * `get-task-allow`, true on a simulator, so `development` there and under a development profile and `production`
+ * under the others. App Attest's and push's (`aps-environment`, LLP 1133.004 §9 P2, which a Live Activity that takes
+ * pushes signs too); Apple uses production for TestFlight and App Store builds whatever they say. */
 export function entitlementValue(name, debuggable) {
-  if (name === 'com.apple.developer.devicecheck.appattest-environment') return debuggable ? 'development' : 'production';
+  if (name === 'com.apple.developer.devicecheck.appattest-environment' || name === 'aps-environment') return signedEnvironment(debuggable);
   return true;
+}
+
+/** The grant entitlements (`reach.entitlements`) a bundle of `app` signs, and so the ones its profile must allow:
+ * all of them for the app, none of push's for an App Clip, whose notifications are ephemeral (`NSAppClip`), or for an
+ * extension, which reads no token (LLP 1133.004 §9 P2). The signature and the profile check both read this. */
+export function grantEntitlements(app, names = []) {
+  return app.clipParent || app.widgetAppId ? names.filter((name) => name !== 'aps-environment') : names;
 }
 
 /** The device rows whose entitlement a Mac takes only with a provisioning profile (LLP 1133.028 D17): App Attest's

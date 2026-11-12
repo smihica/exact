@@ -30,6 +30,7 @@ fn main() {
         "library_gate_data::Gate",
         "library_gate_data::Gate",
         contract::web_rust_mode(&compat.inputs),
+        &compat.inputs,
     )
     .unwrap();
     std::fs::write(

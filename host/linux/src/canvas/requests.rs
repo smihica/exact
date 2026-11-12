@@ -124,13 +124,14 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// (LLP 1124 D7, LLP 1133.006 D8).
     pub fn bind_extensions(&mut self, names: &str) {
         let under_agent = crate::canvas::jni::jni_extensions::under_agent;
-        let (under, real): (Vec<&str>, Vec<&str>) =
-            (names.lines().filter(|n| !n.is_empty())).partition(|n| under_agent(n));
-        let runner = self.p.host_mut().runner_mut();
+        let (under, real): (Vec<String>, Vec<String>) = (names.lines())
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .partition(|n| under_agent(n));
         // An interface's `owned` and `images.owned` are by target (LLP
         // 1133.019 D11 item 4).
-        runner.set_module_target("android");
-        runner.bind_extensions(&real, &under);
+        self.p.say_target("android");
+        self.p.bind_modules(real, under);
         self.p.bind_pictures();
     }
 

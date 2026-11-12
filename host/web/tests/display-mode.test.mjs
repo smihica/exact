@@ -38,7 +38,7 @@ test('viewport media changes update resources, rendered text and packed facts', 
     expect(build.status, build.stderr + build.stdout).toBe(0);
     server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: req => {
       const path = new URL(req.url).pathname;
-      if (path === '/navigation.js') return new Response(Bun.file(resolve(ROOT, 'host/web/navigation.js')));
+      if (['/navigation.js', '/grant-admission.js'].includes(path)) return new Response(Bun.file(resolve(dist, '.gen', path.slice(1))));
       return new Response(Bun.file(resolve(dist, path === '/' ? 'index.html' : path.slice(1))));
     } });
     browser = await suiteBrowser();

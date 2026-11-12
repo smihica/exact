@@ -14,11 +14,13 @@ test = false
 bench = false
 
 [dependencies]
+ibex2-sqlite = { path = "../../../vendor/ibex/crates/ibex2-sqlite" }
 exact-logic = { path = "../../../logic" }
 exact-apple = { path = "../../../host/apple" }
 messages-stress-data = { path = "../data" }
 
 [build-dependencies]
+serde_json = "1.0"
 contract = { path = "../../../contract/cli" }
 exact-bake = { path = "../../../bake" }
 messages-stress-data = { path = "../data" }

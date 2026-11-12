@@ -191,8 +191,8 @@ pub fn ellipse(
 }
 
 /// `arcTo`'s geometry from the last point `p0` (user space): `None` when the
-/// spec's straight-line cases apply (coincident points, zero radius,
-/// collinear), else the tangent point to join with a line and the arc.
+/// Chrome's straight-line cases apply (coincident points, zero radius,
+/// nearly collinear), else the tangent point to join with a line and the arc.
 pub fn arc_to(
     p0: (f64, f64),
     p1: (f64, f64),
@@ -205,7 +205,8 @@ pub fn arc_to(
     let (v1, v2) = ((p0.0 - p1.0, p0.1 - p1.1), (p2.0 - p1.0, p2.1 - p1.1));
     let cross = v1.0 * v2.1 - v1.1 * v2.0;
     let (l1, l2) = (v1.0.hypot(v1.1), v2.0.hypot(v2.1));
-    if cross.abs() <= 1e-12 * l1 * l2 {
+    // Skia's arcTo treats |sin(turn)| <= 1/4096 as collinear.
+    if cross.abs() <= (1.0 / 4096.0) * l1 * l2 {
         return None;
     }
     let (u1, u2) = ((v1.0 / l1, v1.1 / l1), (v2.0 / l2, v2.1 / l2));

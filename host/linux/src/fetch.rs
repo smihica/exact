@@ -1,17 +1,18 @@
 //! The network form of the dev plan (LLP 1023 Stage 1, Linux): given the
 //! app URL — the one a browser opens — resolve the envelope, negotiated or
-//! through `index.html`'s `rel=alternate` link, fetch the plan, verify its
-//! length and SHA-256, and hand back the bytes to boot. One shot, at
-//! process start: a headless run is per-invocation (the fleet's shape —
-//! run, read, run again), and the display loop's live SSE half waits for a
-//! Linux display to verify it on (QUEUE).
+//! through `index.html`'s `rel=alternate` link, fetch the plan and selected
+//! Rust pair, verify their lengths and SHA-256, and hand them back to boot.
+//! After first pixel, `EXACT_DEV_PLAN` URLs are polled by the display,
+//! Android reader and stdio agent loops, with a 500 ms pause after each
+//! completed poll.
+//! The host applies accepted generations with state carried.
 //!
 //! The transport is ibex2's default — rustls off Apple, the platform's on a
 //! Mac — used directly: grants govern *app* authority (ibex LLP 0067); this
 //! is host apparatus, the same standing as the Apple host's URLSession use
-//! in `PlanURL.swift`. Redirects are not followed in v1: the error names
-//! the limitation and the direct URL fixes it. Every line goes to stderr —
-//! in agent mode stdout is the protocol.
+//! in `PlanURL.swift`. Redirects are not followed: the error names the
+//! limitation and the `Location` header when supplied. Every line goes to
+//! stderr — in agent mode stdout is the protocol.
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -119,6 +120,9 @@ pub(crate) struct Poller {
     url: String,
     compat: String,
     pub identity: Option<String>,
+    /// A generation the host holds (preparing its module, or waiting on
+    /// requests) or could not run: the poll does not download it again.
+    pub held: Option<String>,
     due: std::time::Instant,
     worker: Option<std::sync::mpsc::Receiver<Tick>>,
     /// The in-flight tick asked for `/__dev/design`.
@@ -172,6 +176,7 @@ impl Poller {
             url,
             compat,
             identity,
+            held: None,
             due: now,
             worker: None,
             asked_design: false,
@@ -301,7 +306,7 @@ impl Poller {
         if self.worker.is_none() && std::time::Instant::now() >= self.due {
             let url = self.url.clone();
             let compat = self.compat.clone();
-            let previous = self.identity.clone();
+            let (previous, held) = (self.identity.clone(), self.held.clone());
             // Once the channel is on, live frames come down its poll and
             // the snapshot is fetched only when asked (LLP 1122 D4).
             let design = self.link.as_mut().is_none_or(|link| link.take_design());
@@ -310,7 +315,7 @@ impl Poller {
             self.worker = Some(receive);
             let waker = self.waker.clone();
             std::thread::spawn(move || {
-                let changed = fetch_changed(&url, &compat, previous.as_deref());
+                let changed = fetch_unless(&url, &compat, &[previous.as_deref(), held.as_deref()]);
                 let design = design.then(|| fetch_design(&url)).flatten();
                 let _ = send.send((changed, design));
                 wake(&waker);
@@ -352,6 +357,17 @@ pub fn fetch_changed(
     compat: &str,
     previous: Option<&str>,
 ) -> Result<Option<Generation>, String> {
+    fetch_unless(page, compat, &[previous])
+}
+
+/// Fetch only when the envelope's generation is none of `known`: the one
+/// running, and one the host holds or could not run, which another download
+/// would not change.
+fn fetch_unless(
+    page: &str,
+    compat: &str,
+    known: &[Option<&str>],
+) -> Result<Option<Generation>, String> {
     let transport = ibex2::transport::default_transport();
     let get = |url: &str, accept: &str, limit: usize| -> Result<(u16, Vec<u8>, String), String> {
         let mut req = ibex2::stdlib::fetch::Request::get(url);
@@ -362,6 +378,13 @@ pub fn fetch_changed(
         // a plan, four hundred times too generous for an envelope.
         req.max_body = Some(limit);
         let r = transport.send(&req).map_err(|e| format!("{url}: {e}"))?;
+        if matches!(r.status, 301 | 302 | 303 | 307 | 308) {
+            let mut error = format!("{url}: HTTP {}; redirects are not followed", r.status);
+            if let Some(location) = r.headers.get("location") {
+                error.push_str(&format!("; Location: {location}"));
+            }
+            return Err(error);
+        }
         let kind = r
             .headers
             .get("content-type")
@@ -415,7 +438,7 @@ pub fn fetch_changed(
         }
     }
     let identity = format!("{:x}", Sha256::digest(fingerprint.as_bytes()));
-    if previous == Some(identity.as_str()) {
+    if known.contains(&Some(identity.as_str())) {
         return Ok(None);
     }
     let fetch_card = |card: &PlanCard, limit: usize| -> Result<Vec<u8>, String> {
@@ -447,19 +470,28 @@ pub fn fetch_changed(
         }
         Ok(bytes)
     };
+    // The Rust variant this binary runs is chosen before anything is
+    // downloaded: an envelope it cannot take costs no plan.
+    let variant = match &envelope.rust {
+        Some(variants) => {
+            let compat: serde_json::Value =
+                serde_json::from_str(compat).map_err(|e| e.to_string())?;
+            let mode = compat["inputs"]["rustMode"].as_str().unwrap_or("off");
+            if variants.keys().any(|k| k != "native" && k != "wasm") {
+                return Err("invalid Rust executor manifest".into());
+            }
+            let variant = variants
+                .get(mode)
+                .ok_or("no Rust replacement matching this binary's executor")?;
+            if mode == "native" && variant.target.as_deref() != compat["target"].as_str() {
+                return Err("Rust replacement target does not match this binary".into());
+            }
+            Some(variant)
+        }
+        None => None,
+    };
     let plan = fetch_card(&envelope.plan, MAX_PLAN_BYTES)?;
-    let module = if let Some(variants) = envelope.rust {
-        let compat: serde_json::Value = serde_json::from_str(compat).map_err(|e| e.to_string())?;
-        let mode = compat["inputs"]["rustMode"].as_str().unwrap_or("off");
-        if variants.keys().any(|k| k != "native" && k != "wasm") {
-            return Err("invalid Rust executor manifest".into());
-        }
-        let variant = variants
-            .get(mode)
-            .ok_or("no Rust replacement matching this binary's executor")?;
-        if mode == "native" && variant.target.as_deref() != compat["target"].as_str() {
-            return Err("Rust replacement target does not match this binary".into());
-        }
+    let module = if let Some(variant) = variant {
         Some(crate::delivery::Module {
             receipt: String::from_utf8(fetch_card(&variant.receipt, 1 << 20)?)
                 .map_err(|e| e.to_string())?,
@@ -668,6 +700,43 @@ mod tests {
         format!("http://127.0.0.1:{port}/")
     }
 
+    #[test]
+    fn redirects_name_the_limitation_and_location() {
+        let mut answers = Vec::new();
+        for status in [301, 302, 303, 307, 308, 404] {
+            for location in [Some("/app/"), None] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let page = format!("http://{}/app", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    drop(listener);
+                    assert_eq!(read_request_path(&mut stream), "/app");
+                    let header = location
+                        .map(|value| format!("Location: {value}\r\n"))
+                        .unwrap_or_default();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                });
+                let error = fetch_app(&page).unwrap_err();
+                server.join().unwrap();
+                answers.push((page, status, location, error));
+            }
+        }
+        for (page, status, location, error) in answers {
+            let mut expected = format!("{page}: HTTP {status}");
+            if status != 404 {
+                expected.push_str("; redirects are not followed");
+                if let Some(location) = location {
+                    expected.push_str(&format!("; Location: {location}"));
+                }
+            }
+            assert_eq!(error, expected);
+        }
+    }
+
     /// A dev loop whose producers start answers its status, read as what
     /// it is (dtool2's pass 3 #8): preparing, or the error its start ended
     /// with; anything else is the HTTP error it was.
@@ -834,7 +903,7 @@ mod tests {
         let serving_revision = revision.clone();
         let serving_payloads = payload_requests.clone();
         let server = std::thread::spawn(move || {
-            for connection in listener.incoming().take(9) {
+            for connection in listener.incoming().take(11) {
                 let mut stream = connection.unwrap();
                 let path = read_request_path(&mut stream);
                 let module =
@@ -883,6 +952,21 @@ mod tests {
         assert_ne!(next.identity, first.identity);
         assert_eq!(next.module.unwrap().bytes, b"wasm revision 2");
         assert_eq!(payload_requests.load(SeqCst), 6);
+        // A generation the host holds or refused is not downloaded again, and
+        // one whose Rust this binary cannot run costs no plan.
+        assert!(super::fetch_unless(
+            &page,
+            compat,
+            &[Some(&first.identity), Some(&next.identity)]
+        )
+        .unwrap()
+        .is_none());
+        assert!(super::fetch_changed(&page, r#"{"inputs":{"rustMode":"native"}}"#, None).is_err());
+        assert_eq!(
+            payload_requests.load(SeqCst),
+            6,
+            "only the envelope, for a held generation and an unrunnable one"
+        );
         server.join().unwrap();
     }
 }

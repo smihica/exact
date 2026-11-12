@@ -91,25 +91,30 @@ fn a_router_s_tabs_are_screens_not_rows() {
     assert_eq!(lookups(src), Vec::<u32>::new());
 }
 
-/// `lower-key-position` (LLP 1142 D6): a key that reads the row's position.
+/// `lower-key-position` (LLP 1142 D6, LLP 1156.005 D2): a key that reads the
+/// row's position, over rows that hold something to follow.
 #[test]
 fn a_key_that_reads_the_position_is_named_and_one_that_shadows_it_is_not() {
     let keyed = |view: &str| -> Vec<u32> {
         let (result, warnings) = contract::compile_warned(&app(view));
-        assert!(result.is_ok(), "a warning never fails a build");
+        assert!(result.is_ok(), "a warning never fails a build: {result:?}");
         warnings
             .iter()
             .filter(|w| w.id == "lower-key-position")
             .map(|w| w.span.line)
             .collect()
     };
-    assert_eq!(keyed("for p, i in posts key=i\n  text p.id"), [14]);
+    let field = "  input value=p.id aria-label=\"Post\"";
+    assert_eq!(keyed(&format!("for p, i in posts key=i\n{field}")), [14]);
     assert_eq!(
-        keyed("for p, i in posts key=`${p.userId}-${i}`\n  text p.id"),
+        keyed(&format!(
+            "for p, i in posts key=`${{p.userId}}-${{i}}`\n{field}"
+        )),
         [14]
     );
-    assert!(keyed("for p, i in posts key=p.id\n  text `${i}`").is_empty());
-    let (_, warnings) = contract::compile_warned(&app("for p, i in posts key=i\n  text p.id"));
+    assert!(keyed(&format!("for p, i in posts key=p.id\n{field}")).is_empty());
+    let (_, warnings) =
+        contract::compile_warned(&app(&format!("for p, i in posts key=i\n{field}")));
     let w = warnings
         .iter()
         .find(|w| w.id == "lower-key-position")
@@ -119,6 +124,48 @@ fn a_key_that_reads_the_position_is_named_and_one_that_shadows_it_is_not() {
             .starts_with("this key reads `i`, the row's position"),
         "{}",
         w.message
+    );
+}
+
+/// A row of text, images and boxes keeps nothing of its own, so its position
+/// may be its items' only identity (a waveform's bars over repeated values).
+/// Motion, a scroll offset, a Tab stop or a handler, written on the element
+/// or through its class, is something to follow.
+#[test]
+fn a_position_key_over_rows_that_hold_nothing_is_not_named() {
+    let keyed = |view: &str| -> usize {
+        let src = format!("style moving\n  transition=\"opacity 0.2s\"\n{}", app(view));
+        let (result, warnings) = contract::compile_warned(&src);
+        assert!(result.is_ok(), "a warning never fails a build: {result:?}");
+        warnings
+            .iter()
+            .filter(|w| w.id == "lower-key-position")
+            .count()
+    };
+    assert_eq!(keyed("for p, i in posts key=i\n  row\n    text p.id"), 0);
+    assert_eq!(
+        keyed("for c, i in categories key=i\n  view height=8 width=2"),
+        0
+    );
+    assert_eq!(
+        keyed("for p, i in posts key=i\n  row transition=\"opacity 0.2s\"\n    text p.id"),
+        1
+    );
+    assert_eq!(
+        keyed("for p, i in posts key=i\n  row class=moving\n    text p.id"),
+        1
+    );
+    assert_eq!(
+        keyed("for p, i in posts key=i\n  row overflow=\"scroll\"\n    text p.id"),
+        1
+    );
+    assert_eq!(
+        keyed("for p, i in posts key=i\n  row tabindex=0\n    text p.id"),
+        1
+    );
+    assert_eq!(
+        keyed("for p, i in posts key=i\n  row -exact-layout-transition=\"-exact-spring(240, 26, 1)\"\n    text p.id"),
+        1
     );
 }
 

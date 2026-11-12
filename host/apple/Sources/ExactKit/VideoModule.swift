@@ -262,7 +262,7 @@ final class VideoView {
                 if let hit = resolved[name], hit.source == source { url = hit.url } else {
                     // The app's own file (LLP 1069.002 D7), as an `image`
                     // shows one: a download its data module kept (podcast F19).
-                    url = source.hasPrefix("app:/") ? AppFiles.url(source) : NodeView.resolveSource(source, app: owner.presenter?.session?.app)
+                    url = source.hasPrefix("app:/") ? AppFiles.file(source) : NodeView.resolveSource(source, app: owner.presenter?.session?.app)
                     resolved[name] = (source, url)
                 }
                 // The artwork keeps its authored source for `state` (LLP 1098 D1, D7).

@@ -350,6 +350,8 @@ fn a_launch_relative_time_sent_to_a_source_is_named_with_its_repair() {
         "performanceNow() - other",
         // The origin added on one branch only: the other is a launch's time.
         "performanceNow() + (other > 0 ? time.epochAtZero : 0)",
+        // A reading with a span added is a later reading.
+        "performanceNow() + (performanceNow() - start)",
     ] {
         assert_eq!(
             warned(&stopwatch("", send)),
@@ -415,6 +417,28 @@ fn a_launch_relative_time_in_a_persisted_state_is_named() {
     // the origin: added to a reading it is the wall-clock time, kept as is.
     let origin = "shape Time\n  epochAtZero: number\ncomponent App\n  resource time = exactTime() as shape Time\n  state at = 0 persist\n  derive origin = time.epochAtZero\n  action go\n    at = origin + performanceNow()\n  view\n    button \"go\" press=go\n";
     assert_eq!(warned(origin), []);
+}
+
+#[test]
+fn a_banked_duration_with_a_reset_is_not_named() {
+    // A stopwatch with a Reset banks what was banked plus a reading less
+    // its start: a span, kept across Stop and Start, however it is grouped.
+    let src = |total: &str, keep: &str| {
+        format!("shape Ack\n  ok: bool\ncomponent App\n  mutation wrote as shape Ack\n  state start = 0\n  state banked = 0\n  action begin\n    start = performanceNow()\n  action stop\n    let total = {total}\n    banked = total\n  action reset\n    banked = 0\n  action save\n    send wrote = keep({keep})\n  view\n    button \"save\" press=save\n")
+    };
+    for total in [
+        "banked + performanceNow() - start",
+        "banked + (performanceNow() - start)",
+        "performanceNow() - start + banked",
+    ] {
+        assert_eq!(warned(&src(total, "banked")), [], "{total}");
+    }
+    // The bank added to a reading is still a launch's time.
+    let reading = src(
+        "banked + performanceNow() - start",
+        "banked + performanceNow()",
+    );
+    assert_eq!(warned(&reading), [(PERSISTED.to_string(), 15)]);
 }
 
 const ONE_SCHEME: &str = "lower-colour-one-scheme";
@@ -1146,6 +1170,28 @@ fn another_name_no_bar_or_a_sections_own_name_is_not_named() {
 }
 
 const WIDTH_PADDING: &str = "lower-width-padding";
+
+#[test]
+fn a_full_width_view_root_with_padding_or_border_is_named() {
+    for (attrs, warns) in [
+        ("padding=16", true),
+        ("border=\"1px solid -exact-separator\"", true),
+        ("padding=16 box-sizing=\"border-box\"", false),
+        ("padding=0", false),
+        ("padding=\"16px 0\"", false),
+        ("", false),
+    ] {
+        let src = format!(
+            "component App\n  view\n    main testId=\"root\" width=\"100%\" height=\"100%\" {attrs}\n      text \"Hello\"\n"
+        );
+        let expected = if warns {
+            vec![(WIDTH_PADDING.to_string(), 3)]
+        } else {
+            vec![]
+        };
+        assert_eq!(warned(&src), expected, "{src}");
+    }
+}
 
 #[test]
 fn a_full_width_box_with_padding_is_named_with_its_repair() {

@@ -1,7 +1,7 @@
 //! Implements placing items in the grid and resolving the implicit grid.
 //! <https://www.w3.org/TR/css-grid-1/#placement>
 use super::types::{CellOccupancyMatrix, CellOccupancyState, GridItem};
-use super::{NamedLineResolver, OriginZeroLine, MAX_OZ_LINE, MIN_OZ_LINE};
+use super::{LineLimit, NamedLineResolver, OriginZeroLine};
 use crate::geometry::Line;
 use crate::geometry::{AbsoluteAxis, InBothAbsAxis};
 use crate::style::{AlignItems, GridAutoFlow, OriginZeroGridPlacement};
@@ -37,6 +37,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
     align_items: AlignItems,
     justify_items: AlignItems,
     named_line_resolver: &NamedLineResolver<<S as CoreStyle>::CustomIdent>,
+    limit: LineLimit,
 ) where
     S: GridItemStyle + 'a,
     ChildIter: Iterator<Item = (usize, NodeId, S)>,
@@ -51,10 +52,10 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
             let origin_zero_placement = InBothAbsAxis {
                 horizontal: named_line_resolver
                     .resolve_column_names(&style.grid_column())
-                    .map(|placement| placement.into_origin_zero_placement(explicit_col_count)),
+                    .map(|placement| placement.into_origin_zero_placement(explicit_col_count, limit)),
                 vertical: named_line_resolver
                     .resolve_row_names(&style.grid_row())
-                    .map(|placement| placement.into_origin_zero_placement(explicit_row_count)),
+                    .map(|placement| placement.into_origin_zero_placement(explicit_row_count, limit)),
             };
             (index, node, origin_zero_placement, style)
         }
@@ -83,6 +84,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
                 row_span,
                 col_span,
                 CellOccupancyState::DefinitelyPlaced,
+                limit,
             );
         });
 
@@ -113,6 +115,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
                 primary_span,
                 secondary_span,
                 CellOccupancyState::AutoPlaced,
+                limit,
             );
         });
 
@@ -171,6 +174,7 @@ pub(super) fn place_grid_items<'a, S, ChildIter>(
                 primary_span,
                 secondary_span,
                 CellOccupancyState::AutoPlaced,
+                limit,
             );
 
             // If using the "dense" placement algorithm then reset the grid position back to grid_start_position ready for the next item
@@ -346,9 +350,9 @@ fn place_indefinitely_positioned_item(
 /// Items placed outside of the limited grid are clamped into it.
 ///
 /// See: <https://www.w3.org/TR/css-grid-1/#overlarge-grids>
-fn clamp_span_to_limited_grid(span: Line<OriginZeroLine>) -> Line<OriginZeroLine> {
-    let start = span.start.0.clamp(MIN_OZ_LINE, MAX_OZ_LINE - 1);
-    let end = span.end.0.clamp(start + 1, MAX_OZ_LINE);
+fn clamp_span_to_limited_grid(span: Line<OriginZeroLine>, limit: LineLimit) -> Line<OriginZeroLine> {
+    let start = span.start.0.clamp(limit.min, limit.max - 1);
+    let end = span.end.0.clamp(start + 1, limit.max);
     Line { start: OriginZeroLine(start), end: OriginZeroLine(end) }
 }
 
@@ -367,6 +371,7 @@ fn record_grid_placement<S: GridItemStyle>(
     primary_span: Line<OriginZeroLine>,
     secondary_span: Line<OriginZeroLine>,
     placement_type: CellOccupancyState,
+    limit: LineLimit,
 ) {
     #[cfg(test)]
     println!("BEFORE placement:");
@@ -375,8 +380,8 @@ fn record_grid_placement<S: GridItemStyle>(
 
     // Clamp placements into the limited grid to prevent arithmetic overflow when growing the
     // implicit grid (https://www.w3.org/TR/css-grid-1/#overlarge-grids)
-    let primary_span = clamp_span_to_limited_grid(primary_span);
-    let secondary_span = clamp_span_to_limited_grid(secondary_span);
+    let primary_span = clamp_span_to_limited_grid(primary_span, limit);
+    let secondary_span = clamp_span_to_limited_grid(secondary_span, limit);
 
     // Mark area of grid as occupied
     cell_occupancy_matrix.mark_area_as(primary_axis, primary_span, secondary_span, placement_type);
@@ -413,6 +418,7 @@ mod tests {
         use crate::compute::grid::types::TrackCounts;
         use crate::compute::grid::util::*;
         use crate::compute::grid::CellOccupancyMatrix;
+        use crate::compute::grid::LineLimit;
         use crate::compute::grid::NamedLineResolver;
         use crate::compute::grid::OriginZeroLine;
         use crate::prelude::*;
@@ -433,7 +439,12 @@ mod tests {
             // Setup test
             let children_iter = || children.iter().map(|(index, style, _)| (*index, NodeId::from(*index), style));
             let child_styles_iter = children.iter().map(|(_, style, _)| style);
-            let estimated_sizes = compute_grid_size_estimate(explicit_col_count, explicit_row_count, child_styles_iter);
+            let estimated_sizes = compute_grid_size_estimate(
+                explicit_col_count,
+                explicit_row_count,
+                LineLimit::DEFAULT,
+                child_styles_iter,
+            );
             let mut items = Vec::new();
             let mut cell_occupancy_matrix =
                 CellOccupancyMatrix::with_track_counts(estimated_sizes.0, estimated_sizes.1);
@@ -451,6 +462,7 @@ mod tests {
                 AlignSelf::START,
                 // TODO: actually test named line resolution
                 &name_resolver,
+                LineLimit::DEFAULT,
             );
 
             // Assert that each item has been placed in the right location
@@ -672,6 +684,7 @@ mod tests {
             let estimated_sizes = compute_grid_size_estimate(
                 explicit_col_count,
                 explicit_row_count,
+                LineLimit::DEFAULT,
                 children.iter().map(|(_, style)| style),
             );
             let mut items = Vec::new();
@@ -688,8 +701,64 @@ mod tests {
                 AlignSelf::START,
                 AlignSelf::START,
                 &name_resolver,
+                LineLimit::DEFAULT,
             );
             assert_eq!(items[0].column, Line { start: OriginZeroLine(-10_000), end: OriginZeroLine(-9_999) });
+        }
+
+        /// EXACT PATCH 70: the rows each item is placed in under `limit`.
+        fn rows_within(limit: LineLimit, rows: &[Line<GridPlacement>]) -> Vec<(i16, i16)> {
+            let children: Vec<(usize, Style)> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut style = Style::DEFAULT;
+                    style.rare.grid_row = row.clone();
+                    style.rare.grid_column = Line { start: line(1), end: auto() };
+                    (index, style)
+                })
+                .collect();
+            let estimated_sizes = compute_grid_size_estimate(1, 0, limit, children.iter().map(|(_, style)| style));
+            let mut items = Vec::new();
+            let mut cell_occupancy_matrix =
+                CellOccupancyMatrix::with_track_counts(estimated_sizes.0, estimated_sizes.1);
+            let mut name_resolver = NamedLineResolver::new(&Style::DEFAULT, 0, 0);
+            name_resolver.set_explicit_column_count(1);
+            place_grid_items(
+                &mut cell_occupancy_matrix,
+                &mut items,
+                || children.iter().map(|(index, style)| (*index, NodeId::from(*index), style)),
+                GridAutoFlow::Row,
+                AlignSelf::START,
+                AlignSelf::START,
+                &name_resolver,
+                limit,
+            );
+            items.iter().map(|item| (item.row.start.0, item.row.end.0)).collect()
+        }
+
+        #[test]
+        fn a_raised_line_limit_places_rows_past_ten_thousand() {
+            let rows = [
+                Line { start: line(30_001), end: span(1) },
+                Line { start: line(i16::MAX), end: span(40) },
+                Line { start: line(5), end: span(u16::MAX) },
+                Line { start: line(-5), end: auto() },
+            ];
+            let raised = LineLimit::with_max_line(i16::MAX as u16);
+            assert_eq!(raised, LineLimit { min: 0, max: i16::MAX });
+            assert_eq!(
+                rows_within(raised, &rows),
+                [(30_000, 30_001), (i16::MAX - 1, i16::MAX), (4, i16::MAX), (0, 1)],
+                "a span is clamped to the last line, and nothing is placed before the first"
+            );
+            assert_eq!(
+                rows_within(LineLimit::DEFAULT, &rows),
+                [(9_999, 10_000), (9_999, 10_000), (4, 10_000), (-4, -3)],
+                "the default limit is unchanged"
+            );
+            assert_eq!(LineLimit::with_max_line(0), LineLimit::DEFAULT);
+            assert_eq!(LineLimit::with_max_line(30_000), LineLimit { min: -2_767, max: 30_000 });
         }
     }
 

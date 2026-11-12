@@ -2,27 +2,36 @@
 //! with `class=(cond ? A : B)`. Either way its rows come in ahead of the
 //! node's own attributes, which win for the same name.
 
+use crate::tags::{self, AttrTarget};
 use crate::{err, LowerError, Lowerer};
-use contract_syntax::{Attr, Expr, Node};
+use contract_syntax::state::state_of;
+use contract_syntax::{Attr, Expr, Node, Span};
+use exact_kernel::StyleId;
 
 impl Lowerer<'_> {
-    /// A node's class rows as attributes ([`rows`]), from this file's styles.
+    /// A node's class rows as attributes ([`rows`]), from this file's
+    /// styles, as a node that takes no row unwritten has them.
     pub(crate) fn class_rows(
         &self,
         attrs: &[Attr],
     ) -> Result<Option<(String, Vec<Attr>)>, LowerError> {
-        rows(attrs, &|name| self.styles.get(name).map(Vec::as_slice))
+        rows(attrs, &|name| self.styles.get(name).map(Vec::as_slice), &[])
     }
 }
 
 /// A node's class rows as attributes, with a label for the source map: a
 /// named style's rows as declared; a choice's as one `cond ? A's : B's` per
-/// row either style sets, where a row only one side sets is `none` on the
-/// other — an explicit unset the runner clears to the kernel's default. Rows
-/// the node itself sets are left out. `style` finds a style's rows by name.
+/// attribute either style sets. A side that does not set a row is what the
+/// node takes unwritten (`unwritten`: its tag's fixed rows, a link's
+/// colour), else `none`, an explicit unset the runner clears to the
+/// kernel's default. Attributes that write one row under different names (a
+/// shorthand and its longhand) are paired row by row, so neither side's
+/// unset clears what it set under the other name. Rows the node itself sets
+/// are left out. `style` finds a style's rows by name.
 pub(crate) fn rows<'s>(
     attrs: &[Attr],
     style: &dyn Fn(&str) -> Option<&'s [Attr]>,
+    unwritten: &[(StyleId, Expr)],
 ) -> Result<Option<(String, Vec<Attr>)>, LowerError> {
     let Some(c) = attrs.iter().find(|a| a.name == "class") else {
         return Ok(None);
@@ -53,18 +62,20 @@ pub(crate) fn rows<'s>(
                 );
             };
             let (sa, sb) = (style(a, yes.span())?, style(b, no.span())?);
+            let both: Vec<&Attr> = sa.iter().chain(sb).collect();
+            let (sa, sb) = (by_row(sa, &both, unwritten), by_row(sb, &both, unwritten));
             let mut rows: Vec<Attr> = Vec::new();
-            for s in sa.iter().chain(sb) {
+            for s in sa.iter().chain(&sb) {
                 if own(&s.name) || rows.iter().any(|r| r.name == s.name) {
                     continue;
                 }
                 let side = |style: &[Attr]| {
-                    style
-                        .iter()
-                        .find(|r| r.name == s.name)
-                        .map_or(Expr::None(*span), |r| r.value.clone())
+                    style.iter().rfind(|r| r.name == s.name).map_or_else(
+                        || absent(s, unwritten, *span).unwrap_or(Expr::None(*span)),
+                        |r| r.value.clone(),
+                    )
                 };
-                let (va, vb) = (side(sa), side(sb));
+                let (va, vb) = (side(&sa), side(&sb));
                 // @ref LLP 1069.011 D12 — a prop has no `none` to fall to.
                 let styleable = matches!(crate::tags::attr(&s.name), Some(crate::tags::AttrTarget::Prop(p)) if p.styleable());
                 if styleable && (matches!(va, Expr::None(_)) || matches!(vb, Expr::None(_))) {
@@ -81,7 +92,15 @@ pub(crate) fn rows<'s>(
                     (Expr::Number(x, _), Expr::Number(y, _)) if x == y => va.clone(),
                     _ => Expr::Ternary(cond.clone(), Box::new(va), Box::new(vb), *span),
                 };
-                rows.push(Attr { value, ..s.clone() });
+                // No author's row may hold a metric the compiler writes (an
+                // `hr`'s hairline): a choice with a side that takes one
+                // unwritten is unwritten, as a state's fold over one is.
+                let written = s.written && !crate::states::metric_in(&value);
+                rows.push(Attr {
+                    value,
+                    written,
+                    ..s.clone()
+                });
             }
             Ok(Some((format!("{a}/{b}"), rows)))
         }
@@ -91,6 +110,103 @@ pub(crate) fn rows<'s>(
             c.span,
         ),
     }
+}
+
+/// What `a`'s rows are on a node whose class choice leaves them unset: the
+/// value they take unwritten when each takes the same one, `none` when none
+/// takes one, and `None` when they differ, so that `a` is paired row by row
+/// ([`by_row`]). A state part's row takes none here: its base is the fold's
+/// (`Lowerer::fold_states`).
+fn absent(a: &Attr, unwritten: &[(StyleId, Expr)], span: Span) -> Option<Expr> {
+    if state_of(&a.name).is_some() {
+        return Some(Expr::None(span));
+    }
+    let mut values = crate::anatomy::rows_of(a)
+        .into_iter()
+        .map(|row| unwritten.iter().rfind(|(id, _)| *id == row).map(|(_, e)| e));
+    let first = values.next().flatten();
+    values
+        .all(|v| v == first)
+        .then(|| first.cloned().unwrap_or(Expr::None(span)))
+}
+
+/// `style`'s attributes in a class choice, `both` the two styles'
+/// attributes together: each that writes a row another name among `both`
+/// writes in the same state layer, or whose rows differ unwritten
+/// ([`absent`]), as one attribute a row ([`longhands`]).
+fn by_row(style: &[Attr], both: &[&Attr], unwritten: &[(StyleId, Expr)]) -> Vec<Attr> {
+    let layer = |a: &Attr| state_of(&a.name).map(|(s, _)| s.to_string());
+    style
+        .iter()
+        .flat_map(|a| {
+            let ids = crate::anatomy::rows_of(a);
+            let shared = both.iter().any(|o| {
+                o.name != a.name
+                    && layer(o) == layer(a)
+                    && crate::anatomy::rows_of(o).iter().any(|id| ids.contains(id))
+            });
+            let mixed = absent(a, unwritten, a.span).is_none();
+            (shared || mixed)
+                .then(|| longhands(a))
+                .flatten()
+                .unwrap_or_else(|| vec![a.clone()])
+        })
+        .collect()
+}
+
+/// `a` as one attribute per row it writes, each named by the row's own
+/// longhand and valued as `a`'s lowering projects it onto that row. `None`
+/// where a row has no longhand, for `font` (whose shorthand also marks the
+/// node), and for a computed value of a box shorthand, which only its own
+/// lowering splits (`shorthands::computed_list`).
+fn longhands(a: &Attr) -> Option<Vec<Attr>> {
+    fn literal(e: &Expr) -> bool {
+        match e {
+            Expr::Str(..) | Expr::Number(..) | Expr::None(_) => true,
+            Expr::Ternary(_, yes, no, _) => literal(yes) && literal(no),
+            _ => false,
+        }
+    }
+    let (state, name) = match state_of(&a.name) {
+        Some((s, row)) => (Some(s), row),
+        None => (None, a.name.as_str()),
+    };
+    let ids = crate::anatomy::rows_of(a);
+    let values: Vec<Expr> = match tags::attr_valued(name, &a.value)? {
+        AttrTarget::Styles([_]) => vec![a.value.clone()],
+        AttrTarget::Styles(rows) if crate::values::four_sided(rows) => {
+            match crate::shorthands::sides(name, &a.value).ok()? {
+                Some(sides) => sides,
+                None if literal(&a.value) => vec![a.value.clone(); rows.len()],
+                None => return None,
+            }
+        }
+        AttrTarget::Shorthand if name != "font" => (0..ids.len())
+            .map(|i| crate::shorthands::component(&a.value, name, i).ok())
+            .collect::<Option<_>>()?,
+        AttrTarget::Flex => (0..ids.len())
+            .map(|i| crate::values::flex_component(&a.value, i).ok())
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    ids.iter()
+        .zip(values)
+        .map(|(id, value)| {
+            let longhand = crate::style_names::STYLE_NAMES
+                .iter()
+                .find(|(_, _, t)| matches!(t, AttrTarget::Styles(rows) if *rows == [*id]))?
+                .0;
+            let name = match state {
+                Some(s) => contract_syntax::state::state_attr(&format!(":{s}"), longhand),
+                None => longhand.to_string(),
+            };
+            Some(Attr {
+                name,
+                value,
+                ..a.clone()
+            })
+        })
+        .collect()
 }
 
 impl Lowerer<'_> {

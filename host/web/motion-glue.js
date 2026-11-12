@@ -115,6 +115,14 @@ export function motionController({views,now,generation,request,applyBatch,inert,
   // down (swipe) marks its pointer 'pending' until it claims or refuses; an
   // ancestor's recognizer that would capture waits for that verdict.
   const contacts=()=>(globalThis.exact??={}).contacts??=new Map();
+  // A mouse has no implicit capture: an uncaptured contact can end outside its node.
+  const watchEnd=(el,finish)=>{
+    const listen=enabled=>{
+      for(const type of ['pointerup','pointercancel'])
+        el.ownerDocument[enabled?'addEventListener':'removeEventListener'](type,finish,true);
+    };
+    listen(true);return ()=>listen(false);
+  };
   // Each view motion writes over, with the function that lets it go if it leaves (presence-glue.js `release`)
   const holds=()=>(globalThis.exact??={}).motionHolds??=new Map();
   const deferred=d=>{
@@ -123,6 +131,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
     if(state==='pending')return true;
     if(state==='claimed'){drags.get(d.id)?.();return true;}
     d.deferred=false;
+    d.unwatch?.();
     for(const pointer of d.pointers?.keys()??[d.pointer])d.el.setPointerCapture(pointer);
     return false;
   };
@@ -665,6 +674,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       const pairLocal=d=>d.pair?.every(local)&&transformLocal(d.binding)&&d.binding.admitted&&d.sequence===d.binding.sequence;
       const finiteTerminal=v=>pixel(v[0])&&pixel(v[1])&&positiveScale(v[2])&&v.slice(3).every(Number.isFinite);
       function clearContact(d) {
+        d.unwatch?.();
         for(const pointer of d.pointers.keys()){if(el.hasPointerCapture(pointer))el.releasePointerCapture(pointer);releaseInteraction(pointer);}
         clearTimeout(d.idle);
       }
@@ -765,13 +775,15 @@ export function motionController({views,now,generation,request,applyBatch,inert,
         if(!second&&pressable(e,el))return;
         const d=second?drag:arm(e,{x:e.clientX,y:e.clientY,id,el,deferred:contacts().get(e.pointerId)==='pending'});if(!d)return;
         d.pointers.set(e.pointerId,[e.clientX,e.clientY]);
-        if(second&&d.deferred){d.deferred=false;for(const pointer of d.pointers.keys())el.setPointerCapture(pointer);}
+        if(second&&d.deferred){d.deferred=false;d.unwatch?.();for(const pointer of d.pointers.keys())el.setPointerCapture(pointer);}
+        if(!second&&d.deferred)d.unwatch=watchEnd(el,finish);
         if(!d.deferred)el.setPointerCapture(e.pointerId);e.preventDefault();
         // A second finger is a pinch: recognized at once, then re-anchored.
         if(second){if(!d.pair&&!begin(d))return;if(drag===d)anchor(d);}
       });
       const move=e=>{
         const d=drag;if(!d||!d.pointers.has(e.pointerId))return false;
+        if(e.pointerType==='mouse'&&e.buttons===0){stop();return false;}
         d.pointers.set(e.pointerId,[e.clientX,e.clientY]);
         if(deferred(d))return false;
         checkGeometry(d.binding);
@@ -788,6 +800,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       on('pointermove',move);
       const finish=e=>{
         const d=drag;if(!d||!d.pointers.has(e.pointerId))return;
+        if(e.type==='lostpointercapture'&&e.target!==el)return;
         if(e.type!=='pointerup'||!d.pair){stop();return;}
         d.pointers.set(e.pointerId,[e.clientX,e.clientY]);
         if(d.pointers.size>1) {
@@ -840,6 +853,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       function stop() {
         const d=drag; drag=null; active.delete(id);
         if(!d) return;
+        d.unwatch?.();
         if(d.h) { suppressClick=true; api.end(d.h,[0,0],true); }
         if(el.hasPointerCapture(d.pointer)) el.releasePointerCapture(d.pointer);
         releaseInteraction(d.pointer);
@@ -850,12 +864,14 @@ export function motionController({views,now,generation,request,applyBatch,inert,
         const binding=heightBindings.get(id);
         if(!e.isPrimary||e.button!==0||!bindingLive(binding)||e.target.closest('button,a,input,textarea,select,[contenteditable]')) return;
         stop(); drag={pointer:e.pointerId,x:e.clientX,y:e.clientY,binding,id,el,deferred:contacts().get(e.pointerId)==='pending'}; active.set(id,stop);
+        if(drag.deferred)drag.unwatch=watchEnd(el,finish);
         // A fast first move can already leave a narrow header. Retain delivery
         // while intent is pending; motion takeover still waits for recognition.
         if(!drag.deferred)el.setPointerCapture(e.pointerId); e.preventDefault();
       });
       const move=e=>{
         if(!drag||drag.pointer!==e.pointerId) return false;
+        if(e.type==='pointermove'&&e.pointerType==='mouse'&&e.buttons===0){stop();return false;}
         if(deferred(drag)) return false;
         if(!stop.valid()) { stop(); return false; }
         const current=drag;
@@ -887,6 +903,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       on('pointermove',move);
       const finish=e=>{
         if(!drag||drag.pointer!==e.pointerId) return;
+        if(e.type==='lostpointercapture'&&e.target!==el)return;
         if(e.type!=='pointerup'||!drag.h) { stop(); return; }
         if(!move(e)) return;
         const d=drag; drag=null; active.delete(id); suppressClick=true;
@@ -924,6 +941,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       function stop() {
         const ended=drag; drag=null; active.delete(id);
         if(ended) {
+          ended.unwatch();
           contacts().delete(ended.pointer);
           if(ended.holds) suppressClick=true;
           for(const h of ended.holds??[]) api.end(h,[0,0],true);
@@ -936,9 +954,11 @@ export function motionController({views,now,generation,request,applyBatch,inert,
         if(!e.isPrimary||e.button!==0||!eligible(el)||e.target.closest('input,textarea,[contenteditable]')||pressable(e,el))return;
         stop(); drag={pointer:e.pointerId,x:e.clientX,y:e.clientY}; active.set(id,stop);
         contacts().set(e.pointerId,'pending');
+        drag.unwatch=watchEnd(el,finish);
       });
       const move=e=>{
         if(!drag||e.pointerId!==drag.pointer)return false;
+        if(e.type==='pointermove'&&e.pointerType==='mouse'&&e.buttons===0){stop();return false;}
         if(!eligible(el)){stop();return false;}
         const dx=e.clientX-drag.x,dy=e.clientY-drag.y;
         if(!drag.holds) {
@@ -958,6 +978,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
           }
           for(const h of drag.holds) h.base=[...h.value];
           el.setPointerCapture(e.pointerId);
+          drag.unwatch();
         }
         const h=drag.holds[0], displacement=e.clientX-drag.origin;
         const x=displacement===0?drag.base[0]:rubber(drag.raw+displacement);

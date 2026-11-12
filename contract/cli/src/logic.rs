@@ -2,8 +2,15 @@
 //! @ref LLP 1029.000 — disabling replacement removes its reachable loader code.
 
 /// Generate `AppData` and `app_data()` for a host's source type and constructor.
-/// `mode` is the validated `compat.inputs.rustMode` from the actual target bake.
-pub fn rust_entry(data: &str, constructor: &str, mode: &str) -> Result<String, String> {
+/// `inputs` are the actual target bake's compatibility inputs.
+pub fn rust_entry(
+    data: &str,
+    constructor: &str,
+    mode: &str,
+    inputs: &serde_json::Value,
+) -> Result<String, String> {
+    let constructor = native_storage_constructor(constructor, inputs)?;
+    let constructor = constructor.as_str();
     // The digest of the source this binary compiles `constructor`'s crate
     // from (`scripts/app.mjs` `nativeSource`): a Rust update built from the
     // same source then runs this native code, not the module.
@@ -41,12 +48,36 @@ pub fn rust_entry(data: &str, constructor: &str, mode: &str) -> Result<String, S
         format!("exact_logic::Swappable::{mode}({constructor}){native}")
     };
     match mode {
-        "off" => Ok(format!("type AppData = {data};\n#[allow(dead_code)]\nfn app_data() -> AppData {{ {constructor} }}\n")),
-        "native" | "tiered" | "wasm" | "browser" => Ok(format!(
+        "off" if inputs["platform"] == "web" => Ok(format!("type AppData = {data};\n#[allow(dead_code)]\nfn app_data() -> AppData {{ {constructor} }}\n")),
+        "off" | "native" | "tiered" | "wasm" | "browser" => Ok(format!(
             "exact_logic::configured!(AppData, {data}, || {supplemental});\n#[allow(dead_code)]\nfn app_data() -> AppData {{ Default::default() }}\n"
         )),
         _ => Err(format!("unknown Rust executor {mode:?}")),
     }
+}
+
+/// Register SQL storage only from a native shell whose composition links it.
+/// Refuse a grant beyond that composition while generating the entry.
+pub fn native_storage_constructor(
+    constructor: &str,
+    inputs: &serde_json::Value,
+) -> Result<String, String> {
+    if inputs["platform"] == "web" {
+        return Ok(constructor.to_owned());
+    }
+    let linked = inputs["linked"]
+        .as_array()
+        .is_none_or(|names| names.iter().any(|name| name == "sqlite"));
+    let required =
+        exact_runner::Uses::NONE.with_grants(inputs["grantCeiling"].as_str().unwrap_or(""));
+    if !linked && required.has(exact_runner::Capability::Sqlite) {
+        return Err("Unlinked(\"sqlite\")".into());
+    }
+    Ok(if linked {
+        format!("{{ #[cfg(not(target_arch = \"wasm32\"))] ibex2_sqlite::link(); {constructor} }}")
+    } else {
+        constructor.to_owned()
+    })
 }
 
 /// A Linux app's whole `entry.rs`: [`rust_entry`], its `launch_parts()`, its
@@ -56,14 +87,19 @@ pub fn rust_entry(data: &str, constructor: &str, mode: &str) -> Result<String, S
 pub fn linux_entry(
     data: &str,
     constructor: &str,
-    mode: &str,
+    inputs: &serde_json::Value,
     host: &str,
     hatches: &str,
     run: &str,
 ) -> Result<String, String> {
     Ok(format!(
         "{}\n{}\n{hatches}fn main() {{ launch_parts(); std::process::exit({host}::{run}); }}\n",
-        rust_entry(data, constructor, mode)?,
+        rust_entry(
+            data,
+            constructor,
+            inputs["rustMode"].as_str().ok_or("missing Rust policy")?,
+            inputs
+        )?,
         launch_parts()?
     ))
 }
@@ -236,6 +272,7 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
                     | Capability::AuthSession
                     | Capability::Numerals
                     | Capability::Dates
+                    | Capability::Sqlite
             )
         })
         .map(|c| c.name())
@@ -286,7 +323,8 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
             | Capability::MediaPicker
             | Capability::AuthSession
             | Capability::Numerals
-            | Capability::Dates => {}
+            | Capability::Dates
+            | Capability::Sqlite => {}
         }
     }
     entry
@@ -325,6 +363,27 @@ pub fn apple_linked(uses: exact_runner::Uses, host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::web_rust_mode;
+
+    #[test]
+    fn native_entries_link_sqlite_by_composition_and_refuse_missing_sql_storage() {
+        let mut inputs = serde_json::json!({
+            "rustMode": "off", "linked": ["io"],
+            "grantCeiling": "net.fetch https://example.test"
+        });
+        let entry = super::rust_entry("Data", "data()", "off", &inputs).unwrap();
+        assert!(!entry.contains("sqlite"), "{entry}");
+        inputs["grantCeiling"] = "sqlite.open app:/data/notes.db".into();
+        let refused = super::rust_entry("Data", "data()", "off", &inputs).unwrap_err();
+        assert_eq!(refused, "Unlinked(\"sqlite\")");
+        eprintln!("entry generation: {refused}");
+        inputs["linked"] = serde_json::json!(["io", "sqlite"]);
+        let entry = super::rust_entry("Data", "data()", "off", &inputs).unwrap();
+        assert!(entry.contains("ibex2_sqlite::link();"), "{entry}");
+        inputs.as_object_mut().unwrap().remove("linked");
+        assert!(super::rust_entry("Data", "data()", "off", &inputs)
+            .unwrap()
+            .contains("ibex2_sqlite::link();"));
+    }
 
     /// LLP 1047.001 D3: the entry names its set and invokes the export
     /// groups of what it names, through whichever host crate it calls.

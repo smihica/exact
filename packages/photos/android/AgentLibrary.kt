@@ -95,14 +95,16 @@ internal class AgentLibrary(assets: AssetManager) {
         return assets.filter { it.id in seen }.sortedByDescending { it.created }.take(limit)
     }
 
-    /** An add: [bytes], kept in [directory], join the library at the session's [now]. Null for bytes that are no image. */
-    fun add(bytes: ByteArray, directory: File, now: Double): Asset? {
+    /** An add: [bytes], kept at the file [destination] answers for its name, join the library at the session's [now].
+     * Null for bytes that are no image, or where [destination] answers no file or it is not written. */
+    fun add(bytes: ByteArray, now: Double, destination: (String) -> File?): Asset? {
         val (w, h, type) = size(bytes) ?: return null
         val id = "agent-${assets.size + 1}"
         val name = "$id.${extension(type)}"
+        val file = destination(name) ?: return null
         try {
-            directory.mkdirs()
-            File(directory, name).writeBytes(bytes)
+            file.parentFile?.mkdirs()
+            dev.exact.canvas.Files.write(file, bytes)
         } catch (e: java.io.IOException) { return null }
         // The session's clock counts from 0 under the agent, so an add is dated a day after the newest fixture, plus
         // that clock: newer than all of them, as a photo saved today is.

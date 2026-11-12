@@ -231,6 +231,61 @@ final class AudioSessionIOSTests: XCTestCase {
         XCTAssertEqual(AVAudioSession.sharedInstance().category, .ambient)
     }
 
+    func testSoundAndPlayerReleasesLeaveACallsSessionToTheSystem() throws {
+        final class Holder {}
+        let sound = Holder(), player = Holder()
+        for value in ["playback", "playback-mix"] {
+            for video in [false, true] {
+                for hasPlayer in [false, true] {
+                    AudioSession.configuration = .init(value)
+                    try AudioSession.hold(ObjectIdentifier(sound))
+                    if hasPlayer { AudioSession.playerCame(ObjectIdentifier(player)) }
+                    let call = AudioSession.claimCall(video: video) { _ in }
+                    AudioSession.callActivated(true)
+                    let mode: AVAudioSession.Mode = video ? .videoChat : .voiceChat
+                    XCTAssertEqual(session.category, .playAndRecord)
+                    XCTAssertEqual(session.mode, mode)
+                    let options = session.categoryOptions
+                    XCTAssertTrue(options.contains(.allowBluetoothHFP))
+
+                    func unchanged(_ step: String) {
+                        XCTAssertEqual(session.category, .playAndRecord, step)
+                        XCTAssertEqual(session.mode, mode, step)
+                        XCTAssertEqual(session.categoryOptions, options, step)
+                        XCTAssertEqual(categorySets, 0, step)
+                        XCTAssertEqual(activations, [], step)
+                    }
+                    try counting {
+                        AudioSession.release(ObjectIdentifier(sound))
+                        unchanged("sound released")
+                        if hasPlayer {
+                            AudioSession.playerWent(ObjectIdentifier(player))
+                            unchanged("player removed")
+                        }
+                        let capture = AudioSession.claimCapture(mode: .default, options: [], background: false) { _ in }
+                        XCTAssertNotEqual(capture, 0)
+                        unchanged("capture joins the call")
+                        AudioSession.releaseCapture(capture)
+                        unchanged("capture released")
+                        AudioSession.callActivated(false)
+                        unchanged("the system deactivated a call whose claim is still held")
+                        AudioSession.callActivated(true)
+                        AudioSession.releaseCall(call)
+                        unchanged("restoration waits for the system's deactivation")
+                        AudioSession.callActivated(false)
+                        XCTAssertEqual(session.category, .ambient, "the released sound holds nothing after the call")
+                        XCTAssertEqual(activations, [], "restoring a call leaves activation to the system")
+                    }
+                    try counting {
+                        try AudioSession.hold(ObjectIdentifier(sound))
+                        AudioSession.release(ObjectIdentifier(sound))
+                        XCTAssertTrue(activations.contains(false), "the removed player no longer keeps the session active")
+                    }
+                }
+            }
+        }
+    }
+
     /// A hold whose activation fails (during a call) still wants the
     /// session: the next activation takes playback, and its release yields.
     func testAFailedActivationStillHoldsAndIsActivatedAgain() throws {

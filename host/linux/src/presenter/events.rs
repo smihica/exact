@@ -803,21 +803,27 @@ impl<D: DataSource> Presenter<D> {
         id: ViewId,
         at: Option<(f32, f32)>,
     ) -> Result<String, String> {
-        let names_popover = self
-            .host
-            .kernel()
-            .node(id)
-            .is_some_and(|node| node.props.str(PropId::ContextPopover).is_some());
-        // Where the top layer is windows (LLP 1115.001 D10) the menu a node
-        // names opens as a finger held on it opens it: its `contextmenu`
-        // runs, then the menu shows at the point (the node's middle unsaid).
+        // The node names a menu, or is inside one that does (a card's title
+        // or grip): a finger held there opens that menu, as a secondary
+        // click on a child opens its parent's on the web and on Apple.
+        let names_popover = {
+            let kernel = self.host.kernel();
+            let mut at = kernel.node(id);
+            while at.is_some_and(|node| node.props.str(PropId::ContextPopover).is_none()) {
+                at = at
+                    .and_then(|node| node.parent)
+                    .and_then(|parent| kernel.node(parent));
+            }
+            at.is_some()
+        };
+        // Where the top layer is windows (LLP 1115.001 D10) the menu opens as
+        // a finger held on the node opens it: its `contextmenu` runs, then the
+        // menu shows at the point (the node's middle unsaid). The finger is
+        // held only where one can be: on a shown node that is not covered.
         if names_popover && self.has_windows() {
-            let b = self
-                .box_of(id)
-                .ok_or_else(|| format!("no view {id} on screen"))?;
-            let (dx, dy) = at.unwrap_or((b.rect.2 / 2.0, b.rect.3 / 2.0));
+            let (x, y) = self.pointer_target(id, at)?;
             let now = self.host.now();
-            return match self.long_press(b.rect.0 + dx, b.rect.1 + dy, now) {
+            return match self.long_press(x, y, now) {
                 true => Ok(format!("{{\"tapped\":{id},\"contextmenu\":true}}")),
                 false => Err(format!("view {id} opened no context menu")),
             };

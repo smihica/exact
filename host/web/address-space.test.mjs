@@ -4,6 +4,7 @@
 // public space's permission is answered and not granted.
 import { expect, test } from 'bun:test';
 import { reachRefusal, redirectFor, setSpaceState, spaceOf } from './address-space.js';
+import { isCloudMetadata, isLocalNetwork } from './grant-admission.js';
 
 const page = host => { globalThis.location = { hostname: host }; };
 const setSpaceStates = state => { setSpaceState('local', state); setSpaceState('loopback', state); };
@@ -12,9 +13,22 @@ test('spaces are read as the URL writes the host', () => {
   expect(spaceOf('192.168.1.40')).toBe('local');
   expect(spaceOf('wled-a1b2c3.local')).toBe('local');
   expect(spaceOf('[fd00::1]')).toBe('local');
+  expect(spaceOf('169.254.169.254')).toBe('local');
+  expect(spaceOf('[::ffff:a9fe:a9fe]')).toBe('local');
+  expect(spaceOf('[fd00:ec2::254]')).toBe('local');
   expect(spaceOf('127.0.0.1')).toBe('loopback');
   expect(spaceOf('localhost')).toBe('loopback');
   expect(spaceOf('example.com')).toBe('public');
+});
+
+test('a grant\'s local network leaves out the cloud metadata service and keeps its neighbours', () => {
+  for (const host of ['169.254.169.254', '[::ffff:a9fe:a9fe]', '[fd00:ec2::254]', '[FD00:EC2:0:0:0:0:0:254]']) {
+    expect([isCloudMetadata(host), isLocalNetwork(host, false), isLocalNetwork(host, true)], host).toEqual([true, false, false]);
+  }
+  for (const host of ['169.254.169.253', '[::ffff:a9fe:a903]', '[fd00:ec2::253]', '[fd00::254]']) {
+    expect([isCloudMetadata(host), isLocalNetwork(host, false)], host).toEqual([false, true]);
+  }
+  expect([isLocalNetwork('[::ffff:7f00:1]', true), isLocalNetwork('[::1]', true), isLocalNetwork('[::1]', false)]).toEqual([true, true, false]);
 });
 
 test('a tool from a public page is refused by the space\'s state; the app never', () => {

@@ -2,7 +2,7 @@
 // prelude.js: base64 for what crosses the seam
 // as JSON, a string's UTF-8 length, a stream message's data, a long
 // poll's terms as the seam carries them (LLP 1016.000 D8), an upload's
-// option and events, a fetch's file
+// option and events, a fetch's body and file
 // options, an image call's options and an answer's timers (here, beside the
 // prelude, under its line cap). Natively a
 // binary message (a byte stream's bytes, a socket's frame; LLP 1016.000)
@@ -14,6 +14,10 @@
 (function (global) {
   "use strict";
   var door = global.__exact_bytes; // natively; prelude.js takes it from the global
+  var StreamBody = global.__exact_stream_body || global.Response;
+  delete global.__exact_stream_body;
+  var streamLocked = global.ReadableStream && Object.getOwnPropertyDescriptor(global.ReadableStream.prototype, "locked").get;
+  function isReadableStream(value) { return value !== null && typeof value === "object" && streamLocked && holds(streamLocked, value); }
   function fromBase64(text) {
     return Uint8Array.from(global.atob(text), function (c) { return c.charCodeAt(0); });
   }
@@ -87,6 +91,13 @@
     if (method === "GET" || method === "HEAD") return "exactUploadProgress: a GET or HEAD request sends no body";
     return true;
   }
+  // `exactIdleTimeout` (LLP 1016.000 D11): why it is refused, if it is. `socket`: a WebSocket stream that is no
+  // listener, child, upload or long poll.
+  function idleRefusal(idle, socket) {
+    if (idle === undefined) return undefined;
+    if (!Number.isInteger(idle) || idle < 1 || idle > 3600000) return "exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000";
+    return socket ? undefined : "exactIdleTimeout: only a WebSocket stream takes an idle timeout";
+  }
   // An upload's event for its mapper, as XMLHttpRequest names them: `progress` for the host's count of the body's
   // bytes sent, and `load` for the reply, whatever its status, which ends the stream.
   function uploadEvent(o) {
@@ -101,8 +112,6 @@
   // unlocked value to its promise alone, never through the store. A refusal
   // whose message names its error (`InvalidAccessError: …`) carries that name.
   function presence(host, get, refuse) {
-    // Own properties: a hardened realm's frozen `Error.prototype` refuses an
-    // assigned `name`.
     function as(e, name) {
       Object.defineProperty(e, "name", { value: name, writable: true, configurable: true });
       Object.defineProperty(e, "code", { value: name, writable: true, enumerable: true, configurable: true });
@@ -573,12 +582,35 @@
   // Whether `value` has the internal slot `getter` reads
   function holds(getter, value) { try { slot(getter, value); return true; } catch (e) { return false; } }
 
+  var formText = global.URLSearchParams && global.URLSearchParams.prototype.toString;
+  // Whether `value` is a `URLSearchParams`, by the platform's own check
+  function isForm(value) {
+    if (!formText || value === null || typeof value !== "object") return false;
+    try { reflectApply(formText, value, []); return true; } catch (e) { return false; }
+  }
+  // Fetch's BodyInit extraction gives strings and forms a type, bytes and streams none.
+  function bodyType(body, form) {
+    return form ? "application/x-www-form-urlencoded;charset=UTF-8" : typeof body === "string" ? "text/plain;charset=UTF-8" : null;
+  }
+  function requestBody(raw, method, headers) {
+    if (isReadableStream(raw)) throw new TypeError("fetch: ReadableStream request bodies are unavailable; collect the bytes with new Response(body).arrayBuffer() first");
+    // Fetch's Request refuses a body on a GET or HEAD, an empty one too.
+    if (raw != null && (method === "GET" || method === "HEAD"))
+      throw new TypeError("fetch: a " + method + " request cannot have a body");
+    // A BufferSource goes as bytes (LLP 1069.002 D4); forms use their internal list, never an app's toString.
+    var bytes = bufferSourceBytes(raw, "fetch"), form = !bytes && isForm(raw);
+    var text = bytes || raw == null ? "" : form ? reflectApply(formText, raw, []) : String(raw);
+    var type = bytes || raw == null ? null : bodyType(text, form);
+    if (type && !headers.has("content-type")) headers.set("content-type", type);
+    return { bytes: bytes, text: text };
+  }
+
   // A fetch's `Response` (Fetch, "Response class"): the host's replies
   // (`reply`) and an app's own, as a demo's server in the app makes one. Its
   // state is out of the app's reach, as the platform's is: properties an app
-  // gives one are not a clone's. A body is read once. An app's is held as
-  // bytes and read back as UTF-8, as Fetch extracts and reads it ("BodyInit
-  // unions"): a BufferSource's bytes, with no type; a `URLSearchParams`, as
+  // gives one are not a clone's. A body is read once. An app's bytes, or a
+  // ReadableStream's byte chunks, are read back as UTF-8 (Fetch's "BodyInit
+  // unions"): bytes and streams bring no type; a `URLSearchParams`, as
   // `application/x-www-form-urlencoded;charset=UTF-8`; any other value, its
   // string, as `text/plain;charset=UTF-8`, unless `headers` names a type. Its
   // headers take no cookie a server sets (the "response" guard); a
@@ -596,8 +628,13 @@
     // The platform's own operations, taken before any app code runs, for what an app's object could answer itself; a
     // realm may lack either class
     var Headers = global.Headers, eachHeader = Headers && Headers.prototype.forEach, appendHeader = Headers && Headers.prototype.append;
-    var formText = global.URLSearchParams && global.URLSearchParams.prototype.toString;
     var states = new WeakMap();
+    var streamRead = StreamBody && StreamBody.prototype.arrayBuffer, streamClone = StreamBody && StreamBody.prototype.clone;
+    var streamUsed = StreamBody && Object.getOwnPropertyDescriptor(StreamBody.prototype, "bodyUsed").get;
+    var streamBody = StreamBody && Object.getOwnPropertyDescriptor(StreamBody.prototype, "body").get;
+    function isStreamBody(body) { return StreamBody && body instanceof StreamBody; }
+    function used(s) { return isStreamBody(s.body) ? slot(streamUsed, s.body) : s.used; }
+    function unusable(s) { return used(s) || isStreamBody(s.body) && slot(streamLocked, slot(streamBody, s.body)); }
     function state(response) {
       var s = states.get(response);
       if (!s) throw new TypeError("not a Response");
@@ -612,11 +649,6 @@
       var copy = new Headers();
       reflectApply(eachHeader, headers, [function (value, name) { reflectApply(appendHeader, copy, [name, value]); }]);
       return guard(copy, kind);
-    }
-    // Whether `value` is a `URLSearchParams`, by the platform's own check
-    function isForm(value) {
-      if (!formText || value === null || typeof value !== "object") return false;
-      try { reflectApply(formText, value, []); return true; } catch (e) { return false; }
     }
     // Web IDL's `unsigned short`: ToNumber (a BigInt or a symbol refused), truncated, modulo 2^16; NaN and the infinities 0
     function unsignedShort(value) { var n = +value; return isFinite(n) ? ((Math.trunc(n) % 65536) + 65536) % 65536 : 0; }
@@ -684,7 +716,7 @@
       var status = asked === undefined ? 200 : unsignedShort(asked), statusText = given.statusText;
       return { headers: headers, status: status, statusText: statusText === undefined ? "" : byteString(statusText, api) };
     }
-    // Fetch's "initialize a response": a body `source` (bytes or a string, or null for none) and the type it brings
+    // Fetch's "initialize a response": the extracted body and the type it brings
     function initialized(source, type, options, api) {
       var status = options.status, statusText = options.statusText, headers = new Headers();
       if (status < 200 || status > 599) throw new RangeError(api + ": the status must be from 200 to 599, not " + status);
@@ -706,22 +738,22 @@
       states.set(response, fields);
       return response;
     }
-    // Web IDL converts the body first (a BufferSource or a `URLSearchParams` kept as it is, any other value made a
+    // Web IDL converts the body first (bytes, a stream or a `URLSearchParams` kept as it is, any other value made a
     // string), then the init; Fetch extracts the body after both
     function Response(body, init) {
       if (!new.target) throw new TypeError("Response must be constructed with new");
-      var api = "new Response()", form = isForm(body);
-      var kept = body == null || form || isBufferSource(body, api) ? body : string(body, api), options = initOf(init, api);
-      var source = kept == null ? null : form ? reflectApply(formText, kept, []) : typeof kept === "string" ? kept : bufferSourceBytes(kept, api);
-      var type = typeof kept === "string" ? "text/plain;charset=UTF-8" : form ? "application/x-www-form-urlencoded;charset=UTF-8" : null;
+      var api = "new Response()", form = isForm(body), stream = isReadableStream(body);
+      var kept = body == null || form || stream || isBufferSource(body, api) ? body : string(body, api), options = initOf(init, api);
+      var source = kept == null ? null : stream ? new StreamBody(kept) : form ? reflectApply(formText, kept, []) : typeof kept === "string" ? kept : bufferSourceBytes(kept, api);
+      var type = bodyType(kept, form);
       states.set(this, initialized(source, type, options, api));
     }
     ["status", "statusText", "headers", "exactBodyTo"].forEach(function (name) {
       Object.defineProperty(Response.prototype, name, { get: function () { return state(this)[name]; }, enumerable: true, configurable: true });
     });
     Object.defineProperty(Response.prototype, "ok", { get: function () { var status = state(this).status; return status >= 200 && status < 300; }, enumerable: true, configurable: true });
-    Object.defineProperty(Response.prototype, "bodyUsed", { get: function () { var s = state(this); return s.body !== null && s.used; }, enumerable: true, configurable: true });
-    // Fetch's "consume body": a body is read once; none reads as empty, as often as asked. An app's body is bytes;
+    Object.defineProperty(Response.prototype, "bodyUsed", { get: function () { var s = state(this); return s.body !== null && used(s); }, enumerable: true, configurable: true });
+    // Fetch's "consume body": a body is read once; none reads as empty, as often as asked. An app's body is bytes or a stream;
     // a host reply's, its bytes in base64 and their UTF-8 text, as the host decoded it. `read` makes the reader's
     // value from it, and the promise is resolved with that value alone: the body held stays out of reach. As Fetch
     // consumes one, a body is marked read now and read in a later turn, and none is read now, so its promise is
@@ -732,7 +764,8 @@
       try {
         var s = state(response);
         if (s.body === null) return Promise.resolve(read(none));
-        if (s.used) throw new TypeError("the body was read already");
+        if (unusable(s)) throw new TypeError("the body is locked or was read already");
+        if (isStreamBody(s.body)) return reflectApply(streamRead, s.body, []).then(function (bytes) { return read(new Uint8Array(bytes)); });
         s.used = true;
         body = s.body;
       } catch (e) {
@@ -753,8 +786,9 @@
     Response.prototype.json = function () { return consumed(this, function (body) { return JSON.parse(decoded(body)); }); };
     Response.prototype.clone = function () {
       var s = state(this);
-      if (s.body !== null && s.used) throw new TypeError("Response.clone(): the body was read already");
-      return made({ status: s.status, statusText: s.statusText, headers: headersCopy(s.headers, s.guard), guard: s.guard, body: s.body, used: false, exactBodyTo: s.exactBodyTo });
+      if (s.body !== null && unusable(s)) throw new TypeError("Response.clone(): the body is locked or was read already");
+      var body = isStreamBody(s.body) ? reflectApply(streamClone, s.body, []) : s.body;
+      return made({ status: s.status, statusText: s.statusText, headers: headersCopy(s.headers, s.guard), guard: s.guard, body: body, used: false, exactBodyTo: s.exactBodyTo });
     };
     // The init converted before the data is serialized, as Web IDL converts the arguments first
     Response.json = function (data, init) {
@@ -782,9 +816,9 @@
     return { Response: Response, reply: reply };
   }
   global.__exact_binary = Object.freeze({
+    requestBody: requestBody,
     keptReply: keptReply,
     responses: responses,
-    bufferSourceBytes: bufferSourceBytes,
     copyBytes: copyBytes,
     timers: timers,
     fileRefusal: fileRefusal,
@@ -795,6 +829,7 @@
     gateDecode: door ? gateDecode : undefined,
     longPollOf: longPollOf,
     uploadOf: uploadOf,
+    idleRefusal: idleRefusal,
     uploadEvent: uploadEvent,
     presence: presence,
     sockets: sockets,

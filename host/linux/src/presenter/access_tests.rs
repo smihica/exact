@@ -476,6 +476,86 @@ fn a_control_is_its_kind_with_its_state_and_what_is_hidden_is_no_node() {
 }
 
 #[test]
+fn a_virtual_rows_position_stays_in_its_subtree() {
+    let source = format!(
+        "{ROWS}{}",
+        r#"      button press=pick(-1) height=40
+        text "Done"
+      text "Footer" height=20
+"#
+    );
+    let mut p = boot(&source, (320., 480.), 0);
+    let port = id(&p, "port");
+    for offset in [0.0, 80.0, 8000.0, 0.0] {
+        p.scroll_to(port, (0.0, offset)).unwrap();
+        settle(&mut p);
+        let nodes = read(&mut p);
+        let list = nodes.iter().find(|n| n.view == port).unwrap();
+        let rows: Vec<_> = nodes.iter().filter(|n| n.parent == list.id).collect();
+        assert!(!rows.is_empty());
+        for row in rows {
+            let number: i32 = row.name.strip_prefix("Row ").unwrap().parse().unwrap();
+            assert_eq!((row.role, row.set), (role::BUTTON, (number + 1, 400)));
+        }
+        let done = named(&nodes, "Done");
+        assert_eq!(
+            (done.role, done.parent, done.set),
+            (role::BUTTON, 0, (0, 0))
+        );
+        let footer = named(&nodes, "Footer");
+        assert_eq!(
+            (footer.role, footer.parent, footer.set),
+            (role::TEXT, 0, (0, 0))
+        );
+    }
+}
+
+#[test]
+fn an_explicit_position_restores_the_pending_ancestor_position() {
+    let mut p = boot(
+        r#"component App
+  view
+    column
+      column testId="outer"
+        text "" testId="empty"
+        text "Inner" testId="inner"
+        column
+          text "Outer first"
+          text "Outer second"
+      text "After"
+"#,
+        (320., 480.),
+        0,
+    );
+    for (name, at, size) in [("outer", 2, 5), ("empty", 4, 9), ("inner", 3, 7)] {
+        let node = id(&p, name);
+        p.host.apply_test_ops(&[
+            exact_kernel::Op::SetProp {
+                id: node,
+                prop: PropId::AccessibilityPosInSet,
+                value: exact_kernel::PropValue::Int(at),
+            },
+            exact_kernel::Op::SetProp {
+                id: node,
+                prop: PropId::AccessibilitySetSize,
+                value: exact_kernel::PropValue::Int(size),
+            },
+        ]);
+    }
+    let nodes = read(&mut p);
+    let places: Vec<_> = nodes.iter().map(|n| (n.name.as_str(), n.set)).collect();
+    assert_eq!(
+        places,
+        [
+            ("Inner", (3, 7)),
+            ("Outer first", (2, 5)),
+            ("Outer second", (0, 0)),
+            ("After", (0, 0)),
+        ]
+    );
+}
+
+#[test]
 fn a_nodes_identity_outlives_a_commit_a_scroll_and_a_row_that_returns() {
     let mut p = boot(ROWS, (320., 480.), 0);
     let port = id(&p, "port");

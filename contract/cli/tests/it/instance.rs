@@ -264,6 +264,50 @@ fn child_derives_resolve_in_either_order_without_capturing_the_parent() {
 }
 
 #[test]
+fn view_binders_do_not_capture_child_derives() {
+    let component = r#"component Child
+  state item = "state"
+  state index = 9
+  state items = ["a", "b"]
+  state option = some("bound")
+  derive label = `${item}!${index}`
+  action change
+    item = "next"
+    index = 10
+  view
+    column
+      text label testId="outside"
+      for item, index in items key=item
+        text label testId=`in-${item}-${index}`
+      match option
+        case some(item)
+          text label testId=`match-${item}`
+        case none
+          text label testId="none"
+      for label in items key=label
+        text label testId=`direct-${label}`
+      button "Change" press=change testId="change"
+"#;
+    for prefix in ["", "component App\n  view\n    Child()\n"] {
+        let mut r = Runner::boot(
+            contract::compile(&format!("{prefix}{component}")).unwrap(),
+            Stations,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap();
+        for expected in ["state!9", "next!10"] {
+            let ids = ["outside", "in-a-0", "in-b-1", "match-bound"];
+            assert_eq!(ids.map(|id| text_of(&r, id)), [expected; 4], "{prefix}");
+            assert_eq!(text_of(&r, "direct-a"), "a");
+            assert_eq!(text_of(&r, "direct-b"), "b");
+            r.dispatch(view_of(&r, "change"), Event::Press).unwrap();
+        }
+    }
+}
+
+#[test]
 fn a_derive_that_reads_a_refused_one_is_not_called_a_cycle() {
     let src = "component App\n  state text = \"1\"\n  derive bill = Number(text)\n  derive tip = bill / 10\n  derive total = bill + tip\n  view\n    text `${total}`\n";
     let Err(errors) =

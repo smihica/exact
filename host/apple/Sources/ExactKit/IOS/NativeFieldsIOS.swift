@@ -22,7 +22,7 @@ extension NodeView {
         f.backgroundColor = .clear
         f.delegate = self
         f.addTarget(self, action: #selector(fieldChanged), for: .editingChanged)
-        addSubview(f)
+        (clipBox ?? self).addSubview(f)
         field = f
     }
     /// An `input` made inside a closed `dialog` or popover, which the
@@ -227,7 +227,7 @@ extension NodeView {
         field.adjustsFontForContentSizeCategory = isNativeTextControl
         field.clearButtonMode = search ? .whileEditing : .never
         if search, searchChrome == nil {
-            insertSubview(SearchChrome(), belowSubview: field)
+            (clipBox ?? self).insertSubview(SearchChrome(), belowSubview: field)
         } else if !search, let chrome = searchChrome {
             chrome.removeFromSuperview()
         }
@@ -304,7 +304,7 @@ final class SearchChrome: UISearchTextField {
 
 extension NodeView {
     /// The search chrome behind this node's field, when it is a native search field.
-    var searchChrome: SearchChrome? { subviews.lazy.compactMap { $0 as? SearchChrome }.first }
+    var searchChrome: SearchChrome? { (clipBox ?? self).subviews.lazy.compactMap { $0 as? SearchChrome }.first }
 }
 #endif
 

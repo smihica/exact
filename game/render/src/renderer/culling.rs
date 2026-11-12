@@ -25,10 +25,11 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         // items, drawn as they were: no new setup, no level of detail changed,
         // nothing fading (a dithered occluder hides what shows through it).
         let mut lists = std::mem::take(&mut self.cull_drew) && !self.lights.fading;
-        if self.cull.stale() || self.locals_stale() {
+        let setup_changed = self.cull.stale() || self.locals_stale();
+        if setup_changed {
             lists = false;
             self.write_cull_setup();
-        } else if std::mem::take(&mut self.levels.changed) {
+        } else if self.levels.changed {
             lists = false;
             let hidden = &self.levels.hidden;
             self.cull.hide_records(&self.queue, hidden);
@@ -38,12 +39,39 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 }
             }
         }
+        // The setup resolves storage-limit fallback for this frame. Skin the
+        // records its passes draw, even when distance selected another level.
+        if ASSETS && (setup_changed || self.levels.changed) {
+            if let Some(skinning) = &mut self.models.skinning {
+                let levels = &self.levels;
+                skinning.activate(&self.queue, |record| {
+                    let material = self.models.records[record].material;
+                    if self.cull.direct
+                        && self.models.materials[material.0].alpha
+                            != exact_game::asset::AlphaMode::Blend
+                    {
+                        levels.records.get(record).copied().unwrap_or(0) == 0
+                    } else {
+                        !levels.hidden.get(record).copied().unwrap_or(false)
+                    }
+                });
+            }
+        }
         self.levels.changed = false;
-        self.local_views();
         self.occluding = false;
+        // Measure storage with every level, then keep only the finest for
+        // direct drawing, including the first frame that exceeds the limit.
+        if self.cull.direct {
+            let finest = |g: &Group| self.batches[g.batch].level == 0;
+            self.cull.groups.retain(finest);
+            for local in &mut self.local_culls {
+                local.cull.groups.retain(finest);
+            }
+        }
         if self.cull.direct || self.cull.groups.is_empty() {
             return;
         }
+        self.local_views();
         self.occluding = lists && self.slot_list.len() >= self.occlusion_items;
         if self.occluding {
             let occlusion = self.occlusion.get_or_insert_with(|| {
@@ -127,10 +155,6 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         self.viewmodels = self.quads.order.iter().any(|o| o.viewmodel);
         for (index, batch) in self.batches.iter().enumerate() {
             if batch.slots.is_empty() {
-                continue;
-            }
-            // Direct draws have no per-instance cull: only the finest level.
-            if self.cull.direct && batch.level != 0 {
                 continue;
             }
             self.viewmodels |= batch.viewmodel;

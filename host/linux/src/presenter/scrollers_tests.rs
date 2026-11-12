@@ -94,6 +94,7 @@ fn the_scrollers_under_a_point_are_told_innermost_first() {
             axes: (false, true),
             max: (0., 1020.),
             offset: (0., 0.),
+            from_right: false,
             port: [0., 0., 400., 380.],
             node: false,
         }]
@@ -131,6 +132,65 @@ fn a_contained_scroller_ends_the_chain_on_its_axis() {
     let under = p.scrollers_at(200., 240.);
     let ids: Vec<_> = under.chain.iter().map(|s| s.id).collect();
     assert_eq!(ids, [id(&p, "inner")], "nothing past it takes the drag");
+}
+
+#[test]
+fn scrollbar_policy_reaches_both_reader_messages_and_live_updates() {
+    for name in ["inner", "page", "strip"] {
+        let source = PAGE_OF_SCROLLERS.replace(
+            &format!(r#"testId="{name}""#),
+            &format!(r#"testId="{name}" scrollbar-width="none""#),
+        );
+        let mut p = boot(&source);
+        let target = id(&p, name);
+        let y = if name == "strip" { 140. } else { 240. };
+        let words = p.reader_under(200., y, 1.);
+        for entry in words[3..].chunks_exact(11) {
+            assert_eq!(entry[1] & 8, if entry[0] == target as i32 { 8 } else { 0 });
+        }
+        let words = p.reader_scrollers(&[], 1.).unwrap();
+        assert_eq!(told(&words, target).0 & 8, 8);
+        let patch = exact_kernel::StyleProps {
+            mask: exact_kernel::StyleMask::of(exact_kernel::StyleId::ScrollbarWidth),
+            ..Default::default()
+        };
+        p.host
+            .runner_mut()
+            .kernel_mut()
+            .apply(
+                0,
+                0,
+                &[exact_kernel::Op::SetStyle {
+                    id: target,
+                    patch: Box::new(patch),
+                }],
+            )
+            .unwrap();
+        let words = p
+            .reader_scrollers(&[], 1.)
+            .expect("a style change must publish");
+        assert_eq!(told(&words, target).0 & 8, 0);
+    }
+}
+
+#[test]
+fn the_page_indicator_follows_the_root_scrollbar_policy() {
+    for (width, child_width, flag) in [("none", "auto", 8), ("auto", "none", 0)] {
+        let mut p = boot(&format!(
+            r#"component App
+  view
+    column testId="root" width=400 scrollbar-width="{width}"
+      box width=400 height=900 scrollbar-width="{child_width}"
+"#
+        ));
+        // `view` introduces the component's section; the column is its root node.
+        assert_eq!(p.host.roots(), &[id(&p, "root")]);
+        let words = p.reader_under(200., 200., 1.);
+        assert_eq!(words[3], PAGE as i32);
+        assert_eq!(words[4] & 8, flag);
+        let words = p.reader_scrollers(&[], 1.).unwrap();
+        assert_eq!(told(&words, PAGE).0 & 8, flag);
+    }
 }
 
 #[test]

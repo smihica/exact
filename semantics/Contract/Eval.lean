@@ -26,7 +26,9 @@ def lookup (x : String) : List (String × Value) → Option Value
 
 /-- Everything an expression may read besides its locals. `derives` and
 `resources` hold what has settled so far in this update; a read of one not
-yet there is `pending`. `rows` are the row slots of the rows in force. -/
+yet there is `pending`. `rows` are the row slots of the rows in force.
+`idle` names the resources whose `when` was false when they settled (LLP
+1161.002 D2). -/
 structure Env where
   prog : Program
   slots : List (String × Value)
@@ -34,6 +36,7 @@ structure Env where
   resources : List (String × Value) := []
   rows : List (String × Value) := []
   now : F64 := 0
+  idle : List String := []
   deriving Inhabited
 
 namespace Env
@@ -404,6 +407,12 @@ def eval : Nat → Env → Bool → Locals → Expr → Result Value
         if env.prog.resources.any (·.name == x) then
           (lookup x env.resources).elim (.error .pending) (fun _ => .ok .none)
         else .ok .none
+      | "current", [.var x] =>
+        -- Every settled answer here answers its arguments; an idle
+        -- resource's value is no answer (LLP 1161.001 D5, 1161.002 D2).
+        if env.prog.resources.any (·.name == x) then
+          (lookup x env.resources).elim (.error .pending) (fun _ => .ok (.bool !(env.idle.contains x)))
+        else .ok (.bool false)
       | _, _ => do
         let vs ← evalList fuel env inFn ls args
         stdlib env name vs

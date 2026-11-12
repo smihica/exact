@@ -1152,7 +1152,7 @@ component Corners
     let style = |r: &Runner<NoData>, name: &str| {
         let k = r.kernel();
         let n = k.node_by_key(k.find_by_test_id(name)[0]).unwrap();
-        (n.id, n.style.border_radius_top_left)
+        (n.id, n.style.border_radius_top_left.clone())
     };
     let (id, initial) = style(&r, "box");
     assert_eq!(initial, Dimension::Points(4.0));
@@ -1232,15 +1232,16 @@ fn css_flex_shorthands_lower_in_order_to_the_longhands() {
 
 #[test]
 fn a_zero_minimum_scroller_can_shrink_under_a_bounded_column() {
-    for bound in ["height=200", "max-height=200", "max-height=\"100%\""] {
-        contract::compile(&format!("component App\n  view\n    column {bound}\n      scroll flex-shrink=1 min-height=0\n        box height=1000\n")).unwrap();
-    }
-    for parent in ["column", "box height=200"] {
-        let e = contract::compile(&format!(
-            "component App\n  view\n    {parent}\n      scroll flex-shrink=1 min-height=0\n"
-        ))
-        .unwrap_err();
-        assert_eq!(e.id, "lower-scroll-unbounded");
+    // A scroll container's automatic minimum is zero: a bare `scroll` is one.
+    for scroll in ["scroll flex-shrink=1 min-height=0", "scroll"] {
+        for bound in ["height=200", "max-height=200", "max-height=\"100%\""] {
+            contract::compile(&format!("component App\n  view\n    column {bound}\n      {scroll}\n        box height=1000\n")).unwrap();
+        }
+        for parent in ["column", "box height=200"] {
+            let src = format!("component App\n  view\n    {parent}\n      {scroll}\n");
+            let e = contract::compile(&src).unwrap_err();
+            assert_eq!(e.id, "lower-scroll-unbounded");
+        }
     }
 }
 
@@ -1286,8 +1287,13 @@ fn a_css_width_transition_names_the_engine_limit_not_a_syntax_error() {
         contract::compile(&app).unwrap_or_else(|e| panic!("{p}: {e}"));
     }
     assert!(!e.message.contains("not a CSS"), "{e}");
-    let malformed = refused("transition=\"opacity 20ms gibberish\"");
-    assert!(malformed.message.contains("invalid transition components"));
+    let malformed = refused("transition=\"opacity 20ms gibberish\"").message;
+    assert!(
+        malformed.contains("components: `gibberish` is neither a time"),
+        "{malformed}"
+    );
+    let unitless = refused("transition=\"opacity 0.3\"").message;
+    assert!(unitless.contains("`0.3` is not a time"), "{unitless}");
     for v in [
         "opacity 200ms ease",
         "border-color 200ms ease",

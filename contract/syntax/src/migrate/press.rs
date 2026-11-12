@@ -168,9 +168,20 @@ impl Paints<'_> {
                     .iter()
                     .position(|t| t.kind == TokenKind::Newline)
                     .expect("parsed line");
+            // A logical newline ends the whole value, including multiline
+            // expressions and positionals on the owner's opening line.
+            let last_attr = attrs
+                .iter()
+                .map(|a| a.span.line)
+                .max()
+                .unwrap_or(owner.line);
+            let end = self.tokens[line..]
+                .iter()
+                .find(|t| t.kind == TokenKind::Newline && t.span.line >= last_attr)
+                .expect("parsed attribute line");
             let at = self
                 .starts
-                .get(self.tokens[line].span.line as usize)
+                .get(end.span.line as usize)
                 .copied()
                 .unwrap_or(self.src.len());
             let prefix = if at > 0 && !self.src[..at].ends_with('\n') {

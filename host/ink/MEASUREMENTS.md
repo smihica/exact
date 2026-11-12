@@ -1818,7 +1818,7 @@ softbuffer by +4.74% and −2.46%, within D15's 10% relative limit and no
 worse than S2.4's +5.2% and +4.7%. The app still opts into Ink through its
 manifest; an unspecified Windows painter remains the CPU painter.
 On 2026-11-01 Charlie made ink the Windows default and kept an explicit CPU
-choice ([LLP 1149 D12](../../llp/1149-the-renderer.rfc.md#d12--where-it-is-the-presenter-and-what-the-same-everywhere-promises)); the numbers above remain the historical record.
+choice (LLP 1149 D12); the numbers above remain the historical record.
 
 ### Method and limits
 

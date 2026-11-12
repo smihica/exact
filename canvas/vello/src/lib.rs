@@ -192,7 +192,7 @@ pub struct Handle {
 /// The ABI's version.
 #[no_mangle]
 pub extern "C" fn ecg_abi() -> u32 {
-    // A build without the Metal toolchain has no kernels: not a module.
+    // Without a supported SDK or the Metal toolchain there are no kernels.
     if cfg!(exact_no_metal_toolchain) {
         0
     } else {

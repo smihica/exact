@@ -1,9 +1,10 @@
 // The Swift that composes an app's module with its packages' implementations (LLP 1133.001 D5), which
 // host/apple/build.mjs writes beside the module's sources and never commits.
 
-/** The module side's fixed Swift, in `root`: the table, its view entries, the hatch bindings, extensions and service query. */
+/** The module side's fixed Swift, in `root`: the table, its view entries, the hatch bindings, extensions and service query,
+ * and ExactKit's walk to an app file through no link, which an extension's `file` takes too. */
 export const moduleSeam = (resolve, root) => ['ExactNativeModule.swift', 'ExactNativeViews.swift', 'ExactTamber.swift', 'ExactExtensions.swift', 'ExactServices.swift']
-  .map(f => resolve(root, 'host/apple/modules', f));
+  .map(f => resolve(root, 'host/apple/modules', f)).concat(resolve(root, 'host/apple/Sources/ExactKit/AppFileWalk.swift'));
 
 /** Link declared system frameworks even when only an Objective-C category uses them. Frameworks introduced
  * above the app's minimum OS are weak-linked; the package checks `#available` before using them (LLP 1133.016 D15). */

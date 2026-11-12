@@ -110,6 +110,10 @@ it can never be written again.
       answer ends `00 11 03` (NTAG215's storage size and protocol).
     - On the iPhone, a second sticker is read only after the first is taken
       away.
+    - On the iPhone, Scan all, then Write link and hold a sticker: it is
+      written. Take it away and hold another: it is read. Write link again
+      and hold a third: it is written. Write link onto the locked sticker:
+      it fails `read-only`, and the next sticker held is read.
     - Command after the scan ended fails `InvalidStateError`.
 - **Chrome, a data-code write (D15).** In Chrome on the phone, Tag This
   Book's write runs from data code after the press. Record whether Chrome

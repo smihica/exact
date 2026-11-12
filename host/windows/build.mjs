@@ -6,11 +6,13 @@
 // `--run` opens it. From SSH, which has no display a window can show on (docs/testing.md, "Windows: the
 // NucBox"), it opens on the desktop of the user signed in at the console, through a one-off scheduled task, as
 // host/windows/reference/draw.mjs opens WinUI's, and returns once the window is up.
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { bakeTarget, buildBake, copyShaders, developmentBuildEnv, resolveApp, windowsFile } from '../../scripts/app.mjs';
+import { guardFlags, reportBuilt } from '../../scripts/help.mjs';
+import { syncStaticTree } from '../web/serve.mjs';
 
 const quote = (s) => `'${String(s).replaceAll("'", "''")}'`;
 const powershell = (command) => spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', windowsHide: true });
@@ -110,8 +112,8 @@ public static class ExactDesktop {
 }
 
 if (import.meta.main) {
+  const args = guardFlags('windows', process.argv.slice(2));
   if (process.platform !== 'win32') throw new Error('build the Windows host on Windows with the MSVC Rust target');
-  const args = process.argv.slice(2);
   const outAt = args.indexOf('--out');
   if (outAt >= 0 && !args[outAt + 1]) throw new Error('--out needs a directory');
   const app = resolveApp(args.find((arg, i) => !arg.startsWith('--') && (outAt < 0 || i !== outAt + 1)));
@@ -138,12 +140,12 @@ if (import.meta.main) {
     }
   }
   for (const name of ['assets','deck']) {
-    const source = resolve(app.dir, name);
-    if (existsSync(source)) cpSync(source, resolve(output, name), {recursive:true});
+    syncStaticTree(resolve(app.dir, name), resolve(output, name));
   }
   copyShaders(app, resolve(output, 'shaders'), {replace:true});
   writeFileSync(resolve(output, 'compat.json'), JSON.stringify(build.compat, null, 2) + '\n');
   console.log(`Windows: ${executable}`);
+  if (args.includes('--json')) reportBuilt({ path: executable, target: 'windows', trust: build.trust });
   if (args.includes('--run') && remote()) {
     const opened = await openOnDesktop(executable);
     if (opened.error) { console.error(`--run: ${opened.error}`); process.exitCode = 1; }

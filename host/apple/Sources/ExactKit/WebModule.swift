@@ -386,7 +386,6 @@ final class WebViews {
         let path = src.components(separatedBy: "?")[0].components(separatedBy: "#")[0]
         let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
         let id = owner.id
-        let appFile = src.hasPrefix("app:/") ? AppFiles.url(path) : nil
         // The app files the page's query names, by their roots; the arm gives
         // those it can open and empties the rest ("" here: refused already).
         var given: [String: String] = [:]
@@ -397,7 +396,7 @@ final class WebViews {
         }
         WebViews.reads.async { [weak self] in
             let document = src.hasPrefix("app:/")
-                ? appFile.flatMap { try? Data(contentsOf: $0) }
+                ? AppFiles.open(path).flatMap { try? $0.readToEnd() }
                 : resolver?.bytes(name)
             DispatchQueue.main.async {
                 guard let self, self.entries[id] === entry, entry.sourceRevision == revision, let handle = entry.handle, let module = self.module else { return }

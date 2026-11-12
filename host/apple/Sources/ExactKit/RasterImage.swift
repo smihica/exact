@@ -8,7 +8,7 @@ import UIKit
 #endif
 
 enum RasterFailure: Error, CustomStringConvertible, Equatable {
-    case encodedLimit, headerLimit, dimensions, sourcePixels, overflow, tooLarge, decode, reservation
+    case encodedLimit, headerLimit, dimensions, sourcePixels, overflow, decode, reservation
     /// Bytes no decoder here reads (text served as `image/png`).
     case format
     /// An SVG the parser refused, with its reason and line (LLP 1011.001 D2).
@@ -23,7 +23,6 @@ enum RasterFailure: Error, CustomStringConvertible, Equatable {
         case .dimensions: return "invalid dimensions"
         case .sourcePixels: return "over \(RasterMetadata.pixelLimit) source pixels"
         case .overflow: return "overflow"
-        case .tooLarge: return "too large"
         case .decode: return "decode failed"
         case .reservation: return "actual exceeds reservation"
         case .svg(let why): return "not an SVG this host reads: \(why)"
@@ -408,8 +407,8 @@ struct RasterDecodePlan: Sendable {
         let (scratch, overflow) = staging.addingReportingOverflow(64 * 1024)
         guard !overflow else { throw RasterFailure.overflow }
         scratchBytes = scratch
-        let (peak, peakOverflow) = outputBytes.addingReportingOverflow(scratchBytes)
-        guard !peakOverflow, peak <= 32 * 1024 * 1024 else { throw RasterFailure.tooLarge }
+        let (_, peakOverflow) = outputBytes.addingReportingOverflow(scratchBytes)
+        guard !peakOverflow else { throw RasterFailure.overflow }
     }
     private static func product(_ a: Int, _ b: Int) throws -> Int {
         let (n, overflow) = a.multipliedReportingOverflow(by: b)
@@ -533,7 +532,7 @@ final class RasterImage: @unchecked Sendable {
     /// An SVG drawn at the plan's size (LLP 1011.001 D3, D4): the file
     /// parsed and resolved in Rust at the plan's size in CSS pixels, its scene
     /// rendered as an island is (`SvgIsland.render`), on the main thread when
-    /// it has text (where the session's fonts are) and here otherwise, into
+    /// it has text and here otherwise, using the image's own font stacks, into
     /// the plan's storage. Animation is ignored and nothing is dark: a
     /// picture does not follow the page's scheme, as a browser's `<img>`
     /// does not.
@@ -558,7 +557,7 @@ final class RasterImage: @unchecked Sendable {
                                  space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
             }
             return SvgIsland.render(els, rect: CGRect(origin: .zero, size: css), w: plan.width, h: plan.height, k: plan.scale,
-                                    transform: transform, flip: true, dark: false, fonts: nil)
+                                    transform: transform, flip: true, dark: false, fonts: flags & 1 != 0 ? SvgText.imageFonts(spec["fonts"]) : nil)
         }
         let context = flags & 1 != 0 && !Thread.isMainThread ? DispatchQueue.main.sync(execute: render) : render()
         guard let context else { throw RasterFailure.svg("the picture did not render at \(plan.width)×\(plan.height)") }

@@ -571,8 +571,63 @@ fn a_journal_that_leaves_the_app_or_lost_its_text_is_kept_and_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn history_plans_param_reverts_as_writable_operations() {
+    let v1 = "tamber t\n\ntheme\n  ink = #000000\n\nparams\n  PostButton.radius = 8px\n";
+    let v2 = v1.replace("8px", "20px");
+    let v3 = v2.replace("#000000", "#111111").replace("20px", "30px");
+    let dir = app("history-params", &v3);
+    std::fs::write(
+        dir.join("app.contract"),
+        "use PostButton from \"./post.contract\"\n\ncomponent App\n  view\n    PostButton()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("post.contract"),
+        "component PostButton\n  params\n    radius: length = \"4px\"\n  view\n    button border-radius=\"param.radius\"\n      text \"Post\"\n",
+    )
+    .unwrap();
+    let mut s = Serve::start(&dir, &[]);
+    let pair = |before: &str, after: &str| json!([{"file": "app.tamber", "before": before, "after": after}]);
+    let (compared, _) = s.ask(json!({"method": "compare", "pairs": pair(v1, &v2)}));
+    assert_eq!(
+        compared["ok"]["files"][0]["edits"],
+        json!([{"what": "param", "name": "PostButton.radius", "when": [], "before": "8px", "after": "20px"}])
+    );
+    let (clash, _) = s.ask(json!({"method": "revert-plan", "pairs": pair(v1, &v2)}));
+    assert_eq!(clash["ok"]["conflicts"][0]["edit"]["what"], "param");
+    assert_eq!(clash["ok"]["conflicts"][0]["now"], "30px");
+    for (before, after, kinds) in [
+        (v2.as_str(), v3.as_str(), vec!["set-token", "set-param"]),
+        (v1, v2.as_str(), vec!["set-param"]),
+        (
+            "tamber t\n\ntheme\n  ink = #000000\n",
+            v1,
+            vec!["unset-param"],
+        ),
+    ] {
+        let (plan, _) = s.ask(json!({"method": "revert-plan", "pairs": pair(before, after)}));
+        assert_eq!(plan["ok"]["conflicts"], json!([]), "{plan}");
+        let ops = plan["ok"]["ops"].as_array().unwrap();
+        assert_eq!(
+            ops.iter()
+                .map(|op| op["op"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        let (written, _) = s.ask(json!({"method": "transaction", "client": "test", "files": plan["ok"]["files"], "ops": ops}));
+        assert!(written["ok"].is_object(), "{written}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("app.tamber")).unwrap(),
+            before
+        );
+    }
+    drop(s);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The wire's own requests (LLP 1122 T1): `compare` reads a commit's versions
-/// as token edits, `revert-plan` inverts one on today's file (and refuses
+/// as declaration edits, `revert-plan` inverts one on today's file (and refuses
 /// where the file moved on its edit), `import-plan` plans an import from a
 /// source's text. None writes.
 #[test]

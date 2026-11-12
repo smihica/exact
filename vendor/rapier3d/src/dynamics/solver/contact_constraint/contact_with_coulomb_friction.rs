@@ -46,10 +46,15 @@ pub(crate) struct ContactWithCoulombFrictionBuilder {
     /// The pair's restitution coefficient (needed by `refresh` to recompute the
     /// restitution rhs seed).
     restitution: SimdReal,
+    /// Exact2: each point's weight-bounded friction per second of substep, decided
+    /// once per step by `generate` (see `IntegrationParameters::friction_gravity`);
+    /// zero keeps the Coulomb bound.
+    weights: [SimdReal; MAX_MANIFOLD_POINTS],
 }
 
 impl ContactWithCoulombFrictionBuilder {
     pub fn generate(
+        params: &IntegrationParameters,
         manifold_id: [ContactRef; SIMD_WIDTH],
         manifolds: [&ContactManifold; SIMD_WIDTH],
         bodies: &RigidBodySet,
@@ -312,6 +317,25 @@ impl ContactWithCoulombFrictionBuilder {
             out_builder.infos[k].dist =
                 dist - ((world_com1 + dp1) - (world_com2 + dp2)).gdot(force_dir1);
             out_builder.infos[k].restitution_seed = restitution_seed;
+            // Exact2: weight-bounded friction. A point touching now, and moving at
+            // least the slip speed along or across the normal, keeps
+            // `friction × friction_gravity × reduced mass` for the whole step.
+            out_builder.weights[k] = if params.friction_gravity > 0.0 {
+                let rel = vel1 - vel2;
+                let vn = rel.gdot(force_dir1);
+                let vt = rel - force_dir1 * vn;
+                let slip = SimdReal::splat(params.friction_slip_speed * params.friction_slip_speed);
+                let moving = (vn * vn).simd_ge(slip) | vt.gdot(vt).simd_ge(slip);
+                let imsum = poses1.im + poses2.im;
+                let reduced_mass =
+                    utils::simd_inv(force_dir1.gdot(imsum.component_mul(&force_dir1)));
+                (friction * SimdReal::splat(params.friction_gravity) * reduced_mass).select(
+                    active & moving & dist.simd_le(SimdReal::zero()),
+                    SimdReal::zero(),
+                )
+            } else {
+                SimdReal::zero()
+            };
         }
 
         #[cfg(feature = "block-solver")]
@@ -389,8 +413,6 @@ impl ContactWithCoulombFrictionBuilder {
         let poses1 = bodies.gather_transforms(constraint.solver_vel1);
         let poses2 = bodies.gather_transforms(constraint.solver_vel2);
         let all_infos = &self.infos[..constraint.num_contacts as usize];
-        let normal_parts = &mut constraint.normal_part[..constraint.num_contacts as usize];
-        let tangent_parts = &mut constraint.tangent_part[..constraint.num_contacts as usize];
 
         #[cfg(feature = "dim2")]
         let tangents1 = constraint.dir1.orthonormal_basis();
@@ -401,6 +423,14 @@ impl ContactWithCoulombFrictionBuilder {
         ];
 
         let solved_dt = SimdReal::splat(solved_dt);
+        // Exact2: the weight bound of this substep; `refresh_rhs_wo_bias` keeps it.
+        let substep_dt = SimdReal::splat(params.dt);
+        let n = constraint.num_contacts as usize;
+        for (limit, weight) in constraint.weight_limit[..n].iter_mut().zip(&self.weights) {
+            *limit = *weight * substep_dt;
+        }
+        let normal_parts = &mut constraint.normal_part[..constraint.num_contacts as usize];
+        let tangent_parts = &mut constraint.tangent_part[..constraint.num_contacts as usize];
 
         for ((info, normal_part), tangent_part) in all_infos
             .iter()
@@ -551,6 +581,9 @@ pub(crate) struct ContactWithCoulombFriction<N: ScalarType> {
     pub manifold_id: [ContactRef; SIMD_WIDTH],
     pub num_contacts: u8,
     pub manifold_contact_id: [[u8; SIMD_WIDTH]; MAX_MANIFOLD_POINTS],
+    /// Exact2: each point's weight-bounded friction impulse for this substep, or
+    /// zero for the Coulomb bound (see `CoulombContactPointInfos::weight`).
+    pub weight_limit: [N; MAX_MANIFOLD_POINTS],
 }
 
 impl ContactWithCoulombFriction<SimdReal> {
@@ -663,8 +696,14 @@ impl ContactWithCoulombFriction<SimdReal> {
             #[cfg(feature = "dim2")]
             let tangents1 = [&self.dir1.orthonormal_vector()];
 
-            for (tangent_part, normal_part) in tangent_parts.iter_mut().zip(normal_parts.iter()) {
-                let limit = self.limit * normal_part.impulse;
+            for ((tangent_part, normal_part), weight_limit) in tangent_parts
+                .iter_mut()
+                .zip(normal_parts.iter())
+                .zip(&self.weight_limit)
+            {
+                // Exact2: a weight-bounded point takes its weight bound instead.
+                let limit = (self.limit * normal_part.impulse)
+                    .select(weight_limit.simd_le(SimdReal::zero()), *weight_limit);
                 tangent_part.solve(
                     tangents1,
                     &self.im1,
@@ -812,6 +851,7 @@ mod test {
             manifold: 0,
         });
         ContactWithCoulombFrictionBuilder::generate(
+            &IntegrationParameters::default(),
             ids,
             manifolds,
             &bodies,

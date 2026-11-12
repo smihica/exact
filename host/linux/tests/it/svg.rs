@@ -2,6 +2,144 @@
 //! by `pointer-events`, and bubbles as a box's press does.
 use exact_linux::{presenter::PainterChoice, Presenter};
 
+#[test]
+fn svg_overflow_clips_to_its_content_box() {
+    for overflow in [
+        "",
+        "overflow=\"hidden\"",
+        "overflow=\"clip\"",
+        "overflow=\"visible\"",
+    ] {
+        let plan = contract::compile(&format!(
+            r##"component App
+  view
+    box width=400 height=400 background-color="#ffffff"
+      svg width=100 height=100 padding=20 viewBox="0 0 100 100" {overflow}
+        rect x=-50 y=-50 width=200 height=200 fill="#ff0000"
+"##,
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (mut presenter, error) = Presenter::boot_with(
+            &plan.encode(),
+            (),
+            (400., 400.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let frame = presenter.frame();
+        let clips = overflow != "overflow=\"visible\"";
+        for (x, y, red) in [
+            (10, 10, !clips),
+            (25, 25, true),
+            (130, 130, !clips),
+            (180, 180, false),
+        ] {
+            let c = frame.pixel(x, y).unwrap().demultiply();
+            let expected = if red {
+                (255, 0, 0, 255)
+            } else {
+                (255, 255, 255, 255)
+            };
+            assert_eq!(
+                (c.red(), c.green(), c.blue(), c.alpha()),
+                expected,
+                "({x}, {y}), {overflow}"
+            );
+        }
+    }
+}
+
+#[test]
+fn svg_content_clip_uses_inner_radii_and_leaves_its_border_visible() {
+    for radius in [10, 50] {
+        let plan = contract::compile(&format!(
+            r##"component App
+  view
+    box width=400 height=400 background-color="#ffffff"
+      svg width=100 height=100 padding="10px 20px 30px 40px" border-width="2px 4px 6px 8px" border-style="solid" border-color="#0000ff" border-radius={radius} viewBox="0 0 100 100"
+        rect x=-50 y=-50 width=200 height=200 fill="#ff0000"
+"##,
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (mut presenter, error) = Presenter::boot_with(
+            &plan.encode(),
+            (),
+            (400., 400.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let frame = presenter.frame();
+        let red = (255, 0, 0);
+        let white = (255, 255, 255);
+        let blue = (0, 0, 255);
+        for (x, y, expected) in [
+            (45, 60, white),
+            (150, 70, white),
+            (80, 8, white),
+            (80, 120, white),
+            (4, 70, blue),
+            (170, 70, blue),
+            (86, 1, blue),
+            (86, 145, blue),
+            (49, 60, red),
+            (138, 30, red),
+            (146, 13, if radius == 50 { white } else { red }),
+            (146, 110, if radius == 50 { white } else { red }),
+        ] {
+            let c = frame.pixel(x, y).unwrap().demultiply();
+            assert_eq!(
+                (c.red(), c.green(), c.blue()),
+                expected,
+                "({x}, {y}), radius={radius}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_clip_use_paints_at_its_targets_transformed_position() {
+    let plan = contract::compile(
+        r##"component App
+  view
+    svg width=100 height=100 viewBox="0 0 100 100"
+      defs
+        rect id="shape" width=10 height=10 transform="translate(50 0)"
+      clipPath id="clip"
+        use href="#shape"
+      rect width=100 height=100 fill="#ff0000" clip-path="url(#clip)"
+"##,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let (mut presenter, error) = Presenter::boot_with(
+        &plan.encode(),
+        (),
+        (100., 100.),
+        1.,
+        std::env::temp_dir(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let frame = presenter.frame();
+    let red = |x, y| {
+        let c = frame.pixel(x, y).unwrap().demultiply();
+        (c.red(), c.green(), c.blue(), c.alpha()) == (255, 0, 0, 255)
+    };
+    assert!(red(55, 5), "the target's translation moves the clip");
+    assert!(!red(5, 5), "the untransformed position is clipped away");
+    let count = (0..100)
+        .flat_map(|y| (0..100).map(move |x| (x, y)))
+        .filter(|&(x, y)| red(x, y))
+        .count();
+    assert_eq!(count, 100, "only the 10 by 10 clip paints");
+}
+
 const APP: &str = "component App\n  state picked = \"none\"\n  action pick(which: string)\n    picked = which\n  view\n    column\n      text picked testId=\"picked\"\n      svg testId=\"chart\" width=100 height=100 viewBox=\"0 0 100 100\"\n        rect width=100 height=100 fill=\"#eeeeee\" press=pick(\"back\")\n        g press=pick(\"bars\")\n          rect x=10 y=10 width=20 height=80 fill=\"#2563eb\"\n          rect x=40 y=40 width=20 height=50 fill=\"#2563eb\" pointer-events=\"none\"\n        polyline points=\"70,90 90,10\" fill=\"none\" stroke=\"#000000\" stroke-width=6 press=pick(\"line\")\n";
 
 #[test]

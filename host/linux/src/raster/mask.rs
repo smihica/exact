@@ -89,6 +89,9 @@ impl Raster {
 
     /// The current clip intersected with more shapes, as a mask of its own.
     pub(super) fn mask_with(&self, shapes: &[Shape], ts: Transform) -> Option<Mask> {
+        if shapes.iter().any(|s| s.rect.2 <= 0.0 || s.rect.3 <= 0.0) {
+            return self.new_clip_mask();
+        }
         let dev = self.device(ts);
         // A clip tiny-skia cannot reach (an SVG viewport's or mask region's)
         // shows nothing.
@@ -216,6 +219,41 @@ fn intersect(mask: &mut Mask, parent: &Mask, path: &Path, dev: Transform, round:
 mod tests {
     use super::*;
     use tiny_skia::FillRule;
+
+    #[test]
+    fn empty_clip_hides_pixels_and_pop_restores_parent() {
+        let identity = Transform::identity();
+        let fill = Shape::rect((0., 0., 60., 60.));
+        for parent in [
+            None,
+            Some(fill),
+            Some(Shape::rect((5., 5., 40., 40.))),
+            Some(Shape::new((5., 5., 40., 40.), [8.; 4])),
+        ] {
+            for (width, height) in [(20., 0.), (0., 20.), (0., 0.), (-1., 20.), (20., -1.)] {
+                let mut r = Raster::transparent();
+                r.begin(60., 60., 1.);
+                if let Some(parent) = parent {
+                    r.push_clip(&parent, identity);
+                }
+                let parent_mask = r.active_clip().cloned();
+                r.push_clip(&Shape::rect((10., 10., width, height)), identity);
+                r.fill(&fill, [255, 0, 0, 255], identity);
+                assert!(
+                    r.target.pixels().unwrap().data().iter().all(|b| *b == 0),
+                    "parent={parent:?} empty={width}x{height}"
+                );
+                assert_eq!(r.text_clips.last(), Some(&(0., 0., 0., 0.)));
+                r.pop_clip();
+                assert_eq!(
+                    r.active_clip().map(|m| m.data()),
+                    parent_mask.as_ref().map(|m| m.data())
+                );
+                r.fill(&fill, [255, 0, 0, 255], identity);
+                assert!(r.target.pixels().unwrap().data().iter().any(|b| *b != 0));
+            }
+        }
+    }
 
     #[test]
     fn released_mask_storage_is_cleared_reused_and_bounded() {
@@ -385,10 +423,16 @@ mod tests {
                     vec![child],
                     vec![child, parent],
                     vec![Shape::rect((0., 0., 0., 0.)), child, parent],
+                    vec![child, Shape::rect((10., 10., 20., 0.)), parent],
+                    vec![child, parent, Shape::rect((10., 10., 0., 20.))],
                     vec![Shape::rect((100., 100., 10., 10.))],
                 ] {
                     let mut reference = (**r.active_clip().unwrap()).clone();
-                    for path in shapes.iter().filter_map(super::super::rounded_rect) {
+                    for shape in &shapes {
+                        let Some(path) = rounded_rect(shape) else {
+                            reference.data_mut().fill(0);
+                            break;
+                        };
                         reference.intersect_path(
                             &path,
                             FillRule::Winding,

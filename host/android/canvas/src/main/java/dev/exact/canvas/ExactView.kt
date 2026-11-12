@@ -1085,15 +1085,6 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         var i = from
         while (i < n) {
             when (b.get(i)) {
-                1 -> i += 7
-                2 -> i += 14
-                3 -> i = skipPath(b, i + 3)
-                4 -> i += 13
-                5 -> i = skipPath(b, i + 2)
-                6 -> i += 1
-                7 -> i += 2
-                8 -> i += 6
-                9 -> i += 6 + 3 * b.get(i + 5)
                 10, 41 -> { fonts[b.get(i + 1)] = fontAt(b, i); i = fontEnd(b, i) }
                 11 -> {
                     val id = b.get(i + 1)
@@ -1119,14 +1110,6 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
                     }
                     i += 2
                 }
-                13 -> i = skipPath(b, i + 5)
-                14 -> i += 18
-                25 -> i += 3 + b.get(i + 2)
-                43 -> i += 2 + b.get(i + 1)
-                44 -> i += 2
-                27 -> i += 14
-                42 -> i += 14 + 2 * b.get(i + 1)
-                40 -> i += 27
                 28 -> {
                     val id = b.get(i + 1); val kind = b.get(i + 2) and 255; val len = b.get(i + 15)
                     val bytes = ByteArray(len)
@@ -1194,10 +1177,8 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
                     } else makeRow(b, i, shown)
                     i = j
                 }
-                16 -> i += 1
                 17 -> { if (ingestRow == 0) { rowTop.put(b.get(i + 1), b.get(i + 3)); rowGroup.put(b.get(i + 1), ingestGroup) }; i += 4 }
                 18 -> { freeing.add(b.get(i + 1)); i += 2 }
-                19 -> i += 26
                 20 -> { if (ingestRow == 0) ingestGroup = b.get(i + 1); i += 2 }
                 21 -> { if (ingestRow == 0) ingestGroup = 0; i += 1 }
                 23 -> {
@@ -1249,7 +1230,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
                     slots.set(id, b, i + 3, i + 3 + len, main)
                     i += 3 + len
                 }
-                else -> throw IllegalStateException("op ${b.get(i)} at $i")
+                else -> i = structure.end(b, i)
             }
         }
     }
@@ -1476,14 +1457,6 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         slotOwner = Slots.layer(b.get(at + 1))
         slots.again(slotOwner) { ingest(b, at + 19, at + 3 + len) }
         slotOwner = outer
-    }
-
-    private fun skipPath(b: IntBuffer, at: Int): Int {
-        var i = at + 1
-        repeat(b.get(at)) {
-            i += when (b.get(i)) { 0, 1 -> 3; 2 -> 7; else -> 1 }
-        }
-        return i
     }
 }
 

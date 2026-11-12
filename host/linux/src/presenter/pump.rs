@@ -5,10 +5,15 @@ use super::*;
 #[path = "abort_tests.rs"]
 mod abort_tests;
 
+#[cfg(test)]
+#[path = "held_work_tests.rs"]
+mod held_work_tests;
+
 impl<D: DataSource> Presenter<D> {
     /// The executor's replies into the runner (LLP 1016 D2), each a
     /// commit: the display loop calls this when the executor's fd is
-    /// readable, the agent when it waits. `None` when nothing was queued.
+    /// readable, the agent when it waits. A source may also wake it to
+    /// release held work without a reply.
     pub fn pump(&mut self, now_ms: f64) -> Option<String> {
         let region_error = self.poll_content_region();
         self.executor.begin_pump();
@@ -43,6 +48,7 @@ impl<D: DataSource> Presenter<D> {
             // A cancel with no answer to give (its request was retired) still goes.
             let aborted = self.host.runner_mut().take_explicit_aborts();
             self.executor.cancel(&aborted);
+            self.release_held_work();
             let refined = self.refine_collections();
             return region_error
                 .or(refined)
@@ -53,5 +59,13 @@ impl<D: DataSource> Presenter<D> {
         let after = self.after_commit();
         let ends = self.deliver_scroll_ends();
         region_error.or(e).or(after).or(ends)
+    }
+
+    pub(super) fn release_held_work(&mut self) {
+        for (token, dispatch) in self.host.release_work() {
+            if let Some(r) = self.parked.remove(&token) {
+                self.run_dispatch(r, dispatch);
+            }
+        }
     }
 }

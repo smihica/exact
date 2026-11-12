@@ -3,15 +3,40 @@
 // group or base (or a group that always ships with it). documents-glue.js (base) importing storage-environment.js (then storage only) left an app with no
 // storage capability without its drops and pastes on the wasm page (the module 404'd; conform's synthetic-file-drag).
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { webHostFiles } from './app.mjs';
+import { buildHostGlue } from '../host/web-js/glue.mjs';
+import { glueDeclarations } from '../host/web/tests/glue-fixture.mjs';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const GROUPS = ['base', 'module', 'storage', 'rust', 'gpu', 'gpuModules', 'native', 'development'];
 // Groups that always ship with another: storage ships whenever module does (an app with app.ts; scripts/app.mjs).
 const WITH = { module: ['storage'] };
+
+test.each([false, true])('built wasm host admits agent parameters only in development (production: %s)', async production => {
+  const root = mkdtempSync(join(ROOT, 'target/web-host-agent-'));
+  try {
+    await buildHostGlue(ROOT, { production, out: root });
+    const code = readFileSync(join(root, 'glue.js'), 'utf8');
+    const declarations = glueDeclarations(code, ['AGENT_ADMITTED', 'agentMode']);
+    const read = new Function('location', `${declarations}\nreturn agentMode;`);
+    expect(read({ href: 'https://example.test/?agent' })).toBe(!production);
+    const navigation = await import(join(root, 'navigation.js'));
+    const params = new URLSearchParams('agent&epoch=1&seed=3&locale=de&timeZone=UTC');
+    const platform = {
+      Date: class extends Date { static now() { return 1000; } getTimezoneOffset() { return 60; } },
+      navigator: { language: 'fr' },
+      crypto: { getRandomValues: array => array.fill(17) },
+      Intl: { DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'Europe/Paris', locale: 'fr-FR' }) }) },
+    };
+    expect(navigation.timeReporter(params, platform)(10)).toEqual(production ? [990, -60] : [1, 0]);
+    expect(navigation.placeReporter(params, platform)()).toBe((production ? ['fr', 'Europe/Paris', 17, 'fr-FR'] : ['de', 'UTC', 3, '']).join('\0'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 /** A source's static relative imports (import and export forms, comments and line breaks anywhere), by file name, as
  * Bun's own parser reads them (`import-statement`: export … from too); dynamic import() and require() are not. */
@@ -28,16 +53,50 @@ test('static imports: import, export and side-effect forms, with comments, not d
   expect(staticImports(`function h(require) { return require('./h.js'); }`)).toEqual([]);
 });
 
-test("each group's files import statically only from their own group or base", () => {
+test("each group's files import statically only from their own group or base", async () => {
+  await buildHostGlue(ROOT);
   const base = new Set(Object.keys(webHostFiles('base')));
   const strays = [];
   for (const group of GROUPS) {
     const files = webHostFiles(group), own = new Set(Object.keys(webHostFiles(group, ...(WITH[group] ?? []))));
     for (const [name, path] of Object.entries(files)) {
-      if (!/\.m?js$/.test(name) || !path.startsWith('host/web/')) continue;
+      if (!/\.m?js$/.test(name) || !(path.startsWith('host/web/') || path.startsWith('target/web-host/'))) continue;
       for (const dep of staticImports(readFileSync(join(ROOT, path), 'utf8')))
         if (!own.has(dep) && !base.has(dep)) strays.push(`${group}/${name} imports ${dep}`);
     }
   }
   expect(strays).toEqual([]);
+});
+
+test('concurrent host builds preserve modules already opened by a reader', async () => {
+  mkdirSync(join(ROOT, 'target'), { recursive: true });
+  const root = mkdtempSync(join(ROOT, 'target/web-host-reader-'));
+  const held = [];
+  try {
+    const source = join(root, 'host/web');
+    const out = join(root, 'target/web-host');
+    mkdirSync(source, { recursive: true });
+    mkdirSync(out, { recursive: true });
+    const modules = {
+      'glue.js': "export { value } from './navigation.js';\n",
+      'navigation.js': "export { grant } from './grant-admission.js';\nexport const value = 'complete';\n",
+      'grant-admission.js': 'export const grant = true;\n',
+    };
+    for (const [name, text] of Object.entries(modules)) {
+      writeFileSync(join(source, name), text);
+      writeFileSync(join(out, name), 'export const previous = true;\n');
+      held.push(openSync(join(out, name), 'r'));
+    }
+    // A copy can open a published file before another build replaces it.
+    await Promise.all([buildHostGlue(root), buildHostGlue(root)]);
+    for (const fd of held) {
+      expect(readFileSync(fd, 'utf8')).toBe('export const previous = true;\n');
+    }
+    expect(staticImports(readFileSync(join(out, 'glue.js'), 'utf8'))).toEqual(['navigation.js']);
+    expect((await import(join(out, 'glue.js'))).value).toBe('complete');
+    expect((await import(join(out, 'grant-admission.js'))).grant).toBe(true);
+  } finally {
+    for (const fd of held) closeSync(fd);
+    rmSync(root, { recursive: true, force: true });
+  }
 });

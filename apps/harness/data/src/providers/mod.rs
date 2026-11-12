@@ -1,11 +1,14 @@
 //! The model providers: which models exist and whether each is usable,
 //! and one call that streams a reply as [`Event`]s. The HTTP is `ureq`; a
 //! reader thread hands the body's lines over a channel, so an interrupt is
-//! seen within 100 ms and a stream silent for two minutes fails.
+//! seen within 100 ms and two minutes without a complete line fails the stream.
 
 pub mod anthropic;
 pub mod mock;
 pub mod openai;
+
+#[cfg(test)]
+mod tests;
 
 use crate::keys::{self, Keys};
 use crate::sse::{Event, Parser, Sse};
@@ -45,13 +48,42 @@ impl Drop for Alive {
     }
 }
 
+struct StopReader(Arc<AtomicBool>);
+
+impl Drop for StopReader {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Clock {
+    #[cfg(test)]
+    time: Option<Arc<std::sync::Mutex<Instant>>>,
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(time) = &self.time {
+            return *time.lock().unwrap();
+        }
+        Instant::now()
+    }
+}
+
 /// The last link of the connector chain: wraps the connection (TLS or
 /// plain) so every read waits at most [`SLICE`] at a time and checks the
 /// cancel flag between slices. A cancelled read fails, so the body reader
 /// and its thread end within a slice of an interrupt, even when the server
-/// has gone silent.
+/// has gone silent. Each wait also enforces the idle limit independently
+/// of how long the response has been streaming.
 #[derive(Debug)]
-struct CancelConnector(Arc<AtomicBool>);
+struct CancelConnector {
+    cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    clock: Clock,
+}
 
 impl Connector<Box<dyn Transport>> for CancelConnector {
     type Out = CancelTransport;
@@ -63,7 +95,9 @@ impl Connector<Box<dyn Transport>> for CancelConnector {
     ) -> Result<Option<CancelTransport>, ureq::Error> {
         Ok(chained.map(|inner| CancelTransport {
             inner,
-            cancel: self.0.clone(),
+            cancel: self.cancel.clone(),
+            stop: self.stop.clone(),
+            clock: self.clock.clone(),
         }))
     }
 }
@@ -72,6 +106,8 @@ impl Connector<Box<dyn Transport>> for CancelConnector {
 struct CancelTransport {
     inner: Box<dyn Transport>,
     cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    clock: Clock,
 }
 
 impl Transport for CancelTransport {
@@ -84,24 +120,37 @@ impl Transport for CancelTransport {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        let deadline = (!timeout.after.is_not_happening()).then(|| Instant::now() + *timeout.after);
+        let idle_timeout = timeout.after.is_not_happening() || *timeout.after >= IDLE;
+        let deadline = self.clock.now() + (*timeout.after).min(IDLE);
+        let expired = || {
+            if idle_timeout {
+                ureq::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no data from the server for {} s", IDLE.as_secs()),
+                ))
+            } else {
+                ureq::Error::Timeout(timeout.reason)
+            }
+        };
         loop {
-            if self.cancel.load(Ordering::SeqCst) {
+            if self.cancel.load(Ordering::SeqCst) || self.stop.load(Ordering::SeqCst) {
                 // Not `Interrupted`, which `read_line` would retry.
                 return Err(ureq::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
                     "cancelled",
                 )));
             }
-            let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-            let slice = left.map_or(SLICE, |l| l.min(SLICE));
-            let last = left.is_some_and(|l| l <= SLICE);
+            let left = deadline.saturating_duration_since(self.clock.now());
+            if left.is_zero() {
+                return Err(expired());
+            }
             let next = NextTimeout {
-                after: slice.into(),
+                after: left.min(SLICE).into(),
                 reason: timeout.reason,
             };
             match self.inner.await_input(next) {
-                Err(ureq::Error::Timeout(_)) if !last => continue,
+                Err(ureq::Error::Timeout(_)) if left > SLICE => continue,
+                Err(ureq::Error::Timeout(_)) => return Err(expired()),
                 other => return other,
             }
         }
@@ -360,7 +409,16 @@ pub fn post_sse(
         .flat_map(|(_, v)| [v.clone(), v.trim_start_matches("Bearer ").to_string()])
         .filter(|v| v.len() >= 6)
         .collect();
-    post(url, headers, body, cancel, each).map_err(|e| keys::scrub(&e, &secrets))
+    post(
+        url,
+        headers,
+        body,
+        cancel,
+        DefaultConnector::new(),
+        Clock::default(),
+        each,
+    )
+    .map_err(|e| keys::scrub(&e, &secrets))
 }
 
 fn post(
@@ -368,14 +426,24 @@ fn post(
     headers: &[(&str, String)],
     body: &serde_json::Value,
     cancel: &Arc<AtomicBool>,
+    connector: impl Connector<Out = Box<dyn Transport>>,
+    clock: Clock,
     each: &mut dyn FnMut(Sse) -> bool,
 ) -> Result<(), String> {
+    // Dropping the channel cannot interrupt read_line on a trickling line.
+    // Stop this request's reader on every exit without cancelling the turn.
+    let stop = StopReader(Arc::new(AtomicBool::new(false)));
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(CONNECT))
-        .timeout_recv_response(Some(IDLE))
         .build();
-    let connector = DefaultConnector::new().chain(CancelConnector(cancel.clone()));
+    // ureq's response-header timeout also bounds the body from the time
+    // the headers arrived. The transport owns the idle deadline instead.
+    let connector = connector.chain(CancelConnector {
+        cancel: cancel.clone(),
+        stop: stop.0.clone(),
+        clock: clock.clone(),
+    });
     let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
     let mut request = agent.post(url).header("content-type", "application/json");
     for (k, v) in headers {
@@ -412,14 +480,14 @@ fn post(
         }
     });
     let mut parser = Parser::default();
-    let mut last = Instant::now();
+    let mut last = clock.now();
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Ok(());
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(line)) => {
-                last = Instant::now();
+                last = clock.now();
                 let text = line.trim_end_matches(['\n', '\r']);
                 if let Some(sse) = parser.line(text) {
                     if !each(sse) {
@@ -429,7 +497,7 @@ fn post(
             }
             Ok(Err(e)) => return Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if last.elapsed() > IDLE {
+                if clock.now().duration_since(last) > IDLE {
                     return Err(format!("no data from the server for {} s", IDLE.as_secs()));
                 }
             }

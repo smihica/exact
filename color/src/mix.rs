@@ -140,6 +140,26 @@ impl MixSpace {
         )
     }
 
+    /// The colour space whose components are this space's, if there is one.
+    fn own(self) -> Option<Space> {
+        Some(match self {
+            MixSpace::Srgb => Space::Srgb,
+            MixSpace::SrgbLinear => Space::SrgbLinear,
+            MixSpace::DisplayP3 => Space::DisplayP3,
+            MixSpace::DisplayP3Linear => Space::DisplayP3Linear,
+            MixSpace::A98Rgb => Space::A98Rgb,
+            MixSpace::ProphotoRgb => Space::ProphotoRgb,
+            MixSpace::Rec2020 => Space::Rec2020,
+            MixSpace::Lab => Space::Lab,
+            MixSpace::Oklab => Space::Oklab,
+            MixSpace::XyzD50 => Space::XyzD50,
+            MixSpace::XyzD65 => Space::XyzD65,
+            MixSpace::Lch => Space::Lch,
+            MixSpace::Oklch => Space::Oklch,
+            MixSpace::Hsl | MixSpace::Hwb => return None,
+        })
+    }
+
     fn hue_index(self) -> usize {
         match self {
             MixSpace::Hsl | MixSpace::Hwb => 0,
@@ -261,9 +281,16 @@ fn rgb_to_hwb(rgb: [f64; 3]) -> [f64; 3] {
     [h, w * 100.0, bl * 100.0]
 }
 
-/// Components, alpha, and whether the hue is powerless (CSS Color 4 §12.2).
-fn endpoint(w: &Wide, space: MixSpace) -> ([f64; 3], f64, bool) {
-    let c = space.from_linear_srgb(w.linear_srgb());
+/// Components, alpha, whether the hue is powerless (CSS Color 4 §12.2), and
+/// whether the components are as written: §12 converts a colour only when it
+/// is not already in the space.
+fn endpoint(w: &Wide, space: MixSpace) -> ([f64; 3], f64, bool, bool) {
+    let written = space.own() == Some(w.space);
+    let c = if written {
+        w.c
+    } else {
+        space.from_linear_srgb(w.linear_srgb())
+    };
     let achromatic = space.is_polar() && {
         let chroma = match space {
             MixSpace::Hsl | MixSpace::Hwb => {
@@ -274,15 +301,39 @@ fn endpoint(w: &Wide, space: MixSpace) -> ([f64; 3], f64, bool) {
         };
         chroma.abs() < 1e-6
     };
-    (c, w.alpha, achromatic)
+    (c, w.alpha, achromatic, written)
+}
+
+/// How far from a half turn a converted end's hue may land by rounding alone.
+const HALF_TURN_ROUNDING: f64 = 1e-6;
+
+/// `h2` moved by whole turns so that interpolating from `h1` goes round as
+/// `method` says (CSS Color 4 §12.4). `written` says both hues are as
+/// written; otherwise a difference within rounding of ±180° is taken as
+/// exactly that, which `shorter` and `longer` leave as it is, so a
+/// conversion's last bit does not pick the arc.
+pub fn hue_arc(h1: f64, h2: f64, method: HueMethod, written: bool) -> f64 {
+    let mut d = h2 - h1;
+    if !written && (d.abs() - 180.0).abs() < HALF_TURN_ROUNDING {
+        d = 180f64.copysign(d);
+    }
+    match method {
+        HueMethod::Shorter if d > 180.0 => h2 - 360.0,
+        HueMethod::Shorter if d < -180.0 => h2 + 360.0,
+        HueMethod::Longer if d > 0.0 && d < 180.0 => h2 - 360.0,
+        HueMethod::Longer if d > -180.0 && d <= 0.0 => h2 + 360.0,
+        HueMethod::Increasing if d < 0.0 => h2 + 360.0,
+        HueMethod::Decreasing if d > 0.0 => h2 - 360.0,
+        _ => h2,
+    }
 }
 
 /// The colour `t` of the way from `a` to `b`, premultiplied, as extended
 /// linear sRGB and alpha.
 pub fn mix(a: &Wide, b: &Wide, t: f64, how: Interpolation) -> ([f64; 3], f64) {
     let space = how.space;
-    let (mut ca, aa, a_gray) = endpoint(a, space);
-    let (mut cb, ab, b_gray) = endpoint(b, space);
+    let (mut ca, aa, a_gray, a_written) = endpoint(a, space);
+    let (mut cb, ab, b_gray, b_written) = endpoint(b, space);
     let hi = space.hue_index();
     if space.is_polar() {
         match (a_gray, b_gray) {
@@ -290,17 +341,7 @@ pub fn mix(a: &Wide, b: &Wide, t: f64, how: Interpolation) -> ([f64; 3], f64) {
             (false, true) => cb[hi] = ca[hi],
             _ => {}
         }
-        let (h1, h2) = (ca[hi], cb[hi]);
-        let d = h2 - h1;
-        cb[hi] = match how.hue {
-            HueMethod::Shorter if d > 180.0 => h2 - 360.0,
-            HueMethod::Shorter if d < -180.0 => h2 + 360.0,
-            HueMethod::Longer if (0.0..180.0).contains(&d) && d != 0.0 => h2 - 360.0,
-            HueMethod::Longer if (-180.0..=0.0).contains(&d) => h2 + 360.0,
-            HueMethod::Increasing if d < 0.0 => h2 + 360.0,
-            HueMethod::Decreasing if d > 0.0 => h2 - 360.0,
-            _ => h2,
-        };
+        cb[hi] = hue_arc(ca[hi], cb[hi], how.hue, a_written && b_written);
     }
     let pre = |c: [f64; 3], alpha: f64| {
         let mut out = c;

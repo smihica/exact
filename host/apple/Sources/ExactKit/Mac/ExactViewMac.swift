@@ -17,7 +17,7 @@ extension ExactSession {
 
 public final class ExactView: NSView {
     public let session: ExactSession
-    public override func selectAll(_ sender: Any?) { session.presenter.selection.selectAll() }
+    public override func selectAll(_ sender: Any?) { session.presenter.selection.selectAll(in: window) }
     /// The first root's `copy` with nothing focused (`RootEdits`), else the text selection's.
     @objc public func copy(_ sender: Any?) { if !rootEdits.perform(#selector(NodeView.copy(_:))) { session.presenter.selection.copy() } }
     /// Edit ▸ Cut, Copy and Paste with nothing focused, after the window in its responder chain.
@@ -386,7 +386,7 @@ public final class ExactView: NSView {
                    self.session.canvases.pressedControlKey(code,down:event.type == .keyDown,timestamp:event.timestamp) {return nil}
                 // Shortcuts, then the `key` handlers (before a field editor can
                 // take the key), then the menus' and dialogs' defaults.
-                return self.session.presenter.routeKey(event, focused: focused) ? nil : event
+                return self.session.presenter.routeKey(event, focused: focused) ? nil : self.session.presenter.dialogs.appKitEvent(event)
             }
         }
         // Mounted and visible participate in frame demand (D3): an unmounted

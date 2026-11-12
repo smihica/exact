@@ -269,6 +269,107 @@ fn transforms_turn_about_the_transform_origin() {
 }
 
 #[test]
+fn a_collapsed_box_inside_a_scroll_container_hides_its_content() {
+    let mut p = compiled(
+        r##"component App
+  view
+    box width=400 height=400 background-color="#ffffff"
+      scroll width=300 height=300
+        text "Section" font-size=16
+        box testId="body" height=0 overflow="hidden"
+          box width=100 height=100 flex-shrink=0 background-color="#ff0000"
+        text "Next section" testId="next" font-size=16
+"##,
+        1.,
+        PainterChoice::Cpu,
+    );
+    assert_eq!(rect(&mut p, "body").3, 0.);
+    let next = rect(&mut p, "next");
+    let frame = p.frame();
+    let red = frame
+        .pixels()
+        .iter()
+        .filter(|p| p.red() > 200 && p.green() < 60 && p.blue() < 60)
+        .count();
+    assert_eq!(red, 0, "the collapsed body must hide its red child");
+    assert!(darkest(&frame, next) < 200, "the next section is visible");
+}
+
+/// CSS Overflow 3 §3.1: `clip` on one axis beside `visible` on the other
+/// clips that axis only, square at the box's edges whatever its radius.
+#[test]
+fn a_one_axis_clip_leaves_the_other_axis_visible() {
+    let source = r##"component App
+  view
+    column background-color="#ffffff" padding=20 width="100%" height="100%"
+      box testId="x" width=100 height=100 margin-bottom=150 overflow-x="clip" border-radius=40 background-color="#eeeeee"
+        box testId="x-child" width=200 height=200 flex-shrink=0 background-color="#0000ff"
+      box testId="y" width=100 height=100 overflow-y="clip" background-color="#eeeeee"
+        box width=200 height=200 flex-shrink=0 background-color="#0000ff"
+"##;
+    let blue = (0, 0, 255);
+    let white = (255, 255, 255);
+    for choice in painters() {
+        let mut p = compiled(source, 1.0, choice);
+        let frame = p.frame();
+        let (x, y) = (rect(&mut p, "x"), rect(&mut p, "y"));
+        for (at, want, what) in [
+            ((x.0 + 2.0, x.1 + 2.0), blue, "x: a corner is not rounded"),
+            ((x.0 + 150.0, x.1 + 50.0), white, "x: right of the box"),
+            ((x.0 + 50.0, x.1 + 150.0), blue, "x: below the box"),
+            ((y.0 + 150.0, y.1 + 50.0), blue, "y: right of the box"),
+            ((y.0 + 50.0, y.1 + 150.0), white, "y: below the box"),
+        ] {
+            assert_eq!(px(&frame, at.0, at.1), want, "{what} ({choice:?})");
+        }
+        // The child is hit where it shows, and not where it is clipped.
+        let child = Some(view(&p, "x-child"));
+        assert_eq!(p.hit(x.0 + 50.0, x.1 + 150.0), child, "{choice:?}");
+        assert_ne!(p.hit(x.0 + 150.0, x.1 + 50.0), child, "{choice:?}");
+    }
+}
+
+/// CSS Overflow 3 §3.2: a box clips its children at its padding edge, with
+/// the padding box's radii, so its border stays over what they paint.
+#[test]
+fn overflow_clips_at_the_padding_box() {
+    let source = r##"component App
+  view
+    column background-color="#ffffff" padding=20 gap=20 width="100%" height="100%"
+      box testId="a" width=100 height=100 box-sizing="border-box" overflow="hidden" border-style="solid" border-width=10 border-color="#ff0000"
+        box testId="a-child" width=200 height=200 margin-left=-10 margin-top=-10 flex-shrink=0 background-color="#0000ff"
+      box testId="b" width=100 height=100 box-sizing="border-box" overflow="hidden" border-style="solid" border-width=6 border-radius=20 border-color="#ff0000"
+        box width=88 height=88 flex-shrink=0 background-color="#0000ff"
+      scroll testId="c" width=100 height=100 box-sizing="border-box" border-style="solid" border-width=10 border-color="#ff0000"
+        box width=80 height=300 flex-shrink=0 background-color="#0000ff"
+      box testId="d" width=100 height=100 box-sizing="border-box" overflow-x="clip" border-style="solid" border-width=10 border-color="#ff0000"
+        box width=200 height=40 flex-shrink=0 background-color="#0000ff"
+"##;
+    let (red, blue) = ((255, 0, 0), (0, 0, 255));
+    for choice in painters() {
+        let mut p = compiled(source, 1.0, choice);
+        let frame = p.frame();
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|id| rect(&mut p, id));
+        for (at, want, what) in [
+            ((a.0 + 50.0, a.1 + 5.0), red, "a: top border"),
+            ((a.0 + 50.0, a.1 + 50.0), blue, "a: inside"),
+            ((b.0 + 8.0, b.1 + 8.0), red, "b: inner corner"),
+            ((b.0 + 50.0, b.1 + 50.0), blue, "b: inside"),
+            ((c.0 + 50.0, c.1 + 95.0), red, "c: bottom border"),
+            ((c.0 + 50.0, c.1 + 50.0), blue, "c: inside"),
+            ((d.0 + 95.0, d.1 + 30.0), red, "d: right border"),
+            ((d.0 + 50.0, d.1 + 30.0), blue, "d: inside"),
+        ] {
+            assert_eq!(px(&frame, at.0, at.1), want, "{what} ({choice:?})");
+        }
+        // The border is the box's, not the clipped child's.
+        let child = Some(view(&p, "a-child"));
+        assert_ne!(p.hit(a.0 + 50.0, a.1 + 5.0), child, "{choice:?}");
+        assert_eq!(p.hit(a.0 + 50.0, a.1 + 50.0), child, "{choice:?}");
+    }
+}
+
+#[test]
 fn a_scroll_container_clips_what_it_scrolled_out() {
     for choice in painters() {
         let mut p = fixture("scroll", 1.0, choice);
@@ -749,6 +850,53 @@ fn damage_clearing_matches_the_full_masked_viewport() {
 }
 
 #[test]
+fn damage_clearing_preserves_the_page_colour_at_fractional_scales() {
+    use exact_linux::paint::{Backend, Shape};
+    use exact_linux::raster::Raster;
+    use tiny_skia::Transform;
+
+    for (width, scale) in [(300.0, 1.0), (440.0, 1.75), (513.0, 1.75), (300.0, 2.625)] {
+        for page in [None, Some([18, 24, 32, 255])] {
+            let mut raster = Raster::new();
+            if let Some(color) = page {
+                raster.page(color);
+            }
+            raster.begin(width, 80.0, scale);
+            let background = raster.finish().unwrap();
+            let page = page.unwrap_or([255; 4]);
+            assert!(background.data().chunks_exact(4).all(|px| px == page));
+
+            let red = [255, 0, 0, 255];
+            raster.begin(width, 80.0, scale);
+            raster.fill(
+                &Shape::rect((0.0, 0.0, width, 80.0)),
+                red,
+                Transform::identity(),
+            );
+            let previous = raster.finish().unwrap();
+            let damage = [(8.0, 8.0, 16.0, 16.0)];
+            assert!(raster.begin_damage(width, 80.0, scale, &previous, &damage));
+            let actual = raster.finish().unwrap();
+            let cleared = (8.0 * scale) as u32..(24.0 * scale) as u32;
+            for y in 0..actual.height() {
+                for x in 0..actual.width() {
+                    let expected = if cleared.contains(&x) && cleared.contains(&y) {
+                        background.pixel(x, y).unwrap()
+                    } else {
+                        previous.pixel(x, y).unwrap()
+                    };
+                    assert_eq!(
+                        actual.pixel(x, y).unwrap(),
+                        expected,
+                        "width={width}, scale={scale}, page={page:?}, pixel=({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn rectangular_damage_fills_keep_mask_pixels_and_clip_lifetime() {
     use exact_linux::paint::{Backend, Shape};
     use exact_linux::raster::{rounded_rect, Raster};
@@ -1143,6 +1291,36 @@ fn percentage_radius_paints_an_ellipse_in_a_nonsquare_box() {
             "ellipse, not a pill: {choice:?}"
         );
         assert_eq!(px(&frame, 80.0, 5.0), (36, 104, 172));
+    }
+}
+
+/// An infinite radius is a pill, as Chrome draws `calc(infinity * 1px)`,
+/// Tailwind's `rounded-full`, and a length near `f32::MAX`: the overlap
+/// rule's sums stay finite, so the corners are not squared off.
+#[test]
+fn an_infinite_radius_paints_a_pill() {
+    for radius in [r#""calc(infinity * 1px)""#, r#""3e38px""#, "9999"] {
+        let source = format!(
+            r##"component Rounded
+  view
+    view width=200 height=150 background-color="#ffffff"
+      view width=100 height=40 border-radius={radius} background-color="#2468ac"
+"##
+        );
+        for choice in painters() {
+            let mut p = compiled(&source, 1.0, choice);
+            let frame = p.frame();
+            assert_eq!(
+                px(&frame, 50.0, 20.0),
+                (36, 104, 172),
+                "{radius}: {choice:?}"
+            );
+            assert_eq!(
+                px(&frame, 2.0, 2.0),
+                (255, 255, 255),
+                "{radius}: a pill's corner shows the page, {choice:?}"
+            );
+        }
     }
 }
 

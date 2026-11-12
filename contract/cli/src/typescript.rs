@@ -1,8 +1,8 @@
 //! TypeScript's side of the data seam, derived from the plan's signatures.
 //! @ref LLP 1027 D2/D5 — no separately maintained argument or result shapes.
 
-use exact_plan::{Opcode, Plan, StrId, TypeKind, TypesId};
-use std::collections::BTreeSet;
+use exact_plan::{Opcode, Plan, StrId, TypeKind, TypesId, TypesRow};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 
 /// Generate an `app.d.ts` from a compiled Contract's source signatures.
@@ -41,19 +41,7 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
         match row.kind {
             TypeKind::Number => out.push_str("number"),
             TypeKind::Bool => out.push_str("boolean"),
-            TypeKind::String => {
-                if row.fields.is_empty() {
-                    out.push_str("string");
-                } else {
-                    out.push_str(
-                        &row.fields
-                            .iter()
-                            .map(|f| quoted(plan.str(plan.field(f).name)))
-                            .collect::<Vec<_>>()
-                            .join(" | "),
-                    );
-                }
-            }
+            TypeKind::String => out.push_str(&string_type(plan, row)),
             TypeKind::Unit => out.push_str("null"),
             TypeKind::Option | TypeKind::List => {
                 let elem = row.elem.ok_or_else(|| format!("type {i} has no element"))?;
@@ -171,7 +159,7 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
          }\n\
          export interface StreamEvent { readonly type: string; readonly data: string | ArrayBuffer; readonly lastEventId: string; readonly coalesced: number; readonly kind?: string; readonly message?: string; readonly status?: number; readonly code?: number; readonly reason?: string; readonly wasClean?: boolean; /** An upload's `progress`: the body's bytes sent so far, of `total`. */ readonly loaded?: number; readonly total?: number; readonly lengthComputable?: boolean }\n\
          declare global {\n\
-           interface RequestInit { exactStream?: (event: StreamEvent, socket?: StreamSocket) => unknown; exactIndependentHttp?: { maxResponseBytes: number }; /** A deadline for the whole exchange, 1 to 3600000 ms: the request is cancelled and the fetch rejects with a FetchError whose `kind` is \"Timeout\". Not with `exactStream`, but for an upload (`exactUploadProgress`). */ exactTimeout?: number; /** The body is this app file (`app:/…`), read by the host when it sends the request, under `fs.read`, at most 64 MiB; its bytes never enter JavaScript. Not with `body`, nor on a GET or HEAD; no Content-Type is added. */ exactBodyFrom?: string; /** A 2xx reply's body is written to this app file (`app:/…`) by the host as it arrives, under `fs.write`, at most `exactIndependentHttp.maxResponseBytes` or 1 GiB; its bytes never enter JavaScript. The file appears whole or not at all, and the response's `exactBodyTo` names the bytes written. A reply that is not 2xx leaves the file untouched and is read as usual. Not with `exactStream`, nor on a HEAD. */ exactBodyTo?: string; /** The server may hold the reply until something changes (a long poll): no clock waits on it (a jump, `clock settle`, `clock data`), and each reply that leaves it out names it. Its answer must be safe to supersede. Not with `exactStream`. */ exactHeld?: boolean; /** With `exactStream`, an upload: as its body (`body` or `exactBodyFrom`) goes out the mapper gets `progress` events (`loaded` of `total` bytes sent), then `load` with the reply's `status` and `data`, whatever the status, which ends it. It is in flight until that reply, for `pending` and every clock. Not on a GET or HEAD, a WebSocket or a long poll; it follows its redirects. */ exactUploadProgress?: boolean; /** With `exactStream`, a long poll: the host asks again and again, one GET at a time, each JSON reply an event whose `lastEventId` is its cursor (the reply's field `from`, `a` or `a.b`), asked with next in the query parameter `cursor`; a heartbeat (204, 304, an empty body, or by default the same cursor) is asked again with no event; the network, 408, 429, 502, 503 or 504 after `Retry-After` or a backoff of 1 s doubling to 30 s. */ exactLongPoll?: { cursor: string; from: string; sameCursor?: \"heartbeat\" | \"event\" } }\n\
+           interface RequestInit { exactStream?: (event: StreamEvent, socket?: StreamSocket) => unknown; exactIndependentHttp?: { maxResponseBytes: number }; /** A deadline for the whole exchange, 1 to 3600000 ms: the request is cancelled and the fetch rejects with a FetchError whose `kind` is \"Timeout\". Not with `exactStream`, but for an upload (`exactUploadProgress`). */ exactTimeout?: number; /** With `exactStream` on a `ws:` or `wss:` URL: the socket ends when nothing has arrived for this long, 1 to 3600000 ms of real time, its opening and each message counting; the mapper gets one `error` event whose `kind` is \"Timeout\". Reopening is the app's: refresh the resource. */ exactIdleTimeout?: number; /** The body is this app file (`app:/…`), read by the host when it sends the request, under `fs.read`, at most 64 MiB; its bytes never enter JavaScript. Not with `body`, nor on a GET or HEAD; no Content-Type is added. */ exactBodyFrom?: string; /** A 2xx reply's body is written to this app file (`app:/…`) by the host as it arrives, under `fs.write`, at most `exactIndependentHttp.maxResponseBytes` or 1 GiB; its bytes never enter JavaScript. The file appears whole or not at all, and the response's `exactBodyTo` names the bytes written. A reply that is not 2xx leaves the file untouched and is read as usual. Not with `exactStream`, nor on a HEAD. */ exactBodyTo?: string; /** The server may hold the reply until something changes (a long poll): no clock waits on it (a jump, `clock settle`, `clock data`), and each reply that leaves it out names it. Its answer must be safe to supersede. Not with `exactStream`. */ exactHeld?: boolean; /** With `exactStream`, an upload: as its body (`body` or `exactBodyFrom`) goes out the mapper gets `progress` events (`loaded` of `total` bytes sent), then `load` with the reply's `status` and `data`, whatever the status, which ends it. It is in flight until that reply, for `pending` and every clock. Not on a GET or HEAD, a WebSocket or a long poll; it follows its redirects. */ exactUploadProgress?: boolean; /** With `exactStream`, a long poll: the host asks again and again, one GET at a time, each JSON reply an event whose `lastEventId` is its cursor (the reply's field `from`, `a` or `a.b`), asked with next in the query parameter `cursor`; a heartbeat (204, 304, an empty body, or by default the same cursor) is asked again with no event; the network, 408, 429, 502, 503 or 504 after `Retry-After` or a backoff of 1 s doubling to 30 s. */ exactLongPoll?: { cursor: string; from: string; sameCursor?: \"heartbeat\" | \"event\" } }\n\
            /** `{path, bytes}` when `exactBodyTo` wrote the body to its file (its `text()` and `arrayBuffer()` are then empty); absent or `null` otherwise. */\n\
            interface Response { readonly exactBodyTo?: { readonly path: string; readonly bytes: number } | null }\n\
            /** An answer that keeps coming: `exactStream` maps each event, and the end, to the answer. */\n\
@@ -185,6 +173,9 @@ pub fn typescript_exporting(plan: &Plan, exports: Option<&[String]>) -> Result<S
          export type Overlay = <S extends Source>(source: S, args: Args<S>, answer: Result<S>, writes: readonly Write[]) => Result<S> | undefined;\n",
     );
     tokens(plan, exports, &mut out);
+    // Canvas types describe the data seam even when `draw` is exported from
+    // another module; no producer needs to inspect app.ts to include them (LLP 1056 D1).
+    out.push_str(include_str!("../../../canvas/types.d.ts"));
     Ok(out)
 }
 
@@ -274,7 +265,7 @@ fn summary(plan: &Plan, out: &mut String) {
          // function per source, given its arguments as an array (then store, storage, native) and\n\
          // answering its shape, or a Promise of it.\n",
     );
-    let mut shapes = Vec::new();
+    let mut shapes = Noted::default();
     for row in &sources {
         let args: Vec<_> = params(row)
             .into_iter()
@@ -289,14 +280,14 @@ fn summary(plan: &Plan, out: &mut String) {
         )
         .unwrap();
     }
-    if shapes.is_empty() {
+    if shapes.order.is_empty() {
         return;
     }
     // A shape's own fields name the shapes inside it, which join the list after it.
     let mut lines = Vec::new();
     let mut i = 0;
-    while i < shapes.len() {
-        let ty = shapes[i];
+    while i < shapes.order.len() {
+        let ty = shapes.order[i];
         let body = record(plan, ty, &mut shapes);
         lines.push((
             ty.0,
@@ -338,22 +329,49 @@ fn summary(plan: &Plan, out: &mut String) {
     }
 }
 
+fn string_type(plan: &Plan, row: &TypesRow) -> String {
+    if row.fields.is_empty() {
+        "string".into()
+    } else {
+        row.fields
+            .iter()
+            .map(|f| {
+                // JSON leaves these literal, but they terminate the summary's line comments.
+                serde_json::to_string(plan.str(plan.field(f).name))
+                    .expect("a string is JSON")
+                    .replace('\u{2028}', "\\u2028")
+                    .replace('\u{2029}', "\\u2029")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+/// Keep first-reference order while deduplicating shapes by their printed name.
+#[derive(Default)]
+struct Noted {
+    order: Vec<TypesId>,
+    names: HashSet<String>,
+}
+
 /// A type as the summary writes it: a named shape by its name (noted in `shapes` once).
-fn inline(plan: &Plan, ty: TypesId, shapes: &mut Vec<TypesId>) -> String {
+fn inline(plan: &Plan, ty: TypesId, shapes: &mut Noted) -> String {
     let row = &plan.types[ty.0 as usize];
     let mut elem = || row.elem.map(|e| inline(plan, e, shapes));
     match row.kind {
         TypeKind::Number => "number".into(),
         TypeKind::Bool => "boolean".into(),
-        TypeKind::String => "string".into(),
+        TypeKind::String => string_type(plan, row),
         TypeKind::Unit => "null".into(),
         TypeKind::Option => format!("{} | null", elem().unwrap_or_default()),
         TypeKind::List => {
-            let nullable = row
-                .elem
-                .is_some_and(|e| plan.types[e.0 as usize].kind == TypeKind::Option);
+            let union = row.elem.is_some_and(|e| {
+                let elem = &plan.types[e.0 as usize];
+                elem.kind == TypeKind::Option
+                    || (elem.kind == TypeKind::String && elem.fields.len > 1)
+            });
             let elem = elem().unwrap_or_default();
-            if nullable {
+            if union {
                 format!("({elem})[]")
             } else {
                 format!("{elem}[]")
@@ -365,11 +383,8 @@ fn inline(plan: &Plan, ty: TypesId, shapes: &mut Vec<TypesId>) -> String {
                 return record(plan, ty, shapes);
             }
             // The plan may hold a shape more than once: one line per name.
-            if !shapes
-                .iter()
-                .any(|s| plan.str(plan.types[s.0 as usize].name) == name)
-            {
-                shapes.push(ty);
+            if shapes.names.insert(name.to_string()) {
+                shapes.order.push(ty);
             }
             name.to_string()
         }
@@ -377,7 +392,7 @@ fn inline(plan: &Plan, ty: TypesId, shapes: &mut Vec<TypesId>) -> String {
 }
 
 /// A record's fields on one line, `{ id: string; done: boolean }`.
-fn record(plan: &Plan, ty: TypesId, shapes: &mut Vec<TypesId>) -> String {
+fn record(plan: &Plan, ty: TypesId, shapes: &mut Noted) -> String {
     let row = &plan.types[ty.0 as usize];
     let fields: Vec<_> = plan.fields
         [row.fields.start as usize..row.fields.start as usize + row.fields.len as usize]

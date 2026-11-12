@@ -3,6 +3,24 @@ use super::*;
 use crate::host::Restyle;
 
 impl<D: DataSource> Bridge<D> {
+    /// A collection's nearest logical row snap position; NaN when absent.
+    pub fn collection_snap(
+        &self,
+        view: u32,
+        proposed: f64,
+        port: f64,
+        maximum: f64,
+        distance: f64,
+    ) -> f64 {
+        self.host
+            .as_ref()
+            .and_then(|h| {
+                h.runner()
+                    .collection_snap(view, proposed, port, maximum, distance)
+            })
+            .unwrap_or(f64::NAN)
+    }
+
     /// What native containers cover of boxes (LLP 1075.003 §3.5), from the
     /// input buffer's first `len` bytes: LE records of (u32 view, u32 kind —
     /// 0 clears, 1 edges, 2 whole, 3 a scroller's platform inset (top and

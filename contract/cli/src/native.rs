@@ -560,6 +560,15 @@ pub(super) fn check(file: &File, app_root: &Path) -> Result<Vec<PackageView>, Ve
     }
 }
 
+fn stale_manifest_hint(app_root: &Path) -> &'static str {
+    if Manifest::generated_stale(app_root) {
+        "; .shells/app.json is stale, generated from an earlier app.json: \
+         `bun exact.mjs shells` regenerates it, as the web and test builds do"
+    } else {
+        ""
+    }
+}
+
 fn check_words(used: Vec<(String, Span)>, app_root: &Path, kind: &Words) -> Vec<CompileError> {
     if used.is_empty() {
         return Vec::new();
@@ -601,12 +610,7 @@ fn check_words(used: Vec<(String, Span)>, app_root: &Path, kind: &Words) -> Vec<
             } else {
                 format!("the app's words are {}", declared.join(", "))
             };
-            let stale = if Manifest::generated_stale(app_root) {
-                "; .shells/app.json is stale, generated from an earlier app.json: \
-                 `bun exact.mjs shells` regenerates it, as the web and test builds do"
-            } else {
-                ""
-            };
+            let stale = stale_manifest_hint(app_root);
             refusal(
                 kind.refusal,
                 format!(
@@ -638,7 +642,7 @@ fn check_modules(file: &File, app_root: &Path) -> Result<Vec<PackageView>, Vec<C
         .and_then(|m| roster(&m))
         .map_err(|message| vec![refusal("app-manifest", message, Span::default())])?;
     let packages = crate::package_views::declared(app_root)
-        .map_err(|message| vec![refusal("bake-view-twice", message, Span::default())])?;
+        .map_err(|e| vec![refusal(e.id, e.message, Span::default())])?;
     if let Some(view) = packages.values().find(|v| roster.contains(&v.tag)) {
         return Err(vec![refusal(
             "bake-view-twice",
@@ -675,9 +679,10 @@ fn check_modules(file: &File, app_root: &Path) -> Result<Vec<PackageView>, Vec<C
             let add = crate::package_views::standard_with(&tag)
                 .map(|m| format!("; exact2's `{m}` module serves it: `exact add {m}` adds it to the app's package.json"))
                 .unwrap_or_default();
+            let stale = stale_manifest_hint(app_root);
             refusal(
                 "bake-unknown-module",
-                format!("`{tag}` is not a native module of this app: {listed}{hint}{add}"),
+                format!("`{tag}` is not a native module of this app: {listed}{hint}{add}{stale}"),
                 span,
             )
         })

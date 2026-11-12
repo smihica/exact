@@ -1,3 +1,4 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // A context menu's popover (LLP 1021 §5.1; LLP 1115.000 D4.7) in each engine: the navigation glue's
 // `contextAt`, which both web runtimes open one through (rt.js `cp`, glue.js `contextpopover`).
 //
@@ -8,7 +9,6 @@
 // which neutral-look.test.mjs holds; LLP 1116 D1's reads neither, and its menu stays where the user agent
 // puts a popover). The page's stylesheet is a default build's (look.mjs).
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 

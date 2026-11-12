@@ -943,7 +943,12 @@ fn acts_are_queued_run_between_turns_and_journaled_an_input_by_its_length() {
         s["slots"]["text"], "Palo Alto",
         "cut to the field's maxlength, as typing is"
     );
-    assert_eq!(s["slots"]["secret"], "hunter2");
+    // A password field's slot is masked in `state` and kept whole (LLP 1156.001 D6).
+    assert_eq!(s["slots"]["secret"], "•••");
+    assert_eq!(
+        agent(&mut p, json!({"op": "state", "reveal": true}))["slots"]["secret"],
+        "hunter2"
+    );
     assert_eq!(
         p.focus(),
         Some(id(&p, "arm")),

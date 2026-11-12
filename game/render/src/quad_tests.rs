@@ -356,8 +356,19 @@ fn invalid_quads_are_journaled_without_refusing_valid_neighbors() {
         &gpu.queue,
         wgpu::TextureFormat::Rgba8Unorm,
     );
-    crate::Feed::default().feed(&w, &mut r).unwrap();
-    assert!(w.journal().iter().any(|l| l.line.contains("Emitter:")));
+    let mut feed = crate::Feed::default();
+    feed.feed(&w, &mut r).unwrap();
+    for _ in 0..3 {
+        emitter::step(&w);
+        feed.feed(&w, &mut r).unwrap();
+    }
+    let journal = w.journal();
+    let refusals: Vec<_> = journal
+        .iter()
+        .filter(|l| l.line.contains("Emitter:"))
+        .collect();
+    assert_eq!(refusals.len(), 1);
+    assert!(refusals[0].line.contains("rate"));
     assert!(w
         .journal()
         .iter()

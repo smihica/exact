@@ -168,8 +168,183 @@ impl Deadline {
     }
 }
 
+/// A WebSocket stream's idle timeout (LLP 1016.000 D11): a thread that
+/// ends the stream when nothing has arrived for `ms`, measured from the
+/// instant of each [`Quiet::heard`] and not from when the thread next runs.
+///
+/// The stream ends once, by whichever claims it first: the watch, which
+/// then aborts the read, or its reader, with what it found
+/// ([`Quiet::finish`]). So a close or a failure the reader already has is
+/// never rewritten as a timeout while the socket is torn down, and the
+/// watch never aborts a stream that has finished.
+pub(super) struct Quiet {
+    ms: u32,
+    shared: std::sync::Arc<QuietState>,
+    _done: std::sync::mpsc::Sender<()>,
+}
+
+struct QuietState {
+    /// When something last arrived.
+    heard: std::sync::Mutex<std::time::Instant>,
+    /// [`ARMED`], then [`TIMED_OUT`] or [`FINISHED`], once.
+    end: std::sync::atomic::AtomicU8,
+}
+
+const ARMED: u8 = 0;
+const TIMED_OUT: u8 = 1;
+const FINISHED: u8 = 2;
+
+impl Quiet {
+    pub(super) fn arm(ms: u32, abort: &AbortController) -> Result<Quiet, String> {
+        use std::sync::atomic::Ordering;
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let shared = std::sync::Arc::new(QuietState {
+            heard: std::sync::Mutex::new(std::time::Instant::now()),
+            end: std::sync::atomic::AtomicU8::new(ARMED),
+        });
+        let (state, abort) = (shared.clone(), abort.clone());
+        let limit = std::time::Duration::from_millis(ms.into());
+        std::thread::Builder::new()
+            .name("exact-stream-quiet".into())
+            .spawn(move || loop {
+                // The time is read and the end claimed under the one lock an
+                // arrival takes, so an arrival is either counted or comes
+                // after the timeout, never between the two.
+                let heard = state.heard.lock().unwrap();
+                let left = (*heard + limit).saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    // A stream already let go stays Aborted: the quiet did
+                    // not end it. The claim is made before the abort, so the
+                    // reader the abort wakes finds it.
+                    let claimed = !abort.signal().aborted()
+                        && (state.end)
+                            .compare_exchange(ARMED, TIMED_OUT, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                    drop(heard);
+                    if claimed {
+                        abort.abort();
+                    }
+                    return;
+                }
+                drop(heard);
+                // Woken early only by the stream's end (the sender drops).
+                if let Err(std::sync::mpsc::RecvTimeoutError::Disconnected) =
+                    wait.recv_timeout(left)
+                {
+                    return;
+                }
+            })
+            .map_err(|e| format!("the stream's idle timeout could not be armed: {e}"))?;
+        Ok(Quiet {
+            ms,
+            shared,
+            _done: done,
+        })
+    }
+
+    /// Something arrived now: the opening, or a complete data message.
+    pub(super) fn heard(&self) {
+        *self.shared.heard.lock().unwrap() = std::time::Instant::now();
+    }
+
+    /// The stream's end: `end`, which its reader found, unless the watch
+    /// ended it first, which is the timeout whatever the abort then produced
+    /// (an aborted read, the peer's close). Call it before the socket is torn
+    /// down.
+    pub(super) fn finish(quiet: Option<&Quiet>, end: Outcome) -> Outcome {
+        use std::sync::atomic::Ordering;
+        let Some(q) = quiet else { return end };
+        match (q.shared.end).compare_exchange(ARMED, FINISHED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Err(TIMED_OUT) => failed(
+                FailureKind::Timeout,
+                format!("nothing arrived for {} ms", q.ms),
+            ),
+            _ => end,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{failed, FailureKind, Outcome, Quiet};
+    use ibex2::stdlib::abort::AbortController;
+    use std::time::Duration;
+
+    fn network() -> Outcome {
+        failed(FailureKind::Network, "the socket closed (1006)")
+    }
+
+    /// LLP 1016.000 D11: the stream ends once. A reader that finishes first
+    /// keeps what it found, however long its teardown takes, and the watch
+    /// then aborts nothing; a watch that fires first is the timeout, whatever
+    /// the reader's aborted read produced.
+    #[test]
+    fn a_quiet_watch_and_its_reader_settle_the_end_once() {
+        let abort = AbortController::new();
+        let quiet = Quiet::arm(400, &abort).unwrap();
+        let end = Quiet::finish(Some(&quiet), network());
+        assert!(
+            matches!(
+                end,
+                Outcome::Failed {
+                    kind: FailureKind::Network,
+                    ..
+                }
+            ),
+            "{end:?}"
+        );
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !abort.signal().aborted(),
+            "a finished stream is not aborted"
+        );
+
+        let abort = AbortController::new();
+        let quiet = Quiet::arm(60, &abort).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(abort.signal().aborted(), "the watch aborts the read");
+        let end = Quiet::finish(Some(&quiet), network());
+        assert!(
+            matches!(&end, Outcome::Failed { kind: FailureKind::Timeout, message } if message == "nothing arrived for 60 ms"),
+            "{end:?}"
+        );
+
+        // A stream let go first is not the watch's to end.
+        let abort = AbortController::new();
+        abort.abort();
+        let quiet = Quiet::arm(20, &abort).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        let end = Quiet::finish(Some(&quiet), network());
+        assert!(
+            matches!(
+                end,
+                Outcome::Failed {
+                    kind: FailureKind::Network,
+                    ..
+                }
+            ),
+            "{end:?}"
+        );
+    }
+
+    /// The time is counted from when something arrived, not from when the
+    /// watch next ran.
+    #[test]
+    fn a_quiet_watch_counts_from_the_last_arrival() {
+        let abort = AbortController::new();
+        let quiet = Quiet::arm(1000, &abort).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        quiet.heard();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !abort.signal().aborted(),
+            "1200 ms after arming, 600 ms after the arrival"
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(abort.signal().aborted(), "1500 ms after the arrival");
+    }
+
     #[test]
     fn a_build_count_is_its_digits_or_the_default() {
         assert_eq!(super::build_number(None, 6), 6);

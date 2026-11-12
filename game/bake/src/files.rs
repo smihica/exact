@@ -61,7 +61,14 @@ pub fn check_size(name: &str, size: usize) -> Result<(), String> {
 /// Validate the game's single declared JSON level using its `Data` derive, then
 /// deliver it separately from executable code. No source bytes enter the module.
 pub fn bake_game_level<G: exact_game::Game>(app: impl AsRef<Path>) -> Result<(), String> {
-    let Some(level) = G::LEVEL else { return Ok(()) };
+    let receipt = app.as_ref().join(".shells/level.json");
+    let Some(level) = G::LEVEL else {
+        return match std::fs::remove_file(&receipt) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", receipt.display())),
+        };
+    };
     let source = app.as_ref().join(level.name);
     println!("cargo:rerun-if-changed={}", source.display());
     let bytes = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display()))?;
@@ -70,5 +77,9 @@ pub fn bake_game_level<G: exact_game::Game>(app: impl AsRef<Path>) -> Result<(),
     level.decode(text).map_err(|e| e.to_string())?;
     let output = app.as_ref().join("assets").join(level.name);
     std::fs::create_dir_all(output.parent().unwrap()).map_err(|e| e.to_string())?;
-    write_changed(&output, &bytes)
+    write_changed(&output, &bytes)?;
+    // Input inventories must distinguish this output from handwritten assets.
+    let name = exact_game::json::to_string(&level.name.to_owned()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(receipt.parent().unwrap()).map_err(|e| e.to_string())?;
+    write_changed(&receipt, name.as_bytes())
 }

@@ -52,10 +52,24 @@ private struct Shortcut {
         if ["Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].contains(key) {
             return NodeView.keyName(event) == key
         }
+        var characters = event.charactersIgnoringModifiers
+        // Command can select another layout and omit Shift from characters.
+        // Ask that layout for Shift's glyph first. US omits Shift there too,
+        // so use charactersIgnoringModifiers only when Command kept the base key.
+        if modifiers.contains(.command), !modifiers.contains(.control) {
+            characters = event.characters
+            if modifiers.contains(.shift), let command = event.characters(byApplyingModifiers: .command),
+               characters?.lowercased() == command.lowercased() {
+                if let shifted = event.characters(byApplyingModifiers: [.command, .shift]), shifted.lowercased() != command.lowercased() {
+                    characters = shifted
+                } else if command.lowercased() == event.characters(byApplyingModifiers: [])?.lowercased() {
+                    characters = event.charactersIgnoringModifiers
+                }
+            }
+        }
         // Option changes the logical key (Option-C can produce ç). An empty
         // character is a dead key, not the unmodified letter. Control may
         // instead emit a control character; retranslate with glyph modifiers.
-        var characters = event.charactersIgnoringModifiers
         if modifiers.contains(.option) {
             characters = event.characters
             if modifiers.contains(.control), characters?.unicodeScalars.contains(where: { $0.value < 0x20 }) == true {

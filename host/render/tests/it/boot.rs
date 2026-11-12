@@ -85,7 +85,7 @@ impl DataSource for Cards {
 /// A browser's navigation of `target`: the page's bytes as they came, and
 /// how long until its boot document (the bytes up to `data-boot`'s `</div>`)
 /// had arrived, if it had one.
-fn navigate(addr: std::net::SocketAddr, target: &str) -> (String, Option<Duration>) {
+pub(super) fn navigate(addr: std::net::SocketAddr, target: &str) -> (String, Option<Duration>) {
     let started = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, BOUND).unwrap();
     stream.set_read_timeout(Some(BOUND)).unwrap();

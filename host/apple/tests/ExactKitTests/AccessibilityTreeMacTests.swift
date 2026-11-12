@@ -249,6 +249,79 @@ final class AccessibilityTreeMacTests: XCTestCase {
         XCTAssertEqual(slider.doubleValue, 40, "the bound value, once it changes")
     }
 
+    func testRangeAccessibilityStepsCommitAfterUnrelatedEvents() throws {
+        let p = try fixture()
+        p.apply(wireBatch([
+            ["op": "create", "id": 11, "kind": "control",
+             "props": ["type": "range", "min": "0", "max": "100", "step": "5", "value": "50"],
+             "handlers": ["input", "change"]],
+            ["op": "children", "id": 1, "ids": [2, 3, 11]],
+            ["op": "frame", "id": 11, "x": 0, "y": 140, "w": 129, "h": 24],
+        ]))
+        let slider = try XCTUnwrap(p.controls.controls[11] as? NSSlider)
+        let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
+        var heard: [String] = []
+        p.onControlValue = { id, value, input, change in
+            XCTAssertEqual(id, 11)
+            if input { heard.append("input:\(value)") }
+            if change { heard.append("change:\(value)") }
+        }
+        for type: NSEvent.EventType in [.mouseMoved, .keyUp, .flagsChanged, .applicationDefined, .leftMouseUp] {
+            try rangeCurrentEvent(type)
+            heard = []
+            _ = slider.accessibilityPerformIncrement()
+            XCTAssertEqual(slider.doubleValue, 55)
+            XCTAssertEqual(heard, ["input:55", "change:55"], "after \(type)")
+            heard = []
+            _ = cell.accessibilityPerformDecrement()
+            XCTAssertEqual(slider.doubleValue, 50)
+            XCTAssertEqual(heard, ["input:50", "change:50"], "after \(type)")
+            XCTAssertNil(p.controls.lastRange[11])
+        }
+
+        try rangeCurrentEvent(.keyDown)
+        heard = []
+        slider.moveRight(nil)
+        XCTAssertEqual(heard, ["input:55", "change:55"])
+
+        heard = []
+        try rangeCurrentEvent(.leftMouseDown)
+        slider.doubleValue = 61
+        XCTAssertTrue(slider.sendAction(slider.action, to: slider.target))
+        XCTAssertEqual(slider.doubleValue, 60)
+        XCTAssertEqual(heard, ["input:60"])
+        try rangeCurrentEvent(.leftMouseDragged)
+        slider.doubleValue = 69
+        XCTAssertTrue(slider.sendAction(slider.action, to: slider.target))
+        XCTAssertTrue(slider.sendAction(slider.action, to: slider.target))
+        XCTAssertEqual(slider.doubleValue, 70)
+        XCTAssertEqual(heard, ["input:60", "input:70"])
+        try rangeCurrentEvent(.leftMouseUp)
+        XCTAssertTrue(slider.sendAction(slider.action, to: slider.target))
+        XCTAssertEqual(heard, ["input:60", "input:70", "change:70"])
+        XCTAssertNil(p.controls.lastRange[11])
+    }
+
+    private func rangeCurrentEvent(_ type: NSEvent.EventType) throws {
+        let event: NSEvent?
+        switch type {
+        case .keyDown, .keyUp, .flagsChanged:
+            event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "\u{F703}",
+                charactersIgnoringModifiers: "\u{F703}", isARepeat: false, keyCode: 124)
+        case .applicationDefined:
+            event = NSEvent.otherEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, subtype: 0, data1: 0, data2: 0)
+        default:
+            event = NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)
+        }
+        NSApp.postEvent(try XCTUnwrap(event), atStart: true)
+        let mask = NSEvent.EventTypeMask(rawValue: 1 << type.rawValue)
+        _ = try XCTUnwrap(NSApp.nextEvent(matching: mask, until: .distantPast, inMode: .default, dequeue: true))
+        XCTAssertEqual(NSApp.currentEvent?.type, type)
+    }
+
     /// An attached sheet is the modal: the driver judges everything else against it.
     func testASheetRootIsReportedAsTheModal() throws {
         let p = try fixture()

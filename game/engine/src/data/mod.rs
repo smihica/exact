@@ -383,6 +383,69 @@ pub(crate) fn type_name<T>() -> &'static str {
     std::any::type_name::<T>().rsplit("::").next().unwrap()
 }
 
+/// `Data` for a record the derive would write, followed by opt-in fields that are
+/// written only when one of them differs from the type's default. A value that
+/// leaves them at their defaults keeps the bytes and hash it had before they
+/// existed. They are written all together: the hash names no fields, so two
+/// fields written alone could hash the same. As the writer omits them only at
+/// their defaults, a record that lacks them reads them as their defaults, not
+/// as a patch. They are declared after the record's fields.
+macro_rules! opt_in_record {
+    ($ty:ident { $($field:ident),* $(,)? } opt_in { $($opt:ident),+ $(,)? }) => {
+        impl $crate::Data for $ty {
+            const TYPE_ID: &'static str =
+                concat!("table:", module_path!(), "::", stringify!($ty));
+            fn set_field(&mut self, field: &str, text: &str) -> Result<(), $crate::DataError> {
+                match field {
+                    $(stringify!($field) => $crate::data::edit_field(&mut self.$field, text),)*
+                    $(stringify!($opt) => $crate::data::edit_field(&mut self.$opt, text),)+
+                    _ => Err($crate::DataError::new(format!("unknown field {field}"))),
+                }
+            }
+            fn write(&self, w: &mut dyn $crate::Writer) {
+                w.begin_struct();
+                $(
+                    w.field(stringify!($field));
+                    $crate::Data::write(&self.$field, w);
+                )*
+                let default = <Self as Default>::default();
+                if false $(|| self.$opt != default.$opt)+ {
+                    $(
+                        w.field(stringify!($opt));
+                        $crate::Data::write(&self.$opt, w);
+                    )+
+                }
+                w.end_struct();
+            }
+            fn read(&mut self, r: &mut dyn $crate::Reader) -> Result<(), $crate::DataError> {
+                let default = <Self as Default>::default();
+                $(self.$opt = default.$opt;)+
+                let fields = [$(stringify!($field)),*];
+                let mut seen = [false; [$(stringify!($field)),*].len()];
+                r.begin_struct()?;
+                while let Some(field) = r.field()? {
+                    if let Some(i) = fields.iter().position(|f| *f == field) {
+                        seen[i] = true;
+                    }
+                    match field.as_str() {
+                        $(stringify!($field) => $crate::Data::read(&mut self.$field, r)
+                            .map_err(|e| e.at(stringify!($field)))?,)*
+                        $(stringify!($opt) => $crate::Data::read(&mut self.$opt, r)
+                            .map_err(|e| e.at(stringify!($opt)))?,)+
+                        _ => r.skip().map_err(|e| e.at(&field))?,
+                    }
+                }
+                // A complete record (a tuning table's) names every field but the opt-in ones.
+                if let Some(i) = seen.iter().position(|s| !s).filter(|_| r.complete()) {
+                    return Err($crate::DataError::new("missing field").at(fields[i]));
+                }
+                Ok(())
+            }
+        }
+    };
+}
+pub(crate) use opt_in_record;
+
 /// Decode and check finite JSON before replacing a live-edit candidate's field.
 #[doc(hidden)]
 pub fn edit_field<T: Data>(value: &mut T, text: &str) -> Result<(), DataError> {

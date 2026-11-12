@@ -168,6 +168,13 @@ pub struct Request {
     /// URLSession's 60-second idle timeout). A stream takes none, except an upload.
     /// Set by TypeScript's `fetch(url, {exactTimeout})` and [`Request::timeout`].
     pub timeout_ms: Option<u32>,
+    /// A WebSocket stream ends, as [`FailureKind::Timeout`], when nothing
+    /// has arrived on it for this long, in milliseconds (LLP 1016.000 D11):
+    /// its opening and each complete data message count, and the count
+    /// starts when the executor takes the request. Set by TypeScript's
+    /// `fetch(url, {exactStream, exactIdleTimeout})` and
+    /// [`Request::idle_timeout`].
+    pub idle_timeout_ms: Option<u32>,
     /// The body is this app file's bytes (`app:/…`), read by the host when it
     /// runs the request, under the `fs.read` grant, at most
     /// [`MAX_BODY_FROM_BYTES`]: the bytes never cross the source. `body` is
@@ -322,6 +329,7 @@ impl Request {
             upload_progress: false,
             long_poll: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
@@ -379,7 +387,7 @@ impl Request {
             && !self.stream
             && !self.socket
             && self.long_poll.is_none()
-            && !self.held
+            && !self.is_held()
     }
 
     /// Native ordered lane is mandatory for storage and continuations, even
@@ -408,6 +416,7 @@ impl Request {
             upload_progress: false,
             long_poll: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
@@ -418,6 +427,19 @@ impl Request {
             wake_ms: None,
             fetch: None,
         }
+    }
+
+    /// A two-way WebSocket to a `ws:` or `wss:` URL (LLP 1016.003 D1): a
+    /// stream whose `parse` receives `open`, each frame in order and the
+    /// close, and whose mapper and the module's mutations send on it through
+    /// [`crate::Socket`]. Answer it with `Answer::Later`.
+    pub fn socket(url: &str) -> Request {
+        let request = Request {
+            stream: true,
+            socket: true,
+            ..Request::get(url)
+        };
+        request.independent_http(1 << 20)
     }
 
     /// A `POST` of a JSON text.
@@ -438,6 +460,7 @@ impl Request {
             upload_progress: false,
             long_poll: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
@@ -604,6 +627,13 @@ impl Request {
         self
     }
 
+    /// A WebSocket stream that ends when nothing arrives for `ms` (see
+    /// [`Request::idle_timeout_ms`]).
+    pub fn idle_timeout(mut self, ms: u32) -> Self {
+        self.idle_timeout_ms = Some(ms);
+        self
+    }
+
     /// Held: the server may keep the reply until something changes, and no
     /// clock waits on it (see [`Request::held`]). On anything but a plain
     /// HTTP request it changes nothing.
@@ -729,10 +759,36 @@ impl Request {
         }
     }
 
+    /// Why this request's idle timeout is refused, if it is: zero, over
+    /// [`MAX_TIMEOUT_MS`], or on anything but a WebSocket stream (LLP
+    /// 1016.000 D11). Every host asks it with [`Request::timeout_refusal`].
+    pub fn idle_timeout_refusal(&self) -> Option<&'static str> {
+        let ms = self.idle_timeout_ms?;
+        let socket = self.stream
+            && self.listen.is_none()
+            && self.long_poll.is_none()
+            && !self.upload_progress
+            && ["ws:", "wss:"].iter().any(|scheme| {
+                self.url
+                    .get(..scheme.len())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(scheme))
+            });
+        if ms == 0 || ms > MAX_TIMEOUT_MS {
+            Some("an idle timeout must be 1 to 3600000 ms")
+        } else if !socket {
+            Some("only a WebSocket stream takes an idle timeout")
+        } else {
+            None
+        }
+    }
+
     /// Why this request's deadline is refused, if it is: zero, over
     /// [`MAX_TIMEOUT_MS`], on a stream that is not an upload, or on work
     /// that is not HTTP.
     pub fn timeout_refusal(&self) -> Option<&'static str> {
+        if let Some(why) = self.idle_timeout_refusal() {
+            return Some(why);
+        }
         let ms = self.timeout_ms?;
         if ms == 0 || ms > MAX_TIMEOUT_MS {
             Some("a request timeout must be 1 to 3600000 ms")

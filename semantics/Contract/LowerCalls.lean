@@ -366,6 +366,10 @@ theorem evalR_call_inv {name args v} (h : EvalR env inFn ls (.call name args) v)
        (∃ x, name = "failure" ∧ args = [.var x] ∧ v = .none ∧
           ((env.prog.resources.any (·.name == x) = true ∧ (lookup x env.resources).isSome = true) ∨
             env.prog.resources.any (·.name == x) = false)) ∨
+       (∃ x, name = "current" ∧ args = [.var x] ∧
+          ((env.prog.resources.any (·.name == x) = true ∧ (lookup x env.resources).isSome = true ∧
+              v = .bool !(env.idle.contains x)) ∨
+            (env.prog.resources.any (·.name == x) = false ∧ v = .bool false))) ∨
        (∃ vs, ListR env inFn ls args vs ∧ stdlib env name vs = .ok v) ∨
        (∃ l ps body dir xs ks d, name = "sortBy" ∧ args = l :: .arrow ps body :: dir ∧
           EvalR env inFn ls l (.list xs) ∧ MapR env inFn ls ps body xs 0 ks ∧ sortDir dir = .ok d ∧
@@ -381,9 +385,12 @@ theorem evalR_call_inv {name args v} (h : EvalR env inFn ls (.call name args) v)
   case failureSettled hfd h1 h2 =>
     exact .inr ⟨hfd, .inr (.inr (.inr (.inl ⟨_, rfl, rfl, rfl, .inl ⟨h1, h2⟩⟩)))⟩
   case failureOther hfd h1 => exact .inr ⟨hfd, .inr (.inr (.inr (.inl ⟨_, rfl, rfl, rfl, .inr h1⟩)))⟩
-  case stdlib hfd hargs hs => exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inl ⟨_, hargs, hs⟩))))⟩
+  case currentSettled hfd h1 h2 =>
+    exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inl ⟨_, rfl, rfl, .inl ⟨h1, h2, rfl⟩⟩))))⟩
+  case currentOther hfd h1 => exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inl ⟨_, rfl, rfl, .inr ⟨h1, rfl⟩⟩))))⟩
+  case stdlib hfd hargs hs => exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inr (.inl ⟨_, hargs, hs⟩)))))⟩
   case sortBy hfd hd hl hm hs =>
-    exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inr ⟨_, _, _, _, _, _, _, rfl, rfl, hl, hm, hd, hs⟩))))⟩
+    exact .inr ⟨hfd, .inr (.inr (.inr (.inr (.inr (.inr ⟨_, _, _, _, _, _, _, rfl, rfl, hl, hm, hd, hs⟩)))))⟩
 
 /-- `pending(r)`/`failed(r)` of a resource: the flag, once it settled. -/
 theorem spec_flag {e : Expr} {x : String} {j : Nat} {i : Instr} {flags : List Bool}
@@ -407,11 +414,12 @@ theorem spec_flag {e : Expr} {x : String} {j : Nat} {i : Instr} {flags : List Bo
     · exact absurd hst ((hex pc S cbs fx).2 (fun w h => hw ⟨w, h⟩) st)
 
 theorem exec_flag {P : Code} {venv j pc S L cbs fx} {flags : List Bool} {i : Instr}
-    (hi : i = .pendingResource j ∧ flags = venv.pendingResources ∨ i = .failedResource j ∧ flags = venv.failedResources) :
+    (hi : i = .pendingResource j ∧ flags = venv.pendingResources ∨ i = .failedResource j ∧ flags = venv.failedResources ∨
+      i = .currentResource j ∧ flags = venv.currentResources) :
     (∀ w, venv.resources[j]? = some (some w) →
         Vm.exec P.length venv i (M pc S L cbs fx) = .ok (.run (M (pc + 1) (.bool (flags[j]?.getD false) :: S) L cbs fx))) ∧
       ((∀ w, venv.resources[j]? ≠ some (some w)) → ∀ s, Vm.exec P.length venv i (M pc S L cbs fx) ≠ .ok s) := by
-  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;>
+  rcases hi with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;>
   refine ⟨fun w hw => by simp [Vm.exec, hw], fun hn s => ?_⟩ <;>
   simp only [Vm.exec] <;> (try split) <;> simp_all
 
@@ -429,11 +437,12 @@ theorem case_pending (hfd : p.fns.find? (·.name == "pending") = none)
     constructor
     · intro h
       rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
-        ⟨y, _, h2, h3, h4⟩ | ⟨y, h2, _⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
+        ⟨y, _, h2, h3, h4⟩ | ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
       · rw [hfd'] at h1; cases h1
       · simp at h1
       · simp at h1
       · simp at h2; subst h2; exact ⟨h3, h4⟩
+      · simp at h2
       · simp at h2
       · exact absurd h1 stdlib_pending
       · simp at h1
@@ -443,7 +452,7 @@ theorem case_pending (hfd : p.fns.find? (·.name == "pending") = none)
   split at hc
   · rename_i i t0 hl
     simp at hc; obtain ⟨rfl, rfl⟩ := hc
-    obtain ⟨-, -, -, hany, hiff⟩ := hx.agree x _ _ hl
+    obtain ⟨-, -, -, hany, hiff, -⟩ := hx.agree x _ _ hl
     refine spec_flag hx.quiet.pendingResources (fun v => ?_) hiff (fun _ _ _ _ => exec_flag (.inl ⟨rfl, rfl⟩))
     rw [hinv]; simp [hany]
   · rename_i s k t0 hl
@@ -467,11 +476,12 @@ theorem case_failed (hfd : p.fns.find? (·.name == "failed") = none)
     constructor
     · intro h
       rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
-        ⟨y, _, h2, h3, h4⟩ | ⟨y, h2, _⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
+        ⟨y, _, h2, h3, h4⟩ | ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
       · rw [hfd'] at h1; cases h1
       · simp at h1
       · simp at h1
       · simp at h2; subst h2; exact ⟨h3, h4⟩
+      · simp at h2
       · simp at h2
       · exact absurd h1 stdlib_failed
       · simp at h1
@@ -481,9 +491,55 @@ theorem case_failed (hfd : p.fns.find? (·.name == "failed") = none)
   split at hc
   · rename_i i t0 hl
     simp at hc; obtain ⟨rfl, rfl⟩ := hc
-    obtain ⟨-, -, -, hany, hiff⟩ := hx.agree x _ _ hl
-    refine spec_flag hx.quiet.failedResources (fun v => ?_) hiff (fun _ _ _ _ => exec_flag (.inr ⟨rfl, rfl⟩))
+    obtain ⟨-, -, -, hany, hiff, -⟩ := hx.agree x _ _ hl
+    refine spec_flag hx.quiet.failedResources (fun v => ?_) hiff (fun _ _ _ _ => exec_flag (.inr (.inl ⟨rfl, rfl⟩)))
     rw [hinv]; simp [hany]
+  · cases hc
+
+/-- `current(r)` of a resource: once it settled, the VM's flag, which is
+the semantics' `true` unless idle (`RefOk`). -/
+theorem case_current (hfd : p.fns.find? (·.name == "current") = none)
+    (hc : (match scopeLookup x sc with
+      | some (.resource i, _) => Except.ok ([Instr.currentResource i], STy.bool)
+      | _ => Except.error s!"`{x}` is not a resource" : Except String (Code × STy)) = .ok (c, t))
+    (hx : Ctx env inFn ls venv L p sc n) : ExprSpec env inFn ls venv P L (.call "current" [.var x]) c t := by
+  have hfd' : env.prog.fns.find? (·.name == "current") = none := by rw [hx.prog]; exact hfd
+  split at hc
+  · rename_i j t0 hl
+    simp at hc; obtain ⟨rfl, rfl⟩ := hc
+    obtain ⟨-, -, -, hany, hiff, hcur⟩ := hx.agree x _ _ hl
+    have hev : ∀ v, EvalR env inFn ls (.call "current" [.var x]) v ↔
+        v = .bool (venv.currentResources[j]?.getD false) ∧ (lookup x env.resources).isSome = true := by
+      intro v
+      constructor
+      · intro h
+        rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
+          ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | ⟨y, -, h3, h4⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
+        · rw [hfd'] at h1; cases h1
+        · simp at h1
+        · simp at h1
+        · simp at h2
+        · simp at h2
+        · simp only [List.cons.injEq, Expr.var.injEq, and_true] at h3
+          subst h3
+          rcases h4 with ⟨-, h5, rfl⟩ | ⟨h5, -⟩
+          · exact ⟨by rw [hcur], h5⟩
+          · rw [hany] at h5; cases h5
+        · exact absurd h1 stdlib_current
+        · simp at h1
+      · rintro ⟨rfl, h⟩
+        rw [hcur]; exact .currentSettled hfd' hany h
+    have hex := fun pc S cbs fx => exec_flag (P := P) (venv := venv) (j := j) (pc := pc) (S := S)
+      (L := L) (cbs := cbs) (fx := fx) (i := .currentResource j) (.inr (.inr ⟨rfl, rfl⟩))
+    intro pc S cbs fx hr
+    refine ⟨fun v hv => ?_, fun hh => ?_⟩
+    · obtain ⟨rfl, hs⟩ := (hev v).mp hv
+      obtain ⟨w, hw⟩ := hiff.mp hs
+      exact ⟨by simp [VTy], hr.step ((hex pc S cbs fx).1 w hw)⟩
+    · obtain ⟨st, hst⟩ := hr.halts hh
+      by_cases hw : ∃ w, venv.resources[j]? = some (some w)
+      · exact ⟨_, (hev _).mpr ⟨rfl, hiff.mpr hw⟩⟩
+      · exact absurd hst ((hex pc S cbs fx).2 (fun w h => hw ⟨w, h⟩) st)
   · cases hc
 
 /-- `FailureResource j`: `none` once resource `j` settled, nothing failing
@@ -510,12 +566,13 @@ theorem case_failure (hfd : p.fns.find? (·.name == "failure") = none)
     constructor
     · intro h
       rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
-        ⟨y, h2, _⟩ | ⟨y, _, h2, h3, h4⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
+        ⟨y, h2, _⟩ | ⟨y, _, h2, h3, h4⟩ | ⟨y, h2, _⟩ | ⟨_, _, h1⟩ | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
       · rw [hfd'] at h1; cases h1
       · simp at h1
       · simp at h1
       · simp at h2
       · simp at h2; subst h2; exact ⟨h3, h4⟩
+      · simp at h2
       · exact absurd h1 stdlib_failure
       · simp at h1
     · rintro ⟨rfl, ⟨h1, h2⟩ | h1⟩
@@ -524,7 +581,7 @@ theorem case_failure (hfd : p.fns.find? (·.name == "failure") = none)
   split at hc
   · rename_i i t0 hl
     simp at hc; obtain ⟨rfl, rfl⟩ := hc
-    obtain ⟨-, -, -, hany, hiff⟩ := hx.agree x _ _ hl
+    obtain ⟨-, -, -, hany, hiff, -⟩ := hx.agree x _ _ hl
     have hev : ∀ v, EvalR env inFn ls (.call "failure" [.var x]) v ↔
         v = .none ∧ (lookup x env.resources).isSome = true := by
       intro v; rw [hinv]; simp [hany]
@@ -544,7 +601,7 @@ theorem case_failure (hfd : p.fns.find? (·.name == "failure") = none)
 /-- Any other roster entry, on its arguments. -/
 theorem case_stdlib (ih : AllOk fuel) {name args ca ts} (hfd : p.fns.find? (·.name == name) = none)
     (hname : ¬ (name = "map" ∨ name = "filter" ∨ name = "pending" ∨ name = "failed" ∨ name = "failure" ∨
-      name = "sortBy"))
+      name = "current" ∨ name = "sortBy"))
     (ha : compileArgs fuel p depth sc n args = .ok (ca, ts))
     (hx : Ctx env inFn ls venv L p sc n) :
     ExprSpec env inFn ls venv P L (.call name args) (ca ++ [.call name args.length]) (rosterTy name ts) := by
@@ -555,7 +612,7 @@ theorem case_stdlib (ih : AllOk fuel) {name args ca ts} (hfd : p.fns.find? (·.n
     constructor
     · intro h
       rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
-        ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | h1 | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
+        ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | ⟨y, h2, _⟩ | h1 | ⟨_, _, _, _, _, _, _, h1, _⟩⟩
       · rw [hfd'] at h1; cases h1
       · exact absurd (.inl h1) hname
       · exact absurd (.inr (.inl h1)) hname
@@ -563,8 +620,9 @@ theorem case_stdlib (ih : AllOk fuel) {name args ca ts} (hfd : p.fns.find? (·.n
         · exact absurd (.inr (.inr (.inl h2))) hname
         · exact absurd (.inr (.inr (.inr (.inl h2)))) hname
       · exact absurd (.inr (.inr (.inr (.inr (.inl h2))))) hname
+      · exact absurd (.inr (.inr (.inr (.inr (.inr (.inl h2)))))) hname
       · exact h1
-      · exact absurd (.inr (.inr (.inr (.inr (.inr h1))))) hname
+      · exact absurd (.inr (.inr (.inr (.inr (.inr (.inr h1)))))) hname
     · rintro ⟨vs, h1, h2⟩; exact .stdlib hfd' h1 h2
   intro pc S cbs fx hr
   have iha := ih.2.1 _ _ _ _ _ _ _ ha _ _ _ _ _ P hx pc S cbs fx hr.left
@@ -660,10 +718,12 @@ theorem sortBy_sem {l ps body dir d} (hfd : env.prog.fns.find? (·.name == "sort
   constructor
   · intro h
     rcases evalR_call_inv h with ⟨_, _, h1, _⟩ | ⟨_, ⟨_, _, _, _, _, h1, _⟩ | ⟨_, _, _, _, _, h1, _⟩ |
-      ⟨y, h2, h3, _⟩ | ⟨y, h2, h3, _⟩ | ⟨_, h1, _⟩ | ⟨l', ps', body', dir', xs, ks, d', -, h2, h3, h4, h5, h6⟩⟩
+      ⟨y, h2, h3, _⟩ | ⟨y, h2, h3, _⟩ | ⟨y, h2, h3, _⟩ | ⟨_, h1, _⟩ |
+      ⟨l', ps', body', dir', xs, ks, d', -, h2, h3, h4, h5, h6⟩⟩
     · rw [hfd] at h1; cases h1
     · simp at h1
     · simp at h1
+    · simp at h3
     · simp at h3
     · simp at h3
     · cases h1 with | cons _ h1 => cases h1 with | cons h1 _ => cases h1

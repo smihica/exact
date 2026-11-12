@@ -281,7 +281,7 @@ internal class ContactStore(private val context: ExtensionContext, private val s
         directories.clear()
     }
 
-    private fun remove(dir: String) { context.file("$dir/x")?.parentFile?.deleteRecursively() }
+    private fun remove(dir: String) { context.directory(dir)?.let { dev.exact.canvas.Files.removeTree(it) } }
 
     // A contact, as read
 
@@ -332,7 +332,7 @@ internal class ContactStore(private val context: ExtensionContext, private val s
                 val path = "$icons/$n-0.${if (bytes.size > 1 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte()) "png" else "jpg"}"
                 val file = context.file(path) ?: return null
                 file.parentFile?.mkdirs()
-                file.writeBytes(bytes)
+                dev.exact.canvas.Files.write(file, bytes)
                 path
             } catch (e: java.io.IOException) { null } catch (e: SecurityException) { null }
         }

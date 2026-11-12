@@ -82,4 +82,4 @@ These are local development servers, not public deployments. Godot has a
 known large-step automation failure; Three.js has unresolved collision failures.
 
 Final outcomes and tracking recommendations belong in
-[LLP 1041.003](../../../llp/1041.003-game-engines-for-agents.research.md).
+LLP 1041.003.

@@ -8,6 +8,9 @@ const dateFormatter = new Intl.DateTimeFormat("en-US", { year: "numeric", timeZo
 const { format } = dateFormatter;
 const parts = dateFormatter.formatToParts.bind(dateFormatter);
 const formatGetter = Object.getOwnPropertyDescriptor(Intl.DateTimeFormat.prototype, "format")!.get!;
+const localTimeOptions = { hour: "numeric", minute: "numeric" } as const;
+const localDateFormatter = new Intl.DateTimeFormat("en-US", localTimeOptions);
+const localDateFormat = localDateFormatter.format;
 const calls: Record<string, () => unknown> = {
   idle: () => "idle",
   now: () => Date.now(),
@@ -82,6 +85,35 @@ function answer(source: string, args: any[]): unknown {
         parts(epochMs).map((part) => part.value).join(""),
         Intl.DateTimeFormat.prototype.formatToParts.call(dateFormatter, epochMs).map((part) => part.value).join(""),
       ].join("/");
+    }
+    case "localDates": {
+      const date = new Date(args[0]);
+      const formats = (timeZone?: string) => [
+        undefined, {}, { timeZone: undefined }, localTimeOptions,
+        Object.assign(Object.create(null), localTimeOptions),
+      ].map(options => {
+        if (timeZone !== undefined) options = { ...options, timeZone };
+        const formatter = new Intl.DateTimeFormat("en-US", options);
+        return [
+          formatter.resolvedOptions().timeZone, formatter.format(date),
+          formatter.formatToParts(date).map(part => part.value).join(""),
+          Intl.DateTimeFormat("en-US", options).format(date),
+          date.toLocaleString("en-US", options),
+          date.toLocaleDateString("en-US", options),
+          date.toLocaleTimeString("en-US", options),
+        ];
+      });
+      // Class instances bypass the argument cache, so this reads the engine's zone.
+      class Options { hour = "numeric" as const; }
+      return JSON.stringify({
+        engineZone: new Intl.DateTimeFormat("en-US", new Options()).resolvedOptions().timeZone,
+        current: formats(), expected: formats(args[1]), pinned: formats("UTC"),
+        held: [
+          localDateFormatter.resolvedOptions().timeZone,
+          localDateFormatter.format(date), localDateFormat(date),
+          localDateFormatter.formatToParts(date).map(part => part.value).join(""),
+        ],
+      });
     }
     default: throw new Error("unknown source " + source);
   }

@@ -31,9 +31,7 @@ impl LayoutTree {
             }
             if let Some(node) = arena.taffy(*slot) {
                 let before = tree.alert_prefixes.get(slot).copied();
-                let children = order::laid_out(arena, *slot, &tree.taffy, node, before, |child| {
-                    arena.taffy(child)
-                });
+                let children = order::laid_out(arena, *slot, before, |child| arena.taffy(child));
                 tree.set_children(node, &children);
             }
         }
@@ -72,9 +70,7 @@ impl LayoutTree {
             }
             let node = nodes[&slot];
             let before = tree.alert_prefixes.get(&slot).copied();
-            let children = order::laid_out(arena, slot, &tree.taffy, node, before, |child| {
-                nodes.get(&child).copied()
-            });
+            let children = order::laid_out(arena, slot, before, |child| nodes.get(&child).copied());
             tree.set_children(node, &children);
         }
         let slots: Vec<u32> = nodes.keys().copied().collect();
@@ -99,9 +95,7 @@ impl LayoutTree {
         } else {
             None
         };
-        let children = order::laid_out(arena, parent, &self.taffy, node, before, |child| {
-            nodes.get(&child).copied()
-        });
+        let children = order::laid_out(arena, parent, before, |child| nodes.get(&child).copied());
         self.set_children(node, &children);
     }
 }

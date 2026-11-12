@@ -580,3 +580,171 @@ fn a_write_line_made_later_and_spelt_in_another_case_still_stops_the_walk() {
     let got = call(&grants, FsOp::ReadFile, &lower.join("inner/secret"), None);
     assert!(got.is_err(), "read outside through the link: {got:?}");
 }
+
+/// The refusal of `file_line` beside `lines` and the line it says to put in
+/// its place, after checking that the replacement admits reading `file`, the
+/// file the refusal names, as spelt.
+fn suggested(lines: &str, file_line: &str, file: &Path) -> (String, String) {
+    let grants = GrantSet::parse(&format!("{lines}\n{file_line}")).unwrap();
+    let said = (call(&grants, FsOp::ReadFile, file, None))
+        .unwrap_err()
+        .to_string();
+    let line = (said.split_once("; replace that line with `"))
+        .and_then(|(_, rest)| rest.split_once("` and use the file under it"))
+        .map(|(line, _)| line.to_string())
+        .unwrap_or_else(|| panic!("{said}"));
+    let grants =
+        GrantSet::parse(&format!("{lines}\n{line}")).unwrap_or_else(|e| panic!("{line}: {e}"));
+    let read = call(&grants, FsOp::ReadFile, file, None);
+    assert!(matches!(read, Ok(FsResult::Bytes(_))), "{line}: {read:?}");
+    (said, line)
+}
+
+/// A line whose last name is a file reaches nothing (exact2 LLP 1133.007
+/// §9): the refusal says so, with the grant's code, and says to replace it
+/// with the line for the directory that holds the file, which admits the
+/// file as the line spells it.
+#[test]
+fn a_line_naming_a_file_is_refused_naming_the_rule_and_the_directory() {
+    let (inside, _, _) = granted("file-line");
+    let file = inside.join("f");
+    std::fs::write(&file, b"bytes").unwrap();
+    let line = format!("fs.read {}", file.display());
+    let (said, suggestion) = suggested("", &line, &file);
+    assert_eq!(
+        said,
+        format!(
+            "denied: {0}: the line `fs.read {0}` names a file, and a native grant line names a \
+             directory, not a file; replace that line with `fs.read {1}` and use the file \
+             under it",
+            file.display(),
+            inside.display()
+        )
+    );
+    assert_eq!(suggestion, format!("fs.read {}", inside.display()));
+    // The directory's line beside the file's still refuses, as the file's
+    // line is the one that matches; replacing it is what admits the file.
+    let parent = format!("fs.read {}", inside.display());
+    assert_eq!(suggested(&parent, &line, &file).1, parent);
+    // A name a grant line must quote is suggested quoted.
+    let spaced = inside.join("My Documents");
+    std::fs::create_dir(&spaced).unwrap();
+    let file = spaced.join("settings.json");
+    std::fs::write(&file, b"{}").unwrap();
+    let quote = |path: &Path| serde_json::to_string(&path.display().to_string()).unwrap();
+    let line = format!("fs.read {}", quote(&file));
+    assert_eq!(
+        suggested("", &line, &file).1,
+        format!("fs.read {}", quote(&spaced))
+    );
+    // The reporter's line, and one spelt through a system link (macOS's
+    // `/etc`), where the system has that file and it is no link.
+    for (path, directory) in [
+        ("/private/etc/hosts", "/private/etc"),
+        ("/etc/hosts", "/etc"),
+    ] {
+        let hosts = Path::new(path);
+        if std::fs::symlink_metadata(hosts).is_ok_and(|m| m.is_file()) {
+            let line = format!("fs.read {path}");
+            assert_eq!(
+                suggested("", &line, hosts).1,
+                format!("fs.read {directory}")
+            );
+        }
+    }
+}
+
+/// A line through a link this user made is refused as that link whatever
+/// the link points to, a file among them.
+#[test]
+fn a_file_line_through_this_users_link_is_refused_as_the_link() {
+    let (inside, outside, _) = granted("file-link");
+    std::fs::write(inside.join("f"), b"file").unwrap();
+    for (name, target, line) in [
+        ("to-file", inside.join("f"), ""),
+        ("to-outside-file", outside.join("secret"), ""),
+        ("to-dir", outside.join("dir"), "inner"),
+    ] {
+        let link = inside.join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let line = if line.is_empty() {
+            link.clone()
+        } else {
+            link.join(line)
+        };
+        let grants = GrantSet::parse(&format!("fs.read {}", line.display())).unwrap();
+        let got = call(&grants, FsOp::ReadFile, &line, None);
+        let real = std::fs::canonicalize(&inside).unwrap().join(name);
+        assert!(refused_at(&got, &real), "{name}: {got:?}");
+        assert!(
+            !format!("{got:?}").contains("names a file"),
+            "{name}: {got:?}"
+        );
+    }
+}
+
+/// What is admitted and what is refused is as before the refusal of a file
+/// line was worded: each case is a set of lines and operations run in turn,
+/// and whether each succeeded. Only the file line's own refusal changed words.
+#[test]
+fn which_operations_are_admitted_is_unchanged() {
+    use FsOp::{Mkdir, ReadFile, WriteFile};
+    let (inside, _, _) = granted("unchanged");
+    std::fs::write(inside.join("f"), b"bytes").unwrap();
+    let d = inside.display();
+    type Steps<'a> = &'a [(FsOp, &'a str, bool)];
+    let cases: &[(&str, String, Steps)] = &[
+        (
+            "a file under a directory line",
+            format!("fs.read {d}"),
+            &[(ReadFile, "f", true), (ReadFile, "missing", false)],
+        ),
+        (
+            "a file line",
+            format!("fs.read {d}/f"),
+            &[(ReadFile, "f", false), (ReadFile, "f/x", false)],
+        ),
+        (
+            "a file line beneath a write line",
+            format!("fs.write {d}\nfs.read {d}/f"),
+            &[
+                (ReadFile, "f", true),
+                (WriteFile, "f", true),
+                (WriteFile, "f", true),
+                (ReadFile, "f", true),
+            ],
+        ),
+        (
+            "a write line on a file not made yet, beneath a write line",
+            format!("fs.write {d}\nfs.write {d}/new\nfs.read {d}"),
+            &[
+                (WriteFile, "new", true),
+                (WriteFile, "new", true),
+                (ReadFile, "new", true),
+            ],
+        ),
+        (
+            "a missing file line",
+            format!("fs.read {d}/absent"),
+            &[(ReadFile, "absent", false)],
+        ),
+        (
+            "a directory line made later",
+            format!("fs.write {d}\nfs.read {d}/later\nfs.write {d}/later"),
+            &[
+                (ReadFile, "later/x", false),
+                (Mkdir, "later", true),
+                (WriteFile, "later/x", true),
+                (ReadFile, "later/x", true),
+            ],
+        ),
+    ];
+    for (case, lines, steps) in cases {
+        let grants = GrantSet::parse(lines).unwrap();
+        for (i, (op, name, admitted)) in steps.iter().enumerate() {
+            let data = (*op == WriteFile).then_some(&b"w"[..]);
+            let got = call(&grants, *op, &inside.join(name), data);
+            assert_eq!(got.is_ok(), *admitted, "{case}, step {i}: {got:?}");
+        }
+    }
+}

@@ -7,8 +7,8 @@
 // - A store read answers a bounded page (D6) whose cursor is a key in the provider's order, `SORT_KEY_PRIMARY` then
 //   `_ID`. Its icons are written to `app:/tmp/contacts/` and deleted with their answer: when the reader is released,
 //   when its page is answered again, at the first call of a launch, and when access narrows to none.
-// - A change is announced, coalesced (D7): while the re-asks one announcement caused are in flight, further changes
-//   set a mark, and one more announcement follows them landing.
+// - With list readers, changes are coalesced (D7): while the re-asks one announcement caused are in flight,
+//   further changes set a mark, and one more announcement follows them landing.
 // - Android has no limited access to contacts and no access picker: `showContactAccessPicker` is iOS's.
 // - Tier 3 (D10): `pickIntentHatch` sees the picker's `Intent` after the module's extras, before it starts, on the
 //   main thread, never under the agent.
@@ -51,7 +51,7 @@ class ContactsModule(context: ExtensionContext) : ExactExtension(context) {
     private val real by lazy { ContactStore(context, ::say, ::changedStore) }
     private var picks = 0
     private var pages = 0
-    /** The live names read and not released, which observing follows. */
+    /** The list names read and not released, which observing follows. */
     private val readers = HashSet<String>()
     /** Each store reader's icon directory, by its arguments. */
     private val directories = HashMap<String, String>()
@@ -146,9 +146,12 @@ class ContactsModule(context: ExtensionContext) : ExactExtension(context) {
 
     // Announcing (D7)
 
-    /** The store changed: announced, or marked while an announcement's re-asks are in flight. */
+    /** A store change always announces status; list re-asks are coalesced. */
     private fun changedStore() {
-        if (readers.isEmpty()) return
+        if (readers.isEmpty()) {
+            context.changed("contacts.contactsStatus")
+            return
+        }
         if (awaiting) { dirty = true; return }
         announce()
     }
@@ -230,7 +233,7 @@ class ContactsModule(context: ExtensionContext) : ExactExtension(context) {
                 val file = context.file(path) ?: return@forEachIndexed
                 try {
                     file.parentFile?.mkdirs()
-                    file.writeBytes(bytes)
+                    dev.exact.canvas.Files.write(file, bytes)
                     paths.put(path)
                 } catch (e: java.io.IOException) { say("icon $path: $e") }
             }
@@ -239,7 +242,7 @@ class ContactsModule(context: ExtensionContext) : ExactExtension(context) {
         return out
     }
 
-    private fun remove(dir: String) { context.file("$dir/x")?.parentFile?.deleteRecursively() }
+    private fun remove(dir: String) { context.directory(dir)?.let { dev.exact.canvas.Files.removeTree(it) } }
 
     private fun emptyStoreIcons() {
         remove("app:/tmp/contacts")

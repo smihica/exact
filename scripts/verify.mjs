@@ -411,7 +411,17 @@ async function webBuild(app) {
   const started = Date.now();
   const r = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.name], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 << 20, env: { ...process.env, EXACT_APP_DIR: app.dir } });
   const output = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-  return { ms: Date.now() - started, code: r.status ?? 1, output, warnings: output.split('\n').filter((l) => /^warning: /.test(l)) };
+  return { ms: Date.now() - started, code: r.status ?? 1, output, warnings: buildWarnings(output) };
+}
+
+/** A build's warning lines, less Cargo's that a crates.io patch every outside workspace must carry (`patchLines`, LLP
+ * 1036.001 D2) is unused in this app's graph. An unused patch of the author's own, or at another path, still counts. */
+export function buildWarnings(output) {
+  const real = (path) => { try { return realpathSync(path); } catch { return resolve(path); } };
+  const required = new Set(Object.entries(Bun.TOML.parse(readFileSync(resolve(ROOT, 'Cargo.toml'), 'utf8')).patch?.['crates-io'] ?? {})
+    .map(([name, spec]) => `${name} ${real(resolve(ROOT, spec.path))}`));
+  const unused = (line) => /^warning: patch `(\S+) v\S+ \((.+)\)` was not used in the crate graph$/.exec(line);
+  return output.split('\n').filter((line) => { const m = unused(line); return /^warning: /.test(line) && !(m && required.has(`${m[1]} ${real(m[2])}`)); });
 }
 
 /** The iOS build a drive needs, or its plan alone (agent-build.mjs): null when fresh, else what it said. */

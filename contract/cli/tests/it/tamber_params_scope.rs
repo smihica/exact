@@ -15,6 +15,37 @@ fn app(name: &str, files: &[(&str, &str)]) -> PathBuf {
 
 const DESIGN: &str = "tamber t\n\ntheme\n  accent.fill = #0a7aff\n";
 
+#[test]
+fn a_components_url_prop_keeps_dotted_param_text() {
+    let url = "https://param.example.com/icon.png";
+    for row in [format!("image \"{url}\""), format!("Icon(src=\"{url}\")")] {
+        let src = format!(
+            "component App\n  view\n    column\n      {row}\ncomponent Icon\n  props\n    src: string\n  view\n    image src\n"
+        );
+        let plan = contract::compile(&src).unwrap_or_else(|e| panic!("{row}: {e:?}"));
+        assert!(
+            plan.strings.iter().any(|s| s == url),
+            "{row}: {:?}",
+            plan.strings
+        );
+    }
+}
+
+#[test]
+fn a_row_cannot_write_a_params_internal_token_name() {
+    let token = contract_lower::params::token_name("app.contract#App", "ink");
+    for (component, row) in [("App", 6), ("Chip", 11)] {
+        let src = format!(
+            "component App\n  params\n    ink: color = \"#333333\"\n  view\n    column\n      image \"symbol:add\" color=\"{}\" aria-label=\"a\"\n      Chip()\ncomponent Chip\n  view\n    column\n      image \"symbol:add\" color=\"{}\" aria-label=\"a\"\n",
+            if component == "App" { &token } else { "param.ink" },
+            if component == "Chip" { &token } else { "red" },
+        );
+        let error = contract::compile(&src).unwrap_err();
+        assert_eq!(error.id, "tamber-param-unknown", "{error:?}");
+        assert_eq!(error.span.line, row, "{error:?}");
+    }
+}
+
 /// This thread's CPU time: what an in-process build's work takes, not the
 /// wall clock, which a loaded machine (the suite's other tests, another
 /// agent's builds) stretches with no work the build did (many ranged params
@@ -557,7 +588,7 @@ fn fold_with_answers_an_unchanged_design_from_the_last() {
     assert!(!params.failed && params.tokens.len() == 1, "{params:?}");
     let vocab = contract_lower::tamber_vocab();
     let began = std::time::Instant::now();
-    let first = contract::tamber_params::fold_with(&design, &params, &vocab)
+    let first = contract::tamber_params::fold_with(&design, &params, &vocab, None)
         .map(|(f, _)| f.tokens.len())
         .ok();
     let cold = began.elapsed();
@@ -566,7 +597,7 @@ fn fold_with_answers_an_unchanged_design_from_the_last() {
     let warm = (0..5)
         .map(|_| {
             let began = std::time::Instant::now();
-            let again = contract::tamber_params::fold_with(&design, &params, &vocab)
+            let again = contract::tamber_params::fold_with(&design, &params, &vocab, None)
                 .map(|(f, _)| f.tokens.len())
                 .ok();
             assert_eq!(again, first);

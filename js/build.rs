@@ -23,6 +23,7 @@ fn main() {
         "package_tool.rs",
         "engine_os.rs",
         "src/shim.cc",
+        "src/console.js",
         "src/pure.js",
         "src/standard.js",
         "src/streams.js",
@@ -107,8 +108,11 @@ fn main() {
         );
     };
 
-    // Ibex installs PURE | CRYPTO | ABORT first. These are only Exact's
-    // trusted policy and data-seam layers; application bytecode follows after
+    // Ibex's abort binding captures console.error at installation.
+    compile(&manifest.join("src/console.js"), &out.join("console.hbc"));
+
+    // Ibex installs PURE | CRYPTO | ABORT before Exact's trusted policy
+    // and data-seam layers; application bytecode follows after
     // Adapter::capture_intrinsics() and Adapter::harden().
     let prelude = [
         "src/pure.js",
@@ -210,6 +214,7 @@ fn main() {
         "timers",
         "outlive",
         "kept-json",
+        "nul",
     ] {
         let source = manifest.join(format!("tests/fixtures/{name}.ts"));
         println!("cargo:rerun-if-changed={}", source.display());

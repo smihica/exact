@@ -1,8 +1,10 @@
 //! What a reader copies a picture from: a decoded image, or a canvas's
 //! rasterized drawing (Canvas 2D, LLP 1056), both premultiplied RGBA.
+use super::{pending, Recorder, Shape, ANIMATED, CLIP_RRECT, IMAGE, IMAGE_DEF, RESTORE};
 use crate::image::Bitmap;
+use crate::paint::Rect4;
 use std::sync::{Arc, Weak};
-use tiny_skia::Pixmap;
+use tiny_skia::{Pixmap, Transform};
 
 /// A picture the reader fetches by id ([`super::CanvasHost::image`]).
 #[derive(Clone)]
@@ -88,6 +90,75 @@ impl WeakPicture {
             }
             _ => false,
         }
+    }
+}
+
+/// The next image's colour, including a fully transparent tint.
+pub(super) const IMAGE_TINT: u32 = 47;
+
+impl Recorder {
+    pub(super) fn image_tint(&mut self, tint: Option<[u8; 4]>) {
+        if let Some(color) = tint {
+            self.ops.extend([IMAGE_TINT, Self::color(color)]);
+        }
+    }
+
+    /// A picture mapped onto `dst` under `clips`.
+    pub(super) fn picture(
+        &mut self,
+        picture: &Picture,
+        dst: Rect4,
+        clips: &[Shape],
+        ts: Transform,
+        tint: Option<[u8; 4]>,
+    ) {
+        let id = self.image_id(picture);
+        if self.image_rrect(id, dst, clips, ts, tint) {
+            return;
+        }
+        self.need(None);
+        self.transform(ts);
+        for c in clips {
+            self.ops.push(CLIP_RRECT);
+            self.rect_radii(c);
+        }
+        self.image_tint(tint);
+        self.ops.extend([IMAGE, id]);
+        for v in [dst.0, dst.1, dst.2, dst.3] {
+            self.f(v);
+        }
+        for _ in clips {
+            self.ops.push(RESTORE);
+        }
+    }
+
+    pub(super) fn image_id(&mut self, image: &Picture) -> u32 {
+        let key = image.key();
+        let now = self.frames;
+        match &mut self.row {
+            Some(row) => row.images.push(key),
+            None => self.again_image(key),
+        }
+        if let Some((id, weak, used)) = self.images.get_mut(&key) {
+            if weak.is(image) {
+                *used = now;
+                return *id;
+            }
+        }
+        let id = self.next_image;
+        self.next_image += 1;
+        self.images.insert(key, (id, image.downgrade(), now));
+        self.ops
+            .extend([IMAGE_DEF, id, image.width(), image.height()]);
+        if let Picture::Bitmap(b) = image {
+            if let Some(file) = b.animation_file() {
+                let path = file.to_string_lossy();
+                self.ops.extend([ANIMATED, id]);
+                self.string(&path);
+            }
+        }
+        pending().insert(id, image.clone());
+        id
     }
 }
 

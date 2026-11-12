@@ -9,8 +9,8 @@
 //   once they are granted, so `requestFullCalendarAccess` answers the status as it is.
 // - The editor's `save` adds the event to the store; Android's calendar apps report nothing, so it answers
 //   `unknown`, as production does unless the calendar app returns `RESULT_OK` (D15).
-// - A change is announced, coalesced (D7): while the re-asks one announcement caused are in flight, further changes
-//   set a mark, and one more announcement follows them landing.
+// - With list readers, changes are coalesced (D7): while the re-asks one announcement caused are in flight,
+//   further changes set a mark, and one more announcement follows them landing.
 // - Tier 3 (D10): `insertIntentHatch` sees the editor's `Intent` after the module's extras, before it starts, on the
 //   main thread, never under the agent.
 package exact.calendar
@@ -38,7 +38,7 @@ class CalendarModule(context: ExtensionContext) : ExactExtension(context) {
     private val book by lazy { AgentCalendar(context.application.assets) }
     /** The Calendar Provider, outside the agent. */
     private val real by lazy { EventStore(context, ::say, ::changedStore) }
-    /** The live names read and not released, which observing follows. */
+    /** The list names read and not released, which observing follows. */
     private val readers = HashSet<String>()
     /** Coalescing (D7): an announcement's re-asks in flight; a change since. */
     private var awaiting = false
@@ -128,7 +128,10 @@ class CalendarModule(context: ExtensionContext) : ExactExtension(context) {
     // Announcing (D7)
 
     private fun changedStore() {
-        if (readers.isEmpty()) return
+        if (readers.isEmpty()) {
+            context.changed("calendar.calendarStatus")
+            return
+        }
         if (awaiting) { dirty = true; return }
         announce()
     }

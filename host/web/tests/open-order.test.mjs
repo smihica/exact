@@ -1,8 +1,8 @@
+import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // The order dialogs and popovers opened in (navigation.js stamps each `exactOpened`), which the runtime's structural
 // reads (`modalLayers`) and the menu on top (input-glue.js) go by, holds when two copies of navigation.js run, as the JS
 // target's agent loads its own (`agent-navigation.js`) after the page has opened things: one copy stamps each opening.
 import { test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 
 const navigation = readFileSync(new URL('../navigation.js', import.meta.url), 'utf8');
