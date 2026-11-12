@@ -17,7 +17,13 @@ impl Painter {
             return;
         };
         self.damage.unsupported = true;
-        if let Some(scrim) = alert.scrim {
+        if let Some(mut scrim) = alert.scrim {
+            if self.kiosk_dialog_fade {
+                // The comparison uses a black 72% scrim tied to dialog opacity,
+                // without another full-screen opacity layer.
+                let progress = (walk.scene.presented)(node.id).opacity.clamp(0., 1.);
+                scrim = [0, 0, 0, (255. * 0.72 * progress) as u8];
+            }
             self.backend.fill(
                 &Shape::rect((0., 0., self.viewport.0, self.viewport.1)),
                 scrim,

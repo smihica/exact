@@ -881,3 +881,60 @@ mod popover_tests;
 #[cfg(test)]
 #[path = "press_point_tests.rs"]
 mod press_point_tests;
+
+#[cfg(test)]
+mod kiosk_tests {
+    use super::*;
+
+    #[test]
+    fn kiosk_scrim_tracks_opening_and_closing_opacity() {
+        let source = r##"keyframes enter
+  from opacity=0
+  to opacity=1
+keyframes leave
+  from opacity=1
+  to opacity=0
+component App
+  state phase = "closed"
+  action open
+    phase = "open"
+    showModal("box")
+  action cancel
+    phase = "closing"
+  view
+    column width="100%" height="100%" background-color="#ffffff"
+      button "Open" testId="open" press=open
+      dialog id="box" closedby="none" width=100 height=100 background-color="#ffffff" animation=(phase == "open" ? "enter 400ms linear both" : "leave 160ms linear both")
+        button "Cancel" testId="cancel" press=cancel
+"##;
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan(source),
+            (),
+            (480., 400.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none());
+        p.serve_overlays();
+        p.brush.kiosk_dialog_fade = true;
+        p.frame();
+        let tap = |p: &mut Presenter<()>, name: &str| {
+            let k = p.host.kernel();
+            let id = k.node_by_key(k.find_by_test_id(name)[0]).unwrap().id;
+            p.tap(id).unwrap();
+            p.run_commands(|| ());
+        };
+        tap(&mut p, "open");
+        for (time, expected) in [(0., 255), (200., 164), (400., 72)] {
+            assert!(p.clock(time).1.is_none());
+            assert_eq!(p.frame().pixel(0, 0).unwrap().red(), expected, "{time}");
+        }
+        tap(&mut p, "cancel");
+        for (time, expected) in [(400., 72), (480., 164), (560., 255)] {
+            assert!(p.clock(time).1.is_none());
+            assert_eq!(p.frame().pixel(0, 0).unwrap().red(), expected, "{time}");
+        }
+    }
+}

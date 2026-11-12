@@ -506,6 +506,7 @@ pub use frame::Frame;
 pub struct Painter {
     /// KIOSK: frames a second to show in the corner (`KIOSK_FPS=1`).
     pub(crate) fps: Option<u32>,
+    pub(crate) kiosk_dialog_fade: bool,
     pub(crate) split: Option<crate::presenter::split::Split>,
     pub(crate) window_canvas: Option<ViewId>,
     pub(crate) direct_canvases: std::collections::BTreeSet<ViewId>,
@@ -633,6 +634,7 @@ impl Painter {
     pub fn new(text: Shared, scale: f32, backend: Box<dyn Backend>) -> Painter {
         Painter {
             fps: None,
+            kiosk_dialog_fade: std::env::var("KIOSK_DIALOG_FADE").as_deref() == Ok("1"),
             split: None,
             window_canvas: None,
             direct_canvases: Default::default(),

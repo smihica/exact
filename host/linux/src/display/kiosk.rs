@@ -25,6 +25,7 @@ pub(super) fn copy_portrait(frame: &Pixmap, dst: &mut [u8], pitch: usize, width:
 pub(super) fn input(event: InputEvent) -> InputEvent {
     match event {
         InputEvent::Absolute(x, y) => InputEvent::Absolute(y, x.map(|x| 1.0 - x)),
+        InputEvent::Touch(x, y) => InputEvent::Touch(y, x.map(|x| 1.0 - x)),
         event => event,
     }
 }
@@ -93,5 +94,13 @@ mod tests {
             InputEvent::Motion(3., 5.)
         );
         assert_eq!(input(InputEvent::Button(false)), InputEvent::Button(false));
+        assert_eq!(
+            input(InputEvent::Touch(Some(0.25), None)),
+            InputEvent::Touch(None, Some(0.75))
+        );
+        assert_eq!(
+            input(InputEvent::TouchButton(false)),
+            InputEvent::TouchButton(false)
+        );
     }
 }
