@@ -384,7 +384,17 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     var color = brush(v, data, dx, dy);
     var clip1 = 1.0;
     if (flags & 128u) != 0u {
-        clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
+        let lo = v.clip1.xy;
+        let hi = lo + v.clip1.zw;
+        let q = abs(v.position.xy - (lo + hi) * 0.5) - v.clip1.zw * 0.5;
+        let reach = max(max(abs(lo.x), abs(lo.y)), max(abs(hi.x), abs(hi.y)));
+        // Cached outer shadows use CSS-reduced clips. Beyond this margin their
+        // coverage is already zero, including the derivative-based AA fringe.
+        if kind == 2u && (data.x >> 16u) == 2u && max(q.x, q.y) >= 4.0 && reach < 32768.0 {
+            clip1 = 0.0;
+        } else {
+            clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
+        }
     }
     switch kind {
         case 0u: { alpha = shape_coverage(v.local, v.rect, v.radii, pixel); }

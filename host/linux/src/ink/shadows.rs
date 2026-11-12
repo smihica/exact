@@ -19,6 +19,7 @@ const MIN_SIGMA: f32 = 4.;
 #[derive(Default)]
 pub(super) struct Shadows {
     enabled: bool,
+    bands: bool,
     /// Scale, reach, size, radii and sigma bits: all the raster reads.
     rasters: HashMap<[u32; 9], TextureId>,
     bytes: u64,
@@ -30,6 +31,7 @@ impl Shadows {
     pub(super) fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            bands: std::env::var("KIOSK_SHADOW_BANDS").as_deref() == Ok("1"),
             ..Self::default()
         }
     }
@@ -115,6 +117,54 @@ impl Ink {
                 ..Default::default()
             },
         ))
+    }
+
+    /// Omit only the interior where the live inverse clip is already zero.
+    /// The four quads retain the full raster's coordinates, tint and clips.
+    pub(super) fn emit_shadow(&mut self, i: Instance, b: Bindings) -> Result<()> {
+        if !self.shadows.bands || b.image == TextureId(0) {
+            return self.emit(i, b);
+        }
+        let [x, y, w, h] = i.clip1;
+        if ![x, y, x + w, y + h].iter().all(|v| v.abs() < 32768.) {
+            return self.emit(i, b);
+        }
+        let radius = i.clip_radii[2..]
+            .iter()
+            .flat_map(|r| [r & 65535, r >> 16])
+            .max()
+            .unwrap() as f32
+            / 16.;
+        // Match shape_coverage's saturated interior: 4px from every edge,
+        // and clear of all corner arcs on one axis (including AA samples).
+        let inset = (radius + 1.).max(4.);
+        let (ix, iy) = if w >= h { (inset, 4.) } else { (4., inset) };
+        let [sw, _, _, sh, tx, ty] = i.xform;
+        let left = ((x + ix).ceil() - tx).clamp(0., sw) / sw;
+        let top = ((y + iy).ceil() - ty).clamp(0., sh) / sh;
+        let right = ((x + w - ix).floor() - tx).clamp(0., sw) / sw;
+        let bottom = ((y + h - iy).floor() - ty).clamp(0., sh) / sh;
+        if left >= right || top >= bottom {
+            return self.emit(i, b);
+        }
+        for rect in [
+            [0., 0., 1., top],
+            [0., bottom, 1., 1. - bottom],
+            [0., top, left, bottom - top],
+            [right, top, 1. - right, bottom - top],
+        ] {
+            if rect[2] > 0. && rect[3] > 0. {
+                self.emit(
+                    Instance {
+                        rect,
+                        uv: rect,
+                        ..i
+                    },
+                    b,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// The shadow's alpha at device scale, the quad's origin at the texture's.

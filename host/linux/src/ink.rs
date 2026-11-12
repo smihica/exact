@@ -570,7 +570,7 @@ impl Backend for Ink {
         }
         let result = self
             .cached_shadow(i, reach)
-            .and_then(|(i, b)| self.emit(i, b));
+            .and_then(|(i, b)| self.emit_shadow(i, b));
         self.accept(result);
         true
     }

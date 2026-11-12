@@ -43,6 +43,7 @@ fn a_rastered_shadow_draws_as_the_analytic_one_wherever_it_lands() {
     analytic.shadows = Shadows::new(false);
     let mut cached = Ink::new().unwrap();
     cached.shadows = Shadows::new(true);
+    cached.shadows.bands = true;
     for (n, scale) in [1., 1.5, 2.].into_iter().enumerate() {
         let hits = cached.shadows.hits;
         for ink in [&mut analytic, &mut cached] {
@@ -94,6 +95,7 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
     };
     let analytic = draw(&mut ink, 0., 3.).instances[0];
     ink.shadows = Shadows::new(true);
+    ink.shadows.bands = false;
     for dx in [0., 0.375, 7.] {
         let frame = draw(&mut ink, dx, 3.);
         let i = frame.instances[0];
@@ -124,4 +126,76 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
     assert_eq!(frame.instances[0].kind_brush, Kind::Shadow as u32);
     assert!(ink.shadows.full);
     assert_eq!(ink.shadows.rasters.len(), 1);
+}
+
+#[test]
+fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
+    let mut full = Ink::new().unwrap();
+    full.shadows = Shadows::new(true);
+    full.shadows.bands = false;
+    let mut bands = Ink::new().unwrap();
+    bands.shadows = Shadows::new(true);
+    bands.shadows.bands = true;
+    for scale in [1., 1.5, 2.] {
+        for phase in [0., 0.25, 0.5, 0.75] {
+            for ink in [&mut full, &mut bands] {
+                ink.begin(260., 380., scale);
+                ink.push_opacity(0.7);
+                ink.push_clip(
+                    &Shape::new((5., 10., 245., 360.), [25.; 4]),
+                    Transform::identity(),
+                );
+                for (n, (w, h)) in [(180., 40.), (40., 150.), (40., 40.)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let x = 20.3 + phase;
+                    let y = 25.65 + n as f32 * 100. + phase;
+                    let outer = Shape::new((x, y, w, h), [2., 16., 5., 12.]);
+                    // Different offset and spread: the hole belongs to outer, not shape.
+                    let shadow =
+                        Shape::new((x - 9., y + 3., w + 12., h + 12.), [8., 22., 11., 18.]);
+                    assert!(ink.blurred_shadow(
+                        &shadow,
+                        [0, 0, 0, 255],
+                        6.,
+                        &outer,
+                        Transform::identity()
+                    ));
+                    // No covering fill: clipping errors remain visible inside the box.
+                }
+                ink.pop_clip();
+                ink.pop_opacity();
+            }
+            let (max, percent) = difference(&full.finish().unwrap(), &bands.finish().unwrap());
+            assert!(
+                max <= 1 && percent < 0.1,
+                "scale {scale}, phase {phase}: {max}, {percent}%"
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn bands_skip_most_of_a_wide_cards_shadow_quad_without_extra_batches() {
+    let mut ink = Ink::from_device(Selected::Fake(ordered_tests::Fake::default()));
+    ink.shadows = Shadows::new(true);
+    ink.shadows.bands = true;
+    ink.begin(800., 1280., 1.);
+    let outer = Shape::new((32., 50., 736., 160.), [16.; 4]);
+    let shape = Shape::new((32., 54., 736., 160.), [16.; 4]);
+    assert!(ink.blurred_shadow(&shape, SHADOW, 9., &outer, Transform::identity()));
+    let frame = ink.encoder.take_frame();
+    assert_eq!(frame.instances.len(), 4);
+    assert_eq!(frame.batches.len(), 1);
+    let area: f32 = frame
+        .instances
+        .iter()
+        .map(|i| {
+            assert_eq!(i.rect, i.uv);
+            i.rect[2] * i.rect[3]
+        })
+        .sum();
+    assert!(area < 0.4, "fraction of full quad: {area}");
 }
