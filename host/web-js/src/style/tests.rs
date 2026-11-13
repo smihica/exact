@@ -1,5 +1,75 @@
 use super::*;
 
+#[test]
+fn a_native_buttons_cleared_display_matches_the_wasm_face() {
+    let plan = contract::compile(
+        r#"component App
+  state visible = true
+  view
+    button appearance="auto" display=(visible ? "flex" : "none")
+      text "Lock"
+      image "symbol:lock"
+"#,
+    )
+    .unwrap();
+    let js = crate::emit::emit(&plan, false, false).unwrap().js;
+    let start = js.find("v=>v===\"none\"?\"none\":\"grid\"").unwrap();
+    let arguments = js[start..].split("));").next().unwrap();
+    let tree = include_str!("../../tree.js");
+    let at = tree.find("export const mapped = ").unwrap() + "export const mapped = ".len();
+    let mapped = &tree[at..at + tree[at..].find(";\n").unwrap()];
+    let actual = run(
+        &format!("v=>({mapped})(v,{arguments})"),
+        &["", " \t", "flex", "none"],
+    );
+    let sites = crate::emit::Sites::new(&plan).unwrap();
+    let (mut kernel, _) = static_tree(&plan, &sites).unwrap();
+    let mut patch = exact_kernel::StyleProps::default();
+    patch.written.set(StyleId::Display);
+    kernel
+        .apply(
+            1,
+            2,
+            &[Op::SetStyle {
+                id: 1,
+                patch: Box::new(patch),
+            }],
+        )
+        .unwrap();
+    let css = exact_web::host::template::parts(&kernel, &plan, 1)
+        .unwrap()
+        .css;
+    let display = css
+        .split(';')
+        .filter_map(|d| d.strip_prefix("display:"))
+        .next_back()
+        .unwrap();
+    assert_eq!(display, "grid");
+    assert_eq!(
+        actual,
+        serde_json::json!([display, display, display, "none"])
+    );
+}
+
+#[test]
+fn mapped_css_clears_leave_timeline_companions_absent() {
+    let plan = contract::compile(
+        "component App\n  state c = \"\"\n  view\n    view cursor=c animation-timeline=c testId=\"v\"\n",
+    )
+    .unwrap();
+    let js = crate::emit::emit(&plan, false, false).unwrap().js;
+    for (name, clear) in [
+        ("\"cursor\"", true),
+        ("\"--exact-animation-timeline\"", false),
+        ("\"animation-play-state\"", false),
+    ] {
+        let at = js.find(name).unwrap_or_else(|| panic!("{name}:\n{js}"));
+        let write = js[at..].split(";S").next().unwrap();
+        assert!(write.contains("mapped(("), "{name}: {write}");
+        assert_eq!(write.contains(",\"unset\")"), clear, "{name}: {write}");
+    }
+}
+
 /// @ref LLP 1095 D4 — a bound colour naming a theme entry or an
 /// overridden role writes the entry's CSS, as the literal path does.
 #[test]
@@ -119,6 +189,7 @@ fn a_bound_accent_role_leaves_the_inherited_accent_unset() {
 #[test]
 fn mapped_clears_and_invalid_values_keep_declarations_but_none_removes_them() {
     for (id, invalid) in [
+        (StyleId::ZIndex, "2.5"),
         (StyleId::Cursor, "not-a-cursor"),
         (StyleId::ClipPath, "circle(20%)"),
         (StyleId::ColorScheme, "orange"),
@@ -217,6 +288,56 @@ fn bound_font_smoothing_writes_the_prefixed_property() {
     assert_eq!(writes[0].map, None);
     assert_eq!(writes[1].name, "-moz-osx-font-smoothing");
     assert!(writes[1].map.unwrap().contains("grayscale"));
+}
+
+/// The write of `property` on the node with test id `v` in `view`, a view
+/// line under `state s = ""`.
+fn bound_write(view: &str, property: &str) -> String {
+    let source = format!("component App\n  state s = \"\"\n  view\n    {view}\n");
+    let js = crate::emit::emit(&contract::compile(&source).unwrap(), false, false)
+        .unwrap()
+        .js;
+    let at = js
+        .find(&format!(",\"{property}\","))
+        .unwrap_or_else(|| panic!("no {property} write:\n{js}"));
+    js[at..].split(";S").next().unwrap().to_string()
+}
+
+/// A cleared row writes `unset` for each property a value writes, as
+/// css.rs's clear does: the stroke shorthand for its two longhands, Firefox's
+/// font smoothing beside WebKit's, and a bare button's copy of its padding.
+/// (A write with no map is `unset` by rt.js `cssText`.)
+#[test]
+fn a_blank_clears_every_property_its_value_writes() {
+    for (view, property) in [
+        ("text \"a\" -webkit-text-stroke=s", "-webkit-text-stroke"),
+        (
+            "text \"a\" -webkit-font-smoothing=s",
+            "-moz-osx-font-smoothing",
+        ),
+        (
+            "button appearance=\"none\" padding-left=s\n      text \"a\"",
+            "--exact-padding-left",
+        ),
+    ] {
+        let write = bound_write(view, property);
+        assert!(
+            write.contains("mapped(") && write.contains(",\"unset\"))"),
+            "{property}: {write}"
+        );
+    }
+}
+
+/// A bound size on a native button is the author's while it is declared, a
+/// clear included, as the kernel's written bit says a literal one
+/// (element.rs `data-exact-said`).
+#[test]
+fn a_native_buttons_cleared_width_stays_said() {
+    let write = bound_write(
+        "button appearance=\"auto\" width=s\n      text \"a\"",
+        "data-exact-width",
+    );
+    assert!(write.contains("return v==null?null:\"\""), "{write}");
 }
 
 /// LLP 1104 D3: a bound `::placeholder` colour writes css.rs's
@@ -368,10 +489,32 @@ fn a_computed_transition_is_checked_as_an_authors() {
 
 #[test]
 fn bound_spring_transitions_match_the_static_css_writer() {
-    assert_spring_transitions(&TRANSITION_MAP);
+    assert_spring_transitions(&TRANSITION_MAP, false);
 }
 
-pub(crate) fn assert_spring_transitions(map: &str) {
+pub(crate) fn assert_spring_transitions(map: &str, pressed: bool) {
+    let expected = |value: &str| {
+        let mut style = exact_kernel::StyleProps::default();
+        style
+            .set_dynamic(
+                StyleId::Transition,
+                &exact_kernel::StyleValue::Text(value.into()),
+            )
+            .unwrap();
+        if pressed {
+            style
+                .set_dynamic(StyleId::PressScale, &exact_kernel::StyleValue::Number(0.9))
+                .unwrap();
+        }
+        let css = exact_web::css::css_text(&style, &[]).0;
+        css.split("transition:")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    };
     let values = [
         "color -exact-spring()",
         "font-weight -exact-spring(100, 20, 1)",
@@ -387,17 +530,14 @@ pub(crate) fn assert_spring_transitions(map: &str) {
         "color 0.25s ease 0s, color -exact-spring()",
         "all -exact-spring(), color 0.25s ease 0s",
         "translate -exact-spring(), scale -exact-spring(), rotate -exact-spring(), opacity -exact-spring(), height -exact-spring()",
+        // #49: in any ASCII case, as motion reads it.
+        "COLOR -EXACT-SPRING(100, 20, 1)",
+        "All -Exact-Spring() 0S 100MS",
+        "Background-Color -exact-spring(250, 3, 0.01), Opacity 0.25S Ease 0S",
     ];
     let actual = run(map, &values);
     for (i, value) in values.iter().enumerate() {
-        let transitions = exact_motion::Transitions::parse(value).unwrap();
-        let (expected, _) = exact_web::css::transition_css(&transitions);
-        let expected = if expected.is_empty() {
-            "none"
-        } else {
-            &expected
-        };
-        assert_eq!(actual[i], expected, "{value}");
+        assert_eq!(actual[i], expected(value), "{value}");
     }
     let values: Vec<_> = [0.0001, 0.1, 1.0, 100.0, 10000.0]
         .into_iter()
@@ -415,12 +555,7 @@ pub(crate) fn assert_spring_transitions(map: &str) {
         .collect();
     let actual = run(map, &values.iter().map(String::as_str).collect::<Vec<_>>());
     for (i, value) in values.iter().enumerate() {
-        let transitions = exact_motion::Transitions::parse(value).unwrap();
-        assert_eq!(
-            actual[i],
-            exact_web::css::transition_css(&transitions).0,
-            "{value}"
-        );
+        assert_eq!(actual[i], expected(value), "{value}");
     }
 }
 

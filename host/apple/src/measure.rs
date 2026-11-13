@@ -75,6 +75,11 @@ pub struct CRun {
     pub box_height: f32,
     /// Its `vertical-align` length, points: how far it is raised.
     pub box_shift: f32,
+    /// Its inline boxes' padding, border and margin before its first glyph
+    /// and after its last, points (`TextRun::edges`).
+    pub inline_start: f32,
+    /// See `inline_start`.
+    pub inline_end: f32,
 }
 
 /// One request, as the callback sees it.
@@ -371,6 +376,23 @@ fn offer(a: AxisOffer) -> f32 {
     }
 }
 
+pub(crate) fn c_hyphens(hyphens: exact_kernel::Hyphens) -> u8 {
+    match hyphens {
+        exact_kernel::Hyphens::Manual => 0,
+        exact_kernel::Hyphens::None => 1,
+        exact_kernel::Hyphens::Auto => 2,
+    }
+}
+
+/// A kernel run as the callback sees it, its edges with it.
+fn c_run_of(text: &str, run: &exact_kernel::TextRun<'_>) -> CRun {
+    CRun {
+        inline_start: run.edges.start,
+        inline_end: run.edges.end,
+        ..c_run(text, run.style, run.inline)
+    }
+}
+
 pub(crate) fn c_run(text: &str, style: exact_kernel::TextStyle, inline: Option<InlineBox>) -> CRun {
     let b = inline.unwrap_or(InlineBox {
         width: 0.0,
@@ -384,6 +406,8 @@ pub(crate) fn c_run(text: &str, style: exact_kernel::TextStyle, inline: Option<I
         box_width: b.width,
         box_height: b.height,
         box_shift: b.shift,
+        inline_start: 0.0,
+        inline_end: 0.0,
         text: text.as_ptr(),
         len: text.len(),
         font_size: style.font_size,
@@ -500,14 +524,14 @@ impl CallbackMeasurer {
         let single;
         let owned;
         let runs: &[CRun] = if let [run] = request.runs {
-            single = c_run(text(0), run.style, run.inline);
+            single = c_run_of(text(0), run);
             std::slice::from_ref(&single)
         } else {
             owned = request
                 .runs
                 .iter()
                 .enumerate()
-                .map(|(i, r)| c_run(text(i), r.style, r.inline))
+                .map(|(i, r)| c_run_of(text(i), r))
                 .collect::<Vec<CRun>>();
             &owned
         };
@@ -541,11 +565,7 @@ impl CallbackMeasurer {
             exclusion_count: shapes.flat.len(),
             markup: u8::from(request.paragraph.markup == exact_kernel::Markup::Markdown),
             text_indent: request.paragraph.text_indent,
-            hyphens: match request.paragraph.hyphens {
-                exact_kernel::Hyphens::Manual => 0,
-                exact_kernel::Hyphens::None => 1,
-                exact_kernel::Hyphens::Auto => 2,
-            },
+            hyphens: c_hyphens(request.paragraph.hyphens),
             lang: self.language.as_ptr(),
             lang_len: self.language.len(),
             text_box_trim: request.paragraph.text_box_trim as u8,

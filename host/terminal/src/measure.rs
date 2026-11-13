@@ -120,6 +120,12 @@ impl<const PAINT: bool> Wrapped<PAINT> {
     fn cluster(&mut self, glyph: Cluster<'_>) {
         if glyph.text == "\n" {
             self.newline();
+        } else if glyph.text == "\t" {
+            let stop = tab_stop(self.cols);
+            for _ in 0..stop {
+                self.push(Cluster { text: " ", ..glyph });
+            }
+            self.trailing += stop;
         } else if glyph.cols > 0 {
             if glyph.text == " " {
                 if self.keeps || self.cols > 0 {
@@ -144,7 +150,9 @@ impl<const PAINT: bool> Wrapped<PAINT> {
             if glyph.text == "\n" {
                 return (i + 1, false);
             }
-            let space = glyph.text == " ";
+            let tab = glyph.text == "\t";
+            let space = tab || glyph.text == " ";
+            let width = if tab { tab_stop(cols) } else { glyph.cols };
             if !space && glyph.cols > 0 && cols + glyph.cols > limit {
                 if let Some(end) = best {
                     return end;
@@ -158,8 +166,8 @@ impl<const PAINT: bool> Wrapped<PAINT> {
             }
             if space {
                 if self.keeps || cols > 0 {
-                    cols += glyph.cols;
-                    trailing += glyph.cols;
+                    cols += width;
+                    trailing += width;
                 }
             } else if glyph.cols > 0 {
                 cols += glyph.cols;
@@ -309,7 +317,12 @@ pub(crate) fn visit_preserved(
                 return;
             }
             let glyph = cell(cluster, run);
-            if glyph.cols > 0 {
+            if glyph.text == "\t" {
+                for _ in 0..tab_stop(col) {
+                    each(row, col, " ", 1, run);
+                    col += 1;
+                }
+            } else if glyph.cols > 0 {
                 each(row, col, glyph.text, glyph.cols, run);
                 col += glyph.cols;
             }
@@ -322,6 +335,10 @@ fn cell(cluster: &str, run: usize) -> Cluster<'_> {
         ("\n", 0)
     } else if matches!(cluster, "\u{ad}" | "\u{200b}") {
         (cluster, 0)
+    } else if cluster == "\t" {
+        // Only a preserved tab is still one (collapsing makes it a space);
+        // its columns are its line's to give ([`tab_stop`]).
+        ("\t", 1)
     } else if cluster.chars().all(char::is_whitespace)
         && !matches!(cluster, "\u{a0}" | "\u{202f}" | "\u{2007}" | "\u{feff}")
     {
@@ -330,14 +347,24 @@ fn cell(cluster: &str, run: usize) -> Cluster<'_> {
         // A control character is never drawn as itself (LLP 1101 D7).
         ("\u{fffd}", 1)
     } else {
-        (cluster, cluster.width().max(1))
+        // A zero-width cluster (a format character, Unicode category Cf,
+        // such as U+FEFF or U+200E) advances no column in a terminal, so it
+        // takes none and is not drawn (UAX #11).
+        (cluster, cluster.width())
     };
     Cluster { text, cols, run }
 }
 
+/// The columns a preserved tab at `col` takes: to the next stop of eight,
+/// `tab-size`'s initial value (CSS Text 3 §4.2; LLP 1001).
+fn tab_stop(col: usize) -> usize {
+    8 - col % 8
+}
+
 /// LLP 1104 D7: the terminal drops the symbol and paints the title, or
-/// the accessible label of a symbol-only face. Measurement and paint share
-/// this wrap, with one cell of chrome on each side.
+/// the accessible label of a symbol-only face, and a tab's badge (LLP
+/// 1075.003 §9.9) after it in parentheses. Measurement and paint share this
+/// wrap, with one cell of chrome on each side.
 pub(crate) fn button_lines(
     face: &PressFace,
     style: &ButtonFaceStyle,
@@ -348,9 +375,15 @@ pub(crate) fn button_lines(
         .as_deref()
         .or(face.label.as_deref())
         .unwrap_or("");
+    let text = match face.badge.as_deref() {
+        Some(badge) if title.is_empty() => format!("({badge})"),
+        Some(badge) => format!("{title} ({badge})"),
+        None => title.to_owned(),
+    };
     let runs = [TextRun {
-        text: title.into(),
+        text: text.into(),
         style: exact_kernel::text::TextStyle::from_style(&style.title),
+        edges: Default::default(),
         inline: None,
     }];
     let (limit, min) = match width {
@@ -498,6 +531,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             assert_layout(&runs, &paragraph, Some(limit), false, &expected);
@@ -538,7 +572,7 @@ mod tests {
                 "a\t\u{ad}b",
                 WhiteSpace::PreWrap,
                 2,
-                vec![("a ", 2), ("b", 1)],
+                vec![("a       ", 8), ("b", 1)],
             ),
             (
                 "a  \u{ad}b",
@@ -568,11 +602,13 @@ mod tests {
                     TextRun {
                         text: text[..split].into(),
                         style: paragraph.strut,
+                        edges: Default::default(),
                         inline: None,
                     },
                     TextRun {
                         text: text[split..].into(),
                         style: second,
+                        edges: Default::default(),
                         inline: None,
                     },
                 ];
@@ -596,6 +632,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             for mode in [
@@ -633,11 +670,13 @@ mod tests {
                     TextRun {
                         text: text[..split].into(),
                         style: paragraph.strut,
+                        edges: Default::default(),
                         inline: None,
                     },
                     TextRun {
                         text: text[split..].into(),
                         style: second,
+                        edges: Default::default(),
                         inline: None,
                     },
                 ];
@@ -675,6 +714,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             for mode in [
@@ -714,6 +754,7 @@ mod tests {
         let runs = [TextRun {
             text: "👩🏽‍💻\u{200b}é界".into(),
             style: paragraph.strut,
+            edges: Default::default(),
             inline: None,
         }];
         assert_layout(
@@ -731,6 +772,7 @@ mod tests {
         let runs = ["ab\u{ad}", "cd\u{200b}", "界\u{1b}"].map(|text| TextRun {
             text: text.into(),
             style: paragraph.strut,
+            edges: Default::default(),
             inline: None,
         });
         for space in [
@@ -770,6 +812,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.as_str().into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             for white_space in [WhiteSpace::Normal, WhiteSpace::Nowrap, WhiteSpace::PreLine] {
@@ -785,6 +828,7 @@ mod tests {
                 let runs = [TextRun {
                     text: text.as_str().into(),
                     style: paragraph.strut,
+                    edges: Default::default(),
                     inline: None,
                 }];
                 paragraph.white_space = WhiteSpace::Normal;
@@ -799,6 +843,7 @@ mod tests {
         let runs = [TextRun {
             text: "".into(),
             style: TextStyle::from_style(&style),
+            edges: Default::default(),
             inline: None,
         }];
         for width in [
@@ -837,6 +882,7 @@ mod tests {
                 let runs = [&text[..split], &text[split..]].map(|text| TextRun {
                     text: text.into(),
                     style: TextStyle::from_style(&style),
+                    edges: Default::default(),
                     inline: None,
                 });
                 for (space, wrapping) in [
@@ -1124,6 +1170,7 @@ mod tests {
         let runs = ["  ab", "c 界 é\nxy  "].map(|text| TextRun {
             text: text.into(),
             style: TextStyle::from_style(&style),
+            edges: Default::default(),
             inline: None,
         });
         for (white_space, limit, clamp, expected) in [
@@ -1173,11 +1220,12 @@ mod tests {
     #[test]
     fn nonbreaking_spaces_stay_in_the_word() {
         let mut paragraph = Paragraph::from_style(&StyleProps::default());
-        for space in ['\u{a0}', '\u{202f}', '\u{2007}', '\u{feff}'] {
+        for space in ['\u{a0}', '\u{202f}', '\u{2007}'] {
             let text = format!("XX{space}YY");
             let runs = [TextRun {
                 text: text.as_str().into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             for white_space in [
@@ -1207,6 +1255,22 @@ mod tests {
         }
     }
 
+    /// U+FEFF joins the words as a no-break space does, and takes no column.
+    #[test]
+    fn a_zero_width_no_break_space_joins_in_no_column() {
+        let mut paragraph = Paragraph::from_style(&StyleProps::default());
+        let runs = [TextRun {
+            text: "XX\u{feff}YY".into(),
+            style: paragraph.strut,
+            edges: Default::default(),
+            inline: None,
+        }];
+        for white_space in [WhiteSpace::Normal, WhiteSpace::Pre, WhiteSpace::PreWrap] {
+            paragraph.white_space = white_space;
+            assert_layout(&runs, &paragraph, Some(4), false, &[("XXYY", 4)]);
+        }
+    }
+
     #[test]
     fn ordinary_spaces_tabs_and_newlines_keep_their_breaks() {
         let mut paragraph = Paragraph::from_style(&StyleProps::default());
@@ -1219,6 +1283,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             let lines = wrap(&runs, &paragraph, Some(4), false);
@@ -1247,6 +1312,7 @@ mod tests {
             let runs = [TextRun {
                 text: text.into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             let lines = wrap(&runs, &paragraph, Some(4), false);
@@ -1271,6 +1337,7 @@ mod tests {
             let runs = [TextRun {
                 text: source.as_str().into(),
                 style: paragraph.strut,
+                edges: Default::default(),
                 inline: None,
             }];
             let lines = wrap(&runs, &paragraph, Some(4), false);
@@ -1300,6 +1367,7 @@ mod tests {
         let runs = [TextRun {
             text: "A\r\nB".into(),
             style: paragraph.strut,
+            edges: Default::default(),
             inline: None,
         }];
         let lines = wrap(&runs, &paragraph, Some(80), false);

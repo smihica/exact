@@ -68,6 +68,36 @@ final class AccessibilityTreeIOSTests: XCTestCase {
         XCTAssertEqual(image.accessibilityValue, image.rangeValueText)
     }
 
+    /// A `spinbutton`'s value is its number, whatever its bounds, as WebKit
+    /// on iOS speaks one and `UIPickerView`'s adjustable column its row ("3");
+    /// ARIA gives the role no default bounds. A slider's is a percentage of
+    /// its range, as `UISlider` speaks its own ("30%").
+    func testASpinbuttonSpeaksItsNumberAndASliderItsPercentage() throws {
+        let p = try fixture()
+        func range(_ id: UInt32, _ props: [String: String]) -> NodeView {
+            let node = NodeView(id: id, kind: "view", presenter: p)
+            p.views[node.id] = node
+            p.root.addSubview(node)
+            node.frame = CGRect(x: 0, y: 300 + CGFloat(id - 40) * 30, width: 100, height: 24)
+            node.applyProps(set: props, clear: [])
+            return node
+        }
+        let bounded = range(40, ["accessibilityRole": "spinbutton", "accessibilityLabel": "Quantity",
+                                 "accessibilityValueNow": "3", "accessibilityValueMin": "1", "accessibilityValueMax": "99"])
+        let unbounded = range(41, ["accessibilityRole": "spinbutton", "accessibilityValueNow": "3"])
+        let slider = range(42, ["accessibilityRole": "slider", "accessibilityValueNow": "30"])
+        XCTAssertTrue(bounded.isAccessibilityElement)
+        XCTAssertEqual(bounded.accessibilityValue, "3", "not 2%, its place between 1 and 99")
+        XCTAssertEqual(unbounded.accessibilityValue, "3", "not 3%, as if bounded by 0 and 100")
+        XCTAssertNil(unbounded.rangeNumbers?.min)
+        XCTAssertNil(unbounded.rangeNumbers?.max)
+        XCTAssertEqual(slider.accessibilityValue, NumberFormatter.localizedString(from: 0.3, number: .percent))
+        bounded.applyProps(set: ["accessibilityValueNow": "2.5"], clear: [])
+        XCTAssertEqual(bounded.accessibilityValue, NumberFormatter.localizedString(from: 2.5, number: .decimal))
+        bounded.applyProps(set: ["accessibilityValueText": "3 tickets"], clear: [])
+        XCTAssertEqual(bounded.accessibilityValue, "3 tickets", "`aria-valuetext` first")
+    }
+
     /// A native control is named by `aria-labelledby` as by `aria-label`
     /// (accname), and follows the text it names.
     func testANativeCheckboxIsNamedByTheTextItsLabelledbyNames() throws {
@@ -204,6 +234,34 @@ final class AccessibilityTreeIOSTests: XCTestCase {
         return p
     }
     private func elements(_ ax: [String: Any]) -> [[String: Any]] { ax["elements"] as? [[String: Any]] ?? [] }
+
+    func testProjectedSegmentsJoinTheirAuthoredTabsAndStaySuppressedWithTheirOwner() throws {
+        guard Presenter.axRuntimeLoaded else { throw missing("accessibility", "UIKit's segments need its accessibility runtime") }
+        let p = try fixture()
+        p.apply(wireBatch([
+            ["op": "create", "id": 30, "kind": "view", "props": ["accessibilityRole": "tablist"]],
+            ["op": "create", "id": 31, "kind": "button", "handlers": ["press"], "props": ["accessibilityRole": "tab", "testId": "one"]],
+            ["op": "create", "id": 32, "kind": "button", "handlers": ["press"], "props": ["accessibilityRole": "tab", "testId": "two"]],
+            ["op": "create", "id": 33, "kind": "text", "props": ["text": "One"]],
+            ["op": "create", "id": 34, "kind": "text", "props": ["text": "Two"]],
+            ["op": "children", "id": 31, "ids": [33]], ["op": "children", "id": 32, "ids": [34]],
+            ["op": "children", "id": 30, "ids": [31, 32]], ["op": "children", "id": 1, "ids": [2, 3, 4, 30]],
+            ["op": "frame", "id": 30, "x": 0, "y": 220, "w": 250, "h": 40],
+        ]))
+        let control = try XCTUnwrap(p.segments.control(of: 30))
+        control.layoutIfNeeded()
+        func projected() -> [[String: Any]] { elements(p.axElements(roots: [p.viewport])).filter { ($0["name"] as? String).map(["One", "Two"].contains) == true } }
+        let shown = projected()
+        XCTAssertEqual(Set(shown.compactMap { $0["id"] as? UInt32 }), [31, 32])
+        XCTAssertEqual(Set(shown.compactMap { $0["testId"] as? String }), ["one", "two"])
+        XCTAssertTrue(shown.allSatisfy { $0["via"] as? String == "owner" })
+        for prop in ["accessibilityElementsHidden", "inert"] {
+            p.apply(wireBatch([["op": "props", "id": 30, "set": [prop: "true"]]]))
+            XCTAssertTrue(projected().isEmpty)
+            p.apply(wireBatch([["op": "props", "id": 30, "clear": [prop]]]))
+            XCTAssertEqual(projected().count, 2)
+        }
+    }
     private func element(_ ax: [String: Any], _ testId: String) -> [String: Any]? { elements(ax).first { $0["testId"] as? String == testId } }
 
     /// LLP 1115.000 D11.6: a `link` is a link to VoiceOver. The tag lowers

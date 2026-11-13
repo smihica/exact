@@ -559,6 +559,14 @@ extensions' factors; a model that uses either extension's textures
 `sheenColorTexture`, `sheenRoughnessTexture`) is refused by name, and so is one
 that lists either extension as required, which the glTF reader does not accept.
 
+Generated models can set `clearcoat_mask_from_alpha: true` to multiply the coat
+factor by the alpha channel of `metallic_roughness_texture`. Green and blue keep
+their roughness and metallic meanings; alpha is linear and uses that texture's
+UV transform. This lets paint or engravings stay uncoated without another draw
+or sampler. The default is false, so existing alpha channels keep their pixels
+and model bytes. A missing texture acts as alpha one. This packing is opt-in;
+the baker still refuses the glTF extensions' separate layer textures.
+
 A material with either layer draws in a *layered* pipeline, a variant key bit
 (`MODEL_LAYERED`) beside the others above, made on first use like them and with
 its own uniform-driven fallback; a material with neither never compiles or runs
@@ -689,6 +697,35 @@ derivatives; baked models contain no tangent arrays. The shader reads a normal
 map's XY and rebuilds Z (`sqrt(1 − x² − y²)`), so RGBA8, BC5 and two-channel ASTC
 draw alike. Material UV transforms apply separately to every texture.
 
+### Contract performance
+
+Contract's opt-in `exactCanvasPerformance("surface")` read receives a bounded
+snapshot at most once per second. The renderer reports the last submitted frame's
+actual pixels, render scale, effective pixel ratio, MSAA and submitted work counts.
+Frame counts and CPU tick/feed/encode means and maxima cover the window since the
+previous snapshot. Late/missed frames and the longest gap describe inter-frame
+intervals completed in that window; an interval may start before its snapshot window.
+An idle poll has no completed interval to report. Enabling, restarting the scene
+or restoring a save starts a fresh window; disabling drops these counters.
+`windowMs` measures monotonic time since the previous snapshot; `fps` is submitted
+frames per second over that window, not display or compositor FPS. An idle window
+reports zero. The first snapshot, virtual-clock snapshots and the first after a
+clock-mode change leave these fields unavailable. A clock-mode change discards the
+open measurement window. Delayed snapshots use their actual elapsed time.
+The cadence comparison honors the canvas frame cap and excludes virtual time and
+the first frame after rest. `quality`, `maxFps` and `idle` are
+read when the snapshot is taken, not over the window (`thermalState` is the last
+drawn frame's, absent from a window with no drawn frame), as are `textureMemoryBytes`
+(the delivered textures the renderer holds, retired ones included, render
+targets excluded) and
+`geometryMemoryBytes` (the shared vertex and index buffers' allocated bytes);
+the GPU module adds the process's footprint and, on the web, its own heap. `audioState` is the game audio output's (`running`, `suspended`,
+`interrupted`, `closed`) where the target has a player. CPU encoding is distinct
+from queue submission (`cpuSubmitMs`, which the GPU module times) and GPU
+execution (`gpuMs`: each frame's timestamp envelope, measured by the agent's
+timing without its samples or trace while only a reader asks); unsupported
+timing, memory and audio fields stay unavailable. No simulation state, save or hash contains these readings.
+
 ### Texture families
 
 A `.tex` record is RGBA8, BC4, BC5, BC7 or ASTC 4×4 (`TextureData.format`,
@@ -696,7 +733,9 @@ A `.tex` record is RGBA8, BC4, BC5, BC7 or ASTC 4×4 (`TextureData.format`,
 delivered, whole blocks per level, and never transcodes. The device requests every
 available block family (`exact_gpu::requested_features`); `Surface::device_ready`
 passes the granted features, and the surface chooses **BC** when granted, else
-**ASTC**, else **RGBA8**. Worlds and models name the authored `x.tex`; the surface asks
+**ASTC**, else **RGBA8**, among the families its target's bundle holds
+(`TextureFamily::BUNDLED`): BC alone on macOS, ASTC alone on iOS and tvOS, so an
+M-series iPad, which grants both, takes ASTC there. Worlds and models name the authored `x.tex`; the surface asks
 the host for `x.bc.tex`, `x.astc.tex` or `x.tex` and maps the delivered file back,
 so hosts fetch by name and the simulation never sees a family. A headless surface
 has no device and fetches RGBA8, which validates and hashes like any delivery
@@ -746,6 +785,20 @@ changed too, until every texture of its new set is
 resident, so a skin never draws with mixed maps; the feed watches the names it waits
 for and rebuilds when one arrives.
 A variant is reclaimed with its material or when one of its textures retires.
+
+`MaterialOverride.roughness`, `metallic`, `clearcoat` and `clearcoat_roughness`
+replace those material factors on one instance. `None` keeps the authored
+factor; finite values are clamped to [0, 1], and non-finite values are ignored.
+Roughness and metallic still multiply their texture channels. A zero coat
+removes its reflection and attenuation; its roughness has the same .045 floor
+as an authored coat. Unlit and custom materials ignore these factors.
+
+The factors live in the optional look table. Their first appearance or removal
+can rebatch; later values patch in place. Enabling a coat on an uncoated material selects a layered variant, shared by all its
+coated instances with the same textures; it may compile that family on first
+use. Changing factors within that family creates no new material or texture.
+Turning off an added coat returns to the uncoated family. The instance record does
+not grow, and simulation state, saves and hashes are unchanged.
 `MaterialOverride.uv_offset` adds to the coordinates the material's base colour and
 emission textures are sampled at on that instance, after the material's
 `KHR_texture_transform` (`MaterialData.uv_transforms`), in the transformed space, so
@@ -758,6 +811,12 @@ gets a run of one neutral entry, which adds nothing, and a record with merged-pa
 looks carries it in each part's entry. Changing it patches those entries in place;
 its first appearance, or removal, changes the table's shape and rebatches. Instances
 without one draw as before (`surface_tests::cosmetics::a_blended_material_s_uv_offset_scrolls_its_texture_in_place`).
+For motion between world ticks, also write `uv_offset_previous`, the offset at
+the previous tick. The renderer interpolates the pair at each display frame,
+using the same alpha as model poses; neither the world nor its hash changes.
+Omitting it keeps the current offset at every frame. Keep scrolling coordinates
+unwrapped across repeats: interpolate 0.9 to 1.1, then let the sampler wrap.
+Base colour and emission use the same offset, including unlit emission.
 
 When an entity's `Mesh` names a model that cannot draw yet, the feed keeps drawing the
 rigid model (no skin, no animated parts) that entity drew at its last rebuild, with the
@@ -982,9 +1041,10 @@ until it has, and the driver asks again.
   so a look frame with particles draws its translucency in a pass of its own, as
   soft particles do, over the attachments the live frame draws into: the HDR
   image, or a direct frame's target, with the direct frame's format, blending and
-  resolve (its colour and depth kept between the two passes in attachments of the
-  look frame's own, released at the next live frame, so the live frame's stay
-  transient). build.rs assembles every quad module, validates it with naga, and
+  resolve. Particle counting keeps any transient colour or depth in retained
+  attachments of the look frame's own, released at the next live frame. HDR
+  looks share the live resolve image and tone binding, preserving effect
+  bindings. build.rs assembles every quad module, validates it with naga, and
   reflects the probe variants' counter group, from which the renderer takes its
   layout, binding numbers and entry points. Limits, each a gap or a stated
   meaning, not an approximation: GL has no fragment storage writes, and a scene
@@ -1039,9 +1099,10 @@ until it has, and the driver asks again.
   outside the view by the quad's own extent about its anchor, or drawn. An
   entity's word combines all of its drawables: when an opaque part drew, that
   part's word (`drawn`, `custom-material`, `outside-cascade <n>`); when only a
-  blended part, a sprite or an emitter drew, `drawn`, the reason naming which;
+  blended part, a sprite or an emitter drew, `drawn`;
   when none drew, the first one's word (the mesh's, then the sprite's, then the
-  emitter's), the reason naming the others'.
+  emitter's). For multiple drawables, the reason lists each drawable's word and
+  explanation in that order.
 - **Views**: the game's camera; an orbit at a yaw, pitch and distance from the
   centre of the scene; or an orthographic plan from above. An orbit or plan first
   reads a camera frame for the scene's bounds: the cull's sphere of every item it

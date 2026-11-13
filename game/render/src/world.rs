@@ -9,6 +9,7 @@ mod upload;
 mod visibility;
 pub(crate) use scene::snap as trace_snap;
 use scene::Scene;
+pub(crate) use visibility::ParentChanges;
 
 // The same feed algorithm runs against the GPU and the recording test backend.
 /// Pages in one transform write: 2 MiB, so the queue's staging buffer fits a
@@ -24,7 +25,7 @@ pub(crate) trait Writes {
         _: &World,
         _: bool,
         _: bool,
-        _: bool,
+        _: Option<&visibility::ParentChanges>,
         _: bool,
     ) {
     }
@@ -41,11 +42,13 @@ pub(crate) trait Writes {
         false
     }
     /// `material` with the textures `names` gives replacing its own (by
-    /// `MaterialData` slot order), once all of them can draw.
+    /// `MaterialData` slot order), once all of them can draw. `layered`
+    /// enables the coat family without making a variant for each scalar value.
     fn material_variant(
         &mut self,
         _: crate::MaterialId,
         _: &[Option<String>; 5],
+        _: bool,
     ) -> Option<crate::MaterialId> {
         None
     }
@@ -108,7 +111,7 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
         w: &World,
         initial: bool,
         tick: bool,
-        parent: bool,
+        chains: Option<&visibility::ParentChanges>,
         models: bool,
     ) {
         if ASSETS {
@@ -121,7 +124,7 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
                         .map(|(name, model)| (name.clone(), model.digest)),
                 );
             }
-            a.feed(w, initial, tick, parent, models);
+            a.feed(w, initial, tick, chains, models);
         }
     }
     fn model(&self, name: &str) -> Option<crate::models::Draws<'_>> {
@@ -154,9 +157,10 @@ impl<const ASSETS: bool> Writes for crate::renderer::RendererWithAssets<ASSETS> 
         &mut self,
         material: crate::MaterialId,
         names: &[Option<String>; 5],
+        layered: bool,
     ) -> Option<crate::MaterialId> {
         if ASSETS {
-            self.textured_variant(material, names)
+            self.override_variant(material, names, layered)
         } else {
             None
         }
@@ -622,9 +626,6 @@ impl Feed {
             })
             .collect()
     }
-    pub(crate) fn trace_camera(&self, alpha: f32) -> [f64; 3] {
-        self.scene.trace_camera(alpha)
-    }
     /// Frame inputs: interpolated camera and up to 16 positive tick-end lights,
     /// ordered by tick-end camera distance then entity index. Lit samples frame time.
     /// No world queries; retained attachment chains are composed at this alpha.
@@ -640,11 +641,20 @@ impl Feed {
     /// The pointer motion the next frame's camera `MouseLook` turns by: the
     /// simulation's `Sim::unshown_motion` at that frame.
     pub fn unshown_motion(&mut self, motion: glam::Vec2) {
-        self.scene.unshown = motion;
+        self.scene.pointer.unshown = motion;
     }
     /// Whether the fed camera has a `MouseLook` (else no frame reads the motion).
     pub fn mouse_look(&self) -> bool {
-        self.scene.has_look()
+        self.scene.pointer.look.is_some()
+    }
+    /// The camera's contact, if it has a `PointerPan` presentation component.
+    pub fn pointer_pan(&self) -> Option<u64> {
+        self.scene.pointer.contact()
+    }
+    /// Supply the newest host sample for the next frame's `PointerPan`.
+    /// Obtain it from `Sim::frame_pointer`; it is consumed once by `frame`.
+    pub fn pointer_sample(&mut self, sample: Option<exact_game::PointerSample>) {
+        self.scene.pointer.sample = sample;
     }
     /// Frame projection at the CSS-pixel viewport size, including integer scaling.
     pub fn frame_pixels(
@@ -1183,7 +1193,7 @@ impl Feed {
             w,
             initial,
             initial || self.tick != w.tick(),
-            parent_changed,
+            parent_changed.then_some(&self.parent_changes),
             initial || next.assets != old.assets,
         );
         if material {
@@ -1215,7 +1225,7 @@ impl Feed {
             initial || self.tick != w.tick(),
             moved,
             next.live != old.live || next.membership != old.membership,
-            parent_changed,
+            parent_changed.then_some(&self.parent_changes),
         );
         self.tick = w.tick();
         self.versions = Some(next);

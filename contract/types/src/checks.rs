@@ -4,7 +4,7 @@ use super::{
     arms, disagree, err, infer, ComponentTypes, Ref, Scope, Shapes, Sink, Ty, TypeError, Types,
 };
 use contract_syntax::{
-    Attr, Component, Expr, File, Node, Owner, Span, TemplatePart, TypeExpr, UnOp, HOST_COMMANDS,
+    Attr, Component, Expr, File, Node, Owner, Span, TypeExpr, UnOp, HOST_COMMANDS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,54 +106,10 @@ pub(super) fn check_function_cycles(file: &File) -> Result<(), TypeError> {
 
 /// Function calls in expression order, excluding calls outside the authored graph.
 fn calls_in(e: &Expr, indices: &BTreeMap<&str, usize>, out: &mut Vec<usize>) {
-    match e {
-        Expr::Call(n, args, _) => {
-            if let Some(&index) = indices.get(n.as_str()) {
-                out.push(index);
-            }
-            for a in args {
-                calls_in(a, indices, out);
-            }
-        }
-        Expr::Some(x, _)
-        | Expr::Unary(_, x, _)
-        | Expr::Member(x, _, _)
-        | Expr::NamedArg(_, x, _)
-        | Expr::Typed(x, _, _) => calls_in(x, indices, out),
-        Expr::Binary(_, a, b, _) => {
-            calls_in(a, indices, out);
-            calls_in(b, indices, out);
-        }
-        Expr::Ternary(a, b, c, _) => {
-            calls_in(a, indices, out);
-            calls_in(b, indices, out);
-            calls_in(c, indices, out);
-        }
-        Expr::Match {
-            subject,
-            some,
-            none,
-            ..
-        } => {
-            calls_in(subject, indices, out);
-            calls_in(some, indices, out);
-            calls_in(none, indices, out);
-        }
-        Expr::Let { value, body, .. } => {
-            calls_in(value, indices, out);
-            calls_in(body, indices, out);
-        }
-        Expr::Arrow { body, .. } => calls_in(body, indices, out),
-        Expr::Template(parts, _) => {
-            for p in parts {
-                if let TemplatePart::Expr(x) = p {
-                    calls_in(x, indices, out);
-                }
-            }
-        }
-        Expr::Number(..) | Expr::Str(..) | Expr::Bool(..) | Expr::None(_) | Expr::Ident(..) => {}
-        Expr::List(items, _) => items.iter().for_each(|x| calls_in(x, indices, out)),
-    }
+    out.extend(e.walk().filter_map(|e| match e {
+        Expr::Call(n, _, _) => indices.get(n.as_str()).copied(),
+        _ => None,
+    }));
 }
 
 pub(super) use super::enums::accepts_expr;
@@ -308,6 +264,8 @@ impl Shapes {
 }
 
 /// Reject shape cycles before lowering recursively materializes plan types.
+/// The walk keeps its own stack, so a long acyclic chain of shapes reaches
+/// the depth refusal instead of exhausting the native one.
 pub(super) fn check_shape_cycles(file: &File, shapes: &Shapes) -> Result<(), TypeError> {
     let indices: BTreeMap<&str, usize> = file
         .shapes
@@ -315,59 +273,62 @@ pub(super) fn check_shape_cycles(file: &File, shapes: &Shapes) -> Result<(), Typ
         .enumerate()
         .map(|(i, shape)| (shape.name.as_str(), i))
         .collect();
+    // 0: unvisited, 1: on the path, 2: done.
     let mut states = vec![0u8; file.shapes.len()];
-    let mut path = Vec::new();
-    for i in 0..file.shapes.len() {
-        visit_shape(i, file, shapes, &indices, &mut states, &mut path)?;
-    }
-    Ok(())
-}
-
-fn visit_shape(
-    index: usize,
-    file: &File,
-    shapes: &Shapes,
-    indices: &BTreeMap<&str, usize>,
-    states: &mut [u8],
-    path: &mut Vec<String>,
-) -> Result<(), TypeError> {
-    if states[index] == 2 {
-        return Ok(());
-    }
-    states[index] = 1;
-    path.push(file.shapes[index].name.clone());
-    for field in &file.shapes[index].fields {
-        // Wrapper types still depend on their leaf shape. Ask the same
-        // resolver as field typing: primitive names take precedence even if
-        // an authored shape has that spelling.
-        let mut leaf = &field.ty;
-        while let TypeExpr::Option(inner, _) | TypeExpr::List(inner, _) = leaf {
-            leaf = inner;
-        }
-        let Ty::Record(name) = shapes.resolve(leaf)? else {
+    for root in 0..file.shapes.len() {
+        if states[root] != 0 {
             continue;
-        };
-        let Some(&next) = indices.get(name.as_str()) else {
-            continue;
-        };
-        if states[next] == 1 {
-            let start = path.iter().position(|part| part == &name).unwrap_or(0);
-            let mut cycle = path[start..].to_vec();
-            cycle.push(name);
-            return err(
-                "type-shape-recursive",
-                format!(
-                    "shape field `{}` makes a recursive type cycle ({}); plan values are finite trees",
-                    field.name,
-                    cycle.join(" -> ")
-                ),
-                field.span,
-            );
         }
-        visit_shape(next, file, shapes, indices, states, path)?;
+        // The path from `root`, each shape with the next field to follow.
+        let mut path: Vec<(usize, usize)> = vec![(root, 0)];
+        states[root] = 1;
+        while let Some(top) = path.last_mut() {
+            let (index, cursor) = *top;
+            top.1 += 1;
+            let Some(field) = file.shapes[index].fields.get(cursor) else {
+                states[index] = 2;
+                path.pop();
+                continue;
+            };
+            // Wrapper types still depend on their leaf shape. Ask the same
+            // resolver as field typing: primitive names take precedence even if
+            // an authored shape has that spelling.
+            let mut leaf = &field.ty;
+            while let TypeExpr::Option(inner, _) | TypeExpr::List(inner, _) = leaf {
+                leaf = inner;
+            }
+            let Ty::Record(name) = shapes.resolve(leaf)? else {
+                continue;
+            };
+            let Some(&next) = indices.get(name.as_str()) else {
+                continue;
+            };
+            match states[next] {
+                0 => {
+                    states[next] = 1;
+                    path.push((next, 0));
+                }
+                1 => {
+                    let start = path.iter().position(|&(i, _)| i == next).unwrap_or(0);
+                    let mut cycle: Vec<&str> = path[start..]
+                        .iter()
+                        .map(|&(i, _)| file.shapes[i].name.as_str())
+                        .collect();
+                    cycle.push(&name);
+                    return err(
+                        "type-shape-recursive",
+                        format!(
+                            "shape field `{}` makes a recursive type cycle ({}); plan values are finite trees",
+                            field.name,
+                            cycle.join(" -> ")
+                        ),
+                        field.span,
+                    );
+                }
+                _ => {}
+            }
+        }
     }
-    path.pop();
-    states[index] = 2;
     Ok(())
 }
 
@@ -475,7 +436,7 @@ pub(super) fn infer_owned_state_initializers(
             if let Some(e) = super::component::initializer_scope(c, i, &scope, &types.shapes) {
                 return Err(e);
             }
-            ct.slots[i] = infer(&state.expr, &scope, &types.shapes)?;
+            ct.slots[i] = super::component::state_type(state, &scope, &types.shapes)?;
         }
         base.push_name_at(
             1,
@@ -880,7 +841,7 @@ pub(super) fn check_command(
                 "`{name}` is an action of `{owner}`, not in `{component}`'s scope; pass it as an `action` prop or `provide` it"
             ),
             None if matches!(name, "showNotification" | "closeNotification" | "setAppBadge" | "clearAppBadge") => format!(
-                "`{name}` is `@exact/notifications`' (LLP 1133.004): `exact add notifications`, then `use {name} from \"@exact/notifications\"` (`closeNotification` takes `tag=`)"
+                "`{name}` is `@exact/notifications`' (LLP 1133.004): `bun exact.mjs add notifications`, then `use {name} from \"@exact/notifications\"` (`closeNotification` takes `tag=`)"
             ),
             _ => format!(
                 "`{name}` is not a host command; the hosts answer {}",
@@ -926,6 +887,13 @@ pub(super) fn check_command(
         return err(
             "type-window-opacity",
             "`setWindowOpacity(opacity)` takes the window's opacity as a number from 0 (unseen) to 1 (opaque)",
+            span,
+        );
+    }
+    if name == "hideWindow" && !args.is_empty() {
+        return err(
+            "type-hide-window",
+            "`hideWindow()` takes no arguments: the session's window is put away and the app keeps running, as when the person closes it under `keepRunning`; bare `focus()` shows it again",
             span,
         );
     }
@@ -1008,6 +976,9 @@ pub(super) fn check_command(
     if name == "setRootFontSize" {
         return root_font_size_args(args, scope, shapes, span);
     }
+    if name == "setLocale" {
+        return super::strings::set_locale_args(args, scope, shapes, span);
+    }
     // @ref LLP 1021 §5.3.1 — one factor, CSS px per device-independent
     // pixel: 1 is Actual Size.
     if name == "setPageZoom" {
@@ -1042,7 +1013,10 @@ pub(super) fn check_command(
         }
         return Ok(());
     }
-    if matches!(name, "playSound" | "playSounds" | "stopSounds" | "haptic") {
+    if matches!(
+        name,
+        "playSound" | "playSounds" | "stopSounds" | "setSounds" | "haptic"
+    ) {
         return sounds::args(name, args, scope, shapes, span);
     }
     if matches!(name, "requestMIDIAccess" | "sendMIDI") {

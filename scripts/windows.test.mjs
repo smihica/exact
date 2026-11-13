@@ -1,3 +1,4 @@
+import { bakeSourceInputs, inputHashes } from './cargo-dep-info.mjs';
 import {test, expect, spyOn} from 'bun:test';
 import * as crypto from 'node:crypto';
 import assert from 'node:assert/strict';
@@ -5,7 +6,7 @@ import {spawn, spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {createServer, get} from 'node:http';
-import {cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync} from 'node:fs';
+import {cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {dirname, parse, relative, resolve} from 'node:path';
 import {PassThrough} from 'node:stream';
@@ -19,7 +20,7 @@ import {binaryenArchive, binaryenVersion} from './exact.mjs';
 import {buildTreeFile, serveBuildTree, listPublicFiles, publicFileCards, readStaticFile, readStaticFileAsync, staticFile} from '../host/web/serve.mjs';
 import {gameShells} from '../game/app/shells.mjs';
 import {formatProofError, proofFailureRow} from '../game/proof.mjs';
-import {readManifest} from './app.mjs';
+import {pendingBuildInputs, readManifest} from './app.mjs';
 
 test('TypeScript captures accept physical path aliases and reject declarations outside them', async () => {
   const {check, configure} = await import('../js/bake/src/typescript.mjs');
@@ -134,8 +135,8 @@ test('ordinary Windows host manifests admit only the empty host settings object'
 });
 
 test('storage error numbers retain platform meaning and require an exact typed suffix', () => {
-  const source=readFileSync(new URL('../js/src/prelude.js',import.meta.url),'utf8');
-  const mapping=source.slice(source.indexOf('  var windowsStorage ='),source.indexOf('  function storageError('));
+  const source=readFileSync(new URL('../js/src/storage.js',import.meta.url),'utf8');
+  const mapping=source.slice(source.indexOf('    var windowsStorage ='),source.indexOf('    function storageError('));
   const make=marker=>{
     const global={__exact_windows_storage:marker};
     const code=new Function('global',`${mapping}\nreturn storageCode;`)(global);
@@ -805,7 +806,8 @@ test('setup selects supported pinned Binaryen archives on Windows and Unix', () 
 test('SDK CLI entrypoint executes', () => {
   const result=spawnSync(process.execPath,[resolve(import.meta.dir,'exact.mjs'),'--help'],{encoding:'utf8'});
   expect(result.status).toBe(0);
-  expect(result.stdout).toContain('exact setup [--check]');
+  // The verb and its first flag, not the whole usage line, which grows with its options.
+  expect(result.stdout).toMatch(/^\s*exact setup \[--check\b/m);
 });
 
 test('caps command reports the checkout budgets', () => {
@@ -881,6 +883,29 @@ test('a real filesystem helper missing-parent response preserves ENOENT', () => 
   finally { rmSync(root,{recursive:true,force:true}); }
 });
 
+test('rebuilt receipt inputs refresh their digest after an equal-size equal-mtime edit', () => {
+  const root = mkdtempSync(resolve(import.meta.dir, '../target/receipt-digest-'));
+  const source = resolve(root, 'main.rs'), app = {target:root}, old = new Date('2000-01-01T00:00:00Z');
+  const receipt = () => {
+    const hashes = inputHashes(app, {});
+    const build = {binary:{inputs:[{path:source,name:'main.rs',sha256:hashes.of(source, statSync(source))}],missing:[],directories:[]}};
+    hashes.save();
+    return build;
+  };
+  try {
+    writeFileSync(source, 'fn main() { println!("one"); }\n'); utimesSync(source, old, old);
+    const original = receipt();
+    assert.deepEqual(pendingBuildInputs(original), []);
+    assert.deepEqual(receipt(), original, 'an unchanged input retains its identity');
+    writeFileSync(source, 'fn main() { println!("two"); }\n'); utimesSync(source, old, old);
+    assert.deepEqual(pendingBuildInputs(original), ['main.rs']);
+    const rebuilt = receipt();
+    assert.notEqual(rebuilt.binary.inputs[0].sha256, original.binary.inputs[0].sha256);
+    assert.deepEqual(pendingBuildInputs(rebuilt), [], 'the new receipt records the current bytes');
+    assert.deepEqual(receipt(), rebuilt);
+  } finally { rmSync(root, {recursive:true,force:true}); }
+});
+
 test('packaged native freshness rejects changed source and copied binary bytes', () => {
   const root=mkdtempSync(resolve(tmpdir(),'exact-package-receipt-'));
   // Cargo's executable is the crate's; the package names it for the app, as Visual Studio would.
@@ -891,7 +916,11 @@ test('packaged native freshness rejects changed source and copied binary bytes',
     expect(packagedBuildChanges(receipt,root,app)).toEqual(['missing compiler build receipt']);
     mkdirSync(resolve(root,'cargo')); writeFileSync(built,'exe');
     for(const path of [source,binary,gpu]) writeFileSync(path,path===binary?'exe':path);
-    writeFileSync(receipt,JSON.stringify({version:1,binary:{inputs:[{path:source,name:'source',sha256:digest(source)}],missing:[],directories:[]},products:[built,gpu].map(path=>({path,sha256:digest(path)}))}));
+    const build={version:1,binary:{inputs:[{path:source,name:'source',sha256:digest(source)}],missing:[],directories:[]},products:[built,gpu].map(path=>({path,sha256:digest(path)}))};
+    writeFileSync(receipt,JSON.stringify(build));
+    expect(packagedBuildChanges(receipt,root,app)).toEqual(['invalid compiler build receipt']);
+    build.sourceInputs=bakeSourceInputs({dir:root,manifest:{}},[],[root]);
+    writeFileSync(receipt,JSON.stringify(build));
     expect(packagedBuildChanges(receipt,root,app)).toEqual([]);
     writeFileSync(source,'changed'); expect(packagedBuildChanges(receipt,root,app)).toEqual(['source']);
     writeFileSync(source,source); writeFileSync(gpu,'changed'); expect(packagedBuildChanges(receipt,root,app)).toEqual([gpu]);
@@ -906,7 +935,7 @@ test('packaged native freshness verifies executable-relative shader bytes', () =
   const digest=bytes=>createHash('sha256').update(bytes).digest('hex');
   try {
     mkdirSync(resolve(root,'shaders')); writeFileSync(binary,'exe'); writeFileSync(shader,'shader');
-    writeFileSync(receipt,JSON.stringify({version:1,binary:{inputs:[],missing:[],directories:[]},products:[{path:binary,sha256:digest('exe')}]}));
+    writeFileSync(receipt,JSON.stringify({version:1,binary:{inputs:[],missing:[],directories:[]},sourceInputs:bakeSourceInputs({dir:root,manifest:{}},[],[root]),products:[{path:binary,sha256:digest('exe')}]}));
     writeFileSync(resolve(root,'compat.json'),JSON.stringify({embedded:{assets:[{name:'shaders/fog.wgsl',bytes:6,sha256:digest('shader')}]}}));
     const app={id:'com.exact.game',displayName:'game',crate:()=>'game-windows'};
     expect(packagedBuildChanges(receipt,root,app)).toEqual([]);

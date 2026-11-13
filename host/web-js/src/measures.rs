@@ -53,7 +53,9 @@ pub fn css(kind: Kind, value: &str) -> String {
             let medium = relative::MEDIUM;
             format!(
                 "{}rem",
-                exact_web::css::num(n * unit.basis(medium, medium, 1.0) / medium)
+                exact_web::css::num(
+                    n * unit.basis(medium, medium, 1.0, &exact_kernel::Env::default()) / medium
+                )
             )
         }
         Some((unit @ Unit::TextStyleAtMost(_), n)) => unit.capped_css(n),
@@ -323,8 +325,8 @@ pub fn sentinel(kind: Kind, k: u32, i: usize) -> Vec<String> {
     }
 }
 
-/// The name of row `id`'s bound map ([`map`]): one per mix of the kinds it
-/// takes, and an attribute row's of its own.
+/// The name of row `id`'s bound map ([`map`]): token kinds, inheritance,
+/// SVG attributes and the type and base-scale rules distinguish its contents.
 pub fn map_name(id: StyleId, attribute: bool, container: bool, bases: bool) -> String {
     use exact_kernel::style::theme::admits;
     format!(
@@ -355,7 +357,13 @@ pub fn map_name(id: StyleId, attribute: bool, container: bool, bases: bool) -> S
         } else {
             String::new()
         },
-        if attribute { "a" } else { "" },
+        if attribute {
+            "a"
+        } else if id.inherited() {
+            "i"
+        } else {
+            ""
+        },
         // A node with children: its varying type tokens stand (`map`).
         if container && admits(Kind::Type, id) {
             "c"

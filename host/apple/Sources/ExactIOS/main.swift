@@ -54,13 +54,13 @@ final class Adapter: ExactSessionDelegate {
             default: window?.overrideUserInterfaceStyle = .unspecified
             }
         // The app's page in Settings (LLP 1133.002 D11); under the agent, journaled only.
-        // `change` at the second argument's id hears whether it opened (OpenURL.swift `answerOpenURL`).
+        // `change` at the second argument's id hears whether it opened (OpenURL.swift `openURLAnswer`).
         case "openURL" where args.first as? String == UIApplication.openSettingsURLString:
-            let answer = { (opened: Bool) in session.answerOpenURL(args, opened: opened) }
+            let answer = session.openURLAnswer(args)
             session.log("openURL app-settings: opens the app's page in Settings\(agentMode ? " (not under the agent)" : "")")
             if agentMode { answer(true) } else if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url, options: [:], completionHandler: answer) }
         case "openURL":
-            let answer = { (opened: Bool) in session.answerOpenURL(args, opened: opened) }
+            let answer = session.openURLAnswer(args)
             // A scheme the app declares (OpenURL.swift), else the web's, mail's and the phone's.
             if let value = args.first as? String, let url = URL(string: value),
                session.openDeclaredScheme(url, open: { url, done in UIApplication.shared.open(url, options: [:], completionHandler: done) }, answer: answer) { return }
@@ -79,6 +79,8 @@ final class Adapter: ExactSessionDelegate {
         case "focus": session.log("focus window: unsupported: an iOS app is in front or not running")
         // A scene's full screen and opacity are the system's (LLP 1069.010).
         case "exitFullscreen", "setWindowOpacity": session.log("\(name): unsupported: iOS has no window an app fades or takes out of full screen")
+        // An app cannot put its own scene away and keep running (LLP 1133.025 D4).
+        case "hideWindow": session.log("hideWindow: unsupported: iOS has no window an app hides")
         default: FileHandle.standardError.write(Data("exact: unknown command \(name)\n".utf8))
         }
     }
@@ -114,18 +116,7 @@ func watchPlan() {
         return
     }
     devPlanPath = planPath
-    let candidate = ExactDevelopmentPlan(planPath)
-    var last = candidate.hasModule ? [] : candidate.revision
-    let t = DispatchSource.makeTimerSource(queue: .main)
-    t.schedule(deadline: .now() + 0.1, repeating: 0.1)
-    t.setEventHandler {
-        let revision = candidate.revision
-        guard revision != last else { return }
-        last = revision
-        candidate.apply(to: exact)
-    }
-    t.resume()
-    planWatch = t
+    planWatch = ExactDevelopmentPlan(planPath).watch(exact)
 }
 
 /// Announce `ready` after the driver connects and the first frame is applied.
@@ -138,12 +129,12 @@ nonisolated(unsafe) var planRefusal: String?
 func agentReady() {
     guard agentMode, !readySent, session.booted || session.bootError != nil else { return }
     readySent = true
-    Agent.startSocket(ready: ["ready": true, "boot": session.bootMs, "views": session.viewCount, "error": planRefusal ?? session.bootError ?? NSNull(), "pid": Int(getpid())], sessions: [("main", session)])
+    Agent.startSocket(ready: ["ready": true, "boot": session.bootMs, "views": session.viewCount, "error": planRefusal ?? session.bootError ?? session.nativeArtifactFailure ?? NSNull(), "pid": Int(getpid())], sessions: [("main", session)])
 }
 
 /// The one screen: the view fills the controller's view; the plan boots at
 /// the view's first layout (`ExactView.fit`).
-/// The build's launch colour (the manifest's `launch`); unset, the
+/// The build's launch colour (the manifest's `background_color`); unset, the
 /// platform's background, as the system's own launch screen then is and
 /// the view under it (`ExactView`): never a fixed white (LLP 1115 D2).
 let launchColor = launchScreenColor ?? .platformBackground(in: nil)
@@ -211,7 +202,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         }
         session = exact.makeSession(delegate: adapter, label: "main")
         #if !os(tvOS)
-        exact.installNotificationClicks()
+        // A notification's background action that launched the app with no scene boots it with none (LLP 1133.004 stage 2).
+        exact.installNotificationClicks(boot: { $0.bootForWake() }, activate: nil)
         // A wake that launched the app with no scene boots it with none (LLP 1133.017 D7).
         exact.installWakes { session.bootForWake() }
         // A tool call that launched the app with no scene boots it the same way (LLP 1133.023 D7).
@@ -268,6 +260,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
+    func sceneWillEnterForeground(_ scene: UIScene) { ExactLaunch.shared.opened() }
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         guard let ws = scene as? UIWindowScene else { return }
         ExactEnv.stamp("scene")

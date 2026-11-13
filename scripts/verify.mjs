@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-// `bun exact.mjs verify [web|ios|windows|android]` (LLP 1116.004 D7, 1116.005 D7): one command a builder can stop on, where test,
+// `bun exact.mjs verify [web|ios|windows|android]` (LLP 1116.004 D7, 1116.005 D7; unnamed, a host the app ships, app-cli.mjs
+// `shippedHost`): one command a builder can stop on, where test,
 // drives, check and screenshots were three to five turns. It builds when the build is stale (web: the dist's
 // record against its sources, as the driver checks it; iOS: agent-build.mjs `buildFirst`, the plan fast path
 // included), runs the app's tests (app.test.contract and each other `*.test.contract` beside it, app.mjs
@@ -15,8 +16,9 @@
 // its texts compared before and after (LLP 1116.010 D6; `judgeReload` says what it forgives): a screen that reloads into another state
 // ('Card 2 of 3' → '0 / 0') is a note, not a problem, since a game or a draft in progress lives in memory by design (LLP 1116.011 D5);
 // it is a finding only when a saved value came back different (`savedChanges`: a `persist` state, a field showing what the app kept).
-// A native host's cold launch is `/` (LLP 1038 §7), so iOS has no such reload to compare. A refusal
-// the host journaled during the run (`logs`: 'swipeContent … is refused: …') is shown first in the report (LLP 1116.010 D5). One capture of each screen is kept in
+// Native relaunch opens at the launch location (on iOS, the manifest's `start_url` by default), so verify
+// compares end-route reloads only on the web. A refusal the host journaled during the run
+// (`logs`: 'swipeContent … is refused: …') is shown first in the report (LLP 1116.010 D5). One capture of each screen is kept in
 // .exact/verify/ for milestones (four of the first screen: each width and scheme). It prints one short report
 // ending "verify: clean" or "verify: N problems" (`--json`: one object). Exit 1 when the build, a test, a launch
 // or the relaunch fails; check's findings, the relaunch's, those at the largest text size and the compiler's warnings
@@ -45,17 +47,18 @@ import { createRequire } from 'node:module';
 import { availableParallelism, loadavg, networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { findings as feelFindings, summary as feelSummary } from '../host/apple/feel/analyze.mjs';
-import { compilerWarnings, information, windowsWindow } from './app-cli.mjs';
+import { compilerWarnings, information, shippedHost, windowsWindow } from './app-cli.mjs';
 import { guardFlags } from './help.mjs';
 import { holderOf, takePort } from './port-lock.mjs';
-import { backendOriginSelection, privateNetwork } from '../js/bake/src/typescript.mjs';
+import { alive, ancestors, commandLine } from './processes.mjs';
+import { backendOriginSelection, privateNetwork, selectBackendOrigin } from '../js/bake/src/typescript.mjs';
 import { contractVerify, semanticsSummary } from './verify-semantics.mjs';
-import { byRule, groups, ruleOf } from './verify-findings.mjs';
-export { byRule, groups, ruleOf };
-
-import { declaredSettings, settingValues } from '../js/bake/src/__exact_env.mjs';
+import { byRule, groups, ruleOf, largeRemedy, iosNavigationContent, iosTabBar } from './verify-findings.mjs';
+import { cargoDiagnosticFilter } from './cargo-check.mjs';
+export { byRule, groups, ruleOf, largeRemedy };
 
 import { inlineSettings } from '../js/bake/src/__exact_env.mjs';
+import { importsOf, readsDB, serverModules } from './app-imports.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 /** The web's two widths: a phone's, and a desktop window's. */
@@ -73,20 +76,8 @@ const firstLine = (text) => String(text ?? '').split('\n').find((l) => l.trim())
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 // The app's own server (LLP 1116.006 D3). A local origin the data module calls, with any path under it.
-const LOCAL = /\bhttps?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{2,5}(?:\/[\w\-./]*)?/;
+const LOCAL = /\bhttps?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{2,5}(?:\/[\w\-./]*)?/, LOCAL_SOCKET = new RegExp(LOCAL.source.replace('https?', 'wss?'));
 const readIn = (dir, path) => { try { return readFileSync(resolve(dir, path), 'utf8'); } catch { return null; } };
-
-/** The modules of the app's own that `path` imports (`from './x'`, `import './x'`, `import('./x')`, `require('./x')`),
- * as paths in `dir` that exist: `./x` is x, x.ts, x.js, x.mjs or x/index.ts. */
-function importsOf(dir, path) {
-  const found = [], base = resolve(dir, path, '..');
-  for (const [, spec] of (readIn(dir, path) ?? '').matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g)) {
-    const at = resolve(base, spec);
-    const file = [at, `${at}.ts`, `${at}.js`, `${at}.mjs`, `${at}/index.ts`].find((p) => readIn(dir, p) != null);
-    if (file && !relative(dir, file).startsWith('..')) found.push(relative(dir, file));
-  }
-  return found;
-}
 
 /** Whether `origin` is served from this machine: a loopback address, or a private-network one that names
  *  one of this machine's interfaces (a phone's development build reaches the checkout's fixture there). */
@@ -100,24 +91,33 @@ export function onThisMachine(origin) {
 function builtSettings(dir, env, code = readIn(dir, 'app.ts')) {
   try { const { code: built, record } = inlineSettings(code, dir, createRequire(import.meta.url)('rolldown/utils').parseSync, env); return { code: built, values: Object.fromEntries(Object.entries(record).map(([name, s]) => [name, s.value])) }; } catch { return { code, values: {} }; }
 }
-/** The server URL the data module calls: the first local one (`http://127.0.0.1:8787`, localhost) in app.ts as built (a
- * setting's value, not a default it overrides), else in a module of its own it imports (`./api`'s `API`); else null. */
-export function serverUrl(dir, env = process.env) {
-  const at = (text) => text?.match(LOCAL)?.[0].replace(/\/$/, '') ?? null;
-  return at(builtSettings(dir, env).code) ?? importsOf(dir, 'app.ts').map((p) => at(readIn(dir, p))).find(Boolean) ?? null;
+/** `text` with its comments blanked, so a URL a comment names is not taken for one the code calls; as written when
+ * it does not parse. */
+function uncommented(text, path) {
+  if (!text) return text;
+  try {
+    const parsed = createRequire(import.meta.url)('rolldown/utils').parseSync(path, text);
+    if (parsed.errors?.length) return text;
+    for (const c of [...parsed.comments].reverse()) text = text.slice(0, c.start) + ' '.repeat(c.end - c.start) + text.slice(c.end);
+    return text;
+  } catch { return text; }
 }
+/** The server URL the data module calls: a setting's value that is a local URL (`http://127.0.0.1:8787`, localhost), as the
+ * build inlines it; else the first local one in app.ts's code (not its comments), else in a module of its own it imports
+ * (`./api`'s `API`); with no http one, a socket's origin (`ws://…`) is its server's. Null with none. */
+export function serverUrl(dir, env = process.env) { return serverChoice(dir, env).url; }
 
-/** Whether `entry`, or a module of the app's own it imports (a root shim that only imports the backend), reads the
- * database's path from `DB`: `process.env.DB`, `Bun.env.DB`, `env["DB"]`, `const { DB } = process.env`, and a server in
- * another language's (`os.environ["DB"]`, `os.getenv("DB")`, `ENV["DB"]`, Go's `os.Getenv("DB")`). */
-const READS_DB = /\benv\??\.DB\b|\benv\[\s*['"]DB['"]\s*\]|\{[^}]*\bDB\b[^}]*\}\s*=\s*[\w.]*\benv\b|\b(?:environ|ENV)\s*\[\s*['"]DB['"]|\b(?:environ\.get|[Gg]etenv)\(\s*['"]DB['"]/;
-function readsDB(dir, entry) {
-  const seen = new Set([entry]);
-  for (const path of seen) {
-    if (READS_DB.test(readIn(dir, path) ?? '')) return true;
-    for (const next of importsOf(dir, path)) if (seen.size < 40) seen.add(next);
-  }
-  return false;
+/** `serverUrl`'s answer as `{ url, note }`: `note` says which origin it took and why when the code names more than one. */
+export function serverChoice(dir, env = process.env) {
+  const { code, values } = builtSettings(dir, env);
+  const texts = [['app.ts', uncommented(code, 'app.ts')], ...importsOf(dir, 'app.ts').map((p) => [p, uncommented(readIn(dir, p), p)])];
+  const all = (re) => texts.flatMap(([path, t]) => [...(t ?? '').matchAll(new RegExp(re.source, 'g'))].map((m) => ({ path, url: m[0] })));
+  const found = [...all(LOCAL), ...all(LOCAL_SOCKET)].map((f) => ({ ...f, url: f.url.replace(/\/$/, '').replace(/^ws/, 'http') }));
+  const setting = Object.entries(values).map(([name, value]) => ({ name, url: String(value).match(LOCAL)?.[0] ?? String(value).match(LOCAL_SOCKET)?.[0] })).find((s) => s.url);
+  const url = setting ? setting.url.replace(/\/$/, '').replace(/^ws/, 'http') : found[0]?.url ?? null;
+  const origins = [...new Set([...(setting ? [url] : []), ...found.map((f) => f.url)].map((u) => new URL(u).origin))];
+  const why = setting ? `the value of ${setting.name}` : `the first in ${found[0]?.path}'s code`;
+  return { url, note: url && origins.length > 1 ? `the app's code names ${origins.join(', ')}: the server is started at ${url}, ${why}` : null };
 }
 
 /** The app's own server, the `rest` pattern's shape: an entry Bun runs (app.json's `commands.server`, as
@@ -144,7 +144,7 @@ export function appServer(dir, env = process.env) {
   const fixture = /(^|[/\\])fixtures?[/\\]/.test(entry);
   const selected = fixture ? backendOriginSelection(dir, env) : null;
   const local = selected && onThisMachine(selected.origin);
-  const url = selected ? local ? selected.origin : null : serverUrl(dir, env);
+  const chosen = selected ? null : serverChoice(dir, env), url = selected ? local ? selected.origin : null : chosen.url;
   const why = !url ? `${entry} is left alone: app.ts calls no local URL (http://127.0.0.1:<port>), so where the app reaches it is unknown` : null;
   const refusal = url && database && command && !named
     ? `app.json's commands.server (${command.join(' ')}) names no file of the app to read, so whether it opens its database at the path DB names cannot be told: name its entry file in the command, or say it keeps none in app.json: "server": { "database": false }`
@@ -153,7 +153,7 @@ export function appServer(dir, env = process.env) {
     : null;
   const port = url ? Number(new URL(url).port || (new URL(url).protocol === 'https:' ? 443 : 80)) : null;
   if (selected && local) { const at = serverArgs.indexOf('--port'); if (at >= 0) serverArgs[at + 1] = String(port); }
-  return { entry, args: entry === named ? serverArgs : [], database, url, port, why, refusal, settings: builtSettings(dir, env).values, ...(fixture ? { fixture: true } : {}), ...(command ? { command } : {}) };
+  return { entry, args: entry === named ? serverArgs : [], database, url, port, why, refusal, settings: builtSettings(dir, env).values, ...(chosen?.note ? { note: chosen.note } : {}), ...(fixture ? { fixture: true } : {}), ...(command ? { command } : {}) };
 }
 
 // app.ts's settings as `appServer` read them: a server importing it (site's) listens where it looked, as Bun's .env loading may not.
@@ -163,17 +163,24 @@ function serverEnv(server, db) {
   return env;
 }
 
-const serverRun = (server, name) => `${(server.command ?? ['bun', server.entry, ...server.args]).join(' ')} at ${server.url}, ${server.database ? `on an empty database (.exact/${name}/db.sqlite, removed after)` : 'without a database'}`;
+const serverRun = (server, name) => `${(server.command ?? ['bun', server.entry, ...server.args]).join(' ')} at ${server.url}, ${server.database ? `on an empty database (.exact/${name}/db.sqlite, removed after)` : 'without a database'}${server.note ? `; ${server.note}` : ''}`;
 
 /** Whether anything answers HTTP at `url` (any status). */
 export const answering = (url) => fetch(url, { signal: AbortSignal.timeout(1000) }).then(() => true, () => false);
 
+/** The process listening on `server.port`, when the system says: its `pid`, and `holder`, " already answers (pid …:
+ * <command>)" to follow the URL. */
+function portHolder(server) {
+  const pid = spawnSync('lsof', ['-nP', `-iTCP:${server.port}`, '-sTCP:LISTEN', '-Fp'], { encoding: 'utf8' }).stdout?.match(/^p(\d+)/m)?.[1];
+  const command = pid ? commandLine(pid).slice(0, 60) : '';
+  return { pid, holder: ` already answers${pid ? ` (pid ${pid}${command ? `: ${command}` : ''})` : ''}` };
+}
+
 /** The one line a server's URL already answering gets: who holds the port, when the system says, and what to do. A
  * server this did not start is never stopped, nor written to. */
 export function heldLine(server) {
-  const pid = spawnSync('lsof', ['-nP', `-iTCP:${server.port}`, '-sTCP:LISTEN', '-Fp'], { encoding: 'utf8' }).stdout?.match(/^p(\d+)/m)?.[1];
-  const command = pid ? commandLine(pid).slice(0, 60) : '';
-  return `${server.url} already answers${pid ? ` (pid ${pid}${command ? `: ${command}` : ''})` : ''}, and the tests would ${server.database ? "write into that server's database" : 'change that server\'s state'}: stop it (${pid ? `kill ${pid}` : 'Ctrl-C where it runs'}) and run this again, which starts ${server.entry} itself${server.database ? ' on an empty one' : ''}`;
+  const { pid, holder } = portHolder(server);
+  return `${server.url}${holder}, and the tests would ${server.database ? "write into that server's database" : 'change that server\'s state'}: stop it (${pid ? `kill ${pid}` : 'Ctrl-C where it runs'}) and run this again, which starts ${server.entry} itself${server.database ? ' on an empty one' : ''}${server.note ? `; ${server.note}` : ''}`;
 }
 
 /** Keep the URL appServer accepted, including its path and explicit default port, for exact record comparisons. */
@@ -265,14 +272,9 @@ async function started(dir, server, name, forward, give) {
   return { stop, exited: () => child.exitCode, tail };
 }
 
-const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-// A process's command line: `ps` has no Windows build, where CIM's Win32_Process reports it. Empty when neither answers.
-const commandLine = (pid) => (process.platform === 'win32'
-  ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter 'ProcessId=${Number(pid)}').CommandLine`], { encoding: 'utf8' })
-  : spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })).stdout?.trim() ?? '';
-
 /** The app's server for one `agent` drive (LLP 1116.008 D1): null when the app has none, or the URL it calls already answers
- * (the builder's own, or another drive's: used, said nothing of); else started where app.ts calls it, on a database of the
+ * (another drive's: used, said only when on another database; one no drive started, the builder's or another program's:
+ * used, and one line names its pid and command); else started where app.ts calls it, on a database of the
  * drive's own, `.exact/agent/<storage>/db.sqlite` kept for the `--storage` name so a second drive on it sees the first's data
  * (without one, an empty database removed after; `fresh`, a drive that starts its store empty, empties it first, and is
  * refused while another drive or the builder's server is using the app server), and one line says so. `{ stop() }` ends it. Drives that overlap share the
@@ -343,8 +345,10 @@ export async function driveServer(dir, storage, say = (line) => console.error(li
         await stop();
         throw new Error(`agent: ${server.url} answers, but its fixture does not belong to ${realpathSync(dir)}; use --backend http://127.0.0.1:<free-port> or PORT=<free-port> for this checkout`);
       }
-      const other = db && files('server').map(([file]) => { try { return JSON.parse(readIn(lease, file)).db; } catch { return null; } }).find((was) => was && was !== db);
-      if (other) say(`agent: ${server.entry} at ${server.url} is another drive's, on its database (${relative(dir, other)}); this drive uses it`);
+      const records = files('server').filter(([, pid]) => alive(pid)).map(([file]) => { try { return JSON.parse(readIn(lease, file)); } catch { return null; } }).filter((r) => r?.origin === server.url);
+      const other = db && records.map((r) => r.db).find((was) => was && was !== db);
+      if (!records.length) say(`agent: ${server.url}${portHolder(server).holder}, a server no drive started: this drive uses it and its data${server.database ? ', not a database of its own' : ''}; stop it to have the drive start ${server.entry} itself`);
+      else if (other) say(`agent: ${server.entry} at ${server.url} is another drive's, on its database (${relative(dir, other)}); this drive uses it`);
       return { stop };
     }
     if (db) mkdirSync(dirname(db), { recursive: true });
@@ -360,21 +364,9 @@ export async function driveServer(dir, storage, say = (line) => console.error(li
       await stop();
       throw new Error(`agent: ${server.url} answered before this checkout's fixture owned its port; choose another port with --backend or PORT`);
     }
-    say(`agent: started ${server.entry} at ${server.url} for this drive (${!db ? 'no database' : storage ? `database ${relative(dir, db)}, kept for --storage ${storage}` : 'an empty database'}); stopped after`);
+    say(`agent: started ${server.entry} at ${server.url} for this drive (${!db ? 'no database' : storage ? `database ${relative(dir, db)}, kept for --storage ${storage}` : 'an empty database'}); stopped after${server.note ? `; ${server.note}` : ''}`);
     return { stop };
   } finally { if (locked) rmSync(starting, { force: true }); }
-}
-
-/** This process's ancestors' pids, nearest first. */
-function ancestors() {
-  const out = [];
-  for (let pid = process.ppid; pid > 1 && out.length < 32;) {
-    out.push(String(pid));
-    const parent = Number(spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' }).stdout?.trim());
-    if (!Number.isInteger(parent) || parent === pid) break;
-    pid = parent;
-  }
-  return out;
 }
 
 /** `fn` with the app's server running on an empty database, as verify runs it: its exit code, or 1 when the server cannot
@@ -406,7 +398,7 @@ export async function withAppServer(dir, fn, { verb = 'api-test', optional = fal
  * null when fresh, else `{ ms, code, warnings, output }`. */
 async function webBuild(app) {
   const [{ webDist }, { builtAppMatches, jsTargetBuild }, { webChanges }] = await Promise.all([import('./app.mjs'), import('../host/web/serve.mjs'), import('./agent-launch.mjs')]);
-  const dist = webDist();
+  const dist = webDist(app);
   if (await builtAppMatches(dist, app) && jsTargetBuild(dist) && !webChanges(dist, app).all.length) return null;
   const started = Date.now();
   const r = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.name], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 << 20, env: { ...process.env, EXACT_APP_DIR: app.dir } });
@@ -417,26 +409,28 @@ async function webBuild(app) {
 /** A build's warning lines, less Cargo's that a crates.io patch every outside workspace must carry (`patchLines`, LLP
  * 1036.001 D2) is unused in this app's graph. An unused patch of the author's own, or at another path, still counts. */
 export function buildWarnings(output) {
-  const real = (path) => { try { return realpathSync(path); } catch { return resolve(path); } };
-  const required = new Set(Object.entries(Bun.TOML.parse(readFileSync(resolve(ROOT, 'Cargo.toml'), 'utf8')).patch?.['crates-io'] ?? {})
-    .map(([name, spec]) => `${name} ${real(resolve(ROOT, spec.path))}`));
-  const unused = (line) => /^warning: patch `(\S+) v\S+ \((.+)\)` was not used in the crate graph$/.exec(line);
-  return output.split('\n').filter((line) => { const m = unused(line); return /^warning: /.test(line) && !(m && required.has(`${m[1]} ${real(m[2])}`)); });
+  let kept = '';
+  const filter = cargoDiagnosticFilter(text => { kept += text; });
+  filter.write(output); filter.end();
+  return kept.split('\n').filter(line => /^warning: /.test(line));
 }
+
+/** A line a drive's build says that `verify` shows as it comes: the build or the wait starting (minutes, and the report
+ * comes after them), and `logged`'s ticker while it runs. */
+export const buildProgress = line => /^(?:(?:building|waiting) for|\s*still building)/.test(line);
 
 /** The iOS build a drive needs, or its plan alone (agent-build.mjs): null when fresh, else what it said. */
 async function iosBuild(app) {
   const { buildFirst } = await import('./agent-build.mjs');
   const said = [], started = Date.now();
-  // A native build (or the wait for one) is said as it starts too: it is minutes, and the report comes after it.
-  const code = await buildFirst('ios', app, { say: (line) => { said.push(line); if (/^(building|waiting) for/.test(line)) console.error(line); } });
+  const code = await buildFirst('ios', app, { say: (line) => { said.push(line); if (buildProgress(line)) console.error(line); } });
   return said.length || code ? { ms: Date.now() - started, code, said, warnings: [] } : null;
 }
 
 /** The Windows build a drive needs (agent-build.mjs `windowsBuildFirst`): null when fresh, else what it said. */
 async function windowsBuild(app) {
   const { windowsBuildFirst } = await import('./agent-build.mjs'), said = [], started = Date.now();
-  const code = await windowsBuildFirst(app, { say: (line) => { said.push(line); if (/^building for/.test(line)) console.error(line); } });
+  const code = await windowsBuildFirst(app, { say: (line) => { said.push(line); if (buildProgress(line)) console.error(line); } });
   return said.length || code ? { ms: Date.now() - started, code, said, warnings: [] } : null;
 }
 /** A drive's own options on a host: iOS shows UIKit's bars; Windows opens at app.json's window size, as a person sees it. */
@@ -561,11 +555,11 @@ function typedFields(before, after, touched, states) {
 export const draftFields = (before, after, touched, states) => typedFields(before, after, touched, states).drafts;
 
 /** The root states the app says `persist` on (LLP 1116 D5), by name, read from app.contract: only the root's may, and the root is
- * its first component. A trailing comment is not read. */
+ * its first component. A state may name its type (`state saved: string[] = [] persist`). A trailing comment is not read. */
 export function persistedStates(dir) {
   const names = [];
   for (const line of (readIn(dir, 'app.contract') ?? '').split('\n')) {
-    const m = line.replace(/\s\/\/.*$/, '').match(/^\s*state\s+([A-Za-z_][\w-]*)\s*=.*\spersist\s*$/);
+    const m = line.replace(/\s\/\/.*$/, '').match(/^\s*state\s+([A-Za-z_][\w-]*)\s*(?::[^=]*)?=.*\spersist\s*$/);
     if (m) names.push(m[1]);
   }
   return names;
@@ -705,31 +699,11 @@ const ANDROID = 'not on Android yet: check\'s findings (each screen is captured 
 // layout is the builder's (LLP 1115.000 D12.1), and a failure would invite `overflow: hidden`. iOS sets the
 // simulator's own size, which UIKit's controls and Exact's text both follow; the web, where a builder iterates, sets the root
 // font size to iOS's body at that size on the phone's width. Only the kinds of finding a larger text makes are kept, each with
-// a remedy that keeps the text's size: a smaller font is the platform tell this pass exists to prevent.
+// a remedy that keeps the text's size: a smaller font is the platform tell this pass exists to prevent. The web omits
+// what iOS projects into its navigation bar and its tab bar: the web's boxes there do not measure UIKit's title, items
+// and tabs.
 export const LARGEST = 'accessibility-extra-extra-extra-large', LARGEST_PX = 53;
 const LARGE_KINDS = new Set(['overflow', 'clipped', 'overlap', 'squeezed']), PAGES = 6;
-const WRAP = 'wrap the row: flex-wrap="wrap" with a flex-basis in rem on its items (docs/recipes/responsive-columns.md)';
-/** The remedy for a finding at the largest size: never a smaller or fixed font. A text in a list's row (`inRow`) is cut by
- * the row, which wrapping the row does not change: at the accessibility sizes UIKit's cells wrap a label and grow taller,
- * never truncating it, so a `line-clamp` there reads as a tell (round 22's book-club and contacts took one from this
- * remedy). A grouped list's standard cell already hyphenates as its label does. Elsewhere a UILabel wraps at words and breaks
- * between syllables only a word longer than its line (iOS 27), so `hyphens="auto"` is the remedy for a text of one word;
- * on a heading or sentence it hyphenates words a UILabel keeps whole, which round 26's graders named a tell. */
-export function largeRemedy(f, { inRow = false } = {}) {
-  const wide = (f.detail?.need ?? f.detail?.cut ?? [0])[0] > 0;
-  if (f.kind === 'clipped' && inRow && !f.detail?.edge) {
-    return `${wide ? 'give the text more of the row (no px width beside it) and ' : ''}let the row grow taller with its text, as a cell does at this size (no px height on the row or what it holds; no \`line-clamp\`, which cuts what a cell shows whole)`;
-  }
-  const oneWord = typeof f.text === 'string' && f.text.trim() !== '' && !/\s/.test(f.text.trim());
-  if (f.kind === 'clipped') return f.detail?.edge ? 'let the page scroll there (a scroll with flex=1 min-height=0)'
-    : wide && f.detail?.need ? `give it room (no px width on its box), or ${WRAP}; ${oneWord ? 'a word longer than any line breaks between syllables with `hyphens="auto"`, as a UILabel breaks it' : 'not `hyphens="auto"`, which breaks words a UILabel wraps whole'}`
-    : f.detail?.need ? 'let its box grow with its text: no px height on it (a rem size, or none)' : `give the box that cuts it room (no px width or height on it), or ${WRAP}`;
-  if (f.kind === 'squeezed') return `let it keep its words (no min-width: 0 or px width beside it), or ${WRAP}`;
-  // Overlapping cells of a row that stays one line (a week's days) wrap nowhere: UIKit's calendar caps its day numbers, which
-  // grow to 31 points and no further (iOS 27), never shrinking them.
-  if (f.kind === 'overlap') return `${WRAP}; for a row of equal cells that must stay one line (a week's days), cap the size its text grows to, as UIKit's calendar does: font-size="min(-exact-subheadline, 31px)"`;
-  return WRAP;
-}
 /** LLP 1116.020 D4: each font size the app's own Contract fixes (no-tells.mjs `fixedSizesIn`), which no spill shows (a fixed
  * size never grows to spill), and LLP 1116.021 D6's two like it: a symbol sized in points beside text that grows
  * (`fixedSymbolsIn`), and text that breaks inside words (`brokenWordsIn`), the remedy builders reached for when a large
@@ -764,7 +738,7 @@ const contentSize = (udid, size) => spawnSync('xcrun', ['simctl', 'ui', udid, 'c
  * own size is put back after, and when the process ends first. Null on iOS with no simulator to set. */
 /** Where the largest text size's pictures go, this run's (`deviceMain`): one per screen with a finding (LLP 1156.001 D3). */
 let largeShots = null;
-async function largestText(s, screen) {
+export async function largestText(s, screen) {
   const web = s.host === 'web', udid = s.carrier?.udid, was = web ? null : udid && contentSize(udid).stdout?.trim();
   if (!web && !was) return null;
   const started = Date.now(), body = async () => (await s.prefer({})).page?.['root-font-size'];
@@ -784,19 +758,22 @@ async function largestText(s, screen) {
     await s.clock('settle');
     const [{ judge, line, accepts }, tree] = await Promise.all([import('./agent-check.mjs'), s.op({ op: 'tree' })]);
     const nodes = new Map((tree.nodes ?? []).map((n) => [n.id, n])), looked = new Set(), found = new Map();
+    const projected = web ? new Set([...await iosNavigationContent(nodes, async id => (await s.op({ op: 'layout', id })).node?.style), ...iosTabBar(nodes)]) : new Set();
     let obs; const shots = [];
     // A screen at a time, as check reads one: the page is scrolled to the first node with a testId that no reading has
-    // held yet, at most PAGES times (a list's rows off the screen have no cells to read).
+    // held yet, at most PAGES times (a list's rows off the screen have no cells to read). Never to projected content:
+    // scrolling sideways to a header item the bar would size moves the whole page past the viewport.
     for (let page = 0; page < PAGES; page++) {
       obs = await s.op({ op: 'check' });
       for (const it of obs.items ?? []) looked.add(it.id).add(it.of);
       const before = found.size;
-      for (const f of judge(obs, null, { host: web ? 'web' : 'ios' })) if (LARGE_KINDS.has(f.kind) && !accepts(ACCEPT, f, nodes) && !found.has(`${f.kind} ${f.id}`)) found.set(`${f.kind} ${f.id}`, f);
+      const compared = { ...obs, items: (obs.items ?? []).filter(it => !projected.has(it.id) && !projected.has(it.of)) };
+      for (const f of judge(compared, null, { host: web ? 'web' : 'ios' })) if (LARGE_KINDS.has(f.kind) && !accepts(ACCEPT, f, nodes) && !found.has(`${f.kind} ${f.id}`)) found.set(`${f.kind} ${f.id}`, f);
       // Each page as its findings were read, before it scrolls on, so each finding is seen, not reproduced by hand.
       if (found.size > before && largeShots) { const shot = resolve(largeShots.dir, `${largeShots.host}-largest-${++largeShots.n}.png`); if (await s.screenshot(shot).then(() => true, () => false)) shots.push(shot); }
       let moved = false;
       for (const n of tree.nodes ?? []) {
-        if (n.inactive || n.props?.testId == null || looked.has(n.id)) continue;
+        if (n.inactive || n.props?.testId == null || looked.has(n.id) || projected.has(n.id)) continue;
         looked.add(n.id);
         if ((await s.carrier.reveal(n.id).catch(() => null))?.scrolled) { moved = true; break; }
       }
@@ -858,7 +835,7 @@ async function tests(host, app, shots) {
   for (const [i, file] of files.entries()) {
     const first = out.results.length;
     try {
-      const r = await runTests({ host, file, app: app.name, atEnd: (s, t) => atEnd(s, { ...t, index: first + t.index }), ...(i ? { storage: `test${i}` } : {}), ...hostOpen(host, app) });
+      const r = await runTests({ host, file, app: app.selector, atEnd: (s, t) => atEnd(s, { ...t, index: first + t.index }), ...(i ? { storage: `test${i}` } : {}), ...hostOpen(host, app) });
       out.passed += r.passed; out.failed += r.failed;
       // A failure the test did not arrange is a finding (LLP 1146 D4): `runTests` says it in a note.
       out.results.push(...r.results.map(({ name, failures, notes = [], end, store, shots }) => ({ name, file: basename(file), failures, unarranged: notes.filter((n) => n.startsWith('unarranged: ')).map((n) => n.slice(12)), ...(shots ? { shots } : {}), ...(end ? { end } : {}), ...(store ? { store } : {}) })));
@@ -892,7 +869,7 @@ async function largeTour(app) {
   };
   for (const file of authoredTests(app.dir)) {
     if (spent()) break;
-    try { await runTests({ host: 'web', file, app: app.name, size: WEB_SIZES[0], storage: 'verify-tour', atStep }); }
+    try { await runTests({ host: 'web', file, app: app.selector, size: WEB_SIZES[0], storage: 'verify-tour', atStep }); }
     catch { /* the tests' own run says what does not compile */ }
   }
   return read;
@@ -913,7 +890,7 @@ export function tourNews(visited, toured) {
 async function checkAt(host, app, size, store, shots) {
   const [{ open }, { driveStore, removeBrowserProfile }] = await Promise.all([import('./agent.mjs'), import('./agent-launch.mjs')]);
   const fresh = { EXACT_AGENT_STORAGE_FRESH: '1' };
-  const s = await open({ host, app: app.name, storage: store, env: fresh, ...(size ? { size } : hostOpen(host, app)) });
+  const s = await open({ host, app: app.selector, storage: store, env: fresh, ...(size ? { size } : hostOpen(host, app)) });
   try {
     await s.clock('data');
     await s.clock('settle');
@@ -974,13 +951,6 @@ export async function scrollKey(app, { udid, server = null } = {}) {
     probe: PROBE.map((p) => fileDigest(resolve(ROOT, p))) }));
 }
 
-/** A server's entry and the modules of the app's own it imports, transitively (at most 40). */
-function serverModules(dir, entry) {
-  const seen = new Set([entry]);
-  for (const path of seen) for (const next of importsOf(dir, path)) if (seen.size < 40) seen.add(next);
-  return seen;
-}
-
 /** Whether the measurement `last` (`{ key, load }`) stands for this run, whose key is `key` and whose load is `now`:
  * the same key, and timing judged then or not judgeable now either. */
 export const reusable = (last, key, now) => !!key && last?.key === key && (timingJudged(last.load) || !timingJudged(now));
@@ -1012,7 +982,7 @@ async function scrolling(app, shots, { key = null, force = false } = {}) {
     rmSync(out, { recursive: true, force: true });
     mkdirSync(out, { recursive: true });
     writeFileSync(tracePath, '');
-    const s = await open({ host: 'ios', app: app.name, storage: 'verify', env: { EXACT_AGENT_STORAGE_FRESH: '1', ...feel.recorderEnv(tracePath) }, chrome: 'platform', timing: 'platform', touch: 'drag' });
+    const s = await open({ host: 'ios', app: app.selector, storage: 'verify', env: { EXACT_AGENT_STORAGE_FRESH: '1', ...feel.recorderEnv(tracePath) }, chrome: 'platform', timing: 'platform', touch: 'drag' });
     let played;
     try {
       await Bun.sleep(2500); // its first loads, on real time; the accessibility runtime the touch runner turns on
@@ -1083,7 +1053,7 @@ export function pinnedLaunch(test, defaults) {
 /** What a fresh launch shows under `launch`'s facts on an empty scratch store, for `seen`'s comparison. */
 async function freshUnder(host, app, launch, store) {
   const [{ open }, { driveStore, removeBrowserProfile }] = await Promise.all([import('./agent.mjs'), import('./agent-launch.mjs')]);
-  const s = await open({ host, app: app.name, storage: store, env: { EXACT_AGENT_STORAGE_FRESH: '1' }, ...launchOf(launch), ...(host === 'web' ? { size: WEB_SIZES[0] } : hostOpen(host, app)) });
+  const s = await open({ host, app: app.selector, storage: store, env: { EXACT_AGENT_STORAGE_FRESH: '1' }, ...launchOf(launch), ...(host === 'web' ? { size: WEB_SIZES[0] } : hostOpen(host, app)) });
   try {
     for (const [name, value] of Object.entries(launch?.media ?? {})) await s.prefer({ [name]: value });
     await s.clock('data');
@@ -1101,7 +1071,7 @@ async function freshUnder(host, app, launch, store) {
  * end; then `check both` (the web: at both widths, one capture kept). */
 async function relaunch(host, app, test, fresh, shots) {
   const [{ open }, { driveStore, removeBrowserProfile }] = await Promise.all([import('./agent.mjs'), import('./agent-launch.mjs')]);
-  const s = await open({ host, app: app.name, storage: test.store, ...launchOf(relaunchFacts(test)), ...(host === 'web' ? { size: WEB_SIZES[0], ...(test.end.port ? { port: test.end.port } : {}) } : hostOpen(host, app)) });
+  const s = await open({ host, app: app.selector, storage: test.store, ...launchOf(relaunchFacts(test)), ...(host === 'web' ? { size: WEB_SIZES[0], ...(test.end.port ? { port: test.end.port } : {}) } : hostOpen(host, app)) });
   try {
     for (const [name, value] of Object.entries(test.end?.launch?.media ?? {})) await s.prefer({ [name]: value });
     const started = performance.now(), b = (st) => (st.background?.queued ?? 0) + (st.background?.inFlight ?? 0);
@@ -1337,21 +1307,26 @@ export function report({ host, built, compiler = [], server, tested, checks, rel
   return { lines: out, problems, exit: failedTests || broken || (strict && problems) ? 1 : 0, full: grouped ? full : [] };
 }
 
-// `ended` takes the report's last line, which `main` prints last, after `contract verify`'s summary.
+// `ended` takes the report's last line, which `main` prints last with `contract verify`'s summary.
 async function deviceMain(argv, emitJSON, declined, ended) {
   const args = guardFlags('verify', argv);
   const value = (flag) => args.indexOf(flag) >= 0 ? args[args.indexOf(flag) + 1] : undefined;
   const json = args.includes('--json'), sim = value('--sim'), copyTo = value('--shots');
   const flagged = new Set([args.indexOf('--app') + 1, args.indexOf('--sim') + 1, args.indexOf('--shots') + 1].filter((i) => i > 0));
-  if (args.includes('--shots') && (!copyTo || copyTo.startsWith('-'))) { console.error('verify: --shots takes a directory: the screenshots are copied there, under the names in .exact/verify/'); return declined(2); }
-  const host = args.find((a, i) => !a.startsWith('-') && !flagged.has(i)) ?? 'web';
+  const { resolveApp } = await import('./app.mjs');
+  const app = resolveApp(value('--app'));
+  const named = args.find((a, i) => !a.startsWith('-') && !flagged.has(i)), chosen = named ? { host: named } : shippedHost('verify', app.manifest);
+  // No platform the app ships has a leg here: the semantics check runs alone, and the run says so.
+  if (!chosen.host) {
+    if (json) emitJSON({ host: null, skipped: chosen.why, problems: 0, exit: 0 }); else ended(`verify: ${chosen.why}`);
+    return 0;
+  }
+  const host = chosen.host;
   if (!['web', 'ios', 'windows', 'android'].includes(host)) { console.error(`verify: web, ios, windows or android, not ${host} (test ${host} runs the tests there)`); return declined(2); }
   if (host === 'windows' && process.platform !== 'win32') { console.error('verify windows runs on Windows (bun exact.mjs verify windows there)'); return declined(2); }
   if (host === 'android') process.env.EXACT_ANDROID_READER = '1'; // the APK, as `test android` drives it
   if (sim) process.env.EXACT_SIM = sim; // as the driver names it (devices.mjs `simulator`)
   const started = Date.now();
-  const { resolveApp } = await import('./app.mjs');
-  const app = resolveApp(value('--app'));
   ACCEPT = app.manifest.verify?.accept ?? [];
   const say = (lines) => console.log(lines.join('\n'));
   // An app with a server of its own: verify runs it where the app calls it, on an empty database. One already
@@ -1468,7 +1443,7 @@ async function deviceMain(argv, emitJSON, declined, ended) {
     emitJSON({ host, built: built && { ms: built.ms, said: built.said ?? [], warnings: built.warnings }, compiler, ...(serverSaid ? { server: serverSaid } : {}), refused: refusedList, tests: testsOut, checks, reloads, large, fixed, relaunch: relaunchOut, ...(scrolled ? { scrolling: scrollingOut(scrolled) } : {}), ...(desktop ? { window: desktop } : {}), screenshots: kept, problems: r.problems, exit: r.exit, ms: Date.now() - started });
   } else { say(r.lines.slice(0, -1)); ended(r.lines.at(-1)); }
   // The run, against the build it used (LLP 1146 D2: `bun scripts/evidence.mjs`).
-  (await import('./evidence.mjs')).recordRun(app.name, { host, what: 'verify', result: r.problems ? `${r.problems} problem${r.problems === 1 ? '' : 's'}${tested?.failed ? `, ${tested.failed} failed test${tested.failed === 1 ? '' : 's'}` : ''}` : 'clean', timing: 'agent', sim });
+  (await import('./evidence.mjs')).recordRun(app.selector, { host, what: 'verify', result: r.problems ? `${r.problems} problem${r.problems === 1 ? '' : 's'}${tested?.failed ? `, ${tested.failed} failed test${tested.failed === 1 ? '' : 's'}` : ''}` : 'clean', timing: 'agent', sim });
   return r.exit;
 }
 
@@ -1476,6 +1451,8 @@ async function deviceMain(argv, emitJSON, declined, ended) {
 // a server verify will not start or write to) stops both: it is one line and nothing runs (LLP 1116.008 D1).
 async function main(argv) {
   const args = guardFlags('verify', argv), json = args.includes('--json');
+  const backend = args.indexOf('--backend');
+  if (backend >= 0) { selectBackendOrigin(args[backend + 1]); args.splice(backend, 2); }
   const { resolveApp } = await import('./app.mjs');
   const app = resolveApp(args.includes('--app') ? args[args.indexOf('--app') + 1] : undefined);
   const semantics = contractVerify(app, json);
@@ -1490,8 +1467,9 @@ async function main(argv) {
   mkdirSync(dirname(kept), { recursive: true });
   writeFileSync(kept, `${done.output}${done.errors}`);
   const listed = relative(process.cwd(), kept);
-  console.log(semanticsSummary(done, listed.startsWith('..') ? kept : listed).join('\n'));
-  if (verdict) console.log(done.exit ? `${verdict}; contract verify failed (exit ${done.exit}), as above` : verdict);
+  const [summary, ...details] = semanticsSummary(done, listed.startsWith('..') ? kept : listed);
+  if (details.length) console.log(details.join('\n'));
+  console.log(verdict ? `${verdict}; ${summary}` : summary);
   return exit;
 }
 

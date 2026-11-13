@@ -5,13 +5,12 @@
 use std::borrow::Cow;
 use taffy::prelude::{auto, length, percent};
 
-use crate::arena::NodeArena;
-use crate::error::StyleValueError;
 use crate::generated::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, Direction, Display, FlexDirection, FlexWrap,
     GridAutoFlow, JustifyContent, JustifyItems, NodeType, Overflow, PositionType, StyleId,
     StyleMask, StyleProps,
 };
+use crate::{arena::NodeArena, error::StyleValueError};
 
 mod backdrop;
 pub use backdrop::{link as link_backdrop_filter, BackdropFilter, BackdropOp};
@@ -158,10 +157,14 @@ impl Dimension {
             Dimension::Segment(var, x, y, plus) => env::resolve(var, x, y, plus, env),
             Dimension::Compare(c) if c.undefined(env) => Dimension::Auto,
             Dimension::Compare(c) => match c.substituted(env) {
-                // A tree needs a basis only where it reads a percentage
-                Some(Dimension::Compare(t)) if t == c => c
-                    .value(env, None)
-                    .map_or(Dimension::Compare(c), Dimension::Points),
+                // A tree needs a basis only where it reads a percentage,
+                // and goes to layout with its local insets in it
+                Some(Dimension::Compare(t)) if t == c => match c.value(env, None) {
+                    Some(v) => Dimension::Points(v),
+                    None => c
+                        .localized(env)
+                        .map_or(Dimension::Compare(c), |d| d.resolve(env)),
+                },
                 // A text substituted is the row's value it reads as
                 Some(d) => d.resolve(env),
                 None => Dimension::Auto,
@@ -329,10 +332,11 @@ pub enum StyleValue<'a> {
 
 impl StyleValue<'_> {
     /// Whether this value leaves row `style` unset — inherited, else
-    /// initial — which is what clearing the row does: an empty string, which
-    /// declares nothing (CSSOM's `setProperty(p, "")`), `unset`, and `inherit`
+    /// initial — which is what clearing the row does: an empty string,
+    /// `unset`, and `inherit`
     /// on an inherited row (`color: currentcolor` is `inherit`). `inherit` on
     /// any other row needs its parent's value, which no row holds, so it stays refused (feed F1).
+    /// An authored clear keeps its written bit; an absent binding removes it.
     pub fn unsets(&self, style: StyleId) -> bool {
         let StyleValue::Text(t) = self else {
             return false;
@@ -395,8 +399,8 @@ impl StyleValue<'_> {
                 style, expected: "nonnegative finite length in points/px (percentage shape-margin is not implemented in exact2 v1)",
             });
         }
-        // @ref LLP 1053 G3 — CSS refuses a negative flex factor, gap or
-        // border width.
+        // @ref LLP 1053 G3 — a row CSS gives no negative value refuses a
+        // negative number, as it refuses a negative length written as text.
         if calc::nonnegative_row(style) {
             return match self {
                 StyleValue::Number(n) if (*n as f32).is_finite() && *n >= 0.0 => Ok(*n as f32),
@@ -428,6 +432,25 @@ impl StyleValue<'_> {
                 style,
                 expected: "integer",
             }),
+        }
+    }
+
+    pub(crate) fn auto_i32(&self, style: StyleId) -> Result<Option<i32>, StyleValueError> {
+        match self {
+            StyleValue::Auto => Ok(None),
+            StyleValue::Text(t) if t.trim().eq_ignore_ascii_case("auto") => Ok(None),
+            StyleValue::Text(t) => {
+                t.trim()
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| StyleValueError::WrongKind {
+                        style,
+                        expected: "integer or auto",
+                    })
+            }
+            _ => self
+                .int(style, i32::MIN as f64, i32::MAX as f64)
+                .map(|n| Some(n as i32)),
         }
     }
 
@@ -580,8 +603,8 @@ impl StyleValue<'_> {
     pub(crate) fn vec2(&self, style: StyleId) -> Result<Vec2, StyleValueError> {
         match self {
             StyleValue::Vec2(x, y) if x.is_finite() && y.is_finite() => Ok(Vec2 { x: *x, y: *y }),
-            // @ref LLP 1077 D8 — the one `translate` text sets its lengths,
-            // its percentages (chess diary #4) and its z, each row its part.
+            StyleValue::Text(t) if style == StyleId::TranslateVelocity => space::velocity(t),
+            // @ref LLP 1077 D8 — each row sets its part of translate (lengths, percentages, z).
             StyleValue::Text(t)
                 if style == StyleId::Translate || style == StyleId::TranslatePercent =>
             {
@@ -611,7 +634,7 @@ impl StyleValue<'_> {
 
 /// Whether `set_dynamic` reads any text on row `style` besides the CSS-wide
 /// keywords [`StyleValue::unsets`] clears a row with. A number row with no
-/// text arm (`opacity`, `flex-grow`, `z-index`, `font-weight`) refuses every
+/// text arm (`opacity`, `flex-grow`, `font-weight`) refuses every
 /// computed string, where a browser applies one (`opacity: 0.5`), so the
 /// compiler refuses a string-typed binding of such a row as it refuses the
 /// literal (LLP 1017 P1a). The rows listed are those whose conversion has a
@@ -888,6 +911,10 @@ pub enum RowValue<'a> {
     AnimationRange(&'a crate::timeline::AnimationRange),
     /// CSS `timeline-scope` (LLP 1057.003 D4).
     TimelineScope(&'a crate::timeline::TimelineScope),
+    /// CSS `scroll-timeline-name` or `view-timeline-name` (LLP 1057.003 D5).
+    TimelineName(&'a crate::timeline::TimelineName),
+    /// CSS `view-timeline-inset` (LLP 1057.003 D5).
+    ViewTimelineInset(&'a crate::timeline::ViewTimelineInset),
     /// SVG paint (LLP 1055 D2).
     Paint(&'a crate::svg::Paint),
     /// SVG `stroke-dasharray` (LLP 1055 D2).
@@ -941,50 +968,6 @@ pub enum RowValue<'a> {
     Transitions(&'a Transitions),
     /// The `animation` row (LLP 1055 D5).
     Animations(&'a Animations),
-}
-
-impl RowValue<'_> {
-    /// Whether every number the row carries is finite. Rows without floats
-    /// (and the CSS values, which parse to finite numbers) are.
-    pub(crate) fn is_finite(&self) -> bool {
-        match self {
-            RowValue::LineHeight(v) => v.is_finite(),
-            RowValue::BackdropFilter(v) => v.is_finite(),
-            RowValue::Dimension(v) => v.is_finite(),
-            RowValue::Number(v) => v.is_finite(),
-            RowValue::Vec2(v) => v.x.is_finite() && v.y.is_finite(),
-            RowValue::Tracks(v) => v.is_finite(),
-            RowValue::Transitions(v) => v.is_finite(),
-            RowValue::Animations(v) => v.is_finite(),
-            RowValue::DashArray(v) => v.0.iter().all(|n| n.is_finite()),
-            RowValue::Transform(v) => v.is_finite(),
-            RowValue::TransformOrigin(v) => v.is_finite(),
-            RowValue::AnimationRange(v) => v.0.is_none_or(|[a, b]| a.is_finite() && b.is_finite()),
-            RowValue::Paint(_)
-            | RowValue::PaintOrder(_)
-            | RowValue::Marker(_)
-            | RowValue::Filter(_)
-            | RowValue::ClipPath(_)
-            | RowValue::ShapeOutside(_)
-            | RowValue::AspectRatio(_)
-            | RowValue::PositionTryFallbacks(_)
-            | RowValue::DragTimeline(_)
-            | RowValue::AnimationTimeline(_)
-            | RowValue::TimelineScope(_)
-            | RowValue::BackgroundImage(_)
-            | RowValue::TextShadow(_)
-            | RowValue::FontVariations(_)
-            | RowValue::FontFeatures(_)
-            | RowValue::BoxShadow(_)
-            | RowValue::MaskImage(_)
-            | RowValue::CornerShape(_)
-            | RowValue::RotateAxis(_)
-            | RowValue::SymbolPalette(_)
-            | RowValue::ColorValue(_)
-            | RowValue::Enum(_)
-            | RowValue::Placement(_) => true,
-        }
-    }
 }
 
 /// Two floats.
@@ -1051,7 +1034,7 @@ fn align_items(v: AlignItems) -> Option<taffy::style::AlignItems> {
     })
 }
 
-fn justify_items(v: JustifyItems, direction: Direction) -> Option<taffy::style::AlignItems> {
+fn justify_items(v: JustifyItems) -> Option<taffy::style::AlignItems> {
     use taffy::style::AlignItems as T;
     Some(match v {
         JustifyItems::Normal => return None,
@@ -1064,14 +1047,8 @@ fn justify_items(v: JustifyItems, direction: Direction) -> Option<taffy::style::
         JustifyItems::SelfEnd | JustifyItems::UnsafeSelfEnd => T::SELF_END,
         JustifyItems::FlexStart | JustifyItems::UnsafeFlexStart => T::FLEX_START,
         JustifyItems::FlexEnd | JustifyItems::UnsafeFlexEnd => T::FLEX_END,
-        JustifyItems::Left | JustifyItems::UnsafeLeft => match direction {
-            Direction::Ltr => T::START,
-            Direction::Rtl => T::END,
-        },
-        JustifyItems::Right | JustifyItems::UnsafeRight => match direction {
-            Direction::Ltr => T::END,
-            Direction::Rtl => T::START,
-        },
+        JustifyItems::Left | JustifyItems::UnsafeLeft => T::LEFT,
+        JustifyItems::Right | JustifyItems::UnsafeRight => T::RIGHT,
         JustifyItems::SafeCenter => T::SAFE_CENTER,
         JustifyItems::SafeStart => T::SAFE_START,
         JustifyItems::SafeEnd => T::SAFE_END,
@@ -1079,14 +1056,8 @@ fn justify_items(v: JustifyItems, direction: Direction) -> Option<taffy::style::
         JustifyItems::SafeSelfEnd => T::SAFE_SELF_END,
         JustifyItems::SafeFlexStart => T::SAFE_FLEX_START,
         JustifyItems::SafeFlexEnd => T::SAFE_FLEX_END,
-        JustifyItems::SafeLeft => match direction {
-            Direction::Ltr => T::SAFE_START,
-            Direction::Rtl => T::SAFE_END,
-        },
-        JustifyItems::SafeRight => match direction {
-            Direction::Ltr => T::SAFE_END,
-            Direction::Rtl => T::SAFE_START,
-        },
+        JustifyItems::SafeLeft => T::SAFE_LEFT,
+        JustifyItems::SafeRight => T::SAFE_RIGHT,
     })
 }
 
@@ -1351,7 +1322,7 @@ impl StyleProps {
         s.align_items = align_items(self.align_items);
         s.align_self = align_self(self.align_self);
         s.align_content = align_content(self.align_content);
-        s.justify_items = justify_items(self.justify_items, self.direction);
+        s.justify_items = justify_items(self.justify_items);
         s.gap = taffy::geometry::Size {
             width: length(cells::gap(env, self.column_gap, across)),
             height: length(cells::gap(env, self.row_gap, down)),
@@ -1367,10 +1338,11 @@ impl StyleProps {
 /// the arena's environment.
 pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
     let lowering = handles::Lowering::new();
-    let mut s = arena
-        .effective_style(slot)
-        .to_taffy(arena.node_type(slot), arena.env());
+    let style = arena.effective_style(slot);
+    let env = crate::kernel::owner::env_for(arena, slot, &style);
+    let mut s = style.to_taffy(arena.node_type(slot), &env);
     arena.alert_layout(slot, &mut s);
+    arena.bar_symbol_layout(slot, &mut s);
     // HTML's button layout, which Exact's reset of a `<button>` keeps: its
     // automatic inline size is shrink-to-fit, and a block button's content
     // sits in an anonymous flow-root box centred safely in the block axis,
@@ -1426,7 +1398,6 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
         Direction::Ltr => taffy::style::Direction::Ltr,
         Direction::Rtl => taffy::style::Direction::Rtl,
     };
-    s.justify_items = justify_items(arena.style(slot).justify_items, direction);
     if let Some(multicol) = crate::fragment::taffy_multicol(arena, slot) {
         s.rare.multicol = Some(multicol);
         // The flow thread starts at the content top: `align-content` moves
@@ -1461,7 +1432,7 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
     crate::kernel::apply_projection(arena, slot, &mut s);
     // @ref LLP 1075.003 §3.5 — what a native container covers of the box.
     crate::kernel::apply_cover(arena, slot, &mut s);
-    // A grouped list's card and cell margins, as the platform's list has them.
+    // A grouped list's cell margins, as the platform's list has them.
     crate::grouped::apply_margins(arena, slot, &mut s);
     crate::rows::apply_margins(arena, slot, &mut s);
     crate::segmented::apply(arena, slot, &mut s);
@@ -1469,6 +1440,7 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
     if direction == Direction::Rtl {
         sides::mirror_unsaid(arena.style(slot), &mut s);
     }
+    crate::grouped::apply_card_margins(arena, slot, &mut s);
     // After the mirror: a table's sides are what they cancel, physically.
     table::apply(arena, slot, &mut s);
     // @ref LLP 1115.002 D8.2 — the containing block a host gave the subtree.
@@ -1483,15 +1455,16 @@ pub fn taffy_style(arena: &NodeArena, slot: u32) -> taffy::style::Style {
     s
 }
 
+mod decoration;
+// Whether a row's numbers are finite.
+mod finite;
 #[cfg(test)]
 mod finite_tests;
+pub mod snap;
 #[cfg(test)]
 mod tests;
 pub(crate) mod top_layer;
 // A `touch-action` value's pinch and pan parts.
-mod decoration;
-#[cfg(test)]
-mod decoration_tests;
 mod touch_action;
 #[cfg(test)]
 mod touch_action_tests;

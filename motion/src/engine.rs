@@ -278,6 +278,7 @@ pub struct Engine {
     start_on_frame: bool,
     // Keys whose running curve may be pending, for the frame that starts them.
     pending: BTreeSet<(u64, Property)>,
+    // Missing means `all 0s`; an empty list is explicit `none`.
     transitions: BTreeMap<u64, Transitions>,
     slots: slots::Slots,
     // Observed targets provide CSS's before-change style, but only live curves
@@ -308,7 +309,8 @@ pub struct Engine {
     // and the nodes whose own appearance differs from it.
     dark: bool,
     node_dark: BTreeMap<u64, bool>,
-    // Drag timelines (LLP 1057.003): sources and bound consumers.
+    // Drag, scroll and view timelines (LLP 1057.003): drag sources,
+    // scrollers' offsets and bound consumers.
     timelines: timeline::Timelines,
     // Clock timelines (LLP 1055.002): each node's, and each one's origin.
     clocks: clock::Clocks,
@@ -342,8 +344,25 @@ impl Engine {
         }
     }
 
-    /// Set a node's `transition` row. Governs changes observed from now on;
-    /// a transition already running keeps its own declaration.
+    /// Whether the current declaration drives this property as a physical spring.
+    pub fn has_spring_transition(&self, node: u64, property: Property) -> bool {
+        let row = if property == Property::Layout {
+            self.layout.get(&node)
+        } else {
+            self.transitions
+                .get(&node)
+                .and_then(|t| t.matching(property))
+        };
+        row.is_some_and(|t| {
+            matches!(
+                t.governing(property).timing,
+                crate::TimingFunction::Spring(_)
+            )
+        })
+    }
+
+    /// Set a node's `transition` row. An existing transition keeps its timing
+    /// while the row still covers its property; observation cancels it otherwise.
     pub fn set_transitions(
         &mut self,
         node: u64,
@@ -358,7 +377,7 @@ impl Engine {
         transitions: Transitions,
     ) -> Result<(), EngineError> {
         transitions.validate().map_err(EngineError::Transition)?;
-        if transitions.0.is_empty() {
+        if transitions.0.as_slice() == [Transition::INITIAL] {
             self.transitions.remove(&node);
         } else {
             self.transitions.insert(node, transitions);
@@ -423,7 +442,7 @@ impl Engine {
                 .is_none_or(|slot| slot.live.is_none());
         }
         settled
-            && !self.transitions.contains_key(&node)
+            && self.transitions.get(&node).is_none_or(|t| t.0.is_empty())
             && !self.layout.contains_key(&node)
             && !self.node_dark.contains_key(&node)
             && !self.animations.contains_key(&node)
@@ -516,19 +535,27 @@ impl Engine {
         // Layout moves only under `-exact-layout-transition`; a spring on a
         // property no spring drives as physics is its curve from rest (LLP
         // 1062 D3).
-        let declaration = if change.property == Property::Layout {
+        let matching = if change.property == Property::Layout {
             self.layout.get(&change.node)
         } else {
             self.transitions
                 .get(&change.node)
                 .and_then(|t| t.matching(change.property))
-        }
-        .filter(|t| t.starts() && !STILL.with(std::cell::Cell::get))
-        .map(|t| t.governing(change.property));
+        };
+        let covered = matching.is_some()
+            || change.property != Property::Layout && !self.transitions.contains_key(&change.node);
+        let declaration = matching
+            .filter(|t| t.starts() && !STILL.with(std::cell::Cell::get))
+            .map(|t| t.governing(change.property));
 
         // An unchanged settled slot (most of a touched node's) changes
         // nothing; asking for it mutably would make an entry of a bit.
-        let unchanged = |slot: &Slot| slot.live.is_none() && slot.target == change.value;
+        let released = change.velocity.is_some_and(|v| v != Value::ZERO)
+            && declaration
+                .as_ref()
+                .is_some_and(|t| matches!(t.timing, crate::TimingFunction::Spring(_)));
+        let unchanged =
+            |slot: &Slot| !released && slot.live.is_none() && slot.target == change.value;
         if self.slots.get(&key).is_some_and(unchanged) {
             self.played.remove(&key);
             return Ok(());
@@ -549,7 +576,7 @@ impl Engine {
         }
         match slot.take_running() {
             None => {
-                if after == slot.target {
+                if after == slot.target && !released {
                     return Ok(());
                 }
                 slot.set_owner(None);
@@ -569,10 +596,11 @@ impl Engine {
                 }
             }
             Some(running) => {
-                // An unchanged target leaves the transition as it is.
+                // Coverage survives a zero duration; timing changes do not
+                // rewrite a running curve (CSS Transitions §3).
                 // Compared as changes state it (the slot's target): a curve
                 // between colour spaces ends in Oklab
-                if after == slot.target {
+                if after == slot.target && covered {
                     slot.set_running(Some(running));
                     if played {
                         self.played.insert(key);
@@ -582,19 +610,23 @@ impl Engine {
                 slot.set_owner(None);
                 let current = running.sample(now);
                 slot.set_target(after);
-                let Some(declaration) = declaration.filter(|_| current.value != after) else {
+                let inherited = change.velocity.unwrap_or(current.velocity);
+                let Some(declaration) = declaration.filter(|t| {
+                    current.value != after
+                        || inherited != Value::ZERO
+                            && matches!(t.timing, crate::TimingFunction::Spring(_))
+                }) else {
                     slot.set_presented(after);
                     self.running.remove(&key);
                     self.pending.remove(&key);
                     self.dirty.insert(key);
                     return Ok(());
                 };
-                let inherited = change.velocity.unwrap_or(current.velocity);
                 let is_easing = matches!(
                     declaration.timing,
                     crate::transition::TimingFunction::Easing(_)
                 );
-                let mut next = if is_easing && after == running.reversing_adjusted_start {
+                let mut next = if is_easing && after.same(running.reversing_adjusted_start) {
                     // CSS §3.2, the reversing case.
                     let progress = running.easing_progress(now);
                     let factor = (progress * running.reversing_shortening
@@ -746,7 +778,10 @@ impl Engine {
         property: Property,
     ) -> Option<SpringDescriptor> {
         let running = self.slots.get(&(node, property))?.running()?;
-        let Curve::Spring { config, velocity } = &running.curve else {
+        let Curve::Spring {
+            config, velocity, ..
+        } = &running.curve
+        else {
             return None;
         };
         Some(SpringDescriptor {

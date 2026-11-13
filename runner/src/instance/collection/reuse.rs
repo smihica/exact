@@ -61,6 +61,11 @@ const REFUSED_STYLES: &[StyleId] = &[
     StyleId::AnimationTimeline,
     StyleId::AnimationRange,
     StyleId::TimelineScope,
+    StyleId::ScrollTimelineName,
+    StyleId::ScrollTimelineAxis,
+    StyleId::ViewTimelineName,
+    StyleId::ViewTimelineAxis,
+    StyleId::ViewTimelineInset,
 ];
 
 /// Whether a rebind could carry state of this site's into another item's row.
@@ -307,7 +312,20 @@ impl Collection {
         let arm = plan.region(self.region).arms.iter().next();
         for (i, s) in plan.slots.iter().enumerate() {
             if s.owner.is_some() && s.owner == arm {
-                let value = u.eval(s.init, &inner)?;
+                let value = u
+                    .eval_named(s.init, &inner, || {
+                        format!("state {:?} initializer", plan.str(s.name))
+                    })
+                    .map_err(|e| {
+                        e.at_view(
+                            self.view,
+                            u.env
+                                .plan
+                                .region(self.region)
+                                .parent
+                                .expect("collection parent"),
+                        )
+                    })?;
                 if !value.conforms(plan, s.ty) {
                     return Err(InstanceError::slot_type(
                         plan,

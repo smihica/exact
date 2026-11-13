@@ -20,26 +20,26 @@ export interface OAuthSession {
 /** What `signIn()` and `signOut()` answer; `OAuthResult` in Contract. */
 export interface OAuthResult {
   ok: boolean;
-  /** A stable code: "access_denied", "cancelled", "popup_blocked", "state_mismatch", "issuer_mismatch", "invalid_grant", "network", "server", "config", "invalid_response", or the provider's OAuth error code. */
+  /** A stable code: "access_denied", "cancelled", "popup_blocked", "state_mismatch", "issuer_mismatch", "invalid_grant", "auth_session", "network", "server", "config", "invalid_response", the provider's OAuth error code, or, on a sign-out that is ok, "end_session": the provider's own sign-in may stand. */
   code: string;
-  /** A sentence for the person; "" when ok. */
+  /** A sentence for the person; "" when ok with no `code`. */
   error: string;
   /** Trying again later may succeed. */
   retryable: boolean;
-  /** The HTTP status, 400 or over, of the reply that failed; 0 otherwise: no reply came, or the package refused a 2xx or 3xx it could not use. */
+  /** The HTTP status, 400 or over, of the reply that failed, or 502 for a failed system auth session; 0 otherwise: no reply came, or the package refused a 2xx or 3xx it could not use. */
   status: number;
 }
 
 export interface OAuthConfig {
   /** The issuer. Discovery reads `<issuer>/.well-known/openid-configuration`, then RFC 8414's document. */
   issuer?: string;
-  /** Endpoints for a provider without discovery. With an exact `issuer` (no `issuerTemplate`), `authorization` and `token` both given make no discovery: the ID token and a callback's `iss` are still checked against `issuer`, a callback without `iss` is taken, and sign-out revokes only at `revocation`. Otherwise they override what discovery found. */
-  endpoints?: { authorization?: string; token?: string; revocation?: string };
+  /** Endpoints for a provider without discovery. With an exact `issuer` (no `issuerTemplate`), `authorization` and `token` both given make no discovery: the ID token and a callback's `iss` are still checked against `issuer`, a callback without `iss` is taken, and sign-out revokes only at `revocation`. Otherwise they override what discovery found. `endSession` is where `signOut`'s `endSession` ends the provider's own sign-in (`end_session_endpoint`, OpenID Connect RP-Initiated Logout 1.0 §2). */
+  endpoints?: { authorization?: string; token?: string; revocation?: string; endSession?: string };
   clientId: string;
   scopes: string[];
   /** The `secret.keep` name the session is kept under. */
   key: string;
-  /** The origins that receive the access token, such as `https://api.example.com`. */
+  /** The origins `fetch` and `json` may send the access token to, such as `https://api.example.com`. */
   apis: string[];
   /** Only for a provider whose app client types demand one; a secret in an app is not confidential (RFC 8252 §8.5). */
   clientSecret?: string;
@@ -67,6 +67,8 @@ export interface OAuthConfig {
   cancelCodes?: string[];
   /** Ask the browser for a private session with no shared cookies, to choose another account. */
   ephemeral?: boolean;
+  /** The end-session request's parameter that names the callback, for a provider that does not call it `post_logout_redirect_uri` (RP-Initiated Logout 1.0 §2). */
+  logoutRedirectParam?: string;
   /** The callback; the default is `authCallback()`. With `signIn`'s `authorize`, the redirect URI the provider registered. */
   callback?: string;
   /** The statuses an API answers an expired access token with: `[401]` by default (RFC 6750 §3.1); `[401, 403]` for a gateway that answers 403. `fetch` and `json` refresh once on each. A token an API refused right after the refresh that brought it refreshes again only once it has expired by the API's `Date`, or, its expiry unknown, a minute after that refusal; where the app cannot read the API's `Date` (from another origin, a browser shows it only when the API exposes it), each read the API refuses refreshes once, as without this limit. */
@@ -101,15 +103,27 @@ export interface OAuthAuthorization {
   url: string;
   /** The authorization endpoint. */
   endpoint: string;
-  /** `response_type`, `client_id`, `redirect_uri`, `scope`, `state`, the PKCE challenge, `nonce` with `openid`, and `authorizationParams`. */
+  /** `response_type`, `client_id`, `redirect_uri`, `scope`, `state`, the PKCE challenge, `nonce` with `openid`, and `authorizationParams` with the sign-in’s `params` overrides. */
   params: Record<string, string>;
   /** The package's transport (`OAuthConfig.fetch`, else `fetch`), to send it with. */
   fetch: (url: string, init: RequestInit) => Promise<Response>;
 }
 
 export interface OAuthSignIn {
+  /** Extra authorization parameters for this press, overriding authorizationParams. The package's own fields (response_type, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, nonce and max_age) are refused with TypeError. */
+  params?: Record<string, string>;
   /** For an app that signs the person in with its own screens (LLP 1146 D8): sends the authorization request as the provider documents, and answers the URL it redirected to. Throw an `OAuthError` to say why it could not. */
   authorize?: (request: OAuthAuthorization) => Promise<string>;
+}
+
+export interface OAuthSignOut {
+  /** Also end the person's sign-in at the provider (OpenID Connect RP-Initiated Logout 1.0), so that the next sign-in
+   *  shows the provider's page instead of completing as the same account. The browser opens the provider's end-session
+   *  endpoint with the ID token as `id_token_hint`, `client_id`, the callback and `state`; the provider must send the
+   *  person back to the callback with that `state`, so register the callback as a post-logout redirect URI. Send it from
+   *  a press, as `signIn`. The session is forgotten and revoked either way; a browser step that does not finish, or a
+   *  provider that names no end-session endpoint, is answered as `ok` with code "end_session" and a sentence in `error`. */
+  endSession?: boolean;
 }
 
 /** A failed authorized request. A resource source that throws it keeps its last answer (LLP 1016 D4). */
@@ -136,9 +150,11 @@ export interface OAuthProvider {
   session(store: OAuthStore): Promise<OAuthSession>;
   /** Opens the provider's sign-in, then exchanges and keeps the tokens. Send it from a press. With `authorize`, the app's own sign-in sends the authorization request instead. */
   signIn(store: OAuthStore, options?: OAuthSignIn): Promise<OAuthResult>;
-  /** Forgets the session, then asks the provider to revoke it. */
-  signOut(store: OAuthStore): Promise<OAuthResult>;
-  /** `fetch` with the access token, to an origin in `apis`; refreshes once on 401 (`expiredStatus`). Answers the `Response`. */
+  /** Forgets the session, then asks the provider to revoke it. With `endSession`, also ends the person's sign-in at the provider. */
+  signOut(store: OAuthStore, options?: OAuthSignOut): Promise<OAuthResult>;
+  /** `fetch` with the access token, to an origin in `apis`; refreshes once on 401 (`expiredStatus`). Answers the `Response`.
+   *  A request refused after its sign-in ended is not sent again: it throws `OAuthError` `signed_out`, or
+   *  `session_changed` when the person has signed in again since it was sent. */
   fetch(store: OAuthStore, url: string, init?: RequestInit): Promise<Response>;
   /** As `fetch`, then the parsed JSON body; any status that is not 2xx throws `OAuthError`. */
   json(store: OAuthStore, url: string, init?: RequestInit): Promise<unknown>;
@@ -148,7 +164,13 @@ export interface OAuthProvider {
    *  `null` while signed out or with none. It is read at once, so a source can hand it on in its own turn. It is the
    *  person's credential: keep it in data code, and never answer it to Contract, where an answer is kept and shown. */
   idToken(store: OAuthStore): string | null;
-  /** Refreshes the session now, for a service that said the ID token had expired: data code reads no clock to see
+  /** The access token the store holds now, or `null` while signed out. Synchronous: no refresh and no clock.
+   *  For a socket's first message after open or an SDK; send it only to the API it was issued for, never in a URL.
+   *  Unlike `fetch`, this cannot check the destination against `apis`. Keep this credential in data code;
+   *  never answer it to Contract, where an answer is kept and shown. When the service reports expiry, await
+   *  `refresh(store)` and ask again on success; do not hold a copy across a refresh or sign-out. */
+  accessToken(store: OAuthStore): string | null;
+  /** Refreshes the session now, for a service that said the access or ID token had expired: data code reads no clock to see
    *  it. A provider need not issue an ID token on a refresh (OIDC Core §12.2): the kept one then stands. */
   refresh(store: OAuthStore): Promise<OAuthResult>;
 }

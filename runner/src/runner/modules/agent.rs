@@ -22,8 +22,8 @@ impl<D: DataSource> Runner<D> {
         let mut out = Map::new();
         for row in &self.plan.modules {
             let extension = self.plan.str(row.extension).to_owned();
-            let declared = self.plan.str(row.declared).to_owned();
             let key = self.key(row);
+            let declared = key.split_once('.').unwrap().1.to_owned();
             let bound = self.extensions.bound.contains(&extension);
             let entry = out.entry(extension.clone()).or_insert_with(
                 || json!({ "bound": bound, "preferred": {}, "readers": {}, "held": [] }),
@@ -34,6 +34,9 @@ impl<D: DataSource> Runner<D> {
             self.devices_json(&extension, entry);
             // Each permission by name; `permission` too where it has one.
             let sub = self.substitute(row);
+            if sub["owner"].is_string() {
+                entry["names"][&declared] = json!({ "owner": sub["owner"], "route": match self.route(row) { Route::Real => "real", Route::Agent => "agent", Route::Substitute => "substitute" } });
+            }
             let by = sub["permissionBy"].as_object().into_iter().flatten();
             let list = sub["permissionList"].as_array().into_iter().flatten();
             for p in std::iter::once(&sub["permission"])
@@ -146,6 +149,20 @@ impl<D: DataSource> Runner<D> {
                 || json!({ "bound": bound, "preferred": {}, "readers": {}, "held": [] }),
             );
             entry["views"] = json!(views);
+            entry["preferred"] = json!(self
+                .extensions
+                .preferred
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((
+                        key.strip_prefix(&format!("{extension}."))?.to_owned(),
+                        value.clone(),
+                    ))
+                })
+                .collect::<Map<String, Json>>());
+            if self.extensions.agent.contains(extension) && !bound {
+                entry["agent"] = json!(true);
+            }
         }
         Some(Json::Object(out).to_string())
     }
@@ -313,6 +330,16 @@ impl<D: DataSource> Runner<D> {
             });
             if let Some(row) = row.filter(|r| self.route(r) == Route::Agent) {
                 told.insert(self.plan.str(row.extension).to_owned());
+            } else if self.agent_word(key).is_some()
+                && self.extensions.agent.contains(extension)
+                && !self.extensions.bound.contains(extension)
+                && self
+                    .plan
+                    .views
+                    .iter()
+                    .any(|v| self.plan.str(v.extension) == extension)
+            {
+                told.insert(extension.to_owned());
             }
         }
         for extension in told {
@@ -348,10 +375,22 @@ impl<D: DataSource> Runner<D> {
         if (self.plan.modules.iter()).any(|m| self.key(m) == key) {
             return None;
         }
-        let row = (self.plan.modules.iter()).find(|m| self.plan.str(m.extension) == extension)?;
-        self.substitute(row)["agent"][word]
-            .as_str()
-            .map(str::to_owned)
+        let words = if let Some(row) = self
+            .plan
+            .modules
+            .iter()
+            .find(|m| self.plan.str(m.extension) == extension)
+        {
+            self.substitute(row)["agent"].clone()
+        } else {
+            let view = self
+                .plan
+                .views
+                .iter()
+                .find(|v| self.plan.str(v.extension) == extension)?;
+            serde_json::from_str(self.plan.str(view.agent)).ok()?
+        };
+        words[word].as_str().map(str::to_owned)
     }
 }
 

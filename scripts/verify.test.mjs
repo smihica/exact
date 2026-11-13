@@ -11,7 +11,8 @@ import { resolve, toNamespacedPath } from 'node:path';
 import { applyPattern, createApp } from '../game/new.mjs';
 import { findings } from '../host/apple/feel/analyze.mjs';
 import { chromium } from './agent-launch.mjs';
-import { ago, appServer, buildWarnings, draftFields, fixedType, groups, judgeRelaunch, judgeReload, movedClock, persistedStates, pinnedLaunch, recordedServerAddress, refusalsOf, relaunchFacts, relaunchStore, reloadLine, reloadNote, report, reusable, savedChanges, screenTexts, serverUrl, shotName, storedTexts, warningsOfBuild } from './verify.mjs';
+import { ancestors, parentsOf } from './processes.mjs';
+import { ago, appServer, buildProgress, buildWarnings, draftFields, fixedType, groups, judgeRelaunch, judgeReload, movedClock, persistedStates, pinnedLaunch, refusalsOf, relaunchFacts, relaunchStore, reloadLine, reloadNote, report, reusable, savedChanges, screenTexts, serverChoice, serverUrl, shotName, storedTexts, warningsOfBuild } from './verify.mjs';
 import { semanticsSummary } from './verify-semantics.mjs';
 
 const SIZES = [[390, 844], [1280, 900]];
@@ -25,19 +26,18 @@ function onPort(dir) {
 const runs = (lines, screen) => SIZES.flatMap((size) => ['light', 'dark'].map((scheme) => ({ ...(screen ? { screen } : {}), size, scheme, asked: scheme, lines: lines(size, scheme), hidden: 0 })));
 const shots = SIZES.flatMap(([w, h]) => ['light', 'dark'].map((scheme) => `/app/.exact/verify/web-${w}x${h}-${scheme}.png`));
 
-test('contract verify beside the run: a line, the receipt; a failure\'s own lines, not the routine ones', () => {
+test('contract verify beside the run: one line of counts and the report path; a failure\'s own lines', () => {
   const receipt = ['verify receipt — reproduce: contract verify app.contract --walks 20', '  scripts: 2 tests delivered (2 whole; 0 in part: none; 0 skipped: none), 1 explored, 20 walks',
-    '  suggestions: 3 observed candidates; 2 printed; 1 dropped', '    dropped set "q is one of 6 values": `q`: the value is not bounded', '  properties: 0 held, 0 false, 0 counted only, 0 not exercised'];
+    '  suggestions: 3 observed candidates; 2 printed; 1 dropped', '    dropped set "q is one of 6 values": `q`: the value is not bounded', '  properties: 1 held, 0 false, 2 counted only, 3 not exercised'];
   const routine = ['undeliverable parser step kinds: drag, reload', 'WHOLE /app/app.test.contract: adds; kept: /x.events', 'NOTE /app/app.test.contract: adds: with the oracle\'s data, after step 0: Text("n", "1") does not hold',
-    'OUTSIDE walk 1 from "boot": # unsupported: roster entry `toLowerCase`', 'runner: 1.0s; 22 search scripts; 0 findings; 0 shrink candidates', 'properties: 0 held, 0 false, 0 counted only, 0 not exercised; 0 violations, 0 counted-only line steps'];
+    'OUTSIDE walk 1 from "boot": # unsupported: roster entry `toLowerCase`', 'runner: 1.0s; 22 search scripts; 1 finding; 0 shrink candidates', 'properties: 1 held, 0 false, 2 counted only, 3 not exercised; 0 violations, 4 counted-only line steps'];
   const suggestions = ['Observed over 23 scripts and 400 steps and code-consistent, not proved; keep the ones the app means:', '', 'always "n is a whole number"', '  expect state n whole', '', 'after "add" "add writes only n"', '  only writes n', ''];
   const clean = semanticsSummary({ exit: 0, output: [...routine, ...suggestions, ...receipt].join('\n'), errors: '' }, '.exact/verify/properties.txt');
-  assert.deepEqual(clean, ['contract verify: done; 2 suggested properties (observed, not proved: keep the ones the app means); every line: .exact/verify/properties.txt',
-    ...receipt.filter((l) => !l.includes('dropped set'))]);
+  assert.deepEqual(clean, ['contract verify: done; 1 finding; properties: 1 held, 0 false, 2 counted only, 3 not exercised; 2 suggested properties (observed, not proved: keep the ones the app means); report and receipt: .exact/verify/properties.txt']);
   const false_ = ['property "n stays small": false', '  after tap "add" at step 3: n = 7'];
-  const failed = semanticsSummary({ exit: 1, output: [...routine, ...false_, ...suggestions, ...receipt].join('\n'), errors: 'cargo: a warning\n' }, 'p.txt');
-  assert.deepEqual(failed.slice(0, 4), ['contract verify: failed (exit 1); 2 suggested properties (observed, not proved: keep the ones the app means); every line: p.txt', ...false_, 'cargo: a warning']);
-  assert.equal(failed.at(-1), receipt.at(-1));
+  const failed = semanticsSummary({ exit: 1, output: [...routine, ...false_, ...suggestions, ...receipt].join('\n').replaceAll('0 false', '1 false'), errors: 'cargo: a warning\n' }, 'p.txt');
+  assert.deepEqual(failed, ['contract verify: failed (exit 1); 1 finding; properties: 1 held, 1 false, 2 counted only, 3 not exercised; 2 suggested properties (observed, not proved: keep the ones the app means); report and receipt: p.txt', ...false_, 'cargo: a warning']);
+  assert.deepEqual(semanticsSummary({ exit: 1, output: '', errors: 'could not compile\n' }, 'p.txt'), ['contract verify: failed (exit 1); report and receipt: p.txt', 'could not compile']);
 });
 
 test('the report: clean in four lines; a failed test fails it; a finding is said once, where it was', () => {
@@ -328,8 +328,8 @@ test('a reload: the persisted states, and the evidence that something saved was 
   assert.deepEqual(persistedStates('/no/such/app'), []);
   const dir = mkdtempSync(resolve(tmpdir(), 'verify-persist-'));
   try {
-    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  state goal = 2000 persist\n  state last-seen = "" persist // kept\n  state draft = ""\n  state label = "persist"\n  state note = "x" // persist\n  state tab = "home"  persist  \n  view\n    text "x"\n');
-    assert.deepEqual(persistedStates(dir), ['goal', 'last-seen', 'tab']);
+    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  state goal = 2000 persist\n  state last-seen = "" persist // kept\n  state draft = ""\n  state label = "persist"\n  state note = "x" // persist\n  state tab = "home"  persist  \n  state typed-goal: number = 8 persist\n  state saved: string[] = [] persist\n  state typed: string = "persist"\n  view\n    text "x"\n');
+    assert.deepEqual(persistedStates(dir), ['goal', 'last-seen', 'tab', 'typed-goal', 'saved']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 
   const node = (testId, value, extra = {}) => ({ id: 1, type: 'TextInput', depth: 1, props: { testId, value }, ...extra });
@@ -391,7 +391,7 @@ test('the report: each test end reloaded; a saved value lost is a finding once a
   const stuck = report({ ...base, tested: { passed: 1, failed: 0, results: [] },
     reloads: [{ test: 'saves', ran: true, error: 'reload: the app\'s storage did not finish before the restart: x\nmore' }] });
   assert.deepEqual(stuck.lines.slice(2, 4), ['reload 1 test end: 1 finding', '  reload   "saves": could not reload the end screen: reload: the app\'s storage did not finish before the restart: x']);
-  // The iOS report has no reload: a native host's cold launch is `/` (LLP 1038 §7).
+  // The iOS report has no end-route reload: relaunch uses its launch location, defaulting to the manifest's `start_url`.
   assert.ok(!report({ ...base, host: 'ios', reloads: [{ test: 'a', ran: false }] }).lines.some((l) => l.startsWith('reload')));
 });
 
@@ -474,11 +474,30 @@ test('the app\'s server: its entry, the URL app.ts calls, and why it cannot be r
     const setting = { 'app.ts': "export const API = import.meta.env.API_BASE_URL ?? 'http://127.0.0.1:8080';\nexport const grants = `net.fetch ${API}`;\n", 'app.json': JSON.stringify({ env: ['API_BASE_URL'], server: { database: false } }), 'server.ts': 'Bun.serve({});\n' };
     put(setting);
     assert.equal(serverUrl(dir, {}), 'http://127.0.0.1:8080');
+    // An app whose backend is one socket names its origin alone: the server is there.
+    put({ ...setting, 'app.ts': "const CONVEX = 'ws://127.0.0.1:3210';\nexport const grants = `net.websocket ${CONVEX}`;\n" });
+    assert.equal(serverUrl(dir, {}), 'http://127.0.0.1:3210');
+    // A socket elsewhere does not stand for the server when the app names an http: one, whichever comes first.
+    put({ ...setting, 'app.ts': "const FEED = 'ws://127.0.0.1:4791';\nconst API = 'http://127.0.0.1:8080';\nexport const grants = `net.websocket ${FEED}\\nnet.fetch ${API}`;\n" });
+    assert.equal(serverUrl(dir, {}), 'http://127.0.0.1:8080');
+    // …in a module app.ts imports, too.
+    put({ ...setting, 'app.ts': "import { API } from './api';\nconst FEED = 'ws://127.0.0.1:4791';\nexport const grants = `net.websocket ${FEED}\\nnet.fetch ${API}`;\n", 'api.ts': "export const API = 'http://127.0.0.1:8090';\n" });
+    assert.equal(serverUrl(dir, {}), 'http://127.0.0.1:8090');
     put({ ...setting, '.env': 'API_BASE_URL=http://127.0.0.1:8787\n' });
     assert.deepEqual([appServer(dir, {}).url, appServer(dir, {}).refusal], ['http://127.0.0.1:8787', null]);
     put({ ...setting, '.env': 'API_BASE_URL=http://127.0.0.1:8787\n', '.env.local': 'API_BASE_URL=http://localhost:9000\n' });
     assert.equal(serverUrl(dir, {}), 'http://localhost:9000');
     assert.equal(serverUrl(dir, { API_BASE_URL: 'http://127.0.0.1:7000' }), 'http://127.0.0.1:7000');
+    // A comment naming another local URL is not code, and a setting's value wins over a constant before it; the
+    // server's line says which origin it took and why.
+    put({ ...setting, 'app.ts': "// The server listens on http://127.0.0.1:8787 by default.\nconst API = import.meta.env.API_BASE_URL ?? 'http://127.0.0.1:8787';\nexport function load() { return fetch(`${API}/items`); }\n" });
+    assert.deepEqual([serverUrl(dir, { API_BASE_URL: 'http://127.0.0.1:9100' }), appServer(dir, { API_BASE_URL: 'http://127.0.0.1:9100' }).note], ['http://127.0.0.1:9100', undefined]);
+    assert.equal(serverUrl(dir, {}), 'http://127.0.0.1:8787');
+    put({ ...setting, 'app.ts': "const FALLBACK = 'http://127.0.0.1:8787'; /* or http://localhost:1 */\nconst API = import.meta.env.API_BASE_URL ?? 'http://127.0.0.1:8787';\nexport const grants = `net.fetch ${API} ${FALLBACK}`;\n" });
+    assert.deepEqual([serverChoice(dir, { API_BASE_URL: 'http://127.0.0.1:9100' })], [{ url: 'http://127.0.0.1:9100', note: "the app's code names http://127.0.0.1:9100, http://127.0.0.1:8787: the server is started at http://127.0.0.1:9100, the value of API_BASE_URL" }]);
+    put({ ...setting, 'app.ts': "const API = 'http://127.0.0.1:8080'; // not http://localhost:1\nconst OTHER = 'http://localhost:9000';\nexport const grants = `net.fetch ${API} ${OTHER}`;\n" });
+    assert.deepEqual(serverChoice(dir, {}), { url: 'http://127.0.0.1:8080', note: "the app's code names http://127.0.0.1:8080, http://localhost:9000: the server is started at http://127.0.0.1:8080, the first in app.ts's code" });
+    put(setting);
     assert.equal(appServer(dir, { API_BASE_URL: 'https://api.example.com' }).url, null);
     assert.match(appServer(dir, { API_BASE_URL: 'https://api.example.com' }).why, /^server\.ts is left alone: app\.ts calls no local URL/);
     // The spellings of reading DB, and a root shim that only imports the backend that reads it (book-club, polls, event-rsvp).
@@ -665,27 +684,6 @@ test('an agent drive passes server arguments without DB or a scratch database', 
     assert.equal(readFileSync(old, 'utf8'), 'untouched');
     assert.deepEqual(readdirSync(lease), ['db.sqlite']);
   `);
-});
-
-test('recorded server addresses preserve accepted default ports and paths, refusing credentials and queries', () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-server-address-'));
-  try {
-    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ server: { database: false } }));
-    writeFileSync(resolve(dir, 'server.ts'), 'Bun.serve({});\n');
-    for (const [url, port] of [
-      ['http://127.0.0.1:80', 80], ['http://127.0.0.1:080', 80], ['https://localhost:443', 443],
-      ['https://[::1]:0443/api', 443], ['http://localhost:80/health', 80], ['http://127.0.0.1:8080/api/v1/', 8080],
-    ]) {
-      writeFileSync(resolve(dir, 'app.ts'), `export const API = ${JSON.stringify(url)};\n`);
-      const accepted = appServer(dir, {});
-      assert.equal(accepted.url, url.replace(/\/$/, ''));
-      assert.equal(accepted.port, port);
-      assert.deepEqual(recordedServerAddress(accepted.url), { url: accepted.url, port });
-    }
-    for (const url of [null, {}, 'file:///tmp/server', 'ftp://localhost:80', 'http://user:pw@localhost:80',
-      'http://@localhost:80', 'http://localhost:80/?', 'http://localhost:80/?q=x', 'http://localhost:80/#',
-      'http://localhost:80/#x', 'http://:80', 'http://localhost:65536']) assert.equal(recordedServerAddress(url), null);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('fixture drives isolate checkouts, refuse foreign servers and clean overlapping ports', async () => {
@@ -930,14 +928,16 @@ test('agent\'s server: started on a database of its own, shared by overlapping d
     assert.match(await c.said(), /^agent: started server\.ts at \S+ for this drive \(an empty database\); stopped after\n$/);
     assert.deepEqual([await up(), existsSync(resolve(dir, '.exact/agent-server'))], [false, false]);
 
-    // The builder's own server answers: used, said nothing of, and still running after.
+    // The builder's own server answers: used, said in one line naming it, and still running after.
     const theirs = Bun.spawn([process.execPath, 'server.ts'], { cwd: dir, env: { ...process.env, DB: resolve(dir, 'theirs.db') }, stdout: 'ignore', stderr: 'ignore' });
     try {
       for (let i = 0; !(await up()); i++) { assert.ok(i < 100, 'their server answers'); await Bun.sleep(100); }
       const d = drive('three');
       assert.equal(await d.next(), 'up');
       assert.equal(await d.end(), 'stopped');
-      assert.equal(await d.said(), '');
+      const named = await d.said();
+      assert.ok(named.startsWith(`agent: ${url} already answers (pid ${theirs.pid}: `), named);
+      assert.ok(named.endsWith('), a server no drive started: this drive uses it and its data, not a database of its own; stop it to have the drive start server.ts itself\n'), named);
       assert.deepEqual([await up(), theirs.exitCode], [true, null]);
       // Asked empty, a drive is refused rather than writing into theirs.
       assert.match(await drive('three', 'fresh').next(), /but something already answers at /);
@@ -970,13 +970,13 @@ test.skipIf(!!chromium().unavailable)('agent on a server app: its server for the
       const other = agent(...flags, 'clock data', 'state lib.items');
       assert.match(other.stdout, /^\[\]$/m, other.stdout + other.stderr);
     }
-    // A server the builder runs is used, and runs on.
+    // A server the builder runs is used, said so, and runs on.
     const theirs = Bun.spawn([process.execPath, 'server.ts'], { cwd: dir, stdout: 'ignore', stderr: 'ignore' });
     try {
       for (let i = 0; !(await fetch(`${url}/health`).then((r) => r.ok, () => false)); i++) { assert.ok(i < 100, 'their server answers'); await Bun.sleep(100); }
       const used = agent('--storage', 's3', 'clock data', 'state lib.items');
       assert.equal(used.status, 0, used.stdout + used.stderr);
-      assert.doesNotMatch(used.stderr, /^agent: /m);
+      assert.deepEqual(used.stderr.match(/^agent: .*$/gm), [`agent: ${url} already answers (pid ${theirs.pid}: ${used.stderr.match(/\(pid \d+: ([^)]*)\)/)?.[1]}), a server no drive started: this drive uses it and its data, not a database of its own; stop it to have the drive start server.ts itself`]);
       assert.equal(theirs.exitCode, null, 'their server runs on');
     } finally { theirs.kill(); await theirs.exited; rmSync(resolve(dir, 'data.db'), { force: true }); }
   } finally { rmSync(parent, { recursive: true, force: true }); }
@@ -994,11 +994,7 @@ test.skipIf(!!chromium().unavailable)('verify on a new app: clean, a failing tes
       const r = spawnSync(process.execPath, [resolve(dir, 'exact.mjs'), verb, ...args], { cwd: dir, encoding: 'utf8', timeout: 180_000, env: { ...process.env, EXACT_FEEDBACK: '0' } });
       return { ...r, lines: r.stdout.trim().split('\n') };
     };
-    // `contract verify`'s summary and receipt come after verify's own report and before its verdict, the last line (LLP 1151 D8).
-    const verify = (...args) => {
-      const r = exact('verify', ...args), at = r.lines.findIndex((l) => l.startsWith('contract verify: '));
-      return at >= 0 && !args.includes('--json') ? { ...r, lines: [...r.lines.slice(0, at), r.lines.at(-1)], semantics: r.lines.slice(at, -1).join('\n') } : r;
-    };
+    const verify = (...args) => exact('verify', ...args);
     const warned = (text) => text.split('\n').filter((l) => / warning \[/.test(l));
     // The build `test web` runs first says its count, and here names nothing; its drive's stdout is the tests'.
     const quiet = exact('test', 'web');
@@ -1014,9 +1010,15 @@ test.skipIf(!!chromium().unavailable)('verify on a new app: clean, a failing tes
     assert.ok(clean.lines.includes('check first screen, 2 test ends, relaunch · 390x844, 1280x900 · light, dark: no findings'), clean.stdout);
     // The starter keeps nothing: the relaunch on the second test's store opens as a fresh launch does, and says so.
     assert.match(clean.stdout, /^relaunch on "the header's button likes it"'s store \(\d+\.\d s of real time\): the first screen is a fresh launch's; that test wrote no storage$/m);
-    assert.match(clean.lines.at(-1), /^verify: clean in \d+\.\d s$/);
+    assert.match(clean.lines.at(-1), /^verify: clean in \d+\.\d s; contract verify: done; 0 findings; properties: 0 held, 0 false, 0 counted only, 0 not exercised; \d+ suggested properties .*; report and receipt: \.exact\/verify\/properties\.txt$/);
     assert.equal(clean.lines.at(-2), 'open it: bun exact.mjs web (serves what verify checked)'); // how a person opens it, with no dev server of the builder's own
-    assert.match(clean.semantics, /^verify receipt — reproduce: contract verify .*app\.contract /m, clean.stdout);
+    const properties = resolve(dir, '.exact/verify/properties.txt'), full = readFileSync(properties, 'utf8');
+    assert.match(full, /^Observed over .*not proved/m);
+    assert.match(full, /^(always|after|never) /m);
+    assert.match(full, /^verify receipt — reproduce: contract verify .*app\.contract /m);
+    assert.match(full, /^ {2}app sha256:.*tests sha256:.*embedding sha256:/m);
+    assert.match(full, /^ {2}suggestions: .* printed; .* dropped/m);
+    assert.doesNotMatch(clean.stdout, /^verify receipt|^Observed over/m);
     for (const [w, h] of SIZES) for (const scheme of ['light', 'dark']) assert.ok(existsSync(resolve(dir, `.exact/verify/web-${w}x${h}-${scheme}.png`)), `${w}x${h} ${scheme}`);
     for (const f of ['web-t1-the-greeting-loads.png', 'web-t2-the-header-s-button-likes-it.png', 'web-relaunch.png']) assert.ok(existsSync(resolve(dir, '.exact/verify', f)), f);
     // `--shots out/shots` made the directory and copied every one, under the names verify keeps (LLP 1116.008 D2).
@@ -1026,9 +1028,23 @@ test.skipIf(!!chromium().unavailable)('verify on a new app: clean, a failing tes
     assert.ok(readFileSync(resolve(dir, 'out/shots/web-relaunch.png')).equals(readFileSync(resolve(dir, '.exact/verify/web-relaunch.png'))));
     assert.match(clean.stdout, /^screenshots \(\.exact\/verify, copied to out\/shots\): /m);
     const bare = verify('--shots');
-    assert.deepEqual([bare.status, bare.stdout, bare.stderr], [2, '', 'verify: --shots takes a directory: the screenshots are copied there, under the names in .exact/verify/\n']);
+    assert.deepEqual([bare.status, bare.stdout, bare.stderr], [2, '', 'verify: --shots needs a value (--shots <dir>)\n']);
 
     const tests = resolve(dir, 'app.test.contract'), authored = readFileSync(tests, 'utf8');
+    const property = '\nafter "like" "liking writes nothing"\n  writes none\n';
+    writeFileSync(tests, authored + property);
+    const semanticFailed = verify();
+    assert.equal(semanticFailed.status, 1, semanticFailed.stdout + semanticFailed.stderr);
+    assert.ok(semanticFailed.lines.includes('tests: 2 passed, 0 failed'), semanticFailed.stdout);
+    assert.match(semanticFailed.stdout, /^PROPERTY "liking writes nothing" is false/m);
+    assert.match(semanticFailed.lines.at(-1), /^verify: clean in \d+\.\d s; contract verify: failed \(exit 1\); .*properties: 0 held, 1 false, 0 counted only, 0 not exercised;/);
+    assert.match(readFileSync(properties, 'utf8'), /^verify receipt — reproduce:/m);
+    writeFileSync(tests, authored.replace('expect state liked == true', 'expect state liked == false') + property);
+    const both = verify('--json'), bothJSON = JSON.parse(both.stdout);
+    assert.deepEqual([both.status, bothJSON.exit, bothJSON.tests.failed, bothJSON.semantics.exit], [1, 1, 1, 1], both.stdout + both.stderr);
+    assert.deepEqual(Object.keys(bothJSON.semantics).sort(), ['exit', 'output']);
+    assert.match(bothJSON.semantics.output, /^PROPERTY "liking writes nothing" is false/m);
+    assert.match(bothJSON.semantics.output, /^verify receipt — reproduce:/m);
     writeFileSync(tests, authored.replace('expect state liked == true', 'expect state liked == false'));
     const failing = verify();
     assert.equal(failing.status, 1, failing.stdout + failing.stderr);
@@ -1068,6 +1084,8 @@ test.skipIf(!!chromium().unavailable)('verify on a new app: clean, a failing tes
     const json = verify('--json');
     assert.equal(json.status, 0, json.stderr);
     const r = JSON.parse(json.stdout);
+    assert.equal(r.semantics.exit, 0);
+    assert.match(r.semantics.output, /^verify receipt — reproduce:/m);
     assert.deepEqual([r.host, r.built, r.tests.passed, r.tests.failed, r.problems, r.exit, r.screenshots.length, r.compiler.length], ['web', null, 2, 0, 2, 0, 7, 1]);
     // Each screen at each width and scheme: the first screen, the two test ends (in their own sessions), the relaunch.
     const onScreen = (screen) => r.checks.filter((c) => c.screen === screen).map((c) => `${c.size.join('x')} ${c.scheme} ${c.findings.map((f) => f.kind).join(',')}`);
@@ -1409,4 +1427,58 @@ test('scrolling: the scrub and a carousel join the summary; their hitches and th
   // A drag down the list that moved the carousel is UIKit's arbitration, which Exact owns.
   const along = findings(feel({ along: 'bad' }));
   assert.deepEqual(along.map((f) => [f.metric, f.value, f.owner]), [['carousel: a mostly-vertical drag', '0.95, 40', 'exact']]);
+});
+
+test('every drive after the build, and the run recorded, select the app the caller named, under EXACT_APP_DIR of another basename', () => {
+  // `EXACT_APP_DIR=…/copy verify web --app original` (a staged design tool's): its drives and its record are
+  // `original`'s, whose crates are `original-*`, never `copy`'s. The build, server, drives and record are stubbed.
+  const root = mkdtempSync(resolve(tmpdir(), 'exact-verify-selector-')), dir = resolve(root, 'copy');
+  mkdirSync(dir);
+  writeFileSync(resolve(dir, 'app.contract'), 'component App\n  view\n    text "Test"\n');
+  writeFileSync(resolve(dir, 'app.test.contract'), 'test "a"\n  expect text "Test" == "Test"\n');
+  const seen = resolve(root, 'seen.jsonl'), preload = resolve(root, 'stub.mjs'), scripts = import.meta.dir;
+  writeFileSync(preload, `
+    import { mock } from 'bun:test';
+    import { appendFileSync } from 'node:fs';
+    const scripts = ${JSON.stringify(scripts)}, at = (p) => scripts + '/' + p;
+    // Before the first await: verify.mjs imports it statically, and Bun runs the entry once this file awaits.
+    mock.module(at('verify-semantics.mjs'), () => ({ contractVerify: () => ({ stop() {}, done: Promise.resolve({ exit: 0, output: '', errors: '' }) }), semanticsSummary: () => [] }));
+    const { resolveApp } = await import(at('app.mjs'));
+    const note = (by, selector) => { const a = resolveApp(selector); appendFileSync(${JSON.stringify(seen)}, JSON.stringify([by, a.name, a.dir, a.crate('gpu')]) + '\\n'); };
+    const real = async (p) => ({ ...(await import(at(p))) });
+    const launch = await real('agent-launch.mjs'), serve = await real('../host/web/serve.mjs'), web = await real('../host/web-js/module.mjs'), driven = await real('agent-test.mjs');
+    mock.module(at('../host/web/serve.mjs'), () => ({ ...serve, builtAppMatches: async () => true, jsTargetBuild: () => true }));
+    mock.module(at('../host/web-js/module.mjs'), () => ({ ...web, fresh: () => true }));
+    mock.module(at('agent-launch.mjs'), () => ({ ...launch, webChanges: () => ({ all: [], app: [] }), driveStore: () => ({ base: ${JSON.stringify(root)}, profile: ${JSON.stringify(root)} }), removeBrowserProfile: async () => {} }));
+    mock.module(at('agent-test.mjs'), () => ({ ...driven, sweepTestStores() {}, runTests: async ({ app }) => {
+      note('runTests', app);
+      return { passed: 1, failed: 0, results: [{ name: 'a', failures: [], store: 'test', end: { ops: 1, resources: {} } }] };
+    } }));
+    mock.module(at('agent.mjs'), () => ({ open: async ({ app }) => { note('open', app); throw new Error('stubbed drive'); } }));
+    mock.module(at('evidence.mjs'), () => ({ recordRun: (app) => note('recordRun', app) }));
+  `);
+  try {
+    const r = spawnSync(process.execPath, ['--preload', preload, resolve(scripts, 'verify.mjs'), 'web', '--app', 'original', '--json'],
+      { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8', timeout: 30_000 });
+    const lines = existsSync(seen) ? readFileSync(seen, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+    // The tests and the tour; a first screen at each width; the relaunch on the test's store; the run.
+    assert.deepEqual(lines.map(([by]) => by).sort(), ['open', 'open', 'open', 'recordRun', 'runTests', 'runTests'], r.stdout + r.stderr);
+    for (const [, name, at, gpu] of lines) assert.deepEqual([name, at, gpu], ['original', realpathSync(dir), 'original-gpu']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 60_000);
+
+test('verify shows a drive build as it starts and as it runs, not its other lines', () => {
+  const lines = ['building for ios: app.contract changed', 'waiting for the build in another drive', '  still building (60 s): Compiling exact-kernel', 'kept the plan', 'warning: x'];
+  assert.deepEqual(lines.filter(buildProgress), lines.slice(0, 3));
+});
+
+test('a server owner two processes up is found on every platform: the parent table, then the walk up it', () => {
+  // `ps -A -o pid=,ppid=` pads its columns; Win32_Process's lines are as written.
+  const posix = parentsOf('    1     0\n  420     1\n  500   420\n  612   500\n');
+  assert.deepEqual(ancestors(612, posix), ['612', '500', '420']);
+  const windows = parentsOf('0 0\r\n4 0\r\n7100 4\r\n7200 7100\r\n7300 7200\r\n');
+  assert.deepEqual(ancestors(7300, windows), ['7300', '7200', '7100', '4']);
+  assert.deepEqual(ancestors(7300, new Map()), ['7300'], 'a parent table that could not be read');
+  assert.deepEqual(ancestors(10, new Map([[10, 11], [11, 10]])), ['10', '11'], 'a reused pid makes no loop');
+  assert.ok(ancestors().includes(String(process.ppid)));
 });

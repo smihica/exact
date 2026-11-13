@@ -87,8 +87,8 @@ pub use handoff::Handoff;
 pub use id::{AxisOffer, Frame, NodeFlags, NodeKey, Offer, ViewId};
 pub use invocation::Invocation;
 pub use kernel::{
-    BlockAxis, BlockMeasure, HostBlock, HostCover, Kernel, NodeRef, PresentedHeight,
-    StickyConstraint,
+    credited_edges, BlockAxis, BlockMeasure, HostBlock, HostCover, Kernel, NodeRef,
+    PresentedHeight, StickyConstraint,
 };
 pub use layout::LayoutReceipt;
 pub use motion::{motion_node, MotionSync};
@@ -109,8 +109,8 @@ pub use text::case::{
 };
 pub use text::inline_box::{FontEdges, InlineBox, INLINE_BOX_TEXT};
 pub use text::{
-    Markup, MarkupAtoms, MonospaceMeasurer, OverEdge, ParagraphStamp, SymbolRequest, TextEdges,
-    TextMeasureRequest, TextMeasurer, TextMetrics, TextRun, TextStyle, UnderEdge,
+    InlineEdges, Markup, MarkupAtoms, MonospaceMeasurer, OverEdge, ParagraphStamp, SymbolRequest,
+    TextEdges, TextMeasureRequest, TextMeasurer, TextMetrics, TextRun, TextStyle, UnderEdge,
 };
 pub use transform::TransformDragBinding;
 pub use txn::{CommitReceipt, Exit, MAX_DEPTH};

@@ -19,7 +19,7 @@ import { basename, dirname, relative, resolve } from 'node:path';
 import { acceptsHTML, appDocumentPath, webRequestURL } from '../../scripts/origin.mjs';
 import { compilerWarnings, INPUT_TREE, OUTPUT, listenOn } from '../../scripts/agent-launch.mjs';
 import { builtSettings } from '../../js/bake/src/__exact_env.mjs';
-import { alsoOnIPv6Loopback, appManifestDigest, buildFileCards, listenDelay, replaceBuild, saveTrace, sendStaticBody, watchLauncher, webContentType } from '../web/serve.mjs';
+import { alsoOnIPv6Loopback, appManifestDigest, appSources, buildFileCards, listenDelay, replaceBuild, saveTrace, sendStaticBody, watchLauncher, webContentType } from '../web/serve.mjs';
 import { generationFile, generationPath, servedFile } from '../web/generations.mjs';
 import { besidePattern } from '../web/beside.mjs';
 import { localInstaller } from '../web/local-install.mjs';
@@ -28,13 +28,15 @@ import { pluginOnLoopback } from '../../scripts/tamber-remote.mjs';
 import { openRemoteCanvas } from '../../scripts/tamber-canvas.mjs';
 import { mapCard, pullMap } from '../../scripts/tamber-inspect.mjs';
 import { serveCommands, serveReport, streamFrame } from '../../scripts/tamber-builds.mjs';
-import { fresh, freshCompiler, webCompiler } from './module.mjs';
+import { EXE, depInfoOf, fresh, freshCompiler, webCompiler } from './module.mjs';
 import { hostModuleSources } from './glue.mjs';
 import { INSPECT_EVENTS } from './inspect-dev.js';
 import { galleryLoop } from './dev-gallery.mjs';
 import { inlineWhy as inlineWhyOf } from './dev-inline.mjs';
 import { DEV_STATUS_TYPE, FAILED, PHASE, gist } from '../web/dev-phase.mjs';
+import { startupBuilds, stopBuildTree } from '../web/dev-startup.mjs';
 import { fileURLToPath } from 'node:url';
+import { installedFileDependencies } from '../../scripts/file-dependencies.mjs';
 
 const CHECKPOINT_BYTES = 16 * 1024 * 1024, CHECKPOINTS = 8;
 
@@ -106,13 +108,17 @@ function mapDesignSource(app, dir) {
  * when it says so as the build ends (an input moved since it began, or it
  * was stopped for one), or a source it read moved since, leaves `dist` as
  * it was and resolves `{superseded}`: what it read is older than the files.
- * With none, it is published whatever moved. */
-function build(app, dist, keep = () => false, compiler = null, superseded = null) {
+ * With none, it is published whatever moved. `cancelled()` still sets it
+ * aside during shutdown, including the final startup attempt. */
+function build(app, dist, keep = () => false, compiler = null, superseded = null, cancelled = () => false) {
   // One stage per dist: two loops on one target/ (two apps outside a workspace, or one CARGO_TARGET_DIR) never
   // build into each other's.
   const stage = resolve(app.target, 'web-js-dev-stage', createHash('sha256').update(resolve(dist)).digest('hex').slice(0, 16));
   rmSync(stage, { recursive: true, force: true });
-  const began = Date.now();
+  // The app's `file:` packages as their directories hold them, before the build begins: installed during it, they
+  // would be sources moved since it began, and it would be set aside (#115).
+  try { installedFileDependencies(app.dir); } catch (error) { return Promise.resolve({ packages: devPackages(stage), error: error.message }); }
+  const began = Date.now(), sources = appSources(app.dir, resolve(dist)).digest;
   // The app's own inputs beside its Contract sources, and which were there.
   const own = [designPath(app.dir) ?? resolve(app.dir, 'app.tamber'), resolve(app.dir, 'app.ts'), resolve(app.dir, 'app.json'), resolve(app.dir, '.exact/backend-origin'), resolve(app.dir, '.env.local'), resolve(app.dir, '.env')];
   const there = new Set(own.filter((path) => existsSync(path)));
@@ -121,7 +127,7 @@ function build(app, dist, keep = () => false, compiler = null, superseded = null
     // The JS target's build itself, rendering no pages (every route is the
     // shell), with the completion marker host/web/build.mjs writes.
     const child = building = spawn(process.execPath, [resolve(root, 'host/web-js/build.mjs'), app.name, '--out', stage, '--render', 'none', '--dev'],
-      { cwd: root, env: compiler ? { ...process.env, EXACT_WEB_COMPILER: compiler } : process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+      { cwd: root, env: { ...process.env, EXACT_APP_DIR: app.dir, ...(compiler ? { EXACT_WEB_COMPILER: compiler } : {}) }, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     let log = '';
     child.stdout.on('data', (d) => { log += d; });
     child.stderr.on('data', (d) => { log += d; });
@@ -148,7 +154,7 @@ function build(app, dist, keep = () => false, compiler = null, superseded = null
       const newer = () => packages.sources.some((path) => { try { return since(path); } catch { return known.has(path); } })
         || own.some((path) => { try { lstatSync(path); } catch { return there.has(path); } return !there.has(path) || since(path); });
       const setAside = () => { rmSync(stage, { recursive: true, force: true }); done({ superseded: true, packages }); };
-      const moved = () => superseded && (superseded() || newer());
+      const moved = () => cancelled() || (superseded && (superseded() || newer()));
       // A failed one too: its errors may be of files since edited.
       if (moved()) return setAside();
       // The one line a build says when it rewrote the types app.ts imports, built or not (LLP 1116.001 D4.5).
@@ -163,8 +169,10 @@ function build(app, dist, keep = () => false, compiler = null, superseded = null
           rmSync(stage, { recursive: true, force: true }); done({ error: null, logic, packages, design, designSource, kept: true, warnings: compilerWarnings(log) });
         });
       }
+      // `sources` as host/web/build.mjs records it: null when a file came or went while it built.
+      const after = appSources(app.dir, resolve(dist)).digest;
       writeFileSync(resolve(stage, '.exact-build.json'), JSON.stringify({ exactBuild: 1, target: 'js', app: { id: app.id, name: app.displayName },
-        manifestSha256: appManifestDigest(app), files: buildFileCards(stage), ...builtSettings(stage) }) + '\n');
+        manifestSha256: appManifestDigest(app), files: buildFileCards(stage), sources: after === sources ? after : null, ...builtSettings(stage) }) + '\n');
       // Once more after the watchers' events queued meanwhile are taken.
       setImmediate(() => {
         if (moved()) return setAside();
@@ -184,19 +192,41 @@ const mtimeMs = (path) => { try { return statSync(path).mtimeMs; } catch { retur
 function copyCompiler(path, copy, built) {
   const temp = `${copy}.${process.pid}.tmp`, tempDep = `${temp}.d`;
   try {
-    const dep = mtimeMs(`${path}.d`);
+    const dep = mtimeMs(depInfoOf(path));
     if (mtimeMs(path) !== built || dep === null) throw new Error('built again');
     copyFileSync(path, temp);
     utimesSync(temp, new Date(built), new Date(built));
-    copyFileSync(`${path}.d`, tempDep);
-    if (mtimeMs(path) !== built || mtimeMs(`${path}.d`) !== dep || !readFileSync(tempDep, 'utf8').endsWith('\n')) throw new Error('built again');
-    renameSync(tempDep, `${copy}.d`);
+    copyFileSync(depInfoOf(path), tempDep);
+    if (mtimeMs(path) !== built || mtimeMs(depInfoOf(path)) !== dep || !readFileSync(tempDep, 'utf8').endsWith('\n')) throw new Error('built again');
+    renameSync(tempDep, depInfoOf(copy));
     renameSync(temp, copy);
   } catch { rmSync(temp, { force: true }); rmSync(tempDep, { force: true }); }
 }
+/** Where `app`'s builds take the loop's compiler copy (`copyCompiler`). */
+const compilerCopy = (app) => resolve(app.target, `web-js-dev-compiler-${app.name.replace(/[^\w.-]/g, '_')}${EXE}`);
 
 /** Build `app` on the JS target and serve it with reload, until the process ends. */
 export async function devJs({ app, dist, port, host, origins, gate, lan, allowHosts = [], remoteAsked = { remote: null, tunnel: null, plugin: false, hosts: [] }, residentPort = 0, pairTtlMs }) {
+  let stopping = false, shutdown = null;
+  // A design (`exact-web-js design`), read from the compiler with no build:
+  // a value-only edit's and a scrub's. Optimised (host-dev), built as the
+  // loop starts and again after any edit that is not a design's, so it is
+  // the compiler the builds use; until it is, the debug compiler answers.
+  const tool = { path: resolve(process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : resolve(root, 'target'), `host-dev/exact-web-js${EXE}`), ready: false, built: null, child: null, reading: null, cleaner: null };
+  const patcher = { child: null, built: null, asks: new Map(), n: 0 };
+  const toolExits = new Set(), inspections = new Set();
+  const stopGroup = child => {
+    const exit = stopBuildTree(child);
+    toolExits.add(exit);
+    void exit.finally(() => toolExits.delete(exit));
+    return exit;
+  };
+  const stopCompilers = () => {
+    for (const child of [building, tool.child, tool.reading, tool.cleaner, patcher.child, ...inspections]) stopGroup(child);
+    return Promise.all(toolExits);
+  };
+  const startup = startupBuilds();
+  startup.handoff(() => shutdown ??= (async () => { stopping = true; await stopCompilers(); process.exit(0); })());
   const budget = /\|\s*Dev restart[^|]*\|\s*([^|\n]+)/.exec(readFileSync(resolve(root, 'rules/RULES.md'), 'utf8'))?.[1].trim() ?? '?';
   const t0 = Date.now();
   // A first build that fails (a refusal or a compile error) serves its
@@ -211,7 +241,8 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     const input = (name) => name && ((!skipped.test(String(name)) && String(name) !== 'app.contract.d.ts') || /^\.exact(?:[\\/]backend-origin)?$/.test(String(name)) || settingsFile(name));
     const begun = Date.now();
     const early = [watch(app.dir, { recursive: true }, (_, name) => { if (!moved && input(name) && movedSince(resolve(app.dir, String(name)), begun)) moved = true; }), watch(resolve(root, 'host/web-js'), { recursive: true }, (_, name) => { if (!moved && name && !skipped.test(String(name)) && movedSince(resolve(root, 'host/web-js', String(name)), begun)) moved = true; })];
-    try { built = await build(app, dist, () => false, null, tries < 3 ? () => moved : null); } finally { for (const w of early) w.close(); }
+    try { built = await build(app, dist, () => false, null, tries < 3 ? () => moved : null, () => stopping); } finally { for (const w of early) w.close(); }
+    if (stopping) await shutdown;
     startMoved = moved;
     if (!built.superseded) break;
     console.log('a source moved while the first build ran: building again');
@@ -280,13 +311,6 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // frames, *1.11*), so a late fetch of one of them never shows over it; the
   // scrub ends with it.
   const releasedMark = () => { const mark = released?.id ? released : undefined; scrubbed = null; aside = null; released = false; return mark; };
-  // A design (`exact-web-js design`), read from the compiler with no build:
-  // a value-only edit's and a scrub's. Optimised (host-dev), built as the
-  // loop starts and again after any edit that is not a design's, so it is
-  // the compiler the builds use; until it is, the debug compiler answers.
-  const tool = { path: resolve(process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : resolve(root, 'target'), 'host-dev/exact-web-js'), ready: false, built: null, child: null, reading: null, cleaner: null };
-  // Cargo and the compilers it runs, as a group (stopped together).
-  const stopGroup = (child) => { if (!child) return; try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill(); } };
   // What a failed build said: each error with the lines that explain it (a
   // linker's `ld:` and `Undefined symbols` lines, its notes, the command line
   // cut short), then its last lines.
@@ -337,6 +361,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   };
   let cleaned = false, readerHolds = 0;
   const buildTool = () => {
+    if (stopping) return;
     tool.ready = false;
     stopGroup(tool.child);
     const started = new Date();
@@ -348,7 +373,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     // (only the first: one built again because a cold build left its inputs newer is not held twice).
     const hold = readerHolds++ === 0 ? Number(process.env.EXACT_DEV_READER_HOLD_MS) || 0 : 0;
     child.on('exit', (code, signal) => setTimeout(() => {
-      if (tool.child !== child) return;
+      if (stopping || tool.child !== child) return;
       tool.child = null;
       tool.ready = code === 0 && existsSync(tool.path);
       // Dated to the build's start, as Cargo dates its fingerprints: a
@@ -381,13 +406,13 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // edit the loop does not watch, under contract/ or kernel/, rebuilds it).
   const toolFresh = () => {
     if (!tool.ready) return false;
-    if (fresh(tool.path, `${tool.path}.d`)) return true;
+    if (fresh(tool.path, depInfoOf(tool.path))) return true;
     buildTool();
     return false;
   };
   // The same, starting nothing: for what a request below write scope reaches
   // (`propose`'s class, stage 10 A1), which may not start a build.
-  const toolReady = () => tool.ready && fresh(tool.path, `${tool.path}.d`);
+  const toolReady = () => tool.ready && fresh(tool.path, depInfoOf(tool.path));
   buildTool();
   // The page's inspect table (LLP 1122 T2b, inspect.rs), made for dist's
   // plan when the page first asks (seconds for a large app, so no build
@@ -395,12 +420,15 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // and one made while dist moved on is not served.
   const tables = new Map();
   const inspectTable = (digest, plan = resolve(dist, 'app.plan')) => {
+    if (stopping) return Promise.resolve(null);
     if (!tables.has(digest)) {
       tables.set(digest, new Promise((done) => {
         // (this loop's own: another loop on one target/ may make the same plan's table, and removes its own)
         const out = resolve(app.target, `inspect-${digest}-${process.pid}.json`);
         const compiler = toolFresh() ? { cmd: tool.path, pre: [], done() {} } : webCompiler();
-        const child = spawn(compiler.cmd, [...compiler.pre, 'inspect-table', plan, out], { cwd: root, stdio: ['ignore', 'ignore', 'pipe'] });
+        const child = spawn(compiler.cmd, [...compiler.pre, 'inspect-table', plan, out], { cwd: root, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+        inspections.add(child);
+        child.once('close', () => inspections.delete(child));
         let err = '';
         child.stderr.on('data', (d) => { err += d; });
         child.on('exit', (code) => {
@@ -444,7 +472,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // A fast batch is checked by the full build after it (its verifying build): the
   // design's module inputs and its compile; a value-only edit during that
   // build is sent at once and checked after it.
-  let designing = false, stopping = false;
+  let designing = false;
   // Input changes seen, counted: a build that began before the last one
   // read older files, and is set aside (`superseded`), never published.
   // An edit stops the build in flight, once in a burst and only while it
@@ -478,12 +506,12 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // The variant gallery (dev-gallery.mjs), started by its first page: told of each publication after it is out.
   const gallery = galleryLoop({ app, root, appDist: dist, channel: () => tamber?.channel, design: () => design?.digest ?? null, idleMs: Number(process.env.EXACT_DEV_GALLERY_IDLE_MS) || undefined,
     // (The reader's binary while it is fresh, asked without building it or the reader again; else no table yet.)
-    tableTool: () => (tool.ready && tool.path && fresh(tool.path, `${tool.path}.d`) ? { cmd: tool.path, pre: [] } : null),
-    compiler: () => { const copy = resolve(app.target, `web-js-dev-compiler-${app.name.replace(/[^\w.-]/g, '_')}`); return freshCompiler(copy) ? copy : null; },
+    tableTool: () => (tool.ready && tool.path && fresh(tool.path, depInfoOf(tool.path)) ? { cmd: tool.path, pre: [] } : null),
+    compiler: () => { const copy = compilerCopy(app); return freshCompiler(copy) ? copy : null; },
     client: (n) => client(n, null, { base: '/__dev/gallery', stream: '/__dev/gallery/stream', page: 'gallery' }) });
   const rebuild = async () => {
     // A burst a build already took (its timer still armed) is no edit.
-    if (!edited.size) return;
+    if (stopping || !edited.size) return;
     const at = saved, t = Date.now();
     // A path that existed during the save and is gone by now (an editor's
     // or sed's temporary file) edited nothing; one already gone when its
@@ -565,7 +593,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
     // kept while it is fresh, so a build while the reader builds again (as
     // it does below, after every edit) takes it as well.
     // The app's own (apps in the tree share a target/).
-    const copy = resolve(app.target, `web-js-dev-compiler-${app.name.replace(/[^\w.-]/g, '_')}`);
+    const copy = compilerCopy(app);
     // Only the binary this loop's own build left (another loop on this
     // target/ may have linked one since, not yet dated to its start).
     if (tool.ready && tool.built !== null && freshCompiler(tool.path)) copyCompiler(tool.path, copy, tool.built);
@@ -582,7 +610,8 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
       && next.tokens.every((t, i) => t.name === design.tokens[i].name && String(t.accent) === String(design.tokens[i].accent) && (!t.inline || same(t, design.tokens[i])));
     buildBegan = Date.now();
     console.log(`edit → building${checking ? ' (checking the batch)' : ''}`);
-    built = await build(app, dist, keep, compiler, () => inputs !== began);
+    built = await build(app, dist, keep, compiler, () => inputs !== began, () => stopping);
+    if (stopping) return;
     if (built.superseded && ++asideRun === 3) console.log('edit → three builds in a row set aside: an input moves during every build (does one write its own input?)');
     if (!built.superseded) { stopped = false; lastBuildMs = Date.now() - buildBegan; asideRun = 0; }
     // An input moved while it built (a value-only edit's batch included):
@@ -671,6 +700,7 @@ export async function devJs({ app, dist, port, host, origins, gate, lan, allowHo
   // A build reading a tree (the assets it copies) is reported too on macOS:
   // a path not modified since the last build started is no edit.
   const changed = (base, skip = skipped, fresh = true) => (_, name) => {
+    if (stopping) return;
     // A Contract source the compile read is an input even where the app's
     // watcher skips (a dot directory).
     if (name && skip.test(String(name)) && !contractInput(resolve(base, String(name)))
@@ -790,8 +820,8 @@ es.onmessage=e=>{const m=JSON.parse(e.data);if(m.kind==='tamber-batch'||m.kind==
   // committed design, each frame's folded rows set on that plan, compiling
   // nothing. Started at a scrub's first frame, again after the reader
   // builds again; a frame it cannot patch is compiled whole instead.
-  const patcher = { child: null, built: null, asks: new Map(), n: 0 };
   const patcherAsk = (request) => new Promise((done) => {
+    if (stopping) return done({ fallback: true });
     if (!toolFresh()) return done({ fallback: true });
     if (!patcher.child || patcher.built !== tool.built) {
       stopGroup(patcher.child);
@@ -1051,12 +1081,13 @@ es.onmessage=e=>{const m=JSON.parse(e.data);if(m.kind==='tamber-batch'||m.kind==
       body = body.toString();
       const id = url.searchParams.get('__exactDev'), carried = id && checkpoints.get(id);
       if (carried) {
-        checkpoints.delete(id);
+        // A HEAD or a failed document load must leave the handoff available to a retry. The bounded map evicts it.
+        let text = carried.text;
         if (carried.revision !== String(logicRevision ?? '')) {
-          const c = JSON.parse(carried.text);
-          if (c.carryAnswers || c.answers?.length) { c.carryAnswers = false; c.answers = []; carried.text = JSON.stringify(c); }
+          const c = JSON.parse(text);
+          if (c.carryAnswers || c.answers?.length) { c.carryAnswers = false; c.answers = []; text = JSON.stringify(c); }
         }
-        const checkpoint = `<script type="application/vnd.exact.dev-checkpoint" data-seq="${carried.seq}">${carried.text.replaceAll('<', '\\u003c')}</script><script>const u=new URL(location.href);u.searchParams.delete('__exactDev');history.replaceState(history.state,'',u.pathname+(u.search?'?'+u.searchParams:'')+u.hash)</script>`;
+        const checkpoint = `<script type="application/vnd.exact.dev-checkpoint" data-seq="${carried.seq}">${text.replaceAll('<', '\\u003c')}</script><script>const u=new URL(location.href);u.searchParams.delete('__exactDev');history.replaceState(history.state,'',u.pathname+(u.search?'?'+u.searchParams:'')+u.hash)</script>`;
         body = body.replace('<script type="module"', () => checkpoint + '<script type="module"');
       }
       body += client(seq, logicRevision);
@@ -1080,7 +1111,7 @@ es.onmessage=e=>{const m=JSON.parse(e.data);if(m.kind==='tamber-batch'||m.kind==
         mkdirSync(dirname(residentDist), { recursive: true });
         // (EXACT_DEV_RESIDENT_SCRIPT: a test's stand-in resident)
         residentChild = spawn(process.execPath, [process.env.EXACT_DEV_RESIDENT_SCRIPT || resolve(root, 'host/web/dev.mjs'), '--app', app.name, '--wasm', '--port', String(internal), '--serve-as', String(port), ...(lan ? ['--lan'] : []), ...allowHosts.flatMap((name) => ['--allow-host', name])],
-          { cwd: root, env: { ...process.env, EXACT_WEB_DIST: residentDist, EXACT_LAUNCHER_PID: String(process.pid), EXACT_MAP_FD: '3' }, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
+          { cwd: root, env: { ...process.env, EXACT_APP_DIR: app.dir, EXACT_WEB_DIST: residentDist, EXACT_LAUNCHER_PID: String(process.pid), EXACT_MAP_FD: '3' }, stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
         // Its errors as before (piped, so a slow terminal holds it back), the
         // last of them kept: what a start that fails says to the client.
         let errors = '';
@@ -1149,19 +1180,19 @@ es.onmessage=e=>{const m=JSON.parse(e.data);if(m.kind==='tamber-batch'||m.kind==
       req.pipe(out);
     }, () => { starting.waiting.delete(fail); if (!gone) failedNow(res); });
   };
-  const stop = async () => {
+  const stop = () => shutdown ??= (async () => {
     stopping = true;
-    for (const w of watchers) w.close(); stopBuild('SIGKILL'); stopGroup(tool.child); stopGroup(tool.reading); stopGroup(tool.cleaner); stopGroup(patcher.child); residentChild?.kill('SIGTERM'); server.close(); server.closeAllConnections?.();
+    clearTimeout(timer); timer = null;
+    const buildExit = stopCompilers();
+    for (const w of watchers) w.close(); residentChild?.kill('SIGTERM'); server.close(); server.closeAllConnections?.();
     // The design server lets go of its lock before this exits.
-    await Promise.all([tamber?.close(), doors?.close(), gallery.stop()]);
+    await Promise.all([buildExit, tamber?.close(), doors?.close(), gallery.stop()]);
     // A local iOS build in flight is stopped and waited for, as the resident loop does.
     const install = installer.child;
     if (install && install.exitCode === null && install.signalCode === null) { const exit = new Promise((ok) => install.once('exit', ok)); install.kill('SIGTERM'); await exit; }
     process.exit(process.exitCode ?? 0);
-  };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-  process.on('SIGHUP', stop);
+  })();
+  startup.handoff(stop);
   watchLauncher(stop);
   await listenDelay();
   // (and on [::1], for a localhost URL: the design tool's canvas)

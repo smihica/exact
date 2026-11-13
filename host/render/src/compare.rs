@@ -5,7 +5,7 @@
 //! page takes over the runtime's form of the root).
 
 use crate::page::{body_js, Js};
-use crate::{render_with, Ids, Projection, Rendered, Settled};
+use crate::{render_with_at, Ids, Projection, Rendered, Settled};
 use exact_plan::Plan;
 use exact_runner::DataSource;
 use exact_web::document::Site;
@@ -23,9 +23,10 @@ pub(crate) fn location<D: DataSource + 'static, F: Fn() -> D>(
     site: &Site,
     deadline: Duration,
     shell: Option<&str>,
+    delivery: &exact_runner::delivery::Delivery,
 ) -> String {
     let render = |projection| {
-        render_with(
+        render_with_at(
             plan,
             data,
             viewport,
@@ -34,6 +35,8 @@ pub(crate) fn location<D: DataSource + 'static, F: Fn() -> D>(
             deadline,
             Ids::Any,
             projection,
+            crate::render_time(),
+            delivery,
         )
     };
     let kernel = match render(Projection::Kernel) {
@@ -50,7 +53,7 @@ pub(crate) fn location<D: DataSource + 'static, F: Fn() -> D>(
     let js = shell.and_then(|shell| crate::page::is_js(shell).then_some(shell));
     if let Some(shell) = js {
         match streamed(
-            plan, data, viewport, location, site, deadline, shell, &kernel,
+            plan, data, viewport, location, site, deadline, shell, &kernel, delivery,
         ) {
             Ok(None) => {}
             Ok(Some(differs)) => return format!(",\"same\":false,\"differs\":{}", json(&differs)),
@@ -115,6 +118,7 @@ fn streamed<D: DataSource + 'static, F: Fn() -> D>(
     deadline: Duration,
     shell: &str,
     kernel: &Rendered,
+    delivery: &exact_runner::delivery::Delivery,
 ) -> Result<Option<String>, String> {
     let js = Js::of(shell)?;
     let preload = crate::page::preloads_early(plan, location);
@@ -130,10 +134,12 @@ fn streamed<D: DataSource + 'static, F: Fn() -> D>(
         location,
         site,
         deadline,
+        delivery,
         shell,
         &js,
         late,
         usize::MAX,
+        None,
         &mut send,
     )?
     else {
@@ -148,13 +154,14 @@ fn streamed<D: DataSource + 'static, F: Fn() -> D>(
             late(page.rendered.activate),
             false,
             Some(boot),
+            None,
         )
     });
     let start = page.boot.as_ref().map_or(0, |boot| boot.sent);
     if sent.get(start..) != Some(after_boot.as_deref().unwrap_or(&page.body).as_bytes()) {
         return Ok(Some("the streamed runs are not the page".into()));
     }
-    let expected = body_js(shell, &js, kernel, late(kernel.activate), false);
+    let expected = body_js(shell, &js, kernel, late(kernel.activate), false, None);
     let (a, b) = (
         without_clock(&without_digest(&expected)),
         without_clock(&without_digest(&page.body)),

@@ -210,9 +210,16 @@ struct Server {
     /// program loads as it did (`contract::retention_build`).
     kept: Option<(String, contract::Kept)>,
     /// The style rows the last retention build found literal, with each
-    /// source's path, by the Contract sources' key: what a write's rows
-    /// check judges again (`contract_lower::rows`).
-    rows: Option<(String, Vec<contract_lower::rows::Row>, Vec<PathBuf>)>,
+    /// source's path and what the rows leave to the build, by the Contract
+    /// sources' key: what a write's rows check judges again
+    /// (`contract_lower::rows`).
+    #[allow(clippy::type_complexity)]
+    rows: Option<(
+        String,
+        Vec<contract_lower::rows::Row>,
+        Vec<PathBuf>,
+        contract_lower::rows::Left,
+    )>,
     /// The background whole build, which says when a retention build's
     /// build fails after the design (theme2's 12:15 ruling).
     checker: check::Checker,
@@ -397,8 +404,10 @@ impl Server {
 
     /// The app's synthetic tokens: every expression over tokens its rows
     /// write, folding or not, as the compiler finds them (the plan keeps
-    /// only those that fold), and the plan's retention beside them. Read
-    /// again when a Contract source or what resolved its imports changes, or
+    /// only those that fold), with the view retention and native-param
+    /// roots beside them. The params' closure is recomputed by `plan` from
+    /// the current design. Read again when a Contract source or what
+    /// resolved its imports changes, or
     /// what of the app's or a package's design can move them does
     /// (`walk::retention_key`): an edit of a value that names nothing
     /// keeps them; one that moves an alias, a `params` entry or a component's
@@ -465,7 +474,7 @@ impl Server {
             let _ = file.and_then(|mut f| f.write_all(line.as_bytes()));
         }
         self.kept = built.kept.map(|kept| (sources.clone(), kept));
-        self.rows = Some((sources, built.rows, built.paths));
+        self.rows = Some((sources, built.rows, built.paths, built.left));
         // A build that stopped before the design says nothing of them.
         let retention = built.retention?;
         self.synthetic = Some((key.clone(), built.candidates.clone(), Some(retention)));
@@ -1173,7 +1182,7 @@ impl Server {
         // override that varies by an app axis (LLP 1121 D5, the compiler's
         // `tamber-role-axis`). An undo restores what was, and is not judged.
         if !undo {
-            self.write_checks(&texts, &planned, &self.last_key)?;
+            self.write_checks(&texts, &planned, &self.last_key.clone())?;
         }
         let mut out = json!({
             "files": files_json(snap),

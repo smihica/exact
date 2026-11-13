@@ -49,6 +49,21 @@ impl exact_runner::DataSourceWrapper for Composed {
     ) -> Result<Answer, DataError> {
         self.0.parse(store, source, args, outcome)
     }
+    fn more_for(&mut self, target: Target) -> Vec<exact_runner::Request> {
+        self.0.more_for(target)
+    }
+    fn parse_fetch_for(
+        &mut self,
+        target: Target,
+        fetch: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Option<Answer>, DataError> {
+        self.0
+            .parse_fetch_for(target, fetch, store, source, args, outcome)
+    }
     fn parse_for(
         &mut self,
         target: Target,
@@ -62,6 +77,13 @@ impl exact_runner::DataSourceWrapper for Composed {
     fn app_id(&self) -> &str {
         self.0.app_id()
     }
+    fn launch(&self) -> Option<exact_runner::request::Launch> {
+        self.0.launch()
+    }
+    fn preloads(&self) -> &[exact_runner::request::Preload] {
+        self.0.preloads()
+    }
+
     fn grants(&self) -> &str {
         self.0.grants()
     }
@@ -158,8 +180,9 @@ impl exact_runner::DataSourceWrapper for Composed {
         &mut self,
         store: &Store,
         in_flight: InFlight<'_>,
+        fetch: Option<u64>,
     ) -> Option<(u64, exact_runner::Request)> {
-        self.0.timer_before_reply(store, in_flight)
+        self.0.timer_before_reply(store, in_flight, fetch)
     }
     fn module_landed(
         &mut self,
@@ -175,6 +198,23 @@ impl exact_runner::DataSourceWrapper for Composed {
     fn take_logs(&mut self) -> Vec<String> {
         self.0.take_logs()
     }
+    fn parse_tool(
+        &mut self,
+        fetch: Option<u64>,
+        continuation: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        self.0
+            .parse_tool(fetch, continuation, store, source, args, outcome)
+    }
+
+    fn module_identity(&self, source: &str) -> Option<exact_runner::ModuleIdentity> {
+        self.0.module_identity(source)
+    }
+
     fn take_aborted(&mut self) -> Vec<u64> {
         self.0.take_aborted()
     }

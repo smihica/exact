@@ -98,6 +98,7 @@ impl<D: DataSource> Runner<D> {
         self.next_ticket += 1;
         self.note_asked(target, ticket);
         self.pending.push(PendingReq {
+            module: self.data.module_identity(&source).map(|m| m.instance()),
             inspection_generation: self.inspected_request(i),
             refusal: None,
             refused: false,
@@ -119,6 +120,7 @@ impl<D: DataSource> Runner<D> {
             long_poll: false,
             replied: false,
             reask_at: Some(at),
+            launch: self.launch.contains(&i),
             reasks,
             module_again: None,
             effects: false,
@@ -178,7 +180,9 @@ impl<D: DataSource> Runner<D> {
         else {
             return false;
         };
-        if self.pending[pos].replay_unsafe {
+        if self.pending[pos].replay_unsafe
+            || self.pending.iter().filter(|p| p.target == target).count() > 1
+        {
             return false;
         }
         let reasks = self.pending[pos].reasks;
@@ -241,6 +245,9 @@ impl<D: DataSource> Runner<D> {
             unreachable!("only a resource waits to be asked again")
         };
         let args = p.args.clone();
+        if p.launch {
+            self.launch.push(i);
+        }
         let (origin, id) = (self.ticket_origin(ticket), self.ticket_id(ticket));
         let result = self.as_invocation(origin, id, |r| {
             let before = r.overrun.reasking.replace((i, reasks + 1, args));
@@ -248,6 +255,7 @@ impl<D: DataSource> Runner<D> {
             r.overrun.reasking = before;
             result
         });
+        self.launch.clear();
         let refused = match &result {
             Err(e) => Some(Failure::of(e).message),
             // Stood without asking it (a source not ready): its forced ask

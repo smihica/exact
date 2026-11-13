@@ -106,6 +106,8 @@ fn an_elements_state_part_is_linted_as_lowering_folds_it() {
         ("active", "color=\"#000000\""),
         ("hover", "color=\"#000000\""),
         ("focus-visible", "color=\"#000000\""),
+        ("hover", "scale=1.08"),
+        ("focus-visible", "scale = 1.1"),
     ] {
         assert!(
             lint(state, row).is_empty(),
@@ -125,6 +127,12 @@ fn an_elements_state_part_is_linted_as_lowering_folds_it() {
         ("hover", "-exact-tint-color=\"#000000\"", "lower-state-row"),
         ("active", "-exact-press-opacity-to=0.5", "lower-state-row"),
         ("active", "color=\"inherit\"", "lower-attr-value"),
+        ("hover", "color=\"inherit\"", "lower-attr-value"),
+        (
+            "focus-visible",
+            "color=\"currentColor\"",
+            "lower-attr-value",
+        ),
     ] {
         let found = lint(state, row);
         assert_eq!(found.first().copied(), Some(id), "{state} {row}: {found:?}");
@@ -727,7 +735,6 @@ fn a_bound_string_on_a_number_row_is_refused_as_its_literal_is() {
     for (node, name) in [
         ("text \"a\" opacity=`${size / 20}`", "opacity"),
         ("column flex-grow=label", "flex-grow"),
-        ("text \"a\" z-index=label", "z-index"),
         ("text \"a\" font-weight=`${size}0`", "font-weight"),
         ("view column-count=label", "column-count"),
         ("view column-rule-width=`${size}px`", "column-rule-width"),

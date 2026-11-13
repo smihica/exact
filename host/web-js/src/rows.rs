@@ -125,7 +125,9 @@ impl Em<'_> {
         if !self.paint || kind.is_svg_element() || kind.is_metadata() {
             return;
         }
-        if let Some((name, value)) = crate::paint::binding(self.plan, kind, b) {
+        if let Some((name, value)) = crate::paint::binding(self.plan, kind, b, || {
+            self.uses.share('t', crate::paint::transitions())
+        }) {
             let f = if b.kind == BindingKind::Style && b.id == StyleId::BackdropFilter as u16 {
                 format!("()=>{}(({f})(),false)", self.uses.rt("backdropValue"))
             } else {
@@ -246,9 +248,10 @@ impl Em<'_> {
             let _ = write!(self.out, "{p}({e},\"data-x-pin\",{f});");
             return Ok(());
         }
-        // Mark bound rows while they hold a value: grouped separators yield to
-        // authored edges and images (LLP 1084 D7), and a native button's floor
-        // yields to authored size and padding. Literal rows use data-exact-said.
+        // Mark bound rows while they are declared, a clear included, as the
+        // kernel's written bit marks a literal one (data-exact-said): grouped
+        // separators yield to authored edges and images (LLP 1084 D7), and a
+        // native button's floor yields to authored size and padding.
         let button = kind == NodeType::Control && parts.props.contains_key("data-button-style");
         let mark = match id {
             StyleId::BorderWidthTop if b.written => Some("data-exact-top-width"),
@@ -275,7 +278,7 @@ impl Em<'_> {
             let when = if id == StyleId::Display {
                 "v===\"none\"?\"\":null"
             } else {
-                "v==null||v===\"\"?null:\"\""
+                "v==null?null:\"\""
             };
             let _ = write!(
                 self.out,
@@ -480,15 +483,15 @@ impl Em<'_> {
                 "transition",
                 Some(pressed_transition_map()),
             ),
-            // Presence maps source literals through the kernel; other values clear the row.
-            StyleId::LayoutTransition | StyleId::ExitAnimation => {
-                let (property, name, values) = if id == StyleId::LayoutTransition {
-                    ("--exact-layout-transition", "layout-transition", crate::presence::layout_transitions(plan, plan.code(b.expr)))
-                } else {
-                    ("--exact-exit-animation", "exit-animation", crate::presence::exit_animations(plan, plan.code(b.expr), press))
-                };
+            StyleId::LayoutTransition => {
+                let parser = self.uses.share('t', crate::paint::transitions());
                 let (say, view) = (self.uses.rt("say"), self.uses.rt("viewId"));
-                one(property, Some(crate::presence::declaration_map(&values, &format!("{view}({e})"), &say, name)))
+                one("--exact-layout-transition", Some(crate::presence::layout_transition_map(&parser, &format!("{view}({e})"), &say)))
+            }
+            StyleId::ExitAnimation => {
+                let values = crate::presence::exit_animations(plan, plan.code(b.expr), press);
+                let (say, view) = (self.uses.rt("say"), self.uses.rt("viewId"));
+                one("--exact-exit-animation", Some(crate::presence::declaration_map(&values, &format!("{view}({e})"), &say, "exit-animation")))
             }
             // A side is the author's when they wrote it or the other of its
             // pair (css.rs `unsaid_side`): only a side the sheet alone sets mirrors.
@@ -527,6 +530,27 @@ impl Em<'_> {
         let sized = crate::sized::writes(id, parts);
         if !sized.is_empty() {
             self.uses.rt("normal");
+        }
+        let play_state = crate::timelines::play_state(self.drag_timelines);
+        if id == StyleId::AnimationTimeline && !self.drag_timelines {
+            crate::timelines::css_writes(&mut writes);
+        }
+        // An animation shorthand resets the play state, the timeline and the
+        // range, so read them live again after it.
+        if id == StyleId::Animation && timeline {
+            let getter = self.bound(i, e, &binding(StyleId::AnimationTimeline).unwrap(), scope)?;
+            for (name, _, map) in &mut writes {
+                if name == "animation-play-state" {
+                    let inner = map.take().unwrap();
+                    *map = Some(format!(
+                        "v=>({inner})(v)==null?null:({play_state})(({getter})())"
+                    ));
+                }
+            }
+            let range = (binding(StyleId::AnimationRange))
+                .map(|r| self.bound(i, e, &r, scope))
+                .transpose()?;
+            crate::timelines::after_shorthand(&mut writes, self.drag_timelines, &getter, range);
         }
         writes.extend(sized);
         if matches!(id, StyleId::FontWeight | StyleId::LineHeight) {
@@ -595,18 +619,12 @@ impl Em<'_> {
         // so its `--exact-accent` naming one that names the accent would name
         // itself: that token's colour stands by tuple (`data-x-accent`), as
         // css.rs leaves a self-reference out; a clear there writes nothing.
-        // A bound `color` that decides a symbol's ink (style.rs
-        // `symbol_marks`) keeps whether its binding has a value now, a clear
-        // included, whatever its map writes: symbols.js `inked` reads it.
-        let inked = (id == StyleId::TextColor
-            && parts.props.get("data-exact-ink").is_some_and(|w| w != "b"))
-        .then(|| format!("()=>{{const v=({f})();{e}.$ink=v!=null;return v}}"));
-        let f = inked.as_deref().unwrap_or(f);
         // A blank text row clears its start; `none` leaves that start exposed.
         let clear = matches!(id, StyleId::FontWeight | StyleId::LineHeight).then(|| {
             format!("()=>{{const v=({f})();return typeof v===\"string\"&&!v.trim()?\"unset\":v}}")
         });
         let f = clear.as_deref().unwrap_or(f);
+        let clear_css = style::clear_css(id, press);
         for (name, unit, map) in writes {
             let modes = self.answers.modes;
             let channel = crate::modes::CHANNELS
@@ -615,17 +633,28 @@ impl Em<'_> {
                     *p == name || name == "-webkit-text-stroke" && *p == "-webkit-text-stroke-color"
                 })
                 .filter(|_| modes);
-            let map = match map {
-                Some(m) if modes && name == "--exact-accent" => Some(format!(
-                    "v=>{{v=({m})(v);if(!{e}.hasAttribute(\"data-x-b\"))return v;{e}.removeAttribute(\"data-x-accent\");if(v==null||/^\\s*(unset|inherit)?\\s*$/i.test(v))return null;const n={}.find(p=>v.includes(`var(${{p}})`));if(n){{{e}.setAttribute(\"data-x-accent\",n);return null}}return v}}",
-                    self.answers.accent()
-                )),
-                map => map,
-            };
+            let clear = style::cleared(&clear_css, &name)
+                .filter(|_| {
+                    id != StyleId::Display || !parts.props.contains_key("data-button-style")
+                })
+                .map(|v| format!(",{}", serde_json::to_string(v).unwrap()));
+            let map =
+                map.or_else(|| (name.starts_with("--") && clear.is_some()).then(|| "v=>v".into()));
             let value = match map {
-                // An empty string declares nothing before the map reads it.
-                Some(m) => format!("()=>({m})({}(({f})()))", self.uses.rt("blank")),
+                Some(m) => format!(
+                    "()=>{}(({f})(),{m}{})",
+                    self.uses.rt("mapped"),
+                    clear.unwrap_or_default()
+                ),
                 None => f.to_string(),
+            };
+            let value = if modes && name == "--exact-accent" {
+                format!(
+                    "()=>{{const v=({value})();if(!{e}.hasAttribute(\"data-x-b\"))return v;{e}.removeAttribute(\"data-x-accent\");if(v==null||/^\\s*(unset|inherit)?\\s*$/i.test(v))return null;const n={}.find(p=>v.includes(`var(${{p}})`));if(n){{{e}.setAttribute(\"data-x-accent\",n);return null}}return v}}",
+                    self.answers.accent()
+                )
+            } else {
+                value
             };
             match channel {
                 Some(j) => {
@@ -642,21 +671,11 @@ impl Em<'_> {
                 }
             }
         }
-        // Presence asks which values declare the row before each tree update (rt.js `lt`).
+        // Probe the new region value while presence can still measure the old box.
         if id == StyleId::LayoutTransition {
-            let values = crate::presence::layout_transitions(plan, plan.code(b.expr));
-            let declaring: Vec<&String> = values
-                .held
-                .iter()
-                .filter(|(_, css)| css.is_some())
-                .map(|(v, _)| v)
-                .collect();
+            let parser = self.uses.share('t', crate::paint::transitions());
             let lt = self.uses.rt("lt");
-            let _ = write!(
-                self.out,
-                "{lt}({e},{},{f});",
-                serde_json::to_string(&declaring).unwrap()
-            );
+            let _ = write!(self.out, "{lt}({e},{parser},{f});");
         }
         Ok(())
     }
@@ -819,6 +838,10 @@ pub(super) fn presence_decls(css: &mut String) -> String {
             "--exact-animation-clock:",
             "--exact-animation-range:",
             "--exact-timeline-scope:",
+            "--exact-scroll-timeline:",
+            // A browser timeline's consumer, which index.html's `[style*=…]` finds.
+            "--exact-css-timeline:",
+            "--exact-view-timeline:",
             // The press feedback's factor (LLP 1061) and haptic (LLP 1077
             // D14), which input-glue.js reads from the element's own style.
             "--exact-press:",
@@ -1109,22 +1132,6 @@ mod tests {
     }
 
     #[test]
-    fn a_native_buttons_bound_display_preserves_the_semantic_grid() {
-        let plan = contract::compile(
-            r#"component App
-  state visible = true
-  view
-    button appearance="auto" display=(visible ? "flex" : "none")
-      text "Lock"
-      image "symbol:lock"
-"#,
-        )
-        .unwrap();
-        let js = crate::emit::emit(&plan, false, false).unwrap().js;
-        assert!(js.contains("v=>v===\"none\"?\"none\":\"grid\""), "{js}");
-    }
-
-    #[test]
     fn a_literal_data_frame_is_shown_by_its_sandbox() {
         // A literal opaque sandbox decides here; a bound one, in rt.js `P`,
         // which is handed the source (no attribute until then); a
@@ -1188,7 +1195,7 @@ mod tests {
                 "none"
             ])
         );
-        crate::style::tests::assert_spring_transitions(&super::pressed_transition_map());
+        crate::style::tests::assert_spring_transitions(&super::pressed_transition_map(), true);
     }
 
     use crate::style::{
@@ -1226,7 +1233,7 @@ mod tests {
         );
         assert!(
             js.contains(&format!("const $cm={map};\n"))
-                && js.contains(",\"filter\",\"\",()=>($cm)(blank(("),
+                && js.contains(",\"filter\",\"\",()=>mapped(("),
             "the bound filter is not mapped:\n{js}"
         );
         // One constant, however many sites; none where no site maps a colour.
@@ -1353,10 +1360,9 @@ mod tests {
             .unwrap_or_else(|| panic!("no column-count write:\n{js}"));
         let rest = &js[at + marker.len()..];
         let (unit, after) = rest.split_once('"').expect("unit");
-        let map = after.strip_prefix(",()=>(").and_then(|mapped| {
-            mapped
-                .find(")(blank((")
-                .map(|end| mapped[..end].to_string())
+        let map = after.strip_prefix(",()=>mapped(").and_then(|mapped| {
+            let (_, map) = mapped.split_once(")(),")?;
+            map.split_once(",\"unset\")").map(|(m, _)| m.to_string())
         });
         let map_src = map.unwrap_or_else(|| "v=>v".into());
         let script = format!(
@@ -1475,26 +1481,5 @@ try {{
             got,
             serde_json::json!({"out": ["unset", "unset", "calc(10px + 2px)", "12px", 8, null], "journal": 2})
         );
-    }
-
-    /// An empty string declares nothing before a row's map reads it: the
-    /// mapped rows (`cursor`, `animation-timeline` and its companions) see
-    /// `null` (rt.js `blank`), never a value to diagnose.
-    #[test]
-    fn an_empty_value_reaches_a_mapped_row_as_nothing() {
-        let plan = contract::compile(
-            "component App\n  state c = \"\"\n  view\n    view cursor=c animation-timeline=c testId=\"v\"\n",
-        )
-        .unwrap();
-        let js = crate::emit::emit(&plan, false, false).unwrap().js;
-        for name in [
-            "\"cursor\"",
-            "\"--exact-animation-timeline\"",
-            "\"animation-play-state\"",
-        ] {
-            let at = js.find(name).unwrap_or_else(|| panic!("{name}:\n{js}"));
-            let write = js[at..].split(";S").next().unwrap();
-            assert!(write.contains("blank(("), "{name}: {write}");
-        }
     }
 }

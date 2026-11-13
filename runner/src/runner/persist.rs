@@ -138,13 +138,28 @@ pub fn decode(plan: &Plan, ty: TypesId, text: &[u8]) -> Option<Value> {
     (r.at == r.b.len()).then_some(v)
 }
 
+/// `text` as a JSON string, its escapes decoded: `None` when it is not one.
+pub(crate) fn decode_string(text: &[u8]) -> Option<String> {
+    let mut r = Reader { b: text, at: 0 };
+    let s = r.string()?;
+    r.space();
+    (r.at == r.b.len()).then_some(s)
+}
+
 /// A type as the journal names it.
 fn type_name(plan: &Plan, ty: TypesId) -> String {
     let t = plan.type_(ty);
     let elem = || t.elem.map(|e| type_name(plan, e)).unwrap_or_default();
     match t.kind {
         TypeKind::Number => "number".into(),
-        TypeKind::String => "string".into(),
+        TypeKind::String if t.fields.is_empty() => "string".into(),
+        // An enum's members are its string type's fields.
+        TypeKind::String => {
+            let members: Vec<String> = (t.fields.iter())
+                .map(|f| format!("{:?}", plan.str(plan.field(f).name)))
+                .collect();
+            format!("enum<{}>", members.join(", "))
+        }
         TypeKind::Bool => "bool".into(),
         TypeKind::Option => format!("option<{}>", elem()),
         TypeKind::List => format!("{}[]", elem()),

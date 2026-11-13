@@ -5,8 +5,12 @@ import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import { test, expect } from 'bun:test';
 import { withLook, appleColors } from '../look.mjs';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
-import { glueDeclarations } from './glue-fixture.mjs';
+import { glueDeclarations, glueCase } from './glue-fixture.mjs';
 import { decodePng } from '../../../scripts/png.mjs';
+import { readdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const shell = read('../index.html'), neutral = read('../neutral.css');
@@ -73,6 +77,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
     'segmented-padding': ['padding'], 'segment-padding-block': ['padding'], 'segment-padding-inline': ['padding'], 'segment-height-coarse': ['min-height'],
     'segment-shadow-y': ['box-shadow'], 'segment-shadow-blur': ['box-shadow'],
     'tabbar-height': ['min-height'], 'tabbar-padding-block': ['padding'], 'tabbar-padding-inline': ['padding'], 'tabbar-font': ['font-size'],
+    'tabbar-badge-height': ['min-width', 'height'], 'tabbar-badge-padding': ['padding-inline', 'margin-inline-start'], 'tabbar-badge-font': ['font-size'],
     'button-image-gap': ['--exact-button-column-gap', '--exact-button-row-gap'],
     'tabbar-symbol': ['width', 'height'], 'tabbar-gap': ['--exact-button-space-height'],
     'sidebar-row-height': ['min-height'], 'sidebar-symbol': ['width', 'height'], 'sidebar-gap': ['--exact-button-space-width'],
@@ -80,8 +85,8 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
     'alert-width': ['width'], 'alert-margin': ['width'], 'alert-padding': ['padding'], 'alert-gap': ['gap'], 'alert-action-gap': ['gap'],
     'alert-title': ['font-size'], 'alert-message-gap': ['margin-bottom', 'margin-top'], 'alert-scroll-gutter': ['padding-inline-end'],
     'menu-min-width': ['min-width'], 'menu-max-width': ['max-width'], 'menu-margin': ['max-width'], 'menu-padding': ['padding'], 'menu-offset': ['margin'], 'popover-padding': ['padding'], 'popover-margin': ['margin', 'margin-left'],
-    'menu-row-height': ['min-height'], 'menu-row-padding-block': ['padding'], 'menu-row-padding-inline': ['padding'], 'menu-row-gap': ['--exact-button-space-width', 'margin-inline-end'],
-    'sheet-wide': ['@media'], 'sheet-width': ['width'], 'sheet-height': ['height', 'max-height'], 'sheet-margin': ['width', 'height', 'max-height'], 'sheet-top': ['inset'],
+    'menu-row-height': ['min-height'], 'menu-row-padding-block': ['padding'], 'menu-row-padding-inline': ['padding', 'padding-inline-start'], 'menu-row-gap': ['--exact-button-space-width', 'margin-inline-end', 'padding-inline-start', 'margin-inline-start'],
+    'sheet-wide': ['@media'], 'sheet-width': ['width'], 'sheet-height': ['height', 'max-height'], 'sheet-margin': ['width', 'height', 'max-height'], 'sheet-top': ['inset', 'max-height'], 'sheet-compact-height': ['@media'],
     'sheet-padding': ['padding', 'margin', 'margin-inline-end', 'padding-inline-end'], 'sheet-gap': ['padding', 'margin'], 'sheet-action-gap': ['margin'],
     'list-row-inset': ['padding-left', 'padding-right'],
     'raised-shadow-y': ['--exact-raised'], 'raised-shadow-blur': ['--exact-raised'], 'modal-shadow-y': ['--exact-modal'], 'modal-shadow-blur': ['--exact-modal'],
@@ -94,7 +99,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
   const largeTitle = schema.textStyles.find(([name]) => name === 'large-title')[5][schema.textStyleBodies.indexOf(16)];
   const DERIVED = {
     'min-height': [`${2 * value.get('segmented-padding')}px`], // a segment is the control's height less the track's padding either side
-    'border-radius': ['1em', half('range-track', 'px')], // the switch is a pill (any radius of half its height or more); the track's ends are round
+    'border-radius': ['1em', half('range-track', 'px'), `${parseFloat(value.get('tabbar-badge-height')) / 2}rem`.replace(/^0\./, '.')], // the switch and a tab's badge are pills (any radius of half its height or more); the track's ends are round
     'margin-top': [half('range-track', 'px'), '.625em'], // a range's thumb is centred on its track: half the track less half the thumb
     'background-position': ['1em'], // the thumb travels the track's width less its height
     'box-shadow': ['64px'], // a hovered row's wash reaches the card's edge, past any inset a row has
@@ -104,6 +109,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
     'padding-block': ['.125em'], // a written height keeps room for a titled button's symbol's ink past its place
     'width': ['1em'], 'height': ['1em'], // a bar item's symbol is its em square times its scale, as a button face's is
     'mask': ['1em'], // a checked menu row's checkmark is drawn in its font's em square
+    'padding-inline-start': ['1em'], 'margin-inline-start': ['1em'], 'top': ['.5em'], // a raster row reserves the mark's square and centres it vertically
   };
   const lengths = (text) => [...text.matchAll(/(?<![\w.#])(\d*\.?\d+)(px|rem|em)\b/g)].map((m) => m[0]).filter((token) => parseFloat(token) !== 0);
   const declarations = (css) => [...css.replace(/\/\*[\s\S]*?\*\//g, '').replace(/url\("[^"]*"\)/g, '').matchAll(/\{([^{}]*)\}/g)]
@@ -151,7 +157,7 @@ test('the neutral sheet\'s lengths and ratios are the metric table\'s neutral co
   for (const [name, spelled] of Object.entries(RATIO)) expect([name, [spelled].flat().every((s) => neutral.includes(s))]).toEqual([name, true]);
   // The one ratio the table does not hold: iOS's large-title line height, about 41 pt for 34 pt, which a bar's
   // level-1 title takes at the large title's size.
-  expect(neutral.includes(`margin-block: max(0px, (${largeTitle / 16}rem * 1.2 - 1lh) / 2);`)).toBe(true);
+  expect(neutral.includes(`margin-block: max(0px, (var(--exact-large-title-size, ${largeTitle / 16}rem) * 1.2 - 1lh) / 2);`)).toBe(true);
   expect(shell.includes(`line-height: var(--exact-control-line-height); --exact-control-line-height: ${value.get('select-line-height')};`)).toBe(true);
   // A control's line is one height and its title one weight, wherever the sheets write them: a select's own line
   // aside, and a menu's rows, which are regular.
@@ -227,27 +233,33 @@ const checkMenus = `
   <div popover="manual" role="menu" id="outer" style="display:flex;flex-direction:column;top:8px;left:320px;margin:0"><button type="button" data-native data-button-style="bordered" id="outer-row" style="display:grid"><span data-exact-text>Rename</span></button><div popover="manual" role="menu" id="inner" style="display:flex;flex-direction:column;top:120px;left:320px;margin:0">${radio('inner-on', 'Inner', 'aria-checked="true"')}</div></div>
   <div popover="manual" role="menu" id="outer2" style="display:flex;flex-direction:column;top:220px;left:320px;margin:0">${radio('outer2-on', 'Outer', 'aria-checked="true"')}<div role="presentation" data-exact-list-item="" style="display:contents">${radio('item-off', 'Listed', 'aria-checked="false"')}</div><div popover="manual" role="menu" id="inner2" style="display:flex;flex-direction:column;top:340px;left:320px;margin:0"><button type="button" data-native data-button-style="bordered" id="inner2-row" style="display:grid"><span data-exact-text>Plain</span></button></div></div>
 </div>`;
-// Each row's label offset from its border edge in ems of its font, and its mark as painted: the row is shot with
+// Each row's face offset from its inline-start edge in ems of its font, and its mark as painted: the row is shot with
 // its face hidden, so the only ink left is the mark's. `pixels` counts [ink, ground] in the ink's bounds (a pixel
 // nearer the mark's colour, else the row's, than the menu's surface, and one at the surface); `painted`: some ink with ground among it (a check, not
-// a block); `before`: the ink ends before the label starts.
-const checkLook = async (page, ids) => {
+// a block); `before`: the ink ends before the image or label starts, in either writing direction; `lead`: pixels from
+// the row's inline-start edge to the ink. `inset` leaves
+// that many pixels of each edge out of the shot, where an authored border is drawn.
+const checkLook = async (page, ids, inset = 0) => {
   const rows = await page.evaluate((ids) => ids.map((id) => {
-    const b = document.getElementById(id), l = b.querySelector('[data-exact-text]').getBoundingClientRect(), r = b.getBoundingClientRect();
+    const b = document.getElementById(id), boxes = [...b.children].map(c => c.getBoundingClientRect()), r = b.getBoundingClientRect();
+    const rtl = getComputedStyle(b).direction === 'rtl', face = rtl ? Math.max(...boxes.map(c => c.right)) : Math.min(...boxes.map(c => c.left));
     const mark = getComputedStyle(b, '::after');
-    return { id, fs: parseFloat(getComputedStyle(b).fontSize), offset: Math.round((l.x - r.x) / parseFloat(getComputedStyle(b).fontSize) * 1000) / 1000, label: l.x, at: { x: r.x, y: r.y, width: r.width, height: r.height }, ink: rgba(mark.backgroundColor)[3] ? rgba(mark.backgroundColor) : rgba(getComputedStyle(b).color), ground: rgba(getComputedStyle(b.closest('[popover]')).backgroundColor) };
+    return { id, rtl, face, opacity: Number(getComputedStyle(b).opacity), fs: parseFloat(getComputedStyle(b).fontSize), offset: Math.round((rtl ? r.right - face : face - r.left) / parseFloat(getComputedStyle(b).fontSize) * 1000) / 1000, at: { x: r.x, y: r.y, width: r.width, height: r.height }, ink: rgba(mark.backgroundColor)[3] ? rgba(mark.backgroundColor) : rgba(getComputedStyle(b).color), ground: rgba(getComputedStyle(b.closest('[popover]')).backgroundColor) };
   }), ids);
   await page.addStyleTag({ content: '#exact-root [popover] :is([data-exact-text], img) { visibility: hidden !important; }' });
   for (const row of rows) {
+    row.at = { x: row.at.x + inset, y: row.at.y + inset, width: row.at.width - 2 * inset, height: row.at.height - 2 * inset };
     const { width, height, data } = decodePng(await page.screenshot({ clip: row.at }));
+    const ink = row.ink.map((c, i) => i < 3 ? c * row.opacity + row.ground[i] * (1 - row.opacity) : c);
     const far = (c, i) => Math.abs(data[i] - c[0]) + Math.abs(data[i + 1] - c[1]) + Math.abs(data[i + 2] - c[2]);
     let [x0, y0, x1, y1] = [Infinity, Infinity, -1, -1];
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) if (far(row.ink, (y * width + x) * 4) < far(row.ground, (y * width + x) * 4)) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) if (far(ink, (y * width + x) * 4) < far(row.ground, (y * width + x) * 4)) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
     row.pixels = [0, 0];
-    for (let y = Math.max(0, y0); y <= y1; y++) for (let x = Math.max(0, x0); x <= x1; x++) { const i = (y * width + x) * 4; if (far(row.ink, i) < far(row.ground, i)) row.pixels[0]++; else if (far(row.ground, i) < 30) row.pixels[1]++; }
+    for (let y = Math.max(0, y0); y <= y1; y++) for (let x = Math.max(0, x0); x <= x1; x++) { const i = (y * width + x) * 4; if (far(ink, i) < far(row.ground, i)) row.pixels[0]++; else if (far(row.ground, i) < 30) row.pixels[1]++; }
     row.painted = row.pixels[0] > 4 && row.pixels[1] > row.pixels[0] / 4 && x1 - x0 < row.fs && y1 - y0 < row.fs;
-    row.before = x1 < 0 || row.at.x + x1 + 1 <= row.label;
-    delete row.at; delete row.label; delete row.fs;
+    row.before = x1 < 0 || (row.rtl ? row.at.x + x0 >= row.face : row.at.x + x1 + 1 <= row.face);
+    row.lead = x1 < 0 ? null : (row.rtl ? width - 1 - x1 : x0) + inset;
+    delete row.at; delete row.face; delete row.rtl; delete row.opacity; delete row.fs;
   }
   await page.evaluate(() => document.querySelector('head > style:last-of-type').remove());
   return Object.fromEntries(rows.map(({ id, ...row }) => [id, row]));
@@ -294,6 +306,142 @@ test('chromium: a checked menu row keeps its mark under forced colours', async (
     expect([look.on.ink, look.dim.ink]).toEqual(await page.evaluate(() => [rgba('ButtonText'), rgba('GrayText')]));
   } finally { await browser.close(); }
 });
+
+// native-fixture's open-in menu uses these raster faces, which lower as bare buttons. A raster's checked
+// state must reserve the column for native siblings too; a List changes no row's membership in its menu.
+const mapIcon = readFileSync(new URL('../../../apps/native-fixture/assets/maps/apple.png', import.meta.url)).toString('base64');
+const rasterRow = (id, attrs = '', layout = 'display:flex;flex-direction:row;align-items:center;gap:8px;') => `<button type="button" id="${id}" role="menuitemradio" ${attrs} style="${layout}height:44px"><img src="data:image/png;base64,${mapIcon}" width="24" height="24"><div data-exact-text>Maps</div></button>`;
+const listedRow = (row) => `<div data-exact-list-item="" role="presentation" style="display:contents">${row}</div>`;
+const rasterMenus = `
+<div id="exact-root">
+  <div popover="manual" role="menu" id="rasters" style="display:flex;flex-direction:column;top:8px;left:8px;margin:0;width:220px">
+    ${rasterRow('r-on', 'aria-checked="true"')}${rasterRow('r-off', 'aria-checked="false"')}${rasterRow('r-dim', 'aria-checked="true" disabled')}${rasterRow('r-plain')}${radio('r-native', 'Cancel', '')}
+  </div>
+  <div popover="manual" role="menu" id="r-outer" style="display:flex;flex-direction:column;top:8px;left:280px;margin:0">
+    ${rasterRow('r-outer-row')}
+    <div popover="manual" role="menu" id="r-inner" style="display:flex;flex-direction:column;top:8px;left:550px;margin:0">${radio('r-inner-on', 'Inner', 'aria-checked="true"')}</div>
+  </div>
+  <div popover="manual" role="menu" id="r-outer2" style="display:flex;flex-direction:column;top:160px;left:280px;margin:0">
+    ${radio('r-outer-on', 'Outer', 'aria-checked="true"')}${listedRow(rasterRow('r-item-off', 'aria-checked="false"'))}
+    <div popover="manual" role="menu" id="r-inner2" style="display:flex;flex-direction:column;top:160px;left:550px;margin:0">${rasterRow('r-inner-row')}</div>
+  </div>
+  <div popover="manual" role="menu" id="r-listed" style="display:flex;flex-direction:column;top:300px;left:8px;margin:0;width:220px">
+    ${listedRow(rasterRow('r-item-on', 'aria-checked="true"'))}${rasterRow('r-direct-off', 'aria-checked="false"')}${radio('r-listed-native', 'Cancel', '')}
+  </div>
+  <div popover="manual" role="menu" id="r-block" style="display:flex;flex-direction:column;top:300px;left:550px;margin:0;width:220px">
+    ${listedRow(rasterRow('rb-on', 'aria-checked="true"', ''))}${rasterRow('rb-off', 'aria-checked="false"', '')}${rasterRow('rb-dim', 'aria-checked="true" disabled', '')}${rasterRow('rb-plain', '', '')}${radio('rb-native', 'Cancel', '')}
+  </div>
+  <div popover="manual" role="menu" id="r-inherit" style="display:flex;flex-direction:column;top:560px;left:8px;margin:0;width:220px;--exact-padding-left:32px;--exact-padding-right:32px;--exact-padding-inline-start:32px">
+    ${radio('ri-native', 'All', 'aria-checked="true"')}${rasterRow('ri-off', 'aria-checked="false"')}
+  </div>
+  <div popover="manual" role="menu" id="r-pct" style="display:flex;flex-direction:column;top:560px;left:300px;margin:0;width:220px">
+    ${rasterRow('rp-on', 'aria-checked="true"', 'display:flex;flex-direction:row;align-items:center;gap:8px;width:40px;padding-left:50%;--exact-padding-left:50%;')}
+  </div>
+  <div popover="manual" role="menu" id="r-dir" style="display:flex;flex-direction:column;top:560px;left:620px;margin:0;width:220px">
+    ${rasterRow('rd-on', 'aria-checked="true"', 'display:flex;flex-direction:row;align-items:center;gap:8px;padding-left:4px;padding-right:12px;--exact-padding-left:4px;--exact-padding-right:12px;')}${rasterRow('rd-off', 'aria-checked="false"')}${radio('rd-native', 'Cancel', '')}
+  </div>
+</div>`;
+for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: checked raster menu faces keep a leading mark beside native faces`, async () => {
+  const browser = await launch(engine);
+  try {
+    for (const mode of ['light', 'dark', ...(engine === 'chromium' ? ['forced'] : [])]) for (const dir of ['ltr', 'rtl']) {
+      const page = await (await browser.newContext({ viewport: { width: 850, height: 750 }, colorScheme: mode === 'dark' ? 'dark' : 'light', forcedColors: mode === 'forced' ? 'active' : 'none' })).newPage();
+      try {
+        await page.setContent(`<style>${sheet()}</style>${rasterMenus}<script>${helpers}</script>`);
+        await page.evaluate((dir) => {
+          document.documentElement.dir = dir;
+          for (const menu of document.querySelectorAll('[popover]')) menu.showPopover();
+        }, dir);
+        const at = [engine, mode, dir], checked = ['r-on', 'r-dim', 'r-inner-on', 'r-outer-on', 'r-item-on', 'rb-on', 'rb-dim'];
+        const unchecked = ['r-off', 'r-plain', 'r-native', 'r-outer-row', 'r-item-off', 'r-inner-row', 'r-direct-off', 'r-listed-native', 'rb-off', 'rb-plain', 'rb-native'];
+        const look = await checkLook(page, [...checked, ...unchecked]);
+        expect([at, Object.entries(look).filter(([, row]) => row.painted).map(([id]) => id)]).toEqual([at, checked]);
+        expect([at, Object.entries(look).filter(([, row]) => !row.before).map(([id]) => id)]).toEqual([at, []]);
+        expect([at, ['r-on', 'r-off', 'r-dim', 'r-plain', 'r-item-on', 'r-item-off', 'r-direct-off', 'r-native', 'r-listed-native', 'rb-on', 'rb-off', 'rb-dim', 'rb-plain', 'rb-native'].map(id => look[id].offset)])
+          .toEqual([at, Array(14).fill(2.125)]);
+        expect([at, look['r-outer-row'].offset, look['r-inner-row'].offset]).toEqual([at, 0, 0]);
+        // An ancestor's padding copies are not a row's own (r-inherit); a percentage of padding is placed where it
+        // lays out, the content box's start, not re-resolved against the row (r-pct); and a direction written the
+        // other way from the page's (r-dir, as css.rs writes it) takes its gutter from the padding on its own start
+        // side and draws the mark there.
+        await page.evaluate((dir) => {
+          const other = dir === 'ltr' ? 'rtl' : 'ltr';
+          Object.assign(document.getElementById('r-dir').style, { direction: other });
+          document.getElementById('r-dir').style.setProperty('--exact-separator-dir', other === 'rtl' ? '-1' : '1');
+        }, dir);
+        const edge = await checkLook(page, ['ri-native', 'ri-off', 'rp-on', 'rd-on', 'rd-off', 'rd-native']);
+        expect([at, Object.entries(edge).filter(([, row]) => row.painted).map(([id]) => id)]).toEqual([at, ['ri-native', 'rp-on', 'rd-on']]);
+        expect([at, Object.entries(edge).filter(([, row]) => !row.before).map(([id]) => id)]).toEqual([at, []]);
+        const pct = await page.evaluate(() => { const m = document.getElementById('r-pct'), cs = getComputedStyle(m); return m.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight); });
+        const start = { 'rd-on': dir === 'ltr' ? 12 : 4, 'rp-on': dir === 'ltr' ? pct / 2 : 10 };
+        expect([at, ['ri-native', 'ri-off', 'rd-off', 'rd-native', 'rd-on', 'rp-on'].map(id => edge[id].offset)])
+          .toEqual([at, [2.125, 2.125, 2.125, 2.125, ...['rd-on', 'rp-on'].map(id => Math.round((start[id] + 24) / 16 * 1000) / 1000)]]);
+        // The check's ink starts within its square, which starts where the row's own start padding ends.
+        expect([at, ['rd-on', 'rp-on'].map(id => edge[id].lead - start[id] >= 2 && edge[id].lead - start[id] <= 5)]).toEqual([at, [true, true]]);
+        // The mark adds no gap between the image and title and changes neither the authored image nor row height.
+        expect([at, await page.evaluate(() => ['r-on', 'r-off', 'r-dim'].map(id => {
+          const b = document.getElementById(id), [image, title] = [...b.children].map(c => c.getBoundingClientRect());
+          return [getComputedStyle(b).display, b.getBoundingClientRect().height, image.width, image.height, Math.round(getComputedStyle(b).direction === 'rtl' ? image.left - title.right : title.left - image.right)];
+        }))]).toEqual([at, Array(3).fill(['flex', 44, 24, 24, 8])]);
+        expect([at, await page.evaluate(() => ['rb-on', 'rb-off', 'rb-dim'].map(id => {
+          const b = document.getElementById(id), [image, title] = [...b.children].map(c => c.getBoundingClientRect());
+          return [getComputedStyle(b).display, b.getBoundingClientRect().height, image.width, image.height, title.top >= image.bottom];
+        }))]).toEqual([at, Array(3).fill(['block', 44, 24, 24, true])]);
+        if (mode === 'forced') expect([look['r-on'].ink, look['r-dim'].ink, look['rb-on'].ink, look['rb-dim'].ink]).toEqual(await page.evaluate(() => [rgba('ButtonText'), rgba('GrayText'), rgba('ButtonText'), rgba('GrayText')]));
+        await page.evaluate(() => { document.getElementById('r-on').setAttribute('aria-checked', 'false'); document.getElementById('r-off').setAttribute('aria-checked', 'true'); });
+        const moved = await checkLook(page, ['r-on', 'r-off']);
+        expect([at, moved['r-on'].painted, moved['r-off'].painted, moved['r-off'].before]).toEqual([at, false, true, true]);
+        // Authored padding leaves a separate mark column, in block and flex rows and their native siblings. The
+        // runtimes write a bare button's padding with its copies (button_css.rs `face`), as here.
+        const paddedIds = ['r-on', 'r-off', 'r-dim', 'r-native', 'rb-on', 'rb-off', 'rb-dim', 'rb-native'];
+        for (const padding of [4, 0]) {
+          await page.evaluate(({ ids, padding }) => {
+            for (const id of ids) {
+              const b = document.getElementById(id);
+              b.style.padding = `${padding}px`;
+              if (!b.dataset.buttonStyle) for (const side of ['left', 'right']) b.style.setProperty(`--exact-padding-${side}`, `${padding}px`);
+            }
+          }, { ids: paddedIds, padding });
+          const padded = await checkLook(page, paddedIds);
+          expect([at, padding, Object.entries(padded).filter(([, row]) => !row.before).map(([id]) => id)]).toEqual([at, padding, []]);
+          expect([at, padding, paddedIds.map(id => padded[id].offset)]).toEqual([at, padding, Array(paddedIds.length).fill(1.5 + padding / 16)]);
+          expect([at, padding, paddedIds.map(id => padded[id].painted)]).toEqual([at, padding, [false, true, true, false, true, false, true, false]]);
+          // The author's padding stands on every side; a raster row's inline start has the mark's column after it.
+          expect([at, padding, await page.evaluate(ids => ids.map(id => {
+            const b = document.getElementById(id), cs = getComputedStyle(b), rtl = cs.direction === 'rtl';
+            const column = b.dataset.buttonStyle ? 0 : 1.5 * parseFloat(cs.fontSize);
+            return [cs.paddingTop, cs.paddingBottom, rtl ? cs.paddingLeft : cs.paddingRight, parseFloat(rtl ? cs.paddingRight : cs.paddingLeft) - column];
+          }), paddedIds)]).toEqual([at, padding, Array(paddedIds.length).fill([`${padding}px`, `${padding}px`, `${padding}px`, padding])]);
+        }
+        // Authored borders, which Exact writes as longhands, stay the author's and are painted, checked or not: a
+        // separator under each row and a left edge on one.
+        const bordered = ['r-on', 'r-off', 'rb-on', 'rb-off'];
+        await page.evaluate((ids) => {
+          for (const id of ids) Object.assign(document.getElementById(id).style, { borderBottomWidth: '2px', borderBottomStyle: 'solid', borderBottomColor: '#ff0000' });
+          Object.assign(document.getElementById('r-off').style, { borderLeftWidth: '2px', borderLeftStyle: 'solid', borderLeftColor: '#ff0000' });
+        }, bordered);
+        expect([at, await page.evaluate((ids) => ids.map(id => {
+          const cs = getComputedStyle(document.getElementById(id));
+          return [cs.borderBottomWidth, cs.borderBottomStyle, cs.borderImageSource, id === 'r-off' ? [cs.borderLeftWidth, cs.borderLeftStyle] : null];
+        }), bordered)]).toEqual([at, bordered.map(id => ['2px', 'solid', 'none', id === 'r-off' ? ['2px', 'solid'] : null])]);
+        // A pixel in each authored edge, against the menu's surface: red, or under forced colours a system colour.
+        const edges = [];
+        for (const id of bordered) {
+          const at = await page.evaluate((id) => { const r = document.getElementById(id).getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; }, id);
+          const { width, height, data } = decodePng(await page.screenshot({ clip: at }));
+          const pixel = (x, y) => [...data.subarray((y * width + x) * 4, (y * width + x) * 4 + 3)];
+          edges.push(pixel(Math.floor(width / 2), height - 1));
+          if (id === 'r-off') edges.push(pixel(0, Math.floor(height / 2)));
+        }
+        const surface = await page.evaluate(() => rgba(getComputedStyle(document.getElementById('rasters')).backgroundColor).slice(0, 3));
+        const drawn = (p) => mode === 'forced' ? p.some((c, i) => Math.abs(c - surface[i]) > 64) : p[0] > 200 && p[1] < 60 && p[2] < 60;
+        expect([at, edges.map(drawn)]).toEqual([at, Array(5).fill(true)]);
+        const edged = await checkLook(page, bordered, 2);
+        expect([at, bordered.map(id => [edged[id].painted, edged[id].before])]).toEqual([at, [[false, true], [true, true], [true, true], [false, true]]]);
+      } finally { await page.close(); }
+    }
+  } finally { await browser.close(); }
+}, 30000);
 // What the page answers with: a colour as the engine paints it (each serializes `color-mix()` its own way), a box.
 const helpers = `
   const ink = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
@@ -677,6 +825,43 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: the neu
 
 // A sheet in a narrow window (D4.8) is iOS's: from 12 px below the window's top to its bottom, over the tab bar, its top
 // corners a surface's. One that opens slides up from the window's bottom edge, unless the person asks for less motion.
+test('chromium: authored popovers pad unsaid edges by the root font', async () => {
+  const browser = await launch('chromium');
+  const page = await browser.newPage({ viewport: { width: 480, height: 640 } });
+  try {
+    await page.setContent(`<style>${sheet()}</style><div id="exact-root"></div>`);
+    for (const root of [16, 20]) {
+      for (const [padding, expected] of [
+        ['', [root, root, root, root]],
+        ['padding:0', [0, 0, 0, 0]],
+        ['padding:16px', [16, 16, 16, 16]],
+        ['padding-top:7px;padding-left:0', [7, root, root, 0]],
+        ['direction:rtl;padding-top:7px;padding-left:0', [7, root, root, 0]],
+        ['padding:2px 3px 4px 5px', [2, 3, 4, 5]],
+      ]) {
+        const geometry = await page.evaluate(({ root, padding }) => {
+          document.documentElement.style.fontSize = `${root}px`;
+          document.getElementById('exact-root').innerHTML = `<div id="content" popover="auto" role="dialog" style="display:flex;flex-direction:column;width:160px;font-size:30px;background-color:#eeeeee;${padding}"><button id="save" style="appearance:none;width:160px;height:32px;min-height:0;padding:0;border:none;background-color:#ff0000"></button></div>`;
+          const popover = document.getElementById('content');
+          popover.showPopover();
+          const a = popover.getBoundingClientRect(), b = document.getElementById('save').getBoundingClientRect();
+          return { x: a.x, y: a.y, width: a.width, height: a.height, insets: [b.top - a.top, a.right - b.right, a.bottom - b.bottom, b.left - a.left] };
+        }, { root, padding });
+        expect(geometry.insets).toEqual(expected);
+        if (root !== 16 || padding) continue;
+        expect([geometry.width, geometry.height]).toEqual([192, 64]);
+        const { width, data } = decodePng(await page.screenshot());
+        for (const [dx, dy, ink, target] of [[8, 32, [238, 238, 238], 'content'], [96, 8, [238, 238, 238], 'content'], [24, 24, [255, 0, 0], 'save']]) {
+          const x = geometry.x + dx, y = geometry.y + dy;
+          const at = (Math.floor(y) * width + Math.floor(x)) * 4;
+          expect([...data.slice(at, at + 3)]).toEqual(ink);
+          expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y).id, { x, y })).toBe(target);
+        }
+      }
+    }
+  } finally { await page.close(); }
+});
+
 for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a sheet in a narrow window rises from the bottom edge`, async () => {
   const browser = await launch(engine);
   try {
@@ -986,6 +1171,123 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a bar's
     await page.setContent(`<!doctype html><style>${sheet()} html { font-size: 20px; }</style><div id="exact-root"><main navigationKey="page">
       ${route('page', title('h1', 1, 'font-size:1.6875rem'))}</main></div>`);
     expect([engine, await page.evaluate(() => Math.round(document.querySelector('#page > header').getBoundingClientRect().height * 10) / 10)]).toEqual([engine, Math.round((2.0625 * 20 * 1.2 + 13) * 10) / 10]);
+  } finally { await browser.close(); }
+}, 90000);
+
+for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a bar uses each runtime's large-title line at the current root`, async () => {
+  const browser = await launch(engine);
+  try {
+    const page = await browser.newPage({ viewport: { width: 600, height: 2400 } });
+    const errors = [];
+    page.on('pageerror', error => errors.push(String(error)));
+    const title = (style, text) => `<h1 role="heading" aria-level="1" style="font-size:var(--title-size);line-height:1.2;${style}">${text}</h1>`;
+    const route = (id, content) => `<div navigationKey="${id}" id="${id}"><header>${content}</header></div>`;
+    // The wasm host reads the nonlinear ramp; the JS target keeps proportional rem sizes. Each root is both an
+    // initial size and a change on an already mounted page. Explicit typography keeps its own line and box.
+    const applyTitle = glueCase(read('../glue.js'), 'large-title');
+    const script = `<script>(() => {
+      const root = document.getElementById("exact-root");
+      globalThis.applyTitle = op => { switch (op.op) { ${applyTitle} } };
+    })();</script>`;
+    const sizes = [[14, 31, 25], [16, 33, 27], [20, 37, 31], [53, 60, 58]];
+    for (const runtime of ['wasm', 'js']) for (const initial of sizes) {
+      const cases = [
+        ['plain', '', 'Inbox'], ['empty', '', ''], ['small', 'font-size:17px;line-height:1', 'Inbox'],
+        ['tight', 'line-height:1', 'Inbox'], ['large', 'font-size:80px;line-height:1.2', 'Inbox'],
+        ['margin', 'font-size:17px;line-height:1;margin:0', 'Inbox'],
+      ];
+      await page.setContent(`<!doctype html><style>${sheet()} html { font-size:${initial[0]}px; }</style><div id="exact-root">
+        ${cases.map(([id, style, text]) => route(id, title(style, text))).join('')}</div>${script}`);
+      for (const [root, wasmLarge, wasmTitle] of [initial, ...sizes.slice().reverse()]) {
+        await page.evaluate(({ root, runtime, wasmLarge, wasmTitle }) => {
+          document.documentElement.style.fontSize = `${root}px`;
+          const app = document.getElementById('exact-root');
+          app.style.setProperty('--title-size', runtime === 'wasm' ? `${wasmTitle}px` : '1.6875rem');
+          if (runtime === 'wasm') globalThis.applyTitle({ op: 'large-title', size: wasmLarge });
+        }, { root, runtime, wasmLarge, wasmTitle });
+        const geometry = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('header')].map(bar => {
+          const heading = bar.firstElementChild, css = getComputedStyle(heading);
+          const b = bar.getBoundingClientRect(), h = heading.getBoundingClientRect();
+          return [bar.parentElement.id, {
+            height: b.height, heading: h.height,
+            centre: (h.top + h.bottom) / 2 - (b.top + (b.height - 1) / 2),
+            margin: parseFloat(css.marginTop), size: parseFloat(css.fontSize),
+          }];
+        })));
+        const largeLine = (runtime === 'wasm' ? wasmLarge : 2.0625 * root) * 1.2;
+        for (const id of ['plain', 'empty', 'small', 'tight', 'large']) {
+          const got = geometry[id], wanted = Math.max(largeLine, got.heading);
+          expect([engine, runtime, root, id, Math.abs(got.height - (wanted + 13)) < .05, Math.abs(got.centre) < .05])
+            .toEqual([engine, runtime, root, id, true, true]);
+        }
+        expect(geometry.small.size).toBe(17);
+        expect(geometry.large.size).toBe(80);
+        expect(geometry.margin.margin).toBe(0);
+      }
+    }
+    expect(errors).toEqual([]);
+  } finally { await browser.close(); }
+}, 90000);
+
+test('chromium: painted route titles match the web at several root sizes', async () => {
+  // Build outside the test: cargo test -p exact-painted --test route_titles --no-run.
+  const deps = resolve(process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../../../target', import.meta.url)), 'debug/deps');
+  const binary = readdirSync(deps).filter(name => /^route_titles-[0-9a-f]+(?:\.exe)?$/.test(name))
+    .map(name => resolve(deps, name)).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  if (!binary) throw new Error('build the headless fixture: cargo test -p exact-painted --test route_titles --no-run');
+  const linux = spawnSync(binary, ['--exact', 'route_titles_keep_the_large_title_line', '--nocapture'], { encoding: 'utf8', timeout: 60000 });
+  expect([linux.status, linux.stderr]).toEqual([0, '']);
+  const layouts = JSON.parse(linux.stdout.match(/^ROUTE_TITLE_LAYOUT (.+)$/m)[1]);
+  const browser = await launch('chromium');
+  try {
+    const page = await browser.newPage({ viewport: { width: 480, height: 2400 } });
+    const font = (name) => readFileSync(new URL(`../../../scripts/fixtures/fonts/assets/DejaVuSans${name}.ttf`, import.meta.url)).toString('base64');
+    const fonts = `@font-face { font-family: RouteTitle; src: url(data:font/ttf;base64,${font('')}); }
+      @font-face { font-family: RouteTitle; font-weight: 700; src: url(data:font/ttf;base64,${font('-Bold')}); }
+      #exact-root { font-family: RouteTitle; }`;
+    const cases = [
+      ['page'], ['normal', 'line-height:normal'], ['empty', '', ''], ['space', '', ' '], ['small', 'font-size:17px'], ['tight', 'line-height:1'],
+      ['button'], ['boxed'], ['own', 'margin:0'], ['one-margin', 'margin-top:0'], ['sized', 'height:60px'],
+      ['short', 'height:20px;overflow:hidden'], ['clamp', 'width:100px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:1;overflow:hidden', 'Inbox of everything'],
+      ['plain'], ['later'], ['modal'], ['dialog'], ['popover'],
+    ];
+    const html = cases.map(([name, style = '', words = 'Inbox']) => {
+      let title = `<h1 role="heading" aria-level="1" style="font-size:1.6875rem;font-weight:700;line-height:1.2;${style}">${words}</h1>`;
+      if (name === 'boxed') title = `<div style="display:flex;flex-direction:column">${title}</div>`;
+      const surface = name === 'dialog' || name === 'popover';
+      const button = name === 'button' || surface ? '<button style="appearance:none;width:60px;height:24px;padding:0;border:0">Edit</button>' : '';
+      const header = name === 'button' || surface ? 'style="display:flex;align-items:center;gap:8px"'
+        : name === 'plain' ? 'data-exact-said="appearance" style="appearance:none;padding:0;min-height:0;border:0"' : '';
+      const route = `<div navigationkey="${name}" id="${name}"${name === 'modal' ? ' navigationPresentation="modal"' : ''}>
+        ${name === 'later' ? '<div style="height:0"></div>' : ''}<header ${header}>${title}${button}</header></div>`;
+      return name === 'dialog' ? `<dialog style="padding:0;border:0;width:480px">${route}</dialog>`
+        : name === 'popover' ? `<div popover="manual" style="padding:0;border:0;width:480px">${route}</div>` : route;
+    }).join('');
+    await page.setContent(`<!doctype html><style>${sheet()}${fonts}</style><div id="exact-root">${html}</div>`);
+    await page.evaluate(() => document.fonts.ready);
+    await page.evaluate(() => {
+      document.querySelector('dialog').showModal();
+      document.querySelector('[popover]').showPopover();
+    });
+    for (const { root, boxes } of layouts) {
+      const web = await page.evaluate(root => {
+        document.documentElement.style.fontSize = `${root}px`;
+        return Object.fromEntries([...document.querySelectorAll('[navigationkey]')].map(route => {
+          const bar = route.querySelector('header').getBoundingClientRect(), title = route.querySelector('h1').getBoundingClientRect();
+          return [route.id, [bar.height, title.top - bar.top, title.height]];
+        }));
+      }, root);
+      for (const [name, expected] of Object.entries(boxes)) for (let i = 0; i < expected.length; i++) {
+        // Chrome quantizes flow geometry to 1/64px; the kernel retains floats.
+        // Normal font metrics differ by a pixel between the text engines;
+        // the bar and the title's centre must still agree.
+        if (name === 'normal' && i > 0) {
+          if (i === 1) expect(web[name][1] + web[name][2] / 2).toBeCloseTo(expected[1] + expected[2] / 2, 1);
+          continue;
+        }
+        expect(web[name][i], `${root}px ${name} dimension ${i}`).toBeCloseTo(expected[i], 1);
+      }
+    }
   } finally { await browser.close(); }
 }, 90000);
 

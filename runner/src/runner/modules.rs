@@ -559,10 +559,14 @@ impl<D: DataSource> Runner<D> {
             .clone()
     }
 
-    /// `extension.source`, as `prefer` and the journal name it.
+    /// The declaration's qualified name, as `prefer` and the journal name it.
     pub(super) fn key(&self, row: &ModulesRow) -> String {
+        let owner = self.substitute(row)["owner"]
+            .as_str()
+            .map(|s| format!("#{s}"))
+            .unwrap_or_default();
         format!(
-            "{}.{}",
+            "{}.{}{owner}",
             self.plan.str(row.extension),
             self.plan.str(row.declared)
         )
@@ -586,9 +590,13 @@ impl<D: DataSource> Runner<D> {
     fn sibling(&self, row: &ModulesRow, declared: &str) -> Option<ModulesRow> {
         let extension = self.plan.str(row.extension);
         (self.plan.modules.iter())
-            .find(|m| {
-                self.plan.str(m.extension) == extension && self.plan.str(m.declared) == declared
+            .filter(|m| {
+                self.plan.str(m.extension) == extension
+                    && self.plan.str(m.declared) == declared
+                    && (self.substitute(m)["owner"] == self.substitute(row)["owner"]
+                        || self.substitute(m)["owner"].is_null())
             })
+            .min_by_key(|m| self.substitute(m)["owner"] != self.substitute(row)["owner"])
             .cloned()
     }
 
@@ -749,19 +757,15 @@ impl<D: DataSource> Runner<D> {
                     .unwrap_or_else(|| json!({ "error": "NotSupportedError" })),
             );
         }
-        // A send that answers another source's value, raising it when it
-        // matches `raise.when` (D10): held under the raise's ticket.
+        if let Some(decision) = self.decide_raise(row, send) {
+            return decision;
+        }
+        // A send that answers another source's value without raising it.
         if let Some(answers) = sub["answers"].as_str().and_then(|a| self.sibling(row, a)) {
             let Decision::Now(value) = self.decide(&answers, false, &json!({})) else {
                 return Decision::Now(json!({ "error": "NotSupportedError" }));
             };
-            let when = sub["raise"]["when"].as_object();
-            let matches = when.is_some_and(|w| w.iter().all(|(k, v)| value.get(k) == Some(v)));
-            return if matches {
-                Decision::Hold(Waits::Raise)
-            } else {
-                Decision::Now(value)
-            };
+            return Decision::Now(value);
         }
         let from = sub["from"].as_str().and_then(|f| self.sibling(row, f));
         if let Some(value) = from.as_ref().and_then(|f| self.preferred(f)) {
@@ -1106,7 +1110,11 @@ impl<D: DataSource> Runner<D> {
             (None, Some(name)) => (name, true),
             _ => return None,
         };
-        let key = format!("{extension}.{declared}");
+        let owner = v["owner"]
+            .as_str()
+            .map(|s| format!("#{s}"))
+            .unwrap_or_default();
+        let key = format!("{extension}.{declared}{owner}");
         let now = |answer: Json| Dispatch::Run(Work::Now(Box::new(move || response(&answer))));
         let Some(row) = self
             .plan
@@ -1284,8 +1292,12 @@ impl<D: DataSource> Runner<D> {
     /// The topic a data-code read of a module's source watches, its key.
     pub(super) fn module_topic(&self, body: &[u8]) -> Option<String> {
         let v: Json = serde_json::from_slice(body).ok()?;
+        let owner = v["owner"]
+            .as_str()
+            .map(|s| format!("#{s}"))
+            .unwrap_or_default();
         let key = format!(
-            "{}.{}",
+            "{}.{}{owner}",
             v.get("extension")?.as_str()?,
             v.get("source")?.as_str()?
         );

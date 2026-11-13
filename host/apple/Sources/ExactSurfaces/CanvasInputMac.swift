@@ -27,13 +27,19 @@ final class CanvasInputHost {
         }
         focusIfUnheld()
         DispatchQueue.main.async { [weak self] in self?.focusIfUnheld() }
-        CanvasPads.shared.add(self)
+    }
+    /// Whether this canvas hears the pads: once its world reads them.
+    private(set) var padsOpened = false
+    func openPads() {
+        guard !padsOpened else { return }
+        padsOpened = true
+        CanvasPads.open().add(self)
     }
     /// The pads follow the focus here (`CanvasPads.resync`).
-    func focused() { CanvasPads.shared.resync() }
+    func focused() { CanvasPads.opened?.resync() }
     /// And away from here, wherever it went: an editor outside every canvas
     /// says nothing as it takes the focus.
-    func focusLeft() { CanvasPads.shared.reconcile() }
+    func focusLeft() { CanvasPads.opened?.reconcile() }
     /// Pads go to the canvas with the keyboard focus in the key window, as keys do.
     var padFocus: Bool {
         guard let view, let window = view.window, window.isKeyWindow, let responder = window.firstResponder as? NSView else { return false }
@@ -81,7 +87,7 @@ final class CanvasInputHost {
         buttons = 0; modifiers.removeAll(); keys.removeAll(); last = nil
         if let c=view.canvases as? CanvasesHost, let e=c.entries[view.id] {c.cancelControls(e)}
         view.canvases?.input(view, ["t": "blur"])
-        CanvasPads.shared.blurred(self)
+        CanvasPads.opened?.blurred(self)
     }
     func key(_ event: NSEvent, down: Bool, source: NodeView) -> Bool {
         guard let view else { return false }
@@ -124,7 +130,10 @@ final class CanvasInputHost {
         return root.hitTest(root.superview?.convert(windowPoint(event, view), from: nil) ?? windowPoint(event, view)) === view
     }
     func pointer(_ event: NSEvent, phase: String) -> Bool {
-        guard let view, !view.disabled, !view.inert else { return false }
+        // A disabled or inert canvas takes no new input, but a held button's
+        // release still reaches it: the surface holds nothing, and the next
+        // press is a press, not a move.
+        guard let view, phase == "up" || (!view.disabled && !view.inert) else { return false }
         // The event's type names left and right; an event made with
         // NSEvent.mouseEvent (the agent's) carries buttonNumber 0 for both.
         let bit = [.leftMouseDown, .leftMouseUp, .leftMouseDragged].contains(event.type) ? 1

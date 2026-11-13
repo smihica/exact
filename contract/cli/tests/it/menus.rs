@@ -763,6 +763,25 @@ fn popover_action_commands_and_toggle_payload_compile() {
     assert!(exact_runner::Event::of_host_kind(50, "closed,maybe").is_err());
 }
 
+/// Issue #364: `toggle` fires at the popover, never at the button that opens
+/// it, so on an element with no `popover` it would never run. It is refused
+/// there, the native button's included, which would otherwise have become a
+/// bare box without a word; a `popover` written as a choice keeps it.
+#[test]
+fn toggle_is_refused_where_no_popover_can_fire_it() {
+    for element in [
+        "button press=go toggle=seen\n        text \"Add\"",
+        "button appearance=\"auto\" press=go toggle=seen\n        text \"Add\"",
+        "row toggle=seen\n        text \"Tip\"",
+        "dialog toggle=seen\n        text \"Hi\"",
+    ] {
+        let e = contract::compile(&format!("component App\n  state n = 0\n  action go\n    n = n + 1\n  action seen\n    n = n + 1\n  view\n    column\n      {element}\n")).unwrap_err();
+        assert_eq!(e.id, "lower-handler-tag", "{element}: {e}");
+        assert!(e.message.contains("has no `popover`"), "{element}: {e}");
+    }
+    contract::compile("component App\n  state open = false\n  action seen\n    open = not open\n  view\n    column\n      column id=\"m\" popover=(open ? some(\"manual\") : none) toggle=seen\n        text \"Tip\"\n").unwrap();
+}
+
 #[test]
 fn popover_commands_check_their_id_and_source() {
     for command in [
@@ -856,4 +875,43 @@ fn optional_popover_preserves_the_node_and_clears_without_a_journal_refusal() {
             format!("component App\n  view\n    column popover={value}\n      text \"x\"\n");
         assert!(contract::compile(&source).is_ok(), "{source}");
     }
+}
+
+/// `menuOrder` on a menu's trigger is the author's word over the platform's
+/// order (LLP 1115 §2): one of three words, kept as a prop for the host, bound
+/// too; any other literal is refused.
+#[test]
+fn a_menu_order_is_one_of_three_words_on_its_trigger() {
+    let menu = "column id=\"m\" popover=\"auto\" role=\"menu\"\n  button press=go popovertarget=\"m\" popovertargetaction=\"hide\"\n    text \"One\"";
+    for word in ["fixed", "priority", "automatic"] {
+        let r = boot(&app(&format!(
+            "button popovertarget=\"m\" menuOrder=\"{word}\" testId=\"t\"\n  text \"Open\"\n{menu}"
+        )));
+        assert_eq!(node(&r, "t").props.str(PropId::MenuOrder), Some(word));
+    }
+    let r = boot(&app(&format!("button popovertarget=\"m\" menuOrder=(busy ? \"fixed\" : \"automatic\") testId=\"t\"\n  text \"Open\"\n{menu}")));
+    assert_eq!(
+        node(&r, "t").props.str(PropId::MenuOrder),
+        Some("automatic")
+    );
+    let r = boot(&app(&format!(
+        "button popovertarget=\"m\" testId=\"t\"\n  text \"Open\"\n{menu}"
+    )));
+    assert_eq!(
+        node(&r, "t").props.str(PropId::MenuOrder),
+        None,
+        "unsaid, the platform's"
+    );
+    for word in ["", "reversed", "Fixed"] {
+        let (id, message) = refused(&format!(
+            "button popovertarget=\"m\" menuOrder=\"{word}\"\n  text \"Open\"\n{menu}"
+        ));
+        assert_eq!(id, "lower-attr-value", "{word}: {message}");
+        assert!(message.contains("`menuOrder` takes"), "{word}: {message}");
+    }
+    // UIKit's name points at Exact's.
+    let (_, message) = refused(&format!(
+        "button popovertarget=\"m\" preferredMenuElementOrder=\"fixed\"\n  text \"Open\"\n{menu}"
+    ));
+    assert!(message.contains("menuOrder"), "{message}");
 }

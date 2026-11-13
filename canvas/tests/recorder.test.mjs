@@ -10,12 +10,22 @@ test('the shared cases hold for the TypeScript recorder', () => {
 });
 
 test('colours serialise as Chrome serialises them', () => {
-  const c = (s) => { const v = parseColor(s); return v === 'current' ? 'current' : v ? serializeColor(v) : 'none'; };
+  const c = (s) => { const v = parseColor(s); return v === 'current' ? 'current' : v ? v.text ?? serializeColor(v) : 'none'; };
   expect(c('rgba(0,0,0,0.123456)')).toBe('rgba(0, 0, 0, 0.12)');
   expect(c('rgb(1 2 3 / 0.999)')).toBe('#010203');
   expect(c('hsl(120 50 50)')).toBe('#40bf40');
   expect(c('hsl(120, 50, 50)')).toBe('none');
   expect(c('#abcd')).toBe('rgba(170, 187, 204, 0.867)');
+  // hwb() has no upper bound on whiteness or blackness: Chrome's rgb(170, 170, 170), 200 / 300.
+  expect(c('hwb(0 200% 100%)')).toBe('#aaaaaa');
+  expect(c('hwb(0 50% 150%)')).toBe('#404040');
+  expect(c('hwb(200 120% 30%)')).toBe('#cccccc');
+  expect(c('hsl(200 50% 150%)')).toBe('#ffffff');
+  // A component written `none` reads back as `none` (Chrome 156).
+  expect(c('oklch(0.7 0 none)')).toBe('oklch(0.7 0 none)');
+  expect(c('lab(none 20 20)')).toBe('lab(none 20 20)');
+  expect(c('oklch(0.7 0.1 120 / none)')).toBe('oklch(0.7 0.1 120 / none)');
+  expect(c('color(srgb none 0.5 0.5)')).toBe('color(srgb none 0.5 0.5)');
 });
 
 // A list's records as [code, operands] (canvas/src/list.rs).
@@ -66,6 +76,23 @@ test('a display-p3 canvas records Display P3 bytes, as the Rust recorder does', 
   expect(r.filter(([c]) => c === 10).map(([, k]) => k)).toEqual([[234, 51, 35, 1], [255, 0, 0, 1]]);
   const pixel = r.find(([c]) => c === 72)[1][4];
   expect([pixel >>> 24, (pixel >>> 16) & 255, (pixel >>> 8) & 255, pixel & 255]).toEqual([234, 51, 35, 255]);
+});
+
+test('a font-relative spacing follows a later font, as the Rust recorder does', () => {
+  // canvas/tests/cases.rs `a_font_relative_spacing_follows_a_later_font`.
+  const width = (ctx) => ctx.measureText('Hello World').width;
+  const ctx = new Recorder(), plain = width(ctx);
+  ctx.letterSpacing = '1em';
+  const atTen = width(ctx) - plain;
+  ctx.font = '20px serif';
+  const other = new Recorder();
+  other.font = '20px serif';
+  expect(width(ctx) - width(other)).toBe(2 * atTen);
+  expect(ctx.letterSpacing).toBe('1em');
+  ctx.wordSpacing = '1ex';
+  ctx.fillText('Hello World', 0, 0);
+  const font = records(ctx._.take()[0]).find(([c]) => c === 60)[1];
+  expect(font.slice(7, 9)).toEqual([20, 10]);
 });
 
 test('a number after Z ends the path there, as Chrome does', () => {

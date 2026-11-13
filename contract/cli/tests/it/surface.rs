@@ -337,9 +337,25 @@ fn a_stale_surface_declaration_warns_and_hides_nothing() {
         "under --json the stale declaration's findings are the array's warnings"
     );
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    // Printed as the editor's problem matcher reads a warning (editors/vscode,
+    // `$exact-contract`): `file:line:col warning [id] message`.
     let out = run(&["build", path.to_str().unwrap()]);
-    assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("warning: .shells/surfaces.json is older than"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stale = format!(
+        "{}:1:1 warning [surface-declaration-stale] .shells/surfaces.json is older than this file",
+        lib.canonicalize().unwrap().display()
+    );
+    assert!(stderr.lines().any(|l| l.starts_with(&stale)), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.contains(" warning [analyze-surface-arguments] ")),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("warning:")),
+        "{stderr}"
+    );
     // Without the type error the build passes, and `contract rust` writes its shapes either way.
     std::fs::write(
         &path,
@@ -363,7 +379,7 @@ fn a_stale_surface_declaration_warns_and_hides_nothing() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("warning:"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(" warning [analyze-surface-arguments] "));
     let out = run(&["build", path.to_str().unwrap(), "--json"]);
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("analyze-surface-arguments"),
@@ -662,5 +678,55 @@ fn a_chord_names_its_modifiers_and_the_physical_keys_that_type_it() {
         "Hyper+K",
     ] {
         assert!(names(chord).is_empty(), "{chord}: {:?}", names(chord));
+    }
+}
+
+#[test]
+fn canvas_performance_is_optional_ephemeral_and_names_its_canvas() {
+    let source = r#"shape Metrics
+  frames: option<number>
+  gpuMs: option<number>
+component App
+  resource metrics = exactCanvasPerformance("world") as shape Metrics
+  view
+    column
+      canvas surface=world
+      text "Metrics"
+"#;
+    let p = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
+    assert!(!contract::typescript(&p)
+        .unwrap()
+        .contains("exactCanvasPerformance"));
+    let mut r = Runner::boot(p, NoData, Kernel::with_monospace(), Default::default(), "/").unwrap();
+    let empty = Value::record(vec![Value::NONE, Value::NONE]);
+    assert_eq!(r.resource("metrics"), Some(&empty));
+    assert!(r.wants_canvas_performance("world"));
+    assert!(!r.wants_canvas_performance("unread"));
+    assert!(r
+        .set_canvas_performance("unread", Some("invalid"))
+        .unwrap()
+        .is_none());
+    r.set_canvas_performance("world", Some(r#"{"frames":60}"#))
+        .unwrap();
+    let sampled = Value::record(vec![Value::some(Value::Number(60.)), Value::NONE]);
+    assert_eq!(r.resource("metrics"), Some(&sampled));
+    assert!(r
+        .set_canvas_performance("world", Some(r#"{"frames":"bad"}"#))
+        .is_err());
+    assert_eq!(r.resource("metrics"), Some(&sampled));
+    assert!(r
+        .set_canvas_performance("world", Some(&" ".repeat(16385)))
+        .is_err());
+    assert!(r.take_store_writes().is_empty());
+    assert!(r.carry().store.is_empty());
+    r.set_canvas_performance("world", None).unwrap();
+    assert_eq!(r.resource("metrics"), Some(&empty));
+    for bad in [
+        source.replace("frames: option<number>", "frames: number"),
+        source.replace("frames", "unknown"),
+        source.replace("Performance(\"world\")", "Performance(\"missing\")"),
+    ] {
+        let p = contract::compile(&bad).unwrap();
+        assert!(contract::bake(p, NoData).is_err());
     }
 }

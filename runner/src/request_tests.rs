@@ -162,3 +162,55 @@ fn a_held_mark_does_not_remove_a_file_transfers_effects() {
         .held()
         .has_effects());
 }
+
+#[test]
+fn cache_mode_is_part_of_request_equality() {
+    let default = Request::get("https://example.test");
+    assert_ne!(default, default.clone().cache(super::CacheMode::Default));
+    for word in [
+        "no-store",
+        "reload",
+        "no-cache",
+        "force-cache",
+        "only-if-cached",
+    ] {
+        let mode = super::CacheMode::parse(Some(word)).unwrap();
+        assert_eq!(mode.name(), word);
+        assert_ne!(default, default.clone().cache(mode));
+    }
+    assert!(super::CacheMode::parse(Some("other")).is_err());
+}
+
+#[test]
+fn preload_names_follow_the_manifest_grammar() {
+    for name in ["feed", "a", "feed-2", "a-"] {
+        let request = Request::get("https://example.test").preload(name).unwrap();
+        assert_eq!(request.preload.as_deref(), Some(name));
+        assert_ne!(request, Request::get("https://example.test"));
+    }
+    for name in [
+        "",
+        "Feed",
+        "2feed",
+        "feed_name",
+        "feed.name",
+        "feed\n",
+        "fée",
+    ] {
+        assert!(Request::get("https://example.test").preload(name).is_err());
+    }
+}
+
+#[test]
+fn prefetch_is_part_of_equality_and_only_plain_http_takes_it() {
+    let request = Request::get("https://example.test");
+    assert_ne!(request, request.clone().prefetch());
+    assert!(request.clone().prefetch().prefetch_refusal().is_none());
+    for request in [
+        request.clone().body_to("app:/data/a"),
+        Request::post_json("https://example.test", "").body_from("app:/data/a"),
+        request.independent_http(1024),
+    ] {
+        assert!(request.prefetch().prefetch_refusal().is_some());
+    }
+}

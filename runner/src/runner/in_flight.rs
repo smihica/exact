@@ -95,8 +95,8 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    /// Drop the request in flight for `target`, if any: its reply, when it
-    /// comes, is dropped too (a `POST` already sent is not unsent — LLP 1016 D5).
+    /// Drop the requests in flight for `target`: their replies are dropped too
+    /// (a `POST` already sent is not unsent — LLP 1016 D5).
     pub(super) fn forget(&mut self, target: Target) {
         self.forget_ticket(target);
         if let Target::Mutation(_) = target {
@@ -105,13 +105,13 @@ impl<D: DataSource> Runner<D> {
         self.sync_pending_flags();
     }
 
-    /// Let go of `target`'s request in flight, keeping a send that waits
+    /// Let go of `target`'s requests in flight, keeping a send that waits
     /// for the source; `false` keeps a child (LLP 1133.007 D13).
     pub(super) fn forget_ticket(&mut self, target: Target) -> bool {
         if self.holds_child(target) {
             return false;
         }
-        if let Some(pos) = self.pending.iter().position(|p| p.target == target) {
+        while let Some(pos) = self.pending.iter().position(|p| p.target == target) {
             let p = self.pending.remove(pos);
             self.note_retired(&p);
             let t = p.ticket;
@@ -177,6 +177,17 @@ impl<D: DataSource> Runner<D> {
                 .pending
                 .iter()
                 .any(|p| p.waited() && !self.held_for_agent(p) && !self.data_timer_held(p.ticket))
+    }
+
+    /// Whether one-shot work is armed (LLP 1101.003 D2): an `after` timer
+    /// not yet fired (a spent one is set to infinity), a mutation's `then`,
+    /// or a queued mutation's next send. A repeating timer is not: an
+    /// `every` spinner never ends, so it cannot hold a run open.
+    pub fn one_shot_armed(&self) -> bool {
+        (self.timers.iter().zip(&self.plan.timers))
+            .any(|(t, row)| row.once && t.next_ms.is_finite())
+            || self.then_due.iter().any(|due| due.is_finite())
+            || self.queues.next_due.iter().any(|due| due.is_finite())
     }
 
     /// Replies landed for held requests, by target, whatever they said (LLP

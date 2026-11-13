@@ -9,6 +9,8 @@
 //! sizes; other presentation values follow. The kernel is the single source of truth; the mirror
 //! is a memo of what the presenter has been told.
 
+#[path = "host_replies.rs"]
+mod replies;
 use crate::{batch::Batch, style};
 use exact_kernel::motion::{motion_node, node_key, targets, MotionSync};
 use exact_kernel::{
@@ -33,6 +35,10 @@ mod arrange_group_tests;
 mod arrange_tests;
 #[path = "canvas2d.rs"]
 pub(crate) mod canvas2d;
+#[path = "canvas_capture.rs"]
+mod canvas_capture;
+#[path = "canvas_performance.rs"]
+mod canvas_performance;
 #[path = "colors.rs"]
 mod colors;
 #[path = "content_region/host.rs"]
@@ -73,6 +79,8 @@ use paragraph::props_for;
 mod persistence;
 #[path = "presence.rs"]
 mod presence;
+#[path = "renew.rs"]
+mod renew;
 #[path = "tamber.rs"]
 mod tamber;
 #[cfg(test)]
@@ -116,6 +124,11 @@ mod svg_lower;
 #[cfg(test)]
 #[path = "svg_tests.rs"]
 mod svg_tests;
+#[path = "timeline_scroll.rs"]
+mod timeline_scroll;
+#[cfg(test)]
+#[path = "timeline_scroll_tests.rs"]
+mod timeline_scroll_tests;
 #[path = "transform_drag.rs"]
 mod transform_drag;
 #[path = "transform_drag_wire.rs"]
@@ -153,6 +166,7 @@ pub(crate) struct Mirror {
     children: Box<[ViewId]>,
     frame: Option<(f32, f32, f32, f32)>,
     content: Option<(f32, f32)>,
+    fit_height: Option<f32>,
     flow: Box<[exact_kernel::FlowShape]>,
     /// Boxed: only a text field has one, and inline it was a quarter of the mirror.
     field_content: Option<Box<crate::batch::ContentBox>>,
@@ -165,6 +179,11 @@ pub(crate) struct Mirror {
 
 /// One runner, one presenter.
 pub struct Host<D: DataSource> {
+    pub(crate) preloads: Option<crate::launch_preloads::LaunchPreloads>,
+    pub(crate) launch_store: Option<std::sync::Arc<crate::launch_preloads::StoreWatch>>,
+    boot_requests: Vec<RequestOut>,
+    preload_content: Vec<String>,
+    preload_accepted: bool,
     runner: Runner<D>,
     admitting_frame: bool,
     font_hook: Option<(crate::measure::FontsFn, *mut std::ffi::c_void, usize)>,
@@ -191,6 +210,8 @@ pub struct Host<D: DataSource> {
     /// Canvas draws run in a turn of their own (`exact_canvas_draw`), not in
     /// the turns main waits on (LLP 1072 §8.5).
     canvas_deferred: bool,
+    /// This session's display scale for Canvas 2D (LLP 1056 D4).
+    canvas_scale: f64,
     dirty_paragraphs: BTreeSet<ViewId>,
     pending_layout: IdSet<NodeKey>,
     layout_withheld: bool,
@@ -204,6 +225,8 @@ pub struct Host<D: DataSource> {
     fit_routes: Vec<(ViewId, Option<[f32; 10]>)>,
     /// Each sticky node's constraint as the presenter last heard it (LLP 1083).
     stickies: IdMap<ViewId, exact_kernel::StickyConstraint>,
+    /// The scrollers scroll and view timelines read (LLP 1057.003 D5).
+    timeline_scrolls: timeline_scroll::TimelineScrolls,
     /// Each multi-column record as the presenter last heard it (LLP 1093 D7).
     fragments: IdMap<ViewId, String>,
     ranks: IdMap<ViewId, i64>,
@@ -214,6 +237,9 @@ pub struct Host<D: DataSource> {
     engine: Engine,
     paint: paint::Paint,
     holds: BTreeMap<u64, HoldToken>,
+    /// Canvas captures the presenter is encoding, or refused (`canvas_capture.rs`).
+    canvas_capture_waiting: Vec<(RequestOut, Option<String>)>,
+    canvas_captures: BTreeMap<u64, canvas_capture::Pending>,
     height_owner: Option<NodeKey>,
     height_handles: BTreeMap<NodeKey, HeightHandle>,
     height_auto_owned: bool,
@@ -235,7 +261,7 @@ pub struct Host<D: DataSource> {
     #[cfg(test)]
     height_target_passes: usize,
     #[cfg(test)]
-    layout_calls: usize,
+    pub(crate) layout_calls: usize,
     viewport: (f32, f32),
     now_ms: f64,
     /// Where the app's kept secrets, and the runner's kept answers, go after
@@ -244,6 +270,9 @@ pub struct Host<D: DataSource> {
     secrets: Option<Box<dyn crate::store::KeptStore>>,
     pending_store_writes: Vec<exact_runner::StoreWrite>,
     pending_store_stamps: std::collections::BTreeMap<String, exact_data::secrets::Stamp>,
+    /// What the disk held for each owed name when its write first failed.
+    pending_store_bases: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    reported_store_failures: BTreeSet<String>,
     data_activated: bool,
     /// The source's activation, run ahead of `activate_data` by `prepare_data`.
     source_prepared: Option<Result<(), String>>,
@@ -291,7 +320,6 @@ impl<D: DataSource> Host<D> {
             None,
         )
     }
-
     /// Boot carrying an earlier host's state (the dev reload, LLP 1007 §6):
     /// slots by name where their types still fit, settled resources where
     /// their arguments still match, the clock.
@@ -314,7 +342,6 @@ impl<D: DataSource> Host<D> {
             None,
         )
     }
-
     /// Boot with the app's kept secrets (LLP 1018 D6): `snapshot` is what
     /// the platform's store holds under the granted names, read before this
     /// call (a carried boot takes the carried store instead); `secrets` is
@@ -353,7 +380,6 @@ impl<D: DataSource> Host<D> {
         host.commit_boot();
         Ok((host, batch))
     }
-
     /// Boot with one action over the accepted plan before its first layout.
     /// The Apple ABI uses this for synchronous font registration without decoding the plan twice.
     #[allow(clippy::too_many_arguments)]
@@ -429,8 +455,10 @@ impl<D: DataSource> Host<D> {
         }
         let plan = plan_bytes.decode().map_err(HostError::Plan)?;
         let entry_props = match plan_bytes {
-            PlanBytes::Entry(_, _, Some(bytes)) => {
-                Some(snapshot::props(&plan, bytes).map_err(HostError::Layout)?)
+            PlanBytes::Entry(_, _, props, configuration)
+                if props.is_some() || configuration.is_some() =>
+            {
+                Some(snapshot::slots(&plan, props, configuration).map_err(HostError::Layout)?)
             }
             _ => None,
         };
@@ -511,7 +539,18 @@ impl<D: DataSource> Host<D> {
             .nodes
             .iter()
             .any(|n| n.node_type == NodeType::Head as u8);
+        let preloads = links.io.and_then(|io| (io.preloads)());
+        let (boot_requests, preload_content) = preloads
+            .as_ref()
+            .map(|p| p.settle(&mut runner))
+            .transpose()?
+            .unwrap_or_default();
         let mut host = Host {
+            launch_store: None,
+            preloads,
+            boot_requests,
+            preload_content,
+            preload_accepted: false,
             has_heads,
             head_title: None,
             head_edited: false,
@@ -529,6 +568,7 @@ impl<D: DataSource> Host<D> {
             canvas_held: IdSet::default(),
             canvas_kept: Default::default(),
             canvas_deferred: false,
+            canvas_scale: layout.canvas_scale.unwrap_or(canvas2d::DEFAULT_SCALE),
             dirty_paragraphs: BTreeSet::new(),
             pending_layout: IdSet::default(),
             layout_withheld: false,
@@ -536,6 +576,7 @@ impl<D: DataSource> Host<D> {
             in_advance: false,
             fit_routes: Vec::new(),
             stickies: IdMap::default(),
+            timeline_scrolls: Default::default(),
             fragments: IdMap::default(),
             ranks: IdMap::default(),
             roots: Vec::new(),
@@ -554,6 +595,8 @@ impl<D: DataSource> Host<D> {
             },
             paint: paint::Paint::default(),
             holds: BTreeMap::new(),
+            canvas_capture_waiting: Vec::new(),
+            canvas_captures: BTreeMap::new(),
             height_owner: None,
             height_handles: BTreeMap::new(),
             height_auto_owned: false,
@@ -586,6 +629,8 @@ impl<D: DataSource> Host<D> {
             secrets,
             pending_store_writes: Vec::new(),
             pending_store_stamps: Default::default(),
+            pending_store_bases: Default::default(),
+            reported_store_failures: BTreeSet::new(),
             update_line: None,
             delivery,
             colors_seen: None,
@@ -659,20 +704,21 @@ impl<D: DataSource> Host<D> {
         let batch = host.write(batch, None);
         Ok((host, batch))
     }
-
     /// Release effects only after the containing app accepted every candidate.
     pub(crate) fn commit_boot(&mut self) {
         if let Some(note) = self.delivery.and_then(|hooks| (hooks.take_note)()) {
             self.runner.log(note);
         }
         self.persist();
+        self.preload_accepted = true;
+        if let Some(preloads) = &self.preloads {
+            preloads.committed(std::mem::take(&mut self.preload_content), self.runner.seq());
+        }
     }
-
     /// The runner.
     pub fn runner(&self) -> &Runner<D> {
         &self.runner
     }
-
     /// The runner, mutably: an auth session's arm (LLP 1069.006).
     pub fn runner_mut(&mut self) -> &mut Runner<D> {
         &mut self.runner
@@ -694,7 +740,7 @@ impl<D: DataSource> Host<D> {
             return Some(crate::picker::file_op(op, request, self.runner.data_ref()));
         }
         if op.as_deref() == Some("appRoots") {
-            return Some(crate::picker::roots_reply());
+            return Some(crate::picker::app_roots_reply(self.runner.data_ref()));
         }
         if op.as_deref() == Some("sensorEvents") {
             return Some(self.sensor_events(request));
@@ -775,6 +821,9 @@ impl<D: DataSource> Host<D> {
 
     /// Take the source's announced topics, waking the host (LLP 1016.002).
     pub fn listen(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if let Some(store) = &self.launch_store {
+            store.listen(wake.clone());
+        }
         self.preload_wake.set(wake.clone());
         self.runner.listen(wake);
     }
@@ -804,9 +853,10 @@ impl<D: DataSource> Host<D> {
         self.runner.release_work()
     }
 
-    /// The hosts the app may reach (LLP 1016 D6), as the data crate declares them.
+    /// The hosts the app may reach (LLP 1016 D6): the data crate's grants and
+    /// the origins its declared sources carry (LLP 1162.001 D3).
     pub fn grants(&mut self) -> String {
-        self.runner.data().grants().to_string()
+        self.runner.grants()
     }
 
     /// The app's `app:/data`, `app:/cache` and `app:/tmp`, as storage
@@ -830,7 +880,9 @@ impl<D: DataSource> Host<D> {
     /// The requests the runner handed out since the last take (LLP 1016 D2):
     /// the bridge gives them to the executor; nothing reaches the presenter.
     pub fn take_requests(&mut self) -> Vec<RequestOut> {
-        self.runner.take_requests()
+        let mut requests = std::mem::take(&mut self.boot_requests);
+        requests.extend(self.runner.take_requests());
+        requests
     }
 
     /// Admission failures remain on the runner's current tickets, not a queue.
@@ -851,44 +903,6 @@ impl<D: DataSource> Host<D> {
     /// Whether another pump must settle an admission failure.
     pub fn has_request_refusals(&self, allow_ordered: bool) -> bool {
         self.runner.has_request_refusals(allow_ordered)
-    }
-
-    /// The outcomes the executor brought back, oldest first, as one batch:
-    /// each reply is a commit at `now_ms` (a ticket no longer held commits
-    /// nothing); a reply the source cannot shape is the batch's error and
-    /// the ones before it stand.
-    pub fn fulfill_all(
-        &mut self,
-        outcomes: Vec<(u64, Outcome, Option<u64>)>,
-        now_ms: f64,
-    ) -> String {
-        self.now_ms = now_ms.max(self.now_ms);
-        // Sample the presented batch's authored scroll before this pump changes geometry.
-        let (batch, intersect_error) = self.intersect_round(Batch::new(), None);
-        // Announced topics first: what the device said before these replies.
-        let (announced, failed) = self.runner.apply_announced();
-        let mut error = failed.map(|e| format!("{e:?}"));
-        let mut receipts: Vec<Timed> = announced
-            .into_iter()
-            .map(|receipt| Timed {
-                at_ms: self.now_ms,
-                receipt,
-            })
-            .collect();
-        for (ticket, outcome, elapsed_ms) in outcomes {
-            match self.runner.fulfill_measured(ticket, outcome, elapsed_ms) {
-                Ok(Some(receipt)) => receipts.push(Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }),
-                Ok(None) => {}
-                Err(e) => {
-                    error = Some(format!("{e:?}"));
-                    break;
-                }
-            }
-        }
-        self.commit_into(&receipts, error.or(intersect_error), batch)
     }
 
     /// Strict common LE viewport feedback followed by any runner edge action.
@@ -1163,31 +1177,6 @@ impl<D: DataSource> Host<D> {
         }
     }
 
-    /// The viewport's change into `batch`, after what it holds (`set_view`).
-    fn resize_inner(
-        &mut self,
-        width: f32,
-        height: f32,
-        mut batch: Batch,
-        error: Option<String>,
-    ) -> String {
-        let _roles = self.runner.bind_roles(); // Its own (LLP 1121 stage 5).
-                                               // @ref LLP 1039 D2 — merge re-answer and relayout, once.
-        let receipt = match self.runner.set_viewport(width as f64, height as f64) {
-            Ok(receipt) => receipt,
-            Err(e) => return self.finish(batch, error.or(Some(format!("viewport: {e:?}")))),
-        };
-        self.viewport = (width, height);
-        self.height_targets_dirty = true;
-        self.presence.snap = true;
-        if let Some(receipt) = receipt {
-            let at_ms = self.now_ms;
-            return self.commit_into(&[Timed { at_ms, receipt }], error, batch);
-        }
-        let laid_out = self.layout(&mut batch).err();
-        self.finish(batch, error.or(laid_out))
-    }
-
     /// Content has settled: the tree and the motion engine give back what
     /// they hold beyond the live nodes ([`exact_kernel::Kernel::trim`]).
     pub fn trim(&mut self) {
@@ -1217,12 +1206,22 @@ impl<D: DataSource> Host<D> {
         }
     }
 
-    fn finish(&mut self, batch: Batch, error: Option<String>) -> String {
+    fn finish(&mut self, mut batch: Batch, error: Option<String>) -> String {
+        // A host's fact laid out again (a native control's measured size, an
+        // inset, the text size): a box already moving was retargeted from where
+        // it shows, and its new frame and offset go in one batch. Without the
+        // offset the presenter showed the new frame with the old offset until
+        // the next tick, which then put the box back where it started (#134).
+        if self.presence.unauthored {
+            self.present(&mut batch, false);
+        }
         // Clear the mark first: the resize handlers below commit the app's own moves
         self.presence.unauthored = false;
         let _roles = self.runner.bind_roles(); // Its own, crossing (LLP 1121 stage 5).
         crate::doc_watch::sync(&mut self.doc_watch, &mut self.runner);
         let (mut batch, error) = self.resize_rounds(batch, error);
+        self.drain_canvas_captures(&mut batch);
+        self.forget_canvas_captures();
         self.state_onto(&mut batch);
         self.write(batch, error.as_deref())
     }
@@ -1256,6 +1255,7 @@ impl<D: DataSource> Host<D> {
             > 1)
         .then(|| self.runner.handlers());
         self.close_new_top_layer(receipts);
+        let mut repaint = Vec::new();
         for t in receipts {
             let r = &t.receipt;
             // Flights capture their leavers before an exit takes them
@@ -1281,6 +1281,7 @@ impl<D: DataSource> Host<D> {
                     self.transform_drags.remove(id);
                 }
             }
+            repaint.extend(self.renew_views(r, &mut batch));
             for key in &r.created {
                 if let Some(node) = self.runner.kernel().node_by_key(*key) {
                     let id = node.id;
@@ -1326,6 +1327,7 @@ impl<D: DataSource> Host<D> {
             let seek = self.engine.advance(self.engine_time(t.at_ms));
             debug_assert!(seek.is_ok(), "the clock never runs backwards here");
             let mut sync = self.runner.kernel().motion_sync(&t.receipt);
+            self.presence.looks.apply(self.runner.kernel(), &mut sync);
             self.spare_exits(&mut sync);
             let applied = sync.apply(&mut self.engine);
             debug_assert!(applied.is_ok(), "kernel rows are always valid engine input");
@@ -1363,6 +1365,7 @@ impl<D: DataSource> Host<D> {
             self.cancel_invalid_height_drag();
             self.reconcile_transform_drags(&mut batch);
         }
+        self.repaint_renewed(&repaint, &mut batch);
         let seek = self.engine.advance(self.engine_time(self.now_ms));
         debug_assert!(seek.is_ok(), "the clock never runs backwards here");
         // An advance whose commits changed no node (a frame task that only

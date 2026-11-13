@@ -346,6 +346,39 @@ fn a_view_carries_a_keyboards_segment_rects() {
             exact_kernel::Rect::new(0., 440., 402., 15.)
         );
         assert_eq!(env.viewport_height, 455.);
+        // The keyboard's overlap (mask 32) is the last word, after the rects.
+        let mut tail = vec![2];
+        tail.extend(rects(15.));
+        tail.push(419.0f32.to_bits());
+        let len = bridge.input_write(&view_words((mask & !8) | 32, &regions, &tail));
+        let out = bridge.view(len);
+        let batch = std::str::from_utf8(bridge.output_bytes(out as usize)).unwrap();
+        assert!(!batch.contains("\"error\":\""), "{batch}");
+        assert_eq!(
+            bridge
+                .host
+                .as_ref()
+                .unwrap()
+                .runner()
+                .viewport()
+                .keyboard_height,
+            419.
+        );
+        // Without that word, mask 32 is malformed and changes nothing.
+        let len = bridge.input_write(&view_words(32, &regions, &[]));
+        let out = bridge.view(len);
+        let batch = std::str::from_utf8(bridge.output_bytes(out as usize)).unwrap();
+        assert!(batch.contains("view: malformed"), "{batch}");
+        assert_eq!(
+            bridge
+                .host
+                .as_ref()
+                .unwrap()
+                .runner()
+                .viewport()
+                .keyboard_height,
+            419.
+        );
     }
 }
 
@@ -630,4 +663,37 @@ fn a_clock_only_change_refuses_a_candidate_that_would_rewind_time() {
     let len = bridge.commit_plan();
     assert_ne!(output(&bridge, len)["pending"], true);
     assert_eq!(bridge.host.as_ref().unwrap().carry().now_ms, latest.now_ms);
+}
+
+#[test]
+fn a_pick_after_preparation_refuses_a_candidate_that_would_reuse_its_path() {
+    let plan = contract::compile("component App\n  view\n    text \"Pick\"\n")
+        .unwrap()
+        .encode();
+    let mut bridge = Bridge::new();
+    bridge.boot(&plan, Dot, Hooks::none(), 390., 844.);
+    bridge.input_write(&plan);
+    bridge.prepare_plan(plan.len(), Dot, Hooks::none(), 390., 844.);
+    let path = bridge
+        .host
+        .as_mut()
+        .unwrap()
+        .runner_mut()
+        .picked_path("photo.jpg");
+    let len = bridge.check_prepared();
+    assert_eq!(output(&bridge, len)["pending"], true);
+    assert!(bridge.prepared.is_none());
+    bridge.input_write(&plan);
+    bridge.prepare_plan(plan.len(), Dot, Hooks::none(), 390., 844.);
+    let len = bridge.commit_plan();
+    assert_ne!(output(&bridge, len)["pending"], true);
+    assert_ne!(
+        bridge
+            .host
+            .as_mut()
+            .unwrap()
+            .runner_mut()
+            .picked_path("photo.jpg"),
+        path
+    );
 }

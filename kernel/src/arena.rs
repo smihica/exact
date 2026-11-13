@@ -80,6 +80,7 @@ pub struct NodeArena {
     pub(crate) mark_sizes: Vec<((crate::ControlKind, u32), (f32, f32))>,
     /// The kind and font size each standing mark report was made under (`Kernel::mark_withdrawn`).
     pub(crate) mark_reports: IdMap<u32, (crate::ControlKind, u32)>,
+    pub(crate) bar_symbols: Vec<(u32, f32)>,
     /// Slots that are `position: sticky` (LLP 1083 D3).
     pub(crate) sticky_slots: SlotSet,
     /// Slots in HTML's top layer: popovers, unless their author made them
@@ -125,9 +126,8 @@ pub struct NodeArena {
     /// The margin the platform's cell gives a cells list's rows at each end,
     /// by the list's slot (LLP 1138): a few lists at most.
     list_margins: Vec<(u32, [f32; 2])>,
-    /// Alert roots whose host supplies the CSS `::before` title item. The
-    /// engine derives the item from the root's live label and inherited text.
-    pub(crate) alert_prefixes: SlotSet,
+    /// Host-rendered alert titles, and the popovers open as choosers.
+    pub(crate) alert_state: alert::State,
     /// The containing blocks hosts gave subtrees (LLP 1115.002 D8.2).
     pub(crate) blocks: crate::kernel::Blocks,
     taffy: Vec<Option<NodeId>>,
@@ -189,6 +189,7 @@ impl Clone for NodeArena {
             measured_symbols: self.measured_symbols.clone(),
             mark_sizes: self.mark_sizes.clone(),
             mark_reports: self.mark_reports.clone(),
+            bar_symbols: self.bar_symbols.clone(),
             sticky_slots: self.sticky_slots.clone(),
             top_layer_slots: self.top_layer_slots.clone(),
             timelines: self.timelines.clone(),
@@ -205,7 +206,7 @@ impl Clone for NodeArena {
             covers: self.covers.clone(),
             grouped_margins: self.grouped_margins.clone(),
             list_margins: self.list_margins.clone(),
-            alert_prefixes: self.alert_prefixes.clone(),
+            alert_state: self.alert_state.clone(),
             blocks: self.blocks.clone(),
             taffy: self.taffy.clone(),
             is_root: self.is_root.clone(),
@@ -279,6 +280,7 @@ impl NodeArena {
         self.measured_symbols.clear();
         self.mark_sizes.clear();
         self.mark_reports.clear();
+        self.bar_symbols.clear();
         self.sticky_slots.clear();
         self.top_layer_slots.clear();
         self.timelines = Default::default();
@@ -303,7 +305,7 @@ impl NodeArena {
         self.covers.clear();
         self.grouped_margins.clear();
         self.list_margins.clear();
-        self.alert_prefixes.clear();
+        self.alert_state.clear();
         self.blocks = Default::default();
         self.free = (0..self.live.len() as u32).rev().collect();
         self.roots.clear();
@@ -393,12 +395,6 @@ impl NodeArena {
     /// Node type of a slot.
     pub fn node_type(&self, slot: u32) -> NodeType {
         self.node_types[slot as usize]
-    }
-    /// Whether a slot is a `<button>` element on the web: a Pressable,
-    /// whatever its ARIA role, unless an `href` makes it an `<a>`.
-    pub(crate) fn is_button(&self, slot: u32) -> bool {
-        self.node_type(slot) == NodeType::Pressable
-            && self.props(slot).str(crate::PropId::Href).is_none()
     }
     /// Parent slot.
     pub fn parent(&self, slot: u32) -> Option<u32> {
@@ -716,6 +712,7 @@ impl NodeArena {
         if scale != 1.0 {
             for run in &mut out[start..] {
                 run.style = run.style.scaled(scale);
+                run.edges = run.edges.scaled(scale);
             }
         }
     }
@@ -752,11 +749,7 @@ impl NodeArena {
                         .or_else(|| props.str(PropId::Placeholder).filter(|p| !p.is_empty()))
                         .unwrap_or(" ")
                 };
-                out.push(TextRun {
-                    text: text.into(),
-                    style,
-                    inline: None,
-                });
+                out.push(TextRun::new(text, style));
                 // A textarea's final Return creates a caret line. Paragraph
                 // shapers can omit a terminal break, so retain that line with
                 // zero-width measurement content, never in the field's value.
@@ -764,11 +757,7 @@ impl NodeArena {
                     && props.str(PropId::SemanticTag) == Some("textarea")
                     && text.ends_with('\n')
                 {
-                    out.push(TextRun {
-                        text: "\u{200b}".into(),
-                        style,
-                        inline: None,
-                    });
+                    out.push(TextRun::new("\u{200b}", style));
                 }
             }
             _ => {
@@ -786,17 +775,22 @@ impl NodeArena {
                     let mut style = rows.style();
                     // Bold Text (LLP 1115.000 D12.3), as `text_style` reads it.
                     self.embolden(slot, &mut style);
-                    out.push(TextRun {
-                        text: shown,
-                        style,
-                        inline: None,
-                    });
+                    out.push(TextRun::new(shown, style));
                 } else {
                     for child in &self.children[s] {
                         match self.node_types[*child as usize] {
                             NodeType::Text => {
                                 let rows = self.run_style_rows(*child, rows);
+                                let first = out.len();
                                 self.text_runs_after(*child, rows, out, boundary);
+                                // Its box's edges beside its first and last runs; an
+                                // inner box's are already there.
+                                let edges = crate::text::inline_box::inline_edges(self, *child);
+                                if out.len() > first {
+                                    out[first].edges.start += edges.start;
+                                    let last = out.len() - 1;
+                                    out[last].edges.end += edges.end;
+                                }
                             }
                             // Its alignment reads its parent's font (CSS 2
                             // §10.8.1), so its run is in the paragraph's style.
@@ -804,6 +798,7 @@ impl NodeArena {
                                 out.push(TextRun {
                                     text: crate::text::inline_box::INLINE_BOX_TEXT.into(),
                                     style: rows.style(),
+                                    edges: Default::default(),
                                     inline: Some(
                                         crate::text::inline_box::inline_image(self, *child)
                                             .reserved,
@@ -923,6 +918,7 @@ impl NodeArena {
     }
 
     pub(crate) fn free_slot(&mut self, slot: u32) {
+        self.bar_symbols.retain(|(s, _)| *s != slot);
         self.field_content.remove(&slot);
         self.mark_reports.remove(&slot);
         self.exclusion_slots.remove(slot);
@@ -957,7 +953,7 @@ impl NodeArena {
         self.covers.retain(|(s, _)| *s != slot);
         self.grouped_margins.retain(|(s, _)| *s != slot);
         self.list_margins.retain(|(s, _)| *s != slot);
-        self.alert_prefixes.remove(slot);
+        self.alert_state.remove(slot);
         self.blocks.remove(slot);
         self.taffy[s] = None;
         if self.is_root[s] {
@@ -1381,7 +1377,8 @@ mod tests {
             (StyleId::FontSmoothing, text("antialiased")),
         ];
         let mut covered = StyleMask::EMPTY;
-        for (id, value) in samples {
+        let insets = crate::kernel::owner::OVERRIDES.map(|id| (id, number(8.0)));
+        for (id, value) in samples.into_iter().chain(insets) {
             covered.set(id);
             let mut arena = NodeArena::new();
             let root = arena.alloc(1, NodeType::View).unwrap();

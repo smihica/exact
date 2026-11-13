@@ -25,10 +25,12 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { closeSync, createWriteStream, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { within } from './paths.mjs';
 import { fileURLToPath } from 'node:url';
 import { appleArtifacts, appleRunBinary } from '../host/apple/build.mjs';
-import { compilerWarnings, warningLines, CONFIG_JSON, DECLARATIONS, depInfoInputs, moduleGraph, newerThan, notBuildInput, packagedBuildChanges, receiptChanges, refuseStale } from './agent-launch.mjs';
-import { bakeOutput, bakeTarget, claimLive, developmentBuildEnv, executableName, linuxBuild, resolveApp, shaderWatchRoots } from './app.mjs';
+import { compilerWarnings, warningLines, depInfoInputs, newerThan, notBuildInput, otherHosts, packagedBuildChanges, receiptChanges, refuseBackendOrigin, refuseStale } from './agent-launch.mjs';
+import { CONFIG_JSON, DECLARATIONS, moduleGraph } from './module-graph.mjs';
+import { bakeOutput, bakeTarget, claimLive, developmentBuildEnv, executableName, resolveApp, shaderWatchRoots } from './app.mjs';
 import { bakeTool, linkedBakeDir } from './linked-plan.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -41,7 +43,8 @@ const shown = file => relative(process.cwd(), file).startsWith('..') ? file : re
 
 /** What a drive of `app` on `host` (`ios`, else macOS) launches, by its own
  * record: `missing`, or the inputs `changed` since its receipt ([] when fresh,
- * or when a macOS binary has no receipt). `sample` is the sample host's.
+ * or when a macOS binary has no receipt), and the receipt's `backendOrigin`.
+ * `sample` is the sample host's.
  * `checked` is the digest of a receipt whose inputs this drive's own check
  * (`buildFirst`, run first by an app's exact.mjs) has just hashed: the same
  * receipt's are not hashed twice (LLP 1012.001.000 D1: once a drive). */
@@ -50,17 +53,18 @@ export function nativeBuild(host, app, { sample = false, checked = null } = {}) 
   const built = ios ? appleArtifacts(app, { destination: 'ios-simulator', host: sample }).bundle : appleRunBinary(app, sample);
   if (!existsSync(built)) return { built, missing: true, changed: [] };
   const receipt = receiptPath(host, app, { sample });
-  const changed = receipt ? receiptChanges(receipt, app, { hashed: !!checked && checked === digestOf(receipt) }) : [];
+  const backendOrigin = receipt ? JSON.parse(readFileSync(receipt, 'utf8')).build?.backendOrigin : null;
+  const changed = receiptChanges(receipt, app, { hashed: !!checked && !!receipt && checked === digestOf(receipt) });
   if (!ios && !sample && receipt) {
     const bundled = resolve(appleArtifacts(app).bundle, 'Contents/Resources/receipt.json');
     try {
       const selected = JSON.parse(readFileSync(receipt, 'utf8')), actual = JSON.parse(readFileSync(bundled, 'utf8'));
-      const identity = r => [r.built, r.started, r.target, r.composition, r.compatibilityId, r.build?.trust, r.build?.binary?.sha256];
+      const identity = r => [r.built, r.started, r.target, r.composition, r.compatibilityId, r.build?.trust, r.build?.backendOrigin, r.build?.binary?.sha256];
       // The shared .app path can have been replaced by a release in another build namespace.
       if (actual.build?.trust !== 'development' || JSON.stringify(identity(selected)) !== JSON.stringify(identity(actual))) changed.push(bundled);
     } catch { changed.push(bundled); }
   }
-  return { built, receipt, changed };
+  return { built, receipt, changed, backendOrigin };
 }
 
 /** The receipt of the build a drive of `app` on `host` (`ios`, else macOS) launches, or undefined without one. */
@@ -91,21 +95,23 @@ export function rebuildCommand(app, verb) {
 
 /** `verb` run by an `exact new` app's own `exact.mjs`, in its directory; null for an app in this checkout. */
 export function ownVerb(app, verb) {
-  const own = app.dir && !resolve(app.dir).startsWith(`${ROOT}/`) && existsSync(resolve(app.dir, 'exact.mjs'));
+  const own = app.dir && !within(ROOT, resolve(app.dir)) && existsSync(resolve(app.dir, 'exact.mjs'));
   const quoted = (path) => `'${String(path).replaceAll("'", "'\\''")}'`;
   // A target the environment names resolves against the directory the drive ran in, not the app's: pinned whole
   const target = process.env.CARGO_TARGET_DIR && app.target ? `CARGO_TARGET_DIR=${quoted(app.target)} ` : '';
   return own ? `(cd ${quoted(app.dir)} && ${target}bun exact.mjs ${verb})` : null;
 }
 
-/** The command that builds `app`'s Linux host for a drive: an `exact new` app's own verb, else exact2's build. */
-export const linuxRebuild = (app) => ownVerb(app, 'linux') ?? linuxBuild(app).join(' ');
+/** The command that builds `app`'s Linux host for a drive: an `exact new` app's own verb, else exact2's build, which
+ * also binds the executable's backend and settings record that a bare `cargo build` does not write. */
+export const linuxRebuild = (app) => ownVerb(app, 'linux') ?? `bun scripts/build-linux.mjs ${app.name}`;
 
 /** The driver's refusal (LLP 1012.001.000 D1) on what `nativeBuild` found. */
 export function refuseBuild(host, state, app, { sample = false } = {}) {
   const ios = host === 'ios';
   const command = sample ? `bun host/apple/build.mjs${ios ? ' --ios' : ''} ${app.crate('apple')} --host` : rebuildCommand(app, ios ? 'ios' : 'mac');
   if (state.missing) throw new Error(`run ${command} first`);
+  refuseBackendOrigin(state, app, command);
   refuseStale(ios ? 'ios' : sample ? 'sample host' : 'macos', state.receipt, state.changed, command);
 }
 
@@ -174,12 +180,13 @@ export function logged(command, args, log, { cwd, env, append = false, say = nul
   });
 }
 /** host/apple/build.mjs with `args`, its output into `log`; its exit code and output. */
-const appleBuild = (args, log, say) => logged(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), ...args], log, { say });
+const appleBuild = (args, log, say, app) => logged(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), ...args], log,
+  { say, env: { ...process.env, ...(app.outside ? { EXACT_APP_DIR: app.dir } : {}) } });
 
 // ---------------------------------------------------------------- a plan-only edit (LLP 1116.003)
 
 // What a plan is made of and nothing native reads: the Contract, and the
-// TypeScript and JSON app.ts imports (agent-launch.mjs `moduleGraph`; every
+// TypeScript and JSON app.ts imports (module-graph.mjs `moduleGraph`; every
 // TypeScript file when that cannot be read), outside the trees a native build
 // takes files from and the app's Rust crates (which can include any file
 // beside them). A file app.ts does not import is no input at all.
@@ -191,7 +198,7 @@ const graphOf = app => moduleGraph(app.dir, app.manifest);
 export function planSource(path, app, graph = graphOf(app)) {
   const at = resolve(ROOT, path), rel = relative(app.dir, at);
   if (!rel || rel.startsWith('..') || isAbsolute(rel) || NATIVE_TREE.test(rel) || rel === DECLARATIONS) return false;
-  for (let dir = dirname(at); dir.startsWith(`${app.dir}/`); dir = dirname(dir)) if (existsSync(resolve(dir, 'Cargo.toml'))) return false;
+  for (let dir = dirname(at); dir !== app.dir && within(app.dir, dir); dir = dirname(dir)) if (existsSync(resolve(dir, 'Cargo.toml'))) return false;
   if (/\.contract$/.test(rel)) return true;
   if (!/\.(tsx?|json)$/.test(rel) || CONFIG_JSON.test(rel)) return false;
   return graph ? graph.has(at) : /\.tsx?$/.test(rel);
@@ -202,10 +209,11 @@ export function planSource(path, app, graph = graphOf(app)) {
  * from the directories app.json's `typescript.sources` mounts. */
 export function planSources(app, graph = graphOf(app)) {
   const skip = notBuildInput(app.dir, shaderWatchRoots(app));
-  const own = newerThan(-Infinity, [app.dir], path => /\/(apple|ios|macos|linux|web)$/.test(path) && path.startsWith(`${app.dir}/`) || skip(path))
+  const hosts = otherHosts(app);
+  const own = newerThan(-Infinity, [app.dir], path => hosts(path) || skip(path))
     .filter(path => planSource(path, app, graph));
   const mounts = Object.values(app.manifest?.typescript?.sources ?? {}).map(path => resolve(app.dir, String(path)));
-  const mounted = graph ? [...graph].filter(path => !path.startsWith(`${app.dir}/`)) : newerThan(-Infinity, mounts).filter(path => /\.tsx?$/.test(path));
+  const mounted = graph ? [...graph].filter(path => !within(app.dir, path)) : newerThan(-Infinity, mounts).filter(path => /\.tsx?$/.test(path));
   return Object.fromEntries([...own, ...mounted].sort().map(path => [path, digestOf(resolve(ROOT, path))]));
 }
 
@@ -375,6 +383,7 @@ export async function buildFirst(host, app, { say = line => console.error(line),
   await wait(app, say);
   await reportPrebuild(app, host === 'ios' ? ['--ios'] : [], say);
   const state = nativeBuild(host, app);
+  if (!state.missing) refuseBackendOrigin(state, app);
   // What the drive after this need not hash again: its receipt, when nothing is rebuilt (`nativeBuild`'s `checked`).
   const hashed = () => { if (process.env.EXACT_BUILD_CHECK_OUT && state.receipt) writeFileSync(process.env.EXACT_BUILD_CHECK_OUT, digestOf(state.receipt)); return 0; };
   let reason = buildReason(state, app);
@@ -398,7 +407,7 @@ export async function buildFirst(host, app, { say = line => console.error(line),
   rmSync(overrideDir(host, app), { recursive: true, force: true }); // the build supersedes it
   const log = resolve(app.dir, '.exact', `${host}-build.log`);
   say(`building for ${label(host)}: ${reason}; its log: ${shown(log)}`);
-  const { code, output } = await build(buildArgs(host, app), log, say);
+  const { code, output } = await build(buildArgs(host, app), log, say, app);
   // Another build took the claim between the check and this one (two started together): wait for it, then decide again.
   if (code && retries > 0 && /Apple build busy for/.test(output)) return buildFirst(host, app, { say, build, wait, bake, retries: retries - 1 });
   if (code) say(failureSummary(output, { host, code, log: shown(log) }));
@@ -408,14 +417,11 @@ export async function buildFirst(host, app, { say = line => console.error(line),
 }
 
 /** What a Windows drive of `app` launches, `dist-windows/<name>.exe`, and its changes since the build that packaged it
- * (`changed`, null when there is none): what the build's receipt records (agent-launch.mjs `packagedBuildChanges`, on
- * which the driver refuses it), and the app's own files edited since, which that receipt does not name (the plan's
- * sources and the crate's), other hosts' crates aside. */
+ * (`changed`, null when there is none), from the same receipt check the driver uses. */
 export function windowsBuild(app) {
   const bin = resolve(app.dir, 'dist-windows', `${executableName(app)}.exe`);
   if (!existsSync(bin)) return { bin, changed: null };
-  const own = newerThan(statSync(bin).mtimeMs, [app.dir], path => /[\\/](apple|ios|macos|linux|web|android)$/.test(path) && dirname(path) === app.dir);
-  return { bin, changed: [...packagedBuildChanges(resolve(bakeOutput(app), `windows-${bakeTarget('windows')}.build.json`), dirname(bin), app), ...own] };
+  return { bin, changed: packagedBuildChanges(resolve(bakeOutput(app), `windows-${bakeTarget('windows')}.build.json`), dirname(bin), app) };
 }
 
 /** `buildFirst` for Windows: host/windows/build.mjs when the packaged build is missing or stale, said in one line, its

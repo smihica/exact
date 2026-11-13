@@ -254,6 +254,7 @@ fn a_coalesced_retirement_still_lets_go_what_an_earlier_one_did() {
         target: Target::Resource(0),
         source: "read",
         args: &args,
+        fetch: None,
         continuation: Some(replacement),
     }];
     placed.forgotten(&store, &in_flight);
@@ -314,6 +315,7 @@ fn a_key_both_coalesced_retirements_keep_stays_in_flight() {
             target: Target::Resource(0),
             source: "read",
             args: &args,
+            fetch: None,
             continuation: Some(continuation),
         }]
     };
@@ -456,6 +458,7 @@ fn a_turn_not_yet_handed_over_survives_a_retirement_that_keeps_its_call() {
         target: Target::Resource(0),
         source: "read",
         args: &args,
+        fetch: None,
         continuation: None,
     }];
     placed.forgotten(&empty, &in_flight);
@@ -510,7 +513,7 @@ fn coalesced_retirements_let_go_what_retiring_each_in_order_does() {
                     };
                     let live: Vec<Key> = view
                         .iter()
-                        .map(|(t, s, a)| (Some(*t), s.clone(), a.concat()))
+                        .map(|((t, s, a), _)| (Some(*t), s.clone(), a.concat()))
                         .collect();
                     parked.retain(|(id, k)| {
                         let keep = live.contains(k);
@@ -554,7 +557,12 @@ fn coalesced_retirements_let_go_what_retiring_each_in_order_does() {
         for _ in 0..30 {
             match next(3) {
                 0 => {
-                    let view: Vec<_> = keys.iter().filter(|_| next(2) == 0).cloned().collect();
+                    let view: Vec<_> = keys
+                        .iter()
+                        .filter(|_| next(2) == 0)
+                        .cloned()
+                        .map(|call| (call, None))
+                        .collect();
                     coalesced.forgotten((view.clone(), Vec::new()));
                     // In order: each its own marker, never merged.
                     ordered.pending = None;
@@ -563,6 +571,7 @@ fn coalesced_retirements_let_go_what_retiring_each_in_order_does() {
                 1 => {
                     let (target, source, args) = keys[next(4) as usize].clone();
                     let job = |reply| Job::Answer {
+                        instance: None,
                         target: Some(target),
                         source: source.clone(),
                         args: args.clone(),
@@ -632,6 +641,44 @@ fn a_long_poll_on_a_worker_s_own_work_is_refused_before_it_runs() {
         "{refused:?}"
     );
     assert!(!*ran.lock().unwrap(), "its work never ran");
+}
+
+/// LLP 1016.003 in a worker: a Rust source's two-way socket is refused by
+/// name, not opened to only listen.
+struct Subscribes;
+
+impl DataSource for Subscribes {
+    fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+        Ok(Value::Number(0.0))
+    }
+
+    fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
+        Ok(Answer::Later(Request::socket("wss://stream.example/ws")))
+    }
+}
+
+#[test]
+fn a_rust_socket_in_a_worker_is_refused_by_name() {
+    let mut placed = Placed::new(Subscribes, Placement::Worker);
+    placed.activate().unwrap();
+    let mut store = Store::new("", []);
+    let token = match placed.answer(&mut store, "book", &[]).unwrap() {
+        Answer::Later(request) => request.continuation.unwrap(),
+        _ => panic!("a worker answer"),
+    };
+    let outcome = send(placed.dispatch(token, &store))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let refused = crate::envelope::apply(outcome, &mut store, &mut Vec::new()).unwrap_err();
+    assert_eq!(
+        format!("{refused:?}"),
+        format!(
+            "{:?}",
+            DataError::Unavailable(
+                "Request::socket is unavailable in a worker-placed source; place it on main".into()
+            )
+        )
+    );
 }
 
 #[test]
@@ -717,4 +764,198 @@ fn a_kept_reply_waits_off_the_host_while_its_owner_has_unrelated_work() {
         .is_none());
     assert_eq!(store.get("document"), Some("kept at 5000"));
     assert!(store.take_writes()[0].durable);
+}
+
+struct Retiring {
+    started: Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    identity: exact_runner::ModuleIdentity,
+}
+impl DataSource for Retiring {
+    fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+        Err(DataError::UnknownSource(source.into()))
+    }
+    fn answer(&mut self, _: &mut Store, source: &str, _: &[Value]) -> Result<Answer, DataError> {
+        if source == "timer" {
+            return Ok(Answer::Later(Request::continuation(700).due(10000)));
+        }
+        self.started.send(()).unwrap();
+        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        self.identity.retire("heap exhausted".into());
+        Err(DataError::Failed(
+            exact_runner::failure::FailureCode::Error,
+            "heap exhausted".into(),
+            String::new(),
+        ))
+    }
+    fn module_identity(&self, _: &str) -> Option<exact_runner::ModuleIdentity> {
+        Some(self.identity.clone())
+    }
+}
+
+fn worker_heap_failures(forgotten: bool) {
+    let (started, running) = channel();
+    let (release, proceed) = channel();
+    let mut placed = Placed::new(
+        Retiring {
+            started,
+            release: proceed,
+            identity: Default::default(),
+        },
+        Placement::Worker,
+    );
+    placed.activate().unwrap();
+    let instance = placed.module_identity("").unwrap().instance();
+    let mut store = Store::new("", []);
+    let Answer::Later(turn) = placed
+        .answer_for(Target::Resource(0), &mut store, "timer", &[])
+        .unwrap()
+    else {
+        panic!("turn")
+    };
+    let envelope = send(placed.dispatch(turn.continuation.unwrap(), &store))
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    if forgotten {
+        placed
+            .parse_for(
+                Target::Resource(0),
+                &mut store,
+                "timer",
+                &[],
+                envelope.clone(),
+            )
+            .unwrap();
+        assert_eq!(placed.recorded.len(), 1);
+    }
+    let Answer::Later(crash) = placed
+        .answer_for(Target::Resource(1), &mut store, "crash", &[])
+        .unwrap()
+    else {
+        panic!("turn")
+    };
+    let reply = send(placed.dispatch(crash.continuation.unwrap(), &store));
+    running.recv_timeout(Duration::from_secs(5)).unwrap();
+    if forgotten {
+        placed.forgotten(&store, &[]);
+    }
+    release.send(()).unwrap();
+    let failed_turn = reply.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(instance.failure(), Some("heap exhausted"));
+    if !forgotten {
+        let Answer::Later(timer) = placed
+            .parse_for(Target::Resource(0), &mut store, "timer", &[], envelope)
+            .unwrap()
+        else {
+            panic!("timer")
+        };
+        placed.discard(timer.continuation.unwrap());
+        assert!(placed
+            .parse_for(Target::Resource(1), &mut store, "crash", &[], failed_turn)
+            .is_err());
+    }
+    placed.take_aborted();
+    assert!(placed.recorded.is_empty());
+    assert!(placed.stages.is_empty());
+    assert!(placed.hosted.is_empty());
+    assert!(placed.sent.is_empty());
+    assert!(placed.kept.is_empty());
+    assert!(placed.deliveries.is_empty());
+    assert!(placed.delivery_waiters.is_empty());
+    assert!(placed.more.is_empty());
+    assert!(placed
+        .owner
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .unqueued
+        .is_empty());
+    assert!(placed
+        .module_identity("")
+        .unwrap()
+        .instance()
+        .failure()
+        .is_none());
+}
+
+#[test]
+fn worker_retirement_precedes_envelope_delivery() {
+    worker_heap_failures(false);
+}
+
+#[test]
+fn worker_retirement_needs_no_forgotten_continuation_records() {
+    worker_heap_failures(true);
+}
+
+#[test]
+fn repeated_successful_worker_timers_and_discards_leave_no_bookkeeping() {
+    struct Timer;
+    impl DataSource for Timer {
+        fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
+            unreachable!()
+        }
+        fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
+            Ok(Answer::Later(Request::continuation(1).due(10)))
+        }
+        fn parse(
+            &mut self,
+            _: &mut Store,
+            _: &str,
+            _: &[Value],
+            _: Outcome,
+        ) -> Result<Answer, DataError> {
+            Ok(Answer::Now(Value::str("done")))
+        }
+    }
+    let mut placed = Placed::new(Timer, Placement::Worker);
+    placed.activate().unwrap();
+    let mut store = Store::default();
+    for cancel in [false, true] {
+        for _ in 0..32 {
+            let Answer::Later(turn) = placed
+                .answer_for(Target::Resource(0), &mut store, "timer", &[])
+                .unwrap()
+            else {
+                panic!("turn")
+            };
+            let outcome = send(placed.dispatch(turn.continuation.unwrap(), &store))
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let Answer::Later(timer) = placed
+                .parse_for(Target::Resource(0), &mut store, "timer", &[], outcome)
+                .unwrap()
+            else {
+                panic!("timer")
+            };
+            if cancel {
+                placed.discard(timer.continuation.unwrap());
+            } else {
+                let outcome = send(placed.dispatch(timer.continuation.unwrap(), &store))
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(
+                    placed
+                        .parse_for(Target::Resource(0), &mut store, "timer", &[], outcome)
+                        .unwrap(),
+                    Answer::Now(Value::str("done"))
+                );
+            }
+            assert!(placed.recorded.is_empty());
+            assert!(placed.stages.is_empty());
+            assert!(placed.hosted.is_empty());
+            assert!(placed.sent.is_empty());
+            assert!(placed.kept.is_empty());
+            assert!(placed.more.is_empty());
+            assert!(placed
+                .owner
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .unqueued
+                .is_empty());
+        }
+    }
 }

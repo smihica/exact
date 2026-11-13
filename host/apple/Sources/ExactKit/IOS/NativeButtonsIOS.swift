@@ -14,6 +14,15 @@ import UIKit
 /// UIKit's button, as a native button's control: never a UIKit focus item
 /// (the node is the focus owner, D4).
 final class NativeButtonIOS: UIButton {
+    /// Where the surface draws it, inside a placed canvas child (PlacedAccessibilityIOS.swift).
+    override var accessibilityFrame: CGRect {
+        get { placedAccessibilityFrame ?? super.accessibilityFrame }
+        set { super.accessibilityFrame = newValue }
+    }
+    override var accessibilityActivationPoint: CGPoint {
+        get { placedActivationPoint(from: super.accessibilityActivationPoint) ?? super.accessibilityActivationPoint }
+        set { super.accessibilityActivationPoint = newValue }
+    }
     weak var owner: NodeView?
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -471,6 +480,7 @@ extension MenuHost {
             if !open, let pop, self?.presentedMenu[pop.id] != nil { self?.presentedMenu = [:] }
         }
         button.showsMenuAsPrimaryAction = true
+        button.preferredMenuElementOrder = Self.order(v.props["menuOrder"])
         guard button.menu == nil || shape != button.menuShape else { return }
         button.menuShape = shape
         button.menu = pullDown(of: v, titled: heading)
@@ -492,6 +502,7 @@ extension MenuHost {
         button.menu = nil
         button.menuShape = nil
         button.showsMenuAsPrimaryAction = false
+        button.preferredMenuElementOrder = .automatic
         button.popover = nil
         button.toggled = nil
     }

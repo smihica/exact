@@ -315,6 +315,18 @@ extension Agent {
         if !presenter.reach(of: v).contains(local) || seen == nil {
             return ["error": "tap #\(v.id): the point is outside the viewport; scroll it into view first"]
         }
+        #if os(iOS) && EXACT_INSPECT
+        // UIKit's backdrop takes an outside touch to dismiss its context menu.
+        // Only an explicit point may address it; a named press still means that node.
+        if at["at"] != nil || at["x"] != nil || at["y"] != nil,
+           let owner = presenter.menus.context.open, owner.toggled, owner.source?.window === win,
+           let backdrop = seen, NSStringFromClass(Swift.type(of: backdrop)) == "_UIContextMenuPlatterTransitionView",
+           let space = scene?.coordinateSpace {
+            if let why = obscured(backdrop, at: p, hit: backdrop) { return ["error": "tap #\(v.id): \(why)"] }
+            return aimed(v, at: p, local: local, in: win, space: space, hit: nil,
+                         native: ["kind": "contextMenuDismissal", "label": "Dismiss context menu"])
+        }
+        #endif
         if let why = obscured(inBar ? barItemTarget(v, bar: target, hit: seen!) : target, at: p, hit: seen!) { return ["error": "tap #\(v.id): \(why)"] }
         // Named, it presses what it names, as the activation's tap does.
         var avoided: PressReach?
@@ -374,7 +386,8 @@ extension Agent {
             },
             "at": [Agent.r2(local.x), Agent.r2(local.y)], // the viewport point, as `tap` replies it
             "window": [Agent.r2(p.x), Agent.r2(p.y)], // the window point, as the dispatch log records touches
-            "viewport": [Agent.r2(vp.pageSize.width), Agent.r2(vp.pageSize.height)], // where a drag must end
+            "viewport": [Agent.r2(vp.pageSize.width), Agent.r2(vp.pageSize.height)], // where a drag must end, or
+            "keyboard": keyboardBox().map { [$0.minX, $0.minY, $0.width, $0.height].map(Agent.r2) } ?? NSNull(), // over it (§11)
             // The Exact node the window's hit test finds there: where the dispatch log must see the touch land.
             "hit": TouchLog.landing(seen)["node"] ?? NSNull(),
             // In a grouped list, the row and part it must land on too.
@@ -386,16 +399,33 @@ extension Agent {
         return ["aim": aim]
     }
 
+    /// The software keyboard's box in the viewport's space while it shows
+    /// (`state.keyboard.visible`), nil otherwise: a real drag may end over it,
+    /// as a person's drag to dismiss it does (LLP 1080.000 §11). Under
+    /// `interactive-widget="resizes-content"` it lies below the viewport.
+    func keyboardBox() -> CGRect? {
+        #if os(iOS)
+        guard let container = presenter.keyboardContainer, presenter.keyboardGuideTop(in: container) != nil else { return nil }
+        let vp = presenter.viewport, r = container.convert(container.keyboardLayoutGuide.layoutFrame, to: vp)
+        return r.offsetBy(dx: -vp.pageOrigin.x, dy: -vp.pageOrigin.y)
+        #else
+        return nil
+        #endif
+    }
+
     /// Where UIKit shows `row` of the menu it presents for `pop`, or why a
     /// finger cannot pick it. UIKit puts no identifier on the element it
     /// shows for an action, so the row is found by its popover and place:
     /// `pop` must be the menu UIKit was last given to present, or one of its
     /// submenus (`MenuHost.presentedMenu`), and its rows (`MenuHost.given`) must
-    /// read as exactly one run of the rows shown (in a menu that scrolls,
-    /// the rows it shows as one slice of them); the row is the one at its
-    /// place there. A row of another popover, however alike its rows read,
-    /// is refused, and so are two popovers of the presented menu that read
-    /// the same, a menu shown twice, and a row scrolled out of its menu.
+    /// read as a run of the rows shown (in a menu that scrolls, the rows it
+    /// shows as one slice of them), passing over the titles it was given as
+    /// headers (`givenHeaders`), forward or, in a menu UIKit shows last
+    /// row first, reversed; the row is the one at its place there, which
+    /// every such reading must agree on. A row of another popover, however
+    /// alike its rows read, is refused, and so is a row another popover of
+    /// the presented menu also reads as its own (in either order), a menu
+    /// shown twice, and a row scrolled out of its menu.
     func shownRow(_ row: NodeView, of pop: NodeView, in window: UIWindow) -> Result<CGRect, AimRefusal> {
         let menus = presenter.menus, name = Agent.popoverName(pop)
         guard let given = menus.given[pop.id], menus.presentedMenu[pop.id] == pop.incarnation,
@@ -403,33 +433,40 @@ extension Agent {
             let shown = menus.presentedMenu.keys.sorted().first.flatMap { presenter.views[$0] }.map { " (UIKit was last given \(Agent.popoverName($0))'s)" } ?? ""
             return .failure(AimRefusal(why: "it is a row of the menu of \(name), which is not the menu UIKit shows\(shown): tap its invoker first"))
         }
-        let labels = given.map(\.label)
+        let labels = given.map(\.label), headers = menus.givenHeaders[pop.id] ?? []
         if let twin = menus.presentedMenu.keys.sorted().first(where: { $0 != pop.id && menus.given[$0]?.map(\.label) == labels }) {
             return .failure(AimRefusal(why: "\(name) and popover #\(twin) are both in the menu UIKit shows and read the same; give their rows different titles"))
         }
-        // Where the menu shows: a run of all its rows, or, in a list that
-        // scrolls, the rows the list shows as one slice of them (`first`:
-        // the place of the slice's first row).
-        var found: [(rows: [(label: String, box: CGRect)], first: Int)] = []
-        for group in Agent.menuGroups(in: window) {
-            if group.scrolls, !group.rows.isEmpty, group.rows.count <= labels.count {
-                for k in 0...(labels.count - group.rows.count) where zip(group.rows, labels[k...]).allSatisfy({ $0.label == $1 }) { found.append((group.rows, k)) }
-                continue
-            }
-            for i in group.rows.indices where i + labels.count <= group.rows.count && zip(group.rows[i...], labels).allSatisfy({ $0.label == $1 }) {
-                found.append((Array(group.rows[i..<i + labels.count]), 0))
-            }
+        // Every reading of the rows shown as this menu's (`MenuReadings`):
+        // a menu that reads the same both ways has two, which must agree on
+        // the row.
+        let groups = Agent.menuGroups(in: window)
+        let readings = groups.map { MenuReadings(of: labels, in: $0, passing: headers) }
+        guard readings.contains(where: \.shown) else {
+            return .failure(AimRefusal(why: "the menu of \(name) does not show its rows: tap its invoker first, then `clock settle`"))
         }
-        guard found.count == 1 else {
-            return .failure(AimRefusal(why: found.isEmpty
-                ? "the menu of \(name) does not show its rows: tap its invoker first, then `clock settle`"
-                : "\(found.count) places UIKit shows read as the menu of \(name) (another menu, or a scrolled slice whose rows repeat); close the others first, or drive it without --touch platform"))
+        // Where the readings put the row, each once; nil where a slice leaves it out.
+        var boxes: [CGRect?] = []
+        for reading in readings {
+            for box in reading.boxes(at: place) where !boxes.contains(where: { $0 == box }) { boxes.append(box) }
         }
-        let (rows, first) = found[0]
-        guard place >= first, place < first + rows.count else {
+        if boxes.allSatisfy({ $0 == nil }) {
             return .failure(AimRefusal(why: "its row is scrolled out of the menu of \(name), and the agent's finger picks only rows the menu shows: drive it without --touch platform, where `tap` opens the menu painted"))
         }
-        return .success(rows[place - first].box)
+        guard boxes.count == 1, let box = boxes[0] else {
+            return .failure(AimRefusal(why: "\(boxes.count) places UIKit shows read as the menu of \(name) (another menu, a scrolled slice whose rows repeat, or rows that read the same reversed); close the others first, or drive it without --touch platform"))
+        }
+        // UIKit records a menu's submenus when it builds it, and a submenu
+        // not shown can read some of the rows shown, either way round
+        // (`Delete, More` and its `More, Delete`): whose row the one aimed
+        // at is cannot be told from the labels, so it is not picked.
+        if let other = menus.presentedMenu.keys.sorted().first(where: { id in
+            guard id != pop.id, let theirs = menus.given[id]?.map(\.label), !theirs.isEmpty else { return false }
+            return groups.contains { MenuReadings(of: theirs, in: $0, passing: menus.givenHeaders[id] ?? []).read.contains(box) }
+        }) {
+            return .failure(AimRefusal(why: "\(name) and popover #\(other) are both in the menu UIKit shows and read as rows shown, one maybe reversed; give their rows different titles"))
+        }
+        return .success(box)
     }
 
     /// Where `alert` shows its button for `action`, in `window`, or why a
@@ -466,24 +503,22 @@ extension Agent {
     /// Whether UIKit shows the menu it was last given (`shownRow`'s match),
     /// whatever presents it: a pull-down, a popover.
     func menuShown(in window: UIWindow) -> Bool {
-        let groups = Agent.menuGroups(in: window).map { ($0.scrolls, $0.rows.map(\.label)) }
+        let groups = Agent.menuGroups(in: window)
         return presenter.menus.presentedMenu.keys.contains { id in
             guard let labels = presenter.menus.given[id]?.map(\.label), !labels.isEmpty else { return false }
-            return groups.contains { scrolls, group in
-                // All of its rows; in a list that scrolls, a slice of them.
-                let (whole, part) = scrolls ? (labels, group) : (group, labels)
-                return !part.isEmpty && whole.indices.contains { $0 + part.count <= whole.count && Array(whole[$0..<$0 + part.count]) == part }
-            }
+            return groups.contains { MenuReadings(of: labels, in: $0, passing: presenter.menus.givenHeaders[id] ?? []).shown }
         }
     }
+
+    typealias MenuRow = (label: String, box: CGRect)
 
     /// The labelled accessibility elements the window shows outside every
     /// session, as VoiceOver finds them (none inside another), grouped by
     /// the scroll view that holds them (a menu's list) and in reading order
     /// within each: what a menu UIKit shows reads as. `scrolls`: the list
     /// holds more than it shows, and rows off the screen are not among these.
-    static func menuGroups(in window: UIWindow) -> [(scrolls: Bool, rows: [(label: String, box: CGRect)])] {
-        var groups: [ObjectIdentifier: (list: UIView, rows: [(label: String, box: CGRect)])] = [:], order: [ObjectIdentifier] = []
+    static func menuGroups(in window: UIWindow) -> [(scrolls: Bool, rows: [MenuRow])] {
+        var groups: [ObjectIdentifier: (list: UIView, rows: [MenuRow])] = [:], order: [ObjectIdentifier] = []
         func visit(_ v: UIView, in list: UIView) {
             guard !v.isHidden, v.alpha > 0.01, !(v is NodeView), !routes.contains(where: { shows($0.1, v) }) else { return }
             if v.isAccessibilityElement {
@@ -504,6 +539,96 @@ extension Agent {
             let scrolls = (group.list as? UIScrollView).map { $0.contentSize.height > $0.bounds.height + 1 } ?? false
             return (scrolls, group.rows.sorted { ($0.box.minY, $0.box.minX) < ($1.box.minY, $1.box.minX) })
         }
+    }
+}
+
+/// How a group of elements UIKit shows (`Agent.menuGroups`) reads as the
+/// rows `labels` names: a run of all of them or, in a list that scrolls, one
+/// slice of them. A run passes over the titles the menu was given as headers
+/// (`headers`: UIKit shows a section's title as a labelled element among the
+/// rows), so where a title is also a row's label there are several readings.
+/// A menu that opens upward in UIKit's `.automatic` order shows its rows
+/// last first (`UIContextMenuConfiguration.ElementOrder`), so the group is
+/// read both ways.
+///
+/// The readings are not listed one by one: rows and titles that repeat one
+/// label read in exponentially many ways. What is kept is which element
+/// some reading reads as which row, found in one pass each way over the
+/// elements and rows: O(elements x rows).
+struct MenuReadings {
+    private struct Way {
+        let shown: [Agent.MenuRow]
+        /// `can[j][k]`: some reading reads element `j` as row `k`.
+        let can: [[Bool]]
+        /// In a scrolled slice, the least row a reading ends at and the
+        /// greatest it starts at: a row past either is out of that reading.
+        let lastEnd: Int, firstStart: Int
+    }
+    private var ways: [Way] = []
+
+    init(of labels: [String], in group: (scrolls: Bool, rows: [Agent.MenuRow]), passing headers: Set<String> = []) {
+        guard !labels.isEmpty else { return }
+        for shown in [group.rows, Array(group.rows.reversed())] {
+            ways.append(Self.way(shown, labels, headers, slice: group.scrolls))
+        }
+    }
+
+    private static func way(_ shown: [Agent.MenuRow], _ labels: [String], _ headers: Set<String>, slice: Bool) -> Way {
+        let n = shown.count, m = labels.count
+        let header = shown.map { headers.contains($0.label) }
+        // Where a reading may start and end: in a slice, at an element with
+        // only headers before (after) it, at any row; otherwise at the
+        // first (last) row, anywhere.
+        var before = Array(repeating: true, count: n), after = Array(repeating: true, count: n)
+        for j in 1..<max(n, 1) { before[j] = before[j - 1] && header[j - 1] }
+        for j in stride(from: n - 2, through: 0, by: -1) { after[j] = after[j + 1] && header[j + 1] }
+        func starts(_ j: Int, _ k: Int) -> Bool { slice ? before[j] : k == 0 }
+        func ends(_ j: Int, _ k: Int) -> Bool { slice ? after[j] : k == m - 1 }
+        func reads(_ j: Int, _ k: Int) -> Bool { shown[j].label == labels[k] }
+        let none = Array(repeating: Array(repeating: false, count: m), count: n)
+        // `from[j][k]`: a reading from a start reads element `j` as row `k`;
+        // `held[k]`: one read row `k` at an earlier element, only headers since.
+        var from = none, held = Array(repeating: false, count: m)
+        for j in 0..<n {
+            for k in 0..<m { from[j][k] = reads(j, k) && (starts(j, k) || k > 0 && held[k - 1]) }
+            for k in 0..<m { held[k] = from[j][k] || header[j] && held[k] }
+        }
+        // `to[j][k]`: a reading that reads element `j` as row `k` goes on to an end.
+        var to = none
+        held = Array(repeating: false, count: m)
+        for j in stride(from: n - 1, through: 0, by: -1) {
+            for k in 0..<m { to[j][k] = reads(j, k) && (ends(j, k) || k < m - 1 && held[k + 1]) }
+            for k in 0..<m { held[k] = to[j][k] || header[j] && held[k] }
+        }
+        var can = none, lastEnd = m, firstStart = -1
+        for j in 0..<n {
+            for k in 0..<m where from[j][k] && to[j][k] {
+                can[j][k] = true
+                if slice, after[j] { lastEnd = min(lastEnd, k) }
+                if slice, before[j] { firstStart = max(firstStart, k) }
+            }
+        }
+        return Way(shown: shown, can: can, lastEnd: lastEnd, firstStart: firstStart)
+    }
+
+    /// Whether any reading is shown.
+    var shown: Bool { ways.contains { $0.can.contains { $0.contains(true) } } }
+
+    /// Where the readings put row `place`, each place once: nil where a
+    /// scrolled slice leaves it out.
+    func boxes(at place: Int) -> [CGRect?] {
+        var out: [CGRect?] = []
+        func add(_ box: CGRect?) { if !out.contains(where: { $0 == box }) { out.append(box) } }
+        for way in ways where way.can.contains(where: { $0.contains(true) }) {
+            for (j, rows) in way.can.enumerated() where rows[place] { add(way.shown[j].box) }
+            if way.lastEnd < place || way.firstStart > place { add(nil) }
+        }
+        return out
+    }
+
+    /// The boxes some reading reads as a row.
+    var read: [CGRect] {
+        ways.flatMap { way in way.can.indices.filter { way.can[$0].contains(true) }.map { way.shown[$0].box } }
     }
 }
 

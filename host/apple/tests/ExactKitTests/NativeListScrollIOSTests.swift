@@ -488,6 +488,41 @@ final class NativeListScrollIOSTests: GroupedListFixture {
         }
     }
 
+    func testAHiddenPositionWaitsForAPortWithASize() throws {
+        let cases: [(written: String, top: CGFloat, message: String)] = [
+            ("none", 140, "the saved position is restored once the port has a size"),
+            ("authored", 60, "an authored position written while it waits is written after it"),
+            ("carried", 140, "a position carried from another scroll view while it waits does not replace it"),
+        ]
+        for (written, top, message) in cases {
+            let p = presenter(height: 180) { self.model() }
+            let owner = try XCTUnwrap(p.views[1])
+            let style: [String: Any] = ["overflow_y": "scroll"]
+            let laidOut = { (h: Double, content: Double) -> [[String: Any]] in
+                [["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 402.0, "h": h], ["op": "content", "id": 1, "w": 402.0, "h": content]]
+            }
+            let plain: [[String: Any]] = [["op": "style", "id": 1, "style": style], ["op": "props", "id": 1, "set": [String: String](), "clear": ["listStyle"]]]
+            let scrolled: [[String: Any]] = [["op": "props", "id": 1, "set": ["scrollTop": "140"]]]
+            p.apply(wireBatch(plain + laidOut(180, 9000) + scrolled))
+            p.apply(wireBatch([["op": "style", "id": 1, "style": style.merging(["display": "none"]) { $1 }]]))
+            // Shown before it is laid out, as a pane is while the cover that hid it in its arrangement still applies
+            var shown: [[String: Any]] = [["op": "style", "id": 1, "style": style]]
+            shown += laidOut(0, 0)
+            if written == "authored" { shown.append(["op": "props", "id": 1, "set": ["scrollTop": "60"]]) }
+            p.apply(wireBatch(shown))
+            // The empty port at its start, where a write to it would clamp
+            let empty = try XCTUnwrap(owner.scrollView)
+            empty.contentOffset = .zero
+            if written == "carried" {
+                owner.retainScrollPosition(from: empty)
+                p.apply(wireBatch([]))
+            }
+            p.apply(wireBatch(laidOut(180, 9000)))
+            let scroll = try XCTUnwrap(owner.scrollView)
+            XCTAssertEqual(scroll.contentOffset.y + owner.scrollTopInset(scroll), top, accuracy: 0.5, message)
+        }
+    }
+
     func testRevealingACarriedRowDoesNotReserveContentPaddingForAKeyboard() throws {
         let p = presenter(height: 180) { self.model(custom: true) }
         p.apply(wireBatch([["op": "style", "id": 1, "style": ["overflow_y": "scroll", "padding_bottom": 83.0]],

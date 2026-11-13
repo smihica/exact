@@ -287,14 +287,15 @@ final class NativeListNavigationIOSTests: XCTestCase {
         route.view.addSubview(firstNative); route.view.addSubview(secondNative)
         defer { firstNative.removeFromSuperview(); secondNative.removeFromSuperview() }
 
+        // A side edge's selection and nil leave the top and bottom edges as they were: UIKit takes no side selection
         route.setContentScrollView(firstNative, for: .leading)
-        XCTAssertTrue(route.nativeContentScrollEdges.contains(.leading))
+        XCTAssertEqual(route.nativeContentScrollEdges, [], "the route records no side edge")
         route.setContentScrollView(nil, for: .leading)
-        XCTAssertFalse(route.nativeContentScrollEdges.contains(.leading), "nil releases a side edge")
+        XCTAssertTrue(route.contentScrollView(for: .top) === automatic)
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === automaticBottom)
 
         route.setContentScrollView(firstNative, for: .all)
-        XCTAssertTrue(route.nativeContentScrollEdges.contains(.leading))
-        XCTAssertTrue(route.nativeContentScrollEdges.contains(.trailing))
+        XCTAssertEqual(route.nativeContentScrollEdges, [.top, .bottom], "`.all` records both edges UIKit takes")
         XCTAssertTrue(firstNative.scrollsToTop, "a selected native view is enabled even when its flag was false")
         XCTAssertFalse(automatic.scrollsToTop)
         p.navigation.prepareRoutes([route], in: nav)
@@ -323,15 +324,30 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(secondNative.scrollsToTop)
         #endif
 
-        // nil is UIKit's automatic selection, which Exact makes for the route's authored scrollers
+        // nil is UIKit's automatic selection, which Exact makes for the route's authored scrollers.
+        // Each edge is released alone, then both held edges together
+        route.setContentScrollView(nil, for: .top)
+        XCTAssertEqual(route.nativeContentScrollEdges, [.bottom])
+        route.setContentScrollView(nil, for: .bottom)
+        XCTAssertTrue(route.nativeContentScrollEdges.isEmpty)
+
+        route.setContentScrollView(firstNative, for: .all)
+        route.setContentScrollView(secondNative, for: .top)
+        XCTAssertEqual(route.nativeContentScrollEdges, [.top, .bottom])
+        XCTAssertTrue(route.contentScrollView(for: .top) === secondNative)
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === firstNative)
+        XCTAssertTrue(secondNative.scrollsToTop)
+        XCTAssertFalse(automatic.scrollsToTop)
+        p.navigation.prepareRoutes([route], in: nav)
+        p.navigation.reportCovers()
+        XCTAssertNotEqual(topCover(), automaticCover)
         route.setContentScrollView(nil, for: .all)
+        XCTAssertTrue(route.nativeContentScrollEdges.isEmpty)
         XCTAssertFalse(firstNative.scrollsToTop)
         XCTAssertFalse(secondNative.scrollsToTop)
         XCTAssertTrue(automatic.scrollsToTop)
         XCTAssertTrue(route.contentScrollView(for: .top) === automatic, "the bar follows the automatic scroller again")
         XCTAssertTrue(route.contentScrollView(for: .bottom) === automaticBottom)
-        XCTAssertFalse(route.nativeContentScrollEdges.contains(.leading), "nil releases the leading edge selected by .all")
-        XCTAssertFalse(route.nativeContentScrollEdges.contains(.trailing), "nil releases the trailing edge selected by .all")
         XCTAssertEqual(topCover(), automaticCover, "the covers follow the edge given back at once")
         p.navigation.prepareRoutes([route], in: nav)
         XCTAssertEqual(route.projected?.scroll, ObjectIdentifier(automatic))
@@ -352,6 +368,14 @@ final class NativeListNavigationIOSTests: XCTestCase {
         XCTAssertTrue(firstNative.scrollsToTop)
         p.navigation.reset()
         XCTAssertFalse(firstNative.scrollsToTop, "retiring navigation releases its native status-bar target")
+    }
+
+    /// The guide's reading of UIKit: the setter takes `.all`, and the getter reads each edge it selected.
+    func testUIKitContentScrollGettersReadTheSelectedEdges() {
+        let controller = UIViewController(), scroll = UIScrollView()
+        controller.setContentScrollView(scroll, for: .all)
+        XCTAssertTrue(controller.contentScrollView(for: .top) === scroll)
+        XCTAssertTrue(controller.contentScrollView(for: .bottom) === scroll)
     }
 
     private func nativeList(initialTop: Double? = 0, paddingTop: Double = 0, laterAuthoredTop: Double? = nil, customHero: Bool = false, heroHeight: Double = 80, followEnd: Bool = false) throws -> (ExactSession, UINavigationController, RouteController, NodeView) {

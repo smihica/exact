@@ -1,6 +1,6 @@
 //! The display loop's input dispatch, testable without a DRM master.
 use crate::input::InputEvent;
-use crate::Presenter;
+use exact_painted::Presenter;
 use exact_runner::DataSource;
 
 pub(super) fn dispatch<D: DataSource>(
@@ -90,8 +90,8 @@ pub(super) fn dispatch<D: DataSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presenter::PainterChoice;
     use exact_kernel::PropId;
+    use exact_painted::presenter::PainterChoice;
     use std::path::PathBuf;
     /// An evdev key press (1 Escape, 45 x).
     fn press(code: u16) -> InputEvent {
@@ -252,7 +252,7 @@ component App
         let mut p = fixture();
         let mut at = (200., 250.);
         let frame = p.display_frame().unwrap();
-        let hidden = frame.pixels.data().to_vec();
+        let hidden = frame.pixels().data().to_vec();
         assert!(p.display_complete(&frame));
         for (event, visible) in [
             (InputEvent::Motion(0., 0.), true),
@@ -264,7 +264,7 @@ component App
         ] {
             dispatch(&mut p, &mut at, (400., 500.), 1., event, 0.).unwrap();
             let frame = p.display_frame().unwrap();
-            assert_eq!(frame.pixels.data() != hidden, visible, "{event:?}");
+            assert_eq!(frame.pixels().data() != hidden, visible, "{event:?}");
             assert!(p.display_complete(&frame));
             assert_eq!(at, (200., 250.));
         }
@@ -277,7 +277,7 @@ component App
         assert!(p.display_complete(&a));
         assert!(p.resize(300., 300.).is_none());
         let b = p.display_frame().unwrap();
-        let b_pixels = b.pixels.data().to_vec();
+        let b_pixels = b.pixels().data().to_vec();
         assert!(p.resize(800., 1000.).is_none());
         let mut at = (20., 40.);
         let absolute = InputEvent::Absolute(Some(0.25), Some(0.5));
@@ -285,7 +285,7 @@ component App
         assert_eq!(at, (20., 40.), "refusal must not reinterpret a pointer");
         dispatch(&mut p, &mut at, (400., 500.), 1., absolute, 1.).unwrap();
         assert_eq!(at, (100., 250.));
-        assert_eq!(b.pixels.data(), b_pixels);
+        assert_eq!(b.pixels().data(), b_pixels);
         assert!(p.display_complete(&b));
         // No C paint between ACK and input. B's mapping is now authoritative.
         assert!(dispatch(&mut p, &mut at, (400., 500.), 1., absolute, 2.).is_err());
@@ -293,7 +293,7 @@ component App
         dispatch(&mut p, &mut at, (300., 300.), 1., absolute, 2.).unwrap();
         assert_eq!(at, (75., 150.));
         assert!(p.dirty());
-        assert_eq!(b.pixels.data(), b_pixels);
+        assert_eq!(b.pixels().data(), b_pixels);
     }
 
     #[test]
@@ -354,7 +354,7 @@ component App
             assert!(p.display_complete(&a));
             assert!(p.resize(300., 300.).is_none());
             let b = p.display_frame().unwrap();
-            let b_pixels = b.pixels.data().to_vec();
+            let b_pixels = b.pixels().data().to_vec();
             assert!(p.resize(800., 1000.).is_none());
             let mut at = (20., 40.);
             for (time, event) in [
@@ -393,7 +393,7 @@ component App
                 p.collection_interaction().is_none(),
                 "physical UP must release its pin"
             );
-            assert_eq!(b.pixels.data(), b_pixels);
+            assert_eq!(b.pixels().data(), b_pixels);
             assert!(p.display_frame().is_none());
             assert!(p.display_complete(&b));
         }

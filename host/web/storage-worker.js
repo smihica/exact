@@ -228,7 +228,7 @@ async function dispatch(owner, { appId, op, args }) {
   const { databases } = owner;
   const sqlite = await ready;
   if (op === 'open') {
-    const path = args[0], release = await lockPaths(appId, [path]);
+    const path = args[0], release = await lockPaths(appId, [path], undefined, undefined, owner.gone.signal);
     const files = createFileStore(appId);
     const session = { path, release, files, db: new sqlite.oo1.DB(':memory:'), statements: new Map(), internal: false };
     try {
@@ -305,8 +305,21 @@ async function dispatch(owner, { appId, op, args }) {
     if (sql === undefined) fail('statement is closed');
   }
   const query = op === 'query' || op === 'statementQuery';
-  const result = run(sqlite, session, sql, values, query);
-  if (!query) await persist(sqlite, databases, id, session);
+  if (query) return run(sqlite, session, sql, values, true);
+  const c = sqlite.capi, before = c.sqlite3_total_changes(session.db.pointer);
+  let result;
+  try { result = run(sqlite, session, sql, values, false); }
+  catch (error) {
+    // A statement that fails under the FAIL conflict resolution keeps the
+    // rows it changed before the error, and outside a transaction they are
+    // committed (https://www.sqlite.org/lang_conflict.html), so the file
+    // must hold them too. A persist that fails closes the connection.
+    if (c.sqlite3_get_autocommit(session.db.pointer) && c.sqlite3_total_changes(session.db.pointer) !== before) {
+      await persist(sqlite, databases, id, session).catch(() => {});
+    }
+    throw error;
+  }
+  await persist(sqlite, databases, id, session);
   return result;
 }
 
@@ -317,7 +330,7 @@ const sqliteCode = error => [5, 6].includes(error.resultCode & 0xff) ? 'EBUSY' :
 onmessage = ({ data }) => {
   let owner = clients.get(data.client);
   if (!owner) {
-    owner = { databases: new Map(), nextDatabase: 0, nextStatement: 0, queue: Promise.resolve() };
+    owner = { databases: new Map(), nextDatabase: 0, nextStatement: 0, queue: Promise.resolve(), gone: new AbortController() };
     clients.set(data.client, owner);
   }
   // Capture only earlier cleanup: waiting on future disposal could wait on
@@ -325,6 +338,8 @@ onmessage = ({ data }) => {
   const earlierDisposals = retiring;
   if (data.op === 'dispose') {
     clients.delete(data.client);
+    // An open still waiting for its lock ends now: its holder's close may be what waits on this disposal.
+    owner.gone.abort();
     retiring = Promise.all([earlierDisposals, owner.queue]).then(async () => {
       await Promise.allSettled([...owner.databases.keys()].map(id => close(owner.databases, id)));
     });

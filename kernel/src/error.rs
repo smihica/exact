@@ -33,6 +33,8 @@ pub enum StyleDomainError {
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// An incoming patch carried an invalid retained relative length.
+    InvalidRelativeLength,
     /// Invalid line-height tag, negative length or ratio.
     InvalidLineHeight,
     /// Fewer bytes remained than the field needs.
@@ -40,6 +42,8 @@ pub enum DecodeError {
     /// A colour row's tag byte named neither a fixed colour nor a
     /// `light-dark()` pair (LLP 1034 D1).
     BadColorValue(u8),
+    /// An auto-integer tag was neither auto (0) nor an integer (1).
+    BadAutoI32(u8),
     /// The frame does not start with the EXWF magic.
     BadMagic,
     /// Invalid or unsupported CSS clipping path.
@@ -76,6 +80,10 @@ pub enum DecodeError {
     BadAnimationRange,
     /// Invalid `timeline-scope` (LLP 1057.003 D4).
     BadTimelineScope,
+    /// Invalid `scroll-timeline-name` or `view-timeline-name` (LLP 1057.003 D5).
+    BadTimelineName,
+    /// Invalid `view-timeline-inset` (LLP 1057.003 D5).
+    BadViewTimelineInset,
     /// Invalid invoker-popover flip fallback list.
     BadPositionTryFallbacks,
     /// Invalid SVG paint (LLP 1055 D2).
@@ -562,6 +570,14 @@ pub enum StyleValueError {
     },
     /// Not `none`, `all` or a list of `<dashed-ident>`s.
     BadTimelineScope {
+        style: StyleId,
+    },
+    /// Not `none` or one `<dashed-ident>`.
+    BadTimelineName {
+        style: StyleId,
+    },
+    /// Not one or two of `auto` and a length or percentage.
+    BadViewTimelineInset {
         style: StyleId,
     },
     /// Not none or a list of flip-block/flip-inline/flip-start combinations.

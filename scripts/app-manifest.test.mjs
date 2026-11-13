@@ -5,6 +5,23 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
+test('a widget declares fixed enum configuration choices', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'widget-configuration-'));
+  const parameter = { name: 'rows', title: 'Rows', type: 'enum', values: [{ value: 'one', title: '1' }], default: 'one' };
+  const manifest = { name: 'Choices', app: { id: 'dev.exact.choices', name: 'Choices' }, widgets: [{
+    kind: 'card', families: ['systemSmall'], component: 'Card', props: 'Props', refresh: 'refresh', preview: {},
+    configuration: { title: 'Card', parameters: [parameter] },
+  }] };
+  try {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
+    assert.deepEqual(readManifest(dir, 'choices').widgets[0].configuration.parameters[0], parameter);
+    parameter.type = 'entity';
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
+    assert.throws(() => readManifest(dir, 'choices'), /type/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('each painted host admits ink, carries it in native metadata and refuses gpu', async () => {
   const { readManifest, nativeManifestMetadata } = await import('./app.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'manifest-painter-'));
@@ -192,10 +209,11 @@ test('readManifest admits the app\'s design, `tamber` (LLP 1121 D2)', async () =
 test('manifest colours follow the web and retired launch and alias keys are refused', async () => {
   const { readManifest } = await import('./app.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
-  const manifest = { name: 'Manifest', app: { id: 'test.manifest', name: 'Manifest' }, background_color: '#fff', background_color_dark: '#123456' };
+  const manifest = { name: 'Manifest', app: { id: 'test.manifest', name: 'Manifest' }, background_color: '#fff', color_scheme_dark: { background_color: '#123456' } };
   const read = value => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify(value)); return readManifest(dir, 'fixture'); };
   try {
-    assert.equal(read(manifest).background_color_dark, '#123456');
+    assert.equal(read(manifest).color_scheme_dark.background_color, '#123456');
+    assert.throws(() => read({ ...manifest, background_color_dark: '#123456' }), /background_color_dark/);
     assert.throws(() => read({ ...manifest, launch: { background: '#fff' } }), /launch/);
     assert.throws(() => read({ ...manifest, typescript: { aliases: { '@/*': './*' } } }), /aliases/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -221,7 +239,7 @@ test('host.web.head takes script, link and meta entries and refuses the rest by 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('host.windows.window takes its size and refuses keepRunning, which the Windows host does not build', async () => {
+test('host.windows.window takes its size and keepRunning, and refuses a keepRunning that is not a boolean', async () => {
   const { readManifest } = await import('./app.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
   const read = window => {
@@ -230,7 +248,8 @@ test('host.windows.window takes its size and refuses keepRunning, which the Wind
   };
   try {
     assert.doesNotThrow(() => read({ width: 800, height: 600 }));
-    assert.throws(() => read({ keepRunning: true }), /host\.windows\.window\.keepRunning: not a known key/);
+    assert.doesNotThrow(() => read({ keepRunning: true }));
+    assert.throws(() => read({ keepRunning: 'yes' }), /host\.windows\.window\.keepRunning/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -302,7 +321,7 @@ test("host.web.head takes an attribute that names a property of Object, and its 
     assert.throws(() => read([{ meta: { constructor: 'a', Constructor: 'b' } }]), /\[0\]\.meta: "Constructor" is the attribute "constructor" again/);
     // Another origin's `app.js` is its own; the app's origin, written whole or without its scheme, names Exact's.
     read([{ script: { type: 'module', src: 'https://cdn.example/app.js' } }, { script: { type: 'module', src: 'https://example.com.cdn.example/app.js' } }], 'https://example.com');
-    const own = ['https://example.com/app.js', '//example.com/glue.js?v=1', 'https://EXAMPLE.com:443/./app.wasm', 'https://example.com/x/../navigation.js'];
+    const own = ['https://example.com/app.js', '//example.com/glue.js?v=1', 'https://EXAMPLE.com:443/./app.wasm', 'https://example.com/x/../navigation.js', 'https://example.com/audio-session.js'];
     assert.throws(() => read(own.map((src) => ({ script: { type: 'module', src } })), 'https://example.com'), (error) => {
       own.forEach((_, i) => assert.match(error.message, new RegExp(`\\[${i}\\]: Exact writes this script itself`)));
       return true;
@@ -330,9 +349,36 @@ test("host.web.head writes a script's text as it is, refuses one HTML would read
     assert.equal(problems.length, 1, code);
     assert.match(problems[0], new RegExp(`^host\\.web\\.head\\[0\\]\\.script\\.text: holds "${seen}", .*write it so the parser cannot see it`), code);
   }
+  // An attribute's `>` is escaped too, so a reader that ends the start tag at a `>` reads the whole tag.
+  assert.equal(webHead({ host: { web: { head: [{ script: { 'data-x': 'a>b"<&', text: 'x()' } }] } } }), '<script data-x="a&gt;b&quot;&lt;&amp;">x()</script>\n');
   // A JSON text reads `\u003C` as `<`.
   const json = webHead(head({ name: '</script><!--<script>' }, 'application/ld+json'));
   assert.equal(JSON.parse(json.slice(json.indexOf('>') + 1, json.lastIndexOf('</script>'))).name, '</script><!--<script>');
+});
+
+// LLP 1048.000 D11: the app's part of the render server's CSP. The build refuses only what would not be one directive
+// of one policy (CSP3 §2.3); the browser reads the rest.
+test('host.web.csp takes lists to add and strings to replace, and refuses what would end a directive or a policy', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const { webCspFile } = await import('./web-head.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-manifest-'));
+  const read = (web) => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Csp', app: { id: 'test.csp', name: 'Csp' }, host: { web } })); return readManifest(dir, 'fixture'); };
+  try {
+    const web = { csp: { 'script-src': ['https://tags.example'], 'img-src': "exact https://img.example", 'upgrade-insecure-requests': '' }, cspReportOnly: false };
+    assert.equal(webCspFile(read(web)), JSON.stringify(web) + '\n');
+    assert.equal(webCspFile(read({ csp: false })), '{"csp":false}\n');
+    assert.equal(webCspFile(read({})), null);
+    const refused = [
+      [{ csp: { 'Script-Src': ['a.example'] } }, /host\.web\.csp: "Script-Src" is not a directive name in lower case/],
+      [{ csp: { 'img-src': ['a.example b.example'] } }, /host\.web\.csp\.img-src\[0\]: "a\.example b\.example" is not one source/],
+      [{ csp: { 'img-src': "'self'; script-src *" } }, /host\.web\.csp\.img-src: .* holds a comma, a semicolon/],
+      [{ cspReportOnly: { 'img-src': 'a.example, b.example' } }, /host\.web\.cspReportOnly\.img-src: .* holds a comma/],
+      [{ csp: { 'img-src': 'a.example\nX-Injected: 1' } }, /host\.web\.csp\.img-src: .* a line break/],
+      [{ csp: true }, /host\.web\.csp: expected false or an object of directives/],
+      [{ csp: { 'img-src': 1 } }, /host\.web\.csp\.img-src: expected a list of sources to add, or a string/],
+    ];
+    for (const [web, says] of refused) assert.throws(() => read(web), says, JSON.stringify(web));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('readManifest names the game.presentation rename instead of an unknown key', async () => {
@@ -375,6 +421,7 @@ test('the manifest orientation locks the iPhone, and an unknown one is refused',
 
 test('document handlers and TypeScript source mounts accept their manifest shapes and reject guessed ones', async () => {
   const { readManifest } = await import('./app.mjs');
+  const { documentTypes } = await import('../host/apple/documents.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'manifest-author-shapes-'));
   const base = { name: 'Reader', app: { id: 'dev.exact.reader', name: 'Reader' } };
   const read = extra => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ ...base, ...extra })); return readManifest(dir, 'reader'); };
@@ -384,6 +431,14 @@ test('document handlers and TypeScript source mounts accept their manifest shape
     const manifest = read({ file_handlers, typescript: { sources } });
     assert.deepEqual(manifest.file_handlers, file_handlers);
     assert.deepEqual(manifest.typescript.sources, sources);
+    for (const [mime, ext, uti] of [
+      ['audio/mpeg', '.mp3', 'public.mp3'], ['audio/wav', '.wav', 'com.microsoft.waveform-audio'],
+      ['audio/mp4', '.m4a', 'public.mpeg-4-audio'], ['audio/ogg', '.ogg', 'org.xiph.ogg-audio'],
+      ['application/xhtml+xml', '.xhtml', 'public.xhtml'],
+    ]) {
+      const manifest = read({ file_handlers: [{ action: '/', accept: { [mime]: [ext] } }] });
+      assert.deepEqual(documentTypes({ manifest })[0].LSItemContentTypes, [uti]);
+    }
     assert.throws(() => read({ file_handlers: { 'text/markdown': ['.md'] } }), /file_handlers:.*array/);
     assert.throws(() => read({ file_handlers: [{ action: '/', accept: ['text/markdown'] }] }), /file_handlers\[0\].accept:.*object/);
     assert.throws(() => read({ typescript: { sources: ['../generated'] } }), /typescript.sources:.*object/);
@@ -606,3 +661,119 @@ test('`userInterfaceStyle` takes Expo\'s three values, refusing others by name, 
     assert.throws(() => read('Dark'), /userInterfaceStyle: "Dark" is not one of "automatic", "light", "dark"/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a launch colour of a host\'s own or Expo\'s splash is refused for background_color, every host\'s one colour', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-launch-'));
+  const read = (extra) => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Launch', app: { id: 'dev.exact.launch', name: 'Launch' }, ...extra }));
+    return readManifest(dir, 'launch');
+  };
+  try {
+    for (const [extra, key] of [[{ host: { android: { windowBackground: '#000' } } }, 'host.android.windowBackground'], [{ splash: { backgroundColor: '#000' } }, 'splash'], [{ host: { android: { splashScreen: {} } } }, 'host.android.splashScreen']]) {
+      assert.throws(() => read(extra), new RegExp(`${key.replaceAll('.', '\\.')}: not a known key; what shows before the first frame is background_color`));
+    }
+    assert.equal(read({ background_color: '#102839', color_scheme_dark: { background_color: '#000' } }).background_color, '#102839');
+    assert.throws(() => read({ color_scheme_dark: { background_color: 'navy' } }), /color_scheme_dark\.background_color: "navy" does not match/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('host.android.maven accepts only pinned group:artifact:version coordinates', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-maven-'));
+  const read = maven => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Maps', app: { id: 'dev.exact.maps', name: 'Maps' }, host: { android: { maven } } }));
+    return readManifest(dir, 'maps');
+  };
+  try {
+    for (const maven of [[], ['org.maplibre.gl:android-sdk:12.0.0', 'androidx.camera:camera-core:1.6.0-alpha01']]) {
+      assert.deepEqual(read(maven).host.android.maven, maven);
+    }
+    for (const bad of [null, 'g:a:1', [12], ['g:a'], ['g:a:'], ['g:a:+'], ['g:a:1.+'], ['g:a:[1,2)'],
+      ['g:a:latest.release'], ['g:a:LATEST'], ['g:a:RELEASE'], ['g:a:1-SNAPSHOT'], ['g:a:1:classifier'], ['g:a:1@aar'], ['https://repo/g:a:1'], ['g:a:1\n']]) {
+      assert.throws(() => read(bad), /maven/, JSON.stringify(bad));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('preload admits the entry shape and refuses malformed names, fields and bounds', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-preload-'));
+  const read = preload => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Fixture', app: { id: 'test.preload', name: 'Fixture' }, preload }));
+    return readManifest(dir, 'fixture');
+  };
+  try {
+    const preload = { second: { url: 'https://api.example/{secret:session}' }, first: { url: 'https://api.example', method: 'POST', headers: { Authorization: 'Bearer {secret:session}' }, body: '{{', timeoutMs: 42, when: 'foreground' } };
+    assert.deepEqual(read(preload).preload, preload);
+    for (const [value, field] of [
+      [{ Wrong: { url: 'https://api.example' } }, 'Wrong.name'],
+      [{ feed: { url: 1 } }, 'feed.url'],
+      [{ feed: { url: 'https://api.example', extra: true } }, 'feed.extra'],
+      [{ feed: { url: 'https://api.example', timeoutMs: 1.5 } }, 'feed.timeoutMs'],
+      [{ feed: { url: 'https://api.example', timeoutMs: 0 } }, 'feed.timeoutMs'],
+      [{ feed: { url: 'https://api.example', timeoutMs: 3600001 } }, 'feed.timeoutMs'],
+      [{ feed: { url: 'https://api.example', headers: { Accept: 1 } } }, 'feed.headers.Accept'],
+      [{ feed: { url: 'https://api.example', when: 'later' } }, 'feed.when'],
+      [Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`request-${i}`, { url: 'https://api.example' }])), 'request-8.name'],
+    ]) assert.throws(() => read(value), error => error.message.includes(`preload.${field}:`));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// A deploy captures the app and the checkout keeping their relative places, so a generated workspace that named the
+// checkout absolutely (an app under another top folder than the checkout's) led its capture back to the live tree.
+test('a generated workspace names the checkout relatively, and is rewritten when the app moves', async () => {
+  const { ensureShells } = await import('./app-shells.mjs');
+  const { existsSync, mkdirSync, readFileSync, realpathSync, renameSync } = await import('node:fs');
+  const { dirname, isAbsolute } = await import('node:path');
+  const parent = realpathSync(mkdtempSync(resolve(tmpdir(), 'manifest-relative-shell-')));
+  const manifest = { name: 'Rel', app: { id: 'test.relative', name: 'Rel' }, host: { linux: {} }, deploy: { store: { web: '0', linux: '0' } } };
+  // Each path the workspace and its Linux crate name, resolved where Cargo reads it.
+  const paths = (dir) => {
+    const shells = resolve(dir, '.exact/shells');
+    const named = [[shells, 'Cargo.toml'], [resolve(shells, 'linux'), 'Cargo.toml']].flatMap(([at, file]) =>
+      [...readFileSync(resolve(at, file), 'utf8').matchAll(/path = "([^"]+)"/g)].map((m) => [at, m[1]]));
+    assert.ok(named.length > 0);
+    for (const [at, path] of named) {
+      assert.ok(!isAbsolute(path), path);
+      assert.ok(existsSync(resolve(at, path)), path);
+    }
+    return named.map(([, path]) => path);
+  };
+  try {
+    const first = resolve(parent, 'one');
+    mkdirSync(first);
+    writeFileSync(resolve(first, 'app.json'), JSON.stringify(manifest));
+    ensureShells(first, manifest, 'rel');
+    const before = paths(first);
+    const moved = resolve(parent, 'deeper/two');
+    mkdirSync(dirname(moved));
+    renameSync(first, moved);
+    assert.equal(ensureShells(moved, manifest, 'rel').wrote, true);
+    assert.notDeepEqual(paths(moved), before);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+}, 60000);
+
+test('adding and removing preload regenerates native shells with the baked accessor', async () => {
+  const { ensureShells } = await import('./app-shells.mjs');
+  const { readFileSync } = await import('node:fs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-preload-shell-'));
+  const manifest = { name: 'Preload', app: { id: 'test.preload', name: 'Preload' }, host: { linux: {} }, deploy: { store: { web: '0', linux: '0' } } };
+  const generate = () => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
+    return ensureShells(dir, manifest, 'preload');
+  };
+  try {
+    const initial = generate();
+    const source = resolve(initial.workspace, 'linux/src/main.rs');
+    const before = readFileSync(source, 'utf8');
+    assert.ok(!before.includes('.with_preloads'));
+    manifest.preload = { feed: { url: 'https://api.example' } };
+    assert.equal(generate().wrote, true);
+    assert.ok(readFileSync(source, 'utf8').includes('.with_preloads(PRELOAD)'));
+    assert.equal(generate().wrote, false);
+    delete manifest.preload;
+    assert.equal(generate().wrote, true);
+    assert.equal(readFileSync(source, 'utf8'), before);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 30000);

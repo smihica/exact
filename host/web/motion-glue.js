@@ -45,20 +45,23 @@ export function motionBytes(facts) {
   return bytes;
 }
 // @ref LLP 1057.003 D3 — a consumer's animation while its timeline's source
-// plays a release spring. `p` is the timeline's progress at each of the
-// spring's evenly spaced frames; the answer is a `linear()` easing of the
-// animation's directed progress (Web Animations 1 §4.8) over the spring's
-// duration, for a copy of its keyframes. The frames interpolate linearly, so
-// with a point wherever the local time crosses the delay, an iteration or
-// the end it is exact between frames too. `undefined` for an endless
+// plays a sampled release. `p` is the timeline's progress at each of the
+// release's evenly spaced frames; the answer is a `linear()` easing of the
+// animation's directed progress (Web Animations 1 §4.8) over the release's
+// duration, for a copy of its keyframes. For a piecewise-linear source,
+// points wherever local time crosses the delay, an iteration or the end
+// make it exact between frames too. `undefined` for an endless
 // animation, which holds its start; `null` where no easing can say it: a
-// fill that leaves the animation out of effect where the spring goes.
-export function timelineEasing(timing,p) {
+// fill that leaves the animation out of effect where the release goes. For
+// samples of a curve that can peak between them, a frame between the ends
+// may be off by `tolerance` (timeline progress) either way.
+export function timelineEasing(timing,p,tolerance=0) {
   const {delay=0,duration,iterations=1,iterationStart=0,direction='normal',fill='none',endTime}=timing;
   if(!Number.isFinite(endTime))return undefined;
   if(!(duration>0)||!Number.isFinite(iterations)||iterations>1000||p.length<2)return null;
   const active=duration*iterations,before=Math.max(Math.min(delay,endTime),0),after=Math.max(Math.min(delay+active,endTime),0);
-  const L=p.map(v=>v*endTime),lo=Math.min(...L),hi=Math.max(...L);
+  const L=p.map(v=>v*endTime),inner=L.slice(1,-1),margin=tolerance*endTime;
+  const lo=Math.min(L[0],L.at(-1),...inner.map(v=>v-margin)),hi=Math.max(L[0],L.at(-1),...inner.map(v=>v+margin));
   if(!L.every(Number.isFinite)||lo<before&&fill!=='backwards'&&fill!=='both'||hi>=after&&fill!=='forwards'&&fill!=='both')return null;
   const q=t=>{
     const phase=t<before?-1:t>=after?1:0;
@@ -84,6 +87,44 @@ export function timelineEasing(timing,p) {
     push(x1,q(b-e*s));
   }
   return `linear(${points.map(([x,y])=>`${+y.toPrecision(12)} ${+(x*100).toPrecision(12)}%`).join(', ')})`;
+}
+// The box a translate percentage is of (CSS Transforms 1 §5, `transform-box`), untransformed: getBoundingClientRect()
+// would include the element's own scale and rotate and its ancestors' transforms. A CSS box's is its content box for
+// `content-box` and `fill-box`, else its border box; an SVG element's, which has no CSS box, is its viewport's view
+// box, or its bounding box for `fill-box` (`stroke-box` adds the stroke), as the kernel's (svg/scene.rs).
+export function referenceBox(el,cs=getComputedStyle(el)) {
+  const n=v=>parseFloat(v)||0;
+  if(el instanceof SVGElement&&el.ownerSVGElement) {
+    const box=cs.transformBox;
+    if(box!=='view-box'&&el.getBBox) {
+      const b=el.getBBox(),stroke=(box==='stroke-box'||box==='border-box')&&cs.stroke!=='none'?n(cs.strokeWidth):0;
+      return [b.width+stroke,b.height+stroke];
+    }
+    const v=el.nearestViewportElement??el.ownerSVGElement,view=v.viewBox?.baseVal;
+    if(view?.width>0&&view?.height>0) return [view.width,view.height];
+    return v.ownerSVGElement?[v.width.baseVal.value,v.height.baseVal.value]:[v.clientWidth,v.clientHeight];
+  }
+  const edges=(a,b)=>n(cs[`padding${a}`])+n(cs[`padding${b}`])+n(cs[`border${a}Width`])+n(cs[`border${b}Width`]);
+  const sides=[edges('Left','Right'),edges('Top','Bottom')],content=cs.transformBox==='content-box'||cs.transformBox==='fill-box';
+  // `width` is the content box's, or the border box's under `box-sizing: border-box`; one that is not a length (an
+  // inline box's `auto`) leaves the layout's border box.
+  const border=cs.width.endsWith('px')?[n(cs.width),n(cs.height)].map((v,i)=>cs.boxSizing==='border-box'?v:v+sides[i]):[el.offsetWidth??0,el.offsetHeight??0];
+  return content?border.map((v,i)=>Math.max(0,v-sides[i])):border;
+}
+// A computed `translate` in px per axis, NaN for one it cannot read. An axis with a length and a percentage computes
+// as one `calc()`, its terms in any order (the glue writes `calc(Apx + B%)`; Chrome gives `calc(B% + Apx)`), so its
+// terms are summed.
+export function translation(el,text,cs) {
+  if(text==='none') return [0,0];
+  const axes=text.match(/calc\([^)]*\)|\S+/g)??[];
+  let box=null;
+  return [0,1].map(i=>{
+    let v=0,terms=0;
+    for(const [,sign,number,unit] of (axes[i]??'0px').matchAll(/([+-]?)\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(px|%)/gi)) {
+      v+=(sign==='-'?-1:1)*Number(number)*(unit==='%'?(box??=referenceBox(el,cs))[i]/100:1);terms++;
+    }
+    return terms?v:NaN;
+  });
 }
 export function motionController({views,now,generation,request,applyBatch,inert,releaseInteraction=()=>{},ready=()=>true}) {
   const properties=['translate','scale','rotate','opacity','height'];
@@ -142,10 +183,10 @@ export function motionController({views,now,generation,request,applyBatch,inert,
   // translate drives the `animation`s of nodes bound to its named timeline:
   // their CSS animations are paused (css.rs) and seeked here. A held value is
   // followed where the drag presents it (transform drag's `present`), in the
-  // pointer event. A translate spring hands each consumer its frames
+  // pointer event. A translate release hands each consumer its frames
   // (`follow`, D3), so the browser plays both and nothing here runs per
   // frame; only a consumer that easing can't express is sought in each
-  // animation frame while the spring runs (`kickTimelines`).
+  // animation frame while the release runs (`kickTimelines`).
   const timelineSources='[style*="--exact-drag-timeline"]';
   const timelineName=el=>el.style.getPropertyValue('--exact-drag-timeline').trim().split(/\s+/);
   // @ref LLP 1057.003 D4 — the source a consumer's name resolves to, as CSS
@@ -155,17 +196,26 @@ export function motionController({views,now,generation,request,applyBatch,inert,
   // declaring element whose nearest scope of the name, itself included, is
   // that scope; none or several are an inactive timeline (null), but `all`
   // declares only the names below it. No timeline in scope is undefined.
+  // @ref LLP 1057.003 D5 — a scroll or view timeline (css.rs's
+  // `--exact-scroll-timeline`, `--exact-view-timeline`, before a drag's on
+  // one element) is the browser's own, as is `scroll()` or `view()`: 'css'.
   const scopes=(el,name)=>{const s=el.style.getPropertyValue('--exact-timeline-scope').trim();return s==='all'?2:s.split(/\s*,\s*/).includes(name)?1:0;};
+  const declarations=`${timelineSources},[style*="--exact-scroll-timeline"],[style*="--exact-view-timeline"]`;
+  const declared=(el,name)=>['--exact-scroll-timeline','--exact-view-timeline'].some(p=>el.style.getPropertyValue(p).trim()===name)?'css':timelineName(el)[0]===name?el:undefined;
   const timelineSource=(consumer,name)=>{
+    if(!name.startsWith('--'))return 'css';
     for(let el=consumer;el?.style;el=el.parentElement) {
-      if(timelineName(el)[0]===name)return el;
+      const own=declared(el,name);
+      if(own)return own;
       const scope=scopes(el,name);
       if(!scope)continue;
-      const found=[...el.querySelectorAll(timelineSources)].filter(s=>{if(timelineName(s)[0]!==name)return false;while(!scopes(s,name))s=s.parentElement;return s===el;});
-      if(found.length===1)return found[0];
+      const found=[...el.querySelectorAll(declarations)].filter(s=>{if(!declared(s,name))return false;while(!scopes(s,name))s=s.parentElement;return s===el;});
+      if(found.length===1)return declared(found[0],name);
       if(found.length||scope===1)return null;
     }
   };
+  // Whether the browser runs scroll and view timelines itself.
+  const cssTimelines=typeof CSS!=='undefined'&&typeof CSS.supports==='function'&&CSS.supports('animation-timeline','scroll()');
   const inactive=new WeakMap();
   let timelineFrame=0;
   const kickTimelines=()=>{if(!timelineFrame&&typeof requestAnimationFrame==='function'&&typeof document!=='undefined'&&document.querySelector(timelineSources))
@@ -177,10 +227,14 @@ export function motionController({views,now,generation,request,applyBatch,inert,
     &&current.timing===snapshot.timing&&current.keyframes===snapshot.keyframes;};
   // Seek every bound consumer; whether a source is still moving on its own.
   function followTimelines() {
+    for(const el of document.querySelectorAll(timelineSources))followTransition(el);
     // A commit may make a consumer resolve its name to another source, an
     // inactive timeline or no timeline while the old source's release still
     // plays. Stop that follower before seeking the current resolution.
     for(const [id,record] of followers) {
+      if(record.driver.effect?.getComputedTiming().progress===null) {
+        followers.delete(id);cancelFollowers(record);continue;
+      }
       const [sourceName,sourceAxis='y']=timelineName(record.source);
       record.animations=record.animations.filter(({animation,consumer,basis,range,snapshot})=>{
         const name=consumer.style.getPropertyValue('--exact-animation-timeline').trim();
@@ -191,6 +245,11 @@ export function motionController({views,now,generation,request,applyBatch,inert,
           &&timelineSource(consumer,name)===record.source&&index>=0&&sameSnapshot(basis,snapshot,index))return true;
         animation.cancel();return false;
       });
+      // A transition can already be paused by the agent before transitionrun
+      // delivers its follower. Its source's local time remains authoritative.
+      if(record.driver.transitionProperty==='translate'&&['paused','finished'].includes(record.driver.playState))for(const f of record.animations) {
+        f.animation.pause();f.animation.currentTime=record.driver.currentTime;
+      }
       if(!record.animations.length)followers.delete(id);
     }
     const covered=new Set([...followers.values()].flatMap(record=>record.animations.map(f=>f.basis)));
@@ -200,8 +259,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       let v=[...held.values()].find(h=>h.el===el&&h.property==='translate'&&local(h))?.value;
       let moving=false;
       if(!v) {
-        const t=getComputedStyle(el).translate.trim().split(/\s+/);
-        v=t[0]==='none'?[0,0]:[parseFloat(t[0]),parseFloat(t[1]??'0')];
+        v=translation(el,getComputedStyle(el).translate);
         moving=el.getAnimations().some(a=>a.playState==='running');
       }
       sources.set(el,{value:axis==='x'?v[0]:v[1],moving});
@@ -209,21 +267,37 @@ export function motionController({views,now,generation,request,applyBatch,inert,
     let moving=false;
     for(const el of document.querySelectorAll('[style*="--exact-animation-timeline"]')) {
       const name=el.style.getPropertyValue('--exact-animation-timeline').trim();
-      const range=el.style.getPropertyValue('--exact-animation-range').trim().split(/\s+/).map(parseFloat);
-      if(range.length!==2||range[1]===range[0])continue;
       // No timeline in scope: the animations keep the time they have (0 if
       // new), as Chrome's and the engine's do.
       const source=timelineSource(el,name);
       if(source===undefined)continue;
+      const parked=inactive.get(el)??[],live=el.getAnimations().filter(a=>a.animationName!==undefined);
+      // A scroll or view timeline the browser runs: a name is handed to it
+      // as CSS's own row (css.rs writes `scroll()` and `view()` so), its
+      // animations played again if this glue held them or an inactive
+      // timeline parked them. A browser without one would play it on the
+      // clock: it is out of effect there, as an inactive timeline's, so the
+      // node's own values show.
+      const handed=el.style.getPropertyValue('animation-timeline').trim();
+      if(source==='css'&&cssTimelines) {
+        if(name.startsWith('--')&&handed!==name){el.style.setProperty('animation-timeline',name);el.style.setProperty('animation-play-state','running');
+          for(const a of live)if(a.playState==='paused')a.play();}
+        if(parked.length){inactive.delete(el);const names=getComputedStyle(el).animationName.split(/,\s*/);
+          for(const a of parked)if(names.includes(a.animationName)&&!live.some(b=>b.animationName===a.animationName))a.play();}
+        continue;
+      }
+      // A name the browser ran that now finds a drag, or nothing: this glue's again.
+      if(handed&&name.startsWith('--')){el.style.removeProperty('animation-timeline');el.style.setProperty('animation-play-state','paused');}
+      if(!source||source==='css'){for(const a of live)a.cancel();inactive.set(el,[...parked,...live]);continue;}
+      const range=el.style.getPropertyValue('--exact-animation-range').trim().split(/\s+/).map(parseFloat);
+      if(range.length!==2||range[1]===range[0])continue;
       // Unclamped, and over the delay and active interval together, as a CSS
       // scroll timeline maps them; an endless animation holds its start
       // (motion's `seek_timeline`).
       const resolved=sources.get(source),p=(resolved?.value-range[0])/(range[1]-range[0]);
-      // An inactive timeline: not in effect, whatever the fill (Chrome's
-      // unresolved time). Cancelled, and revived when the name resolves
-      // again, unless its CSS has since dropped or replaced it.
-      const parked=inactive.get(el)??[],live=el.getAnimations().filter(a=>a.animationName!==undefined);
-      if(!source){for(const a of live)a.cancel();inactive.set(el,[...parked,...live]);continue;}
+      // An inactive timeline (above): not in effect, whatever the fill
+      // (Chrome's unresolved time). Cancelled, and revived when the name
+      // resolves again, unless its CSS has since dropped or replaced it.
       inactive.delete(el);
       const names=parked.length?getComputedStyle(el).animationName.split(/,\s*/):[];
       const basis=[...live,...parked.filter(a=>names.includes(a.animationName)&&!live.some(b=>b.animationName===a.animationName))];
@@ -237,19 +311,54 @@ export function motionController({views,now,generation,request,applyBatch,inert,
     }
     return moving;
   }
-  // @ref LLP 1057.003 D3 — a source's release spring, `op`, for its
+  // @ref LLP 1057.003 D3 — a source's sampled release, `op`, for its
   // consumers: each CSS animation's keyframes, copied and played over the
-  // spring's delay and duration with the easing its progress gives
-  // (`timelineEasing`). They start with the spring, so the agent's clock
-  // seeks them with it; a grab or a new spring cancels them
+  // release's delay and duration with the easing its progress gives
+  // (`timelineEasing`). They start with the source, so the agent's clock
+  // seeks them with it; a grab or a new release cancels them
   // (`cancelProperty`), and when they end the paused animations take over
   // where the source rests.
   const followers=new Map();
   const cancelFollowers=record=>{for(const f of record.animations)f.animation.cancel();};
-  // A source a CSS transition moves (an eased release, not a spring) is
-  // sought in each frame while it runs: its easing is the browser's, not
-  // frames this glue holds.
-  if(typeof document?.addEventListener==='function')document.addEventListener('transitionrun',e=>{if(e.propertyName==='translate'&&e.target.style?.getPropertyValue('--exact-drag-timeline'))kickTimelines();});
+  const transitions=new WeakSet();
+  const continuousEasing=easing=>/^(linear|ease|ease-in|ease-out|ease-in-out|cubic-bezier\([^)]*\))$/.test(easing);
+  // Sample continuous CSS easing through the browser's timing model. Steps
+  // and linear() can jump; interpolating across those jumps would be wrong,
+  // so they retain frame seeking. A percentage endpoint can change as its
+  // reference box resizes and likewise keeps that path.
+  function followTransition(el) {
+    const source=el.getAnimations().find(a=>a.transitionProperty==='translate'&&a.effect?.target===el);
+    if(!source||transitions.has(source))return;
+    transitions.add(source);
+    const id=[...views].find(([,view])=>view===el)?.[0];
+    if(id===undefined)return;
+    const previous=followers.get(id);
+    if(previous){followers.delete(id);cancelFollowers(previous);}
+    const timing=source.effect.getTiming(),frames=source.effect.getKeyframes();
+    if(!(timing.duration>0)||frames.length!==2||frames.some(f=>f.translate?.includes('%'))
+      ||!continuousEasing(timing.easing))return;
+    const ends=frames.map(f=>translation(el,f.translate));
+    if(!ends.flat().every(Number.isFinite))return;
+    const sampler=new Animation(new KeyframeEffect(null,[],{duration:1024,easing:timing.easing,fill:'both'}));
+    const progress=t=>{sampler.currentTime=t*1024;return sampler.effect.getComputedTiming().progress;};
+    const samples=Array.from({length:1025},(_,i)=>progress(i/1024)),error=1e-5;
+    // Sharp curves need more than this grid can represent. Keep the browser's
+    // exact presentation instead of composing a visibly different curve.
+    const accurate=samples.slice(1).every((p,i)=>Math.abs(progress((i+0.5)/1024)-(samples[i]+p)/2)<=error);
+    sampler.cancel();
+    if(!accurate)return;
+    // A cubic Bézier lies within its control points' hull: with y1 and y2 in
+    // [0, 1] the source stays between its ends, which the samples hold
+    // exactly. One that overshoots peaks between samples, up to about the
+    // midpoint error past them.
+    const y=timing.easing.match(/^cubic-bezier\((.*)\)$/)?.[1].split(',').map(Number).filter((_,i)=>i%2);
+    const tolerance=y?.some(v=>v<0||v>1)?2*error:0;
+    const values=samples.map(p=>ends[0].map((v,j)=>v+(ends[1][j]-v)*p));
+    follow(id,el,{delay:timing.delay,duration:timing.duration,values,tolerance},source);
+  }
+  if(typeof document?.addEventListener==='function')document.addEventListener('transitionrun',e=>{
+    if(e.propertyName==='translate'&&e.target.style?.getPropertyValue('--exact-drag-timeline'))api.followTimelines();
+  });
   function follow(id,el,op,source) {
     const [name,axis='y']=timelineName(el);
     if(!name||op.values.length<2)return;
@@ -258,22 +367,39 @@ export function motionController({views,now,generation,request,applyBatch,inert,
       if(c.style.getPropertyValue('--exact-animation-timeline').trim()!==name||timelineSource(c,name)!==el)continue;
       const [a,b]=c.style.getPropertyValue('--exact-animation-range').trim().split(/\s+/).map(parseFloat);
       if(!Number.isFinite(a)||!Number.isFinite(b)||a===b)continue;
-      const list=c.getAnimations();
+      // The samples' error, in source progress, as this consumer's timeline progress.
+      const tolerance=(op.tolerance??0)*Math.abs(at.at(-1)-at[0])/Math.abs(b-a);
+      // Followers sort above every CSS animation (CSS Animations 2, "Animation
+      // composite order"), so only a suffix of the consumer's list can be
+      // followed: one standing in for an animation before a sought or endless
+      // one would override it.
+      const list=c.getAnimations(),own=[];
       for(const [index,animation] of list.entries()) {
         if(animation.animationName===undefined||animation.effect?.target!==c)continue;
-        const easing=timelineEasing(animation.effect.getComputedTiming(),at.map(v=>(v-a)/(b-a)));
-        if(easing===undefined)continue;
+        const timing=animation.effect.getComputedTiming();
+        const easing=timelineEasing(timing,at.map(v=>(v-a)/(b-a)),tolerance);
+        if(easing===undefined){if(own.length)seek=true;own.length=0;continue;}
         const keyframes=animation.effect.getKeyframes().map(({computedOffset,...k})=>k);
+        // CSS easing samples approximate the source between points. Even a tiny
+        // error can cross a consumer's iteration wrap or easing jump early.
+        const wraps=source.transitionProperty==='translate'&&!timing.direction.startsWith('alternate')
+          &&Math.floor(timing.iterationStart)+1<timing.iterationStart+timing.iterations;
+        const jumps=source.transitionProperty==='translate'&&[timing,...keyframes].some(k=>!continuousEasing(k.easing));
         // Added to the paused animation it stands in for, it would count twice.
-        if(easing===null||animation.effect.composite!=='replace'||keyframes.some(k=>k.composite==='add'||k.composite==='accumulate')){seek=true;continue;}
+        if(wraps||jumps||easing===null||animation.effect.composite!=='replace'||keyframes.some(k=>k.composite==='add'||k.composite==='accumulate')){seek=true;own.length=0;continue;}
+        own.push({keyframes,easing,basis:animation,index});
+      }
+      for(const {keyframes,easing,basis,index} of own) {
         const f=c.animate(keyframes,{delay:op.delay,duration:op.duration,easing,fill:'both'});
         if(source.startTime!==null)f.startTime=source.startTime;
-        made.push({animation:f,consumer:c,basis:animation,range:[a,b],snapshot:snapshotAnimation(animation,index)});
+        made.push({animation:f,consumer:c,basis,range:[a,b],snapshot:snapshotAnimation(basis,index)});
       }
     }
     if(made.length) {
-      const record={source:el,name,axis,animations:made};followers.set(id,record);
-      Promise.allSettled(made.map(f=>f.animation.finished)).then(()=>{if(followers.get(id)!==record)return;followers.delete(id);followTimelines();cancelFollowers(record);});
+      const record={source:el,name,axis,driver:source,animations:made};followers.set(id,record);
+      const finished=()=>{if(followers.get(id)!==record)return;followers.delete(id);followTimelines();cancelFollowers(record);};
+      Promise.allSettled(made.map(f=>f.animation.finished)).then(finished);
+      source.finished.then(finished,finished);
     }
     if(seek)kickTimelines();
   }
@@ -329,11 +455,7 @@ export function motionController({views,now,generation,request,applyBatch,inert,
   }
   function sample(el,property) {
     const text=getComputedStyle(el).getPropertyValue(cssProperty(el,property)), numbers=text.trim().split(/\s+/);
-    if(property==='translate') {
-      if(text==='none') return [0,0];
-      const box=el.getBoundingClientRect();
-      return [0,1].map(i=>numbers[i]?.endsWith('%')?parseFloat(numbers[i])*[box.width,box.height][i]/100:parseFloat(numbers[i]??'0'));
-    }
+    if(property==='translate') return translation(el,text);
     if(property==='scale' && numbers.length>1 && Number(numbers[0])!==Number(numbers[1])) return null;
     return [text==='none'?(property==='scale'?1:0):parseFloat(text),0];
   }

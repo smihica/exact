@@ -203,6 +203,7 @@ if (process.argv.includes('--web-bytes')) {
 }
 const appName = process.argv.includes('--app') ? process.argv[process.argv.indexOf('--app') + 1] : undefined;
 const app = resolveApp(appName);
+const appEnv = { ...process.env, ...(app.outside ? { EXACT_APP_DIR: app.dir } : {}) };
 // The child uses the captured scripts and inputs; only this invocation's
 // resolved root bypasses capture. Foreign inherited markers cannot do so.
 if (!process.argv.includes('--flow') && !process.argv.includes('--scaling') && !process.argv.includes('--list-memory') && process.env.EXACT_DIAGNOSTIC_ROOT !== ROOT) {
@@ -239,6 +240,9 @@ if (process.env.EXACT_DIAGNOSTIC_ROOT === ROOT) {
 }
 // Opt-in large workloads run in the existing metrics binary. No browser or
 // rebuild is needed to compare runner algorithms on one fixed machine.
+// Rust metrics binaries retain release: their runner, kernel and batch timings
+// measure production optimizations. The compile/bake rows share that profile;
+// developer rebuild timings below run the dev loop and its host-dev producers.
 if (process.argv.includes('--list-memory') && process.argv.includes('--collections')) {
   if (process.argv.includes('--scaling')) throw new Error('choose collections or scaling');
   const repeats = process.argv.includes('--repeats') ? Number(process.argv[process.argv.indexOf('--repeats') + 1]) : 3;
@@ -412,7 +416,7 @@ mkdirSync(profile, { recursive: true });
 const step = async (name, f) => { const t = Date.now(); const v = await f(); out[`_${name}_s`] = (Date.now() - t) / 1000; return v; };
 
 const NATIVE_ROWS = ['compile_ms', 'bake_ms', 'decode_ms', 'plan_bytes', 'baked_bytes', 'boot_ms', 'nodes', 'text_nodes', 'layout_ms', 'update_ms', 'inherit_ms', 'inherit_touched', 'tick_ms', 'web_boot_ms', 'web_first_batch_bytes', 'web_update_ms', 'web_update_batch_bytes'];
-// 1. Native pipeline numbers (a release bin; warm cache builds in ~1 s).
+// 1. Native pipeline numbers from the release bin.
 await step('native', () => {
   const source = resolve(app.dir, 'web/src/bin/metrics.rs');
   if (!existsSync(source)) {
@@ -420,7 +424,7 @@ await step('native', () => {
     Object.assign(out, Object.fromEntries(NATIVE_ROWS.map((key) => [key, NaN])));
     return;
   }
-  const r = spawnSync('cargo', ['run', '-q', '--release', '-p', app.crate('web'), '--bin', 'metrics'], { cwd: app.workspace, encoding: 'utf8', env: developmentBuildEnv() });
+  const r = spawnSync('cargo', ['run', '-q', '--release', '-p', app.crate('web'), '--bin', 'metrics'], { cwd: app.workspace, encoding: 'utf8', env: { ...developmentBuildEnv(), ...(app.outside ? { EXACT_APP_DIR: app.dir } : {}) } });
   if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
   Object.assign(out, JSON.parse(r.stdout.trim().split('\n').pop()));
 });
@@ -430,7 +434,7 @@ await step('native', () => {
 // ~1.5 s), so every number below is for the code as it is now.
 await step('wasm', async () => {
   const dist = resolve(ROOT, 'host/web/dist');
-  const b = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.crate('web')], { cwd: ROOT, stdio: ['ignore', 'ignore', 'inherit'] });
+  const b = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.crate('web')], { cwd: ROOT, env: appEnv, stdio: ['ignore', 'ignore', 'inherit'] });
   if (b.status !== 0) process.exit(b.status ?? 1);
   out.web_target = jsTargetBuild(dist) ? 'js' : 'wasm';
   if (out.web_target === 'js') {
@@ -622,7 +626,10 @@ await step('boot', () => {
   const t = Date.now();
   const { executable: chrome, unavailable } = chromium({ needs: ['gpu', 'perf'] });
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const dev = spawn(process.execPath, [resolve(ROOT, 'host/web/dev.mjs'), '--app', app.name, '--port', String(port)], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  const dev = spawn(process.execPath, [resolve(ROOT, 'host/web/dev.mjs'), '--app', app.name, '--port', String(port)], {
+    cwd: ROOT, env: appEnv,
+    stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+  });
   let compilerPid = null, diagnostic = '', devExited = false;
   dev.stderr.on('data', chunk => { diagnostic = (diagnostic + chunk).slice(-8000); });
   dev.on('exit', () => { devExited = true; });
@@ -756,7 +763,7 @@ if (rebuild) {
     const now = new Date();
     utimesSync(source, now, now);
     const t = Date.now();
-    const r = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.crate('web')], { cwd: ROOT, stdio: 'ignore' });
+    const r = spawnSync(process.execPath, [resolve(ROOT, 'host/web/build.mjs'), app.crate('web')], { cwd: ROOT, env: appEnv, stdio: 'ignore' });
     out.rebuild_ms = r.status === 0 ? Date.now() - t : NaN;
   });
 }
@@ -813,7 +820,7 @@ await step('macos-boot', () => {
   floorRun();
 });
 
-// 7. Long: the macOS host's builds — a warm build (cargo release staticlib +
+// 7. Long: the macOS host's builds — a warm build (cargo host-dev staticlib +
 // swift), then the budget row "touch one line, rebuild that crate" for the
 // host crate — and the startup again on the fresh binary.
 if (long) {
@@ -855,7 +862,7 @@ if (long) {
   await step('macos', () => {
     const build = () => {
       const t = Date.now();
-      const r = spawnSync(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), app.crate('apple')], { cwd: ROOT, encoding: 'utf8' });
+      const r = spawnSync(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), app.crate('apple')], { cwd: ROOT, env: appEnv, encoding: 'utf8' });
       const m = /cargo ([\d.]+) s, swift ([\d.]+) s/.exec(r.stdout ?? '');
       // A build that did not finish is a finding, never a blank: its last words.
       const failed = r.status === 0 ? null : `${r.error?.message ?? `exit ${r.status}`}: ${failure(r)}`;
@@ -881,7 +888,7 @@ if (long) {
   // `floor.swift`, installed bytes and gzip apart; each optional artifact
   // (the GPU module, the web arm) reported beside it, never folded in.
   await step('macos-link-delta', () => {
-    const r = spawnSync(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), app.crate('apple'), '--host'], { cwd: ROOT, encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [resolve(ROOT, 'host/apple/build.mjs'), app.crate('apple'), '--host'], { cwd: ROOT, env: appEnv, encoding: 'utf8' });
     if (r.status !== 0 || !existsSync(macHostBinary) || !existsSync(floorBin)) {
       out.link_delta_bytes = NaN;
       if (r.status !== 0) out.link_delta_failed = `exit ${r.status}: ${failure(r)}`;

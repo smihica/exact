@@ -304,10 +304,13 @@ pub fn tag(name: &str) -> Option<Tag> {
         },
         // @ref LLP 1069.001 D1, D2 — HTML's `select`: the platform's pop-up
         // control, its options its children. ARIA's role for a one-line
-        // select is `combobox`.
+        // select is `combobox`. @ref LLP 1115.000 D10.4 — no wider than what
+        // holds it: the web sizes a select to its longest option, which can
+        // outgrow a phone, where a pop-up button never runs past its
+        // container. Implied, so an authored `max-width` replaces it.
         "select" => Tag {
             node_type: NodeType::Control,
-            fixed_styles: &[],
+            fixed_styles: crate::controls::CONTAINED,
             fixed_props: &[
                 (PropId::Type, "select"),
                 (PropId::AccessibilityRole, "combobox"),
@@ -639,9 +642,14 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         "contextMagnify" => AttrTarget::Prop(p("contextMagnify")),
         // @ref LLP 1021 §5.1 — the popover a node's context menu shows, and its preview row.
         "contextPopover" | "contextPreview" => AttrTarget::Prop(p(name)),
+        // @ref LLP 1035.006.000 D1, D2 — a tip over the element, and whether its lesson is done.
+        "tip" | "tipMessage" | "tipImage" | "tipDone" => AttrTarget::Prop(p(name)),
         "emojiPicker" => AttrTarget::Prop(p("emojiPicker")),
         "backgroundMaterial" => AttrTarget::Prop(p("backgroundMaterial")),
         "glassGroup" => AttrTarget::Prop(p("glassGroup")),
+        "glassInteractive" => AttrTarget::Prop(p("glassInteractive")),
+        // The order a trigger's menu shows its rows in (LLP 1115 §2).
+        "menuOrder" => AttrTarget::Prop(p("menuOrder")),
         "buttonStyle" => AttrTarget::Prop(p("buttonStyle")),
         "listStyle" => AttrTarget::Prop(p("listStyle")),
         "toolbarPlacement" => AttrTarget::Prop(p("toolbarPlacement")),
@@ -757,6 +765,8 @@ pub fn attr(name: &str) -> Option<AttrTarget> {
         // @ref LLP 1039 D6 — vertical tablists retain authored layout.
         "aria-orientation" => AttrTarget::Prop(p("accessibilityOrientation")),
         "aria-controls" => AttrTarget::Prop(p("accessibilityControls")), // LLP 1075.003 §3.7: a tab names its tabpanel.
+        // @ref LLP 1141.002 D1 — HTML's link types; on a root tab, `search` names the search tab.
+        "rel" => AttrTarget::Prop(p("rel")),
         "aria-selected" => AttrTarget::Prop(p("accessibilitySelected")),
         "aria-expanded" => AttrTarget::Prop(p("accessibilityExpanded")),
         "aria-pressed" => AttrTarget::Prop(p("accessibilityPressed")),
@@ -954,6 +964,13 @@ pub fn renamed(old: &str) -> Option<&'static str> {
         "autoComplete" | "textContentType" | "autoCompleteType" => "autocomplete",
         "viewportFit" | "safeArea" | "safeAreaView" => "viewport-fit",
         "statusBarStyle" | "barStyle" | "StatusBar" => "status-bar-style",
+        // UIKit's and SwiftUI's names for a menu's order.
+        "preferredMenuElementOrder" | "menu-order" | "menuElementOrder" => "menuOrder",
+        // UIKit's `UIGlassEffect` properties and SwiftUI's `.tint`/`.interactive()`.
+        "background-material-tint" | "backgroundMaterialTint" | "glassTint" | "glass-tint" => {
+            "-exact-glass-tint"
+        }
+        "isInteractive" | "glass-interactive" => "glassInteractive",
         // React Native's and Expo's `hidden`, React Navigation's screen
         // options, UIKit's controller properties, Android's immersive mode.
         "status-bar-hidden"
@@ -1072,11 +1089,21 @@ pub(crate) fn validate_list(
             estimate.span,
         );
     }
-    if !matches!(estimate.value, Expr::Number(n, _) if n.is_finite() && n > 0.0) {
+    // A computed estimate is read again as it changes (LLP 1070, as amended
+    // for #226); a literal one is positive.
+    let positive = match (
+        super::values::numeric_literal(&estimate.value),
+        &estimate.value,
+    ) {
+        (Some(n), _) => n.is_finite() && n > 0.0,
+        (None, Expr::Str(..) | Expr::Bool(..)) => false,
+        _ => true,
+    };
+    if !positive {
         return super::err(
             "lower-list-height",
             format!(
-                "virtualized lists accept one positive literal `{}`",
+                "virtualized lists accept one positive `{}`, a literal or a computed number",
                 estimate.name
             ),
             estimate.span,
@@ -1236,18 +1263,13 @@ pub(crate) fn host_transform_recipients(
                     });
                     collect(lower, children, Some(index), false, boxes);
                 }
-                Node::When {
-                    then, otherwise, ..
-                } => {
-                    collect(lower, then, parent, repeated, boxes);
-                    collect(lower, otherwise, parent, repeated, boxes);
+                Node::Use { .. } | Node::Children { .. } => {}
+                node => {
+                    let repeated = repeated || matches!(node, Node::Each { .. });
+                    for list in node.child_lists() {
+                        collect(lower, list, parent, repeated, boxes);
+                    }
                 }
-                Node::Each { body, .. } => collect(lower, body, parent, true, boxes),
-                Node::Match { some, none, .. } => {
-                    collect(lower, &some.1, parent, repeated, boxes);
-                    collect(lower, none, parent, repeated, boxes);
-                }
-                _ => {}
             }
         }
     }
@@ -1411,12 +1433,8 @@ impl crate::Lowerer<'_> {
         fn words(node: &Node) -> bool {
             match node {
                 Node::Element { tag, .. } => tag == "text" || tag == "image",
-                Node::When {
-                    then, otherwise, ..
-                } => then.iter().chain(otherwise).all(words),
-                Node::Each { body, .. } => body.iter().all(words),
-                Node::Match { some, none, .. } => some.1.iter().chain(none).all(words),
                 Node::Use { .. } | Node::Children { .. } => false,
+                node => node.children().all(words),
             }
         }
         let has = |name: &str| attrs.iter().any(|a| a.name == name);

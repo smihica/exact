@@ -69,7 +69,7 @@ pub(crate) enum Refusal {
     /// R4: a property a glue writes inline itself, or reads inline (the
     /// runtime's own `scroll-behavior` included), and a live time's widths.
     GlueWritten,
-    /// R5: a side path in `style_row` (a mark, `$ink`, `Sx`/`Sm`/`Sr`, a
+    /// R5: a side path in `style_row` (a mark, `Sx`/`Sm`/`Sr`, a
     /// press or fit hook, an SVG attribute, a painting binding); a
     /// development build's per-binding counter is not one (the key counts).
     SidePath,
@@ -104,7 +104,7 @@ pub(crate) enum Refusal {
 /// `touch-action`, `scale`, `transform`, `top` and `left` are in GLUE.
 /// Left inline on purpose, not refused: agent.js and inspect-dev.js read a
 /// lowered node's arm rule (class-aware); dom.js 116 `font-size` is the
-/// render shim's, where lowered rows are written inline; said.js 22
+/// render shim's, where lowered rows are written inline; button-fill.js 14
 /// `background-color` is read on pressable buttons only (R1);
 /// navigation.js 1042 saves and restores `width`/`flex-shrink` around one
 /// synchronous measurement; presence-glue.js 314-318 writes an exiting
@@ -330,7 +330,7 @@ impl Em<'_> {
                     .strip_prefix('"')
                     .and_then(|r| r.split('"').next())
                     .ok_or(Refusal::SidePath)?;
-                if names(rest, e) || st.contains(".$ink") {
+                if names(rest, e) {
                     return Err(Refusal::SidePath);
                 }
                 refuse_prop(prop, tinted)?;

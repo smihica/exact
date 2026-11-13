@@ -10,6 +10,7 @@
 //
 // Simulator only so far; a phone is LLP 1080.000 stage 4.
 import { spawn, spawnSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
@@ -19,6 +20,7 @@ import { iosTriple } from './build.mjs';
 import { claimLive } from '../../scripts/app.mjs';
 import { phoneBridge } from './devices.mjs';
 import { watchCloak } from './cloak.mjs';
+import { retainCleanupError, simulatorDisplay } from '../../scripts/agent-launch.mjs';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -214,6 +216,20 @@ async function keptRunner(udid, appId, key) {
 // session needs all three on (without them a kept runner's tap never finishes and a menu's rows are not found), so
 // it turns them on and puts them back at its end; a write takes effect at the next launch, with no reboot.
 const AX = 'com.apple.Accessibility', AX_KEYS = ['AutomationEnabled', 'AccessibilityEnabled', 'ApplicationAccessibilityEnabled'];
+const accessibilityLocks = new AsyncLocalStorage();
+// Launch failure can close its touch session while still holding the display lock.
+// Work deferred past that launch must acquire the lock again.
+function withAccessibilityLock(udid, fn) {
+  const held = accessibilityLocks.getStore() ?? [];
+  if (held.some(owner => owner.udid === udid && owner.active)) return fn();
+  return simulatorDisplay(udid, () => {
+    const owner = { udid, active: true };
+    return accessibilityLocks.run([...held, owner], async () => {
+      try { return await fn(); }
+      finally { owner.active = false; }
+    });
+  });
+}
 /** `defaults <args>` in simulator `udid`, asynchronously: each spawn costs about 0.35 s, so a session runs them
  * together. One that has not answered in 10 s is killed, and fails: the device's lock waits on it. */
 const simDefaults = (udid, args) => new Promise((done) => {
@@ -225,6 +241,30 @@ const simDefaults = (udid, args) => new Promise((done) => {
   p.on('error', (e) => { clearTimeout(timer); done({ status: -1, out, err: String(e) }); });
   p.on('close', (status, signal) => { clearTimeout(timer); done({ status: signal ? -1 : status, out, err: signal ? 'no answer in 10 s' : err }); });
 });
+/** Hold the simulator's shared launch lock through AX setup, launch and restoration.
+ * The loaded runtime stays with the process. Ordinary drives perform no defaults reads or writes. */
+export async function withAccessibilityRuntime(udid, enabled, launch, run = simDefaults) {
+  return withAccessibilityLock(udid, async () => {
+    if (!enabled) return launch();
+    const key = 'ApplicationAccessibilityEnabled', args = [AX, key];
+    const before = await run(udid, ['read', ...args]);
+    if (before.status !== 0 && !/does not exist|not found/.test(before.err)) throw new Error(`simulator accessibility: ${before.err}`);
+    if (before.status === 0 && before.out.trim() === '1') return launch();
+    const set = await run(udid, ['write', ...args, '-bool', 'true']);
+    if (set.status !== 0) throw new Error(`simulator accessibility: ${set.err}`);
+    let carrier;
+    try { carrier = await launch(); return carrier; }
+    finally {
+      try {
+        const restored = await run(udid, before.status === 0 ? ['write', ...args, '-bool', 'false'] : ['delete', ...args]);
+        if (restored.status !== 0) throw new Error(`simulator accessibility could not be restored: ${restored.err}`);
+      } catch (error) {
+        try { await carrier?.close(); } catch (failure) { retainCleanupError(error, failure); }
+        throw error;
+      }
+    }
+  });
+}
 /** The three keys as simulator `udid` has them (`'1'`, `'0'`, or undefined when unset), or null when it could not say. */
 async function accessibilityKeys(udid) {
   const r = await simDefaults(udid, ['read', AX]);
@@ -243,14 +283,16 @@ export async function foundAccessibility(udid, record, read = accessibilityKeys)
  * all three on (a person sets ApplicationAccessibilityEnabled alone, for `tree --ax`), so they go back to unset.
  * Resolves with what failed, or null. */
 export async function restoreAccessibility(udid, found, run = simDefaults) {
-  const left = found.AutomationEnabled === '1';
-  const failed = (await Promise.all(AX_KEYS.map(async (k) => {
-    const v = left ? undefined : found[k];
-    const r = await run(udid, v == null ? ['delete', AX, k] : ['write', AX, k, '-bool', v === '1' ? 'true' : 'false']);
-    // Deleting a key or domain that is not there fails, and leaves what was wanted.
-    return r.status === 0 || (v == null && /Could not find key|not found/.test(r.err)) ? null : `${k}: ${r.err.trim() || `exit ${r.status}`}`;
-  }))).filter(Boolean);
-  return failed.length ? failed.join('; ') : null;
+  return withAccessibilityLock(udid, async () => {
+    const left = found.AutomationEnabled === '1';
+    const failed = (await Promise.all(AX_KEYS.map(async (k) => {
+      const v = left ? undefined : found[k];
+      const r = await run(udid, v == null ? ['delete', AX, k] : ['write', AX, k, '-bool', v === '1' ? 'true' : 'false']);
+      // Deleting a key or domain that is not there fails, and leaves what was wanted.
+      return r.status === 0 || (v == null && /Could not find key|not found/.test(r.err)) ? null : `${k}: ${r.err.trim() || `exit ${r.status}`}`;
+    }))).filter(Boolean);
+    return failed.length ? failed.join('; ') : null;
+  });
 }
 
 /**
@@ -259,12 +301,13 @@ export async function restoreAccessibility(udid, found, run = simDefaults) {
  * for (its hello, 30 s; xcodebuild's start is most of 5 s). A runner outlives
  * the drive that started it: closing hangs up and the runner waits
  * KEPT_IDLE for the next session. Returns `{ ask(req), close(), pid, started,
- * kept, cloak }`: `ask` sends one line and resolves with its reply, or with an error
+ * kept, cloak, handoff() }`: `ask` sends one line and resolves with its reply, or with an error
  * at `RUNNER_MS`, which also ends the runner (a stalled runner never hangs a
  * drive). `cloak` follows SpringBoard's main transitions and, on a `foldable`
  * simulator (the iPhone Duo), fold cloaks: a real touch waits until both clear
  * (cloak.mjs). The simulator's accessibility keys are on for the session and put back when it
- * ends (`AX_KEYS`).
+ * ends (`AX_KEYS`). `handoff` awaits this connection's close and returns the port and token
+ * for a hosted XCTest to connect; ownership and accessibility stay held until `close` or `end`.
  */
 export async function openTouches({ udid, appId, foldable }) {
   const lockRelease = lock(udid);
@@ -348,9 +391,10 @@ export async function openTouches({ udid, appId, foldable }) {
       child.unref();
     }
     // Teardown runs once; a failure to end the runner is kept for `close()` to report.
-    let closing = null;
+    let closing = null, handedOff = false;
     const end = () => (closing ??= teardown().then(() => null, (e) => e));
     const ask = async (req, ms = RUNNER_MS) => {
+      if (handedOff) return { error: 'the touch connection was handed to the hosted tests' };
       const broken = talk.broken();
       if (broken) return { error: broken };
       return within(talk.request(req), ms, () => {
@@ -366,10 +410,19 @@ export async function openTouches({ udid, appId, foldable }) {
     return {
       ask, pid: kept.pid, started: Date.now() - started, kept: reused, cloak,
       end,
+      async handoff() {
+        if (closing || handedOff || talk.broken()) throw new Error('the touch connection is no longer available for handoff');
+        handedOff = true;
+        // The hosted xcodebuild blocks this event loop, so flush the EOF before it starts.
+        const hungUp = new Promise(r => socket.once('close', () => r(true)));
+        socket.end();
+        if (!(await within(hungUp, 3000, () => false))) throw new Error('the initial touch connection did not close for handoff');
+        return { port: kept.port, token: kept.token };
+      },
       // A session that ends well hangs up and leaves the runner for the next.
       async close() {
         if (closing) { const failed = await closing; if (failed) throw failed; return; }
-        if (talk.broken()) { const failed = await end(); if (failed) throw failed; return; }
+        if (!handedOff && talk.broken()) { const failed = await end(); if (failed) throw failed; return; }
         closing = Promise.resolve(null);
         cloak.close();
         socket.end();
@@ -423,6 +476,14 @@ export const DRAG_BOUNDS = { press: 10000, hold: 10000, over: 2000, total: 10000
  * real time and whether the finger is still down. `ask` is the app's carrier; `touches`
  * the runner's.
  */
+/** Whether a drag may reach viewport point `p` by the aim `a`: in its viewport, or over the software keyboard while it
+ *  shows (`a.keyboard`, LLP 1080.000 §11: a person's drag to dismiss it ends there). */
+export function reaches(a, [x, y]) {
+  const within = ([bx, by, bw, bh]) => x >= bx && y >= by && x <= bx + bw && y <= by + bh;
+  return within([0, 0, ...a.viewport]) || (Array.isArray(a.keyboard) && within(a.keyboard));
+}
+const outside = (a) => `outside the viewport (${a.viewport[0]} × ${a.viewport[1]})${Array.isArray(a.keyboard) ? ' and the software keyboard' : ' and no software keyboard shows'}`;
+
 // What a lost touch's error advises: the synthesizer, unlike XCTest's public calls, does not wait for the app to go idle
 const SETTLE_FIRST = 'a real touch played while native work still moves (a push, a sheet, the keyboard) can be lost, so `clock settle` first';
 
@@ -452,9 +513,9 @@ export async function realTap({ ask, touches, id, at, rel, drag, abandon }) {
   // `screen`: where XCTest's synthesizer presses a tap, on the display whose size is `display` (touches.swift).
   let request = { op: 'tap', point: a.point, ...(a.fixed ? { screen: a.fixed, display: a.display } : {}) }, moves = false, ms = 0;
   if (drag) {
-    // The end, from the start the host resolved just now, in the viewport it reported with it.
-    const end = [a.at[0] + drag.dx, a.at[1] + drag.dy], [vw, vh] = a.viewport;
-    if (!(end[0] >= 0 && end[1] >= 0 && end[0] <= vw && end[1] <= vh)) throw new Error(`${what}: the drag would end at (${end}), outside the viewport (${vw} × ${vh})`);
+    // The end, from the start the host resolved just now, in the viewport or over the keyboard it reported with it.
+    const end = [a.at[0] + drag.dx, a.at[1] + drag.dy];
+    if (!reaches(a, end)) throw new Error(`${what}: the drag would end at (${end}), ${outside(a)}`);
     moves = drag.dx !== 0 || drag.dy !== 0;
     ms = drag.press + drag.hold + (moves ? drag.over : 0);
     // Points per second: what XCTest's velocity measured as on a 3x simulator, whatever its header says (§11).
@@ -474,7 +535,7 @@ export async function realTap({ ask, touches, id, at, rel, drag, abandon }) {
       offset += leg.press + (leg.dx || leg.dy ? leg.over : 0);
       x += leg.dx; y += leg.dy;
       const point = [a.at[0] + x, a.at[1] + y];
-      if (point.some((v, i) => v < 0 || v > a.viewport[i])) throw new Error(`${what}: path waypoint (${point}) is outside the viewport`);
+      if (!reaches(a, point)) throw new Error(`${what}: path waypoint (${point}) is ${outside(a)}`);
       checkpoints.push({ offset, end: offset + leg.hold, ops: leg.during, tick: leg.tick });
       offset += leg.hold;
       return { to: [a.fixed[0] + x * rx + y * ux, a.fixed[1] + x * ry + y * uy], over: (leg.dx || leg.dy ? leg.over : 0) / 1000, hold: leg.hold / 1000 };

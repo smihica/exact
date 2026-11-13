@@ -120,6 +120,42 @@ fn a_role_prerenders_at_the_size_it_paints() {
     assert!(doc.contains("width='24' height='24'"), "{doc}");
 }
 
+#[test]
+fn images_decode_asynchronously_with_their_loading_and_hero_attributes() {
+    let host = host(
+        r#"component App
+  view
+    column
+      image "assets/hero.png" alt="Hero"
+      image "assets/ordinary.png" alt="Ordinary"
+      for name in ["a", "b"] key=name
+        image `assets/${name}.png` alt=name
+"#,
+        Says(""),
+        "/",
+    );
+    let doc = exact_web::document::project_for_js(host.runner()).unwrap();
+    let images: Vec<_> = doc
+        .root
+        .split("<img ")
+        .skip(1)
+        .map(|tail| tail.split_once('>').unwrap().0)
+        .collect();
+    assert_eq!(images.len(), 4, "{}", doc.root);
+    for (image, lazy, hero) in [
+        (images[0], false, true),
+        (images[1], false, false),
+        (images[2], true, false),
+        (images[3], true, false),
+    ] {
+        assert_eq!(image.matches("decoding=\"async\"").count(), 1, "{image}");
+        assert_eq!(image.contains("loading=\"lazy\""), lazy, "{image}");
+        assert_eq!(image.contains("fetchpriority=\"high\""), hero, "{image}");
+    }
+    assert_eq!(doc.root.matches("decoding=").count(), images.len());
+    assert_eq!(doc.hero_image.unwrap().src, "assets/hero.png");
+}
+
 fn caltrain() -> (Host<caltrain_data::Caltrain>, String) {
     let plan = caltrain::build().unwrap();
     exact_web::link(exact_web_capabilities::ALL);
@@ -723,6 +759,40 @@ component App
         let tag = tag(launch, header);
         assert_eq!(tag.contains("data-exact-site"), site, "{tag}");
         assert_eq!(tag.contains("data-exact-bar"), bar, "{tag}");
+    }
+}
+
+// A header of buttons alone is the bar when it places all of them: a button
+// that shows a dialog by its command, pressing nothing, is one of its items
+// (#387), and one whose command only closes the dialog is not.
+#[test]
+fn a_button_that_shows_a_dialog_by_its_command_is_a_bar_item() {
+    let src = |command: &str| {
+        format!(
+            r#"
+routes nav
+  tab home "/"
+component App
+  view
+    main navigationKey=`${{top(nav).id}}` navigationBack="back" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        column navigationKey=`${{e.id}}`
+          header testId="header"
+            button commandfor="clear" command="{command}" aria-label="Clear"
+              text "Clear"
+          dialog id="clear" role="alertdialog" aria-label="Clear History?"
+            text "Every conversation will be deleted."
+            button commandfor="clear" command="close"
+              text "Cancel"
+"#
+        )
+    };
+    for (command, bar) in [("show-modal", true), ("close", false)] {
+        let doc = host(&src(command), Says(""), "/").document().unwrap().root;
+        let at = doc.find("data-testid=\"header\"").unwrap();
+        let start = doc[..at].rfind('<').unwrap();
+        let tag = &doc[start..at + doc[at..].find('>').unwrap() + 1];
+        assert_eq!(tag.contains("data-exact-bar"), bar, "{command}: {tag}");
     }
 }
 

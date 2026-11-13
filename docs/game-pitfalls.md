@@ -1,14 +1,14 @@
-# Pitfalls when writing exact2 games
+# Pitfalls when writing Exact games
 
 **Adding an entry:** only a pitfall you hit and reproduced on current `main`, written
 as symptom → cause → what to do, with where it was found. Delete the entry in the
 change that fixes the footgun, or that makes the compiler, runtime or driver
 diagnose it. **Candidate diagnostic** marks one that could become a check cheaply.
 
-> **Lookup reference.** Search it by symptom (`grep -n`); don't read it front to back.
+> **Lookup reference: start at [Start here](start-here.md).** Search it by symptom (`grep -n`); don't read it front to back.
 > Look a name up first (`bun exact.mjs game vocab <name>`), then the
 > [recipes](../game/recipes/README.md). Contract's pitfalls (menus, the HUD, its
-> keys, drags and sounds) are in [agent-pitfalls.md](agent-pitfalls.md).
+> keys, drags and sounds) are in [Pitfalls when writing Exact apps](agent-pitfalls.md).
 
 ## The world and its saves
 

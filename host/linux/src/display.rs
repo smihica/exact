@@ -15,9 +15,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::app::Config;
 use crate::input::Input;
-use crate::presenter::{Presenter, SubmittedFrame};
 use crate::vnc::Vnc;
 use drm::buffer::{Buffer as _, DrmFourcc};
 use drm::control::{
@@ -25,6 +23,8 @@ use drm::control::{
     ModeTypeFlags, PageFlipFlags,
 };
 use drm::Device;
+use exact_painted::app::Config;
+use exact_painted::presenter::{Presenter, SubmittedFrame};
 use exact_runner::DataSource;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -59,7 +59,7 @@ pub struct Display {
     connector: connector::Handle,
     mode: Mode,
     buffers: Vec<(DumbBuffer, framebuffer::Handle)>,
-    flips: FlipState,
+    flips: FlipState<SubmittedFrame>,
     width: u32,
     height: u32,
     portrait: bool,
@@ -139,6 +139,18 @@ impl Display {
         self.mode.vrefresh()
     }
 
+    /// The mode's frame period, milliseconds: its total pixels a frame over
+    /// its pixel clock (kHz), which `vrefresh`'s whole hertz round.
+    pub fn period_ms(&self) -> f64 {
+        let (h, v) = (self.mode.hsync().2, self.mode.vsync().2);
+        let clock = self.mode.clock();
+        if clock == 0 || h == 0 || v == 0 {
+            1000.0 / f64::from(self.refresh().max(1))
+        } else {
+            f64::from(h) * f64::from(v) / f64::from(clock)
+        }
+    }
+
     fn pending(&self) -> bool {
         self.flips.pending()
     }
@@ -165,7 +177,7 @@ impl Display {
         // loop; `run` neither polls it nor submits a dumb buffer afterwards, and
         // ends when this fails.
         unsafe {
-            p.brush.attach_scanout(
+            p.kiosk_attach_scanout(
                 self.fd(),
                 self.connector.into(),
                 [self.width, self.height],
@@ -288,10 +300,10 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     let wall = || started.elapsed().as_secs_f64() * 1000.0;
     config.clock_started = Some(started);
     // Startup timestamps for Observe's launch metrics.
-    let mut marks = crate::launch_marks::LaunchMarks::new();
+    let mut marks = exact_painted::launch_marks::LaunchMarks::new();
     let observe_log = std::env::var("EXACT_OBSERVE_LOG").as_deref() == Ok("1");
     marks.launch_end();
-    let (mut p, error) = match crate::app::boot_presenter::<D>(config, viewport) {
+    let (mut p, error) = match exact_painted::app::boot_presenter::<D>(config, viewport) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("exact: boot: {e}");
@@ -302,7 +314,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         eprintln!("exact: {e}");
     }
     // The display's clock owns time (the timers RFC, D1)
-    p.set_live_clock(Some(crate::presenter::wall_since(started)));
+    p.set_live_clock(Some(exact_painted::presenter::wall_since(started)));
     let mut input = Input::open();
     let clock_set = clock_set::ClockSet::open();
     // @ref LLP 1132 D10 — a touch screen alone is `pointer: coarse`, `hover: none`.
@@ -328,8 +340,10 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
     let mut pointer = (viewport.0 / 2.0, viewport.1 / 2.0);
     // A development display samples its flips, and writes a trace on
     // SIGUSR1 (LLP 1079 D3, D5); a production binary does neither.
-    let measured = !exact_runner::delivery::production(&p.compat);
-    let mut frames = crate::frames::Frames::new(display.refresh());
+    let measured = !exact_runner::delivery::production(p.compat());
+    let mut frames = exact_painted::frames::Frames::new(display.refresh());
+    // A GPU canvas's `Frame::period_ms` (LLP 1009).
+    p.set_frame_period(display.period_ms());
     if measured {
         trace_on_signal();
     }
@@ -380,7 +394,7 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         }
         if measured {
             // A replaced host's flip and samples are the old runner's.
-            frames.host(p.hosts);
+            frames.host(p.hosts());
             if p.dirty() {
                 frames.dirty(wall());
             }
@@ -388,20 +402,22 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         if p.dirty() && !display.pending() {
             let start = Instant::now();
             if let Some(fps) = &mut fps {
-                p.brush.fps = fps.frame(start).or(p.brush.fps);
+                if let Some(value) = fps.frame(start) {
+                    p.set_kiosk_fps(value);
+                }
             }
             let Some(frame) = p.display_frame() else {
                 eprintln!("exact: display/presenter submission ownership mismatch");
                 return 1;
             };
             if measured {
-                frames.submitted(wall(), p.host().runner().seq(), p.hosts);
+                frames.submitted(wall(), p.host().runner().seq(), p.hosts());
             }
             let render_ms = start.elapsed().as_secs_f64() * 1000.0;
             // A painter replaced after a lost device returns pixels, which this
             // loop can no longer show.
             #[cfg(all(feature = "scanout", target_os = "linux"))]
-            if direct && !p.brush.presents() {
+            if direct && !p.kiosk_presents() {
                 eprintln!("kiosk: the painter stopped presenting to the display");
                 return 1;
             }
@@ -444,12 +460,12 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
             if !p.module_pending() {
                 marks.activated();
             }
-            marks.turn(&crate::launch_marks::items(
+            marks.turn(&exact_painted::launch_marks::items(
                 &p.host().runner().outstanding(),
             ));
         }
         if marks.take_done() {
-            crate::journal::record("startup", marks.report());
+            exact_painted::journal::record("startup", marks.report());
             if observe_log {
                 eprintln!("observe: startup {}", marks.line());
             }
@@ -510,7 +526,9 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
                         if let Some(at) = display.last_flip() {
                             marks.flipped(
                                 at,
-                                &crate::launch_marks::items(&p.host().runner().outstanding()),
+                                &exact_painted::launch_marks::items(
+                                    &p.host().runner().outstanding(),
+                                ),
                             );
                         }
                     }
@@ -548,7 +566,11 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
         // SIGUSR1's, or a hatch's `diagnostics().save_trace()`.
         let asked = TRACE.swap(false, std::sync::atomic::Ordering::Relaxed);
         if measured && (asked || p.hatch_trace_asked()) {
-            match crate::frames::save_trace(&mut p, &frames, &crate::frames::app_name()) {
+            match exact_painted::frames::save_trace(
+                &mut p,
+                &frames,
+                &exact_painted::frames::app_name(),
+            ) {
                 Ok(path) => println!("exact: trace saved to {}", path.display()),
                 Err(e) => eprintln!("exact: {e}"),
             }
@@ -631,12 +653,12 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
                 plan_seen = m.clone();
                 if let Ok(bytes) = std::fs::read(path) {
                     let t = Instant::now();
-                    let module = crate::delivery::Module::local(path, &config.compat);
+                    let module = exact_painted::delivery::Module::local(path, &config.compat);
                     let let_go = held.as_ref().is_some_and(|(at, t)| {
-                        *at == m && t.elapsed() >= crate::host::LET_GO_AFTER
+                        *at == m && t.elapsed() >= exact_painted::host::LET_GO_AFTER
                     });
                     match module
-                        .map_err(crate::host::HostError::Asset)
+                        .map_err(exact_painted::host::HostError::Asset)
                         .and_then(|module| p.reload_module(&bytes, D::default(), module, let_go))
                     {
                         Ok(e) => println!(
@@ -647,9 +669,9 @@ pub fn run<D: DataSource + Default>(config: &mut Config, started: Instant) -> i3
                             t.elapsed().as_secs_f64() * 1000.0,
                             e.map(|e| format!(" — {e}")).unwrap_or_default()
                         ),
-                        Err(crate::host::HostError::PreparingModule) => plan_seen = None,
+                        Err(exact_painted::host::HostError::PreparingModule) => plan_seen = None,
                         // Asked again each turn; after a second it lets the requests go (LLP 1007 §6).
-                        Err(crate::host::HostError::RequestsPending) => {
+                        Err(exact_painted::host::HostError::RequestsPending) => {
                             plan_seen = None;
                             if held.as_ref().is_none_or(|(at, _)| *at != m) {
                                 held = Some((m.clone(), Instant::now()));
@@ -730,7 +752,7 @@ fn presented<D: DataSource>(
 ) {
     // Pixels belong to this receipt, even if input/reload changed the live Host.
     if let Some(v) = vnc {
-        v.publish(frame.pixels.clone());
+        v.publish(frame.pixels().clone());
     }
     p.display_complete(&frame);
     // Its boxes are the ones the pointer rests on now: their hover, and

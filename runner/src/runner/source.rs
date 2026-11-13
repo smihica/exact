@@ -143,9 +143,13 @@ impl Native {
                 .ok()
                 .and_then(|v| {
                     Some(format!(
-                        "{}.{}",
+                        "{}.{}{}",
                         v.get("extension")?.as_str()?,
-                        v.get("sync")?.as_str()?
+                        v.get("sync")?.as_str()?,
+                        v["owner"]
+                            .as_str()
+                            .map(|s| format!("#{s}"))
+                            .unwrap_or_default()
                     ))
                 });
             let Some(key) = named else { return call(body) };
@@ -233,6 +237,8 @@ pub struct InFlight<'a> {
     pub source: &'a str,
     /// The arguments it asks with.
     pub args: &'a [Value],
+    /// The request's fetch within its answer's set (LLP 1162 D2).
+    pub fetch: Option<u64>,
     /// The continuation token the source handed out for it, when it is one
     /// (`None` for a fetch or storage request, or where a forwarder can no
     /// longer tell): what tells two calls with equal arguments apart.
@@ -272,10 +278,9 @@ pub struct Overlaid {
 }
 
 /// What a request answers: a runtime resource row, a plan mutation, or one
-/// send of a `parallel` mutation. The runner keeps at most one request in
-/// flight per target (LLP 1016 D5), so an executor that parks a call until
-/// its reply comes keys it by target: two targets may ask one source with
-/// equal arguments.
+/// send of a `parallel` mutation. The runner keeps one answer
+/// in flight per target, with a set of requests for a resource (LLP 1162 D2).
+/// Two targets may ask one source with equal arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     /// A declared resource or a runtime member of a resource over a list.
@@ -348,11 +353,22 @@ macro_rules! data_source {
                 $(, $arg:ident: $arg_type:ty)* $(,)?) $(-> $result:ty)?
                 $(where Self: $bound:ident,)? $body:block
         )*
+        defaults {
+            $(
+                $(#[$new_doc:meta])*
+                fn $new:ident(&mut $new_self:ident $(, $new_arg:ident: $new_type:ty)*)
+                    -> $new_result:ty $new_body:block
+            )*
+        }
     ) => {
         /// The app's data source: the one seam through which computation enters
         /// (LLP 1004 D4). Leaves implement this trait; sources that wrap another
-        /// implement [`DataSourceWrapper`] so an omitted method cannot use a leaf default.
+        /// implement [`DataSourceWrapper`] to handle host capabilities explicitly.
         pub trait DataSource {
+            $(
+                $(#[$new_doc])*
+                fn $new(&mut $new_self, $($new_arg: $new_type),*) -> $new_result $new_body
+            )*
             $(
                 $(#[$required_doc])*
                 fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result;
@@ -364,9 +380,10 @@ macro_rules! data_source {
             )*
         }
 
-        /// A composing or forwarding source must handle every data-source method.
+        /// A composing or forwarding source handles every data-source method.
         /// Implementations forward, translate, or explicitly refuse each call.
-        /// The method descriptions document the defaults available only to leaves.
+        /// The request-set methods default to the single-request seam (LLP 1162 D2);
+        /// other defaults are available only to leaves.
         ///
         /// ```compile_fail,E0046
         /// use exact_runner::{DataError, DataSourceWrapper, Value};
@@ -379,6 +396,10 @@ macro_rules! data_source {
         /// ```
         pub trait DataSourceWrapper {
             $(
+                $(#[$new_doc])*
+                fn $new(&mut $new_self, $($new_arg: $new_type),*) -> $new_result $new_body
+            )*
+            $(
                 $(#[$required_doc])*
                 fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result;
             )*
@@ -390,6 +411,11 @@ macro_rules! data_source {
         }
 
         impl<T: DataSourceWrapper + ?Sized> DataSource for T {
+            $(
+                fn $new(&mut $new_self, $($new_arg: $new_type),*) -> $new_result {
+                    <T as DataSourceWrapper>::$new($new_self, $($new_arg),*)
+                }
+            )*
             $(
                 fn $required(&$r_receiver $($r_self)?, $($r_arg: $r_type),*) -> $r_result {
                     <T as DataSourceWrapper>::$required(
@@ -591,13 +617,15 @@ data_source! {
     /// delivered under the token it returns ([`DataSource::module_landed`]),
     /// and returns the answer's continuation, in which the timer runs. `None`
     /// leaves the answer waiting for the reply. A source that forwards
-    /// `keep_sent` forwards this.
+    /// `keep_sent` forwards this. `fetch` names the request within a
+    /// resource's set, whose wake times may differ (LLP 1162 D2).
     fn timer_before_reply(
         &mut self,
         store: &Store,
         in_flight: InFlight<'_>,
+        fetch: Option<u64>,
     ) -> Option<(u64, crate::request::Request)> {
-        let _ = (store, in_flight);
+        let _ = (store, in_flight, fetch);
         None
     }
 
@@ -637,6 +665,26 @@ data_source! {
     /// nothing. Taken after each answer and reply, where the logs are.
     fn take_aborted(&mut self) -> Vec<u64> {
         Vec::new()
+    }
+
+    /// Resume one untargeted tool invocation by the request the runner holds.
+    fn parse_tool(
+        &mut self,
+        fetch: Option<u64>,
+        continuation: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        let _ = (fetch, continuation);
+        self.parse(store, source, args, outcome)
+    }
+
+    /// The module owning `source`; an empty name selects background work.
+    fn module_identity(&self, source: &str) -> Option<super::ModuleIdentity> {
+        let _ = source;
+        None
     }
 
     /// The host's wake, for a source that hears an abort off the host's
@@ -688,7 +736,9 @@ data_source! {
     /// The app identity, reverse-DNS (LLP 1023 D5) — the one declaration:
     /// bake writes it into the plan header, and boot refuses a plan whose
     /// header names a different app. Empty is unnamed — a fixture or a
-    /// stand-in — and unnamed matches anything.
+    /// stand-in — and unnamed matches anything. An app's generated entry
+    /// gives an unnamed source its manifest's `app.id`
+    /// (`exact_logic::Swappable::named`), which names its storage.
     fn app_id(&self) -> &str {
         ""
     }
@@ -772,6 +822,16 @@ data_source! {
     /// and on a device grants nothing.
     fn grants(&self) -> &str {
         ""
+    }
+
+    /// Optional binary-bound Rust entry point, without activating this source (LLP 1162.000 D2).
+    fn launch(&self) -> Option<crate::request::Launch> {
+        None
+    }
+
+    /// Checked process-start definitions, without activating this source (LLP 1162.000 D2).
+    fn preloads(&self) -> &[crate::request::Preload] {
+        &[]
     }
 
     /// Identity of replaceable logic, if any. A changed identity invalidates
@@ -914,6 +974,32 @@ data_source! {
         let _ = retired;
     }
 
+    defaults {
+        /// Requests made by the last `Later` answer for `target`, after its
+        /// first request, in order. Taken once per turn (LLP 1162 D2).
+        /// A source forwarding request sets forwards this too.
+        fn more_for(&mut self, target: Target) -> Vec<crate::Request> {
+            let _ = target;
+            Vec::new()
+        }
+
+        /// Deliver a reply naming its request's [`crate::Request::fetch`]
+        /// (LLP 1162 D2). `None` keeps the answer in flight without new work;
+        /// it is valid only for a resource with other requests still out.
+        /// A source forwarding request sets forwards this too.
+        fn parse_fetch_for(
+            &mut self,
+            target: Target,
+            fetch: Option<u64>,
+            store: &mut Store,
+            source: &str,
+            args: &[Value],
+            outcome: Outcome
+        ) -> Result<Option<Answer>, DataError> {
+            let _ = fetch;
+            self.parse_for(target, store, source, args, outcome).map(Some)
+        }
+    }
 }
 
 /// A Contract app without application data has no sources to answer.
@@ -930,8 +1016,12 @@ pub enum DataError {
     UnknownSource(String),
     BadArguments(String),
     Unavailable(String),
-    /// Build-time storage cannot answer; use the resource placeholder until activation.
-    DeferredAtBake(String),
+    /// A build-time call cannot answer; use the resource placeholder until activation.
+    DeferredAtBake {
+        message: String,
+        /// An invalid option needs a build warning; ordinary deferral does not.
+        warning: bool,
+    },
     /// The seam to a loaded Rust module could not carry the call (an
     /// answer over its bound, a trap): the source is there but cannot
     /// answer now. A resource asked this fails; it does not refuse the
@@ -958,7 +1048,9 @@ impl std::fmt::Display for DataError {
             Self::UnknownSource(name) => write!(f, "unknown source: {name}"),
             Self::BadArguments(reason)
             | Self::Unavailable(reason)
-            | Self::DeferredAtBake(reason)
+            | Self::DeferredAtBake {
+                message: reason, ..
+            }
             | Self::Interface(reason)
             | Self::Overrun(reason)
             | Self::Failed(_, reason, _) => f.write_str(reason),

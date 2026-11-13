@@ -2,6 +2,7 @@
 // also exercises the shared build and launch helpers.
 // `bun test ./scripts/caps.test.mjs`.
 import { test, expect } from 'bun:test';
+import { EXE } from './paths.mjs';
 // These cases run cargo (the filesystem tool, bakes, locks). A shell whose PATH
 // omits rustup's bin directory still finds it there; without cargo, say so.
 const cargoBin = `${process.env.CARGO_HOME ?? `${process.env.HOME}/.cargo`}/bin`;
@@ -17,14 +18,14 @@ import { tmpdir } from 'node:os';
 import { join, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
-import { applyStaticChange, applyStaticTreeChange, appManifestDigest, builtAppMatches, copyStaticTree, copyStaticTreeIfPresent, installStaticCandidate, listAssets, listPublicFiles, publicFileCards, readDevGeneration, retainDevGeneration, shaderInterfaceDigests, staticFile, readStaticFile, serveStatic, syncStaticTree, watchStaticTrees, webEnvelope, devGenerationDigest, assetCards } from '../host/web/serve.mjs';
+import { captureAssets, applyStaticChange, applyStaticTreeChange, appManifestDigest, builtAppMatches, copyStaticTree, copyStaticTreeIfPresent, installStaticCandidate, listAssets, listPublicFiles, publicFileCards, readDevGeneration, retainDevGeneration, shaderInterfaceDigests, staticFile, readStaticFile, serveStatic, syncStaticTree, watchStaticTrees, webEnvelope, devGenerationDigest, assetCards } from '../host/web/serve.mjs';
 import { assertWebDistApp, jsonLines } from './agent.mjs';
 import { verifyBakeFiles, pendingBuildInputs } from './app.mjs';
 import { appDigest, driveStore, newerThan, notBuildInput, receiptChanges, webStore } from './agent-launch.mjs';
 import { storeBase, sweepTestStores } from './agent-test.mjs';
 import { copyAppleStaticTrees, rebuildArgs } from '../host/apple/build.mjs';
 import { developmentLaunchEnvironment, deviceLaunchArgs } from '../host/apple/devices.mjs';
-import { classify, publishRoot, webRelease } from './deploy.mjs';
+import { classify, publishRoot, readAssetIndex, sealEnvelope, webRelease } from './deploy.mjs';
 import { DirectoryOrigin, webRootPath, webReleasePath, sha256 } from './origin.mjs';
 const CAPS = join(dirname(fileURLToPath(import.meta.url)), 'caps.mjs');
 const BOOT = join(dirname(fileURLToPath(import.meta.url)), 'boot.mjs');
@@ -136,6 +137,16 @@ const cases = [
     { 'rules/RULES.md': GOOD_RULES, 'docs/recipes/money.md': 'x'.repeat(3073) }, 'cap:recipe'],
   ['a recipe of exactly 3,072 bytes passes',
     { 'rules/RULES.md': GOOD_RULES, 'docs/recipes/money.md': 'x'.repeat(3072) }, null],
+  ['a file named for a Windows device, with an extension, fails',
+    { 'rules/RULES.md': GOOD_RULES, 'js/tests/fixtures/nul.ts': '' }, 'path:windows'],
+  ['a directory named for a Windows device fails',
+    { 'rules/RULES.md': GOOD_RULES, 'src/COM1/a.rs': '' }, 'path:windows'],
+  ['a name with a character Windows reserves fails',
+    { 'rules/RULES.md': GOOD_RULES, 'src/a:b.txt': '' }, 'path:windows'],
+  ['a name ending in a period fails',
+    { 'rules/RULES.md': GOOD_RULES, 'src/notes.': '' }, 'path:windows'],
+  ['names that only begin with a device name pass',
+    { 'rules/RULES.md': GOOD_RULES, 'js/tests/fixtures/nul-byte.ts': '', 'src/console.ts': '', 'src/aux_data.rs': '', 'src/com10.md': '' }, null],
   ['the recipe cap counts bytes, not characters',
     { 'rules/RULES.md': GOOD_RULES, 'docs/recipes/money.md': '’'.repeat(1025) }, 'cap:recipe'],
   ['navigation-stack and rest-backend may run to 5,120 bytes',
@@ -261,8 +272,9 @@ for (const [name, html, files, expectCode, expect] of [
   const files = (seq) => {
     const plan = Buffer.from('plan'), page = Buffer.from(`guest ${seq}`);
     const card = (body) => ({ bytes: body.length, sha256: sha256(body) });
-    return new Map([['app.plan', plan], ['deck/nested/page.html', page], ['exact.json', Buffer.from(JSON.stringify({
-      exact: 1, dev: { epoch, seq }, plan: card(plan), assets: [{ name: 'deck/nested/page.html', ...card(page) }],
+    const index = Buffer.from(JSON.stringify({ assets: [{ name: 'deck/nested/page.html', url: './deck/nested/page.html', ...card(page) }] }));
+    return new Map([['app.plan', plan], ['deck/nested/page.html', page], ['assets.json', index], ['exact.json', Buffer.from(JSON.stringify({
+      exact: 1, dev: { epoch, seq }, plan: card(plan), assets: { url: 'assets.json', ...card(index), count: 1 },
     }))]]);
   };
   const first = files(1); retainDevGeneration(cache, epoch, 1, first);
@@ -281,13 +293,17 @@ for (const [name, html, files, expectCode, expect] of [
   rmSync(join(cache, epoch, '7', 'app.plan'));
   writeFileSync(join(cache, epoch, '6', 'app.plan'), 'broken');
   writeFileSync(join(cache, epoch, '5', 'exact.json'), '{');
-  result('damaged dev cache payloads and envelopes fail closed after restart',
+  writeFileSync(join(cache, epoch, '4', 'assets.json'), '{"assets":[]}');
+  result('damaged dev cache payloads, indexes and envelopes fail closed after restart',
     readDevGeneration(cache, `/__dev/generation/${epoch}/7/app.plan`) === null
+      && readDevGeneration(cache, `/__dev/generation/${epoch}/4/deck/nested/page.html`) === null
+      && readDevGeneration(cache, `/__dev/generation/${epoch}/3/deck/nested/page.html`)?.body.toString() === 'guest 3'
+      && readDevGeneration(cache, `/__dev/generation/${epoch}/3/assets.json`)?.body.length > 0
       && readDevGeneration(cache, `/__dev/generation/${epoch}/6/app.plan`) === null
       && readDevGeneration(cache, `/__dev/generation/${epoch}/5/exact.json`) === null
       && readDevGeneration(cache, prefix + 'app.plan')?.body.toString() === 'plan');
   const secret = join(dir, 'secret'); writeFileSync(secret, 'outside');
-  const page = join(cache, epoch, '1', 'deck', 'nested', 'page.html'); rmSync(page); symlinkSync(secret, page);
+  const page = join(cache, 'blobs', sha256(Buffer.from('guest 1'))); rmSync(page); symlinkSync(secret, page);
   result('retained dev routes reject links, traversal, undeclared and partial files', refused
     && readDevGeneration(cache, prefix + 'deck/nested/page.html') === null && readFileSync(secret, 'utf8') === 'outside');
   rmSync(dir, { recursive: true, force: true });
@@ -340,7 +356,7 @@ for (const [name, html, files, expectCode, expect] of [
   const brokenCopyRefused = await rejects(() => copyStaticTreeIfPresent(startupSource, join(dir, 'broken-copy')), error => error.message.includes('must be a real directory'));
   const shaderSource = join(dir, 'shader-source');
   const shaderTarget = join(dir, 'shader-target');
-  const reflector = resolve(dirname(fileURLToPath(import.meta.url)), '..', process.env.CARGO_TARGET_DIR ?? 'target', 'debug/exact-gpu-reflect');
+  const reflector = resolve(dirname(fileURLToPath(import.meta.url)), '..', process.env.CARGO_TARGET_DIR ?? 'target', `debug/exact-gpu-reflect${EXE}`);
   if (!existsSync(reflector)) spawnSync('cargo', ['build', '-q', '-p', 'exact-gpu-reflect'], { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '..') });
   mkdirSync(shaderSource);
   writeFileSync(join(shaderSource, 'surface.wgsl'), '@compute @workgroup_size(1) fn main() {}\n');
@@ -396,49 +412,121 @@ for (const [name, html, files, expectCode, expect] of [
     JSON.stringify({ created, deleted, recreated, errors }));
   rmSync(dir, { recursive: true, force: true });
 }
+// One helper request or reply cannot hold a large generation. It is captured
+// and retained in pages, and a later generation shares its unchanged assets.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'exact-dev-large-')), cache = join(dir, 'cache'), epoch = 'e'.repeat(32), size = 44 * 1024 * 1024;
+  mkdirSync(join(dir, 'assets'));
+  for (let i = 0; i < 3; i++) writeFileSync(join(dir, 'assets', `${i}.bin`), Buffer.alloc(size, i + 1));
+  const captured = captureAssets(dir), cards = assetCards(captured), plan = Buffer.from('plan');
+  const card = (body) => ({ bytes: body.length, sha256: sha256(body) });
+  const files = (seq) => {
+    const index = Buffer.from(JSON.stringify({ assets: cards }));
+    return new Map([['app.plan', plan], ...captured, ['assets.json', index], ['exact.json', Buffer.from(JSON.stringify({
+      exact: 1, dev: { epoch, seq }, plan: card(plan), assets: { url: 'assets.json', ...card(index), count: 3 },
+    }))]]);
+  };
+  const first = retainDevGeneration(cache, epoch, 1, files(1)), second = retainDevGeneration(cache, epoch, 2, files(2), undefined, first.token);
+  const read = readDevGeneration(cache, `/__dev/generation/${epoch}/2/assets/2.bin`)?.body;
+  const stored = readdirSync(join(cache, 'blobs')).length;
+  rmSync(dir, { recursive: true, force: true });
+  result('a large dev generation is captured and retained in pages and shares unchanged assets',
+    captured.size === 3 && first.bytes > 3 * size && second.bytes - first.bytes < 4096 && stored === 3 && read?.equals(captured.get('assets/2.bin')),
+    JSON.stringify({ captured: captured.size, first: first.bytes, second: second.bytes, stored, read: read?.length }));
+}
+// A publication the quota cannot hold is refused before its first batch is kept,
+// and one refused after its batches releases them, so a smaller one then fits.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'exact-dev-refused-')), cache = join(dir, 'cache'), epoch = 'f'.repeat(32), quota = 4500, batch = 1000;
+  const card = (body) => ({ bytes: body.length, sha256: sha256(body) }), plan = Buffer.from('plan');
+  const files = (seq, count) => {
+    const assets = Array.from({ length: count }, (_, i) => [`assets/${i}.bin`, Buffer.alloc(batch, seq * 16 + i)]);
+    const index = Buffer.from(JSON.stringify({ assets: assets.map(([name, body]) => ({ name, url: `./${name}`, ...card(body) })) }));
+    return new Map([['app.plan', plan], ...assets, ['assets.json', index], ['exact.json', Buffer.from(JSON.stringify({
+      exact: 1, dev: { epoch, seq }, plan: card(plan), assets: { url: 'assets.json', ...card(index), count },
+    }))]]);
+  };
+  const blobs = () => readdirSync(join(cache, 'blobs')).length;
+  retainDevGeneration(cache, epoch, 1, files(1, 1), quota, null, batch);
+  const whole = await rejects(() => retainDevGeneration(cache, epoch, 2, files(2, 3), quota, null, batch), (error) => error.message.includes('close all pages'));
+  const afterWhole = blobs();
+  // A conflicting payload refuses the envelope's request after two batches were kept.
+  mkdirSync(join(cache, epoch, '3'), { recursive: true });
+  writeFileSync(join(cache, epoch, '3', 'app.plan'), 'other');
+  const late = await rejects(() => retainDevGeneration(cache, epoch, 3, files(3, 2), quota, null, batch), (error) => error.message.includes('immutable'));
+  const afterLate = blobs();
+  const smaller = files(4, 1);
+  let fits = true;
+  try { retainDevGeneration(cache, epoch, 4, smaller, quota, null, batch); } catch { fits = false; }
+  const read = readDevGeneration(cache, `/__dev/generation/${epoch}/4/assets/0.bin`)?.body;
+  const detail = JSON.stringify({ whole, afterWhole, late, afterLate, fits, after: blobs() });
+  rmSync(dir, { recursive: true, force: true });
+  result('a refused dev publication leaves no blob charged, and a smaller one then fits',
+    whole && afterWhole === 1 && late && afterLate === 1 && fits && read?.equals(smaller.get('assets/0.bin')), detail);
+}
 // Independent dev payloads share a bounded queue; integrity still gates return.
 {
   const origin = 'http://exact.test/', body = Buffer.from('payload');
+  const assetBody = Buffer.alloc(56 * 1024 * 1024, 7);
+  const assetHash = sha256(assetBody);
   const card = name => ({ url: origin + name, bytes: body.length, sha256: sha256(body) });
-  const assets = Array.from({ length: 5 }, (_, i) => ({ name: `assets/${i}.txt`, ...card(`assets/${i}.txt`) }));
+  // Every tree the server captures is a name the client admits; an activity schema is one.
+  const assets = Array.from({ length: 5 }, (_, i) => i === 3 ? 'activities/3.json' : `assets/${i}.txt`).map(name => ({ name, url: origin + name, bytes: assetBody.length, sha256: assetHash }));
   const module = Object.fromEntries(['native', 'receipt', 'web'].map(key => [key, card(key)]));
-  const canonical = { assets: assets.map(({ name, bytes, sha256 }) => ({ bytes, name, sha256 })),
+  const canonical = { assets: assets.map(({ name, bytes, sha256 }) => ({ bytes, name, sha256 })).sort((a, b) => a.name < b.name ? -1 : 1),
     module: Object.fromEntries(['native', 'receipt', 'web'].map(key => [key, { bytes: body.length, sha256: sha256(body) }])),
     plan: { bytes: body.length, sha256: sha256(body) } };
   const identity = { epoch: 'a'.repeat(32), seq: 1, generation: sha256(Buffer.from(JSON.stringify(canonical))), program: 'b'.repeat(64) };
-  const envelope = { exact: 1, app: { id: 'com.exact.test' }, dev: identity, plan: card('app.plan'), assets, module };
-  let pending = [], peak = 0, count = 0, corrupt = false;
-  const context = { TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
+  // The cards are in the index the envelope names, fetched before the queue.
+  const index = Buffer.from(JSON.stringify({ assets }));
+  const envelope = { exact: 1, app: { id: 'com.exact.test' }, dev: identity, plan: card('app.plan'), assets: { url: origin + 'assets.json', bytes: index.length, sha256: sha256(index), count: 5 }, module };
+  let pending = [], peak = 0, count = 0, corrupt = false, asked = false, wake = () => {};
+  const context = { crypto: globalThis.crypto, TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
     performance, location: { href: origin, origin: new URL(origin).origin }, exact: { ready: Promise.resolve(), compat: { inputs: { app: 'com.exact.test' } } },
     fetch: async url => {
-      if (url === origin + 'exact.json') return new Response(JSON.stringify(envelope));
+      if (url === origin + 'exact.json') { asked = true; return new Response(JSON.stringify(envelope)); }
+      if (url === origin + 'assets.json') return new Response(index);
       count++;
       return await new Promise(resolve => {
-        pending.push(() => resolve(new Response(corrupt && url === origin + 'web' ? 'damaged' : body)));
+        pending.push(() => resolve(new Response(corrupt && url === origin + 'web' ? 'damaged' : /\/(assets|activities)\//.test(url) ? assetBody : body)));
         peak = Math.max(peak, pending.length);
+        wake();
       });
     } };
   runInNewContext(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../host/web/dev.js'), 'utf8'), context);
-  const run = async () => {
-    let done = false;
-    const promise = context.fetchGeneration({ ...identity, envelope: origin + 'exact.json' }, new AbortController().signal)
-      .then(value => ({ value }), error => ({ error })).finally(() => { done = true; });
-    await new Promise(setImmediate);
+  const run = async (held) => {
+    let done = false; asked = false;
+    // The held assets are read after the envelope: a page that boots this generation holds none before.
+    const promise = context.fetchGeneration({ ...identity, envelope: origin + 'exact.json' }, new AbortController().signal, false, () => asked ? held : null)
+      .then(value => ({ value }), error => ({ error })).finally(() => { done = true; wake(); });
+    await new Promise(resolve => {
+      wake = resolve;
+      if (pending.length || done) resolve();
+    });
     const first = pending.length;
-    for (let i = 0; !done && i < 20; i++) {
-      const batch = pending; pending = []; batch.forEach(resolve => resolve());
-      await new Promise(setImmediate);
+    while (!done) {
+      const batch = pending; pending = [];
+      await new Promise(resolve => {
+        wake = resolve;
+        batch.forEach(resolve => resolve());
+        if (done) resolve();
+      });
     }
-    if (!done) throw new Error('dev fetch queue did not settle');
     return { first, ...await promise };
   };
   const good = await run();
+  // The live generation's unchanged assets are not fetched again; a changed one is.
+  const live = new Map(good.value?.assets);
+  live.set('assets/4.txt', { ...live.get('assets/4.txt'), sha256: '0'.repeat(64) });
+  const again = await run(live), refetched = count - 8;
   corrupt = true;
   const bad = await run();
-  result('dev payloads fetch concurrently within four slots and refuse bad integrity',
-    good.first === 4 && peak === 4 && count === 16 && good.value?.assets.size === 5 && good.value?.module
+  result('a 280 MiB dev asset generation fetches within four slots, reuses unchanged assets and refuses bad integrity',
+    good.first === 4 && peak === 4 && refetched === 4 && count === 20 && good.value?.assets.size === 5 && good.value?.module
+      && again.value?.assets.get('assets/0.txt').bytes === good.value.assets.get('assets/0.txt').bytes
+      && again.value.assets.get('assets/4.txt').bytes !== good.value.assets.get('assets/4.txt').bytes
       && bad.error?.message.includes('payload integrity failed: module web'),
-    JSON.stringify({first:good.first,peak,count,goodError:good.error?.message,badError:bad.error?.message,assets:good.value?.assets.size}));
+    JSON.stringify({first:good.first,peak,count,refetched,goodError:good.error?.message,againError:again.error?.message,badError:bad.error?.message,assets:good.value?.assets.size}));
 }
 // A generation the dev loop names from asset cards captured on disk (which
 // carry their urls, as at a loop's start or an asset's edit) binds the
@@ -452,11 +540,12 @@ for (const [name, html, files, expectCode, expect] of [
   // Named in any order: the identity is over UTF-8 order, as a client sorts them.
   const generation = devGenerationDigest({ bytes: body.length, sha256: sha256(body) }, [...assets].reverse(), module);
   const identity = { epoch: 'a'.repeat(32), seq: 1, generation, program: 'b'.repeat(64) };
-  const envelope = { exact: 1, app: { id: 'com.exact.test' }, dev: identity, plan: card('app.plan'),
-    assets: assets.map(a => ({ ...a, url: origin + a.name })), module: Object.fromEntries(Object.keys(module).map(key => [key, card(key)])) };
+  // The index as a build writes it: cards relative to the index's own URL.
+  const { envelope: sealed, index } = sealEnvelope({ exact: 1, app: { id: 'com.exact.test' }, dev: identity, plan: card('app.plan'), assets,
+    module: Object.fromEntries(Object.keys(module).map(key => [key, card(key)])) }, origin + 'assets.json');
   const context = { TextEncoder, TextDecoder, AbortController, URL, setTimeout, clearTimeout,
     performance, location: { href: origin, origin: new URL(origin).origin }, exact: { ready: Promise.resolve(), compat: { inputs: { app: 'com.exact.test' } } },
-    fetch: async url => new Response(url === origin + 'exact.json' ? JSON.stringify(envelope) : body) };
+    fetch: async url => new Response(url === origin + 'exact.json' ? JSON.stringify(sealed) : url === origin + 'assets.json' ? index : body) };
   runInNewContext(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../host/web/dev.js'), 'utf8'), context);
   const got = await context.fetchGeneration({ ...identity, envelope: origin + 'exact.json' }, new AbortController().signal).then(value => ({ value }), error => ({ error }));
   result('a dev generation named from cards captured on disk binds the manifest a client checks',
@@ -598,7 +687,9 @@ for (const [name, html, files, expectCode, expect] of [
       writeFileSync(join(root, '.well-known/apple-app-site-association'), 'association');
     }
     const card = (name) => { const body = readFileSync(join(root, name)); return { name, url: './' + name, sha256: sha256(body), bytes: body.length }; };
-    writeFileSync(join(root, 'exact.json'), JSON.stringify({ exact: 1, plan: card('app.plan'), assets: listPublicFiles(root).filter((n) => n.startsWith('assets/')).map(card) }));
+    // A bake's roster has portable names only; `space #?.txt` is a public file it does not name.
+    const sealed = sealEnvelope({ exact: 1, plan: card('app.plan'), assets: listPublicFiles(root).filter((n) => /^assets\/[a-z.]+$/.test(n)).map(card) });
+    writeFileSync(join(root, 'assets.json'), sealed.index); writeFileSync(join(root, 'exact.json'), sealed.bytes);
     return root;
   };
   const oldWeb = makeWeb('old'), newWeb = makeWeb('new');
@@ -648,7 +739,7 @@ for (const [name, html, files, expectCode, expect] of [
   const table = await classify({ app, opts: {}, origin, channel: 'prod', snapshot: { commit: '0'.repeat(40), dirty: false, changes: [] }, release: 'test', web: newWeb,
     bundle: {}, compat: {}, platforms: [], wantOrigin: true });
   whole &&= table.rows[0].files.removed.join(',') === '.well-known/apple-app-site-association,assets/removed.txt';
-  const directHeadRefused = await rejects(async () => await origin.put(`.exact/web/${'b'.repeat(64)}/exact.json`, Buffer.from('unguarded'), { immutable: true }), error => error.message.includes('stream heads require putHead'));
+  const directHeadRefused = await rejects(async () => await origin.put(`.exact/web/${'b'.repeat(64)}/exact.json`, Buffer.from('unguarded'), { immutable: true }), error => error.message.includes('stream heads and locks require the held stream lock'));
   whole &&= directHeadRefused;
   const rootChannel = await classify({ app, opts: {}, origin, channel: 'root', snapshot: { commit: '0'.repeat(40), dirty: false, changes: [] }, release: 'test', web: newWeb,
     bundle: { plan: { sha256: '0'.repeat(64), bytes: 3 }, assets: [] }, compat: { linux: { id: 'c'.repeat(32), inputs: { store: { L: 'A' }, executors: [] } } }, platforms: ['linux'], wantOrigin: false });
@@ -668,9 +759,12 @@ for (const [name, html, files, expectCode, expect] of [
     }));
     const envelopeResponse = await fetch(url, { headers: { accept: 'application/vnd.exact.envelope+json' } });
     const envelope = await envelopeResponse.json();
-    for (const card of [envelope.plan, ...envelope.assets]) {
-      const response = await fetch(url + card.url), bytes = Buffer.from(await response.arrayBuffer());
-      payload.push(response.ok && card.url.startsWith('/.exact/root/web/releases/') && sha256(bytes) === card.sha256 && bytes.length === card.bytes);
+    const indexURL = new URL(envelope.assets.url, url), listed = readAssetIndex(envelope.assets, Buffer.from(await (await fetch(indexURL)).arrayBuffer()));
+    payload.push(envelope.assets.url.startsWith('/.exact/root/web/releases/'));
+    for (const card of [envelope.plan, ...listed]) {
+      const at = new URL(card.url, card === envelope.plan ? url : indexURL);
+      const response = await fetch(at), bytes = Buffer.from(await response.arrayBuffer());
+      payload.push(response.ok && at.pathname.startsWith('/.exact/root/web/releases/') && sha256(bytes) === card.sha256 && bytes.length === card.bytes);
     }
     rounds++;
     return expected && payload.every(Boolean) && envelopeResponse.headers.get('vary') === 'Accept';
@@ -861,7 +955,7 @@ for (const [name, html, files, expectCode, expect] of [
 
 // Exercise the driver's actual method with a quantized wall clock (#285).
 test('clock +N real never seeks behind the last reply and ends at from + N', async () => {
-  const source = readFileSync(new URL('./agent.mjs', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('./agent-session.mjs', import.meta.url), 'utf8');
   const start = source.indexOf("    async clock(spec = 'settle'"); // (its parameters after the spec are its own)
   const end = source.indexOf('\n    /** The window', start);
   for (const host of ['macos', 'ios', 'host', 'host-ios', 'web', 'linux']) {

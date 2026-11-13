@@ -1,6 +1,7 @@
 //! Opt-in, single-finger vertical scrolling for the KMS kiosk probe.
 //! The presenter owns logical scrolling/virtualization; this shell owns touch physics.
-use crate::{input::InputEvent, Presenter};
+use crate::input::InputEvent;
+use exact_painted::Presenter;
 use exact_runner::DataSource;
 
 // Rendering may queue several evdev reports. Sample the final position once per
@@ -106,12 +107,12 @@ impl TouchScroll {
                     .as_ref()
                     .is_some_and(|g| g.id == s.id && matches!(g.phase, Phase::Coasting));
                 let position = s.offset.1
-                    + p.kiosk_overscroll
+                    + p.kiosk_overscroll()
                         .filter(|(id, _)| *id == s.id)
                         .map_or(0., |(_, y)| y);
                 self.gesture = Some(Gesture {
                     id: s.id,
-                    host: p.hosts,
+                    host: p.hosts(),
                     phase: if catch {
                         Phase::Dragging
                     } else {
@@ -140,7 +141,7 @@ impl TouchScroll {
                     x.map_or(pointer.0, |v| (v * viewport.0).clamp(0., viewport.0 - 1.)),
                     y.map_or(pointer.1, |v| (v * viewport.1).clamp(0., viewport.1 - 1.)),
                 );
-                let Some(s) = p.kiosk_scroll_state(g.id).filter(|_| g.host == p.hosts) else {
+                let Some(s) = p.kiosk_scroll_state(g.id).filter(|_| g.host == p.hosts()) else {
                     self.clear(p);
                     return false;
                 };
@@ -211,7 +212,7 @@ impl TouchScroll {
         if !matches!(g.phase, Phase::Coasting) {
             return;
         }
-        let Some(s) = p.kiosk_scroll_state(g.id).filter(|_| g.host == p.hosts) else {
+        let Some(s) = p.kiosk_scroll_state(g.id).filter(|_| g.host == p.hosts()) else {
             self.clear(p);
             return;
         };
@@ -231,7 +232,7 @@ impl TouchScroll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presenter::PainterChoice;
+    use exact_painted::presenter::PainterChoice;
     use std::path::PathBuf;
 
     fn fixture() -> (Presenter<()>, TouchScroll, (f32, f32), u32) {
@@ -345,7 +346,7 @@ mod tests {
             20.,
         );
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 0.);
-        let over = p.kiosk_overscroll.unwrap().1;
+        let over = p.kiosk_overscroll().unwrap().1;
         assert!(over < 0. && over > -100.);
         input(
             &mut s,
@@ -374,7 +375,7 @@ mod tests {
             s.tick(&mut p, 152. + n as f64 * 16.);
         }
         assert!(!s.animating());
-        assert!(p.kiosk_overscroll.is_none());
+        assert!(p.kiosk_overscroll().is_none());
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 0.);
     }
     #[test]

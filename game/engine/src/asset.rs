@@ -100,6 +100,9 @@ pub struct MaterialData {
     pub clearcoat: f32,
     /// The coat's roughness, 0 to 1.
     pub clearcoat_roughness: f32,
+    /// Multiply clearcoat by the metallic-roughness texture's alpha channel.
+    /// Opt-in packing for generated models; absent textures have alpha one.
+    pub clearcoat_mask_from_alpha: bool,
     /// A sheen's linear colour (`KHR_materials_sheen`); black is none.
     pub sheen_color: [f32; 3],
     /// The sheen's roughness, 0 to 1.
@@ -128,6 +131,7 @@ impl Default for MaterialData {
             unlit: false,
             clearcoat: 0.0,
             clearcoat_roughness: 0.0,
+            clearcoat_mask_from_alpha: false,
             sheen_color: [0.0; 3],
             sheen_roughness: 0.0,
         }
@@ -182,6 +186,10 @@ macro_rules! material_record {
                     w.field(stringify!($field));
                     Data::write(&self.$field, w);
                 )*
+                if self.clearcoat_mask_from_alpha {
+                    w.field("clearcoat_mask_from_alpha");
+                    self.clearcoat_mask_from_alpha.write(w);
+                }
                 let shading = Shading::of(self);
                 if !shading.is_default() {
                     w.field("shading");
@@ -192,6 +200,7 @@ macro_rules! material_record {
             fn read(&mut self, r: &mut dyn crate::Reader) -> Result<(), crate::DataError> {
                 // The record's rule, not a patch: no name read is no name.
                 self.name.clear();
+                self.clearcoat_mask_from_alpha = false;
                 Shading::default().assign(self);
                 let fields = [$(stringify!($field)),*];
                 let mut seen = [false; [$(stringify!($field)),*].len()];
@@ -202,6 +211,8 @@ macro_rules! material_record {
                     }
                     match field.as_str() {
                         "name" => self.name.read(r).map_err(|e| e.at("name"))?,
+                        "clearcoat_mask_from_alpha" => self.clearcoat_mask_from_alpha.read(r)
+                            .map_err(|e| e.at("clearcoat_mask_from_alpha"))?,
                         "shading" => {
                             let mut shading = Shading::default();
                             shading.read(r).map_err(|e| e.at("shading"))?;
@@ -329,6 +340,17 @@ impl TextureFormat {
     }
 }
 impl TextureFamily {
+    /// The compressed families this target's native bundle holds, as
+    /// `scripts/texture-families.mjs` thins it: BC on a Mac, whose every GPU
+    /// reads it; ASTC on iOS and tvOS, whose every GPU reads it (an M-series
+    /// iPad reads BC too, but its bundle holds ASTC). Elsewhere both.
+    pub const BUNDLED: &'static [Self] = if cfg!(target_os = "macos") {
+        &[Self::Bc]
+    } else if cfg!(any(target_os = "ios", target_os = "tvos")) {
+        &[Self::Astc]
+    } else {
+        &[Self::Bc, Self::Astc]
+    };
     /// The family's name, as `state.world.gpu.textureFamily` reports it.
     pub fn label(self) -> &'static str {
         ["Rgba8", "Bc", "Astc"][self as usize]
@@ -747,7 +769,7 @@ pub enum AssetState {
 #[derive(Default, Clone)]
 pub(crate) struct Assets {
     pub models: map::AssetMap<ModelAsset>,
-    pub identities: std::collections::BTreeMap<String, u64>,
+    pub identities: std::collections::BTreeMap<String, generated::Identity>,
     pub levels: map::AssetMap<Arc<LevelValue>>,
     pub tables: Option<Arc<table::TableStore>>,
     pub sounds: map::AssetMap<Arc<SoundAsset>>,

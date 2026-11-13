@@ -12,10 +12,10 @@ import { fileURLToPath } from 'node:url';
 const dir = mkdtempSync(resolve(tmpdir(), 'exact-js-symbols-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 copyFileSync(resolve(fileURLToPath(new URL('../../web-js/symbols.js', import.meta.url))), resolve(dir, 'symbols.js'));
-writeFileSync(resolve(dir, 'rt.js'), 'export const { After, PropHooks, inflight, journal, clock, data } = globalThis.rtStandIn;\n');
+writeFileSync(resolve(dir, 'rt.js'), 'export const { After, PropHooks, Hooks, inflight, journal, clock, data, onEnd } = globalThis.rtStandIn;\n');
 writeFileSync(resolve(dir, 'picker-glue.js'), '');
 const After = [], PropHooks = {}, inflight = { n: 0 };
-globalThis.rtStandIn = { After, PropHooks, inflight, journal: [], clock: { now: 0 }, data: { appId: 'com.example' } };
+globalThis.rtStandIn = { After, PropHooks, Hooks: {}, inflight, journal: [], clock: { now: 0 }, data: { appId: 'com.example' }, onEnd() {} };
 
 class Img {
   constructor() { this.localName = 'img'; this.attrs = new Map(); this.props = new Map(); this.classList = [];
@@ -28,21 +28,68 @@ class Img {
   set src(v) { this.setAttribute('src', v); }
   get alt() { return this.getAttribute('alt') ?? ''; }
   set alt(v) { this.setAttribute('alt', v); }
+  get isConnected() { return true; }
   get clientWidth() { return 24; } get clientHeight() { return 24; }
 }
 const el = new Img();
 globalThis.document = {
   head: { append() {} }, createElement: () => ({}), styleSheets: [],
-  querySelectorAll: (sel) => (sel.includes('data-symbol-path') ? el.hasAttribute('data-symbol-path') : sel.includes('data-app-src') ? el.hasAttribute('data-app-src') : el.hasAttribute('data-symbol-source')) ? [el] : [],
+  getElementById: () => ({}),
 };
+globalThis.window = {};
+globalThis.addEventListener = () => {};
+globalThis.matchMedia = () => ({ addEventListener() {} });
+globalThis.MutationObserver = class { observe() {} };
 globalThis.getComputedStyle = () => ({ fontSize: '17px', fontWeight: '400', objectFit: 'contain', paddingLeft: '0', paddingRight: '0', paddingTop: '0', paddingBottom: '0', getPropertyValue: () => '' });
 globalThis.exact = { appURL: async (path) => `blob:test/${path}` };
+
+async function refresh() {
+  for (const f of After) f();
+  await Promise.resolve();
+}
+
+function symbolServer(content, boot) {
+  const root = resolve(import.meta.dir, '../../..');
+  const html = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8'))
+    .replace('<link rel="preload" href="./app.wasm" as="fetch" crossorigin>', '')
+    .replace('<div id="exact-root"></div>', `<div id="exact-root">${content}</div>`)
+    // Register static images as rt.js does when it adopts a page.
+    .replace('<script type="module" src="./glue.js"></script>', `<script type="module">
+      import { Hooks } from '/rt.js';
+      for (const e of document.querySelectorAll('#exact-root img[data-symbol-source]')) Hooks.image(e);
+      ${boot}</script>`);
+  return Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    const path = new URL(request.url).pathname.slice(1);
+    if (!path) return new Response(html, { headers: { 'content-type': 'text/html' } });
+    // Unbundled rt.js re-exports perf.js, which reads this generated table.
+    if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
+    const match = /^(web\/)?([A-Za-z0-9_.-]+\.js)$/.exec(path);
+    if (!match) return new Response('Not found', { status: 404 });
+    const files = match[1] ? [resolve(root, 'host/web', match[2])]
+      : [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)];
+    const file = files.find(existsSync);
+    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
+  } });
+}
+
+async function symbolReady(page, url, report = () => {}) {
+  const errors = [];
+  const error = (kind, value) => { errors.push([kind, value]); report(kind, value); };
+  page.setDefaultTimeout(5000);
+  page.on('pageerror', value => error('pageerror', String(value)));
+  page.on('requestfailed', request => error('requestfailed', [request.url(), request.failure()]));
+  page.on('response', response => { if (response.status() >= 400) error('http', [response.url(), response.status()]); });
+  await page.goto(url);
+  await page.waitForFunction(() => globalThis.ready);
+  expect(errors).toEqual([]);
+  return errors;
+}
 
 test('an image that leaves a symbol for an app:/ file keeps the file', async () => {
   const { symbols } = await import(resolve(dir, 'symbols.js'));
   symbols({ photo: ['M0 0L24 24', false] });
   expect(PropHooks.src(el, 'symbol:photo')).toBe(true);
-  for (const f of After) f();
+  await refresh();
   expect(el.getAttribute('data-symbol-path')).toBe('M0 0L24 24');
   expect(el.getAttribute('src')).toStartWith('data:image/svg+xml');
   expect(PropHooks.src(el, 'app:/data/photo.png')).toBe(true);
@@ -52,7 +99,7 @@ test('an image that leaves a symbol for an app:/ file keeps the file', async () 
   while (inflight.n) await Bun.sleep(1);
   expect(el.getAttribute('src')).toBe('blob:test/app:/data/photo.png');
   // A later commit's refresh leaves it there.
-  for (const f of After) f();
+  await refresh();
   expect(el.getAttribute('src')).toBe('blob:test/app:/data/photo.png');
 });
 
@@ -73,23 +120,21 @@ test('a symbol is decorative unless its author named it', async () => {
 test('a symbol keeps its aspect under object-fit: fill', async () => {
   const { symbols } = await import(resolve(dir, 'symbols.js'));
   symbols({ chevron: ['M8 6l6 6-6 6', false] });
-  const was = globalThis.getComputedStyle, query = document.querySelectorAll;
+  const was = globalThis.getComputedStyle;
   try {
     for (const [fit, size] of [['fill', 'contain'], ['cover', 'cover'], ['none', '17px 17px']]) {
       globalThis.getComputedStyle = () => ({ fontSize: '17px', fontWeight: '400', objectFit: fit, paddingLeft: '0', paddingRight: '0', paddingTop: '0', paddingBottom: '0', getPropertyValue: () => '' });
       const wide = new Img();
-      document.querySelectorAll = (sel) => sel.includes('data-symbol-path') && wide.hasAttribute('data-symbol-path') ? [wide] : [];
       expect(PropHooks.src(wide, 'symbol:chevron')).toBe(true);
-      for (const f of After) f();
+      await refresh();
       expect(wide.style.getPropertyValue('--exact-symbol-fit')).toBe(size);
     }
-  } finally { globalThis.getComputedStyle = was; document.querySelectorAll = query; }
+  } finally { globalThis.getComputedStyle = was; }
 });
 
 // The emitted entry installs symbols before mounting, then projects navigation.
 // Use the real consumers and stylesheet: no exactViewport resource commits on resize.
 test('symbol axes follow the current projected title and root font without another action', async () => {
-  const root = resolve(import.meta.dir, '../../..');
   const axes = { auto: '', fixed: '--exact-symbol-size-authored:1;--exact-symbol-weight-authored:1;font-size:23px;font-weight:800;',
     size: '--exact-symbol-size-authored:1;font-size:23px;', weight: '--exact-symbol-weight-authored:1;font-weight:800;' };
   const tabs = Object.entries(axes).map(([id, style]) => `<button id="tab-${id}" role="tab" aria-controls="panel-${id}" aria-selected="${id === 'auto'}" data-button-style="bordered" style="display:grid;flex:1">
@@ -99,9 +144,11 @@ test('symbol axes follow the current projected title and root font without anoth
     <div style="flex:1">${panels}</div><div role="tablist" style="display:flex;flex-direction:row">${tabs}</div></div>
     <button id="larger">Root 125%</button><button id="reset">Root medium</button><button id="title">Title 30/600</button><button id="inherit">Inherited title</button>`;
   const boot = `import { symbols } from '/symbols.js';
-    import { After, commit, C, sig, W, S } from '/rt.js';
+    import { After, commit, C, sig, W, S, useCommands } from '/rt.js';
+    import { setRootFontSize } from '/commands.js';
     import { projectRoots } from '/document.js';
     import { navigation } from '/navigation.js';
+    useCommands({ setRootFontSize });
     const size = sig(null), weight = sig(null);
     for (const e of document.querySelectorAll('[data-exact-text]')) {
       S(e, 'font-size', 'px', () => size()); S(e, 'font-weight', '', () => weight());
@@ -114,33 +161,16 @@ test('symbol axes follow the current projected title and root font without anoth
     document.getElementById('title').onclick = () => commit(() => { W(size, 30); W(weight, 600); });
     document.getElementById('inherit').onclick = () => commit(() => { W(size, null); W(weight, null); });
     globalThis.ready = true;`;
-  const html = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8'))
-    .replace('<div id="exact-root"></div>', `<div id="exact-root">${content}</div>`)
-    .replace('<script type="module" src="./glue.js"></script>', `<script type="module">${boot}</script>`);
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
-    const path = new URL(request.url).pathname.slice(1);
-    if (!path) return new Response(html, { headers: { 'content-type': 'text/html' } });
-    // Unbundled rt.js re-exports perf.js, which reads this generated table.
-    if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
-    if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
-    const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
-  } });
+  const server = symbolServer(content, boot);
   let browser, stage = 'launch';
   const report = (kind, value) => console.log('symbol diagnostic', JSON.stringify({ stage, kind, value }));
   try {
     browser = await suiteBrowser('chromium', { timeout: 10000 });
     stage = 'page'; report('stage', stage);
     const page = await browser.newPage({ viewport: { width: 1280, height: 700 } });
-    page.setDefaultTimeout(5000);
-    const errors = [], observed = [], expected = [];
-    page.on('pageerror', error => { errors.push(String(error)); report('pageerror', String(error)); });
-    page.on('requestfailed', request => report('requestfailed', [request.url(), request.failure()]));
-    page.on('response', response => { if (response.status() >= 400) report('http', [response.url(), response.status()]); });
+    const observed = [], expected = [];
     stage = 'navigation'; report('stage', stage);
-    await page.goto(server.url.href);
-    stage = 'ready'; report('stage', stage);
-    await page.waitForFunction(() => globalThis.ready);
+    const errors = await symbolReady(page, server.url.href, report);
     async function sample(name, titleSize, titleWeight, sidebar) {
       const value = await page.evaluate(() => ({
         sidebar: document.getElementById('nav').hasAttribute('data-exact-sidebar'),
@@ -184,18 +214,14 @@ test('symbol axes follow the current projected title and root font without anoth
 }, 30000);
 
 
-// LLP 1121 stage 9 B (D10): under a bound `color` the JS target decides after
-// each commit whether a symbol draws in its colour (style.rs `symbol_marks`,
-// symbols.js `inked`). Since LLP 1081 stage 2 (317ddfea6a) every page symbol
-// draws in its `color`, as the Apple hosts do, written or not: a conditional
-// colour that goes leaves the colour past it, one that comes back takes it again.
+// LLP 1081 stage 2: a conditional colour that goes leaves the colour past it;
+// one that comes back takes it again.
 test('a symbol under a bound colour follows whether it has a value', async () => {
-  const root = resolve(import.meta.dir, '../../..');
-  const img = (id, ink) => `<img id="${id}" data-symbol-source="symbol:book" data-symbol-path="M0 0L24 24" data-symbol-ink="${ink}" style="width:16px;height:16px">`;
-  const content = `<div style="--exact-accent:rgb(102, 82, 197)">
-    <div id="bound" data-exact-ink="1">${img('alone', '10')}</div>
-    <div style="color:rgb(0, 128, 0)"><div id="inner" data-exact-ink="1">${img('over', '11')}</div></div>
-    <div id="implied" data-exact-ink="0">${img('unwritten', '10')}</div></div>
+  const img = id => `<img id="${id}" data-symbol-source="symbol:book" data-symbol-path="M0 0L24 24" style="width:16px;height:16px">`;
+  const content = `<div style="color:rgb(10, 20, 30);--exact-accent:rgb(102, 82, 197)">
+    <div id="bound">${img('alone')}</div>
+    <div style="color:rgb(0, 128, 0)"><div id="inner">${img('over')}</div></div>
+    <div id="implied">${img('unwritten')}</div></div>
     <button id="off">Off</button><button id="on">On</button>`;
   const boot = `import { symbols } from '/symbols.js';
     import { commit, sig, W, S } from '/rt.js';
@@ -206,37 +232,20 @@ test('a symbol under a bound colour follows whether it has a value', async () =>
     document.getElementById('off').onclick = () => commit(() => W(c, null));
     document.getElementById('on').onclick = () => commit(() => W(c, 'rgb(255, 0, 0)'));
     globalThis.ready = true;`;
-  const html = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8'))
-    .replace('<div id="exact-root"></div>', `<div id="exact-root">${content}</div>`)
-    .replace('<script type="module" src="./glue.js"></script>', `<script type="module">${boot}</script>`);
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
-    const path = new URL(request.url).pathname.slice(1);
-    if (!path) return new Response(html, { headers: { 'content-type': 'text/html' } });
-    if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
-    if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
-    const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
-  } });
+  const server = symbolServer(content, boot);
   let browser;
   try {
     browser = await suiteBrowser('chromium', { timeout: 10000 });
     const page = await browser.newPage();
-    const errors = [];
-    page.on('pageerror', error => errors.push(String(error)));
-    await page.goto(server.url.href);
-    await page.waitForFunction(() => globalThis.ready);
-    // Each symbol's ink: its own `color` (named so), else the colour it shows.
+    const errors = await symbolReady(page, server.url.href);
     const ink = () => page.evaluate(() => new Promise(done => requestAnimationFrame(() => done(Object.fromEntries(['alone', 'over', 'unwritten']
-      .map(id => { const s = getComputedStyle(document.getElementById(id)); return [id, [s.backgroundColor === s.color ? 'colour' : s.backgroundColor, s.color]]; }))))));
-    const red = 'rgb(255, 0, 0)', green = 'rgb(0, 128, 0)';
-    expect(await ink()).toEqual({ alone: ['colour', red], over: ['colour', red], unwritten: ['colour', red] });
+      .map(id => [id, getComputedStyle(document.getElementById(id)).backgroundColor]))))));
+    const red = 'rgb(255, 0, 0)', green = 'rgb(0, 128, 0)', base = 'rgb(10, 20, 30)';
+    expect(await ink()).toEqual({ alone: red, over: red, unwritten: red });
     await page.locator('#off').click();
-    const off = await ink();
-    expect(off.over).toEqual(['colour', green]);
-    expect([off.alone[0], off.unwritten[0]]).toEqual(['colour', 'colour']);
-    expect(off.alone[1]).not.toBe(red);
+    expect(await ink()).toEqual({ alone: base, over: green, unwritten: base });
     await page.locator('#on').click();
-    expect(await ink()).toEqual({ alone: ['colour', red], over: ['colour', red], unwritten: ['colour', red] });
+    expect(await ink()).toEqual({ alone: red, over: red, unwritten: red });
     expect(errors).toEqual([]);
   } finally {
     try { await browser?.close(); } finally { server.stop(true); }
@@ -247,7 +256,6 @@ test('a symbol under a bound colour follows whether it has a value', async () =>
 // scheme changes without a commit: it follows, as on the web host (glue.js
 // `mediaChanged`).
 test('a symbol on a button follows its title across a colour scheme change', async () => {
-  const root = resolve(import.meta.dir, '../../..');
   const content = `<button type="button" data-native data-button-style="bordered" style="display:grid;color:light-dark(rgb(1, 2, 3), rgb(4, 5, 6))">
     <img id="symbol" data-symbol-source="symbol:book" data-symbol-path="M0 0L24 24"><span data-exact-text>Library</span></button>`;
   const boot = `import { symbols } from '/symbols.js';
@@ -255,25 +263,12 @@ test('a symbol on a button follows its title across a colour scheme change', asy
     symbols({ book: ['M0 0L24 24', false] });
     commit(() => {});
     globalThis.ready = true;`;
-  const html = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8'))
-    .replace('<div id="exact-root"></div>', `<div id="exact-root">${content}</div>`)
-    .replace('<script type="module" src="./glue.js"></script>', `<script type="module">${boot}</script>`);
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
-    const path = new URL(request.url).pathname.slice(1);
-    if (!path) return new Response(html, { headers: { 'content-type': 'text/html' } });
-    if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
-    if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
-    const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
-  } });
+  const server = symbolServer(content, boot);
   let browser;
   try {
     browser = await suiteBrowser('chromium', { timeout: 10000 });
     const page = await browser.newPage({ colorScheme: 'light' });
-    const errors = [];
-    page.on('pageerror', error => errors.push(String(error)));
-    await page.goto(server.url.href);
-    await page.waitForFunction(() => globalThis.ready);
+    const errors = await symbolReady(page, server.url.href);
     const ink = () => page.evaluate(() => new Promise(done => requestAnimationFrame(() => done(getComputedStyle(document.getElementById('symbol')).backgroundColor))));
     expect(await ink()).toBe('rgb(1, 2, 3)');
     await page.emulateMedia({ colorScheme: 'dark' });
@@ -289,25 +284,22 @@ test('a symbol on a button follows its title across a colour scheme change', asy
 // token colour writes it again as its implied row, no author's, and a symbol under it
 // draws in that colour (LLP 1081 stage 2), as does one under a boundary whose own bound
 // colour clears (the implied row stands there, as the runner installs it). The parent's
-// own colour differs from the mode's row, so inheritance alone would show blue. A bound colour on a boundary
-// (`Sx`) otherwise keeps its binding's provenance (`$ink`, rows.rs), not what the
-// boundary leaves inline: with no token above, a clear is said; `none` gives the
-// decision past it back; a value is said; a refused value is a clear.
+// own colour differs from the mode's row, so inheritance alone would show blue.
+// With no token above, a clear or refusal leaves the inherited colour.
 test('a symbol under a mode boundary follows its implied row and its binding', async () => {
-  const root = resolve(import.meta.dir, '../../..');
-  const img = (id, attr) => `<img id="${id}" data-symbol-source="symbol:book" data-symbol-path="M0 0L24 24" ${attr} style="width:16px;height:16px">`;
-  const content = `<div style="--exact-accent:rgb(102, 82, 197)">
-    <div class="c1" style="color:rgb(0, 0, 255)">${img('beside', 'data-symbol-color')}
-      <div id="pin" data-x-b="0" data-exact-ink="b">${img('under', 'data-symbol-ink="11"')}</div>
-      <div id="bound" data-x-b="0" data-exact-ink="1b">${img('cleared', 'data-symbol-ink="11"')}</div></div>
-    <div id="bare" data-x-b="0" data-exact-ink="1b">${img('alone', 'data-symbol-ink="10"')}</div></div>
+  const img = id => `<img id="${id}" data-symbol-source="symbol:book" data-symbol-path="M0 0L24 24" style="width:16px;height:16px">`;
+  const content = `<div style="color:rgb(10, 20, 30);--exact-accent:rgb(102, 82, 197)">
+    <div class="c1" style="color:rgb(0, 0, 255)">${img('beside')}
+      <div id="pin" data-x-b="0">${img('under')}</div>
+      <div id="bound" data-x-b="0">${img('cleared')}</div></div>
+    <div id="bare" data-x-b="0">${img('alone')}</div></div>
     <button id="none">None</button><button id="red">Red</button><button id="bad">Bad</button><button id="paint">Paint</button>`;
   const boot = `import { symbols } from '/symbols.js';
     import { modes, Sx } from '/modes.js';
     import { commit, sig, W, S } from '/rt.js';
     modes([], { c1: [0] }, ['color:rgb(0, 128, 0)'], {}, [], {});
     const c = sig('inherit');
-    for (const id of ['bound', 'bare']) { const e = document.getElementById(id); Sx(S, e, 'color', '', () => { const v = c(); e.$ink = v != null; return v; }, 0); }
+    for (const id of ['bound', 'bare']) Sx(S, document.getElementById(id), 'color', '', () => c(), 0);
     symbols({ book: ['M0 0L24 24', false] });
     commit(() => {});
     document.getElementById('none').onclick = () => commit(() => W(c, null));
@@ -315,53 +307,83 @@ test('a symbol under a mode boundary follows its implied row and its binding', a
     document.getElementById('bad').onclick = () => commit(() => W(c, 'not a colour'));
     document.getElementById('paint').onclick = () => commit(() => W(c, document.getElementById('paint').dataset.v));
     globalThis.ready = true;`;
-  const html = withLook(readFileSync(resolve(root, 'host/web/index.html'), 'utf8'))
-    .replace('<div id="exact-root"></div>', `<div id="exact-root">${content}</div>`)
-    .replace('<script type="module" src="./glue.js"></script>', `<script type="module">${boot}</script>`);
-  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
-    const path = new URL(request.url).pathname.slice(1);
-    if (!path) return new Response(html, { headers: { 'content-type': 'text/html' } });
-    if (path === 'names.js') return new Response('export const sourceTypes = {};', { headers: { 'content-type': 'text/javascript' } });
-    if (!/^[A-Za-z0-9_.-]+\.js$/.test(path)) return new Response('Not found', { status: 404 });
-    const file = [resolve(root, 'host/web-js', path), resolve(root, 'host/web', path)].find(existsSync);
-    return file ? new Response(readFileSync(file), { headers: { 'content-type': 'text/javascript' } }) : new Response('Not found', { status: 404 });
-  } });
+  const server = symbolServer(content, boot);
   let browser;
   try {
     browser = await suiteBrowser('chromium', { timeout: 10000 });
     const page = await browser.newPage();
-    const errors = [];
-    page.on('pageerror', error => errors.push(String(error)));
-    await page.goto(server.url.href);
-    await page.waitForFunction(() => globalThis.ready);
-    // Each symbol's ink, and the colour it would take (its own `color`).
+    const errors = await symbolReady(page, server.url.href);
     const ink = () => page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(() => done(Object.fromEntries(['beside', 'under', 'cleared', 'alone']
-      .map(id => { const s = getComputedStyle(document.getElementById(id)); return [id, s.backgroundColor === s.color ? 'colour' : s.backgroundColor]; })))))));
-    // Every symbol draws in its `color` since LLP 1081 stage 2 (317ddfea6a): what the binding and the implied
-    // row decide is that colour, read below.
-    const all = { beside: 'colour', under: 'colour', cleared: 'colour', alone: 'colour' };
-    const colour = id => page.evaluate(id => getComputedStyle(document.getElementById(id)).color, id);
-    const green = 'rgb(0, 128, 0)';
-    expect(await ink()).toEqual(all);
-    expect([await colour('beside'), await colour('under'), await colour('cleared')]).toEqual(['rgb(0, 0, 255)', green, green]);
+      .map(id => [id, getComputedStyle(document.getElementById(id)).backgroundColor])))))));
+    const green = 'rgb(0, 128, 0)', red = 'rgb(255, 0, 0)', base = 'rgb(10, 20, 30)';
+    const colours = (cleared = green, alone = base) => ({ beside: 'rgb(0, 0, 255)', under: green, cleared, alone });
+    expect(await ink()).toEqual(colours());
     await page.locator('#none').click();
-    expect(await ink()).toEqual(all);
-    expect(await colour('cleared')).toBe(green);
+    expect(await ink()).toEqual(colours());
     await page.locator('#red').click();
-    expect(await ink()).toEqual(all);
-    expect(await colour('cleared')).toBe('rgb(255, 0, 0)');
+    expect(await ink()).toEqual(colours(red, red));
     // A value the row refuses is unset as a clear is: the implied row stands.
     await page.locator('#bad').click();
-    expect(await colour('cleared')).toBe(green);
-    // One clear or refusal after another keeps the implied row; a value is said
-    // (the kernel's, modes_tests.rs `a_symbol_under_a_mode_boundary_…`).
+    expect(await ink()).toEqual(colours());
+    // One clear or refusal after another keeps the implied row.
     for (const [v, want] of [['inherit', green], ['unset', green], ['currentcolor', green], ['nope', green], ['nada', green], ['rgb(255, 0, 0)', 'rgb(255, 0, 0)'], ['inherit', green]]) {
       await page.evaluate(v => { document.getElementById('paint').dataset.v = v; }, v);
       await page.locator('#paint').click();
-      expect([v, (await ink()).cleared, await colour('cleared')]).toEqual([v, 'colour', want]);
+      expect([v, await ink()]).toEqual([v, colours(want, want === red ? red : base)]);
     }
     expect(errors).toEqual([]);
   } finally {
     try { await browser?.close(); } finally { server.stop(true); }
   }
 }, 30000);
+
+
+test('adoption draws the static icon selected by the client viewport', async () => {
+  const wide = 'M2 2H8V22H2Z', narrow = 'M16 2H22V22H16Z';
+  const server = symbolServer(`<img id="icon" data-symbol-source="symbol:icon|star|0 0 24 24|${wide}|icons/wide.svg" data-symbol-path="${wide}" data-symbol-fill data-symbol-nonzero data-symbol-viewbox="0 0 24 24">`, `
+    import { symbols } from '/symbols.js';
+    import { h, adoptRow, commit } from '/rt.js';
+    symbols({});
+    const root = document.getElementById('exact-root'), original = root.firstElementChild;
+    const path = innerWidth < 600 ? '${narrow}' : '${wide}';
+    commit(() => adoptRow(root, () => h(root, 'img', 0, {
+      id: 'icon', 'data-symbol-source': 'symbol:icon|star|0 0 24 24|' + path + '|icons/client.svg',
+      'data-symbol-fill': '', 'data-symbol-nonzero': '', 'data-symbol-viewbox': '0 0 24 24'
+    }, 0)));
+    globalThis.reused = original === root.firstElementChild;
+    globalThis.ready = true;`);
+  const browser = await suiteBrowser('chromium', { timeout: 10000 });
+  try {
+    const page = await browser.newPage({ viewport: { width: 400, height: 300 } });
+    await symbolReady(page, server.url.href);
+    const result = await page.evaluate(() => {
+      const e = document.getElementById('icon');
+      return [globalThis.reused, e.getAttribute('data-symbol-path'), decodeURIComponent(e.symbolMask)];
+    });
+    expect(result.slice(0, 2)).toEqual([true, narrow]);
+    expect(result[2]).toContain('d="' + narrow + '"');
+  } finally { await browser.close(); server.stop(true); }
+}, 15000);
+
+test('a static icon without a viewBox keeps its nonzero fill rule', async () => {
+  const path = 'M2 2H22V22H2Z M8 8H16V16H8Z';
+  const server = symbolServer('', `
+    import { symbols } from '/symbols.js';
+    import { h, commit } from '/rt.js';
+    symbols({});
+    commit(() => h(document.getElementById('exact-root'), 'img', 0, {
+      id: 'icon', 'data-symbol-source': 'symbol:icon|star||${path}|icons/a.svg',
+      'data-symbol-fill': '', 'data-symbol-nonzero': ''
+    }, 0));
+    globalThis.ready = true;`);
+  const browser = await suiteBrowser('chromium', { timeout: 10000 });
+  try {
+    const page = await browser.newPage();
+    await symbolReady(page, server.url.href);
+    expect(await page.evaluate(() => {
+      const e = document.getElementById('icon');
+      return [e.hasAttribute('data-symbol-nonzero'), e.hasAttribute('data-symbol-evenodd'),
+        decodeURIComponent(e.symbolMask).match(/fill-rule="([a-z]+)"/)[1]];
+    })).toEqual([true, false, 'nonzero']);
+  } finally { await browser.close(); server.stop(true); }
+}, 15000);

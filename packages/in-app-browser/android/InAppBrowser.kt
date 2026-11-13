@@ -59,7 +59,8 @@ class InAppBrowserModule(context: ExtensionContext) : ExactExtension(context) {
         if (uri == null || uri.scheme?.lowercase() !in setOf("http", "https") || uri.host.isNullOrEmpty()) {
             return reply(JSONObject().put("error", "TypeError").put("message", "openBrowser takes an absolute http or https URL; open any other with openURL"))
         }
-        val origin = "${uri.scheme}://${uri.authority}"
+        // Not `uri.authority`, which carries the user name and password the URL may have.
+        val origin = "${uri.scheme}://${uri.host}${if (uri.port != -1) ":${uri.port}" else ""}"
         if (context.agent) {
             val action = tap ?: "opened"
             say("$action $origin")
@@ -92,7 +93,8 @@ class InAppBrowserModule(context: ExtensionContext) : ExactExtension(context) {
         }
         customTabsBuilder?.invoke(builder)
         try {
-            builder.build().launchUrl(activity, uri)
+            val tab = builder.build()
+            dev.exact.canvas.SystemBrowser.launch(activity, uri, tab.intent, options = tab.startAnimationBundle)
         } catch (e: android.content.ActivityNotFoundException) {
             return reply(JSONObject().put("error", "NotSupportedError").put("message", "no browser opens this page"))
         }

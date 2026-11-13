@@ -7,6 +7,51 @@ import UIKit
 
 final class LaunchServiceTests: XCTestCase {
     #if os(iOS)
+    func testAnEarlyWorldPresentationIsKeptUntilTheTreePresents() throws {
+        let launch = ExactLaunch()
+        let session = ExactApp.shared.makeSession(label: "early-world-presentation")
+        defer { launch.link?.invalidate(); session.destroy() }
+        launch.delegateInit()
+        launch.didFinishLaunching()
+        launch.bootEntered(session)
+        launch.treeApplied(session, path: "/")
+        // The GPU's completed drawable can be reported before UIKit draws the root.
+        launch.worldPresented()
+        XCTAssertNil(launch.marks[.world])
+        launch.drawn(session)
+        launch.link?.isPaused = true
+        let commit = try XCTUnwrap(launch.marks[.commit])
+        launch.frame(Vsync(at: commit, interval: 1.0 / 60))
+        let present = try XCTUnwrap(launch.marks[.present])
+        XCTAssertEqual(launch.marks[.world], present)
+        launch.worldPresented()
+        XCTAssertEqual(launch.marks[.world], present, "later frames keep the first mark")
+    }
+
+    func testAWorldPresentationAfterFirstPixelKeepsItsOwnTime() throws {
+        let launch = ExactLaunch()
+        let session = ExactApp.shared.makeSession(label: "late-world-presentation")
+        defer { launch.link?.invalidate(); session.destroy() }
+        launch.delegateInit()
+        launch.didFinishLaunching()
+        launch.bootEntered(session)
+        launch.treeApplied(session, path: "/")
+        launch.drawn(session)
+        launch.link?.isPaused = true
+        let commit = try XCTUnwrap(launch.marks[.commit])
+        launch.frame(Vsync(at: commit, interval: 1.0 / 60))
+        let present = try XCTUnwrap(launch.marks[.present])
+        waitFor("the first-pixel timestamp to pass") { CACurrentMediaTime() > present }
+        let before = CACurrentMediaTime()
+        launch.worldPresented()
+        let world = try XCTUnwrap(launch.marks[.world])
+        XCTAssertGreaterThan(world, present)
+        XCTAssertGreaterThanOrEqual(world, before)
+        XCTAssertLessThanOrEqual(world, CACurrentMediaTime())
+        launch.worldPresented()
+        XCTAssertEqual(launch.marks[.world], world, "later frames keep the first mark")
+    }
+
     func testAnInterruptedCommitKeepsWatchingUntilItsPresentation() {
         let launch = ExactLaunch()
         let session = ExactApp.shared.makeSession(label: "interrupted-launch")
@@ -30,9 +75,55 @@ final class LaunchServiceTests: XCTestCase {
     /// otherwise move it a frame later every period. The test supplies the
     /// frames, so the link's own callbacks are paused.
     func testWorkEndingWithoutAChangeKeepsTheSettledVsync() throws {
+        let (launch, session, candidate) = try settlingLaunch("settled-launch")
+        launch.workEnded(session)
+        waitForMainQueue("the evaluation after the work ended")
+        XCTAssertEqual(launch.candidate, candidate, "work that changed nothing does not move the candidate")
+        launch.frame(Vsync(at: candidate, interval: 1.0 / 60))
+        XCTAssertEqual(launch.ttiOutcome, "settled")
+        XCTAssertEqual(launch.marks[.interactive], candidate)
+    }
+
+    func testAnInertOrientationRequestKeepsTheSettledVsync() throws {
+        let (launch, session, candidate) = try settlingLaunch("settled-orientation")
+        var batch = wireBatch([])
+        batch.orientation = .init()
+        batch.orientation?.types = 1
+        session.applyUnlessEmpty(batch)
+        launch.applied(session, batch)
+        launch.workEnded(session)
+        waitForMainQueue("the evaluation after the orientation request")
+        XCTAssertEqual(session.presenter.orientationLock.mask, 0)
+        XCTAssertFalse(session.presenter.orientationLock.locked)
+        XCTAssertEqual(launch.candidate, candidate)
+        launch.frame(Vsync(at: candidate, interval: 1.0 / 60))
+        XCTAssertEqual(launch.marks[.interactive], candidate)
+    }
+
+    /// A batch that changes the screen with no ops, such as a control's
+    /// viewless contents, moves the mark to the vsync that shows it, as a
+    /// batch with ops does.
+    func testAChangeWithNoOpsMovesTheSettledVsync() throws {
+        let (launch, session, candidate) = try settlingLaunch("settled-controls")
+        var controls = wireBatch([])
+        controls.controls = true
+        launch.applied(session, controls)
+        launch.workEnded(session)
+        waitForMainQueue("the evaluation after the change")
+        let moved = try XCTUnwrap(launch.candidate, "the change sets a new candidate")
+        XCTAssertGreaterThan(moved, candidate, "the change shows at a later vsync")
+        launch.frame(Vsync(at: candidate, interval: 1.0 / 60))
+        XCTAssertNil(launch.ttiOutcome, "the old candidate's vsync is before the change shows")
+        launch.frame(Vsync(at: moved, interval: 1.0 / 60))
+        XCTAssertEqual(launch.marks[.interactive], moved)
+    }
+
+    /// A launch presented and activated with a change on screen and nothing
+    /// outstanding, its candidate's vsync passed and not yet confirmed.
+    private func settlingLaunch(_ label: String) throws -> (ExactLaunch, ExactSession, Double) {
         let launch = ExactLaunch()
-        let session = ExactApp.shared.makeSession(label: "settled-launch")
-        defer { session.destroy() }
+        let session = ExactApp.shared.makeSession(label: label)
+        addTeardownBlock { launch.link?.invalidate(); session.destroy() }
         XCTAssertNil(session.boot(plan: try fixturePlan("HEADLESS"), size: CGSize(width: 400, height: 800)).error)
         launch.delegateInit()
         launch.didFinishLaunching()
@@ -51,12 +142,7 @@ final class LaunchServiceTests: XCTestCase {
         waitForMainQueue("the evaluation that finds nothing outstanding")
         let candidate = try XCTUnwrap(launch.candidate, "the screen changed, so it settles at the next vsync")
         waitFor("the candidate's vsync to pass") { CACurrentMediaTime() > candidate }
-        launch.workEnded(session)
-        waitForMainQueue("the evaluation after the work ended")
-        XCTAssertEqual(launch.candidate, candidate, "work that changed nothing does not move the candidate")
-        launch.frame(Vsync(at: candidate, interval: 1.0 / 60))
-        XCTAssertEqual(launch.ttiOutcome, "settled")
-        XCTAssertEqual(launch.marks[.interactive], candidate)
+        return (launch, session, candidate)
     }
 
     func testSuppressedLaunchesStillWaitForFirstPixelBeforeLoadingServices() {

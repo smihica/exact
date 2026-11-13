@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { EXE } from '../scripts/paths.mjs';
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -454,6 +455,21 @@ test('two copies of a new game derive byte-identical shell locks from the SDK lo
   } finally {rmSync(root,{recursive:true,force:true});}
 }, 120000);
 
+test('Rivals\' captured lock resolves its generated hosts without changing dependencies', async () => {
+  const {prepareGame, gameDefaults} = await import('./app/shells.mjs');
+  const root = realpathSync(mkdtempSync(resolve(tmpdir(), 'rivals-lock-')));
+  const dir = resolve(root, 'rivals'), source = resolve(import.meta.dir, 'games/rivals');
+  try {
+    mkdirSync(dir);
+    for (const entry of ['app.json', 'Cargo.lock', 'logic'])
+      cpSync(resolve(source, entry), resolve(dir, entry), {recursive:true});
+    const captured = readFileSync(resolve(dir, 'Cargo.lock'), 'utf8');
+    prepareGame(dir, gameDefaults(dir).game);
+    assert.equal(readFileSync(resolve(dir, 'Cargo.lock'), 'utf8'), captured);
+    assert.equal(readFileSync(resolve(dir, '.shells/Cargo.lock'), 'utf8'), captured);
+  } finally {rmSync(root, {recursive:true, force:true});}
+});
+
 test('game and generated shell workspaces inherit every root vendor patch', async () => {
   const {outsideWorkspaceProblems} = await import('../scripts/app.mjs');
   assert.deepEqual(outsideWorkspaceProblems(import.meta.dir), []);
@@ -471,7 +487,7 @@ test('a Windows game shell links the shared presenter its baked entry uses', () 
     const app = resolve(root, 'windows-game');
     createGame(app);
     const manifest = Bun.TOML.parse(readFileSync(resolve(app, '.shells/windows/Cargo.toml'), 'utf8'));
-    assert.deepEqual(manifest.dependencies['exact-linux'], {workspace:true});
+    assert.deepEqual(manifest.dependencies['exact-painted'], {workspace:true});
     assert.deepEqual(manifest.dependencies['exact-windows'], {workspace:true});
   } finally {rmSync(root, {recursive:true, force:true});}
 });
@@ -686,7 +702,7 @@ test('an app.json edited after its shells: the compiler says the copy is stale, 
   const root=resolve(import.meta.dir,'..'), built=spawnSync('cargo',['build','-q','-p','contract','--bin','contract'],{cwd:root,encoding:'utf8'});
   assert.equal(built.status,0,built.stderr);
   const parent=realpathSync(mkdtempSync(resolve(tmpdir(),'stale-shells-'))), app=resolve(parent,'my-game');
-  const build=()=>spawnSync(resolve(root,'target/debug/contract'),['build',resolve(app,'app.contract'),'-o',resolve(parent,'app.plan')],{encoding:'utf8'});
+  const build=()=>spawnSync(resolve(root,`target/debug/contract${EXE}`),['build',resolve(app,'app.contract'),'-o',resolve(parent,'app.plan')],{encoding:'utf8'});
   try {
     createGame(app);
     gameShells(app,gameDefaults(app).game,import.meta.dir);
@@ -984,7 +1000,7 @@ test('generated logic targets rebuild from each snapshot sharing a Cargo target'
       const env = {...process.env,CARGO_TARGET_DIR:target,CARGO_BUILD_BUILD_DIR:target};
       const built = spawnSync('cargo',['build','--offline','--bin','probe'],{cwd:resolve(app,'.shells'),env,encoding:'utf8'});
       assert.equal(built.status,0,built.stderr);
-      const result = spawnSync(resolve(target,'debug/probe'),[],{encoding:'utf8'});
+      const result = spawnSync(resolve(target,`debug/probe${EXE}`),[],{encoding:'utf8'});
       assert.equal(result.status,0,result.stderr);
       assert.equal(result.stdout.trim(),String(value),'the product must contain this snapshot source');
     }

@@ -611,6 +611,50 @@ component App
     assert!(r.failed_resources().is_empty());
 }
 
+/// A wake's reply outside its shape is let go as the wake's: what the
+/// release refreshes is asked under the wake's origin, not the app's.
+#[test]
+fn a_refused_wake_reply_releases_its_request_under_the_wakes_origin() {
+    let app = App::new("refused-origin");
+    app.edit_interface(
+        r#""source": "everyTides","#,
+        r#""source": "everyTides", "origin": "app","#,
+    );
+    app.write(
+        "app.contract",
+        r#"
+use everyTides, tide, TideEntry from "@fixture/tide"
+
+shape Pulled
+  tag: string
+
+component App
+  mutation pulled as shape Pulled refreshes sensitive
+  resource sensitive = everyTides() as shape TideEntry[]
+  action ebbed(tag: string)
+    send pulled = pull(tag)
+  view
+    column tide=ebbed
+      text `${sensitive.length}`
+"#,
+    );
+    let mut r = boot(&app);
+    r.raise_wake("tide", "tide", r#"["wake"]"#, WakeHow::default())
+        .unwrap();
+    by(&mut r, 0.0);
+    assert!(r.failed_resources().is_empty());
+    // `Later` answers `{tag: 7}`, outside `Pulled`.
+    answer_pull(&mut r);
+    let logs = logs(&r);
+    assert!(logs.contains("answered outside its shape"), "{logs}");
+    assert!(
+        logs.contains("tide.everyTides: refused, person-required (wake origin)"),
+        "{logs}"
+    );
+    assert_eq!(r.failed_resources().len(), 1, "{logs}");
+    assert_eq!(r.failed_resources()[0].0, "sensitive");
+}
+
 #[test]
 fn an_expired_wake_clears_only_the_stall_of_a_head_it_drops() {
     for wake_is_head in [true, false] {
@@ -943,6 +987,41 @@ fn a_call_waits_for_a_running_wake() {
     assert_eq!(calls[0]["certainty"], "applied");
 }
 
+/// LLP 1133.023 D7: a call waits at most [`WAIT`] for the invocation
+/// before it, a running call as much as a wake: behind a call that has not
+/// settled after 5 s it is refused `busy` and never runs.
+#[test]
+fn a_call_behind_a_running_call_is_refused_after_five_seconds() {
+    let app = App::new("call");
+    let text = std::fs::read_to_string(app.0.join("app.contract")).unwrap();
+    let tool = "  tool poke writes closed \"Pull once.\" = poke\n  action poke\n    send pulled = pull(\"call\")\n  action once\n";
+    app.write("app.contract", &text.replacen("  action once\n", tool, 1));
+    let mut r = boot(&app);
+    let how = || exact_runner::CallHow {
+        door: "agent".into(),
+        ..Default::default()
+    };
+    r.call_tool("poke", "{}", how()).unwrap();
+    r.call_tool("poke", "{}", how()).unwrap();
+    by(&mut r, 0.0);
+    let calls = state(&r)["intents"]["calls"].clone();
+    assert_eq!(calls[0]["state"], "running", "{calls}");
+    assert_eq!(calls[1]["state"], "waiting", "{calls}");
+    by(&mut r, 4_999.0);
+    let calls = state(&r)["intents"]["calls"].clone();
+    assert_eq!(calls[1]["state"], "waiting", "{calls}");
+    by(&mut r, 1.0);
+    let calls = state(&r)["intents"]["calls"].clone();
+    assert_eq!(calls[0]["outcome"], "refused", "{calls} {}", logs(&r));
+    assert_eq!(calls[0]["reason"], "busy");
+    assert_eq!(calls[1]["state"], "running", "{calls}");
+    answer_pull(&mut r);
+    by(&mut r, 0.0);
+    let calls = state(&r)["intents"]["calls"].clone();
+    assert_eq!(calls[1]["outcome"], "ok", "{calls} {}", logs(&r));
+    assert!(r.take_requests().is_empty(), "{}", logs(&r));
+}
+
 /// LLP 1133.033 D21: Android's reader under the agent starts no foreground
 /// service and says each claim through the claimant's `changed`; the runner
 /// journals it and lists the claims held in the claimant's
@@ -1035,4 +1114,49 @@ fn waiting_timers_stay_stopped_during_a_hidden_wake() {
             "{kind}: timers resume after the wake"
         );
     }
+}
+
+#[test]
+fn change_tasks_wait_for_unseen_wakes_and_for_their_expiry_receipts() {
+    let app = App::new("change-wake");
+    let source = std::fs::read_to_string(app.0.join("app.contract")).unwrap();
+    let source = source.replace("  task ticker mount\n    every(1000, tick)\n", "");
+    app.write(
+        "app.contract",
+        &source.replace(
+            "  view\n",
+            r#"  state changed = 0
+  action countChange
+    changed = changed + 1
+  task change when heard != "" key=heard
+    change(countChange)
+  view
+"#,
+        ),
+    );
+    let mut r = boot(&app);
+    r.act("periodic", Vec::new()).unwrap();
+    let reference = entry(&r, "every")["ref"].as_u64().unwrap();
+    by(&mut r, 60_000.0);
+    tap(&mut r, reference).unwrap();
+    by(&mut r, 0.0);
+    assert!(r.page().hidden);
+    assert!(r.land_then().receipts.is_empty());
+    assert_eq!(r.slot("changed"), Some(&Value::Number(0.0)));
+    by(&mut r, 3_000.0);
+    assert_eq!(r.slot("changed"), Some(&Value::Number(0.0)));
+    let expired = r.advance_timed(65_001.0);
+    assert!(expired.error.is_none(), "{:?}", expired.error);
+    assert!(expired.needs_apply);
+    assert!(!expired.receipts.is_empty());
+    assert_eq!(r.slot("changed"), Some(&Value::Number(0.0)));
+    let change = r.advance_timed(65_001.0);
+    assert!(change.error.is_none(), "{:?}", change.error);
+    assert!(change.needs_apply);
+    assert_eq!(r.slot("changed"), Some(&Value::Number(1.0)));
+    assert_eq!(
+        r.now_ms(),
+        65_000.0,
+        "a deferred change never rewinds the clock"
+    );
 }

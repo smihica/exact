@@ -11,6 +11,7 @@ use crate::request::{Outcome, Request, RequestOut};
 /// The round out for the module's background work, if any.
 #[derive(Default)]
 pub(super) struct Background {
+    module: Option<super::ModuleInstance>,
     /// The runner ticket of the round the host holds.
     ticket: Option<u64>,
     /// Rounds delivered since the work began: `background: done (N operations)`.
@@ -52,12 +53,21 @@ impl<D: DataSource> Runner<D> {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         self.background.ticket = Some(ticket);
+        self.background.module = self.data.module_identity("").map(|m| m.instance());
         self.requests.push(RequestOut {
+            class: crate::RequestClass::Ordered,
             ticket,
             target: NAME.into(),
             request,
             forced: false,
         });
+    }
+
+    pub(super) fn failed_background(&self) -> Option<(u64, String)> {
+        Some((
+            self.background.ticket?,
+            self.background.module.as_ref()?.failure()?.to_owned(),
+        ))
     }
 
     /// The host's admission refusal of the round out, if any, that
@@ -100,7 +110,7 @@ impl<D: DataSource> Runner<D> {
                 | super::DataError::BadArguments(m)
                 | super::DataError::Unavailable(m)
                 | super::DataError::Interface(m)
-                | super::DataError::DeferredAtBake(m)
+                | super::DataError::DeferredAtBake { message: m, .. }
                 | super::DataError::Overrun(m)
                 | super::DataError::Failed(_, m, _),
             ) => {

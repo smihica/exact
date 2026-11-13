@@ -34,6 +34,8 @@ mod measures_tests;
 mod modes;
 #[cfg(test)]
 mod modes_tests;
+#[cfg(test)]
+mod module_tests;
 mod paint;
 #[cfg(test)]
 mod paint_tests;
@@ -43,7 +45,9 @@ mod presence_tests;
 mod reads;
 mod sized;
 mod style;
+mod svg_lengths;
 mod symbols;
+mod timelines;
 
 use std::process::ExitCode;
 
@@ -232,7 +236,14 @@ fn main() -> ExitCode {
                     // the web build fails where a native one would.
                     match exact_runner::auth::session_grant_refusal(&spec) {
                         Some(refusal) => println!("{}", serde_json::json!({ "error": refusal })),
-                        None => println!("{}", exact_runner::grants::normalized_json(&spec)),
+                        None => {
+                            let mut set: serde_json::Value =
+                                serde_json::from_str(&exact_runner::grants::normalized_json(&spec))
+                                    .expect("normalized grants JSON");
+                            set["keepsNoAnswers"] =
+                                exact_runner::device::keeps_no_answers(&spec).into();
+                            println!("{set}");
+                        }
                     }
                     ExitCode::SUCCESS
                 }
@@ -487,7 +498,9 @@ fn main() -> ExitCode {
                 None => Ok(plan.clone()),
             };
             if let Err(e) = declared
-                .and_then(|declared| contract::typescript_exporting(&declared, exports.as_deref()))
+                .and_then(|declared| {
+                    contract::typescript_exporting(&declared, exports.as_deref(), &[])
+                })
                 .and_then(|d| {
                     std::fs::write(dir.join("app.contract.d.ts"), d).map_err(|e| e.to_string())
                 })

@@ -88,11 +88,25 @@ impl<D: DataSource> Runner<D> {
     /// 1133.030 D12 item 1) reads the least of its own state and theirs:
     /// `denied`, then `prompt`, then `unknown`, then `granted`.
     pub(super) fn permission_state(&self, name: &str) -> String {
+        self.permission_state_on(name, &mut Vec::new())
+    }
+
+    /// [`Self::permission_state`] where `path` holds the permissions whose
+    /// states are reading this one's. A name already on it is not read
+    /// again: the compiler refuses a cycle within one interface, but one
+    /// through a permission another interface declares (LLP 1133.026 D19
+    /// item 2) reaches the runner.
+    fn permission_state_on(&self, name: &str, path: &mut Vec<String>) -> String {
         let declared = self.permission_or_status(name);
-        let own = self.own_permission_state(name, &declared);
-        (self.required(&declared).iter())
-            .filter(|r| *r != name)
-            .fold(own, |state, r| least(state, self.permission_state(r)))
+        path.push(name.to_owned());
+        let mut state = self.own_state_on(name, &declared, path);
+        for r in self.required(&declared) {
+            if !path.contains(&r) {
+                state = least(state, self.permission_state_on(&r, path));
+            }
+        }
+        path.pop();
+        state
     }
 
     /// Permission `name` as declared, or as a status source names it: a
@@ -161,8 +175,14 @@ impl<D: DataSource> Runner<D> {
 
     /// Permission `name`'s own state, before what it requires.
     pub(super) fn own_permission_state(&self, name: &str, declared: &Json) -> String {
-        if let Some(by) = declared["grantedBy"].as_str().filter(|by| *by != name) {
-            if self.permission_state(by) == "granted" {
+        self.own_state_on(name, declared, &mut vec![name.to_owned()])
+    }
+
+    /// [`Self::own_permission_state`], `path` as [`Self::permission_state_on`]'s.
+    fn own_state_on(&self, name: &str, declared: &Json, path: &mut Vec<String>) -> String {
+        let by = declared["grantedBy"].as_str();
+        if let Some(by) = by.filter(|by| !path.iter().any(|p| p == by)) {
+            if self.permission_state_on(by, path) == "granted" {
                 return "granted".into();
             }
         }
@@ -443,8 +463,9 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// A send that answers another source's value under the agent, raising
-    /// it while that value matches `raise.when` (LLP 1133.018 D5: write-only
-    /// raised to full): held under the raise's ticket, else that value now.
+    /// it while that value matches `raise.when` and the app declares the
+    /// optional `raise.grant` (LLP 1133.002 D7; LLP 1133.018 D5): held under
+    /// the raise's ticket, else that value now.
     /// `None` for a send that declares no raise.
     pub(super) fn decide_raise(&self, row: &ModulesRow, send: bool) -> Option<Decision> {
         let sub = self.substitute(row);
@@ -456,7 +477,11 @@ impl<D: DataSource> Runner<D> {
             return Some(Decision::Now(json!({ "error": "NotSupportedError" })));
         };
         let when = sub["raise"]["when"].as_object();
-        let matches = when.is_some_and(|w| w.iter().all(|(k, v)| value.get(k) == Some(v)));
+        let granted = sub["raise"]["grant"]
+            .as_str()
+            .is_none_or(|line| self.declares(line));
+        let matches =
+            granted && when.is_some_and(|w| w.iter().all(|(k, v)| value.get(k) == Some(v)));
         Some(match matches {
             true => Decision::Hold(Waits::Raise),
             false => Decision::Now(value),
@@ -517,11 +542,11 @@ impl<D: DataSource> Runner<D> {
     /// the agent too (LLP 1133.002 D14 step 2).
     pub(super) fn unsupported_here(&self, row: &ModulesRow) -> bool {
         let target = self.host_target();
-        (self.substitute(row)["unsupported"]
-            .as_array()
-            .into_iter()
-            .flatten())
-        .any(|t| t == target)
+        let sub = self.substitute(row);
+        if row.send && !self.implementation_here(row) {
+            return true;
+        }
+        (sub["unsupported"].as_array().into_iter().flatten()).any(|t| t == target)
     }
 }
 

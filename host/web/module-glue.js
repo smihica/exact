@@ -61,7 +61,7 @@ export function fetchEarly(request, grants) {
   // A GET a driver fault will fail is not started early: the request fails it, counted once (LLP 1103 D1).
   // A GET that does not follow redirects is never sent early, nor one a tool, a wake or the device asked,
   // which `request` checks against the local network's rule first (LLP 1133.036 D6).
-  if ((request.origin ?? 'app') !== 'app' || grantError(grants) || request.method !== 'GET' || (request.redirect ?? 'follow') !== 'follow' || request.body || request.body_base64 != null || !admitsNetwork(grants, request.url, 'fetch') || faultMatches(request.url)) return null;
+  if ((request.origin ?? 'app') !== 'app' || grantError(grants) || request.method !== 'GET' || (request.redirect ?? 'follow') !== 'follow' || (request.cache ?? 'default') !== 'default' || request.body || request.body_base64 != null || !admitsNetwork(grants, request.url, 'fetch') || faultMatches(request.url)) return null;
   const key = earlyKey(request.url, request.headers), controller = new AbortController();
   const entry = { controller, response: fetch(request.url, { method: 'GET', headers: request.headers, redirect: 'follow', cache: 'default', signal: controller.signal }) };
   entry.response.catch(() => {});
@@ -93,9 +93,8 @@ export async function baked() {
   return { receipt: artifact(0), script: artifact(1) };
 }
 export async function prepare(payload, admitted, id = nextId++) {
-  const ceiling = new Set(admitted.grants.split('\n').map(s=>s.trim()).filter(Boolean));
   const meta = JSON.parse(decoder.decode(payload.receipt));
-  if (meta.version !== 1 || (meta.abi !== 1 && meta.abi !== 2) || meta.appId !== admitted.appId || typeof meta.grants !== 'string' || meta.grants.split('\n').map(s=>s.trim()).filter(Boolean).some(s=>!ceiling.has(s))
+  if (meta.version !== 1 || (meta.abi !== 1 && meta.abi !== 2) || meta.appId !== admitted.appId || typeof meta.grants !== 'string'
       || meta.web?.file !== 'app.js' || meta.web.bytes !== payload.script.length || meta.web.sha256 !== await hash(payload.script)
       || !/^[0-9a-f]{64}$/.test(meta.module?.sha256)) throw new Error('module integrity, ABI, identity, or grants mismatch');
   const childGrantSet = scopedGrantSet(admitted.grantSet, meta.grants);
@@ -174,7 +173,7 @@ export async function prepare(payload, admitted, id = nextId++) {
     // Disable accidental browser I/O before the module captures globals: a
     // function, so `new WebSocket(url)` refuses by name too, as the JS target's
     // ts-fetch.js does. The prelude refuses the clock and every timer but an
-    // answer's own (binary.js `timers`), by name, as Hermes does.
+    // answer's own (time.js `timers`), by name, as Hermes does.
     for (const key of ['XMLHttpRequest', 'WebSocket', 'EventSource']) {
       Object.defineProperty(win, key, { value: function () { throw new Error(`${key} is unavailable in data sources`); }, configurable: false });
     }
@@ -470,8 +469,10 @@ async function prepareWorker(payload, admitted, id, before, meta, helpers) {
   const ready = new Promise((resolve, reject) => waiting.set(0, { resolve, reject }));
   worker.postMessage({ op: 'init', token: 0, binary: helpers, prelude: before, script: decoder.decode(payload.script), admitted,
     storage: storageKey(admitted.appId), pageDigest: !!globalThis.exact.moduleDigest, seed: agentSeed() });
-  try { await ready; } catch (error) { worker.terminate(); throw error; }
+  let overlayAtLoad;
+  try { overlayAtLoad = (await ready).hasOverlay; } catch (error) { worker.terminate(); throw error; }
   const realm = { frame: null, meta, grantSet: admitted.grantSet, id, placement: 'worker',
+    hasOverlay: () => overlayAtLoad,
     aborted: () => aborted.splice(0),
     forget(inFlight) {
       forgetSecretTurns(id, new Set(inFlight.map(workerKey)));
@@ -528,8 +529,7 @@ export function call(request) {
   if (request.op === 'journal') return { lines: realm.journal ? realm.journal() : [] };
   if (request.op === 'aborted') return { tickets: realm.aborted ? realm.aborted() : [] };
   if (request.op === 'draw') return realm.draw ? realm.draw(request.request) : { error: 'a worker-placed module does not draw Canvas 2D yet' };
-  // A worker realm can't say synchronously: it answers yes, and its overlay's `{tag:4, worker}` tells why the writes wait.
-  if (request.op === 'has-overlay') return { has: realm.hasOverlay ? realm.hasOverlay() : true };
+  if (request.op === 'has-overlay') return { has: realm.hasOverlay() };
   if (request.op === 'overlay') return realm.overlay ? realm.overlay(request) : { tag: 4, worker: true };
   if (request.op === 'retire') { realm.retire?.(request.retired); return { ok: true }; }
   if (request.op === 'answer' || request.op === 'resume') return realm.invoke(request);

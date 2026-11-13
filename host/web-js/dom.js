@@ -5,7 +5,9 @@
 // boolean attributes). Region anchors (comments) are not written: adoption
 // inserts its own.
 const VOID = new Set(['img', 'input', 'br', 'hr', 'meta', 'link', 'source', 'area', 'col', 'embed', 'wbr']);
-const esc = (s, attr) => String(s).replace(attr ? /[&"\r]/g : /[&<>\r]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\r': '&#13;' })[c]);
+// An attribute value's `<` and `>` are references too, as HTML's serializer writes them: the render server's hero
+// image scan ends a tag at its first `>` (render.mjs `heroImage`).
+const esc = (s, attr) => String(s).replace(attr ? /[&"<>\r]/g : /[&<>\r]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\r': '&#13;' })[c]);
 
 let Trees = 0;
 class Node {
@@ -77,10 +79,11 @@ class Element extends Node {
   get children() { return this.childNodes.filter(c => c.nodeType === 1); }
   get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== 1) n = n.nextSibling; return n; }
   get tagName() { return this.localName.toUpperCase(); }
-  setAttribute(k, v) { this.attrs.set(k, String(v)); }
-  getAttribute(k) { return this.attrs.get(k) ?? null; }
-  hasAttribute(k) { return this.attrs.has(k); }
-  removeAttribute(k) { this.attrs.delete(k); }
+  // The `style` attribute is the inline style map, which `html` writes.
+  setAttribute(k, v) { if (k === 'style') this.style.cssText = String(v); else this.attrs.set(k, String(v)); }
+  getAttribute(k) { return k === 'style' ? this.style.cssText || null : this.attrs.get(k) ?? null; }
+  hasAttribute(k) { return k === 'style' ? !!this.style.cssText : this.attrs.has(k); }
+  removeAttribute(k) { if (k === 'style') this.style.cssText = ''; else this.attrs.delete(k); }
   toggleAttribute(k, on) { if (on) this.attrs.set(k, ''); else this.attrs.delete(k); }
   get childElementCount() { return this.childNodes.filter(c => c.nodeType === 1).length; }
   get firstElementChild() { return this.childNodes.find(c => c.nodeType === 1) ?? null; }
@@ -142,7 +145,7 @@ class Element extends Node {
     if (this.localName === 'template') return '';
     let out = `<${this.localName}`;
     const style = this.style.cssText;
-    for (const [k, v] of this.attrs) if (k !== 'style') out += v === '' ? ` ${k}` : ` ${k}="${esc(v, true)}"`;
+    for (const [k, v] of this.attrs) out += v === '' ? ` ${k}` : ` ${k}="${esc(v, true)}"`;
     if (style) out += ` style="${esc(style, true)}"`;
     out += '>';
     if (VOID.has(this.localName)) return out;
@@ -174,7 +177,7 @@ export function createDocument(shell = '') {
     title: '', head, body, documentElement: body, styleSheets: [], // symbols.js reads a tint from the stylesheets: a render has none
     createElement: t => new Element(t, fonts), createElementNS: (_, t) => new Element(t, fonts),
     createTextNode: t => new Text(t), createComment: () => new Comment(), createDocumentFragment: () => new Fragment(),
-    getElementById: id => (id === 'exact-root' ? root : id ? root.getElementsByTagName('*').find(e => e.getAttribute('id') === id) ?? null : null), // navigation.js `opensPopover` names a popover
+    getElementById: id => (id === 'exact-root' ? root : id ? root.getElementsByTagName('*').find(e => e.getAttribute('id') === id) ?? null : null), // navigation.js `opens` names a popover or dialog
     querySelector: sel => (/meta\[name="description"\]/.test(sel) ? head.childNodes.find(m => m.getAttribute?.('name') === 'description') ?? null : null),
     querySelectorAll: () => [],
     root, rootHTML: () => root.childNodes.map(c => c.html()).join(''),

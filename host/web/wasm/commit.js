@@ -1,9 +1,34 @@
-import { views, retiredViews, presence, host, followedScrolls, motion, loadAfterPaint, root, agentMode, log, t0, readOut, writeIn, loadLiveTime, lists, arrange, pieces, loadGpuIfNeeded, afterNativePaint, deferFulfill, holds, agentKeepsStore, pendingStore, moduleReady, safelyFulfill, encoder, track, byTicket, forgettable, surfaceGranted, HOST_WORK_BASE64, loadPageNative, localAssetURL, controllers, pageFile, heldAsks, httpHelpers, now, postSurface, ask, picker, inflight, documentsGlue, frameNav, followScroll, messageFrames, messageViews, dropSurface, register, seek, settleFollow, pendingScrolls, rememberScroll, collections, focusAutofocus, markScrollDocument, letGo, holdWake, holdOrientation, clocks } from "../glue.js";
+import { views, retiredViews, presence, host, followedScrolls, motion, loadAfterPaint, root, agentMode, log, t0, readOut, writeIn, loadLiveTime, lists, arrange, pieces, loadGpuIfNeeded, afterNativePaint, deferFulfill, holds, agentKeepsStore, pendingStore, moduleReady, safelyFulfill, encoder, track, byTicket, forgettable, surfaceGranted, HOST_WORK_BASE64, loadPageNative, localAssetURL, controllers, pageFile, heldAsks, httpHelpers, now, postSurface, ask, picker, inflight, documentsGlue, frameNav, followScroll, messageFrames, messageViews, dropSurface, register, seek, settleFollow, pendingScrolls, rememberScroll, ownFollowed, releaseFollowed, collections, focusAutofocus, markScrollDocument, letGo, holdWake, holdOrientation, clocks } from "../glue.js";
 import { prepareContexts, positionContexts } from "./context.js";
-import { pageTitle, navigation, noteFit, syncListItemRoles, listItem, settleValue, afterPaint, createGrantSet, rawGrantText, grantError, scopedGrantSet, refusal, appRootFontSize, liveById, navigableURL, sheetLeaves, popoverCommand, runFocusCommands, inertAncestor, refitTexts } from "../navigation.js";
+import { pageTitle, navigation, noteFit, syncListItemRoles, listItem, settleValue, afterPaint, createGrantSet, rawGrantText, grantError, grantWords, scopedGrantSet, refusal, appRootFontSize, liveById, navigableURL, sheetLeaves, popoverCommand, runFocusCommands, inertAncestor, refitTexts } from "../navigation.js";
 import { applyProps, nativeCreate, listView, appSource, syncMedia, forgetList, syncViewportFit, refreshSymbols, syncLists } from "./views.js";
 import { attach } from "./input.js";
 import { flowBatch } from "./flow.js";
+// The page's storage service for a Rust source's requests, made at the first one, for this incarnation's requests.
+async function storageService(requestIncarnation) {
+  await moduleReady;
+  if (!host.inputReady) {
+    throw new Error("data executor is unavailable");
+  }
+  if (requestIncarnation !== host.incarnation) {
+    throw new Error("storage source unloaded");
+  }
+  if (!host.storageRequests) {
+    const app = globalThis.exact.compat.inputs.app;
+    const pending = loadAfterPaint("./storage-request.js", "createStorageRequests").then((create) => create(app, host.grantSet)).catch((error) => {
+      if (host.storageRequests === pending) {
+        host.storageRequests = null;
+      }
+      throw error;
+    });
+    host.storageRequests = pending;
+  }
+  const service = await host.storageRequests;
+  if (requestIncarnation !== host.incarnation) {
+    throw new Error("storage source unloaded");
+  }
+  return service;
+}
 function viewFor(op, id) {
   const el = views.get(id);
   if (!el) {
@@ -30,7 +55,7 @@ function apply(batch) {
   host.listSelection?.before();
   prepareContexts(batch);
   for (const s of followedScrolls.values()) {
-    s.scrolled();
+    s.observed();
   }
   const focusCommands = [];
   const collectionOp = batch.ops?.find((op) => op.op === "collections");
@@ -62,6 +87,9 @@ function apply(batch) {
         }
         case "theme":
           (document.getElementById("exact-theme") ?? document.head.appendChild(Object.assign(document.createElement("style"), { id: "exact-theme" }))).textContent = op.css;
+          break;
+        case "large-title":
+          root.style.setProperty("--exact-large-title-size", `${op.size}px`);
           break;
         // LLP 1055 D7: the page's @keyframes; LLP 1121 D8: a view's state looks (src/host/looks.rs); LLP 1095 D4: the theme's :root rule
         case "language":
@@ -118,7 +146,8 @@ function apply(batch) {
         // LLP 1096 D7: the voice table's ops, after first paint; never under the agent, whose clock is virtual (D10); LLP 1125 D7: the MIDI queue's ops and the ports, after first paint; never under the agent, whose runner answers a request itself
         case "create": {
           // Canvas overlays use a div; data-surface is the host-owned drawing leaf.
-          const el = host.page?.adopting?.get(op.id) ?? (op.ns ? document.createElementNS(op.ns, op.tag) : document.createElement(op.tag === "canvas" ? "div" : op.tag));
+          const adopted = host.page?.adopting?.get(op.id);
+          const el = adopted ?? (op.ns ? document.createElementNS(op.ns, op.tag) : document.createElement(op.tag === "canvas" ? "div" : op.tag));
           // an adopted document's element (LLP 1048.000 D6); SVG in its namespace (LLP 1055 D4)
           if (op.tag === "canvas" && el.firstElementChild?.dataset.surface === undefined) {
             const surface = document.createElement("canvas");
@@ -126,7 +155,7 @@ function apply(batch) {
             surface.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;z-index:-1";
             el.append(surface);
           }
-          applyProps(el, op.props, []);
+          applyProps(el, op.props, [], !!adopted);
           const css = op.css + (el.hasAttribute("data-action") ? ";touch-action:none" : "");
           if ((el.getAttribute("style") ?? "") !== css) {
             el.style.cssText = css;
@@ -282,7 +311,7 @@ function apply(batch) {
           if (host.unparsed) {
             console.warn("exact:", host.unparsed);
           }
-          if (host.grants.some((l) => /^\s*auth\.session /.test(l))) {
+          if (host.grants.some((l) => grantWords(l)[0] === "auth.session")) {
             host.authHost ??= afterNativePaint().then(() => loadAfterPaint("./auth-glue.js", "authHost")).then((h) => host.authHost = h);
           }
           break;
@@ -326,30 +355,35 @@ function apply(batch) {
         }
         case "storage": {
           const requestIncarnation = host.incarnation;
-          const p = Promise.resolve().then(async () => {
-            await moduleReady;
-            if (!host.inputReady) {
-              throw new Error("data executor is unavailable");
-            }
-            if (requestIncarnation !== host.incarnation) {
-              throw new Error("storage source unloaded");
-            }
-            if (!host.storageRequests) {
-              const app = globalThis.exact.compat.inputs.app;
-              const pending = loadAfterPaint("./storage-request.js", "createStorageRequests").then((create) => create(app, host.grantSet)).catch((error) => {
-                if (host.storageRequests === pending) {
-                  host.storageRequests = null;
-                }
-                throw error;
-              });
-              host.storageRequests = pending;
-            }
-            const service = await host.storageRequests;
-            if (requestIncarnation !== host.incarnation) {
-              throw new Error("storage source unloaded");
-            }
-            return service.run(op.payload, scopedGrantSet(host.grantSet, op.scope));
-          }).then((bytes) => safelyFulfill(requestIncarnation, op.ticket, 5, 0, "", bytes)).catch((error) => safelyFulfill(requestIncarnation, op.ticket, 3, 0, "", encoder.encode(String(error))));
+          const p = storageService(requestIncarnation).then((service) => service.run(op.payload, scopedGrantSet(host.grantSet, op.scope))).then((bytes) => safelyFulfill(requestIncarnation, op.ticket, 5, 0, "", bytes)).catch((error) => safelyFulfill(requestIncarnation, op.ticket, 3, 0, "", encoder.encode(String(error))));
+          track(p, op.ticket);
+          break;
+        }
+        // A canvas capture (LLP 1056 D9, as amended for #188): the glue's PNG of the canvas's bitmap, written as a
+        // Rust source's `fs.atomicWriteFile` is; `{path, width, height, scale}` or a refusal by name, both JSON.
+        case "canvasCapturePrepare": {
+          const owner = host.incarnation;
+          // The stylesheet's queued flush precedes this layout read.
+          const p = Promise.resolve().then(() => new Promise((resolve, reject) => pieces.canvas2d({
+            prepareCapture: op.ticket, held: () => holds(op.ticket, owner), resolve, reject
+          }))).catch(error => safelyFulfill(owner, op.ticket, 0, 400, "", encoder.encode(JSON.stringify({
+            name: "EncodingError", message: `canvas preparation failed: ${error.message ?? error}`
+          }))));
+          track(p, op.ticket);
+          break;
+        }
+        case "canvasCapture": {
+          if (!holds(op.ticket)) break;
+          const requestIncarnation = host.incarnation, answer = (status, value) => safelyFulfill(requestIncarnation, op.ticket, 0, status, "", encoder.encode(JSON.stringify(value)));
+          const p = new Promise((resolve, reject) => pieces.canvas2d({ capture: op, resolve, reject })).then(async (blob) => {
+            const png = new Uint8Array(await blob.arrayBuffer());
+            const storage = await storageService(requestIncarnation);
+            if (!holds(op.ticket, requestIncarnation)) return;
+            await storage.writePng(op.path, png, scopedGrantSet(host.grantSet, op.scope), () => holds(op.ticket, requestIncarnation)).catch((error) => {
+              throw Object.assign(error, { name: /denied: /.test(error.message) ? "NotAllowedError" : error.code === "agent" ? "NotSupportedError" : "EncodingError" });
+            });
+            answer(200, { path: op.path, width: op.w, height: op.h, scale: op.scale });
+          }).catch((error) => answer(400, { name: ["NotAllowedError", "NotSupportedError"].includes(error.name) ? error.name : "EncodingError", message: `${op.path}: ${error.message ?? error}` }));
           track(p, op.ticket);
           break;
         }
@@ -405,7 +439,7 @@ function apply(batch) {
           // forgot it (`letGo`), as the native executor does: a write that
           // was sent was sent, and runs on, uncounted (LLP 1016 D5).
           const requestIncarnation = host.incarnation, controller = new AbortController(), started = performance.now();
-          let p, first, messages = 0;
+          let p, first, messages = 0, batch = [];
           const opened = new Promise((r) => {
             first = r;
           });
@@ -422,11 +456,20 @@ function apply(batch) {
             active: () => requestIncarnation === host.incarnation,
             // A stream's message (LLP 1016.000): after its first, the stream is open, not in flight, so `clock settle`
             // stops waiting on it (D5), an upload only at its reply — what is counted ends there, so a wait already racing it wakes (LLP 1069.004).
+            // Messages that arrive together (`more`) are one delivery, one commit (D4; host.rs `outcome_from`).
             message: (m) => {
               if (messages++ === 0) {
                 first();
               }
-              safelyFulfill(requestIncarnation, op.ticket, 8, 0, `event: ${m.event}\nid: ${m.id}\ncoalesced: ${m.coalesced}`, encoder.encode(m.data));
+              batch.push(m);
+              if (m.more) {
+                return;
+              }
+              const data = batch.map((m) => encoder.encode(m.data)), body = new Uint8Array(data.reduce((n, d) => n + d.length, 0));
+              data.reduce((at, d) => (body.set(d, at), at + d.length), 0);
+              const head = batch.map((m, i) => `event: ${m.event}\nid: ${m.id}\ncoalesced: ${m.coalesced}\nprotocol: ${m.protocol ?? ""}${batch.length > 1 ? `\nlength: ${data[i].length}` : ""}`).join("\n\n");
+              batch = [];
+              safelyFulfill(requestIncarnation, op.ticket, 8, 0, head, body);
             }
           };
           controllers.add(controller);
@@ -568,9 +611,15 @@ function apply(batch) {
           } else if (op.name === "requestPictureInPicture" || op.name === "exitPictureInPicture") {
             const why = "the wasm target does not float an image; the JS target does", el = op.name === "requestPictureInPicture" ? liveById(String(op.args?.[0] ?? "")) : null;
             log(`${op.name} refused: ${why}`);
-            /* the image hears the refusal after this batch, as its pictureinpictureerror (LLP 1042 §9) */
+            /* the image hears the refusal after this batch, as its pictureinpictureerror (LLP 1042 §9); a reload in
+               between reuses view ids, so only the same element in the same incarnation hears it */
             if (el?.dataset.view) {
-              setTimeout(() => send(host.wasm.exact_dispatch(Number(el.dataset.view), 19, writeIn("pictureinpictureerror\n" + why), now())));
+              const view = Number(el.dataset.view), asked = host.incarnation;
+              setTimeout(() => {
+                if (host.incarnation === asked && views.get(view) === el && !retiredViews.has(el)) {
+                  send(host.wasm.exact_dispatch(view, 19, writeIn("pictureinpictureerror\n" + why), now()));
+                }
+              });
             }
           } else if (op.name === "requestFullscreen") {
             const el = [...views.values()].find((el) => el.id === op.args?.[0] && el.exactMedia);
@@ -599,6 +648,8 @@ function apply(batch) {
               });
               if (r.error) {
                 console.warn("exact:", r.error);
+              } else {
+                globalThis.exact.pickerOpened?.();
               }
             } else if (!el) {
               log(`picker: refused: no file input with id "${op.args?.[0]}"`);
@@ -771,7 +822,9 @@ function apply(batch) {
             }
           } else if (op.name === "setWindowOpacity") {
             log("setWindowOpacity refused: a page cannot change its window's opacity");
-          } else if (!/^(playSound|playSounds|stopSounds|sendMIDI|requestMIDIAccess)$/.test(op.name)) {
+          } else if (op.name === "hideWindow") {
+            log("hideWindow refused: a page cannot hide its window");
+          } else if (!/^(playSound|playSounds|stopSounds|setSounds|sendMIDI|requestMIDIAccess)$/.test(op.name)) {
             console.warn(`exact: unknown command ${op.name}`);
           }
           /* LLP 1069.010 */
@@ -857,6 +910,20 @@ function apply(batch) {
   for (const snapshot of collectionOp?.items ?? []) {
     followScroll(views.get(snapshot.view), false);
   }
+  // A scroll the batch asks for wins over the end-follow, and owns the
+  // followed scrollers it moves until it settles (LLP 1070.000 §15).
+  const reveals = [];
+  for (const command of focusCommands) {
+    const el = command.name === "scrollIntoView" ? liveById(command.args?.[0], root) : null;
+    if (el) {
+      reveals.push([ownFollowed(el), command.args?.[3] ?? "auto"]);
+    }
+  }
+  for (const [el, offsets] of pendingScrolls) {
+    if (followedScrolls.has(el) && Object.entries(offsets).some(([name, offset]) => el[name] !== offset)) {
+      ownFollowed(el);
+    }
+  }
   for (const s of followedScrolls.values()) {
     settleFollow(s);
   }
@@ -886,7 +953,11 @@ function apply(batch) {
         }
       }
       const s = followedScrolls.get(el);
-      if (s) {
+      if (s?.owned && !agentMode && el.style.scrollBehavior === "smooth") {
+        // settles at its `scrollend`
+      } else if (s?.owned) {
+        releaseFollowed(s);
+      } else if (s) {
         rememberScroll(s);
       }
     }
@@ -919,6 +990,14 @@ function apply(batch) {
       });
     }
   }
+  // An instant reveal has landed; a smooth one settles at its `scrollend`.
+  for (const [owned, behavior] of reveals) {
+    for (const s of owned) {
+      if (behavior === "instant" || behavior === "auto" && getComputedStyle(s.el).scrollBehavior !== "smooth") {
+        releaseFollowed(s);
+      }
+    }
+  }
   focusAutofocus();
   host.inputHandlers?.arrive();
   // then the focus follows the route, unless either set it (input-glue.js; LLP 1115.000 D4.2)
@@ -927,22 +1006,26 @@ function apply(batch) {
   markScrollDocument();
   return batch.timers;
 }
+const heldLinks = new WeakMap();
 export function applyBatch(batch) {
   for (const line of batch.alerts?.splice(0) ?? []) {
     console.error("exact:", line);
   }
+  const link = heldLinks.get(batch) ?? navigation.holdLink();
   if (host.page?.hold(batch) || presence.hold(batch)) {
+    if (link) heldLinks.set(batch, link);
     return {
       timers: batch.timers,
       batch
     };
   }
+  heldLinks.delete(batch);
   host.textflow?.beforeBatch(batch);
   const began = host.frameSampler ? performance.now() : 0;
   // what applying it cost, for the next frame's record (LLP 1079 D3)
   globalThis.exact.applyDepth = (globalThis.exact.applyDepth ?? 0) + 1;
   try {
-    const timers = apply(batch);
+    const timers = link ? navigation.withLink(link, () => apply(batch)) : apply(batch);
     letGo();
     refitTexts();
     if (host.wakeLock) {
@@ -988,6 +1071,9 @@ export function applyBatch(batch) {
   } finally {
     const outer = --globalThis.exact.applyDepth === 0;
     if (outer) {
+      // After a commit (its `at` op), a held press paints again over the boundaries as they are now (input-glue.js
+      // `repaintPress`), as modes.js does after each JS-target commit: a boundary's `data-exact-from` may have moved.
+      if (batch.ops?.some((op) => op.op === "at")) globalThis.exact.repaintPress?.();
       globalThis.exact.gpu?.drainRecords();
       globalThis.exact.gpu?.layout?.();
       globalThis.exact.committed?.();

@@ -10,6 +10,18 @@ fn css(rows: &[(StyleId, StyleValue)], fonts: &[&str]) -> String {
     css_text(&style, &fonts).0
 }
 
+#[test]
+fn explicit_transition_none_covers_no_property_in_the_browser() {
+    assert_eq!(css(&[], &[]), "");
+    assert_eq!(
+        css(
+            &[(StyleId::Transition, StyleValue::Text("none".into()))],
+            &[]
+        ),
+        "transition:none;"
+    );
+}
+
 /// LLP 1001 §6's balance; LLP 1104 D3's `::placeholder` colour.
 #[test]
 fn balance_and_the_placeholder_colour_are_written_for_the_browser() {
@@ -462,4 +474,23 @@ fn a_hit_slop_is_its_four_custom_properties() {
         "--exact-hit-slop-top:12px;--exact-hit-slop-right:8px;\
          --exact-hit-slop-bottom:12px;--exact-hit-slop-left:8px;"
     );
+}
+
+#[test]
+fn scroll_snap_emits_both_axes_and_center() {
+    for axis in ["x", "y"] {
+        assert_eq!(
+            css(
+                &[
+                    (
+                        StyleId::ScrollSnapType,
+                        StyleValue::Text(format!("{axis} mandatory").into())
+                    ),
+                    (StyleId::ScrollSnapAlign, StyleValue::Text("center".into()))
+                ],
+                &[]
+            ),
+            format!("scroll-snap-type:{axis} mandatory;scroll-snap-align:center;")
+        );
+    }
 }

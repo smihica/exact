@@ -9,7 +9,7 @@
 mod css;
 mod lower;
 mod values;
-mod xml;
+pub mod xml;
 
 #[cfg(test)]
 mod text_tests;
@@ -220,7 +220,7 @@ pub fn natural(prefix: &[u8]) -> Option<Natural> {
 /// Parse a document into its ops. With no user languages supplied to this
 /// loader, elements supporting `systemLanguage` fail its condition when present.
 pub fn parse(text: &str) -> Result<Document, Error> {
-    lower::lower(xml::tokenize(text)?)
+    lower::lower(xml::tokenize(text)?.events)
 }
 
 /// A document built in a scratch kernel, ready to resolve at any size.
@@ -419,6 +419,34 @@ mod tests {
         let scene = loaded.scene(10.0, 10.0);
         // The link's rect (filled by the class), the use, the switch's one taken child.
         assert_eq!(scene.items.len(), 3, "{scene:#?}");
+    }
+
+    #[test]
+    fn foreign_elements_with_combining_marks_are_ignored() {
+        let loaded = load("<svg xmlns:m='urn:m'><m:cafe\u{301}></m:cafe\u{301}><rect width='5' height='5'/></svg>").unwrap();
+        assert!(
+            loaded.document.warnings.is_empty(),
+            "{:?}",
+            loaded.document.warnings
+        );
+        assert_eq!(loaded.scene(10.0, 10.0).items.len(), 1);
+    }
+
+    #[test]
+    fn external_hrefs_warn_and_leave_link_contents_and_local_references() {
+        for attr in ["href", "xlink:href"] {
+            let text = format!(
+                "<svg xmlns:xlink='http://www.w3.org/1999/xlink'><defs><rect id='r' width='5' height='5'/></defs><use {attr}='#r'/><use {attr}='https://example.com/x.svg#r'/><a {attr}='https://example.com'><rect width='2' height='2'/></a></svg>"
+            );
+            let loaded = load(&text).unwrap();
+            let warnings = &loaded.document.warnings;
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
+            for (warning, tag) in warnings.iter().zip(["use", "a"]) {
+                assert!(warning.contains(&format!("on `<{tag}>`")), "{warning}");
+                assert!(warning.contains("external reference"), "{warning}");
+            }
+            assert_eq!(loaded.scene(10.0, 10.0).items.len(), 2);
+        }
     }
 
     #[test]
@@ -664,19 +692,44 @@ mod tests {
 
     /// Files a few kilobytes long that name billions of items, dashes or
     /// surface pixels (LLP 1011.001 D2): each is refused by the limit it
-    /// passes, quickly, before a host allocates for it.
+    /// passes, before a host allocates for it.
     #[test]
     fn a_file_that_expands_past_a_limit_draws_nothing_and_names_it() {
+        check_expansion_limits(None);
+    }
+
+    // Wall time includes scheduler contention, so qualify it separately.
+    #[test]
+    #[ignore = "async lane: measures SVG expansion limits on the wall clock"]
+    fn expansion_limits_finish_within_five_seconds() {
+        check_expansion_limits(Some(std::time::Duration::from_secs(5)));
+    }
+
+    fn check_expansion_limits(deadline: Option<std::time::Duration>) {
         use exact_kernel::svg::scene::Limit;
         const NS: &str = "xmlns=\"http://www.w3.org/2000/svg\"";
         let zigzag =
             |n: usize| -> String { (0..n).map(|i| format!("l1 {}", i % 2)).collect::<String>() };
-        let over = |file: String| {
+        let check = |name: &str, file: String, expected: Option<Limit>| {
             let started = std::time::Instant::now();
             let scene = load(&file).unwrap().scene(64.0, 64.0);
-            assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
-            assert!(scene.items.is_empty() || scene.over.is_none());
-            scene.over
+            let elapsed = started.elapsed();
+            assert_eq!(scene.over, expected, "{name}");
+            if expected.is_some() {
+                assert!(
+                    scene.items.is_empty(),
+                    "{name}: a refused scene draws nothing"
+                );
+            } else {
+                assert!(!scene.items.is_empty(), "{name}: an ordinary scene draws");
+            }
+            if let Some(deadline) = deadline {
+                eprintln!("{name}: {elapsed:?}");
+                assert!(
+                    elapsed < deadline,
+                    "{name}: {elapsed:?} exceeds {deadline:?}"
+                );
+            }
         };
         // 16 levels of `symbol`, each using the one below twice.
         let mut defs = format!(
@@ -686,20 +739,20 @@ mod tests {
         for k in 1..=16 {
             defs += &format!("<symbol id=\"s{k}\" viewBox=\"0 0 9 9\"><use href=\"#s{}\"/><use href=\"#s{}\" x=\"1\"/></symbol>", k - 1, k - 1);
         }
-        assert_eq!(
-            over(format!(
-                "<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><use href=\"#s16\"/></svg>"
-            )),
-            Some(Limit::Expansion)
+        check(
+            "symbol copies",
+            format!("<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><use href=\"#s16\"/></svg>"),
+            Some(Limit::Expansion),
         );
         // Markers whose content is a marked path, four deep: 100^4 copies.
         let mut defs = String::from("<marker id=\"m0\"><circle r=\"1\"/></marker>");
         for k in 1..=4 {
             defs += &format!("<marker id=\"m{k}\"><path d=\"M0 0{}\" marker-mid=\"url(#m{})\" stroke=\"#000\"/></marker>", zigzag(100), k - 1);
         }
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><path d=\"M0 0{}\" marker-mid=\"url(#m4)\"/></svg>", zigzag(100))),
-            Some(Limit::Expansion)
+        check(
+            "marker copies",
+            format!("<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><path d=\"M0 0{}\" marker-mid=\"url(#m4)\"/></svg>", zigzag(100)),
+            Some(Limit::Expansion),
         );
         // 300 paths of a million dashes each.
         let paths: String = (0..300)
@@ -707,16 +760,18 @@ mod tests {
                 format!("<path d=\"M0 {i}H99000\" stroke=\"#000\" stroke-dasharray=\"0.05\"/>")
             })
             .collect();
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 99000 300\">{paths}</svg>")),
-            Some(Limit::Dashes)
+        check(
+            "dashes",
+            format!("<svg {NS} viewBox=\"0 0 99000 300\">{paths}</svg>"),
+            Some(Limit::Dashes),
         );
         // Filters whose region is far past the drawing, each an island of
         // the largest size with its working images, on 400 shapes.
         let shapes = "<rect width=\"5\" height=\"5\" filter=\"url(#f)\"/>".repeat(400);
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"f\" filterUnits=\"userSpaceOnUse\" x=\"-1e6\" y=\"-1e6\" width=\"2e6\" height=\"2e6\"><feGaussianBlur stdDeviation=\"20\"/></filter>{shapes}</svg>")),
-            Some(Limit::Surfaces)
+        check(
+            "surface pixels",
+            format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"f\" filterUnits=\"userSpaceOnUse\" x=\"-1e6\" y=\"-1e6\" width=\"2e6\" height=\"2e6\"><feGaussianBlur stdDeviation=\"20\"/></filter>{shapes}</svg>"),
+            Some(Limit::Surfaces),
         );
         // A primitive whose work per pixel is a parameter of the file.
         let filtered = |primitive: &str| {
@@ -726,29 +781,31 @@ mod tests {
             "<feTurbulence baseFrequency=\"0.1\" numOctaves=\"1000000000\"/>",
             "<feMorphology radius=\"1000000\"/>",
         ] {
-            assert_eq!(
-                over(filtered(primitive)),
-                Some(Limit::FilterWork),
-                "{primitive}"
-            );
+            check(primitive, filtered(primitive), Some(Limit::FilterWork));
         }
-        assert_eq!(over(filtered("<feMorphology radius=\"0.2\"/>")), None);
+        check(
+            "ordinary morphology",
+            filtered("<feMorphology radius=\"0.2\"/>"),
+            None,
+        );
         // One filter named a thousand times in one list: each a copy.
         let offsets = "<feOffset dx=\"1\"/>".repeat(2000);
         let list = "url(#f) ".repeat(1000);
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"f\">{offsets}</filter><rect width=\"5\" height=\"5\" style=\"filter: {list}\"/></svg>")),
-            Some(Limit::Expansion)
+        check(
+            "filter list",
+            format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"f\">{offsets}</filter><rect width=\"5\" height=\"5\" style=\"filter: {list}\"/></svg>"),
+            Some(Limit::Expansion),
         );
         // A transfer table each filtered shape carries a copy of.
         let table = "1 ".repeat(10_000);
         let shapes = "<rect width=\"1\" height=\"1\" filter=\"url(#t)\"/>".repeat(200);
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"t\"><feComponentTransfer><feFuncR type=\"table\" tableValues=\"{table}\"/></feComponentTransfer></filter>{shapes}</svg>")),
-            Some(Limit::Expansion)
+        check(
+            "transfer tables",
+            format!("<svg {NS} viewBox=\"0 0 10 10\"><filter id=\"t\"><feComponentTransfer><feFuncR type=\"table\" tableValues=\"{table}\"/></feComponentTransfer></filter>{shapes}</svg>"),
+            Some(Limit::Expansion),
         );
         // Copies that carry a gradient's stops, or empty spans of text.
-        let doubling = |base: &str, defs: &str| {
+        let doubling = |name: &str, base: &str, defs: &str| {
             let mut defs = format!("{defs}<g id=\"l0\">{base}</g>");
             for k in 1..=14 {
                 defs += &format!(
@@ -756,9 +813,13 @@ mod tests {
                     k - 1
                 );
             }
-            over(format!(
-                "<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><use href=\"#l14\"/></svg>"
-            ))
+            check(
+                name,
+                format!(
+                    "<svg {NS} viewBox=\"0 0 9 9\"><defs>{defs}</defs><use href=\"#l14\"/></svg>"
+                ),
+                Some(Limit::Expansion),
+            );
         };
         let stops: String = (0..200)
             .map(|i| {
@@ -769,22 +830,18 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            doubling(
-                "<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>",
-                &format!("<linearGradient id=\"g\">{stops}</linearGradient>")
-            ),
-            Some(Limit::Expansion)
+        doubling(
+            "gradient stops",
+            "<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>",
+            &format!("<linearGradient id=\"g\">{stops}</linearGradient>"),
         );
         let spans = "<tspan dx=\"1\"/>".repeat(100);
-        assert_eq!(
-            doubling(&format!("<text>{spans}</text>"), ""),
-            Some(Limit::Expansion)
-        );
+        doubling("empty text spans", &format!("<text>{spans}</text>"), "");
         // An icon with a drop shadow, a pattern and a few uses is none of these.
-        assert_eq!(
-            over(format!("<svg {NS} viewBox=\"0 0 24 24\"><defs><filter id=\"f\"><feGaussianBlur stdDeviation=\"1\"/></filter><pattern id=\"p\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\"><circle cx=\"2\" cy=\"2\" r=\"1\"/></pattern><path id=\"a\" d=\"M2 2h8v8z\"/></defs><g filter=\"url(#f)\"><use href=\"#a\"/><use href=\"#a\" x=\"10\"/></g><rect width=\"24\" height=\"6\" fill=\"url(#p)\" stroke=\"#000\" stroke-dasharray=\"1 1\"/></svg>")),
-            None
+        check(
+            "ordinary icon",
+            format!("<svg {NS} viewBox=\"0 0 24 24\"><defs><filter id=\"f\"><feGaussianBlur stdDeviation=\"1\"/></filter><pattern id=\"p\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\"><circle cx=\"2\" cy=\"2\" r=\"1\"/></pattern><path id=\"a\" d=\"M2 2h8v8z\"/></defs><g filter=\"url(#f)\"><use href=\"#a\"/><use href=\"#a\" x=\"10\"/></g><rect width=\"24\" height=\"6\" fill=\"url(#p)\" stroke=\"#000\" stroke-dasharray=\"1 1\"/></svg>"),
+            None,
         );
     }
 

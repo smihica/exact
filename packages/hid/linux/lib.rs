@@ -10,20 +10,35 @@
 //! - Output reports are `write(2)`, feature reports `HIDIOCSFEATURE` and `HIDIOCGFEATURE` (the kernel's
 //!   hidraw.rst).
 //! - The painted presenter draws no chooser (D2): `requestDevice` fails `NotSupportedError`.
+//! - A close ends the read: the reader polls its node beside a socket whose other end the open holds, so dropping
+//!   the open wakes it, and it announces nothing once stopped. A closed connection keeps the log for its last
+//!   reads, its device still connected.
 //!
-//! The package names only `exact_linux` and `std`, so the ioctls are declared here.
+//! The package names only `exact_painted` and `std`, so the ioctls and `poll` are declared here.
 
-use exact_linux::package::{json, Context, Json, Notifier, Package, Reply};
+use exact_painted::package::{json, Context, Json, Notifier, Package, Reply};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn poll(fds: *mut PollFd, count: std::ffi::c_ulong, timeout: i32) -> i32;
 }
+
+/// `struct pollfd` (poll(2)).
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLLIN: i16 = 1;
 
 /// `_IOC(_IOC_WRITE | _IOC_READ, 'H', nr, len)`, the hidraw feature report ioctls.
 fn hid_ioc(nr: u64, len: usize) -> u64 {
@@ -157,13 +172,43 @@ struct Open {
     file: Arc<File>,
     log: Arc<Mutex<Log>>,
     stop: Arc<AtomicBool>,
+    /// The reader polls the other end: dropping this one wakes it.
+    _wake: UnixStream,
     leases: usize,
 }
 
 struct Connection {
     device: Device,
     open: bool,
+    /// The open's log, kept past this connection's close for its last reads; `gone` only once the reader saw the
+    /// device leave.
+    log: Arc<Mutex<Log>>,
     readers: BTreeMap<String, u64>,
+}
+
+impl Connection {
+    /// `hidConnection`'s answer: a close leaves the device connected.
+    fn state(&self) -> Json {
+        let gone = self.log.lock().unwrap_or_else(|e| e.into_inner()).gone;
+        json!({ "open": self.open && !gone, "connected": !gone })
+    }
+
+    /// `inputReports`' answer: the reports this reader has not taken, at most `history` of them.
+    fn reports(&mut self, args: &Json) -> Json {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted = args["reportId"].as_u64().map(|r| r as u8);
+        let history = args["history"].as_u64().unwrap_or(16).min(1024) as usize;
+        let reader = format!("{wanted:?} {history}");
+        let of: Vec<&(u64, u8, Vec<u8>, f64)> = log.reports.iter().filter(|r| wanted.is_none_or(|w| w == r.1)).collect();
+        let mut fresh: Vec<&(u64, u8, Vec<u8>, f64)> = match self.readers.get(&reader) {
+            Some(cursor) => of.into_iter().filter(|r| r.0 > *cursor).collect(),
+            None => of.into_iter().last().into_iter().collect(),
+        };
+        let dropped = fresh.len().saturating_sub(history);
+        fresh.drain(..dropped);
+        self.readers.insert(reader, log.sequence);
+        json!({ "reports": fresh.iter().map(|r| json!({ "reportId": r.1, "data": base64(&r.2), "at": r.3 })).collect::<Vec<_>>(), "dropped": dropped, "interrupted": log.gone })
+    }
 }
 
 pub struct Hid {
@@ -174,11 +219,31 @@ pub struct Hid {
     remembered: Vec<String>,
 }
 
-fn read_loop(file: Arc<File>, log: Arc<Mutex<Log>>, stop: Arc<AtomicBool>, device: Device, notifier: Notifier, epoch: std::time::Instant) {
+/// Whether `file` has a report to read, waiting for one; false once `wake`'s other end is gone.
+fn readable(file: &File, wake: &UnixStream) -> bool {
+    loop {
+        let mut fds = [file.as_raw_fd(), wake.as_raw_fd()].map(|fd| PollFd { fd, events: POLLIN, revents: 0 });
+        // SAFETY: poll reads and writes the two entries of `fds`, which outlive the call.
+        if unsafe { poll(fds.as_mut_ptr(), 2, -1) } >= 0 {
+            return fds[1].revents == 0;
+        }
+        if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+            // The read then reports what is wrong with the node.
+            return true;
+        }
+    }
+}
+
+fn read_loop(file: Arc<File>, wake: UnixStream, log: Arc<Mutex<Log>>, stop: Arc<AtomicBool>, device: Device, notifier: Notifier, epoch: std::time::Instant) {
     let numbered = device.collections.iter().any(|c| !c.reports.is_empty());
     let mut buf = [0u8; 4096];
-    while !stop.load(Ordering::Relaxed) {
-        match (&*file).read(&mut buf) {
+    while readable(&file, &wake) {
+        let read = (&*file).read(&mut buf);
+        // Closed while the report arrived: nothing is announced for a closed connection.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match read {
             Ok(0) | Err(_) => {
                 log.lock().unwrap_or_else(|e| e.into_inner()).gone = true;
                 notifier.changed("hid.inputReports");
@@ -249,44 +314,35 @@ impl Hid {
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => return json!({ "error": "NotAllowedError", "message": e.to_string() }),
                 Err(e) => return json!({ "error": "NetworkError", "message": e.to_string() }),
             };
+            let (wake, woken) = match UnixStream::pair() {
+                Ok(pair) => pair,
+                Err(e) => return json!({ "error": "NetworkError", "message": e.to_string() }),
+            };
             let (log, stop) = (Arc::new(Mutex::new(Log::default())), Arc::new(AtomicBool::new(false)));
             let (f, l, s, d, n) = (file.clone(), log.clone(), stop.clone(), device.clone(), self.context.notifier());
             let epoch = std::time::Instant::now();
-            std::thread::spawn(move || read_loop(f, l, s, d, n, epoch));
-            self.opens.insert(id.to_owned(), Open { file, log, stop, leases: 0 });
+            std::thread::spawn(move || read_loop(f, woken, l, s, d, n, epoch));
+            self.opens.insert(id.to_owned(), Open { file, log, stop, _wake: wake, leases: 0 });
         }
-        self.opens.get_mut(id).expect("just opened").leases += 1;
+        let shared = self.opens.get_mut(id).expect("just opened");
+        shared.leases += 1;
+        let log = shared.log.clone();
         self.next += 1;
         let handle = format!("hid-{}", self.next);
         if !self.remembered.iter().any(|r| r == id) {
             self.remembered.push(id.to_owned());
         }
         let answer = json!({ "connection": handle, "device": record(&device, true) });
-        self.connections.insert(handle, Connection { device, open: true, readers: BTreeMap::new() });
+        self.connections.insert(handle, Connection { device, open: true, log, readers: BTreeMap::new() });
         self.context.changed("hid.getDevices");
         answer
     }
 
     fn reports(&mut self, args: &Json) -> Json {
-        let Some(c) = self.connections.get_mut(args["connection"].as_str().unwrap_or_default()) else {
-            return json!({ "error": "InvalidStateError" });
-        };
-        let Some(o) = self.opens.get(&c.device.id) else {
-            return json!({ "reports": [], "dropped": 0, "interrupted": true });
-        };
-        let log = o.log.lock().unwrap_or_else(|e| e.into_inner());
-        let wanted = args["reportId"].as_u64().map(|r| r as u8);
-        let history = args["history"].as_u64().unwrap_or(16).min(1024) as usize;
-        let reader = format!("{wanted:?} {history}");
-        let of: Vec<&(u64, u8, Vec<u8>, f64)> = log.reports.iter().filter(|r| wanted.is_none_or(|w| w == r.1)).collect();
-        let mut fresh: Vec<&(u64, u8, Vec<u8>, f64)> = match c.readers.get(&reader) {
-            Some(cursor) => of.into_iter().filter(|r| r.0 > *cursor).collect(),
-            None => of.into_iter().last().into_iter().collect(),
-        };
-        let dropped = fresh.len().saturating_sub(history);
-        fresh.drain(..dropped);
-        c.readers.insert(reader, log.sequence);
-        json!({ "reports": fresh.iter().map(|r| json!({ "reportId": r.1, "data": base64(&r.2), "at": r.3 })).collect::<Vec<_>>(), "dropped": dropped, "interrupted": log.gone })
+        match self.connections.get_mut(args["connection"].as_str().unwrap_or_default()) {
+            Some(c) => c.reports(args),
+            None => json!({ "error": "InvalidStateError" }),
+        }
     }
 
     fn send(&self, args: &Json, feature: bool) -> Json {
@@ -324,6 +380,7 @@ impl Hid {
         if let Some(o) = self.opens.get_mut(&id) {
             o.leases -= 1;
             if o.leases == 0 {
+                // Stopped before woken: the reader then announces nothing.
                 o.stop.store(true, Ordering::Relaxed);
                 self.opens.remove(&id);
             }
@@ -352,10 +409,7 @@ impl Package for Hid {
             "requestDevice" => json!({ "error": "NotSupportedError" }),
             "open" => self.open(args["device"].as_str().unwrap_or_default()),
             "hidConnection" => match self.connections.get(args["connection"].as_str().unwrap_or_default()) {
-                Some(c) => {
-                    let gone = self.opens.get(&c.device.id).is_none_or(|o| o.log.lock().map(|l| l.gone).unwrap_or(true));
-                    json!({ "open": c.open && !gone, "connected": !gone })
-                }
+                Some(c) => c.state(),
                 None => json!({ "open": false, "connected": false }),
             },
             "inputReports" => self.reports(args),
@@ -402,6 +456,35 @@ impl Package for Hid {
         for o in self.opens.values() {
             o.stop.store(true, Ordering::Relaxed);
         }
+        self.opens.clear();
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device() -> Device {
+        Device { id: String::new(), path: String::new(), vendor: 0, product: 0, name: String::new(), collections: Vec::new() }
+    }
+
+    /// A close keeps the log for the connection's last reads and leaves the device connected; only the reader seeing
+    /// the device leave interrupts the reads.
+    #[test]
+    fn a_close_keeps_the_log_and_the_device_connected() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let mut c = Connection { device: device(), open: true, log: log.clone(), readers: BTreeMap::new() };
+        let all = json!({ "history": 16 });
+        assert_eq!(c.reports(&all)["reports"], json!([]));
+        log.lock().unwrap().sequence = 1;
+        log.lock().unwrap().reports.push((1, 0, vec![1, 2, 3], 5.0));
+        c.open = false;
+        assert_eq!(c.state(), json!({ "open": false, "connected": true }));
+        let last = c.reports(&all);
+        assert_eq!(last["reports"], json!([{ "reportId": 0, "data": "AQID", "at": 5.0 }]));
+        assert_eq!(last["interrupted"], json!(false));
+        log.lock().unwrap().gone = true;
+        assert_eq!(c.state(), json!({ "open": false, "connected": false }));
+        assert_eq!(c.reports(&all)["interrupted"], json!(true));
+    }
+}

@@ -404,6 +404,7 @@ public final class Agent {
             var reply = session.agent(json)
             var nativeSections = stateSections()
             nativeSections["frameHealthUI"] = session.frameHealth.uiReply()
+            nativeSections["observation"] = session.executionObservation()
             for (key, value) in Agent.hostState?() ?? [:] { nativeSections[key] = value }
             nativeSections["decorations"] = presenter.views.values.sorted { $0.id < $1.id }.compactMap { node -> [String: Any]? in
                 guard let decorations = (node.textArea as? TextArea)?.decorations else { return nil }
@@ -422,9 +423,9 @@ public final class Agent {
             nativeSections["observe"] = ExactLaunch.shared.report(for: session)
             nativeSections["media"] = presenter.views.compactMap { id, view in view.video.map { ["id": id, "state": $0.state()] as [String: Any] } }
             nativeSections["mediaSession"] = mediaSessionState() // LLP 1098 D10
-            // The drive's app storage (trivia F7): none unless it names a scratch store.
-            nativeSections["storage"] = ExactEnv.environment["EXACT_AGENT_STORAGE"].map { ["available": true, "store": $0] as [String: Any] }
-                ?? ["available": false, "code": "agent", "message": "storage is unavailable in agent mode unless the drive names a scratch store (--storage <name>)"]
+            // LLP 1035.006.000 D6: each tip, as TipKit has it, and whether it shows.
+            nativeSections["tips"] = ["linked": TipLink.installed != nil, "tips": TipLink.installed?.state(owner: presenter) ?? []] as [String: Any]
+            nativeSections["storage"] = session.appFileStorage()
             var raster = session.rasters.diagnostics
             raster["encodedResolverBytes"] = session.app.resolver.encodedCacheBytes
             raster["encodedHTTPCache"] = RasterInput.httpCacheUsage
@@ -1111,7 +1112,11 @@ public final class Agent {
                 return Batch(ops: [], timers: batch.timers, motion: batch.motion, clock: session.clock, error: limit)
             }
         }
-        return advanceRunner(to: to, deadline: deadline, floor: floor)
+        let batch = advanceRunner(to: to, deadline: deadline, floor: floor)
+        if batch.error == nil, let limit = clock.fire(at: session.clock ?? to) {
+            return Batch(ops: [], timers: batch.timers, motion: batch.motion, clock: session.clock, error: limit)
+        }
+        return batch
     }
 
     private func advanceRunner(to: Double, deadline: Date, floor: Double) -> Batch {

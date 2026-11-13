@@ -106,7 +106,7 @@ fn a_cold_share_shows_its_text_first_with_its_files_pending_then_they_land() {
     let token = share_in::token(7.0, 0);
     assert_eq!(
         claimed.location,
-        format!("/share?text=hello%20there&files={token}")
+        format!("/share?text=hello+there&files={token}")
     );
     assert_eq!(
         claimed.line,
@@ -295,6 +295,42 @@ fn the_bake_refuses_a_share_target_no_route_matches() {
         refused[0]
             .1
             .contains("matches none of the app's routes (/, /share)"),
+        "{}",
+        refused[0].1
+    );
+    // expo/exact#413: the bake admits an action exactly when a share delivered
+    // there reaches the share route by the router's own match, under which a
+    // trailing `/` matches no pattern (the share would open `notfound`).
+    for action in [
+        "/share",
+        "/share?from=sheet",
+        "/share#top",
+        "/share/",
+        "/share//",
+        "//share",
+        "/share/x",
+    ] {
+        let shared = share_in::Incoming {
+            text: Some("hi".into()),
+            ..Default::default()
+        };
+        let at = share_in::location(
+            &ShareTarget {
+                action: action.into(),
+                text: Some("text".into()),
+                ..Default::default()
+            },
+            &shared,
+            |_| String::new(),
+        );
+        let delivered = text_of(&boot(Launch::NONE, &at), "text") == ["hi"];
+        assert_eq!(compile(action).is_ok(), delivered, "{action} as {at}");
+    }
+    let refused = compile("/share/").unwrap_err();
+    assert!(
+        refused[0]
+            .1
+            .ends_with("a path ending in `/` matches no route, so write `/share`"),
         "{}",
         refused[0].1
     );

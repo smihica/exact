@@ -83,6 +83,7 @@ impl Request {
     /// the child; anything else answers once, within `max_response_bytes`.
     pub fn process(body: Vec<u8>, stream: bool, max_response_bytes: u32) -> Request {
         Request {
+            module: None,
             http: HttpScheduling::Independent { max_response_bytes },
             continuation: None,
             storage: None,
@@ -99,9 +100,13 @@ impl Request {
             long_poll: None,
             timeout_ms: None,
             idle_timeout_ms: None,
+            protocols: Vec::new(),
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
+            cache: Default::default(),
+            preload: None,
+            prefetch: false,
             held: false,
             listen: None,
             reach: Default::default(),

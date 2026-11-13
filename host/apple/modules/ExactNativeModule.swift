@@ -94,7 +94,7 @@ public final class ExactModuleContext: @unchecked Sendable {
     // has the hatch table (before its hatches are called), and what each token calls.
     typealias FramesFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Int32) -> Void
     typealias AfterFn = @convention(c) (UnsafeMutableRawPointer?, UInt64, Double) -> Void
-    var framesFn: FramesFn?, afterFn: AfterFn?
+    var framesFn: FramesFn?, afterFn: AfterFn?, coalescingAfterFn: AfterFn?
     var ticks: [UInt64: (ExactFrame) -> Void] = [:], afters: [UInt64: () -> Void] = [:]
     private var nextToken: UInt64 = 1
 
@@ -144,10 +144,15 @@ public final class ExactModuleContext: @unchecked Sendable {
     /// agent, where a seek fires it at its own instant. `stop()` before then
     /// and it never runs. Main thread.
     @discardableResult
-    public func after(_ ms: Double, _ body: @escaping () -> Void) -> ExactTicket {
+    public func after(_ ms: Double, _ body: @escaping () -> Void) -> ExactTicket { after(ms, coalescing: false, body) }
+
+    /// A coalescing callback runs at the next clock instant at or past its
+    /// deadline, without adding a seek stop or advancing settlement.
+    @discardableResult
+    public func after(_ ms: Double, coalescing: Bool, _ body: @escaping () -> Void) -> ExactTicket {
         let token = nextToken
         nextToken += 1
-        guard let afterFn else { return ExactTicket {} }
+        guard let afterFn = coalescing ? coalescingAfterFn : afterFn else { return ExactTicket {} }
         afters[token] = body
         afterFn(host, token, max(0, ms))
         return ExactTicket { [weak self] in
@@ -186,6 +191,15 @@ public final class ExactTicket {
     public func stop() { end?(); end = nil }
 }
 
+/// `value` as JSON, a bare number or string included, or nil for a value
+/// JSON cannot hold (NaN, an infinity, a `Date`): for one of those
+/// `JSONSerialization.data` raises an Objective-C exception, which `try?`
+/// does not catch, rather than throwing.
+func exactJSON(_ value: Any) -> Data? {
+    guard JSONSerialization.isValidJSONObject([value]) else { return nil }
+    return try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed)
+}
+
 /// The answer to one `native.later` call. Only the first `send` or `fail`
 /// answers; one dropped unanswered fails the call.
 public final class ExactReply: @unchecked Sendable {
@@ -209,11 +223,7 @@ public final class ExactReply: @unchecked Sendable {
     /// an absent `option`; ExactPackage.swift).
     public func send(_ value: [String: Any]) {
         let sent: Any = value.count == 1 ? value["exact:answer"] ?? value : value
-        let scalar = sent is NSNull || sent is NSNumber || sent is String
-        guard scalar || JSONSerialization.isValidJSONObject(sent),
-              let data = try? JSONSerialization.data(withJSONObject: sent, options: .fragmentsAllowed) else {
-            return fail("the reply was not JSON")
-        }
+        guard let data = exactJSON(sent) else { return fail("the reply was not JSON") }
         answer(200, String(decoding: data, as: UTF8.self))
     }
 
@@ -314,8 +324,8 @@ open class ExactModule {
     /// already built). Set `showsBar` here; the bar's look is the app's.
     open func navigation(_ navigation: ExactNavigation) {}
     /// A route: when its controller is built (`route.isNew`), and again
-    /// whenever its `data-*` words or the header Exact projects change, each
-    /// time before the frame that shows it. Its `navigationItem` is the
+    /// whenever its `data-*` words, the header Exact projects or its content
+    /// scroll view change, each time before the frame that shows it. Its `navigationItem` is the
     /// app's, over the defaults Exact projects from an authored header.
     open func route(_ route: ExactRoute) {}
     /// A route's controller is leaving for good; its handle does nothing
@@ -324,9 +334,9 @@ open class ExactModule {
     /// Exact's tab container (LLP 1075.003 §3.7): once, before its tabs are
     /// laid out. Its appearance is the app's; its tabs Exact's. A person's
     /// selection is UIKit's, which Exact's router follows through UIKit's
-    /// delegate calls. A selection the app sets in code sends no tab delegate
-    /// call, so the router follows it only for a tab under More, whose
-    /// `willShow` More sends: press the authored tab instead. Each tab's
+    /// delegate calls. To select a tab, press its authored tab: a selection
+    /// the app sets in code sends no tab delegate call, so the router follows
+    /// it only for a tab under More, whose `willShow` More sends. Each tab's
     /// controller is made with the container and kept for the tab's life
     /// (`ExactTab.controller`).
     open func tabs(_ tabs: ExactTabs) {}
@@ -509,8 +519,7 @@ public final class ExactDiagnostics: @unchecked Sendable {
     /// A snapshot, as JSON, the latest kept. One over 4 KB is refused whole.
     public func publish(_ name: String, _ value: Any) {
         guard recordFn != nil else { return }
-        let json = JSONSerialization.isValidJSONObject([value]) ? (try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed)) : nil
-        record(5, name, 0, json.map(Array.init) ?? [])
+        record(5, name, 0, exactJSON(value).map(Array.init) ?? [])
     }
     /// Ask for Save Trace (LLP 1079 D5): at most one a second.
     public func saveTrace() { record(6) }
@@ -573,6 +582,8 @@ final class ExactHatches {
     let arrangementFn: ArrangementFn?
     /// One of 184 or more: a module's service query (ExactServices.swift).
     let serviceFn: ServiceFn?
+    /// One of 192 or more: an after that coalesces across a seek.
+    let coalescingAfterFn: ExactModuleContext.AfterFn?
     #if os(iOS) || os(tvOS)
     var navigations: [ObjectIdentifier: ExactNavigation] = [:]
     var routes: [String: ExactRoute] = [:]
@@ -624,6 +635,8 @@ final class ExactHatches {
             ? table.load(fromByteOffset: 168, as: UnsafeRawPointer?.self).map { unsafeBitCast($0, to: ArrangementFn.self) } : nil
         serviceFn = table.load(as: UInt32.self) >= 184
             ? table.load(fromByteOffset: 176, as: UnsafeRawPointer?.self).map { unsafeBitCast($0, to: ServiceFn.self) } : nil
+        coalescingAfterFn = table.load(as: UInt32.self) >= 192
+            ? table.load(fromByteOffset: 184, as: UnsafeRawPointer?.self).map { unsafeBitCast($0, to: ExactModuleContext.AfterFn.self) } : nil
     }
 
     /// A package picture changed (0) or revoked (1): the host's raster loader acts on it.
@@ -721,10 +734,15 @@ public final class ExactRoute {
     public internal(set) var navigation: ExactNavigation?
     /// The route node's `data-*` words.
     public internal(set) var data: ExactData
-    /// The route's content scroll view: its native top-edge selection, else the one named
-    /// by `navigationScroll` or its first vertical scroller. Select with UIKit's
-    /// `controller.setContentScrollView(_:for:)`; nil makes an edge automatic again, as in
-    /// UIKit, and Exact makes the selection that UIKit cannot make through Exact's views.
+    /// The route's content scroll view when the hatch was last called: the app's top-edge
+    /// selection; else, where the route has a `navigationScroll`, the scroll view of the element
+    /// it names, or nil when no element carries the name or it does not scroll; else the scroll
+    /// view of the route's first vertical scroller; else the route's own viewport, which only an
+    /// unpresented route under `interactive-widget="resizes-visual"` has; else nil. A top-edge
+    /// selection or nil made with UIKit's `controller.setContentScrollView(_:for:)` reaches it
+    /// when Exact next prepares the route, at the next authored update (after a nil, possibly
+    /// within the call), and the hatch is called again then; nil makes the edge automatic, as
+    /// in UIKit.
     /// An authored scroller's offset, insets, size and delegate remain Exact's.
     public internal(set) weak var contentScrollView: UIScrollView?
     /// Whether this call is the controller's first.
@@ -1032,8 +1050,8 @@ private let moduleCall: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<
             return answer(500, "the request was not a JSON object")
         }
         let value = try ExactExtensions.call(m, request) ?? m.call(request)
-        guard JSONSerialization.isValidJSONObject(value) else { return answer(500, "the reply was not JSON") }
-        answer(200, String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self))
+        guard let json = exactJSON(value) else { return answer(500, "the reply was not JSON") }
+        answer(200, String(decoding: json, as: UTF8.self))
     } catch {
         answer(500, String(describing: error))
     }
@@ -1077,6 +1095,7 @@ private let moduleConnect: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPo
     m.context.diagnostics.recordFn = m.hatches?.recordFn
     m.context.framesFn = m.hatches?.framesFn
     m.context.afterFn = m.hatches?.afterFn
+    m.context.coalescingAfterFn = m.hatches?.coalescingAfterFn
 }
 
 /// `tamber(module)`: a batch moved what a binding reads (LLP 1121 D12); each

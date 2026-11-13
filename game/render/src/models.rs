@@ -42,8 +42,9 @@ pub(crate) const REPLACE: u32 = 1 << 31;
 pub(crate) const NUMBERED: u32 = 1 << 30;
 /// A look-table entry: tint, glow, its part's first vertex as bits; then, in a
 /// draw of several materials, its material (merge.rs `PartMaterial`); then the
-/// record's base colour and emission UV offset (`MaterialOverride::uv_offset`).
-pub(crate) type PartLook = [f32; 18];
+/// record's current and previous base colour and emission UV offsets, and its
+/// optional surface factors.
+pub(crate) type PartLook = [f32; 24];
 pub(crate) type ModelNode = (MeshId, MaterialId, Mat4, Option<u32>);
 /// What the feed batches one loaded model from.
 pub(crate) struct Draws<'a> {
@@ -95,9 +96,12 @@ mod prepare;
 pub(crate) use poses::Moved;
 pub(crate) use prepare::{caster, depth, ModelFrame};
 mod textures;
+#[cfg(not(target_arch = "wasm32"))]
+mod uploads;
 mod variants;
-use textures::upload_texture;
 pub(crate) use textures::Texture;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use uploads::Uploads;
 struct PoseHistory {
     entity: exact_game::Entity,
     saved: Option<(u64, u64, [exact_game::Transform; 2])>,
@@ -280,11 +284,12 @@ impl Models {
         }
         // A look-table entry is one record-sized entry: its tint and glow, in
         // `local`'s first two columns its material, when it has one, and in
-        // the third's first two words its UV offset.
+        // the third its current and previous UV offsets, and in the fourth its
+        // surface factors.
         for look in &self.part_looks.1 {
             words.extend([0; 4]);
             words.extend(look[8..].iter().map(|v| v.to_bits()));
-            words.extend([0; 22]);
+            words.extend([0; 16]);
             words.extend(look[..8].iter().map(|v| v.to_bits()));
         }
         if words.len() as u64 * 4 > device.limits().max_storage_buffer_binding_size {
@@ -734,53 +739,6 @@ impl<const ASSETS: bool> crate::renderer::RendererWithAssets<ASSETS> {
             }
         }
     }
-    /// Reuse a name only when its content digest matches. CPU mips may be dropped.
-    pub fn add_texture(&mut self, name: &str, data: &TextureData) -> Result<(), RenderError> {
-        let digest = exact_game::hash::of(data);
-        if let Some(texture) = self
-            .models
-            .textures
-            .get_mut(name)
-            .filter(|t| t.digest == digest)
-        {
-            texture.active = true;
-            return Ok(());
-        }
-        data.validate().map_err(RenderError::scene)?;
-        let sprite = self
-            .models
-            .textures
-            .get(name)
-            .is_some_and(|texture| texture.sprite_bind.is_some());
-        let mut texture =
-            upload_texture(&self.device, &self.queue, data, &mut self.models.samplers)?;
-        texture.digest = digest;
-        if sprite {
-            texture.sprite_bind = Some(self.quads.sprite_bind(&self.device, &texture));
-        }
-        self.models.textures.insert(name.into(), texture);
-        self.models.uploads += 1;
-        for material in &mut self.models.materials {
-            if material.bind.is_some()
-                && material.names.iter().flatten().any(|n| n == name)
-                && material
-                    .names
-                    .iter()
-                    .flatten()
-                    .all(|n| self.models.textures.contains_key(n))
-            {
-                *material = material_bind(
-                    &self.device,
-                    &self.queue,
-                    &self.pipelines.models.as_ref().unwrap().material,
-                    (&material.data, &material.names),
-                    &self.models.textures,
-                    None,
-                );
-            }
-        }
-        Ok(())
-    }
     /// Cumulative model pipeline creations and asset texture uploads, for diagnostics.
     pub fn asset_work(&self) -> (usize, u64) {
         (
@@ -797,6 +755,10 @@ impl<const ASSETS: bool> crate::renderer::RendererWithAssets<ASSETS> {
     /// Resident texture bytes and formats, as JSON for the world state.
     pub(crate) fn texture_summary(&self) -> String {
         textures::summary(&self.models.textures)
+    }
+    /// Device bytes of the delivered textures held, retired ones included.
+    pub(crate) fn texture_bytes(&self) -> u64 {
+        textures::resident_bytes(&self.models.textures)
     }
     pub(crate) fn residency_work(&self) -> crate::world::assets::Work {
         let (pipelines, textures) = self.asset_work();
@@ -906,7 +868,8 @@ fn baked(m: &MaterialData) -> Vec<f32> {
     for uv in m.uv_transforms {
         values.extend([uv[0], uv[1], uv[2], uv[3], uv[4], uv[5], 0., 0.]);
     }
-    values.extend([m.clearcoat, m.clearcoat_roughness, m.sheen_roughness, 0.]);
+    let mask = if m.clearcoat_mask_from_alpha { 1. } else { 0. };
+    values.extend([m.clearcoat, m.clearcoat_roughness, m.sheen_roughness, mask]);
     values.extend(m.sheen_color);
     values.push(0.);
     values
@@ -1468,6 +1431,9 @@ impl<P: crate::Executor> crate::Executor for ModelExecutor<P> {
     }
     fn suspend(&mut self, suspended: bool) {
         self.inner.suspend(suspended);
+    }
+    fn audio_state(&self) -> Option<&'static str> {
+        self.inner.audio_state()
     }
     fn sync(&mut self, world: &exact_game::World, generation: u64, playing: bool, seekable: bool) {
         self.inner.sync(world, generation, playing, seekable);

@@ -90,6 +90,7 @@ type UpdateList = fn(
     bool,
     bool,
     Option<&Value>,
+    [Option<&Value>; 2],
 ) -> Result<(), InstanceError>;
 type ListTypography = fn(&mut [Child], &mut Update<'_>, &[Frame]) -> Result<(), InstanceError>;
 
@@ -115,7 +116,8 @@ fn unlinked() -> InstanceError {
     )
 }
 
-mod errors;
+pub(crate) mod errors;
+use errors::invalid;
 pub use errors::InstanceError;
 
 /// One realized node.
@@ -897,7 +899,8 @@ impl NodeInst {
             colour_moved: false,
             around: u.theme.tuple,
         };
-        inst.emit_bindings(u, frames, true)?;
+        inst.emit_bindings(u, frames, true)
+            .map_err(|e| e.at_view(view, node))?;
         // Its children are created in what it sets: nothing to visit again.
         inst.colour_moved = false;
         let saved = inst.enter(u, inst.tuple);
@@ -914,7 +917,9 @@ impl NodeInst {
             Ok(())
         })();
         u.theme = saved;
-        realized.map(|()| inst)
+        realized
+            .map_err(|e: InstanceError| e.at_view(view, node))
+            .map(|()| inst)
     }
 
     fn emit_bindings(
@@ -1180,8 +1185,10 @@ impl NodeInst {
         }) {
             let s = plan.surface(surface);
             let mut values = Vec::with_capacity(s.args.len as usize);
-            for a in s.args.iter() {
-                values.push(u.eval(plan.surface_arg(a).expr, frames)?);
+            for (k, a) in s.args.iter().enumerate() {
+                values.push(u.eval_named(plan.surface_arg(a).expr, frames, || {
+                    format!("surface argument {}", k + 1)
+                })?);
             }
             if self.rare.as_ref().and_then(|r| r.last_surface.as_ref()) != Some(&values) {
                 u.surfaces.push(SurfaceUpdate {
@@ -1217,11 +1224,12 @@ impl NodeInst {
     fn update(&mut self, u: &mut Update<'_>, frames: &[Frame]) -> Result<(), InstanceError> {
         u.work.nodes_visited += 1;
         let before = self.tuple;
-        self.emit_bindings(u, frames, false)?;
+        self.emit_bindings(u, frames, false)
+            .map_err(|e| e.at_view(self.view, self.node))?;
         let saved = self.enter(u, before);
         let updated = self.update_children(u, frames);
         u.theme = saved;
-        updated
+        updated.map_err(|e| e.at_view(self.view, self.node))
     }
 
     fn update_children(
@@ -1248,6 +1256,14 @@ impl NodeInst {
             && self
                 .bound_style(plan, u.sites, exact_kernel::StyleId::ScrollBehavior)
                 .is_some_and(|value| value.as_str() == Some("smooth"));
+        // Its estimate and its gap, read again as they change (`sizing.rs`).
+        use exact_kernel::PropId::{EstimatedItemHeight, EstimatedItemWidth};
+        let estimate = (self
+            .collection()
+            .map(|_| self.bound_prop(plan, u.sites, EstimatedItemWidth)))
+        .and_then(|w| w.or_else(|| self.bound_prop(plan, u.sites, EstimatedItemHeight)));
+        let gap = (self.collection())
+            .and_then(|_| self.bound_style(plan, u.sites, exact_kernel::StyleId::ColumnGap));
         if let Some(collection) = self.collection_mut() {
             collection.around = theme::Around {
                 retheme: false,
@@ -1260,6 +1276,7 @@ impl NodeInst {
                 follow,
                 smooth,
                 keep.as_ref(),
+                [estimate.as_ref(), gap.as_ref()],
             )?;
         } else if update_all(u, &mut self.children, frames)? {
             self.emit_children(u);
@@ -1273,13 +1290,6 @@ impl NodeInst {
         collection::work::retire_node(u, &self);
         u.ops.push(Op::DestroyView { id: self.view });
     }
-}
-
-/// The journal line for a value a row refused.
-fn invalid(view: ViewId, row: &str, value: &Value) -> String {
-    let mut shown = String::new();
-    crate::agent::untyped_json(value, &mut shown);
-    format!("view {view}: invalid {row} value {shown}; unset")
 }
 
 /// A face's colour that is no colour (LLP 1045.000 D2), as written; `then`

@@ -6,16 +6,23 @@
 //! Kernel validation precedes every write; a refusal leaves the kernel untouched.
 mod admission;
 mod advance;
+mod capture;
 mod native_timers;
+mod retirement;
 pub use native_timers::NativeTimer;
 use native_timers::Timer;
+pub use retirement::{ModuleIdentity, ModuleInstance};
 mod background;
 mod commit;
 mod control;
 mod errors;
+mod reply;
+#[cfg(test)]
+mod request_set_tests;
 pub use errors::RunnerError;
 mod event;
 pub mod faults;
+mod fetches;
 mod field;
 mod fonts;
 pub mod foresee;
@@ -124,6 +131,7 @@ mod modules;
 pub use modules::{AppState, CallHow, CallOrigin, PresenceAnswer, PresenceAsk, WakeHow};
 #[cfg(test)]
 mod abort_tests;
+mod canvas_performance;
 mod split;
 mod surface_record;
 mod text_axes;
@@ -136,12 +144,12 @@ mod viewport;
 mod writes;
 pub use carry::Carried;
 pub use checkpoint::Checkpoint;
-pub use router::{routing, RouterChange, Routing};
+pub use router::{launch_matches, routing, RouterChange, Routing};
 pub use split::{press_writes_router, StackSplit};
 pub use uploads::{UploadEnd, UploadMark};
 
 use crate::instance::{Ids, InstanceError, InstanceStep, SurfaceUpdate, Tree, Update};
-use crate::request::{Answer, Dispatch, Outcome, Request, RequestOut};
+use crate::request::{Answer, Dispatch, Outcome, Request, RequestClass, RequestOut};
 use crate::store::{Store, StoreWrite};
 use crate::vm::{self, Env, Frame, RowSlots};
 use exact_kernel::{CommitReceipt, Kernel, ViewId};
@@ -184,6 +192,9 @@ pub struct Advanced {
     /// request, short of its cutoff or at it: the host lands the reply
     /// before it advances again.
     pub stopped_on_request: bool,
+    /// Apply this batch before continuing: a keyed change action needs
+    /// the preceding host layout and commands to be visible.
+    pub needs_apply: bool,
 }
 
 #[derive(Clone)]
@@ -240,6 +251,7 @@ enum Seed<'a> {
 /// answers, and the arguments it was asked with (what `parse` sees).
 #[derive(Clone)]
 struct PendingReq {
+    module: Option<ModuleInstance>,
     inspection_generation: u64,
     refusal: Option<(&'static str, bool)>,
     /// The host refused this ordered request before execution (LLP 1041 §8.4).
@@ -289,6 +301,8 @@ struct PendingReq {
     replied: bool,
     /// Never sent: when a resource an overrun refused is asked again (`overrun.rs`).
     reask_at: Option<f64>,
+    /// The wait is for the launch's own ask, so its re-ask is the launch's too.
+    launch: bool,
     /// The re-asks after a turn over its budget this ask's streak has made.
     reasks: usize,
 }
@@ -349,6 +363,7 @@ pub struct Runner<D: DataSource> {
     action_binding_origin: std::rc::Rc<()>,
     detached_focus: Vec<(ViewId, FocusPath)>,
     data: D,
+    bake_warnings: Vec<String>,
     kernel: Kernel,
     slots: Vec<Value>,
     derives: Vec<Option<Value>>,
@@ -397,6 +412,11 @@ pub struct Runner<D: DataSource> {
     reuse: bool,
     /// The 2D canvases (LLP 1056 D4), when Canvas 2D is linked.
     canvases: Option<Box<dyn canvas2d::CanvasEngine>>,
+    canvas_owner: std::sync::Arc<()>,
+    canvas_captures: Vec<(
+        crate::Request,
+        std::sync::Weak<std::sync::Mutex<crate::canvas_capture::CaptureState>>,
+    )>,
     /// Requests in flight (LLP 1016): at most one per resource or mutation.
     pending: Vec<PendingReq>,
     /// This commit let a request go: `conclude` tells the source what is still in flight.
@@ -413,6 +433,7 @@ pub struct Runner<D: DataSource> {
     /// for this answer to reject it in a module turn, so a refused aborting
     /// commit still delivers it on the next pump.
     module_aborts: Vec<u64>,
+    failed_tickets: std::collections::BTreeMap<u64, String>,
     /// The tickets answered aborted, until the host cancels their requests
     /// whatever their method ([`Runner::take_explicit_aborts`]).
     explicit_aborts: Vec<u64>,
@@ -460,6 +481,12 @@ pub struct Runner<D: DataSource> {
     /// Resources an action asked to re-request; consumed by the next settle
     /// that can ask them (LLP 1054.000.000 D2).
     refresh_next: Vec<usize>,
+    /// Resources whose ask in the commit being made is the launch's own,
+    /// replacing a stand-in: nobody asked for fresh data, so the request is
+    /// not sent as a refresh, and a reply fetched for this launch may answer
+    /// it (LLP 1162.000 D1). Set for the boot's settlement, `data_ready`'s
+    /// commit and the re-ask of a wait that carries it; empty otherwise.
+    launch: Vec<usize>,
     /// Sends to mutations that declare `refreshes`, shown over the answers
     /// of the resources they change until they end or are answered.
     writes: writes::Writes,
@@ -511,6 +538,7 @@ pub struct Runner<D: DataSource> {
     delivery: crate::delivery::Delivery,
     // @ref LLP 1039 D2 — the layout size before settlement.
     viewport: crate::Viewport,
+    viewport_geometry: crate::viewport::Geometry,
     // @ref LLP 1069.000 D2 — visibility, connectivity, the share sheet.
     page: crate::page::Page,
     // @ref LLP 1027.000.000 — the date, once the host says it.
@@ -519,6 +547,7 @@ pub struct Runner<D: DataSource> {
     text_axes: text_axes::TextAxes,
     place: crate::time::Place,
     surface_records: exact_kernel::SortedMap<String, String>,
+    canvas_performance: exact_kernel::SortedMap<String, String>,
     surface_refusals: exact_kernel::SortedMap<String, String>,
     /// What the host links of the runner's own answers (LLP 1047 D3).
     links: RunnerLinks,
@@ -639,9 +668,13 @@ impl<D: DataSource> Runner<D> {
         snapshot: Vec<(String, Vec<u8>)>,
         delivery: crate::delivery::Delivery,
         // @ref LLP 1039 D2 — the layout size before settlement.
-        viewport: crate::Viewport,
+        mut viewport: crate::Viewport,
         launch: &str,
     ) -> Result<Runner<D>, RunnerError> {
+        viewport.device_pixel_ratio = kernel
+            .reported_display_scale()
+            .map(f64::from)
+            .or(viewport.device_pixel_ratio);
         viewport.validate()?;
         // @ref LLP 1095 D9 — every platform colour the plan can show is known
         // before the host's first report, a branch not yet taken included.
@@ -681,6 +714,15 @@ impl<D: DataSource> Runner<D> {
             return Err(RunnerError::AppMismatch {
                 plan: plan.app_id.clone(),
                 host: data.app_id().to_string(),
+                fix: format!(
+                    "the plan names {plan:?} and this binary's data source {host:?}. If the plan is this app's own \
+                     (baked from its app.json), the data source is wrong: a Rust data crate's `fn app_id` (one copied \
+                     from a sample keeps the sample's) or app.ts's `appId` must say {plan:?}, or remove that \
+                     `fn app_id` to take app.json's. If the plan came from elsewhere (another app's dev server, \
+                     update or link), the plan is the wrong one: change nothing in the app",
+                    plan = plan.app_id,
+                    host = data.app_id()
+                ),
             });
         }
         let roots = plan
@@ -705,12 +747,12 @@ impl<D: DataSource> Runner<D> {
         }
         let same_logic = carried.is_none_or(|c| c.data_revision.as_deref() == data.revision());
         data.bind(&plan);
-        // A cold boot forgets the kept answers no declared reader seeds; an
+        // A cold boot forgets the kept answers no resource seeds (`kept::obsolete`); an
         // app granting Health forgets them all, at every boot (LLP 1069.008.000 D7).
         let private = crate::device::keeps_no_answers(data.grants());
         let obsolete_kept = match carried {
-            _ if private => kept::all(&snapshot),
-            None => kept::obsolete(&plan, &snapshot),
+            _ if private => kept::all(snapshot.iter().map(|(name, _)| name)),
+            None => kept::obsolete(&plan, snapshot.iter().map(|(name, _)| name)),
             Some(_) => Vec::new(),
         };
         let mut store = Store::new_linked(data.grants(), snapshot, links.grants);
@@ -756,6 +798,16 @@ impl<D: DataSource> Runner<D> {
                         }))
             })
             .collect();
+        // What each carried reader's last ask read (LLP 1069.005 D2): whether
+        // a store change asks it again.
+        let read_contents: Vec<Option<bool>> = (plan.resources.iter())
+            .map(|resource| {
+                let (name, source) = (plan.str(resource.name), plan.str(resource.source));
+                (carried.filter(|_| same_logic)?.read_contents.iter())
+                    .find(|(reader, origin, _)| reader == name && origin == source)
+                    .map(|(_, _, contents)| *contents)
+            })
+            .collect();
         let router = match links.router {
             Some(routing) => routing(&plan)?,
             None => None,
@@ -765,6 +817,7 @@ impl<D: DataSource> Runner<D> {
         let roles = exact_kernel::style::roles::Roles::new(crate::bridge::role_overrides(&plan));
         let booting = exact_kernel::style::roles::bind(&roles);
         root_font::bold_text_facts(&mut kernel, &plan, viewport.preferences.bold_text); // LLP 1115.000 D12.3
+        let viewport_geometry = crate::viewport::Geometry::of(&kernel);
         let mut runner = Runner {
             sites: crate::instance::SiteIndex::linked(&plan, links.keyframes),
             strings: vm::intern(&plan),
@@ -782,12 +835,16 @@ impl<D: DataSource> Runner<D> {
             derives: Vec::new(),
             resources: store_readers
                 .into_iter()
-                .map(|store_reader| resources::ResourceRow {
+                .zip(read_contents)
+                .map(|(store_reader, contents)| resources::ResourceRow {
                     store_reader,
+                    contents_reader: contents.unwrap_or(false),
+                    reads_known: contents.is_some(),
                     ..Default::default()
                 })
                 .collect(),
             tree: None,
+            bake_warnings: Vec::new(),
             reorder_owner: None,
             reorder_ops: Vec::new(),
             reorder_kept: Default::default(),
@@ -819,6 +876,8 @@ impl<D: DataSource> Runner<D> {
             shown: Default::default(),
             reuse: false,
             canvases: links.canvas.map(|engine| engine()),
+            canvas_owner: std::sync::Arc::new(()),
+            canvas_captures: Vec::new(),
             pending: Vec::new(),
             pending_mut: Vec::new(),
             announced: Default::default(),
@@ -831,10 +890,11 @@ impl<D: DataSource> Runner<D> {
             background: Default::default(),
             module_work: Default::default(),
             mapper_turns: Default::default(),
-            picked_count: 0,
+            picked_count: carried.map_or(0, |c| c.picked_count),
             forgot: false,
             heard_aborts: Vec::new(),
             module_aborts: Vec::new(),
+            failed_tickets: Default::default(),
             explicit_aborts: Vec::new(),
             retired_fetches: Vec::new(),
             uploads: Default::default(),
@@ -847,6 +907,7 @@ impl<D: DataSource> Runner<D> {
             retry_reader: None,
             mutation_requests: 0,
             refresh_next: Vec::new(),
+            launch: Vec::new(),
             writes: writes::Writes::default(),
             reconciling: Vec::new(),
             refused_unsent: Vec::new(),
@@ -858,12 +919,14 @@ impl<D: DataSource> Runner<D> {
             extensions: Default::default(),
             delivery,
             viewport,
+            viewport_geometry,
             page: Default::default(),
             time: crate::time::launch_time(),
             live_times: Default::default(),
             text_axes: Default::default(),
             place: launched_place.clone().unwrap_or_default(),
             surface_records: Default::default(),
+            canvas_performance: Default::default(),
             surface_refusals: Default::default(),
             links,
             router,
@@ -927,38 +990,29 @@ impl<D: DataSource> Runner<D> {
         runner.carry_uploads_in(carried.map_or(&[][..], |c| &c.uploads));
         // @ref LLP 1048.000 D6 — a document's answers seed their resources.
         // The device's own store is an input its render never had.
-        let (seeded, open, note) = match seed {
+        let (seeded, mut again) = match seed {
             Seed::Checkpoint(checkpoint) => runner.seed_checkpoint(checkpoint),
-            _ => (
-                vec![false; runner.plan.resources.len()],
-                Vec::new(),
-                String::new(),
-            ),
+            _ => (vec![false; runner.resources.len()], Vec::new()),
         };
-        let device_state = matches!(seed, Seed::Checkpoint(_)) && runner.has_app_store();
-        // Store-reading resources when the data source is not ready (a TypeScript module before
-        // its host loads it, LLP 1027 D4): the answer kept from the last launch seeds the first
-        // frame if its identifying arguments still match and its value still fits; the compiled
-        // empty-store placeholder is the fallback (settlement); either way the resource is asked
-        // again at `data_ready`.
+        // A carried answer of a stream still open, as a checkpoint's.
+        let streamed = |name: &str| carried.is_some_and(|c| c.streams.iter().any(|s| s == name));
+        again.extend((0..runner.plan.resources.len()).filter(|&i| {
+            runner.resources[i].state.is_some()
+                && streamed(runner.plan.str(runner.plan.resources[i].name))
+        }));
+        // A data module's store readers when it is not ready (a TypeScript module before its host
+        // loads it, LLP 1027 D4): the answer kept from the last launch seeds the first frame if its
+        // identifying arguments still match and its value still fits; the compiled empty-store
+        // placeholder is the fallback (settlement); either way the resource is asked again at
+        // `data_ready`.
         let ready = runner.data.ready();
         runner.keeping.on = !private && (!ready || carried.is_some_and(|c| c.keeps_answers));
-        runner.seed_at_boot(&seeded, device_state, ready, private);
-        if ready && device_state {
-            // … and asked now when it can answer, showing the rendered
-            // answer until it does.
-            runner.refresh_next.extend(
-                (0..seeded.len()).filter(|&i| seeded[i] && runner.plan.resources[i].reader),
-            );
-        }
-        // An open stream's rendered answer shows until the stream, asked
-        // again, answers: now when its source can, else at `data_ready`.
-        for i in open {
-            if !ready {
-                runner.resources[i].stale = true;
-            } else if !runner.refresh_next.contains(&i) {
-                runner.refresh_next.push(i);
-            }
+        runner.seed_at_boot(&seeded, ready, private);
+        // A seeded answer asked again, an open stream's or, on a device with
+        // its own store, a store reader's, shows until it answers: asked now
+        // when its source can answer, else at `data_ready`.
+        for i in again {
+            runner.ask_at_launch(i);
         }
         runner.pending_mut = vec![false; runner.plan.mutations.len()];
         runner.then_due = vec![f64::INFINITY; runner.plan.mutations.len()];
@@ -966,6 +1020,10 @@ impl<D: DataSource> Runner<D> {
         // A carried boot never takes compiled data: it was baked for the
         // initial state, and the carried state is not that.
         runner.settle(carried.is_none())?;
+        let note = match seed {
+            Seed::Checkpoint(checkpoint) => runner.end_checkpoint_seeding(checkpoint, &seeded),
+            _ => String::new(),
+        };
         runner.journal_kept_seeds();
         runner.init_late_slots(carried)?;
         let now = runner.now_ms;
@@ -991,6 +1049,7 @@ impl<D: DataSource> Runner<D> {
             })
             .collect();
         runner.gate_step()?;
+        runner.launch.clear();
         // No commit's end follows the boot's settlement: what it did here.
         runner.hear_forgotten();
         runner.keep_sent(false);
@@ -1012,6 +1071,7 @@ impl<D: DataSource> Runner<D> {
         let receipt = runner.apply(ops)?;
         runner.samples_stood();
         runner.publish_surfaces(surfaces);
+        runner.pin_canvas_captures();
         let line = lines::boot(carried.is_some(), runner.kernel.live_count(), receipt.epoch);
         runner.log(line);
         runner.persist_boot();
@@ -1137,6 +1197,12 @@ impl<D: DataSource> Runner<D> {
     /// Inspect data-source identity and readiness without executing app logic.
     pub fn data_ref(&self) -> &D {
         &self.data
+    }
+
+    /// The app's grants: the data module's, and the origins its declared
+    /// sources carry (LLP 1162.001 D3). What a host endows its executor with.
+    pub fn grants(&self) -> String {
+        crate::grants::with_declared(self.data.grants(), &self.plan)
     }
 
     /// Current value of a slot by name.

@@ -132,19 +132,10 @@ impl<D: DataSource> Runner<D> {
 impl<D: DataSource> Tamber<'_, D> {
     /// The app tuple at `place`.
     pub fn tuple(&self, place: Place) -> u32 {
-        let kernel = self.runner.kernel();
-        let mut at = match place {
-            Place::Node(id) => kernel.node(id),
-            Place::Root => None,
-        };
-        while let Some(node) = at {
-            // A pin's row holds the tuple it makes, plus one (bridge.rs).
-            if node.style.mask.has(StyleId::Mode) && node.style.mode > 0 {
-                return node.style.mode - 1;
-            }
-            at = node.parent.and_then(|p| kernel.node(p));
+        match place {
+            Place::Node(id) => self.runner.tuple_at(id),
+            Place::Root => self.runner.ids.theme.window,
         }
-        self.runner.ids.theme.window
     }
 
     /// Generated constant `token` at `place` (`SURFACE_CARD`): its value,
@@ -255,7 +246,7 @@ impl<D: DataSource> Tamber<'_, D> {
         (root, at.unwrap_or(root))
     }
 
-    /// Length `text` (px, `rem`, `em`, a text style, the hairline, cells) in points
+    /// Length `text` (px, font/viewport units, a text style, the hairline, cells) in points
     /// at `place`.
     fn points(&self, text: &str, place: Place) -> Option<f64> {
         // The terminal's column holds cells (`1ch`, `2lh`): their px (round
@@ -267,7 +258,9 @@ impl<D: DataSource> Tamber<'_, D> {
         match exact_kernel::style::relative::parse(text) {
             Some((unit, n)) => {
                 let device = self.runner.kernel().device_pixel();
-                Some(f64::from(unit.basis(root, reference, device) * n))
+                Some(f64::from(
+                    unit.basis(root, reference, device, &self.runner.kernel().env()) * n,
+                ))
             }
             None => exact_num::parse_f64(text.trim().trim_end_matches("px")).ok(),
         }

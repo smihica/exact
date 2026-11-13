@@ -44,6 +44,7 @@ pub mod activation;
 pub mod agent;
 pub mod auth;
 pub mod bridge;
+pub mod canvas_capture;
 pub use bridge::icon_of;
 pub mod commands;
 pub mod compare;
@@ -54,8 +55,11 @@ pub mod design;
 pub mod desktop;
 pub mod device;
 pub mod failure;
+pub mod fetch_template;
 pub mod file_pickers;
 mod format;
+/// The native hosts' frame-health reducer (LLP 1079.000 §5.1): Apple's and Android's collectors.
+pub mod frame_health;
 pub mod geometry;
 pub mod grants;
 pub mod hardened;
@@ -78,6 +82,7 @@ pub mod save_file;
 pub use runner::picker as picker_support;
 /// A received share's helpers a host shares (LLP 1133.024 D2, D3).
 pub use runner::picker::shared as share_in;
+pub mod canvas_performance;
 pub mod machine;
 pub mod midi;
 pub mod rows;
@@ -115,28 +120,29 @@ pub use instance::{DocNode, DocTree, DocTreeError, ListLinks, SurfaceUpdate, LIS
 pub use page::Page;
 pub use process::{ProcessOp, WorkClock, PROCESS_URL};
 pub use request::{
-    io_grants, Answer, Dispatch, FailureKind, HttpScheduling, LongPoll, Message, Outcome,
-    Placement, Redirect, Reply, Request, RequestOut, Response, RetryReader, Retrying, SocketOp,
-    SocketOrigin, SocketSend, SurfaceOutcome, SurfaceRequest, Work, BODY_TO_HELD_BYTES,
-    BODY_WRITTEN, LONG_POLL_REPLY, MAX_BODY_FROM_BYTES, MAX_BODY_FROM_PATH, MAX_BODY_TO_BYTES,
-    MAX_HOST_WORK_BYTES, MAX_TIMEOUT_MS, NATIVE_URL,
+    io_grants, Answer, CacheMode, CompletionTiming, Dispatch, FailureKind, HttpScheduling,
+    LongPoll, Message, Outcome, Placement, Redirect, Reply, Request, RequestClass, RequestOut,
+    Response, RetryReader, Retrying, SocketOp, SocketOrigin, SocketSend, SurfaceOutcome,
+    SurfaceRequest, Work, BODY_TO_HELD_BYTES, BODY_WRITTEN, LONG_POLL_REPLY, MAX_BODY_FROM_BYTES,
+    MAX_BODY_FROM_PATH, MAX_BODY_TO_BYTES, MAX_HOST_WORK_BYTES, MAX_TIMEOUT_MS, NATIVE_URL,
 };
 pub use runner::{
-    canvas_engine, press_writes_router, routing, virtual_frame, Advanced, Announce, AuthLinks,
-    BackgroundState, BlockPlacement, CallOrigin, CanvasEngine, CanvasLink, CanvasList, Carried,
-    Checkpoint, Command, ControlValue, DataError, DataSource, DataSourceWrapper, DeviceLinks,
-    DrawReply, DrawRequest, Drawn, DropEvent, Event, FieldSelection, FormatLink, Geometry,
-    GeometryLink, Hold, HoldAnswer, InFlight, InputDetails, Interrupt, Intersection, KeyModifiers,
-    KeyboardEvent, Limits, ListTextPolicy, ListTextPosition, MouseEvent, Native, NativeCall,
-    NativeHandler, Overlaid, Picked, PickerLinks, PickerRequest, PointerEvent, PreloadWake,
-    ResizeRect, RouterChange, RouterLink, Routing, Runner, RunnerError, RunnerLinks, ScrollEvent,
-    SelectionDirection, SnapshotModule, SocketReader, SocketState, StackSplit, StreamCount,
-    SurfaceAnswer, Target, Timed, UploadEnd, UploadMark, WheelEvent, Write, BACKGROUND,
-    JOURNAL_RING, MAX_CLOCK_MS, PICKED, QUEUE_BOUND, RESIZE_UNDELIVERED, TIMER_FIRE_LIMIT,
-    VIRTUAL_FRAME_MS,
+    canvas_engine, launch_matches, press_writes_router, routing, virtual_frame, Advanced, Announce,
+    AuthLinks, BackgroundState, BlockPlacement, CallOrigin, CanvasEngine, CanvasLink, CanvasList,
+    Carried, Checkpoint, Command, ControlValue, DataError, DataSource, DataSourceWrapper,
+    DeviceLinks, DrawReply, DrawRequest, Drawn, DropEvent, Event, FieldSelection, FormatLink,
+    Geometry, GeometryLink, Hold, HoldAnswer, InFlight, InputDetails, Interrupt, Intersection,
+    KeyModifiers, KeyboardEvent, Limits, ListTextPolicy, ListTextPosition, MouseEvent, Native,
+    NativeCall, NativeHandler, Overlaid, Picked, PickerLinks, PickerRequest, PointerEvent,
+    PreloadWake, ResizeRect, RouterChange, RouterLink, Routing, Runner, RunnerError, RunnerLinks,
+    ScrollEvent, SelectionDirection, SnapshotModule, SocketReader, SocketState, StackSplit,
+    StreamCount, SurfaceAnswer, Target, Timed, UploadEnd, UploadMark, WheelEvent, Write,
+    BACKGROUND, JOURNAL_RING, MAX_CLOCK_MS, PICKED, QUEUE_BOUND, RESIZE_UNDELIVERED,
+    TIMER_FIRE_LIMIT, VIRTUAL_FRAME_MS,
 };
 pub use runner::{AppState, LiveApplied, LiveRefusal, Place, Tamber};
 pub use runner::{CallHow, WakeHow};
+pub use runner::{ModuleIdentity, ModuleInstance};
 pub use upload::{UPLOAD_PROGRESS, UPLOAD_SENDING};
 /// The binding core's names (LLP 1121 D12): what `contract tamber gen rust`
 /// writes (`pub const SURFACE_CARD: Token<Color>`) and resolves.
@@ -149,7 +155,7 @@ pub mod tamber {
 pub use secrets::{SecretLease, SecretWait, SharedSecrets};
 pub use store::{Socket, SocketCall, Store, StoreChange, StoreError, StoreWrite};
 pub use uses::{svg_filters, svg_islands, uses, Capability, Uses};
-pub use viewport::{Contrast, Fold, Gamut, Hover, Pointer, Posture, Preferences, Viewport};
+pub use viewport::{Contrast, Fold, Gamut, Hover, Pointer, Posture, Preferences, Update, Viewport};
 pub use vm::Trap;
 
 /// Timer admission observations shared by all hosts.

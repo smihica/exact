@@ -55,6 +55,38 @@ impl DataSource for Module {
         self.journal_lines()
     }
 
+    fn parse_tool(
+        &mut self,
+        fetch: Option<u64>,
+        continuation: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        let answer = self
+            .resume_request(
+                Some(store),
+                None,
+                fetch,
+                continuation,
+                source,
+                args,
+                outcome,
+            )
+            .and_then(|a| {
+                a.ok_or_else(|| {
+                    DataError::Unavailable("the tool still has requests in flight".into())
+                })
+            });
+        self.refresh_background();
+        self.owned_answer(answer)
+    }
+
+    fn module_identity(&self, _: &str) -> Option<exact_runner::ModuleIdentity> {
+        Some(self.identity.clone())
+    }
+
     fn take_aborted(&mut self) -> Vec<u64> {
         Module::take_aborted(self)
     }
@@ -70,7 +102,8 @@ impl DataSource for Module {
         outcome: Outcome,
     ) -> Result<Option<Request>, DataError> {
         let _ = store;
-        self.background_round(outcome)
+        let result = self.background_round(outcome);
+        self.after_oom(result)
     }
 
     fn keeps_sent(&self, fetch: u64) -> bool {
@@ -84,16 +117,21 @@ impl DataSource for Module {
         refused: bool,
     ) -> Vec<Option<u64>> {
         let _ = store;
-        self.keep_sent_now(let_go, refused)
+        let kept = self.keep_sent_now(let_go, refused);
+        self.retire_oom();
+        kept
     }
 
     fn timer_before_reply(
         &mut self,
         store: &Store,
         in_flight: InFlight<'_>,
+        fetch: Option<u64>,
     ) -> Option<(u64, Request)> {
         let _ = store;
-        self.timer_first(&in_flight)
+        let request = self.timer_first(&in_flight, fetch);
+        self.retire_oom();
+        request
     }
 
     fn module_landed(
@@ -102,7 +140,8 @@ impl DataSource for Module {
         token: u64,
         outcome: Outcome,
     ) -> Result<(), DataError> {
-        self.module_landed_now(store, token, outcome)
+        let result = self.module_landed_now(store, token, outcome);
+        self.after_oom(result)
     }
 
     fn background_state(&self) -> Option<exact_runner::BackgroundState> {
@@ -157,7 +196,6 @@ impl DataSource for Module {
     }
 
     fn dispatch(&mut self, token: u64, store: &Store) -> Dispatch {
-        let _ = store;
         if let Some(dispatch) = self.host.secrets.dispatch(token) {
             return dispatch;
         }
@@ -169,7 +207,11 @@ impl DataSource for Module {
             .iter()
             .any(|(_, p)| p.call == token && p.ticket == WAITING)
         {
-            return self.wake(token).unwrap_or_else(|| {
+            self.refresh_waiting();
+            if self.retire_oom().is_some() {
+                return Dispatch::Missing;
+            }
+            return self.wake(token, store.clock_ms()).unwrap_or_else(|| {
                 self.waiters.push(token);
                 Dispatch::Held
             });
@@ -184,19 +226,11 @@ impl DataSource for Module {
     }
 
     fn release(&mut self, store: &Store) -> Vec<(u64, Dispatch)> {
-        let _ = store;
-        // Waiting answers whose wait may be over are asked again.
-        let mut released = self.host.secrets.release();
-        for token in std::mem::take(&mut self.waiters) {
-            match self.wake(token) {
-                Some(work) => released.push((token, work)),
-                None if self.parked.iter().any(|(_, p)| p.call == token) => {
-                    self.waiters.push(token)
-                }
-                None => {}
-            }
+        self.refresh_waiting();
+        if self.retire_oom().is_some() {
+            return Vec::new();
         }
-        released
+        self.release_ready(store.clock_ms())
     }
 
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
@@ -237,7 +271,11 @@ impl DataSource for Module {
     }
 
     fn activate(&mut self) -> Result<(), DataError> {
-        self.load().map_err(DataError::Unavailable)
+        if self.reached {
+            self.load().map_err(DataError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
 
     fn activate_for_validation(&mut self) -> Result<(), DataError> {
@@ -257,6 +295,7 @@ impl DataSource for Module {
                 module.directories = self.directories.clone();
                 module.host.secrets = self.host.secrets.replacement();
                 module.document_owner = self.document_owner;
+                module.preloads = self.preloads;
                 module.native_factory = self.native_factory;
                 // It keeps the placement (`Placed::replacement`), not `placed`'s word.
                 module.keeps_plan = self.keeps_plan;
@@ -267,6 +306,10 @@ impl DataSource for Module {
 
     fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    fn preloads(&self) -> &[exact_runner::request::Preload] {
+        self.preloads
     }
 
     fn grants(&self) -> &str {
@@ -295,6 +338,7 @@ impl DataSource for Module {
             return;
         };
         let (_, parked) = self.parked.remove(at);
+        self.parked.retain(|(_, p)| p.call != parked.call);
         self.waiters.retain(|waiter| *waiter != token);
         self.forget_calls(vec![parked.call]);
     }
@@ -312,6 +356,7 @@ impl DataSource for Module {
     fn forgotten(&mut self, store: &Store, in_flight: &[InFlight<'_>]) {
         let _ = store;
         self.forget_in_flight(in_flight);
+        self.retire_oom();
     }
 
     /// Stops the running call, or the next one to start, from any thread:
@@ -325,10 +370,10 @@ impl DataSource for Module {
         Some(self.native_slot.clone())
     }
 
-    /// Not before the host loads it (LLP 1027 D4): the runner boots
-    /// store-reading resources from their kept answers meanwhile.
+    /// An entry reaching this module waits for its load (LLP 1027 D4),
+    /// using kept answers for store-reading resources meanwhile.
     fn ready(&self) -> bool {
-        self.is_loaded()
+        !self.reached || self.is_loaded() || self.retirement.reload
     }
 
     fn canvas_surfaces(&self) -> Vec<(String, usize)> {
@@ -342,12 +387,19 @@ impl DataSource for Module {
         request: &exact_runner::DrawRequest<'_>,
         ctx: &exact_runner::exact_canvas::Context2d,
     ) -> exact_runner::Drawn {
+        if let Err(error) = self.reload_after_oom() {
+            return exact_runner::Drawn::Now(exact_runner::DrawReply {
+                error: Some(error.to_string()),
+                ..Default::default()
+            });
+        }
         self.host.canvas = Some(ctx.env());
         let reply = match self.engine.as_mut() {
             None => Err("the module is not loaded".to_string()),
             Some(engine) => engine.call("__exact_draw", [&request.json(), "", ""]),
         };
         self.host.canvas = None;
+        self.retire_oom();
         exact_runner::Drawn::Now(match reply {
             Ok(json) => exact_runner::DrawReply::from_seam(&json),
             Err(e) => exact_runner::DrawReply {
@@ -358,14 +410,28 @@ impl DataSource for Module {
     }
 
     fn canvases_retired(&mut self, retired: &[(u64, u32)]) {
+        if self.reload_after_oom().is_err() {
+            return;
+        }
         if let Some(engine) = self.engine.as_mut() {
             let json = serde_json::to_string(retired).unwrap_or_default();
             let _ = engine.call("__exact_retire", [&json, "", ""]);
         }
+        self.retire_oom();
     }
 
     /// The seam's signatures, from the plan's `sources` table (LLP 1027 D2).
     fn bind(&mut self, plan: &Plan) {
+        self.reached = plan.sources.iter().any(|row| {
+            let name = plan.str(row.name);
+            !exact_plan::runner_owned_source(name)
+                && plan.module_named(name).is_none()
+                && plan.fetch_named(name).is_none()
+        }) || plan.surfaces.iter().any(|row| {
+            self.canvas_surfaces
+                .iter()
+                .any(|(name, _)| name == plan.str(row.name))
+        });
         if self.keeps_plan {
             self.plan = Some(plan.clone());
         }
@@ -421,8 +487,10 @@ impl DataSource for Module {
                 )))
             }
             Answer::Later(_) => {
-                self.parked
-                    .retain(|(k, _)| *k != Module::key(None, source, args));
+                // A stream parks among the streams, which keep the module
+                // outstanding: let both rows go, and the calls with them.
+                let gone = self.replace_on(&Module::key(None, source, args));
+                self.forget_calls(gone);
                 Err(DataError::Unavailable(format!(
                     "`{source}` fetches, and there is no host to run it here"
                 )))
@@ -451,7 +519,7 @@ impl DataSource for Module {
         }
         let answer = self.begin(Some(store), None, source, args);
         self.refresh_background();
-        answer
+        self.owned_answer(answer)
     }
 
     fn parse(
@@ -463,7 +531,7 @@ impl DataSource for Module {
     ) -> Result<Answer, DataError> {
         let answer = self.resume(Some(store), None, source, args, outcome);
         self.refresh_background();
-        answer
+        self.owned_answer(answer)
     }
 
     fn answer_for(
@@ -473,14 +541,14 @@ impl DataSource for Module {
         source: &str,
         args: &[Value],
     ) -> Result<Answer, DataError> {
-        // A resource whose answer the bake's storage refusal ended (an
-        // uncaught `code: 'bake'`) is the device's to answer: that is
-        // `DeferredAtBake` (aab190948), and the runner shows its placeholder.
+        // An uncaught storage or stream-option refusal marked `code: 'bake'`
+        // is the device's to answer: that is `DeferredAtBake` (aab190948),
+        // and the runner shows its placeholder.
         // At bake, an error the source raises itself stays fatal, even after a
         // refusal it caught (kanban2 #5).
         let answer = self.begin(Some(store), Some(target), source, args);
         self.refresh_background();
-        answer
+        self.owned_answer(answer)
     }
 
     fn parse_for(
@@ -493,7 +561,29 @@ impl DataSource for Module {
     ) -> Result<Answer, DataError> {
         let answer = self.resume(Some(store), Some(target), source, args, outcome);
         self.refresh_background();
-        answer
+        self.owned_answer(answer)
+    }
+
+    fn more_for(&mut self, target: Target) -> Vec<Request> {
+        self.parked
+            .iter_mut()
+            .filter(|(key, _)| key.0 == Some(target))
+            .filter_map(|(_, p)| p.more.take())
+            .collect()
+    }
+
+    fn parse_fetch_for(
+        &mut self,
+        target: Target,
+        fetch: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Option<Answer>, DataError> {
+        let answer = self.resume_fetch(Some(store), Some(target), fetch, source, args, outcome);
+        self.refresh_background();
+        self.after_oom(answer)
     }
 
     fn overlay(
@@ -503,6 +593,7 @@ impl DataSource for Module {
         answer: &Value,
         writes: &[exact_runner::Write<'_>],
     ) -> Result<Option<exact_runner::Overlaid>, DataError> {
-        Module::overlay(self, source, args, answer, writes)
+        let result = Module::overlay(self, source, args, answer, writes);
+        self.after_oom(result)
     }
 }

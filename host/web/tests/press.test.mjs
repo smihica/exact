@@ -351,12 +351,12 @@ check('a pressable that declares no feedback dims while pressed; a row, a native
     expect(await shown('custom')).toBe('0.65');
     await mouse('mouseReleased', custom);
     expect(await faded('custom')).toBe('1');
-    // A link without a `press` handler shows nothing under a mouse when it declares its own feedback; otherwise
-    // it dims. A finger shows the authored feedback (below). LLP 1061 has yet to unify this behavior across hosts.
+    // A link without a `press` handler is pressed as CSS's `:active` holds on it, under a mouse as under a finger:
+    // it shows the feedback it declares, and dims where it declares none (LLP 1121 D8).
     await evaluate(`document.getElementById('away').insertAdjacentHTML('beforebegin', '<a id="bare" data-view="" href="#there" style="scale:calc(var(--exact-scale,1) * var(--exact-press-factor,1))!important;--exact-press:0.9">bare</a>')`);
     const bare = () => evaluate(`document.getAnimations().forEach(a => a.finish()), [parseFloat(getComputedStyle(document.getElementById('bare')).scale) || 1, (globalThis.exact?.pressShown?.(document.getElementById('bare')) ?? getComputedStyle(document.getElementById('bare'))).opacity].join()`);
     await mouse('mousePressed', await centre('bare'));
-    expect(await bare()).toBe('1,1');
+    expect(await bare()).toBe('0.9,1');
     await mouse('mouseReleased', await centre('bare'));
     // Only the innermost: a button or a field in a card takes the press, and the card's own area dims the card.
     expect(await held('inner', 'inner', 'outer')).toBe('0.65,1');
@@ -529,8 +529,8 @@ check('a pressable that declares no feedback dims while pressed; a row, a native
     expect(await pressedAfter('bare')).not.toBe(null);
     expect(await bare()).toBe('0.9,1');
     await finger('touchEnd');
-    // A person's scroll under a press ends it (the browser takes the touch to pan: `pointercancel`), and a touch that
-    // stops a list a person set moving is no press.
+    // A person's scroll under a press ends it (the browser takes the touch to pan: `pointercancel`).
+    // The test with a controlled clock below times recent-scroll suppression: CDP round trips can outlast its window.
     await evaluate(`document.getElementById('away').insertAdjacentHTML('beforebegin', '<div id="scroller" style="position:fixed;top:0;left:0;width:300px;height:40px;overflow:auto"><div id="deep" data-exact-on="press" style="height:200px">deep</div><div id="next" data-exact-on="press" style="height:100px">next</div></div>')`);
     const scrollTop = () => evaluate(`document.getElementById('scroller').scrollTop`);
     const [across] = await centre('scroller');
@@ -538,10 +538,6 @@ check('a pressable that declares no feedback dims while pressed; a row, a native
     for (const y of [28, 21, 14, 7]) await finger('touchMove', [across, y]);
     expect([await marked('deep', 'data-pressed'), await scrollTop() > 0]).toEqual([false, true]);
     await finger('touchEnd');
-    await finger('touchStart', [across, 20]);
-    if (await evaluate('at.down - at.scrolled < 150')) expect(await pressedAfter('deep')).toBe(null);
-    await finger('touchEnd');
-    await released('deep');
     // The page moving itself (an app's `scrollTop`) is no person's scroll, as UIKit's `setContentOffset` cancels no
     // touch: a touch just after it presses, and a press it moves goes on, shown while its target is under the finger.
     await evaluate(`new Promise(ok => { const poll = setInterval(() => { if (performance.now() - at.scrolled > 150) { clearInterval(poll); ok(); } }, 10); })`);
@@ -1370,13 +1366,18 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: press f
     // A document's scroll is reported on Document, outside the element ancestor chain. The page scrolling itself is
     // no person's scroll, and takes no press.
     // A wheel elsewhere makes no other scroller's own scrolling a person's.
-    for (const [name, scroll] of [['movingPage', 'person'], ['appScroll', 'app'], ['wheelElsewhere', 'wheel']]) {
+    // The scroll-stopping touch lands just inside the 150 ms window; a deliberate touch after the rest presses.
+    for (const [name, scroll] of [['movingPage', 'person'], ['movingPort', 'port'], ['restedPort', 'rest'], ['appScroll', 'app'], ['wheelElsewhere', 'wheel']]) {
       await page.evaluate(scroll => {
         if (scroll === 'person') personScroll(document);
+        else if (scroll === 'port' || scroll === 'rest') personScroll(document.getElementById('port'));
         else if (scroll === 'wheel') { document.getElementById('authored').dispatchEvent(new WheelEvent('wheel', { bubbles: true })); document.getElementById('port').dispatchEvent(new Event('scroll')); }
         else document.dispatchEvent(new Event('scroll'));
-        pointer('moving', 'pointerdown');
       }, scroll);
+      if (scroll === 'port' || scroll === 'rest') await page.clock.runFor(scroll === 'port' ? 149 : 151);
+      // Once scrolls have rested for the delay, a later scroll is no longer tied to the cancelled touch.
+      if (scroll === 'rest') await page.evaluate(() => document.getElementById('port').dispatchEvent(new Event('scroll')));
+      await page.evaluate(() => pointer('moving', 'pointerdown'));
       await page.clock.runFor(151);
       seen[name] = await page.evaluate(() => {
         const marked = document.getElementById('moving').hasAttribute('data-pressed');
@@ -1413,7 +1414,7 @@ for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: press f
       el.click();
       return clicked;
     });
-    expect(seen).toEqual({ authoredButton: '0.4', movingPage: false, appScroll: true, wheelElsewhere: true, afterScrollEnd: true, fixedBar: [true, true], scriptClick: true });
+    expect(seen).toEqual({ authoredButton: '0.4', movingPage: false, movingPort: false, restedPort: true, appScroll: true, wheelElsewhere: true, afterScrollEnd: true, fixedBar: [true, true], scriptClick: true });
     // Ignore delayed feedback if the target is disabled or removed before its timer fires
     await page.clock.runFor(151);
     for (const change of ['disabled', 'removed']) {

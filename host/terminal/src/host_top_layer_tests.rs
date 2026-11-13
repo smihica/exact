@@ -127,3 +127,91 @@ fn reveal_stops_at_the_popover() {
     host.reveal_to(inside, "start");
     assert_eq!(host.scroll.get(&page).copied(), Some(500.0));
 }
+
+/// An open dialog with no background of its own covers the page in the
+/// terminal's default ground, as every other host's opaque surface does.
+#[test]
+fn a_layer_without_a_background_covers_the_page() {
+    let plan = contract::compile_terminal(
+        r#"component App
+  view
+    column width="100%" height="100%"
+      text "aaaaaaaaaaaaaaaaaaaaaaaa"
+      text "bbbbbbbbbbbbbbbbbbbbbbbb"
+      text "cccccccccccccccccccccccc"
+      text "dddddddddddddddddddddddd"
+      dialog id="d" width="10ch" height="2lh"
+        text "hi"
+"#,
+    )
+    .unwrap();
+    let mut host = Host::boot(plan, (), Mode::Fullscreen, 24, 6).unwrap();
+    host.open_layer(node(&host, "d"), true);
+    let screen = host.frame().grid.text();
+    let rows: Vec<&str> = screen.lines().collect();
+    assert_eq!(rows[2], "ccccccchi        ccccccc", "{screen}");
+    assert_eq!(rows[3], "ddddddd          ddddddd", "{screen}");
+}
+
+/// A scroller's indicator is painted over its rows: a row that reaches the
+/// last column does not hide it.
+#[test]
+fn a_scrollers_indicator_is_over_its_rows() {
+    let rows = "      text \"0123456789\"\n".repeat(8);
+    let plan = contract::compile_terminal(&format!(
+        "component App\n  view\n    scroll width=\"10ch\" height=\"4lh\"\n{rows}"
+    ))
+    .unwrap();
+    let mut host = Host::boot(plan, (), Mode::Fullscreen, 20, 6).unwrap();
+    let screen = host.frame().grid.text();
+    let ends: String = screen
+        .lines()
+        .take(4)
+        .map(|l| l.chars().nth(9).unwrap_or(' '))
+        .collect();
+    assert_eq!(ends, "┃┃││", "{screen}");
+}
+
+const BLUR_OPENS: &str = r#"component App
+  state typed = ""
+  state other = ""
+  action open
+    showModal("dialog")
+  action put(value: string)
+    other = value
+  action opened(key: string)
+    showModal("dialog")
+  action edit(value: string)
+    typed = value
+  view
+    column
+      input value=typed input=edit blur=open id="field"
+      button id="next"
+        text "Next"
+      input value=other input=put key=opened id="opener"
+      dialog id="dialog"
+        input autofocus=true id="inside"
+"#;
+
+#[test]
+fn a_dialog_a_blur_opens_keeps_its_autofocus() {
+    let boot = || {
+        let plan = contract::compile_terminal(BLUR_OPENS).unwrap();
+        let mut host = Host::boot(plan, (), Mode::Fullscreen, 40, 12).unwrap();
+        host.arm = false;
+        host
+    };
+    let mut host = boot();
+    host.focus(Some(node(&host, "field")));
+    host.key(Key::Named("Tab"));
+    assert_eq!(host.focus, Some(node(&host, "inside")), "the dialog's");
+    host.key(Key::Char('x'));
+    assert_eq!(host.value(node(&host, "field")), "", "the covered field");
+    // A key whose handler opens the dialog types nothing into the field
+    // the dialog now covers.
+    let mut host = boot();
+    host.focus(Some(node(&host, "opener")));
+    host.key(Key::Char('x'));
+    assert_eq!(host.focus, Some(node(&host, "inside")));
+    assert_eq!(host.value(node(&host, "opener")), "");
+}

@@ -246,12 +246,22 @@ fn a_timers_send_lands_only_if_its_reply_beats_the_next_tick() {
     assert_eq!(requests.len(), 2);
     let (first, last) = (requests[0].ticket, requests[1].ticket);
     let dropped = r
-        .fulfill(first, exact_runner::Outcome::Storage(b"three".to_vec()))
+        .fulfill_measured(
+            first,
+            exact_runner::Outcome::Storage(b"three".to_vec()),
+            Some(exact_runner::CompletionTiming {
+                cached: false,
+                elapsed_ms: 17,
+                delivery_wait_ms: 0,
+            }),
+        )
         .unwrap();
     assert!(dropped.is_none());
     let line = format!("reply {first} dropped: no such request in flight");
     assert!(
-        r.journal().any(|l| l.contains(&line)),
+        r.journal().any(|l| l.contains(&line)
+            && l.contains("; wall 17 ms")
+            && !l.contains("delivery wait")),
         "{:?}",
         r.journal().collect::<Vec<_>>()
     );
@@ -260,14 +270,17 @@ fn a_timers_send_lands_only_if_its_reply_beats_the_next_tick() {
         .fulfill_measured(
             last,
             exact_runner::Outcome::Storage(b"four".to_vec()),
-            Some(212)
+            Some(exact_runner::CompletionTiming {
+                cached: true,
+                elapsed_ms: 212,
+                delivery_wait_ms: 37
+            })
         )
         .unwrap()
         .is_some());
     assert_eq!(r.slot("result"), Some(&Value::some(Value::str("four"))));
-    assert!(r
-        .journal()
-        .any(|line| line.starts_with("t=1200 fulfil ") && line.contains("wall 212 ms")));
+    assert!(r.journal().any(|line| line.starts_with("t=1200 fulfil ")
+        && line.contains("; HTTP cache; wall 212 ms; delivery wait 37 ms")));
 }
 
 fn style_id(name: &str) -> u16 {
@@ -844,7 +857,7 @@ fn commands_exit_the_side_and_refusals_leave_the_kernel_untouched() {
     let err = r.act("rogue", vec![]).unwrap_err();
     assert!(matches!(
         err,
-        RunnerError::Trap(Trap::WriteNotDeclared { slot: 2, .. })
+        RunnerError::Evaluation { ref error, .. } if matches!(**error, RunnerError::Trap(Trap::WriteNotDeclared { slot: 2, .. }))
     ));
     assert_eq!(r.slot("nowMs"), Some(&Value::Number(0.0)));
     assert_eq!(r.kernel().export(None).unwrap(), before);
@@ -1142,9 +1155,16 @@ fn app_identity_gate() {
         Default::default(),
         "/",
     ) {
-        Err(RunnerError::AppMismatch { plan, host }) => {
+        Err(RunnerError::AppMismatch { plan, host, fix }) => {
             assert_eq!(plan, "com.exact.other");
             assert_eq!(host, "com.exact.mine");
+            // The refusal names both causes: the data source's declaration, and a plan from elsewhere.
+            assert!(
+                fix.contains("`fn app_id`")
+                    && fix.contains("must say \"com.exact.other\"")
+                    && fix.contains("the plan is the wrong one"),
+                "{fix}"
+            );
         }
         Err(other) => panic!("expected AppMismatch, got {other:?}"),
         Ok(_) => panic!("expected AppMismatch, got a boot"),

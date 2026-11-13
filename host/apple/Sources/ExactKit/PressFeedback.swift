@@ -109,7 +109,7 @@ extension NodeView {
         // press down on the node as it was held is taken over, and its
         // release shows nothing (the click is still its own).
         if holds("active") { return }
-        if pressed, defaultLink == nil { pressHaptic() }
+        if pressed { pressHaptic() }
         showPress(pressed)
     }
     /// The press shown (`down`), or taken off: the scale and the paint, or
@@ -123,7 +123,6 @@ extension NodeView {
         }
         #endif
         if isNativeButton { heldHighlight(); return }
-        let down = down && defaultLink == nil
         // What a press shows goes at its release whatever the style says now:
         // an authored look the style dropped while held included.
         if !down || !authorsPress { paintPress(false, instantly: down); aimPress(false, release: true) }
@@ -146,7 +145,6 @@ extension NodeView {
     func pressFollows(inside: Bool) {
         guard pressed else { return }
         pressPaint.outside = !inside
-        if defaultLink != nil { showPress(false); return }
         if holds("active") { return }
         if !inside { paintPress(false); aimPress(false) }
         #if os(iOS)
@@ -386,7 +384,9 @@ extension NodeView {
         t = t.translatedBy(x: o.x, y: o.y).rotated(by: rotate * .pi / 180).scaledBy(x: s, y: s).translatedBy(x: -o.x, y: -o.y)
         // Outermost, a layout transition's offset; its size is the surface's
         // alone (`Surface.swift`, LLP 1063).
-        layer?.setAffineTransform(t.concatenating(CGAffineTransform(translationX: layoutOffset.x, y: layoutOffset.y)))
+        // Written when it differs: this runs at every display of the view, and at every rebinding of a list's row.
+        let placed = t.concatenating(CGAffineTransform(translationX: layoutOffset.x, y: layoutOffset.y))
+        if let layer, !CATransform3DIsAffine(layer.transform) || layer.affineTransform() != placed { layer.setAffineTransform(placed) }
     }
     /// Whether a window point is inside the box as it stands unpressed.
     /// `local` reaches a transformed box through its plane, the press
@@ -426,7 +426,7 @@ extension NodeView {
     static let dimHold: CFTimeInterval = 0.1
 
     /// Whether a press shows the platform's dim: a node the host presses
-    /// (a `press` handler or a custom invoker's visual contact),
+    /// (a `press` handler, a link's `href` or a custom invoker's visual contact),
     /// with no pressed look written (a
     /// `-exact-press-scale` or pressed paint, any value, 1 included, is the
     /// author's: `authorsPress`), no `pointerdown` or `pointerup` of its own
@@ -435,13 +435,24 @@ extension NodeView {
     /// native button is UIKit's own and never comes here.
     var platformPressDims: Bool {
         guard !authorsPress, !isNativeButton, !isSurfaceControl,
-              handlers.contains("press") || pressContact?.invokerLook == true || overlayHoldsPress,
+              handlers.contains("press") || defaultLink != nil || pressContact?.invokerLook == true || overlayHoldsPress,
               !handlers.contains("pointerdown"), !handlers.contains("pointerup") else { return false }
         if let w = window {
             let r = convert(bounds, to: w)
             if r.width >= w.bounds.width, r.height >= w.bounds.height * 0.9 { return false }
         }
         return true
+    }
+
+    private var dimOpacityDepth: Float {
+        -(pressPaint.lookOpacity ?? ownOpacity) * filterOpacityFactor * (1 - Self.dimmedOpacity)
+    }
+
+    func refreshDimOpacity() {
+        guard let fade = layer.animation(forKey: "pressDim")?.copy() as? CABasicAnimation else { return }
+        fade.fromValue = dimOpacityDepth
+        if press.dimmedAt != nil { fade.toValue = fade.fromValue }
+        layer.add(fade, forKey: "pressDim")
     }
 
     /// Dim (`down`) or fade back. `instantly` drops it without the fade.
@@ -451,7 +462,7 @@ extension NodeView {
         if down {
             guard press.dimmedAt == nil else { return }
             press.dimmedAt = now
-            let delta = -layer.opacity * (1 - Self.dimmedOpacity)
+            let delta = dimOpacityDepth
             let hold = CABasicAnimation(keyPath: "opacity")
             hold.isAdditive = true
             hold.fromValue = delta

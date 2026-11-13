@@ -40,11 +40,6 @@ pub const MAX_MODULE: usize = 32 << 20;
 
 trait Executor {
     fn call(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String>;
-    /// Whether a call trapped. A trapped instance's memory and state are
-    /// undefined, so it takes no further calls.
-    fn trapped(&self) -> bool {
-        false
-    }
     #[cfg(any(
         target_os = "macos",
         target_os = "linux",
@@ -66,6 +61,8 @@ pub struct Swappable<D> {
     embedded: Option<D>,
     app_id: String,
     grants: String,
+    preloads: Vec<exact_runner::request::Preload>,
+    launch: Option<exact_runner::request::Launch>,
     mode: &'static str,
     loader: Option<Loader>,
     preloader: Option<Preloader>,
@@ -89,6 +86,8 @@ impl<D: DataSource> Swappable<D> {
         Self {
             app_id: embedded.app_id().into(),
             grants: embedded.grants().into(),
+            preloads: embedded.preloads().to_vec(),
+            launch: embedded.launch(),
             canvas_surfaces: embedded.canvas_surfaces(),
             embedded: Some(embedded),
             mode,
@@ -101,10 +100,30 @@ impl<D: DataSource> Swappable<D> {
             native: None,
         }
     }
-    /// Name the source digest (`scripts/app.mjs` `nativeSource`) the binary
+    /// The app's identity from its manifest (`app.json`'s `app.id`), for an
+    /// embedded source that names none (`DataSource::app_id`'s default). The
+    /// hosts key the app's storage roots, kept answers and persisted states by
+    /// this id; without one a native host gives the app no storage, and an
+    /// agent drive's named store (`--storage`) would be memory. A source that
+    /// names its own id keeps it: its users' files are already under it.
+    pub fn named(mut self, app: &str) -> Self {
+        if self.app_id.is_empty() {
+            self.app_id = app.into();
+        }
+        self
+    }
+    /// Attach the binary's checked process-start requests (LLP 1162.000 D2).
+    pub fn with_preloads(mut self, preloads: &'static [exact_runner::request::Preload]) -> Self {
+        self.preloads = preloads.to_vec();
+        self
+    }
+
+    /// Name the source digest (`scripts/rust.mjs` `nativeSource`) the binary
     /// compiled `make`'s data crate from. A Rust candidate whose receipt names
     /// the same source is that code already: replacement makes it natively,
     /// so a module costs interpretation only while it differs from the binary.
+    /// The comparison is of source, never of the wasm module, whose bytes can
+    /// stay the same while a native-only arm changed (LLP 1030 D3a).
     pub fn with_native(mut self, source: &'static str, make: fn() -> D) -> Self {
         self.native = Some((source, make));
         self
@@ -202,9 +221,12 @@ impl<D: DataSource> Swappable<D> {
         let bytes = self.run(&request)?;
         abi::call_reply(&bytes, store)
     }
-    /// Run one request on the active executor. After a trap the instance is
-    /// discarded and the module activated afresh, so the trap costs that call
-    /// only (LLP 1029.000 §3: module-local caches may be discarded).
+    /// Run one request on the active executor. A call that fails may have
+    /// run, and changed the module's own state, before it failed: a trap
+    /// leaves the instance's memory undefined, and a reply over the seam's
+    /// bound is refused after its answer ran. So the instance is discarded
+    /// and the module activated afresh, and the failure costs that call only
+    /// (LLP 1029.000 §3: module-local caches may be discarded).
     fn run(&mut self, request: &[u8]) -> Result<Vec<u8>, DataError> {
         let engine = self.executor.as_mut().ok_or_else(|| {
             DataError::Unavailable("Rust module awaits post-pixel activation".into())
@@ -213,13 +235,11 @@ impl<D: DataSource> Swappable<D> {
             Ok(bytes) => return Ok(bytes),
             Err(error) => error,
         };
-        if engine.trapped() {
-            self.executor = None;
-            if let Err(again) = self.activate_module() {
-                return Err(DataError::Interface(format!(
-                    "{error}; activating the module again failed: {again}"
-                )));
-            }
+        self.executor = None;
+        if let Err(again) = self.activate_module() {
+            return Err(DataError::Interface(format!(
+                "{error}; activating the module again failed: {again}"
+            )));
         }
         Err(DataError::Interface(error))
     }
@@ -306,6 +326,13 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
     fn app_id(&self) -> &str {
         &self.app_id
     }
+    fn launch(&self) -> Option<exact_runner::request::Launch> {
+        self.launch.clone()
+    }
+    fn preloads(&self) -> &[exact_runner::request::Preload] {
+        &self.preloads
+    }
+
     fn grants(&self) -> &str {
         &self.grants
     }
@@ -441,8 +468,11 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
         &mut self,
         store: &Store,
         in_flight: exact_runner::InFlight<'_>,
+        fetch: Option<u64>,
     ) -> Option<(u64, exact_runner::Request)> {
-        self.embedded.as_mut()?.timer_before_reply(store, in_flight)
+        self.embedded
+            .as_mut()?
+            .timer_before_reply(store, in_flight, fetch)
     }
     fn module_landed(
         &mut self,
@@ -472,6 +502,28 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
             .map(DataSource::take_logs)
             .unwrap_or_default()
     }
+    fn parse_tool(
+        &mut self,
+        fetch: Option<u64>,
+        continuation: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Answer, DataError> {
+        if let Some(source_impl) = &mut self.embedded {
+            source_impl.parse_tool(fetch, continuation, store, source, args, outcome)
+        } else {
+            self.call(store, source, args, Some(&outcome))
+        }
+    }
+
+    fn module_identity(&self, source: &str) -> Option<exact_runner::ModuleIdentity> {
+        self.embedded
+            .as_ref()
+            .and_then(|m| m.module_identity(source))
+    }
+
     fn take_aborted(&mut self) -> Vec<u64> {
         self.embedded
             .as_mut()
@@ -525,7 +577,8 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
                 let embedded = embedded
                     .replacement(plan, receipt, module)
                     .map_err(|e| format!("{e:?}"))?;
-                let mut source = Self::configured(embedded, self.mode, self.loader);
+                let mut source =
+                    Self::configured(embedded, self.mode, self.loader).named(&self.app_id);
                 source.preloader = self.preloader;
                 source.native = self.native;
                 return Ok(source);
@@ -583,7 +636,9 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
             }
             if let Some((source, make)) = self.native {
                 if meta["source"].as_str() == Some(source) {
-                    let mut native = Self::configured(make(), self.mode, self.loader);
+                    let mut native =
+                        Self::configured(make(), self.mode, self.loader).named(&self.app_id);
+                    native.preloads = self.preloads.clone();
                     native.preloader = self.preloader;
                     native.native = self.native;
                     return Ok(native);
@@ -596,6 +651,8 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
                 embedded: None,
                 app_id: self.app_id.clone(),
                 grants: self.grants.clone(),
+                preloads: self.preloads.clone(),
+                launch: self.launch.clone(),
                 mode: self.mode,
                 loader: self.loader,
                 preloader: self.preloader,
@@ -695,6 +752,27 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Swappable<D> {
             embedded.answer_for(target, store, source, args)
         } else {
             self.call(store, source, args, None)
+        }
+    }
+    fn more_for(&mut self, target: Target) -> Vec<exact_runner::Request> {
+        self.embedded
+            .as_mut()
+            .map(|d| d.more_for(target))
+            .unwrap_or_default()
+    }
+    fn parse_fetch_for(
+        &mut self,
+        target: Target,
+        fetch: Option<u64>,
+        store: &mut Store,
+        source: &str,
+        args: &[Value],
+        outcome: Outcome,
+    ) -> Result<Option<Answer>, DataError> {
+        if let Some(embedded) = &mut self.embedded {
+            embedded.parse_fetch_for(target, fetch, store, source, args, outcome)
+        } else {
+            self.call(store, source, args, Some(&outcome)).map(Some)
         }
     }
     fn parse_for(

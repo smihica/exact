@@ -98,7 +98,7 @@ section binds (`rules/RULES.md`, "Agents").
   `default-members`. The sixth (Charlie, 2026-10-12) compiles every crate and target
   of the workspace and runs none of their tests: on 2026-10-11 six things outside
   `default-members` were broken on origin/main while the five were green, and it
-  catches the ones that did not compile (`exact-web-js`, `exact-linux`'s tests). It
+  catches the ones that did not compile (`exact-web-js`, `exact-painted`'s tests). It
   needs the pinned Bun first on PATH (or named by `BUN`): app crates' build scripts
   run Bun, and under an older one each fails with "Bun … is older than …". It shares
   no compiled crate with the build, so it costs its whole time again: on an 18-core
@@ -106,7 +106,8 @@ section binds (`rules/RULES.md`, "Agents").
   (the build: 7 to 13 s), 2.4 min cold. The async lane (`bun scripts/async.mjs`, per commit on
   origin/main) runs the first three with `--workspace`, which covers the sixth, plus the `async lane:` ignored tests,
   the web JS target's conformance run (`host/web-js/conform.mjs --strict`) and its
-  Chrome-oracle Firefox/WebKit steps (`conform-firefox`, `conform-webkit`),
+  Chrome-oracle Firefox/WebKit step (`conform-browsers`),
+  the module seam and notifications web drives,
   the separate game workspace's locked tests, the UIKit XCTests, touch smoke and
   the tvOS and watchOS compiles
   (`build.mjs --test --ios`; `build.mjs --tvos --no-install`, which builds and signs
@@ -157,8 +158,9 @@ section binds (`rules/RULES.md`, "Agents").
   fails the build. A game builds the wasm target (LLP 1071 §8), and `--wasm` is the
   internal flag for the uses below. The dev loop, the agent's web host, the smoke's app drive and
   metrics run what the build makes: on the JS target an edit rebuilds and reloads the
-  page (~0.1 s, no state carried); a native client opening the dev URL is forwarded to
-  the resident loop's producers (`dev.mjs --wasm`, started at its first request).
+  page, carrying compatible state and, while the logic is unchanged, settled answers.
+  A native client opening the dev URL is forwarded to the resident loop's producers
+  (`dev.mjs --wasm`, started at its first request).
   Delivery bakes the web crate without its wasm for the native streams and publishes
   the JS build of that bake's plan as the web root; the smoke's bare-plan fixtures and
   conformance's oracle stay `--wasm` (LLP 1071 §7, "Retiring the wasm target on the web").
@@ -184,15 +186,17 @@ section binds (`rules/RULES.md`, "Agents").
   takes about 10 s warm, and is advice, not a check (`semantics/README.md`, "Using it day to
   day"; `contract verify <app>` is the app author's version).
 - The gate tests only `default-members`. Of the hosts it holds the web host
-  (`exact-web`) and the Apple host's Rust (`exact-apple`; its tests that drive a real
+  (`exact-web`), the Apple host's Rust (`exact-apple`; its tests that drive a real
   socket through URLSession, wait on the wall clock or launch Bun, Swift or a nested
-  cargo build are `async lane:`, and its Swift is the XCTests). The
-  others (`exact-web-js`, `exact-web-capabilities`, `exact-linux`, `exact-windows`,
-  `exact-render`, …), `js/`, `gpu/` and most apps are
+  cargo build are `async lane:`, and its Swift is the XCTests) and the native
+  request executor the Apple, Linux and render hosts share (`exact-executor`). The
+  others (`exact-web-js`, `exact-web-capabilities`, `exact-painted` (the painted host
+  that `exact-linux`, `exact-windows` and Android's reader present), `exact-render`, …),
+  `js/`, `gpu/` and most apps are
   not tested by it (the sixth check compiles them, their tests too, and runs none),
   and the async lane reports a failing test only after the push. When you touch one, or
   what its tests read, run its tests before landing (`bun scripts/affected.mjs` names
-  them): `cargo test -p exact-linux --lib --tests --no-fail-fast`, or `--bins` for a
+  them): `cargo test -p exact-painted --lib --tests --no-fail-fast`, or `--bins` for a
   bin-only crate such as `exact-web-js`. Advice, not a check.
 - Verify by running, never by grepping. Fix loops get three rounds, then stop and say so.
 - To see a change work, drive the app: `bun scripts/agent.mjs <web|macos|ios|linux> tree
@@ -215,10 +219,13 @@ section binds (`rules/RULES.md`, "Agents").
 - The terminal host (LLP 1101): `cargo build --profile host-dev -p harness-terminal`,
   then `./target/host-dev/harness` runs the coding harness in this terminal (inline;
   `--fullscreen` for the alternate screen), or `exact-terminal <entry.contract>` any
-  terminal entry. With operations it runs headless (`--size 80x24 type prompt "hi" key
-  Enter until "…" print`); headless, the frames go into a terminal emulator (`vt100`)
-  and `print`, `screenshot` read its screen (`print --all` the scrollback, `document`
-  the whole laid-out document). Develop it in `host-dev`: a debug build lays out a long
+  terminal entry. After `--drive` it runs the operations headless (`--size 80x24 --drive
+  type prompt "hi" key Enter until "…" print`); headless, the frames go into a terminal
+  emulator (`vt100`) and `print`, `screenshot` read its screen (`print --all` the
+  scrollback, `document` the whole laid-out document). With `--print`, `--json`, or a
+  pipe on stdin or stdout, an entry runs once and exits (LLP 1101.003: `harness --print
+  --prompt "…"`, `exact-terminal apps/todo/terminal.contract --json /done`); the other
+  words are its location (`--help`). Develop it in `host-dev`: a debug build lays out a long
   document hundreds of times slower. `exact-terminal` is in `default-members`
   (`tests/it/screen.rs` drives inline mode through the emulator); `harness-data` is not,
   so when you touch the harness run `cargo test -p harness-data`.

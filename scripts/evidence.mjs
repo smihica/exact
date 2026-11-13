@@ -32,7 +32,7 @@ const runsOf = (app) => resolve(app.dir, '.exact', 'runs.jsonl');
 /** The record of the build a run on `host` uses: its path, or null where builds are not identified. */
 function buildRecord(app, host, { webDist, device } = {}) {
   if (device) return null;
-  if (host === 'web') { const marker = resolve(webDist ?? defaultWebDist(), '.exact-build.json'); return existsSync(marker) ? marker : null; }
+  if (host === 'web') { const marker = resolve(webDist ?? defaultWebDist(app), '.exact-build.json'); return existsSync(marker) ? marker : null; }
   if (host === 'macos' || host === 'ios') return receiptPath(host, app) ?? null;
   return null;
 }
@@ -57,7 +57,7 @@ export function runs(app) {
 /** The host's build now: its id, and what changed since it was built ([] when fresh); null where unidentified. */
 function buildNow(app, host) {
   if (host === 'web') {
-    const dist = defaultWebDist(), marker = resolve(dist, '.exact-build.json');
+    const dist = defaultWebDist(app), marker = resolve(dist, '.exact-build.json');
     return existsSync(marker) ? { id: digest(marker), changed: webChanges(dist, app).all } : null;
   }
   if (host === 'macos' || host === 'ios') {
@@ -171,15 +171,14 @@ export function hostsTouched(paths, app) {
     const platform = local !== null ? directory
       : /^(apple|ios|macos|tvos|watchos|web|linux|windows|android|terminal)(?:-|$)/.exec(directory)?.[1];
     let hosts = all;
-    // The executor core is included by Linux and the web's native renderer.
-    // Its process transport is selected by the compilation target, and the ordering tests belong to Apple's ABI.
-    if (local === null && /^host\/apple\/src\/executor_/.test(p)) {
-      if (p === 'host/apple/src/executor_order_tests.rs') hosts = apple;
-      else if (p === 'host/apple/src/executor_process_off.rs') hosts = ['web', 'ios', 'tvos', 'windows', 'android'];
-      else if (/\/executor_process(?:_|\.)/.test(p)) hosts = ['web', 'macos', 'linux'];
+    // The executor serves every native host and the web's native renderer.
+    // Its process transport is selected by the compilation target.
+    if (local === null && directory === 'executor') {
+      if (p === 'host/executor/src/process_off.rs') hosts = ['web', 'ios', 'tvos', 'windows', 'android'];
+      else if (/^host\/executor\/src\/process(?:_|\.)/.test(p)) hosts = ['web', 'macos', 'linux'];
     } else if (local === null && ['raster', 'svg-raster'].includes(directory)) hosts = [...apple, ...linux];
-    else if (local === null && directory === 'linux-update') hosts = ['linux'];
-    else if (local === null && ['linux', 'ink'].includes(directory)) hosts = macUses(`exact-${directory}`) ? ['macos', ...linux] : linux;
+    else if (local === null && ['linux', 'linux-update'].includes(directory)) hosts = ['linux'];
+    else if (local === null && ['painted', 'ink'].includes(directory)) hosts = macUses(`exact-${directory}`) ? ['macos', ...linux] : linux;
     else if (local === null && directory === 'listen') hosts = ['macos', 'linux', 'android'];
     else if (local === null && directory === 'render') hosts = ['web'];
     else if (local === null && directory === 'apple-painted') hosts = ['macos'];
@@ -225,7 +224,7 @@ if (import.meta.main) {
     const [, host, what] = argv;
     if (!host || !what) throw new Error('evidence note <host> "<what was seen>" [--device "<model, OS>"]');
     // Seen on a named device, the note stands for that device, whose build is not identified; else for the host's build now.
-    recordRun(app.name, { host, what, result: null, kind: 'note', target: opt('--device'), timing: 'real' });
+    recordRun(app.selector, { host, what, result: null, kind: 'note', target: opt('--device'), timing: 'real' });
     console.log(`noted on ${host}: ${what}`);
     process.exit(0);
   }

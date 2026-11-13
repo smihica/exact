@@ -83,7 +83,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Record a host admission refusal on a still-current ticket. Repeating
-    /// refusals cannot grow a queue: there is at most one ticket per target.
+    /// refusals cannot grow a queue: each request already has its ticket.
     pub fn refuse_request(&mut self, ticket: u64, reason: &'static str, ordered: bool) {
         if let Some(pending) = self.pending.iter_mut().find(|p| p.ticket == ticket) {
             pending.refusal = Some((reason, ordered));
@@ -143,6 +143,7 @@ impl<D: DataSource> Runner<D> {
             }
             false
         });
+        self.match_failed_requests();
     }
 
     /// Collect the module's aborted fetches now: a host calls this after the
@@ -203,12 +204,24 @@ impl<D: DataSource> Runner<D> {
     pub fn take_aborted_answer(&mut self) -> Option<(u64, Outcome)> {
         while !self.module_aborts.is_empty() {
             let ticket = self.module_aborts.remove(0);
+            // A pump may answer the abort before it takes queued requests.
+            self.requests.retain(|r| r.ticket != ticket);
             self.explicit_aborts.push(ticket);
             // Kept module work is answered aborted too: its cancelled reply
             // never comes, and the let-go answer's continuation hears this
             // (LLP 1146 D2) as a browser's aborted fetch rejects.
-            if !self.pending.iter().any(|p| p.ticket == ticket) && !self.is_module_work(ticket) {
+            if !self.holds(ticket) {
+                self.failed_tickets.remove(&ticket);
                 continue;
+            }
+            if let Some(message) = self.failed_tickets.get(&ticket) {
+                return Some((
+                    ticket,
+                    Outcome::Failed {
+                        kind: FailureKind::Refused,
+                        message: message.clone(),
+                    },
+                ));
             }
             return Some((
                 ticket,
@@ -219,6 +232,18 @@ impl<D: DataSource> Runner<D> {
             ));
         }
         None
+    }
+
+    /// Put back aborted answers a host took and did not apply (a fulfil
+    /// before them was refused): uncancelled, they wait for the next pump,
+    /// in the order taken. Tickets that are not taken aborts are ignored.
+    pub fn requeue_aborted_answers(&mut self, tickets: &[u64]) {
+        let mut back: Vec<u64> = (tickets.iter().copied())
+            .filter(|t| self.explicit_aborts.contains(t))
+            .collect();
+        self.explicit_aborts.retain(|t| !back.contains(t));
+        back.retain(|t| !self.module_aborts.contains(t));
+        self.module_aborts.splice(0..0, back);
     }
 
     /// Take one refusal for ordinary transactional parsing/settlement. A
@@ -282,6 +307,24 @@ impl<D: DataSource> Runner<D> {
         ))
     }
 
+    /// [`Self::release_failed`] as a commit of the request's origin,
+    /// invocation and causes, as its reply's refused commit was (LLP
+    /// 1133.002 D12, LLP 1133.035 D16 item 6): what the release refreshes
+    /// is asked as the request's, so a wake's failed reply reaches no
+    /// app-only source.
+    pub(super) fn release_failed_as_asked(
+        &mut self,
+        ticket: u64,
+        target: Target,
+        why: Failure,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        let (origin, id) = (self.ticket_origin(ticket), self.ticket_id(ticket));
+        let causes = self.ticket_causes(ticket);
+        self.as_invocation_caused(origin, id, causes, |r| {
+            r.release_failed(ticket, target, why)
+        })
+    }
+
     /// A reply the source failed to take (it threw, ran over its budget, or
     /// answered outside its shape). The refused commit's rollback restored
     /// the request to the pending set, but the host has already delivered
@@ -303,6 +346,7 @@ impl<D: DataSource> Runner<D> {
             .map(|p| (Some(p.args.clone()), p.ask_again, p.write, p.upload, p.sent))
             .unwrap_or_default();
         self.pending.retain(|p| p.ticket != ticket);
+        self.forget_ticket(target);
         self.forgot = true;
         self.sync_pending_flags();
         let name = self.target_name(target);

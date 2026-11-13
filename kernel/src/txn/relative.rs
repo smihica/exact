@@ -9,6 +9,8 @@
 //! `rem` inside a calculation or a grid track is no row of its own: it
 //! resolves at layout against the environment's root font size, which a
 //! change here writes, restyling the nodes that hold one.
+//! Scalar viewport lengths resolve with these rows; a changed viewport basis
+//! invalidates their owners through `Kernel::replace_env` before layout.
 use super::*;
 use crate::generated::StyleProps;
 use crate::style::env::root_font_readers;
@@ -128,9 +130,12 @@ pub(crate) fn resolve(
             let rows = StyleMask::of(StyleId::FontSize);
             let slots: Vec<u32> = arena.iter_live().collect();
             for slot in slots {
-                // Tab metrics use rem even when an authored local font stops
-                // inheritance. Refresh their minimum and cached host offers.
-                if arena.neutral_tab_root(slot).is_some() || arena.neutral_alert(slot) {
+                // Top-layer and tab metrics use rem even when an authored local
+                // font stops inheritance. Refresh their layout and host offers.
+                if arena.neutral_tab_root(slot).is_some()
+                    || arena.neutral_alert(slot)
+                    || arena.neutral_content_popover(slot)
+                {
                     control_env_changed(arena, layout, slot);
                     receipt.layout_invalidated = true;
                     touched.push(arena.key(slot));
@@ -252,7 +257,7 @@ pub(crate) fn resolve(
             if id != StyleId::FontSize {
                 continue;
             }
-            let px = unit.px(n, root, parent, device);
+            let px = unit.px(n, root, parent, device, arena.env());
             if next.set_resolved(id, px) {
                 changed.set(id);
             }
@@ -264,7 +269,7 @@ pub(crate) fn resolve(
             if id == StyleId::FontSize {
                 continue;
             }
-            let px = unit.px(n, root, font, device);
+            let px = unit.px(n, root, font, device, arena.env());
             if next.set_resolved(id, px) {
                 changed.set(id);
             }

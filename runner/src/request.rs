@@ -80,44 +80,19 @@ pub enum HttpScheduling {
     },
 }
 
-/// What a redirect response does: the Fetch standard's `redirect` option.
-/// Native transports follow it in Rust, re-checking the grant on every hop;
-/// `Manual` hands the 3xx back (its `Location` readable), `Error` fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Redirect {
-    /// Follow to the final response.
-    #[default]
-    Follow,
-    /// Return the redirect response itself.
-    Manual,
-    /// Fail the request on a redirect.
-    Error,
-}
-
-impl Redirect {
-    /// The mode `fetch` names (absent is `follow`), refusing any other word.
-    pub fn parse(name: Option<&str>) -> Result<Redirect, String> {
-        match name.unwrap_or("follow") {
-            "follow" => Ok(Redirect::Follow),
-            "manual" => Ok(Redirect::Manual),
-            "error" => Ok(Redirect::Error),
-            other => Err(format!("redirect: follow, manual or error, not {other}")),
-        }
-    }
-
-    /// Its name as `fetch` spells it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Redirect::Follow => "follow",
-            Redirect::Manual => "manual",
-            Redirect::Error => "error",
-        }
-    }
-}
-
+pub use http::{CacheMode, Redirect};
+#[path = "request_preload.rs"]
+mod preload;
+pub use preload::{
+    Launch, LaunchContext, LaunchRequest, MissingPreloadSecret, Preload, PreloadPart, PreloadWhen,
+};
+#[path = "request_http.rs"]
+mod http;
 /// One host request, with ordered native execution unless explicitly opted in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
+    /// The producing module generation. Kept in process; never part of the wire request.
+    pub module: Option<crate::ModuleInstance>,
     /// Native HTTP scheduling; storage and continuations must remain ordered.
     pub http: HttpScheduling,
     /// Executor-local continuation token, not an HTTP request. The browser
@@ -146,6 +121,8 @@ pub struct Request {
     /// coalesced, and a [`Outcome::Closed`] end; mutations send on it
     /// ([`SocketSend`]). Unset, a socket only listens, as in D4.
     pub socket: bool,
+    /// Ordered WebSocket protocol names (LLP 1016.000); set with [`Request::protocols`].
+    pub protocols: Vec<String>,
     /// An HTTP stream whose body, when it is not `text/event-stream`,
     /// arrives as bytes (LLP 1016.000, the byte stream of 2026-10-23): each
     /// [`Message`] is `binary`, the bytes read since the runner took the
@@ -191,6 +168,12 @@ pub struct Request {
     pub body_to: Option<String>,
     /// What a redirect response does (`fetch`'s `redirect`).
     pub redirect: Redirect,
+    /// Fetch's HTTP cache mode (LLP 1162 D4).
+    pub cache: CacheMode,
+    /// A preload to take by name when method and URL agree (LLP 1162.000 D1).
+    pub preload: Option<Box<str>>,
+    /// Checked prefetch option; currently a plain fetch on every host (LLP 1162.000 D5).
+    pub prefetch: bool,
     /// The server may hold the reply until something changes (a long poll;
     /// LLP 1016.000 D9): pending as any request, but no clock waits on it,
     /// neither a jump nor `clock settle` nor `clock data`, and each reply
@@ -312,6 +295,7 @@ impl Request {
     /// D3). The answer is an HTTP-shaped outcome: 200 carries the JSON reply.
     pub fn native(body: Vec<u8>) -> Request {
         Request {
+            module: None,
             http: HttpScheduling::Independent {
                 max_response_bytes: 1 << 20,
             },
@@ -325,6 +309,7 @@ impl Request {
             body,
             stream: false,
             socket: false,
+            protocols: Vec::new(),
             bytes: false,
             upload_progress: false,
             long_poll: None,
@@ -333,6 +318,9 @@ impl Request {
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
+            cache: CacheMode::Unspecified,
+            preload: None,
+            prefetch: false,
             held: false,
             reach: Default::default(),
             listen: None,
@@ -341,7 +329,6 @@ impl Request {
             fetch: None,
         }
     }
-
     /// An auth session (`openAuthSession`, LLP 1069.006 D1): the body is
     /// [`crate::auth::Session`]'s JSON; the independent lane, a 64 KiB reply.
     pub fn auth(body: Vec<u8>) -> Request {
@@ -353,7 +340,6 @@ impl Request {
             ..Request::native(body)
         }
     }
-
     /// An auth session, for the host's auth arm, not the network.
     pub fn is_auth(&self) -> bool {
         self.url == crate::auth::AUTH_URL
@@ -361,7 +347,6 @@ impl Request {
             && self.storage.is_none()
             && self.surface.is_none()
     }
-
     /// A long native call, for the source's native handler, not the network.
     pub fn is_native(&self) -> bool {
         self.url == NATIVE_URL
@@ -369,7 +354,6 @@ impl Request {
             && self.storage.is_none()
             && self.surface.is_none()
     }
-
     /// Whether the request may change something at its server: an `http:`
     /// or `https:` request whose method is not safe (RFC 9110 §9.2.1), and
     /// no stream, socket, long poll or held request. One its answer lets go
@@ -389,7 +373,6 @@ impl Request {
             && self.long_poll.is_none()
             && !self.is_held()
     }
-
     /// Native ordered lane is mandatory for storage and continuations, even
     /// when an invalid HTTP annotation will cause their admission to refuse.
     pub fn is_ordered(&self) -> bool {
@@ -397,10 +380,27 @@ impl Request {
             || self.storage.is_some()
             || self.continuation.is_some()
     }
-
+    /// Eligible for read or parallel-send overlap (LLP 1162 D1).
+    pub fn is_plain_http(&self) -> bool {
+        self.http == HttpScheduling::Ordered
+            && self.storage.is_none()
+            && self.continuation.is_none()
+            && self.surface.is_none()
+            && !self.stream
+            && !self.socket
+            && self.listen.is_none()
+            && !self.is_process()
+            && self.long_poll.is_none()
+            && !self.upload_progress
+            && !self.is_native()
+            && !self.is_auth()
+            && self.body_from.is_none()
+            && self.body_to.is_none()
+    }
     /// A `GET`.
     pub fn get(url: &str) -> Request {
         Request {
+            module: None,
             http: HttpScheduling::Ordered,
             continuation: None,
             storage: None,
@@ -412,6 +412,7 @@ impl Request {
             body: Vec::new(),
             stream: false,
             socket: false,
+            protocols: Vec::new(),
             bytes: false,
             upload_progress: false,
             long_poll: None,
@@ -420,6 +421,9 @@ impl Request {
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
+            cache: CacheMode::Unspecified,
+            preload: None,
+            prefetch: false,
             held: false,
             reach: Default::default(),
             listen: None,
@@ -428,7 +432,6 @@ impl Request {
             fetch: None,
         }
     }
-
     /// A two-way WebSocket to a `ws:` or `wss:` URL (LLP 1016.003 D1): a
     /// stream whose `parse` receives `open`, each frame in order and the
     /// close, and whose mapper and the module's mutations send on it through
@@ -441,10 +444,10 @@ impl Request {
         };
         request.independent_http(1 << 20)
     }
-
     /// A `POST` of a JSON text.
     pub fn post_json(url: &str, json: &str) -> Request {
         Request {
+            module: None,
             http: HttpScheduling::Ordered,
             continuation: None,
             storage: None,
@@ -456,6 +459,7 @@ impl Request {
             body: json.as_bytes().to_vec(),
             stream: false,
             socket: false,
+            protocols: Vec::new(),
             bytes: false,
             upload_progress: false,
             long_poll: None,
@@ -464,6 +468,9 @@ impl Request {
             body_from: None,
             body_to: None,
             redirect: Redirect::Follow,
+            cache: CacheMode::Unspecified,
+            preload: None,
+            prefetch: false,
             held: false,
             reach: Default::default(),
             listen: None,
@@ -472,7 +479,6 @@ impl Request {
             fetch: None,
         }
     }
-
     /// Host storage work as a bounded protocol payload (LLP 1027.001 D2).
     pub fn storage(payload: Vec<u8>) -> Self {
         Self {
@@ -480,7 +486,6 @@ impl Request {
             ..Self::get("")
         }
     }
-
     /// Capture the complete carried state of one named live surface.
     pub fn capture_surface(name: impl Into<String>) -> Self {
         Self {
@@ -518,6 +523,11 @@ impl Request {
         let capability = match surface {
             SurfaceRequest::Capture { name } => format!("surface.read {name}"),
             SurfaceRequest::Restore { name, .. } => format!("surface.write {name}"),
+            // The app's own pixels need no grant; writing them needs
+            // `fs.write`, which the host's write checks (LLP 1133.009 D10).
+            SurfaceRequest::Canvas { path, .. } => {
+                return crate::canvas_capture::path_refusal(path).map_or(Ok(()), Err);
+            }
         };
         let admitted: Vec<_> = admitted
             .lines()
@@ -618,6 +628,12 @@ impl Request {
     /// (see [`Request::wake_ms`]).
     pub fn wake(mut self, ms: u64) -> Self {
         self.wake_ms = Some(ms);
+        self
+    }
+
+    /// With Fetch's HTTP cache mode (LLP 1162 D4).
+    pub fn cache(mut self, mode: CacheMode) -> Self {
+        self.cache = mode;
         self
     }
 
@@ -854,6 +870,16 @@ pub enum SurfaceRequest {
         /// The complete carried state; hosts never project or truncate it.
         bytes: Vec<u8>,
     },
+    /// Write the kept bitmap of a 2D canvas as a PNG file
+    /// ([`crate::canvas_capture`]).
+    Canvas {
+        /// The authored canvas surface name.
+        name: String,
+        /// The `app:/` file to write.
+        path: String,
+        /// The runner's owned drawing boundary; absent until the requesting commit stands.
+        job: Option<crate::canvas_capture::CaptureJob>,
+    },
 }
 
 /// The result of presenter-owned surface work.
@@ -897,10 +923,12 @@ pub struct Message {
     pub id: String,
     /// The event's data (`data:` lines joined by newlines).
     pub data: String,
-    /// Messages the host dropped for this one because the runner had not
-    /// taken them yet (LLP 1016.000 D4: display data coalesces to the
-    /// newest). Non-zero is a gap a log re-asks across from its cursor.
+    /// Messages the host folded into this one because the runner had not
+    /// taken them yet. Only an upload's progress folds (LLP 1016.000 D10);
+    /// every other message reaches the source (D4), so this is 0 for it.
     pub coalesced: u32,
+    /// The negotiated WebSocket protocol; empty for other streams or no offer.
+    pub protocol: Box<str>,
     /// A two-way socket's binary frame (LLP 1016.000 D7): its bytes, with
     /// `data` empty. `None` for text and for every server-sent event.
     pub binary: Option<Vec<u8>>,
@@ -1031,6 +1059,11 @@ pub enum Outcome {
     /// One message of a stream (LLP 1016.000 D1): the stream stays open.
     /// Every other outcome delivered to a stream's ticket ends it.
     Message(Message),
+    /// Messages of one stream that waited for the runner together, in
+    /// arrival order (LLP 1016.000 D4): the source parses each in turn, and
+    /// they commit once, as the last one's answer. Only a host delivers
+    /// this; a source's `parse` is never given it.
+    Messages(Vec<Message>),
     /// A two-way socket's end (LLP 1016.000 D7): the closing handshake's
     /// code and reason, or 1006 when the connection dropped without one.
     Closed {
@@ -1051,6 +1084,16 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The stream messages it carries, in arrival order: none unless it is
+    /// a [`Outcome::Message`] or [`Outcome::Messages`].
+    pub fn messages(&self) -> &[Message] {
+        match self {
+            Outcome::Message(m) => std::slice::from_ref(m),
+            Outcome::Messages(ms) => ms,
+            _ => &[],
+        }
+    }
+
     /// What came back, for the journal: a status and a size, or why nothing
     /// did, cut to 200 characters — never a body. A failure the app catches
     /// is still on the record (LLP 1016 D4).
@@ -1063,6 +1106,11 @@ impl Outcome {
             Outcome::Message(m) => text!(
                 "message, {} bytes",
                 m.binary.as_ref().map_or(m.data.len(), Vec::len)
+            ),
+            Outcome::Messages(ms) => text!(
+                "{} messages, {} bytes",
+                ms.len(),
+                ms.iter().map(|m| m.data.len()).sum::<usize>()
             ),
             Outcome::Closed { code, reason, .. } if reason.is_empty() => {
                 text!("socket closed ({})", code)
@@ -1249,6 +1297,29 @@ impl Dispatch {
     }
 }
 
+/// What the executor may overlap (LLP 1162 D1). The runner sets it when it hands a request out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestClass {
+    /// Starts when everything before it in the ordered sequence has ended.
+    #[default]
+    Ordered,
+    /// A plain HTTP request a resource's answer made: it does not wait for the reads before it.
+    Read,
+    /// A send of `plan.mutations[m]`, a `parallel` mutation: it does not wait for that mutation's other sends.
+    Parallel(u32),
+}
+
+/// Monotonic milliseconds measured by the executor, apart from the agent clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionTiming {
+    /// The executor supplied a cached body (LLP 1162 D4).
+    pub cached: bool,
+    /// Time spent executing the request, ending before delivery (LLP 1162 D1).
+    pub elapsed_ms: u64,
+    /// Time from the exchange ending until its outcome is drained (LLP 1162 D1).
+    pub delivery_wait_ms: u64,
+}
+
 /// A request the host is to run: its ticket, the resource or mutation it
 /// answers, and the request. Taken by [`Runner::take_requests`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,6 +1330,8 @@ pub struct RequestOut {
     pub target: String,
     /// What to run.
     pub request: Request,
+    /// What the executor may overlap (LLP 1162 D1).
+    pub class: RequestClass,
     /// The app forced it (`refresh`): the executor bypasses its cache.
     pub forced: bool,
 }
@@ -1314,90 +1387,8 @@ mod summary_tests {
 }
 
 #[cfg(test)]
-mod reply_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    type Seen = Arc<Mutex<Vec<String>>>;
-
-    fn recorder() -> (Seen, impl FnMut(Outcome) + Send + 'static) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let into = seen.clone();
-        (seen, move |o: Outcome| {
-            into.lock().unwrap().push(o.summary())
-        })
-    }
-
-    #[test]
-    fn a_stream_reply_sends_many_then_ends_once() {
-        let (seen, deliver) = recorder();
-        let mut reply = Reply::stream(deliver);
-        for data in ["a", "bb"] {
-            reply.message(Message {
-                data: data.into(),
-                ..Message::default()
-            });
-        }
-        reply.send(Outcome::Failed {
-            kind: FailureKind::Network,
-            message: "closed".into(),
-        });
-        assert_eq!(
-            *seen.lock().unwrap(),
-            ["message, 1 bytes", "message, 2 bytes", "network: closed"]
-        );
-    }
-
-    #[test]
-    fn a_stream_reply_dropped_without_an_end_aborts_once() {
-        let (seen, deliver) = recorder();
-        let mut reply = Reply::stream(deliver);
-        reply.message(Message::default());
-        drop(reply);
-        assert_eq!(
-            *seen.lock().unwrap(),
-            [
-                "message, 0 bytes",
-                "aborted: the owner ended without a reply"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_message_on_a_single_reply_is_its_one_answer() {
-        let (seen, deliver) = recorder();
-        let mut reply = Reply::new(deliver);
-        reply.message(Message::default());
-        reply.message(Message::default());
-        drop(reply);
-        assert_eq!(*seen.lock().unwrap(), ["message, 0 bytes"]);
-    }
-
-    #[test]
-    fn a_stream_answer_is_independent_and_marked() {
-        let Answer::Later(request) = Answer::stream(Request::get("https://example.test/e")) else {
-            panic!("a stream is a request")
-        };
-        assert!(request.stream);
-        assert_eq!(
-            request.http,
-            HttpScheduling::Independent {
-                max_response_bytes: 1 << 20
-            }
-        );
-        let Answer::Later(kept) =
-            Answer::stream(Request::get("https://example.test/e").independent_http(4096))
-        else {
-            panic!("a stream is a request")
-        };
-        assert_eq!(
-            kept.http,
-            HttpScheduling::Independent {
-                max_response_bytes: 4096
-            }
-        );
-    }
-}
+#[path = "request_reply_tests.rs"]
+mod reply_tests;
 
 #[cfg(test)]
 mod scheduling_tests {
@@ -1426,3 +1417,6 @@ mod scheduling_tests {
 #[cfg(test)]
 #[path = "request_tests.rs"]
 mod tests;
+
+#[path = "request_socket.rs"]
+mod socket_protocols;

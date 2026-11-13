@@ -90,6 +90,7 @@ class Natives(
         var props = ""
         var module: String? = null
         var generation = 0
+        var session = 0L
         var slot = 0
         var disabled = false
         var eventBinding = 0
@@ -172,6 +173,9 @@ class Natives(
                 live = true
                 val f = try { Native.canvasFrame(e.id) } catch (x: UnsatisfiedLinkError) { -2L }
                 if (f == -2L) { refused = true; unbuffer(e); any = true; continue }
+                // None after one was drawn: a new canvas (the host was replaced), whose ring may reuse the old one's
+                // numbers. The image drawn stays until its first frame.
+                if (f == -1L && e.drawn != -1L) { e.drawn = -1L; e.wrapped.clear() }
                 if (f < 0 || f == e.drawn) continue
                 val key = f ushr 32
                 val bmp = e.wrapped[key] ?: run {
@@ -330,17 +334,24 @@ class Natives(
 
     /** Op 28 seen while ingesting a stream: make or update the element; [row] draws it (0: not in a row). */
     fun ensure(id: Int, kind: Int, w: Int, h: Int, props: String, row: Int, fullWindow: Boolean = false) {
+        // A top-level WebView cannot enforce an iframe's sandbox (LLP 1020 D2).
+        if (kind == 1 && !JSONObject(props).isNull("sandbox")) {
+            elements[id]?.let { release(it, reuse = false) }
+            android.util.Log.w("exact", "iframe $id: sandbox is unsupported on Android")
+            return
+        }
         val json = if (kind == 2) JSONObject(props) else null
         val module = json?.optString("module")
         val generation = json?.optInt("generation") ?: 0
         val slot = json?.optInt("slot") ?: 0
+        val session = json?.optLong("session") ?: 0L
         var e = elements[id]
-        if (e == null || e.kind != kind || (kind == 2 && (e.generation != generation || e.slot != slot || e.module != module))) {
+        if (e == null || e.kind != kind || (kind == 2 && (e.generation != generation || e.slot != slot || e.module != module || e.session != session))) {
             e?.let { release(it) }
             val created = if (lazy && row != 0 && ((kind == 0 && videos != null && lazyVideo) || kind == 1 || (kind == 2 && modules.containsKey(module)))) {
                 Element(id, kind, standIn, RenderNode("exact native")).also {
                     it.parked = true; it.module = module
-                    it.generation = generation; it.slot = slot
+                    it.generation = generation; it.slot = slot; it.session = session
                     waiting++
                 }
             } else create(id, kind, props) ?: return
@@ -353,6 +364,7 @@ class Natives(
         if (!e.fullWindow) e.presentation.failed = false
         if (kind == 3) {
             presentation(e, e.fullWindow && windowCanvas)
+            if (e.view is SurfaceView && e.presentation.replaced(Native.canvasReady(id))) { e.dirty = true; poll() }
         }
         if (json != null) e.disabled = json.optBoolean("disabled")
         e.rows.add(row)
@@ -516,7 +528,7 @@ class Natives(
         5 -> hatched?.invoke(id, context)?.also { (it.parent as? android.view.ViewGroup)?.removeView(it) }
         3 -> if (buffered && !refused) View(context) else TextureView(context).apply { isOpaque = false }
         0 -> videoPool.removeLastOrNull() ?: TextureView(context).apply { isOpaque = false }
-        1 -> webPool.removeLastOrNull()?.apply { onResume() } ?: WebView(context).apply {
+        1 -> webPool.removeLastOrNull()?.apply { settings.javaScriptEnabled = true; onResume() } ?: WebView(context).apply {
             settings.javaScriptEnabled = true
             // A guest's navigations stay in its frame, as in a browser's; a file only under the asset root.
             webViewClient = object : WebViewClient() {
@@ -543,11 +555,12 @@ class Natives(
         if (kind == 2) {
             e.module = json.optString("module")
             e.generation = json.optInt("generation")
+            e.session = json.optLong("session")
             e.slot = json.optInt("slot")
             bindEvents(e)
         }
         if (pooled(kind)) held++
-        if (kind == 3) { if (view is TextureView) listen(e, view) else e.buffers = true }
+        if (kind == 3) { if (view is TextureView) listen(e, view) else e.buffers = true; frameRate(e) }
         return e
     }
 
@@ -623,6 +636,7 @@ class Natives(
                 e.presentation.attach()
                 e.surface = holder.surface
                 Exact.attachSurface(e.id, holder.surface, w, h) { e.window = it }
+                frameRate(e)
                 e.dirty = true
                 if (refresh()) frame()
                 poll()
@@ -641,6 +655,7 @@ class Natives(
             }
         }) else if (view is TextureView) listen(e, view)
         addView(view, LayoutParams(1, 1))
+        frameRate(e)
         if (e.w > 0 && e.h > 0) { place(e); askBuffers(e); record(e) }
         invalidate(); poll()
     }
@@ -651,15 +666,15 @@ class Natives(
             // Modules may reply asynchronously; retirement or reuse must never retarget that reply.
             post {
                 if (elements[e.id] === e && !e.parked && e.eventBinding == binding) {
-                    Exact.moduleEvent(e.id, e.slot, e.generation, kind, payload)
+                    Exact.moduleEvent(e.id, e.slot, e.generation, e.session, kind, payload)
                 }
             }
         }
     }
 
     /** A module button under an unscrolled tap. Other native input stays with its dedicated host. */
-    fun click(id: Int, slot: Int, generation: Int, x: Float, y: Float): Boolean {
-        val e = elements[id]?.takeIf { it.kind == 2 && !it.parked && it.slot == slot && it.generation == generation } ?: return false
+    fun click(id: Int, slot: Int, generation: Int, session: Long, x: Float, y: Float): Boolean {
+        val e = elements[id]?.takeIf { it.kind == 2 && !it.parked && it.slot == slot && it.generation == generation && it.session == session } ?: return false
         if (e.disabled || !e.view.isEnabled || !e.view.isClickable) return false
         e.view.translationX = x
         e.view.translationY = y
@@ -748,6 +763,36 @@ class Natives(
         // Not waited for: exact2's thread may be busy (the GPU module's first frame, right after the first content),
         // and the main thread would wait out that work in its first draw.
         Exact.attachSurface(e.id, surface, w, h) { e.window = it }
+        frameRate(e)
+    }
+
+    /** The frame rates GPU canvases ask for ([Native.frameRates]: view and rate pairs, 0 for the display's): a
+     * canvas with a window of its own asks the compositor for its rate as a fixed source (Android 11 and later), so
+     * a 60 fps canvas on a 120 Hz panel is shown at an even 60; one drawn in the reader's window votes for its rate
+     * as a view (Android 15 and later). Elsewhere the module's own pacing holds the rate (LLP 1009). */
+    fun frameRates(rates: IntArray) {
+        for (k in 0 until rates.size / 2) {
+            val e = elements[rates[2 * k]] ?: continue
+            frameRate(e, rates[2 * k + 1].toFloat())
+        }
+    }
+
+    /** A canvas given a view or a window asks for the rate last told for it, if any. */
+    private fun frameRate(e: Element) {
+        val fps = Exact.owner?.frameRates?.of(e.id) ?: 0
+        if (fps > 0) frameRate(e, fps.toFloat())
+    }
+
+    private fun frameRate(e: Element, fps: Float) {
+        val surface = e.surface
+        if (e.view is SurfaceView && surface != null && surface.isValid && android.os.Build.VERSION.SDK_INT >= 30) {
+            try {
+                surface.setFrameRate(fps, if (fps > 0f) android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
+                    else android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            } catch (x: IllegalArgumentException) {}
+        } else if (android.os.Build.VERSION.SDK_INT >= 35) {
+            e.view.requestedFrameRate = if (fps > 0f) fps else android.view.View.REQUESTED_FRAME_RATE_CATEGORY_DEFAULT
+        }
     }
 
     private fun unwindow(e: Element) {
@@ -771,18 +816,18 @@ class Natives(
         e.dirty = true
     }
 
-    private fun release(e: Element) {
+    private fun release(e: Element, reuse: Boolean = true) {
         elements.remove(e.id)
         nodes = null
         if (e.parked) { waiting--; e.node.discardDisplayList(); return }
         byView.remove(e.view)
         if (e.kind == 3) { if (e.buffers) { if (e.asked != 0L) Exact.detachBuffers(e.id); e.wrapped.clear() } else unwindow(e) }
-        retire(e)
+        retire(e, reuse)
         e.node.discardDisplayList()
     }
 
     /** [e]'s view is kept for the next element of its kind, or goes. */
-    private fun retire(e: Element) {
+    private fun retire(e: Element, reuse: Boolean = true) {
         e.eventBinding++
         if (pooled(e.kind)) held--
         val module = e.module?.let { modules[it] }
@@ -800,18 +845,25 @@ class Natives(
             e.playing = false; e.inView = false; e.stale = false; e.video = null
         } else if (e.kind == 2 && module != null && (pool[e.module!!]?.size ?: 0) < modulePool && module.reset(e.view)) {
             pool.getOrPut(e.module!!) { ArrayList() }.add(e.view)
-        } else if (e.kind == 1 && webPool.size < WEB_POOL && webs) {
-            webPool.add((e.view as WebView).apply { onPause() })
+        } else if (e.kind == 1 && reuse && webPool.size < WEB_POOL && webs) {
+            webPool.add((e.view as WebView).apply {
+                // onPause alone keeps JavaScript running; a lent view must hold no active guest.
+                stopLoading()
+                settings.javaScriptEnabled = false
+                settings.allowFileAccess = false
+                loadUrl("about:blank")
+                onPause()
+            })
         } else {
             module?.destroy(e.view)
-            (e.view as? WebView)?.destroy()
             removeView(e.view)
+            (e.view as? WebView)?.destroy()
         }
     }
 
     fun destroyAll() {
         for (e in elements.values.toList()) release(e)
-        for (w in webPool) { w.destroy(); removeView(w) }
+        for (w in webPool) { removeView(w); w.destroy() }
         webPool.clear()
         for (v in videoPool) { players.remove(v)?.release(); removeView(v) }
         videoPool.clear(); sources.clear(); sizes.clear()

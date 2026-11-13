@@ -3,25 +3,28 @@
 // LAN clients can read plans, errors and generations (LLP 1023 D8); the agent
 // carrier and installer stay loopback-only. Games serve HTTP during the first build.
 import { buildingServer } from '../../game/dev.mjs';
-import { acceptModuleReply, failedPhase, phased } from './dev-phase.mjs';
+import { acceptModuleReply, failedPhase, phased, phasedAsync } from './dev-phase.mjs';
+import { watchDirectoryInputs, watchModuleSources } from './dev-watch.mjs';
+import { directoryInputNames } from '../../scripts/cargo-dep-info.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 let tuning = null;
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { canonicalBytes, classifyArtifacts, cohortReceipt } from '../../scripts/deploy.mjs';
+import { canonicalBytes, classifyArtifacts, cohortReceipt, sealEnvelope } from '../../scripts/deploy.mjs';
 import { filesystem } from '../../scripts/filesystem.mjs';
 import { allowHostArgs, developmentGate, installBrowserOrigins, LOCAL_IOS_INSTALL_ENDPOINT } from '../../scripts/install-page.mjs';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, unwatchFile, watch, watchFile, writeSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, unwatchFile, watchFile, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
+import { slashRelative, within } from '../../scripts/paths.mjs';
 import { rustPackage, rustOutput, rustInputs, rustCards } from '../../scripts/rust.mjs';
 import { gpuModules, shaderWatchRoots, rustPolicy, rebuildPolicy } from '../../scripts/app.mjs';
-import { webDist, cargoReproducibilityFlags, compilerPaths, developmentBuildEnv, developmentCandidate, devBinRun, pendingBuildInputs, readBuilds, resolveApp } from '../../scripts/app.mjs';
+import { HOST_DEV, webDist, cargoReproducibilityFlags, compilerPaths, developmentBuildEnv, developmentCandidate, devBinRun, pendingBuildInputs, readBuilds, resolveApp } from '../../scripts/app.mjs';
 import { developmentLinks } from '../apple/build.mjs';
 import { acceptsHTML, webRequestURL } from '../../scripts/origin.mjs';
 import { guardFlags } from '../../scripts/help.mjs';
 import { webPortRange } from '../../scripts/agent-launch.mjs';
 import { localInstaller } from './local-install.mjs';
-import { startupBuilds } from './dev-startup.mjs';
+import { claimDevLoop, runBuildTree, startupBuilds, stopBuildTree } from './dev-startup.mjs';
 import { designPath, frameOnlyByTool, tamberServer } from '../../scripts/tamber-server.mjs';
 import { pluginOnLoopback, remoteArgs } from '../../scripts/tamber-remote.mjs'; import { openRemoteCanvas } from '../../scripts/tamber-canvas.mjs';
 import { designDigest, patchDesign } from '../../scripts/tamber-patch.mjs';
@@ -34,6 +37,7 @@ const arg = (name, fallback) => { const i = argv.indexOf(name); return i >= 0 ? 
 // one restarts in place, never waiting on a wasm rebuild.
 const buildEnv = {...developmentBuildEnv(),EXACT_UPDATE_TRUST:'development',EXACT_WEB_LINK:'all'};
 let app = resolveApp(arg('--app', undefined));
+if (app.outside) buildEnv.EXACT_APP_DIR = app.dir;
 if (app.manifest.game) buildEnv.EXACT_GAME_PROOF_PROFILE ??= 'gpu-dev';
 const lan = argv.includes('--lan');
 /** The first of 100 ports from `from` up that `host` can listen on: another app's loop holding 8765 is common.
@@ -52,7 +56,9 @@ async function freePort(from, host) {
 // loudly if taken; the default moves to a free one.
 const named = argv.includes('--port') ? arg('--port') : process.env.EXACT_PORT || null;
 if (named != null && !(Number.isInteger(Number(named)) && Number(named) >= 1 && Number(named) <= 65535)) { console.error(`${argv.includes('--port') ? '--port' : 'EXACT_PORT'} ${named}: a port number, 1–65535`); process.exit(2); }
+let loopClaim; try { loopClaim = argv.includes('--serve-as') ? null : claimDevLoop(app.dir, argv.includes('--wasm') || app.manifest.game !== undefined ? 'wasm' : 'js'); } catch (error) { console.error(error.message); process.exit(1); }
 const port = named != null || argv.includes('--serve-as') ? Number(named ?? 8765) : await freePort(8765, lan ? '0.0.0.0' : '127.0.0.1');
+loopClaim?.url(`http://127.0.0.1:${port}`);
 if (port !== 8765 && named == null && !webPortRange() && !argv.includes('--serve-as')) console.log(`port 8765 is in use; serving on ${port} (--port <n> or EXACT_PORT picks one)`);
 // `--serve-as <port>` (internal): the resident loop's producers behind the
 // JS loop on that port (host/web-js/dev.mjs forwards a native client's
@@ -67,9 +73,9 @@ const gate = developmentGate(origins, servedAs ?? port, allowHosts);
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 // An outside app's wasm loop builds apart from the JS target's `target/web-dist`,
 // so `web` and `web --wasm` can run at once without one serving the other's files.
-if (argv.includes('--wasm') && servedAs == null && process.env.EXACT_APP_DIR && !process.env.EXACT_WEB_DIST)
+if (argv.includes('--wasm') && servedAs == null && app.outside && !process.env.EXACT_WEB_DIST)
   process.env.EXACT_WEB_DIST = buildEnv.EXACT_WEB_DIST = resolve(app.target, 'web-dist-wasm');
-const dist = webDist();
+const dist = webDist(app);
 const source = resolve(app.dir, 'app.contract');
 // The JS target (LLP 1071): the runtime the app ships, rebuilt and reloaded
 // on an edit (host/web-js/dev.mjs); a build it refuses shows in the page.
@@ -91,6 +97,7 @@ let rebuildOn = rebuildPolicy(app.manifest);
 let manualTypescript = null, rustChild = null, rustActive = false, rustRun = 0, rustHeartbeat = null, rustDirty = false, rustSaved = 0, rustSourceWatch = null, rustOutputWatch = null;
 let rustInputFiles = new Set();
 let changed = new Set(), timer=null, building=false, buildPending=false, rustPending=false, builds=0;
+let hostBuildChild = null, stopping = false, shutdown = null;
 // A failed wasm build: its files ride with the next build, and the files its
 // diagnostics named are watched (the receipt names only a built wasm's inputs).
 let lastFailed = new Set(), failedInputs = new Set();
@@ -170,7 +177,7 @@ function gameRuntimeInputs(inputs) {
   for (const profile of [resolve(app.target,'web'), resolve(app.target,'wasm32-unknown-unknown/web')]) {
     const units = [{directory:resolve(profile,'deps'),output:null,name:''}];
     for (const entry of subdirectories(resolve(profile,'build'))) {
-      const name = entry.slice(entry.lastIndexOf('/')+1), nested = subdirectories(entry).filter(d => /^[a-f0-9]+$/.test(d.slice(d.lastIndexOf('/')+1)));
+      const name = basename(entry), nested = subdirectories(entry).filter(d => /^[a-f0-9]+$/.test(basename(d)));
       if (nested.length) for (const unit of nested) units.push({directory:resolve(unit,'out'),output:resolve(unit,'run/stdout'),name});
       else units.push({directory:entry,output:resolve(entry,'output'),name:name.replace(/-[a-f0-9]+$/,'')});
     }
@@ -181,7 +188,7 @@ function gameRuntimeInputs(inputs) {
         for (const line of readFileSync(output,'utf8').split('\n')) {
           const changed=/^cargo::?rerun-if-changed=(.+)$/.exec(line); if (!changed) continue;
           const watched=resolve(pkg.manifest_path,'..',changed[1]);
-          for (const path of inputs) if (path===watched || path.startsWith(watched+'/')) included.add(path);
+          for (const path of inputs) if (within(watched, path)) included.add(path);
         }
       }
       for (const file of readdirSync(directory)) {
@@ -197,7 +204,7 @@ function gameRuntimeInputs(inputs) {
   if ([...sources].some(path=>inputs.has(path) && !found.has(path))) return inputs;
   const owners = metadata.packages.map(p=>({id:p.id,dir:resolve(p.manifest_path,'..')})).sort((a,b)=>b.dir.length-a.dir.length);
   return new Set([...inputs].filter(path=>{
-    const owner = owners.find(p=>path===p.dir || path.startsWith(p.dir+'/'));
+    const owner = owners.find(p=>within(p.dir, path));
     return !owner || runtime.has(owner.id) || included.has(path);
   }));
 }
@@ -206,16 +213,23 @@ const gpuOnly = files => !tuning?.paths.size && !producersOnly && files.length >
   && files.every(path => path.endsWith('.rs') && gpuInputs.has(path) && !appInputs.has(path));
 const budget = /\|\s*Dev restart[^|]*\|\s*([^|\n]+)/.exec(readFileSync(resolve(root, 'rules/RULES.md'), 'utf8'))?.[1].trim() ?? '?';
 const assetTrees = [...[['assets', 'assets'], ['deck', 'deck']].map(([from, to]) => [resolve(app.dir, from), to]), ...shaderWatchRoots(app).map(root => [root, 'shaders'])];
-const skipped = /(^|\/)(target|dist(?:\.previous)?|\.build|node_modules)(\/|$)/;
+const skipped = /(^|[\\/])(target|dist(?:\.previous)?|\.build|node_modules)([\\/]|$)/;
 const shaderDigests = new Map();
 const toolingEnv = { ...buildEnv, CARGO_TARGET_DIR: app.target };
 const reflectBin = resolve(app.target, 'debug/exact-gpu-reflect');
+const reflectBuild = ['the GPU tools (exact-gpu-reflect)', 'cargo', ['build', '-q', '-p', 'exact-gpu-reflect'], { cwd: root, env: toolingEnv }];
 function reflectShaders(tree) {
   if (!existsSync(reflectBin)) {
-    const built = phased('the GPU tools (exact-gpu-reflect)', 'cargo', ['build', '-q', '-p', 'exact-gpu-reflect'], { cwd: root, env: toolingEnv });
+    const built = phased(...reflectBuild);
     if (built.status !== 0) throw new Error(`exact-gpu-reflect did not build (exit ${built.status ?? built.signal})`);
   }
   return shaderInterfaceDigests(tree, reflectBin);
+}
+// The shader check below needs the tool. A cold build of it is long, so it
+// runs owned and asynchronously here, where a signal can stop it.
+if (!existsSync(reflectBin)) {
+  const built = await startup.owned(own => phasedAsync(...reflectBuild, own));
+  if (built.status !== 0) throw new Error(`exact-gpu-reflect did not build (exit ${built.status})`);
 }
 // A completed build may predate a source-tree deletion or restoration. Mirror
 // every declared tree before any compiler/server process starts. A truly
@@ -471,7 +485,7 @@ function captureGeneration(reuseCurrentAssets = false, tableUpdate = null) {
       if (fromProducer(asset.name)) continue;
       const body = tableUpdate?.get(asset.name) ?? current.files.get(asset.name);
       files.set(asset.name, body);
-      assets.push({ name: asset.name, sha256: tableUpdate?.has(asset.name) ? createHash('sha256').update(body).digest('hex') : asset.sha256, bytes: body.length });
+      assets.push({ name: asset.name, url: `./${asset.name}`, sha256: tableUpdate?.has(asset.name) ? createHash('sha256').update(body).digest('hex') : asset.sha256, bytes: body.length });
     }
   } else {
     const captured = new Map([...captureAssets(dist)].filter(([name]) => !fromProducer(name)));
@@ -484,8 +498,9 @@ function captureGeneration(reuseCurrentAssets = false, tableUpdate = null) {
     assets.push(...assetCards(entries));
   }
   assets.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+  // Match the retained dev cache quota in serve.mjs.
   if ([planBytes, ...files.values()].some((body) => body.length > 64 * 1024 * 1024)
-    || [...files.values()].reduce((sum, body) => sum + body.length, 0) > 256 * 1024 * 1024) throw new Error('generation exceeds the payload budget');
+    || [...files.values()].reduce((sum, body) => sum + body.length, 0) > 4 * 1024 * 1024 * 1024) throw new Error('generation exceeds the payload budget');
   const envelope = webEnvelope(app, planBytes, assets);
   const generation = devGenerationDigest({ sha256: envelope.plan.sha256, bytes: planBytes.length }, assets, module, rust);
   const prefix = `/__dev/generation/${epoch}/${seq}/`;
@@ -497,10 +512,9 @@ function captureGeneration(reuseCurrentAssets = false, tableUpdate = null) {
   envelope.plan.url = prefix + 'app.plan';
   if (rust) envelope.rust = Object.fromEntries(Object.entries(rust).map(([kind, variant]) => [kind, { ...variant, receipt:{...variant.receipt,url:prefix+variant.receipt.url},module:{...variant.module,url:prefix+variant.module.url} }]));
   if (module) envelope.module = Object.fromEntries(Object.entries(module).map(([key, card]) => [key, { ...card, url: prefix + MODULE_FILES[key] }]));
-  for (const asset of envelope.assets) asset.url = prefix + asset.name.split('/').map(encodeURIComponent).join('/');
-  const envelopeBytes = Buffer.from(JSON.stringify(envelope) + '\n');
-  if (envelopeBytes.length > 64 * 1024) throw new Error('generation envelope exceeds 64 KiB');
-  files.set('exact.json', envelopeBytes);
+  const sealed = sealEnvelope(envelope, prefix + 'assets.json');
+  if (sealed.index) files.set('assets.json', sealed.index);
+  files.set('exact.json', sealed.bytes);
   if (tableUpdate) {
     // Table edits retain immutable bytes in this session; no filesystem helper is launched.
     tableGenerations.set(prefix, files);
@@ -523,9 +537,10 @@ const contractBytes = () => { try { return createHash('sha256').update(readFileS
 const contractInputsStamp = () => createHash('sha256').update([...readinessContracts].sort().map(path => { try { return path + ':' + readFileSync(path); } catch { return path + ':missing'; } }).join('\0')).digest('hex');
 function contractReady(compiled = compiledContract) { contractStamp = compiled; contractTreeStamp = contractInputsStamp(); early?.phase('contract', compiled === contractBytes() ? 'ready' : 'build'); }
 function startCompiler() {
+  if (stopping) return;
   early?.phase('contract','build');
   if (portableRust) startRustCompiler();
-  if (typescript) { startModuleCompiler(); return; }
+  if (typescript) { void startModuleCompiler().catch(error => { console.error(error); process.exitCode = 1; void stop(); }); return; }
   if (portableRust) return;
   const metadata = spawnSync('cargo', ['metadata',...cargoReproducibilityFlags(app),'--no-deps','--format-version','1'], {cwd:app.workspace,env:buildEnv,encoding:'utf8'});
   if (metadata.status !== 0) throw new Error(`cargo metadata failed: ${metadata.stderr || metadata.error || metadata.status}`);
@@ -581,81 +596,6 @@ function startCompiler() {
   });
   dev.on('exit', (code) => { if (dev === me) { console.error(`dev compiler exited ${code}`); killCompiler(); process.exit(code ?? 1); } });
 }
-// Direct file watchers avoid recursive-directory event coalescing on macOS.
-// The directory watcher discovers new paths; file metadata suppresses its
-// delayed duplicate events. Bounds match the producer's byte limits, with a
-// finite traversal/descriptor budget for the development watcher itself.
-function watchModuleSources(directory, ignore, changed) {
-  const files = new Map();
-  let identity = '', refusal = null, closed = false, queued = false;
-  const metadata = stat => [stat.dev,stat.ino,stat.size,stat.mtimeNs,stat.ctimeNs].join(':');
-  const rescan = () => {
-    if (closed || queued) return;
-    queued = true;
-    queueMicrotask(() => { queued = false; if (!closed) scan(true); });
-  };
-  function scan(notify) {
-    const next = new Map(), state = [];
-    let entries = 0, bytes = 0;
-    try {
-      const rootStat = lstatSync(directory);
-      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error('module source root is not a regular directory');
-      function walk(at, prefix = '', depth = 0) {
-        if (depth > 64) throw new Error('module watcher source graph is too deep');
-        for (const entry of readdirSync(at, { withFileTypes: true })) {
-          const name = prefix + entry.name;
-          if (ignore(name)) continue;
-          if (++entries > 4096) throw new Error('module watcher source graph exceeds 4096 entries');
-          const path = resolve(directory, name), stat = lstatSync(path, { bigint: true });
-          // A link is what it leads to: retargeting it is an edit.
-          if (stat.isSymbolicLink()) {
-            let target = '';
-            try { const to = statSync(path, { bigint: true }); target = `${readlinkSync(path)}:${metadata(to)}:${to.dev}:${to.ino}`; } catch { target = 'dangling'; }
-            state.push([name, `symlink:${target}`]);
-            continue;
-          }
-          if (stat.isDirectory()) { walk(path,name+'/',depth+1); continue; }
-          // A design (`.tamber`) is a source: a value-only edit goes as a batch (LLP 1121 stage 4).
-          if (!/\.(ts|contract|json|tamber)$/.test(name) && !['.exact/backend-origin', '.env.local', '.env'].includes(name)) continue;
-          if (!stat.isFile()) { state.push([name,'not-regular']); continue; }
-          bytes += Number(stat.size);
-          if (stat.size > 16n*1024n*1024n || bytes > 64*1024*1024 || next.size >= 2048) throw new Error('module watcher source graph exceeds its file/byte budget');
-          const stamp = metadata(stat);
-          next.set(path,{ stamp, inode:stat.dev+':'+stat.ino });
-          state.push([name,stamp]);
-        }
-      }
-      walk(directory);
-      for (const [path, old] of files) if (!next.has(path) || next.get(path).inode !== old.inode) { old.watch.close(); files.delete(path); }
-      for (const [path, record] of next) {
-        const old = files.get(path);
-        const handle = old?.watch ?? watch(path, rescan);
-        if (!old) handle.on('error',()=>{handle.close();if(files.get(path)?.watch===handle)files.delete(path);rescan();});
-        files.set(path,{ ...record,watch:handle });
-      }
-      const value = JSON.stringify(state.sort(([a],[b])=>a<b?-1:a>b?1:0));
-      const different = value !== identity || refusal !== null;
-      identity = value; refusal = null;
-      if (notify && different) changed(null);
-    } catch (error) {
-      const different = refusal?.message !== error.message;
-      refusal = error;
-      if (notify && different) changed(error);
-    }
-  }
-  const rootStat = lstatSync(directory);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error('module source root is not a regular directory');
-  scan(false);
-  const directoryWatch = watch(directory,{recursive:true},(_event,name)=>{ if(!name || !ignore(String(name))) rescan(); });
-  directoryWatch.on('error',error=>{refusal=error;changed(error);});
-  // FSEvents delivery is not guaranteed: Bun 1.4.2's fs.watch on macOS can
-  // report a save minutes late or never (oven-sh/bun#43870). A stat poll of
-  // the same identity bounds edit → plan at the compiler-input watcher's
-  // 100 ms, whatever the watchers deliver; a no-change scan is a few lstats.
-  const poll = setInterval(() => scan(true), 100);
-  poll.unref?.();
-  return { get error(){return refusal;}, close(){closed=true;clearInterval(poll);directoryWatch.close();for(const file of files.values())file.watch.close();files.clear();} };
-}
 let moduleWatch = null, moduleTimer = null, moduleRun = 0, moduleStage = null, moduleSaved = 0;
 /** The Contract sources the app reads from packages (LLP 1091 D10), and
  * the directories to watch for them: each package's root, and the nearest
@@ -699,12 +639,13 @@ function contractGraph() {
     return { files, dirs, shallow: [...shallow.values()], sources };
   } catch { return { files: new Set(), dirs: new Set(), shallow: [], sources: new Set() }; }
 }
-function startModuleCompiler() {
-  const built = phased('the module producer (exact-js-bake --release; the first run takes a few minutes)', 'cargo', ['build', '-q', '--release', '-p', 'exact-js-bake'], { cwd: root, env: toolingEnv });
+async function startModuleCompiler() {
+  const built = await phasedAsync(`the module producer (exact-js-bake --profile ${HOST_DEV}; the first run takes a few minutes)`, 'cargo', ['build', '-q', '--profile', HOST_DEV, '-p', 'exact-js-bake'], { cwd: root, env: toolingEnv }, child => { dev = child; });
+  if (stopping || dev !== built.child) return;
   if (built.status !== 0) throw new Error('the module producer did not build');
   const scratch = resolve(app.target, 'module-dev');
   mkdirSync(scratch, { recursive: true });
-  const child = dev = spawn(resolve(app.target, 'release/exact-js-bake'), [app.dir, '--serve'], {
+  const child = dev = spawn(resolve(app.target, HOST_DEV, 'exact-js-bake'), [app.dir, '--serve'], {
     cwd: root, env: toolingEnv, detached: true, stdio: ['pipe', 'pipe', 'pipe'],
   });
   console.log(`compiler pid ${child.pid}`);
@@ -807,11 +748,11 @@ function startModuleCompiler() {
   const contractInput = path => contractSources.has(path) || [...contractSources].some(s => s.startsWith(path + '/') || s.startsWith(path + '\\'));
   const dotInput = name => /^\.exact(?:[\\/]backend-origin)?$|^\.env(?:\.local)?$/.test(name); // the backend selection, and the settings' files (LLP 1153 D4)
   const watches = [watchModuleSources(app.dir, name => name === 'app.contract.d.ts' || (skipped.test(name) && !contractInput(resolve(app.dir, name)))
-    || (/(^|\/)\./.test(name) && !contractInput(resolve(app.dir, name)) && !dotInput(name))
-    || (assetTrees.some(([tree]) => resolve(app.dir,name) === tree || resolve(app.dir,name).startsWith(tree+'/')) && !contractInput(resolve(app.dir, name))), moduleChanged)];
+    || (/(^|[\\/])\./.test(name) && !contractInput(resolve(app.dir, name)) && !dotInput(name))
+    || (assetTrees.some(([tree]) => within(tree, resolve(app.dir,name))) && !contractInput(resolve(app.dir, name))), moduleChanged)];
   // Directories the manifest mounts beside app.ts (typescript.sources) are sources too.
   for (const path of Object.values(app.manifest.typescript?.sources ?? {})) {
-    watches.push(watchModuleSources(realpathSync(resolve(app.dir, path)), name => skipped.test(name) || /(^|\/)\./.test(name), moduleChanged));
+    watches.push(watchModuleSources(realpathSync(resolve(app.dir, path)), name => skipped.test(name) || /(^|[\\/])\./.test(name), moduleChanged));
   }
   // And the Contract packages it uses, wherever installed (a package's own
   // dot directories are its sources too; only its node_modules is not).
@@ -834,8 +775,7 @@ function startModuleCompiler() {
       if (packageDirs.has(key)) continue;
       packageDirs.add(key);
       try {
-        const handle = watch(dir, (_event, name) => { if (String(name) === entry) moduleChanged(); });
-        watches.push({ error: null, close: () => handle.close() });
+        watches.push(watchDirectoryInputs(dir, () => moduleChanged(), { ignore: name => name !== entry }));
       } catch (error) { console.error(`cannot watch ${dir}: ${error.message}`); }
     }
   };
@@ -846,7 +786,7 @@ function startModuleCompiler() {
   produce();
 }
 function readRustGeneration() {
-  if (building || changed.size) return;
+  if (building || changed.size) return false;
   const directory = rustOutput(app), id = readFileSync(resolve(directory, 'current'), 'utf8');
   if (!/^[0-9a-f]{64}$/.test(id)) throw new Error('invalid Rust generation pointer');
   if (id === currentRustId && current) return;
@@ -872,17 +812,18 @@ function readRustGeneration() {
 }
 function produceRust() { rustPending = true; drainBuilds(); }
 function drainBuilds() {
-  if (building || rustActive) return;
+  if (stopping || building || rustActive) return;
   if (buildPending || changed.size) {
     buildPending = false;
     // A GPU-only save after a failed app build still rebuilds the wasm.
     const files = [...new Set([...lastFailed, ...changed])]; lastFailed = new Set(); changed = new Set();
     if (app.manifest.game) {
       building = true; early?.phase('check', 'build');
-      const check = hostBuildChild = spawn(process.execPath, [resolve(root, 'game/app/shells.mjs'), app.dir, '--check'], {cwd:root, env:buildEnv, stdio:['ignore','pipe','pipe']});
+      const check = hostBuildChild = spawn(process.execPath, [resolve(root, 'game/app/shells.mjs'), app.dir, '--check'], {cwd:root, env:buildEnv, stdio:['ignore','pipe','pipe'], detached:true});
       let output = '';
       for (const stream of [check.stdout, check.stderr]) stream.on('data', bytes => { output += bytes; process.stdout.write(bytes); });
       check.on('exit', code => {
+        if (stopping) return;
         building = false; hostBuildChild = null; early?.phase('check', code === 0 ? 'ready' : 'failed');
         if (code === 0) { if (gpuOnly(files)) void produceGpu(files); else rebuildNow(files); }
         else {
@@ -919,7 +860,7 @@ function produceRustNow() {
           if(reply.id!==rustRun||!rustActive||typeof reply.ok!=='boolean')throw new Error('invalid Rust producer reply');
           rustActive=false;clearInterval(rustHeartbeat);rustHeartbeat=null;
           if(!reply.ok){early?.phase('rust','failed');console.error(reply.error);push({error:reply.error});}
-          // The reply follows the pointer's rename; the directory watch would see it a filesystem event later and then finds it current.
+          // The reply follows the pointer's rename; a later watcher scan finds it current.
           // A repair that makes the running generation again publishes nothing new: it is announced once more, so a client showing the save's error takes it down (LLP 1159.001).
           else try{readRustGeneration();early?.phase('rust','ready');contractReady();if(push.refused&&current)push(announcement());}catch(error){console.error(error.message);push({error:error.message});}
           if(rustDirty && rebuildOn.rust==='save') rustPending = true;
@@ -938,10 +879,9 @@ function produceRustNow() {
 function startRustCompiler() {
   rustInputFiles = new Set(rustInputs(app, buildEnv, {reloadOnly:true}));
   const directory = rustOutput(app); mkdirSync(directory, {recursive:true});
-  rustOutputWatch = watch(directory, (_event,name) => {
-    if (name !== 'current') return;
-    try { readRustGeneration(); } catch (error) { console.error(error.message); push({error:error.message}); }
-  });
+  rustOutputWatch = watchDirectoryInputs(directory, () => {
+    try { return readRustGeneration(); } catch (error) { console.error(error.message); push({error:error.message}); }
+  }, { ignore: name => name !== 'current' });
   rustSourceWatch = watchModuleSources(app.dir, rustWatchIgnores, error => {
     if (error) { push({error:error.message}); return; }
     // The TS producer owns mixed Contract edits. If a Contract changes
@@ -957,9 +897,9 @@ function startRustCompiler() {
 }
 // App-relative names the Rust source watcher leaves to other producers (a
 // design edit is the TypeScript producer's, as a batch or a generation).
-const rustWatchIgnores = name => skipped.test(name) || /(^|\/)\./.test(name)
+const rustWatchIgnores = name => skipped.test(name) || /(^|[\\/])\./.test(name)
   || /\.(ts|json|tamber)$/.test(name) || gpuOnly([resolve(app.dir, name)])
-  || assetTrees.some(([tree]) => resolve(app.dir,name).startsWith(tree+'/'));
+  || assetTrees.some(([tree]) => resolve(app.dir,name) !== tree && within(tree, resolve(app.dir,name)));
 const killCompiler = () => {
   const gpuChild = gpuBuildChild; gpuBuildChild = null;
   if (gpuChild) { try { process.kill(-gpuChild.pid, 'SIGKILL'); } catch {} }
@@ -973,6 +913,17 @@ const killCompiler = () => {
   unasked();
   if (moduleStage) { rmSync(moduleStage, { recursive: true, force: true }); moduleStage = null; }
 };
+const stop = () => shutdown ??= (async () => {
+  stopping = true; clearTimeout(timer);
+  const exits = [dev, rustChild, gpuBuildChild, hostBuildChild].map(stopBuildTree);
+  tuning?.close(); killCompiler();
+  // The design server lets go of its lock before this exits.
+  exits.push(tamber?.close(), doors?.close());
+  const install = installer.child;
+  if (install && install.exitCode === null && install.signalCode === null) { exits.push(new Promise(ok => install.once('exit', ok))); install.kill('SIGTERM'); }
+  await Promise.all(exits); process.exit(process.exitCode ?? 0);
+})();
+startup.handoff(stop);
 startCompiler();
 if (early) {
   const watcher = watchModuleSources(app.dir, name => skipped.test(name) || (!name.endsWith('.contract') && /\.[^/]+$/.test(name)), () => {
@@ -980,17 +931,6 @@ if (early) {
   });
   process.once('exit', () => watcher.close());
 }
-const stop = async () => {
-  const children = [dev, rustChild, gpuBuildChild, installer.child, hostBuildChild].filter(Boolean);
-  const exits = children.map(child => new Promise(ok => child.exitCode !== null || child.signalCode !== null ? ok() : child.once('exit', ok)));
-  tuning?.close(); killCompiler();
-  // The design server lets go of its lock before this exits.
-  exits.push(tamber?.close(), doors?.close());
-  installer.child?.kill('SIGTERM');
-  // A rebuild in flight would otherwise swap dist under the next dev server.
-  hostBuildChild?.kill('SIGTERM');
-  await Promise.all(exits); process.exit(process.exitCode ?? 0);
-};
 
 // Asset edits carry state. A shader interface change rebuilds the host and
 // wasm because Rust binds the layout (LLP 1030 D8, D10; 1030.000 stage 1).
@@ -1000,7 +940,7 @@ try {
   watchStaticTrees(app.dir, assetTrees, (change) => {
     if (tuning && change.name === 'assets/exact-tables.json') return;
     if (change.targetRoot === 'shaders') change = {...change,tree:true,relative:'',name:'shaders'};
-    if (skipped.test(change.relative) || /(^|\/)\./.test(change.relative)) return;
+    if (skipped.test(change.relative) || /(^|[\\/])\./.test(change.relative)) return;
     if (change.tree) {
       for (const name of assetChanges.keys()) if (name === change.targetRoot || name.startsWith(`${change.targetRoot}/`)) assetChanges.delete(name);
       assetChanges.set(change.targetRoot, change);
@@ -1092,6 +1032,8 @@ function pushAssets() {
     rows.push(row);
   }
   if (!rows.length) return;
+  // A checked SVG (or icon) is a compiler input as well as a shipped file.
+  if (rows.some(row => readinessContracts.has(resolve(app.dir, row.name)))) needsRebuild = true;
   if (needsRebuild) {
     assetsNeedRebuild = true;
     for (const [name] of edits) changed.add(name);
@@ -1146,13 +1088,13 @@ let compilerInputFiles = new Set(), compilerInputTrees = [], compilerMissingInpu
 const optionalRoots = () => ['assets', 'deck', 'gpu', 'gpu/shaders'].map(root => existsSync(resolve(app.dir, root)) ? 1 : 0).join('');
 let optionalRootsSeen = optionalRoots();
 function watchCompilerInputs() {
-  // Poll declared file metadata: saves and replacement survive directory-event
-  // coalescing. Only open-ended source discovery needs a directory watch.
+  // Poll file and directory-entry metadata: saves, replacements and new paths
+  // remain visible when filesystem notifications are lost or coalesced.
   // A Contract package's files are inputs wherever they are installed,
   // node_modules included (LLP 1091 D10).
   const contract=contractGraph(); for (const path of contract.sources) readinessContracts.add(path);
   const outside=p=>skipped.test(p)&&!contract.files.has(p);
-  const files=new Set([...builtReceipts.flatMap(r=>r.binary.inputs.map(f=>f.path)),...rustInputFiles,...gpuInputs,...appInputs,...failedInputs,...contract.files].filter(p=>!outside(p)&&!p.includes('/.cargo/')));
+  const files=new Set([...builtReceipts.flatMap(r=>r.binary.inputs.map(f=>f.path)),...rustInputFiles,...gpuInputs,...appInputs,...failedInputs,...contract.files].filter(p=>!outside(p)&&!/[\\/]\.cargo[\\/]/.test(p)));
   for(const receipt of builtReceipts)for(const missing of receipt.binary.missing)files.add(missing);
   files.add(resolve(app.dir,'app.json'));
   compilerInputFiles = files;
@@ -1163,11 +1105,11 @@ function watchCompilerInputs() {
   const targets=new Set([...files,...directories]);
   for(const [path,handle] of watched)if(!targets.has(path)){handle.close();watched.delete(path);}
   for(const target of targets) {
-    if(outside(target)||target.includes('/.cargo/')||watched.has(target))continue;
+    if(outside(target)||/[\\/]\.cargo[\\/]/.test(target)||watched.has(target))continue;
     const file=files.has(target),dir=file?resolve(target,'..'):target;
     const changedPath=name=>{
-      if(file)name=target.slice(target.lastIndexOf('/')+1);
-      if(!name||skipped.test(name)||/(^|\/)\./.test(name)||name.endsWith('dev.js')||assetTrees.some(([tree])=>resolve(dir,name)===tree||resolve(dir,name).startsWith(tree+'/'))||resolve(dir,name)===source)return;
+      if(file)name=basename(target);
+      if(name==null||skipped.test(name)||/(^|[\\/])\./.test(name)||name.endsWith('dev.js')||assetTrees.some(([tree])=>within(tree, resolve(dir,name)))||resolve(dir,name)===source)return;
       // Parent-directory notifications include unrelated documents and output.
       // Only receipt inputs, declared trees/missing paths, and Swift's implicit
       // source discovery can invalidate the host. Rust additions are reached
@@ -1178,16 +1120,16 @@ function watchCompilerInputs() {
       // The resident Contract compiler already watches generated game arguments.
       // Rebuilding the host afterward would discard the carried world.
       if (app.manifest.game && path === resolve(app.dir, '.shells/surfaces.json')) return;
-      if (!compilerInputFiles.has(path) && !compilerInputTrees.some(tree=>path===tree||path.startsWith(tree+'/'))
-        && !compilerMissingInputs.some(missing=>path===missing||missing.startsWith(path+'/'))
+      if (!compilerInputFiles.has(path) && !compilerInputTrees.some(tree=>within(tree, path))
+        && !compilerMissingInputs.some(missing=>within(path, missing))
         && !(name.endsWith('.swift') && swiftSourceDirectories.has(dir))) return;
       // The TypeScript producer takes the app's sources and its design (a
       // value-only design edit is a batch, never a host rebuild).
-      if (typescript && resolve(dir, name).startsWith(app.dir + '/') && /\.(ts|contract|tamber)$/.test(name)) return;
+      if (typescript && within(app.dir, resolve(dir, name)) && /\.(ts|contract|tamber)$/.test(name)) return;
       if (portableRust && rustInputFiles.has(path)) {
         // A Contract source the Rust source watcher sees has already started
         // its build (that watcher tracks .contract names, never .rs).
-        if (rustSourceWatch && path.endsWith('.contract') && path.startsWith(app.dir + '/') && !rustWatchIgnores(path.slice(app.dir.length + 1))) return;
+        if (rustSourceWatch && path.endsWith('.contract') && within(app.dir, path) && !rustWatchIgnores(slashRelative(app.dir, path))) return;
         rustSaved=Date.now();rustDirty=true;if(rebuildOn.rust==='save'){clearTimeout(timer);timer=setTimeout(produceRust,200);}return;
       }
       changed.add(resolve(dir,name));console.log(`edit ${resolve(dir,name)} → build pending; classification follows its receipt`);
@@ -1203,7 +1145,10 @@ function watchCompilerInputs() {
         };
         watchFile(target,{bigint:true,interval:100},listener);
         watched.set(target,{close:()=>unwatchFile(target,listener)});
-      }else if(existsSync(target))watched.set(target,watch(target,(_event,name)=>changedPath(name)));
+      }else watched.set(target,watchDirectoryInputs(target,changedPath,{
+        readNames:compilerInputTrees.includes(target)?directoryInputNames:readdirSync,
+        ignore:name=>skipped.test(name)||/(^|\/)\./.test(name),
+      }));
     }catch(error){console.error(`cannot watch ${target}: ${error.message}`);}
   }
 }
@@ -1223,17 +1168,17 @@ process.stdin.on('data', input => {
   }
 });
 console.log(`rebuild: Rust ${rebuildOn.rust}, TypeScript ${rebuildOn.typescript}; r + Enter builds Rust, t + Enter builds TypeScript, f + Enter starts a fresh page`);
-let hostBuildChild = null;
 function rebuild() { buildPending = true; drainBuilds(); }
 function rebuildNow(files) {
   building = true; early?.phase('host', 'build');
   const t = Date.now();
   console.log(`rust: ${files.length} file${files.length === 1 ? '' : 's'} changed (${files.slice(0, 3).join(', ')}${files.length > 3 ? ', …' : ''}) — rebuilding the ${producersOnly ? "bake" : "wasm"}`);
-  const b = hostBuildChild = spawn(process.execPath, [resolve(root, 'host/web/build.mjs'), app.crate('web'), hostBuild], { cwd: root, env:buildEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  const b = hostBuildChild = spawn(process.execPath, [resolve(root, 'host/web/build.mjs'), app.crate('web'), hostBuild], { cwd: root, env:buildEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
   let out = '';
   b.stdout.on('data', (d) => { out += d; });
   b.stderr.on('data', (d) => { out += d; process.stderr.write(d); });
   b.on('exit', async (code) => {
+    if (stopping) return;
     building = false; hostBuildChild = null;
     const ms = Date.now() - t;
     if (code === 0) {
@@ -1276,7 +1221,10 @@ async function produceGpu(files) {
   building = true; early?.phase('gpu', 'build');
   try {
     const results = [];
-    for (const artifact of gpuArtifacts().filter(({ stem }) => files.some(path => gpuArtifactInputs.get(stem)?.has(path)))) results.push(await produceGpuArtifact(files, artifact));
+    for (const artifact of gpuArtifacts().filter(({ stem }) => files.some(path => gpuArtifactInputs.get(stem)?.has(path)))) {
+      if (stopping) break;
+      results.push(await produceGpuArtifact(files, artifact));
+    }
     early?.phase('gpu', results.every(Boolean) ? 'ready' : 'failed');
   } finally {
     building = false;
@@ -1289,14 +1237,9 @@ async function produceGpuArtifact(files, { stem, kind, module }) {
   if (profile === 'web') console.log('gpu: add [profile.gpu-dev] inheriting dev, opt-level=1, no LTO, and optimized dependencies for fast module rebuilds');
   mkdirSync(gpuSideRoot, { recursive: true });
   const stage = mkdtempSync(resolve(gpuSideRoot, 'build-'));
-  const run = (command, args) => new Promise((ok, fail) => {
-    const child = gpuBuildChild = spawn(command, args, { cwd: app.workspace, env: {...buildEnv, CARGO_TARGET_DIR:app.target}, stdio:['ignore','pipe','pipe'], detached:true });
-    let output = '';
-    child.stdout.on('data', data => { output += data; });
-    child.stderr.on('data', data => { output += data; process.stderr.write(data); });
-    child.on('error', fail);
-    child.on('exit', code => { gpuBuildChild = null; code === 0 ? ok() : fail(new Error(output.trim())); });
-  });
+  const run = (command, args) => runBuildTree(command, args,
+    { cwd: app.workspace, env: { ...buildEnv, CARGO_TARGET_DIR: app.target } },
+    child => { gpuBuildChild = child; }, () => stopping);
   try {
     console.log(`gpu: ${files.length} source file(s) changed; building ${app.crate(kind)} (${profile})`);
     await run('cargo', ['build',...cargoReproducibilityFlags(app),'-p',app.crate(kind),'--target','wasm32-unknown-unknown','--profile',profile]);
@@ -1306,6 +1249,7 @@ async function produceGpuArtifact(files, { stem, kind, module }) {
     if (tuning && stem === 'gpu' && (await (await import('../../game/app/tables.mjs')).tableValidator(stage, true)).names.length) {
       changed.add(source); buildPending = true; early?.phase('host', 'build'); rmSync(stage, {recursive:true,force:true}); return true;
     }
+    if (stopping) throw new Error('build cancelled');
     gpuVersion++; gpuVersions.set(gpuVersion, { stem, directory: stage }); gpuSides.set(stem, gpuVersion);
     // Query versions pin JS and wasm together. A lagging fetch gets 404 rather
     // than silently pairing exports from one build with another build's wasm.
@@ -1489,5 +1433,5 @@ const banner = () => {
   console.log(`  (dev loop on ${source.replace(root + '/', '')} and the wasm's crates; ${lan ? 'LAN bind — any peer on this network can read the app, its compile errors and dev generations; macOS may ask to allow bun' : 'loopback only — --lan to serve a phone on this network'}; ctrl-c to stop)`);
 };
 if (early) banner(); else await new Promise(ok => server.listen(port, host, () => { banner(); ok(); }));
-startup.handoff(stop); doors = servedAs == null && tamber ? await openRemoteCanvas(tamber, remoteAsked, `http://127.0.0.1:${port}`).catch(async (e) => { console.error(`cannot listen: ${e.message}`); server.close(); server.closeAllConnections?.(); process.exitCode = 1; await stop(); }) : null;
+doors = servedAs == null && tamber ? await openRemoteCanvas(tamber, remoteAsked, `http://127.0.0.1:${port}`).catch(async (e) => { console.error(`cannot listen: ${e.message}`); server.close(); server.closeAllConnections?.(); process.exitCode = 1; await stop(); }) : null;
 watchLauncher(stop); listening = true; for (const line of readyLines.splice(0)) console.log(line); // once it answers and its doors are open

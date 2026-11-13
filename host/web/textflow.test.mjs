@@ -1,11 +1,44 @@
 import { hostFixtureFile, wasmSource, glueDeclarations } from './tests/glue-fixture.mjs';
-// @ref LLP 1043.000 §3 D7/D8 — pure glue tests, beside existing bun:test glue tests.
+// @ref LLP 1043.000 §3 D7/D8 — browser flow and its optional walker.
 import { test, expect } from 'bun:test';
 import { baselineIn, fragmentBaseline, fragmentDiff, framePhases, fontStyle, forgetTextBoxEdges, measurementCache, textBoxCut } from './textflow-glue.js';
 import { render } from '../../scripts/agent.mjs';
 import { cdpBrowser, chromium } from '../../scripts/agent-launch.mjs';
 import { timerWake, createTimerScheduler } from './timer-glue.js';
 import { fileURLToPath } from 'node:url';
+import { buildFlow } from '../web-js/module.mjs';
+import { readFileSync } from 'node:fs';
+import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
+
+test('the optional textflow walker stays below 96 KiB and preserves fractional geometry', async () => {
+  const bytes = readFileSync(await buildFlow());
+  // Compress the leaf separately, as scripts/metrics.mjs measures shipped files.
+  const brotli = brotliCompressSync(bytes, { params: {
+    [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: bytes.length,
+  } }).length;
+  console.log(`textflow.wasm: ${bytes.length} raw, ${gzipSync(bytes, { level: 9 }).length} gzip-9, ${brotli} brotli-11 bytes (on demand)`);
+  expect(bytes.length).toBeLessThanOrEqual(96 * 1024);
+  const { instance: { exports: wasm } } = await WebAssembly.instantiate(bytes);
+  const request = (op, input) => {
+    const ptr = wasm.textflow_in(input.length);
+    new Uint8Array(wasm.memory.buffer, ptr, input.length).set(input);
+    const len = wasm.textflow_request(op, 1, input.length);
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(wasm.memory.buffer, wasm.textflow_out(), len)));
+  };
+  const source = new Uint8Array(13);
+  source.set(new TextEncoder().encode('a'), 12);
+  expect(request(0, source).utf16_len).toBe(1);
+  expect(request(1, new Uint8Array(new Float32Array([0, 0.1]).buffer))).toEqual({ prepared: true });
+  const geometry = new ArrayBuffer(24), view = new DataView(geometry);
+  view.setFloat32(0, 100, true);
+  view.setFloat32(4, 0.1, true);
+  view.setFloat32(8, 1, true);
+  const result = request(2, new Uint8Array(geometry));
+  expect(result.line_height).toBe(0.1);
+  expect(result.height).toBe(0.1);
+  expect(result.fragments[0]).toMatchObject({ start: 0, end: 1, width: 0.1, available: 100 });
+  expect(result.complete).toBe(true);
+}, 60000);
 
 const { unavailable: browserUnavailable } = chromium();
 const browserTest = need('chrome', browserUnavailable);
@@ -604,13 +637,26 @@ async function inChrome(fixture, modules = ['/textflow-glue.js', '/timer-glue.js
 
 browserTest('flowed links keep press ownership and native Enter activation', async () => {
   const result = await inChrome(flowInputFixture, undefined, {}, false, async (cdp, sessionId, deliveries) => {
+    const focus = await cdp.send('Runtime.evaluate', { expression: `(() => {
+      const link = document.querySelector('[data-flow-fragment] a');
+      globalThis.enterActivation = { clicks: [], navigations: [], errors: [] };
+      addEventListener('click', e => enterActivation.clicks.push({ trusted: e.isTrusted, prevented: e.defaultPrevented }));
+      navigation.addEventListener('navigate', e => enterActivation.navigations.push(new URL(e.destination.url).hash));
+      addEventListener('error', e => enterActivation.errors.push(e.message));
+      return { focused: document.activeElement === link, connected: link.isConnected, href: link.getAttribute('href') };
+    })()`, returnByValue: true }, sessionId);
+    expect(focus.result.value).toEqual({ focused: true, connected: true, href: '#story' });
     for (const type of ['rawKeyDown', 'keyUp']) await cdp.send('Input.dispatchKeyEvent', {
       type, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13,
     }, sessionId);
-    const hash = await cdp.send('Runtime.evaluate', { expression: 'location.hash', returnByValue: true }, sessionId);
-    return { deliveries, hash: hash.result.value };
+    const activation = await cdp.send('Runtime.evaluate', {
+      expression: '({ hash: location.hash, ...enterActivation })', returnByValue: true,
+    }, sessionId);
+    return { deliveries, activation: activation.result.value };
   });
-  expect(result.hash).toBe('#story');
+  expect(result.activation).toEqual({
+    hash: '#story', clicks: [{ trusted: true, prevented: false }], navigations: ['#story'], errors: [],
+  });
   expect(result.deliveries).toEqual([
     { press: 1, navigate: 0, prevented: true },
     { press: 1, navigate: 0, prevented: true },
@@ -625,7 +671,7 @@ browserTest('flowed links keep press ownership and native Enter activation', asy
 // for a Contract action; both hosts' actual listener functions run unchanged.
 browserTest('same-target capture precedes a key registered first in both web runtimes', async () => {
   expect(await inChrome(targetKeyFixture, ['/glue.js'], {
-    '/rt.js': fileURLToPath(new URL('../web-js/rt.js', import.meta.url)),
+    '/events.js': fileURLToPath(new URL('../web-js/events.js', import.meta.url)),
   })).toEqual([
     [['capture', 'key'], ['capture']],
     [['capture', 'key'], ['capture']],
@@ -633,11 +679,11 @@ browserTest('same-target capture precedes a key registered first in both web run
 }, 60000);
 
 async function targetKeyFixture() {
-  const [glue, rt] = await Promise.all(['/glue.js', '/rt.js'].map(url => fetch(url).then(r => r.text())));
+  const [glue, rt] = await Promise.all(['/glue.js', '/events.js'].map(url => fetch(url).then(r => r.text())));
   const attach = await fetch('/wasm-input.js').then(r => r.text());
   const on = rt.slice(rt.indexOf('export function on('), rt.indexOf('// Each event family')).replace('export ', '');
-  // onKey hears a key with nothing focused through atBody, the line before it (0c3cf4405f).
-  const onKey = [rt.split('\n').find(line => line.startsWith('let BodyHeard;')), rt.split('\n').find(line => line.startsWith('export const onKey =')).replace('export ', '')].join('\n');
+  // onKey hears a key with nothing focused through atBody, declared before it (0c3cf4405f).
+  const onKey = rt.slice(rt.indexOf('let BodyHeard;'), rt.indexOf('export function onMIDI')).replace('export ', '');
   const bindWasm = new Function('el', 'heard', `
     let keyEvent = null, bodyHeard; // glue.js declares both; attach reads them (0c3cf4405f)
     const views = new Map([[1, el]]), retiredViews = new WeakSet(), inputReady = true, page = null;
@@ -1024,7 +1070,8 @@ async function flowInputFixture() {
   const { createInputHandlers } = await import('/input-glue.js');
   const root = document.getElementById('root'), views = new Map(), results = [];
   let presses = 0, navigates = 0;
-  globalThis.exact = { wasm: { exact_route_match: () => 1, exact_log() {} }, writeIn: s => s,
+  // Only /story is routed; this fixture document's #story link uses native navigation.
+  globalThis.exact = { wasm: { exact_route_match: path => Number(path === '/story'), exact_log() {} }, writeIn: s => s,
     navigate() { navigates++; return { ops: [{ op: 'router' }] }; } };
   createInputHandlers({ root, views, retiredViews: new WeakSet(), ready: () => true, inertAncestor: () => false, dispatch() {} });
   for (const [press, navigate, modified] of [[true, true, false], [true, false, false], [false, true, false], [true, true, true], [false, false, false]]) {
@@ -1135,7 +1182,7 @@ browserTest('a flowed paragraph is trimmed to its own font\'s cap height, whatev
     const cut = textBoxCut({ textBoxTrim: 'trim-both', textBoxEdge: 'cap alphabetic' }, { font: '20px Arabic' }, 30, context);
     return { cap: baseline - cut.top, fallbackInk: m.actualBoundingBoxAscent };
   };
-  const { cap, fallbackInk } = await inChrome(fixture, ['/textflow-glue.js', '/timer-glue.js'], { '/arabic.ttf': new URL('../linux/tests/fonts/NotoSansArabic.ttf', import.meta.url) });
+  const { cap, fallbackInk } = await inChrome(fixture, ['/textflow-glue.js', '/timer-glue.js'], { '/arabic.ttf': new URL('../painted/tests/fonts/NotoSansArabic.ttf', import.meta.url) });
   expect(Math.abs(cap - 20 * 0.416)).toBeLessThan(0.5);
   expect(Math.abs(fallbackInk - 20 * 0.416)).toBeGreaterThan(1); // the fallback's H is not the font's cap height
 }, 20000);
@@ -1187,7 +1234,7 @@ async function flowWidthFixture() {
 // percentage computed style gives, and a percentage with no keyword keeps ordinary layout.
 browserTest('a flowed paragraph is measured and painted at the width CSS gives it', async () => {
   const { between, condensedClamp, condensedHyphen, ...got } = await inChrome(flowWidthFixture, ['/textflow-glue.js', '/timer-glue.js'],
-    { '/flex.ttf': new URL('../linux/tests/fonts/RobotoFlex-subset.ttf', import.meta.url) });
+    { '/flex.ttf': new URL('../painted/tests/fonts/RobotoFlex-subset.ttf', import.meta.url) });
   for (const [name, { css, measured, painted }] of Object.entries(got)) {
     expect([name, Math.abs(measured - css) < 0.5, Math.abs(painted - css) < 0.5]).toEqual([name, true, true]);
   }

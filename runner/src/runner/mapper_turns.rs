@@ -40,11 +40,68 @@ struct Behind {
     /// The request out for the stream: its ticket, and whether it hands
     /// back a held outcome rather than resuming the mapper.
     out: Option<(u64, bool)>,
+    /// The mapper request's fetch, distinct from the stream's.
+    fetch: Option<u64>,
     held: VecDeque<Outcome>,
+    /// The messages held, a batch counting each of its own, and their bytes.
+    messages: usize,
     bytes: usize,
 }
 
+impl Behind {
+    /// Whether `outcome` may wait behind the turn within both bounds; if
+    /// not, why the stream ends.
+    fn room(&self, outcome: &Outcome) -> Result<(), String> {
+        let (n, bytes) = (outcome.messages().len().max(1), size(outcome));
+        if self.messages + n <= MOST_HELD && self.bytes + bytes <= MOST_HELD_BYTES {
+            return Ok(());
+        }
+        Err(format!(
+            "the stream's mapper fell behind: {} messages ({} bytes) waited for its turns, and {} more arrived",
+            self.messages, self.bytes, n
+        ))
+    }
+
+    /// Hold `outcome` behind the turn, last or (`first`) ahead of the rest.
+    fn hold(&mut self, outcome: Outcome, first: bool) {
+        self.messages += outcome.messages().len().max(1);
+        self.bytes += size(&outcome);
+        if first {
+            self.held.push_front(outcome);
+        } else {
+            self.held.push_back(outcome);
+        }
+    }
+
+    fn next(&mut self) -> Option<Outcome> {
+        let next = self.held.pop_front()?;
+        self.messages -= next.messages().len().max(1);
+        self.bytes -= size(&next);
+        Some(next)
+    }
+}
+
 impl<D: DataSource> Runner<D> {
+    pub(super) fn fail_mapper_turn(&mut self, stream: u64, message: &str) {
+        if let Some(behind) = self.mapper_turns.by_stream.remove(&stream) {
+            if let Some((ticket, _)) = behind.out {
+                if let Some(token) = self
+                    .requests
+                    .iter()
+                    .find(|r| r.ticket == ticket)
+                    .and_then(|r| r.request.continuation)
+                {
+                    self.data.discard(token);
+                }
+                self.explicit_aborts.push(ticket);
+                self.failed_tickets.insert(ticket, message.into());
+                if !self.module_aborts.contains(&ticket) {
+                    self.module_aborts.push(ticket);
+                }
+            }
+        }
+    }
+
     /// The open stream whose turn request `ticket` is.
     fn turn_stream(&self, ticket: u64) -> Option<u64> {
         let (stream, _) = (self.mapper_turns.by_stream.iter())
@@ -90,7 +147,9 @@ impl<D: DataSource> Runner<D> {
         self.log(super::lines::enqueued(ticket, &name, &request));
         let behind = self.mapper_turns.by_stream.entry(stream).or_default();
         behind.out = Some((ticket, held));
+        behind.fetch = request.fetch;
         self.requests.push(RequestOut {
+            class: crate::RequestClass::Ordered,
             ticket,
             target: name,
             request,
@@ -122,16 +181,20 @@ impl<D: DataSource> Runner<D> {
         if behind.out.is_none() {
             return Continue(outcome);
         }
-        if behind.held.len() < MOST_HELD && behind.bytes + size(&outcome) <= MOST_HELD_BYTES {
-            behind.bytes += size(&outcome);
-            behind.held.push_back(outcome);
-            return Break(Ok(None));
+        if let Err(message) = behind.room(&outcome) {
+            return self.fell_behind(ticket, message, outcome);
         }
-        let message = format!(
-            "the stream's mapper fell behind: {} messages ({} bytes) waited for its turns",
-            behind.held.len(),
-            behind.bytes
-        );
+        behind.hold(outcome, false);
+        Break(Ok(None))
+    }
+
+    /// Past the bound, the stream ends as a failed reply ends a request.
+    fn fell_behind(
+        &mut self,
+        ticket: u64,
+        message: String,
+        outcome: Outcome,
+    ) -> ControlFlow<Result<Option<CommitReceipt>, RunnerError>, Outcome> {
         self.mapper_turns.by_stream.remove(&ticket);
         let Some(target) = (self.pending.iter().find(|p| p.ticket == ticket)).map(|p| p.target)
         else {
@@ -142,7 +205,25 @@ impl<D: DataSource> Runner<D> {
             message,
             reason: String::new(),
         };
-        Break(self.release_failed(ticket, target, why))
+        Break(self.release_failed_as_asked(ticket, target, why))
+    }
+
+    /// The rest of a batch whose message the mapper answered with a
+    /// promise: they wait behind its turn, ahead of what waited already,
+    /// within the same bounds; past them, why the stream ends.
+    pub(super) fn hold_behind_turn(
+        &mut self,
+        stream: u64,
+        rest: Vec<crate::Message>,
+    ) -> Result<(), String> {
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let behind = self.mapper_turns.by_stream.entry(stream).or_default();
+        let rest = Outcome::Messages(rest);
+        behind.room(&rest)?;
+        behind.hold(rest, true);
+        Ok(())
     }
 
     fn turn_landed(
@@ -152,10 +233,10 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Option<CommitReceipt>, RunnerError> {
         let behind = (self.mapper_turns.by_stream.get_mut(&stream)).expect("found by turn_stream");
         let (_, held) = behind.out.take().expect("found by turn_stream");
+        let fetch = behind.fetch.take();
         let result = if !held {
-            self.run_turn(stream, outcome)
-        } else if let Some(next) = behind.held.pop_front() {
-            behind.bytes -= size(&next);
+            self.run_turn(stream, fetch, outcome)
+        } else if let Some(next) = behind.next() {
             self.fulfill_now(stream, next, None)
         } else {
             Ok(None)
@@ -178,13 +259,15 @@ impl<D: DataSource> Runner<D> {
     fn run_turn(
         &mut self,
         stream: u64,
+        fetch: Option<u64>,
         outcome: Outcome,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
         let was_poisoned = self.poisoned;
         let checkpoint = self.checkpoint();
         let pos =
             (self.pending.iter().position(|p| p.ticket == stream)).expect("found by turn_stream");
-        let p = self.pending[pos].clone();
+        let mut p = self.pending[pos].clone();
+        p.fetch = fetch;
         let target = p.target;
         let what = super::lines::fulfilling(stream, &self.target_name(target), "mapper turn");
         let (origin, id) = (self.ticket_origin(stream), self.ticket_id(stream));
@@ -197,7 +280,7 @@ impl<D: DataSource> Runner<D> {
         self.arm_next(result.is_ok());
         self.log_outcome(&what, &result, was_poisoned);
         if let (Err(e), true) = (&result, self.holds(stream)) {
-            return self.release_failed(stream, target, Failure::of(e));
+            return self.release_failed_as_asked(stream, target, Failure::of(e));
         }
         result.map(Some)
     }
@@ -207,6 +290,7 @@ impl<D: DataSource> Runner<D> {
 fn size(outcome: &Outcome) -> usize {
     match outcome {
         Outcome::Message(m) => m.data.len() + m.binary.as_ref().map_or(0, Vec::len),
+        Outcome::Messages(ms) => ms.iter().map(|m| m.data.len()).sum(),
         _ => 0,
     }
 }

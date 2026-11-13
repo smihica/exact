@@ -31,6 +31,12 @@ macro_rules! configured {
             fn app_id(&self) -> &str {
                 $crate::exact_runner::DataSource::app_id(&self.0)
             }
+            fn launch(&self) -> Option<$crate::exact_runner::request::Launch> {
+                $crate::exact_runner::DataSource::launch(&self.0)
+            }
+            fn preloads(&self) -> &[$crate::exact_runner::request::Preload] {
+                $crate::exact_runner::DataSource::preloads(&self.0)
+            }
             fn grants(&self) -> &str {
                 $crate::exact_runner::DataSource::grants(&self.0)
             }
@@ -170,8 +176,14 @@ macro_rules! configured {
                 &mut self,
                 store: &$crate::exact_runner::Store,
                 in_flight: $crate::exact_runner::InFlight<'_>,
+                fetch: Option<u64>,
             ) -> Option<(u64, $crate::exact_runner::Request)> {
-                $crate::exact_runner::DataSource::timer_before_reply(&mut self.0, store, in_flight)
+                $crate::exact_runner::DataSource::timer_before_reply(
+                    &mut self.0,
+                    store,
+                    in_flight,
+                    fetch,
+                )
             }
             fn module_landed(
                 &mut self,
@@ -198,6 +210,33 @@ macro_rules! configured {
             fn take_logs(&mut self) -> Vec<String> {
                 $crate::exact_runner::DataSource::take_logs(&mut self.0)
             }
+            fn parse_tool(
+                &mut self,
+                fetch: Option<u64>,
+                continuation: Option<u64>,
+                store: &mut $crate::exact_runner::Store,
+                source: &str,
+                args: &[$crate::exact_plan::Value],
+                outcome: $crate::exact_runner::Outcome,
+            ) -> Result<$crate::exact_runner::Answer, $crate::exact_runner::DataError> {
+                $crate::exact_runner::DataSource::parse_tool(
+                    &mut self.0,
+                    fetch,
+                    continuation,
+                    store,
+                    source,
+                    args,
+                    outcome,
+                )
+            }
+
+            fn module_identity(
+                &self,
+                source: &str,
+            ) -> Option<$crate::exact_runner::ModuleIdentity> {
+                $crate::exact_runner::DataSource::module_identity(&self.0, source)
+            }
+
             fn take_aborted(&mut self) -> Vec<u64> {
                 $crate::exact_runner::DataSource::take_aborted(&mut self.0)
             }
@@ -267,6 +306,31 @@ macro_rules! configured {
                     store,
                     source,
                     args,
+                )
+            }
+            fn more_for(
+                &mut self,
+                target: $crate::exact_runner::Target,
+            ) -> Vec<$crate::exact_runner::Request> {
+                $crate::exact_runner::DataSource::more_for(&mut self.0, target)
+            }
+            fn parse_fetch_for(
+                &mut self,
+                target: $crate::exact_runner::Target,
+                fetch: Option<u64>,
+                store: &mut $crate::exact_runner::Store,
+                source: &str,
+                args: &[$crate::exact_plan::Value],
+                outcome: $crate::exact_runner::Outcome,
+            ) -> Result<Option<$crate::exact_runner::Answer>, $crate::exact_runner::DataError> {
+                $crate::exact_runner::DataSource::parse_fetch_for(
+                    &mut self.0,
+                    target,
+                    fetch,
+                    store,
+                    source,
+                    args,
+                    outcome,
                 )
             }
             fn parse_for(

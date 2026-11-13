@@ -3,21 +3,21 @@ use super::*;
 use crate::host::Restyle;
 
 impl<D: DataSource> Bridge<D> {
-    /// A collection's nearest logical row snap position; NaN when absent.
-    pub fn collection_snap(
-        &self,
-        view: u32,
-        proposed: f64,
-        port: f64,
-        maximum: f64,
-        distance: f64,
-    ) -> f64 {
+    /// A collection's nearest logical row snap position; NaN when absent
+    /// (`Runner::collection_snap`).
+    pub fn collection_snap(&self, view: u32, geometry: [f64; 5]) -> f64 {
         self.host
             .as_ref()
-            .and_then(|h| {
-                h.runner()
-                    .collection_snap(view, proposed, port, maximum, distance)
-            })
+            .and_then(|h| h.runner().collection_snap(view, geometry))
+            .unwrap_or(f64::NAN)
+    }
+
+    /// A collection's first unmounted `always` snap position past a release
+    /// toward its rest; NaN when absent (`Runner::collection_snap_stop`).
+    pub fn collection_snap_stop(&self, view: u32, travel: [f64; 2], snapport: [f64; 3]) -> f64 {
+        self.host
+            .as_ref()
+            .and_then(|h| h.runner().collection_snap_stop(view, travel, snapport))
             .unwrap_or(f64::NAN)
     }
 
@@ -69,6 +69,7 @@ impl<D: DataSource> Bridge<D> {
                 Vec::new(),
                 Vec::new(),
             );
+            let mut locals = Vec::new();
             for r in records {
                 let word = |i: usize| [r[i], r[i + 1], r[i + 2], r[i + 3]];
                 let edge = |i: usize| f32::from_le_bytes(word(i));
@@ -114,6 +115,13 @@ impl<D: DataSource> Bridge<D> {
                         let axis = |i: usize| Some(edge(i)).filter(|v| !v.is_nan());
                         restyles.push((view, Restyle::Size([axis(8), axis(12)])));
                     }
+                    // A content owner's local insets, or the session root's
+                    // (LLP 1123 D9): set, or taken back
+                    17 | 19 => locals.push((
+                        (kind == 17).then_some(view),
+                        Some([edge(8), edge(12), edge(16), edge(20)]),
+                    )),
+                    18 | 20 => locals.push(((kind == 18).then_some(view), None)),
                     10 => lists.push((view, Some([edge(8), edge(12)]))),
                     11 => lists.push((view, None)),
                     1 => {
@@ -133,16 +141,25 @@ impl<D: DataSource> Bridge<D> {
                 }
             }
             self.host.as_mut().map_or_else(not_booted, |h| {
-                h.set_claims(&covers, &blocks, &placements, &margins, &lists, &restyles)
+                h.set_claims(
+                    &covers,
+                    &blocks,
+                    &placements,
+                    &margins,
+                    &lists,
+                    &restyles,
+                    &locals,
+                )
             })
         };
         self.emit(out)
     }
 
     /// What `view`'s subtree would measure in a block (`Kernel::measure_block`,
-    /// a popover's position-area option): the border box's width and height,
-    /// then the margins, top, right, bottom and left, as the layout resolved
-    /// them, six LE f32s in the output buffer, and 24; 0 when refused. Each axis is a
+    /// a pane's fitting proposal or a popover's position-area option): the used
+    /// width and height, the border box's width and height, then the margins,
+    /// top, right, bottom and left, as the layout resolved them. Eight LE f32s
+    /// in the output buffer, and 32; 0 when refused. Each axis is a
     /// length and a policy as `covers`' kind 4 takes them, 3 being a region.
     /// No batch: nothing is laid out, published or sent.
     pub fn measure_block(&mut self, view: u32, lengths: [f32; 2], policies: [u32; 2]) -> u32 {
@@ -156,10 +173,12 @@ impl<D: DataSource> Bridge<D> {
             .and_then(|h| h.measure_block(view, block));
         self.output = used.map_or_else(Vec::new, |m| {
             let [top, right, bottom, left] = m.margin;
-            [m.border.0, m.border.1, top, right, bottom, left]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect()
+            [
+                m.used.0, m.used.1, m.border.0, m.border.1, top, right, bottom, left,
+            ]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
         });
         self.output.len() as u32
     }

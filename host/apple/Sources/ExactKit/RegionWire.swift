@@ -74,6 +74,10 @@ extension RegionTextSource {
                 decoration: row["decoration"] as? String ?? "", href: row["href"] as? String ?? "")
             // The colour is one its author fixed, not a role (LLP 1115.000 D7.9).
             run.fixedInk = row["fixed"] as? Bool == true
+            // Its inline boxes' room beside its text (`Run.inlineStart`, `inlineEnd`).
+            if let edges = row["edges"] as? [Double], edges.count == 2, edges.allSatisfy(\.isFinite) {
+                run.inlineStart = CGFloat(Float(edges[0])); run.inlineEnd = CGFloat(Float(edges[1]))
+            }
             // Its decorating ancestors' lines, in their colours (`Run.propagate`).
             run.underlineColor = row[dark ? "underlineDarkColor" : "underlineColor"] as? [Double]
             run.strikeColor = row[dark ? "strikeDarkColor" : "strikeColor"] as? [Double]
@@ -84,7 +88,10 @@ extension RegionTextSource {
               runs.reduce(0, { $0 + $1.text.utf8.count }) <= 8 * 1024 * 1024 else { return nil }
         var spec = Spec(runs: runs, align: wire["align"] as? Int ?? 0,
             lineClamp: wire["lineClamp"] as? Int ?? 0, color: [0,0,0,255],
-            overflowWrap: wire["overflowWrap"] as? Int ?? 0, strut: strut)
+            overflowWrap: wire["overflowWrap"] as? Int ?? 0,
+            direction: wire["direction"] as? Int ?? 0, whiteSpace: wire["whiteSpace"] as? Int ?? 0,
+            strut: strut, textIndent: CGFloat(wire["textIndent"] as? Double ?? 0),
+            hyphens: wire["hyphens"] as? Int ?? 0, language: wire["language"] as? String ?? "")
         // CSS `text-box`: a region's paragraph is trimmed as any other
         spec.textBoxTrim = wire["textBoxTrim"] as? Int ?? 0
         spec.textBoxOver = wire["textBoxOver"] as? Int ?? 0

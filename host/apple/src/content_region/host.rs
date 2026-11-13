@@ -5,6 +5,7 @@ use exact_kernel::{RegionInputs, RegionTextRequest, TextMetrics};
 use std::{any::Any, rc::Rc};
 impl<D: DataSource> Host<D> {
     /// Boot one explicitly registered content region before any text layout.
+    /// `facts` supplies the date, place and clock before settlement (LLP 1027.000.000 D2).
     pub fn boot_region(
         plan: &[u8],
         data: D,
@@ -12,28 +13,31 @@ impl<D: DataSource> Host<D> {
         width: f32,
         height: f32,
         registration: ContentRegionRegistration,
+        facts: exact_runner::time::Launch,
     ) -> Result<(Self, String), HostError> {
-        let (mut host, batch) = Self::boot_stored_after_decode(
-            crate::host::PlanBytes::Copied(plan),
-            data,
-            measurer,
-            crate::host::LaunchLayout::NONE,
-            exact_runner::Viewport::sized(width as f64, height as f64),
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-            "/",
-            false,
-            Some(registration),
-            crate::link::Links::ALL,
-            None,
-            |_| Ok(()),
-        )?;
-        host.commit_boot();
-        Ok((host, batch))
+        exact_runner::time::launching_with(facts, || {
+            let (mut host, batch) = Self::boot_stored_after_decode(
+                crate::host::PlanBytes::Copied(plan),
+                data,
+                measurer,
+                crate::host::LaunchLayout::NONE,
+                exact_runner::Viewport::sized(width as f64, height as f64),
+                None,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                "/",
+                false,
+                Some(registration),
+                crate::link::Links::ALL,
+                None,
+                |_| Ok(()),
+            )?;
+            host.commit_boot();
+            Ok((host, batch))
+        })
     }
     /// The one current request. The source/ticket retains no Arena/Runtime.
     pub fn pending_region_request(&self) -> Option<(u64, &RegionTextRequest)> {
@@ -48,7 +52,12 @@ impl<D: DataSource> Host<D> {
         self.content_region
             .as_ref()
             .ok_or("no content region")?
-            .request_json(self.runner.kernel(), id, known)
+            .request_json(
+                self.runner.kernel(),
+                id,
+                known,
+                self.runner.resolved_locale(),
+            )
     }
     /// Selected immutable publication identity, including retained old content.
     pub fn region_publication_id(&self) -> Option<u64> {
@@ -177,7 +186,9 @@ use exact_kernel::RegionSelection;
 impl<D: DataSource> Host<D> {
     /// Explicit native-subtree projection. Existing opaque registration and ABI
     /// entry points do not opt in. This is a Rust producer seam, not a Swift
-    /// realization/retained-action implementation.
+    /// realization/retained-action implementation. `facts` supplies the date,
+    /// place and clock before settlement (LLP 1027.000.000 D2).
+    #[allow(clippy::too_many_arguments)]
     pub fn boot_native_region(
         plan: &[u8],
         data: D,
@@ -186,29 +197,32 @@ impl<D: DataSource> Host<D> {
         height: f32,
         registration: ContentRegionRegistration,
         limits: NativeProjectionLimits,
+        facts: exact_runner::time::Launch,
     ) -> Result<(Self, String), HostError> {
-        let (mut host, batch) = Self::boot_stored_after_decode_mode(
-            crate::host::PlanBytes::Copied(plan),
-            data,
-            measurer,
-            crate::host::LaunchLayout::NONE,
-            exact_runner::Viewport::sized(width as f64, height as f64),
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-            "/",
-            false,
-            Some(registration),
-            Some(limits),
-            crate::link::Links::ALL,
-            None,
-            |_| Ok(()),
-        )?;
-        host.commit_boot();
-        Ok((host, batch))
+        exact_runner::time::launching_with(facts, || {
+            let (mut host, batch) = Self::boot_stored_after_decode_mode(
+                crate::host::PlanBytes::Copied(plan),
+                data,
+                measurer,
+                crate::host::LaunchLayout::NONE,
+                exact_runner::Viewport::sized(width as f64, height as f64),
+                None,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                "/",
+                false,
+                Some(registration),
+                Some(limits),
+                crate::link::Links::ALL,
+                None,
+                |_| Ok(()),
+            )?;
+            host.commit_boot();
+            Ok((host, batch))
+        })
     }
     pub(super) fn native_mode(&self) -> bool {
         self.content_region
@@ -406,7 +420,7 @@ impl<D: DataSource> Host<D> {
                 .node_by_key(arena.key(slot))
                 .ok_or("native removed node")?;
             let props = props_for(&node);
-            let (style, _) = style::style_json_for(&node, &self.runner.kernel().env());
+            let (style, _) = style::style_json_for(&node, &self.runner.kernel().env_of(node.id));
             let children = arena
                 .children(slot)
                 .iter()
@@ -667,7 +681,7 @@ impl<D: DataSource> Host<D> {
             }
             if self.layout_withheld || old.is_none_or(|m| m.content != node.mirror.content) {
                 if let Some((w, h)) = node.mirror.content {
-                    staged.content(node.header.id, w, h);
+                    staged.content(node.header.id, w, h, None);
                 }
             }
         }
@@ -858,6 +872,7 @@ mod selected_current_tests {
             600.,
             registration,
             Default::default(),
+            exact_runner::time::Launch::NONE,
         )
         .unwrap();
         settle(&mut host);
@@ -1015,6 +1030,7 @@ mod selected_current_tests {
                     pending: "pending",
                 },
                 limits,
+                exact_runner::time::Launch::NONE,
             )
             .unwrap()
         };
@@ -1184,6 +1200,7 @@ mod selected_current_tests {
             600.,
             registration,
             Default::default(),
+            exact_runner::time::Launch::NONE,
         )
         .unwrap();
         let (id, _) = host.pending_region_request().unwrap();

@@ -112,7 +112,6 @@ impl Module {
                 }
                 self.host.between_answers = false;
                 if failed {
-                    self.progress += 1;
                     self.read_background();
                     return Ok(self.background_request());
                 }
@@ -138,8 +137,6 @@ impl Module {
             self.finish_let_go();
         }
         self.host.between_answers = false;
-        // What landed may settle an answer waiting on the background's work.
-        self.progress += 1;
         self.read_background();
         match delivered {
             Ok(true) => Ok(self.background_request()),
@@ -155,6 +152,9 @@ impl Module {
     /// are, within `bound`; what is left then is dropped and said. An
     /// operation the store already has completes on disk regardless.
     pub(crate) fn finish_background(&mut self, bound: std::time::Duration) {
+        if self.retire_oom().is_some() {
+            return;
+        }
         let deadline = std::time::Instant::now() + bound;
         self.read_background();
         self.host.between_answers = true;
@@ -165,6 +165,9 @@ impl Module {
         }
         self.read_background();
         loop {
+            if self.retire_oom().is_some() {
+                break;
+            }
             let left = self.background.state.queued + self.background.state.in_flight;
             if left == 0 {
                 break;

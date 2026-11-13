@@ -3,6 +3,25 @@ use super::*;
 use crate::{generated::metric, style::metrics, Dimension, StyleValue};
 use std::sync::LazyLock;
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct State {
+    pub prefixes: SlotSet,
+    /// Popovers a shown source opened as choosers (`set_popover_source_visible`).
+    pub choosers: SlotSet,
+}
+
+impl State {
+    pub fn clear(&mut self) {
+        self.prefixes.clear();
+        self.choosers.clear();
+    }
+
+    pub fn remove(&mut self, slot: u32) {
+        self.prefixes.remove(slot);
+        self.choosers.remove(slot);
+    }
+}
+
 fn rows(values: &[(StyleId, &str)]) -> StyleProps {
     let mut s = StyleProps::default();
     for (id, value) in values {
@@ -259,14 +278,14 @@ impl NodeArena {
     }
 
     pub(crate) fn has_alert_prefix(&self, slot: u32) -> bool {
-        self.alert_prefixes.contains(slot)
+        self.alert_state.prefixes.contains(slot)
     }
 
     pub(crate) fn set_alert_prefix(&mut self, slot: u32, present: bool) {
         if present {
-            self.alert_prefixes.insert(slot);
+            self.alert_state.prefixes.insert(slot);
         } else {
-            self.alert_prefixes.remove(slot);
+            self.alert_state.prefixes.remove(slot);
         }
     }
 
@@ -274,6 +293,14 @@ impl NodeArena {
         metrics::column() == metrics::Column::Neutral
             && self.props(slot).str(PropId::SemanticTag) == Some("dialog")
             && self.props(slot).str(PropId::AccessibilityRole) == Some("alertdialog")
+    }
+    pub(crate) fn neutral_content_popover(&self, slot: u32) -> bool {
+        metrics::column() == metrics::Column::Neutral
+            && self.props(slot).str(PropId::Popover).is_some()
+            && !matches!(
+                self.props(slot).str(PropId::AccessibilityRole),
+                Some("menu" | "alertdialog")
+            )
     }
     fn is_alert_button(&self, slot: u32) -> bool {
         self.is_button(slot) || self.is_native_button(slot)
@@ -303,10 +330,15 @@ impl NodeArena {
             if props.str(PropId::Popover).is_some()
                 && props.str(PropId::AccessibilityRole) != Some("menu")
             {
-                return if props.bool(PropId::DefaultSurface) == Some(true) {
-                    15
-                } else {
-                    14
+                // A retained popover must relayout when its role changes its padding.
+                return match (
+                    props.bool(PropId::DefaultSurface) == Some(true),
+                    self.neutral_content_popover(slot),
+                ) {
+                    (false, false) => 14,
+                    (true, false) => 15,
+                    (false, true) => 16,
+                    (true, true) => 17,
                 };
             }
             if props.str(PropId::SemanticTag) == Some("dialog")
@@ -378,8 +410,8 @@ impl NodeArena {
             10 => Some(&MESSAGE_TEXT),
             12 => Some(&ACTIONS_FIRST),
             13 => Some(&DIALOG),
-            14 => Some(&POPOVER),
-            15 => Some(&RAISED),
+            14 | 16 => Some(&POPOVER),
+            15 | 17 => Some(&RAISED),
             _ => None,
         }
     }
@@ -410,13 +442,29 @@ impl NodeArena {
             s.display = taffy::Display::None;
             return;
         }
-        if !self.neutral_alert(slot) && self.alert_context(slot) != 13 {
+        let content_popover = self.neutral_content_popover(slot);
+        if !content_popover && !self.neutral_alert(slot) && self.alert_context(slot) != 13 {
             return;
         }
         let own = self.style(slot).mask.union(self.style(slot).written);
         let em = self.computed_source(slot, StyleId::FontSize).font_size;
         let px =
             |m| metrics::length_in(m, metrics::Column::Neutral, em, self.root_font_size()).unwrap();
+        if content_popover {
+            // The neutral sheet's 1rem follows the page, even under an authored font.
+            let padding = taffy::style::LengthPercentage::length(px(metric::POPOVER_PADDING));
+            for (row, side) in [
+                (StyleId::PaddingTop, &mut s.padding.top),
+                (StyleId::PaddingRight, &mut s.padding.right),
+                (StyleId::PaddingBottom, &mut s.padding.bottom),
+                (StyleId::PaddingLeft, &mut s.padding.left),
+            ] {
+                if !own.has(row) {
+                    *side = padding;
+                }
+            }
+            return;
+        }
         if self.neutral_alert(slot) && !own.has(StyleId::Width) {
             s.size.width = taffy::style::Dimension::length(
                 px(metric::ALERT_WIDTH)

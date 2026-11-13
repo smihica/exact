@@ -1,7 +1,7 @@
 # Recipe: a navigation stack
 
-A list pushing a detail, a Cancel/Save sheet, an alert (`pattern list-detail`).
-A second screen is a route (`if` over state gets no Back, links or split).
+Keyed screens go directly in the app's first element (navigation root) or in
+panels named with `aria-controls` by its first linked tablist's direct tabs.
 
 A route's first `header` with one heading is its bar (title large at `aria-level=1`,
 inline at 2); buttons before it lead, after it trail. A pushed route has
@@ -135,7 +135,7 @@ test "add, open, delete after asking"
 ```
 
 - An alert's `aria-label` is its title. Escape/Back chooses Cancel; only `closedby="any"`
-  dismisses outside. Another modal is a sheet, closed on ok ([after-a-write](after-a-write.md)).
+  dismisses outside. Another modal is a sheet, closed on ok ([after a write](after-a-write.md)).
 - Routes stay mounted: unique `testId`s. `clock settle` after a push, sheet or alert;
   `clock data` before reading a save.
 - A run (a workout, a quiz) has one exit that ends it or asks; no Back leaves it running.

@@ -1,4 +1,7 @@
 import XCTest
+#if os(iOS)
+import UIKit
+#endif
 @testable import ExactKit
 
 /// A timer's (or a scroll event's) batch that changes nothing only moves the clock: it does not
@@ -6,8 +9,88 @@ import XCTest
 /// next timer is armed for its deadline. A batch with ops, an error, a
 /// control's viewless contents (`controls`, LLP 1069.011 §9), new motion,
 /// moved page facts, a wake lock or word on work the app must finish still applies. The flag crosses the wire
-/// as `"controls":true`.
+/// as `"controls":true`. A published batch that shows nothing new is not outstanding work either.
 final class IdleTickTests: XCTestCase {
+    /// A published batch (a reply's, a frame's tick's) that shows nothing new
+    /// does not hold settled or TTI (LLP 1132 D5); one that changes a view or
+    /// asks for a canvas image holds them until it lands. A slice in flight
+    /// holds them as `fill`, whatever its batch.
+    func testAPublishedBatchIsOutstandingOnlyWhenItShowsSomethingNew() throws {
+        let session = ExactApp.shared.makeSession(label: "published-not-loading")
+        defer { session.destroy() }
+        func reply(_ batch: Batch) {
+            session.repliesInFlight += 1; session.replySubmissions.append(0)
+            session.publish(.reply, batch, session.generation)
+        }
+        session.publishTickForTests(wireBatch([]))
+        reply(wireBatch([]))
+        // Work the app must finish is a hold, and an error is only logged: neither is loading
+        var finished = wireBatch([])
+        finished.mustFinish = false
+        reply(finished)
+        reply(Batch(ops: [], timers: false, motion: false, clock: nil, error: "boom"))
+        XCTAssertEqual(session.hostOutstanding, [])
+        reply(wireBatch([["op": "props", "id": 1, "set": ["testId": "x"]]]))
+        XCTAssertEqual(session.hostOutstanding, ["published"])
+        waitFor("the batches land") { session.hostOutstanding.isEmpty && !session.ownerInFlight }
+        var image = wireBatch([])
+        image.canvasImages = ["missing-canvas-image.png"]
+        session.publishTickForTests(image)
+        XCTAssertEqual(session.hostOutstanding, ["published"])
+        waitFor("the tick lands") { session.hostOutstanding.isEmpty && !session.ownerInFlight }
+        session.publishFillForTests(1, wireBatch([]), generation: session.generation)
+        XCTAssertEqual(session.hostOutstanding, ["fill"])
+        waitFor("the slice lands") { session.hostOutstanding.isEmpty }
+    }
+
+    func testAnInertOrientationRequestAppliesWithoutHoldingSettled() {
+        let session = ExactApp.shared.makeSession(label: "inert-orientation")
+        defer { session.destroy() }
+        var batch = wireBatch([])
+        batch.orientation = .init()
+        batch.orientation?.types = 1
+        XCTAssertTrue(session.showsNothing(batch), "an embedded session cannot turn its host's window")
+        XCTAssertFalse(session.changesNothing(batch), "the request must still reach the presenter and readback")
+        session.publishTickForTests(batch)
+        XCTAssertEqual(session.hostOutstanding, [])
+        waitFor("the orientation request lands") { !session.tickInFlight }
+        XCTAssertEqual(session.presenter.orientationLock.request.types, 1)
+    }
+
+    #if os(iOS)
+    func testAnIPadTypeRequestLeavesSettledAloneButALockChangeDoesNot() throws {
+        guard let scene = hostedWindowScene() else { throw missing("scene", "orientation resolution needs a window scene") }
+        guard scene.traitCollection.userInterfaceIdiom == .pad else { throw XCTSkip("n/a: iPad orientation policy") }
+        guard #available(iOS 26, *) else { throw XCTSkip("n/a: current orientation lock needs iPadOS 26") }
+        let session = ExactApp.shared.makeSession(label: "ipad-orientation")
+        session.hatchesOwnWindow = true
+        let window = UIWindow(windowScene: scene), host = UIViewController()
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        let view = ExactView(session: session)
+        host.view.addSubview(view)
+        view.frame = host.view.bounds
+        defer { session.destroy(); window.isHidden = true }
+        var batch = wireBatch([])
+        batch.orientation = .init()
+        batch.orientation?.types = 1
+        XCTAssertTrue(session.showsNothing(batch), "an iPad ignores an orientation type")
+        session.applyUnlessEmpty(batch)
+        XCTAssertEqual(session.presenter.orientationLock.why, "an iPad applies no type")
+        XCTAssertFalse(session.presenter.orientationLock.locked)
+        batch.orientation?.types = 15
+        batch.orientation?.current = true
+        XCTAssertFalse(session.showsNothing(batch), "a current lock changes the controller's answer")
+        session.applyUnlessEmpty(batch)
+        XCTAssertTrue(session.presenter.orientationLock.locked)
+        XCTAssertTrue(session.showsNothing(batch), "repeating the held lock changes nothing")
+        batch.orientation = .init()
+        XCTAssertFalse(session.showsNothing(batch), "releasing the lock changes the controller's answer")
+        session.applyUnlessEmpty(batch)
+        XCTAssertFalse(session.presenter.orientationLock.locked)
+    }
+    #endif
+
     func testATickThatChangesNothingOnlyMovesTheClock() throws {
         let session = ExactApp.shared.makeSession(label: "idle-tick")
         defer { session.destroy() }

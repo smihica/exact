@@ -109,15 +109,19 @@ enum ExactExtensions {
     /// The live modules, in the order they were made: the first is handed
     /// a due wake (LLP 1133.017 D7: the app's first session).
     private static var modules: [WeakModule] = []
+    /// The process's one observer of the host's due wakes, made with the
+    /// first module and kept after the last one ends, so a module made then
+    /// adds no second observer and a wake is handed over once.
+    private static var dueWakes: NSObjectProtocol?
 
-    /// A module was made. The first one hears the host's due wakes
+    /// A module was made. The first live one hears the host's due wakes
     /// (`exact.wakes.due`, ExactKit's Wakes.swift), each handed to its
     /// extension's adapter; then the host is told a module is ready, so it
     /// hands over a wake it holds.
     static func created(_ m: ExactModule) {
         modules.append(WeakModule(m))
-        if modules.count == 1 {
-            NotificationCenter.default.addObserver(forName: Notification.Name("exact.wakes.due"), object: nil, queue: .main) { note in
+        if dueWakes == nil {
+            dueWakes = NotificationCenter.default.addObserver(forName: Notification.Name("exact.wakes.due"), object: nil, queue: .main) { note in
                 guard let offer = note.object as? NSMutableDictionary, let due = offer as? [String: Any],
                       let name = due["package"] as? String, let token = due["token"] as? String,
                       let m = modules.lazy.compactMap({ $0.module }).first, let a = adapter(m, name) else { return }
@@ -331,9 +335,10 @@ enum Invocations {
     }
 
     static func invoke(_ h: ExactHatches?, _ body: [String: Any], reply: @escaping ([String: Any]) -> Void) {
-        guard let h, let fn = h.invokeFn, let data = try? JSONSerialization.data(withJSONObject: body) else {
+        guard let h, let fn = h.invokeFn else {
             return reply(["error": "NotSupportedError", "message": "this host runs no handler for a package"])
         }
+        guard let data = exactJSON(body) else { return reply(["error": "TypeError", "message": "the handler's arguments are not JSON"]) }
         let box = Unmanaged.passRetained(Box(reply)), bytes = [UInt8](data)
         bytes.withUnsafeBufferPointer { fn(h.host, $0.baseAddress, UInt32($0.count), invokeReply, box.toOpaque()) }
     }
@@ -366,6 +371,8 @@ extension ExactExtensions {
         tables[ObjectIdentifier(m)] = tracks
         return ExactPackageContext(
             agent: module.agent && !real.contains(name), session: session, hostSession: module.poster["owner"] ?? "",
+            label: module.poster["session"].flatMap { $0.isEmpty ? nil : $0 },
+            data: module.data, cache: module.cache, temporary: module.temporary,
             changed: { [weak module] topic in module?.changed(topic) },
             log: { [weak module] line in module?.diagnostics.log(line) },
             now: { [weak module] in module?.now() ?? 0 },
@@ -410,14 +417,14 @@ extension ExactExtensions {
                 return box["reply"]
             },
             pads: ExactPads(driven: module.agent, injected: injectedPads),
-            after: { [weak module] ms, body in
+            after: { [weak module] ms, coalescing, body in
                 // A host without the session clock's timer: the wall's.
                 guard let module, module.afterFn != nil else {
                     let work = DispatchWorkItem(block: body)
                     DispatchQueue.main.asyncAfter(deadline: .now() + ms / 1000, execute: work)
                     return work.cancel
                 }
-                return module.after(ms, body).stop
+                return module.after(ms, coalescing: coalescing, body).stop
             },
             regions: ExactRegions { op, args in
                 let box = NSMutableDictionary(dictionary: args)
@@ -435,7 +442,7 @@ extension ExactExtensions {
             state: { [weak module] fields in
                 guard let module, module.agent else { return }
                 let body: [String: Any] = ["extension": name, "state": fields]
-                guard JSONSerialization.isValidJSONObject(body), let json = try? JSONSerialization.data(withJSONObject: body) else {
+                guard let json = exactJSON(body) else {
                     return module.diagnostics.log("\(name): its state is not JSON")
                 }
                 module.changed("exact-state:" + String(decoding: json, as: UTF8.self))
@@ -462,7 +469,7 @@ extension ExactModuleContext {
         }
         emitted &+= 1
         let body: [String: Any] = ["extension": extensionName, "event": name, "args": args, "seq": emitted]
-        guard JSONSerialization.isValidJSONObject(body), let json = try? JSONSerialization.data(withJSONObject: body) else {
+        guard let json = exactJSON(body) else {
             diagnostics.log("\(extensionName).\(name): its arguments are not JSON")
             return
         }
@@ -474,7 +481,7 @@ extension ExactModuleContext {
     /// the runner tells the extension `{"woke": id, "outcome"}` at its end.
     public func wake(_ extensionName: String, _ name: String, _ args: [Any], id: String) {
         let body: [String: Any] = ["extension": extensionName, "event": name, "args": args, "id": id]
-        guard JSONSerialization.isValidJSONObject(body), let json = try? JSONSerialization.data(withJSONObject: body) else {
+        guard let json = exactJSON(body) else {
             diagnostics.log("\(extensionName).\(name): its arguments are not JSON")
             return
         }
@@ -491,11 +498,15 @@ extension ExactModuleContext {
     /// The `userInfo` entry for content the module posts whose activation
     /// raises `name` (LLP 1133.004 D6, D7): the host's notification delegate
     /// reads it when the person opens the notification, opens `navigate` if
-    /// given, else raises the event on the session that posted it.
+    /// given, else raises the event on the session that posted it. Empty
+    /// for `args` that are not JSON.
     public func activation(_ extensionName: String, _ name: String, _ args: [Any], navigate: String? = nil) -> [AnyHashable: Any] {
-        let json = (try? JSONSerialization.data(withJSONObject: args)).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+        guard let json = exactJSON(args) else {
+            diagnostics.log("\(extensionName).\(name): its arguments are not JSON")
+            return [:]
+        }
         var entry: [String: Any] = poster
-        entry["extension"] = extensionName; entry["event"] = name; entry["args"] = json
+        entry["extension"] = extensionName; entry["event"] = name; entry["args"] = String(decoding: json, as: UTF8.self)
         if let navigate { entry["navigate"] = navigate }
         return ["exact": entry]
     }

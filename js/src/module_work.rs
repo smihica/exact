@@ -17,10 +17,17 @@ pub(crate) struct Letting {
     /// Let-go calls whose awaited fetch has effects, set aside until the
     /// commit that let them go ends: the runner then names the ones it keeps,
     /// and the rest are forgotten.
-    calls: Vec<(Key, Parked)>,
+    pub(super) calls: Vec<(Key, Parked)>,
+    kept: std::collections::HashSet<u64>,
     /// What the runner said is in flight at its last `forgotten`, by key: a
     /// continuation's token, or `None` for a plain request.
     pub(crate) flight: HashMap<Key, Option<u64>>,
+}
+
+impl Letting {
+    pub(super) fn keep_ticket(&mut self, ticket: u64) {
+        self.kept.insert(ticket);
+    }
 }
 
 /// Start call `call`'s turn: the steps module work left for it run first
@@ -54,22 +61,28 @@ impl Module {
     /// worker keeps a protected secret's sent effect too: its proxy delivers
     /// the retained reply on the owner before releasing the lease.
     pub(crate) fn set_aside(&mut self, gone: Vec<(Key, Parked)>) -> Vec<u64> {
+        let protected: std::collections::HashSet<_> = gone
+            .iter()
+            .filter(|(key, p)| {
+                key.0.is_some()
+                    && (self.main_thread || self.host.secrets.holds(p.call))
+                    && p.effects
+            })
+            .map(|(_, p)| p.call)
+            .collect();
         let mut forget = Vec::new();
         for (key, parked) in gone {
-            if key.0.is_some()
-                && (self.main_thread || self.host.secrets.holds(parked.call))
-                && parked.effects
-            {
+            if protected.contains(&parked.call) {
                 self.work.calls.push((key, parked));
-            } else {
+            } else if !forget.contains(&parked.call) {
                 forget.push(parked.call);
             }
         }
         forget
     }
 
-    /// The let-go requests the runner keeps: the call set aside on each
-    /// one's key has its fetch adopted, and its token is that fetch's ticket.
+    /// The let-go requests the runner keeps: each key and fetch identifies
+    /// its parked request (LLP 1162 D2), whose adopted token is its ticket.
     /// Every call set aside is then forgotten, its other fetches rejected,
     /// unless the commit was `refused` and put its request back in flight:
     /// then it is parked again, and the call that replaced it forgotten.
@@ -85,23 +98,30 @@ impl Module {
         let mut forget = Vec::new();
         for f in let_go {
             let key = Module::key(Some(f.target), f.source, f.args);
-            let Some(at) = (self.work.calls.iter()).position(|(k, _)| *k == key) else {
+            let Some(at) = (self.work.calls.iter())
+                .position(|(k, p)| *k == key && Some(p.ticket) == f.fetch && p.effects)
+            else {
                 kept.push(None);
                 continue;
             };
             let (_, parked) = self.work.calls.remove(at);
             let (call, ticket) = (parked.call.to_string(), parked.ticket.to_string());
             let adopted = self.engine.as_mut().is_some_and(|engine| {
-                engine
+                let adopted = engine
                     .call("__exact_adopt", [&call, &ticket, ""])
-                    .is_ok_and(|r| r == "adopted")
+                    .is_ok_and(|r| r == "adopted");
+                // Keep the submitted request until retirement settles it, even if adoption exhausted the VM.
+                adopted || engine.out_of_memory()
             });
+            if adopted {
+                self.work.kept.insert(parked.ticket);
+            }
             kept.push(adopted.then_some(parked.ticket));
             forget.push(parked.call);
         }
         // The oldest call set aside under a key is the one whose request a
         // refused commit put back: the first restored, any later forgotten.
-        let mut restored = std::collections::HashSet::new();
+        let mut restored = HashMap::new();
         for (key, parked) in std::mem::take(&mut self.work.calls) {
             // Back in flight: its plain request, or its own continuation.
             let back = match self.work.flight.get(&key) {
@@ -109,9 +129,10 @@ impl Module {
                 Some(Some(call)) => *call == parked.call,
                 None => false,
             };
-            if refused && back && restored.insert(key.clone()) {
+            let oldest = *restored.entry(key.clone()).or_insert(parked.call);
+            if refused && back && oldest == parked.call {
                 let (replacing, others) = (std::mem::take(&mut self.parked).into_iter())
-                    .partition::<Vec<_>, _>(|(k, _)| *k == key);
+                    .partition::<Vec<_>, _>(|(k, p)| *k == key && p.call != parked.call);
                 self.parked = others;
                 forget.extend(replacing.into_iter().map(|(_, p)| p.call));
                 self.parked.push((key, parked));
@@ -119,6 +140,8 @@ impl Module {
                 forget.push(parked.call);
             }
         }
+        forget.sort_unstable();
+        forget.dedup();
         self.forget_calls(forget);
         kept
     }
@@ -130,6 +153,11 @@ impl Module {
         token: u64,
         outcome: Outcome,
     ) -> Result<(), DataError> {
+        if !self.work.kept.remove(&token) {
+            return Err(DataError::Unavailable(
+                "module work belongs to a retired runtime".into(),
+            ));
+        }
         let Some(engine) = self.engine.as_mut() else {
             return Err(DataError::Unavailable(
                 "exact-js: the engine is not loaded".into(),
@@ -151,8 +179,6 @@ impl Module {
             .and_then(|_| engine.drain());
         self.host.between_answers = false;
         let _ = engine.call("__exact_turn", ["", "", ""]);
-        // What landed may settle an answer waiting on another's work.
-        self.progress += 1;
         self.refresh_background();
         let unfinished = self.host.secrets.retire_fetch(token);
         ran.map_err(|e| DataError::Unavailable(format!("module work threw: {e}")))?;

@@ -1,7 +1,7 @@
 # Recipe: a capability that asks permission
 
 A native module that needs the person's permission (location here) is asked
-for, read as a fact and recovered from in the app's own UI. exact2 never
+for, read as a fact and recovered from in the app's own UI. Exact never
 answers the platform's prompt (LLP 1133 D7).
 
 1. **Declare** one grant line, and its purpose in the strings table. The build
@@ -22,7 +22,7 @@ answers the platform's prompt (LLP 1133 D7).
 
 4. **Recover:** while `denied`, say so and offer Settings; the rest keeps
    working. A refused request fails and runs no `then`: read
-   `failed(located)` ([error-alert](error-alert.md)).
+   `failed(located)` ([error alert](error-alert.md)).
 
 ```text
 use getCurrentPosition, geolocationStatus, GeolocationPosition, GeolocationStatus from "@exact/geolocation"

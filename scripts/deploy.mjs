@@ -40,20 +40,23 @@ import { requireReleasePins } from '../game/inputs.mjs';
 // the repository. `update/tests/it/publisher.rs` reads a head this script
 // produced and proves the client verifies it.
 import { spawnSync } from 'node:child_process';
-import { randomBytes, verify } from 'node:crypto';
-import { Refusal, refuse, canonicalBytes, canonicalJson, publicKeyFromRaw, loadSigner, keygen, validateRawIntegers } from './deploy-signing.mjs';
-export { canonicalBytes, publicKeyFromRaw, loadSigner } from './deploy-signing.mjs';
+import { randomBytes } from 'node:crypto';
+import { Refusal, refuse, assetIndex, canonicalBytes, canonicalJson, envelopeBytes, portableAssetNames, loadSigner, keygen, readAssetIndex, envelopeReport } from './deploy-signing.mjs';
+export { canonicalBytes, portableAssetNames, publicKeyFromRaw, loadSigner, readAssetIndex, sealEnvelope } from './deploy-signing.mjs';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir, userInfo } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildRust, publishedSignature, rustBundle, rustPackage, tieredNative } from './rust.mjs';
 import { appleProduction } from '../host/apple/link.mjs';
-import { assertOwnTarget, cargoReproducibilityFlags, readManifest, buildBake, bakeTarget, readBuilds, cohortReceipt, classifyArtifacts, resolveApp, shaderWatchRoots } from './app.mjs';
+import { assertOwnTarget, bakedEntryAssets, cargoReproducibilityFlags, readManifest, buildBake, bakeTarget, readBuilds, cohortReceipt, classifyArtifacts, resolveApp, shaderWatchRoots } from './app.mjs';
 import { gameShells } from "../game/app/shells.mjs";
+import { streamBundle, unbundledTextures } from './texture-families.mjs';
 import { blobPath, channelOrigin, openOrigin, OriginUnavailable, sha256, streamPath, parseWebRoot, webRootPath, webRootStream, webReleasePath, validateChannel } from './origin.mjs';
+import { admitHead, keepRecord, latestRecord, nextSeq } from './deploy-heads.mjs';
+export { admitHead, inspectHead } from './deploy-heads.mjs';
 import { filesystemLock, removePrivateTree } from './filesystem.mjs';
-import { entryPlans, listBuildFiles, listPublicFiles, readStaticCandidate } from '../host/web/serve.mjs';
+import { listBuildFiles, listPublicFiles, readStaticCandidate } from '../host/web/serve.mjs';
 import { BESIDE, STAGE } from '../host/web/beside.mjs';
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const PLATFORMS = ['web', 'ios', 'macos', 'linux'];
@@ -494,10 +497,10 @@ function keepLiveMtimes(repo, staged) {
   walk(staged);
 }
 
-/** Keep Git discovery and process state inside the private snapshot boundary;
+/** Keep Git discovery and compiler paths inside the private snapshot boundary;
  * shipping bakes ignore a proof profile inherited from the caller's shell. */
 function sealedSourceEnv(sourceRoot, extra = {}) {
-  const env = { ...process.env, ...extra, EXACT_GAME_PROOF_PROFILE: 'release' };
+  const env = { ...process.env, ...extra, EXACT_GAME_PROOF_PROFILE: 'release', EXACT_SOURCE_ROOT: sourceRoot };
   for (const name of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
     'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[name];
   env.GIT_CEILING_DIRECTORIES = sourceRoot;
@@ -647,7 +650,7 @@ export function bake(app, run, exactRoot, sourceRoot) {
   return web;
 }
 
-/** The bundle the bake produced (LLP 1023 D2's cards with their bytes): the plan and every asset `exact.json` lists — the same bytes for every platform in v1. */
+/** The bundle the bake produced (LLP 1023 D2's cards with their bytes): the plan and every asset its asset index lists — the same bytes for every platform in v1. */
 function readBundle(web, app) {
   const envelope = JSON.parse(readFileSync(resolve(web, 'exact.json'), 'utf8'));
   if (envelope.app?.id !== app.id || envelope.app?.name !== app.displayName) {
@@ -655,12 +658,30 @@ function readBundle(web, app) {
   }
   const plan = readFileSync(resolve(web, 'app.plan'));
   if (sha256(plan) !== envelope.plan.sha256) refuse(`${web}/app.plan is not the plan exact.json names`);
-  const assets = (envelope.assets ?? []).map((card) => {
+  const listed = envelope.assets ? readAssetIndex(envelope.assets, readFileSync(resolve(web, 'assets.json'))) : [];
+  const assets = listed.map((card) => {
     const bytes = readFileSync(resolve(web, card.name));
     if (sha256(bytes) !== card.sha256) refuse(`${web}/${card.name} is not the asset exact.json names`);
     return { name: card.name, sha256: card.sha256, bytes };
   });
   return { envelope, plan: { sha256: envelope.plan.sha256, bytes: plan, formatVersion: envelope.plan.formatVersion, kernelSchema: envelope.plan.kernelSchema }, assets };
+}
+
+/** Hold each platform's bake graph to the bundle its stream publishes. A TypeScript app's widget and activity
+ * generation lists its module pair (`typescript/`, bake/src/widgets.rs), which the web bundle carries as its own
+ * module instead: that platform's bundle (`bundle.platforms`) adds the pair its bake made, and leaves out the
+ * texture families its devices do not read (scripts/texture-families.mjs). Any other difference refuses. */
+export function holdBundles(bundle, builds, directory) {
+  const cards = (b) => canonicalJson([{ name: 'app.plan', sha256: b.plan.sha256, bytes: b.plan.bytes.length },
+    ...b.assets.map((a) => ({ name: a.name, sha256: a.sha256, bytes: a.bytes.length }))].sort((a, c) => a.name.localeCompare(c.name)));
+  const { platforms, ...base } = bundle;
+  for (const [platform, build] of Object.entries(builds)) {
+    const pair = bakedEntryAssets(directory, build, (name) => name.startsWith('typescript/'));
+    const unbundled = unbundledTextures(base.assets.map((a) => a.name), build.compat.inputs?.textureFamily);
+    if (pair.length || unbundled.size) bundle.platforms = { ...bundle.platforms, [platform]: { ...base, assets: [...base.assets.filter((a) => !unbundled.has(a.name)), ...pair], thinned: base.assets.filter((a) => unbundled.has(a.name)) } };
+    const graph = build.graph.artifacts.map(({ name, sha256, bytes }) => ({ name, sha256, bytes })).sort((a, c) => a.name.localeCompare(c.name));
+    if (canonicalJson(graph) !== cards(bundle.platforms?.[platform] ?? base)) refuse(`${platform} bake graph differs from the packaged bundle`);
+  }
 }
 
 /** Compile the actual target/grants producer. Analysis artifacts have no
@@ -731,7 +752,7 @@ function changesAgainst(bundle, head, sunset = null) {
   for (const a of bundle.assets) {
     const had = before.get(a.name);
     if (had === undefined) changes.push({ name: a.name, change: 'new' });
-    else if (had.sha256 !== a.sha256 || had.bytes !== a.bytes.length || had.url !== `../../blobs/${a.sha256}`) {
+    else if (had.sha256 !== a.sha256 || had.bytes !== a.bytes.length || had.url !== `./${a.sha256}`) {
       changes.push({ name: a.name, change: 'changed', note: a.name.endsWith('.wgsl') ? 'interface unchanged: asset' : undefined });
     }
     before.delete(a.name);
@@ -740,212 +761,41 @@ function changesAgainst(bundle, head, sunset = null) {
   return changes;
 }
 
+/** A stream's asset index, a blob beside the ones it names: its cards
+ * resolve against its own URL, so each is `./<sha256>`. Null for no assets. */
+export function streamIndex(bundle) {
+  portableAssetNames(bundle.assets.map((asset) => asset.name));
+  return assetIndex(bundle.assets.map((asset) => ({ name: asset.name, url: `./${asset.sha256}`, sha256: asset.sha256, bytes: asset.bytes.length })),
+    (sha) => `../../blobs/${sha}`);
+}
+
 /** The unsigned stream head. One producer keeps its identity/name and blob
  * pointers identical across classification fixtures and publication. */
 export function streamHead({ app, bundle, stream, seq, release, sunset = null }) {
-  portableAssetNames(bundle.assets.map((asset) => asset.name));
+  const index = streamIndex(bundle);
   const head = {
     exact: 1,
     app: { id: app.id, name: app.displayName },
     plan: { url: `../../blobs/${bundle.plan.sha256}`, sha256: bundle.plan.sha256, bytes: bundle.plan.bytes.length,
       formatVersion: bundle.plan.formatVersion, kernelSchema: bundle.plan.kernelSchema },
-    assets: bundle.assets.map((asset) => ({ name: asset.name, url: `../../blobs/${asset.sha256}`,
-      sha256: asset.sha256, bytes: asset.bytes.length })),
+    ...(index ? { assets: index.card } : {}),
     stream: { app: app.id, channel: stream.channel, compatibilityId: stream.compatibilityId, seq },
     release,
   };
-  Object.assign(head, entryPlans(head.assets));
   if (sunset) head.sunset = sunset.store ? { message: sunset.message, store: sunset.store } : { message: sunset.message };
   return head;
 }
 
-function strictBase64(text, length, label) {
-  if (typeof text !== 'string') throw new Error(`${label} is not base64 text`);
-  const decoded = Buffer.from(text, 'base64');
-  if (decoded.length !== length || decoded.toString('base64') !== text) throw new Error(`${label} is not canonical base64 of ${length} bytes`);
-  return decoded;
-}
-
-function fileCard(object, name) {
-  if (!object || typeof object !== 'object' || Array.isArray(object)) throw new Error(`the envelope names no ${name}`);
-  if (typeof object.url !== 'string') throw new Error(`${name} has no url`);
-  if (typeof object.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(object.sha256)) throw new Error(`${name}'s sha256 is not 64 lowercase hex digits`);
-  if (!Number.isSafeInteger(object.bytes) || object.bytes < 0) throw new Error(`${name} has no exact nonnegative byte count`);
-}
-
-/** exact-update's `safe_name`: a relative path whose segments use only the
- * POSIX portable filename characters and `@` (`photo@2x.png`), so no
- * filesystem can fold or normalize two names into one file. */
-function safeAssetName(name) {
-  if (typeof name !== 'string' || !name) throw new Error('an asset has no nonempty name');
-  for (const part of name.split('/')) {
-    if (!part || part === '.' || part === '..') throw new Error(`the asset name ${name} is not a relative path`);
-    if (!/^[A-Za-z0-9._@-]+$/.test(part)) throw new Error(`the asset name ${name} is not portable: segments use A-Z, a-z, 0-9, '.', '_', '-' and '@'`);
-  }
-}
-
-/** exact-update's `check_asset_names`: a roster stages as distinct files on a
- * case-insensitive filesystem (APFS's default), so no two names differ only
- * by case and none is a file where another needs a directory. The bake and
- * every client refuse the same rosters, and name every refused name at once. */
-export function portableAssetNames(names) {
-  const files = new Map(), directories = new Map(), problems = [];
-  for (const name of names) {
-    try { safeAssetName(name); } catch (error) { problems.push(error.message); continue; }
-    const folded = name.toLowerCase(), other = files.get(folded); // ASCII after safeAssetName
-    if (other !== undefined) { problems.push(other === name ? `the envelope names the asset ${name} twice` : `the assets ${other} and ${name} differ only by case, one file on a case-insensitive filesystem`); continue; }
-    if (directories.has(folded)) { problems.push(`the asset ${name} is a file where ${directories.get(folded)} needs a directory`); continue; }
-    for (let end = folded.indexOf('/'); end !== -1; end = folded.indexOf('/', end + 1)) {
-      const directory = folded.slice(0, end);
-      if (files.has(directory)) problems.push(`the asset ${files.get(directory)} is a file where ${name} needs a directory`);
-      if (!directories.has(directory)) directories.set(directory, name);
-    }
-    files.set(folded, name);
-  }
-  if (problems.length) throw new Error(problems.join('\n'));
-}
-
-/** Parse and authenticate one origin head by the same pre-download rules as
- * exact-update. An unusable head contributes no sequence: even a syntactically
- * valid number is attacker-controlled until its signature has verified. */
 /** The signed native Rust module of the stream's last published release: its
  * head authenticated, its blob the one the head names. Else null. */
 async function publishedModule(origin, app, stream) {
   try {
-    const admission = inspectHead(await origin.head(stream), app, stream);
+    const admission = await admitHead(origin, await origin.head(stream), app, stream);
     const card = admission.usable && admission.authenticated ? admission.head.assets?.find((a) => /^rust\/app\.module\.(dylib|bin)$/.test(a.name)) : null;
     const bytes = card ? await origin.get(blobPath(card.sha256)) : null;
     if (!bytes || sha256(bytes) !== card.sha256) return null;
     return card.name.endsWith('.bin') ? tieredNative(bytes) : bytes;
   } catch { return null; }
-}
-
-export function inspectHead(found, app, stream) {
-  try {
-    if (!Buffer.isBuffer(found?.bytes)) throw new Error('the origin returned no head bytes');
-    if (found.bytes.length > 64 * 1024) throw new Error(`the envelope is ${found.bytes.length} bytes; the most is ${64 * 1024}`);
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(found.bytes);
-    validateRawIntegers(text);
-    const head = JSON.parse(text);
-    if (!head || typeof head !== 'object' || Array.isArray(head)) throw new Error('the envelope is not a JSON object');
-    canonicalBytes(head); // recursively rejects every inexact JSON number
-    if (head.exact !== 1) throw new Error(`the envelope is exact ${head.exact ?? '(missing)'}; this binary reads exact 1`);
-    if (!head.app || typeof head.app !== 'object' || Array.isArray(head.app)) throw new Error('the envelope names no app');
-    if (typeof head.app.id !== 'string' || !head.app.id) throw new Error('the envelope names no nonempty app id');
-    fileCard(head.plan, 'app.plan');
-    if (!head.stream || typeof head.stream !== 'object' || Array.isArray(head.stream)) throw new Error('the envelope names no stream');
-    if (typeof head.stream.channel !== 'string') throw new Error('the stream names no channel');
-    if (typeof head.stream.compatibilityId !== 'string') throw new Error('the stream names no compatibility id');
-    if (!Number.isSafeInteger(head.stream.seq) || head.stream.seq < 0) throw new Error('the stream names no exact nonnegative seq');
-    if (head.assets !== undefined && !Array.isArray(head.assets)) throw new Error("the envelope's assets are not a list");
-    for (const asset of head.assets ?? []) {
-      if (!asset || typeof asset !== 'object' || Array.isArray(asset)) throw new Error('an asset is not an object');
-      if (typeof asset.name !== 'string' || !asset.name) throw new Error('an asset has no nonempty name');
-      fileCard(asset, asset.name);
-    }
-    portableAssetNames((head.assets ?? []).map((asset) => asset.name));
-    if (head.plans !== undefined && canonicalJson(head.plans) !== canonicalJson(entryPlans(head.assets ?? []).plans ?? {})) throw new Error("the envelope's plans must index its authenticated plan assets");
-    if (head.sunset !== undefined) {
-      if (!head.sunset || typeof head.sunset !== 'object' || Array.isArray(head.sunset)) throw new Error('the sunset card is not an object');
-      if (typeof head.sunset.message !== 'string') throw new Error('the sunset card has no message');
-    }
-    let signature = null;
-    if (head.signature !== undefined) {
-      if (!head.signature || typeof head.signature !== 'object' || Array.isArray(head.signature)) throw new Error('the signature is not an object');
-      if (typeof head.signature.keyId !== 'string') throw new Error('the signature names no key id');
-      signature = strictBase64(head.signature.ed25519, 64, 'the signature');
-    }
-    if (head.app.id !== app.id) throw new Error(`the head is for ${head.app.id}; this binary is ${app.id}`);
-    if (head.app.name !== app.displayName) throw new Error(`the head calls ${app.id} ${JSON.stringify(head.app.name)}, not ${JSON.stringify(app.displayName)}`);
-    if (typeof head.stream.app === 'string' && head.stream.app !== app.id) throw new Error(`the head's stream is for ${head.stream.app}; this binary is ${app.id}`);
-    if (head.stream.channel !== stream.channel) throw new Error(`the head is for channel ${head.stream.channel}; this binary is ${stream.channel}`);
-    if (head.stream.compatibilityId !== stream.compatibilityId) throw new Error(`the head is for cohort ${head.stream.compatibilityId}; this binary is ${stream.compatibilityId}`);
-    const keys = app.manifest.deploy?.signing?.keys ?? {};
-    let authenticated = false;
-    if (Object.keys(keys).length) {
-      if (!signature) throw new Error('the head is unsigned and this binary carries keys');
-      if (!Object.hasOwn(keys, head.signature.keyId)) throw new Error(`the head is signed by ${head.signature.keyId}, which this binary does not carry`);
-      const key = strictBase64(keys[head.signature.keyId], 32, `the embedded key ${head.signature.keyId}`);
-      if (!verify(null, canonicalBytes(head), publicKeyFromRaw(key), signature)) throw new Error(`the head's signature by ${head.signature.keyId} does not verify`);
-      authenticated = true;
-    }
-    return { usable: true, authenticated, head, seq: head.stream.seq, problem: null };
-  } catch (error) {
-    return { usable: false, authenticated: false, head: found?.json ?? null, seq: null, problem: error.message || String(error) };
-  }
-}
-
-/** The largest sequence authenticated inside an immutable release record.
- * The record wrapper is audit metadata; only its embedded signed envelope is
- * authority for a client's rollback floor. Malformed, foreign, and unsigned
- * records do not contribute a number. */
-async function authenticatedReleaseFloor(origin, app, stream) {
-  // Hidden names were accepted by older publishers. Include them while
-  // recovering the rollback floor even though new release ids cannot begin
-  // with a dot.
-  const names = await origin.list(`${streamPath(stream)}/releases`, { includeHidden: true });
-  // A missing directory on the writable filesystem origin is authoritative
-  // emptiness. Other adapters use null when they cannot enumerate history;
-  // that is not evidence that no client has observed a higher sequence.
-  if (names === null && origin.kind !== 'directory') return { known: false, empty: false, floor: null };
-  if (names === null || names.length === 0) return { known: true, empty: true, floor: null };
-  let floor = null;
-  for (const name of names.filter((entry) => entry.endsWith('.json'))) {
-    const bytes = await origin.get(`${streamPath(stream)}/releases/${name}`);
-    if (!bytes) throw new OriginUnavailable(`the listed release record ${origin.describe()}/${streamPath(stream)}/releases/${name} disappeared while establishing the authenticated sequence floor`);
-    try {
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      const record = JSON.parse(text);
-      if (!record.envelope || typeof record.envelope !== 'object' || Array.isArray(record.envelope)) continue;
-      const recordApp = { ...app, displayName: record.envelope.app?.name };
-      const envelopeBytes = Buffer.from(JSON.stringify(record.envelope), 'utf8');
-      const admission = inspectHead({ bytes: envelopeBytes, json: record.envelope, sha256: sha256(envelopeBytes) }, recordApp, stream);
-      if (admission.usable && admission.authenticated) floor = Math.max(floor ?? 0, admission.seq);
-    } catch { /* an unauthenticated audit record has no say in the floor */ }
-  }
-  return { known: true, empty: false, floor };
-}
-
-/** Allocate above everything the stream has authenticated: an admitted head
- * and the maximum signed immutable history. A head rolled back on the origin
- * (a restored backup, a stale replica) would otherwise hand out a seq that
- * clients already hold for another bundle. Repairing an unusable head uses
- * the history alone; if none exists, overwriting would guess at the clients'
- * rollback floor and is refused. */
-async function nextSeq(origin, app, stream, admission, at, above = 0) {
-  return Math.max(above + 1, await nextOriginSeq(origin, app, stream, admission, at));
-}
-
-async function nextOriginSeq(origin, app, stream, admission, at) {
-  const history = await authenticatedReleaseFloor(origin, app, stream);
-  let floor;
-  if (admission?.usable) floor = Math.max(admission.seq, history.floor ?? 0);
-  else {
-    if (!history.known) throw new OriginUnavailable(`${at} ${admission ? `is unusable (${admission.problem})` : 'is missing'}, but ${origin.describe()} cannot enumerate its authenticated release history; a rollback-safe sequence cannot be allocated`);
-    floor = history.floor;
-    if (floor === null && !admission && history.empty) return 1;
-    if (floor === null) refuse(`${at} ${admission ? `is unusable (${admission.problem}) and its` : 'is missing, and its nonempty'} release history has no authenticated sequence floor; restore a signed release record before repairing it`);
-  }
-  if (floor === Number.MAX_SAFE_INTEGER) refuse(`${at} is at the largest exact JavaScript seq; a higher repair seq cannot be allocated safely`);
-  return floor + 1;
-}
-
-/** The latest release record under a stream, when the origin has any: it names the platform and carries the cohort's inputs, so two ids that differ are explained field by field. */
-async function latestRecord(origin, app, stream) {
-  const names = await origin.list(`${streamPath(stream)}/releases`, { includeHidden: true });
-  if (!names?.length) return null;
-  const records = [];
-  for (const name of names.filter((n) => n.endsWith('.json'))) {
-    const bytes = await origin.get(`${streamPath(stream)}/releases/${name}`);
-    try {
-      const record = JSON.parse(bytes.toString('utf8'));
-      const recordApp = {...app, displayName:record.envelope?.app?.name};
-      const admission = inspectHead({bytes:Buffer.from(JSON.stringify(record.envelope))}, recordApp, stream);
-      if(admission.usable && admission.authenticated) records.push(record);
-    } catch { /* unauthenticated audit metadata has no capability authority */ }
-  }
-  records.sort((a,b)=>a.envelope.stream.seq-b.envelope.stream.seq);
-  return records.at(-1) ?? null;
 }
 
 /** The table (LLP 1030 D3; 1030.000 D3 item 3): the origin row, a row per stream, a binary row per stream whose cohort this snapshot is not. Nothing is written. */
@@ -1003,14 +853,13 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
     let {platform,compatibilityId}=item;
     const stream={channel,compatibilityId};
     if(platform && compat[platform].inputs?.store?.L==='0') {binary.set(platform,'store.L=0: links no update store; deliver changes in the platform binary');continue;}
-    let head,record;
-    try { head=await origin.head(stream); record=await latestRecord(origin,app,stream); }
+    let head,record,admission;
+    try { head=await origin.head(stream); record=await latestRecord(origin,app,stream); admission=head?await admitHead(origin,head,app,stream):null; }
     catch(error) {
       if(!(error instanceof OriginUnavailable))throw error;
       rows.push({kind:'stream',platform,channel,compatibilityId,cohort:null,head:null,action:'unavailable',changes:[],reason:error.message});continue;
     }
     if(!head&&!record&&!platform&&!declared)continue;
-    const admission=head?inspectHead(head,app,stream):null;
     const signed=admission?.usable&&admission.authenticated?admission.head:record?.envelope;
     const frozen=signed?.cohort?.version===1 && signed.cohort.compat?.id===compatibilityId ? signed.cohort : null;
     platform ??= frozen?.compat?.inputs?.platform ?? record?.platform ?? null;
@@ -1022,7 +871,7 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
     const installed=frozen ?? (!head&&!record&&candidate?cohortReceipt(candidate):null);
     const check=classifyArtifacts(candidate,installed,signingKey);
     const inputs=installed?.compat.inputs ?? compat[platform]?.inputs;
-    const selectedBundle=bundle.platforms?.[platform] ?? bundle;
+    const selectedBundle=streamBundle(bundle,platform,inputs);
     const changes=admission?.usable?changesAgainst(selectedBundle,admission.head,sunsetFor(app,stream)):head?[{name:'exact.json',change:'repair',note:admission.problem}]:changesAgainst(selectedBundle,null,sunsetFor(app,stream));
     let seq=admission?.seq;
     if(changes.length && (check.bundle || item.platform)) {
@@ -1111,13 +960,14 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
   const stream = { channel: row.channel, compatibilityId: row.compatibilityId };
   const base = streamPath(stream);
   const recordPath = `${base}/releases/${release}.json`;
-  const files = [{ name: 'app.plan', sha256: bundle.plan.sha256, bytes: bundle.plan.bytes }, ...bundle.assets];
+  const index = streamIndex(bundle);
+  const files = [{ name: 'app.plan', sha256: bundle.plan.sha256, bytes: bundle.plan.bytes }, ...(index ? [{ name: 'assets.json', sha256: index.card.sha256, bytes: index.bytes }] : []), ...bundle.assets];
   if (await origin.get(recordPath)) refuse(`release ${release} already has an immutable record at ${origin.describe()}/${recordPath}; choose another --release`);
   return origin.withLock(stream, async () => {
     if (await origin.get(recordPath)) refuse(`release ${release} already has an immutable record at ${origin.describe()}/${recordPath}; choose another --release`);
     const current = await origin.head(stream);
     const previousDigest = current?.sha256 ?? null;
-    const admission = current ? inspectHead(current, app, stream) : null;
+    const admission = current ? await admitHead(origin, current, app, stream) : null;
     let installed = null;
     if (build) {
       const frozen = admission?.usable && admission.authenticated ? admission.head.cohort : row.receipt;
@@ -1142,8 +992,7 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
     const head = streamHead({ app, bundle, stream, seq, release, sunset });
     if (installed) head.cohort = installed;
     head.signature = signer.sign(head);
-    const bytes = Buffer.from(JSON.stringify(head) + '\n', 'utf8');
-    if(bytes.length>64*1024)refuse(`the signed envelope is ${bytes.length} bytes; clients accept at most 65536`);
+    const bytes = envelopeBytes(head);
     const originDigest = sha256(bytes);
     const entryDigest = sha256(canonicalBytes(head));
     const record = {
@@ -1151,9 +1000,12 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
       platform: row.platform, stream: head.stream, seq, snapshot,
       head: { entryDigest, originDigest, bytes: bytes.length, keyId: signer.keyId }, previous: previousDigest,
       compat: { id: compat.id, inputs: compat.inputs }, row: { action: row.action, changes },
-      envelope: head,
+      // The asset index as JSON: its blob is this value's canonical bytes,
+      // which a release bake checks against the head (bake/src/receipt.rs).
+      envelope: head, ...(index ? { assets: JSON.parse(index.bytes.toString('utf8')) } : {}),
     };
     await origin.put(recordPath, Buffer.from(JSON.stringify(record, null, 2) + '\n', 'utf8'), { immutable: true });
+    keepRecord(origin, stream, `${release}.json`, seq);
     try {
       await origin.putHead(stream, bytes, { previousDigest });
     } catch (error) {
@@ -1190,6 +1042,7 @@ export function webRelease(web) {
   const source = files.map(({ name, body }) => ({ name, sha256: sha256(body) }));
   const id = sha256(canonicalBytes({ webRoot: 1, source }));
   const prefix = `/${webReleasePath(id)}/`;
+  let report = null;
   for (const file of files) {
     file.sourceSha256 = sha256(file.body);
     if (file.name === 'index.html') {
@@ -1235,24 +1088,30 @@ export function webRelease(web) {
       for (const row of manifest.file_handlers ?? []) row.action = canonical(row.action);
       file.body = Buffer.from(JSON.stringify(manifest));
     } else if (file.name === 'exact.json') {
+      // The index is published as built: its cards resolve against its own URL.
       const envelope = JSON.parse(file.body.toString('utf8'));
-      for (const card of [envelope.plan, ...(envelope.assets ?? [])]) {
+      const index = envelope.assets && files.find((f) => f.name === 'assets.json');
+      if (envelope.assets && !index) refuse('web envelope names an asset index the build does not hold');
+      for (const card of [envelope.plan, ...(index ? readAssetIndex(envelope.assets, index.body, { bounded: false }) : [])]) {
         const name = card === envelope.plan ? 'app.plan' : card.name;
         const captured = files.find((f) => f.name === name);
         if (!captured || card.sha256 !== sha256(captured.body) || card.bytes !== captured.body.length) refuse(`web envelope does not bind ${name}`);
-        card.url = prefix + name.split('/').map(encodeURIComponent).join('/');
       }
+      envelope.plan.url = prefix + 'app.plan';
+      if (envelope.assets) envelope.assets.url = prefix + 'assets.json';
       file.body = canonicalBytes(envelope);
+      // Said, never refused: a browser loads a root whatever its envelope weighs.
+      report = `the web root's ${envelopeReport(file.body.length, index ? index.body.length : null, envelope.assets?.count ?? 0)}`;
     }
   }
   const pointer = { webRoot: 1, id, files: files.map(({ name, body, sourceSha256 }) => ({ name, sourceSha256, sha256: sha256(body), bytes: body.length })) };
-  return { pointer, files };
+  return { pointer, files, report };
 }
 
 /** Every payload lands immutably and is read back before the only mutable
  * pointer moves. A failed or concurrent publish cannot damage the prior graph. */
 export async function publishRoot({ origin, row, web, log = () => {} }) {
-  const { pointer, files } = webRelease(web);
+  const { pointer, files, report } = webRelease(web);
   return origin.withLock(webRootStream, async () => {
     const before = await origin.get(webRootPath);
     if (before && parseWebRoot(before).id === pointer.id) {
@@ -1275,7 +1134,7 @@ export async function publishRoot({ origin, row, web, log = () => {} }) {
       // proves this pointer won; otherwise preserve the original refusal.
       if (!(await origin.get(webRootPath))?.equals(bytes)) throw error;
     }
-    log(`  origin: ${files.length} immutable files verified; atomic web root ${pointer.id.slice(0, 12)}`);
+    log(`  origin: ${files.length} immutable files verified; atomic web root ${pointer.id.slice(0, 12)}${report ? `; ${report}` : ''}`);
     return { ...row, action: 'published', root: pointer.id, written: files.map((f) => f.name) };
   });
 }
@@ -1337,11 +1196,9 @@ async function deployCaptured(opts, capsule) {
   if(!webOnly&&!builds.web)refuse('the web build emitted no completed graph receipt');
   for(const platform of platforms)builds[platform]=buildFor(app,platform,sourceRoot,run);
   const compat=Object.fromEntries(Object.entries(builds).map(([p,r])=>[p,r.compat]));
-  for(const [platform,build] of Object.entries(builds)) {
-    const cards=[{name:'app.plan',sha256:bundle.plan.sha256,bytes:bundle.plan.bytes.length},...bundle.assets.map(a=>({name:a.name,sha256:a.sha256,bytes:a.bytes.length}))];
-    if(canonicalJson(build.graph.artifacts.map(({name,sha256,bytes})=>({name,sha256,bytes})).sort((a,b)=>a.name.localeCompare(b.name)))!==canonicalJson(cards.sort((a,b)=>a.name.localeCompare(b.name))))refuse(`${platform} bake graph differs from the packaged bundle`);
-  }
+  if (!webOnly) holdBundles(bundle, builds, resolve(run, 'bake'));
   if (!webOnly && rustPackage(app)) {
+    const held = bundle.platforms ?? {};
     bundle.platforms = {};
     const env = sealedSourceEnv(sourceRoot, {CARGO_TARGET_DIR:app.target,EXACT_UPDATE_TRUST:'production'});
     const nativeTargets = [...new Set(platforms.filter(p=>['native','tiered'].includes(builds[p].compat.inputs.rustMode)).map(p=>builds[p].compat.target))];
@@ -1355,7 +1212,7 @@ async function deployCaptured(opts, capsule) {
       const signed=['native','tiered'].includes(build.compat.inputs.rustMode) && build.compat.target.includes('apple');
       const reused=signed && publishedSignature(produced?.variants.native?.bytes, await publishedModule(origin, app, {channel, compatibilityId:build.compat.id}));
       if (reused) { produced={...produced,variants:{...produced.variants,native:{...produced.variants.native,bytes:reused}}}; log(`  ${platform}: the published Rust module's signature stands (same code, same certificate)`); }
-      const result=rustBundle(app,bundle,build,produced);
+      const result=rustBundle(app,held[platform] ?? bundle,build,produced);
       builds[platform]=result.build; bundle.platforms[platform]=result.bundle;
     }
   }
@@ -1387,7 +1244,7 @@ async function deployCaptured(opts, capsule) {
     if (row.action === 'unavailable') { failed.push({ platform: row.platform, compatibilityId: row.compatibilityId, error: row.reason }); log(`  ${name}: unavailable — ${row.reason}`); continue; }
     if (row.action === 'binary') { refused.push({ platform: row.platform, compatibilityId: row.compatibilityId, reason: row.reason }); log(`  ${name}: refused — ${row.reason}`); continue; }
     try {
-      const result = await publishStream({ origin, row, bundle: bundle.platforms?.[row.platform] ?? bundle, compat: row.receipt?.compat ?? compat[row.platform], app, signer, release, snapshot: table.snapshot, opts, log, build:builds[row.platform] });
+      const result = await publishStream({ origin, row, bundle: streamBundle(bundle, row.platform, (row.receipt?.compat ?? compat[row.platform])?.inputs), compat: row.receipt?.compat ?? compat[row.platform], app, signer, release, snapshot: table.snapshot, opts, log, build:builds[row.platform] });
       published.push(result);
       log(result.action === 'published' ? `  ${name}: head seq ${result.seq} (${result.head.sha256.slice(0, 12)}), previous ${result.previous ? result.previous.slice(0, 12) : 'none'}` : `  ${name}: ${result.note}`);
     } catch (e) {

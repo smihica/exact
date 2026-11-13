@@ -192,6 +192,14 @@ Use a simulator you created when another person shares the Mac.
   the condition the product itself uses (`Agent.nativeInFlight()` on Apple, the
   agent's `clock settle`), not a hardcoded sleep timeout.
 
+For a `contextPopover` source, use `tap <source> drag 0 0 press 1000` under
+`--touch platform`, then `clock settle`. `tap <action>` selects UIKit's
+row. An explicit `tap <root> at <x> <y>` on UIKit's backdrop dismisses it;
+settle again before checking that `state.navigation.popover` is null.
+`tap <source> contextmenu` delivers the recognized event and does not
+qualify a real long press. `scripts/smoke-touch.mjs` covers ordinary and
+projected grouped-list sources in both timing modes.
+
 A real drag with `during` ops fails when the touch runner finishes before a
 dispatch-log read sees the touch begin. The failure carries the aim, the injection
 result and the log, and says whether the touch began and lifted. The log's `t` and
@@ -224,6 +232,18 @@ and checks that no second blur is sent.
 The runner tests distinguish visits with the same URL and reject stale or
 cross-tab jumps. These tests use UIKit's public stack API; they do not establish
 activation of its Back-history menu.
+
+`ModalStackIOSTests.testBackHistoryMenuInThePrimaryStack` and
+`testBackHistoryMenuInThePresentedStack` use the XCTest touch runner to hold the
+active stack's Back control for 0.8 seconds. They require an exposed menu before
+selecting a destination, then check controller and visit identity with repeated
+URLs, with and without authored navigation. A missing menu keeps its accessibility
+snapshot and reports an unqualified interaction as a skip.
+On iPhone 18 Pro with iOS 27.0, the long press performs an adjacent Back in both
+fixtures and exposes no menu. Nonadjacent selection, repeated-URL identity and
+authored navigation through the menu remain unqualified there.
+Tests that declare `missing("touch", …)` run on the selected simulator without
+clones, so their fixture and the touch runner share one screen.
 
 With `EXACT_SIM` naming an iPhone Duo, rebuild Duo Lab and the host fixture, then run
 `bun scripts/smoke.mjs duo --only navigation,navigation-gestures,host-navigation`.
@@ -298,8 +318,9 @@ change the native state inside that pair, then wait for the runner to apply it
 
 ## Windows: the NucBox
 
-Windows's oracle and its consumers' drives run on the NucBox, `nucbox-evo-x2`
-on the tailnet (LLP 1115.004 D13). As recorded on 2026-10-23:
+Windows's oracle and its consumers' drives run on the NucBox, a Windows
+machine on the team's tailnet (LLP 1115.004 D13 names it). Below, `<host>` is
+its name there and `<user>` your account on it. As recorded on 2026-10-23:
 
 - **The machine.** Windows 11 Pro 25H2, build 26200, x64; an AMD Ryzen AI
   Max+ 395 with Radeon 8060S graphics. It has Rust's `x86_64-pc-windows-msvc`,
@@ -307,11 +328,11 @@ on the tailnet (LLP 1115.004 D13). As recorded on 2026-10-23:
 - **The display and input.** One display, a Samsung C49RG9x at 5120×1440, with
   no display scale or text scale set. It has no precision touchpad; D8 needs
   one added.
-- **Reaching it.** SSH as `charlie cheever`, whose shell is PowerShell:
-  `ssh -l "charlie cheever" nucbox-evo-x2`. `scp` refuses a space in
-  `user@host`, so name the user in a config file (`User "charlie cheever"`)
-  and pass it with `-F`. An SSH session has no GitHub credentials, so send
-  commits as a bundle: `git bundle create`, copy it, then
+- **Reaching it.** `ssh -l "<user>" <host>`; the shell is PowerShell. `scp`
+  refuses a space in `user@host`, so for an account name with one, name the
+  user in a config file (`User "<user>"`) and pass it with `-F`. An SSH
+  session has no GitHub credentials, so send commits as a bundle:
+  `git bundle create`, copy it, then
   `git fetch <bundle> main:refs/remotes/origin/main` and `git merge --ff-only`.
 - **SSH is not the desktop.** An SSH session sees one 1024×768 stand-in
   display (`WinDisc`), so a window it opens is never shown. Headless drives

@@ -4,6 +4,7 @@
 // 2xx body into the app's store (storage-fs.js `bodyTarget`), whole or not
 // at all, and read any other reply as usual.
 import { expect, test } from 'bun:test';
+import { EXE } from '../../scripts/paths.mjs';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostFixtureFile as readFileSync, glueCase } from './tests/glue-fixture.mjs';
 import { request } from './http-body.js';
@@ -58,7 +59,7 @@ function normalized(spec) {
   const scratch = mkdtempSync(resolve(tmpdir(), 'exact-grants-'));
   try {
     writeFileSync(resolve(scratch, 'grants.txt'), spec);
-    const bin = resolve(process.env.CARGO_TARGET_DIR || resolve(ROOT, 'target'), 'debug/exact-web-js');
+    const bin = resolve(process.env.CARGO_TARGET_DIR || resolve(ROOT, 'target'), `debug/exact-web-js${EXE}`);
     const run = spawnSync(bin, ['normalize-grants', resolve(scratch, 'grants.txt')], { cwd: ROOT, encoding: 'utf8' });
     if (run.status !== 0) throw new Error(run.stderr || 'grant normalizer failed');
     return JSON.parse(run.stdout);
@@ -125,16 +126,19 @@ test('the wasm host writes a 2xx body to the app file and reads anything else', 
       const kept = async () => new TextDecoder().decode(await store.readFile('app:/data/kept'));
       const big = said(await get('/big', 'app:/data/big'));
       const written = await check(store, 'app:/data/big');
+      // Shown as its path names it, as a writeFile's bytes are, not as the reply's content-type
+      const shownAs = (await store.blob('app:/data/big', 'application/pdf')).blob.type;
       const missing = said(await get('/missing', 'app:/data/kept'));
       const refusals = [];
       for (const [path, more] of [['app:/tmp/x', {}], ['app:/data/none/x', {}]]) refusals.push(said(await get('/never', path, more)));
       const over = said(await get('/big', 'app:/data/kept', { nativeHttp: 'independent', maxResponseBytes: 1 << 20 }));
       const stalled = said(await get('/stall', 'app:/data/kept', { timeoutMs: 300 }));
       const bare = said(await request({ method: 'GET', url: origin + '/never', headers: [], body: '', bodyTo: 'app:/data/x' }, { ...host, bodyTarget: undefined }));
-      return { big, written, missing, refusals, over, stalled, bare, kept: await kept(), names: (await store.readdir('app:/data')).sort() };
+      return { big, written, shownAs, missing, refusals, over, stalled, bare, kept: await kept(), names: (await store.readdir('app:/data')).sort() };
     }, { grants, origin: site.origin });
     expect(out.big).toEqual({ kind: 0, status: 200, headers: `:exact-body-to: ${BIG}`, body: '' });
     expect(out.written).toEqual({ size: BIG, same: true });
+    expect(out.shownAs).toBe('application/pdf');
     expect(out.missing).toMatchObject({ kind: 0, status: 404, body: 'no such thing' });
     expect(out.refusals[0]).toMatchObject({ kind: 2, body: expect.stringContaining('exactBodyTo app:/tmp/x: denied: fs.write app:/tmp/x') });
     expect(out.refusals[1]).toMatchObject({ kind: 2, body: expect.stringContaining('exactBodyTo app:/data/none/x: no such file or directory') });
@@ -203,3 +207,37 @@ test('the JS target writes a 2xx body to the app file, says what it wrote, and r
     expect(site.seen).not.toContain('/never');
   } finally { await browser.close(); site.server.stop(true); }
 }, 120_000);
+
+// The wasm carrier must keep the capture's ticket through the file lock, not just through PNG encoding.
+test('a wasm canvas capture cancelled while its file waits preserves the destination', async () => {
+  const site = serve(), grants = normalized('fs.write app:/data');
+  const browser = await suiteBrowser();
+  const arm = glueCase(readFileSync(new URL('./glue.js', import.meta.url), 'utf8'), 'canvasCapture');
+  try {
+    const page = await browser.newPage();
+    await page.goto(site.origin);
+    const kept = await page.evaluate(async ({ arm, grants }) => {
+      globalThis.exact = {};
+      const { createFileStore, lockPaths } = await import('/web/storage-fs.js');
+      const { createStorageRequests } = await import('/web/storage-request.js');
+      const { createGrantSet, scopedGrantSet } = await import('/web/grant-admission.js');
+      const set = createGrantSet(grants), store = createFileStore('canvas-held');
+      await store.writeFile('app:/data/shot.png', new TextEncoder().encode('keep'));
+      const release = await lockPaths('canvas-held', ['app:/data/shot.png']);
+      const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+      const blob = await new Promise(resolve => canvas.toBlob(resolve));
+      let active = true;
+      const tracked = [], storage = createStorageRequests('canvas-held', set);
+      const bindings = { host: { incarnation: 7, grantSet: set }, holds: () => active,
+        encoder: new TextEncoder(), safelyFulfill() {}, track: p => tracked.push(p), scopedGrantSet,
+        storageService: async () => storage, pieces: { canvas2d: op => op.resolve(blob) } };
+      const apply = new Function(...Object.keys(bindings), 'op', `switch (op.op) { ${arm} }`);
+      apply(...Object.values(bindings), { op: 'canvasCapture', ticket: 9, path: 'app:/data/shot.png', w: 1, h: 1, scale: 1 });
+      while (!(await navigator.locks.query()).pending.length) await new Promise(r => setTimeout(r, 0));
+      active = false;
+      await release(); await Promise.all(tracked);
+      return new TextDecoder().decode(await store.readFile('app:/data/shot.png'));
+    }, { arm, grants });
+    expect(kept).toBe('keep');
+  } finally { await browser.close(); site.server.stop(true); }
+}, 30_000);

@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createDocument } from './dom.js';
 import { webCompiler } from './module.mjs';
@@ -81,7 +82,7 @@ async function withRenderRuntime(run) {
   const previous = globalThis.document, doc = createDocument();
   globalThis.document = doc;
   try {
-    const real = ['rt.js', 'elements.js', 'shape.js', 'overlay.js', 'held.js', 'roster.js', 'budget.js'];
+    const real = ['rt.js', 'clock.js', 'resources.js', 'tree.js', 'events.js', 'pieces.js', 'mount.js', 'strings.js', 'elements.js', 'shape.js', 'overlay.js', 'held.js', 'roster.js', 'budget.js'];
     for (const name of real) copyFileSync(resolve(import.meta.dir, name), resolve(dir, name));
     for (const [name, source] of standIns(real)) writeFileSync(resolve(dir, name), source);
     await run(doc, await import(resolve(dir, 'rt.js')));
@@ -90,6 +91,13 @@ async function withRenderRuntime(run) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+// A static `style` (a presence's custom properties, a symbol's inline rows) is an attribute the compiler emits.
+test('a static style attribute renders', async () => withRenderRuntime((doc, { h }) => {
+  h(doc.root, 'span', 0, { style: '--exact-press:1' }, 0);
+  h(doc.root, 'i', 0, { style: 'color:red' }, 0);
+  expect(doc.rootHTML()).toBe('<span style="--exact-press:1;"></span><i style="color:red;"></i>');
+}));
 
 test.each([['', false], ['b', false], ['', true], ['b', true]])(
   'the runtime selects %j and rechecks changed option labels (explicit value: %j)',
@@ -111,6 +119,8 @@ test.each([['', false], ['b', false], ['', true], ['b', true]])(
     a.textContent = 'a'; settled(true);
     expect(select.options.map(o => o.hasAttribute('selected'))).toEqual([false, true]);
     expect(b.value).toBe('');
+    P(b, 'value', () => null); settled(true);
+    expect([b.getAttribute('value'), b.value]).toEqual([null, 'c']);
   }),
 );
 
@@ -255,6 +265,8 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
         text "site"
       link href=url target="_self" testId="authored"
         text "same tab"
+      link href=url rel="noreferrer" testId="kept"
+        text "kept"
       image \`symbol:\${role}\` testId="sym"
       image \`symbol:\${role}\` alt="A person" testId="named"
       button press=local testId="local"
@@ -283,6 +295,7 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
         return {
           link: ['href', 'target', 'rel'].map(k => el('lnk').getAttribute(k)),
           authored: ['target', 'rel'].map(k => el('authored').getAttribute(k)),
+          kept: el('kept').getAttribute('rel'),
           symbols: ['sym', 'named'].map(id => el(id).getAttribute('alt')),
         };
       }),
@@ -299,10 +312,103 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
     await page.getByTestId('external').click();
     await page.waitForFunction(() => document.querySelector('[data-testid="lnk"]').getAttribute('href') === 'https://example.com/a');
     const external = await read();
-    const expected = link => ({ attrs: { link, authored: ['_self', null], symbols: ['', 'A person'] }, images: 1 });
-    const out = expected(['https://example.com/a', '_blank', 'external noopener']);
-    expect({ before, adopted, local, external }).toEqual({ before: out, adopted: out, local: expected(['/about', null, null]), external: out });
+    // An authored `rel` keeps its tokens, and the ones a new browsing context needs join it (LLP 1141.002 D1).
+    const expected = (link, kept) => ({ attrs: { link, authored: ['_self', null], kept, symbols: ['', 'A person'] }, images: 1 });
+    const out = expected(['https://example.com/a', '_blank', 'external noopener'], 'noreferrer external noopener');
+    expect({ before, adopted, local, external }).toEqual({ before: out, adopted: out, local: expected(['/about', null, null], 'noreferrer'), external: out });
   } finally {
     await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
   }
 }, 60000);
+
+// An attribute's `<` and `>` are written as references (HTML, "Serializing HTML fragments", attribute mode), as
+// document.rs writes them, so the hero image scan, which ends a tag at its first `>` (render.mjs `heroImage`), reads
+// every attribute of an image and of a covered route: the page preloads the image it shows first.
+test.each(['js', 'rust'])('%s-rendered pages escape a > in an attribute and preload the image shown first', async how => {
+  if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/dom-escape-test-'));
+  try {
+    const source = resolve(dir, 'app.contract'), dist = resolve(dir, 'dist');
+    writeFileSync(source, `routes nav
+  home "/" render=build
+    detail "/detail" render=build
+
+component Pages
+  action follow(url: string)
+    nav = go(nav, url)
+  view
+    main navigationKey=\`\${top(nav).id}\` navigationBack="back" navigate=follow
+      for e in stack(nav) key=e.id
+        column navigationKey=\`\${e.id}\` position="absolute" inset=0 aria-label="1 > 0"
+          if e.name == "home"
+            image "https://example.com/home.png" width=96 alt="home"
+          if e.name == "detail"
+            image "https://example.com/one.png" width=10 alt="1 > 0"
+            image "https://example.com/two.png" width=10 alt="second"
+`);
+    const build = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'caltrain', '--contract', source, '--out', dist, '--render', how], {
+      cwd: root, env: process.env, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [status, stdout, stderr] = await Promise.all([build.exited, new Response(build.stdout).text(), new Response(build.stderr).text()]);
+    expect({ status, error: status ? stdout + stderr : '' }).toEqual({ status: 0, error: '' });
+    const html = path => readFileSync(resolve(dist, path, 'index.html'), 'utf8');
+    const preloads = path => html(path).match(/<link rel="preload" as="image"[^>]*>/g);
+    expect([preloads(''), preloads('detail')]).toEqual([['<link rel="preload" as="image" href="https://example.com/home.png">'],
+      ['<link rel="preload" as="image" href="https://example.com/one.png">']]);
+    expect([html('detail').includes('alt="1 &gt; 0"'), html('detail').includes('="1 > 0"')]).toEqual([true, false]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 180000);
+
+test('a generated concatenated row key reuses unchanged rows on an item update', async () => {
+  const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/each-key-test-'));
+  const previous = globalThis.document, render = globalThis.__exactRender;
+  globalThis.__exactRender = true;
+  globalThis.document = createDocument();
+  try {
+    const source = resolve(dir, 'app.contract');
+    writeFileSync(source, `shape Item
+  id: string
+  value: number
+component App
+  state items = range(1000).map(n => Item(id=\`\${n}\`, value=n))
+  view
+    column
+      for item in items key="row-" + item.id
+        text \`\${item.value}\`
+`);
+    const compiler = webCompiler();
+    expect(compiler.cmd).not.toBe('cargo');
+    const built = spawnSync(compiler.cmd, [...compiler.pre, 'js', source, '-o', dir], { cwd: root, encoding: 'utf8' });
+    expect({ status: built.status, error: built.status ? built.stdout + built.stderr : '' }).toEqual({ status: 0, error: '' });
+    const real = ['rt.js', 'clock.js', 'resources.js', 'tree.js', 'events.js', 'pieces.js', 'mount.js', 'strings.js', 'elements.js', 'shape.js', 'overlay.js', 'held.js', 'roster.js', 'budget.js', 'rows.js', 'router.js', 'route-pattern.js', 'schedule.js'];
+    for (const name of real) copyFileSync(resolve(import.meta.dir, name), resolve(dir, name));
+    for (const [name, source] of standIns(real)) writeFileSync(resolve(dir, name), source);
+    const rows = resolve(dir, 'rows.js');
+    writeFileSync(rows, readFileSync(rows, 'utf8').replace('export function inOrder(list) {',
+      'export let orderingPasses = 0; export function inOrder(list) { orderingPasses++;'));
+    writeFileSync(resolve(dir, 'counted-rt.js'), `export * from './rt.js';
+import { each as realEach } from './rt.js';
+export let keyEvaluations = 0;
+export function each(p, list, key, row, pure) {
+  return realEach(p, list, (...args) => { keyEvaluations++; return key(...args); }, row, pure);
+}`);
+    const program = resolve(dir, 'app.js');
+    writeFileSync(program, readFileSync(program, 'utf8').replace('from"./rt.js"', 'from"./counted-rt.js"'));
+    const rt = await import(resolve(dir, 'rt.js'));
+    const counts = await import(resolve(dir, 'counted-rt.js'));
+    const ordering = await import(rows);
+    const [slots] = (await import(program)).default();
+    expect(counts.keyEvaluations).toBe(1000);
+    const passes = ordering.orderingPasses, keys = counts.keyEvaluations;
+    const items = slots[0], next = items().slice();
+    next[500] = ['500', -1];
+    expect(rt.commit(() => rt.W(items, next))).not.toBe(false);
+    expect(counts.keyEvaluations - keys).toBe(1);
+    expect(ordering.orderingPasses - passes).toBe(0);
+    expect(globalThis.document.getElementById('exact-root').textContent.split('-1')).toHaveLength(2);
+  } finally {
+    globalThis.document = previous;
+    if (render === undefined) delete globalThis.__exactRender; else globalThis.__exactRender = render;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -29,7 +29,7 @@ pub struct ContentRegionRegistration {
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn serial() -> Result<u64, String> {
     SERIAL
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .map(|n| n + 1)
         .map_err(|_| "region serial exhausted".into())
 }
@@ -174,13 +174,14 @@ impl RegionState {
         kernel: &Kernel,
         id: u64,
         known_source: u64,
+        language: &str,
     ) -> Result<String, String> {
         let p = self
             .pending
             .as_ref()
             .filter(|p| p.id == id)
             .ok_or("stale region request")?;
-        wire::request(kernel, p, known_source)
+        wire::request(kernel, p, known_source, language)
     }
     pub fn json(&self, kernel: &Kernel) -> String {
         wire::state(self, kernel)

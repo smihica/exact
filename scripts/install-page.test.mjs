@@ -23,6 +23,44 @@ import { DirectoryOrigin, webReleasePath } from './origin.mjs';
 import { developmentLinks } from '../host/apple/build.mjs';
 const manifest = {name:'Interview',app:{id:'com.interview.app',name:'Interview'}};
 
+test('wasm install provenance keeps source facts and records a build time only in development', () => {
+  mkdirSync(join(import.meta.dir, '../target'), { recursive: true });
+  const dir = mkdtempSync(join(import.meta.dir, '../target/install-provenance-'));
+  try {
+    const source = readFileSync(join(import.meta.dir, '../host/web/build.mjs'), 'utf8');
+    const start = source.indexOf('const sourceRevision ='), end = source.indexOf('const escapeHtml =', start);
+    assert.ok(start >= 0 && end > start);
+    const generate = new Function('spawnSync', 'stage', 'app', 'buildReceipt', 'buildEnv', 'bakedReceipt', 'writeInstallPages', source.slice(start, end));
+    for (const trust of ['production', 'development']) for (const known of [true, false]) {
+      generate((command, args, options) => {
+        assert.equal(command, 'git');
+        assert.deepEqual(options, { cwd: dir, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' });
+        return { status: known ? 0 : 128, stdout: args[0] === 'rev-parse' ? 'abc1234567\n' : ' M app.contract\n' };
+      },
+        dir, { dir, manifest }, { binary: { sha256: 'a'.repeat(64) } }, { EXACT_UPDATE_TRUST: trust }, { reach: { rows: [] } }, writeInstallPages);
+      const { build, reach } = JSON.parse(readFileSync(join(dir, '.exact/install.json')));
+      assert.equal(build.source, known ? 'abc1234567' : null);
+      assert.equal(build.dirty, known ? true : null);
+      assert.equal(build.mode, trust === 'production' ? 'Release build' : 'Development build');
+      assert.equal(build.id, 'a'.repeat(64));
+      assert.deepEqual(reach, []);
+      if (trust === 'production') assert.equal(build.builtAt, null);
+      else assert.equal(new Date(build.builtAt).toISOString(), build.builtAt);
+    }
+    // A timed-out process can leave partial stdout without establishing metadata.
+    for (const stalled of ['rev-parse', 'status']) {
+      generate((_command, args, options) => ({ status: args[0] === stalled ? null : 0,
+        ...(args[0] === stalled ? { signal: options.killSignal, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) } : {}),
+        stdout: args[0] === 'rev-parse' ? 'abc1234567\n' : ' M app.contract\n' }),
+        dir, { dir, manifest }, { binary: { sha256: 'a'.repeat(64) } }, { EXACT_UPDATE_TRUST: 'production' }, { reach: { rows: [] } }, writeInstallPages);
+      const { build } = JSON.parse(readFileSync(join(dir, '.exact/install.json')));
+      assert.equal(build.source, stalled === 'rev-parse' ? null : 'abc1234567');
+      assert.equal(build.dirty, stalled === 'status' ? null : true);
+      assert.equal(build.builtAt, null);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('static ancestor notifications reconcile nested trees and retain refused replacements', () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-static-ancestor-'));
   const app = join(dir, 'app'), source = join(app, 'gpu/shaders'), target = join(dir, 'served/shaders');
@@ -173,6 +211,39 @@ test('only a Mac development response adds local Simulator and signed-device act
   assert.doesNotMatch(development,/<section class="platform unavailable" id="ios"/);
   assert.match(development,/<section class="platform unavailable" id="macos"/);
   assert.throws(() => developmentInstallPage(page, 'guessable'), /32 random bytes/);
+});
+
+test('a status poll that fails during a build is retried, and Refresh stays usable', async () => {
+  const script = /<script>\n(\(\(\) => \{\n  const endpoint[\s\S]*?)<\/script>/.exec(developmentInstallPage(installPage(manifest), 'a'.repeat(64)))[1];
+  const element = () => ({ disabled: false, hidden: false, textContent: '', value: '', options: [], listeners: {},
+    addEventListener(type, f) { this.listeners[type] = f; }, replaceChildren(...options) { this.options = options; this.value = options[0]?.value ?? ''; },
+    querySelector() { return this.pre ??= element(); } });
+  const nodes = Object.fromEntries(['target', 'start', 'refresh', 'state', 'log'].map(id => [`#local-ios-${id}`, element()]));
+  const document = { querySelector: selector => nodes[selector], createElement: element };
+  const target = { id: 'sim', name: 'iPhone' };
+  const answers = [{ state: 'building', available: true, targets: [target], message: 'Building' }, null,
+    { state: 'installed', available: true, targets: [target], message: 'Installed' }];
+  let requests = 0, timers = [];
+  const fetch = async () => {
+    const answer = answers[requests++];
+    if (!answer) throw new TypeError('Failed to fetch');
+    return { ok: true, json: async () => answer };
+  };
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  new Function('document', 'fetch', 'setTimeout', 'clearTimeout', script)(document, fetch,
+    f => timers.push(f), () => { timers = []; });
+  await settle();
+  assert.equal(nodes['#local-ios-refresh'].disabled, true, 'Refresh waits while the build runs');
+  for (const expected of ['Failed to fetch', 'Installed']) {
+    assert.equal(timers.length, 1, `a poll is scheduled before "${expected}"`);
+    timers.shift()();
+    await settle();
+    assert.equal(nodes['#local-ios-state'].textContent, expected);
+    if (expected !== 'Installed') assert.equal(nodes['#local-ios-refresh'].disabled, false);
+  }
+  assert.equal(requests, 3);
+  assert.equal(timers.length, 0);
+  assert.equal(nodes['#local-ios-start'].disabled, false);
 });
 
 test('install HTTP routes participate in atomic publication and preserve old pages', async () => {
@@ -363,6 +434,61 @@ chmod 755 target/exact-filesystem-tool/debug/exact-filesystem
     assert.equal(get(),2);
   } finally {rmSync(dir,{recursive:true,force:true});}
 }, 200_000);
+
+test('concurrent helper callers share a checked build and validate it against inputs after waiting', async () => {
+  const {dir,call,claim,has}=helperBuilds(), callers=[];
+  const directory=dirname(claim), tickets=join(directory,'.bootstrap.claims');
+  const choosing=join(tickets,`${process.pid}-${'0'.repeat(24)}`);
+  const source=join(dir,'filesystem/src/main.rs');
+  const start=name=>{const caller=call(name);callers.push(caller);return caller;};
+  const wait=names=>shown('each caller to wait before a capture is published',()=>names.every(name=>has('waited-'+name)));
+  const finished=async (group,value='helper')=>{
+    for(const caller of group) assert.deepEqual(await caller.done,{code:0,out:value});
+    assert.equal(existsSync(claim),false,'builders and reusers release the claim');
+    assert.deepEqual(readdirSync(tickets),[],'builders and reusers release their tickets');
+  };
+  const builds=()=>readFileSync(join(dir,'build-count'),'utf8').length;
+  const records=()=>readdirSync(directory).filter(name=>name.startsWith('checked-'));
+  try {
+    mkdirSync(dirname(source),{recursive:true});writeFileSync(source,'fn main() {}\n');
+    writeFileSync(join(dir,'hold'),'');
+    const builder=start('cold');
+    await shown('the cold build to start',()=>has('building'));
+    const names=['a','b','c'], waiters=names.map(start);
+    await wait(names);
+    assert.equal(records().length,0,'every caller initially misses the record');
+    rmSync(join(dir,'hold'));
+    await finished([builder,...waiters]);
+    assert.equal(builds(),1,'concurrent misses share the completed build');
+
+    const original=join(directory,records()[0]), captured=readFileSync(original,'utf8');
+    rmSync(original);
+    writeFileSync(choosing,'');
+    const editedNames=['edit-a','edit-b','edit-c'], edited=editedNames.map(start);
+    await wait(editedNames);
+    // Restore a record valid for the callers' original inputs, then change those inputs while they wait.
+    writeFileSync(original,captured);writeFileSync(source,'fn main() { }\n');
+    writeFileSync(join(dir,'helper-source'),`#!/bin/sh\nprintf '%s\\n' '{"value":"edited"}'\n`,{mode:0o755});
+    rmSync(choosing);
+    await finished(edited,'edited');
+    assert.equal(builds(),2,'changed inputs require one fresh build for all waiting callers');
+
+    const current=join(directory,records().find(name=>join(directory,name)!==original));
+    rmSync(current);writeFileSync(choosing,'');
+    const corruptNames=['corrupt-a','corrupt-b'], corrupt=corruptNames.map(start);
+    await wait(corruptNames);
+    const invalid=`exact-filesystem-${'0'.repeat(64)}${process.platform==='win32'?'.exe':''}`;
+    writeFileSync(join(directory,invalid),'corrupt');writeFileSync(current,invalid);
+    rmSync(choosing);
+    await finished(corrupt,'edited');
+    assert.equal(builds(),3,'a capture whose bytes do not match its digest is rebuilt');
+  } finally {
+    rmSync(join(dir,'hold'),{force:true});rmSync(choosing,{force:true});
+    for(const caller of callers) if(caller.child.exitCode===null) caller.child.kill();
+    await Promise.all(callers.map(caller=>caller.done));
+    rmSync(dir,{recursive:true,force:true});
+  }
+},120_000);
 
 test('a helper named by its checker is taken without a build, and only if it is this checkout\'s and intact', () => {
   const dir=realpathSync(mkdtempSync(join(tmpdir(),'exact-helper-named-')));

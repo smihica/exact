@@ -5,10 +5,30 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, ut
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { decodePng, encodePng } from '../../scripts/png.mjs';
-import { chooseSimulator, crashReports, crashSummary, crashWatch, forwardedEnv, installedAlready, simulator, withDisplay, withMaterials, phoneBridge, softwareKeyboard, replacedNote, keepInstalledRelease } from './devices.mjs';
+import { chooseSimulator, crashReports, crashSummary, crashWatch, forwardedEnv, installedAlready, simulator, withDisplay, withMaterials, phoneBridge, phoneStartupFailure, softwareKeyboard, replacedNote, keepInstalledRelease } from './devices.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createConnection } from 'node:net';
 import { once } from 'node:events';
+
+test('phone startup failures distinguish reported locks from possible prompts and retain diagnostics', () => {
+  const locked = phoneStartupFailure('the app exited', ['app: FBSOpenApplicationErrorDomain: Locked']);
+  expect(locked).toContain('the iPhone is locked: unlock it and run again');
+  expect(locked).toContain('FBSOpenApplicationErrorDomain: Locked');
+  expect(phoneStartupFailure('launch failed', ['app: FBSOpenApplicationServiceErrorDomain', 'app: for reason: Locked'])).toContain('the iPhone is locked:');
+  for (const cause of ['No route to host', 'deadline expired before handshake (waiting for foreground)']) {
+    const prompt = phoneStartupFailure(cause, []);
+    expect(prompt).toContain(cause);
+    expect(prompt).toContain('local-network prompt may be waiting');
+    expect(prompt).toContain('on the phone');
+    expect(prompt).not.toContain('the iPhone is locked:');
+  }
+  const silent = phoneStartupFailure('the app never became ready', []);
+  expect(silent).toContain('the app printed nothing');
+  expect(silent).toContain('Unlock the phone');
+  const crash = phoneStartupFailure('launch failed', ['app: custom failure']);
+  expect(crash).toContain('custom failure');
+  expect(crash).not.toContain('local-network prompt may be waiting');
+});
 
 // Native startup retries do not change the per-launch authentication boundary.
 test('a refused phone token cannot admit a command carrier; the right token still can', async () => {
@@ -211,6 +231,125 @@ test('a drive shows the software keyboard on a simulator it booted and puts the 
     for (const k of ['PATH', 'DEVELOPER_DIR', 'FAIL_WRITE']) if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
     rmSync(bin, { recursive: true, force: true });
   }
+});
+
+test('an AX launch loads the runtime before launch and restores its setting, including after failure', async () => {
+  const { withAccessibilityRuntime } = await import('./touches.mjs');
+  for (const initial of [undefined, '0', '1']) {
+    for (const fails of [false, true]) {
+      let value = initial;
+      const calls = [];
+      const run = async (udid, args) => {
+        expect(udid).toBe('our-simulator');
+        calls.push(args);
+        const [verb, domain, key] = args;
+        expect([domain, key]).toEqual(['com.apple.Accessibility', 'ApplicationAccessibilityEnabled']);
+        if (verb === 'read') return { status: value == null ? 1 : 0, out: value ?? '', err: value == null ? 'does not exist' : '' };
+        value = verb === 'delete' ? undefined : args.at(-1) === 'true' ? '1' : '0';
+        return { status: 0 };
+      };
+      const launch = async () => { expect(value).toBe('1'); if (fails) throw Error('launch failed'); return 'carrier'; };
+      if (fails) await expect(withAccessibilityRuntime('our-simulator', true, launch, run)).rejects.toThrow('launch failed');
+      else expect(await withAccessibilityRuntime('our-simulator', true, launch, run)).toBe('carrier');
+      expect(value).toBe(initial);
+      expect(calls.map(args => args[0])).toEqual(initial === '1' ? ['read'] : ['read', 'write', initial == null ? 'delete' : 'write']);
+      calls.length = 0;
+      expect(await withAccessibilityRuntime('our-simulator', false, async () => 'plain', run)).toBe('plain');
+      expect(calls).toEqual([]);
+    }
+  }
+  await expect(withAccessibilityRuntime('our-simulator', true, () => { throw Error('must not launch'); }, async () => ({ status: 1, err: 'simulator unavailable' }))).rejects.toThrow('simulator unavailable');
+});
+
+test('AX setup, launch and restoration share the simulator launch lock with ordinary drives', async () => {
+  const { withAccessibilityRuntime } = await import('./touches.mjs');
+  const { simulatorDisplay } = await import('../../scripts/agent-launch.mjs');
+  const udid = `runtime-lock-${process.pid}`;
+  const unlocked = [];
+  const probe = async phase => {
+    try { await simulatorDisplay(udid, () => unlocked.push(phase), { timeout: 0 }); }
+    catch (error) { expect(error.message).toContain("display busy"); }
+  };
+  const run = async (_, args) => {
+    await probe(args[0]);
+    return { status: 0, out: '0' };
+  };
+  for (const ax of [true, false]) {
+    await withAccessibilityRuntime(udid, ax, async () => { await probe(ax ? 'AX launch' : 'ordinary launch'); return 'carrier'; }, run);
+  }
+  expect(unlocked).toEqual([]);
+});
+
+test('an AX restoration failure closes the launched carrier before releasing the app lock', async () => {
+  const { withAccessibilityRuntime } = await import('./touches.mjs');
+  const { exclusiveIOS } = await import('../../scripts/agent-launch.mjs');
+  const udid = `runtime-restore-${process.pid}`;
+  for (const closeFails of [false, true]) {
+    const directory = mkdtempSync(resolve(tmpdir(), 'devices-ax-close-'));
+    let closed = false;
+    const run = async (_, args) => args[0] === 'read' ? { status: 0, out: '0' }
+      : args.at(-1) === 'true' ? { status: 0 } : { status: 1, err: 'restore failed' };
+    try {
+      const launch = () => withAccessibilityRuntime(udid, true, async () => ({
+        async close() {
+          await expect(exclusiveIOS(udid, 'app', () => { throw Error('lock was released'); }, { directory, timeout: 0 })).rejects.toThrow('iOS drive busy');
+          closed = true;
+          if (closeFails) throw Error('close failed');
+        },
+      }), run);
+      const failed = exclusiveIOS(udid, 'app', launch, { directory });
+      await expect(failed).rejects.toThrow(closeFails ? /restore failed.*close failed/ : 'restore failed');
+      expect(closed).toBe(true);
+      const next = await exclusiveIOS(udid, 'app', async () => ({ close() {} }), { directory, timeout: 0 });
+      await next.close();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test('touch restoration cannot disable accessibility between an AX read and launch', async () => {
+  const { restoreAccessibility, withAccessibilityRuntime } = await import('./touches.mjs');
+  const { simulatorDisplay } = await import('../../scripts/agent-launch.mjs');
+  const udid = `touch-restore-lock-${process.pid}`;
+  let value = '1';
+  const reading = Promise.withResolvers(), finish = Promise.withResolvers();
+  const launch = withAccessibilityRuntime(udid, true, async () => { expect(value).toBe('1'); return 'carrier'; }, async (_, args) => {
+    expect(args[0]).toBe('read');
+    const before = value;
+    reading.resolve();
+    await finish.promise;
+    return { status: 0, out: before };
+  });
+  await reading.promise;
+  const restoration = restoreAccessibility(udid, { ApplicationAccessibilityEnabled: '0' }, async (_, args) => {
+    if (args[2] === 'ApplicationAccessibilityEnabled') value = '0';
+    return { status: 0 };
+  });
+  const settled = Promise.allSettled([restoration, launch]);
+  try {
+    await expect(simulatorDisplay(udid, () => {}, { timeout: 0 })).rejects.toThrow('display busy');
+  } finally { finish.resolve(); }
+  const results = await settled;
+  expect(results).toEqual([{ status: 'fulfilled', value: null }, { status: 'fulfilled', value: 'carrier' }]);
+  expect(value).toBe('0');
+});
+
+test('touch cleanup inside a launch reuses its lock, and delayed cleanup takes the lock again', async () => {
+  const { restoreAccessibility, withAccessibilityRuntime } = await import('./touches.mjs');
+  const { simulatorDisplay } = await import('../../scripts/agent-launch.mjs');
+  const udid = `touch-nested-lock-${process.pid}`;
+  const later = Promise.withResolvers();
+  let delayed;
+  const run = async () => {
+    await expect(simulatorDisplay(udid, () => {}, { timeout: 0 })).rejects.toThrow('display busy');
+    return { status: 0 };
+  };
+  await expect(withAccessibilityRuntime(udid, false, async () => {
+    delayed = later.promise.then(() => restoreAccessibility(udid, {}, run));
+    await restoreAccessibility(udid, {}, run);
+    throw Error('launch failed');
+  })).rejects.toThrow('launch failed');
+  later.resolve();
+  expect(await delayed).toBe(null);
 });
 
 test('a touch session records the accessibility keys it found and puts them back so, or unset after a session that left them on', async () => {
@@ -608,3 +747,250 @@ cpSync(process.argv.at(-2), process.argv.at(-1), {recursive: true});
     rmSync(dir, {recursive: true, force: true});
   }
 });
+
+// Synthetic profile XML: no installed signing credentials or devices are read.
+function profileText({ mac = false, platforms = [mac ? 'OSX' : 'iOS'], devices = [], allDevices = false, debuggerKey, debug = true, push = 'production', pushKeys = { [mac ? 'com.apple.developer.aps-environment' : 'aps-environment']: push }, id = 'com.example.profile' } = {}) {
+  return `<?xml version="1.0"?><plist version="1.0"><dict>
+    <key>Name</key><string>Synthetic profile</string>
+    <key>TeamIdentifier</key><array><string>TESTTEAM00</string></array>
+    <key>Platform</key><array>${platforms.map(p => `<string>${p}</string>`).join('')}</array>
+    <key>ExpirationDate</key><date>2099-01-01T00:00:00Z</date>
+    ${devices.length ? `<key>ProvisionedDevices</key><array>${devices.map(d => `<string>${d}</string>`).join('')}</array>` : ''}
+    ${allDevices ? '<key>ProvisionsAllDevices</key><true/>' : ''}
+    <key>Entitlements</key><dict>
+      <key>${mac ? 'com.apple.application-identifier' : 'application-identifier'}</key><string>TESTTEAM00.${id}</string>
+      ${debuggerKey ? `<key>${debuggerKey}</key><${debug ? 'true' : 'false'}/>` : ''}
+      ${Object.entries(pushKeys).filter(([, value]) => value).map(([key, value]) => `<key>${key}</key><string>${value}</string>`).join('')}
+      <key>com.apple.security.application-groups</key><array><string>TESTTEAM00.*</string></array>
+      <key>keychain-access-groups</key><array><string>TESTTEAM00.*</string></array>
+    </dict>
+  </dict></plist>`;
+}
+async function fixtureProfile(options) {
+  const { decodeProfile } = await import('./devices.mjs');
+  const profiles = ['darwin', 'linux'].map(os => decodeProfile('/synthetic/profile', os, { read: (command, args) => {
+    expect([command, ...args]).toEqual(os === 'linux'
+      ? ['openssl', 'smime', '-verify', '-inform', 'DER', '-in', '/synthetic/profile', '-noverify']
+      : ['security', 'cms', '-D', '-i', '/synthetic/profile']);
+    return { status: 0, stdout: profileText(options) };
+  } }));
+  expect(profiles[1]).toEqual(profiles[0]);
+  return profiles[0];
+}
+
+for (const [name, debuggerKey, dev, method, push] of [
+  ['development', 'get-task-allow', true, 'development', 'development'],
+  ['Mac debugger entitlement', 'com.apple.security.get-task-allow', true, 'development', 'development'],
+  ['Ad Hoc', undefined, false, 'adhoc', 'production'],
+]) test(`mixed-platform profile decoding: ${name}`, async () => {
+  const { allows, coveringProfiles, profile } = await import('./devices.mjs');
+  const p = await fixtureProfile({ platforms: ['iOS', 'OSX'], devices: ['TEST-PHONE'], debuggerKey, push });
+  expect(p.dev).toBe(dev);
+  expect(p.method).toBe(method);
+  expect(p.aps).toBe(push);
+  expect(allows(p, ['aps-environment'])).toBe(true);
+  expect(coveringProfiles('TEST-PHONE', 'com.example.profile', [p])).toEqual(dev ? [p] : []);
+  if (dev) expect(profile('TEST-PHONE', 'com.example.profile', ['aps-environment'], { installed: [p], named: null, team: null })).toBe(p);
+});
+
+test('profile decoding keeps debugger entitlements when no platform is listed', async () => {
+  for (const debuggerKey of ['get-task-allow', 'com.apple.security.get-task-allow']) {
+    const p = await fixtureProfile({ platforms: [], devices: ['TEST-PHONE'], debuggerKey });
+    expect(p.dev).toBe(true);
+    expect(p.method).toBe('development');
+  }
+});
+
+for (const platforms of [['OSX'], ['iOS'], ['iOS', 'OSX']]) test(`profile decoding accepts either push key for ${platforms.join('/')}`, async () => {
+  const mac = platforms.length === 1 && platforms[0] === 'OSX';
+  const own = mac ? 'com.apple.developer.aps-environment' : 'aps-environment';
+  const other = mac ? 'aps-environment' : 'com.apple.developer.aps-environment';
+  for (const pushKeys of [{ [other]: 'development' }, { [own]: 'development', [other]: 'production' }]) {
+    const p = await fixtureProfile({ mac, platforms, pushKeys });
+    expect(p.aps).toBe('development');
+    for (const key of Object.keys(pushKeys)) expect(p.entitlements).toContain(key);
+  }
+});
+
+test('an Xcode-managed Mac development profile shape accepts both push spellings', async () => {
+  const { allows } = await import('./devices.mjs');
+  const p = await fixtureProfile({ mac: true, devices: Array.from({ length: 14 }, (_, i) => `TEST-MAC-${i}`),
+    debuggerKey: 'get-task-allow', pushKeys: { 'aps-environment': 'development', 'com.apple.developer.aps-environment': 'development' } });
+  expect(p.platforms).toEqual(['OSX']);
+  expect(p.devices).toHaveLength(14);
+  expect(p.dev).toBe(true);
+  expect(p.method).toBe('development');
+  expect(p.aps).toBe('development');
+  expect(p.entitlements).toContain('aps-environment');
+  expect(p.entitlements).toContain('com.apple.developer.aps-environment');
+  expect(allows(p, ['aps-environment'])).toBe(true);
+});
+
+for (const [name, options, dev, method] of [
+  ['iOS development', { devices: ['TEST-PHONE'], debuggerKey: 'get-task-allow', push: 'development' }, true, 'development'],
+  ['iOS Ad Hoc distribution', { devices: ['TEST-PHONE'], debuggerKey: 'get-task-allow', debug: false }, false, 'adhoc'],
+  ['iOS App Store distribution', { debuggerKey: 'get-task-allow', debug: false }, false, 'appstore'],
+  ['iOS enterprise distribution', { allDevices: true }, false, 'enterprise'],
+  ['Mac development without a debugger entitlement', { mac: true, devices: ['TEST-MAC'], push: 'development' }, true, 'development'],
+  ['Mac development with its debugger entitlement', { mac: true, devices: ['TEST-MAC'], debuggerKey: 'com.apple.security.get-task-allow', push: 'development' }, true, 'development'],
+  ['Mac Developer ID', { mac: true, allDevices: true }, false, 'developerid'],
+  ['Mac App Store', { mac: true }, false, 'appstore'],
+]) test(`profile decoding: ${name}`, async () => {
+  const p = await fixtureProfile(options);
+  expect(p.dev).toBe(dev);
+  expect(p.method).toBe(method);
+  expect(p.appId).toBe('TESTTEAM00.com.example.profile');
+  expect(p.prefix).toBe('TESTTEAM00');
+  expect(p.devices).toEqual(options.devices ?? []);
+  expect(p.platforms).toEqual([options.mac ? 'OSX' : 'iOS']);
+});
+
+test('profile decoding reads each platform\'s push environment and preserves its entitlement key', async () => {
+  for (const mac of [false, true]) for (const push of ['development', 'production', null]) {
+    const p = await fixtureProfile({ mac, push });
+    expect(p.aps).toBe(push);
+    const key = mac ? 'com.apple.developer.aps-environment' : 'aps-environment';
+    expect(p.entitlements.includes(key)).toBe(push !== null);
+  }
+});
+
+test('decoded Mac profiles reach the widget and the app profile searches by build kind', async () => {
+  const { macWidgetProfiles } = await import('./widgets.mjs');
+  const { macProfile } = await import('./presence.mjs');
+  const app = { id: 'com.example.profile' }, team = 'TESTTEAM00', required = ['keychain-access-groups'];
+  for (const [options, distribution, method] of [
+    [{ mac: true, devices: ['TEST-MAC'], push: 'development' }, false, 'development'],
+    [{ mac: true, allDevices: true }, true, 'developerid'],
+    [{ mac: true }, true, 'appstore'],
+  ]) {
+    const owner = await fixtureProfile(options), extension = await fixtureProfile({ ...options, id: app.id + '.widgets' });
+    const installed = [owner, extension], named = null, udid = distribution ? null : 'TEST-MAC';
+    const pair = macWidgetProfiles({ app, team, installed, named, udid, distribution });
+    expect(pair?.app).toBe(owner);
+    expect(pair?.extension).toBe(extension);
+    expect(pair?.keychain).toBe(`${team}.${app.id}`);
+    expect(macProfile(app, required, { installed, named, method, udid })).toBe(owner);
+    expect(macWidgetProfiles({ app, team, installed, named, udid, distribution: !distribution })).toBeNull();
+    for (const other of ['development', 'developerid', 'appstore'].filter((m) => m !== method)) expect(macProfile(app, required, { installed, named, method: other, udid: 'TEST-MAC' })).toBeNull();
+    if (!distribution) expect(macWidgetProfiles({ app, team, installed, named, udid: 'OTHER-MAC' })).toBeNull();
+    if (!distribution) expect(macProfile(app, required, { installed, named, udid: 'OTHER-MAC' })).toBeNull();
+  }
+});
+
+// #325: a Mac build's push grant signs, under a Mac profile that allows it, push's Mac key in the profile's
+// environment, the application identifier and the team, with that team's identity; or names what is missing.
+test('a Mac build signs push from a development or Developer ID profile that allows it (LLP 1133.010 D7)', async () => {
+  const { macProvisioning, macProfile, macProfileIdentity } = await import('./presence.mjs');
+  const app = { id: 'com.example.profile' };
+  const compat = { reach: { profileEntitlements: ['com.apple.developer.aps-environment'] }, inputs: { grantCeiling: 'device.notifications n\ndevice.push' } };
+  const development = await fixtureProfile({ mac: true, devices: ['TEST-MAC'], push: 'development' });
+  const developerId = await fixtureProfile({ mac: true, allDevices: true, push: 'production' });
+  const noPush = await fixtureProfile({ mac: true, devices: ['TEST-MAC'], push: null });
+  const iosOne = await fixtureProfile({ devices: ['TEST-MAC'], push: 'development' });
+  const installed = [noPush, iosOne, development, developerId];
+  const find = (a, required, options) => macProfile(a, required, { ...options, installed, named: null, udid: 'TEST-MAC' });
+  const said = [];
+  const dev = macProvisioning(app, compat, { find, log: (l) => said.push(l) });
+  expect(dev.profile).toBe(development);
+  expect(dev.entitlements).toEqual({ 'com.apple.application-identifier': 'TESTTEAM00.com.example.profile',
+    'com.apple.developer.team-identifier': 'TESTTEAM00', 'com.apple.developer.aps-environment': 'development' });
+  expect(said[0]).toMatch(/^macOS profile: "Synthetic profile" \(team TESTTEAM00, development\) signs com\.apple\.developer\.aps-environment for device\.push/);
+  const shipped = macProvisioning(app, compat, { release: true, method: 'developerid', find, log: () => {} });
+  expect(shipped.profile).toBe(developerId);
+  expect(shipped.entitlements['com.apple.developer.aps-environment']).toBe('production');
+  // The identity is the profile's team's, whichever names it: the development one by team, its certificate checked
+  // as an explicit EXACT_IDENTITY's is; a Developer ID one of another team is refused.
+  const teams = { DEV: ['TESTTEAM00', false], OTHER: ['OTHERTEAM0', false], SHA: ['TESTTEAM00', true] };
+  const teamOf = (sha1, distribution) => teams[sha1]?.[1] === distribution ? teams[sha1][0] : null;
+  expect(macProfileIdentity(development, 'X', { find: () => 'DEV', teamOf })).toBe('DEV');
+  expect(() => macProfileIdentity(development, 'X', { find: () => 'OTHER', teamOf })).toThrow(/is team TESTTEAM00's, and OTHER is not that team's Apple Development identity/);
+  expect(() => macProfileIdentity(development, 'X', { find: () => 'SHA', teamOf })).toThrow(/not that team's Apple Development identity/);
+  expect(() => macProfileIdentity(development, 'X', { find: () => '-', teamOf })).toThrow(/not that team's Apple Development identity/);
+  expect(macProfileIdentity(developerId, 'SHA', { distribution: true, teamOf })).toBe('SHA');
+  expect(() => macProfileIdentity(developerId, 'DEV', { distribution: true, teamOf })).toThrow(/is team TESTTEAM00's; sign with that team's Developer ID/);
+  // No profile allows push: the build signs none and says what the app reports; a release ships so (§9 P7), where
+  // a row a release must keep is refused.
+  const none = (a, required, options) => macProfile(a, required, { ...options, installed: [noPush, iosOne], named: null, udid: 'TEST-MAC' });
+  const told = [];
+  expect(macProvisioning(app, compat, { find: none, log: (l) => told.push(l) })).toBeNull();
+  expect(told[0]).toMatch(/^device\.push: this build signs no com\.apple\.developer\.aps-environment, since no development macOS provisioning profile .* pushPermissionState\(\)\.available is false/);
+  expect(macProvisioning(app, compat, { release: true, find: none, log: () => {} })).toBeNull();
+  const attest = { ...compat, reach: { profileEntitlements: ['com.apple.developer.aps-environment', 'com.apple.developer.devicecheck.appattest-environment'] } };
+  expect(() => macProvisioning(app, attest, { release: true, find: none, log: () => {} })).toThrow(/^grant-needs-profile: device\.attestation: no development macOS provisioning profile on this Mac for com\.example\.profile/);
+  // A named profile that does not fit is refused, saying why.
+  expect(() => macProfile(app, ['com.apple.developer.aps-environment'], { installed, named: noPush, udid: 'TEST-MAC' })).toThrow(/EXACT_MAC_PROFILE \(Synthetic profile\) does not allow com\.apple\.developer\.aps-environment/);
+  expect(() => macProfile(app, [], { installed, named: iosOne, udid: 'TEST-MAC' })).toThrow(/is for iOS, not macOS/);
+  expect(() => macProfile(app, [], { installed, named: development, udid: 'OTHER-MAC' })).toThrow(/does not include this Mac/);
+  // Nothing in the grants needs a profile: no provisioning at all.
+  expect(macProvisioning(app, { reach: {}, inputs: { grantCeiling: 'device.notifications n' } }, { find: () => { throw new Error('asked'); } })).toBeNull();
+});
+
+// One profile serves the Mac widgets and the grants: the newest widget profile lacks push and an older one has both,
+// so the older is chosen for both and the identity stays the widgets' team's; with none that does both, nothing is
+// signed for the grants. An ad hoc build signs no profile's entitlements.
+test('a Mac build with widgets and push resolves one profile and one team for both (LLP 1133.010 D7)', async () => {
+  const { macSigning, macProfile } = await import('./presence.mjs');
+  const { macWidgetProfiles } = await import('./widgets.mjs');
+  const app = { id: 'com.example.profile' }, team = 'TESTTEAM00';
+  const compat = { reach: { profileEntitlements: ['com.apple.developer.aps-environment'] }, inputs: { grantCeiling: 'device.notifications n\ndevice.push' } };
+  const later = (p, days) => ({ ...p, expires: new Date(Date.now() + days * 864e5) });
+  const both = later(await fixtureProfile({ mac: true, devices: ['TEST-MAC'], push: 'development' }), 100);
+  const newest = later({ ...await fixtureProfile({ mac: true, devices: ['TEST-MAC'], push: null }), path: '/newest' }, 300);
+  const extension = await fixtureProfile({ mac: true, devices: ['TEST-MAC'], id: app.id + '.widgets' });
+  const widgetProfiles = (options) => macWidgetProfiles({ ...options, installed: [newest, both, extension], named: null, udid: 'TEST-MAC' });
+  const widgets = { team, profiles: widgetProfiles({ app, team }) };
+  expect(widgets.profiles.app).toBe(newest);
+  const otherTeam = { ...both, team: 'OTHERTEAM0', path: '/other' };
+  const find = (a, required, options) => macProfile(a, required, { ...options, installed: [otherTeam], named: null, udid: 'TEST-MAC' });
+  const signed = macSigning(app, compat, { current: 'DEV', widgets, find, widgetProfiles, log: () => {} });
+  expect(signed.provisioning.profile).toBe(both);
+  expect(signed.widgets.profiles.app).toBe(both);
+  expect(signed.widgets.profiles.extension).toBe(extension);
+  expect(signed.sha1).toBe('DEV');
+  expect(signed.provisioning.entitlements['com.apple.developer.team-identifier']).toBe(team);
+  // No profile of the widgets' team does both: the grants sign nothing, and another team's profile is never taken.
+  const said = [];
+  const alone = macSigning(app, compat, { current: 'DEV', widgets, find, log: (l) => said.push(l),
+    widgetProfiles: (options) => macWidgetProfiles({ ...options, installed: [newest, extension], named: null, udid: 'TEST-MAC' }) });
+  expect(alone).toEqual({ provisioning: null, widgets, sha1: 'DEV' });
+  expect(said[0]).toMatch(/with the Mac widgets' App Group and shared Keychain group for team TESTTEAM00 \(one profile signs both\)/);
+  // Without widgets the profile's team's identity signs.
+  const identityFor = (profile) => `identity of ${profile.team}`;
+  expect(macSigning(app, compat, { current: 'DEV', find, identityFor, log: () => {} }).sha1).toBe('identity of OTHERTEAM0');
+  // Ad hoc: nothing is signed, and the build says why.
+  const adHoc = [];
+  expect(macSigning(app, compat, { current: '-', find, identityFor, log: (l) => adHoc.push(l) }).provisioning).toBeNull();
+  expect(adHoc[0]).toMatch(/since this build is signed ad hoc \(EXACT_IDENTITY=-\)/);
+});
+
+test('Mac launches preserve exit statuses, signals and launch failures', async () => {
+  const {runMac}=await import('./devices.mjs');
+  const dir=mkdtempSync(resolve(tmpdir(),'exact-mac-exit-')), binary=resolve(dir,'app'), said=[];
+  const options={stdio:'ignore',say:line=>said.push(line)};
+  try {
+    writeFileSync(binary,'#!/bin/sh\nexit 7\n'); chmodSync(binary,0o755);
+    expect(runMac(binary,process.env,options)).toBe(7); expect(said).toEqual([]);
+    writeFileSync(binary,'#!/bin/sh\nkill -TERM $$\n');
+    expect(runMac(binary,process.env,options)).toBe(143);
+    expect(said).toEqual([`${binary}: killed by SIGTERM`]);
+    said.length=0;
+    expect(runMac(resolve(dir,'missing'),process.env,options)).toBe(1); expect(said[0]).toContain('launch failed');
+    writeFileSync(binary,'#!/bin/sh\nexit 0\n');
+    expect(runMac(binary,process.env,options)).toBe(0);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+
+test.skipIf(process.platform !== 'darwin')('Mac aborts print the real delayed diagnostic report', async () => {
+  const {runMac}=await import('./devices.mjs'), {basename}=await import('node:path');
+  const dir=mkdtempSync(resolve(tmpdir(),'exact-abort-')), binary=resolve(dir,'exactDriveCrash'+basename(dir).slice(-6)), said=[];
+  try {
+    const source=resolve(dir,'abort.c'); writeFileSync(source,'#include <stdlib.h>\nint main(void) { abort(); }\n');
+    const compiled=spawnSync('cc',[source,'-o',binary],{encoding:'utf8'}); expect(compiled.status,compiled.stderr).toBe(0);
+    expect(runMac(binary,process.env,{stdio:'ignore',say:line=>said.push(line)})).toBe(134);
+    expect(said[0]).toBe(`${binary}: killed by SIGABRT`);
+    const report=said.find(line=>line.startsWith('crash report: '));
+    expect(report).toMatch(/Library\/Logs\/DiagnosticReports\/exactDriveCrash.*\.(ips|crash)/);
+    expect(existsSync(report.slice('crash report: '.length).split(' (')[0])).toBe(true);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+}, 20_000);

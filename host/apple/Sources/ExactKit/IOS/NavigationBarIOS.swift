@@ -26,8 +26,9 @@ struct HatchSource: Equatable {
 /// The delegate Exact gives each navigation controller it builds: Exact's
 /// own handling first, then the app's delegate, which receives straight
 /// anything Exact does not implement — a custom transition's animator
-/// (LLP 1075.003 §3.5). An animated push or pop is reconciled (LLP 1035.001
-/// D1, D2) in its coordinator's completion, after both have heard `didShow`.
+/// (LLP 1075.003 §3.5). A pop UIKit commits reaches the router at Exact's
+/// `willShow`, before the app's; a swipe, in its coordinator's completion,
+/// after both have heard `didShow` (LLP 1035.001 D1, D2).
 final class NavigationDelegateProxy: NSObject, UINavigationControllerDelegate {
     weak var host: NavigationHost?
     weak var app: UINavigationControllerDelegate?
@@ -318,26 +319,31 @@ final class BarPress: NSObject {
         // A popover that is no menu, named with no press of its own, opens
         // from the item (`MenuHost.openFromBar`); with a press, after it
         // (`MenuHost.invoke`).
-        if !node.handlers.contains("press"), let invocation = host.presenter.invocation(of: node), invocation.opensPopover,
-           !host.presenter.menus.pullsDown(invocation.target) {
-            _ = host.presenter.menus.openFromBar(node)
-            return
+        if !node.handlers.contains("press"), let invocation = host.presenter.invocation(of: node) {
+            if invocation.opensPopover, !host.presenter.menus.pullsDown(invocation.target) {
+                _ = host.presenter.menus.openFromBar(node)
+                return
+            }
+            // A dialog it shows modally, as its command says (`MenuHost.invoke`'s bar item).
+            if invocation.action == .showModal {
+                if !node.disabled { host.presenter.press(id) }
+                return
+            }
         }
         _ = host.act(id, 0)
     }
 }
 
 /// One stack Exact built: its delegate, whether its routes may show the bar (they may unless the
-/// app's `navigation` hatch says no; which of them shows it is each route's, LLP 1115.000 D5.3), its
-/// last written controllers, the tint it last gave the bar, its top route's accent (nil: none), and
-/// whether a hatch tinted the bar, which Exact then leaves alone.
+/// app's `navigation` hatch says no; which of them shows it is each route's, LLP 1115.000 D5.3), the
+/// tint it last gave the bar, its top route's accent (nil: none), and whether a hatch tinted the bar,
+/// which Exact then leaves alone.
 final class NavigationStack {
     let proxy = NavigationDelegateProxy()
     var showsBar: Bool
     let order: Int
     let label: String
     var hatched = false
-    var written: [ObjectIdentifier] = []
     var barTint: UIColor?, hatchTintsBar = false
     init(showsBar: Bool, order: Int) { (self.showsBar, self.order, label) = (showsBar, order, "#\(order)") }
 }
@@ -368,7 +374,7 @@ extension NavigationHost {
             if let tabsController = tabController, let controller = tabStack(index), barItem(ofTab: index) != nil {
                 let reselect = controller === tabsController.selectedViewController
                 // Ask the app's delegate, then `mayShow`, as `TabDelegateProxy` does, so the reply can say which declined
-                if tabProxy.app?.tabBarController?(tabsController, shouldSelect: controller) == false {
+                if appDeclinesTab(tabsController, controller) {
                     return ["error": "tab #\(id): the app's tab bar delegate declined the tap (its shouldSelect returned false), so UIKit selects nothing"]
                 }
                 guard mayShow(tabsController, controller) else {
@@ -378,10 +384,19 @@ extension NavigationHost {
                 }
                 if reselect { (controller as? UINavigationController)?.popToRootViewController(animated: !ExactEnv.agentFreezes) }
                 else { tabsController.selectedViewController = controller }
-                tabProxy.tabBarController(tabsController, didSelect: controller)
+                // A container built from `UITab`s sends `didSelectTab` for the selection itself, not for a reselect
+                if reselect { sendReselect(tabsController, controller) } else if builtTabs.isEmpty { tabProxy.tabBarController(tabsController, didSelect: controller) }
                 return reply
             }
-            // Press a row of More's list's tab: the router selects it, which UIKit shows under More
+            // Pick the router's own tab, which More does not show (its list is on top), as a person picks its row:
+            // UIKit selects it and shows it under More, within the tap, as UIKit's layout applies the selection now
+            // rather than in a later turn (LLP 1075.003 §9.16)
+            if index == routerTab, let tabsController = tabController, let controller = tabStack(index), tabsController.selectedViewController !== controller {
+                tabsController.selectedViewController = controller
+                tabsController.view.layoutIfNeeded()
+                return reply
+            }
+            // Press any other row's tab: the router selects it, which UIKit shows under More
             pressTab(node, scrolling: reselectedRoot(index))
             return reply
         }
@@ -418,7 +433,9 @@ extension NavigationHost {
             case nil: return ["error": "unsupported: bar item #\(id) opens its menu as UIKit's pull-down from the bar, which only a real touch opens: under --touch platform `tap` opens it and `tap <row>` picks a row (LLP 1021 D4)"]
             }
         }
-        guard node.handlers.contains("press"), !node.disabled else { return ["error": "bar item #\(id) is disabled or presses nothing"] }
+        // A button with no press of its own that shows a dialog modally: its command, as `BarPress` runs it.
+        let showsModal = presenter.invocation(of: node)?.action == .showModal
+        guard node.handlers.contains("press") || showsModal, !node.disabled else { return ["error": "bar item #\(id) is disabled or presses nothing"] }
         presenter.press(node.id)
         return ["tapped": id, "pressed": id, "delivery": "host-activation", "native": "bar-button-item"]
     }
@@ -523,7 +540,10 @@ extension NavigationHost {
     /// authored source changed, then run the route hatch — before UIKit lays
     /// the stack out (LLP 1075.003 §3.2, §3.5 "projected defaults"). A plain
     /// tab (PlainTabIOS) has no bar: its route's header is its content.
-    func prepareRoutes(_ routes: [RouteController], in stack: UIViewController) {
+    /// Whether a header it lifted keeps its room until the batch being
+    /// applied ends (`coverLifted`).
+    @discardableResult
+    func prepareRoutes(_ routes: [RouteController], in stack: UIViewController) -> Bool {
         let nav = stack as? UINavigationController
         if let nav {
             hatchNavigation(nav)
@@ -533,7 +553,7 @@ extension NavigationHost {
             projectBack(routes, in: nav)
         }
         followTablist(routes, in: stack)
-        let presented = nav.map { nav in presentedNavigations.contains { $0 === nav } } ?? false
+        let presented = isPresented(nav)
         // Count UIKit's list before a tab's root under More: More pushes the root over it, with a Back to it
         let front = nav?.stackFront.count ?? 0
         for (index, c) in routes.enumerated() {
@@ -600,15 +620,16 @@ extension NavigationHost {
             c.hatched = true
             c.ownedScroll = scroller
         }
-        coverLifted(routes)
+        let waits = coverLifted(routes)
         // A route's header shown or hidden in place; a push or pop sets the
         // bar in `willShow` instead, with UIKit's transition.
         if let nav, nav.transitionCoordinator == nil, let top = nav.topViewController as? RouteController, routes.contains(top) {
             showBar(nav, animated: nav.view.window != nil)
         }
+        return waits
     }
 
-    /// The header shape and the bar a route shows in its stack (`prepareRoutes`, `selectScrollEdges`).
+    /// The header shape and the bar a route shows in its stack
     private func barShape(of c: RouteController, in nav: UINavigationController?) -> (HeaderShape?, NavigationRules.Bar) {
         guard nav.map(barShows) ?? false else { return (nil, .hidden) }
         return (HeaderShape.bar(of: c.node, back: container?.props["navigationBack"], backIsUIKits: c.pushed), bar(of: c.node, pushed: c.pushed))
@@ -623,7 +644,7 @@ extension NavigationHost {
         let nav = stack as? UINavigationController
         let (shape, bar) = barShape(of: c, in: nav)
         collapse(c, shape: shape, shows: bar != .hidden, scroller: contentScroller(of: c))
-        reachBottom(c, presented: nav.map { nav in presentedNavigations.contains { $0 === nav } } ?? false)
+        reachBottom(c, presented: isPresented(nav))
         coversChanged()
     }
 
@@ -636,7 +657,11 @@ extension NavigationHost {
     /// layout with `reportCovers`, after the push had begun, so a pushed
     /// route's scroller was still below its header's height then, and every
     /// pushed level-1 title arrived inline and expanded only on a pull.
-    private func coverLifted(_ routes: [RouteController]) {
+    /// Covers reach the runtime outside a batch, after its scroll positions
+    /// are restored; lifted while one is applied, the cover and the runtime's
+    /// answer come after it, and true says so: `sync` then gives UIKit the
+    /// stack after them (`syncAfterBatch`).
+    private func coverLifted(_ routes: [RouteController]) -> Bool {
         var lifted = false
         for c in routes {
             for node in (c.lifted.map({ [$0] }) ?? c.barNodes) + [c.scoped].compactMap({ $0 }) where covers[node.id] != .whole {
@@ -644,8 +669,9 @@ extension NavigationHost {
                 lifted = true
             }
         }
-        guard lifted else { return }
+        guard lifted else { return false }
         presenter.afterBatch { [weak self] in self?.deliverCovers() }
+        return presenter.applying
     }
 
     /// Write the defaults an authored header gives a navigation item, and
@@ -763,6 +789,7 @@ extension NavigationHost {
         control.accessibilityIdentifier = list?.props["testId"]
         control.segmentLabels = tabs.map(SegmentHost.segmentLabel)
         control.segmentIDs = tabs.map { $0.props["testId"] }
+        control.segmentOwners = tabs.map(\.id)
         control.segmentUnavailable = tabs.map { $0.disabled || $0.ariaUnavailable }
         for (index, tab) in tabs.enumerated() { control.setEnabled(!tab.disabled, forSegmentAt: index) }
         segments.fit(titles)
@@ -808,6 +835,8 @@ extension NavigationHost {
             c.definesPresentationContext = true
         }
         search.field = field
+        // The search tab's root field says how the tab presents (TabsIOS.swift)
+        if !builtTabs.isEmpty { followSearchTab() }
         search.scope(c.scoped)
         let bar = search.controller.searchBar
         let placeholder = field.props["placeholder"] ?? ""
@@ -923,7 +952,7 @@ extension NavigationHost {
         // A route that turns transparent, or back, keeps its scroller: only
         // whether UIKit insets it follows.
         if let sv = physical, c.collapseScroll === target, c.collapseScrollView === sv {
-            let adjustment: UIScrollView.ContentInsetAdjustmentBehavior = Self.transparentBar(c.node) ? .never : .automatic
+            let adjustment: UIScrollView.ContentInsetAdjustmentBehavior = Self.insetsNoTop(c.node) ? .never : .automatic
             if sv.contentInsetAdjustmentBehavior != adjustment { sv.contentInsetAdjustmentBehavior = adjustment }
         }
         guard c.collapseScroll !== target || c.collapseScrollView !== physical else {
@@ -948,7 +977,7 @@ extension NavigationHost {
         // Under a transparent bar the content starts at the top edge, under
         // the bar, as on the web under a fixed transparent header: a hero
         // photo bleeds to the top, and the bar's material comes as it scrolls.
-        shown?.contentInsetAdjustmentBehavior = Self.transparentBar(c.node) ? .never : .automatic
+        shown?.contentInsetAdjustmentBehavior = Self.insetsNoTop(c.node) ? .never : .automatic
         // …and is there before UIKit is handed it: a bar handed a
         // scroller that far from its top closes an open large title.
         if atStart, let sv = shown, sv.contentOffset.y != -sv.adjustedContentInset.top { sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: -sv.adjustedContentInset.top), in: sv) }
@@ -1009,7 +1038,8 @@ extension NavigationHost {
     /// UIKit insets the scroller (`reportCovers`, `scroller_insets_bottom`),
     /// so an absolutely positioned footer still rests on the bars. A footer under
     /// the scroller keeps the cover; so does a page under `viewport-fit=cover`,
-    /// whose own `env()` insets would be added to UIKit's, though not a
+    /// whose own `env()` insets would be added to UIKit's (its scroller is drawn
+    /// on under the bars by its band instead, `controlBands`), though not a
     /// sheet's route, which is covered for the sheet's whole safe area
     /// whatever the document's fit (`reportCovers`); and so does a
     /// transparent bar's scroller, which UIKit insets nothing (`collapse`).
@@ -1022,7 +1052,8 @@ extension NavigationHost {
         let peers = arrangementScrollers(in: c, top: false)
         let peer = contentScroller(of: c).flatMap { node in peers.contains(where: { $0 === node }) ? node : nil } ?? peers.first
         let found = presented || presenter.viewportFit != "cover" ? (Self.bottomScroller(in: c.node, cover: c.bottomClearance) ?? peer) : nil
-        let target = found === c.collapseScroll && Self.transparentBar(c.node) ? nil : found
+        // Nor one the route opts out of the bottom clearance of (LLP 1123 D4).
+        let target = found === c.collapseScroll && Self.insetsNoTop(c.node) || Self.clearanceOff(c.node) & 4 != 0 ? nil : found
         let projects = !c.nativeContentScrollEdges.contains(.bottom)
         guard c.edgeScroll !== target || (projects && c.contentScrollView(for: .bottom) !== c.automaticBottomScroll) else { return }
         if let old = c.edgeScroll, old !== target, let sv = old.scrollView, old !== c.collapseScroll, !arrangementInsets(sv, in: c) { sv.contentInsetAdjustmentBehavior = .never }
@@ -1101,9 +1132,12 @@ extension NavigationHost {
     /// The physical backend owned by a content node.
     func shownScroll(_ node: NodeView?) -> UIScrollView? { node?.scrollView }
 
-    /// UIKit insets the route's collapse scroller, bottom-edge scroller and arranged peers
+    /// Exact's inset policy, including arranged peers whose geometry awaits the next sync.
     func insetByUIKit(_ node: NodeView) -> Bool {
-        controllers.values.contains { $0.collapseScroll === node || $0.edgeScroll === node || arrangementPeers(in: $0).contains { $0 === node } }
+        #if os(iOS)
+        if #available(iOS 27.1, *), presenter.arrangements.insets(node) { return true }
+        #endif
+        return controllers.values.contains { $0.collapseScroll === node || $0.edgeScroll === node }
     }
 
     /// UIKit's zero-width fixed space splits shared glass without authored metrics.
@@ -1212,6 +1246,7 @@ extension NavigationHost {
         item.accessibilityLabel = i.label ?? (i.title.isEmpty ? nil : i.title)
         item.accessibilityIdentifier = i.testId
         item.isEnabled = !i.disabled
+        if i.menu { item.preferredMenuElementOrder = MenuHost.order(i.menuOrder) }
         if i.disabled || i.accessibilityDisabled { item.accessibilityTraits.insert(.notEnabled) }
         else { item.accessibilityTraits.remove(.notEnabled) }
         // The authored `color` of a plain item's face; a prominent item's

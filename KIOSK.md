@@ -79,9 +79,9 @@ setup. The Linux and Ink suites cover the affected renderer and host paths:
 
 ```sh
 cargo test --locked -p exact-linux --lib kiosk
-cargo test --locked -p exact-linux --lib ink::
+cargo test --locked -p exact-painted --lib ink::
 cargo test --locked -p exact-ink --lib
-cargo clippy --locked -p exact-linux -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings
+cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings
 ```
 
 Run `bun scripts/affected.mjs` for the full affected suite list. Compare rendered

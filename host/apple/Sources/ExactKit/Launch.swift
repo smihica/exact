@@ -3,6 +3,7 @@
 //   launch time = (constructor − process start) + (didFinishLaunching − delegate init)
 //   time to first render = first vsync after the first tree's commit − didFinishLaunching
 // Time to first render assumes the render server shows a commit at the next vsync.
+import CExact
 import CExactLaunch
 import Foundation
 import QuartzCore
@@ -16,7 +17,7 @@ public final class ExactLaunch: NSObject {
     public static let shared = ExactLaunch()
 
     public enum Mark: String, CaseIterable {
-        case process, constructor, main, delegateInit, didFinishLaunching, scene, boot, commit, present, activated, interactive
+        case process, constructor, main, delegateInit, didFinishLaunching, scene, boot, commit, present, world, activated, interactive
     }
 
     let facts = exact_launch_constructor_facts()
@@ -79,13 +80,27 @@ public final class ExactLaunch: NSObject {
     /// constructor and here is every other image's initializers.
     public func main() {
         if marks[.main] == nil { marks[.main] = CACurrentMediaTime() }
+        // The app's preloads leave now, before UIKit. iOS prewarming runs this
+        // long before a person opens the app, and then they wait (LLP 1162.000 D4).
+        exact_preloads_begin(facts.prewarm != 0 ? 1 : 0)
     }
 
     /// Called from the app delegate's init, inside `UIApplicationMain` and after
     /// any prewarm pause. Observe calls this mark "main".
     public func delegateInit() {
         if marks[.delegateInit] == nil { marks[.delegateInit] = CACurrentMediaTime() }
+        // The first code of a prewarmed process's real launch: what `main` deferred leaves here.
+        exact_preloads_launched()
     }
+
+    /// A person has opened the app: the preloads that wait for that leave
+    /// (`"when": "foreground"`, LLP 1162.000 D4). On iOS this is the scene
+    /// entering the foreground: a background start can connect a scene that is
+    /// never drawn.
+    public func opened() { exact_preloads_opened() }
+
+    /// macOS has no prewarming: its `main` begins the preloads.
+    public static func beginPreloads() { exact_preloads_begin(0) }
 
     /// Called as `didFinishLaunching` returns, after the session is made.
     /// `hidden` means macOS launched the app hidden, as a login item does.
@@ -190,9 +205,9 @@ public final class ExactLaunch: NSObject {
         scheduleEvaluate()
     }
 
-    /// Records a batch that changed the screen (one with ops).
-    func applied(_ session: ExactSession, _ batch: Batch) {
-        guard session === launchSession, ttiOutcome == nil, !batch.ops.isEmpty else { return }
+    /// Records a batch that changed the screen, including an orientation change the presenter resolved.
+    func applied(_ session: ExactSession, _ batch: Batch, orientationChanged: Bool = false) {
+        guard session === launchSession, ttiOutcome == nil, batch.changesScreen || orientationChanged else { return }
         // Nothing outstanding, but the screen still changing: TTI waits for
         // a frame with no change, so this is what holds it then (a fresh
         // answer replacing a kept one, a fade). Its span: first to last.
@@ -208,8 +223,9 @@ public final class ExactLaunch: NSObject {
     }
 
     /// A batch's op kinds and a few of the views it touched (test ID, else
-    /// kind), for the TTI trace.
+    /// kind), or what it changed with no ops, for the TTI trace.
     private static func summary(_ batch: Batch, _ presenter: Presenter) -> String {
+        if batch.ops.isEmpty { return [batch.controls ? "controls" : nil, batch.facts ? "facts" : nil, batch.orientation != nil ? "orientation" : nil].compactMap { $0 }.joined(separator: " ") }
         var kinds: [String: Int] = [:], names: [String] = []
         for op in batch.ops {
             kinds[op.op.rawValue, default: 0] += 1
@@ -234,6 +250,22 @@ public final class ExactLaunch: NSObject {
         resolvePresent()
     }
 
+    private var firstWorldPresentation: Double?
+
+    /// Keep the first gpu_on_presented notice until the tree presents, so the
+    /// present → world → interactive marks cannot date the world before first pixel.
+    public func worldPresented() {
+        guard launchSession != nil, firstWorldPresentation == nil else { return }
+        firstWorldPresentation = CACurrentMediaTime()
+        resolveWorldPresentation()
+    }
+
+    private func resolveWorldPresentation() {
+        guard marks[.world] == nil, let at = firstWorldPresentation,
+              let present = marks[.present] else { return }
+        marks[.world] = max(at, present)
+    }
+
     @objc private func tick(_ link: CADisplayLink) { frame(Vsync(link)) }
 
     /// A display-link callback's sample (a test's own, as its timestamps are read-only).
@@ -250,6 +282,7 @@ public final class ExactLaunch: NSObject {
     private func resolvePresent() {
         guard let commit = marks[.commit], marks[.present] == nil, let present = vsync?.next(after: commit) else { return }
         marks[.present] = present
+        resolveWorldPresentation()
         loadServices(.afterFirstPixel)
         if ttiOutcome != nil || suppressed != nil || ExactEnv.agentMode { loadServices(.afterStartup) }
         scheduleEvaluate()
@@ -279,7 +312,9 @@ public final class ExactLaunch: NSObject {
     /// `kind:name` items, plus failed resources and whether the runner is
     /// poisoned. Nil when there is none to read: a destroyed session, or a
     /// runner that answers with an error (busy, gone), whose missing lists
-    /// would otherwise read as nothing outstanding.
+    /// would otherwise read as nothing outstanding. The runner's call comes
+    /// first and waits for the owner, so work sent there before it has
+    /// published its batch when `hostOutstanding` reads the published queue.
     static func ledger(_ session: ExactSession) -> (items: [String], failed: [String], poisoned: Bool)? {
         guard session.state != .destroyed, let data = session.agent("{\"op\":\"outstanding\"}").data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any], o["error"] == nil else { return nil }
@@ -463,6 +498,8 @@ public final class ExactLaunch: NSObject {
             }
         }
         if !NavigationMarks.shared.recent.isEmpty { out["navigation"] = NavigationMarks.shared.recent }
+        let preloads = preloadMarks()
+        if !preloads.isEmpty { out["preloads"] = preloads }
         if let session { out["launchSession"] = session === launchSession }
         if facts.traced != 0 { out["debugger"] = true }
         if let p = marks[.process] {
@@ -470,6 +507,30 @@ public final class ExactLaunch: NSObject {
         }
         out["metrics"] = metrics()
         return out
+    }
+
+    /// Each preload's marks in ms from process start (from the delegate's
+    /// initializer on a prewarmed launch, whose process start is the prewarm):
+    /// handed to the client, reply complete, and the commit that first carried
+    /// its content, with that commit's place after the first (LLP 1162.000 D4).
+    func preloadMarks() -> [[String: Any]] {
+        let origin = facts.prewarm != 0 ? marks[.delegateInit] : marks[.process]
+        guard let origin else { return [] }
+        let ms = { (t: Double) in ((t - origin) * 1000 * 10).rounded() / 10 }
+        return (0..<exact_preloads_count()).map { index in
+            let mark = exact_preloads_mark(index)
+            var bytes = [UInt8](repeating: 0, count: exact_preloads_name(index, nil, 0))
+            _ = exact_preloads_name(index, &bytes, bytes.count)
+            var row: [String: Any] = ["name": String(decoding: bytes, as: UTF8.self)]
+            if mark.handed > 0 { row["handed"] = ms(mark.handed) }
+            if mark.completed > 0 { row["completed"] = ms(mark.completed) }
+            if mark.committed > 0 {
+                row["committed"] = ms(mark.committed)
+                row["sequence"] = mark.sequence
+                if let first = marks[.commit] { row["afterFirstCommit"] = ((mark.committed - first) * 1000 * 10).rounded() / 10 }
+            }
+            return row
+        }
     }
 
     func metrics() -> [String: Double] {
@@ -492,7 +553,13 @@ extension ExactLaunch {
         let marks = self.marks[.process].map { p in
             Mark.allCases.compactMap { m in self.marks[m].map { "\(m.rawValue) \(String(format: "%.1f", ($0 - p) * 1000))" } }.joined(separator: " · ")
         } ?? ""
-        return "\(launchType ?? "?") \(bootPath ?? "?") tti \(ttiOutcome ?? "pending")\(lastOutstanding.isEmpty ? "" : " outstanding \(lastOutstanding)") \(suppressed.map { "suppressed: \($0) " } ?? "")activation \(activation); \(metrics.isEmpty ? "no metrics" : metrics); marks \(marks); ledger \(trace.joined(separator: " → "))"
+        let line = "\(launchType ?? "?") \(bootPath ?? "?") tti \(ttiOutcome ?? "pending")\(lastOutstanding.isEmpty ? "" : " outstanding \(lastOutstanding)") \(suppressed.map { "suppressed: \($0) " } ?? "")activation \(activation); \(metrics.isEmpty ? "no metrics" : metrics); marks \(marks); ledger \(trace.joined(separator: " → "))"
+        // Each preload: handed to the client, reply complete, the commit that carried it (LLP 1162.000 D4).
+        let preloads = preloadMarks().map { row -> String in
+            let part = { (key: String) in (row[key] as? Double).map { " \(key) \(String(format: "%.1f", $0))" } ?? "" }
+            return " · preload \(row["name"] as? String ?? "?")" + part("handed") + part("completed") + part("committed") + part("afterFirstCommit")
+        }.joined()
+        return line + preloads
     }
 }
 

@@ -105,7 +105,12 @@ typealias NativeImage = UIImage
 private typealias NativeEventFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, UnsafePointer<UInt8>?, UInt32) -> Void
 private typealias NativeReplyFn = @convention(c) (UnsafeMutableRawPointer?, UInt32, UInt32, UInt32, UnsafePointer<UInt8>?, UInt32) -> Void
 
-private struct NativeFailure: Error { let state: String; let message: String }
+private struct NativeFailure: Error {
+    let state: String, message: String
+    /// The loader refused a file that is there: the build is broken (a
+    /// library it links is not in the bundle), not skewed (LLP 1024 D8.3).
+    var unloadable = false
+}
 
 /// The loaded table: the roster and the entries, read once.
 private final class NativeTable {
@@ -187,7 +192,7 @@ private final class NativeTable {
             return .failure(NativeFailure(state: "unavailable", message: "no module artifact at \(path)"))
         }
         guard let library = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
-            return .failure(NativeFailure(state: "unavailable", message: "dlopen \(path): \(String(cString: dlerror()))"))
+            return .failure(NativeFailure(state: "unavailable", message: "dlopen \(path): \(String(cString: dlerror()))", unloadable: true))
         }
         // Never dlclosed, even on refusal: nothing in v1 unloads (D5).
         guard let entry = dlsym(library, "exact_native_abi"),
@@ -441,7 +446,6 @@ final class NativeViews {
     fileprivate var observers: [NSObjectProtocol] = []
     deinit {
         for o in observers { NotificationCenter.default.removeObserver(o) }
-        if let crumbSlot { HatchBreadcrumb.shared?.free(crumbSlot) }
     }
     #endif
     private static let kinds = ["press", "change", "hover", "focus", "blur", "key", "submit", "load", "message"]
@@ -584,11 +588,7 @@ final class NativeViews {
         if let instance { return .success(instance) }
         if let instanceFailure { return .failure(instanceFailure) }
         guard let session else { return .failure(NativeFailure(state: "unavailable", message: "the session ended")) }
-        let roots = NativeViews.roots(session: session)
-        // Who posts what an activation is for (LLP 1133.004 D7), as the host's delegate matches it.
-        let context: [String: Any] = ["agent": ExactEnv.agentMode, "data": roots.data, "cache": roots.cache, "temporary": roots.temporary,
-                                      "session": session.label, "owner": session.notificationOwnerID, "process": session.app.notificationProcessID]
-        let json = (try? JSONSerialization.data(withJSONObject: context)) ?? Data()
+        let json = (try? JSONSerialization.data(withJSONObject: Self.moduleContext(session))) ?? Data()
         var error = [UInt8](repeating: 0, count: 512)
         let host = UnsafeMutableRawPointer(bitPattern: UInt(session.runtime.rt))
         let made = json.withUnsafeBytes { j in
@@ -660,6 +660,16 @@ final class NativeViews {
         return (home + "/Library/Application Support/exact/" + id + "/data", cache + "/cache", cache + "/temporary")
     }
 
+    /// What the session's module is made with (`ExactModuleContext`), which
+    /// each package's context reads: the roots, the session's label, and who
+    /// posts what an activation is for (LLP 1133.004 D7), as the host's
+    /// delegate matches it.
+    static func moduleContext(_ session: ExactSession) -> [String: Any] {
+        let roots = roots(session: session)
+        return ["agent": ExactEnv.agentMode, "data": roots.data, "cache": roots.cache, "temporary": roots.temporary,
+                "session": session.label, "owner": session.notificationOwnerID, "process": session.app.notificationProcessID]
+    }
+
     /// Tell the runtime this session has an app module, when the app ships
     /// an artifact: `native` is then available to its sources, and their long
     /// calls come here. Nothing loads until one arrives or a view needs it.
@@ -673,6 +683,16 @@ final class NativeViews {
     }
 
     var hasAppModule = false
+
+    /// Why the loader refused the artifact the app ships (`dlopen`'s error
+    /// names the library it could not find), or nil. Loads it if nothing
+    /// has. A drive refuses such an app, whose every native call would
+    /// answer `unavailable`; a missing or skewed artifact is LLP 1024 D8.3's
+    /// failure family, which the app runs with.
+    func artifactFailure() -> String? {
+        guard hasAppModule, case .failure(let failure) = table(), failure.unloadable else { return nil }
+        return "the app's native module artifact did not load: \(failure.message)"
+    }
 
     /// After first pixel, before data activates: load the artifact and make
     /// the session's instance, so the first `native.call` pays for neither.
@@ -792,6 +812,8 @@ final class NativeViews {
         endScopes()
         hatchClock.reset()
         pendingHatches = nil
+        // The session's end gives its breadcrumb slot back (LLP 1075.003.000.001 §4.4).
+        if let crumbSlot { HatchBreadcrumb.shared?.free(crumbSlot); self.crumbSlot = nil }
         guard let instance, case .success(let table)? = NativeProcess.table else { return }
         self.instance = nil
         hatchesConnected = false
@@ -1290,33 +1312,9 @@ final class NativeViews {
     }
 }
 
-extension NodeView {
-    /// The embedded platform content a node's kind brings: an iframe's web
-    /// view (LLP 1020 D3) or a native module's box (LLP 1024 D2).
-    func embedPlatformView(_ presenter: Presenter) {
-        if kind == "native" { presenter.session?.natives.create(owner: self); return }
-        guard kind == "iframe", let w = presenter.session?.webviews.create(owner: self) else { return }
-        w.frame = bounds
-        #if os(macOS)
-        w.autoresizingMask = [.width, .height]
-        w.wantsLayer = true
-        #else
-        w.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        #endif
-        w.isHidden = cssVisibilityHidden
-        addSubview(w)
-        web = w
-    }
-
-    func updateEmbedded() {
-        if kind == "iframe" { presenter?.session?.webviews.update(self) }
-        if kind == "native" { presenter?.session?.natives.update(self) }
-    }
-
-    func destroyEmbedded() {
-        presenter?.session?.webviews.destroy(id: id)
-        presenter?.session?.natives.destroy(id: id)
-    }
+extension ExactSession {
+    /// For a drive's ready line: `NativeViews.artifactFailure()`.
+    public var nativeArtifactFailure: String? { natives.artifactFailure() }
 }
 
 #if os(iOS) || os(tvOS)

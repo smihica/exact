@@ -397,13 +397,15 @@ pub(crate) fn container(
     let s = arena.style(slot);
     let l = tree.layout(node);
     let (p, b) = (l.padding, l.border);
-    let (x0, y0) = (p.left + b.left, p.top + b.top);
-    let inset_v = p.top + p.bottom + b.top + b.bottom;
+    let rtl = arena.computed_style(slot, StyleMask::INHERITED).direction == Direction::Rtl;
+    let gutter_left = if rtl { l.scrollbar_size.width } else { 0.0 };
+    let (x0, y0) = (p.left + b.left + gutter_left, p.top + b.top);
+    // The block axis outside the content box: padding, borders and a bottom gutter
+    let inset_v = p.top + p.bottom + b.top + b.bottom + l.scrollbar_size.height;
     let u = (l.size.width - p.left - p.right - b.left - b.right - l.scrollbar_size.width).max(0.0);
     let (n, w) = m.columns(u);
     let n = n as usize;
     let gap = m.gap;
-    let rtl = arena.computed_style(slot, StyleMask::INHERITED).direction == Direction::Rtl;
     let left = |k: usize| {
         let at = k as f32 * (w + gap);
         if rtl {
@@ -424,8 +426,8 @@ pub(crate) fn container(
     // patch 30): only layout knows whether a percentage had a definite basis
     let (min_outer, max_outer) = tree.multicol_bounds(node);
     let definite = s.height != Dimension::Auto;
-    let max = max_outer.map(|v| (v - inset_v - l.scrollbar_size.height).max(0.0));
-    let content = (l.size.height - inset_v - l.scrollbar_size.height).max(0.0);
+    let max = max_outer.map(|v| (v - inset_v).max(0.0));
+    let content = (l.size.height - inset_v).max(0.0);
     let (h, walk, used) = match (definite, max, s.column_fill) {
         (true, _, ColumnFill::Auto) => {
             // As tall as the content while it fits one column, as Chrome
@@ -481,7 +483,7 @@ pub(crate) fn container(
     };
     let height = match used {
         Some(columns) => {
-            let mut outer = columns + inset_v + l.scrollbar_size.height;
+            let mut outer = columns + inset_v;
             if let Some(v) = max_outer {
                 outer = outer.min(v);
             }
@@ -492,7 +494,7 @@ pub(crate) fn container(
         }
         None => l.size.height,
     };
-    let free = height - inset_v - l.scrollbar_size.height - h;
+    let free = height - inset_v - h;
     let align = align(arena.effective_style(slot).align_content, free);
     let pitch = match (definite, s.column_fill) {
         (true, ColumnFill::Auto) => content,
@@ -503,7 +505,8 @@ pub(crate) fn container(
         &walk,
         Geometry {
             x0,
-            y0: y0 + align,
+            y0,
+            align,
             w,
             h,
             pitch,
@@ -568,6 +571,7 @@ fn align(v: AlignContent, free: f32) -> f32 {
 struct Geometry<'a> {
     x0: f32,
     y0: f32,
+    align: f32,
     w: f32,
     h: f32,
     /// The column height the walk broke at, which an absolutely positioned
@@ -609,7 +613,8 @@ fn publish(
     };
     let flow = &cutter.flow;
     let cols = walk.starts.len();
-    let shift = |k: usize| ((g.left)(k), g.y0 - walk.starts[k].1);
+    let aligned_y = g.y0 + g.align;
+    let shift = |k: usize| ((g.left)(k), aligned_y - walk.starts[k].1);
     let mut right = 0f32;
     let mut bottom = 0f32;
     let mut leftmost = 0f32;
@@ -621,7 +626,7 @@ fn publish(
     for k in 0..cols.max(g.n) {
         let column = Column {
             x: g.x0 + (g.left)(k),
-            y: g.y0,
+            y: aligned_y,
             width: g.w,
             height: g.h,
             holds: k < cols,
@@ -654,7 +659,7 @@ fn publish(
                 let (dx, dy) = shift(k);
                 Fragment {
                     x: g.x0 + (g.left)(k),
-                    y: g.y0,
+                    y: aligned_y,
                     width: g.w,
                     height: g.h,
                     lines: range(0, k),
@@ -731,17 +736,24 @@ fn publish(
         cut.fragments.push((b.slot, frags));
     }
     // D10.4: an absolutely positioned box takes the column holding its own
-    // flow-thread top, past the content's last column too.
+    // flow-thread top, past the content's last column too. Chrome adds the
+    // columns' alignment to that top first, and places the box as far below
+    // its column's top as the sum lies past the column's start, so
+    // `align-content: end` can carry a box several columns on. With
+    // `column-fill: auto` at a definite height, Chrome's columns are the
+    // content box, and the alignment moves the content inside them.
+    let column_top = if g.pitch > g.h { g.y0 } else { aligned_y };
     for a in &flow.absolutes {
         let (dx, dy) = if a.in_flow && cols > 0 {
-            let mut k = walk.starts.partition_point(|(_, s)| *s <= a.top).max(1) - 1;
+            let top = a.top + g.align;
+            let mut k = walk.starts.partition_point(|(_, s)| *s <= top).max(1) - 1;
             let mut s = walk.starts[k].1;
-            if k + 1 == cols && g.pitch > 0.0 && a.top >= s + g.pitch {
-                let more = ((a.top - s) / g.pitch).floor();
+            if k + 1 == cols && g.pitch > 0.0 && top >= s + g.pitch {
+                let more = ((top - s) / g.pitch).floor();
                 k += more as usize;
                 s += more * g.pitch;
             }
-            ((g.left)(k), g.y0 - s)
+            ((g.left)(k), column_top + g.align - s)
         } else {
             (0.0, 0.0)
         };
@@ -751,7 +763,7 @@ fn publish(
         }
         // Its column is part of the overflow too, as in Chrome.
         if a.in_flow && cols > 0 {
-            extend(g.x0 + dx, g.y0, g.w, g.pitch);
+            extend(g.x0 + dx, column_top, g.w, g.pitch);
         }
         cut.placements
             .push((a.slot, Placement { dx, dy, size: None }));
