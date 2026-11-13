@@ -477,11 +477,8 @@ This list holds what the [agent guide](contract-for-agents.md)'s rules don't mak
   the scroller right after the route's `header`. Fix: a `scroll flex=1 min-height=0`
   right after the `header`. It is the bar's scroller with nothing written, and
   `navigationScroll="id"` on the route names a different one
-  (docs/contract-for-agents.md, "Routes and web documents"). A pushed route whose
-  content is a plain `list` (its rows built in slices) still opens its large title
-  collapsed (issues/20261112-pushed-screen-large-title-bar-is-54-points.md).
-  The compiler refuses a name nothing in the
-  route carries, or one on a box that never scrolls (`lower-route-scroll`). **Candidate diagnostics:** the
+  (docs/contract-for-agents.md, "Routes and web documents"). The compiler refuses
+  a name nothing in the route carries, or one on a box that never scrolls (`lower-route-scroll`). **Candidate diagnostics:** the
   compiler could refuse a named scroller that is not right after the `header` (an
   iOS-only rule today, so not refused); the hosts could journal a route whose
   content overflows with nothing to scroll it (QUEUE.md).

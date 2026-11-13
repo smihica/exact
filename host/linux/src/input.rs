@@ -492,8 +492,7 @@ impl Input {
                         let code = code.0;
                         let down = value != 0;
                         match code {
-                            // BTN_LEFT (a mouse) and BTN_TOUCH (a
-                            // touchscreen). Both are a primary press.
+                            // Keep mouse and touchscreen presses distinct for the shell.
                             0x110 => out.push(InputEvent::Button(down)),
                             0x14a => out.push(InputEvent::TouchButton(down)),
                             // BTN_RIGHT, BTN_MIDDLE.

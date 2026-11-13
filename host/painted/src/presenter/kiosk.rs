@@ -43,8 +43,9 @@ impl<D: DataSource> Presenter<D> {
     /// Hand a DRM connector to the Ink painter for direct presentation.
     ///
     /// # Safety
-    /// The caller owns DRM master and keeps `fd` open while this presenter lives.
-    /// It must stop submitting and reading display events on that descriptor.
+    /// `fd` is the DRM master of the card that scans out `connector` and stays
+    /// open while this presenter lives. The caller stops submitting frames and
+    /// reading display events on it, including when this call returns an error.
     #[cfg(all(feature = "scanout", target_os = "linux"))]
     #[allow(unsafe_code)]
     pub unsafe fn kiosk_attach_scanout(

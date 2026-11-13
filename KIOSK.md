@@ -43,7 +43,7 @@ Camera capture runs while an image using `kiosk-camera:preview` is mounted.
 The probe reads tightly packed 640×480 YUV420 at 30fps, converts it to RGBA,
 then rotates it clockwise into a 480×640 preview. It is a fixed Pi capture
 path, not a Linux implementation of the cross-platform camera package.
-`image::kiosk_camera::frames()` lets an app analyze the same stream, for example
+`exact_painted::image::kiosk_camera::frames()` lets an app analyze the same stream, for example
 for QR recognition. Each subscriber has one queued unrotated luminance frame;
 a slow reader drops incoming frames, and dropping the receiver unsubscribes.
 Subscriptions do not start capture or change preview ownership.
@@ -51,10 +51,12 @@ Subscriptions do not start capture or change preview ownership.
 ## Limits to retain during integration
 
 - Cursor hiding currently classifies BTN_TOUCH devices together, including
-  pen tablets and touchpads. A mouse cursor appears after its first motion.
+  pen tablets. Touchpads use upstream relative motion handling. A mouse cursor
+  appears after its first motion.
   The shell does not yet forward the device's pointer kind to the presenter.
 - Touch scrolling uses immediate scroll updates rather than the reader's
-  drag lifecycle; scroll-drag events and reader completion are not wired.
+  drag lifecycle; scroll-drag events, reader completion and pull-to-refresh
+  are not wired.
   It is single-finger and vertical. It is not a general gesture
   recognizer for every Linux input device or nested scroll hierarchy.
 - Shadow textures share a 16 MiB non-evicting budget. Animated dimensions,
@@ -79,6 +81,7 @@ setup. The Linux and Ink suites cover the affected renderer and host paths:
 
 ```sh
 cargo test --locked -p exact-linux --lib kiosk
+cargo test --locked -p exact-painted --lib kiosk
 cargo test --locked -p exact-painted --lib ink::
 cargo test --locked -p exact-ink --lib
 cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings

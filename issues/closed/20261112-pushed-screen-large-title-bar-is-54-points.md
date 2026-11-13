@@ -1,6 +1,7 @@
 # On iOS 27 a pushed screen's large-title bar is 54 points tall; PushedTitleIOSTests fails 6 of 13
 
-**Status:** Open
+**Status:** Closed
+**Resolution:** A header lifted in a batch now holds every stack change until the runtime's answer to its cover is applied, however many syncs the batch runs, and a route scroller's clearance no longer counts the top cover it is giving up, so all 13 PushedTitleIOSTests pass on iOS 27.0.
 **Systems:** host/apple UIKit presenter (navigation bar, large titles), host/apple/tests/ExactKitTests/PushedTitleIOSTests.swift
 **Severity:** P3
 **Author:** Claude (found while verifying docs/agent-pitfalls.md)
@@ -41,3 +42,24 @@ of the 13 pass. What is left: in
 route (a plain list whose rows are built in slices) still arrives at 54 points.
 Waiting for the session to be idle (`Session.whenIdle`, which holds the covers'
 answer while a slice is in flight) before the held sync did not change it.
+
+## Fixed (2026-11-13)
+
+Two causes, both Exact's; the tests were right (a hand-built push arrives at
+106 points, above).
+
+- The `plain` route: its batch synced twice. The first sync lifted the
+  header and held the push; the second found the header already lifted and
+  gave UIKit the stack with the list still 49 points down (UIKit's inset
+  67). A lift in a batch now holds every stack change (`liftHeld`) until
+  just before the runtime's answer to its cover is applied, in the
+  session's order of answers (a slice in flight first), so the answer's
+  sync pushes; one the answer did not sync is pushed after it
+  (`liftAnswered`). Pushing from an empty sync after the answer instead
+  left a pushed route's bottom cover unreported
+  (`NavigationBasicsIOSTests`).
+- `testATabSwitchAContentSwapAndAReplaceKeepIt` (168 where 0), since
+  `53d567920`: when the reason above `swap-first` went, the scroller's
+  clearance (`clearanceExtra`) was measured while it still sat below the
+  route's top cover, so it added 168 points to UIKit's own 168. Clearance now
+  leaves out the top cover last reported.

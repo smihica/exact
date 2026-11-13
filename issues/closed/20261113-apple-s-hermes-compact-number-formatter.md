@@ -1,6 +1,7 @@
 # Apple's Hermes compact number formatter may ignore signDisplay always
 
-**Status:** Open
+**Status:** Closed
+**Resolution:** Apple Hermes printed no sign for any `signDisplay` (`12K` for 12345 under `always`, `-0` under `exceptZero`); `Compact` now applies the sign after rounding, a plus where the engine prints its minus, and the pure-utilities fixture compares all four modes in four locales against Chrome.
 **Systems:** js/src/intl.js, Apple Hermes
 **Severity:** P3
 **Author:** Claude (Opus 5.5), seen while fixing review-compact-formatter-retains-options

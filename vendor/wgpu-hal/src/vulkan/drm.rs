@@ -192,7 +192,7 @@ impl super::Instance {
         let acquire_drm_display_instance =
             ext::acquire_drm_display::Instance::new(&self.shared.entry, &self.shared.raw);
 
-        // EXACT (EXACT-PATCHES.md, 15): a split render/display SoC reports
+        // EXACT (EXACT-PATCHES.md, 18): a split render/display SoC reports
         // only the render card's nodes, so the display card's fd matches no device
         // above. Take the device that knows the connector on this fd instead.
         let physical_device = physical_device.or_else(|| {

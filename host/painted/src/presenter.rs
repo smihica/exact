@@ -15,7 +15,7 @@ use crate::host::{Host, HostError, PlanBytes};
 use crate::image::AssetResolver;
 use crate::image::{Assets, Images};
 use crate::paint::{
-    Backend, Frame, PaintedBox, Painter, Rect4, Scene, content_size, effective_overflow,
+    content_size, effective_overflow, Backend, Frame, PaintedBox, Painter, Rect4, Scene,
 };
 use crate::raster::Raster;
 use crate::text::{Measurer, Shared, TextEngine};
@@ -158,19 +158,19 @@ mod swipe_tests;
 #[cfg(test)]
 mod visibility_tests;
 
-pub use clock::{Wall, wall_since};
-pub use device::{Device, Pointing, touch_only};
+pub use clock::{wall_since, Wall};
+pub use device::{touch_only, Device, Pointing};
 pub use hosted::action as field_action;
+use painter::cpu_info;
 pub(crate) use painter::PainterBoot;
 #[cfg(target_os = "macos")]
 pub use painter::SubmittedAppleFrame;
-use painter::cpu_info;
-pub use painter::{PainterChoice, PainterFactory, PainterInfo, set_custom_painter};
+pub use painter::{set_custom_painter, PainterChoice, PainterFactory, PainterInfo};
 pub(crate) use palette::reported_accent;
-pub use palette::{ContrastPalette, MATERIAL_ROLES, Material, Palette, material};
+pub use palette::{material, ContrastPalette, Material, Palette, MATERIAL_ROLES};
 pub use pointer::PointerKind;
 pub use requests::{Haptic, Pick, Request};
-pub use scrollers::{PAGE, Scroller, Under};
+pub use scrollers::{Scroller, Under, PAGE};
 pub use stage::SHEET_HANDLE;
 pub use window::{Chrome, Window};
 

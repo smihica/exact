@@ -1,7 +1,6 @@
 # Kiosk changes and upstream assessment
 
-Snapshot: 2026-11-12, `kiosk` at
-[`95085e29`](https://github.com/smihica/exact/commit/95085e29f6350003d25f4d26185aeeccc30a856d).
+Updated 2026-11-13: `kiosk` integrates upstream `221e551bf`, including `8c742e6a9`.
 This fork evaluates Exact on a Raspberry Pi 4 touchscreen kiosk, using Ink and
 DRM/KMS without a desktop environment. The aim is responsive UI, camera preview
 and touch scrolling on a small GPU. The changes are experiments with measured
@@ -18,7 +17,7 @@ upstream. The assessments are the fork's, not acceptance decisions by Exact's ma
 | [Shader specialization](../host/ink/src/device/wgpu.rs) | Compile a wgpu pipeline per primitive, brush and flag class to reduce register pressure. | High: the V3D measurements show a large benefit. | Bound the program count and first-use cost; measure other GPUs and draw-call overhead. A small fixed set built with the device, or a V3D-specific approach, is worth evaluating. The current implementation affects every host selecting Ink's wgpu device. |
 | [Direct output](../host/ink/src/device/wgpu/scanout.rs) | Present through a Vulkan DRM surface instead of reading every frame back to the CPU. | Very high: this follows the [Linux host's stated direction](../host/linux/src/display.rs). | Select it when available with an appropriate fallback; preserve pixel capture/VNC semantics and investigate the three presents currently used when attaching the display. The current [finish path](../host/painted/src/ink.rs) presents even for a pixel-only request on an attached painter. |
 | [GPU rotation](../host/ink/src/device/wgpu/scanout.rs) | Rotate the final image for a portrait panel; [input mapping](../host/linux/src/display/kiosk.rs) follows the orientation. | High for sideways-mounted kiosk panels. | Define a host orientation setting and consistent display/input coordinates. The current probe's fixed turn is not a complete orientation API. |
-| [GPU limits](../host/ink/src/device/wgpu.rs) | Request the adapter's supported limits in Ink and [Linux Vello](../host/painted/src/gpu.rs). | Very high: without the adjustment, device creation fails on Pi 4. | Use the existing [`requested_limits`](../gpu/src/device.rs) approach to choose what the renderer needs, rather than requesting every adapter maximum. |
+| [GPU limits](../host/ink/src/device/wgpu.rs) | Use upstream `requested_limits` in Ink and [Vello](../host/painted/src/gpu.rs); clamp defaults to adapter capacities and validate renderer requirements. | Already incorporated upstream in `44395c82`. | Confirmed on Pi 4 with Ink/Vulkan, Ink/GLES and Vello/Vulkan; the fork uses the upstream implementation. |
 | [Split render/display devices](../vendor/wgpu-hal/src/vulkan/drm.rs) | Match the Pi's display connector to a different rendering device. | High beyond the Pi; also relevant to gfx-rs/wgpu. | Keep the dependency fix separate, verify device selection on other configurations and preserve the [vendor patch record](../vendor/wgpu-hal/EXACT-PATCHES.md). |
 | [Shadow cache](../host/painted/src/ink/shadows.rs) | Raster eligible fixed geometry once, then reuse alpha with live position, color and opacity. | High: useful for repeated cards and moving dialogs. | Evaluate cache lifetime, changing geometry, allocation failure and first-use work. The current cache has a 16 MiB non-evicting budget and falls back to analytic drawing for uncached geometry after the budget is exhausted. |
 | [Outer shadow bands](../host/painted/src/ink/shadows.rs) | Draw the visible bands around the excluded border box. A separate [shader shortcut](../host/ink/shaders/ink.wgsl) skips zero clip coverage for cached shadows, even when bands are disabled. | Useful: reduces the area drawn for outer shadows. | Fix the extra combined-mask work with nested rounded clips or fractional rectangular clips, then measure broader scenes. |
@@ -103,7 +102,7 @@ inherited-layout case and a runner incremental case also failed on clean upstrea
 runs and occurred on the clean baseline too. These results describe the pinned
 integration revision; see [KIOSK.md](../KIOSK.md) for check commands.
 
-## Continuing from this snapshot
+## Initial integration (2026-11-12)
 
 - Original experiment base: `fe4632ed1800ce58f3bcfa880e95f834395d77d9`.
 - Pre-merge feature stack: `f90ba38adc9088a6e412e1b522fa547a20660e7b`.
@@ -121,10 +120,51 @@ git diff upstream/main...kiosk
 ```
 
 The three-dot comparison starts at the common ancestor and excludes upstream
-commits not yet integrated into `kiosk`. At this snapshot the fork delta is
+commits not yet integrated into `kiosk`. At the initial snapshot the fork delta was
 34 files, +2,365/-127 lines, before adding this memo.
 
 A useful next report would pair the shadow-cache and outer-band results with a
 small public list fixture. One hypothesis for the main-merge regression is the
 change to `shape_coverage` guards. Compare the old and upstream guards with the
 host and fixture held constant to isolate that effect before drawing a conclusion.
+
+## Main integration (2026-11-13)
+
+The painted host is now `exact-painted`; Linux owns KMS, input and the display
+loop. Renderer, camera and presenter experiments follow that extraction.
+`presenter/kiosk.rs` exposes the display and gesture operations the Linux shell
+needs without exposing the painter. A replaced tree clears visual overscroll.
+The split-device wgpu-hal patch is numbered 18 after upstream's new vendor patches.
+
+Upstream `44395c82` creates the device and renders correctly on Pi 4 for
+Ink/Vulkan, Ink/GLES and Vello/Vulkan, with an unmodified SDK. The requested
+[confirmation is posted in #145](https://github.com/expo/exact/issues/145#issuecomment-6860673503).
+
+The integration was compared with `aa881225c` on Pi 4 / Mesa 26.2.6, release
+builds, 800×1280. Both runs enabled specialization, shadow caching and outer
+bands. GPU times are V3D `drm-engine-render` deltas, medians of ten warmed
+samples: the dialog at 200 ms and successive fixed list positions. The 52
+paired PNGs matched byte-for-byte within each backend.
+
+| Scene / backend | Before | After |
+| --- | ---: | ---: |
+| Dialog / Vulkan | 15.59 ms | 15.61 ms |
+| Dialog / GLES | 12.24 ms | 12.16 ms |
+| List / Vulkan | 16.48 ms | 16.53 ms |
+| List / GLES | 13.52 ms | 13.52 ms |
+
+Direct Vulkan output, portrait rotation and injected touch scrolling also ran.
+Four 1.6-second observation windows, each starting with a roughly 0.6-second
+swipe, gave 48.55 fps before and 43.11 fps after;
+reversing the order gave 48.77 fps before and 45.20 fps after. FPS is the inverse
+of the mean page-flip interval within the swipe windows. Temperatures stayed at
+31.1–34.0°C with `throttled=0x0`. The small sample shows a display-frame regression
+worth profiling separately: unchanged offscreen GPU times do not identify its
+cause. Camera preview also captured frames through the shared painted host.
+
+Validation: Ink 38 passed, Linux 51 passed; painted 2,033 passed and five failed.
+All five failures also reproduced on unmodified upstream `221e551bf`: mouse
+back/forward history, two retained inline-row cases, sheet closing and bilingual
+text ordering. That baseline had two additional failures in watch/haptic timing.
+Scoped Clippy with scanout, formatting, caps and boot checks passed. Review used
+GPT-6 Astra and Opus 5.5 with an independent Claude subagent.
