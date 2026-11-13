@@ -29,7 +29,7 @@ mod decode_tests;
 mod jpeg_decode;
 #[cfg(target_os = "linux")]
 #[path = "image/kiosk_camera.rs"]
-mod kiosk_camera;
+pub mod kiosk_camera;
 #[path = "image/package.rs"]
 mod package;
 pub use package::Ask as PackageAsk;

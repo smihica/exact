@@ -43,6 +43,10 @@ Camera capture runs while an image using `kiosk-camera:preview` is mounted.
 The probe reads tightly packed 640×480 YUV420 at 30fps, converts it to RGBA,
 then rotates it clockwise into a 480×640 preview. It is a fixed Pi capture
 path, not a Linux implementation of the cross-platform camera package.
+`image::kiosk_camera::frames()` lets an app analyze the same stream, for example
+for QR recognition. Each subscriber has one queued unrotated luminance frame;
+a slow reader drops incoming frames, and dropping the receiver unsubscribes.
+Subscriptions do not start capture or change preview ownership.
 
 ## Limits to retain during integration
 
