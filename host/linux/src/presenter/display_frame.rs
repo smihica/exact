@@ -343,6 +343,8 @@ impl<D: DataSource> Presenter<D> {
             && self.activation_failed.is_none()
         {
             self.activate_first_pixel();
+            // The accepted receipt may precede newer, dirty input.
+            self.connect_hatches();
         }
         true
     }

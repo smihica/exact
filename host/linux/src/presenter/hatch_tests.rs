@@ -1047,6 +1047,38 @@ impl Hatches for Says {
 }
 
 #[test]
+fn display_receipt_connects_hatches_once_even_with_new_dirty_input() {
+    let mut p = boot::<Paints>(PAINT, &["paint"]);
+    let frame = p.display_frame().unwrap();
+    assert!(notes().is_empty(), "submission is not first pixel");
+    p.set_pointer(Some((200., 200.)));
+    assert!(p.dirty());
+    assert!(p.display_complete(&frame));
+    assert_eq!(notes(), ["built paint n=0 60x40"]);
+    let next = p.display_frame().unwrap();
+    assert!(p.display_complete(&next));
+    assert!(notes().is_empty());
+    assert_eq!(said(&mut p, "hatch: connected").len(), 1);
+}
+
+#[test]
+fn replaced_display_receipt_cannot_connect_hatches() {
+    let mut p = boot::<Paints>(PAINT, &["paint"]);
+    let frame = p.display_frame().unwrap();
+    p.reload(&contract::compile(PAINT).unwrap().encode(), ())
+        .unwrap();
+    assert!(notes().is_empty());
+    assert!(p.display_complete(&frame));
+    assert!(
+        notes().is_empty(),
+        "the old host's receipt cannot activate the new host"
+    );
+    let next = p.display_frame().unwrap();
+    assert!(p.display_complete(&next));
+    assert_eq!(notes(), ["built paint n=0 60x40"]);
+}
+
+#[test]
 fn only_this_platforms_words_are_called_and_never_before_first_pixel() {
     let mut p = boot::<Says>(WORDS, &["known"]);
     // Whatever is painted or committed, nothing of the module is made
