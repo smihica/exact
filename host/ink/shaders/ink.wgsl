@@ -177,7 +177,8 @@ fn mapped(p: vec2<f32>, rect: vec4<f32>, uv: vec4<f32>) -> vec2<f32> {
 }
 
 fn inside(p: vec2<f32>, rect: vec4<f32>) -> f32 {
-    return select(0.0, 1.0, all(p >= rect.xy) && all(p < rect.xy + rect.zw));
+    // Keep all four comparisons in one reduction to avoid holes in masked draws on V3D GLES.
+    return select(0.0, 1.0, all(vec4<bool>(p >= rect.xy, p < rect.xy + rect.zw)));
 }
 
 fn ramp_word(x: i32, row: i32) -> u32 {
