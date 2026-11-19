@@ -21,6 +21,7 @@ mod present;
 mod programs;
 #[cfg(all(feature = "scanout", target_os = "linux"))]
 mod scanout;
+mod solid;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
@@ -96,6 +97,7 @@ pub struct Wgpu {
     queue: ::wgpu::Queue,
     pipeline: ::wgpu::RenderPipeline,
     replace_pipeline: ::wgpu::RenderPipeline,
+    solid_pipeline: ::wgpu::RenderPipeline,
     programs: Vec<::wgpu::RenderPipeline>,
     #[cfg(test)]
     pub(super) general_only: bool,
@@ -257,7 +259,7 @@ impl Wgpu {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let make_pipeline = |blend, constants: &[(&str, f64)]| {
+        let make_pipeline = |entry, blend, constants: &[(&str, f64)]| {
             device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
                 label: Some("ink"),
                 layout: Some(&pipeline_layout),
@@ -279,7 +281,7 @@ impl Wgpu {
                 multisample: Default::default(),
                 fragment: Some(::wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(entry),
                     compilation_options: ::wgpu::PipelineCompilationOptions {
                         constants,
                         ..Default::default()
@@ -294,12 +296,22 @@ impl Wgpu {
                 cache: cache.as_ref(),
             })
         };
-        let pipeline = make_pipeline(Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), &[]);
-        let replace_pipeline = make_pipeline(None, &[]);
+        let pipeline = make_pipeline(
+            "fs_main",
+            Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            &[],
+        );
+        let replace_pipeline = make_pipeline("fs_main", None, &[]);
+        let solid_pipeline = make_pipeline(
+            "fs_flat_fill",
+            Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            &[],
+        );
         let programs = programs::CLASSES
             .iter()
             .map(|class| {
                 make_pipeline(
+                    "fs_main",
                     Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     &class.constants(),
                 )
@@ -373,6 +385,7 @@ impl Wgpu {
             queue,
             pipeline,
             replace_pipeline,
+            solid_pipeline,
             programs,
             #[cfg(test)]
             general_only: false,
@@ -570,7 +583,8 @@ impl Wgpu {
             for run in instances[start as usize..batch.instances.end as usize]
                 .chunk_by(|a, b| class(a) == class(b))
             {
-                let pipeline = class(&run[0]).map_or_else(
+                let selected = class(&run[0]);
+                let pipeline = selected.map_or_else(
                     || {
                         if batch.replace {
                             &self.replace_pipeline
@@ -582,7 +596,14 @@ impl Wgpu {
                 );
                 pass.set_pipeline(pipeline);
                 let end = start + run.len() as u32;
-                pass.draw(0..4, start..end);
+                if selected.is_some()
+                    && run[0].kind_brush == Kind::RoundedRect as u32
+                    && run[0].flags == 0
+                {
+                    solid::draw(&mut pass, pipeline, &self.solid_pipeline, s, start, run);
+                } else {
+                    pass.draw(0..4, start..end);
+                }
                 start = end;
             }
         }

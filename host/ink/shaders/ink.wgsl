@@ -4,6 +4,7 @@
 override SPECIALIZED: bool = false;
 override KIND_BRUSH: u32 = 0u;
 override FLAGS_MASK: u32 = 4294967295u;
+override FLAGS_SET: u32 = 0u;
 
 struct Viewport { size: vec2<f32>, pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> viewport: Viewport;
@@ -91,6 +92,10 @@ fn unpack_radii(packed: vec2<u32>) -> vec4<f32> {
                      f32(packed.y & 65535u), f32(packed.y >> 16u)) / 16.0;
 }
 
+fn edge_distance(q: vec2<f32>) -> f32 {
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+}
+
 fn rounded_distance(p: vec2<f32>, rect: vec4<f32>, r: vec4<f32>) -> f32 {
     let lo = rect.xy;
     let hi = lo + rect.zw;
@@ -107,7 +112,7 @@ fn rounded_distance(p: vec2<f32>, rect: vec4<f32>, r: vec4<f32>) -> f32 {
         return length(p - vec2<f32>(lo.x + r.w, hi.y - r.w)) - r.w;
     }
     let q = abs(p - (lo + hi) * 0.5) - rect.zw * 0.5;
-    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0);
+    return edge_distance(q);
 }
 
 fn shape_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, pixel: vec2<f32>) -> f32 {
@@ -129,9 +134,24 @@ fn shape_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, pixel: vec2<f
         && all(abs(vec4<f32>(lo, hi)) < vec4<f32>(32768.0)) {
         return 1.0;
     }
-    let distance = rounded_distance(p, rect, radii);
-    let normal = vec2<f32>(rounded_distance(p + vec2<f32>(0.01, 0.0), rect, radii),
-                          rounded_distance(p + vec2<f32>(0.0, 0.01), rect, radii)) - vec2<f32>(distance);
+    let next = p + vec2<f32>(0.01);
+    let left = max(lo.x + radii.x, lo.x + radii.w);
+    let right = min(hi.x - radii.y, hi.x - radii.z);
+    let top = max(lo.y + radii.x, lo.y + radii.y);
+    let bottom = min(hi.y - radii.z, hi.y - radii.w);
+    var distance: f32;
+    var normal: vec2<f32>;
+    if (p.x >= left && next.x <= right) || (p.y >= top && next.y <= bottom) {
+        // All three distance samples miss every corner's quadrant.
+        let n = abs(next - (lo + hi) * 0.5) - rect.zw * 0.5;
+        distance = edge_distance(q);
+        normal = vec2<f32>(edge_distance(vec2<f32>(n.x, q.y)),
+                           edge_distance(vec2<f32>(q.x, n.y))) - vec2<f32>(distance);
+    } else {
+        distance = rounded_distance(p, rect, radii);
+        normal = vec2<f32>(rounded_distance(p + vec2<f32>(0.01, 0.0), rect, radii),
+                           rounded_distance(p + vec2<f32>(0.0, 0.01), rect, radii)) - vec2<f32>(distance);
+    }
     let width = max(dot(abs(normal) * 100.0, pixel), 0.00001);
     let alpha = clamp(0.5 - distance / width, 0.0, 1.0);
     return select(0.0, alpha, all(rect.zw > vec2<f32>(0.0)));
@@ -204,7 +224,7 @@ fn stop_ramp(t: f32, row: i32) -> vec4<f32> {
 }
 
 fn selectors(v: Vertex) -> vec2<u32> {
-    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, v.data.y & FLAGS_MASK); }
+    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, (v.data.y & FLAGS_MASK) | FLAGS_SET); }
     return v.data;
 }
 
@@ -422,7 +442,9 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
             // which the 0 would not cancel.
             let sigma = v.param.x;
-            if (flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30) {
+            // A rastered shadow already carries coverage in the image alpha.
+            if (flags & 2u) == 0u
+                && ((flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30)) {
                 alpha = shadow(v.local, v.uv, v.radii, sigma, pixel);
             }
         }
@@ -471,3 +493,5 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     }
     return color * alpha;
 }
+
+@fragment fn fs_flat_fill(v: Vertex) -> @location(0) vec4<f32> { return v.color; }

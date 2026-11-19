@@ -28,6 +28,8 @@ pub enum Brush {
 
 pub mod flags {
     pub const TINT: u32 = 1;
+    /// The sampled image already includes the shape coverage of this outer shadow.
+    pub const RASTERED_SHADOW: u32 = 1 << 1;
     pub const STOP_RAMP: u32 = 1 << 2;
     pub const REPEAT: u32 = 1 << 3;
     pub const PIXELATED: u32 = 1 << 26;
