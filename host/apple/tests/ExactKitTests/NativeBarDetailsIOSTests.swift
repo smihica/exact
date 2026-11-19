@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class NativeBarDetailsIOSTests: XCTestCase {
     func testAPressableTitleFollowsItsHeadingsAuthoredFont() throws {
@@ -22,7 +23,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
                 group.addSubview(seal)
             }
             let engine = try XCTUnwrap(heading.text)
-            let view = HeaderTitleView(host: p.navigation)
+            let view = HeaderTitleView(host: p.navigationHost)
             let base = UIFont.preferredFont(forTextStyle: .headline, compatibleWith: view.traitCollection)
             var previous = try XCTUnwrap(HeaderTitle(header: header, heading: heading, tap: group, apart: []))
             view.update(previous, title: "Chat")
@@ -60,7 +61,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         let header = NodeView(id: 1, kind: "view", presenter: p)
         let heading = NodeView(id: 2, kind: "text", presenter: p)
         header.addSubview(heading)
-        let view = HeaderTitleView(host: p.navigation)
+        let view = HeaderTitleView(host: p.navigationHost)
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
         defer { window.isHidden = true }
         window.traitOverrides.preferredContentSizeCategory = .large
@@ -94,7 +95,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         list.applyStyle(["accent_color": [0, 0, 255, 255], "written": ["accent_color"]])
         first.applyStyle(["tint_color": [[255, 0, 0, 255], [0, 255, 0, 255]], "written": ["tint_color"]])
         list.addSubview(first); list.addSubview(second)
-        let nav = p.navigation, controller = UITabBarController()
+        let nav = p.navigationHost, controller = UITabBarController()
         nav.tabController = controller
         nav.tabItemsSource = NavigationTabs(tablist: list, tabs: [first, second], panels: [])
         nav.routerTab = 0
@@ -118,7 +119,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         let tab = NodeView(id: 2, kind: "button", presenter: p)
         tab.applyStyle(["tint_color": [[255, 0, 0, 255], [0, 255, 0, 255]], "written": ["tint_color"]])
         list.addSubview(tab)
-        let nav = p.navigation, controller = UITabBarController()
+        let nav = p.navigationHost, controller = UITabBarController()
         nav.tabController = controller
         nav.tabItemsSource = NavigationTabs(tablist: list, tabs: [tab], panels: [])
         nav.routerTab = 0
@@ -139,7 +140,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         let tab = NodeView(id: 2, kind: "button", presenter: p)
         list.applyStyle(["accent_color": [0, 0, 255, 255], "written": ["accent_color"]])
         list.addSubview(tab)
-        let nav = p.navigation, controller = UITabBarController()
+        let nav = p.navigationHost, controller = UITabBarController()
         nav.tabController = controller
         nav.tabItemsSource = NavigationTabs(tablist: list, tabs: [tab], panels: [])
         nav.routerTab = 0
@@ -173,7 +174,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         header.addSubview(row); row.addSubview(heading); row.addSubview(seal)
         header.tintAdjustmentMode = .dimmed
         let group = try XCTUnwrap(HeaderTitle(header: header, heading: heading, tap: nil, apart: []))
-        let view = HeaderTitleView(host: p.navigation)
+        let view = HeaderTitleView(host: p.navigationHost)
         view.update(group, title: "Verified")
         let title = try XCTUnwrap(view.title.attributedText)
         var count = 0
@@ -201,7 +202,7 @@ final class NativeBarDetailsIOSTests: XCTestCase {
         let group = try XCTUnwrap(HeaderTitle(header: header, heading: heading, tap: nil, apart: []))
         XCTAssertTrue(group.drawn)
         XCTAssertTrue(group.placed.contains { $0 === seal })
-        let view = HeaderTitleView(host: p.navigation)
+        let view = HeaderTitleView(host: p.navigationHost)
         // Every navigation sync projects the title again (`richTitle`): the
         // second projection keeps the seal's own colour.
         var title = NSAttributedString()

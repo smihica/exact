@@ -1,14 +1,15 @@
 // Queue-confined conservative ink index; no CT/CoreText or UI owner.
 // One slab owns all span/node/list/build/query storage; callbacks borrow results.
+#if os(macOS)
 import Foundation
 
-struct InkSpan { let top: Double; let bottom: Double }
-enum InkRefusal: Error { case capacity, budget }
-struct InkAccountStats { var bytes = 0; var owners = 0; var peak = 0; var allocations = 0; var drops = 0 }
-final class InkAccount: @unchecked Sendable {
+package struct InkSpan { let top: Double; let bottom: Double }
+package enum InkRefusal: Error { case capacity, budget }
+package struct InkAccountStats { package var bytes = 0; package var owners = 0; package var peak = 0; package var allocations = 0; package var drops = 0 }
+package final class InkAccount: @unchecked Sendable {
     private let lock = NSLock()
     private var value = InkAccountStats()
-    var stats: InkAccountStats { lock.lock(); defer { lock.unlock() }; return value }
+    package var stats: InkAccountStats { lock.lock(); defer { lock.unlock() }; return value }
     fileprivate func reserve(_ bytes: Int) -> InkCharge? {
         lock.lock(); defer { lock.unlock() }
         guard bytes > 0, bytes <= 8 * 1024 * 1024, value.owners < 2,
@@ -27,7 +28,7 @@ private final class InkCharge {
     init(_ account: InkAccount, _ bytes: Int) { self.account = account; self.bytes = bytes }
     deinit { account.release(bytes) }
 }
-struct InkQueryStats { var nodes = 0; var endpoints = 0; var selected = 0 }
+package struct InkQueryStats { package var nodes = 0; package var endpoints = 0; package var selected = 0 }
 private struct InkNode {
     var center: Double
     var left: Int32 = -1
@@ -37,22 +38,22 @@ private struct InkNode {
 }
 private struct InkBuildTask { var lo: Int32; var hi: Int32; var parent: Int32; var side: Int32 }
 
-final class WorkerInkIndex {
+package final class WorkerInkIndex {
     // All stored POD types have alignment <=8. Their slab regions have strides
     // divisible by the following region's alignment; no hidden Array capacities.
     private static var unitBytes: Int {
         MemoryLayout<InkSpan>.stride + MemoryLayout<InkNode>.stride
             + 6 * MemoryLayout<Int32>.stride + MemoryLayout<InkBuildTask>.stride
     }
-    static var maximumCount: Int { (8 * 1024 * 1024) / unitBytes }
-    static func requiredBytes(count: Int) -> Int? {
+    package static var maximumCount: Int { (8 * 1024 * 1024) / unitBytes }
+    package static func requiredBytes(count: Int) -> Int? {
         guard count >= 0, count <= maximumCount else { return nil }
         let (bytes, overflow) = max(1, count).multipliedReportingOverflow(by: unitBytes)
         return overflow ? nil : bytes
     }
-    let count: Int
-    let capacityBytes: Int
-    let buildCount = 1
+    package let count: Int
+    package let capacityBytes: Int
+    package let buildCount = 1
     private(set) var queryCount = 0
     private(set) var unboundedCount = 0
     private var nodeCount = 0
@@ -69,7 +70,7 @@ final class WorkerInkIndex {
     private let tasks: UnsafeMutablePointer<InkBuildTask>
     private let stack: UnsafeMutablePointer<Int32>
 
-    init(count: Int, account: InkAccount, span: (Int) -> InkSpan) throws {
+    package init(count: Int, account: InkAccount, span: (Int) -> InkSpan) throws {
         guard let bytes = Self.requiredBytes(count: count) else { throw InkRefusal.capacity }
         guard let charge = account.reserve(bytes) else { throw InkRefusal.budget }
         self.charge = charge; self.count = count; capacityBytes = bytes
@@ -179,7 +180,7 @@ final class WorkerInkIndex {
         precondition(cursor == count)
     }
 
-    func query(top: Double, bottom: Double,
+    package func query(top: Double, bottom: Double,
                _ body: (UnsafeBufferPointer<Int32>, InkQueryStats) -> Void) {
         precondition(top.isFinite && bottom.isFinite && top <= bottom && !querying)
         querying = true; defer { querying = false }
@@ -215,3 +216,4 @@ final class WorkerInkIndex {
         body(UnsafeBufferPointer(start: selected, count: stats.selected), stats)
     }
 }
+#endif

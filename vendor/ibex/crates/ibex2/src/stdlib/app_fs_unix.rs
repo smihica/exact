@@ -14,8 +14,9 @@ use std::{
     sync::Arc,
 };
 
-/// The host supplies existing absolute directories. Handles pin the selected
-/// directories even if their names are subsequently moved or replaced.
+/// The host supplies existing absolute directories; symbolic link roots are
+/// refused. Handles pin the selected directories even if their names are
+/// subsequently moved or replaced.
 #[derive(Clone, Debug)]
 pub struct AppDirectories {
     roots: Arc<[Option<File>; 3]>,
@@ -257,35 +258,34 @@ fn remove_raw(dir: &File, path: &CStr) -> io::Result<bool> {
         Err(_) => unlink_raw(dir, path, false).map(|_| true),
     }
 }
-fn atomic(dir: &File, target: &str, data: &[u8]) -> io::Result<()> {
-    let mut bytes = [0; 16];
-    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
-    let temp = format!(
-        ".ibex-{}",
-        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    );
-    let mut file = open_at(dir, &temp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
-    let result = (|| {
-        file.write_all(data)?;
-        file.sync_all()?;
-        rename(dir, &temp, dir, target)
-    })();
-    if result.is_err() {
-        let _ = unlink(dir, &temp, false);
-    }
-    result
+#[path = "app_fs_create.rs"]
+mod create;
+use create::atomic;
+pub(crate) use create::create_below;
+
+/// A folder where `what` needs a file: EISDIR, the code a write to one gets
+/// from the kernel and the web's store gives every such operation.
+fn is_directory(what: &str) -> HostError {
+    error(format!(
+        "{what} needs a regular file: {}",
+        io::Error::from_raw_os_error(libc::EISDIR)
+    ))
 }
 
 /// Copy `source`'s bytes over the regular file `leaf` in `parent`, made if absent.
 fn copy(mut source: File, parent: &File, leaf: &str) -> Result<FsResult, HostError> {
+    use std::os::unix::fs::MetadataExt;
+    let a = source.metadata().map_err(error)?;
+    // Before the target is opened, which would make it: a folder copies nothing.
+    if a.is_dir() {
+        return Err(is_directory("copy"));
+    }
     let mut target = open_at(
         parent,
         leaf,
         libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
     )
     .map_err(error)?;
-    use std::os::unix::fs::MetadataExt;
-    let a = source.metadata().map_err(error)?;
     let b = target.metadata().map_err(error)?;
     if !a.is_file() || !b.is_file() || (a.dev(), a.ino()) == (b.dev(), b.ino()) {
         return Err(error("copy requires distinct regular files"));
@@ -320,14 +320,17 @@ impl AppDirectories {
             if !path.is_absolute() {
                 return Err(error("app directory must be absolute"));
             }
-            let file = match File::open(path) {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A trailing slash or `.` must not make O_NOFOLLOW follow the root.
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(path.components().as_path())
+            {
                 Ok(file) => file,
                 Err(e) if missing_ok && e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(error(e)),
             };
-            if !file.metadata().map_err(error)?.is_dir() {
-                return Err(error("app root is not a directory"));
-            }
             physical[i] = std::fs::canonicalize(path).map_err(error)?;
             roots[i] = Some(file);
         }
@@ -537,13 +540,14 @@ impl AppDirectories {
 }
 
 /// A path below a retained directory: an `app:/` path's root, or a `home:`
-/// or `bundle:` one's (exact2 LLP 1133.007 D6, Exact patch 24). Each
+/// or `bundle:` one's (exact2 LLP 1133.007 D6), or a well-known folder
+/// (LLP 1173 D4). Each
 /// component is opened `O_NOFOLLOW` from the root, so a link anywhere below
 /// it, planted or not, is refused rather than followed.
 pub(crate) struct Below {
     pub(crate) root: File,
     pub(crate) parts: Vec<String>,
-    /// The root's name in errors: `app`, `home` or `bundle`.
+    /// The root's role in errors.
     pub(crate) name: &'static str,
 }
 
@@ -570,6 +574,16 @@ impl Below {
         let (parent, leaf) = self.parent()?;
         open_at(&parent, &leaf, libc::O_RDONLY | libc::O_NONBLOCK).map_err(error)
     }
+    /// Check existence without reading the leaf or following a link to it.
+    pub(crate) fn exists(&self) -> Result<(), HostError> {
+        if self.parts.is_empty() {
+            document_metadata(&self.root, None).map_err(error)?;
+        } else {
+            let (parent, leaf) = self.parent()?;
+            document_metadata(&parent, Some(&leaf)).map_err(error)?;
+        }
+        Ok(())
+    }
 }
 
 /// Run `op`, admitted above, on `path` (and `destination`) below their roots.
@@ -582,7 +596,11 @@ pub(crate) fn run_below(
     match op {
         FsOp::ReadFile => {
             let file = path.open()?;
-            if !file.metadata().map_err(error)?.is_file() {
+            let meta = file.metadata().map_err(error)?;
+            if meta.is_dir() {
+                return Err(is_directory("read"));
+            }
+            if !meta.is_file() {
                 return Err(error("read needs a regular file"));
             }
             Ok(FsResult::Bytes(
@@ -990,6 +1008,9 @@ pub fn resolve_sqlite(
         Ok(real)
     }
 }
+
+#[path = "app_fs_publish.rs"]
+mod publication;
 
 /// An app file written in pieces beside its target and put in its place
 /// whole (Exact local patch 19): the staging file is removed unless

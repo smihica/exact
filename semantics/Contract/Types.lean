@@ -86,7 +86,9 @@ def unsupportedTy (name : String) (ts : List Ty) : Option Ty :=
         (name = "formatDate" ∧ ts = [.string, .number, .string, .string]) then .some .string
     else .none
   else if name = "formatNumber" then
-    match ts with | [.number, .string, .string, .string] => .some .string | _ => .none
+    match ts with
+    | [.number, .string, .string, .string] | [.number, .string, .number, .string] => .some .string
+    | _ => .none
   else if name = "toFixed" ∨ name = "formatDecimal" then
     match ts with | [.number, .number] => .some .string | _ => .none
   else if name = "formatDay" then
@@ -508,20 +510,20 @@ structure WellTyped (p : Program) : Prop where
   tasks : ∀ t ∈ p.tasks, ∃ u, HasTy p (compScope p) [] t.ms u ∧ u.le .number = true
   /-- A task names an action, which takes no parameters (the analyzer's
   `analyze-unknown-action`, `analyze-handler-arity`): a timer passes none. -/
-  taskActions : ∀ t ∈ p.tasks, ∃ a, p.actions.find? (·.name == t.action) = .some a ∧ a.params = []
+  taskActions : ∀ t ∈ p.tasks, ∃ a, p.actions.find? (·.name == t.action) = .some a ∧ a.params.length = t.args.length
   /-- A task's interval is a number literal (the compiler's
   `lower-timer-literal`). -/
   taskLiterals : ∀ t ∈ p.tasks, ∃ b, t.ms = .num b
   /-- A gated task's gate and key are well typed (the compiler's
   `type-task-gate`, `type-task-key`; LLP 1092 D9). -/
-  taskGates : ∀ t ∈ p.tasks, ∀ e ∈ t.gate.toList ++ t.key.toList, ∃ u, HasTy p (compScope p) [] e u
+  taskGates : ∀ t ∈ p.tasks, t.owner = .none → ∀ e ∈ t.gate.toList ++ t.key.toList, ∃ u, HasTy p (compScope p) [] e u
   /-- A resource's `when` is well typed where its arguments are (the
   compiler's `type-when-not-bool`; LLP 1161.002 D1). -/
   resourceGates : ∀ r ∈ p.resources, ∀ g, r.gate = .some g → ∃ u, HasTy p (settleScope p) [] g u
-  /-- A mutation's `then` names an action that takes no parameters: the
-  clock runs it with none. -/
+  /-- A mutation's `then` names an action that takes as many parameters as
+  the clock passes it: none, or a child's captured props (`thenArgs`). -/
   thenActions : ∀ m ∈ p.mutations, ∀ a, m.andThen = .some a →
-    ∃ ad, p.actions.find? (·.name == a) = .some ad ∧ ad.params = []
+    ∃ ad, p.actions.find? (·.name == a) = .some ad ∧ ad.params.length = m.thenArgs.length
   view : NodesTy p (compScope p) [] p.view
 
 end Contract

@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 @testable import ExactGroupedLists
 
 /// The number pads' bar (LLP 1116.003 D7): the decimal pad has no minus key
@@ -31,7 +32,7 @@ final class PadBarIOSTests: XCTestCase {
     }
     private func waitFor(_ what: String, file: StaticString = #filePath, line: UInt = #line, _ ready: () -> Bool) {
         func done() -> Bool {
-            guard let p = session?.presenter, !p.navigation.inTransition, !p.modals.inTransition else { return false }
+            guard let p = session?.presenter, !p.navigationHost.inTransition, !p.modalHost.inTransition else { return false }
             return ready()
         }
         let deadline = Date().addingTimeInterval(10)
@@ -181,14 +182,14 @@ final class PadBarIOSTests: XCTestCase {
         view.layoutIfNeeded()
         let p = session.presenter
         waitFor("the initial route and its controls are laid out") {
-            p.navigation.primaryNavigation?.view.window != nil && p.views.values.contains {
+            p.navigationHost.primaryNavigation?.view.window != nil && p.views.values.contains {
                 $0.props["testId"] == "swap" && $0.window != nil && $0.convert($0.bounds, to: nil).maxY > self.keys
             }
         }
         func node(_ id: String) throws -> NodeView { try XCTUnwrap(p.views.values.first { $0.props["testId"] == id && $0.window != nil }, "no \(id)") }
         func box(_ v: UIView) -> CGRect { v.convert(v.bounds, to: nil) }
         let from = try node("from-value"), swap = try node("swap")
-        let list = try XCTUnwrap(p.navigation.shownScroll(try node("content")))
+        let list = try XCTUnwrap(p.navigationHost.shownScroll(try node("content")))
         let canvas = try XCTUnwrap(view.backgroundColor)
         XCTAssertGreaterThan(box(swap).maxY, keys, "the fixture's Swap button starts where the keys will be")
 
@@ -207,7 +208,7 @@ final class PadBarIOSTests: XCTestCase {
         // the keys come up, the bar counted in their frame.
         from.textFieldDidBeginEditing(try XCTUnwrap(from.field))
         setKeyboard(p, top: keys)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         waitFor("content draws under the accessory while its fields clear it") {
             abs(route.node.bounds.height - self.keys) < 0.5

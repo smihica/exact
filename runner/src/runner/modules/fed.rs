@@ -46,7 +46,7 @@ struct Surface {
 
 impl<D: DataSource> Runner<D> {
     /// The GPU canvases a commit published: their surface names, kept by view.
-    pub(in crate::runner) fn fed_canvases(&mut self, updates: &[crate::SurfaceUpdate]) {
+    pub(super) fn fed_canvases_linked(&mut self, updates: &[crate::SurfaceUpdate]) {
         for u in updates {
             (self.extensions.fed.canvases).insert(u.view, u.name.clone());
         }
@@ -176,7 +176,7 @@ impl<D: DataSource> Runner<D> {
             return;
         }
         let body = json!({ "extension": extension, "surface": name, "displayed": shown, "origin": origin.word() });
-        if let Some(handler) = self.native_slot().handler() {
+        if let Some(handler) = self.native_slot().extension_handler() {
             handler(
                 body.to_string().into_bytes(),
                 crate::request::Reply::new(|_| {}),

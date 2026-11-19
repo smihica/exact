@@ -8,13 +8,37 @@ import { canonical, filePathOf, matchPattern } from '../web-js/route-pattern.js'
 
 const xml = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/** The pages a render entry's `--build` printed (`exact_render::main_with`), one JSON line each, from `run`, its
+ * `spawnSync` result. It throws when a page's line holds an `error`, as a refused page's does (LLP 1048.000 D7), when a
+ * line is no page's, or when the run failed: each such error, then the entry's stderr or exit status. */
+export function renderEntryPages(bin, run) {
+  if (run.error) throw new Error(`${bin}: ${run.error.message}`);
+  const pages = [], errors = [];
+  // Read only the lines a newline ends: a failed run's last one may be cut short
+  for (const line of run.stdout.split('\n').slice(0, -1)) {
+    let page;
+    try { page = JSON.parse(line); } catch {}
+    if (typeof page?.location !== 'string') { errors.push(`${bin} printed a line that is no page's: ${line}`); continue; }
+    pages.push(page);
+    if (page.error) errors.push(`${bin} ${page.location}: ${page.error}`);
+  }
+  if (run.status !== 0 || errors.length) throw new Error([...errors, run.stderr.trim() || `${bin} exited with ${run.status ?? run.signal}`].join('\n'));
+  return pages;
+}
+
+/** The route a page made at build is the page of: the not-found route's for the not-found page, else the route the router
+ * gives its location (`routes.json`'s table), which may hear the location's one parameter. */
+export function pageRoute(page, routes, parameter) {
+  const at = matchPattern(routes, canonical(page.location), parameter);
+  return page.notfound ? routes.find(r => r.notfound) : routes[at];
+}
+
 /** Choose every page file before either renderer writes one. Static lookup uses the same segment mapping. */
 export function buildPageFiles(dir, pages, routes, paths = path, platform = process.platform) {
   const chosen = new Map();
   const files = pages.map(page => {
     let value;
-    const at = matchPattern(routes, canonical(page.location), (_, parameter) => { value = parameter; });
-    const route = page.notfound ? routes.find(r => r.notfound) : routes[at];
+    const route = pageRoute(page, routes, (_, parameter) => { value = parameter; });
     const label = `route \`${route?.name ?? page.location}\` page ${JSON.stringify(page.location)}${value === undefined ? '' : ` (value ${JSON.stringify(value)})`}`;
     try {
       const decoded = decodeURIComponent(page.location);
@@ -43,14 +67,14 @@ export function buildPageFiles(dir, pages, routes, paths = path, platform = proc
 /** Writes crawler files for built `pages` against the manifest's `origin`. A route declared at either file's path
  * keeps it, whether rendered at build or per request; a route with a parameter does not claim it. Without an origin,
  * or a page to list, there is no sitemap. */
-export function writeCrawlerFiles(dir, pages, origin, routes) {
+export function writeCrawlerFiles(dir, pages, origin, routes, base = '/') {
   const site = origin?.replace(/\/+$/, '');
   const claimed = path => routes.some(r => !r.notfound && canonical(r.pattern) === path);
   const excluded = robots => (robots ?? '').split(',').some(directive => /^(noindex|none)$/i.test(directive.split(':', 1)[0].trim()));
   const listed = !site ? [] : pages.filter(p => !p.notfound && (p.status === 200 || p.status === 503)
     && !excluded(p.robots))
-    .map(p => p.location);
+    .map(p => base === '/' ? p.location : base.slice(0, -1) + p.location);
   const sitemap = listed.length > 0 && !claimed('/sitemap.xml') && !existsSync(resolve(dir, 'sitemap.xml'));
   if (sitemap) writeFileSync(resolve(dir, 'sitemap.xml'), `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${listed.map(l => `  <url><loc>${xml(site + l)}</loc></url>\n`).join('')}</urlset>\n`);
-  if (!claimed('/robots.txt') && !existsSync(resolve(dir, 'robots.txt'))) writeFileSync(resolve(dir, 'robots.txt'), `User-agent: *\nAllow: /\n${sitemap ? `Sitemap: ${site}/sitemap.xml\n` : ''}`);
+  if (!claimed('/robots.txt') && !existsSync(resolve(dir, 'robots.txt'))) writeFileSync(resolve(dir, 'robots.txt'), `User-agent: *\nAllow: ${base}\n${sitemap ? `Sitemap: ${site}${base}sitemap.xml\n` : ''}`);
 }

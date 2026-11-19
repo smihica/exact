@@ -16,7 +16,7 @@ async function page(boot, run) {
   const moduleSource = `
     export default function() {}
     export function gpu_load() {} export function gpu_unload() {}
-    export function gpu_child_view() {} export function gpu_seekable() {} export function gpu_period() {}
+    export function gpu_child_view() {} export function gpu_seekable() {} export function gpu_reduced_motion() {} export function gpu_period() {}
     export function gpu_shader_names(){return '[]';} export function gpu_shaders_clear() {}
     export function gpu_create(){return 1;} export function gpu_bind_at(){return true;}
     export function gpu_wants_input(){return false;} export function gpu_dirty(){return false;}
@@ -32,7 +32,7 @@ async function page(boot, run) {
     // The tier is chosen from an adapter before the stub module loads (gpu-tier.js); a headless shell has none.
     Object.defineProperty(navigator, 'gpu', {configurable:true, value:{requestAdapter: async () => ({info:{}})}});
     const element = document.getElementById('host');
-    globalThis.exact = {views:new Map([[1, element], [2, document.getElementById('frame')]]), root:document.body, now:()=>0, devAssets:[], generation:0, postBound:64, compat:{inputs:{gpuModules:{}}}};
+    globalThis.exact = {views:new Map([[1, element], [2, document.getElementById('frame')]]), root:document.body, now:()=>0, devAssets:[], generation:0, postBound:64, compat:{inputs:{gpuModules:{}}}, wasm:{}, writeIn:text => text};
     ${boot}
     const views = exact.views, retiredViews = new WeakSet(), POST_BOUND = 64, incarnation = 0, now = () => 0, wasm = {}, tagged = x => x, ask = () => ({}), log = line => console.log(line), agentMode = false;
     const host = { wasm, agentClock: 0 };

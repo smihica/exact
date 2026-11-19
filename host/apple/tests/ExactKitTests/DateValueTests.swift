@@ -6,6 +6,7 @@ import UIKit
 #endif
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 final class DateValueTests: XCTestCase {
     func testLocalDateTimesAcceptHTMLSeparatorsAndOptionalSeconds() throws {

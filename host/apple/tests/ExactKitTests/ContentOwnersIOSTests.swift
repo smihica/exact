@@ -2,6 +2,10 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactCollections
+@testable import ExactNativeViews
+@testable import ExactFlights
 
 /// LLP 1123 D2: every route is a content owner. Its root is laid out in its
 /// controller's view, its host block (LLP 1115.002 D8.2), and the runner is
@@ -16,8 +20,8 @@ final class ContentOwnersIOSTests: XCTestCase {
         let session = try fixture("screen-route-backend", scene.coordinateSpace.bounds.size, plan: "EXACT_EDGE_EFFECT_PLAN")
         let p = session.presenter
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node(session, "tab-mixed").id)])["error"])
-        until("the mixed document settles") { p.navigation.activeRoute?.node.props["testId"] == "route-mixed" && !p.navigation.inTransition }
-        let route = try XCTUnwrap(p.navigation.activeRoute)
+        until("the mixed document settles") { p.navigationHost.activeRoute?.node.props["testId"] == "route-mixed" && !p.navigationHost.inTransition }
+        let route = try XCTUnwrap(p.navigationHost.activeRoute)
         let content = try node(session, "document-mixed"), authored = content.style
         let mount = try XCTUnwrap(route.node.superview)
         let field = try XCTUnwrap(try node(session, "mixed-field").field)
@@ -57,8 +61,8 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter, root = try XCTUnwrap(p.root.subviews.first as? NodeView)
         p.apply(wireBatch([["op": "props", "id": Int(root.id), "set": ["interactiveWidget": policy]]]))
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node(session, "tab-mixed").id)])["error"])
-        until("the mixed document settles") { p.navigation.activeRoute?.node.props["testId"] == "route-mixed" && !p.navigation.inTransition }
-        let route = try XCTUnwrap(p.navigation.activeRoute)
+        until("the mixed document settles") { p.navigationHost.activeRoute?.node.props["testId"] == "route-mixed" && !p.navigationHost.inTransition }
+        let route = try XCTUnwrap(p.navigationHost.activeRoute)
         let document = try XCTUnwrap(try node(session, "document-mixed").scrollView)
         if policy == "resizes-visual" {
             let viewport = try XCTUnwrap(route.contentViewport)
@@ -263,7 +267,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node(session, "tab-panes").id)])["error"])
         let root = try node(session, "arrangement")
-        let route = try XCTUnwrap(p.navigation.activeRoute)
+        let route = try XCTUnwrap(p.navigationHost.activeRoute)
         XCTAssertTrue(root.isDescendant(of: route.view))
         let navigation = try XCTUnwrap(route.navigationController)
         let controller = UIArrangementViewController()
@@ -276,7 +280,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             XCTAssertTrue(p.arrangements.set(root.id, controller: controller))
             self.window?.layoutIfNeeded()
             p.arrangements.sync()
-            p.navigation.prepareRoutes([route], in: navigation)
+            p.navigationHost.prepareRoutes([route], in: navigation)
             XCTAssertEqual(route.navigationItem.navigationBarMinimization.safeAreaAdjustment, safeArea)
             XCTAssertEqual(route.navigationItem.navigationBarMinimization.minimizationBehavior, behavior)
             XCTAssertTrue(p.arrangements.set(root.id, controller: nil))
@@ -295,7 +299,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         until("the native allocations reach the authored panes") {
             self.window?.layoutIfNeeded()
             p.arrangements.sync()
-            p.navigation.prepareRoutes([route], in: navigation)
+            p.navigationHost.prepareRoutes([route], in: navigation)
             return entry.holders.allSatisfy { holder in
                 entry.isHidden(holder) ? p.arrangements.blocks[holder.node.id]?.block == .size(.zero)
                     : abs(holder.node.bounds.height - holder.view.bounds.height) < 1
@@ -335,7 +339,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         route.setContentScrollView(primary, for: .bottom)
         // The route's pass and an authored batch
         let pass = {
-            p.navigation.prepareRoutes([route], in: navigation)
+            p.navigationHost.prepareRoutes([route], in: navigation)
             p.apply(wireBatch([]))
         }
         let panesUnderTheBar = {
@@ -356,7 +360,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             panesUnderTheBar()
             XCTAssertTrue(route.contentScrollView(for: .top) === selected, "authored defaults do not overwrite a native selection")
             XCTAssertTrue(route.contentScrollView(for: .bottom) === primary, "the other edge keeps its own native selection")
-            XCTAssertTrue(p.navigation.contentScrollView(of: route) === selected)
+            XCTAssertTrue(p.navigationHost.contentScrollView(of: route) === selected)
             XCTAssertTrue(p.scrollsToTopTarget() === selected)
             XCTAssertTrue([primary, secondary].allSatisfy { $0.contentInsetAdjustmentBehavior == .automatic })
         }
@@ -365,12 +369,13 @@ final class ContentOwnersIOSTests: XCTestCase {
         route.setContentScrollView(nil, for: .top)
         XCTAssertTrue(secondary.scrollsToTop)
         XCTAssertFalse(primary.scrollsToTop)
-        XCTAssertTrue(route.contentScrollView(for: .top) === secondary, "nil gives the edge back at once")
+        route.view.layoutIfNeeded()
+        XCTAssertTrue(route.contentScrollView(for: .top) === secondary, "nil gives the edge back by the route's next layout")
         pass()
         panesUnderTheBar()
         XCTAssertTrue(route.contentScrollView(for: .top) === secondary, "the pass keeps the top edge on the pane `navigationScroll` names")
         XCTAssertTrue(route.contentScrollView(for: .bottom) === primary)
-        XCTAssertTrue(p.navigation.contentScrollView(of: route) === secondary)
+        XCTAssertTrue(p.navigationHost.contentScrollView(of: route) === secondary)
         XCTAssertTrue(p.scrollsToTopTarget() === secondary, "nil gives scroll-to-top back to the authored scroller")
         XCTAssertTrue([primary, secondary].allSatisfy { $0.contentInsetAdjustmentBehavior == .automatic })
         // `.all` with the pane that holds the bottom edge selects the top edge too, and nil gives both back
@@ -383,18 +388,19 @@ final class ContentOwnersIOSTests: XCTestCase {
         self.window?.layoutIfNeeded()
         XCTAssertTrue(route.contentScrollView(for: .top) === primary, "UIKit's all-edges selection survives projection")
         XCTAssertTrue(route.contentScrollView(for: .bottom) === primary)
-        XCTAssertTrue(p.navigation.contentScrollView(of: route) === primary)
+        XCTAssertTrue(p.navigationHost.contentScrollView(of: route) === primary)
         XCTAssertTrue(p.scrollsToTopTarget() === primary)
         route.setContentScrollView(nil, for: .all)
         XCTAssertTrue(secondary.scrollsToTop)
         XCTAssertFalse(primary.scrollsToTop)
         // Exact's bottom scroller here is the pane `navigationScroll` names
-        XCTAssertTrue(route.contentScrollView(for: .bottom) === secondary, "nil gives the bottom edge back to Exact's bottom scroller at once")
+        route.view.layoutIfNeeded()
+        XCTAssertTrue(route.contentScrollView(for: .bottom) === secondary, "nil gives the bottom edge back to Exact's bottom scroller by the route's next layout")
         pass()
         self.window?.layoutIfNeeded()
         XCTAssertTrue(route.contentScrollView(for: .top) === secondary)
         XCTAssertTrue(route.contentScrollView(for: .bottom) === secondary)
-        XCTAssertTrue(p.navigation.contentScrollView(of: route) === secondary)
+        XCTAssertTrue(p.navigationHost.contentScrollView(of: route) === secondary)
         XCTAssertTrue(p.scrollsToTopTarget() === secondary)
     }
 
@@ -411,7 +417,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             XCTAssertGreaterThan(scroll.adjustedContentInset.top, 0)
             XCTAssertEqual(scroll.adjustedContentInset.bottom, scroll.safeAreaInsets.bottom, accuracy: 1)
             XCTAssertEqual(pane.convert(pane.bounds, to: route.view).maxY, route.view.bounds.maxY, accuracy: 1)
-            XCTAssertEqual(p.navigation.covers[pane.id], .inset(top: max(pane.scrollOrigin, scroll.safeAreaInsets.top), bottom: scroll.safeAreaInsets.bottom))
+            XCTAssertEqual(p.navigationHost.covers[pane.id], .inset(top: max(pane.scrollOrigin, scroll.safeAreaInsets.top), bottom: scroll.safeAreaInsets.bottom))
         }
         let holders = try XCTUnwrap(p.arrangements.entries[root.id]).holders
         for holder in holders {
@@ -458,7 +464,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(initialRow.convert(initialRow.bounds, to: route.view).minY, route.view.safeAreaInsets.top - 1)
         for (name, scroll) in [("pane-second", scrolls[1]), ("pane-first", scrolls[0])] {
             route.node.props["navigationScroll"] = name
-            p.navigation.prepareRoutes([route], in: try XCTUnwrap(route.navigationController))
+            p.navigationHost.prepareRoutes([route], in: try XCTUnwrap(route.navigationController))
             XCTAssertTrue(route.contentScrollView(for: .top) === scroll, "the named pane actually becomes the title authority")
             XCTAssertTrue(scrolls.allSatisfy { $0.contentInsetAdjustmentBehavior == .automatic }, "changing title authority keeps both peer insets")
             XCTAssertEqual(route.navigationItem.navigationBarMinimization.safeAreaAdjustment, .automatic, "projection preserves UIKit's default policy")
@@ -467,14 +473,14 @@ final class ContentOwnersIOSTests: XCTestCase {
         _ = Agent(session: session).tap(["id": Int(try node(session, "tab-inline").id)])
         until("the arranged route is retained outside the window") { route.view.window == nil }
         p.arrangements.sync()
-        p.navigation.prepareRoutes([route], in: navigation)
+        p.navigationHost.prepareRoutes([route], in: navigation)
         XCTAssertTrue(scrolls.allSatisfy { $0.contentInsetAdjustmentBehavior == .automatic }, "retained peers keep their native inset policy")
         XCTAssertTrue(route.collapseScroll === first, "a retained route keeps its title authority")
         _ = Agent(session: session).tap(["id": Int(try node(session, "tab-panes").id)])
         until("the arranged route returns") { route.view.window != nil && !Agent(session: session).nativeInFlight() }
         route.node.props.removeValue(forKey: "navigationScroll")
-        p.navigation.prepareRoutes([route], in: navigation)
-        XCTAssertTrue(p.navigation.contentScroller(of: route) === first, "an unnamed route discovers the first authored pane")
+        p.navigationHost.prepareRoutes([route], in: navigation)
+        XCTAssertTrue(p.navigationHost.contentScroller(of: route) === first, "an unnamed route discovers the first authored pane")
         until("the unnamed route hands its top inset to the pane") { self.window?.layoutIfNeeded(); return route.collapseScroll === first }
         let reveal = try node(session, "first-row-30")
         p.reveal(reveal)
@@ -487,7 +493,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.arrangements.sync()
         until("the native-hidden pane leaves the kernel's bottom-edge chain") {
             self.window?.layoutIfNeeded()
-            return p.navigation.covers[second.id] == .whole && abs(first.bounds.height - route.view.bounds.height) < 1
+            return p.navigationHost.covers[second.id] == .whole && abs(first.bounds.height - route.view.bounds.height) < 1
         }
         controller.setViewController(holders[1], for: .secondary)
         controller.view.layoutIfNeeded()
@@ -502,7 +508,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         }
         until("the shown peer restores its inset and position") {
             self.window?.layoutIfNeeded()
-            return p.navigation.covers[second.id] != .whole && scrolls[1].contentInsetAdjustmentBehavior == .automatic
+            return p.navigationHost.covers[second.id] != .whole && scrolls[1].contentInsetAdjustmentBehavior == .automatic
                 && abs(scrolls[1].contentOffset.y + second.scrollTopInset(scrolls[1]) - savedTop) < 1
         }
         let rootBox = root.kernelContentBox, rootPadding = root.kernelPadding
@@ -545,12 +551,12 @@ final class ContentOwnersIOSTests: XCTestCase {
         controller.setViewController(nil, for: .secondary)
         controller.view.layoutIfNeeded()
         p.arrangements.sync()
-        until("the secondary is hidden before retiring the arrangement") { p.navigation.covers[second.id] == .whole }
+        until("the secondary is hidden before retiring the arrangement") { p.navigationHost.covers[second.id] == .whole }
         XCTAssertTrue(p.arrangements.set(root.id, controller: nil))
         until("retired panes return their insets") {
-            p.navigation.coversChanged()
+            p.navigationHost.coversChanged()
             return first.scrollView?.contentInsetAdjustmentBehavior == .never && replacement.contentInsetAdjustmentBehavior == .never
-                && p.navigation.covers[second.id] == nil
+                && p.navigationHost.covers[second.id] == nil
                 && abs(replacement.contentOffset.y + second.scrollTopInset(replacement) - savedTop) < 1
         }
     }
@@ -559,8 +565,8 @@ final class ContentOwnersIOSTests: XCTestCase {
         guard #available(iOS 27.1, *) else { throw XCTSkip("arrangements require iOS 27.1") }
         guard let scene = hostedWindowScene() else { throw missing("scene", "arranged inset ownership needs a route in a window") }
         let (session, root, first, second, route, _) = try arrangedPeers(in: scene)
-        let p = session.presenter, navigation = p.navigation
-        session.natives.hatchesConnected = true
+        let p = session.presenter, navigation = p.navigationHost
+        session.nativeViews!.hatchesConnected = true
         route.hatched = true
         route.ownedScroll = second
         for pane in [first, second] {
@@ -596,9 +602,9 @@ final class ContentOwnersIOSTests: XCTestCase {
         scroll.contentInsetAdjustmentBehavior = .automatic
         XCTAssertTrue(p.arrangements.set(root.id, controller: nil))
         until("the retired peer returns its inset policy") { scroll.contentInsetAdjustmentBehavior == .never }
-        XCTAssertTrue(NavigationHost.ownedChanges(scroll, of: second, insetByUIKit: navigation.insetByUIKit(second)).isEmpty)
+        XCTAssertTrue(RouteGeometry.ownedChanges(scroll, of: second, insetByUIKit: navigation.insetByUIKit(second)).isEmpty)
         scroll.contentInsetAdjustmentBehavior = .automatic
-        XCTAssertEqual(NavigationHost.ownedChanges(scroll, of: second, insetByUIKit: navigation.insetByUIKit(second)), ["contentInsetAdjustmentBehavior"])
+        XCTAssertEqual(RouteGeometry.ownedChanges(scroll, of: second, insetByUIKit: navigation.insetByUIKit(second)), ["contentInsetAdjustmentBehavior"])
     }
 
     /// The edge-effect fixture's Panes tab, its two peers arranged side by side beneath the route's bars.
@@ -610,7 +616,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         XCTAssertNil(reply["error"], "\(reply)")
         let root = try node(session, "arrangement")
         let first = try node(session, "pane-first"), second = try node(session, "pane-second")
-        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
+        let route = try XCTUnwrap(p.navigationHost.primaryNavigation?.topViewController as? RouteController)
         let controller = UIArrangementViewController()
         controller.updateArrangement(.split.axes(.horizontal))
         XCTAssertTrue(p.arrangements.set(root.id, controller: controller))
@@ -713,7 +719,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         XCTAssertNil(session.boot(plan: plan, size: size).error)
         view.frame = host.view.bounds
         view.layoutIfNeeded()
-        until("the stack is installed") { session.presenter.navigation.primaryOwner != nil }
+        until("the stack is installed") { session.presenter.navigationHost.primaryOwner != nil }
         // A sheet waits for the first drawn frame, which this window never draws.
         if session.firstDrawMs == nil { session.firstDrawMs = ExactEnv.wall() }
         return session
@@ -744,7 +750,7 @@ final class ContentOwnersIOSTests: XCTestCase {
     /// `view` in the local coordinates of the routes' owner, where an
     /// ordinary route's placement is.
     private func local(_ session: ExactSession, _ view: UIView) -> BlockPlacement? {
-        let owner = session.presenter.navigation.container
+        let owner = session.presenter.navigationHost.container
         return owner.map { BlockPlacement(rect: view.convert(view.bounds, to: $0), within: $0.id, contentOffset: nil) }
     }
 
@@ -774,12 +780,12 @@ final class ContentOwnersIOSTests: XCTestCase {
         let session = try fixture("owner-routes", CGSize(width: 402, height: 874))
         let p = session.presenter
         let home = try node(session, "route-home")
-        let homeView = try XCTUnwrap(p.navigation.controllers[home.id]?.view)
+        let homeView = try XCTUnwrap(p.navigationHost.controllers[home.id]?.view)
         XCTAssertEqual(laidOut(session, home.id), homeView.bounds.size)
         XCTAssertEqual(placed(session, home), local(session, homeView), "the stack's root is placed where it is shown")
         XCTAssertNil(shown(session, home), "and keeps its place among its siblings")
         // Its parent's own transform is the runner's to apply, not the placement's
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         let before = try XCTUnwrap(placed(session, home))
         root.transform = CGAffineTransform(translationX: 0, y: 40)
         homeView.setNeedsLayout(); homeView.layoutIfNeeded()
@@ -789,20 +795,20 @@ final class ContentOwnersIOSTests: XCTestCase {
 
         p.press(try node(session, "detail").id)
         let detail = try node(session, "route-detail")
-        until("the pushed route is placed") { self.placed(session, detail) != nil && !p.navigation.transitioning }
-        let detailView = try XCTUnwrap(p.navigation.controllers[detail.id]?.view)
+        until("the pushed route is placed") { self.placed(session, detail) != nil && !p.navigationHost.transitioning }
+        let detailView = try XCTUnwrap(p.navigationHost.controllers[detail.id]?.view)
         XCTAssertEqual(placed(session, detail), local(session, detailView))
         XCTAssertNil(shown(session, detail))
         XCTAssertEqual(laidOut(session, detail.id), detailView.bounds.size)
         p.press(try node(session, "back").id)
-        until("back on the stack's root") { p.navigation.activeRoute?.node === home && !p.navigation.transitioning }
+        until("back on the stack's root") { p.navigationHost.activeRoute?.node === home && !p.navigationHost.transitioning }
         XCTAssertEqual(placed(session, home), local(session, homeView))
         XCTAssertNil(p.openTopLayer.modal, "nothing is presented")
 
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet()
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         until("the sheet's route takes its controller's size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         XCTAssertEqual(shown(session, sheet), seen(session, sheetView), "the sheet's route is a top-layer box where it is shown")
         XCTAssertNil(placed(session, sheet), "with no placement")
@@ -822,8 +828,8 @@ final class ContentOwnersIOSTests: XCTestCase {
         guard hostedWindowScene() != nil else { throw missing("scene", "native owner motion requires a scene") }
         let s = try fixture("owner-animation", CGSize(width: 402, height: 874), plan: "EXACT_TAB_OWNER_PLAN")
         let p = s.presenter, route = try node(s, "route-first")
-        let view = try XCTUnwrap(p.navigation.controllers[route.id]?.viewIfLoaded)
-        let owner = try XCTUnwrap(p.navigation.container)
+        let view = try XCTUnwrap(p.navigationHost.controllers[route.id]?.viewIfLoaded)
+        let owner = try XCTUnwrap(p.navigationHost.container)
         p.owners.publish()
         let start = try XCTUnwrap(p.owners.told[route.id]?.placement?.rect).minX
         var finished = false
@@ -906,7 +912,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet(at: CGRect(x: 149, y: 16, width: 653, height: 653))
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         XCTAssertEqual(sheetView.bounds.width, 653, "the sheet's route controller fills the sheet")
         until("the sheet's route takes the sheet's size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         XCTAssertEqual(laidOut(session, try node(session, "sheet-body").id)?.width, 653, "its content takes the sheet's width")
@@ -935,14 +941,14 @@ final class ContentOwnersIOSTests: XCTestCase {
     func testTheDocumentsFitIsTheRootContainersAlone() throws {
         let session = try fixture("owner-root-fit", CGSize(width: 402, height: 874), plan: "EXACT_NAVIGATION_BARS_PLAN")
         let p = session.presenter, view = try XCTUnwrap(session.view)
-        let primary = try XCTUnwrap(p.navigation.primaryNavigation)
+        let primary = try XCTUnwrap(p.navigationHost.primaryNavigation)
         // As the hatch's answer leaves it (`NativeHatches.navigationHatch`)
-        try XCTUnwrap(p.navigation.stacks[ObjectIdentifier(primary)]).showsBar = false
+        try XCTUnwrap(p.navigationHost.stacks[ObjectIdentifier(primary)]).showsBar = false
         view.fit()
         XCTAssertEqual(p.viewport.frame, view.bounds, "the primary container takes the whole view, its bar or not")
         p.press(try node(session, "start-open-sheet").id)
         let controller = try mountSheet()
-        XCTAssertTrue(p.navigation.presentedNavigations.contains { p.navigation.barShows($0) }, "the sheet's stack may show its bar")
+        XCTAssertTrue(p.navigationHost.presentedNavigations.contains { p.navigationHost.barShows($0) }, "the sheet's stack may show its bar")
         view.fit()
         XCTAssertEqual(p.viewport.frame, view.bounds, "the sheet leaves the document's fit alone")
     }
@@ -957,7 +963,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet()
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         let resize = { (height: CGFloat) in
             controller.view.frame = CGRect(x: 0, y: 874 - height, width: 402, height: height)
             controller.view.layoutIfNeeded()
@@ -966,7 +972,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         resize(814)
         until("the sheet's route takes its size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         // A slice in flight: what the presenter tells the runtime waits for it
-        p.collections.onFill?(sheet.id, Data())
+        p.listHost.onFill?(sheet.id, Data())
         XCTAssertTrue(session.fillInFlight)
         // First in line behind the slice, a size told at once when it runs
         session.whenIdle { resize(300) }
@@ -988,7 +994,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter
         p.press(try node(session, "sheet").id)
         let controller = try mountSheet()
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         root.handlers.formUnion(["focusin", "focusout"])
         var heard: [String] = []
         p.onFocusEvent = { at, kind, target, related in
@@ -1042,7 +1048,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet()
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         until("the sheet's route takes the sheet's size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         XCTAssertTrue(try XCTUnwrap(try node(session, "sheet-field-a").field).becomeFirstResponder())
         controller.view.setNeedsLayout()
@@ -1087,7 +1093,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             return sheet.view.window != nil && !sheet.isBeingPresented && sheet.transitionCoordinator == nil
         }
         let route = try node(session, routeID)
-        let controller = try XCTUnwrap(p.navigation.controllers[route.id], file: file, line: line)
+        let controller = try XCTUnwrap(p.navigationHost.controllers[route.id], file: file, line: line)
         let sheetView = try XCTUnwrap(controller.view, file: file, line: line)
         // Layout crosses the host ABI as f32; compare UIKit's bounds at that precision.
         until("the sheet's route takes the sheet's size: kernel \(String(describing: self.laidOut(session, route.id))), UIKit \(sheetView.bounds.size)") {
@@ -1131,7 +1137,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         until("the scroller is laid out") { scroller.bounds.height == 60 }
         XCTAssertEqual(scroller.contentOffset.y, 0)
         XCTAssertTrue(try XCTUnwrap(field.field).becomeFirstResponder())
-        p.collections.onFill?(try node(session, "route-sheet").id, Data())
+        p.listHost.onFill?(try node(session, "route-sheet").id, Data())
         XCTAssertTrue(session.fillInFlight)
         setKeyboard(p, top: 600)
         NotificationCenter.default.post(name: UIResponder.keyboardDidChangeFrameNotification, object: nil)
@@ -1154,7 +1160,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter
         p.press(try node(session, "sheet").id)
         let controller = try mountSheet()
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         let field = try node(session, "sheet-field-a")
         let above = { sequence(first: field as UIView, next: \.superview).dropFirst() }
         let props = { (set: [String: String], clear: [String]) in
@@ -1203,7 +1209,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let route = try node(session, "route-sheet"), field = try node(session, "sheet-field-a")
         p.press(try node(session, "sheet-detail").id)
         let detail = try node(session, "route-detail")
-        until("Detail is pushed in the sheet") { p.navigation.controllers[detail.id] != nil }
+        until("Detail is pushed in the sheet") { p.navigationHost.controllers[detail.id] != nil }
         XCTAssertFalse(detail.isDescendant(of: route), "beside the sheet's first route")
         let pushed = sequence(first: [detail as UIView]) { level in
             let next = level.flatMap(\.subviews)
@@ -1278,7 +1284,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let controller = try mountSheet()
         let relay = try XCTUnwrap(controller.view.subviews.compactMap { ($0 as? PresentationMount)?.relay }.first, "the mount carries a relay")
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         let body = try node(session, "sheet-body")
         let touched = try node(session, "sheet-menu")
         root.handlers.formUnion(["pointerdown", "pointerup", "contextmenu", "dblclick"])
@@ -1304,7 +1310,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter
         p.press(try node(session, "sheet").id)
         let controller = try mountSheet()
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         let body = try node(session, "sheet-body")
         root.handlers.insert("press")
         let inside = body.convert(CGPoint(x: body.bounds.midX, y: 4), to: nil)
@@ -1347,7 +1353,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet()
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         until("the sheet's route takes its size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         Owner.shared.sync {
             Owner.shared.callMain {
@@ -1371,7 +1377,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         let p = session.presenter, agent = Agent(session: session)
         p.press(try node(session, "home-open-viewport").id)
         XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         // The route's child that contains viewport-info-open: a left cover moves it right
         var child = try node(session, "viewport-info-open").id
@@ -1381,7 +1387,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             return CGFloat(x.doubleValue)
         }
         func wantedLeft() -> CGFloat {
-            if case .edges(let edges)? = p.navigation.covers[route.node.id] { return edges.left }
+            if case .edges(let edges)? = p.navigationHost.covers[route.node.id] { return edges.left }
             return 0
         }
         let insets = route.additionalSafeAreaInsets, frame = route.view.frame
@@ -1398,7 +1404,7 @@ final class ContentOwnersIOSTests: XCTestCase {
             until("the runner applies the sampled left cover \(wantedLeft()); the route's child starts at \(String(describing: left()))") {
                 left().map { abs($0 - wantedLeft()) < 0.5 } == true
             }
-            XCTAssertEqual(p.navigation.delivered[route.node.id], p.navigation.covers[route.node.id])
+            XCTAssertEqual(p.navigationHost.delivered[route.node.id], p.navigationHost.covers[route.node.id])
         }
     }
 
@@ -1409,21 +1415,21 @@ final class ContentOwnersIOSTests: XCTestCase {
         let session = try fixture("owner-reintroduced", CGSize(width: 402, height: 874), plan: "EXACT_NAVIGATION_BARS_PLAN")
         let p = session.presenter
         let home = try node(session, "route-start")
-        let controller = try XCTUnwrap(p.navigation.controllers[home.id])
+        let controller = try XCTUnwrap(p.navigationHost.controllers[home.id])
         let homeView = try XCTUnwrap(controller.viewIfLoaded)
         p.press(try node(session, "start-open-detail").id)
         let detail = try node(session, "route-detail")
-        until("the detail covers home") { self.placed(session, detail) != nil && !p.navigation.transitioning && homeView.window == nil }
+        until("the detail covers home") { self.placed(session, detail) != nil && !p.navigationHost.transitioning && homeView.window == nil }
         // The authored temporary route is before the retained stack, so the
         // production projection really releases the old owners' blocks.
         p.press(try node(session, "detail-park-owners").id)
         let parked = try node(session, "route-parked")
-        until("the temporary route replaces the native stack") { p.navigation.activeRoute?.node === parked && !p.navigation.transitioning }
+        until("the temporary route replaces the native stack") { p.navigationHost.activeRoute?.node === parked && !p.navigationHost.transitioning }
         until("the departed owner gives its block back") { p.owners.told[home.id] == nil }
-        XCTAssertTrue(p.navigation.controllers[home.id] === controller, "the authored route retains its controller")
+        XCTAssertTrue(p.navigationHost.controllers[home.id] === controller, "the authored route retains its controller")
         XCTAssertFalse(homeView.bounds.isEmpty)
         p.press(try node(session, "restore-owners").id)
-        until("detail returns with home covered") { p.navigation.activeRoute?.node === detail && !p.navigation.transitioning }
+        until("detail returns with home covered") { p.navigationHost.activeRoute?.node === detail && !p.navigationHost.transitioning }
         until("the reintroduced owner has its real block") { p.owners.told[home.id]?.block == .size(homeView.bounds.size) }
         XCTAssertNil(homeView.window, "the covered route was not shown to restore its block")
         XCTAssertNil(placed(session, home), "no offscreen placement is invented")
@@ -1432,7 +1438,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         XCTAssertEqual(rows.first { ($0["id"] as? NSNumber)?.uint32Value == home.id }?["inactive"] as? Bool, true)
         XCTAssertNil(rows.first { ($0["id"] as? NSNumber)?.uint32Value == detail.id }?["inactive"])
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node(session, "detail-open-plain").id)])["error"], "the shown route remains normally reachable")
-        until("the shown control navigated normally") { p.navigation.activeRoute?.node.props["testId"] == "route-plain" && !p.navigation.transitioning }
+        until("the shown control navigated normally") { p.navigationHost.activeRoute?.node.props["testId"] == "route-plain" && !p.navigationHost.transitioning }
     }
 
     /// A runtime replaced while a report waits behind a slice in flight
@@ -1445,10 +1451,10 @@ final class ContentOwnersIOSTests: XCTestCase {
         p.press(try node(session, "sheet").id)
         let sheet = try node(session, "route-sheet")
         let controller = try mountSheet()
-        let sheetView = try XCTUnwrap(p.navigation.controllers[sheet.id]?.view)
+        let sheetView = try XCTUnwrap(p.navigationHost.controllers[sheet.id]?.view)
         until("the sheet's route takes its size") { self.laidOut(session, sheet.id) == sheetView.bounds.size }
         // A slice in flight, and a report waiting behind it
-        p.collections.onFill?(sheet.id, Data())
+        p.listHost.onFill?(sheet.id, Data())
         XCTAssertTrue(session.fillInFlight)
         controller.view.frame = CGRect(x: 0, y: 374, width: 402, height: 500)
         controller.view.layoutIfNeeded()
@@ -1460,7 +1466,7 @@ final class ContentOwnersIOSTests: XCTestCase {
         until("the old slice is gone") { !session.fillInFlight }
         let home = try node(session, "route-home")
         until("the new route has its block") { p.owners.told[home.id] != nil }
-        let homeView = try XCTUnwrap(p.navigation.controllers[home.id]?.view)
+        let homeView = try XCTUnwrap(p.navigationHost.controllers[home.id]?.view)
         homeView.frame.size.width = 380
         homeView.layoutIfNeeded()
         until("and follows its controller") { p.owners.told[home.id]?.block == .size(homeView.bounds.size) }
@@ -1473,12 +1479,12 @@ final class ContentOwnersIOSTests: XCTestCase {
     func testRoutesGiveTheirBlocksBackWhenTheStackGoes() throws {
         let session = try fixture("owner-teardown", CGSize(width: 402, height: 874))
         let p = session.presenter
-        let root = try XCTUnwrap(p.navigation.container)
+        let root = try XCTUnwrap(p.navigationHost.container)
         p.apply(wireBatch([["op": "props", "id": Int(root.id), "set": ["viewportFit": "cover"]]]))
         let home = try node(session, "route-home")
         until("the route has its block") { p.owners.told[home.id] != nil }
         p.apply(wireBatch([["op": "props", "id": Int(root.id), "set": [String: String](), "clear": ["navigationBack"]]]))
-        until("the stack is down") { p.navigation.primaryOwner == nil }
+        until("the stack is down") { p.navigationHost.primaryOwner == nil }
         XCTAssertTrue(p.owners.told.isEmpty, "every block given back: \(p.owners.told.keys.sorted())")
         XCTAssertTrue(home.isDescendant(of: root), "the route is its parent's again")
     }

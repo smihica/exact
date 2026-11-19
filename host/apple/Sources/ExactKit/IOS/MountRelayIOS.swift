@@ -11,7 +11,7 @@ import UIKit
 /// — a pointer observer, a long press (`contextmenu`), a double tap
 /// (`dblclick`) — unless a nearer listener in the sheet takes it with its
 /// own recognizer. Recognition and arbitration stay UIKit's.
-final class MountRelay: NSObject, UIGestureRecognizerDelegate {
+package final class MountRelay: NSObject, UIGestureRecognizerDelegate {
     private weak var presenter: Presenter?
     unowned let mount: UIView
     private let pointer = PointerRecognizer(target: nil, action: nil)
@@ -19,7 +19,7 @@ final class MountRelay: NSObject, UIGestureRecognizerDelegate {
     private let double = UITapGestureRecognizer()
     private weak var pressed, doubled: NodeView?
 
-    init(_ presenter: Presenter, mount: UIView) {
+    package init(_ presenter: Presenter, mount: UIView) {
         self.presenter = presenter
         self.mount = mount
         super.init()
@@ -48,7 +48,7 @@ final class MountRelay: NSObject, UIGestureRecognizerDelegate {
         return nil
     }
 
-    func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+    package func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         // What a node's own long press and double tap leave to native input
         // (`NodeView.gestureRecognizer(_:shouldReceive:)`)
         if g !== pointer, NodeView.nativeInputOwns(touch.view, below: mount) { return false }

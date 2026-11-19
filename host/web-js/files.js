@@ -90,7 +90,7 @@ export async function answer(req) {
   const why = value != null ? h.check?.(value) ?? (h.capability === 'share' ? 'answered by tap, not type' : null) : null;
   if (why) return { error: `@${h.ticket} (${h.capability}): ${why}` };
   Holds.splice(at, 1); inflight.n--;
-  const n = value == null ? 0 : paths(value).length;
+  const n = value == null ? 0 : (h.capability === 'pick' ? paths(value) : documentPaths(value)).length;
   say(`device ${h.capability} ${h.ticket} ${value == null ? (req.choice === 'cancel' ? 'cancelled' : `answered: ${req.choice}`) : h.capability === 'pick' ? `answered: ${n} ${n === 1 ? 'file' : 'files'}` : h.capability === 'export' ? 'answered: a file' : `answered: ${n} ${n === 1 ? 'item' : 'items'}`}`);
   const out = await h.answer(value, req);
   return { ticket: h.ticket, capability: h.capability, answered: value == null ? req.choice : 'value', delivery: 'substituted', ...out };
@@ -107,7 +107,14 @@ export const deliveredType = (mime, accept) => {
   const heic = mime === 'image/heic' || mime === 'image/heif', keeps = accept.some(t => ['*/*', 'image/*', 'image/heic', 'image/heif', '.heic', '.heif'].includes(t));
   return heic && !keeps && accept.some(t => t.startsWith('image/')) ? 'image/jpeg' : mime;
 };
-const paths = v => { const l = v.split('\n').map(s => s.trim()).filter(Boolean); return v.includes('\n') ? l : String(v).trim().split(/\s+/).filter(Boolean); };
+const documentPaths = v => v.split('\n').map(s => s.trim()).filter(Boolean);
+const paths = v => v.includes('\n') ? documentPaths(v) : String(v).trim().split(/\s+/).filter(Boolean);
+// Paths belong to the driver, which may run on Windows even when the browser does not.
+const isAbsolutePath = path => {
+  if (path.startsWith('/') || /^[a-z]:[/\\]/i.test(path)) return true;
+  if (path.startsWith('\\\\?\\') || /^[/\\]{2}\.[/\\]/.test(path)) return true;
+  return /^[/\\]{2}[^/\\]+[/\\][^/\\]+/.test(path);
+};
 Hosts.showPicker = id => {
   const found = byId(String(id ?? ''));
   const el = found?.el.localName === 'input' && found.el.type === 'file' ? found.el : null;
@@ -142,24 +149,30 @@ function holdPicker(el, id) {
 // ---------------------------------------------------------------- saveFile (save_file.rs)
 // `(id, from, suggestedName)`, or `(id, none, suggestedName, text)` for
 // `text=`: the text itself, with no file to write first (x2apps notes #4).
+// `startIn=` makes either five, `none` fourth for a copy (LLP 1173 D2).
 Hosts.saveFile = (...args) => {
   const refuse = (why, el) => { say(`saveFile: refused: ${why}`); if (el) el.dispatchEvent(new Event('cancel')); };
+  let startIn = args.length === 5 ? args.pop() : undefined;
+  if (args.length === 4 && args[1] != null && args[3] == null) args.pop();
   const text = args.length === 4 && args[1] == null ? args[3] : undefined;
-  if (text !== undefined ? [args[0], args[2], text].some(a => typeof a !== 'string') : args.length !== 3 || args.some(a => typeof a !== 'string')) return refuse('saveFile takes (id, from, suggestedName) or (id, text=, suggestedName=), strings');
+  if (text !== undefined ? [args[0], args[2], text].some(a => typeof a !== 'string') : args.length !== 3 || args.some(a => typeof a !== 'string') || (startIn != null && typeof startIn !== 'string')) return refuse('saveFile takes (id, from, suggestedName) or (id, text=, suggestedName=), strings');
   const [id, from, suggestedName] = text !== undefined ? [args[0], '', args[2]] : args, found = byId(id);
   if (!found) return refuse(`no element with id "${id}"`);
   const rest = from.startsWith('app:/') ? from.slice(5).split('/') : [];
   if (text === undefined && (rest.length < 2 || rest.some(p => !p || p === '.' || p === '..' || p.includes('\0')))) return refuse(`${from} is not an app:/ file`, found.el);
   if (text === undefined && !coversPath(appGrantSet(), 'fs.read', from)) return refuse(`${from} is outside the app's fs.read grants`, found.el);
   if (!suggestedName || suggestedName.length > 255 || suggestedName === '.' || suggestedName === '..' || /[/\\\x00-\x1f\x7f]/.test(suggestedName)) return refuse('suggestedName is not a file name', found.el);
+  startIn = ruledStartIn('saveFile', startIn);
   const r = text !== undefined ? { present: true, view: found.view, text, suggestedName } : { present: true, view: found.view, from, suggestedName };
   if (clock.agent) {
-    hold('export', found.el, text !== undefined ? { id, text, suggestedName } : { id, from, suggestedName }, (value, req) => counted(glue().then(m => m.answerSave({ node: found.view, answered: value == null ? 'cancel' : 'value', request: r }, req.text))));
-    Holds.at(-1).check = v => { v = v.trim(); return (v.startsWith('/') || /^.:\\/.test(v)) && !/[\\/]$/.test(v) ? null : 'type an absolute file path to save to'; };
+    hold('export', found.el, { ...(text !== undefined ? { id, text, suggestedName } : { id, from, suggestedName }), ...(startIn != null && { startIn }) }, (value, req) => counted(glue().then(m => m.answerSave({ node: found.view, answered: value == null ? 'cancel' : 'value', request: r }, req.text))));
+    Holds.at(-1).check = v => { v = v.trim(); return isAbsolutePath(v) && !/[\\/]$/.test(v) ? null : 'type an absolute file path to save to'; };
     return;
   }
   // The save picker starts inside the press's activation, else a download.
-  const chosen = typeof showSaveFilePicker === 'function' ? showSaveFilePicker({ suggestedName }) : null;
+  const chosen = typeof showSaveFilePicker !== 'function' ? null : startIn?.startsWith('doc:/')
+    ? docs().then(m => m.startIn(startIn, 'saveFile')).then(at => showSaveFilePicker({ suggestedName, ...(at && { startIn: at }) }))
+    : showSaveFilePicker({ suggestedName, ...(startIn != null && { startIn: startIn === 'screenshots' ? 'pictures' : startIn }) });
   chosen?.catch(() => {});
   counted(glue().then(m => m.save(r, chosen)));
 };
@@ -242,11 +255,23 @@ OnHooks.pasted = ev => {
   if (!x().documents?.pasted) { say('paste: its files came before the page could hold them'); return []; }
   return x().documents.pasted(ev.clipboardData, driver);
 };
+// `startIn` (LLP 1173 D2): a well-known folder's name or a `doc:/` path
+// passes on to the picker (documents-glue.js resolves a handle); anything
+// else is journalled and left out, and the picker opens where it would.
+const WELL_KNOWN = ['desktop', 'documents', 'downloads', 'music', 'pictures', 'videos', 'screenshots'];
+function ruledStartIn(name, start) {
+  if (start == null || WELL_KNOWN.includes(start) || /^doc:\/\d+(\/|$)/.test(start)) return start ?? undefined;
+  say(`${name}: startIn: refused: "${start}" is neither a well-known folder (${WELL_KNOWN.join(', ')}) nor a doc:/ path`);
+}
 const PICKERS = { showOpenFilePicker: ['open-file', 'showOpenFilePicker takes (id) or (id, multiple)'], showDirectoryPicker: ['open-directory', 'showDirectoryPicker takes (id)'], showSaveFilePicker: ['save-file', 'showSaveFilePicker takes (id, suggestedName)'] };
 for (const [name, [capability, usage]] of Object.entries(PICKERS)) Hosts[name] = (...args) => {
   const refuse = (why, el) => { say(`${name}: refused: ${why}`); if (el) el.dispatchEvent(new Event('cancel')); };
+  // `startIn=` trails the arguments: `(id, multiple, startIn)`, `multiple` none when absent.
+  const named = args.length === (capability === 'open-directory' ? 2 : 3);
+  let startIn = named ? args.pop() : undefined;
+  if (named && capability === 'open-file' && args[1] == null) args.pop();
   const [id, second] = args, rest = args.slice(1);
-  if (typeof id !== 'string') return refuse(usage);
+  if (typeof id !== 'string' || (startIn != null && typeof startIn !== 'string')) return refuse(usage);
   const ok = capability === 'open-file' ? rest.length === 0 || (rest.length === 1 && typeof second === 'boolean')
     : capability === 'open-directory' ? rest.length === 0 : rest.length === 1 && typeof second === 'string';
   if (!ok) return refuse(usage);
@@ -254,11 +279,12 @@ for (const [name, [capability, usage]] of Object.entries(PICKERS)) Hosts[name] =
   if (capability === 'save-file' && (!suggestedName || suggestedName.length > 255 || suggestedName === '.' || suggestedName === '..' || /[/\\\x00-\x1f\x7f]/.test(suggestedName))) return refuse('suggestedName is not a file name');
   const found = byId(id);
   if (!found) return refuse(`no element with id "${id}"`);
-  const r = { present: true, view: found.view, id, multiple, suggestedName };
+  startIn = ruledStartIn(name, startIn);
+  const r = { present: true, view: found.view, id, multiple, suggestedName, startIn };
   if (clock.agent) {
-    hold(capability, found.el, capability === 'open-file' ? { id, multiple } : capability === 'save-file' ? { id, suggestedName } : { id },
+    hold(capability, found.el, { ...(capability === 'open-file' ? { id, multiple } : capability === 'save-file' ? { id, suggestedName } : { id }), ...(startIn != null && { startIn }) },
       (value, req) => counted(docs().then(m => m.answer({ node: found.view, answered: value == null ? 'cancel' : 'value' }, name, req.files))));
-    Holds.at(-1).check = v => { const list = paths(v); return !list.length || list.some(p => !p.startsWith('/')) ? 'type an absolute path' : list.length > 1 && !multiple ? `one path, not ${list.length}` : null; };
+    Holds.at(-1).check = v => { const list = documentPaths(v); return !list.length || list.some(p => !isAbsolutePath(p)) ? 'type an absolute path' : list.length > 1 && !multiple ? `one path, not ${list.length}` : null; };
     return;
   }
   // A save without the browser's picker downloads (documents-glue.js), as `saveFile` does.

@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1105: the status bar's style from `status-bar-style`. The declaration
 /// painted on top of what covers the bar wins, and a flip reaches the

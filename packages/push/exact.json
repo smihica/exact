@@ -2,6 +2,7 @@
   "kind": "interface",
   "name": "@exact/push",
   "version": "1.0.0",
+  "start": "load",
   "grants": [
     "device.push"
   ],
@@ -11,12 +12,26 @@
     "field": "state",
     "denied": "NotAllowedError"
   },
+  "config": {
+    "android": {
+      "googleServices": { "type": "string" }
+    }
+  },
   "shapes": {
     "ApplePushSubscription": {
       "deviceToken": "string"
     },
+    "AndroidPushSubscription": {
+      "installationId": "string",
+      "token": "string",
+      "appId": "string"
+    },
+    "PushEvent": {
+      "data": "string"
+    },
     "PushSubscription": {
-      "apple": "option<ApplePushSubscription>"
+      "apple": "option<ApplePushSubscription>",
+      "android": "option<AndroidPushSubscription>"
     },
     "PushPermissionStatus": {
       "available": "bool",
@@ -24,6 +39,7 @@
     }
   },
   "names": [
+    { "event": "push", "on": "root", "raised": "wake", "args": ["PushEvent"], "hold": 16, "budget": 10000 },
     {
       "send": "subscribePush",
       "request": true,
@@ -36,7 +52,6 @@
         },
         "unsupported": [
           "tvos",
-          "android",
           "web",
           "linux",
           "windows",
@@ -64,10 +79,6 @@
         },
         "targets": {
           "tvos": {
-            "available": false,
-            "state": "unknown"
-          },
-          "android": {
             "available": false,
             "state": "unknown"
           },

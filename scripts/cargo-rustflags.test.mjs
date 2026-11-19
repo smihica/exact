@@ -1,10 +1,10 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { claimTargetCrates, targetRustflags } from './cargo-check.mjs';
+import { authoredWorkspace, claimTargetCrates, declaredWorkspace, targetRustflags } from './cargo-check.mjs';
 import { wasmRemapFlags } from './app.mjs';
 
 // Cargo refuses to merge an array given with --config into a configured string ("expected string, but found array"),
@@ -65,16 +65,37 @@ test('a wasm build takes its remap over the app\'s configured wasm rustflags, a 
 }, 300000);
 
 test('two apps whose crates share names cannot share a target directory while both exist', () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-target-crates-'));
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-target-crates-')));
   try {
     const target = resolve(dir, 'shared'), one = resolve(dir, 'one/budget'), two = resolve(dir, 'two/budget');
     for (const app of [one, two]) { mkdirSync(app, { recursive: true }); writeFileSync(resolve(app, 'app.contract'), ''); }
     claimTargetCrates(target, 'budget', one);
     claimTargetCrates(target, 'budget', one);
+    const alias = resolve(dir, 'alias');
+    symlinkSync(one, alias, 'dir');
+    claimTargetCrates(target, 'budget', alias);
+    claimTargetCrates(target, 'linked', alias);
+    assert.equal(readFileSync(resolve(target, '.exact-crates/linked'), 'utf8'), `${one}\n`);
     claimTargetCrates(target, 'other', two);
     assert.throws(() => claimTargetCrates(target, 'budget', two), new RegExp(`holds the crates budget-\\* of the app in ${one}, and the app in ${two} names its crates the same`));
     rmSync(one, { recursive: true });
     claimTargetCrates(target, 'budget', two);
     assert.equal(readFileSync(resolve(target, '.exact-crates/budget'), 'utf8'), `${two}\n`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('workspace discovery follows a linked app to its physical ancestors', () => {
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'exact-linked-workspace-')));
+  const repo = resolve(dir, 'repo'), app = resolve(repo, 'apps/mobile'), alias = resolve(dir, 'links/mobile');
+  try {
+    mkdirSync(app, { recursive: true });
+    mkdirSync(resolve(dir, 'links'));
+    symlinkSync(app, alias, 'dir');
+    writeFileSync(resolve(repo, 'Cargo.toml'), '[workspace]\nmembers=["apps/mobile"]\n');
+    writeFileSync(resolve(app, 'Cargo.toml'), '[package]\nname="mobile"\nversion="0.1.0"\n');
+    assert.equal(authoredWorkspace(alias), repo);
+    writeFileSync(resolve(app, 'Cargo.toml'), '[package]\nworkspace="../.."\nname="mobile"\nversion="0.1.0"\n');
+    assert.equal(authoredWorkspace(alias), repo);
+    assert.equal(declaredWorkspace(alias, [alias]), repo);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 @testable import ExactGroupedLists
 
 /// LLP 1116.005 D3 over `scripts/fixtures/tab-edge.contract`: each route
@@ -122,7 +123,7 @@ final class RouteScrollIOSTests: XCTestCase {
 
     func testAPushedRouteOpensAtItsTopAndBackFindsTheListWhereItWasLeft() throws {
         let session = try fixture()
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController, "the tabs are a UITabBarController")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController, "the tabs are a UITabBarController")
         for (tab, root, pushed) in [("scrolls", "scrolls", "scrollsPushed"), ("grouped", "grouped", "groupedPushed")] {
             try tap("tab-\(tab)")
             spin(0.6)

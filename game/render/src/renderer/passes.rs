@@ -123,21 +123,20 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameInput<'_>,
         custom: &[CustomMaterial],
+        cached: bool,
     ) -> u32 {
         let Some(shadows) = &self.shadows else {
             return 0;
         };
         let mut draws = 0;
-        // A look frame draws every caster itself and leaves the cache as the
-        // live frames left it (`prepare_shadow_cache`).
-        let cache = shadows.cached.as_ref().filter(|_| self.probe.is_none());
+        let cache = shadows.cached.as_ref().filter(|_| cached);
         for i in 0..shadows.count as usize {
             let view = 1 + i as u32;
             self.probe_stage(Stage::SunShadow(i as u8));
             let stamped = cache.is_some()
                 && timing::encoder_stamp(&self.device, encoder, frame.timestamps, i as u32, false);
             if let Some(cache) = cache {
-                if cache.dirty {
+                if cache.dirty && self.probe.is_none() {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("game static sun casters"),
                         color_attachments: &[],
@@ -172,6 +171,9 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                     }
                     bound.flush(&mut pass);
                 }
+            }
+            if cache.is_some() {
+                self.probe_note(|| Drew::Summary("cached sun casters"));
             }
             let copied = cache.is_some_and(|c| c.copy(encoder, shadows.view.texture(), i));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -212,7 +214,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             }
             bound.flush(&mut pass);
         }
-        if let Some(cache) = cache {
+        if let Some(cache) = cache.filter(|_| self.probe.is_none()) {
             cache.encoded.set(true);
         }
         draws
@@ -309,7 +311,6 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         hooks: &mut H,
         view: &crate::FrameView<'_>,
     ) -> Result<(), RenderError> {
-        let time = view.time;
         // Soft particles: translucency follows in its own pass over this depth.
         let split = self.quads.split();
         let sky = frame
@@ -458,7 +459,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             state.draws += 1;
         }
         if H::ENABLED {
-            let start = (!time.seekable).then(crate::perf::Stamp::now);
+            let start = state.measure.then(crate::perf::Stamp::now);
             timing::pass_stamp(&self.device, &mut pass, frame.timestamps, 18, false);
             self.probe_note(|| Drew::Summary("hook opaque"));
             hooks
@@ -489,7 +490,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
             state.draws += 1;
         }
         if H::ENABLED {
-            let start = (!time.seekable).then(crate::perf::Stamp::now);
+            let start = state.measure.then(crate::perf::Stamp::now);
             timing::pass_stamp(&self.device, &mut pass, frame.timestamps, 19, false);
             self.probe_note(|| Drew::Summary("hook background"));
             hooks
@@ -588,7 +589,6 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         hooks: &mut H,
         view: &crate::FrameView<'_>,
     ) -> Result<(), RenderError> {
-        let time = view.time;
         let targets = self.hook_targets.as_ref().unwrap();
         if targets.resolve_depth(
             encoder,
@@ -647,7 +647,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         });
         self.probe_stage(Stage::Translucent);
         self.scene_viewport(&mut pass, state.size, false);
-        let start = (!time.seekable).then(crate::perf::Stamp::now);
+        let start = state.measure.then(crate::perf::Stamp::now);
         self.probe_note(|| Drew::Summary("hook surface"));
         hooks
             .surface(&mut pass, &targets.scene().unwrap(), view)
@@ -667,7 +667,6 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
         hooks: &mut H,
         view: &crate::FrameView<'_>,
     ) -> Result<(), RenderError> {
-        let time = view.time;
         if let Some(targets) = &self.hook_targets {
             if targets.resolve_depth(
                 encoder,
@@ -684,7 +683,7 @@ impl<const ASSETS: bool> RendererWithAssets<ASSETS> {
                 state.draws += 1;
             }
             if let Some(inputs) = targets.post(&self.targets.resolved) {
-                let start = (!time.seekable).then(crate::perf::Stamp::now);
+                let start = state.measure.then(crate::perf::Stamp::now);
                 timing::encoder_stamp(&self.device, encoder, frame.timestamps, 21, false);
                 self.probe_note(|| Drew::Summary("hook post"));
                 hooks

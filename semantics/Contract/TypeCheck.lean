@@ -68,11 +68,14 @@ theorem boundedTy_some {p : Program} {o : Option Ty} {t : Ty} (h : boundedTy p o
 
 /-- `formatNumber`'s literal parameters (`type-format-style`), then the
 format locale. The embedding fills an omitted code with `""`; only
-non-currency styles take that default. `Format.currencies` has the roster's admitted code literals. -/
+non-currency styles take that default. `Format.currencies` has the roster's admitted code literals.
+`decimal` may take a fraction digit count instead; one past 0–100 or not whole is refused when
+evaluated, as `toFixed`'s is. -/
 def numberFormatArgs : List Expr → Bool
   | [_, .str style, .str code, _] =>
     if style == "currency" then Format.currencies.any (fun c => c.1 == code)
     else ["compact", "decimal", "percent"].contains style && code == ""
+  | [_, .str "decimal", .num _, _] => true
   | _ => false
 
 mutual
@@ -419,10 +422,10 @@ def checkResource (p : Program) (r : ResourceDecl) : Bool :=
       | .none => false
     | _ => false
 def checkAction (p : Program) (a : ActionDecl) : Bool := checkStmts p (compScope p) a.params.reverse a.body
-/-- A task's action exists and takes no parameters. -/
+/-- A task's action accepts its captured props. -/
 def taskAction (p : Program) (t : TaskDecl) : Bool :=
   match p.actions.find? (·.name == t.action) with
-  | .some a => a.params.isEmpty
+  | .some a => a.params.length == t.args.length
   | .none => false
 /-- A gated task's gate is a bool and its key a string, number or bool
 (the compiler's `type-task-gate`, `type-task-key`; LLP 1092 D9). -/
@@ -436,14 +439,15 @@ def taskGate (p : Program) (t : TaskDecl) : Bool :=
       | _ => false
     | .none => true)
 def checkTask (p : Program) (t : TaskDecl) : Bool :=
-  inferLe p (compScope p) [] t.ms .number && taskAction p t && (t.ms matches .num _) && taskGate p t
-/-- A mutation's `then`, if any, names an action of no parameters. -/
+  inferLe p (compScope p) [] t.ms .number && taskAction p t && (t.ms matches .num _) && (t.owner.isSome || taskGate p t)
+/-- A mutation's `then`, if any, names an action of as many parameters as
+its `then` arguments. -/
 def thenAction (p : Program) (m : MutationDecl) : Bool :=
   match m.andThen with
   | .none => true
   | .some a =>
     match p.actions.find? (·.name == a) with
-    | .some ad => ad.params.isEmpty
+    | .some ad => ad.params.length == m.thenArgs.length
     | .none => false
 
 /-- The checker: every part well typed. -/
@@ -1028,9 +1032,10 @@ theorem check_sound {p : Program} (h : check p = true) : WellTyped p := by
     split at this
     · next b hb => exact ⟨b, hb⟩
     · simp at this
-  · intro t ht e he
+  · intro t ht ho e he
     simp only [checkTask, Bool.and_eq_true] at htasks
     have := (htasks t ht).2
+    simp only [ho, Option.isSome_none, Bool.false_or] at this
     simp only [taskGate, Bool.and_eq_true] at this
     obtain ⟨hg, hk⟩ := this
     rcases List.mem_append.mp he with he | he

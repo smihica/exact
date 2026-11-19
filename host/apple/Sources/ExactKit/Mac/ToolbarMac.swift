@@ -19,7 +19,7 @@
 #if os(macOS)
 import AppKit
 
-final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidation {
+package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
     unowned let presenter: Presenter
     private(set) weak var window: NSWindow?
     private(set) var toolbar: NSToolbar?
@@ -154,10 +154,11 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
     var onChange: (() -> Void)?
     /// LLP 1075.003.000 §3.7: the app module's `toolbar` hatch, once a
     /// toolbar is installed; the items it adds after Exact's, which Exact
-    /// never removes; its delegate, which hears what Exact does not answer.
+    /// never removes; the delegate Exact keeps in the toolbar's slot, which
+    /// holds the app's.
     private var hatched = false
     private(set) var appItems: [NSToolbarItem] = []
-    private weak var appDelegate: NSToolbarDelegate?
+    private(set) var delegateProxy: ToolbarDelegateProxy?
 
     init(_ presenter: Presenter) { self.presenter = presenter }
 
@@ -281,7 +282,9 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
         heldForBack = false
         // The app's items and delegate were for that toolbar; the next one's
         // hatch says its own.
-        hatched = false; appItems.removeAll(); appDelegate = nil
+        hatched = false; appItems.removeAll()
+        delegateProxy?.retire()
+        delegateProxy = nil
         if hadToolbar { onChange?(); keepContent(content) }
     }
 
@@ -318,23 +321,10 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
         if syncing { DispatchQueue.main.async { [weak self] in self?.sync() } } else { sync() }
     }
 
-    /// The app's delegate: Exact keeps the toolbar's slot (it supplies its
-    /// command items) and forwards what it does not answer. AppKit reads what
-    /// a delegate answers when it is set, so it is set again.
-    func setAppDelegate(_ delegate: NSToolbarDelegate?) {
-        appDelegate = delegate
-        toolbar?.delegate = nil
-        toolbar?.delegate = self
-        presenter.session?.log("hatch toolbar: delegate \(delegate.map { "\(type(of: $0))" } ?? "cleared")")
-    }
-
-    override func responds(to selector: Selector!) -> Bool {
-        super.responds(to: selector) || (appDelegate?.responds(to: selector) ?? false)
-    }
-
-    override func forwardingTarget(for selector: Selector!) -> Any? {
-        appDelegate?.responds(to: selector) == true ? appDelegate : nil
-    }
+    /// The app's delegate for the installed toolbar
+    /// (`ForwardingDelegate.give`): Exact keeps the toolbar's slot, where it
+    /// supplies its command items.
+    func setAppDelegate(_ delegate: NSToolbarDelegate?) { delegateProxy?.give(delegate) }
 
     /// `state.window.toolbar` (the agent).
     var summary: [String: Any] {
@@ -398,7 +388,7 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
     }
 
     private func children(_ node: NodeView) -> [NodeView] {
-        node.container.subviews.compactMap { $0 as? NodeView }
+        node.childNodes
     }
 
     /// A native button's prominent style is a prominent item, tinted by its
@@ -578,7 +568,7 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
         if let said { presenter.session?.log("window header: \(said)") }
     }
 
-    func sync() {
+    package func sync() {
         guard !syncing else { return }
         let adopted = header?.segments
         syncing = true
@@ -632,8 +622,8 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
         // A list beside its detail (LLP 1115.002 D4): the bar's items stop
         // at the divider between them and begin again after it, so each
         // header's buttons are over its own column.
-        let split = presenter.navigation.split, columns = declared == nil && split.active && split.controller?.view.window === window
-        let listIsOwner = header == nil || header?.route === split.shown?.list
+        let split = presenter.navigation.stackSplit, columns = declared == nil && split.active && split.window === window
+        let listIsOwner = header == nil || header?.route === split.shownSplit?.list
         let (over, after): (WindowHeader?, WindowHeader?) = !columns ? (header, nil) : listIsOwner ? (header, beside) : (beside, header)
         let installing = toolbar == nil
         if installing {
@@ -648,7 +638,10 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
             // A customizable one is the same in every window of the app, as
             // the person arranges it, and AppKit keeps that arrangement.
             let value = NSToolbar(identifier: customizing ?? "Exact.window.commands." + UUID().uuidString)
-            value.delegate = self
+            let proxy = ToolbarDelegateProxy()
+            proxy.host = self
+            proxy.fill(value) { [weak self] in self?.presenter.session?.log("hatch toolbar: \($0)") }
+            delegateProxy = proxy
             value.displayMode = .iconOnly
             value.allowsUserCustomization = customizing != nil
             value.autosavesConfiguration = customizing != nil
@@ -852,14 +845,14 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
             return NSTrackingSeparatorToolbarItem(identifier: identifier, splitView: split, dividerIndex: 0)
         }
         // The same for the divider between a list and its detail (LLP 1115.002 D4).
-        if identifier == Self.listSeparatorIdentifier, let controller = presenter.navigation.split.controller {
-            return NSTrackingSeparatorToolbarItem(identifier: identifier, splitView: controller.splitView, dividerIndex: controller.listDivider)
+        if identifier == Self.listSeparatorIdentifier, let divider = presenter.navigation.stackSplit.listDivider {
+            return NSTrackingSeparatorToolbarItem(identifier: identifier, splitView: divider.view, dividerIndex: divider.index)
         }
         if let group = segments.item, group.itemIdentifier == identifier { return group }
         if let field = search.item, field.itemIdentifier == identifier { return field }
         return items.values.first { $0.itemIdentifier == identifier } ?? appItems.first { $0.itemIdentifier == identifier }
     }
-    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+    package func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         syncAccessibility()
         if item === backItem { return toolbar != nil && window?.toolbar === toolbar && presenter.navigation.canGoBack }
         if item === historyItem { return syncHistory() }
@@ -1023,6 +1016,22 @@ final class WindowToolbarHost: NSObject, NSToolbarDelegate, NSToolbarItemValidat
             }
         }
         return result
+    }
+}
+
+/// The delegate Exact keeps in its window toolbar's slot: the host's items
+/// and identifiers, and the app's delegate for the rest (`ForwardingDelegate`).
+final class ToolbarDelegateProxy: ForwardingDelegate, NSToolbarDelegate {
+    weak var host: WindowToolbarHost?
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        host?.toolbarAllowedItemIdentifiers(toolbar) ?? []
+    }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        host?.toolbarDefaultItemIdentifiers(toolbar) ?? []
+    }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        host?.toolbar(toolbar, itemForItemIdentifier: identifier, willBeInsertedIntoToolbar: flag)
     }
 }
 #endif

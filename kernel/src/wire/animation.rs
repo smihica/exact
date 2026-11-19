@@ -98,7 +98,7 @@ impl Reader<'_> {
         }
         let animations = Animations(out);
         animations
-            .validate()
+            .validate_linked()
             .map_err(DecodeError::InvalidAnimation)?;
         Ok(animations)
     }

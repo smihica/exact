@@ -9,12 +9,16 @@ vendor/ibex/third_party/wpt/urltestdata.json is web-platform-tests'
 url/resources/urltestdata.json, Copyright (c) web-platform-tests contributors,
 under the 3-Clause BSD License; the licence is beside it (LICENSE.md).
 
+packages/model-viewer adapts occlusion-viewer by Ming Kao at b63cff7
+(https://github.com/koolkao/occlusion-viewer), Copyright (c) 2026 Ming Kao,
+under the MIT License; its notice is LICENSE-occlusion-viewer in that package.
+
 Media
 
 The following images are by Daehyeon Mun and are included with permission:
   examples/calendar/assets/themes/
   apps/duo-lab/art/
-  tamber/tests/import/figma/ (Figma kit fixtures)
+  forma/tests/import/figma/ (Figma kit fixtures)
 
 The landscape pictures in apps/exact-live/assets, apps/interaction-gallery/assets
 and apps/duo-lab/assets, and their JPEG copies in apps/shared-elements/assets,

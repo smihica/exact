@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
-import { basename, dirname, resolve } from 'node:path';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { pathFrom } from '../scripts/app.mjs';
 
 const ROOT = resolve(import.meta.dir, '..');
@@ -47,6 +47,17 @@ function replaceSpans(text, edits) {
   return text;
 }
 
+/** Whether a path dependency on another of the checkout's crates (the build script's `contract`, say) points into a
+ * checkout: it ends in that crate's place in this one, and what precedes that is gone or is an exact2 checkout (its
+ * scripts/app-cli.mjs), so an app's own crate of the same name, even at the same place under the app, stays. A path
+ * that holds `<exact2>` is `exact2Placeholders`' to resolve or name as unresolved. */
+function intoCheckout(path, from, dir) {
+  const at = relative(ROOT, dir).split(sep).join('/'), p = path.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (path.includes('<exact2>') || at.startsWith('..') || isAbsolute(at) || !(p + '/').endsWith(`/${at}/`)) return false;
+  const old = resolve(from, p.slice(0, p.length - at.length) || '.');
+  return !existsSync(old) || existsSync(resolve(old, 'scripts/app-cli.mjs'));
+}
+
 /** Mark candidate strings, then let TOML resolve their locations. This covers dotted keys, child tables and inline
  * parents without treating comments, quoted keys or unrelated strings as dependency declarations. */
 function relocate(text, expected, from, crates, advice) {
@@ -54,7 +65,7 @@ function relocate(text, expected, from, crates, advice) {
   for (const [keys, table] of dependencyTables(expected, ['dependencies', 'build-dependencies', 'dev-dependencies'])) {
     for (const [name, dep] of Object.entries(table)) {
       const crate = dep?.package ?? name;
-      if (typeof dep?.path !== 'string' || !(crate.startsWith('exact-') || crate === 'ibex2-sqlite') || !crates.has(crate)) continue;
+      if (typeof dep?.path !== 'string' || !crates.has(crate) || !(crate.startsWith('exact-') || crate === 'ibex2-sqlite' || intoCheckout(dep.path, from, crates.get(crate)))) continue;
       const path = pathFrom(from, crates.get(crate));
       if (dep.path !== path) paths.push({ keys: [...keys, name], old: dep.path, path });
     }
@@ -135,10 +146,42 @@ export function exact2Placeholders(text, from) {
   return { text: out + text.slice(at), unresolved };
 }
 
+/** Cargo otherwise treats path dependencies below .exact/checkout as members of the app's workspace. */
+function excludeCheckout(text) {
+  const doc = Bun.TOML.parse(text);
+  if (!doc.workspace || doc.workspace.exclude?.includes('.exact/checkout')) return text;
+  const expected = structuredClone(doc);
+  expected.workspace.exclude = [...(doc.workspace.exclude ?? []), '.exact/checkout'];
+  const candidates = [];
+  if (doc.workspace.exclude) {
+    for (const match of text.matchAll(/\bexclude\s*=\s*\[/g)) {
+      const at = match.index + match[0].length;
+      candidates.push(text.slice(0, at) + '".exact/checkout", ' + text.slice(at));
+    }
+    expected.workspace.exclude = ['.exact/checkout', ...doc.workspace.exclude];
+  } else {
+    candidates.push(text.replace(/^(\[workspace\][^\n]*\n)/m, '$1exclude = [".exact/checkout"]\n'));
+    for (const match of text.matchAll(/\bworkspace\s*=\s*\{/g)) {
+      const at = match.index + match[0].length;
+      candidates.push(text.slice(0, at) + ' exclude = [".exact/checkout"], ' + text.slice(at));
+    }
+    candidates.push('workspace.exclude = [".exact/checkout"]\n' + text);
+  }
+  for (const next of candidates) {
+    try { if (isDeepStrictEqual(Bun.TOML.parse(next), expected)) return next; } catch {}
+  }
+  throw new Error('set workspace.exclude to include ".exact/checkout", then run update again');
+}
+
 /** Validate each edited manifest before writing it; report all refusals together. */
 export function updateManifests(dir, crates, rootText) {
   const changed = [], unresolved = [], refused = [];
-  const manifests = readdirSync(dir, { recursive: true }).filter(f => basename(f) === 'Cargo.toml' && !/^(target|dist)\//.test(f))
+  const manifestsIn = (at, prefix = '') => readdirSync(at, { withFileTypes: true }).flatMap(entry => {
+    if (['.exact', 'target', 'dist', 'node_modules', '.git'].includes(entry.name)) return [];
+    const name = prefix + entry.name;
+    return entry.isDirectory() ? manifestsIn(resolve(at, entry.name), name + '/') : entry.name === 'Cargo.toml' ? [name] : [];
+  });
+  const manifests = manifestsIn(dir)
     .map(file => {
       const path = resolve(dir, file), text = readFileSync(path, 'utf8');
       let doc; try { doc = Bun.TOML.parse(text); } catch {} // Cargo below reports invalid authored manifests with their paths.
@@ -152,7 +195,7 @@ export function updateManifests(dir, crates, rootText) {
     if (!doc) continue;
     try {
       const result = editManifest(text, dirname(path), crates, {
-        prepared: path === root.path ? rootText ?? text : text, workspaceProvider, rootProvider: path === root.path && inherited,
+        prepared: path === root.path ? existsSync(resolve(dir, '.exact/checkout')) ? excludeCheckout(rootText ?? text) : rootText ?? text : text, workspaceProvider, rootProvider: path === root.path && inherited,
       });
       if (result.unresolved) unresolved.push(file);
       if (result.text !== text) { writeFileSync(path, result.text); changed.push(file); }
@@ -161,3 +204,90 @@ export function updateManifests(dir, crates, rootText) {
   if (refused.length) throw new Error(`update: edit these manifests by hand, then run update again:\n${refused.join('\n')}`);
   return { changed, unresolved };
 }
+
+/** Scan every target's local sources. External modules, generated code and unreadable sources keep the dependency. */
+function usesLinux(android, doc, source, migrated) {
+  try {
+    const paths = [doc.lib, ...['bin', 'example', 'test', 'bench'].flatMap(kind => doc[kind] ?? [])].map(t => t?.path);
+    if (typeof doc.package?.build === 'string') paths.push(doc.package.build);
+    if (paths.some(path => path && (!path.endsWith('.rs') || !resolve(android, path).startsWith(android + '/') ||
+      resolve(android, path).startsWith(resolve(android, 'target') + '/') || !existsSync(resolve(android, path))))) return true;
+    const pending = [android];
+    while (pending.length) {
+      const dir = pending.pop();
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const file = resolve(dir, entry.name);
+        if (entry.isSymbolicLink()) return true;
+        if (entry.isDirectory()) {
+          if (dir !== android || entry.name !== 'target') pending.push(file);
+        } else if (entry.name.endsWith('.rs')) {
+          const text = file === source ? migrated : readFileSync(file, 'utf8');
+          // Rust may load sources outside the crate or from OUT_DIR. Do not guess their module graph.
+          if (/\bexact_linux\b|\bpath\s*=|\binclude\b/.test(text)) return true;
+        }
+      }
+    }
+    return false;
+  } catch { return true; }
+}
+
+/** Rewrite only the old inline path declaration; authored Cargo forms get the complete manual edit instead. */
+function androidCanvas(dir) {
+  const manifest = resolve(dir, 'android/Cargo.toml'), source = resolve(dir, 'android/src/lib.rs');
+  if (!existsSync(source)) return [];
+  const text = readFileSync(source, 'utf8'), macro = /\bexact_linux\s*::\s*canvas_jni\s*!/g;
+  if (!macro.test(text)) return [];
+  const advice = `android/src/lib.rs: change exact_linux::canvas_jni! to exact_painted::canvas_jni!; android/Cargo.toml: add exact-painted = { path = ${JSON.stringify(pathFrom(resolve(dir, 'android'), resolve(ROOT, 'host/painted')))} } in the macro's dependency table (edit an existing entry instead of adding a second), and remove exact-linux only if no other code uses it`;
+  if (!existsSync(manifest)) return [advice];
+  const cargo = readFileSync(manifest, 'utf8');
+  const entries = [...cargo.matchAll(/^exact-linux[ \t]*=[ \t]*\{[ \t]*path[ \t]*=[ \t]*("(?:\\.|[^"\\])*")[ \t]*\}[ \t]*$/gm)];
+  let doc; try { doc = Bun.TOML.parse(cargo); } catch { return [advice]; }
+  const tables = dependencyTables(doc).filter(([, table]) => table['exact-linux']);
+  if (entries.length !== 1 || tables.length !== 1 || tables[0][0][0] === 'workspace' || (cargo.match(/exact-linux/g) ?? []).length !== 1 || cargo.includes('exact-painted')) return [advice];
+  const old = tables[0][1]['exact-linux'];
+  if (Object.keys(old).length !== 1 || typeof old.path !== 'string' || !old.path.endsWith('/host/linux')) return [advice];
+  const entry = entries[0], keep = usesLinux(resolve(dir, 'android'), doc, source, text.replace(macro, ''));
+  const dependency = `exact-painted = { path = ${JSON.stringify(pathFrom(resolve(dir, 'android'), resolve(ROOT, 'host/painted')))} }`;
+  const next = cargo.slice(0, entry.index) + (keep ? entry[0] + '\n' : '') + dependency + cargo.slice(entry.index + entry[0].length);
+  tables[0][1]['exact-painted'] = { path: pathFrom(resolve(dir, 'android'), resolve(ROOT, 'host/painted')) };
+  if (!keep) delete tables[0][1]['exact-linux'];
+  try { if (!isDeepStrictEqual(Bun.TOML.parse(next), doc)) return [advice]; } catch { return [advice]; }
+  writeFileSync(manifest, next);
+  writeFileSync(source, text.replace(macro, 'exact_painted::canvas_jni!'));
+  return [`android/src/lib.rs now uses exact_painted::canvas_jni!; android/Cargo.toml ${keep ? 'keeps exact-linux and adds' : 'replaces exact-linux with'} exact-painted`];
+}
+
+/** Locate dependency values through parsed JSON so unrelated pairs and the rest of the file keep their bytes. */
+function packagePaths(dir) {
+  const file = resolve(dir, 'package.json');
+  if (!existsSync(file)) return [];
+  try {
+    const text = readFileSync(file, 'utf8'), doc = Bun.JSONC.parse(text), paths = [];
+    for (const group of ['dependencies', 'devDependencies', 'optionalDependencies', 'overrides', 'resolutions']) {
+      for (const [name, spec] of Object.entries(doc[group] ?? {})) {
+        const module = /^@exact\/([a-z0-9-]+)$/.exec(name)?.[1];
+        if (!module || typeof spec !== 'string' || !spec.startsWith('file:')) continue;
+        const target = resolve(ROOT, 'packages', module);
+        if (!existsSync(resolve(target, 'package.json'))) continue;
+        const next = 'file:' + pathFrom(dir, target);
+        if (spec !== next) paths.push({ group, name, spec, next });
+      }
+    }
+    if (!paths.length) return [];
+    let prefix = '__exact_update_package_';
+    while (text.includes(prefix)) prefix += '_';
+    const spans = [...text.matchAll(/\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"/g)].filter(m => m[0][0] === '"')
+      .map(m => ({ start: m.index, end: m.index + m[0].length, value: JSON.parse(m[0]) }))
+      .filter(s => paths.some(p => p.spec === s.value));
+    const marked = Bun.JSONC.parse(replaceSpans(text, spans.map((s, i) => ({ ...s, value: JSON.stringify(prefix + i) }))));
+    const edits = paths.map(p => {
+      const span = spans.find((_, i) => marked[p.group]?.[p.name] === prefix + i);
+      if (!span) throw new Error(`update: package.json: set ${p.group}.${p.name} to ${JSON.stringify(p.next)} and run bun install`);
+      return { ...span, value: JSON.stringify(p.next) };
+    });
+    writeFileSync(file, replaceSpans(text, edits));
+    return ['package.json: refreshed @exact package paths; run bun install'];
+  } catch (error) { return [`package.json: left unchanged; could not refresh @exact package paths (${error.message})`]; }
+}
+
+export const updateScaffold = dir => [...androidCanvas(dir), ...packagePaths(dir)];

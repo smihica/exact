@@ -3,6 +3,7 @@ import AppKit
 import WebKit
 import XCTest
 @testable import ExactKit
+@testable import ExactWebViews
 
 /// A scaled iframe hears its events where it is drawn: the web view converts
 /// a window point by AppKit's geometry, which a layer's transform does not
@@ -30,7 +31,7 @@ final class IframeScaleTests: XCTestCase {
         }
         let session = ExactApp.shared.makeSession(label: "frame-scale")
         self.session = session
-        session.webviews.moduleLocation = { arm }
+        session.webHost.moduleLocation = { arm }
         XCTAssertNil(session.boot(size: CGSize(width: 400, height: 300)).error)
         _ = NSApplication.shared
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)

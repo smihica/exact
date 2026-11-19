@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// A pop UIKit runs reaches the app (`NavigationHost.followPops`, and a
 /// swipe's end in `completeTransition`): the app follows a pop UIKit
@@ -65,7 +66,7 @@ final class NavigationPopIOSTests: XCTestCase {
             ["op": "children", "id": 1, "ids": [2, 3, 5]],
             ["op": "roots", "ids": [1]],
         ])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("UIKit holds the three routes") { nav.viewControllers.count == 3 && nav.transitionCoordinator == nil }
         return Stack(session: session, nav: nav, apply: apply)
     }
@@ -83,7 +84,7 @@ final class NavigationPopIOSTests: XCTestCase {
     /// its own (`interactive` false), not under this interaction.
     private func swipe(_ s: Stack) -> InteractivePop {
         let pop = InteractivePop()
-        s.session.presenter.navigation.setAppDelegate(s.nav, pop)
+        s.session.presenter.navigationHost.setAppDelegate(s.nav, pop)
         pop.interactive = true
         let destination = s.nav.viewControllers[s.nav.viewControllers.count - 2]
         s.nav.popViewController(animated: true)
@@ -110,8 +111,8 @@ final class NavigationPopIOSTests: XCTestCase {
         pop.interactive = false
         until("the pop lands on Updates") { s.nav.transitionCoordinator == nil && s.nav.viewControllers.count == 2 && s.key == "updates" }
         XCTAssertEqual(pressed, [6], "Log's Back, once")
-        XCTAssertEqual(s.session.presenter.navigation.selectedKey, "updates")
-        s.session.presenter.navigation.setAppDelegate(s.nav, nil)
+        XCTAssertEqual(s.session.presenter.navigationHost.selectedKey, "updates")
+        s.session.presenter.navigationHost.setAppDelegate(s.nav, nil)
     }
 
     /// The app writes Log anew, under the same key, during a pop UIKit's
@@ -133,7 +134,7 @@ final class NavigationPopIOSTests: XCTestCase {
         ])
         until("the pop lands on Updates") { s.nav.transitionCoordinator == nil && s.nav.viewControllers.count == 2 && s.key == "updates" }
         XCTAssertEqual(pressed, [12], "the new Log's Back, once")
-        XCTAssertEqual(s.session.presenter.navigation.selectedKey, "updates")
+        XCTAssertEqual(s.session.presenter.navigationHost.selectedKey, "updates")
     }
 
     /// The app puts Draft under Log while the finger is down: the swipe took
@@ -156,7 +157,7 @@ final class NavigationPopIOSTests: XCTestCase {
         pop.interactive = false
         until("Draft shows over Updates") { s.nav.transitionCoordinator == nil && s.nav.viewControllers.count == 3 && s.key == "draft" }
         XCTAssertEqual(pressed, [6], "Log's Back, once")
-        s.session.presenter.navigation.setAppDelegate(s.nav, nil)
+        s.session.presenter.navigationHost.setAppDelegate(s.nav, nil)
     }
 
     /// The app replaces Log in place with Day while the finger is down, and
@@ -176,7 +177,7 @@ final class NavigationPopIOSTests: XCTestCase {
         pop.interactive = false
         until("Day takes Log's place") { s.nav.transitionCoordinator == nil && s.nav.viewControllers.count == 3 && s.key == "day" }
         XCTAssertEqual(pressed, [], "a cancelled pop performed no Back")
-        s.session.presenter.navigation.setAppDelegate(s.nav, nil)
+        s.session.presenter.navigationHost.setAppDelegate(s.nav, nil)
     }
 
     /// UIKit pops to Settings while the app selects Updates again, a route
@@ -195,7 +196,7 @@ final class NavigationPopIOSTests: XCTestCase {
         s.apply([["op": "props", "id": 1, "set": ["navigationKey": "updates"]]])
         until("the pop lands on Settings") { s.nav.transitionCoordinator == nil && s.nav.viewControllers.count == 1 && s.key == "settings" }
         XCTAssertEqual(pressed, [4], "Updates' Back, once")
-        XCTAssertEqual(s.session.presenter.navigation.selectedKey, "settings")
+        XCTAssertEqual(s.session.presenter.navigationHost.selectedKey, "settings")
     }
 
     /// The app goes back from Log, a route it retains, and then selects it

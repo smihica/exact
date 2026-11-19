@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1021 §5.1 on UIKit: a node naming a popover with `contextPopover` is
 /// a UIContextMenuInteraction. The node lifts as its own targeted preview,
@@ -97,6 +98,27 @@ final class ContextMenuIOSTests: XCTestCase {
         XCTAssertNil(try outline(), "no radius: the whole view, as UIKit shows it by default")
     }
 
+    func testTheLiftsGroundIsTheNodesLayerFill() throws {
+        let session = try boot()
+        let host = session.presenter.menus.context
+        let peek = try node(session, "peek")
+        let interaction = try XCTUnwrap(peek.interactions.compactMap { $0 as? UIContextMenuInteraction }.first)
+        func ground(_ style: [String: Any]) throws -> UIColor? {
+            session.presenter.apply(wireBatch([["op": "style", "id": Int(peek.id), "style": style]]))
+            peek.layer.displayIfNeeded()
+            let configuration = try XCTUnwrap(host.contextMenuInteraction(interaction, configurationForMenuAtLocation: .zero))
+            defer { host.contextMenuInteraction(interaction, willEndFor: configuration, animator: nil) }
+            return try XCTUnwrap(host.contextMenuInteraction(interaction, configuration: configuration, highlightPreviewForItemWithIdentifier: configuration.identifier)).parameters.backgroundColor
+        }
+        let unfilled = try ground([:])
+        var red: CGFloat = 1, green: CGFloat = 1
+        try XCTUnwrap(ground(["background_color": [0, 122, 255, 255]])).getRed(&red, green: &green, blue: nil, alpha: nil)
+        XCTAssertEqual(red, 0, accuracy: 0.01, "a filled bubble's ground is its fill, not UIKit's white")
+        XCTAssertEqual(green, 122.0 / 255, accuracy: 0.01)
+        XCTAssertEqual(try ground(["background_color": [0, 122, 255, 255], "background_clip": "text"]), unfilled,
+                       "a fill clipped to the text is drawn in the copy: UIKit's own ground")
+    }
+
     /// UIKit hides the long-pressed node and grows its highlight in the
     /// preview's container, the route's mount, after the route and at depth 0.
     /// The positioned route ranks above 0, so the highlight takes the route's
@@ -155,13 +177,13 @@ final class ContextMenuIOSTests: XCTestCase {
         XCTAssertEqual(session.presenter.menus.observation()?["kind"] as? String, "contextmenu")
 
         // Tapping the preview: its press pushes Detail, unanimated, and UIKit pops into it.
-        let before = session.presenter.navigation.activeKey
+        let before = session.presenter.navigationHost.activeKey
         let commit = Commit()
         commit.preferredCommitStyle = .dismiss
         host.contextMenuInteraction(interaction, willPerformPreviewActionForMenuWith: configuration, animator: commit)
         XCTAssertEqual(commit.preferredCommitStyle, .pop, "a press that navigates commits with .pop")
         XCTAssertEqual(commit.animated, 1, "with an animation, without which UIKit shrinks the preview away")
-        XCTAssertNotEqual(session.presenter.navigation.activeKey, before, "the press pushed")
+        XCTAssertNotEqual(session.presenter.navigationHost.activeKey, before, "the press pushed")
         XCTAssertNotNil(try node(session, "route-detail"))
         XCTAssertNil(host.contextMenuInteraction(interaction, configuration: configuration, dismissalPreviewForItemWithIdentifier: configuration.identifier),
                      "after it navigated, the source is under the new screen: no return to it")

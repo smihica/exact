@@ -1,5 +1,6 @@
 // The GPU module's optional input, message and agent seams (LLP 1046.002 §3).
 // The runner never learns what a surface's world is; the web host is the oracle.
+import CExact
 import Foundation
 #if os(macOS)
 import AppKit
@@ -160,7 +161,7 @@ extension CanvasesHost {
     }
 
     func bindSurface(_ m: GpuModule, _ e: Entry) -> UInt32 {
-        guard let data = try? JSONSerialization.data(withJSONObject: e.values) else { return 1 }
+        let data = e.values
         let now = session?.now() ?? 0
         // The size first: a stamped bind may tick a new world, which frames
         // itself for its canvas before its first tick (`Game::first_frame`).
@@ -306,10 +307,26 @@ extension CanvasesHost {
 
     /// The canvas's record, when the module has a new one, to the app.
     func publishRecord(_ e: Entry) {
-        guard live(e.view.id) === e, publishers[e.name] === e, let m = e.module, let take = m.published else { return }
+        guard live(e.view.id) === e, let m = e.module, let take = m.published else { return }
+        let empty = (m.presentationFlags?(e.id) ?? 0) & 4 != 0
+        #if os(macOS)
+        let layer = e.view.canvasMetal?.layer
+        #else
+        let layer = e.view.canvasMetal?.metalLayer
+        #endif
+        if empty {
+            #if os(macOS)
+            layer?.isHidden = true
+            #else
+            e.view.canvasMetal?.hidePicture()
+            #endif
+        }
         let length = take(e.id)
         if length != UInt32.max, let data = length == 0 ? Data() : m.output(length) {
-            surfaceRecord(e.name, String(decoding: data, as: UTF8.self))
+            if !empty, layer?.isHidden == true,
+               let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               record["presented"] as? Bool == true { layer?.isHidden = false }
+            if publishers[e.name] === e { surfaceRecord(e.name, String(decoding: data, as: UTF8.self)) }
         }
     }
 
@@ -320,9 +337,10 @@ extension CanvasesHost {
         for e in Array(entries.values) { publishRecord(e) }
     }
 
+    /// Each canvas of a surface runs its own world; the first live one alone
+    /// publishes the surface's record (LLP 1046.003).
     func claimPublisher(_ e: Entry) {
         if publishers[e.name] == nil { publishers[e.name] = e }
-        else { fputs("exact gpu: surface \(e.name): duplicate live publisher ignored\n", stderr) }
     }
 
     func releasePublisher(_ e: Entry) {
@@ -330,10 +348,18 @@ extension CanvasesHost {
         publishers.removeValue(forKey: e.name)
         updatePerformanceTimer()
         surfaceRecord(e.name, nil)
-        if e.performance { session?.canvasPerformanceRecord(e.name, nil) }
+        session?.canvasPerformanceRecord(e.name, nil)
     }
 
     func updatePerformanceTimer() {
+        for e in entries.values where e.id != 0 {
+            guard let m = e.module else { continue }
+            let enabled = publishers[e.name] === e && session?.canvasPerformanceRequested(e.name) == true
+            if enabled != e.performance {
+                e.performance = enabled
+                _ = m.performanceReporting?(e.id, enabled)
+            }
+        }
         guard visible, session?.clock == nil, publishers.values.contains(where: { $0.performance && $0.id != 0 }) else {
             performanceTimer?.invalidate(); performanceTimer = nil; return
         }
@@ -367,17 +393,39 @@ extension CanvasesHost {
     /// The module's answer when a canvas asks for no asset (`AssetChanges::json`).
     static let noAssetChanges = Data(#"{"requests":[],"retired":[]}"#.utf8)
 
+    static func readAsset(_ name: String, resolver: AssetResolver?, roots: [String: URL]) throws -> Data? {
+        guard AssetResolver.validAssetName(name) else { throw CocoaError(.fileReadInvalidFileName) }
+        if name.hasPrefix("app:/") {
+            guard let file = AppFileWalk.open(name, roots: roots) else { return nil }
+            defer { try? file.close() }
+            return try file.readToEnd() ?? Data()
+        }
+        return try resolver?.delivery("assets/" + name)
+    }
+
+    private func assetReader(_ names: [String]) -> (String) throws -> Data? {
+        let resolver = session?.app.resolver
+        var roots: [String: URL] = [:]
+        if names.contains(where: { $0.hasPrefix("app:/") }), let session,
+           let reply = try? JSONSerialization.jsonObject(with: Data(session.runtime.ask(exact_app_roots, "").utf8)) as? [String: Any],
+           let paths = reply["roots"] as? [String: String] {
+            roots = paths.filter { ["data", "cache", "tmp"].contains($0.key) }.mapValues { URL(fileURLWithPath: $0, isDirectory: true) }
+        }
+        return { name in try Self.readAsset(name, resolver: resolver, roots: roots) }
+    }
+
     /// Read `names` for `e` off the main thread, in order; each lands in
     /// `e.arrived` and is delivered at once on the main thread, so a canvas's
     /// deliveries take a turn each between frames.
     func readAssets(_ names: [String], for e: Entry) {
-        guard !names.isEmpty, let resolver = session?.app.resolver else { return }
+        guard !names.isEmpty, session != nil else { return }
+        let read = assetReader(names)
         for name in names {
             assetReadSerial += 1
             let serial = assetReadSerial
             e.reading[name] = serial
             assetReads.async { [weak self, weak e] in
-                let bytes = Result { try resolver.delivery("assets/" + name) }
+                let bytes = Result { try read(name) }
                 DispatchQueue.main.async {
                     guard let self, let e, e.reading[name] == serial else { return }
                     e.reading.removeValue(forKey: name)
@@ -424,7 +472,8 @@ extension CanvasesHost {
                     // here, in the order asked, and their late results dropped.
                     let inFlight = e.reading.sorted { $0.value < $1.value }.map(\.key)
                     e.reading.removeAll()
-                    ready += (inFlight + requests).map { name in (name, Result { try session?.app.resolver.delivery("assets/" + name) }) }
+                    let names = inFlight + requests, read = assetReader(names)
+                    ready += names.map { name in (name, Result { try read(name) }) }
                 }
                 guard !ready.isEmpty else { break }
                 delivered = true
@@ -525,7 +574,7 @@ extension CanvasesHost {
     func agent(_ view: UInt32, _ request: [String: Any]) -> [String: Any]? {
         guard let e = live(view), let s = session, let m = e.module, let ask = m.agent else { return nil }
         var request = request
-        let size = s.agentInstance.box(e.view)
+        let size = InspectionGeometry.box(e.view.bounds, of: e.view, viewport: s.presenter.viewport)
         request["width"] = max(1, size.width)
         request["height"] = max(1, size.height)
         request["scale"] = e.view.canvasScale
@@ -568,7 +617,7 @@ extension CanvasesHost {
     }
 
     func decorate(_ request: [String: Any], _ reply: [String: Any]) -> [String: Any] {
-        guard reply["error"] == nil, !Agent.worldRequest(request) else { return reply }
+        guard reply["error"] == nil, request["entity"] == nil, request["world"] as? Bool != true else { return reply }
         var reply = reply
         switch request["op"] as? String {
         case "tree":
@@ -606,6 +655,7 @@ extension CanvasesHost {
         let pending = world.filter { $0["quiescent"] as? Bool == false }
         return WorldClock(pending: settle && !pending.isEmpty,
                           settleAt: pending.compactMap { $0["settleAt"] as? Double }.filter(\.isFinite).max(),
+                          nextTickAt: world.compactMap { $0["nextTickAt"] as? Double }.filter(\.isFinite).min(),
                           reply: world.isEmpty ? [:] : ["world": world.map { $0.filter { ["canvas", "tick", "hash", "quiescent", "error", "assets", "changing"].contains($0.key) } }])
     }
 }
@@ -653,25 +703,9 @@ private enum Thermal {
     static func read() -> UInt32 { UInt32(ProcessInfo.processInfo.thermalState.rawValue) + 1 }
 }
 
-// A live surface asks for the session once per process; its category is the
-// app's, set by its one owner (`AudioSession`, LLP 1096 D8).
 private enum CanvasAudio {
-    nonisolated(unsafe) static var active = false
-    nonisolated(unsafe) static var wanted = false
     nonisolated(unsafe) static var interrupted = false
     nonisolated(unsafe) static var resumeBlocked = false
-    @discardableResult static func activate() -> Bool {
-        // NotificationCenter delivers on the posting thread, not necessarily main.
-        if !Thread.isMainThread { return Owner.shared.callMain { activate() } }
-        guard !ExactEnv.agentMode else { return false }
-        wanted = true
-        guard !active else { return true }
-        #if os(iOS) || os(tvOS)
-        do { try AudioSession.activate() } catch { fputs("exact audio session: \(error)\n", stderr); return false }
-        #endif
-        active = true
-        return true
-    }
 }
 
 /// Every canvas gets notifications even when its session uses the agent clock.
@@ -683,8 +717,9 @@ final class CanvasLifecycle: NSObject {
     private var wantsAudio = false
     private var resumeAllowed: Bool
     private var retryFrames = 0
-    private let activate: () -> Bool
-    init(_ owner: CanvasesHost, activate: @escaping () -> Bool = { CanvasAudio.activate() }) {
+    private let activate: (() -> Bool)?
+    private var audioHeld = false
+    init(_ owner: CanvasesHost, activate: (() -> Bool)? = nil) {
         precondition(Thread.isMainThread)
         self.owner = owner
         self.activate = activate
@@ -709,7 +744,38 @@ final class CanvasLifecycle: NSObject {
         #endif
         #endif
     }
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit { NotificationCenter.default.removeObserver(self); releaseAudio() }
+    private var producingAudio: Bool {
+        wantsAudio && !hidden && !interrupted && owner?.visible == true
+            && owner?.entries.values.contains(where: { $0.id != 0 }) == true
+    }
+    private func takeAudio() -> Bool {
+        if let activate { return activate() }
+        #if os(iOS) || os(tvOS)
+        if audioHeld { return true }
+        do {
+            try AudioSession.hold(ObjectIdentifier(self), running: { [weak self] in self?.producingAudio ?? false })
+            audioHeld = true
+        } catch {
+            AudioSession.release(ObjectIdentifier(self))
+            fputs("exact audio session: \(error)\n", stderr)
+            return false
+        }
+        #endif
+        return true
+    }
+    private func releaseAudio() {
+        #if os(iOS) || os(tvOS)
+        guard audioHeld else { return }
+        audioHeld = false
+        AudioSession.release(ObjectIdentifier(self))
+        #endif
+    }
+    func removedCanvas() {
+        guard owner?.entries.isEmpty == true else { return }
+        wantsAudio = false
+        releaseAudio()
+    }
     private func onMain(_ work: @escaping () -> Void) {
         if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
@@ -742,9 +808,12 @@ final class CanvasLifecycle: NSObject {
     private func retryActivation(excluding id: UInt32? = nil) {
         guard wantsAudio, !hidden, resumeAllowed,
               !CanvasAudio.interrupted, !CanvasAudio.resumeBlocked else { return }
-        if activate() {
+        if takeAudio() {
             retryFrames = 0
             if interrupted { interrupted = false; send(3, excluding: id) }
+            #if os(iOS) || os(tvOS)
+            AudioSession.playbackChanged()
+            #endif
         } else {
             retryFrames = 300
             if !interrupted { interrupted = true; send(2, excluding: id) }
@@ -784,14 +853,11 @@ final class CanvasLifecycle: NSObject {
     }
     func refresh(excluding id: UInt32? = nil) {
         precondition(Thread.isMainThread)
-        #if !os(macOS)
-        AppBackground.invalidate()
-        #endif
         let next = !(owner?.visible ?? false)
         owner?.updatePerformanceTimer()
         let becameVisible = hidden && !next
-        if next { CanvasAudio.active = false }
         if next != hidden { hidden = next; send(hidden ? 0 : 1, excluding: id) }
+        if next { releaseAudio() }
         if becameVisible && !CanvasAudio.interrupted {
             Self.allowRecovery(excluding: self)
         }
@@ -805,9 +871,9 @@ final class CanvasLifecycle: NSObject {
             CanvasAudio.resumeBlocked = !began && !shouldResume
             self.resumeAllowed = !began && shouldResume
             if began {
-                CanvasAudio.active = false
                 self.retryFrames = 0
                 if !self.interrupted { self.interrupted = true; self.send(2) }
+                self.releaseAudio()
             } else if self.resumeAllowed {
                 if self.wantsAudio { self.retryActivation() }
                 else if self.interrupted { self.interrupted = false; self.send(3) }
@@ -822,6 +888,8 @@ final class CanvasLifecycle: NSObject {
     /// over when the app is active again and no other app's audio plays.
     private static func heard(_ event: AudioSession.Heard) {
         switch event {
+        case .background:
+            for lifecycle in live.allObjects { lifecycle.refresh() }
         case let .interruption(began, resume):
             for lifecycle in live.allObjects { lifecycle.interruption(began: began, shouldResume: resume) }
         case let .appActive(othersPlaying):

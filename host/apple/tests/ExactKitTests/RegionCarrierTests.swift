@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactWakeCarriers
 
 /// A region's crossings are each heard (LLP 1133.021 D14): one written while
 /// the region's last is in a wake survives that one's delivery and is

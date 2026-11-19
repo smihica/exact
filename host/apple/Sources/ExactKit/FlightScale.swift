@@ -9,10 +9,10 @@
 // small in a card-sized box (Signal Clone, 2026-10-05).
 import CoreGraphics
 
-enum FlightScale {
+package enum FlightScale {
     /// The shown width over the layout's; nil for an empty box or layout,
     /// which shows nothing to scale.
-    static func of(shown: CGSize, layout: CGSize) -> CGFloat? {
+    package static func of(shown: CGSize, layout: CGSize) -> CGFloat? {
         guard layout.width > 0, layout.height > 0, shown.width > 0, shown.height > 0 else { return nil }
         return shown.width / layout.width
     }

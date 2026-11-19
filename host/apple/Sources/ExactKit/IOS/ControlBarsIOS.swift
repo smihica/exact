@@ -9,9 +9,9 @@ import UIKit
 
 /// One pass's answers (`Presenter.reachPageEdges`), so sibling scrollers share
 /// their parent's children and each box is judged once.
-final class ControlBars {
+package final class ControlBars {
     unowned let presenter: Presenter
-    init(_ presenter: Presenter) { self.presenter = presenter }
+    package init(_ presenter: Presenter) { self.presenter = presenter }
     private var bars: [ObjectIdentifier: Bool] = [:]
     /// A parent's shown in-flow children (nil: one drawn as a layer, `FlatLeaves`, never a bar), where each
     /// is, and whether every one before and after each is a bar.
@@ -21,7 +21,7 @@ final class ControlBars {
     private func children(of p: NodeView) -> Kids {
         if let known = kids[ObjectIdentifier(p)] { return known }
         var k = Kids()
-        let shown = { (v: NodeView) in !v.isHidden && NavigationHost.inFlow(v) }
+        let shown = { (v: NodeView) in !v.isHidden && RouteGeometry.inFlow(v) }
         if let ids = presenter.flats.children(of: p.id) {
             k.all = ids.compactMap { id in presenter.flats.leaves[id] != nil ? .some(nil) : presenter.views[id].flatMap { shown($0) ? .some($0) : nil } }
         } else { k.all = p.container.subviews.compactMap { $0 as? NodeView }.filter(shown) }
@@ -50,7 +50,7 @@ final class ControlBars {
     /// makes it no bar.
     func isBar(_ box: NodeView) -> Bool {
         if let known = bars[ObjectIdentifier(box)] { return known }
-        let placed = !box.isHidden && NavigationHost.inFlow(box) && Self.onlyRide(box)
+        let placed = !box.isHidden && RouteGeometry.inFlow(box) && Self.onlyRide(box)
             && ["static", "relative"].contains(box.layoutPosition) && !box.wrote("background_color")
         let answer = placed && contents(box).map { $0 > 0 } == true
         bars[ObjectIdentifier(box)] = answer
@@ -143,10 +143,15 @@ final class ControlBars {
     }
 
     /// `p`'s content box inside the cover a route's containers give it, as
-    /// well as the author's padding.
+    /// well as the author's padding, but for the edges the route opts out of
+    /// (`-exact-safe-area`, LLP 1123 D4), which its content reaches.
     private func available(_ p: NodeView) -> CGRect {
         var room = p.contentBox()
-        if case .edges(let e)? = presenter.navigation.covers[p.id] { room = room.inset(by: UIEdgeInsets(top: e.top, left: e.left, bottom: e.bottom, right: e.right)) }
+        if case .edges(let e)? = presenter.navigation.covers[p.id] {
+            let off = RouteGeometry.clearanceOff(p)
+            let kept = { (bit: Int, inset: CGFloat) in off & bit != 0 ? 0 : inset }
+            room = room.inset(by: UIEdgeInsets(top: kept(1, e.top), left: kept(8, e.left), bottom: kept(4, e.bottom), right: kept(2, e.right)))
+        }
         return room
     }
 

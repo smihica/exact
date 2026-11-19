@@ -11,15 +11,16 @@
 //! recorded ([`kept::restore`]).
 
 use exact_data::documents::{self, kept};
-use exact_runner::agent::{error, field_num, field_str, quote};
+use exact_runner::json::{error, field_num, field_str, quote};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The calls [`answer`] answers.
-const OPS: [&str; 8] = [
+const OPS: [&str; 9] = [
     "openDocument",
     "documentPermission",
+    "documentFolder",
     "mintDocument",
     "forgetDocuments",
     "keptDocuments",
@@ -30,7 +31,7 @@ const OPS: [&str; 8] = [
 
 /// Whether an app keeps the documents a person chooses (D7): on a Mac; iOS
 /// keeps nothing until an iOS document app asks (the LLP's Rulings).
-fn keeps(grants: &str) -> bool {
+pub(crate) fn keeps(grants: &str) -> bool {
     cfg!(target_os = "macos") && grants.lines().any(|line| line.trim() == "doc.keep")
 }
 
@@ -51,7 +52,9 @@ fn store_file(app_id: &str) -> Option<PathBuf> {
 ///   every handle the session minted that its app does not keep.
 /// - `documentPermission` (`{"path"}`): `{"granted": true}` when the path
 ///   resolves for the session, what a native host answers to
-///   `requestPermission` (LLP 1069.010.000 D7).
+///   `requestPermission` (LLP 1069.010.000 D7). `documentFolder`
+///   (`{"path"}`): `{"folder": "/…"}`, where a picker's `startIn` opens
+///   (LLP 1173 D2), or `{}` when the session holds no such document.
 /// - `keptDocuments`, as the session's data activates: `{"keep": false}`
 ///   for an app that keeps nothing; else the records this launch has yet to
 ///   find (`restore`: `n`, `bookmark`, `device`, `inode`), which the host
@@ -73,6 +76,7 @@ pub fn answer<D: exact_runner::DataSource>(
         request,
         runner.data_ref(),
         &runner.native_slot(),
+        runner.covers("fs.read", "doc:/"),
     ))
 }
 
@@ -81,6 +85,7 @@ fn documents<D: exact_runner::DataSource>(
     request: &str,
     data: &D,
     native: &exact_runner::Native,
+    reads_documents: bool,
 ) -> String {
     let owner = field_num(request, "owner").unwrap_or(0.0) as u64;
     let path = field_str(request, "path").unwrap_or_default();
@@ -113,9 +118,7 @@ fn documents<D: exact_runner::DataSource>(
             documents::forget(owner);
             "{}".into()
         }
-        "openDocument" if !exact_runner::save_file::covered(data.grants(), "fs.read", "doc:/") => {
-            reply("path", &path)
-        }
+        "openDocument" if !reads_documents => reply("path", &path),
         "openDocument" => match documents::open_route(&path, owner) {
             Some(doc) => reply("path", &doc),
             None => reply("path", &path),
@@ -123,6 +126,10 @@ fn documents<D: exact_runner::DataSource>(
         "documentPermission" => {
             serde_json::json!({ "granted": documents::resolve(&path, owner).is_ok() }).to_string()
         }
+        "documentFolder" => match documents::folder(&path, owner) {
+            Some(folder) => reply("folder", &folder.to_string_lossy()),
+            None => "{}".into(),
+        },
         "mintDocument" => match documents::mint(std::path::Path::new(&path), owner) {
             Some(doc) => reply("doc", &doc),
             None => error(&format!("{path} is not a file or folder")),

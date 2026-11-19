@@ -17,7 +17,7 @@ struct TextViewportIndex {
     }
     private var groups: [Group] = []
 
-    init(_ paragraphs: [NodeView]) {
+    package init(_ paragraphs: [NodeView]) {
         var positions: [ObjectIdentifier: Int] = [:]
         for node in paragraphs {
             // A paragraph outside every scroll view (a heading over a split's

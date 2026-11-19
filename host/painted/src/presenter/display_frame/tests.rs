@@ -10,6 +10,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tiny_skia::Transform;
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 fn submit<D: DataSource>(p: &mut Presenter<D>) -> Option<SubmittedFrame> {
     p.display_frame()
 }
@@ -25,7 +29,7 @@ impl DataSource for Empty {
     }
     fn answer(&mut self, _: &mut Store, name: &str, _: &[Value]) -> Result<Answer, DataError> {
         assert_eq!(name, "work");
-        Ok(Answer::Later(Request::continuation(1)))
+        Ok(Answer::Later(Request::continuation::<TestWork>(1)))
     }
     fn parse(
         &mut self,
@@ -107,8 +111,9 @@ impl Backend for CountPaint {
         c: &[Shape],
         t: Transform,
         tint: Option<[u8; 4]>,
+        rendering: exact_kernel::ImageRendering,
     ) {
-        self.inner.image(b, r, c, t, tint);
+        self.inner.image(b, r, c, t, tint, rendering);
     }
     fn text(
         &mut self,
@@ -148,7 +153,7 @@ fn boot() -> Fixture {
     boot_app(APP)
 }
 fn boot_app(app: &str) -> Fixture {
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(app),
         Empty,
         (320., 240.),
@@ -945,7 +950,7 @@ impl DataSource for TimerRows {
 #[test]
 fn timer_demand_collection_feedback_still_refines_after_empty_advance() {
     let source = "component App\n  resource rows = timerRows() as shape number[]\n  view\n    list virtualized=true width=320 height=180 testId=\"port\"\n      for x in rows key=x\n        text `${x}` height=24\n";
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(source),
         TimerRows,
         (320., 240.),
@@ -984,7 +989,7 @@ fn timer_demand_collection_feedback_still_refines_after_empty_advance() {
 fn timer_demand_content_region_remains_conservative_for_same_shell() {
     let _service = crate::content_region::test_service();
     let source = "component App\n  view\n    view id=\"owner\" width=320 height=240 overflow-x=\"hidden\" overflow-y=\"hidden\"\n      scroll id=\"content\" width=320 height=240\n        text \"immutable paragraph\" testId=\"paragraph\"\n      text \"Preparing content\" id=\"pending\" position=\"absolute\"\n";
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(source),
         Empty,
         (320., 240.),

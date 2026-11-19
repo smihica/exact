@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { rolldown } from 'rolldown';
 import { parseSync } from 'rolldown/utils';
@@ -68,12 +68,12 @@ test('a linked module checks against the app peer across subpath exports', async
   const fixture = linkedApp();
   const { stage, peerDir } = fixture;
   try {
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     const declarations = readFileSync(join(stage, '__exact_declarations.json'), 'utf8');
     const peers = JSON.parse(declarations).packages.filter(([, , real]) => real.endsWith(join('@scratch', 'peer')));
     expect(peers.map(([, , real]) => real)).toEqual([peerDir]);
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     expect(readFileSync(join(stage, '__exact_declarations.json'), 'utf8')).toBe(declarations);
     rmSync(join(fixture.app, 'node_modules'), { recursive: true });
     rmSync(fixture.module, { recursive: true });
@@ -100,7 +100,7 @@ for (const missing of [true, false]) {
       }
       const why = '@scratch/module@1.0.0 requires peer @scratch/peer@^1.4.0' +
         (missing ? ', which is not installed in the app' : ', but the app has @scratch/peer@2.0.0');
-      configure(stage, false, parseSync);
+      await configure(stage, false, parseSync);
       await expect(check(stage, join(libraries, 'tsc'), libraries)).rejects.toThrow(why);
       await expect(bundle(stage)).rejects.toThrow(why);
     } finally {
@@ -119,7 +119,7 @@ test('ordinary dependencies still refuse two copies of one package version', asy
     const other = join(root, 'node_modules/@scratch/peer');
     mkdirSync(dirname(other), { recursive: true });
     renameSync(join(module, 'node_modules/@scratch/peer'), other);
-    expect(() => configure(stage, false, parseSync)).toThrow('package declarations: two copies of @scratch/peer');
+    await expect(configure(stage, false, parseSync)).rejects.toThrow('package declarations: two copies of @scratch/peer');
     await expect(bundle(stage)).rejects.toThrow('two copies of @scratch/peer@1.4.2');
   } finally {
     fixture.close();
@@ -133,7 +133,7 @@ test('peer declarations can refer back to their consumer without expanding the c
     const path = join(peerDir, 'package.json'), json = JSON.parse(readFileSync(path, 'utf8'));
     put(path, JSON.stringify({ ...json, peerDependencies: { '@scratch/module': '^1.0.0' } }));
     put(join(peerDir, 'consumer.d.ts'), "export type ModuleValue = typeof import('@scratch/module').value;\n");
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     const { packages } = JSON.parse(readFileSync(join(stage, '__exact_declarations.json'), 'utf8'));
     expect(packages).toHaveLength(2);
@@ -154,13 +154,14 @@ test('a declaration subdirectory cannot shadow its app-owned peer', async () => 
     const peer = JSON.parse(readFileSync(join(peerDir, 'package.json'), 'utf8'));
     put(join(nested, '@scratch/peer/package.json'), JSON.stringify({ ...peer, version: '2.0.0' }));
     put(join(nested, '@scratch/peer/values.d.ts'), "export declare class Value { private brand; label: 'nested'; }\n");
-    expect(() => configure(stage, false, parseSync)).toThrow('package declarations: two copies of @scratch/peer');
+    await expect(configure(stage, false, parseSync)).rejects.toThrow('package declarations: two copies of @scratch/peer');
   } finally {
     fixture.close();
   }
 });
 
 test('comments and string types do not require an optional peer', async () => {
+  const { sourceInputChanges } = await import('../src/__exact_env.mjs');
   const fixture = linkedApp();
   const { stage, module, manifest, peerDir, put } = fixture;
   try {
@@ -175,9 +176,11 @@ export type Example = "import('@scratch/peer/values').Extra";
 export declare const value: 1;
 /// <reference types="@scratch/peer" />
 `);
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     await bundle(stage);
+    const inputs = JSON.parse(readFileSync(join(stage,'__exact_inputs.json'),'utf8'));
+    expect(sourceInputChanges(inputs).filter(file=>file.endsWith('index.d.ts'))).toEqual([]);
     for (const declaration of [
       "import type { Value } from /* peer */ '@scratch/peer/values'; export { Value };",
       "export { Value } from '@scratch/peer/values';",
@@ -186,7 +189,7 @@ export declare const value: 1;
       '/// <reference types="@scratch/peer" />',
     ]) {
       put(join(module, 'index.d.ts'), declaration);
-      configure(stage, false, parseSync);
+      await configure(stage, false, parseSync);
       await expect(check(stage, join(libraries, 'tsc'), libraries)).rejects.toThrow('@scratch/module@1.0.0 requires peer @scratch/peer@^1.4.0, which is not installed in the app');
     }
   } finally {
@@ -216,13 +219,13 @@ for (const missing of [true, false]) test(`an unused declaration subpath does no
     put(join(module, 'extra.d.ts'), "export { Value } from './uses-peer.js';\n");
     put(join(module, 'uses-peer.d.ts'), "export type Value = import('@scratch/peer/values').Value;\n");
     put(join(stage, 'app.ts'), "export { value } from '@scratch/module/server';\n");
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     const code = await bundle(stage);
     expect(await bundle(stage, true)).toBe(code);
     // The relative declaration import becomes reachable when this subpath is used.
     put(join(stage, 'app.ts'), "export type { Value } from '@scratch/module/extra';\n");
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await expect(check(stage, join(libraries, 'tsc'), libraries)).rejects.toThrow(
       '@scratch/module@1.0.0 requires peer @scratch/peer@^1.4.0' +
       (missing ? ', which is not installed in the app' : ', but the app has @scratch/peer@2.0.0'));
@@ -248,7 +251,7 @@ test('an installed dependency resolves its peer from its ordinary ancestors', as
     put(join(parent, 'index.js'), entry);
     put(join(parent, 'index.d.ts'), "export { value } from '@scratch/module'; export declare const same: boolean;\n");
     put(join(stage, 'app.ts'), "import { value, same } from '@scratch/parent'; export const label: 'app' = value.label; export { same };\n");
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     const code = await bundle(stage);
     const record = readFileSync(join(stage, '__exact_packages.json'), 'utf8');
@@ -293,7 +296,7 @@ test('an isolated install resolves a dependency\'s peer beside it in the store',
     put(join(parent, 'index.js'), "import { accepts } from '@scratch/peer/server'; import { value } from '@scratch/module'; export { value }; export const same = accepts(value);\n");
     put(join(parent, 'index.d.ts'), "export { value } from '@scratch/module'; export declare const same: boolean;\n");
     put(join(stage, 'app.ts'), "import { value, same } from '@scratch/parent'; export const label: 'app' = value.label; export { same };\n");
-    configure(stage, false, parseSync);
+    await configure(stage, false, parseSync);
     await check(stage, join(libraries, 'tsc'), libraries);
     const code = await bundle(stage);
     const record = JSON.parse(readFileSync(join(stage, '__exact_packages.json'), 'utf8'));
@@ -338,6 +341,184 @@ for (const commonjs of [false, true]) test(`a linked ${commonjs ? 'CommonJS' : '
       expect(result.label).toBe('app');
       expect(result.same).toBe(true);
     }
+  } finally {
+    fixture.close();
+  }
+});
+
+for (const linked of [true, false]) test(`a ${linked ? 'linked' : 'copied'} TypeScript package explains its missing declarations`, async () => {
+  const fixture = linkedApp();
+  const { app, put } = fixture;
+  const stage = join(app, '.exact', 'stage');
+  let module = fixture.module;
+  try {
+    mkdirSync(dirname(stage), { recursive: true });
+    renameSync(fixture.stage, stage);
+    if (!linked) {
+      const installed = join(app, 'node_modules/@scratch/module');
+      rmSync(installed);
+      renameSync(module, installed);
+      module = installed;
+    }
+    const entry = "import { shout } from '@scratch/module'; export const text = shout('hello');\n";
+    put(join(app, 'app.ts'), entry);
+    put(join(stage, 'app.ts'), entry);
+    for (const extension of ['ts', 'mts', 'cts']) {
+      const source = `./source.${extension}`;
+      const manifest = { name: '@scratch/module', type: 'module', exports: { '.': { default: source } } };
+      put(join(module, 'package.json'), JSON.stringify(manifest));
+      put(join(module, source), 'export function shout(text: string): string { return text.toUpperCase(); }\n');
+      await configure(stage, false, parseSync);
+      const refusal = await check(stage, join(libraries, 'tsc'), libraries).catch(error => error);
+      expect(refusal).toBeInstanceOf(Error);
+      for (const spelling of [path => path, win32.normalize]) {
+        expect(refusal.message.replaceAll('\\', '/')).toBe(
+          `module outside captured app: ${spelling(join(module, source))}: TypeScript source in package @scratch/module (${spelling(join(module, 'package.json'))}). The type check stages package declarations, not source. Export a declaration file for this entry (for example, a "types" condition before "default") and keep its imports within the staged declarations.`.replaceAll('\\', '/'));
+      }
+      put(join(module, 'source.d.ts'), 'export declare function shout(text: string): string;\n');
+      manifest.exports['.'] = { types: './source.d.ts', default: source };
+      put(join(module, 'package.json'), JSON.stringify(manifest));
+      await configure(stage, false, parseSync);
+      await check(stage, join(libraries, 'tsc'), libraries);
+    }
+    const code = await bundle(stage), file = join(fixture.root, 'typescript-package.mjs');
+    put(file, code);
+    expect((await import(file)).text).toBe('HELLO');
+  } finally {
+    fixture.close();
+  }
+});
+
+for (const linked of [true, false]) test(`a ${linked ? 'linked' : 'copied'} import-first TypeScript export checks its declarations`, async () => {
+  const fixture = linkedApp();
+  const { app, put } = fixture, stage = join(app, '.exact', 'stage');
+  let module = fixture.module;
+  try {
+    mkdirSync(dirname(stage), { recursive: true });
+    renameSync(fixture.stage, stage);
+    if (!linked) {
+      const installed = join(app, 'node_modules/@scratch/module');
+      rmSync(installed);
+      renameSync(module, installed);
+      module = installed;
+    }
+    put(join(stage, 'app.ts'), "export { shout } from '@scratch/module';\n");
+    put(join(module, 'index.ts'), 'export function shout(text: string): string { return text.toUpperCase(); }\n');
+    for (const declaration of ['./index.d.ts', './types.d.ts']) {
+      put(join(module, declaration), 'export declare function shout(text: string): string;\n');
+      const manifest = { name: '@scratch/module', type: 'module', exports: { '.': { import: './index.ts', types: declaration, default: './index.js' } } };
+      put(join(module, 'package.json'), JSON.stringify(manifest));
+      await configure(stage, false, parseSync);
+      await check(stage, join(libraries, 'tsc'), libraries);
+      rmSync(join(module, declaration));
+    }
+  } finally {
+    fixture.close();
+  }
+});
+
+for (const field of ['exports', 'main', 'types']) for (const nested of [false, true]) test(`an unnamed package with ${field} does not attribute its source to ${nested ? 'its enclosing package' : 'the app'}`, async () => {
+  const fixture = linkedApp();
+  const { app, put } = fixture, stage = join(app, '.exact', 'stage');
+  const module = join(app, 'node_modules/@scratch/module');
+  try {
+    mkdirSync(dirname(stage), { recursive: true });
+    renameSync(fixture.stage, stage);
+    rmSync(module);
+    renameSync(fixture.module, module);
+    rmSync(join(module, 'index.d.ts'));
+    const sourceDir = nested ? join(module, 'unnamed') : module;
+    if (nested) put(join(module, 'package.json'), JSON.stringify({ name: '@scratch/module', type: 'module', exports: { '.': './unnamed/index.ts' } }));
+    const entry = "export { value } from '@scratch/module';\n";
+    put(join(app, 'app.ts'), entry);
+    put(join(stage, 'app.ts'), entry);
+    put(join(sourceDir, 'index.ts'), 'export const value = 1;\n');
+    put(join(sourceDir, 'package.json'), JSON.stringify({ type: 'module', [field]: field === 'exports' ? { '.': './index.ts' } : './index.ts' }));
+    await configure(stage, false, parseSync);
+    const refusal = await check(stage, join(libraries, 'tsc'), libraries).catch(error => error);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal.message.replaceAll('\\', '/')).toBe(`module outside captured app: ${join(sourceDir, 'index.ts')}`.replaceAll('\\', '/'));
+  } finally {
+    fixture.close();
+  }
+});
+
+test('uncaptured app source gets no package-declaration advice', async () => {
+  const fixture = linkedApp();
+  const { app, stage, put } = fixture;
+  try {
+    put(join(app, 'uncaptured.ts'), 'export const value = 1;\n');
+    put(join(stage, 'app.ts'), `export { value } from ${JSON.stringify(join(app, 'uncaptured.ts').replaceAll('\\', '/'))};\n`);
+    await configure(stage, false, parseSync);
+    const refusal = await check(stage, join(libraries, 'tsc'), libraries).catch(error => error);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal.message.replaceAll('\\', '/')).toBe(`module outside captured app: ${join(app, 'uncaptured.ts')}`.replaceAll('\\', '/'));
+  } finally {
+    fixture.close();
+  }
+});
+
+test('a type-only nested manifest still identifies the enclosing named package', async () => {
+  const fixture = linkedApp();
+  const { app, put, module } = fixture, stage = join(app, '.exact', 'stage');
+  try {
+    mkdirSync(dirname(stage), { recursive: true });
+    renameSync(fixture.stage, stage);
+    put(join(stage, 'app.ts'), "export { value } from '@scratch/module';\n");
+    put(join(module, 'package.json'), JSON.stringify({ name: '@scratch/module', type: 'module', exports: { '.': './nested/index.ts' } }));
+    put(join(module, 'nested/package.json'), '{"type":"module"}');
+    put(join(module, 'nested/index.ts'), 'export const value = 1;\n');
+    await configure(stage, false, parseSync);
+    await expect(check(stage, join(libraries, 'tsc'), libraries)).rejects.toThrow('TypeScript source in package @scratch/module');
+  } finally {
+    fixture.close();
+  }
+});
+
+// zod 4 ships `v4/classic/package.json` and its siblings, nameless with `main`, `module` and `types`: its code there is
+// zod's, and bundles, while the type check's advice still stops at such a manifest (the test above).
+for (const field of ['exports', 'main', 'types']) test(`a package's code under a nested nameless manifest with ${field} bundles as the package's`, async () => {
+  const fixture = linkedApp();
+  const { stage, module, put } = fixture;
+  try {
+    put(join(module, 'index.js'), "export { value } from './nested/index.js';\n");
+    put(join(module, 'nested/index.js'), "import { Value } from '@scratch/peer/values'; export const value = new Value();\n");
+    put(join(module, 'nested/package.json'), JSON.stringify({ type: 'module', [field]: field === 'exports' ? { '.': './index.js' } : './index.js' }));
+    const code = await bundle(stage);
+    const record = JSON.parse(readFileSync(join(stage, '__exact_packages.json'), 'utf8'));
+    expect(record.edges).toContainEqual([
+      'node_modules/.packages/@scratch/module@1.0.0/index.js', './nested/index.js', 'import',
+      'node_modules/.packages/@scratch/module@1.0.0/nested/index.js',
+    ]);
+    const file = join(fixture.root, 'bundle.mjs');
+    put(file, code);
+    expect((await import(file)).label).toBe('app');
+  } finally {
+    fixture.close();
+  }
+});
+
+test('Expo push exchanges a typed subscription using the imported app.json on every executor', async () => {
+  const fixture = linkedApp();
+  const { app, stage, put } = fixture;
+  try {
+    mkdirSync(join(app, 'node_modules/@exact'), { recursive: true });
+    symlinkSync(fileURLToPath(new URL('../../../packages/push', import.meta.url)), join(app, 'node_modules/@exact/push'), process.platform === 'win32' ? 'junction' : 'dir');
+    const manifest = { app: { id: 'dev.guard' }, extra: { eas: { projectId: 'project-fixture' } } };
+    const entry = `import manifest from './app.json';
+import { getExpoPushTokenAsync } from '@exact/push/expo';
+import type { PushSubscription } from '@exact/push';
+export const exchange = (subscription: PushSubscription) => getExpoPushTokenAsync(subscription, manifest);
+`;
+    put(join(app, 'app.ts'), entry);
+    put(join(stage, 'app.ts'), entry);
+    put(join(app, 'app.json'), JSON.stringify(manifest));
+    put(join(stage, 'app.json'), JSON.stringify(manifest));
+    await configure(stage, false, parseSync);
+    await check(stage, join(libraries, 'tsc'), libraries);
+    const code = await bundle(stage);
+    expect(code).toContain('project-fixture');
+    expect(code).toContain('https://exp.host/--/api/v2/push/getExpoPushToken');
   } finally {
     fixture.close();
   }

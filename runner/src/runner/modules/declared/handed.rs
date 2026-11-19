@@ -61,7 +61,7 @@ impl<D: DataSource> Runner<D> {
 
     /// Tell the bound implementation that owns list `state` its entries.
     pub(super) fn hand_over(&self, state: &str) {
-        let Some(handler) = self.native_slot().handler() else {
+        let Some(handler) = self.native_slot().extension_handler() else {
             return;
         };
         for (extension, _) in self.handed_lists().into_iter().filter(|(_, s)| s == state) {
@@ -87,7 +87,7 @@ impl<D: DataSource> Runner<D> {
 
     /// A bound implementation's choice (module doc), applied as the
     /// person's; journaled when refused.
-    pub(in crate::runner) fn listed_choice(&mut self, body: &str) {
+    pub(in crate::runner::modules) fn listed_choice_linked(&mut self, body: &str) {
         let v: Json = serde_json::from_str(body).unwrap_or_default();
         let (Some(extension), Some(state), Some(choice)) = (
             v["extension"].as_str(),

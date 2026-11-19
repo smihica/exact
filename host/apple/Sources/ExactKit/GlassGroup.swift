@@ -156,7 +156,7 @@ extension NodeView {
             if v.layer?.mask != nil { note("mask") }
             if v !== self, v is NSClipView || v.clipsToBounds || v.layer?.masksToBounds == true { note("clip") }
             #endif
-            if v !== self, (v.superview as? NodeView)?.overlay === v { note("canvas") }
+            if v !== self, v.canvasOverlayOwner != nil { note("canvas") }
             view = v.superview
         }
         return (nil, [])
@@ -277,9 +277,11 @@ final class GlassSlot: UIVisualEffectView {
 }
 
 extension NodeView {
-    /// What `container` names without a group: the scroll, the canvas
-    /// overlay, a glass's content view, the clip box, or the node.
-    var baseContainer: UIView { scroll ?? overlay ?? (Materials.glass(materialKind) || blurHostsChildren ? materialView?.contentView : nil) ?? clipBox ?? self }
+    /// A one-axis clip holds children outside the material's rounded mask.
+    var baseContainer: UIView {
+        scroll ?? overlay ?? (clipsOneAxis ? clipBox : nil)
+            ?? (Materials.glass(materialKind) || blurHostsChildren ? materialView?.contentView : nil) ?? clipBox ?? self
+    }
 
     /// The group view's place and spacing, or its absence (D2, D6).
     func syncGlassGroup() {
@@ -295,7 +297,7 @@ extension NodeView {
             made.owner = self
             moveOrPlace(new: true) { made.frame = base.bounds }
             made.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            let children = base.subviews.filter { $0 is NodeView }
+            let children = NodeView.structural(base.subviews)
             GlassGroups.moving(in: self) {
                 base.insertSubview(made, at: 0)
                 for child in children { made.contentView.addSubview(child) }
@@ -320,7 +322,7 @@ extension NodeView {
     private func removeGlassGroup(_ group: GlassGroupView) {
         glassGroupView = nil
         let base = baseContainer
-        let children = group.contentView.subviews.filter { $0 is NodeView }
+        let children = NodeView.structural(group.contentView.subviews)
         GlassGroups.moving(in: self) {
             for (i, child) in children.enumerated() { base.insertSubview(child, at: i) }
             group.removeFromSuperview()
@@ -365,6 +367,7 @@ extension NodeView {
                 made.contentView.addSubview(material)
             }
             glassSlot = made
+            sizeMaterial() // made during a layout transition, at its shown size
             return made
         }()
         return slot.isolate(!reasons.isEmpty)
@@ -403,9 +406,8 @@ private final class GlassContent: NSView {
 }
 
 extension NodeView {
-    /// What `container` names without a group: the scroll's document, the
-    /// canvas overlay, a material's content, the clip box, or the node.
-    var baseContainer: NSView { scroll?.documentView ?? overlay ?? materialContent ?? clipBox ?? self }
+    /// A one-axis clip holds children outside the material's rounded mask.
+    var baseContainer: NSView { scroll?.documentView ?? overlay ?? (clipsOneAxis ? clipBox : nil) ?? materialContent ?? clipBox ?? self }
 
     /// The group view's content, where the children are while it exists.
     var glassGroupContent: NSView? {
@@ -431,7 +433,7 @@ extension NodeView {
             content.autoresizingMask = [.width, .height]
             content.setAccessibilityElement(false)
             made.contentView = content
-            let children = base.subviews.filter { $0 is NodeView }
+            let children = NodeView.structural(base.subviews)
             GlassGroups.moving(in: self) {
                 base.addSubview(made, positioned: .below, relativeTo: base.subviews.first)
                 for child in children { content.addSubview(child) }
@@ -454,7 +456,7 @@ extension NodeView {
         glassGroupView = nil
         let base = baseContainer
         let content = group.subviews.first { $0 is GlassContent } ?? group
-        let children = content.subviews.filter { $0 is NodeView }
+        let children = NodeView.structural(content.subviews)
         GlassGroups.moving(in: self) {
             for child in children.reversed() { base.addSubview(child, positioned: .below, relativeTo: base.subviews.first) }
             group.removeFromSuperview()

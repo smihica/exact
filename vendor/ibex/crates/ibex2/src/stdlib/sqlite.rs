@@ -23,8 +23,13 @@ pub struct Rows {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteResult {
+    /// The rows the statement changed, as `sqlite3_changes` counts them;
+    /// zero after a statement that changed none.
     pub changes: u64,
     pub last_insert_rowid: i64,
+    /// Exact patch 51: the statement changed the database, a row (directly or
+    /// by a trigger) or the schema. An embedder tells other readers from it.
+    pub changed: bool,
 }
 #[derive(Debug, Clone)]
 pub struct Command {

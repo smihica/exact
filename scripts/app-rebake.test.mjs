@@ -9,6 +9,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
 import { bakeTarget, buildBake, pendingBuildInputs } from './app.mjs';
+import { packageGpuManifest } from './app-shells.mjs';
 
 async function withContractBake(use, {binding=false,watchPackage=false}={}) {
   const root=resolve(import.meta.dir,'..'), old=new Date('2000-01-01T00:00:00Z');
@@ -54,7 +55,7 @@ async function withContractBake(use, {binding=false,watchPackage=false}={}) {
       assert.ok(unit, 'the bake must leave its build-script marker');
       return resolve(builds,unit);
     };
-    await use({dir,write,source,bake,plan,run,scriptDir,old});
+    await use({dir,write,source,bake,plan,run,scriptDir,old,app});
   } finally {rmSync(dir,{recursive:true,force:true});}
 }
 
@@ -90,6 +91,26 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('restored and equal-mtime Contra
     writeFileSync(library, 'component Child\n  view\n    text "CHANGED!"\n');
     utimesSync(library, old, old);
     bake(); assert.ok(plan().includes(Buffer.from('CHANGED!')), 'installed Contract imports must be watched by content');
+  });
+}, 300000);
+
+// LLP 1153.003 D5: a package's GPU declaration decides what a host builds even when it omits the host, and its lock
+// what the module resolves from.
+test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('a package GPU declaration and lock are native build inputs', async () => {
+  await withContractBake(({dir, write, bake, app}) => {
+    const declaration = targets => JSON.stringify({gpu:{crate:'rust', exactGpu:'0.4', targets, surfaces:{sky:{arity:1, factory:'sky_surface::surface'}}}});
+    write('package.json', JSON.stringify({dependencies:{'@fixture/sky':'1.0.0'}}));
+    write('node_modules/@fixture/sky/package.json', JSON.stringify({name:'@fixture/sky', exports:'./exact.json'}));
+    write('node_modules/@fixture/sky/exact.json', declaration(['macos']));
+    write('node_modules/@fixture/sky/rust/Cargo.lock', 'version = 4\n');
+    app.manifest = packageGpuManifest(app.manifest, dir);
+    const build = bake();
+    assert.deepEqual(pendingBuildInputs(build), []);
+    write('node_modules/@fixture/sky/exact.json', declaration(['macos', 'linux']));
+    assert.deepEqual(pendingBuildInputs(build), ['package/@fixture/sky/exact.json']);
+    write('node_modules/@fixture/sky/exact.json', declaration(['macos']));
+    write('node_modules/@fixture/sky/rust/Cargo.lock', 'version = 4\n\n');
+    assert.deepEqual(pendingBuildInputs(build), ['package/@fixture/sky/rust/Cargo.lock']);
   });
 }, 300000);
 
@@ -162,7 +183,7 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('a dependency regenerates Rust w
     const generated = resolve(scriptDir('binding'), 'out/binding.rs'), stamp = statSync(generated, {bigint:true}).mtimeNs;
     bake(); assert.equal(statSync(generated, {bigint:true}).mtimeNs, stamp, 'a dependency with an absent design must stay warm');
     // Only the dependency reads this package. The app's revision stays fixed.
-    write('node_modules/@fixture/ui/ui.tamber', 'tamber ui\n\ntheme\n  ui.card = #123456\n');
+    write('node_modules/@fixture/ui/ui.forma', 'forma ui\n\ntheme\n  ui.card = #123456\n');
     bake(); assert.notEqual(run(), before, 'a dependency must regenerate when its optional design appears');
   },{binding:true});
 },300000);
@@ -172,11 +193,11 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('the app\'s absent optional desi
     write('node_modules/@fixture/ui/package.json', JSON.stringify({name: '@fixture/ui', exports: './child.contract'}));
     write('node_modules/@fixture/ui/child.contract', 'component Child\n  view\n    text "DESIGNED"\n');
     write('app.contract', 'use Child from "@fixture/ui"\ncomponent App\n  view\n    Child()\n');
-    const design = resolve(dir, 'node_modules/@fixture/ui/ui.tamber');
+    const design = resolve(dir, 'node_modules/@fixture/ui/ui.forma');
     const absent = bake();
     assert.ok(absent.optionalInputs?.includes(design) && !absent.binary.missing.includes(design));
     assert.deepEqual(pendingBuildInputs(absent), []);
-    write('node_modules/@fixture/ui/ui.tamber', 'tamber ui\n\ntheme\n  ui.card = #123456\n');
+    write('node_modules/@fixture/ui/ui.forma', 'forma ui\n\ntheme\n  ui.card = #123456\n');
     assert.deepEqual(pendingBuildInputs(absent), [design], 'making the design must make the build stale');
     const present = bake();
     assert.equal(present.binary.sha256, absent.binary.sha256, 'making the design must not change the binary');

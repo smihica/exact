@@ -3,7 +3,7 @@
 - **Upstream:** `taffy` 0.14.0, crates.io package supplied offline at
   `~/Library/Caches/exact2-textflow/taffy-0.14.0/` (M8, 2026-09-18).
   The archive's `.cargo_vcs_info.json` pins commit `77f385683c1d698c91a23a259f87fdddf26925fb`.
-- **Why vendored:** patches 3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73 and 74 below remain. `[patch.crates-io]`
+- **Why vendored:** patches 3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75 and 76 below remain. `[patch.crates-io]`
   selects this copy; the kernel declares `taffy = "0.14"`.
 - **Owner:** Charlie Cheever (kernel/layout).
 - **Features:** std, taffy_tree, flexbox, grid, block_layout, content_size, calc.
@@ -2324,7 +2324,7 @@ answers, respectively, cache storage is 232, 232 and 424 bytes, against
 describes the conditional additional storage.
 
 **Held by** `kernel/tests/it/size_cache.rs`, the kernel's `layout::size_cache`,
-`layout::size_cache::shapes`, `layout::memo_tests`, and
+`layout::size_cache::shapes_tests`, `layout::memo_tests`, and
 `kernel/tests/it/layout_equality/size_cache.rs`. The public-API regressions,
 including wraparound, both lookups, cache bytes and descendant geometry after
 flex and grid baseline probes, run in kernel test targets. Frames, scroll
@@ -2373,3 +2373,180 @@ every key and size entry.
 for size probes and final layouts, with and without a ratio and percentage
 children. Before the repair a descendant kept 90 points of overflow from the
 old offer; a fresh layout under the new offer gives 45.
+
+## Patch 75: native clearance narrows the absolute containing block — Exact only
+
+The kernel supplies a container's `absolute_clearance` separately from its
+padding: main's clearance of an owner's chrome (expo/exact#36), which LLP 1123
+D3's content root replaces at activation, with `inset_credit`. The shared absolute solver sizes and places descendants
+inside that clearance, including percentage sizes, constraints, insets, padding
+and margins. Grid areas retain their explicit track edges; automatic edges use
+the cleared padding box. An inset marked by `inset_credit` already references
+the same edge's safe area, so its resolved length credits only the clearance
+applied to that edge of its containing block. Explicit grid lines keep the
+authored inset.
+Host blocks lay out separately and do not inherit an ancestor's clearance.
+
+**Held by** `kernel/tests/it/cover.rs`, `kernel/tests/it/cover/sizing.rs` and
+`kernel/src/kernel/owner_tests.rs`, including literal Chrome inner-box geometry,
+the Duo's 951-point allocation and 49-point bottom cover, changing covers,
+static descendants, nested positioned boxes and independent host blocks.
+
+## Patch 76: fractional flex factors share the space beside the gaps — to upstream
+
+When a line's unfrozen flex factors sum below one, `resolve_flexible_lengths`
+distributes that fraction of the initial free space (CSS Flexbox §9.7 step 4b).
+The initial free space already excludes the line's gaps; 0.14.0 subtracted them
+again, growing and shrinking alike. Taffy 0.15.1 has the same line.
+
+**Held by** `kernel/tests/it/browser_flex.rs::fractional_flex_factors_share_the_space_beside_the_gap`:
+two items with `flex-grow: 0.25` and 100-point content, 40 points apart in a
+300-point row, are 115 wide in Chrome; before the repair their targets fell to
+95 and the automatic minimum held them at 100.
+
+## Patch 77: the size keywords resolve as Chrome does — to upstream
+
+LLP 1001.001 D4. `fit-content` (CSS Box Sizing 3 §3.2) is
+`max(min-content, min(max-content, stretch))`, two measurements through
+`fit_content_width`; 0.14 measured the box once at the stretch size, which a
+wrapped text measurer answers with its widest line. `resolve_sizing_keyword`
+returns `Fit` for it, and each caller (block items and floats, flex bases,
+main and cross sizes, grid alignment, absolute boxes, the root) measures it
+with `measure_keyword_width`; in the block axis it is a measurement under the
+stretch size (`block_axis`). A root resolves a keyword width against its
+offer as a block child does. A flex container's intrinsic contribution
+offers an item with a `min-content` or `max-content` main size that
+constraint. A column item's keyword width is resolved before its height is
+measured, and a keyword cross size does not stretch. `Style::min_size` and
+`Style::max_size` become `Dimension` (they were `LengthPercentageAuto`) so
+the bounds can hold the keywords patch 78 resolves.
+
+**Held by** `kernel/tests/it/browser_intrinsic.rs`: 160 cases measured in
+Chrome 156 (`fixtures/browser_intrinsic.tsv`), the size cases among them.
+
+## Patch 78: keyword bounds — to upstream
+
+LLP 1001.001 D4. A keyword on `min-*` or `max-*` resolves where the bounds
+are read, through `sizing_keyword::keyword_bounds`: the inline axis at the
+min-content or max-content constraint, or `fit-content` against the stretch
+size (under a min-content or max-content constraint, that size); the block
+axis as the content height at the box's width. Each is a border-box size
+measured in `SizingMode::ContentSize` with the box's known size, so a
+definite height transfers through a ratio first. The parent resolves its
+items' bounds (block items after the container width, flex items before
+their base sizes, grid items in alignment, absolute boxes); a box's own entry
+(block, flex, grid, leaf) resolves its own only in `InherentSize`
+(`own_keyword_bounds`). In `ContentSize` a keyword bound reads as unset, and
+so does the length bound in an axis that has a keyword bound, since the
+content size there is what the keyword measures (CSS Box Sizing 3 §5.1). The
+leaf's measure function is `FnMut`, so a leaf measures its own bounds. A grid
+item with a keyword height lays out its children with that height indefinite,
+and a box with a ratio and a keyword width keeps the ratio's automatic
+minimum, as with `auto`.
+
+**Held by** `kernel/tests/it/browser_intrinsic.rs` (the bound cases, a
+`min-width: max-content` beside a shorter length maximum on each layout
+among them) and `kernel/tests/it/size_cache.rs`'s `keyword` shapes, which
+compare layout with and without the size cache.
+
+## Patch 79: the grid algorithm through a registered pointer — Exact's
+
+LLP 1047.001 D10. `TaffyView`'s dispatch, its recorded layouts' visits and
+its memoized roots reach `compute_grid_layout` only through the pointer
+`link_grid` sets (`tree/grid_link.rs`), so a binary that never calls it
+carries none of the algorithm: an Apple app whose plan lays out no grid.
+`TaffyTree::new` and `with_capacity` link it, so every other user of a tree
+lays out grid as before; `TaffyTree::by_use` does not, and the kernel's
+trees use it. Unlinked, a grid container is laid out as a block (a debug
+assertion in a debug build): a host that links by use refuses a plan that
+lays out a grid before it lays anything out. The algorithm reads every view
+through one object type, `GridView` over `dyn GridTree`, so it is compiled
+once whatever measure function a tree is laid out with.
+
+**Held by** the grid and table suites, unchanged, and Apple's production link
+proof (`host/apple/link.test.mjs`): a production hello names no
+`taffy::compute::grid`.
+
+## Patch 80: an outset box lays its subtree out past its place — Exact only
+
+LLP 1123 D4. A box that ignores the safe area and touches it reaches past
+the box its parent places, by `RareStyle::outset` on each edge, which the
+kernel measures from the last layout. The kernel gives it two paddings:
+`padding`, which its parent places it with, and `RareStyle::outset_padding`,
+the whole padding its subtree is laid out with; where the band fills the
+padding, the first is the second less the outset, at least 0. Its final
+layout (`compute_child_layout` under `RunMode::PerformLayout`) lays its
+subtree out, as a formatting context of its own, in that box outset by
+`outset`. An axis the parent gave a size is laid out at that size outset,
+as is either axis of a box with an aspect ratio, since each then follows
+from the other. An axis the parent left unknown stays automatic, its
+minimum the placed size outset, so the subtree's percentages and cached
+layouts are as they were. On both axes an authored maximum is extended by
+the outset, since a container clamps even a size it is given. The parent
+is answered with the size it places (its own, or a sizing pass's), with
+the scrollable overflow moved back to where it places the box and no
+baseline, and the answer is stored for the parent's inputs, so that its
+next ask is answered from the cache and the children's final layouts stay
+cached. The box's final cache entry is invalidated first, since it may
+hold the parent's answer for inputs the extended ones equal.
+`TaffyTree::outset_padding` returns the whole padding the subtree was laid
+out with, for publication. `RareStyle::no_baseline` gives the parent no
+baseline from any box the kernel marks, which it does for every box that
+ignores, touching or not. An absolute box hoisted through an outset box is
+placed from its outset box, and through a box the kernel moves instead of
+extending, by `RareStyle::shift`, from where it is moved to. A recorded
+layout (patch 29) answers an outset box and a box without a baseline
+whole, as it does a replaced box that holds children (patch 16), and an
+outset list row is laid out by its own algorithm, not replayed. A child's
+cached answer is returned before its rare style is read, so a cached child
+costs what it does without the patch, and a box without a baseline stores
+its answer without one, as its parent sees it.
+
+**Held by** `kernel/src/kernel/ignore_tests.rs`: extended flex items and
+blocks, the padding the band fills and the padding kept whole, automatic
+axes and a maximum on either axis, a ratio, a hoisted absolute box under
+an extended and under a moved box, a baseline-aligned row, list rows laid
+out by a replay and fresh, a clean box placed anew, and a row's change
+that lays out only its path.
+
+## Patch 81: a parent measures its bars, reserves them and places them — Exact only
+
+LLP 1123 D12. A child whose `RareStyle::bar` names an edge (top 0, right 1,
+bottom 2, left 3) is a bar of its parent, which `RareStyle::bars` marks; the
+kernel lays the bar out `position: absolute`, so the parent's algorithm
+leaves it out of flow, never hoists it to an outer containing block, and the
+absolute pass places nothing for it (`AbsolutePass::place`, through
+`CoreStyle::is_bar`). The parent's layout (`tree/bars.rs`, from
+`placed_layout`) first measures each bar in tree order as the only flex item
+of a slot whose main axis crosses the edge, a bar laid out `display: none`
+taking no slot and keeping no depth. Its extent along the edge is the parent's size there less the
+border, `RareStyle::bar_inset` (what the parent's own reservations add to its
+padding) and the earlier bars on the edges beside it, where that size is
+known; otherwise the bar is measured in the space the parent is offered
+there, less the same. The bar stretches along it within its minimum and
+maximum, which a `content-box` bar's padding and border add to, unless its
+`align-self`, its own size or an `auto` margin along the edge says otherwise;
+its depth is its margin box across the edge. The parent's algorithm then runs
+with each edge's bar depths added to its padding; under `content-box` its
+definite size, minimum and maximum shrink by them, so they keep their border
+box as under `border-box`; and on an axis its parent left unknown, its least
+size is raised to its widest bar's there with the borders, insets and earlier
+side bars. For a final layout each bar is then laid out in its slot,
+stretched to the slot's final extent within its bounds or placed by
+`align-self` (`left` and `right` physical, start and end following the
+parent's direction) or its `auto` margins, held by its margins, at the depth
+it was measured at, which is definite only where the bar authored it. Each
+bar adds its scrollable overflow at its slot to the parent's, and its slot's
+depth is kept for publication (`TaffyTree::bar_depth`). A parent with bars is
+no marked root's recorded algorithm and is laid out outside a trace being
+recorded, as an outset box is.
+
+**Held by** `kernel/src/kernel/bar_tests.rs`: bars on the top and bottom of a
+content root and the content between them, later bars inside earlier ones on
+any edge, `align-self`, margins, a bar's bounds and `auto` margins, a
+content-sized parent as wide as its widest bar, a definite size, a minimum
+and a maximum keeping their border box under a block and a flex parent, a bar
+past its parent's reservation in a flex row, two panes whose bars hold
+wrapping text, a positioned parent's bar in a scroller's content, a bar its
+host replaces, and the boxes that are no bars; `contract/cli/tests/it/duo_lab.rs`'s
+bars screen.

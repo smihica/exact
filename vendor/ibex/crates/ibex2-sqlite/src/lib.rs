@@ -34,7 +34,9 @@ pub fn link() {
 
 struct Session {
     connection: Mutex<Option<Connection>>,
-    internal_transaction: Arc<AtomicBool>,
+    /// The provider's own statement is running: its BEGIN and COMMIT, and
+    /// its read of the schema version.
+    internal: Arc<AtomicBool>,
     /// A `ForeignKeys::Check` batch's statements are running: the
     /// migrators' own `PRAGMA foreign_keys` lines are accepted as no-ops.
     checking: Arc<AtomicBool>,
@@ -168,8 +170,8 @@ impl sqlite::Provider for SqliteProvider {
         connection
             .set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
             .map_err(sql_error)?;
-        let internal_transaction = Arc::new(AtomicBool::new(false));
-        let internal = internal_transaction.clone();
+        let internal = Arc::new(AtomicBool::new(false));
+        let own = internal.clone();
         let checking = Arc::new(AtomicBool::new(false));
         let checked = checking.clone();
         connection
@@ -185,13 +187,21 @@ impl sqlite::Provider for SqliteProvider {
                         "SAVEPOINT: use transaction([...]) for statements that commit together"
                             .into()
                     }
-                    AuthAction::Transaction { .. } if !internal.load(Ordering::Relaxed) => {
+                    AuthAction::Transaction { .. } if !own.load(Ordering::Relaxed) => {
                         "BEGIN, COMMIT and ROLLBACK: use transaction([...]) for statements that commit together".into()
                     }
                     AuthAction::Function { function_name }
                         if function_name.eq_ignore_ascii_case("load_extension") =>
                     {
                         "load_extension: extensions are not loaded".into()
+                    }
+                    AuthAction::Pragma {
+                        pragma_name,
+                        pragma_value: None,
+                    } if own.load(Ordering::Relaxed)
+                        && pragma_name.eq_ignore_ascii_case("schema_version") =>
+                    {
+                        return Authorization::Allow
                     }
                     AuthAction::Pragma { pragma_name, .. }
                         if pragma_name.eq_ignore_ascii_case("foreign_keys") =>
@@ -223,7 +233,7 @@ impl sqlite::Provider for SqliteProvider {
             .map_err(error)?;
         Ok(Arc::new(Session {
             connection: Mutex::new(Some(connection)),
-            internal_transaction,
+            internal,
             checking,
             held,
         }))
@@ -276,7 +286,23 @@ fn parameters(params: &[Value]) -> Result<Vec<SqlValue>, HostError> {
         })
         .collect()
 }
-fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<ExecuteResult, HostError> {
+/// The schema's version, which SQLite moves at each change to the schema
+/// (https://www.sqlite.org/pragma.html#pragma_schema_version). `internal`
+/// admits the PRAGMA, which app SQL may not run, while it prepares and steps.
+fn schema_version(conn: &Connection, internal: &AtomicBool) -> Result<i64, HostError> {
+    internal.store(true, Ordering::Relaxed);
+    let version = conn
+        .prepare_cached("PRAGMA schema_version")
+        .and_then(|mut statement| statement.query_row([], |row| row.get(0)));
+    internal.store(false, Ordering::Relaxed);
+    version.map_err(sql_error)
+}
+fn execute(
+    conn: &Connection,
+    internal: &AtomicBool,
+    sql: &str,
+    params: &[Value],
+) -> Result<ExecuteResult, HostError> {
     validate(conn, sql)?;
     let mut statement = conn.prepare_cached(sql).map_err(sql_error)?;
     if statement.column_count() != 0 {
@@ -284,12 +310,17 @@ fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<ExecuteResu
             "execute does not accept a statement returning rows; use query",
         ));
     }
-    let changes = statement
-        .execute(rusqlite::params_from_iter(parameters(params)?))
-        .map_err(sql_error)?;
+    let params = rusqlite::params_from_iter(parameters(params)?);
+    let (rows, schema) = (conn.total_changes(), schema_version(conn, internal)?);
+    let changes = statement.execute(params).map_err(sql_error)?;
+    // `sqlite3_changes` keeps the last INSERT, UPDATE or DELETE's count
+    // after any other statement (https://www.sqlite.org/c3ref/changes.html);
+    // the connection's total, which triggers add to, moves only for a row.
+    let rows = conn.total_changes() != rows;
     Ok(ExecuteResult {
-        changes: changes as u64,
+        changes: if rows { changes as u64 } else { 0 },
         last_insert_rowid: conn.last_insert_rowid(),
+        changed: rows || schema_version(conn, internal)? != schema,
     })
 }
 /// `e`, naming the statement of a batch it came from.
@@ -395,16 +426,16 @@ impl Session {
         commands: &[Command],
         check: bool,
     ) -> Result<Vec<ExecuteResult>, HostError> {
-        self.internal_transaction.store(true, Ordering::Relaxed);
+        self.internal.store(true, Ordering::Relaxed);
         let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
-        self.internal_transaction.store(false, Ordering::Relaxed);
+        self.internal.store(false, Ordering::Relaxed);
         let transaction = transaction.map_err(sql_error)?;
         self.checking.store(check, Ordering::Relaxed);
         let results: Result<Vec<_>, _> = commands
             .iter()
             .enumerate()
             .map(|(i, command)| {
-                execute(&transaction, &command.sql, &command.params).map_err(|e| {
+                execute(&transaction, &self.internal, &command.sql, &command.params).map_err(|e| {
                     let at = format!("statement {} of {}", i + 1, commands.len());
                     in_statement(e, &at, &command.sql)
                 })
@@ -415,7 +446,7 @@ impl Session {
             true => check_foreign_keys(&transaction).map(|()| values),
             false => Ok(values),
         });
-        self.internal_transaction.store(true, Ordering::Relaxed);
+        self.internal.store(true, Ordering::Relaxed);
         let outcome = match results {
             Ok(values) => transaction.commit().map(|()| values).map_err(sql_error),
             Err(e) => {
@@ -423,7 +454,7 @@ impl Session {
                 Err(e)
             }
         };
-        self.internal_transaction.store(false, Ordering::Relaxed);
+        self.internal.store(false, Ordering::Relaxed);
         outcome
     }
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T, HostError>) -> Result<T, HostError> {
@@ -439,7 +470,7 @@ impl sqlite::Connection for Session {
         self.with(|conn| validate(conn, sql))
     }
     fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, HostError> {
-        self.with(|conn| execute(conn, sql, params))
+        self.with(|conn| execute(conn, &self.internal, sql, params))
     }
     fn query(&self, sql: &str, params: &[Value]) -> Result<Rows, HostError> {
         self.with(|conn| {

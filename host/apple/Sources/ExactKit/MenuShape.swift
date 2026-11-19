@@ -11,14 +11,14 @@ extension NodeView {
     var menuShaped: Bool {
         let rows = menuRows
         func textOnly(_ node: NodeView) -> Bool {
-            node.kind == "text" && node.container.subviews.compactMap { $0 as? NodeView }.allSatisfy(textOnly)
+            node.kind == "text" && node.childNodes.allSatisfy(textOnly)
         }
         func item(_ row: NodeView) -> Bool {
             guard row.isButton else { return false }
             if row.isNativeButton { return true }
             if let face = row.face, face.fits, !face.raster { return true }
             // Text, and at most one image: the item's title and its image.
-            let content = row.container.subviews.compactMap { $0 as? NodeView }
+            let content = row.childNodes
             let images = content.filter { $0.kind == "image" && $0.container.subviews.isEmpty }
             return images.count <= 1 && content.allSatisfy { textOnly($0) || images.contains($0) }
         }
@@ -34,7 +34,7 @@ extension NodeView {
     /// its `aria-labelledby` names, which the web draws as written).
     var menuRows: [NodeView] {
         let titles = isMenuSection ? Set(props["accessibilityLabelledBy"]?.split(separator: " ").map(String.init) ?? []) : []
-        return container.subviews.compactMap { $0 as? NodeView }
+        return childNodes
             .filter { $0.props["contextPreview"] != "true" && $0.props["popover"] == nil && !titles.contains($0.props["id"] ?? "") }
     }
 

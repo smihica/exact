@@ -12,6 +12,7 @@ use std::path::Path;
 /// Cargo bake's receipt). A Rust-owned resource keeps its previous
 /// first-frame value until the next Cargo bake; one that has none refuses
 /// by name.
+#[derive(Clone)]
 pub struct Seed {
     values: BTreeMap<String, Result<exact_plan::Value, String>>,
     pub(crate) rust_sources: Vec<String>,
@@ -85,18 +86,18 @@ impl Seed {
 
 /// The bake's module beside the seed: Rust-owned sources answer from the
 /// previous plan; everything else is the module's.
-pub(crate) struct Seeded<'a> {
+pub(crate) struct Seeded {
     pub(crate) module: Module,
-    pub(crate) seed: &'a Seed,
+    pub(crate) seed: std::rc::Rc<Seed>,
 }
 
-impl Seeded<'_> {
+impl Seeded {
     fn seeds(&self, source: &str) -> bool {
         self.seed.values.contains_key(source)
     }
 }
 
-impl exact_runner::DataSourceWrapper for Seeded<'_> {
+impl exact_runner::DataSourceWrapper for Seeded {
     fn query(&mut self, source: &str, args: &[Value]) -> Result<Value, DataError> {
         match self.seed.values.get(source) {
             Some(Ok(value)) => Ok(value.clone()),
@@ -219,6 +220,9 @@ impl exact_runner::DataSourceWrapper for Seeded<'_> {
     fn set_document_owner(&mut self, owner: u64) {
         self.module.set_document_owner(owner)
     }
+    fn render_web(&mut self) {
+        self.module.render_web()
+    }
     fn configure_storage(
         &mut self,
         data: std::path::PathBuf,
@@ -296,6 +300,9 @@ impl exact_runner::DataSourceWrapper for Seeded<'_> {
     ) -> Result<(), DataError> {
         self.module.module_landed(store, token, outcome)
     }
+    fn take_reports(&mut self) -> Vec<exact_runner::Report> {
+        self.module.take_reports()
+    }
     fn background_state(&self) -> Option<exact_runner::BackgroundState> {
         self.module.background_state()
     }
@@ -341,7 +348,7 @@ impl exact_runner::DataSourceWrapper for Seeded<'_> {
         let module = self.module.replacement(plan, receipt, module)?;
         Ok(Seeded {
             module,
-            seed: self.seed,
+            seed: self.seed.clone(),
         })
     }
     fn forgotten(&mut self, store: &Store, in_flight: &[InFlight<'_>]) {

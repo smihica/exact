@@ -2,6 +2,8 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactControls
 
 /// LLP 1115 wave 1 on UIKit: what the author leaves unsaid is the
 /// platform's. A colour a control only inherits is not its own; an unset
@@ -353,7 +355,7 @@ final class PlatformDefaultsIOSTests: XCTestCase {
         XCTAssertEqual(try mode(3), UIScrollView.KeyboardDismissMode.none, "a sideways strip")
         XCTAssertEqual(try mode(4), UIScrollView.KeyboardDismissMode.none, "an authored none wins")
         XCTAssertEqual(try mode(5), .onDrag, "an authored on-drag wins")
-        XCTAssertEqual(NavigationHost.ownedChanges(try XCTUnwrap(p.views[2]?.scroll), of: try XCTUnwrap(p.views[2]), insetByUIKit: false), [],
+        XCTAssertEqual(RouteGeometry.ownedChanges(try XCTUnwrap(p.views[2]?.scroll), of: try XCTUnwrap(p.views[2]), insetByUIKit: false), [],
                        "the unsaid mode is what Exact wrote, so the ownership check does not report it")
         p.apply(wireBatch([["op": "props", "id": 5, "set": [:], "clear": ["keyboardDismissMode"]],
                            ["op": "props", "id": 2, "set": ["keyboardDismissMode": "none"], "clear": []]]))

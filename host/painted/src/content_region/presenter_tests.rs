@@ -6,8 +6,12 @@ use std::time::Instant;
 
 #[path = "fail_backend.rs"]
 mod fail_backend;
+#[path = "inline_opacity_tests.rs"]
+mod inline_opacity;
 #[path = "input_clock_tests.rs"]
 mod input_clock;
+#[path = "popover_tests.rs"]
+mod popover;
 #[path = "projection_discriminator_tests.rs"]
 mod projection_discriminator;
 const APP: &str = r#"component App
@@ -64,10 +68,11 @@ fn ready(p: &mut Presenter<()>) {
         assert!(p.poll_content_region().is_none());
     }
 }
+
 #[test]
 fn non_cpu_region_refuses_before_plan_font_or_device_work() {
     for choice in [PainterChoice::Auto, PainterChoice::Gpu] {
-        let result = Presenter::boot_with_content_region(
+        let result = Presenter::boot_region_with_fixture_fonts(
             &[],
             (),
             (400., 500.),
@@ -101,7 +106,7 @@ fn retained_pointer_eligibility_changes_only_when_its_picture_is_acknowledged() 
             ("none", "auto")
         };
         let source = APP.replace("testId=\"paragraph\"", &format!("testId=\"paragraph\" pointer-events=(title == \"old picture\" ? \"{old}\" : \"{new}\")"));
-        let (mut p, error) = Presenter::boot_with_content_region(
+        let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
             &crate::test_plan(&source),
             (),
             (400., 500.),
@@ -156,7 +161,7 @@ fn retained_pointer_eligibility_changes_only_when_its_picture_is_acknowledged() 
 #[test]
 fn failed_frame_retains_source_hits_and_rejects_live_replacement_actions() {
     let _service = crate::content_region::test_service();
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(APP),
         (),
         (400., 500.),
@@ -275,7 +280,7 @@ fn failed_frame_retains_source_hits_and_rejects_live_replacement_actions() {
 #[test]
 fn held_old_source_latest_demand_and_destroy_retire_without_publishing_stale_pixels() {
     let _service = crate::content_region::test_service();
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(APP),
         (),
         (400., 500.),
@@ -389,7 +394,7 @@ fn held_old_source_latest_demand_and_destroy_retire_without_publishing_stale_pix
 #[test]
 fn exact_scale_prepared_index_refuses_changed_dpr_before_stale_adoption_or_replay() {
     let _service = crate::content_region::test_service();
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(APP),
         (),
         (400., 500.),
@@ -493,7 +498,7 @@ fn exact_scale_prepared_index_refuses_changed_dpr_before_stale_adoption_or_repla
 #[test]
 fn malformed_region_scale_refuses_before_plan_fonts_or_worker_admission() {
     for scale in [0., -1., f32::NAN, f32::INFINITY] {
-        let result = Presenter::boot_with_content_region(
+        let result = Presenter::boot_region_with_fixture_fonts(
             &[],
             (),
             (400., 500.),
@@ -519,7 +524,7 @@ fn unsupported_region_query_preserves_previous_pixels_and_recovers() {
     let app = APP.replace("state showing = true", "state showing = true\n  state ownerScale = 1\n  action collapse\n    ownerScale = 0\n  action restore\n    ownerScale = 1")
         .replace("view id=\"owner\"", "view id=\"owner\" scale=ownerScale")
         .replace("button press=hide", "button press=collapse testId=\"collapse\" height=20\n        text \"collapse\"\n      button press=restore testId=\"restore\" height=20\n        text \"restore\"\n      button press=hide");
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(&app),
         (),
         (400., 500.),
@@ -564,7 +569,7 @@ fn uncertain_ink_coordinates_refuse_full_glyph_fallback_and_recover() {
     let app = APP.replace("state showing = true", "state showing = true\n  state inset = 0\n  action move\n    inset = 20000000\n  action restore\n    inset = 0")
         .replace("view height=600", "view height=600 padding-top=inset")
         .replace("button press=hide", "button press=move testId=\"move\" height=20\n        text \"move\"\n      button press=restore testId=\"restore\" height=20\n        text \"restore\"\n      button press=hide");
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(&app),
         (),
         (400., 500.),
@@ -636,7 +641,7 @@ fn natural_scroll_fixture(short: bool) -> Presenter<()> {
 "#,
         if short { "Short paragraph." } else { &tall }
     );
-    let (mut p, error) = Presenter::boot_with_content_region(
+    let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(&app),
         (),
         (400., 500.),
@@ -1086,7 +1091,7 @@ fn focus_region() -> Presenter<()> {
 }
 
 fn region_from(source: &str) -> Presenter<()> {
-    let (p, error) = Presenter::boot_with_content_region(
+    let (p, error) = Presenter::boot_region_with_fixture_fonts(
         &crate::test_plan(source),
         (),
         (400., 500.),
@@ -1307,11 +1312,19 @@ fn retained_text_stays_inside_its_overflow_clip() {
     assert!(p.last_frame_succeeded);
     let paragraph = p.host.kernel().node(id(&p, "paragraph")).unwrap().frame;
     let width = frame.width() as usize;
-    let red = |p: &[u8]| p[0] > 128 && p[1] < 100 && p[2] < 100;
-    let inside = frame.data().chunks_exact(4).filter(|p| red(p)).count();
+    let red = |p: &[u8; 4]| p[0] > 128 && p[1] < 100 && p[2] < 100;
+    let inside = frame
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| red(p))
+        .count();
     let past = frame
         .data()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(i, p)| (i % width) as f32 >= paragraph.width + 2.0 && red(p))
         .count();
@@ -1346,4 +1359,91 @@ fn an_accepted_retained_press_commits_and_blurs_the_focused_field() {
     assert_eq!((p.focus, p.edited), (None, None), "focus left the field");
     assert_eq!(p.host.runner().slot("draft"), Some(&Value::str("typed")));
     assert_eq!(p.host.runner().slot("blurred"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn moving_exclusions_publish_owned_fragments_and_keep_original_run_metadata() {
+    let _service = crate::content_region::test_service();
+    let source = r##"component App
+  state left = 40
+  action move
+    left = left + 80
+  view
+    column width=400 height=500
+      button press=move testId="move" height=32
+        text "Move"
+      view id="owner" width=400 height=200 overflow-x="hidden" overflow-y="hidden"
+        view id="content" width=400 height=200 position="relative"
+          text testId="paragraph" width=400 height=180 font-size=16 text-align="justify"
+            text "One two three four five six seven eight nine ten eleven twelve thirteen fourteen. " href="https://example.test/original" color="#cc0000"
+            text "More words flow around the moving circle and keep their original source ranges. One two three four five six seven eight nine ten." color="#0000cc"
+          view position="absolute" left=left top=0 width=120 height=120 wrap-flow="both" shape-outside="circle()"
+        text "Preparing content" id="pending" position="absolute"
+"##;
+    let mut p = region_from(source);
+    p.frame();
+    ready(&mut p);
+    let original = p.frame();
+    let key = p.host.kernel().node(id(&p, "paragraph")).unwrap().key;
+    let snapshot = p.host.content_region().unwrap().text_snapshot(key).unwrap();
+    let paragraph = snapshot.paragraph.fragments().to_vec();
+    let request = snapshot.request.clone();
+    assert!(!paragraph.is_empty());
+    assert_eq!(snapshot.runs.len(), 2);
+    let runs: Vec<_> = snapshot
+        .runs
+        .iter()
+        .map(|r| (r.leaf, r.bytes.clone(), r.utf16.clone(), r.link.clone()))
+        .collect();
+    assert_eq!(
+        runs[0].3.as_ref().unwrap().1.as_ref(),
+        "https://example.test/original"
+    );
+    assert_eq!(runs[0].1.end, runs[1].1.start);
+    assert_eq!(runs[1].1.end, request.source().bytes());
+    let gate = crate::content_region::test_hooks::next_text();
+    for time in [1., 2.] {
+        assert!(p
+            .host
+            .dispatch_at(id(&p, "move"), Event::Press, time)
+            .is_none());
+        assert!(p.after_commit().is_none());
+        if time == 1. {
+            gate.entered();
+        }
+    }
+    assert_eq!(p.frame().data(), original.data());
+    let snapshot = p.host.content_region().unwrap().text_snapshot(key).unwrap();
+    assert!(!snapshot.current);
+    assert_eq!(snapshot.paragraph.fragments(), paragraph);
+    drop(gate);
+    ready(&mut p);
+    let moved = p.frame();
+    assert_ne!(moved.data(), original.data());
+    let snapshot = p.host.content_region().unwrap().text_snapshot(key).unwrap();
+    assert!(snapshot.current);
+    assert_eq!(snapshot.request.stamp(), request.stamp());
+    assert!(Arc::ptr_eq(snapshot.request.source(), request.source()));
+    assert_eq!(
+        snapshot.request.exclusions(),
+        &[exact_kernel::FlowShape::Circle {
+            cx: 260.,
+            cy: 60.,
+            r: 60.
+        }]
+    );
+    assert_ne!(snapshot.paragraph.fragments(), paragraph);
+    assert_eq!(
+        snapshot
+            .runs
+            .iter()
+            .map(|r| (r.leaf, r.bytes.clone(), r.utf16.clone(), r.link.clone()))
+            .collect::<Vec<_>>(),
+        runs
+    );
+    assert!(snapshot
+        .paragraph
+        .layout_runs()
+        .flat_map(|r| r.glyphs)
+        .any(|g| g.run() == 1));
 }

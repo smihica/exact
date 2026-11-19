@@ -20,14 +20,14 @@ extension MenuHost {
 final class PopoverLayer: UIView {
     private struct Host { weak var controller: UIViewController? }
     private var hosts: [Host]
-    let order: Int
+    package let order: Int
     private(set) weak var sheet: UIViewController?
     private weak var popover: UIView?
     var rehost: (() -> Void)?
     private var mounting = false
 
     init(presenter: Presenter, order: Int, popover: UIView) {
-        hosts = presenter.menus.sheets.controllers(holding: popover).reversed().map { Host(controller: $0) }
+        hosts = presenter.dialogs.controllers(holding: popover).reversed().map { Host(controller: $0) }
         self.order = order
         self.popover = popover
         super.init(frame: .zero)
@@ -48,7 +48,7 @@ final class PopoverLayer: UIView {
         var host: UIView = presenter.modals.coordinateView ?? presenter.documentHost
         sheet = nil
         // A sheet hosts it only while its dialog still holds the popover: a move out of it leaves the sheet.
-        let holding = popover.map { presenter.menus.sheets.controllers(holding: $0) } ?? []
+        let holding = popover.map { presenter.dialogs.controllers(holding: $0) } ?? []
         for candidate in hosts {
             if let controller = candidate.controller,
                holding.contains(where: { $0 === controller }),

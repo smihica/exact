@@ -5,6 +5,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
+// Reconfiguration starts from every authored module, even when stage_capture kept its rewritten copy.
+pub(super) fn setting_sources(captured: &BTreeMap<PathBuf, Vec<u8>>) -> Result<Vec<u8>, String> {
+    let modules: BTreeMap<_, _> = captured
+        .iter()
+        .filter(|(path, _)| {
+            path.extension()
+                .is_some_and(|ext| ["ts", "js", "mjs", "cjs", "json"].iter().any(|x| ext == *x))
+                && !path.to_string_lossy().ends_with(".d.ts")
+        })
+        .map(|(path, bytes)| {
+            (
+                path.to_string_lossy().replace('\\', "/"),
+                String::from_utf8_lossy(bytes),
+            )
+        })
+        .collect();
+    serde_json::to_vec(&modules).map_err(|e| e.to_string())
+}
+
 /// Sequential development bakes over one private captured graph. Every request
 /// still runs strict diagnostics, bundling, HBC compilation and the normal bake.
 /// Nonstandard compiler tools retain their existing one-shot invocation contract.
@@ -148,7 +167,7 @@ async function compile() {
   // so an app's ./app.js import follows the same TS substitution as one-shot.
   rmSync(resolve(stage,'app.js'),{force:true});
   const { configure, check, dataBundle, prepareCanvas } = await import(resolve(stage,'__exact_config.mjs'));
-  configure(stage, true, parseSync);
+  await configure(stage, true, parseSync, false, rolldown);
   await prepareCanvas(stage, libraries);
   const checking=check(stage,tsc,libraries).then(()=>null,error=>error);
   let failed;
@@ -183,6 +202,12 @@ pub(super) const ENV: &str = include_str!("__exact_env.mjs");
 /// The check of what package code may use, which `CONFIG` imports from beside it.
 pub(super) const PORTABLE: &str = include_str!("__exact_portable.mjs");
 
+/// A setting a launch may give: its grant lines and launch module (LLP
+/// 1153.002), which `CONFIG` imports from beside it.
+pub(super) const LAUNCH: &str = include_str!("__exact_launch_setting.mjs");
+
+pub(super) const FACTS: &str = include_str!("__exact_facts.mjs");
+
 /// The target a module binding answers `supports` for (LLP 1133.006 D7), as
 /// an implementation's `targets` names it: Cargo's `CARGO_CFG_TARGET_OS` in
 /// an app's build script, else the OS of `TARGET`'s triple, which is all a
@@ -214,6 +239,8 @@ pub(super) fn write_config(stage: &Path) -> Result<(), String> {
     super::write_changed(&stage.join("__exact_config.mjs"), CONFIG.as_bytes())?;
     super::write_changed(&stage.join("__exact_binding.mjs"), BINDING.as_bytes())?;
     super::write_changed(&stage.join("__exact_env.mjs"), ENV.as_bytes())?;
+    super::write_changed(&stage.join("__exact_launch_setting.mjs"), LAUNCH.as_bytes())?;
+    super::write_changed(&stage.join("__exact_facts.mjs"), FACTS.as_bytes())?;
     super::write_changed(&stage.join("__exact_portable.mjs"), PORTABLE.as_bytes())
 }
 
@@ -233,6 +260,8 @@ mod tests {
         write("__exact_config.mjs", CONFIG);
         write("__exact_binding.mjs", BINDING);
         write("__exact_env.mjs", ENV);
+        write("__exact_launch_setting.mjs", LAUNCH);
+        write("__exact_facts.mjs", FACTS);
         write("__exact_portable.mjs", PORTABLE);
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut compiler = Compiler::new(&root, &stage.0).unwrap();
@@ -313,7 +342,7 @@ mod tests {
         write("app.ts", source);
         write(
             "__exact_backend_source.json",
-            &serde_json::to_string(source).unwrap(),
+            &serde_json::to_string(&serde_json::json!({"app.ts": source})).unwrap(),
         );
         write(
             "__exact_entry.ts",

@@ -7,13 +7,15 @@ import AppKit
 extension NodeView {
     /// The colour of row `key` for a face Exact bakes into an image, as `channels` gives it: AppKit
     /// resolves the tint by the nearest accent wherever the node is (`carriedChannels` on UIKit)
-    func carriedChannels(_ key: String, dark: Bool) -> [Double]? { channels(key, dark: dark) }
+    package func carriedChannels(_ key: String, dark: Bool) -> [Double]? { channels(key, dark: dark) }
     func textChannels(_ key: String, dark: Bool? = nil) -> [Double]? { style[key].flatMap { $0.textChannels(dark: dark ?? drawsDark, contrast: drawsHighContrast, tint: ownTint(for: $0)) } }
     package func color(_ key: String, _ fallback: NSColor) -> NSColor { cgColor(key).flatMap { NSColor(cgColor: $0) } ?? fallback }
     /// CSS `::placeholder { color }` (LLP 1104 D3); nil, the platform's.
-    var placeholderColor: NSColor? { cgColor("placeholder_color").flatMap { NSColor(cgColor: $0) } }
+    package var placeholderColor: NSColor? { cgColor("placeholder_color").flatMap { NSColor(cgColor: $0) } }
+    /// CSS `::backdrop { background-color }` on a dialog (LLP 1035.001 D11); nil, the platform's.
+    var backdropColor: NSColor? { cgColor("backdrop_color").flatMap { NSColor(cgColor: $0) } }
     /// A colour row as Core Graphics draws it (LLP 1100 D2).
-    func cgColor(_ key: String, dark: Bool? = nil) -> CGColor? { style[key].flatMap { $0.cgColor(dark: dark ?? drawsDark, contrast: drawsHighContrast, elevated: window is SheetWindow, tint: ownTint(for: $0)) } }
+    package func cgColor(_ key: String, dark: Bool? = nil) -> CGColor? { style[key].flatMap { $0.cgColor(dark: dark ?? drawsDark, contrast: drawsHighContrast, elevated: window is SheetWindow, tint: ownTint(for: $0)) } }
 
     /// The node whose `accent-color` is this view's tint: the nearest at or
     /// above it whose accent is a colour (`auto`, or one naming the tint
@@ -36,7 +38,7 @@ extension NodeView {
     /// accent. The colour follows the appearance it is asked in, as a
     /// `light-dark()` accent must. Reading it records whose it was
     /// (`tintSource`), so a move under another accent is known (`retint`).
-    var nearestAccent: NSColor? {
+    package var nearestAccent: NSColor? {
         let node = accentNode
         tintSource = node.map(ObjectIdentifier.init)
         // No authored accent above: the theme's `AccentColor`, if it sets one
@@ -69,7 +71,7 @@ extension NodeView {
     func retint(changed: Bool = false) {
         guard kind == "svg" || hasSymbolLeaf || style.values.contains(where: \.namesTint) || inlineText.contains(where: \.namesTint) else { return }
         guard changed || accentNode.map(ObjectIdentifier.init) != tintSource else { return }
-        if kind == "svg" { presenter?.svg.reappear(id, dark: drawsDark, clock: presenter?.session?.clock, tint: viewTint) }
+        if kind == "svg" { presenter?.svg?.reappear(id, dark: drawsDark, clock: presenter?.session?.clock, tint: viewTint) }
         reapplyColors()
     }
 }

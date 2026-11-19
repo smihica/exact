@@ -47,6 +47,25 @@ let terminalRestoreReported = false;
 const restoreJournal = [];
 
 const exact = globalThis.exact;
+const motionQuery = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
+const reducedMotion = () => motionQuery?.matches === true;
+motionQuery?.addEventListener('change', () => {
+  if (!loaded || recoveringDevice || terminalDevice || trapped()) return;
+  gpu.gpu_reduced_motion(reducedMotion());
+  schedule();
+});
+function checkSurfaceOwners(module) {
+  const owners = Object.entries(exact.compat?.inputs?.gpuModules ?? {});
+  if (stem !== 'gpu' || !owners.length) return;
+  const names = JSON.parse(module.gpu_surfaces());
+  for (const [owner, surfaces] of owners) {
+    const conflicts = names.filter(name => surfaces.includes(name));
+    if (!conflicts.length) continue;
+    const message = `GPU surfaces ${conflicts.join(', ')} are registered by the primary and owned by module ${owner}`;
+    if (!(exact.production ?? exact.compat?.embedded?.trust === 'production')) throw new Error(message);
+    console.error(message);
+  }
+}
 const publishers = new Map(); // name -> first live entry
 const pendingRecords = [];
 let drainingRecords = false;
@@ -71,9 +90,18 @@ function deliverPosts(name) {
   for (const json of queued) if (!gpu.gpu_input(entry.id, json)) console.error("exact gpu:", gpu.gpu_error());
   messages(entry); schedule();
 }
-const inputStyle = document.createElement("style");
-inputStyle.textContent = "[data-gpu-input]:focus{outline:none}";
-document.head.append(inputStyle);
+// A surface's fade of a placed child (LLP 1133.039 D8). The child carries the factor in a property no author
+// writes, and one rule multiplies it into the child's picture, shadows included, so the child is not moved and its
+// opacity, mask and animations stay the author's. A box around the child is the only other place CSS takes group
+// opacity without writing an authored property, and it would change what the child's percentages, flex or grid
+// placement and containing block resolve against. The rule outranks the shell's (index.html: `all: unset` and
+// `all: revert` on a control would clear it) and yields to the author's, a class under `#exact-root#exact-root`
+// (emit.rs) or inline. So a `filter` the author wrote wins and that child is not faded: the web's known difference.
+const PLACEMENT_OPACITY = "--exact-placement-opacity";
+const placementStyle = `#exact-root#exact-root :where([style*="${PLACEMENT_OPACITY}"]){filter:opacity(var(${PLACEMENT_OPACITY}))}`;
+const glueStyle = document.createElement("style");
+glueStyle.textContent = "[data-gpu-input]:focus{outline:none}" + placementStyle;
+document.head.append(glueStyle);
 let loaded = false, loadMs;
 let recoveringDevice;
 let pendingCutover;
@@ -172,8 +200,7 @@ async function settled() {
   catch (error) { retainTrap(error); return []; }
 }
 
-function size(el) {
-  const r = el.getBoundingClientRect();
+function size(el, r = el.getBoundingClientRect()) {
   return { w: Math.max(r.width, 1), h: Math.max(r.height, 1), s: devicePixelRatio || 1 };
 }
 
@@ -195,6 +222,14 @@ function lifecycle(code) {
 document.addEventListener("visibilitychange", () => lifecycle(document.hidden ? 0 : 1));
 window.addEventListener("pagehide", () => lifecycle(0));
 window.addEventListener("pageshow", event => lifecycle(event.persisted || !document.hidden ? 1 : 0));
+// A browser starts audio only in a user gesture, so any trusted press in the page is told to every surface inside
+// it, as the Contract sound player resumes its own (sound-glue.js): a press on a Contract control never reaches the
+// canvas, and a game whose controls are those has sound from its first press.
+const activated = (event) => {
+  if (!event.isTrusted || trapped() || recoveringDevice) return;
+  for (const entry of surfaces.values()) if (entry.id && !entry.terminal) gpu?.gpu_lifecycle(entry.id, 4);
+};
+for (const type of ["pointerdown", "keydown", "touchend"]) document.addEventListener(type, activated, true);
 
 // A homography maps child-local points to canvas points. CSS adds the child's
 // kernel offset after its transform, so subtract that offset in homogeneous space.
@@ -202,8 +237,14 @@ function childFrames(entry) {
   const children = [...entry.host.children].filter(el => !el.hasAttribute("data-surface"));
   return children.map(el => ({el, name:el.getAttribute("data-testid") ?? "", frame:[el.offsetLeft, el.offsetTop, el.offsetWidth, el.offsetHeight]}));
 }
+// A placed child's fade, which `placementStyle` paints; 1 removes it.
+function placementOpacity(el, factor) {
+  const value = factor === 1 ? "" : String(factor);
+  if (el.style.getPropertyValue(PLACEMENT_OPACITY) !== value) el.style.setProperty(PLACEMENT_OPACITY, value);
+}
 function restoreChild(row) {
   if (!row.original) return;
+  placementOpacity(row.el, 1);
   Object.assign(row.el.style, row.original.style); row.el.inert = row.original.inert;
   delete row.original;
 }
@@ -256,6 +297,9 @@ function placeChildren(entry) {
     row.original ??= {style:Object.fromEntries(["transform","transformOrigin","zIndex","visibility","position"].map(k => [k, el.style[k]])), inert:el.inert};
     el.style.visibility = outcome === 2 ? "hidden" : row.original.style.visibility;
     el.inert = outcome === 2 || row.original.inert;
+    // Read only for a child the surface places and shows; a module without the export fades nothing.
+    const opacity = outcome === 2 ? 1 : gpu.gpu_placement_opacity?.(entry.id, i);
+    placementOpacity(el, Number.isFinite(opacity) ? Math.max(0, Math.min(1, opacity)) : 1);
     if (outcome === 2) continue;
     const [x,y] = row.frame;
     el.style.transformOrigin = "0 0";
@@ -276,7 +320,11 @@ function placeChildren(entry) {
 }
 
 // Both code replacement and device recovery replace the presentation context.
-const replacementCanvas = entry => entry.el.cloneNode(false);
+const replacementCanvas = entry => {
+  const el = entry.el.cloneNode(false);
+  el.style.visibility = "hidden";
+  return el;
+};
 function installCanvas(old, entry) {
   cancelAssets(old); old.observer?.disconnect(); old.unlisten?.();
   old.el.replaceWith(entry.el);
@@ -295,13 +343,13 @@ function fallback(entry) {
   if (api.recovery?.code === "no-adapter") { entry.unsupported = refusal(api.recovery.error); showRefusal(entry); }
   entry.terminal = true;
   entry.wants = false;
-  if (entry.performance && publishers.get(entry.name) === entry) surfaceRecord(entry.name, null, true);
+  if (publishers.get(entry.name) === entry) surfaceRecord(entry.name, null, true);
   schedulePerformance();
   for (const row of entry.children ?? []) restoreChild(row);
   entry.children = undefined;
   entry.el.style.zIndex = "-1";
-  // Resetting the bitmap once discards stale pixels. Its CSS box stays in the
-  // wrapper, transparent over the wrapper's background and under its children.
+  entry.el.style.visibility = "hidden";
+  // Discard stale pixels while retaining the drawing element's CSS box.
   entry.el.width = 1;
   entry.el.height = 1;
 }
@@ -335,9 +383,10 @@ function recoverDevice() {
   recoveringDevice = (async () => {
     const outcome = pendingCutover?.module === module ? pendingCutover.outcome : JSON.parse(await module.gpu_recover(new Uint32Array(entries.map(e => e.id)), staged.map(([,e]) => e.el)));
     if (gpu !== module) { for (const [, e] of staged) e.el.remove(); return; }
+    if (outcome.status === "healthy" || outcome.status === "recovered") module.gpu_reduced_motion(reducedMotion());
     if (outcome.status === "healthy") {
       for (const [, e] of staged) e.el.remove();
-      api.recovery = outcome; resetRecovery(); return;
+      api.recovery = outcome; resetRecovery(); schedule(); return;
     }
     if (outcome.status === "no device") {
       for (const [, e] of staged) e.el.remove();
@@ -498,10 +547,6 @@ padPoller(() => [...surfaces.values()].find(e => e.pads && live(e.view) === e &&
 // forgets the baseline, for positional values, and when an argument is gone, which only a whole bind returns to its
 // default. What was sent becomes the baseline only once the module accepts it.
 function bindValues(entry, module, values, at, whole = false) {
-  // The canvas's size goes first: a stamped bind may tick a new world, which
-  // frames itself for its canvas before its first tick (`Game::first_frame`).
-  const r = entry.host.getBoundingClientRect();
-  if (r.width > 0 && r.height > 0 && module.gpu_size && !module.gpu_size(entry.id, r.width, r.height)) console.error("exact gpu:", module.gpu_error());
   const named = values !== null && typeof values === "object" && !Array.isArray(values);
   const last = named && !whole ? entry.bound : null;
   const object = (keys, wire) => `{${keys.map(k => `${JSON.stringify(k)}:${wire.get(k)}`).join(",")}}`;
@@ -521,14 +566,24 @@ function bindValues(entry, module, values, at, whole = false) {
   entry.bound = named ? {values, wire} : null;
   return true;
 }
+// The canvas's size in points, at creation and then from the ResizeObserver, after layout. A bind reads no geometry:
+// in the middle of a batch that would force the layout of everything the batch wrote so far.
+function tellSize(entry, module, r = entry.host.getBoundingClientRect()) {
+  if (r.width > 0 && r.height > 0 && module.gpu_size && !module.gpu_size(entry.id, r.width, r.height)) console.error("exact gpu:", module.gpu_error());
+}
 // Creation/binding is a hard result. Staging never publishes or attaches listeners.
 function create(entry, module, carry) {
-  const { w, h, s } = size(entry.host);
+  // Until a complete frame is presented, show the author's styles and children (LLP 1181 D13).
+  entry.el.style.visibility = "hidden";
+  const r = entry.host.getBoundingClientRect(), { w, h, s } = size(entry.host, r);
   entry.el.width = Math.max(1, Math.round(w * s));
   entry.el.height = Math.max(1, Math.round(h * s));
   entry.id = module.gpu_create(entry.name, entry.el, entry.el.width, entry.el.height);
   if (!entry.id) throw new Error(`surface ${entry.name}: create: ${module.gpu_error()}`);
   module.gpu_lifecycle(entry.id, hidden ? 0 : 1);
+  // The canvas's size goes before the first bind: a stamped bind may tick a new world, which frames itself for its
+  // canvas before its first tick (`Game::first_frame`).
+  tellSize(entry, module, r);
   if (!bindValues(entry, module, entry.values, exact.now?.(), true)) throw new Error(`surface ${entry.name}: bind: ${module.gpu_error()}`);
   if (carry !== undefined) {
     entry.carry = carry;
@@ -540,12 +595,11 @@ function create(entry, module, carry) {
   }
 }
 function attach(entry) {
-  entry.performance = publishers.get(entry.name) === entry && !!exact.wasm.exact_canvas_performance_requested?.(exact.writeIn(entry.name));
-  if (entry.performance) gpu.gpu_performance_reporting?.(entry.id, true);
-  schedulePerformance();
+  entry.performance = false;
+  syncPerformance();
   // A canvas that rested draws again at its new size, at the present time (its last frame's is
   // the start of its rest); one that now wants more frames gets them.
-  entry.observer = new ResizeObserver(() => { if (entry.id && !entry.terminal) { render(entry, entry.wants ? frameAt ?? performance.now() : performance.now()); flush(); if (entry.wants) schedule(); } });
+  entry.observer = new ResizeObserver(() => { if (entry.id && !entry.terminal) { tellSize(entry, gpu); render(entry, entry.wants ? frameAt ?? performance.now() : performance.now()); flush(); if (entry.wants) schedule(); } });
   entry.observer.observe(entry.el);
   entry.wantsInput = gpu.gpu_wants_input(entry.id);
   entry.hdr = gpu.gpu_high_dynamic_range?.(entry.id) === true;
@@ -613,6 +667,16 @@ function performanceRecord(entry) {
   const metrics = gpu.gpu_performance?.(entry.id, performance.now());
   if (metrics != null) surfaceRecord(entry.name, metrics, true);
 }
+function syncPerformance() {
+  for (const entry of surfaces.values()) {
+    if (!entry.id || entry.terminal) continue;
+    const enabled = publishers.get(entry.name) === entry && !!exact.wasm.exact_canvas_performance_requested?.(exact.writeIn(entry.name));
+    if (enabled === !!entry.performance) continue;
+    entry.performance = enabled;
+    gpu.gpu_performance_reporting?.(entry.id, enabled);
+  }
+  schedulePerformance();
+}
 function schedulePerformance() {
   const enabled = !hidden && !trapped() && [...publishers.values()].some(e => e.performance && e.id && !e.terminal && live(e.view) === e);
   if (!enabled && performanceTimer !== null) { clearTimeout(performanceTimer); performanceTimer = null; }
@@ -644,8 +708,18 @@ function messages(entry, drainAssets = true) {
   if (drainAssets) assets(entry);
   finishRestore(entry, gpu);
   reportRestore(entry);
+  const empty = (gpu.gpu_presentation_flags?.(entry.id) & 4) !== 0;
+  if (empty) entry.el.style.visibility = "hidden";
   const record = gpu.gpu_published(entry.id);
-  if (record !== undefined && live(entry.view) === entry && publishers.get(entry.name) === entry) surfaceRecord(entry.name, record);
+  if (record !== undefined && live(entry.view) === entry) {
+    if (!empty && !entry.terminal && entry.el.style.visibility === "hidden") {
+      // Malformed records still reach the runner's refusal handling.
+      try {
+        if (JSON.parse(record)?.presented === true) entry.el.style.visibility = "";
+      } catch {}
+    }
+    if (publishers.get(entry.name) === entry) surfaceRecord(entry.name, record);
+  }
   performanceRecord(entry);
   const texts = gpu.gpu_messages(entry.id);
   if (texts === undefined) return;
@@ -702,6 +776,7 @@ function listen(entry) {
   // world's deltas never stop at the canvas or screen edge though the position
   // stays put; unlocked it is the position's change, as on every other host. A
   // down or up carries none.
+  const modifiers = (event) => ({ shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey });
   const lockable = () => (el.dataset.pointerLock ?? entry.el.dataset?.pointerLock) === "true";
   const last = new Map(); // each pointer's last point on the canvas
   on("pointerleave", (event) => { if (document.pointerLockElement !== el) last.delete(event.pointerId); });
@@ -734,7 +809,7 @@ function listen(entry) {
     if (!fallsThrough(event)) return;
     if (phase === "down") { if (!editable(document.activeElement)) el.focus({ preventScroll: true }); try { el.setPointerCapture(event.pointerId); } catch {} }
     if (phase === "down" && event.pointerType === "mouse" && lockable() && document.pointerLockElement !== el) Promise.resolve(el.requestPointerLock?.()).catch(() => {});
-    send(event, { t: "pointer", phase, id: event.pointerId, ...pointerAt(event, phase), kind: event.pointerType || "mouse", buttons: event.buttons });
+    send(event, { t: "pointer", phase, id: event.pointerId, ...pointerAt(event, phase), kind: event.pointerType || "mouse", buttons: event.buttons, ...modifiers(event) });
   });
   on("lostpointercapture", event => {
     const button = controls.get(event.pointerId);
@@ -743,7 +818,8 @@ function listen(entry) {
   on("wheel", (event) => {
     if (!fallsThrough(event)) return;
     event.preventDefault();
-    send(event, { t: "wheel", dx: event.deltaX, dy: event.deltaY, ...point(event) });
+    // A trackpad pinch arrives here as the browser delivers it: a wheel with ctrlKey set.
+    send(event, { t: "wheel", dx: event.deltaX, dy: event.deltaY, ...point(event), ...modifiers(event) });
   }, { passive: false });
   // A restored keydown (including a queued one) still owns its future keyup.
   const held = entry.heldKeys ??= new Set();
@@ -892,6 +968,7 @@ function worlds(request) {
 const api = {
   deviceLost() { if (recoveringDevice) lossDuringRecovery = true; else queueMicrotask(() => recoverDevice()); },
   drainRecords,
+  syncPerformance,
   agent,
   settled,
   async surfaceWork(name, mode, bytes, active) {
@@ -1033,7 +1110,8 @@ const api = {
     const world = worlds({ op: "clock", settle });
     const pending = settle && world.some((w) => w.quiescent === false);
     const candidates = world.filter((w) => w.quiescent === false && Number.isFinite(w.settleAt)).map((w) => w.settleAt);
-    return { pending, settleAt: candidates.length ? Math.max(...candidates) : undefined,
+    const ticks = world.map(w => w.nextTickAt).filter(Number.isFinite);
+    return { pending, settleAt: candidates.length ? Math.max(...candidates) : undefined, nextTickAt: ticks.length ? Math.min(...ticks) : undefined,
       reply: world.length ? { world: world.map(({ canvas, tick, hash, quiescent, error, assets, changing }) => ({ canvas, tick, hash, quiescent, changing, ...(error ? {error, assets} : {}) })) } : {} };
   },
   surface(view, name, values) {
@@ -1050,7 +1128,7 @@ const api = {
       const old = publishers.get(name);
       if (old && (!old.el.isConnected || exact.views.get(old.view) !== old.host || surfaces.get(old.view) !== old)) {
         if (surfaces.get(old.view) === old) this.destroy(old.view);
-        else { publishers.delete(name); surfaceRecord(name, null); if (old.performance) surfaceRecord(name, null, true); }
+        else { publishers.delete(name); surfaceRecord(name, null); surfaceRecord(name, null, true); }
       }
       entry = { view, host, el, name, values, id: 0, wants: false, wantsInput: false, logCursor: 0, terminal: terminalDevice }; surfaces.set(view, entry);
       const carried = planCarries.get(name);
@@ -1059,8 +1137,8 @@ const api = {
       const publisher = publishers.get(name);
       const publisherRegistered = publisher && surfaces.get(publisher.view) === publisher
         && exact.views.get(publisher.view) === publisher.host;
+      // Each canvas of a surface runs its own world; the first live one alone publishes the surface's record (LLP 1046.003).
       if (!publisher || !publisherRegistered || !publisher.el.isConnected) publishers.set(name, entry);
-      else console.error(`exact gpu: surface ${name}: duplicate live publisher ignored`);
       ensure(entry); return; }
     entry.values = values;
     if (entry.id && !entry.terminal) {
@@ -1083,7 +1161,7 @@ const api = {
     if (entry) { entry.observer?.disconnect(); entry.unlisten?.(); entry.id = 0; }
     surfaces.delete(view);
     schedulePerformance();
-    if (entry && publishers.get(entry.name) === entry) { publishers.delete(entry.name); surfaceRecord(entry.name, null); if (entry.performance) surfaceRecord(entry.name, null, true); }
+    if (entry && publishers.get(entry.name) === entry) { publishers.delete(entry.name); surfaceRecord(entry.name, null); surfaceRecord(entry.name, null, true); }
   },
   // A plan restart reassigns view ids. Unique surface names can carry across it;
   // duplicate instances are ambiguous and are deliberately left fresh.
@@ -1102,13 +1180,17 @@ const api = {
   // A validated asset generation can reach existing surfaces without replacing their worlds.
   async reloadAssets(cards, names, current = () => true) {
     await ready;
+    // A file the page reads when asked (dev.js `later`) and has not asked for yet reaches surfaces when they request
+    // it. One it has is read before the swap, which does not yield.
+    const asked = names.filter(name => { const old = exact.devAssets?.get(name); return !old?.read || old.bytes || old.held.reading; });
+    const bytes = new Map(await Promise.all(asked.map(async name => [name, cards.get(name)?.read ? await cards.get(name).read() : cards.get(name)?.bytes])));
     return exact.mutate(() => {
       if (!current()) return false;
-      for (const name of names) if (!name.startsWith('assets/') || (!cards.get(name)?.bytes || cards.get(name).bytes.length > 64 * 1024 * 1024)) throw new Error(`missing surface asset ${name}`);
+      for (const name of names) if (!name.startsWith('assets/') || !cards.get(name) || (asked.includes(name) && (!bytes.get(name) || bytes.get(name).length > 64 * 1024 * 1024))) throw new Error(`missing surface asset ${name}`);
       for (const entry of surfaces.values()) if (entry.id && !entry.terminal) {
-        for (const name of names) {
+        for (const name of asked) {
           cancelAssets(entry, new Set([name.slice(7)]));
-          if (!gpu.gpu_asset(entry.id, name.slice(7), cards.get(name).bytes)) throw new Error(gpu.gpu_error());
+          if (!gpu.gpu_asset(entry.id, name.slice(7), bytes.get(name))) throw new Error(gpu.gpu_error());
         }
         messages(entry);
       }
@@ -1156,14 +1238,18 @@ const api = {
   },
   layout() { for (const entry of surfaces.values()) if (entry.id && !entry.terminal) { supplyChildren(entry); placeChildren(entry); } schedule(); },
   /// A live window opens (`perf frames live`, frames.js): each world leaves the seek for its own frame loop
-  /// at the page's lent clock, its perf rings emptied and armed; closed, the seek returns and each world's perf is the reply.
+  /// at the page's lent clock with empty, armed rings. Closing returns the world's perf and hook diagnostics.
   live(on) {
-    liveWindow = on; gpu?.gpu_seekable(!on);
+    liveWindow = on;
+    // Closing reads each world while it is still live: after the seek returns, a due tick would
+    // run as agent work and start a new CPU window in place of the one being read (LLP 1182.000 D3).
+    if (on) gpu?.gpu_seekable(false);
     const worlds = [];
     for (const entry of surfaces.values()) if (entry.id && !entry.terminal) {
-      const perf = agent(entry.view, { op: "state", ...(on ? { perf_reset: true } : { perf: true }) })?.world?.perf;
-      if (!on && perf) worlds.push({ canvas: entry.view, perf });
+      const world = agent(entry.view, { op: "state", ...(on ? { perf_reset: true } : { perf: true }) })?.world;
+      if (!on && world?.perf) worlds.push({ canvas: entry.view, perf: world.perf, renderHooks: world.renderHooks });
     }
+    if (!on) gpu?.gpu_seekable(true);
     schedule();
     return worlds;
   },
@@ -1233,12 +1319,14 @@ async function swap(version) {
   const carrier = { worldCarry: exact.worldCarry };
   try {
     next.gpu_tier?.(tierCode);
+    checkSurfaceOwners(next);
     await next.gpu_load();
     if (exact.now) next.gpu_seekable(true);
     if (sentPeriod) next.gpu_period(sentPeriod);
     const rows = await loadShaders(next);
     for (const [name, text] of rows) if (!await next.gpu_shader_check(name, text)) throw new Error(next.gpu_error());
     replaceShaders(rows, next);
+    next.gpu_reduced_motion(reducedMotion());
     // A canvas context belongs to one device. Stage on detached replacement
     // canvases; the old canvases and their worlds remain untouched until commit.
     // No await from carry through cutover; input cannot arrive between them.
@@ -1299,10 +1387,12 @@ try {
   // The tier is chosen before the device is made, from the adapter's facts (LLP 1139.003 D2).
   tierCode = Math.max(0, TIERS.indexOf(await chooseTier(exact.pageFacts)));
   gpu = guardedModule(await loadModule(version));
+  checkSurfaceOwners(gpu);
   gpu.gpu_tier?.(tierCode);
   await gpu.gpu_load();
   if (exact.now) gpu.gpu_seekable(true);
   replaceShaders(await loadShaders(gpu));
+  gpu.gpu_reduced_motion(reducedMotion());
   api.version = version;
   loaded = true;
 } catch (error) {

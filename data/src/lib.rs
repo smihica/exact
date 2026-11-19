@@ -6,6 +6,25 @@ pub mod crypto;
 pub mod documents;
 pub mod envelope;
 pub mod image;
+pub mod known_folders;
+/// The host work the wrappers hand out for their children (LLP 1047.001
+/// D12), each linked by what makes it.
+mod host_work {
+    /// A turn of an ordered set, whose sources share a `secret.keep` that
+    /// their grants link I/O for, or a child's worker turn, linked by its
+    /// placement.
+    pub(crate) struct OrderedTurn;
+    impl exact_runner::HostWork for OrderedTurn {}
+
+    /// A source placed on a worker, whose placement links I/O.
+    pub(crate) struct WorkerTurn;
+    impl exact_runner::HostWork for WorkerTurn {}
+
+    /// A wrapper forwards its children's continuations, so it declares what
+    /// they do. A mixed source's TypeScript child is the bake's to report.
+    impl<D: exact_runner::HostWork> exact_runner::HostWork for crate::Placed<D> {}
+    impl<J, R: exact_runner::HostWork> exact_runner::HostWork for crate::Mixed<J, R> {}
+}
 mod mixed;
 pub mod modules;
 pub mod placed;
@@ -73,6 +92,33 @@ pub(crate) fn try_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError
 
 #[cfg(test)]
 mod mixed_tests;
+/// A test's directory, removed when dropped, so a test that fails or panics
+/// leaves nothing in the system temp directory.
+#[cfg(test)]
+pub(crate) struct TempDir(pub(crate) std::path::PathBuf);
+
+#[cfg(test)]
+impl std::ops::Deref for TempDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AsRef<std::path::Path> for TempDir {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod try_lock_tests {
     /// The lock excludes another open file description until its holder
@@ -80,7 +126,9 @@ mod try_lock_tests {
     #[test]
     #[cfg(unix)]
     fn try_lock_excludes_another_description_until_released() {
-        let dir = std::env::temp_dir().join(format!("exact-data-lock-{}", std::process::id()));
+        let dir = crate::TempDir(
+            std::env::temp_dir().join(format!("exact-data-lock-{}", std::process::id())),
+        );
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.lock");
         let open = || {

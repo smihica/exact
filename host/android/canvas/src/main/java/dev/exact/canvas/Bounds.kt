@@ -11,9 +11,10 @@ import java.nio.IntBuffer
  * [measure] says false for what it cannot bound (a slot, a layer or a scroller's rows drawn by reference).
  */
 internal class Bounds {
-    /** A kept row's node by id ([measure] places it where op 17 draws it). */
+    /** A kept row's node by id ([measure] places it where op 17 or 55 draws it). */
     var row: (Int) -> android.graphics.RenderNode? = { null }
     private val m = Matrix()
+    private val through = Matrix()
     private val values = FloatArray(9)
     private val r = RectF()
     private val clips = ArrayList<RectF?>()
@@ -78,7 +79,7 @@ internal class Bounds {
                     i += 2 + b.get(i + 1)
                 }
                 46 -> { clips.add(clips.lastOrNull()?.let { RectF(it) }); i += 1 }
-                47 -> i += 2
+                47, 49 -> i += 2
                 6 -> { if (clips.isNotEmpty()) clips.removeAt(clips.size - 1); i += 1 }
                 7 -> { clips.add(clips.lastOrNull()?.let { RectF(it) }); i += 2 }
                 8 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 6 }
@@ -112,6 +113,16 @@ internal class Bounds {
                     add(out, x, y, x + node.width, y + node.height, absolute = true)
                     i += 4
                 }
+                55 -> {
+                    val node = row(b.get(i + 1)) ?: return false
+                    values[0] = f(b, i + 2); values[3] = f(b, i + 3); values[1] = f(b, i + 4); values[4] = f(b, i + 5)
+                    values[2] = f(b, i + 6); values[5] = f(b, i + 7); values[6] = 0f; values[7] = 0f; values[8] = 1f
+                    through.setValues(values)
+                    local.set(0f, 0f, node.width.toFloat(), node.height.toFloat())
+                    through.mapRect(local)
+                    add(out, local.left, local.top, local.right, local.bottom, absolute = true)
+                    i += 8
+                }
                 18 -> i += 2
                 19 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 26 }
                 25 -> i += 3 + b.get(i + 2)
@@ -121,6 +132,9 @@ internal class Bounds {
                 27 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 14 }
                 42 -> { val p = i + 2 + 2 * b.get(i + 1); add(out, f(b, p), f(b, p + 1), f(b, p) + f(b, p + 2), f(b, p + 1) + f(b, p + 3)); i = p + 12 }
                 28 -> { add(out, f(b, i + 3), f(b, i + 4), f(b, i + 3) + f(b, i + 5), f(b, i + 4) + f(b, i + 6)); i += 16 + (b.get(i + 15) + 3) / 4 }
+                // A filter's region holds what it draws, blurred or shadowed.
+                53 -> { add(out, f(b, i + 2), f(b, i + 3), f(b, i + 2) + f(b, i + 4), f(b, i + 3) + f(b, i + 5)); i += 2 + b.get(i + 1) }
+                54 -> i += 1
                 40 -> {
                     val reach = 3f * f(b, i + 2) + 2f
                     add(out, f(b, i + 3) - reach, f(b, i + 4) - reach, f(b, i + 3) + f(b, i + 5) + reach, f(b, i + 4) + f(b, i + 6) + reach)

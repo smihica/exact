@@ -290,7 +290,7 @@ pub(crate) fn result_field(
         }));
     }
     let index = || count(number(2)?);
-    if field == 6 || field == 7 {
+    if field == 6 || field == 7 || field == 9 {
         let result = match data {
             ResultData::Execute(result) => result,
             ResultData::Batch(batch) => batch
@@ -298,10 +298,10 @@ pub(crate) fn result_field(
                 .ok_or_else(|| invalid("SQLite batch index out of bounds"))?,
             _ => return Err(invalid("SQLite result is not an execution result")),
         };
-        return Ok(if field == 6 {
-            HostValue::Number(result.changes as f64)
-        } else {
-            HostValue::Str(result.last_insert_rowid.to_string())
+        return Ok(match field {
+            6 => HostValue::Number(result.changes as f64),
+            7 => HostValue::Str(result.last_insert_rowid.to_string()),
+            _ => HostValue::Bool(result.changed),
         });
     }
     match (field, data) {

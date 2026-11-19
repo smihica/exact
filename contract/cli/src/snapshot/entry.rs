@@ -102,6 +102,11 @@ pub fn compile_entries(
     if let Some(watch) = watch {
         match crate::compile_watch(app, &watch) {
             Ok(mut plan) => {
+                if watch.sync.selected() {
+                    let phone = crate::compile_path(&path).map_err(|e| vec![e])?;
+                    crate::watch_sync::plans(&watch.sync, &phone, &plan)
+                        .map_err(|m| refusal("watch-sync", m, Span::default()))?;
+                }
                 plan.app_id.clone_from(&manifest.id);
                 entries.insert(
                     WATCH_KIND.to_owned(),
@@ -199,7 +204,8 @@ fn viewport_shape(shape: &TypeExpr, file: &File, at: Span) -> Result<(), Vec<Com
 /// configuration: the wrapper holds it in a slot of that name, initially each
 /// parameter's default, which the host replaces with the person's choices. The
 /// inject and the manifest's `configuration` come together, and the shape has
-/// one field per parameter, a `string` or an enum of exactly its values.
+/// one field per parameter: a `string` or an enum of exactly its values, or
+/// for an entity parameter an `option<string>`, the chosen entry's id.
 fn configuration(
     file: &File,
     widget: &RenderEntry<'_>,
@@ -275,26 +281,38 @@ fn configuration(
         let Some(field) = declared.fields.iter().find(|f| f.name == parameter.name) else {
             return Err(fail(format!("`{slot}`: `{name}` has no field `{}`; its fields must be the configuration's parameters: {}", parameter.name, names(parameters)), at));
         };
-        let fits = match &field.ty {
-            TypeExpr::Named(n, _) => n == "string",
-            TypeExpr::Enum(values, _) => {
-                values.len() == parameter.values.len()
-                    && parameter.values.iter().all(|(v, _)| values.contains(v))
+        let initial = match &parameter.choices {
+            crate::Choices::Fixed { values, default } => {
+                let fits = match &field.ty {
+                    TypeExpr::Named(n, _) => n == "string",
+                    TypeExpr::Enum(written, _) => {
+                        written.len() == values.len()
+                            && values.iter().all(|(v, _)| written.contains(v))
+                    }
+                    _ => false,
+                };
+                if !fits {
+                    let values = values
+                        .iter()
+                        .map(|(v, _)| format!("\"{v}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(fail(format!("`{slot}`: declare `{name}.{}` as `string` or `enum<{values}>`, the parameter's values", parameter.name), at));
+                }
+                Expr::Str(default.clone(), at)
             }
-            _ => false,
+            crate::Choices::Entity { kind, .. } => {
+                let fits = matches!(&field.ty, TypeExpr::Option(inner, _)
+                    if matches!(inner.as_ref(), TypeExpr::Named(n, _) if n == "string"));
+                if !fits {
+                    return Err(fail(format!("`{slot}`: declare `{name}.{}` as `option<string>`: the id of the `{kind}` entry the person chose, and `none` until they choose", parameter.name), at));
+                }
+                Expr::None(at)
+            }
         };
-        if !fits {
-            let values = parameter
-                .values
-                .iter()
-                .map(|(v, _)| format!("\"{v}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(fail(format!("`{slot}`: declare `{name}.{}` as `string` or `enum<{values}>`, the parameter's values", parameter.name), at));
-        }
         args.push(Expr::NamedArg(
             parameter.name.clone(),
-            Box::new(Expr::Str(parameter.default.clone(), at)),
+            Box::new(initial),
             at,
         ));
     }
@@ -586,9 +604,11 @@ pub(super) fn compile_file(
         .expect("props slot")
         .ty;
     let mut plan = plan;
+    let mut configuration_ty = None;
     if let Some(configuration) = widget.configuration {
         // LLP 1126: the boot slot keeps the fixed vocabulary even when the inject
         // reads strings. Its first enum member is the current fallback for a saved choice.
+        // An entity field holds any entry's id, so it has no vocabulary.
         let slot = plan
             .slots
             .iter()
@@ -609,23 +629,34 @@ pub(super) fn compile_file(
                     .iter()
                     .find(|p| &p.name == name)
                     .unwrap();
-                let mut values = vec![parameter.default.clone()];
-                values.extend(
-                    parameter
-                        .values
-                        .iter()
-                        .map(|(v, _)| v)
-                        .filter(|v| *v != &parameter.default)
-                        .cloned(),
-                );
-                (name.as_str(), builder.string_enum(&values))
+                let ty = match &parameter.choices {
+                    crate::Choices::Fixed { values, default } => {
+                        let mut ordered = vec![default.clone()];
+                        ordered.extend(
+                            values
+                                .iter()
+                                .map(|(v, _)| v)
+                                .filter(|v| *v != default)
+                                .cloned(),
+                        );
+                        builder.string_enum(&ordered)
+                    }
+                    crate::Choices::Entity { .. } => {
+                        let id = builder.primitive(exact_plan::TypeKind::String);
+                        builder.option(id)
+                    }
+                };
+                (name.as_str(), ty)
             })
             .collect::<Vec<_>>();
-        let ty = builder.record("SnapshotConfiguration", &fields);
+        // Unnamed, so the declarations of two widgets with different
+        // configurations cannot print one shape under a shared name.
+        let ty = builder.record("", &fields);
         plan = builder
             .finish()
             .map_err(|e| vec![fail(format!("invalid configuration: {e:?}"))])?;
         plan.slots[slot].ty = ty;
+        configuration_ty = Some(ty);
     }
     if let Some(refresh) = widget.refresh {
         let mut builder = exact_plan::builder::PlanBuilder::from_plan(plan);
@@ -635,7 +666,9 @@ pub(super) fn compile_file(
             &[("date", number), ("props", props)],
         );
         let timeline = builder.list(entry);
-        let refresh = builder.source(refresh, &[number], timeline);
+        // A configured widget's refresh also receives its placement's choices.
+        let params: Vec<_> = [number].into_iter().chain(configuration_ty).collect();
+        let refresh = builder.source(refresh, &params, timeline);
         plan = builder
             .finish()
             .map_err(|e| vec![fail(format!("invalid refresh signature: {e:?}"))])?;

@@ -8,14 +8,21 @@ import CoreGraphics
 
 /// What a host wants the kernel to hold of local insets, by the owner's root
 /// view (nil: the session root), and what it last told it.
-struct LocalInsetsReport {
+package struct LocalInsetsReport {
     /// Top, right, bottom, left, in points.
-    var wanted: [UInt32?: [CGFloat]] = [:]
+    package var wanted: [UInt32?: [CGFloat]] = [:]
     private var delivered: [UInt32?: [CGFloat]] = [:]
+    package init() {}
+
+    /// Whether `take` would deliver anything.
+    package func changed(live: (UInt32) -> Bool) -> Bool {
+        wanted.contains { delivered[$0.key] != $0.value && $0.key.map(live) != false }
+            || delivered.keys.contains { wanted[$0] == nil && $0.map(live) != false }
+    }
 
     /// What changed since the last delivery, owners whose view is gone left
     /// out (their node took its insets with it); marked delivered.
-    mutating func take(live: (UInt32) -> Bool) -> [(UInt32?, [CGFloat]?)] {
+    package mutating func take(live: (UInt32) -> Bool) -> [(UInt32?, [CGFloat]?)] {
         var changes: [(UInt32?, [CGFloat]?)] = []
         for (owner, insets) in wanted where delivered[owner] != insets && owner.map(live) != false {
             changes.append((owner, insets))
@@ -30,7 +37,7 @@ struct LocalInsetsReport {
 
 extension ExactSession {
     /// Tell the kernel `changes` to local insets, between batches.
-    func localInsets(_ changes: [(UInt32?, [CGFloat]?)]) {
+    package func localInsets(_ changes: [(UInt32?, [CGFloat]?)]) {
         guard !changes.isEmpty else { return }
         whenIdle(bound: true) { [unowned self] in applyUnlessEmpty(runtime.localInsets(changes)) }
     }

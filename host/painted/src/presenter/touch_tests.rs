@@ -4,7 +4,7 @@
 use super::*;
 
 fn boot(source: &str) -> Presenter<()> {
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(source),
         (),
         (400., 400.),
@@ -282,6 +282,7 @@ fn a_tap_that_drifts_inside_the_systems_slop_still_presses() {
     let phone = Device {
         night: false,
         font_scale: 1.0,
+        screen_reader: exact_runner::ScreenReader::Unknown,
         locale: "en-US".into(),
         rtl: false,
         hour24: false,

@@ -31,7 +31,7 @@ pub(super) fn compile_fixture(source: &std::path::Path, path: &std::path::Path) 
             .arg(format!("/IMPLIB:{}", path.with_extension("lib").display()));
         let text = std::fs::read_to_string(source).unwrap();
         for line in text.lines().filter(|line| {
-            ["void ", "bool ", "uint32_t ", "const "]
+            ["void ", "bool ", "uint32_t ", "float ", "const "]
                 .iter()
                 .any(|p| line.starts_with(p))
         }) {
@@ -60,6 +60,7 @@ fn surface_work_scope_is_refused_before_presenter_effects() {
     let request = |ticket, mut request: exact_runner::Request| {
         request.grants = Some("surface.read other".into());
         RequestOut {
+            completion: None,
             class: exact_runner::RequestClass::Ordered,
             ticket,
             target: "save".into(),
@@ -88,6 +89,7 @@ fn surface_work_scope_is_refused_before_presenter_effects() {
     allowed.grants = Some("surface.read world".into());
     surfaces.enqueue(
         RequestOut {
+            completion: None,
             class: exact_runner::RequestClass::Ordered,
             ticket: 8,
             target: "save".into(),
@@ -143,7 +145,29 @@ fn deferred_restore_keeps_bytes_until_commit_and_late_refusal_is_once() {
         assert!(!c.restore_input);
     }
 }
-pub(super) fn fixture() -> (PathBuf, Value) {
+/// A compiled probe module, its directory removed when dropped.
+pub(super) struct Probe(PathBuf);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+    }
+}
+
+impl std::ops::Deref for Probe {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Probe {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+pub(super) fn fixture() -> (Probe, Value) {
     let dir = std::env::temp_dir().join(format!(
         "exact-gpu-loader-{}-{:?}",
         std::process::id(),
@@ -160,6 +184,29 @@ pub(super) fn fixture() -> (PathBuf, Value) {
 #include <stdio.h>
 #include <string.h>
 void gpu_load_headless(void) {}
+static char storage_paths[8192];
+static uint32_t storage_calls, storage_id, storage_len;
+static bool storage_refused;
+void test_refuse_storage(bool refused) { storage_refused = refused; }
+bool gpu_storage(uint32_t id, const unsigned char *data, size_t dl,
+    const unsigned char *cache, size_t cl, const unsigned char *temporary, size_t tl) {
+  storage_id = id; storage_calls++;
+  if (dl + cl + tl + 2 > sizeof(storage_paths)) return false;
+  memcpy(storage_paths, data, dl); storage_paths[dl] = '|';
+  memcpy(storage_paths + dl + 1, cache, cl); storage_paths[dl + cl + 1] = '|';
+  memcpy(storage_paths + dl + cl + 2, temporary, tl);
+  storage_len = (uint32_t)(dl + cl + tl + 2);
+  return !storage_refused;
+}
+const char *test_storage_paths(void) { return storage_paths; }
+uint32_t test_storage_len(void) { return storage_len; }
+uint32_t test_storage_calls(void) { return storage_calls; }
+uint32_t test_storage_id(void) { return storage_id; }
+static uint32_t motion_calls;
+static bool reduced_motion;
+void gpu_reduced_motion(bool on) { motion_calls++; reduced_motion = on; }
+uint32_t test_motion_calls(void) { return motion_calls; }
+bool test_reduced_motion(void) { return reduced_motion; }
 static uint32_t tier_code = 2, retiers;
 uint32_t gpu_tier(uint32_t code) { if (code < 3) tier_code = code; return tier_code; }
 void gpu_retier(void) { retiers++; }
@@ -184,7 +231,10 @@ uint32_t gpu_placement(uint32_t id, uint32_t index, float *h, size_t len) {
 void gpu_unload(void) {}
 uint32_t gpu_create_headless(void) { return 1; }
 static char bound[4096];
+static uint32_t bind_calls;
+uint32_t test_bind_calls(void) { return bind_calls; }
 uint32_t gpu_bind_at(uint32_t id, const unsigned char *text, size_t len, double at) {
+  bind_calls++;
   if (len >= sizeof(bound)) return 1; memcpy(bound, text, len); bound[len] = 0; return 0;
 }
 const char *test_bound(void) { return bound; }
@@ -247,6 +297,7 @@ uint32_t gpu_restore(void) { return 1; }
 void gpu_destroy(void) {}
 uint32_t gpu_error(void) { return 0; }
 uint32_t gpu_shader_names(void) { output="[]"; return 2; }
+uint32_t gpu_surfaces(void) { output="[\"probe\"]"; return strlen(output); }
 const unsigned char* gpu_out_ptr(void) { return (const unsigned char*)(output ? output : reply); }
 "#,
     )
@@ -256,7 +307,7 @@ const unsigned char* gpu_out_ptr(void) { return (const unsigned char*)(output ? 
     let compat = json!({"id":"cohort", "inputs":{"app":"test.app"}, "embedded":{"gpu":{
             "name":path.file_name().unwrap().to_str().unwrap(),"sha256":digest,
             "app":"test.app","cohort":"cohort","trust":"production"}}});
-    (path, compat)
+    (Probe(path), compat)
 }
 #[test]
 fn module_identity_refuses_stale_foreign_and_missing_bakes_before_loading() {
@@ -706,6 +757,19 @@ fn a_module_is_absent_only_without_an_identity_or_a_file() {
     let _ = std::fs::remove_file(here);
 }
 
+#[test]
+fn a_primary_surface_cannot_shadow_a_declared_module() {
+    let (path, mut compat) = fixture();
+    compat["inputs"]["gpuModules"] = json!({"package-probe":["probe"]});
+    let error = Abi::open_path(&path, &compat, "").err().unwrap();
+    assert!(
+        error.contains("primary and owned by module package-probe"),
+        "{error}"
+    );
+    compat["embedded"]["trust"] = json!("production");
+    assert!(Abi::open_path(&path, &compat, "").is_ok());
+}
+
 /// LLP 1139.003 D2: the module's tier (here its own choice, low) is the
 /// page's `gpuTier`; `prefer gpu-tier` tells every module and remakes its
 /// renderers, and the page follows the module's answer.
@@ -742,6 +806,49 @@ fn the_page_fact_follows_the_modules_gpu_tier() {
     assert_eq!(p.host.runner().page().gpu_tier(), "mid");
     drop(p);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn gpu_modules_follow_the_runner_motion_preference() {
+    let (path, compat) = fixture();
+    let plan = crate::test_plan("component App\n  view\n    box\n");
+    let (mut p, error) =
+        Presenter::boot(&plan, (), (100., 100.), 1., path.parent().unwrap().into()).unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let reply = crate::agent::handle(
+        &mut p,
+        r#"{"op":"prefer","media":{"prefers-reduced-motion":"reduce"}}"#,
+    );
+    assert!(!reply.contains("error"), "{reply}");
+    let abi = Abi::open_path(&path, &compat, "").unwrap();
+    // SAFETY: the C fixture's own observers, alive until the presenter drops.
+    let (calls, reduced) = unsafe {
+        (
+            *abi.library
+                .get::<unsafe extern "C" fn() -> u32>(b"test_motion_calls")
+                .unwrap(),
+            *abi.library
+                .get::<unsafe extern "C" fn() -> bool>(b"test_reduced_motion")
+                .unwrap(),
+        )
+    };
+    p.surfaces.abis.insert(String::new(), abi);
+    p.sync_surfaces();
+    assert_eq!(unsafe { calls() }, 1);
+    assert!(unsafe { reduced() });
+    for (value, count, expected) in [
+        ("no-preference", 2, false),
+        ("no-preference", 2, false),
+        ("reduce", 3, true),
+    ] {
+        let reply = crate::agent::handle(
+            &mut p,
+            &format!(r#"{{"op":"prefer","media":{{"prefers-reduced-motion":"{value}"}}}}"#),
+        );
+        assert!(!reply.contains("error"), "{reply}");
+        assert_eq!(unsafe { calls() }, count);
+        assert_eq!(unsafe { reduced() }, expected);
+    }
 }
 
 /// A reload renumbers the tree from 1, so the canvas's old view id can name
@@ -786,10 +893,10 @@ fn a_reload_that_renumbers_the_tree_gives_the_canvas_its_own_surface() {
         (&"world".into(), true, Some(canvas))
     );
 
-    assert!(p
-        .reload(&plan("      text \"new\"\n"), ())
-        .unwrap()
-        .is_none());
+    assert!(
+        p.reload(&plan("      text \"new\"\n"), ()).unwrap()
+            == crate::presenter::ReloadResult::Applied(None)
+    );
     p.sync_surfaces();
     let after = canvases(&p);
     assert_eq!(after.len(), 1, "{after:?}");
@@ -809,7 +916,10 @@ fn opted_in_idle_canvas_reports_on_a_wake_without_a_render() {
   frames: option<number>
   fps: option<number>
 component App
-  resource metrics = exactCanvasPerformance("world") as shape Metrics
+  state perfHud = false
+  action toggle
+    perfHud = not perfHud
+  resource metrics = exactCanvasPerformance("world") when perfHud as shape Metrics
   view
     canvas surface=world width=50 height=50
 "#;
@@ -827,6 +937,9 @@ component App
         p.surfaces.abis[""].symbol::<unsafe extern "C" fn() -> u32>(b"test_performance_reads")
     };
     assert_eq!(unsafe { reads() }, 0);
+    assert_eq!(p.surfaces.performance_due_in_ms(), None);
+    p.host.runner_mut().act("toggle", vec![]).unwrap();
+    p.sync_surfaces();
     assert_eq!(p.surfaces.performance_due_in_ms(), Some(0.));
     assert!(p.wake_due_ms().is_some());
     assert!(p.pump(0.).is_none());
@@ -854,11 +967,22 @@ component App
     p.surfaces.hidden = false;
     assert!(p.pump(0.).is_none());
     assert_eq!(unsafe { reads() }, 2);
+    p.host.runner_mut().act("toggle", vec![]).unwrap();
+    p.sync_surfaces();
+    assert_eq!(p.surfaces.performance_due_in_ms(), None);
+    assert!(p.surfaces.canvases.values().all(|c| !c.performance));
+    assert!(p.pump(0.).is_none());
+    assert_eq!(unsafe { reads() }, 2);
     let view = *p.surfaces.canvases.keys().next().unwrap();
     p.surfaces.retire(view, &mut p.host);
     assert_eq!(p.surfaces.performance_due_in_ms(), None);
     assert!(p.pump(0.).is_none());
     assert_eq!(unsafe { reads() }, 2);
+    p.host.runner_mut().act("toggle", vec![]).unwrap();
+    assert_eq!(
+        p.host.runner().resource("metrics"),
+        Some(&exact_plan::Value::record(vec![exact_plan::Value::NONE; 2]))
+    );
     drop(p);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }

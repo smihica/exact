@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class QueuedAlertIOSTests: XCTestCase {
     private var window: UIWindow?
@@ -215,22 +216,22 @@ final class QueuedAlertIOSTests: XCTestCase {
                 self?.pressed.append(id)
             }
         }
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
-        waitFor("the initial navigation stack settles") { nav.viewControllers.count == 2 && !p.navigation.inTransition }
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
+        waitFor("the initial navigation stack settles") { nav.viewControllers.count == 2 && !p.navigationHost.inTransition }
         showFirst(p, controller)
         p.dialogCommand("showModal", "climate-failed")
         let pop = InteractivePop()
-        p.navigation.setAppDelegate(nav, pop)
+        p.navigationHost.setAppDelegate(nav, pop)
         pop.interactive = true
         nav.popViewController(animated: true)
-        waitFor("the pop holds navigation in transition") { p.navigation.inTransition }
+        waitFor("the pop holds navigation in transition") { p.navigationHost.inTransition }
         pop.interaction.update(0.4)
         close("confirm-lock", p)
         waitFor("the first alert leaves while the pop is held") { controller.presentedViewController == nil }
-        XCTAssertTrue(p.navigation.inTransition)
+        XCTAssertTrue(p.navigationHost.inTransition)
         pop.interaction.finish()
         waitForTitle("Couldn't save climate settings", p, controller)
-        XCTAssertFalse(p.navigation.inTransition)
+        XCTAssertFalse(p.navigationHost.inTransition)
         XCTAssertEqual(pressed, [])
     }
 

@@ -46,6 +46,8 @@ final class TextDirectionTests: XCTestCase {
             let origin = bounds.minX + paragraph.origin(0, align: 0, width: bounds.width)
             assertSelectionExtents(paragraph.selectionRects(selection, align: 0, in: bounds, dirty: .infinite),
                 expected, origin: origin, message: "paragraph: \(text), \(selection)")
+            // The Mac's reader paragraphs select as the paragraph does.
+            #if os(macOS)
             let source = RegionTextSource.capture(spec, engine: engine)
             let done = expectation(description: "reader geometry")
             DispatchQueue.global().async {
@@ -72,6 +74,7 @@ final class TextDirectionTests: XCTestCase {
                 }
             }
             wait(for: [done], timeout: 10)
+            #endif
         }
     }
 
@@ -235,6 +238,7 @@ private func assertSelectionExtents(_ rects: [CGRect], _ expected: [ClosedRange<
     }
 }
 
+#if os(macOS)
 private func readerSelectionPaint(_ layout: RegionWorkerLayout, selection: NSRange, bounds: CGRect,
                                  expected: [ClosedRange<CGFloat>], origin: CGFloat) -> [(RegionRaster, Data, String)] {
     var result: [(RegionRaster, Data, String)] = []
@@ -283,3 +287,4 @@ private func readerSelectionPaint(_ layout: RegionWorkerLayout, selection: NSRan
     } catch { XCTFail("reader selection raster: \(error)") }
     return result
 }
+#endif

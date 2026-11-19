@@ -444,7 +444,8 @@ fn relative_lengths_keep_em_live_and_rem_ahead_of_time() {
 #[test]
 fn scalar_viewport_units_stay_authored_on_both_web_targets() {
     use exact_kernel::{StyleId, StyleProps, StyleValue, ViewportUnit};
-    for unit in ViewportUnit::ALL {
+    // A container unit is not built on these rows (LLP 1123 D16), which refuse it
+    for unit in ViewportUnit::ALL.into_iter().filter(|u| !u.is_container()) {
         for (id, name) in [
             (StyleId::FontSize, "font-size"),
             (StyleId::LineHeight, "line-height"),
@@ -633,6 +634,7 @@ fn explicit_clears_preserve_special_host_row_contracts() {
             "--exact-placeholder-color:initial;",
             false,
         ),
+        (BackdropColor, "--exact-backdrop-color:initial;", false),
         (
             TintColor,
             "--exact-tint:var(--exact-symbol, var(--exact-accent, AccentColor));",

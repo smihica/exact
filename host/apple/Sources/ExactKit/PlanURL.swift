@@ -5,236 +5,14 @@
 // the app for all-session acceptance, and subscribe to the server's events
 // so an edit re-fetches. Transactional: a candidate replaces the
 // running app only after its bytes hash clean and boot runs; every failure
-// keeps the last good app on screen. `{rebuilt}`, or a generation for
-// another program, takes no generation — the wasm-side program changed, so a
-// new plan against this binary's data crate would be a poisoned boot — but
-// the host stays connected and registered, reconnects across restarts, and
-// takes the next generation for its own program; rebuilding the host, or the
-// menu's Reload, starts over. One connection per app (LLP 1031 D11), never
-// per session.
+// keeps the last good app on screen. A rebuild or generation naming changed
+// inputs for this binary's native cohort takes no generation: a new plan
+// against another native program could boot incorrectly. The host stays
+// connected and registered across restarts and takes the next generation for
+// its own program. Web-only rebuilds keep the native program and carried state.
+// One connection per app (LLP 1031 D11), never per session.
 import CryptoKit
 import Foundation
-
-/// A fixed JavaScript/Rust generation crosses the data seam as one candidate.
-enum DevelopmentModules {
-    static func combine(javascript: ExactModule?, rust: ExactModule?) throws -> ExactModule? {
-        guard let javascript else { return rust }
-        guard let rust else { return javascript }
-        guard let jsReceipt = try JSONSerialization.jsonObject(with: javascript.receipt) as? [String: Any],
-              let rustReceipt = try JSONSerialization.jsonObject(with: rust.receipt) as? [String: Any] else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let receipt = try JSONSerialization.data(withJSONObject: [
-            "version": 1, "kind": "mixed", "javascript": jsReceipt, "rust": rustReceipt,
-            "javascriptBytes": javascript.bytecode.count,
-        ], options: .sortedKeys)
-        guard receipt.count <= 1 << 20, javascript.bytecode.count <= 32 << 20,
-              rust.bytecode.count <= (32 << 20) - javascript.bytecode.count else { throw CocoaError(.fileReadTooLarge) }
-        var bytes = javascript.bytecode
-        bytes.append(rust.bytecode)
-        return ExactModule(receipt: receipt, bytecode: bytes)
-    }
-}
-
-/// A local development bake is a plan plus its optional, inseparable module
-/// pair (LLP 1027 D7). Watch all three files: a writer can replace them in
-/// either order, and a refused partial bake must be retried when it finishes.
-public struct ExactDevelopmentPlan {
-    private let baseFiles: [URL]
-    private var files: [URL] {
-        let root = baseFiles[0].deletingLastPathComponent().appendingPathComponent("rust")
-        let found = (FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)?.allObjects as? [URL] ?? [])
-            .filter { !$0.hasDirectoryPath }.sorted { $0.path < $1.path }
-        return baseFiles + found
-    }
-    public init(_ path: String) {
-        let plan = URL(fileURLWithPath: path)
-        let directory = plan.deletingLastPathComponent()
-        baseFiles = [plan, directory.appendingPathComponent("app.module.json"), directory.appendingPathComponent("app.hbc")]
-    }
-
-    public var hasModule: Bool { files.dropFirst().contains { FileManager.default.fileExists(atPath: $0.path) } }
-
-    /// Identity and subsecond modification time, including missing files.
-    public var revision: [Double] {
-        files.flatMap { url -> [Double] in
-            let a = try? FileManager.default.attributesOfItem(atPath: url.path)
-            return [(a?[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? -1,
-                    (a?[.size] as? NSNumber)?.doubleValue ?? -1,
-                    (a?[.systemFileNumber] as? NSNumber)?.doubleValue ?? -1]
-        }
-    }
-
-    /// The plan and, when one is beside it, its module pair, read as one
-    /// candidate: a partial pair or an oversized file is refused.
-    private func read(for app: ExactApp) throws -> (plan: Data, module: ExactModule?) {
-        let files = self.files
-        func read(_ index: Int, limit: Int) throws -> Data {
-            let url = files[index]
-            let a = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard let size = a[.size] as? NSNumber, size.intValue <= limit else {
-                throw NSError(domain: "ExactDevelopmentPlan", code: 1, userInfo: [NSLocalizedDescriptionKey: "\(url.lastPathComponent) exceeds the development artifact limit"])
-            }
-            let bytes = try Data(contentsOf: url)
-            guard bytes.count <= limit else { throw CocoaError(.fileReadTooLarge) }
-            return bytes
-        }
-        let plan = try read(0, limit: 32 << 20)
-        guard hasModule else { return (plan, nil) }
-        var javascript: ExactModule?, rust: ExactModule?
-        if files[1...2].contains(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-            javascript = ExactModule(receipt: try read(1, limit: 1 << 20), bytecode: try read(2, limit: 32 << 20))
-        }
-        if files.count > baseFiles.count && !(app.rustPolicy.mode == "off" && javascript != nil) {
-            let policy = app.rustPolicy
-            let prefix = policy.mode == "wasm" ? "rust/wasm" : "rust/" + policy.mode + "/" + policy.target
-            guard policy.mode != "off",
-                  let index = files.firstIndex(where: { $0.path.hasSuffix(prefix + "/app.module.json") }) else {
-                throw NSError(domain: "ExactDevelopmentPlan", code: 1, userInfo: [NSLocalizedDescriptionKey: "no Rust replacement matching this binary's executor and target"])
-            }
-            let receiptIndex = index
-            let json = try JSONSerialization.jsonObject(with: read(index, limit: 1 << 20)) as? [String: Any]
-            guard let row = json?["module"] as? [String: Any], let name = row["file"] as? String,
-                  ["app.module.wasm", "app.module.dylib", "app.module.so", "app.module.dll", "app.module.bin"].contains(name),
-                  let index = files.firstIndex(where: { $0.path.hasSuffix(prefix + "/" + name) }) else { throw CocoaError(.fileNoSuchFile) }
-            rust = ExactModule(receipt: try read(receiptIndex, limit: 1 << 20), bytecode: try read(index, limit: 32 << 20))
-        }
-        guard let module = try DevelopmentModules.combine(javascript: javascript, rust: rust) else { throw CocoaError(.fileNoSuchFile) }
-        return (plan, module)
-    }
-
-    @discardableResult
-    public func apply(to app: ExactApp) -> Bool {
-        do {
-            let (plan, module) = try read(for: app)
-            let label = baseFiles[0].lastPathComponent
-            guard let module else { return app.apply(plan, label: label) }
-            return app.applyGeneration(ExactGeneration(plan: plan, assets: app.resolver, module: module), label: label, commit: { true })
-        } catch {
-            fputs("exact: local generation refused: \(error.localizedDescription)\n", stderr)
-            return false
-        }
-    }
-
-    /// The plan and its module pair as the launch generation (`EXACT_PLAN`
-    /// naming a local bake, LLP 1116.003): the first boot runs it as a build
-    /// that baked it would, fresh, with nothing carried from the embedded
-    /// plan. Call before the first session; nil once installed, else why not.
-    public func installInitial(on app: ExactApp) -> String? {
-        do {
-            let (plan, module) = try read(for: app)
-            guard let module else { return "\(baseFiles[0].lastPathComponent) has no module beside it" }
-            app.installInitial(ExactGeneration(plan: plan, assets: app.resolver, module: module))
-            return nil
-        } catch {
-            return "local generation refused: \(error.localizedDescription)"
-        }
-    }
-
-    /// The dev loop's file form (LLP 1007 §6): every 100 ms, a changed
-    /// revision is applied to `app`. A module pair starts unseen, so the
-    /// first tick applies it. Keep the timer for as long as the watch runs.
-    public func watch(_ app: ExactApp) -> DispatchSourceTimer {
-        var last = hasModule ? [] : revision
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + 0.1, repeating: 0.1)
-        t.setEventHandler {
-            last = Self.seen(revision, last: last, apply: { apply(to: app) }, pending: { app.generationPending })
-        }
-        t.resume()
-        return t
-    }
-
-    /// The revision seen after a tick. A candidate refused while a
-    /// generation is pending (a module still preparing, a request in
-    /// flight) stays unseen, so the next tick asks again, as the URL form
-    /// does; one applied, or refused otherwise, waits for its files to change.
-    static func seen(_ revision: [Double], last: [Double], apply: () -> Bool, pending: () -> Bool) -> [Double] {
-        guard revision != last else { return last }
-        return apply() || !pending() ? revision : last
-    }
-}
-
-/// Explicit development-only opening action (LLP 1030.000 §7). The locator
-/// stays an HTTP(S) URL; the outer app-specific scheme only selects the client.
-/// The scheme is derived from the public app id and the loader's identity and
-/// compatibility checks are computable by anyone, so neither is trust: a link
-/// is admitted only for the dev-server origins this build was made against,
-/// carrying the random token baked beside them (`host/apple/build.mjs`).
-public enum ExactDevelopmentLink {
-    public static func page(_ link: URL, scheme: String, origins: [String], token: String) -> URL? {
-        guard link.absoluteString.utf8.count <= 8192, validToken(token),
-              let c = URLComponents(url: link, resolvingAgainstBaseURL: false),
-              c.scheme?.lowercased() == scheme, c.host == "open",
-              c.user == nil, c.password == nil, c.port == nil, c.fragment == nil,
-              c.path.isEmpty || c.path == "/",
-              let items = c.queryItems, items.count == 2, Set(items.map(\.name)) == ["url", "token"],
-              let offered = items.first(where: { $0.name == "token" })?.value, equal(offered, token),
-              let value = items.first(where: { $0.name == "url" })?.value, let page = URL(string: value),
-              ["http", "https"].contains(page.scheme?.lowercased() ?? ""),
-              let host = page.host, !host.isEmpty, page.user == nil, page.password == nil,
-              origins.contains(where: { URL(string: $0).map { sameOrigin($0, page) } ?? false })
-        else { return nil }
-        return page
-    }
-
-    /// The scheme, origins and token a development build was baked with, or
-    /// nil: an installed or production build registers no development link.
-    private static var baked: (scheme: String, origins: [String], token: String)? {
-        let info = Bundle.main.infoDictionary ?? [:]
-        guard let scheme = info["ExactDevelopmentURLScheme"] as? String, !scheme.isEmpty,
-              let origins = info["ExactDevelopmentOrigins"] as? [String], !origins.isEmpty,
-              let token = info["ExactDevelopmentToken"] as? String, validToken(token) else { return nil }
-        return (scheme.lowercased(), origins, token)
-    }
-
-    public static func page(_ link: URL) -> URL? {
-        guard let baked else { return nil }
-        return page(link, scheme: baked.scheme, origins: baked.origins, token: baked.token)
-    }
-
-    /// A link in this build's development scheme is consumed here, admitted
-    /// or refused; it never becomes an app location (LLP 1038 D11).
-    public static func claims(_ link: URL) -> Bool {
-        guard let baked else { return false }
-        return link.scheme?.lowercased() == baked.scheme
-    }
-
-    /// True when the link was this build's to take — connected, or refused
-    /// with a line on stderr and every session left as it was.
-    @discardableResult
-    public static func open(_ link: URL) -> Bool {
-        guard claims(link) else { return false }
-        guard let page = page(link) else {
-            fputs("exact: refused a development link that does not name this build's dev server and token\n", stderr)
-            return true
-        }
-        // The existing loader still checks app identity, pairing, grants and
-        // runtime compatibility before changing any session.
-        ExactApp.shared.connect(page.absoluteString)
-        return true
-    }
-
-    private static func validToken(_ token: String) -> Bool {
-        token.utf8.count == 64 && token.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
-    }
-
-    /// Constant time over the token's length.
-    private static func equal(_ a: String, _ b: String) -> Bool {
-        let x = Array(a.utf8), y = Array(b.utf8)
-        guard x.count == y.count else { return false }
-        return zip(x, y).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
-    }
-
-    /// URL.origin, including the scheme's default port.
-    private static func sameOrigin(_ a: URL, _ b: URL) -> Bool {
-        func port(_ u: URL) -> Int? {
-            switch u.scheme?.lowercased() { case "http": return u.port ?? 80; case "https": return u.port ?? 443; default: return nil }
-        }
-        guard let pa = port(a), let ha = a.host?.lowercased(), !ha.isEmpty else { return false }
-        return a.scheme?.lowercased() == b.scheme?.lowercased() && ha == b.host?.lowercased() && pa == port(b)
-    }
-}
 
 /// One bounded HTTP rung. URLSession's completion-handler API buffers an
 /// entire response before the caller can inspect it; the loader instead owns
@@ -339,7 +117,7 @@ private final class BoundedFetch: NSObject, URLSessionDataDelegate, URLSessionTa
     }
 }
 
-final class PlanURL: NSObject, URLSessionDataDelegate {
+final class PlanURL: NSObject, URLSessionDataDelegate, PlanConnection {
     static let envelopeType = "application/vnd.exact.envelope+json"
     /// A dev loop's answer while its producers start, or after their start
     /// failed (llp/1023.001; host/web/dev-phase.mjs): a status, not a failure.
@@ -350,7 +128,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     static let assetIndexLimit = 4 * 1024 * 1024
     static let planLimit = 64 * 1024 * 1024
     static let assetLimit = 64 * 1024 * 1024
-    /// One event frame: 1 MiB, the design server's own line limit, since a large plan's copies (tamber/1.17 `inspect`)
+    /// One event frame: 1 MiB, the design server's own line limit, since a large plan's copies (forma/1.17 `inspect`)
     /// pass 64 KiB (a generated 20,000-copy map: 85 KB).
     static let eventLimit = 1024 * 1024
     static let generationLimit = 256 * 1024 * 1024
@@ -395,12 +173,12 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
 
     /// The app owns the identity: replacing a connection must not restart an
     /// already current app, while another kind of apply invalidates the identity.
-    static func open(_ page: String, program: String? = nil, acceptProgram: @escaping (String?) -> Bool, current: @escaping () -> String?, plan: @escaping () -> String? = { nil }, waiting: @escaping () -> Bool = { false }, held: @escaping () -> Bool = { false }, design: @escaping (String) -> String = { _ in "unsupported" }, channel: @escaping ([String: Any]) -> Void = { _ in }, apply: @escaping (Generation, String, Bool) -> Bool) -> PlanURL? {
+    static func open(_ page: String, program: String? = nil, acceptProgram: @escaping (String?) -> Bool, current: @escaping () -> String?, plan: @escaping () -> String? = { nil }, design: @escaping (String) -> String = { _ in "unsupported" }, channel: @escaping ([String: Any]) -> Void = { _ in }, apply: @escaping (Generation, String, Bool, @escaping (ReplacementCompletion) -> Void) -> ExactApplyResult) -> PlanURL? {
         guard let u = URL(string: page), u.host != nil, sameOrigin(u, u) else {
             fputs("exact url: not an HTTP app URL: \(page)\n", stderr)
             return nil
         }
-        let connection = PlanURL(u, acceptProgram: acceptProgram, current: current, plan: plan, waiting: waiting, held: held, design: design, channel: channel, apply: apply)
+        let connection = PlanURL(u, acceptProgram: acceptProgram, current: current, plan: plan, design: design, channel: channel, apply: apply)
         // The program the app already runs (a connection replaced): the one
         // this connection takes.
         connection.adopted = program
@@ -408,33 +186,42 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         return connection
     }
 
+    /// `app`'s one connection to `page` (`ExactApp.connect`): its program
+    /// pinned to the one the app runs, its generations applied to every
+    /// session together, its notices in the app's dev pills.
+    static func open(for app: ExactApp, _ page: String) -> PlanURL? {
+        let connection = open(page, program: app.devProgram, acceptProgram: { [weak app] program in
+            guard let app else { return false }
+            if let old = app.devProgram { return old == program }
+            app.devProgram = program
+            return true
+        }, current: { [weak app] in app?.devGeneration }, plan: { [weak app] in app?.sessions.first { $0.booted && $0.state != .destroyed }?.runtime.planDigest() }, design: { [weak app] in app?.design($0) ?? "closed" }, channel: { [weak app] in app?.channel($0) }, apply: { [weak app] candidate, label, now, finished in
+            guard let app else { return .refused("app closed") }
+            // A closed connection applies nothing, so the one asking is the open one.
+            return app.applyTogether(candidate.plan, label: label, resolver: candidate.assets, token: 0, identity: candidate.identity, module: candidate.module, development: true, now: now, producer: app.connection, commit: { true }, finished: finished)
+        })
+        connection?.onDevNotice = { [weak app] in app?.showDevStatus($0) } // the old one's went at its close
+        return connection
+    }
+
     let page: URL
     private let currentGeneration: () -> String?
     private let runningPlan: () -> String?
-    /// The candidate, its label, and `letGo` (requests in flight do not hold it back).
-    private let applyGeneration: (Generation, String, Bool) -> Bool
+    /// The candidate, its label, whether Reload asked for it, and its later outcome.
+    private let applyGeneration: (Generation, String, Bool, @escaping (ReplacementCompletion) -> Void) -> ExactApplyResult
     /// A live design batch or snapshot (LLP 1121 stage 4) applied to the
     /// app; answers applied, stale, structure or refused.
     private let applyDesign: (String) -> String
     /// A build-channel frame (LLP 1122 D4): a hello with a new nonce, or a
     /// command (`BuildChannel.commands`).
     private let channel: ([String: Any]) -> Void
-    private let preparationPending: () -> Bool
-    /// Whether requests in flight held the last preparation back (its second's clock).
-    private let requestsHeld: () -> Bool
     private let acceptProgram: (String?) -> Bool
     var terminal: String? { didSet { tellNotice() } }
-    /// What the dev loop said it is doing before it had a plan to give:
-    /// preparing (its producers' first build), or its start's error.
-    enum DevStatus: Equatable { case preparing(String), failed(String) }
-    private(set) var devStatus: DevStatus? { didSet { tellNotice() } }
+    private(set) var devStatus: DevLoopStatus? { didSet { tellNotice() } }
     /// The first line of the last save's error, until a generation is taken
     /// (LLP 1159.001 D1): the app on screen is older than the source.
     private(set) var refused: String? { didSet { tellNotice() } }
-    /// What the window's dev pill says, the first that holds (LLP 1159.001 D2):
-    /// the loop's own status, a host whose native code the server no longer
-    /// runs (`terminal`), or a save that did not apply.
-    enum DevNotice: Equatable { case loop(DevStatus), stale, refused(String) }
+    /// What the window's dev pill says (`DevNotice`).
     var notice: DevNotice? { devStatus.map(DevNotice.loop) ?? (terminal != nil ? .stale : refused.map(DevNotice.refused)) }
     /// Told each change of `notice`; nil when nothing is left to say.
     var onDevNotice: ((DevNotice?) -> Void)?
@@ -458,6 +245,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     private var retrySeconds = 1.0
     private var closed = false
     private var resolution: UInt64 = 0
+    private var applyNow = false
     private var resolutionStarted = ProcessInfo.processInfo.systemUptime
     private var fetches: [UUID: BoundedFetch] = [:]
     private lazy var session: URLSession = {
@@ -468,7 +256,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         return URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }()
 
-    private init(_ page: URL, acceptProgram: @escaping (String?) -> Bool, current: @escaping () -> String?, plan: @escaping () -> String?, waiting: @escaping () -> Bool = { false }, held: @escaping () -> Bool = { false }, design: @escaping (String) -> String, channel: @escaping ([String: Any]) -> Void, apply: @escaping (Generation, String, Bool) -> Bool) {
+    private init(_ page: URL, acceptProgram: @escaping (String?) -> Bool, current: @escaping () -> String?, plan: @escaping () -> String?, design: @escaping (String) -> String, channel: @escaping ([String: Any]) -> Void, apply: @escaping (Generation, String, Bool, @escaping (ReplacementCompletion) -> Void) -> ExactApplyResult) {
         self.page = page
         self.acceptProgram = acceptProgram
         currentGeneration = current
@@ -476,12 +264,11 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         applyGeneration = apply
         applyDesign = design
         self.channel = channel
-        preparationPending = waiting
-        requestsHeld = held
     }
 
     @discardableResult
-    private func beginResolution() -> UInt64 {
+    private func beginResolution(now: Bool = false) -> UInt64 {
+        applyNow = now
         resolution &+= 1
         resolutionStarted = ProcessInfo.processInfo.systemUptime
         pending = nil
@@ -507,16 +294,16 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
 
     func reload() {
         terminal = nil
-        resolveAndBoot()
+        resolveAndBoot(now: true)
     }
 
     // MARK: discovery and immutable generation fetches (LLP 1023 D1–D3)
 
-    private func resolveAndBoot() {
+    private func resolveAndBoot(now: Bool = false) {
         guard !closed else { return }
         stream?.cancel()
         stream = nil
-        let generation = beginResolution()
+        let generation = beginResolution(now: now)
         var request = URLRequest(url: page)
         request.setValue("\(PlanURL.envelopeType), text/html;q=0.9", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
@@ -610,19 +397,28 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
               let count = PlanURL.count(row["bytes"]), count <= (name.isEmpty ? PlanURL.planLimit : PlanURL.assetLimit) else { return nil }
         return FileCard(name: name, url: url, sha: sha, count: count)
     }
+    private static func nativeProgram(_ row: [String: Any]) -> String? {
+        let compat = BakedCompatibility.json
+        guard let cohort = compat["id"] as? String, let target = compat["target"] as? String,
+              let programs = row["nativePrograms"] as? [String: Any] else { return nil }
+        return digest(programs[target + "/" + cohort])
+    }
     private static func revision(_ row: [String: Any]) -> Revision? {
         guard let epoch = row["epoch"] as? String, !epoch.isEmpty, epoch.utf8.count <= 128,
               let seq = count(row["seq"]), let identity = digest(row["generation"]) else { return nil }
-        return Revision(epoch: epoch, seq: seq, identity: identity, program: digest(row["program"]))
+        return Revision(epoch: epoch, seq: seq, identity: identity, program: nativeProgram(row))
     }
 
     /// A new epoch resets ordering; an already retired epoch cannot return.
     /// All fetch completions also carry a local resolution, so a response
     /// started before a newer announcement cannot commit afterward.
     private func observe(_ revision: Revision) -> Bool {
-        // Its program, once known, is the only one it takes; until then the
-        // session pins the first (`acceptProgram`), except while it waits,
-        // when an unknown program cannot be checked and is not pinned.
+        // A revision naming no program for this host's cohort and target is
+        // refused. A known program is the only one the host takes; until one
+        // is known the session pins the first (`acceptProgram`), except while
+        // it waits: it cannot tell its own program returning from a rebuilt
+        // one, so it pins nothing until Reload or a relaunch.
+        guard revision.program != nil else { waitForProgram(); return false }
         if let known = adopted {
             guard revision.program == known else { waitForProgram(); return false }
         } else if terminal != nil || !acceptProgram(revision.program) {
@@ -830,26 +626,30 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
                         let candidate = Generation(identity: identity, plan: payloads[0], assets: resolver, module: logic)
                         payloads.removeAll()
                         let fetched = ProcessInfo.processInfo.systemUptime
-                        // Asked again while the host is preparing, or while requests are in flight;
-                        // a second after they first held it, they are let go, as the web's dev loop does (LLP 1007 §6).
-                        var heldSince: TimeInterval?
-                        func commitCandidate() {
-                            guard !self.closed, self.terminal == nil, generation == self.resolution else { return }
-                            let letGo = heldSince.map { ProcessInfo.processInfo.systemUptime - $0 >= 1 } ?? false
-                            if applyGeneration(candidate, "generation ← " + (page.host ?? ""), letGo) {
+                        var completed = false
+                        let finished: (ReplacementCompletion) -> Void = { [weak self] result in
+                            guard let self, !closed, generation == resolution, !completed else { return }
+                            completed = true
+                            switch result {
+                            case .applied:
                                 refused = nil
-                                // Its plan carries its own design; value-only edits since are the server's.
                                 syncDesign()
                                 status(String(format: "generation %@: envelope %.1f ms, payloads %.1f ms, preparation %.1f ms", String(identity.prefix(12)), envelopeMs, (fetched - payloadStarted) * 1000, (ProcessInfo.processInfo.systemUptime - fetched) * 1000))
-                            } else if preparationPending() {
-                                if requestsHeld() { heldSince = heldSince ?? ProcessInfo.processInfo.systemUptime }
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: commitCandidate)
-                            } else {
-                                refused = "this app refused the new build"
+                            case .ended(.refused, let reason):
+                                refused = reason
                                 status("the host refused the generation; keeping the running app")
+                            case .ended(let outcome, _):
+                                status(outcome == .superseded ? "generation superseded by a newer candidate" : "generation dropped because its sessions were destroyed")
                             }
                         }
-                        commitCandidate()
+                        let result = applyGeneration(candidate, "generation ← " + (page.host ?? ""), applyNow, finished)
+                        if !completed {
+                            switch result {
+                            case .applied: finished(.applied)
+                            case .held(let reason): status("replacement held: " + reason)
+                            case .refused(let reason): finished(.ended(.refused, reason))
+                            }
+                        }
                     } catch {
                         failed("cannot combine JavaScript and Rust modules: \(error.localizedDescription); keeping the running app", generation: generation)
                     }
@@ -964,14 +764,14 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
         failed("events disconnected; resolving the current generation", generation: resolution)
     }
 
-    /// The dev server's native code is no longer this host's (it rebuilt it,
-    /// or a generation names another program). The last good plan keeps
+    /// The dev server has no unchanged build receipt for this native cohort,
+    /// or names another native program. The last good plan keeps
     /// running and no generation is fetched, but the host stays connected and
     /// registered and keeps reconnecting across the server's restarts, so the
     /// generation for its own code, when the server has it again, is taken.
     private func waitForProgram() {
         if terminal == nil {
-            terminal = "the dev server rebuilt the app's native code — rebuild and relaunch this host (the last good plan is still running)"
+            terminal = "this host's native program is unavailable or changed — rebuild and relaunch this host (the last good plan is still running)"
             status(terminal!)
         }
         settle()
@@ -989,7 +789,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     /// The dev loop's status, said once a change, and asked again after its
     /// `Retry-After` (1 to 10 s; 2 s preparing, 5 s failed when it names
     /// none), with no backing off: the loop answers at once.
-    private func loopSaid(_ said: DevStatus, retry: Double?, generation: UInt64) {
+    private func loopSaid(_ said: DevLoopStatus, retry: Double?, generation: UInt64) {
         if devStatus != said {
             devStatus = said
             switch said {
@@ -1038,7 +838,8 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
     private func handle(_ frame: [String: Any]) {
         retrySeconds = 1
         if frame["rebuilt"] != nil {
-            waitForProgram()
+            if let known = adopted, PlanURL.nativeProgram(frame) == known { settle() }
+            else { waitForProgram() }
             return
         }
         if let error = frame["error"] as? String {
@@ -1046,7 +847,7 @@ final class PlanURL: NSObject, URLSessionDataDelegate {
             status("dev: \(error)")
             return
         }
-        if let kind = frame["kind"] as? String, kind == "tamber-batch" || kind == "tamber-snapshot" {
+        if let kind = frame["kind"] as? String, kind == "forma-batch" || kind == "forma-snapshot" {
             design(frame)
             return
         }

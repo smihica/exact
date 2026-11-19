@@ -1,6 +1,6 @@
 import { hostFixtureFile } from '../web/tests/glue-fixture.mjs';
 // Store readers at Rust-module startup and across the adapter's calls (LLP 1027 D4, LLP 1146 §2.3).
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,10 @@ import { createGrantSet, createRequestExecutor } from './admission.js';
 import { appDigest, suiteBrowser } from '../../scripts/agent-launch.mjs';
 
 const ROOT = resolve(import.meta.dir, '../..');
+// A fixture's setup can throw before the `try` that removes its directory.
+const scratches = [];
+const scratch = (prefix) => { const dir = mkdtempSync(resolve(tmpdir(), prefix)); scratches.push(dir); return dir; };
+afterAll(() => { for (const dir of scratches) rmSync(dir, { recursive: true, force: true }); });
 
 test('a store reader shows its declared placeholder until its Rust source is ready when launch secrets were present', async () => {
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
@@ -93,10 +97,9 @@ test('a built store reader replaces its placeholder when the delayed Rust module
   const write = (path, content) => writeFileSync(resolve(dir, path), content);
   let browser, server, release;
   try {
-    for (const path of ['data/src', 'bake/src', 'web']) mkdirSync(resolve(dir, path), { recursive: true });
-    write('app.json', JSON.stringify({ name: 'Reader', app: { id: 'test.reader', name: 'Reader' }, host: { web: {} } }));
+    for (const path of ['data/src', 'bake/src']) mkdirSync(resolve(dir, path), { recursive: true });
+    write('app.json', JSON.stringify({ name: 'Reader', app: { id: 'test.reader', name: 'Reader' }, host: { web: {} }, rust: { data: { crate: 'startup-data', type: 'startup_data::Reader', source: 'startup_data::Reader' } } }));
     write('app.contract', 'component App\n  resource session = session() as shape string else preview()\n  action export\n    saveFile("export", "app:/data/note.txt", "note.txt")\n  view\n    column\n      text session testId="session"\n      button "Export" id="export" testId="export" press=export\n');
-    write('web/build.rs', 'fn main() { contract::bake(plan, startup_data::Reader); }');
     write('Cargo.toml', `[workspace]\nmembers = ["data", "bake"]\nresolver = "2"\n[patch.crates-io]\n${patchLines(dir).join('\n')}\n`);
     cpSync(resolve(ROOT, 'Cargo.lock'), resolve(dir, 'Cargo.lock'));
     write('data/Cargo.toml', `[package]\nname = "startup-data"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nexact-runner = { path = "${ROOT}/runner" }\n`);
@@ -162,11 +165,11 @@ impl DataSource for Reader {
 // `spec` as the web's grant set, by the grammar's own normalizer (`exact-web-js normalize-grants`), the compiler the
 // lane built.
 function normalized(spec) {
-  const { cmd, pre } = webCompiler();
+  const { cmd, pre, env: toolEnv } = webCompiler();
   if (cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
   const scratch = mkdtempSync(resolve(tmpdir(), 'exact-grants-')), input = resolve(scratch, 'grants.txt');
   writeFileSync(input, spec);
-  const run = spawnSync(cmd, [...pre, 'normalize-grants', input], { cwd: ROOT, encoding: 'utf8' });
+  const run = spawnSync(cmd, [...pre, 'normalize-grants', input], { env: toolEnv, cwd: ROOT, encoding: 'utf8' });
   rmSync(scratch, { recursive: true });
   if (run.status !== 0) throw new Error(run.stderr || 'the grant normalizer failed');
   return JSON.parse(run.stdout);
@@ -190,7 +193,7 @@ test('a render refuses a Rust storage request after validating its scope', async
 // answers, and through `data.threwRead` when it fails, an answer's or a parse's, so the resource is a store reader
 // either way, as natively.
 test("a Rust source's store read reaches rt.js whether its call answers or fails", async () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-rust-readers-'));
+  const dir = scratch('exact-rust-readers-');
   const set = normalized('secret.keep k');
   for (const name of ['rust-data.js', 'admission.js', 'held.js', 'rt-link.js']) {
     const source = readFileSync(resolve(ROOT, 'host/web-js', name), 'utf8').replace(/'\.\.\/web\/([a-z-]+\.js)'/g, "'./$1'");
@@ -199,15 +202,16 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
   for (const name of ['http-body.js', 'grant-admission.js', 'faults.js', 'navigation.js', 'address-space.js']) writeFileSync(resolve(dir, name), hostFixtureFile(resolve(ROOT, 'host/web', name)));
   writeFileSync(resolve(dir, 'admission-data.js'), `import {createGrantSet} from './admission.js';export const rustGrantSet=createGrantSet(${JSON.stringify(set)}),tsGrantSet=createGrantSet(${JSON.stringify(normalized(''))});\n`);
   writeFileSync(resolve(dir, 'rt-link.js'), 'export const rt = {};\n');
+  writeFileSync(resolve(dir, 'storage-request.js'), "export const createStorageRequests = () => ({ run: async () => { throw new Error('storage failed'); } });\n");
   const memory = new WebAssembly.Memory({ initial: 1 }), out = 32768;
   let capture = false;
-  let output = new Uint8Array(), read = false, fails = false, unknown = false, socket = false, writes = false, cache, preload, prefetch = false, method = 'GET', abi = 11;
+  let output = new Uint8Array(), read = false, draws = 0, fails = false, unknown = false, socket = false, writes = false, cache, preload, prefetch = false, method = 'GET', abi = 12;
   let held = false, heldTag;
-  const scopes = [];
+  const scopes = [], targets = [];
   const response = fill => {
     const bytes = [], u8 = value => bytes.push(value), u32 = value => bytes.push(value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24 & 255);
     const string = value => { const encoded = new TextEncoder().encode(value); u32(encoded.length); bytes.push(...encoded); };
-    u32(11); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
+    u32(12); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
   };
   const exports = {
     memory, exact_logic_abi: () => abi, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
@@ -223,10 +227,14 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
         const u32 = () => { const n = view.getUint32(at, true); at += 4; return n; };
         const string = () => { const n = u32(), s = new TextDecoder().decode(new Uint8Array(memory.buffer, at, n)); at += n; return s; };
         string(); at += 5; // source and empty arguments
+        const kind = view.getUint8(at++), row = kind ? u32() : null;
+        const sent = kind === 3 ? view.getBigUint64(at, true) : null;
+        if (kind === 3) at += 8;
+        targets.push([code, kind, row, sent]);
         const names = Array.from({ length: u32() }, string), pairs = Array.from({ length: u32() }, () => [string(), string()]);
         scopes.push({ names, pairs });
         response(w => {
-          w.u8(2); w.u8(read ? 1 : 0); w.u32(0); w.u32(0); w.u32(writes ? 1 : 0);
+          w.u8(2); w.u8(read ? 1 : 0); w.u32(0); w.u32(draws); w.u32(writes ? 1 : 0);
           if (writes) { w.string('k'); w.u8(1); w.string('private'); }
           w.u32(0); w.u8(0); w.string('');
           if (held) w.u8(15);
@@ -248,8 +256,8 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
     const module = await import(`${pathToFileURL(resolve(dir, 'rust-data.js')).href}?readers=${Date.now()}`);
     const kept = [], data = { q: [] }, store = { map: new Map(), set(...write) { kept.push(write); } }, failed = { failed: 3, message: 'refused' };
     abi = 9;
-    await expect(module.install(data, { reader: '' }, async () => new ArrayBuffer(0))).rejects.toThrow('Rust module ABI 9 is not 11');
-    abi = 11;
+    await expect(module.install(data, { reader: '' }, async () => new ArrayBuffer(0))).rejects.toThrow('Rust module ABI 9 is not 12');
+    abi = 12;
     await module.install(data, { reader: '' }, async () => new ArrayBuffer(0));
     for (const mode of ['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached']) {
       cache = mode;
@@ -286,6 +294,18 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
     expect(() => data.answer('reader', [], store)).toThrow('invalid preload HTTP result');
     preload = undefined;
     cache = undefined;
+    for (const mutation of [false, true]) {
+      const owner = mutation ? { index: 11, parallel: true, sends: 7 } : { index: 17 };
+      const asked = data.answer('reader', [], store, 'same', mutation, false, owner);
+      const target = targets.at(-1).slice(1);
+      // Both a fulfilled failure outcome and a rejected executor retain the request's target.
+      for (const req of [asked.req, { ...asked.req, storage: '{}' }]) {
+        const outcome = await data.fetch(req);
+        expect(outcome.failed).toBe(req.storage ? 1 : 2);
+        data.parse('reader', [], outcome, store, req);
+        expect(targets.at(-1)).toEqual([4, ...target]);
+      }
+    }
     held = true;
     expect(data.answer('reader', [], store).req).toMatchObject({ held: true, method: 'GET' });
     writes = true;
@@ -320,6 +340,16 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
     capture = true;
     expect(data.answer('reader', [], store).req).toEqual({ canvas: { surface: 'ink', path: 'app:/tmp/ink.png' }, scope: '' });
     capture = false;
+    // A draw the module reports reaches a server render, a failed call's too (LLP 1069.005 D2), and is no read of the
+    // store: a module may mark one without importing the page's entropy
+    let drew = 0;
+    globalThis.__exactDrew = () => { drew++; };
+    [read, draws, fails] = [false, 1, false];
+    expect(data.answer('reader', [], store).store).toBeUndefined();
+    fails = true;
+    expect(() => data.answer('reader', [], store)).toThrow('nothing kept');
+    expect([drew, data.threwRead()]).toEqual([2, false]);
+    delete globalThis.__exactDrew; draws = 0;
     [read, fails] = [true, false];
     expect(data.answer('reader', [], store).store).toBe(true);
     expect(data.parse('reader', [], failed, store).store).toBe(true);
@@ -376,7 +406,7 @@ test("a Rust source's store read reaches rt.js whether its call answers or fails
 
 // A Rust long poll's reply that is no event (LLP 1016.000 D8): the reader counts it, and rust-data.js lands nothing of it.
 test("a Rust long poll's reply that is no event reaches no message", async () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-rust-poll-'));
+  const dir = scratch('exact-rust-poll-');
   for (const name of ['rust-data.js', 'admission.js', 'held.js']) {
     const source = readFileSync(resolve(ROOT, 'host/web-js', name), 'utf8').replace(/'\.\.\/web\/([a-z-]+\.js)'/g, "'./$1'");
     writeFileSync(resolve(dir, name), source);
@@ -394,12 +424,12 @@ export function streamed(req, _grants, message) {
   const memory = new WebAssembly.Memory({ initial: 1 }), out = 32768;
   let output = new Uint8Array();
   const exports = {
-    memory, exact_logic_abi: () => 11, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
+    memory, exact_logic_abi: () => 12, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
     exact_logic_output: () => out, exact_logic_output_len: () => output.length,
     exact_logic_call(_session, pointer) {
       const code = new Uint8Array(memory.buffer)[pointer + 4], bytes = [];
       const u32 = v => bytes.push(v & 255, v >>> 8 & 255, v >>> 16 & 255, v >>> 24 & 255), string = v => { const e = new TextEncoder().encode(v); u32(e.length); bytes.push(...e); };
-      u32(11);
+      u32(12);
       if (code === 0) { bytes.push(0); string('test.rust'); string(''); } else bytes.push(0, 0, 3);
       output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
       return 0;
@@ -521,7 +551,7 @@ test('web dispatch refuses a Rust prefetch on a send and sends a resource prefet
 // A Rust call that fails may have changed the module's own state before it failed: refused after its answer ran, or
 // trapped. The next call runs in a fresh instance, activated again, as natively (logic/src/lib.rs `run`).
 test('a Rust call after a refused or trapped one runs in a fresh instance', async () => {
-  const dir = mkdtempSync(resolve(tmpdir(), 'exact-rust-fresh-'));
+  const dir = scratch('exact-rust-fresh-');
   for (const name of ['rust-data.js', 'admission.js', 'held.js']) {
     const source = readFileSync(resolve(ROOT, 'host/web-js', name), 'utf8').replace(/'\.\.\/web\/([a-z-]+\.js)'/g, "'./$1'");
     writeFileSync(resolve(dir, name), source);
@@ -538,10 +568,10 @@ test('a Rust call after a refused or trapped one runs in a fresh instance', asyn
     const response = fill => {
       const bytes = [], u8 = value => bytes.push(value), u32 = value => bytes.push(value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24 & 255);
       const string = value => { const encoded = new TextEncoder().encode(value); u32(encoded.length); bytes.push(...encoded); };
-      u32(11); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
+      u32(12); fill({ u8, u32, string }); output = Uint8Array.from(bytes); new Uint8Array(memory.buffer, out, output.length).set(output);
     };
     return { exports: {
-      memory, exact_logic_abi: () => 11, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
+      memory, exact_logic_abi: () => 12, exact_logic_create: () => 1, exact_logic_alloc: () => 0, exact_logic_dealloc() {},
       exact_logic_output: () => out, exact_logic_output_len: () => output.length,
       exact_logic_call(_session, pointer) {
         const code = new Uint8Array(memory.buffer)[pointer + 4];
@@ -571,7 +601,7 @@ test('a Rust call after a refused or trapped one runs in a fresh instance', asyn
     expect(() => data.answer('trapped', [], store)).toThrow('unreachable');
     expect(data.answer('count', [], store).v).toBe('0');
     expect(instances).toBe(3);
-    expect(data.logic.exports.exact_logic_abi()).toBe(11);
+    expect(data.logic.exports.exact_logic_abi()).toBe(12);
   } finally {
     [WebAssembly.instantiate, WebAssembly.Instance] = [instantiate, Instance];
     rmSync(dir, { recursive: true, force: true });

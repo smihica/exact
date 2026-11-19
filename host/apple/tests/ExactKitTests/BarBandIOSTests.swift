@@ -1,6 +1,7 @@
 #if os(iOS)
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 @testable import ExactGroupedLists
 import UIKit
 
@@ -86,7 +87,7 @@ final class BarBandIOSTests: XCTestCase {
 
     func testAHeadingOfOnlySpacesIsABlankTitleWithNoQuotes() throws {
         let session = try fixture()
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController)
         XCTAssertGreaterThan(try titleInk(nav), 0, "the large title draws \"Team Board\"")
         let bar = box(nav.navigationBar), card = box(try node("persona"))
@@ -102,11 +103,11 @@ final class BarBandIOSTests: XCTestCase {
     func testTheContentBetweenTheBarAndTheListSitsBelowTheBarAndTakesATap() throws {
         let session = try fixture()
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController)
         XCTAssertEqual(route.navigationItem.title, "Team Board")
         let control = try XCTUnwrap(p.segments.control(of: try node("persona").id), "the tablist is a segmented control")
-        let list = try XCTUnwrap(p.navigation.shownScroll(try node("board")))
+        let list = try XCTUnwrap(p.navigationHost.shownScroll(try node("board")))
 
         // With content above the list the title keeps still (LLP 1115.000
         // D11.1): the large title shows, and the switcher is below it, not
@@ -137,7 +138,7 @@ final class BarBandIOSTests: XCTestCase {
     /// supplies the role, so each scheme resolves its own.
     func testARouteThatScrollsAGroupedListIsOnTheGroupedBackgroundUnderTheSwitcher() throws {
         let session = try fixture()
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let window = try XCTUnwrap(self.window)
         let switcher = box(try node("persona"))

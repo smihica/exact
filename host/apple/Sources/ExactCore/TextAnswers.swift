@@ -159,7 +159,7 @@ package final class TextAnswers: @unchecked Sendable {
         var chained: Entry?
         /// Its own copy of the key, no larger than its bytes: the caller's
         /// buffer is reused for every lookup and is as large as its longest.
-        init(hash: Int, key: [UInt8]) { self.hash = hash; self.key = key.withUnsafeBufferPointer { Array($0) } }
+        package init(hash: Int, key: [UInt8]) { self.hash = hash; self.key = key.withUnsafeBufferPointer { Array($0) } }
     }
     /// A layout pass offers one paragraph several sizes (LLP 1044 F6).
     package static let offersPerParagraph = 8

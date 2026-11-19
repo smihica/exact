@@ -8,7 +8,7 @@
 use crate::error::DecodeError;
 use crate::generated::{StyleId, StyleMask, STYLE_MASK_WORDS};
 use crate::style::{
-    Color, ColorValue, Dimension, Edge, GridPlacement, GridTracks, Transitions, Vec2,
+    Color, ColorValue, Dimension, Edge, GridPlacement, GridTracks, SizeKeyword, Transitions, Vec2,
 };
 use exact_motion::easing::MAX_LINEAR_STOPS;
 use exact_motion::{
@@ -25,6 +25,9 @@ const BORDER_COLOR: u8 = Property::COUNT as u8 + 1;
 
 /// A path's `d` (LLP 1055.000 D15): its property's code, past the wire's.
 const PATH_D: u8 = Property::D as u8 + 1;
+
+/// `filter` (LLP 1003.002 D1): its property's code, past `d`'s.
+const FILTER: u8 = Property::Filter as u8 + 1;
 
 /// Round `n` up to a multiple of 8.
 pub const fn align8(n: usize) -> usize {
@@ -158,7 +161,8 @@ impl<'a> Reader<'a> {
     /// `env()` length at the top/right/bottom/left safe-area inset, 7 a
     /// `calc()` of a percent and points, 8–13 a viewport segment's
     /// width/height/top/left/bottom/right, 14–23 a viewport length, 24 a
-    /// calculation tree) then `f32` (the points added to an inset or a
+    /// calculation tree, 30–35 a container length, LLP 1123 D16) then `f32`
+    /// (a viewport or container length's percentage, the points added to an inset or a
     /// segment length); a `calc()` carries its percent first and a second
     /// `f32`; a segment length carries its two index bytes, `x` then `y`,
     /// after the `f32` (LLP 1078 D3); a calculation tree the other forms do
@@ -188,9 +192,10 @@ impl<'a> Reader<'a> {
                 crate::style::env::decode(kind, value, x, y)
                     .ok_or(DecodeError::UnknownDimensionKind(kind))?
             }
-            14..=23 => {
-                Dimension::Viewport(crate::style::ViewportUnit::ALL[(kind - 14) as usize], value)
-            }
+            14..=23 | 30..=35 => Dimension::Viewport(
+                crate::style::ViewportUnit::from_kind(kind).expect("a unit's kind"),
+                value,
+            ),
             // A layout region's inset (LLP 1123 D10): its region and edge follow.
             25 => {
                 let (region, edge) = (self.u8()?, self.u8()?);
@@ -207,6 +212,14 @@ impl<'a> Reader<'a> {
                 Dimension::Compare(crate::style::Comparison::decode(self, style)?)
             }
             24 => return Err(DecodeError::InvalidComparison),
+            // A size keyword (LLP 1001.001 D2) after a zero `f32`.
+            26..=29 if value.to_bits() == 0 => {
+                let keyword = SizeKeyword::ALL[(kind - 26) as usize];
+                if !style.admits_size_keyword(keyword) {
+                    return Err(DecodeError::KeywordNotAdmitted { style });
+                }
+                Dimension::Keyword(keyword)
+            }
             other => return Err(DecodeError::UnknownDimensionKind(other)),
         };
         if kind != 0 && !dim.is_finite() {
@@ -361,6 +374,7 @@ impl<'a> Reader<'a> {
                 0 => TransitionProperty::All,
                 BORDER_COLOR => TransitionProperty::BorderColor,
                 PATH_D => TransitionProperty::Property(Property::D),
+                FILTER => TransitionProperty::Property(Property::Filter),
                 p => TransitionProperty::Property(
                     Property::from_wire(p - 1)
                         .filter(|p| *p != Property::ShadowColor)
@@ -379,7 +393,7 @@ impl<'a> Reader<'a> {
         }
         let transitions = Transitions(out);
         transitions
-            .validate()
+            .validate_linked()
             .map_err(DecodeError::InvalidTransition)?;
         Ok(transitions)
     }
@@ -526,7 +540,7 @@ impl Writer {
                 self.f32(0.0);
             }
             Dimension::Viewport(unit, v) => {
-                self.u8(14 + unit as u8);
+                self.u8(unit.kind());
                 self.f32(v);
             }
             Dimension::Points(v) => {
@@ -562,6 +576,10 @@ impl Writer {
                 self.u8(24);
                 self.f32(0.0);
                 c.encode(self);
+            }
+            Dimension::Keyword(k) => {
+                self.u8(26 + k as u8);
+                self.f32(0.0);
             }
         }
     }
@@ -735,7 +753,9 @@ mod tests {
         // schema. The literal makes an accidental removal of that coupling a
         // test failure whenever the byte snapshot above is intentionally moved.
         // Recomputed when the schema changes; the digest test prints the value.
-        assert_eq!(SCHEMA_DIGEST, 0x550a_101e_9a80_188e);
+        // Apple JSON record and inline style declarations participate (LLP 1172.001 E4),
+        // even when the EXWF codec bytes above stay unchanged.
+        assert_eq!(SCHEMA_DIGEST, 0x7956ad586e5233f);
     }
 
     #[test]
@@ -791,7 +811,39 @@ mod tests {
                 Ok(Dimension::Env(*edge, i as f32 * 1.5))
             );
         }
-        let mut r = Reader::new(&[26u8, 0, 0, 0, 0]);
+        // Past the container units' kinds, 30 to 35
+        let mut r = Reader::new(&[36u8, 0, 0, 0, 0]);
+        assert_eq!(
+            r.dimension(StyleId::Width, true),
+            Err(DecodeError::UnknownDimensionKind(36))
+        );
+    }
+
+    #[test]
+    fn size_keywords_round_trip_on_the_rows_that_take_them() {
+        for (i, keyword) in SizeKeyword::ALL.into_iter().enumerate() {
+            let mut w = Writer::new();
+            w.dimension(Dimension::Keyword(keyword));
+            let bytes = w.into_vec();
+            assert_eq!(bytes, [26 + i as u8, 0, 0, 0, 0]);
+            let decode = |style| Reader::new(&bytes).dimension(style, true);
+            assert_eq!(decode(StyleId::FlexBasis), Ok(Dimension::Keyword(keyword)));
+            let on_width = if keyword == SizeKeyword::Content {
+                Err(DecodeError::KeywordNotAdmitted {
+                    style: StyleId::Width,
+                })
+            } else {
+                Ok(Dimension::Keyword(keyword))
+            };
+            assert_eq!(decode(StyleId::Width), on_width);
+            assert_eq!(
+                decode(StyleId::PaddingTop),
+                Err(DecodeError::KeywordNotAdmitted {
+                    style: StyleId::PaddingTop
+                })
+            );
+        }
+        let mut r = Reader::new(&[26u8, 0, 0, 0x80, 0x3f]);
         assert_eq!(
             r.dimension(StyleId::Width, true),
             Err(DecodeError::UnknownDimensionKind(26))

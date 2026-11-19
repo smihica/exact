@@ -1,6 +1,9 @@
 // Cargo's exact unit dep-info, including the nightly's copied products.
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { EXE } from './paths.mjs';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
-import { existsSync, lstatSync, mkdirSync, statSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, statSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { beside } from '../host/web/beside.mjs';
 const under = (root, file) => {
@@ -25,9 +28,11 @@ function watchedPackage(path) {
   return existsSync(resolve(root, 'package.json')) ? root : null;
 }
 
+/** Resolve output aliases once for a collection of compiler inputs. */
+export const outputRoots = (outputs = []) => [...new Set(outputs.filter(Boolean).map(path => outputPath(resolve(path))))];
+
 /** Explicit package watches keep installed sources; incidental tool trees and actual outputs stay excluded. */
-export function watchOutput(outputs = [], inputs = []) {
-  const roots = [...new Set(outputs.filter(Boolean).map(path => outputPath(resolve(path))))];
+export function watchOutput(outputs = [], inputs = [], roots = outputRoots(outputs)) {
   const packages = [...new Set(inputs.map(watchedPackage).filter(Boolean))]
     .map(path => ({path, real:outputPath(path)})).sort((a, b) => b.path.length - a.path.length);
   const toolDirectory = name => /^(target|node_modules|\.git|\.exact|\.gradle|\.build)$/.test(name);
@@ -89,7 +94,7 @@ export function directoryInputSnapshot(path, skip = () => false) {
 }
 
 /** The receipt and drive walk the same filtered entries and record links before stopping cycles. */
-export function* watchedTree(paths, {outputs = [], skip = () => false} = {}) {
+export function* watchedTree(paths, {outputs = [], skip = () => false, roots = outputRoots(outputs)} = {}) {
   const ancestors = new Set();
   function* visit(path, excluded, top = false) {
     let info, link;
@@ -108,7 +113,7 @@ export function* watchedTree(paths, {outputs = [], skip = () => false} = {}) {
     finally { ancestors.delete(real); }
   }
   for (const path of paths) {
-    const output = watchOutput(outputs, [path]);
+    const output = watchOutput(outputs, [path], roots);
     yield* visit(resolve(path), (path, directory) => output(path, directory) || skip(path, directory), true);
   }
 }
@@ -128,8 +133,9 @@ export function packageDirectories(paths, outputs = []) {
 /** Capture compiler inputs by bytes, directory membership and the targets written in links. */
 export function buildInputCollector({outputs, nameOf, hashes, replaced}) {
   const inputs = new Map(), absent = new Map(), directories = new Map(), links = new Map();
+  let roots;
   const add = (path, optional = false, declarer = null) => {
-    for (const node of watchedTree([path], {outputs})) {
+    for (const node of watchedTree([path], {outputs, roots: roots ??= outputRoots(outputs)})) {
       const {path:input, info, link, snapshot, error} = node;
       if (replaced.has(input)) continue;
       const name = nameOf(input, declarer);
@@ -147,6 +153,47 @@ export function buildInputCollector({outputs, nameOf, hashes, replaced}) {
     }
   };
   return {inputs, absent, directories, links, add};
+}
+
+/** The inputs of the SwiftPM targets `product` consumes (`swift package
+ * describe`'s targets), added through a `buildInputCollector`. Each target's
+ * whole directory is added: SwiftPM compiles every source file under it, so
+ * a file added there is a new binary although no recorded file changed. */
+export function swiftTargetInputs(description, packageRoot, product, add) {
+  const pending = [product], seen = new Set();
+  while (pending.length) {
+    const name = pending.pop();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const unit = description.targets.find(target => target.name === name);
+    if (!unit) throw new Error(`Swift package has no ${name}`);
+    add(resolve(packageRoot, unit.path));
+    for (const resource of unit.resources ?? []) add(resolve(packageRoot, resource.path));
+    pending.push(...(unit.target_dependencies ?? []));
+  }
+}
+
+/** Source-owned binary inputs, relocated by root instead of the builder's
+ * absolute paths. Generated products and registry caches stay with the bake. */
+export function binarySourceInputs({files, directories, absent, links, inventories = [], metadata}, roots, outputs) {
+  const skip = watchOutput(outputs);
+  const located = path => {
+    if (skip(path)) return null;
+    const root = roots.find(root => under(root.contains ?? root.path, path));
+    return root ? { root: root.name, path: relative(root.path, path).split(sep).join('/') } : null;
+  };
+  const capture = (rows, pathOf, rest) => rows.flatMap(row => {
+    const at = located(pathOf(row));
+    return at ? [{ ...at, ...rest(row) }] : [];
+  });
+  // The receipt holds this as JSON: an undefined field is absent there too.
+  return { version: 1, metadata: JSON.parse(JSON.stringify(metadata)),
+    files: capture(files, file => file.path, file => ({ sha256: file.sha256 })),
+    directories: capture([...directories.values()], dir => dir.path, dir => ({ names: dir.names })),
+    absent: capture([...absent.values()], path => path, () => ({})),
+    links: capture([...links.values()], link => link.path, link => ({ sha256: createHash('sha256').update(link.target).digest('hex') })),
+    inventories: capture(inventories, inventory => inventory.path, inventory => ({ kind: inventory.kind, identity: inventory.identity })),
+  };
 }
 
 function outputPath(path) {
@@ -429,22 +476,24 @@ export function unitDepInfo(message, workspace, metadata) {
     if (matches.length === 1) return matches[0];
     if (matches.length > 1) throw new Error(`ambiguous rustc unit dep-info for ${message.target.name}`);
   }
-  // The pinned nightly puts units under build/<package>/<hash>/out,
-  // reporting only the copied product. Watch archives use that layout too.
+  // Cargo 1.100 puts units under build/<package>/<hash>/out,
+  // reporting only the copied product, including executables.
   const pkg = metadata?.packages?.find(p => p.id === message.package_id);
-  for (const file of message.filenames.filter(path => /\.(wasm|a|rlib)$/.test(path))) {
+  for (const file of message.filenames.filter(path => /\.(wasm|a|rlib)$/.test(path) || path === message.executable)) {
     if (!pkg) continue;
     const directory = resolve(dirname(intermediate(file)), 'build', pkg.name);
     if (!existsSync(directory)) continue;
-    const bytes = readFileSync(file), matches = [], extension = file.slice(file.lastIndexOf('.'));
+    const executable = file === message.executable;
+    const bytes = readFileSync(file), matches = [], extension = executable ? (file.endsWith('.exe') ? '.exe' : '') : file.slice(file.lastIndexOf('.'));
     for (const hash of readdirSync(directory)) {
       if (!/^[a-f0-9]+$/.test(hash)) continue;
       const out = resolve(directory, hash, 'out');
       if (!existsSync(out)) continue;
-      const stem = basename(file, extension);
-      for (const name of readdirSync(out).filter(name => name === basename(file) || name === `${stem}-${hash}${extension}`)) {
+      const stem = executable ? message.target.name.replaceAll('-', '_') : basename(file, extension);
+      for (const name of readdirSync(out).filter(name => name === `${stem}${extension}` || name === `${stem}-${hash}${extension}`)) {
         const product = resolve(out, name);
-        const candidate = resolve(out, name.replace(/\.[^.]+$/, '.d').replace(extension === '.wasm' ? /^$/ : /^lib/, ''));
+        const unit = extension ? name.slice(0, -extension.length) : name;
+        const candidate = resolve(out, (executable || extension === '.wasm' ? unit : unit.replace(/^lib/, '')) + '.d');
         if (!existsSync(candidate) || statSync(product).size !== bytes.length || !readFileSync(product).equals(bytes)) continue;
         if (names(readFileSync(candidate, 'utf8'), candidate)) matches.push(candidate);
       }
@@ -460,3 +509,157 @@ export function unitDepInfo(message, workspace, metadata) {
 /** Rust's canonical source and Cargo's package roots must use the same Windows spelling. */
 export const sourcePath = (path, platform = process.platform) => platform === 'win32'
   ? path.replace(/^\\\\\?\\([A-Za-z]:\\)/, '$1').replace(/^\\\\\?\\UNC\\/i, '\\\\') : path;
+
+/** The dep-info Cargo writes beside binary `product`: `<name>.d`, beside
+ * `<name>` or `<name>.exe` alike. */
+export const depInfoOf = (product) => product.replace(/\.exe$/i, '') + '.d';
+/** The package directory of a source a dep-info lists: the path before its
+ * last `src` component, by either separator. null outside one, and for a build
+ * script's output, whose path has a `src` only when a folder above it is named so. */
+export function crateDir(file) {
+  if (buildScriptDir(file)) return null;
+  const at = Math.max(file.lastIndexOf('/src/'), file.lastIndexOf('\\src\\'));
+  return at < 0 ? null : file.slice(0, at);
+}
+/** The build script directory of a file under its `out/`, in either
+ * Cargo layout and by either separator. null for others. */
+export const buildScriptDir = (file) => /^(.*[\\/]build[\\/][^\\/]+(?:[\\/][0-9a-f]+)?)[\\/]out[\\/]/.exec(file)?.[1] ?? null;
+
+/** Cargo's build-script stdout in the stable and nightly directory layouts. */
+export const buildScriptOutput = dir => [resolve(dir, 'output'), resolve(dir, 'run/stdout')].find(existsSync);
+
+/** Manifests and locks are Cargo inputs even though rustc does not list them. */
+function manifestInputs(dirs) {
+  const inputs = new Set(), manifests = new Map();
+  const manifest = dir => {
+    const path = resolve(dir, 'Cargo.toml');
+    if (!manifests.has(path)) manifests.set(path, existsSync(path) ? Bun.TOML.parse(readFileSync(path, 'utf8')) : null);
+    return manifests.get(path);
+  };
+  for (const dir of dirs) {
+    inputs.add(resolve(dir, 'Cargo.toml'));
+    let workspace = dir;
+    const declared = manifest(dir)?.package?.workspace;
+    if (declared) workspace = resolve(dir, declared);
+    else for (let at = dir; ; at = dirname(at)) {
+      if (manifest(at)?.workspace) { workspace = at; break; }
+      if (at === dirname(at)) break;
+    }
+    inputs.add(resolve(workspace, 'Cargo.toml'));
+    const lock = resolve(workspace, 'Cargo.lock');
+    if (existsSync(lock)) inputs.add(lock);
+  }
+  return [...inputs];
+}
+
+/** Whether `product` is newer than everything Cargo's dep-info `dep` says
+ * it was built from, its manifests and locks, and what the build scripts declared
+ * (`cargo:rerun-if-changed`, beside each `out/` it read). */
+export function fresh(product, dep, also = []) {
+  try {
+    const text = readFileSync(dep, 'utf8');
+    const files = text.slice(text.indexOf(': ') + 2).trim().split(/(?<!\\)\s+/).map(f => f.replace(/\\ /g, ' '));
+    // A build script's relative paths are its package's: the package is
+    // found by name among the crate roots the dep-info lists.
+    const roots = new Map();
+    for (const f of files) {
+      const dir = crateDir(f);
+      if (dir && !roots.has(dir)) roots.set(dir, /^name\s*=\s*"([^"]+)"/m.exec(readFileSync(resolve(dir, 'Cargo.toml'), 'utf8'))?.[1]);
+    }
+    const built = statSync(product).mtimeMs;
+    // A directory is watched whole, as Cargo scans one.
+    const newer = f => { const st = statSync(f); return st.mtimeMs > built || (st.isDirectory() && readdirSync(f).some(n => newer(resolve(f, n)))); };
+    if ([...also, ...manifestInputs(roots.keys())].some(newer)) return false;
+    const byName = new Map([...roots].map(([dir, name]) => [name, dir]));
+    for (const o of new Set(files.map(buildScriptDir).filter(Boolean))) {
+      const name = /[\\/]build[\\/](.+?)(?:-[0-9a-f]+|[\\/][0-9a-f]+)$/.exec(o)?.[1];
+      const dir = byName.get(name);
+      const output = buildScriptOutput(o);
+      for (const m of readFileSync(output, 'utf8').matchAll(/^cargo:(?::)?rerun-if-changed=(.+)$/gm)) files.push(resolve(dir, m[1]));
+    }
+    return !files.some(newer);
+  } catch { return false; }
+}
+
+const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const CONTRACT = resolve(ROOT, 'target/debug', `contract${EXE}`);
+
+const shapeRecords = stdout => stdout.split('\n').flatMap(line => {
+  const text = /^cargo::?metadata=exact-rust-shapes=(.+)$/.exec(line)?.[1];
+  return text ? [JSON.parse(text)] : [];
+});
+
+/** Contract reads are dev-loop inputs, separate from Cargo's generated Rust watch. */
+export function rustShapeInputs(stdout) {
+  return shapeRecords(stdout).flatMap(record => [record.source,
+    ...(record.inputs && existsSync(record.inputs) ? JSON.parse(readFileSync(record.inputs, 'utf8')) : [])]);
+}
+
+/** Refresh a data crate's generated Rust before checking Cargo's inputs.
+ * The build script declares this projection in its stdout; unrelated watches
+ * still belong to Cargo. Unchanged shapes retain their bytes and mtime. */
+export function refreshRustShapes(output, env = process.env, packages = null) {
+  const stdout = readFileSync(output, 'utf8');
+  const records = shapeRecords(stdout);
+  for (const record of records) {
+    if (packages && !packages.has(resolve(record.package))) continue;
+    const path = resolve(output, output.endsWith('stdout') ? '../../out/shapes.rs' : '../out/shapes.rs');
+    const built = freshCompiler(CONTRACT);
+    const run = command => spawnSync(built ? CONTRACT : 'cargo', built ? [command, record.source]
+      : ['run', '-q', '-p', 'contract', '--bin', 'contract', '--', command, record.source], {
+      cwd: ROOT, env: { ...env, CARGO_TARGET_DIR: resolve(ROOT, 'target'), EXACT_ROOT: ROOT },
+      encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+    });
+    // This graph can change while the generated Rust stays identical. Cargo's
+    // stdout then stays unchanged, so the watcher reads the refreshed sidecar.
+    if (record.inputs) {
+      const graph = run('sources');
+      if (graph.stdout) {
+        const { sources, consulted } = JSON.parse(graph.stdout);
+        const paths = [...new Set([record.source, ...sources.map(s => s.path).filter(isAbsolute), ...consulted])].sort();
+        const text = JSON.stringify(paths);
+        if (!existsSync(record.inputs) || readFileSync(record.inputs, 'utf8') !== text) writeFileSync(record.inputs, text);
+      }
+    }
+    const result = run('rust');
+    if (result.status !== 0) {
+      // A previous configuration can name a removed or invalid entry. A missing
+      // watched output makes Cargo run the generator selected by this build;
+      // that generator reports errors for an entry that is still selected.
+      rmSync(path, { force: true });
+      continue;
+    }
+    if (!existsSync(path) || readFileSync(path, 'utf8') !== result.stdout) {
+      const temp = `${path}.${process.pid}.tmp`;
+      try { writeFileSync(temp, result.stdout); renameSync(temp, path); }
+      finally { rmSync(temp, { force: true }); }
+    }
+  }
+}
+
+/** Refresh only build scripts in this Cargo graph, in both Cargo layouts. */
+export function refreshCargoRustShapes(targetDir, target, profile, packages, env, buildDir = targetDir) {
+  const roots = new Set(packages.map(pkg => resolve(dirname(pkg.manifest_path))));
+  const names = new Set(packages.map(pkg => pkg.name));
+  const directory = profile === 'dev' ? 'debug' : profile;
+  const builds = new Set([targetDir, buildDir].filter(Boolean).flatMap(root => [resolve(root, target, directory, 'build'), resolve(root, directory, 'build')]));
+  for (const build of builds) {
+    if (!existsSync(build)) continue;
+    for (const entry of readdirSync(build, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const path = resolve(build, entry.name);
+      const dirs = names.has(entry.name) ? readdirSync(path).map(hash => resolve(path, hash))
+        : names.has(entry.name.replace(/-[0-9a-f]+$/, '')) ? [path] : [];
+      for (const dir of dirs) {
+        const output = buildScriptOutput(dir);
+        if (output) refreshRustShapes(output, env, roots);
+      }
+    }
+  }
+}
+
+/** `fresh`, for a compiler binary: also stale after an edit to the lockfile
+ * or to the manifest of the workspace or of any crate it was built from. */
+export function freshCompiler(product) {
+  return fresh(product, depInfoOf(product), [resolve(ROOT, 'Cargo.lock'), resolve(ROOT, 'Cargo.toml')]);
+}

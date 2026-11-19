@@ -1,0 +1,168 @@
+// @ref LLP 1069.001 D5 — the controls that carry a value, projected onto
+// AppKit as the checkbox is: `select` is an `NSPopUpButton`, its items read
+// from the kernel. Contract owns the value: the control moves at once,
+// reports HTML's `input` then `change`, and shows the bound value when it
+// changes, keeping the person's choice until then (D4, amended 2026-10-04).
+#if os(macOS)
+import AppKit
+import ExactKit
+
+extension ControlHost {
+    func makeValueControl(_ kind: String) -> NSControl {
+        if kind == "range" { return makeRange() }
+        if ControlKinds.dates.contains(kind) { return makeDate(kind) }
+        let popup = SelectField(frame: .zero, pullsDown: false)
+        // Each item's own `disabled`, never AppKit's validation.
+        popup.autoenablesItems = false
+        return popup
+    }
+
+    func configureValue(_ control: NSControl, _ owner: NodeView, accent: NSColor?) {
+        if let slider = control as? NSSlider { configureRange(slider, owner); return }
+        if let picker = control as? NSDatePicker { configureDate(picker, owner, accent: accent); return }
+        guard let popup = control as? NSPopUpButton else { return }
+        (popup as? SelectField)?.owner = owner
+        popup.bezelStyle = owner.inGroupedForm ? .inline : .push
+        let menu = selectMenu(owner.id)
+        guard menus[owner.id] != menu else { return }
+        menus[owner.id] = menu
+        // Items by hand: `addItems(withTitles:)` merges equal titles.
+        popup.removeAllItems()
+        for option in menu.options {
+            let item = NSMenuItem(title: option.label, action: nil, keyEquivalent: "")
+            item.representedObject = option.value
+            item.isEnabled = !option.disabled
+            popup.menu?.addItem(item)
+        }
+        popup.selectItem(at: menu.chosen ?? -1)
+    }
+
+    /// AppKit fits the widest item unless the author asks to fit the shown value.
+    func naturalSize(_ control: NSControl) -> CGSize {
+        HostPhases.shared.count(.nativeControlMeasurements)
+        let natural = control.intrinsicContentSize
+        // A slider has no width of its own: it is as wide as its node, which
+        // the plan makes `width: 100%` (LLP 1115.000 D10.2). 129 is the
+        // range's intrinsic width on every host (`ControlKind::default_size`):
+        // what the node falls back to where that has nothing to resolve against.
+        if control is NSSlider { return CGSize(width: 129, height: ceil(natural.height)) }
+        guard let popup = control as? NSPopUpButton, let cell = popup.cell else { return natural }
+        if (popup as? SelectField)?.owner?.style["field_sizing"]?.string == "content",
+           let copy = cell.copy() as? NSPopUpButtonCell {
+            let probe = NSPopUpButton(frame: .zero, pullsDown: false)
+            probe.cell = copy
+            probe.menu = NSMenu()
+            probe.addItem(withTitle: popup.titleOfSelectedItem ?? "")
+            return CGSize(width: ceil(probe.intrinsicContentSize.width), height: natural.height)
+        }
+        return CGSize(width: ceil(max(natural.width, cell.cellSize.width)), height: natural.height)
+    }
+
+    @objc func valueChanged(_ sender: NSControl) {
+        if let slider = sender as? NSSlider { rangeChanged(slider); return }
+        if let picker = sender as? NSDatePicker { dateChanged(picker); return }
+        guard let popup = sender as? NSPopUpButton, let value = popup.selectedItem?.representedObject as? String else { return }
+        chose(UInt32(sender.tag), value)
+    }
+
+    /// A choice from the menu: `input` then `change`, then the committed
+    /// value shown again, which an action that refused leaves unchanged.
+    func chose(_ id: UInt32, _ value: String) {
+        guard presenter.views[id] != nil else { return }
+        // The shown title can resize even when the action writes no bound value.
+        defer { self.sync() }
+        let before = selectMenu(id)
+        presenter.controlValue(id, value, input: true, change: true)
+        // The bound value is shown when it changes, as the web build's select:
+        // an action that wrote none leaves the person's choice showing (LLP
+        // 1069.001 D4, amended 2026-10-04).
+        guard selectMenu(id) != before else { return }
+        menus.removeValue(forKey: id)
+        if let owner = presenter.views[id], let control = controls[id] {
+            configureValue(control, owner, accent: nil)
+        }
+    }
+
+    /// The agent's `tap` on a select: its menu opens, as a click opens it.
+    /// AppKit tracks an open menu modally; the agent's requests still run
+    /// (common modes), and a `type` closes it with the choice.
+    func openValue(_ control: NSControl) -> Bool {
+        guard let popup = control as? NSPopUpButton else { return false }
+        DispatchQueue.main.async { popup.performClick(nil) }
+        return true
+    }
+
+    #if EXACT_AGENT
+    /// The agent's `type <id> <value>` (D9): the choice a menu would make.
+    func type(_ node: NodeView, _ value: String) -> [String: Any]? {
+        if let slider = controls[node.id] as? NSSlider {
+            guard slider.isEnabled, !node.inert else { return ["error": "control #\(node.id) is disabled or inert"] }
+            return typeRange(slider, node, value)
+        }
+        if let picker = controls[node.id] as? NSDatePicker {
+            guard picker.isEnabled, !node.inert else { return ["error": "control #\(node.id) is disabled or inert"] }
+            return typeDate(picker, node, value)
+        }
+        if kinds[node.id] == "radio" { return typeRadio(node, value) } // x2apps survey #2
+        // A checkbox (or `switch`) takes `true` or `false`, and is clicked when that differs, as on the web.
+        if kinds[node.id] == "checkbox" || kinds[node.id] == "switch", let control = controls[node.id] {
+            guard value == "true" || value == "false" else { return ["error": "checkbox \(node.id) takes true or false, not \"\(value)\""] }
+            if isOn(control) != (value == "true"), activate(node) != true { return ["error": "control #\(node.id) is disabled, inert or not shown"] }
+            return ["typed": Int(node.id), "checked": isOn(control), "delivery": "host-activation", "native": "control"]
+        }
+        guard let control = controls[node.id], let popup = control as? NSPopUpButton else { return nil }
+        guard control.isEnabled, !node.inert else { return ["error": "control #\(node.id) is disabled or inert"] }
+        let choice = (presenter.selectOptions?(node.id) ?? SelectMenu()).choose(value, id: node.id)
+        guard let chosen = choice.value else { return ["error": choice.refusal ?? "select \(node.id) refused \"\(value)\""] }
+        popup.menu?.cancelTracking()
+        if let index = popup.menu?.items.firstIndex(where: { $0.representedObject as? String == chosen }) { popup.selectItem(at: index) }
+        chose(node.id, chosen)
+        return ["typed": Int(node.id), "value": popup.selectedItem?.representedObject as? String ?? "", "delivery": "host-activation", "native": "control"]
+    }
+    #endif
+
+    func valueObservation(_ control: NSControl) -> [String: Any]? {
+        if let slider = control as? NSSlider {
+            return ["view": "NSSlider", "value": slider.doubleValue, "min": slider.minValue, "max": slider.maxValue]
+        }
+        if let picker = control as? NSDatePicker {
+            let empty = (picker as? DateField)?.empty == true
+            return ["view": "NSDatePicker", "value": empty ? "" : DateValue.format(kinds[UInt32(picker.tag)] ?? "date", picker.dateValue)]
+        }
+        guard let popup = control as? NSPopUpButton else { return nil }
+        let menu = menus[UInt32(popup.tag)]
+        return ["view": "NSPopUpButton", "value": menu?.chosenValue as Any, "title": popup.titleOfSelectedItem as Any,
+                "options": menu?.options.map(\.label) ?? []]
+    }
+}
+/// The pop-up itself receives focus and native editing keys; its wrapper is
+/// never a second stop. With macOS Keyboard navigation off it is no Tab stop,
+/// as an `NSPopUpButton` is none (LLP 1115.000 D7.2), unless the author's
+/// `tabindex` makes it one.
+final class SelectField: NSPopUpButton {
+    override class var cellClass: AnyClass? { get { PopupCellMac.self } set {} }
+    override func accessibilityAttributeValue(_ attribute: NSAccessibility.Attribute) -> Any? {
+        if attribute == .enabled, ariaUnavailableFromNode { return false }
+        return super.accessibilityAttributeValue(attribute)
+    }
+    weak var owner: NodeView?
+    override var acceptsFirstResponder: Bool { owner?.acceptsNativeValueFocus(self) == true }
+    override var canBecomeKeyView: Bool { acceptsFirstResponder && owner?.tabStop == true }
+    override func becomeFirstResponder() -> Bool {
+        guard acceptsFirstResponder, super.becomeFirstResponder() else { return false }
+        owner?.focusEntered()
+        return true
+    }
+    override func resignFirstResponder() -> Bool {
+        guard super.resignFirstResponder() else { return false }
+        owner?.focusLeft()
+        return true
+    }
+    override func keyDown(with event: NSEvent) {
+        guard acceptsFirstResponder else { return }
+        if owner?.nativeValueTab(event, control: self) == true { return }
+        super.keyDown(with: event)
+    }
+    override func mouseDown(with event: NSEvent) { if !contextClicked(event) { super.mouseDown(with: event) } }
+}
+#endif

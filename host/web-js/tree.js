@@ -5,16 +5,14 @@ import { listRow, listOwner, renderMarkup } from './navigation.js';
 import { Docs } from './document.js';
 import { Refusal } from './shape.js';
 import { regions } from './regions.js';
+import { declare } from './declarations.js';
 import { backdropValue as backdropCss } from './backdrop.js';
 import { onEnd, effect, say, inflight, After, Paint, Probes, Media, Links, Scrolls, Selects } from './rt.js';
-import { Adopt, adopting } from './mount.js';
-import { input } from './pieces.js';
+import { Adopt, adopting, PrepareTasks } from './mount.js';
 import { autofocusProp } from './focus.js';
 const SVG = 'http://www.w3.org/2000/svg';
 /** An element under `p`: its static class, attributes and text. */
 export function h(p, tag, cls, attrs, text, ns) {
-  // (a look snaps by its edges too, LLP 1121 D8)
-  if (attrs?.['aria-keyshortcuts'] != null || attrs?.['data-exact-looks'] != null) input();
   if (Adopt) {
     const e = adopt(p, tag, cls, attrs);
     if (tag === 'video' || tag === 'audio') Media.media(e, attrs);
@@ -185,7 +183,8 @@ const navigable = v => {
 };
 /** A dynamic prop, by the DOM name the live host uses (`applyProps`). */
 export function P(e, name, f) {
-  if (name === 'aria-keyshortcuts') input();
+  if (PrepareTasks && ['navigationKey', 'navigationBack', 'aria-selected', 'aria-controls', 'id'].includes(name))
+    (e.$taskProps ??= {})[name] = f;
   if (name === 'data-scrolldocument') Docs.add(e);
   effect(() => {
     let v = f();
@@ -215,6 +214,8 @@ export function P(e, name, f) {
       else writeValue(e, v ?? '');
       e.exactDecorations?.sync();
     } else if (name === 'scrollTop' || name === 'scrollLeft') {
+      // Kept as `$scrollTop`, `$scrollLeft`: where the scroller opens when its page arrives (fragment.js, LLP 1153 D5.1).
+      e['$' + name] = v == null ? undefined : Number(v);
       if (v != null) (Scrolls.get(e) ?? Scrolls.set(e, {}).get(e))[name] = Number(v);
     } else if (BOOL.test(name)) {
       if (name === 'inert') e.authoredInert = v === 'true';
@@ -279,10 +280,11 @@ export const mapped = (v, map, clear) =>
 export function S(e, prop, unit, f) {
   Probes?.bind(e, prop, unit, f);
   let rendered = Adopt;
-  effect(() => {
+  const fx = effect(() => {
     css(e, prop, unit, f(), rendered);
     rendered = false;
   });
+  Probes?.track(e, prop, fx);
 }
 let Scratch = null;
 const Normal = new Map(),
@@ -323,6 +325,7 @@ export function css(e, prop, unit, v, rendered) {
     t = cssText(prop, unit, v);
   if (last[prop] === t) return;
   last[prop] = t;
+  if (prop === '--') return declare(e, t);
   if (prop === '--exact-animation-trigger') {
     if (v === 'none') e.setAttribute('data-exact-animation-trigger', 'none');
     else e.removeAttribute('data-exact-animation-trigger');
@@ -337,6 +340,7 @@ export function css(e, prop, unit, v, rendered) {
     const now = e.style.getPropertyValue(prop);
     if (t == null ? !now : same(now) === (normal(prop, t) || 'unset')) return;
   }
+  if (prop in MOVES) moved(e, MOVES[prop]);
   if (t == null) return e.style.removeProperty(prop);
   // A value not yet seen is probed on the detached style `normal` keeps, so the live node gets only the final write
   // (LLP 1071.001 A8). Every property takes `unset`: one that reads back empty is a property this browser does not
@@ -344,6 +348,33 @@ export function css(e, prop, unit, v, rendered) {
   const valid = prop.startsWith('--') || t === 'unset' || normal(prop, t);
   e.style.setProperty(prop, valid ? t : 'unset');
   if (!valid) say(`unset ${prop}: ${JSON.stringify(v)} is not a value it takes`);
+}
+// A box whose transform changes frame after frame is promoted to a compositor layer of its own while it changes, as
+// `will-change` asks (CSS Will Change 1 §2): the browser then moves and scales the layer's pixels instead of
+// rasterizing its content again at each step, which for a box of iframes costs frames and input latency
+// (expo/exact#543). The hint goes once the transform has held for `SETTLED` ms, so the content is rasterized sharp
+// at its new scale. Two changes within `STEADY` ms of each other are a change every frame (a 10 Hz floor).
+const MOVES = { transform: 'transform', translate: 'translate', scale: 'scale', rotate: 'rotate', '--exact-scale': 'scale' },
+  STEADY = 100,
+  SETTLED = 200;
+function moved(e, prop) {
+  const now = performance.now(),
+    m = (e.$moved ??= { at: -Infinity, props: new Set(), timer: 0 }),
+    steady = now - m.at < STEADY;
+  m.at = now;
+  if (!steady || m.props.has(prop)) return;
+  m.props.add(prop);
+  e.style.setProperty('will-change', [...m.props].join(', '));
+  if (!m.timer) {
+    const settle = () => {
+      const held = performance.now() - m.at;
+      if (held < SETTLED) return void (m.timer = setTimeout(settle, SETTLED - held));
+      m.timer = 0;
+      m.props.clear();
+      e.style.removeProperty('will-change');
+    };
+    m.timer = setTimeout(settle, SETTLED);
+  }
 }
 /** `S` for a row that can reference an element (`url(#…)`): an authored id
  * names the node the kernel's `resolve_id` would, the nearest in the tree

@@ -638,6 +638,33 @@ fn segment_lengths_parse_resolve_and_refuse_by_name() {
             "calc(env(viewport-segment-width 0) + 1px)",
             EnvRefusal::IndexCount,
         ),
+        // A calculation's index that is no integer, as written: a number
+        // whose value is one, a dimension, an escaped digit.
+        (
+            "calc(env(viewport-segment-width 1.0 0) + 1px)",
+            EnvRefusal::IndexForm,
+        ),
+        (
+            "calc(env(viewport-segment-width 1px 0) + 1px)",
+            EnvRefusal::IndexForm,
+        ),
+        (
+            "calc(env(viewport-segment-width \\31  0) + 1px)",
+            EnvRefusal::IndexForm,
+        ),
+        (
+            "calc(env(viewport-segment-width 2147483648 0) + 1px)",
+            EnvRefusal::IndexRange,
+        ),
+        // A no-break space is part of an identifier and of a unit.
+        (
+            "calc(env(viewport-segment-width \u{a0}0 0) + 1px)",
+            EnvRefusal::IndexForm,
+        ),
+        (
+            "calc(env(viewport-segment-width 16\u{a0} 0) + 1px)",
+            EnvRefusal::IndexForm,
+        ),
     ] {
         let parsed = super::calc::parse(bad).map_err(|r| match r {
             super::calc::Refused::Env(e) => e,
@@ -1013,5 +1040,33 @@ fn scroll_snap_admits_each_axis_strictness_and_alignment() {
         assert!(style
             .set_dynamic(StyleId::ScrollSnapType, &StyleValue::Text(name.into()))
             .is_err());
+    }
+}
+#[test]
+fn native_visual_codecs_parse_and_round_trip_without_registration() {
+    use crate::wire::codec::{Reader, Writer};
+
+    for (id, text) in [
+        (
+            StyleId::BoxShadow,
+            "0 2px 4px #000, inset 1px 2px 3px 4px #fff",
+        ),
+        (StyleId::TextShadow, "1px 2px 3px light-dark(#000, #fff)"),
+        (StyleId::CornerShape, "bevel scoop superellipse(3) round"),
+        (StyleId::Rotate, "0 0 -1 30deg"),
+        (StyleId::RotateAxis, "1 1 0 30deg"),
+        (StyleId::TextStrokeWidth, "1px light-dark(#f00, #00f)"),
+        (StyleId::TextStrokeColor, "1px light-dark(#f00, #00f)"),
+        (StyleId::SymbolPalette, "#f00 light-dark(#000, #fff)"),
+    ] {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(id, &StyleValue::Text(text.into()))
+            .unwrap();
+        let mut writer = Writer::new();
+        style.encode_patch(&mut writer);
+        let bytes = writer.into_vec();
+        let decoded = StyleProps::decode_patch(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(decoded, style, "{}: {text}", id.name());
     }
 }

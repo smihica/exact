@@ -67,7 +67,7 @@ struct FieldSelection: Equatable {
     }
 }
 
-final class FieldSelections {
+package final class FieldSelections {
     unowned let presenter: Presenter
     var onChange: ((UInt32, String, FieldSelection) -> Void)?
     var onBeforeInput: ((UInt32, String, FieldSelection, FieldInput) -> Void)?
@@ -175,7 +175,7 @@ final class FieldSelections {
     }
 
     /// The editor's selection moved (the platform's notification).
-    func changed(_ node: NodeView) {
+    package func changed(_ node: NodeView) {
         guard presenter.views[node.id] === node, Self.tracks(node), let range = node.liveSelection else { return }
         var next = FieldSelection(range)
         let before = last[node.id]
@@ -196,7 +196,7 @@ final class FieldSelections {
 
     /// The field took the focus: a selection set while it had none is
     /// shown now, else the editor's is what was last seen.
-    func focused(_ node: NodeView) {
+    package func focused(_ node: NodeView) {
         guard Self.tracks(node) else { return }
         #if os(macOS)
         focused(node, by: NSApp.currentEvent)
@@ -352,7 +352,7 @@ final class FieldSelections {
     /// The event the field took the focus in, when it is a press: for that
     /// press's `pressing` (the window makes a pressed view first responder
     /// before its `mouseDown`), which alone matches its timestamp.
-    func focused(_ node: NodeView, by event: NSEvent?) {
+    package func focused(_ node: NodeView, by event: NSEvent?) {
         if let event, event.type == .leftMouseDown { pressFocus[node.id] = (event.timestamp, nil) }
     }
 

@@ -3,7 +3,7 @@
 // in the window, a paragraph's text, ink and type and whether it fits its box
 // or a clip cuts it, a control and who sized it (UIKit's own controls at
 // their own size are the platform's), what a finger at its middle reaches at
-// rest (a bar, the keyboard, a sheet, another node) and whether a scroller
+// rest (a bar, the keyboard, a sheet, a system alert, another node) and whether a scroller
 // could move it clear, a filled box's fill and edge, how far a view runs
 // past the viewport's sides, and a percentage width its own padding pushes
 // past its parent (LLP 1116.009 D5). UIKit's own labels (a native button's title, a
@@ -16,10 +16,15 @@ import UIKit
 
 extension Agent {
     func check(_ req: [String: Any]) -> [String: Any] {
-        _ = settleForPicture()
-        settleMotion()
+        finishCheckPicture()
+        if req["release"] as? Bool == true { return [:] }
+        let holding = req["capture"] as? Bool == true
+        if holding { checkPicture = preparePicture(req) }
+        else { _ = settleForPicture(); settleMotion() }
+        presenter.menus.beginCheck()
+        defer { if !holding { finishCheckPicture() } }
         let vp = presenter.viewport
-        guard let win = vp.window else { return ["error": "check: the app has no window yet"] }
+        guard let win = vp.window else { finishCheckPicture(); return ["error": "check: the app has no window yet"] }
         // What lies over a view is what a finger at its middle lands on, not the cell's widening of its field's
         // target: a touch a grouped row leaves to no control falls to the row's field, which covers nothing the
         // row draws (LLP 1116.009 D5).
@@ -27,6 +32,12 @@ extension Agent {
         NodeView.touchFallsToCellField = false
         defer { NodeView.touchFallsToCellField = falls }
         let port = vp.convert(vp.bounds, to: nil).intersection(win.bounds)
+        var controller = win.rootViewController
+        var alert: UIAlertController?
+        while let current = controller {
+            if let presented = current as? UIAlertController { alert = presented }
+            controller = current.presentedViewController
+        }
         // While a sheet is up, it is what is presented; the screen under it is not.
         let scope: UIView = presenter.modals.coordinateView ?? win
         // A dialog's sheet, and a popover over it, can be above a route's sheet and outside it.
@@ -45,6 +56,15 @@ extension Agent {
         }
         roots.forEach(findBars)
         var items: [[String: Any]] = []
+        // A menu UIKit presents to a person, which the system places, sizes and scrolls, is not the page: the painted
+        // stand-in the agent drives is left unjudged, and named as advice.
+        #if os(iOS)
+        let platformMenus = presenter.menus.platformMenus
+        #else
+        let platformMenus: [(popover: NodeView, context: Bool)] = []
+        #endif
+        let unjudged = Set(platformMenus.map { ObjectIdentifier($0.popover) })
+        func inPlatformMenu(_ v: UIView) -> Bool { sequence(first: v, next: \.superview).contains { unjudged.contains(ObjectIdentifier($0)) } }
 
         func rgba(_ c: [Double]?) -> [Double]? {
             guard let c, c.count >= 4, c[3] > 0 else { return nil }
@@ -189,7 +209,13 @@ extension Agent {
             if let top = keyboard, p.y >= top {
                 return reachable(v, hit: nil, above: false) ? nil : ["kind": "keyboard", "name": "the software keyboard"]
             }
-            guard let hit = win.hitTest(p, with: nil), hit !== v, !hit.isDescendant(of: v), !v.isDescendant(of: hit) else { return nil }
+            guard let hit = win.hitTest(p, with: nil), hit !== v, !hit.isDescendant(of: v), !v.isDescendant(of: hit), !inPlatformMenu(hit) else { return nil }
+            if let alert, !v.isDescendant(of: alert.view) {
+                // A modal alert's backdrop can lie outside its controller's view.
+                let confirmation = presenter.menus.confirmation
+                let modal = alert.preferredStyle == .alert || (confirmation?.alert === alert && confirmation?.style == .sheet)
+                if modal || hit.isDescendant(of: alert.view) { return ["kind": "alert", "name": "a system alert"] }
+            }
             var owner: UIView? = hit, bar: UIView? = nil, barBox: CGRect? = nil
             while let cur = owner, !(cur is NodeView) {
                 if cur.accessibilityIdentifier?.hasPrefix("exact.host.frame-health") == true { return nil }
@@ -291,7 +317,7 @@ extension Agent {
             let a = alpha * v.alpha
             var heldBelow = held, outBelow = out
             if let n = v as? NodeView {
-                guard !n.inert, !n.cssVisibilityHidden, !presenter.navigation.isInactiveRoute(containing: n) else { return }
+                guard !n.inert, !n.cssVisibilityHidden, !presenter.navigation.isInactiveRoute(containing: n), !unjudged.contains(ObjectIdentifier(n)) else { return }
                 let b = n.convert(n.bounds, to: nil)
                 if b.width > 0, b.height > 0, b.intersects(port) || b.intersects(win.bounds) {
                     var item: [String: Any] = rect(b).merging(["id": Int(n.id)]) { x, _ in x }
@@ -526,6 +552,7 @@ extension Agent {
         var reply: [String: Any] = ["viewport": rect(port), "capture": ["window": true, "w": r2(win.bounds.width), "h": r2(win.bounds.height)],
                                     "scheme": dark ? "dark" : "light", "target": 44, "items": items]
         if let keyboard { reply["keyboard"] = r2(keyboard) }
+        if !platformMenus.isEmpty { reply["advice"] = platformMenus.map { ["kind": "menu", "id": Int($0.popover.id), "context": $0.context] } }
         return reply
     }
 

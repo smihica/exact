@@ -2,6 +2,7 @@ import CoreGraphics
 import QuartzCore
 import XCTest
 @testable import ExactKit
+@testable import ExactGradients
 
 /// LLP 1066: `background-image` gradients as the node view paints them, held
 /// to Chrome's pictures of the parity page (`scripts/fixtures/gradients.contract`,

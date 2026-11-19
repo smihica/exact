@@ -104,10 +104,12 @@ impl<D: DataSource> Host<D> {
                 }
             }
             // (landing as any outcome does: this host settles no admission refusals of its own)
-            Dispatch::Host(_) | Dispatch::Missing => reply(Outcome::Failed {
-                kind: exact_runner::FailureKind::Refused,
-                message: "the terminal host runs only its data module's own work".into(),
-            }),
+            Dispatch::Run(Work::HttpResponse(_)) | Dispatch::Host(_) | Dispatch::Missing => {
+                reply(Outcome::Failed {
+                    kind: exact_runner::FailureKind::Refused,
+                    message: "the terminal host runs only its data module's own work".into(),
+                })
+            }
         }
     }
 
@@ -127,6 +129,10 @@ mod tests {
     use exact_plan::Value;
     use exact_runner::{Answer, DataError, DataSource, Dispatch, Outcome, Request, Store};
 
+    /// The host work these tests hand out (LLP 1047.001 D12).
+    struct TestWork;
+    impl exact_runner::HostWork for TestWork {}
+
     /// Holds every call it is asked for until `release` names one.
     #[derive(Default)]
     struct Holding {
@@ -140,7 +146,7 @@ mod tests {
         }
         fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
             self.asked += 1;
-            Ok(Answer::Later(Request::continuation(self.asked)))
+            Ok(Answer::Later(Request::continuation::<TestWork>(self.asked)))
         }
         fn dispatch(&mut self, _: u64, _: &Store) -> Dispatch {
             Dispatch::Held

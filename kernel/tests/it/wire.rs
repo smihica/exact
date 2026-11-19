@@ -275,6 +275,7 @@ fn every_nonempty_payload_padding_width_requires_zero_bytes() {
 
 #[test]
 fn calculated_grid_tracks_roundtrip_through_wire() {
+    exact_kernel::style::link_all();
     for css in [
         "repeat(auto-fill, minmax(min(100%, 200px), 1fr))",
         "calc(50% - 10px) max(20px, 10%)",
@@ -314,6 +315,7 @@ fn calculated_grid_tracks_roundtrip_through_wire() {
 
 #[test]
 fn calculated_grid_wire_allows_canonical_parentheses_at_the_author_limit() {
+    exact_kernel::style::link_all();
     let nested = |inner: &str, n: usize| {
         (0..n).fold(inner.to_string(), |e, _| format!("clamp(none, {e}, none)"))
     };
@@ -342,6 +344,7 @@ fn calculated_grid_wire_allows_canonical_parentheses_at_the_author_limit() {
 
 #[test]
 fn calculated_grid_wire_refuses_excessive_trees_and_unsupported_units() {
+    exact_kernel::style::link_all();
     use exact_kernel::wire::codec::{Reader, Writer};
     let nested = |n| (0..n).fold("1%".to_string(), |e, _| format!("clamp(none, {e}, none)"));
     for css in [

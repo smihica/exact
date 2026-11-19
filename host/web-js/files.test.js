@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { glueDeclarations } from '../web/tests/glue-fixture.mjs';
+import { glueDeclarations, glueNode } from '../web/tests/glue-fixture.mjs';
 
 mock.module('./rt.js', () => ({
   journal: [], clock: { now: 0, agent: true }, nextTicket: () => 1,
@@ -20,6 +20,29 @@ mock.module('./admission.js', () => ({ appGrantSet: () => GRANTS, coversPath }))
 
 const rt = await import('./rt.js');
 const { accepts, deliveredType, tokens, holds } = await import('./files.js');
+
+test('held document and export validators accept fully qualified Windows paths', () => {
+  const source = readFileSync(new URL('./files.js', import.meta.url), 'utf8');
+  const helpers = glueDeclarations(source, ['documentPaths', 'isAbsolutePath']);
+  const checker = (message, multiple = false) => {
+    const assignment = glueNode(source, node => node.type === 'AssignmentExpression'
+      && node.left.type === 'MemberExpression' && node.left.property.name === 'check'
+      && source.slice(node.start, node.end).includes(message) && node);
+    return new Function('Holds', 'multiple', helpers + assignment + '; return Holds[0].check;')([{}], multiple);
+  };
+  for (const check of [checker('type an absolute path'), checker('type an absolute file path')]) {
+    for (const path of [String.raw`C:\temp\selected note.md`, 'C:/temp/selected note.md', String.raw`\\server\share\note.md`, String.raw`\\?\C:\temp\note.md`, String.raw`\\?\UNC\server\share\note.md`, '/tmp/selected note.md']) {
+      expect(check(path), path).toBeNull();
+      expect(check(path + '\n'), path).toBeNull();
+    }
+    for (const path of [String.raw`C:note.md`, String.raw`\note.md`, String.raw`1:\note.md`, 'note.md', ''])
+      expect(check(path), path).toContain('absolute');
+  }
+  const many = 'C:/one note.md\nC:/two notes.md';
+  expect(checker('type an absolute path')(many)).toBe('one path, not 2');
+  expect(checker('type an absolute path', true)(many)).toBeNull();
+  expect(checker('type an absolute file path')('C:/folder/')).toContain('absolute file path');
+});
 
 test('file input accept admits any type only when unrestricted', () => {
   const absent = tokens({ getAttribute: () => null });
@@ -110,10 +133,8 @@ test('app files reach navigator.share as typed Files, guarded by canShare', asyn
 // Check every entry in both directions so adding a type to only one fails.
 test('picker admission and delivery agree on every filename MIME type', async () => {
   const rust = readFileSync(new URL('../../runner/src/runner/picker.rs', import.meta.url), 'utf8');
-  const body = rust.slice(rust.indexOf('pub fn mime_for('), rust.indexOf('/// Whether `accept`'));
-  const native = {};
-  for (const [, extensions, mime] of body.matchAll(/((?:"[a-z0-9]+"\s*\|?\s*)+) => "([^"]+)"/g))
-    for (const [, ext] of extensions.matchAll(/"([a-z0-9]+)"/g)) native[ext] = mime;
+  const body = rust.slice(rust.indexOf('const MIME_TYPES'), rust.indexOf('/// Whether `accept`'));
+  const native = Object.fromEntries([...body.matchAll(/\("([a-z0-9]+)", "([^"]+)"\)/g)].map(([, ext, mime]) => [ext, mime]));
   const js = readFileSync(new URL('./files.js', import.meta.url), 'utf8');
   const table = new Function(glueDeclarations(js, ['MIME']) + '; return MIME;')();
   const source = readFileSync(new URL('../web/picker-glue.js', import.meta.url), 'utf8');

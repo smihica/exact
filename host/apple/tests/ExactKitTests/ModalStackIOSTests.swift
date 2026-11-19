@@ -1,8 +1,8 @@
 #if os(iOS)
 import UIKit
 import XCTest
-import Network
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// Sheets and their navigation stacks (LLP 1075.003 §9, LLP 1035.003 D5):
 /// a second sheet waits for the first presentation, and Back inside a sheet
@@ -82,20 +82,20 @@ final class ModalStackIOSTests: XCTestCase {
         let p = session.presenter, agent = Agent(session: session)
         try press(session, "home-open-inline")
         until("the background stack settles") { !agent.nativeInFlight() }
-        let primary = try XCTUnwrap(p.navigation.primaryNavigation)
+        let primary = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let background = primary.viewControllers
         XCTAssertEqual(background.count, 2)
-        let backgroundBack = try XCTUnwrap(p.navigation.observation()["nativeBack"] as? String)
+        let backgroundBack = try XCTUnwrap(p.navigationHost.observation()["nativeBack"] as? String)
         try press(session, "inline-open-sheet")
-        until("the sheet's own navigation settles") { p.navigation.modalNavigation != nil && !agent.nativeInFlight() }
-        let secondary = try XCTUnwrap(p.navigation.modalNavigation)
+        until("the sheet's own navigation settles") { p.navigationHost.modalNavigation != nil && !agent.nativeInFlight() }
+        let secondary = try XCTUnwrap(p.navigationHost.modalNavigation)
         XCTAssertEqual(secondary.viewControllers.count, 1)
-        XCTAssertNil(p.navigation.observation()["nativeBack"] as? String, "the sheet's root cannot target Back behind it")
+        XCTAssertNil(p.navigationHost.observation()["nativeBack"] as? String, "the sheet's root cannot target Back behind it")
         try press(session, "sheet-open-long")
         until("the secondary push settles") { secondary.viewControllers.count == 2 && !agent.nativeInFlight() }
         let longKey = try XCTUnwrap((secondary.topViewController as? RouteController)?.key)
         let sheetKey = try XCTUnwrap((secondary.viewControllers.first as? RouteController)?.key)
-        let secondaryBack = try XCTUnwrap(p.navigation.observation()["nativeBack"] as? String)
+        let secondaryBack = try XCTUnwrap(p.navigationHost.observation()["nativeBack"] as? String)
         XCTAssertEqual(secondaryBack, secondary.view.accessibilityIdentifier)
         XCTAssertNotEqual(secondaryBack, backgroundBack)
         let scroll = try XCTUnwrap(try node(session, "long-scroll").scroll)
@@ -109,8 +109,8 @@ final class ModalStackIOSTests: XCTestCase {
         XCTAssertNil(agent.type(["id": Int(editor.id), "text": "Secondary draft"])["error"])
         _ = secondary.popViewController(animated: true)
         XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
-        until("Back returns within the sheet") { secondary.viewControllers.count == 2 && p.navigation.selectedKey == longKey && !agent.nativeInFlight() }
-        XCTAssertTrue(p.navigation.modalNavigation === secondary)
+        until("Back returns within the sheet") { secondary.viewControllers.count == 2 && p.navigationHost.selectedKey == longKey && !agent.nativeInFlight() }
+        XCTAssertTrue(p.navigationHost.modalNavigation === secondary)
         XCTAssertNotNil(secondary.view.window)
         let restoredScroll = try XCTUnwrap(try node(session, "long-scroll").scroll)
         XCTAssertEqual(restoredScroll.contentOffset.y, offset.y, accuracy: 0.5)
@@ -118,14 +118,38 @@ final class ModalStackIOSTests: XCTestCase {
         XCTAssertEqual(try stateSlots(session)["query"] as? String, "Secondary draft")
         _ = secondary.popViewController(animated: true)
         XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
-        until("the sheet returns to its root") { secondary.viewControllers.count == 1 && p.navigation.selectedKey == sheetKey && !agent.nativeInFlight() }
-        XCTAssertEqual(p.navigation.selectedKey, sheetKey, session.agent(#"{"op":"state"}"#))
-        XCTAssertNil(p.navigation.observation()["nativeBack"] as? String)
+        until("the sheet returns to its root") { secondary.viewControllers.count == 1 && p.navigationHost.selectedKey == sheetKey && !agent.nativeInFlight() }
+        XCTAssertEqual(p.navigationHost.selectedKey, sheetKey, session.agent(#"{"op":"state"}"#))
+        XCTAssertNil(p.navigationHost.observation()["nativeBack"] as? String)
         XCTAssertEqual(primary.viewControllers, background)
         _ = agent.back()
-        until("the sheet dismisses") { p.navigation.modalNavigation == nil && !agent.nativeInFlight() }
+        until("the sheet dismisses") { p.navigationHost.modalNavigation == nil && !agent.nativeInFlight() }
         XCTAssertEqual(primary.viewControllers, background)
-        XCTAssertEqual(p.navigation.observation()["nativeBack"] as? String, backgroundBack)
+        XCTAssertEqual(p.navigationHost.observation()["nativeBack"] as? String, backgroundBack)
+    }
+
+    /// A sheet dismissed while a route is pushed inside it goes whole, back to
+    /// the route beneath it, as its swipe down and a tap behind it do.
+    func testDismissingASheetFromARoutePushedInsideItLeavesTheWholeSheet() throws {
+        guard UIApplication.shared.connectedScenes.contains(where: { $0 is UIWindowScene }) else {
+            throw missing("scene", "the secondary navigation stack uses UIKit's presented sheet")
+        }
+        let session = try fixture("pushed-inside-dismissal", plan: "EXACT_PUSHED_TITLE_PLAN", fullScreen: true)
+        let p = session.presenter, agent = Agent(session: session)
+        try press(session, "home-open-inline")
+        until("the background stack settles") { !agent.nativeInFlight() }
+        let primary = try XCTUnwrap(p.navigationHost.primaryNavigation)
+        let background = primary.viewControllers
+        let inlineKey = try XCTUnwrap((primary.topViewController as? RouteController)?.key)
+        try press(session, "inline-open-sheet")
+        until("the sheet's own navigation settles") { p.navigationHost.modalNavigation != nil && !agent.nativeInFlight() }
+        let secondary = try XCTUnwrap(p.navigationHost.modalNavigation)
+        try press(session, "sheet-open-long")
+        until("the push inside the sheet settles") { secondary.viewControllers.count == 2 && !agent.nativeInFlight() }
+        XCTAssertEqual(p.modalHost.agentDismiss(), "", "the sheet is dismissed from the route pushed inside it")
+        until("the sheet dismisses") { p.navigationHost.modalNavigation == nil && !agent.nativeInFlight() }
+        XCTAssertEqual(p.navigationHost.selectedKey, inlineKey)
+        XCTAssertEqual(primary.viewControllers, background)
     }
 
     func testBackHistoryUsesTheChosenDestinationInThePrimaryStack() throws {
@@ -138,7 +162,7 @@ final class ModalStackIOSTests: XCTestCase {
             try press(session, target)
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
         }
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         try checkHistoryJump(session, in: nav, destination: "/inline")
     }
 
@@ -156,7 +180,7 @@ final class ModalStackIOSTests: XCTestCase {
                 try press(session, target)
                 XCTAssertEqual(Agent(session: session).clock(["settle": true])["settled"] as? Bool, true)
             }
-            try checkHistoryMenu(session, in: XCTUnwrap(session.presenter.navigation.primaryNavigation), authoredNavigate: authoredNavigate)
+            try checkHistoryMenu(session, in: XCTUnwrap(session.presenter.navigationHost.primaryNavigation), authoredNavigate: authoredNavigate)
         }
     }
 
@@ -173,16 +197,16 @@ final class ModalStackIOSTests: XCTestCase {
             let agent = Agent(session: session)
             XCTAssertTrue(session.navigate("/detail"))
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
-            let primary = try XCTUnwrap(session.presenter.navigation.primaryNavigation), background = primary.viewControllers
+            let primary = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation), background = primary.viewControllers
             XCTAssertTrue(session.navigate("/sheet"))
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
             for target in ["sheet-detail", "detail-chat", "chat-detail", "detail-chat"] {
                 try press(session, target)
                 XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
             }
-            let secondary = try XCTUnwrap(session.presenter.navigation.modalNavigation)
+            let secondary = try XCTUnwrap(session.presenter.navigationHost.modalNavigation)
             try checkHistoryMenu(session, in: secondary, authoredNavigate: authoredNavigate)
-            XCTAssertTrue(session.presenter.navigation.modalNavigation === secondary)
+            XCTAssertTrue(session.presenter.navigationHost.modalNavigation === secondary)
             XCTAssertEqual(primary.viewControllers, background)
         }
     }
@@ -193,13 +217,13 @@ final class ModalStackIOSTests: XCTestCase {
         let root = try node(session, "navigation")
         if !authoredNavigate { root.handlers.remove("navigate") }
         let journalBefore = session.agent(#"{"op":"logs","since":0}"#)
-        let touch = try HistoryTouches(self)
+        let touch = try TouchRunner(self)
         defer { touch.connection.cancel() }
         func elements() throws -> [[String: Any]] {
             try XCTUnwrap(touch.ask(["op": "tree"])["elements"] as? [[String: Any]])
         }
         let before = try elements()
-        let container = try XCTUnwrap(session.presenter.navigation.observation()["nativeBack"] as? String)
+        let container = try XCTUnwrap(session.presenter.navigationHost.observation()["nativeBack"] as? String)
         let owner = try XCTUnwrap(before.firstIndex { $0["identifier"] as? String == container })
         let depth = try XCTUnwrap(before[owner]["depth"] as? Int)
         let buttons = before.dropFirst(owner + 1).prefix { ($0["depth"] as? Int ?? 0) > depth }
@@ -207,11 +231,7 @@ final class ModalStackIOSTests: XCTestCase {
         let back = try XCTUnwrap(buttons.count == 1 ? buttons.first : nil, "Back belongs to the active navigation container")
         func at(_ element: [String: Any]) throws -> [String: Any] {
             let frame = try XCTUnwrap(element["frame"] as? [Double])
-            let point = CGPoint(x: frame[0] + frame[2] / 2, y: frame[1] + frame[3] / 2)
-            let window = try XCTUnwrap(window), scene = try XCTUnwrap(window.windowScene)
-            let fixed = window.screen.fixedCoordinateSpace.convert(point, from: scene.coordinateSpace)
-            return ["point": [point.x, point.y], "screen": [fixed.x, fixed.y],
-                    "display": [window.screen.bounds.width, window.screen.bounds.height]]
+            return try TouchRunner.aim(CGPoint(x: frame[0] + frame[2] / 2, y: frame[1] + frame[3] / 2), in: XCTUnwrap(window))
         }
         var hold = try at(back)
         hold.merge(["op": "drag", "to": hold["point"]!, "screenTo": hold["screen"]!, "press": 0.8, "hold": 0.0, "velocity": 0.0]) { _, new in new }
@@ -237,50 +257,12 @@ final class ModalStackIOSTests: XCTestCase {
         let expected = Array(original.prefix(authoredNavigate ? 4 : 2))
         let target = try XCTUnwrap(expected.last as? RouteController)
         XCTAssertEqual(nav.viewControllers, expected)
-        XCTAssertEqual(session.presenter.navigation.selectedKey, target.key)
+        XCTAssertEqual(session.presenter.navigationHost.selectedKey, target.key)
         XCTAssertEqual(root.props["navigationKey"], target.key)
         XCTAssertEqual(session.routerOp?["url"] as? String, "/detail")
         let journalAfter = session.agent(#"{"op":"logs","since":0}"#)
         XCTAssertEqual(journalAfter.components(separatedBy: "(follow)").count - journalBefore.components(separatedBy: "(follow)").count, authoredNavigate ? 1 : 0)
         XCTAssertEqual(journalAfter.components(separatedBy: "(back)").count, journalBefore.components(separatedBy: "(back)").count)
-    }
-
-    private final class HistoryTouches {
-        let connection: NWConnection
-        let test: XCTestCase
-
-        init(_ test: XCTestCase) throws {
-            self.test = test
-            let env = ProcessInfo.processInfo.environment
-            let port = try XCTUnwrap(env["EXACT_TOUCH_PORT"].flatMap(UInt16.init).flatMap(NWEndpoint.Port.init(rawValue:)))
-            connection = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
-            connection.start(queue: .main)
-            _ = try ask(["token": try XCTUnwrap(env["EXACT_TOUCH_TOKEN"]), "app": try XCTUnwrap(Bundle.main.bundleIdentifier)])
-        }
-
-        func ask(_ request: [String: Any]) throws -> [String: Any] {
-            var reply: [String: Any]?, failure: Error?, bytes = Data()
-            var data = try JSONSerialization.data(withJSONObject: request)
-            data.append(10)
-            connection.send(content: data, completion: .contentProcessed { if let error = $0 { failure = error } })
-            func receive() {
-                connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, ended, error in
-                    if let data { bytes.append(data) }
-                    if let end = bytes.firstIndex(of: 10) {
-                        do { reply = try JSONSerialization.jsonObject(with: bytes.prefix(upTo: end)) as? [String: Any] }
-                        catch { failure = error }
-                    } else if let error { failure = error }
-                    else if ended { failure = NSError(domain: "HistoryTouches", code: 1, userInfo: [NSLocalizedDescriptionKey: "XCTest touch runner disconnected"]) }
-                    else { receive() }
-                }
-            }
-            receive()
-            test.waitFor("XCTest answers \(request["op"] ?? "hello")", cap: 150) { reply != nil || failure != nil }
-            if let failure { throw failure }
-            let result = try XCTUnwrap(reply)
-            XCTAssertNil(result["error"], "\(result)")
-            return result
-        }
     }
 
     func testBackHistoryFinishesHeaderSearchBeforeDispatching() throws {
@@ -295,7 +277,7 @@ final class ModalStackIOSTests: XCTestCase {
                 try press(session, target)
                 XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
             }
-            let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation), original = nav.viewControllers
+            let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation), original = nav.viewControllers
             let search = try XCTUnwrap(nav.topViewController?.navigationItem.searchController)
             let field = search.searchBar.searchTextField
             until("the source's search field takes focus") { field.isFirstResponder }
@@ -319,7 +301,7 @@ final class ModalStackIOSTests: XCTestCase {
                 XCTAssertEqual(nav.viewControllers, Array(original.prefix(2)))
                 XCTAssertEqual(session.routerOp?["url"] as? String, "/inline")
             }
-            XCTAssertEqual(session.presenter.navigation.selectedKey, (nav.topViewController as? RouteController)?.key)
+            XCTAssertEqual(session.presenter.navigationHost.selectedKey, (nav.topViewController as? RouteController)?.key)
             XCTAssertFalse(field.isFirstResponder)
             let slots = try stateSlots(session)
             XCTAssertEqual(slots["searchBlurs"] as? Int, 1)
@@ -350,7 +332,7 @@ final class ModalStackIOSTests: XCTestCase {
             }
             try press(session, presented ? "sheet-open-seek" : "home-open-seek")
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true, variant)
-            let navigation = try XCTUnwrap(presented ? session.presenter.navigation.modalNavigation : session.presenter.navigation.primaryNavigation, variant)
+            let navigation = try XCTUnwrap(presented ? session.presenter.navigationHost.modalNavigation : session.presenter.navigationHost.primaryNavigation, variant)
             let item = try XCTUnwrap(navigation.topViewController?.navigationItem, variant)
             let search = try XCTUnwrap(item.searchController, variant), field = search.searchBar.searchTextField
             until("the search field takes focus (\(variant))") { field.isFirstResponder }
@@ -405,11 +387,11 @@ final class ModalStackIOSTests: XCTestCase {
             try press(session, target)
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
         }
-        let primary = try XCTUnwrap(p.navigation.primaryNavigation), background = primary.viewControllers
-        let secondary = try XCTUnwrap(p.navigation.modalNavigation)
+        let primary = try XCTUnwrap(p.navigationHost.primaryNavigation), background = primary.viewControllers
+        let secondary = try XCTUnwrap(p.navigationHost.modalNavigation)
         try checkHistoryJump(session, in: secondary, destination: "/sheet", remaining: 1)
-        XCTAssertNil(p.navigation.observation()["nativeBack"] as? String)
-        XCTAssertTrue(p.navigation.modalNavigation === secondary)
+        XCTAssertNil(p.navigationHost.observation()["nativeBack"] as? String)
+        XCTAssertTrue(p.navigationHost.modalNavigation === secondary)
         XCTAssertEqual(primary.viewControllers, background)
     }
 
@@ -426,7 +408,7 @@ final class ModalStackIOSTests: XCTestCase {
             let root = try node(session, "navigation")
             if !authoredNavigate { root.handlers.remove("navigate") }
             let journalBefore = session.agent(#"{"op":"logs","since":0}"#)
-            let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+            let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
             try checkHistoryJump(session, in: nav, destination: "/detail")
             let journalAfter = session.agent(#"{"op":"logs","since":0}"#)
             XCTAssertEqual(journalAfter.components(separatedBy: "(follow)").count - journalBefore.components(separatedBy: "(follow)").count, authoredNavigate ? 1 : 0)
@@ -447,16 +429,16 @@ final class ModalStackIOSTests: XCTestCase {
                 try press(session, target)
                 XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
             }
-            let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+            let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
             let original = nav.viewControllers
             _ = nav.popToViewController(original[remaining - 1], animated: true)
             XCTAssertNotNil(nav.transitionCoordinator, "the app navigates before UIKit finishes")
             XCTAssertTrue(session.navigate("/short"))
-            let selected = session.presenter.navigation.selectedKey
+            let selected = session.presenter.navigationHost.selectedKey
             XCTAssertEqual(session.routerOp?["url"] as? String, "/short")
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
             XCTAssertEqual(session.routerOp?["url"] as? String, "/short")
-            XCTAssertEqual(session.presenter.navigation.selectedKey, selected)
+            XCTAssertEqual(session.presenter.navigationHost.selectedKey, selected)
             XCTAssertEqual(Array(nav.viewControllers.prefix(original.count)), original)
             XCTAssertEqual(nav.viewControllers.count, original.count + 1)
             session.destroy()
@@ -473,14 +455,14 @@ final class ModalStackIOSTests: XCTestCase {
             try press(session, target)
             XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
         }
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation), original = nav.viewControllers
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation), original = nav.viewControllers
         let destination = try XCTUnwrap(original[1] as? RouteController)
         destination.node.props["navigationKey"] = "authored-inline"
-        p.navigation.sync(wireBatch([]))
+        p.navigationHost.sync(wireBatch([]))
         _ = nav.popToViewController(destination, animated: true)
         XCTAssertEqual(agent.clock(["settle": true])["settled"] as? Bool, true)
         XCTAssertEqual(nav.viewControllers, original)
-        XCTAssertEqual(p.navigation.selectedKey, (original.last as? RouteController)?.key)
+        XCTAssertEqual(p.navigationHost.selectedKey, (original.last as? RouteController)?.key)
         XCTAssertEqual(session.routerOp?["url"] as? String, "/edit")
         XCTAssertTrue(session.agent(#"{"op":"logs","since":0}"#).contains("the destination has no router visit"))
     }
@@ -493,7 +475,7 @@ final class ModalStackIOSTests: XCTestCase {
         XCTAssertEqual(popped.count, 4 - remaining)
         XCTAssertEqual(Agent(session: session).clock(["settle": true])["settled"] as? Bool, true)
         XCTAssertEqual(nav.viewControllers, expected, "the router must not reintroduce routes UIKit skipped")
-        XCTAssertEqual(session.presenter.navigation.selectedKey, target.key)
+        XCTAssertEqual(session.presenter.navigationHost.selectedKey, target.key)
         XCTAssertEqual(session.routerOp?["url"] as? String, destination)
     }
 
@@ -501,7 +483,7 @@ final class ModalStackIOSTests: XCTestCase {
     func testTheWaitReturnsAtOnceWithNoSheetMoving() throws {
         let session = try fixture("sheet-wait-idle")
         let started = Date()
-        XCTAssertTrue(session.agentInstance.awaitModalTransitions())
+        XCTAssertTrue(session.agentInstance.awaitTransitions())
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.1)
     }
 
@@ -516,7 +498,7 @@ final class ModalStackIOSTests: XCTestCase {
     /// `scripts/smoke-native.mjs` on a simulator.
     func testASheetOverAPresentingSheetWaitsAndTheAgentWaitsWithIt() throws {
         let session = try fixture("sheet-over-presenting-sheet")
-        let modals = session.presenter.modals
+        let modals = session.presenter.modalHost
         try press(session, "sheet")
         XCTAssertEqual(presented().count, 1, "Sheet is being presented")
         XCTAssertTrue(modals.inTransition)
@@ -525,7 +507,7 @@ final class ModalStackIOSTests: XCTestCase {
         XCTAssertEqual(presented().count, 1, "the menu waits while Sheet presents")
         XCTAssertEqual(modals.routes.map { $0.node.props["testId"] }, ["route-sheet"])
         let started = Date()
-        XCTAssertFalse(session.agentInstance.awaitModalTransitions(bound: 0.3), "the wait covers Sheet still presenting")
+        XCTAssertFalse(session.agentInstance.awaitTransitions(bound: 0.3), "the wait covers Sheet still presenting")
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.3)
     }
 
@@ -570,7 +552,7 @@ final class ModalStackIOSTests: XCTestCase {
             ["op": "children", "id": 1, "ids": [2]],
             ["op": "roots", "ids": [1]],
         ])
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let rooms = try XCTUnwrap(session.presenter.views[2]), row = try XCTUnwrap(session.presenter.views[3])
         XCTAssertFalse(navigation.isInactiveRoute(containing: row))
         // Open the sheet: the root names its visit, which its route carries.
@@ -635,7 +617,7 @@ final class ModalStackIOSTests: XCTestCase {
             ["op": "children", "id": 1, "ids": [2, 20, 4]],
             ["op": "props", "id": 1, "set": ["navigationKey": "old"]],
         ]))
-        until("the old route is presented") { presented().count == 1 && !p.modals.inTransition }
+        until("the old route is presented") { presented().count == 1 && !p.modalHost.inTransition }
         p.dialogCommand("showModal", "form")
         until("the page dialog is over the old route") { presented().count == 2 && !p.menus.inTransition }
         let dialog = try XCTUnwrap(p.views[20])
@@ -646,11 +628,11 @@ final class ModalStackIOSTests: XCTestCase {
             ["op": "props", "id": 1, "set": ["navigationKey": "replacement"]],
         ]))
         until("the replacement route and restored dialog are both presented") {
-            p.modals.routes.last?.node.id == 6 && presented().count == 2 && !p.modals.inTransition && !p.menus.inTransition
+            p.modalHost.routes.last?.node.id == 6 && presented().count == 2 && !p.modalHost.inTransition && !p.menus.inTransition
         }
-        XCTAssertTrue(p.menus.sheets.isOpen(dialog))
-        XCTAssertTrue(p.menus.sheets.top?.presentingViewController === p.modals.owner)
-        XCTAssertEqual(p.navigation.selectedKey, "replacement")
+        XCTAssertTrue(p.dialogHost.isOpen(dialog))
+        XCTAssertTrue(p.dialogHost.top?.presentingViewController === p.modalHost.owner)
+        XCTAssertEqual(p.navigationHost.selectedKey, "replacement")
     }
 
 }

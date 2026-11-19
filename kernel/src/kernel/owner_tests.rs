@@ -5,7 +5,7 @@ use crate::id::Offer;
 use crate::wire::Op;
 use crate::{HostCover, NodeType, StyleId, StyleValue};
 
-fn style(id: ViewId, rows: &[(StyleId, &str)]) -> Op {
+pub(in crate::kernel) fn style(id: ViewId, rows: &[(StyleId, &str)]) -> Op {
     let mut patch = StyleProps::default();
     for (row, value) in rows {
         let value = match value.parse::<f64>() {
@@ -20,7 +20,7 @@ fn style(id: ViewId, rows: &[(StyleId, &str)]) -> Op {
     }
 }
 
-fn create(ids: impl IntoIterator<Item = ViewId>) -> Vec<Op> {
+pub(in crate::kernel) fn create(ids: impl IntoIterator<Item = ViewId>) -> Vec<Op> {
     (ids.into_iter())
         .map(|id| Op::CreateView {
             id,
@@ -29,7 +29,7 @@ fn create(ids: impl IntoIterator<Item = ViewId>) -> Vec<Op> {
         .collect()
 }
 
-fn children(id: ViewId, children: &[ViewId]) -> Op {
+pub(in crate::kernel) fn children(id: ViewId, children: &[ViewId]) -> Op {
     Op::SetChildren {
         id,
         children: children.to_vec(),
@@ -217,12 +217,16 @@ fn the_term_parses_writes_back_and_crosses_the_wire() {
         "var(--exact-safe-area-inset-top, 4px)",
         "var(--exact-accent)",
         "var(--exact-safe-area-inset-middle)",
-        "calc(var(--Exact-safe-area-inset-top) + 1px)",
     ] {
         let mut props = StyleProps::default();
         let text = StyleValue::Text(refused.into());
         assert!(props.set_dynamic(TOP, &text).is_err(), "{refused}");
     }
+    // Custom property names are case-sensitive: this is an author's, which a
+    // node may declare (LLP 1123 D5)
+    let mut props = StyleProps::default();
+    let text = StyleValue::Text("calc(var(--Exact-safe-area-inset-top) + 1px)".into());
+    assert!(props.set_dynamic(TOP, &text).is_ok());
 }
 
 #[test]
@@ -242,6 +246,22 @@ fn a_box_moved_or_mounted_into_an_owner_reads_its_insets() {
     k.apply(0, 3, &ops).unwrap();
     layout(&mut k);
     assert_eq!(k.node(7).unwrap().frame.height, 83.0);
+}
+
+/// An inset override resolves where the subtree's insets are made, which
+/// knows no box's query containers, so it refuses a container unit alone or
+/// in a math function (D16), and keeps a viewport unit.
+#[test]
+fn an_override_refuses_a_container_unit() {
+    for text in ["10cqw", "calc(10px + 2cqmin)"] {
+        let mut patch = StyleProps::default();
+        let refused = patch.set_dynamic(OVERRIDES[0], &StyleValue::Text(text.into()));
+        assert!(refused.is_err(), "{text}");
+    }
+    let mut patch = StyleProps::default();
+    assert!(patch
+        .set_dynamic(OVERRIDES[0], &StyleValue::Text("10vw".into()))
+        .is_ok());
 }
 
 /// D9: overrides on one node that read one another resolve in dependency

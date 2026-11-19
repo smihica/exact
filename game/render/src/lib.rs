@@ -19,6 +19,9 @@ mod cull;
 mod cull_tests;
 mod frame;
 pub mod hooks;
+/// Recipe: blended geometry in a hook stage.
+#[doc = include_str!("../../recipes/blended-hook-geometry.md")]
+pub mod blended_hook_geometry {}
 mod ibl;
 mod lights;
 mod local_shadows;
@@ -57,7 +60,8 @@ pub use exact_game;
 /// GPU surface ABI, also used by module! without a direct dependency.
 pub use exact_gpu;
 pub use hooks::{
-    FrameView, HookGpu, HookTime, HookWork, Hooks, Needs, PostInputs, RenderWorld, SceneCopy,
+    FrameView, FrameWork, HookGpu, HookTime, HookWork, Hooks, Needs, PostInputs, RenderWorld,
+    SceneCopy,
 };
 pub use models::ModelExecutor;
 pub use surface::{Executor, WorldSurface};
@@ -564,7 +568,7 @@ macro_rules! module {
     ($game:ty, audio_mode $assets:tt) => { $crate::module!($game, audio_mode $assets, (), &[]); };
     ($game:ty, audio_mode $assets:tt, $hooks:ty, $shaders:expr) => {
         #[derive(Default)]
-        struct GameAudio(exact_game_audio::SurfacePlayer, Option<$crate::exact_game::audio::Sounds>);
+        struct GameAudio(::exact_game_audio::SurfacePlayer, Option<$crate::exact_game::audio::Sounds>);
         impl $crate::Executor for GameAudio {
             fn wants_audio(&self) -> bool { true }
             fn clock(&mut self, seekable: bool) { self.0.clock(seekable); }
@@ -617,13 +621,14 @@ macro_rules! module {
             <$game as $crate::exact_game::Game>::NAME,
             <<$game as $crate::exact_game::Game>::Args as $crate::exact_game::Args>::FIELDS,
         );
+        /// The game's tuning table names as a JSON list when `text` is empty, else `text` once it validates as its tables.
         #[cfg(target_arch = "wasm32")]
-        #[wasm_bindgen::prelude::wasm_bindgen]
-        pub fn exact_game_tables(text: &str) -> Result<String, wasm_bindgen::JsValue> {
+        #[::wasm_bindgen::prelude::wasm_bindgen]
+        pub fn exact_game_tables(text: &str) -> Result<String, ::wasm_bindgen::JsValue> {
             if text.is_empty() {
-                return $crate::exact_game::json::to_string(&<$game as $crate::exact_game::Game>::TABLES.iter().map(|t| t.name.to_owned()).collect::<Vec<_>>()).map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()));
+                return $crate::exact_game::json::to_string(&<$game as $crate::exact_game::Game>::TABLES.iter().map(|t| t.name.to_owned()).collect::<Vec<_>>()).map_err(|e| ::wasm_bindgen::JsValue::from_str(&e.to_string()));
             }
-            $crate::exact_game::asset::validate_tables::<$game>(text).map_err(|e| wasm_bindgen::JsValue::from_str(&e.to_string()))?;
+            $crate::exact_game::asset::validate_tables::<$game>(text).map_err(|e| ::wasm_bindgen::JsValue::from_str(&e.to_string()))?;
             Ok(text.into())
         }
     };

@@ -1,9 +1,10 @@
 import { test, expect } from 'bun:test';
 import { conformArgs } from './conform-args.mjs';
-import { clockOnAll, clockVerdict, parseStep } from './conform-steps.mjs';
+import { clockOnAll, clockVerdict, failedTests, parseStep } from './conform-steps.mjs';
 import { open } from '../../scripts/agent.mjs';
-import { launchFacts, suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { chromium, launchFacts, suiteBrowser } from '../../scripts/agent-launch.mjs';
 import { browserMissing } from '../../scripts/agent-playwright.mjs';
+import { linuxBinary } from '../../scripts/app.mjs';
 import { need } from '../../scripts/coverage.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -11,11 +12,13 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
 
+const chromeTest = need('chrome', chromium().unavailable);
+
 // Load the comparisons without starting the harness's builds and browser drives.
 const comparisonSource = readFileSync(resolve(import.meta.dir, 'conform.mjs'), 'utf8');
 async function fixtureDrive(browser, {
   refuse = null, broken = null, unavailable = null, poison = null, screenshotError = null,
-  appTests = false, settleAfterRefusal = false, knownTree = false,
+  appTests = false, settleAfterRefusal = false, knownTree = false, evaluate = async () => null, shot = async () => null, cut = [],
   script = 'tap scripted\nrefused tap refused\nreload\nwheel auto 12\nclock +5',
 } = {}) {
   const events = [], sessions = [], shots = [];
@@ -25,8 +28,10 @@ async function fixtureDrive(browser, {
   const deps = {
     ...comparisons, crossBrowser: browser, crossBrowsers: browser?.split(',') ?? [],
     readyBrowsers: browser?.split(',') ?? [], maxSteps: 3,
+    // What the JS page's build cut that a stand-in page holds at every step: `cut`, as `uncut` says each.
+    pageCut: () => cut, uncut: async (_evaluate, held) => held,
     STATE_KEYS: ['slots'], LINUX_APART: {}, LINUX_OPS: [], linuxFor: () => null, linuxRef: false,
-    root: '/checkout', here: '/checkout/host/web-js', resolve, parseStep, clockOnAll,
+    root: '/checkout', here: '/checkout/host/web-js', resolve, parseStep, clockOnAll, failedTests,
     resolveApp: () => ({ dir: '/fixture' }),
     existsSync: path => path.endsWith('.steps') || (appTests && path.endsWith('app.test.contract')),
     readFileSync: path => path.endsWith('.steps') ? script : '',
@@ -60,8 +65,9 @@ async function fixtureDrive(browser, {
       const { browser } = options;
       events.push([browser, 'open', options]);
       if (browser === unavailable) throw new Error('engine unavailable');
+      const index = sessions.length;
       const session = {
-        browser, value: 0, pending: ['boot'], carrier: { evaluate: async () => null },
+        browser, value: 0, pending: ['boot'], carrier: { evaluate: source => evaluate(source, index) },
         state: async () => {
           events.push([browser, 'state']);
           return { slots: { value: session.value } };
@@ -89,7 +95,7 @@ async function fixtureDrive(browser, {
           return {};
         },
         screenshot: async path => {
-          shots.push([browser, path]);
+          shots.push([browser, path, await shot(index)]);
           if (browser === screenshotError) throw new Error('capture unavailable');
         },
         close: async () => { events.push([browser, 'close']); },
@@ -136,6 +142,32 @@ test('the wasm and JS drive still delivers every step to its two Chrome pages', 
   expect(run.report.failures).toEqual([]);
   expect(run.report.steps.map(s => s.step)).toEqual(['boot', 'tap scripted', 'refused tap refused', 'reload', 'wheel auto 12', 'clock +5', 'tap auto', 'clock +60000']);
   expect(run.report.steps.every(s => !s.browser && s.differences === 0)).toBe(true);
+  // A JS page holding what its build cut (LLP 1047.003 D1, LLP 1047.002 D2.1, D4.2) fails each step it is seen at.
+  const cut = await fixtureDrive(null, { cut: ['t:dialog, which its sheet was cut for'] });
+  expect(cut.report.failures.filter(f => /^cut: .* has t:dialog, which its sheet was cut for$/.test(f.what)).map(f => f.step))
+    .toEqual(cut.report.steps.map(s => s.step));
+});
+
+chromeTest('conformance screenshots pin only auto images to one filter, after both pages agree on each image\'s', async () => {
+  const browser = await suiteBrowser();
+  const markup = first => `<img style="image-rendering:${first}"><img style="image-rendering:crisp-edges"><div style="image-rendering:pixelated"><img></div><img>`;
+  const modes = page => page.locator('img').evaluateAll(images => images.map(image => [getComputedStyle(image).imageRendering, image.getAttribute('style')]));
+  try {
+    const agreeing = [await browser.newPage(), await browser.newPage()];
+    for (const page of agreeing) await page.setContent(markup('auto'));
+    const run = await fixtureDrive(null, { evaluate: (source, i) => agreeing[i].evaluate(source), shot: i => modes(agreeing[i]) });
+    const captured = [['pixelated', 'image-rendering:auto'], ['crisp-edges', 'image-rendering:crisp-edges'], ['pixelated', null], ['pixelated', null]];
+    expect(run.shots.length).toBeGreaterThan(0);
+    for (const [, , seen] of run.shots) expect(seen.map(([mode]) => mode)).toEqual(captured.map(([mode]) => mode));
+    expect(run.report.failures).toEqual([]);
+    for (const page of agreeing) {
+      expect(await modes(page)).toEqual([['auto', 'image-rendering:auto'], ['crisp-edges', 'image-rendering:crisp-edges'], ['pixelated', null], ['auto', null]]);
+    }
+    const apart = [await browser.newPage(), await browser.newPage()];
+    await apart[0].setContent(markup('auto')); await apart[1].setContent(markup('crisp-edges'));
+    const disagreeing = await fixtureDrive(null, { evaluate: (source, i) => apart[i].evaluate(source) });
+    expect(disagreeing.report.failures.some(f => /image-rendering/.test(f.what))).toBe(true);
+  } finally { await browser.close(); }
 });
 
 test('one engine can refuse, fail to open or lose its tree while the other finishes', async () => {
@@ -525,7 +557,7 @@ test('a cached hidden copy cannot shadow the visible box with the same testId', 
   expect(diffLayout(layout, { nodes: [layout.nodes[1]] }, cached, selected)).toHaveLength(0);
 });
 
-test('a visible descendant of a hidden cached panel still fails conformance', async () => {
+chromeTest('a visible descendant of a hidden cached panel still fails conformance', async () => {
   const browser = await suiteBrowser('chromium');
   try {
     const page = await browser.newPage();
@@ -556,7 +588,7 @@ test('a visible descendant of a hidden cached panel still fails conformance', as
   } finally { await browser.close(); }
 });
 
-test('differing visible folded text in a hidden cached panel fails conformance', async () => {
+chromeTest('differing visible folded text in a hidden cached panel fails conformance', async () => {
   const browser = await suiteBrowser('chromium');
   try {
     // A folded text is its box's `display: contents` child, with no box of its own (host/web/src/element.rs, `folds`).
@@ -583,7 +615,7 @@ test('differing visible folded text in a hidden cached panel fails conformance',
   } finally { await browser.close(); }
 });
 
-test('visible painted runs in a hidden cached panel still fail conformance', async () => {
+chromeTest('visible painted runs in a hidden cached panel still fail conformance', async () => {
   const modules = new Set(['textflow-glue.js', 'timer-glue.js', 'timer-waits-glue.js', 'timer-observations.js']);
   const server = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch(request) {
     const name = new URL(request.url).pathname.slice(1);
@@ -785,6 +817,49 @@ test('URL comparison does not select its URLs or label as apps', () => {
   expect(options['--label']).toBe('preview');
 });
 
+test('conformance finds Linux agent binaries with primary or package GPU modules', () => {
+  const dir = mkdtempSync(resolve(import.meta.dir, '../../target/conform-linux-'));
+  const apps = Object.fromEntries([
+    ['plain', false, {}], ['primary', true, {}], ['package', false, { sky: ['sky'] }], ['render', false, {}],
+  ].map(([name, hasGpu, modules]) => [name, {
+    target: resolve(dir, name, 'target'), hasGpu, manifest: { gpu: { modules } }, crate: () => `${name}-linux`,
+  }]));
+  const bindings = { root: dir, resolve, existsSync, readFileSync, linuxBinary,
+    resolveApp: name => apps[name], linuxRef: true, LINUX_APART: {} };
+  const source = comparisonSource.slice(comparisonSource.indexOf('const linuxCrate ='), comparisonSource.indexOf('// A TypeScript fixture'));
+  const linuxFor = new Function(...Object.keys(bindings), source + '; return linuxFor;')(...Object.values(bindings));
+  try {
+    for (const [name, app] of Object.entries(apps)) {
+      const manifest = resolve(dir, 'apps', name, 'linux/Cargo.toml');
+      mkdirSync(dirname(manifest), { recursive: true });
+      writeFileSync(manifest, `[package]\nname = "${app.crate()}"\n`);
+      const binary = linuxBinary(app, name === 'render' ? 'render-server' : app.crate());
+      mkdirSync(dirname(binary), { recursive: true }); writeFileSync(binary, 'built');
+      const reference = linuxFor({ name, app: name });
+      if (name === 'render') expect(reference.why).toContain('no render-linux binary built');
+      else expect(reference).toEqual({});
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('conformance delegates Linux builds to the host builder and reports failed builds', async () => {
+  const builds = [], report = { failures: [] }, root = '/checkout';
+  const apps = ['plain', 'primary', 'package', 'render'];
+  const bindings = {
+    root, apps, planFixtures: [{ data: 'package' }], resolve,
+    linuxRef: true, engineReady: true, argv: ['--build'], process: { execPath: process.execPath, env: {} }, report,
+    linuxCrate: name => `${name}-linux`, resolveApp: () => ({ target: '/checkout/target', workspace: root }),
+    spawned: async (command, args) => {
+      builds.push([command, args]);
+      return { status: args.includes('package') ? 1 : 0, stderr: 'package GPU build failed' };
+    },
+  };
+  const source = comparisonSource.slice(comparisonSource.indexOf("if (linuxRef && argv.includes('--build')"), comparisonSource.indexOf('const targets = apps.map'));
+  await new Function(...Object.keys(bindings), `return (async () => { ${source} })();`)(...Object.values(bindings));
+  expect(builds).toEqual(apps.map(name => [process.execPath, [resolve(root, 'scripts/build-linux.mjs'), name]]));
+  expect(report.failures).toEqual([{ target: 'linux', step: 'linux-build package', what: 'package GPU build failed' }]);
+});
+
 test("a { slots } Linux entry skips only the slots it names; a stop skips none", async () => {
   const { withoutSlots } = await import('./conform-linux.mjs');
   const slots = { geometry: 'caret width 0', sizes: 'caret 0×18', draft: 'hi' };
@@ -866,9 +941,9 @@ test('every wasm-vs-JS comparison site records through differ, which alone tags 
   const source = readFileSync(resolve(import.meta.dir, 'conform.mjs'), 'utf8');
   expect(source).toContain('const differ = (step, what, field = null) => fail(step, what, field, !crossBrowser);');
   const sites = source.split('\n').filter(l => /\bdiffer\(step,/.test(l));
-  expect(sites.length).toBe(8);
+  expect(sites.length).toBe(9);
   for (const [i, mark] of ["differ(step, 'state ' + x)", 'differ(step, x, crossBrowser ? `tree.${i}` : null)', 'differ(step, x.what, crossBrowser ? x.field : null)',
-    'op.forEach(x => differ(step, x))', 'differ(step, `screenshot: ', 'differ(step, `bound refusals: ', 'differ(step, `sound lines: ', 'differ(step, `storage lines: '].entries()) expect(sites[i], mark).toContain(mark);
+    'op.forEach(x => differ(step, x))', 'differ(step, `image-rendering: ', 'differ(step, `screenshot: ', 'differ(step, `bound refusals: ', 'differ(step, `sound lines: ', 'differ(step, `storage lines: '].entries()) expect(sites[i], mark).toContain(mark);
   // No other call passes `fail`'s difference flag, and Linux's comparisons fail as they are.
   expect(source.split('\n').filter(l => /\bfail\([^\n]*,\s*(?:true|!crossBrowser)\)/.test(l) && !l.includes('const differ ='))).toEqual([]);
   expect(source).toContain("o.forEach(x => fail(step, 'linux ' + x));");
@@ -907,9 +982,21 @@ test('bound comparisons include the evaluation and words while joining view and 
   const start = comparisonSource.indexOf('const boundReasons =');
   const end = comparisonSource.indexOf('}).filter((r, i, all) => r !== all[i - 1]);', start) + '}).filter((r, i, all) => r !== all[i - 1]);'.length;
   const reasons = new Function(source + comparisonSource.slice(start, end) + '; return boundReasons;')();
+  for (const [kind, suffix] of [
+    ['CallLimit', ': past the 65,536 derive calls one evaluation may take'],
+    ['CallDepth', ': past 64 derive call levels'],
+  ]) {
+    const reason = `Trap(${kind} { pc: 19 })${suffix}`;
+    expect(reasons([`site 0: text trapped ${reason}; unset`])).toEqual([reason]);
+  }
   const suffix = ': past the 65,536 list steps one evaluation may take';
   expect(reasons([`poisoned: Instance(Trap(IterationLimit { pc: 17 })) in view 12 (site 58) each subject${suffix}`]))
     .toEqual(reasons([`poisoned: Instance(Trap(IterationLimit { pc: 17 })) in site 58 each subject${suffix}`]));
   expect(reasons([`refused: Trap(IterationLimit { pc: 17 }) in derive "a"${suffix}`]))
     .not.toEqual(reasons([`refused: Trap(IterationLimit { pc: 17 }) in derive "b"${suffix}`]));
+});
+
+test('a failed test\'s detail leaves out a long test\'s progress and the property count', () => {
+  const output = ['test "a": FAIL', '  a: line 3: expected 1', 'still running test "b": 30s, at line 9 of 12 (drag)', 'properties on web: 4 always line checks', 'test "b": FAIL', '  b: line 9: no', '1 passed, 2 failed'].join('\n');
+  expect(failedTests(output)).toEqual(['test "a": FAIL | a: line 3: expected 1', 'test "b": FAIL | b: line 9: no']);
 });

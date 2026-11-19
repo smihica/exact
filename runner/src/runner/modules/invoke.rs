@@ -71,6 +71,7 @@ pub(super) enum To {
 
 /// A handler awaiting a request of its own.
 struct Running {
+    completion: Option<crate::CompletionReply>,
     module: Option<crate::ModuleInstance>,
     fetch: Option<u64>,
     continuation: Option<u64>,
@@ -171,7 +172,11 @@ impl<D: DataSource> Runner<D> {
     /// "handle", "handler", "args"}`: refused unless the call that made
     /// `handle` listed `handler`, else run; `reply` is given `{"text"}`,
     /// the handler's value as JSON, or `{"error", "message"}`, once.
-    pub fn invoke_module(&mut self, body: &str, reply: Box<dyn FnOnce(String) + Send>) {
+    pub(super) fn invoke_module_linked(
+        &mut self,
+        body: &str,
+        reply: Box<dyn FnOnce(String) + Send>,
+    ) {
         let v: Json = serde_json::from_str(body).unwrap_or_default();
         let text = |field: &str| v[field].as_str().unwrap_or_default().to_owned();
         let (extension, handle, handler) = (text("extension"), text("handle"), text("handler"));
@@ -251,6 +256,7 @@ impl<D: DataSource> Runner<D> {
         final_of: Option<u64>,
     ) {
         let run = Running {
+            completion: None,
             module: self
                 .data
                 .module_identity(&format!("tool:{handler}"))
@@ -359,6 +365,7 @@ impl<D: DataSource> Runner<D> {
                 if request.module.is_some() {
                     run.module = request.module.clone();
                 }
+                run.completion = None;
                 run.effects = request.has_effects();
                 run.fetch = request.fetch;
                 run.continuation = request.continuation;
@@ -368,6 +375,7 @@ impl<D: DataSource> Runner<D> {
                 match self.process_refusal(&request) {
                     Some(why) => self.refuse_tool(ticket, why, false),
                     None => self.requests.push(RequestOut {
+                        completion: None,
                         class: crate::RequestClass::Ordered,
                         ticket,
                         target: NAME.into(),
@@ -411,7 +419,7 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    pub(in crate::runner) fn failed_tool_tickets(&self) -> Vec<(u64, String)> {
+    pub(super) fn failed_tool_tickets_linked(&self) -> Vec<(u64, String)> {
         self.extensions
             .invocations
             .running
@@ -420,7 +428,7 @@ impl<D: DataSource> Runner<D> {
             .collect()
     }
 
-    pub(in crate::runner) fn discard_failed_tools(&mut self) {
+    pub(super) fn discard_failed_tools_linked(&mut self) {
         let tokens: Vec<_> = self
             .extensions
             .invocations
@@ -434,19 +442,33 @@ impl<D: DataSource> Runner<D> {
         }
     }
 
-    pub(in crate::runner) fn fail_tool(&mut self, ticket: u64, message: &str) {
+    pub(super) fn fail_tool_linked(&mut self, ticket: u64, message: &str) {
         if let Some(run) = self.extensions.invocations.running.remove(&ticket) {
             self.tool_step(run, Err(DataError::Unavailable(message.into())));
         }
     }
 
+    pub(super) fn tool_completion_linked(
+        &mut self,
+        ticket: u64,
+    ) -> Option<&mut Option<crate::CompletionReply>> {
+        Some(
+            &mut self
+                .extensions
+                .invocations
+                .running
+                .get_mut(&ticket)?
+                .completion,
+        )
+    }
+
     /// Whether `ticket` is a handler's request.
-    pub(in crate::runner) fn is_tool(&self, ticket: u64) -> bool {
+    pub(super) fn is_tool_linked(&self, ticket: u64) -> bool {
         self.extensions.invocations.running.contains_key(&ticket)
     }
 
     /// The handlers' requests in flight, for `pending` and `in_flight`.
-    pub(in crate::runner) fn tool_tickets(&self) -> Vec<(String, u64)> {
+    pub(super) fn tool_tickets_linked(&self) -> Vec<(String, u64)> {
         (self.extensions.invocations.running.keys())
             .map(|t| (NAME.to_owned(), *t))
             .collect()
@@ -454,21 +476,21 @@ impl<D: DataSource> Runner<D> {
 
     /// Whether a handler's request with effects is in flight, one the host
     /// refused at admission aside.
-    pub(in crate::runner) fn tool_effects(&self) -> bool {
+    pub(super) fn tool_effects_linked(&self) -> bool {
         let invocations = &self.extensions.invocations;
         (invocations.running.iter())
             .any(|(t, r)| r.effects && !invocations.refused.iter().any(|(x, ..)| x == t))
     }
 
     /// The least privileged origin of a handler running now, if one is.
-    pub(in crate::runner) fn tool_origin(&self) -> Option<CallOrigin> {
+    pub(super) fn tool_origin_linked(&self) -> Option<CallOrigin> {
         (self.extensions.invocations.running.values())
             .map(|r| r.origin)
             .min()
     }
 
     /// A handler's request came back: its turn resumes.
-    pub(in crate::runner) fn tool_landed(&mut self, ticket: u64, outcome: Outcome) {
+    pub(super) fn tool_landed_linked(&mut self, ticket: u64, outcome: Outcome) {
         let Some(run) = self.extensions.invocations.running.remove(&ticket) else {
             return;
         };
@@ -490,12 +512,7 @@ impl<D: DataSource> Runner<D> {
     /// The host refused a handler's request at admission: it settles in
     /// its turn, as a failure, an ordered one only once earlier ordered work
     /// has.
-    pub(in crate::runner) fn refuse_tool(
-        &mut self,
-        ticket: u64,
-        reason: &'static str,
-        ordered: bool,
-    ) {
+    pub(super) fn refuse_tool_linked(&mut self, ticket: u64, reason: &'static str, ordered: bool) {
         self.extensions
             .invocations
             .refused
@@ -503,18 +520,18 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Whether a handler's refused request may settle now.
-    pub(in crate::runner) fn has_tool_refusal(&self, allow_ordered: bool) -> bool {
+    pub(super) fn has_tool_refusal_linked(&self, allow_ordered: bool) -> bool {
         (self.extensions.invocations.refused.iter())
             .any(|(_, _, ordered)| !ordered || allow_ordered)
     }
 
     /// Whether an ordered handler request's refusal is waiting: it fences ordered work.
-    pub(in crate::runner) fn has_ordered_tool_refusal(&self) -> bool {
+    pub(super) fn has_ordered_tool_refusal_linked(&self) -> bool {
         (self.extensions.invocations.refused.iter()).any(|(_, _, ordered)| *ordered)
     }
 
     /// A handler's refused request that may settle now.
-    pub(in crate::runner) fn tool_refusal(
+    pub(super) fn tool_refusal_linked(
         &mut self,
         allow_ordered: bool,
     ) -> Option<(u64, &'static str)> {
@@ -537,6 +554,10 @@ pub(super) fn grant_handles(granted: &Granted, ids: &[String], grant: &Grant) {
     let over = granted.len().saturating_sub(KEPT);
     granted.drain(..over);
 }
+
+#[cfg(test)]
+#[path = "processes_tests.rs"]
+mod process_tests;
 
 #[cfg(test)]
 mod tests {
@@ -574,7 +595,9 @@ mod tests {
     fn boot() -> Runner<Source> {
         let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
         b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
-        let plan = b.finish().unwrap();
+        let mut plan = b.finish().unwrap();
+        // A package's handlers are the module seam's: the plan names one.
+        plan.add_view("probe", ("probe", "@fixture/probe"), false, &[], "{}");
         Runner::boot(
             plan,
             Source,
@@ -588,6 +611,7 @@ mod tests {
     /// Handler `h`'s run, answering `to`.
     fn running(to: Option<To>) -> Running {
         Running {
+            completion: None,
             module: None,
             fetch: None,
             continuation: None,
@@ -617,6 +641,56 @@ mod tests {
         let reply: Box<dyn FnOnce(String) + Send> =
             Box::new(move |answer| said.lock().unwrap().push((ticket, answer)));
         (r.extensions.invocations.running).insert(ticket, running(Some(To::Implementation(reply))));
+    }
+
+    #[test]
+    fn handler_authority_is_issued_at_handoff_and_spent_once_by_either_entry() {
+        for typed in [false, true] {
+            let mut r = boot();
+            let said = Arc::new(Mutex::new(Vec::new()));
+            let received = said.clone();
+            let reply = To::Implementation(Box::new(move |answer| {
+                received.lock().unwrap().push(answer)
+            }));
+            r.tool_step(
+                running(Some(reply)),
+                Ok(Answer::Later(Request::get("https://example.test/tool"))),
+            );
+            let ticket = r.tool_tickets()[0].1;
+            assert!(r.tool_completion(ticket).unwrap().is_none());
+            assert!(r.completion_identity.get().is_none());
+            let out = r.take_requests().pop().unwrap();
+            let slot = out.completion.as_ref().unwrap();
+            let outcome = Outcome::Failed {
+                kind: crate::FailureKind::Network,
+                message: "offline".into(),
+            };
+            assert!(matches!(
+                slot.completion(outcome.clone(), None),
+                crate::Completion::DurableOperation { .. }
+            ));
+            if typed {
+                let cap = slot.take().unwrap();
+                assert!(out.clone().completion.unwrap().take().is_none());
+                assert!(r
+                    .deliver(
+                        cap,
+                        crate::Completion::DurableOperation {
+                            outcome,
+                            timing: None
+                        }
+                    )
+                    .unwrap()
+                    .is_none());
+            } else {
+                r.fulfill(ticket, outcome).unwrap();
+                assert!(slot.take().is_none());
+            }
+            assert!(!r.holds(ticket));
+            assert_eq!(said.lock().unwrap().len(), 1);
+            r.fulfill(ticket, Outcome::Storage(vec![])).unwrap();
+            assert_eq!(said.lock().unwrap().len(), 1);
+        }
     }
 
     /// Two handlers' requests refused together each settle once, the second

@@ -18,8 +18,35 @@ impl<D: DataSource> Presenter<D> {
         self.after_commit()
     }
 
+    /// Reread Windows language, regional format and zone after a settings
+    /// notification, logging a place the runner refuses. Keep the launch
+    /// seed and the agent's supplied facts.
+    #[cfg(windows)]
+    pub fn refresh_windows_place(&mut self) {
+        if let Some(error) = self.refresh_place(crate::zone::current_place) {
+            eprintln!("exact-windows: place: {error}");
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn refresh_place(
+        &mut self,
+        read: impl FnOnce(f64) -> exact_runner::time::Place,
+    ) -> Option<String> {
+        if self.agent {
+            return None;
+        }
+        let previous = self.host.runner().place();
+        let place = read(previous.seed);
+        if &place == previous {
+            return None;
+        }
+        self.set_place(&place)
+    }
+
     /// A candidate has a new runner, but belongs to the same launch.
     pub(super) fn restore_time(&self, host: &mut Host<D>) -> Result<(), HostError> {
+        host.web_mount = self.host.web_mount.clone();
         host.set_scheme(self.dark());
         // The same launch keeps what the device said about itself.
         let runner = self.host.runner();
@@ -94,17 +121,49 @@ impl<D: DataSource> Presenter<D> {
         if error.is_some() {
             return error;
         }
+        self.dirty |= self.surfaces.reduced_motion(preferences.reduced_motion);
         self.after_commit()
     }
 
     /// `visibilityState`, `onLine`, `canShare`, `canOpenFiles` and
     /// `hasFocus`, as `exactPage()` answers them: re-answered in one commit.
     pub fn set_page(&mut self, page: exact_runner::Page) -> Option<String> {
+        let was_hidden = self.host.runner().page().hidden;
         let error = self.host.set_page(page);
+        // Hidden or frozen, nothing presents what a commit begins (LLP 1003.001 D9).
+        self.refresh_presentable();
         if error.is_some() {
             return error;
         }
-        self.after_commit()
+        let error = self.after_commit();
+        if page.hidden != was_hidden {
+            if page.hidden {
+                self.brush.trim(true);
+            } else {
+                self.repaint();
+            }
+        }
+        error
+    }
+
+    /// Android's reader composes Activity and promoted service ownership in `Exact.executionEligible`.
+    /// Apply visibility and execution together, preserving the agent's substitute.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn page_execution(&mut self, hidden: bool, eligible: bool) -> bool {
+        let page = self.host.runner().page();
+        let frozen = if self.agent { page.frozen } else { !eligible };
+        if page.hidden == hidden && page.frozen == frozen {
+            return false;
+        }
+        if let Some(error) = self.set_page(exact_runner::Page {
+            hidden,
+            frozen,
+            ..page
+        }) {
+            eprintln!("exact: page: {error}");
+        }
+        self.update_foreground(!hidden);
+        true
     }
 
     /// A live design batch or snapshot frame (LLP 1121 stage 4), in place;
@@ -391,4 +450,153 @@ pub fn scrub_frame_drawn() {
         .partition(|l| now.duration_since(l.4) > FRAME_WAIT);
     write_scrub(&late, Some(None));
     write_scrub(&fresh, Some(Some(turned)));
+}
+
+/// The app's `setScheme` argument as what a `light-dark()` colour resolves to
+/// here (LLP 1034 D2): dark, light, or, for `system`, no override.
+pub(crate) fn app_dark(scheme: Option<&exact_plan::Value>) -> Option<bool> {
+    match scheme.and_then(exact_plan::Value::as_str) {
+        Some("dark") => Some(true),
+        Some("light") => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hiding_an_inactive_window_trims_without_waiting_for_another_frame() {
+        use crate::paint::{Backend, GradientPaint, Rect4, Shape};
+        use crate::text::RunPaint;
+        use std::{cell::RefCell, rc::Rc, sync::Arc};
+        use tiny_skia::{Pixmap, Transform};
+        struct Observed(Rc<RefCell<Vec<bool>>>);
+        impl Backend for Observed {
+            crate::paints_nothing!();
+            fn name(&self) -> &'static str {
+                "observed"
+            }
+            fn begin(&mut self, _: f32, _: f32, _: f32) {}
+            fn fill(&mut self, _: &Shape, _: [u8; 4], _: Transform) {}
+            fn fill_gradient(&mut self, _: &Shape, _: &GradientPaint, _: Transform) {}
+            fn fill_border(&mut self, _: &crate::paint::border::BorderFill, _: Transform) {}
+            fn image(
+                &mut self,
+                _: &Arc<crate::image::Bitmap>,
+                _: Rect4,
+                _: &[Shape],
+                _: Transform,
+                _: Option<[u8; 4]>,
+                _: exact_kernel::ImageRendering,
+            ) {
+            }
+            fn text(
+                &mut self,
+                _: &mut crate::text::TextEngine,
+                _: &crate::text::Paragraph,
+                _: &[RunPaint],
+                _: (f32, f32),
+                _: Transform,
+            ) {
+            }
+            fn push_clip(&mut self, _: &Shape, _: Transform) {}
+            fn pop_clip(&mut self) {}
+            fn push_opacity(&mut self, _: f32) {}
+            fn pop_opacity(&mut self) {}
+            fn pointer(&mut self, _: f32, _: f32) {}
+            fn finish(&mut self) -> Result<Pixmap, String> {
+                unreachable!()
+            }
+            fn trim(&mut self, hidden: bool) {
+                self.0.borrow_mut().push(hidden);
+            }
+        }
+        let (mut p, error) = Presenter::boot_with(
+            &crate::test_plan("component App\n  view\n    box\n"),
+            (),
+            (300., 300.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let trims = Rc::new(RefCell::new(Vec::new()));
+        p.brush.replace_backend(Box::new(Observed(trims.clone())));
+        p.memory_warning();
+        p.set_window_active(false);
+        assert_eq!(*trims.borrow(), [false, false]);
+        assert!(!p.dirty(), "trimming a visible window need not repaint");
+        let page = exact_runner::Page {
+            hidden: true,
+            ..p.host.runner().page()
+        };
+        assert!(p.set_page(page).is_none());
+        assert_eq!(
+            *trims.borrow(),
+            [false, false, true],
+            "hide releases storage even after focus was lost"
+        );
+        assert!(p.set_page(page).is_none());
+        assert_eq!(
+            *trims.borrow(),
+            [false, false, true],
+            "an unchanged hidden page does not trim again"
+        );
+        p.dirty = false;
+        assert!(p
+            .set_page(exact_runner::Page {
+                hidden: false,
+                ..page
+            })
+            .is_none());
+        assert!(p.dirty, "showing the window redraws released storage");
+    }
+
+    #[test]
+    fn activity_and_service_execution_edges_update_the_page_together() {
+        let plan = crate::test_plan("shape Page\n  frozen: bool\n  visibilityState: string\ncomponent App\n  resource page = exactPage() as shape Page\n  view\n    text `${page.frozen}`\n");
+        let (mut p, error) = Presenter::boot_with(
+            &plan,
+            (),
+            (300., 300.),
+            1.,
+            std::path::PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.agent = false;
+        // Started; hidden with a promoted service; last claim released; foreground;
+        // failed promotion at stop; promotion while hidden; service destroyed.
+        for (hidden, eligible, frozen) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            p.page_execution(hidden, eligible);
+            let page = p.host.runner().page();
+            assert_eq!(page.hidden, hidden);
+            assert_eq!(page.frozen, frozen);
+            assert!(
+                !p.page_execution(hidden, eligible),
+                "duplicate reports make no commit"
+            );
+        }
+        p.agent = true;
+        let reply = crate::agent::handle(&mut p, r#"{"op":"prefer","page":{"frozen":true}}"#);
+        assert!(!reply.contains("error"), "{reply}");
+        p.page_execution(false, true);
+        assert!(
+            p.host.runner().page().frozen,
+            "live lifecycle cannot replace prefer"
+        );
+    }
 }

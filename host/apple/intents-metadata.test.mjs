@@ -42,6 +42,28 @@ test('a widget configuration intent and its AppEnum row come out under the widge
   expect(out.autoShortcuts).toEqual([]);
 });
 
+// The same widget with an entity row `station` added, compiled by Xcode's swiftc; file and line fields dropped.
+test('an entity row comes out with its entity type, its query and an optional parameter', () => {
+  const types = JSON.parse(readFileSync(new URL('./fixtures/widget-entity.swiftconstvalues', import.meta.url), 'utf8'));
+  const out = intentsMetadata(types, 27, { module: 'ExactWidgets' }), entity = 'Entity_73746174696f6e';
+  expect(Object.keys(out.entities)).toEqual([entity]);
+  expect(out.entities[entity].displayTypeName.key).toBe('Station');
+  expect(out.entities[entity].defaultQueryIdentifier).toBe(`ExactWidgets.${entity}_Query`);
+  expect(out.queries[`${entity}_Query`]).toMatchObject({ entityType: entity, defaultQueryForEntity: true });
+  expect(out.actions[intent].parameters.map(p => p.name)).toEqual(['parameter_rows', 'parameter_station']);
+  expect(out.actions[intent].parameters[1]).toMatchObject({ isOptional: true, capabilities: 0, dynamicOptionsSupport: 2,
+    typeSpecificMetadata: [], valueType: { entity: { wrapper: { typeName: entity } } } });
+});
+
+test('watch recommendations do not change the published configuration intent', () => {
+  const types = JSON.parse(readFileSync(new URL('./fixtures/watch-configuration.swiftconstvalues', import.meta.url), 'utf8'));
+  const action = types.find(t => t.properties?.some(p => p.label === 'exactRecommendations'));
+  expect(action).toBeDefined();
+  const withRecommendations = intentsMetadata(types, 27, { module: 'ExactWidgets' });
+  action.properties = action.properties.filter(p => p.label !== 'exactRecommendations');
+  expect(intentsMetadata(types, 27, { module: 'ExactWidgets' })).toEqual(withRecommendations);
+});
+
 test('the module name scopes every type, and the intents module keeps its default', () => {
   expect(() => intentsMetadata(widget(), 27)).toThrow('invalid or duplicate Swift type');
   expect(() => intentsMetadata(widget(), 27, { module: 'Exact Widgets' })).toThrow('invalid module name');
@@ -69,9 +91,10 @@ test('widget shapes outside what widgets.mjs generates fail the build', () => {
   expect(() => intentsMetadata(lostWrapper, 27, { module: 'ExactWidgets' })).toThrow('incomplete parameters');
 });
 
-// The check against Xcode: Caltrain's configured widget, as widgets.mjs generates it, through Xcode's metadata pass,
-// for iOS and watchOS (whose intent also carries recommendations). EXACT_REFERENCE_OUT=DIR keeps Xcode's extracts
-// and Swift's constant values there, for a Linux session to compare against without a Mac.
+// The check against Xcode: Caltrain's configured widget with an entity row added, as widgets.mjs generates it, through
+// Xcode's metadata pass, for iOS and watchOS (whose intent carries recommendations and no entity row).
+// EXACT_REFERENCE_OUT=DIR keeps Xcode's extracts and Swift's constant values there, for a Linux session to compare
+// against without a Mac.
 const canonical = value => {
   if (Array.isArray(value)) return value.map(canonical);
   if (value == null || typeof value !== 'object') return value;
@@ -84,17 +107,27 @@ for (const platform of ['ios', 'watchos']) {
   test.skipIf(!xcode)(`widget configuration metadata matches Xcode's extractor (${platform})`, () => {
     const dir = mkdtempSync(resolve(tmpdir(), 'exact-widget-intents-')), keep = process.env.EXACT_REFERENCE_OUT;
     const run = (command, args) => {
-      const r = spawnSync(command, args, { encoding: 'utf8', timeout: 90000 });
+      // `swiftc` leaves a `TemporaryDirectory.*` in TMPDIR each run: the children's TMPDIR is this test's directory, removed after.
+      const r = spawnSync(command, args, { encoding: 'utf8', timeout: 90000, env: { ...process.env, TMPDIR: dir } });
       if (r.status !== 0) throw new Error(`${command}: ${r.error?.message ?? ''}\n${r.stdout}\n${r.stderr}`);
       return r.stdout.trim();
     };
     try {
       const app = JSON.parse(readFileSync(new URL('../../apps/caltrain/app.json', import.meta.url), 'utf8'));
-      const entries = app.widgets.filter(w => w.configuration).map(w => ({ ...w, families: platform === 'watchos' ? w.watchFamilies : w.families }));
+      const station = { name: 'station', title: 'Station', type: 'entity', entity: 'station' };
+      const entries = app.widgets.filter(w => w.configuration).map(w => ({ ...w, families: platform === 'watchos' ? w.watchFamilies : w.families,
+        configuration: { ...w.configuration, parameters: [...w.configuration.parameters, station] } }));
       // The intents alone: the Widget structs need the host's views, which the metadata pass does not read.
-      const generated = widgetBundleSource(entries, { platform });
+      const generated = widgetBundleSource(entries, { platform, entities: { station: { title: 'Station' } } });
       const file = resolve(dir, 'Intents.swift');
-      writeFileSync(file, generated.slice(0, generated.indexOf('\nstruct Entry0')) + '\nprotocol ExactConfigurationIntent { var exactConfiguration: [String: String] { get } }\n');
+      writeFileSync(file, generated.slice(0, generated.indexOf('\nstruct Entry0')) + `
+protocol ExactConfigurationIntent { var exactConfiguration: [String: String] { get } }
+protocol ExactConfigurationEntity: AppEntity where ID == String { static var exactTitle: String { get }; init(id: String, title: String, subtitle: String?) }
+extension ExactConfigurationEntity {
+    static func exactPublished(matching text: String? = nil) -> [Self] { [] }
+    static func exactChosen(_ ids: [String]) -> [Self] { ids.map { Self(id: $0, title: exactTitle, subtitle: nil) } }
+}
+`);
       const sdkName = platform === 'watchos' ? 'watchsimulator' : 'iphonesimulator';
       const sdk = run('xcrun', ['--sdk', sdkName, '--show-sdk-path']), major = parseInt(run('xcrun', ['--sdk', sdkName, '--show-sdk-version']));
       const swiftc = run('xcrun', ['--find', 'swiftc']), toolchain = resolve(dirname(swiftc), '../..');

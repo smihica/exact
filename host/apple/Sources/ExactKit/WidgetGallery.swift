@@ -21,16 +21,25 @@ struct WidgetEntry {
     let assets: AssetResolver
     /// A configured widget's parameters (app.json `configuration`), in the Edit Widget sheet's order.
     var parameters: [WidgetParameter] = []
-    /// Each parameter at its default: what an unconfigured widget renders.
-    var defaults: [String: String] { Dictionary(uniqueKeysWithValues: parameters.map { ($0.name, $0.defaultValue) }) }
+    /// Each fixed parameter at its default, and no entity chosen: what an unconfigured widget renders.
+    var defaults: [String: String] {
+        parameters.reduce(into: [:]) { defaults, parameter in
+            if case .fixed(_, let defaultValue) = parameter.choices { defaults[parameter.name] = defaultValue }
+        }
+    }
     /// The defaults with `supplied` over them, refusing a name or value the configuration does not declare.
+    /// An entity parameter takes any entry's id: the gallery has no published list to check it against.
     func configuration(_ supplied: [String: String]) throws -> [String: String] {
         for (name, value) in supplied {
             guard let parameter = parameters.first(where: { $0.name == name }) else {
                 throw HeadlessSession.Failure(description: parameters.isEmpty ? "widget \(kind) has no configuration" : "widget --configuration: \(kind) has no parameter \(name); parameters: \(parameters.map(\.name).joined(separator: ", "))")
             }
-            guard parameter.values.contains(value) else {
-                throw HeadlessSession.Failure(description: "widget --configuration: \(name) is one of \(parameter.values.joined(separator: ", "))")
+            switch parameter.choices {
+            case .fixed(let values, _) where !values.contains(value):
+                throw HeadlessSession.Failure(description: "widget --configuration: \(name) is one of \(values.joined(separator: ", "))")
+            case .entity where value.isEmpty:
+                throw HeadlessSession.Failure(description: "widget --configuration: \(name) is an entry's id, which is not empty")
+            default: break
             }
         }
         return defaults.merging(supplied) { $1 }
@@ -38,9 +47,13 @@ struct WidgetEntry {
 }
 
 struct WidgetParameter {
+    enum Choices {
+        case fixed(values: [String], defaultValue: String)
+        /// app.json `type: "entity"`: the id of a content-index entry.
+        case entity
+    }
     let name: String
-    let values: [String]
-    let defaultValue: String
+    let choices: Choices
 }
 
 struct WidgetVariant: Hashable, Identifiable {
@@ -77,7 +90,7 @@ final class WidgetPreview: ObservableObject {
     let session: HeadlessSession
     let environment: SnapshotEnvironment
     let props: [String: Any]
-    /// The configuration rendered: the variant's choices over the defaults.
+    /// The configuration refreshed and rendered: the variant's choices over the defaults.
     let configuration: [String: String]
     let refresh: String
     let refreshReason: String?
@@ -101,11 +114,13 @@ final class WidgetPreview: ObservableObject {
             rootFontSize: Double(SnapshotDriver.bodySize(for: variant.typeSize)),
             date: date, clock: clock,
             timeZone: TimeZone(identifier: place.timeZone) ?? TimeZone(secondsFromGMT: 0)!, locale: place.locale, formatLocale: place.formatLocale, seed: place.seed)
+        configuration = try entry.configuration(variant.configuration)
+        let chosen = entry.parameters.isEmpty ? nil : try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
         var result: [String: Any] = [:]
         if suppliedProps == nil {
             let initial = try HeadlessSession(plan: plan, entry: entry.kind, size: variant.contentSize, facts: facts, assets: entry.assets)
             defer { initial.close() }
-            result = try initial.previewTimeline(at: date)
+            result = try initial.previewTimeline(at: date, configuration: chosen)
         }
         let first = (result["timeline"] as? [[String: Any]])?.first
         var given: [String: Any]?
@@ -119,8 +134,6 @@ final class WidgetPreview: ObservableObject {
         refresh = suppliedProps != nil ? "props" : first != nil ? "timeline" : result["entryRefresh"] as? String == "timeline" ? "empty" : result["entryRefresh"] as? String ?? "preview"
         refreshReason = result["reason"] as? String
         let bytes = try JSONSerialization.data(withJSONObject: props, options: [.sortedKeys])
-        configuration = try entry.configuration(variant.configuration)
-        let chosen = entry.parameters.isEmpty ? nil : try JSONSerialization.data(withJSONObject: configuration, options: [.sortedKeys])
         let rendered = try HeadlessSession(plan: plan, entry: entry.kind, props: bytes, configuration: chosen, size: variant.contentSize, facts: facts, assets: entry.assets)
         do { try rendered.advance(to: clock) } catch { rendered.close(); throw error }
         session = rendered
@@ -496,17 +509,19 @@ enum WidgetGallery {
                   let preview = value["preview"] as? [String: Any] else { return nil }
             let rows = (value["configuration"] as? [String: Any])?["parameters"] as? [[String: Any]] ?? []
             let parameters = rows.compactMap { row -> WidgetParameter? in
-                guard let name = row["name"] as? String, let values = row["values"] as? [[String: Any]],
-                      let defaultValue = row["default"] as? String else { return nil }
-                return WidgetParameter(name: name, values: values.compactMap { $0["value"] as? String }, defaultValue: defaultValue)
+                guard let name = row["name"] as? String else { return nil }
+                if row["type"] as? String == "entity" { return WidgetParameter(name: name, choices: .entity) }
+                guard let values = row["values"] as? [[String: Any]], let defaultValue = row["default"] as? String else { return nil }
+                return WidgetParameter(name: name, choices: .fixed(values: values.compactMap { $0["value"] as? String }, defaultValue: defaultValue))
             }
             return WidgetEntry(kind: kind, families: families, preview: preview, assets: assets, parameters: parameters)
         }
     }
-    /// One configuration per value a parameter takes other than its default, the others at theirs.
+    /// One configuration per value a fixed parameter takes other than its default, the others at theirs.
     static func choices(_ entry: WidgetEntry) -> [[String: String]] {
-        entry.parameters.flatMap { parameter in
-            parameter.values.filter { $0 != parameter.defaultValue }.map { [parameter.name: $0] }
+        entry.parameters.flatMap { parameter -> [[String: String]] in
+            guard case .fixed(let values, let defaultValue) = parameter.choices else { return [] }
+            return values.filter { $0 != defaultValue }.map { [parameter.name: $0] }
         }
     }
     static func activities(in assets: AssetResolver) -> [ActivityEntry] {

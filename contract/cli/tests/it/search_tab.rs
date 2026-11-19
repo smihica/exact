@@ -52,3 +52,38 @@ fn a_search_tab_is_written_last_and_once() {
         "{e}"
     );
 }
+
+/// LLP 1156.006.000 D1: a root tab bar that some branch leaves out is named,
+/// with `display="none"` as the way to hide it; one that every branch draws,
+/// or that hides by its `display`, is not.
+#[test]
+fn a_tab_bar_some_branch_leaves_out_is_named() {
+    let app = tabs(
+        "  button role=\"tab\" aria-controls=\"panel-home\" aria-selected=true\n    text \"Home\"\n  button role=\"tab\" aria-controls=\"panel-more\" aria-selected=false\n    text \"More\"",
+    );
+    assert_eq!(warned(&app), []);
+    let (head, bar) = app.split_once("      row role=\"tablist\"\n").unwrap();
+    let bar = format!(
+        "        row role=\"tablist\"\n{}",
+        bar.lines().map(|l| format!("  {l}\n")).collect::<String>()
+    );
+    let named = [("lower-tablist-conditional".to_string(), 13)];
+    let hidden = format!("{head}      if nav.tab == \"home\"\n{bar}");
+    assert_eq!(warned(&hidden), named);
+    let (_, warnings) = contract::compile_warned(&hidden);
+    assert!(
+        warnings[0]
+            .message
+            .contains("hide it with `display=\"none\"`"),
+        "{warnings:?}"
+    );
+    let repeated = format!("{head}      for x in nav.tabs key=x.name\n{bar}");
+    assert_eq!(warned(&repeated), named);
+    let either = format!("{head}      if nav.tab == \"home\"\n{bar}      else\n{bar}");
+    assert_eq!(warned(&either), []);
+    let styled = app.replace(
+        "row role=\"tablist\"",
+        "row role=\"tablist\" display=(nav.tab == \"home\" ? \"flex\" : \"none\")",
+    );
+    assert_eq!(warned(&styled), []);
+}

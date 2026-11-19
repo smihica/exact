@@ -2,6 +2,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 final class DatesMacTests: XCTestCase {
     private var window: NSWindow!

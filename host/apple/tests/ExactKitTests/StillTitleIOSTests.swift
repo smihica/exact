@@ -1,6 +1,7 @@
 #if os(iOS)
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 @testable import ExactGroupedLists
 import UIKit
 
@@ -85,7 +86,7 @@ final class StillTitleIOSTests: XCTestCase {
 
     func testTheLargeTitleStaysAsTheContentUnderTheBarChangesInPlace() throws {
         let session = try fixture()
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController)
         XCTAssertEqual(route.navigationItem.title, "Rooms")
         XCTAssertEqual(route.navigationItem.largeTitleDisplayMode, .always)
@@ -100,7 +101,9 @@ final class StillTitleIOSTests: XCTestCase {
         XCTAssertNil(route.contentScrollView(for: .top), "the list no longer follows the header, so nothing collapses the title")
         // A selection the app gives back with nil returns the edge to Exact's, which names no scroller here
         route.setContentScrollView(list, for: .top)
+        route.view.layoutIfNeeded()
         route.setContentScrollView(nil, for: .top)
+        route.view.layoutIfNeeded()
         XCTAssertNil(route.contentScrollView(for: .top), "a selection given back with nil leaves the title still")
         XCTAssertEqual(route.navigationItem.largeTitleDisplayMode, .always)
         XCTAssertGreaterThan(try titleInk(nav), 100, "'Rooms' is still drawn with the reason above the list")
@@ -126,7 +129,7 @@ final class StillTitleIOSTests: XCTestCase {
     /// drawn. Its content size also kept the port before UIKit's bottom inset.
     func testAScrollerMadeInTheListsPlaceRestsAtItsStart() throws {
         let session = try fixture()
-        let route = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController as? RouteController)
+        let route = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController)
         try tap("fail")
         try tap("clear")
         let empty = try node("rooms-empty")

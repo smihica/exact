@@ -38,6 +38,16 @@ final class SpaceHitMacTests: XCTestCase {
         return (p, p.views[1]!, p.views[2]!)
     }
 
+    func testAnAnimatedAxisUsesTheStaticSpatialTransform() {
+        let (p, _, child) = fixture(parent: [:], child: [:], frame: [50, 50, 120, 60],
+            present: [["op": "present", "id": 2, "property": "rotate", "x": -45.0, "y": 1.0, "w": 0.0, "h": 0.0]])
+        XCTAssertTrue(child.standsInSpace)
+        XCTAssertEqual(child.layer!.transform.m22, sqrt(0.5), accuracy: 1e-6)
+        XCTAssertEqual(child.layer!.transform.m11, 1, accuracy: 1e-6)
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "rotate", "x": -90.0, "y": 1.0, "w": 0.0, "h": 0.0]]))
+        XCTAssertEqual(child.layer!.transform.m22, 0, accuracy: 1e-6)
+    }
+
     /// What the mouse finds at a point in the parent's coordinates.
     private func hit(_ parent: NodeView, _ x: CGFloat, _ y: CGFloat) -> NSView? {
         parent.hitTest(parent.superview!.convert(NSPoint(x: x, y: y), from: parent))
@@ -67,6 +77,28 @@ final class SpaceHitMacTests: XCTestCase {
         XCTAssertTrue(child.bounds.contains(child.local(inWindow)), "\(child.local(inWindow))")
         XCTAssertTrue(child.pressInside(inWindow))
         XCTAssertFalse(child.pressInside(parent.convert(NSPoint(x: 140, y: 100), to: nil)))
+    }
+
+    /// A layer playing a transform animation turns about its centre
+    /// (`NodeView.anchorLayer`); the perspective it holds for its children
+    /// is about its anchor, so it is placed again as the anchor moves, both
+    /// ways, and the turned child stays where it was drawn.
+    func testAnAnimatedHolderKeepsItsPerspective() {
+        let (p, parent, child) = fixture(child: ["rotate_axis": [0, 1, 0]], degrees: 60)
+        func width() -> CGFloat {
+            let xs = [CGPoint(x: 0, y: 0), CGPoint(x: 100, y: 0), CGPoint(x: 0, y: 100), CGPoint(x: 100, y: 100)].map { NodeView.map(child.plane!, $0).x }
+            return xs.max()! - xs.min()!
+        }
+        let drawn = width()
+        XCTAssertEqual(drawn, 52.46, accuracy: 0.01)
+        p.apply(wireBatch([["op": "animations", "id": 1, "specs": [["id": "grow#0#transform.scale", "k": "transform.scale", "s": 0.0, "dl": 0.0,
+            "d": 1.0, "n": -1.0, "t": [0.0, 1.0], "v": [1.0, 2.0], "c": [], "fill": 0.0]]]]))
+        XCTAssertEqual(parent.layer?.anchorPoint, CGPoint(x: 0.5, y: 0.5))
+        XCTAssertEqual(width(), drawn, accuracy: 0.01)
+        XCTAssertTrue(hit(parent, 75, 45) === child)
+        p.apply(wireBatch([["op": "animations", "id": 1, "specs": []]]))
+        XCTAssertEqual(parent.layer?.anchorPoint, .zero)
+        XCTAssertEqual(width(), drawn, accuracy: 0.01)
     }
 
     // Moved 100 px toward the viewer under a 300 px perspective from the
@@ -193,6 +225,36 @@ final class SpaceHitMacTests: XCTestCase {
         let (_, flat, plain) = fixture(child: [:])
         XCTAssertNil(plain.plane, "an untransformed box keeps AppKit's own geometry")
         XCTAssertTrue(hit(flat, 55, 55) === plain)
+    }
+
+    /// The document reaches each box where it is drawn: a plain box outside
+    /// the root's laid-out content, and a box under a translated one, moved
+    /// with it (`documentOverflow`).
+    func testTheDocumentReachesBoxesWhereTheyAreDrawn() {
+        _ = NSApplication.shared
+        let p = Presenter()
+        p.viewport.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+        let window = NSWindow(contentRect: p.viewport.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = p.viewport
+        self.window = window
+        p.apply(wireBatch((1...5).map { ["op": "create", "id": $0, "kind": "view", "style": [String: Any]()] } + [
+            ["op": "children", "id": 1, "ids": [2, 4]],
+            ["op": "children", "id": 2, "ids": [3]],
+            ["op": "children", "id": 4, "ids": [5]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0],
+            ["op": "content", "id": 1, "w": 400.0, "h": 300.0],
+            ["op": "frame", "id": 2, "x": 10.0, "y": 10.0, "w": 100.0, "h": 50.0],
+            ["op": "frame", "id": 3, "x": 590.0, "y": 20.0, "w": 10.0, "h": 10.0],
+            ["op": "frame", "id": 4, "x": 0.0, "y": 100.0, "w": 100.0, "h": 50.0],
+            ["op": "frame", "id": 5, "x": 0.0, "y": 0.0, "w": 40.0, "h": 400.0],
+            ["op": "present", "id": 4, "property": "translate", "x": 0.0, "y": 200.0, "w": 0.0, "h": 0.0],
+        ]))
+        p.viewport.layoutSubtreeIfNeeded()
+        p.fitDocument()
+        XCTAssertEqual(p.root.frame.width, 610, accuracy: 1e-6, "the plain box's right edge: 10 + 590 + 10")
+        XCTAssertEqual(p.root.frame.height, 700, accuracy: 1e-6, "the moved box's child: 100 + 200 + 400")
     }
 }
 #endif

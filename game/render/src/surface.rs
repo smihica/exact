@@ -13,6 +13,7 @@ use exact_game::{Clock, Data, Game, Sim, World};
 use exact_gpu::{
     wgpu, AssetError, Frame, InputEvent, Lifecycle, Restore, Surface, SurfaceError, Value,
 };
+use render::observer;
 
 /// Optional presentation executor. The default `()` links no executor code.
 /// Implementations must use a discarding output whenever `seekable` is true.
@@ -80,12 +81,12 @@ pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H
     output_opaque: bool,
     frame_ready: bool,
     assets_dirty: bool,
-    // The world's model revision preparation last saw: a cosmetic model
-    // registered by `Game::present` arrives without a host delivery.
+    // Model revision preparation last saw: a `Game::present` cosmetic has no host delivery.
     models_seen: u64,
     asset_check: Option<(exact_game::WorldId, u64, u64)>,
     reported: bool,
     generation: u64,
+    picture: (u64, bool), // `Sim::picture_generation` seen; true until its first frame.
     seekable: bool,
     audio_requested: bool,
     hidden: bool,
@@ -102,6 +103,7 @@ pub struct WorldSurface<G: Game, P: Executor = (), const ASSETS: bool = false, H
     samples: Option<exact_game::SceneSamples>,
     /// This frame's timing facts (`Surface::timing`), for the hooks' `FrameView.time`.
     timing: exact_gpu::FrameTiming,
+    scheduled_cap: std::cell::Cell<u32>,
     /// Delivered textures a live renderer prepares later (`prepare_now`).
     waiting: std::collections::BTreeMap<String, exact_game::asset::TextureData>,
     /// Models a live preparation left for a later frame.
@@ -186,9 +188,29 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         self.dirty = true;
         self.error = None;
         self.reported = false;
-        self.perf.restart();
-        self.gpu_timing = None;
+        self.restart_perf();
         Ok(())
+    }
+    fn restart_perf(&mut self) {
+        self.perf.restart();
+        if let Some(budget) = &mut self.hook_clock.budget {
+            budget.reset_counters();
+        }
+        self.gpu_timing = None;
+        if let Some(metrics) = self
+            .render
+            .as_mut()
+            .and_then(|(renderer, _)| renderer.hook_metrics.as_mut())
+        {
+            metrics.disarm();
+        }
+    }
+    fn frame_cap(&self) -> u32 {
+        let game = self
+            .sim
+            .as_ref()
+            .map_or(0, |sim| G::max_fps(sim.world(), sim.args()));
+        exact_gpu::lower_cap(game, self.hooks.max_fps())
     }
     fn finish_restore(&mut self) {
         if self.sim.as_ref().is_some_and(|s| !s.is_loading()) {
@@ -264,67 +286,6 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         ))
     }
 }
-#[allow(clippy::too_many_arguments)]
-fn observer<'a, const ASSETS: bool>(
-    render: &'a mut Option<(crate::renderer::RendererWithAssets<ASSETS>, Feed)>,
-    placed: &'a mut crate::placed::Placements,
-    perf: &'a mut Perf,
-    trace: &'a mut Option<crate::trace::Trace>,
-    error: &'a mut Option<SurfaceError>,
-    hook_poses: &'a mut crate::hooks::Poses,
-    measure: bool,
-    ticks: u32,
-) -> impl FnMut(&World, u32) + 'a {
-    let mut start = (measure && (1..=240).contains(&ticks)).then(Stamp::now);
-    move |world, left| {
-        if let Some(start) = &start {
-            if left < 240 {
-                let ms = start.elapsed();
-                perf.tick.push(ms);
-                if let Some(report) = &mut perf.reporting {
-                    report.phases[0].push(ms);
-                }
-                if let Some(trace) = trace {
-                    trace.times[0] += ms;
-                }
-            }
-        }
-        if left < 2 && error.is_none() {
-            hook_poses.sync(world);
-            if let Err(e) = if ASSETS {
-                placed.feed(world)
-            } else {
-                placed.feed_primitive(world)
-            } {
-                *error = Some(SurfaceError(e.to_string()));
-            }
-            if let Some((renderer, feed)) = render {
-                if let Some(trace) = trace {
-                    trace.feed(world);
-                }
-                let upload = measure.then(Stamp::now);
-                if let Err(e) = feed.feed(world, renderer) {
-                    *error = Some(SurfaceError(e.to_string()));
-                }
-                if let Some(upload) = upload {
-                    let ms = upload.elapsed();
-                    perf.feed.push(ms);
-                    if let Some(report) = &mut perf.reporting {
-                        report.phases[1].push(ms);
-                    }
-                    if let Some(trace) = trace {
-                        trace.times[1] += ms;
-                    }
-                }
-            }
-        }
-        // Even the last observer can run on an advance-only frame.
-        if left < 2 {
-            render::retain_primes(render, placed, true);
-        }
-        start = (measure && left > 0 && left <= 240).then(Stamp::now);
-    }
-}
 impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     for WorldSurface<G, P, ASSETS, H>
 {
@@ -332,8 +293,11 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         self.raster_scale()
     }
     fn max_fps(&self) -> u32 {
-        let game = (self.sim.as_ref()).map_or(0, |sim| G::max_fps(sim.world(), sim.args()));
-        exact_gpu::lower_cap(game, crate::Hooks::max_fps(&self.hooks))
+        let cap = self.frame_cap();
+        if H::ENABLED && H::ALLOWANCE > 0 {
+            self.scheduled_cap.set(cap);
+        }
+        cap
     }
     fn timing(&mut self, timing: &exact_gpu::FrameTiming) {
         self.timing = *timing;
@@ -351,6 +315,12 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         self.retier_rung()
     }
     fn clock(&mut self, seekable: bool) {
+        if self.seekable != seekable {
+            self.perf.submitted_live = None;
+            if let Some(budget) = &mut self.hook_clock.budget {
+                budget.reset_clock();
+            }
+        }
         self.seekable = seekable;
         if let Some(report) = &mut self.perf.reporting {
             if report.clock(seekable) {
@@ -367,16 +337,32 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             Lifecycle::Visible => self.hidden = false,
             Lifecycle::Interrupted => self.interrupted = true,
             Lifecycle::Resumed => self.interrupted = false,
+            Lifecycle::Activated => {
+                self.presentation.unlock();
+                return;
+            }
             _ => return,
         }
         self.presentation.suspend(self.hidden || self.interrupted);
+        if matches!(event, Lifecycle::Hidden | Lifecycle::Interrupted) {
+            self.perf.submitted_live = None;
+        }
         self.hook_clock.reset();
     }
     fn arguments(&self) -> Vec<(&'static str, Value)> {
         self.surface_arguments()
     }
     fn bind(&mut self, values: &[Value], at_ms: Option<f64>) -> Result<(), SurfaceError> {
-        self.bind_arguments(values, at_ms)
+        self.bind_arguments(values, at_ms)?;
+        if H::ENABLED && H::ALLOWANCE > 0 {
+            if let Some(now) = at_ms {
+                self.hook_clock
+                    .budget
+                    .get_or_insert_with(Box::default)
+                    .bind(now);
+            }
+        }
+        Ok(())
     }
     fn assets(&mut self) -> exact_gpu::AssetChanges {
         if !ASSETS {
@@ -484,10 +470,10 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         if self.perf.rendering {
             return self.prepare_now(device, queue, format);
         }
-        let timing = crate::perf::PipelineTiming::start(!self.seekable);
+        let timing = crate::perf::PipelineTiming::start(!self.seekable || self.perf.armed());
         self.prepare_now(device, queue, format);
         drop(timing);
-        self.perf.pipeline_pending += crate::perf::pipeline_ms();
+        self.perf.keep_pipeline_time(self.seekable);
     }
     fn carry(&mut self) -> Result<Option<Vec<u8>>, SurfaceError> {
         self.sim
@@ -504,9 +490,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     }
 
     fn preparing(&self) -> bool {
-        self.hooks.needs().contains(crate::Needs::PENDING)
+        crate::hooks::budget::preparing(self.hooks.needs(), self.seekable)
     }
-    fn device_ready(&mut self, features: wgpu::Features) {
+    fn device_ready(&mut self, features: wgpu::Features, _: wgpu::Limits) {
         if ASSETS {
             let family_changed = self.payloads.choose(features);
             if let Some(sim) = &mut self.sim {
@@ -575,7 +561,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
     ) -> bool {
         // Pipeline time a frame leaves unread (it stopped before encoding)
         // counts in this canvas's next drawn frame.
-        let timing = crate::perf::PipelineTiming::start(!frame.seekable);
+        self.perf.measure_frame = !frame.seekable || self.perf.armed();
+        let timing = crate::perf::PipelineTiming::start(self.perf.measure_frame);
         self.perf.live = !frame.seekable;
         self.perf.rendering = true;
         let wants = self.render_frame(frame, device, queue, encoder, target, format);
@@ -586,13 +573,13 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         if self.encoded.is_some() && self.perf.reporting.is_some() {
             let scale = self.raster_scale();
             let samples = self.samples.map_or(1, exact_game::SceneSamples::count);
-            let cap = self.max_fps();
+            let cap = self.frame_cap();
             if let Some(report) = &mut self.perf.reporting {
                 report.encoded(frame, &self.timing, scale, samples, self.perf.stats, cap);
             }
         }
         drop(timing);
-        self.perf.pipeline_pending += crate::perf::pipeline_ms();
+        self.perf.keep_pipeline_time(frame.seekable);
         wants
     }
     fn frame_ready(&self) -> bool {
@@ -698,7 +685,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         let live = performance::Live {
             thermal: self.timing.thermal_state,
             quality: self.rung.map(|rung| rung.level.keyword()),
-            max_fps: self.max_fps(),
+            max_fps: self.frame_cap(),
             idle: self.still,
             audio: performance::audio(self.presentation.audio_state(), self.interrupted),
             memory: (self.render.as_ref())
@@ -757,7 +744,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             }
             Ok(None) => {}
         }
-        let mut reply = sim.agent_with_inspector(
+        let measure = (self.seekable && self.perf.armed()).then_some(Clock::Seekable);
+        let mut reply = sim.agent_observed(
             request,
             observer(
                 &mut self.render,
@@ -766,8 +754,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                 &mut self.trace,
                 &mut self.error,
                 &mut self.hook_poses,
-                false,
-                0,
+                measure,
+                None,
             ),
             P::inspect,
         );
@@ -812,12 +800,10 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
         // its own Data decoder to distinguish state from tree/error/entity replies.
         let state = world_state(&reply);
         if state {
-            let span_since = crate::perf::PerfRequest::parse(request)
-                .ok()
-                .and_then(|r| r.span_since);
-            if let Ok(r) = crate::perf::PerfRequest::parse(request) {
+            let perf_request = crate::perf::PerfRequest::parse(request).ok();
+            if let Some(r) = &perf_request {
                 if r.perf || r.perf_reset {
-                    sim.measure_spans(crate::perf::clock_ms, r.perf_reset);
+                    crate::perf::measure_spans(sim, r.perf_reset);
                 }
                 // A reader's timing keeps no samples to report percentiles
                 // from: arming or resetting perf replaces it at the next frame.
@@ -827,6 +813,9 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                 }
                 if r.perf_reset {
                     self.perf.reset();
+                    if let Some(budget) = &mut self.hook_clock.budget {
+                        budget.reset_counters();
+                    }
                     if let Some(timing) = &mut self.gpu_timing {
                         timing.reset();
                     }
@@ -843,6 +832,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                     }
                 }
             }
+            let (span_since, trace_export) =
+                perf_request.map_or((None, false), |r| (r.span_since, r.trace_export));
             reply.truncate(reply.len() - 2);
             reply.push_str(if self.device {
                 ",\"device\":true"
@@ -856,10 +847,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
             reply.push_str(",\"tickSpans\":");
             reply.push_str(&sim.spans_json(span_since));
             reply.push('}');
-            let trace_events = crate::perf::PerfRequest::parse(request)
-                .ok()
-                .filter(|q| q.trace_export)
-                .map(|_| sim.trace_events_json());
+            let trace_events = trace_export.then(|| sim.trace_events_json());
             let work = self
                 .render
                 .as_ref()
@@ -894,11 +882,14 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                 self.ready_work.unwrap_or(work).json(),
                 self.ready_work.map_or_else(Default::default, |before| work.since(before)).json()));
             if H::ENABLED {
-                if let Some((renderer, _)) = &self.render {
-                    if let Some(metrics) = &renderer.hook_metrics {
-                        metrics.append(&mut reply, self.hooks.work(), self.hooks.needs());
-                    }
-                }
+                crate::hooks::metrics::append_state(
+                    self.render
+                        .as_ref()
+                        .and_then(|(r, _)| r.hook_metrics.as_deref()),
+                    &mut reply,
+                    &self.hooks,
+                    self.hook_clock.budget.as_deref(),
+                );
             }
             // Only the agent's armed timing is the agent's to report.
             if let Some(timing) = self.gpu_timing.as_mut().filter(|t| t.armed()) {
@@ -947,68 +938,53 @@ fn world_state(reply: &str) -> bool {
     parse().unwrap_or(false)
 }
 
+#[cfg(test)]
+#[path = "surface_tests/lifecycle.rs"]
+mod lifecycle_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "surface_tests.rs"]
 mod tests;
+
 #[cfg(test)]
-mod lifecycle_tests {
+mod budget_tests {
     use super::*;
-    #[derive(Default)]
-    struct Hook {
-        seekable: bool,
-        suspended: bool,
-        unlocked: bool,
-    }
-    impl Executor for Hook {
-        fn wants_audio(&self) -> bool {
-            true
-        }
-        fn clock(&mut self, seekable: bool) {
-            self.seekable = seekable;
-        }
-        fn suspend(&mut self, suspended: bool) {
-            self.suspended = suspended;
-        }
-        fn unlock(&mut self) {
-            self.unlocked = !self.seekable && !self.suspended;
-        }
-    }
-    struct GameTest;
-    impl Game for GameTest {
+
+    struct Empty;
+    impl Game for Empty {
         type Args = ();
-        const NAME: &'static str = "lifecycle";
-        const ID: &'static str = "test.lifecycle";
+        const ID: &'static str = "budgeted-clock";
         fn setup(_: &mut World, _: &()) {}
         fn tick(_: &mut World, _: &exact_game::Input, _: &()) {}
     }
+
+    #[derive(Default)]
+    struct Hook;
+    impl crate::Hooks for Hook {
+        const ALLOWANCE: u32 = 64;
+    }
+
     #[test]
-    fn lifecycle_only_changes_presentation_and_clock_precedes_first_input() {
-        let mut surface = WorldSurface::<GameTest, Hook>::default();
-        surface.clock(false);
+    fn preparation_budget_starts_at_the_timed_bind() {
+        let mut surface = WorldSurface::<Empty, (), false, Hook>::default();
+        surface.bind(&[], Some(0.)).unwrap();
+        surface.clock(true);
+        let mut time = crate::HookTime::default();
+        let budget = surface.hook_clock.budget.get_or_insert_with(Box::default);
+        budget.frame(&mut time, 16., 64, None, None);
+        assert_eq!(time.allowance, 64);
+    }
+
+    #[test]
+    fn preparation_budget_restore_clears_overshoots() {
+        let mut surface = WorldSurface::<Empty, (), false, Hook>::default();
         surface.bind(&[], None).unwrap();
-        assert_eq!(surface.messages(), ["exact:audio"]);
-        assert!(surface.messages().is_empty());
-        let saved = surface.carry();
-        surface.input(&InputEvent::Key {
-            code: "KeyW".into(),
-            key: "w".into(),
-            down: true,
-            repeat: false,
-            at_ms: 0.,
-        });
-        assert!(surface.presentation.unlocked);
-        let saved_after_input = surface.carry();
-        for seekable in [false, true] {
-            surface.clock(seekable);
-            surface.lifecycle(Lifecycle::Hidden);
-            surface.lifecycle(Lifecycle::Interrupted);
-            surface.lifecycle(Lifecycle::Visible);
-            assert!(surface.presentation.suspended);
-            surface.lifecycle(Lifecycle::Resumed);
-            assert!(!surface.presentation.suspended);
-            assert_eq!(surface.carry(), saved_after_input);
-        }
-        assert_ne!(saved, saved_after_input); // only the actual input changes saved state
+        let save = surface.carry().unwrap().unwrap();
+        let budget = surface.hook_clock.budget.get_or_insert_with(Box::default);
+        budget.record(-2.);
+        surface.restore(&save, Restore::Carry).unwrap();
+        let mut json = String::new();
+        surface.hook_clock.budget.unwrap().append(&mut json, 64);
+        assert_eq!(json, r#"{"allowance":64,"overFrames":0,"overMs":0}"#);
     }
 }
 
@@ -1073,7 +1049,7 @@ mod residency_tests {
             return;
         };
         let mut s = WorldSurface::<Cosmetic, crate::ModelExecutor, true>::default();
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.bind(&[], None).unwrap();
         let model = model();
         let bytes = exact_game::asset::encode_model(&model);
@@ -1094,7 +1070,7 @@ mod residency_tests {
         else {
             return;
         };
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.prepare_assets(
             &replacement.device,
             &replacement.queue,
@@ -1105,7 +1081,7 @@ mod residency_tests {
         assert!(changes.retired.contains(&model.textures[0]));
         assert!(changes.requests.contains(&model.textures[0]));
         s.asset(&model.textures[0], Ok(tex));
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.prepare_assets(
             &replacement.device,
             &replacement.queue,
@@ -1126,7 +1102,7 @@ mod residency_tests {
             return;
         };
         let mut s = WorldSurface::<Cosmetic, crate::ModelExecutor, true>::default();
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.bind(&[], None).unwrap();
         let mut model = model();
         let texture = include_bytes!("../../bake/tests/fixtures/crate/0-srgb-straight.tex");
@@ -1184,7 +1160,7 @@ mod residency_tests {
             return;
         };
         let mut s = WorldSurface::<Cosmetic, crate::ModelExecutor, true>::default();
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.bind(&[], None).unwrap();
         let mut model = model();
         // Character-sized resident, already retired when the oversized cache enters preparation.
@@ -1297,7 +1273,7 @@ mod residency_tests {
             return;
         };
         let mut s = WorldSurface::<Cosmetic, crate::ModelExecutor, true>::default();
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.bind(&[], None).unwrap();
         let mut model = model();
         let texture = exact_game::asset::TextureData {
@@ -1345,7 +1321,7 @@ mod residency_tests {
     #[test]
     fn ready_reasons_name_declaration_and_render_failures() {
         let mut s = WorldSurface::<Fox, crate::ModelExecutor, true>::default();
-        s.device_ready(wgpu::Features::empty());
+        s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         s.bind(&[], None).unwrap();
         s.asset("fox.model", Err(AssetError::Missing));
         let state = s.agent(r#"{"op":"state"}"#).unwrap();
@@ -1381,7 +1357,7 @@ mod residency_tests {
             return;
         };
         let mut surface = WorldSurface::<Fox, crate::ModelExecutor, true>::default();
-        surface.device_ready(wgpu::Features::empty());
+        surface.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
         surface.bind(&[], None).unwrap();
         surface.asset(
             "fox.model",

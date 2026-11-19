@@ -61,7 +61,7 @@ extension ExactSession {
     /// for a `then`, a queue's `next` or an answer that is the earliest work
     /// due; what is due after it is posted.
     func advanceIfDue() {
-        guard !advancingDue, !applying, !landing, !holdingReports, state != .destroyed, clock == nil, !ExactEnv.agentFreezes,
+        guard !advancingDue, !applying, !landing, !waits(.advance), !holdingReports, state != .destroyed, clock == nil, !ExactEnv.agentFreezes,
               !frames.tasks, !ownerInFlight, let due = timerDue, due <= now() else { return }
         advancingDue = true
         defer { advancingDue = false }
@@ -81,15 +81,14 @@ extension ExactSession {
     /// owner runs it, as one main waited for does.
     func sendAdvance(now: Double, frame: Double? = nil) {
         advanceInFlight = true
-        let captured = generation
-        runtime.advanceAsync(now: now, frame: frame, admitted: timerAdmissions.enabled, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil) { [weak self] batch in self?.publish(.advance, batch, captured) }
+        runtime.advanceAsync(now: now, frame: frame, admitted: timerAdmissions.enabled, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil) { [weak self] batch in self?.publish(.advance, batch) }
     }
 
     /// A frame's tick on the owner, not waited for: motion sampled at this
     /// frame lands with the next main-queue turn (LLP 1072 §7.1).
-    func sendTick(now: Double, frame: Double? = nil) {
+    func sendTick(now: Double, frame: Double? = nil, presentOnly: Bool = false) {
         tickInFlight = true
-        let captured = generation
-        runtime.tickAsync(now: now, frame: frame, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil) { [weak self] batch in self?.publish(.tick, batch, captured) }
+        runtime.tickAsync(now: now, frame: frame, capture: frameHealth.captureID, measureFrame: frameHealth.enabled && clock == nil,
+                          presentOnly: presentOnly) { [weak self] batch in self?.publish(.tick, batch) }
     }
 }

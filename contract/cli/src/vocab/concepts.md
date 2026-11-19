@@ -7,6 +7,19 @@ tag, attribute or function prints its entry first, then the concept. Every `cont
 compiles (`contract/cli/tests/it/vocab.rs`).
 -->
 
+## bluetooth: Bluetooth grants for an app's native module
+names: device.bluetooth, device.bluetooth-background
+
+Declare `device.bluetooth purpose.bluetooth` in the data module's grants and
+`"purpose.bluetooth": "Reads your heart rate from your strap."` in `strings/en.json`.
+Apple derives `NSBluetoothAlwaysUsageDescription`; a sandboxed Mac also gets its
+Bluetooth entitlement. Android derives connection permission and CompanionDeviceManager
+setup metadata; the module asks for runtime permission itself.
+For an iOS central receiving peripheral updates in the background, add
+`device.bluetooth-background` without a purpose key beside the Bluetooth line.
+It derives `bluetooth-central` in `UIBackgroundModes` on iOS only. The native
+module owns Bluetooth calls; see docs/reference.md#bluetooth-in-a-native-module.
+
 ## scroll: scrolling to the top, or to an item
 names: scrollTo, scrollToTop, scroll-to-top, scrollToIndex, scrollIntoView, scrollTop, scrollToEnd, scrollToBottom, scroll-to-bottom
 
@@ -257,7 +270,10 @@ component App
   return by Back or a tab keeps its place. A test opens there with `at "/recipe/Ramen#steps"`.
 - A welcome shown at first launch only is not a second route: the main screen is the root
   route and shows the welcome while a `persist` flag is unset (docs/recipes/first-launch.md).
-  A stack's first visit keeps its root route: `replace` to another route is refused there.
+- `replace(nav, url)` swaps the screen shown for another in place, a stack's first included:
+  the stack keeps its depth and the visit its id, so a route keyed `${e.id}` stays mounted,
+  with no transition. At another path its scrollers open at their start, as a browser's new
+  page does, or at their `scrollTop=`; `scroll-restoration="manual"` keeps one where it was.
 - A route's first child, a `header` holding one heading, is iOS's navigation bar: an
   `aria-level=1` heading is its large title, a lower level the inline title. A pushed route
   has the platform's Back button and edge swipe with nothing written; a control whose `id`
@@ -305,7 +321,10 @@ A form you lay out (fields, Save, Cancel) is a route presented as a sheet:
 `navigationBack` names, so the iOS swipe down and the web's Escape press it, and the screen
 under it is inert. A question with buttons only is a `dialog role="alertdialog"`
 (`contract vocab confirm`). A `dialog` you lay out yourself is a smaller thing: the web's and
-macOS's modal `dialog`, and on iOS a sheet as tall as its content, with no bar. One whose own
+macOS's modal `dialog`, and on iOS a sheet as tall as its content, with no bar. The dialog
+has `fit-content` width, as in HTML: put `width="100%" box-sizing="border-box"` on the `dialog`
+itself to fill the iOS sheet between its side insets. A percentage width on a child alone
+resolves against the dialog's width. One whose own
 `background-color` or `background-image` you write is your box, not the platform's: on iOS it is
 HTML's top layer, over any sheet, centred, its own `animation` its entrance and, when an `if`
 removes it, its `-exact-exit-animation` its exit.
@@ -567,8 +586,8 @@ More: docs/recipes/list-rows.md (search, filter, the long-press menu)
 ## task: a timer, once or repeating (every, after)
 names: every, after, timer, interval, setInterval, setTimeout, debounce
 
-A root `task` has one schedule: `every(ms, action)` repeats, `after(ms, action)` fires once,
-`every(frame, action)` ticks once a display frame. `task t mount` runs from launch; `task t
+A `task` has one schedule: `every(ms, action)` repeats, `after(ms, action)` fires once,
+`every(frame, action)` ticks once a display frame per armed instance. `task t mount` runs from mount; `task t
 when cond` only while `cond` holds, and `key=x` restarts it when `x` changes. The interval is
 a literal number of milliseconds, and the action takes no parameters.
 
@@ -625,7 +644,7 @@ names: sources, fetch, load, useEffect, useQuery, query, transient, no-store, vo
 (or a declared `source`) and shows its answer as `name`; the arguments are state, so a change asks again. Until the first answer it is
 `else empty()`, the shape's zero. `pending(name)`: a request out; `failed(name)`: no answer;
 `current(name)`: it shows its arguments' answer. `when cond` asks nothing while `cond` is
-false. Only the root declares one.
+false. A root or a child at a bounded use may declare one; each instance owns its request.
 
 ```contract
 component App
@@ -639,8 +658,8 @@ component App
       text `${hits.length} found` testId="n"
 ```
 
-- `app.ts` answers exactly the shape (an extra field fails it); a failed fetch is data, not
-  an exception; `refresh name` in an action asks again. A child takes what it shows as props.
+- `app.ts` answers exactly the shape; a failed fetch is data, not an exception.
+  `refresh name` in an action asks again.
 - `transient` after the shape: the answer is never kept for the next launch.
 
 More: docs/recipes/fetch-loading-error.md
@@ -847,7 +866,7 @@ component Tag
       text label
 ```
 
-- Resources, mutations and tasks are the root's: a child takes their results as props.
+- A child at a bounded use owns its resources, mutations and tasks until destroyed. Gate hidden screens' work on activity.
 
 ## derive: a value computed from state
 names: computed, memo, useMemo, selector, getter
@@ -1149,8 +1168,8 @@ On a button, `-exact-menu` is a literal `about` (directly under About), `app`,
 `file`, `edit`, `view`, `go`, `window`, `help` or `none` (no item; the chord
 stays a shortcut). `dock` beside one of them, or alone, also files the button
 in the app's Dock menu (`-exact-menu="file dock"`). `status` alone presents the
-button as the app's status item, a menu bar item on macOS (Windows'
-notification-area icon is not built); it takes the button's place, its
+button as the app's status item, a menu bar item on macOS or a
+notification-area icon on Windows; it takes the button's place, its
 `popovertarget` menu is the item's menu, and with another id it fails
 `lower-menu-status` (LLP 1133.025).
 It adds an item even without a chord and overrides
@@ -1159,14 +1178,15 @@ label or text; `disabled` disables it. An item in the app menu or Help is the
 app's: enabled with no key window, under a sheet and under a Contract modal dialog.
 Hidden/removed buttons leave the menu. Other hosts keep the ordinary button
 and ignore the hint. The agent taps the button. A root
-`-exact-menu-remove="show-tab-bar autofill close-all"` removes selected
-standard items and their menu equivalents. The fixed ids are `close-all`, `autofill`, `show-tab-bar`, `show-all-tabs`, `enter-full-screen`,
+`-exact-menu-remove="show-tab-bar close-all"` removes selected
+standard items and their menu equivalents. The fixed ids are `close-all`, `show-tab-bar`, `show-all-tabs`, `enter-full-screen`,
 `minimize`, `zoom`, `bring-all-to-front`, `show-previous-tab`, `show-next-tab`,
 `move-tab-to-new-window`, `merge-all-windows`, `back` (Go ▸ Back), `forward` (Go ▸ Forward), `develop` (the
 Develop menu; its chords stay), `paste-and-match-style`, `find`,
 `spelling-and-grammar`, `substitutions`, `transformations`, `app-help` (Help ▸
 *App* Help), `actual-size`, `zoom-in`, `zoom-out`, and `status-quit` (the
-host's Quit ending a status item's menu).
+host's Quit ending a status item's menu). AppKit's AutoFill submenu is not
+one: nothing public identifies it.
 The whitespace-separated list must be literal; unknown ids and nested use fail
 with `lower-menu-remove`, naming the set. Empty removes nothing; duplicates
 are harmless. The view’s root is a node, not a conditional. Root replacement and
@@ -1188,7 +1208,7 @@ component App
   action checkUpdates
     message = "Checking…"
   view
-    column -exact-menu-remove="show-tab-bar autofill close-all"
+    column -exact-menu-remove="show-tab-bar close-all"
       button "Check for Updates…" -exact-menu="app" press=checkUpdates testId="updates"
       text message
 ```
@@ -1220,6 +1240,83 @@ component App
   element, which has no placeholder.
 - `::before` and `::after` are refused: Contract has no generated box. Write what they would show as
   a child (a `text`, an `image`).
+
+## ::backdrop: what lies beneath a modal dialog
+names: backdrop, scrim, dim, dimming, modal overlay, overlay colour, backdropColor, UIDimmingView
+
+CSS's `::backdrop { background-color }` is a block: `::backdrop` on its own line under a `dialog`
+(before its children; there a value may compute) or in a `style`, then `background-color=…`
+indented beneath it. It admits `background-color` alone, with its own alpha (`transparent` lays
+nothing over the page), and fades in and out with the dialog. Without one each platform keeps its
+own dim (UIKit's beneath a sheet, the web's and the painted hosts' scrim).
+
+```contract
+component App
+  view
+    column
+      dialog id="confirm" background-color="#0000008C" width="100%" height="100%"
+        ::backdrop
+          background-color="transparent"
+        text "Panel" background-color="#14171D" color="#FFFFFF" padding=24
+```
+
+- Another property in the block (`backdrop-filter`, `opacity`) is refused; so is the block on any
+  element other than a `dialog`.
+
+## view-transition: a route's own entrance and exit
+names: ::view-transition-new, ::view-transition-old, view transition, route transition, screen transition, page transition, navigation animation, view-transition-name, stackAnimation, enterTransition, popExitTransition, transitionSpec, fade route, slide route
+
+A route (an element with `navigationKey`) chooses its own entrance and exit with CSS View
+Transitions' two parts: `::view-transition-new` plays when a push (or a `fullscreen`
+presentation) adds it, `::view-transition-old` when a pop (or the dismissal) removes it. Each
+holds one declaration, the `animation` shorthand, naming `keyframes` that move `opacity`,
+`translate`, `scale` and `rotate`, or `none` for a cut. Only the route added or removed moves;
+the route beneath stands still. Declaring a part replaces the platform's transition for that
+change; a route with no parts keeps the platform's push and pop. Write the parts in a `style`
+the route takes, or under the route before its children.
+
+```contract
+keyframes fade-in
+  from opacity=0
+keyframes fade-out
+  to opacity=0
+
+style Fades
+  ::view-transition-new
+    animation="fade-in 180ms ease-out both"
+  ::view-transition-old
+    animation="fade-out 150ms ease-in both"
+
+routes nav
+  home "/"
+  camera "/camera"
+
+component App
+  action open
+    nav = push(nav, path("camera"))
+  action back
+    nav = back(nav)
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="close" width="100%" height="100%"
+      for e in stack(nav) key=e.id
+        if e.name == "camera"
+          column navigationKey=`${e.id}` navigationPresentation="fullscreen" class=Fades background-color="black"
+            button press=back id="close"
+              text "Close"
+        else
+          column navigationKey=`${e.id}`
+            button press=open
+              text "Camera"
+```
+
+- The longhands (`animation-duration`…) are refused: the shorthand resets every one, so no
+  browser default leaks in. An `infinite` or `paused` animation is refused, and a value is a
+  literal or a choice of literals (`still ? "none" : "fade-in 180ms"`).
+- A sheet (`navigationPresentation="modal"`), a route with `navigationSource` (the zoom), and
+  any element that is no route refuse the parts; an element that moves between states takes
+  `sharedElement` instead. A tab switch keeps the platform's.
+- Under reduce motion the change cuts. On iOS the edge swipe keeps UIKit's interactive pop;
+  Android's predictive Back scrubs the authored exit.
 
 ## glass: Liquid Glass, a material or a blur behind a box
 names: Liquid Glass, liquid-glass, liquidGlass, material, materials, vibrancy, blur, frosted, UIVisualEffectView, UIGlassEffect, BlurView, GlassView, expo-blur, expo-glass-effect, tintColor, glass tint, tinted glass, isInteractive, UIBlurEffect, dark blur, blur tint, blur intensity, intensity
@@ -1272,7 +1369,9 @@ The buttons of a route's `header` are its bar's items: those before the heading 
 after it trail. iOS 26 puts adjacent ungrouped buttons on one shared glass capsule.
 `buttonStyle="glass"` on a bar button gives it a capsule of its own (`sharesBackground =
 false`), and a `row role="group"` around some keeps those on one capsule, set apart from the
-next group. Leave their size, colour and padding unsaid.
+next group. Leave their size, colour and padding unsaid. A button whose face is drawn as
+written (a status dot beside its label, or a label in a `font-family` of yours) keeps its
+left and right padding as room inside its capsule.
 
 ```contract
 routes nav
@@ -1342,7 +1441,10 @@ both properties.
 indicator on iOS, and hides the status and navigation bars on Android (a swipe from the edge
 shows them for a moment), while that node's screen is under them, resolved the same way: a
 `fullscreen` route's wins over the stack, a `medium` sheet's does not (iOS), and a
-descendant's `false` shows them again.
+descendant's `false` shows them again. A notch's or Dynamic Island's inset and the home
+indicator's stay while the bars hide, and a route's content stays clear of them: a route
+that must fill the screen (a game's canvas) takes `-exact-safe-area="none"` and places its
+controls with `var(--exact-safe-area-inset-*)`.
 
 More: docs/contract-for-agents.md (`status-bar-style`, `system-bars-hidden`)
 
@@ -1545,23 +1647,68 @@ component App
 ```
 
 - An icon the platform has is `image "symbol:<role>"`, drawn from each host's own set; a one-colour
-  SVG file is an `app.tamber` icon (docs/recipes/symbols.md), and an `.svg` asset is an
+  SVG file is an `app.forma` icon (docs/recipes/symbols.md), and an `.svg` asset is an
   `image` source too.
 - A `foreignObject` draws on the web only; on every host, place a box over the `svg`.
 
 More: apps/svg-gallery/app.contract (each element and attribute, drawn alike on every host but `foreignObject`)
 
+## env: a setting an app-local module reads, from the build or from a launch (import.meta.env)
+names: import.meta.env, process.env, .env, .env.local, dotenv, environment variable, launchEnvironment, SIMCTL_CHILD, API_BASE_URL
+
+`env()` in a length is CSS's: the concept `safe-area`. A setting is a name in app.json's `env`
+read in a top-level `const` of `app.ts` or an app-local module it imports transitively
+(type-only imports and re-exports read no settings):
+`const API = import.meta.env.API_BASE_URL ?? 'http://127.0.0.1:8080'`.
+Its value is the build's, inlined into the module: the environment,
+then `.env.local`, then `.env` beside app.json, then the default. Every value is public.
+Every read of a name must use the same default, including no default. A declared name
+must be read in this import graph; other captured files do not count. Packages may not
+read app settings. Server discovery and setting digests use the bake's recorded modules.
+Freshness also includes every file the TypeScript check loaded, including `import()` types
+and triple-slash references, plus resolution inputs such as manifests, configuration and
+the names a resolution would have chosen, present or absent, including inside packages; an
+unrelated file or directory is none. A source excluded from
+declaration capture is still recorded as a file when present. Web, Linux and Apple builds
+write the same discovery record beside the app. Type-only modules can type-check declared
+settings without reading their values or supplying defaults. Without a build record, the app needs a build.
+
+Server discovery prefers a local setting read by app.ts, else the first local setting
+in its imports, walked depth-first in source order with each module before its imports,
+else the first literal URL. If the first setting-owning module has different local values,
+keep the server's setting in app.ts and other clients' settings in their modules.
+
+`{ "name": "API_BASE_URL", "launch": true }` in `env` lets a launch replace it (a test, a
+benchmark, a debugger): the same read takes a non-empty value from the launched process's
+environment on Apple, Linux and Windows, and the build's on Android and the web. It is fixed
+for the launch.
+
+- iOS simulator: `SIMCTL_CHILD_API_BASE_URL=http://127.0.0.1:9000 xcrun simctl launch <udid> <bundle-id>`
+- XCUITest: `app.launchEnvironment["API_BASE_URL"] = "…"` before `app.launch()`
+- A phone: `xcrun devicectl device process launch --environment-variables '{"API_BASE_URL": "…"}' --device <id> <bundle-id>`
+- macOS, Linux, Windows: the process's environment (`API_BASE_URL=… ./app`)
+- Grants are fixed at build, so a grant over a marked name is refused: grant what a launch may
+  name (`net.fetch https:`, `net.fetch http:`, or each origin). A `fetch` to its origin outside
+  them is refused naming the setting.
+- A native module is not the way to read one: this read holds the value before the module's
+  first request.
+
+More: docs/reference.md ("A setting a launch gives")
+
 ## safe-area: the notch, the status bar and the home indicator
-names: env, env(), safe-area-inset, safe-area-inset-top, safe-area-inset-bottom, safe-area-inset-left, safe-area-inset-right, SafeAreaView, useSafeAreaInsets, react-native-safe-area-context, safeAreaInsets, notch, home indicator, home-indicator, --exact-safe-area-inset-top, --exact-safe-area-inset-bottom, --exact-safe-area-inset-left, --exact-safe-area-inset-right, bar height, navigation bar height, headerHeight, useHeaderHeight, -exact-safe-area, ignoresSafeArea, contentInsetAdjustmentBehavior
+names: env(), safe-area-inset, safe-area-inset-top, safe-area-inset-bottom, safe-area-inset-left, safe-area-inset-right, SafeAreaView, useSafeAreaInsets, react-native-safe-area-context, safeAreaInsets, notch, home indicator, home-indicator, --exact-safe-area-inset-top, --exact-safe-area-inset-bottom, --exact-safe-area-inset-left, --exact-safe-area-inset-right, bar height, navigation bar height, headerHeight, useHeaderHeight, -exact-safe-area, ignoresSafeArea, contentInsetAdjustmentBehavior
 
 Inside a route, leave it unsaid: the host keeps the route's content clear of the status bar
 and its bars (UIKit's inset on the route's scroller, else the route's padding), and a
 scroller's end clear of the home indicator, as a hand-built screen is. `env()` is CSS's, in
 any length (`padding-bottom="calc(env(safe-area-inset-bottom) + 16px)"`). On a native host
 under the default `viewport-fit="auto"` it is 0, so `env()` padding inside a route adds
-nothing; under the root's `viewport-fit="cover"` it is the device's insets, and a route's
-content goes under the bar unless its column pads `env(safe-area-inset-top)`. On the web it is
-the browser's. `env(-exact-layout-margins-inset-left)` is UIKit's layout margin.
+nothing; under the root's `viewport-fit="cover"` it is the device's insets. While an edge
+stays cleared, `env()` padding on a box inside the route adds that device inset again.
+After `-exact-safe-area` turns that edge's clearance off, padding by either `env()` or
+`var(--exact-safe-area-inset-*)` clears the inset once; the latter includes the route's
+bars. On the web `env()` is the browser's. `env(-exact-layout-margins-inset-left)` is
+UIKit's layout margin.
 
 `var(--exact-safe-area-inset-top)` (and `-right`, `-bottom`, `-left`) is the safe area where
 the box is (LLP 1123 D9): inside a route, a tab or a sheet its own, the status bar, the bars
@@ -1583,12 +1730,12 @@ More: docs/agent-pitfalls.md ("Native presentation and navigation (iOS)"), docs/
 ## var: a design token by CSS's `var(--name)`, and a stylesheet's custom properties
 names: var(), custom-property, custom-properties, tokens.css
 
-`var(--name)` in a style row is the token `name` of the app's design (`app.tamber`, or a root
+`var(--name)` in a style row is the token `name` of the app's design (`app.forma`, or a root
 `theme`), and compiles exactly as writing `name` does: folded, or on the web `var(--x-name)`
 where the token varies by an app mode. It is the build's reference, not the browser's: no
 stylesheet redefines it, and every host draws it. A name the design lacks is refused, naming
 the tokens the row could take, whether or not a fallback is written, so a misspelt name never
-ships the fallback; a declared name's fallback is ignored and warned (`tamber-var-fallback`).
+ships the fallback; a declared name's fallback is ignored and warned (`forma-var-fallback`).
 
 ```contract
 theme
@@ -1602,14 +1749,14 @@ component App
       text "3 patterns" color="ink"
 ```
 
-- `bun exact.mjs tamber import css tokens.css` writes a stylesheet's `:root` custom properties
-  into `app.tamber`, a `prefers-color-scheme: dark` redeclaration as `light-dark()`, between
-  `// tamber:import tokens.css` and `// tamber:end`; after an edit, import again. A `.dark` or
+- `bun exact.mjs forma import css tokens.css` writes a stylesheet's `:root` custom properties
+  into `app.forma`, a `prefers-color-scheme: dark` redeclaration as `light-dark()`, between
+  `// forma:import tokens.css` and `// forma:end`; after an edit, import again. A `.dark` or
   `[data-theme]` scope, or a value built around a `var()`, is refused by name.
 - A token of another kind (`color="var(--space)"` for a length) is refused as its name is.
 - JavaScript's `var`, a name inside an action, is `let` (`contract vocab let`).
 
-More: docs/recipes/tamber.md, docs/recipes/theme.md
+More: docs/recipes/forma.md, docs/recipes/theme.md
 
 ## media: a layout by width, where CSS has `@media`
 names: @media, responsive, media-query, media-queries, breakpoint, breakpoints, matchMedia, container-query
@@ -1648,7 +1795,7 @@ styles, by CSS's name and value (`padding=16`, `font-family="Georgia, serif"`). 
 inherits are inherited, so `font-family` and `color` on the root reach every text below it. A
 `style Name` block at file scope is a class that an element takes with `class=Name`; its own
 attributes win over the class's. A stylesheet's custom properties become the app's design:
-`bun exact.mjs tamber import css tokens.css`, then `var(--name)` names one (`contract vocab var`).
+`bun exact.mjs forma import css tokens.css`, then `var(--name)` names one (`contract vocab var`).
 
 ```contract
 style Card
@@ -1677,3 +1824,54 @@ module state lasts one render. An API that sends no `Cache-Control` is asked eve
 its answers, have it say how long they keep.
 
 More: docs/recipes/rest-backend.md
+
+## rtl: an app in Arabic, Hebrew, Persian or Urdu (right to left)
+names: right-to-left, RTL, dir, bidi, I18nManager, isRTL, forceRTL, writing-direction, layout-direction
+
+An app's direction comes from the strings table it shows (LLP 1060): with `strings/ur.json`
+shown, the web's document is `lang="ur" dir="rtl"`, and a native host lays out and reads aloud
+right to left, so rows and alignment mirror with no `direction` written. The table shown is the
+one for the person's language, else the base. The base is `en` unless app.json names another,
+so an app only in Urdu says:
+
+```json
+{ "strings": { "base": "ur" } }
+```
+
+`strings/ur.json` then holds every key a `t("key")` reads, as `{"title": "سلام"}`. Without
+that line, a build with no `strings/en.json` is refused (`strings-base-missing`). On the web the
+agent's `state` shows the page's as `language {"lang":"ur","dir":"rtl"}`.
+
+`direction="rtl"` is CSS's, for one box: it mirrors that box's content and leaves the page's
+`lang` and `dir` alone. Use it for a run that reads against the page, as `direction="ltr"` on a
+phone number in Arabic text.
+
+More: docs/contract-for-agents.md (`t`, `setLocale`)
+
+## :active: Press feedback without app state
+names: active, pressed, press-translate
+
+`:active` takes `background-color`, `color`, `opacity`, `translate` and
+`-exact-press-scale`. The host shows them on the innermost pressable node,
+without a runner round trip. Translate adds to the node's own translation.
+Percentages use the border box by default. Only x and y are accepted; use
+transitions for 3D motion. A computed target changes with ordinary app
+commits; `none` clears the offset. The node remains the containing block of
+its absolute descendants while unpressed and when a computed target is `none`
+(LLP 1074).
+
+Layout stays unchanged. On the web, the hit area moves with the paint, as
+CSS does, and the browser's click rules apply. Native hosts keep the unpressed
+hit area and use their press timing. Release or cancellation removes the offset.
+
+```contract
+component App
+  state n = 0
+  action count
+    n = n + 1
+  view
+    button press=count appearance="none"
+      :active
+        translate = "4px 4px"
+      text `Pressed ${n}`
+```

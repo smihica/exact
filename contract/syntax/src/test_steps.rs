@@ -1,17 +1,28 @@
 //! Authored tests: a `test` block and its steps (LLP 1017 P7).
 use crate::{Expr, Span, TapForm};
 
-/// The literal comparison in an authored `expect state` step.
+/// The comparison in an authored `expect state` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateComparison {
-    /// Structural literal equality.
+    /// Structural equality.
     Equal,
+    /// Structural inequality.
+    NotEqual,
     /// A numeric lower bound, inclusive.
     AtLeast,
     /// A numeric upper bound, inclusive.
     AtMost,
-    /// Membership in a list of literal alternatives.
+    /// Membership in a list of alternatives.
     In,
+}
+
+/// The right operand of an authored state assertion.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StateOperand {
+    /// A value literal, or the alternatives for `in`.
+    Literal(Expr),
+    /// A declaration followed by fields and list indexes, joined by `.`.
+    State(String),
 }
 
 /// `test "name"` with steps: the agent API's own operations (LLP 1012) and
@@ -61,7 +72,7 @@ pub enum Step {
         span: Span,
     },
     /// `tap "testId" drag dx dy [from x y] [mouse] [press ms] [over ms]
-    /// [hold ms] [during "op" …]`: one whole drag from the node's middle, or
+    /// [hold ms] [into keyboard] [during "op" …]`: one whole drag from the node's middle, or
     /// from `from` in its box, a finger's or the left button's; the driver's
     /// `tap … drag` (kanban F18, files diary F10). `tap "A" drag to "B" [at x y] …`
     /// ends at B's middle, or at `at` from its top left (LLP 1094 D12).
@@ -80,6 +91,8 @@ pub enum Step {
         from: Option<(f64, f64)>,
         /// The left button rather than a finger, where a carrier has both.
         mouse: bool,
+        /// Extend the end below the viewport, above the screen's bottom safe area.
+        into: Option<String>,
         /// Milliseconds held before the move.
         press: Option<f64>,
         /// Milliseconds the move takes.
@@ -132,9 +145,10 @@ pub enum Step {
         /// Where.
         span: Span,
     },
-    /// A media preference, before observations or between steps.
+    /// A media preference or a module's permission, before observations or
+    /// between steps.
     Prefer {
-        /// CSS media feature name.
+        /// A CSS media feature, or `permission.` and the module's name.
         name: String,
         /// The driver's value.
         value: String,
@@ -160,9 +174,25 @@ pub enum Step {
         /// Where.
         span: Span,
     },
-    /// `pass fetch "…"`: the prefix stops failing (LLP 1103).
+    /// An immediate HTTP fixture, installed before boot when leading a test.
+    AnswerFetch {
+        /// What a matching fetch's URL starts with.
+        prefix: String,
+        /// Response status, headers and text body, encoded as JSON.
+        response: String,
+        /// Where.
+        span: Span,
+    },
+    /// `pass fetch "…"`: the prefix stops failing or answering (LLP 1103).
     PassFetch {
         /// The prefix a `fail fetch` armed.
+        prefix: String,
+        /// Where.
+        span: Span,
+    },
+    /// End open network streams whose URL starts with the prefix.
+    DropStream {
+        /// The URL prefix.
         prefix: String,
         /// Where.
         span: Span,
@@ -247,6 +277,13 @@ pub enum Step {
         /// Where.
         span: Span,
     },
+    /// Answer the pending user-presence prompt through the driver's `tap @presence`.
+    Presence {
+        /// `allow`, `cancel`, `fail`, `lockout` or `invalidated`.
+        answer: String,
+        /// Where.
+        span: Span,
+    },
     /// `type "testId" copy`, `… cut`, `… paste "text"`: the clipboard's
     /// event at the node, a paste carrying `text` as the clipboard's.
     Clipboard {
@@ -310,6 +347,29 @@ pub enum Step {
         /// Where.
         span: Span,
     },
+    /// `expect focused "testId"`: the node holds the keyboard focus, as each host's tree
+    /// reports it (the web's `document.activeElement`, the platform's first responder).
+    ExpectFocused {
+        /// The node, by `testId`.
+        target: String,
+        /// Where.
+        span: Span,
+    },
+    /// `expect layout "testId" width|height ==|<=|>= n`: the node's laid-out size, the
+    /// width or height of the box the agent's `layout <target>` reports (LLP 1012:
+    /// viewport points, two decimals, presentation transforms folded in).
+    ExpectLayout {
+        /// The node, by `testId`.
+        target: String,
+        /// `width` or `height`.
+        dimension: String,
+        /// `Equal`, `AtLeast` or `AtMost`.
+        comparison: StateComparison,
+        /// The size, in points.
+        value: f64,
+        /// Where.
+        span: Span,
+    },
     /// `expect text "testId" == "value"`: the node's text — its `text` prop,
     /// else its descendants' text in order (the web's `textContent`), else a
     /// field's value.
@@ -342,17 +402,16 @@ pub enum Step {
         /// Where.
         span: Span,
     },
-    /// `expect state name <comparison> literal`: a slot, derive, or resource from the
+    /// `expect state name <comparison> <operand>`: a slot, derive, or resource from the
     /// `state` reply, or a field of one (`name.field.field`, feed F10), or a
-    /// list index (`rows.0`, drums R7), compared to a number (negative
-    /// included), string, bool, or `none`.
+    /// list index (`rows.0`, drums R7).
     ExpectState {
         /// The declaration's name, then fields and list indexes, joined by `.`.
         name: String,
         /// The comparison.
         comparison: StateComparison,
-        /// The literal, or a list of alternatives for `in`.
-        value: Expr,
+        /// A literal or another state path.
+        value: StateOperand,
         /// Where.
         span: Span,
     },

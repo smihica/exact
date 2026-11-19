@@ -165,7 +165,24 @@ public final class ExactLaunch: NSObject {
     /// What activation spent, seconds: the app's Swift module load, each
     /// `dataReady` call (the last one runs the data module's start), how
     /// long and how often it said pending, and applying its first batch.
-    private var data: (module: Double, waited: Double, polls: Int, ready: Double, apply: Double, first: Double?) = (0, 0, 0, 0, 0, nil)
+    /// The marks, as `CACurrentMediaTime`: activation's start, the module's
+    /// evaluation on the owner when the draw posted it (LLP 1027.008 D3),
+    /// and the end of the `dataReady` that activated, by which its requests
+    /// are with the executor.
+    private var data: (module: Double, waited: Double, polls: Int, ready: Double, apply: Double, first: Double?,
+                       evaluation: (from: Double, to: Double)?, asked: Double?) = (0, 0, 0, 0, 0, nil, nil, nil)
+
+    /// The draw posted the module's evaluation to the owner: activation starts now.
+    func evaluating(_ session: ExactSession) {
+        guard session === launchSession, ttiOutcome == nil else { return }
+        if data.first == nil { data.first = CACurrentMediaTime() }
+        scheduleEvaluate()
+    }
+
+    func evaluated(_ session: ExactSession, from: Double, to: Double) {
+        guard session === launchSession, ttiOutcome == nil, data.evaluation == nil else { return }
+        data.evaluation = (from, to)
+    }
 
     func modulePrepared(_ session: ExactSession, seconds: Double) {
         guard session === launchSession, ttiOutcome == nil else { return }
@@ -183,6 +200,7 @@ public final class ExactLaunch: NSObject {
         } else {
             data.ready = ready
             data.waited = now - ready - data.module - (data.first ?? now)
+            data.asked = now
         }
     }
 
@@ -225,7 +243,7 @@ public final class ExactLaunch: NSObject {
     /// A batch's op kinds and a few of the views it touched (test ID, else
     /// kind), or what it changed with no ops, for the TTI trace.
     private static func summary(_ batch: Batch, _ presenter: Presenter) -> String {
-        if batch.ops.isEmpty { return [batch.controls ? "controls" : nil, batch.facts ? "facts" : nil, batch.orientation != nil ? "orientation" : nil].compactMap { $0 }.joined(separator: " ") }
+        if batch.ops.isEmpty { return [batch.controls ? "controls" : nil, batch.facts ? "facts" : nil, batch.rootTabs != nil ? "rootTabs" : nil, batch.orientation != nil ? "orientation" : nil].compactMap { $0 }.joined(separator: " ") }
         var kinds: [String: Int] = [:], names: [String] = []
         for op in batch.ops {
             kinds[op.op.rawValue, default: 0] += 1
@@ -295,14 +313,20 @@ public final class ExactLaunch: NSObject {
         evaluateScheduled = true
         DispatchQueue.main.async { [weak self] in
             self?.evaluateScheduled = false
-            self?.evaluate()
+            guard let self else { return }
+            if let session = self.launchSession { session.afterBootOwner { [weak self] in self?.evaluate() } }
+            else { self.evaluate() }
         }
     }
 
     /// The launch session's outstanding work, from the runner and the host.
-    /// Empty when the screen can be used.
+    /// Empty when the screen can be used. While the data source is prepared
+    /// on the owner, the ledger's read would wait there for the module's
+    /// evaluation (LLP 1027.008 D2), and only activation is outstanding.
     private func outstandingNow() -> [String]? {
-        guard let session = launchSession, let ledger = Self.ledger(session) else { return nil }
+        guard let session = launchSession else { return nil }
+        if session.dataPreparing { return ["activation"] }
+        guard let ledger = Self.ledger(session) else { return nil }
         if ledger.poisoned { finish("logic_failed"); return nil }
         failedResources = ledger.failed
         return ledger.items + (activation != "ready" ? ["activation"] : [])
@@ -316,7 +340,7 @@ public final class ExactLaunch: NSObject {
     /// first and waits for the owner, so work sent there before it has
     /// published its batch when `hostOutstanding` reads the published queue.
     static func ledger(_ session: ExactSession) -> (items: [String], failed: [String], poisoned: Bool)? {
-        guard session.state != .destroyed, let data = session.agent("{\"op\":\"outstanding\"}").data(using: .utf8),
+        guard session.state != .destroyed, let data = session.runtime.ask(exact_outstanding, "").data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any], o["error"] == nil else { return nil }
         var out: [String] = []
         for key in ["requests", "streams", "awaiting", "oneShots", "busy"] {
@@ -404,13 +428,18 @@ public final class ExactLaunch: NSObject {
     private func load(_ s: (module: String, when: ExactServiceLoad, config: [String: Any], handoff: () -> Data)) {
         loaded.insert(s.module)
         DispatchQueue.main.async {
-            let config = (try? JSONSerialization.data(withJSONObject: s.config)) ?? Data("{}".utf8)
-            guard let service = ExactService.load(module: s.module, config: config, handoff: s.handoff()) else {
-                self.failed.insert(s.module)
-                return ExactJournal.shared.loadEnded(s.module, nil)
-            }
-            ExactJournal.shared.attach(service)
+            if let session = self.launchSession { session.afterBootOwner { self.loadService(s) } }
+            else { self.loadService(s) }
         }
+    }
+
+    private func loadService(_ s: (module: String, when: ExactServiceLoad, config: [String: Any], handoff: () -> Data)) {
+        let config = (try? JSONSerialization.data(withJSONObject: s.config)) ?? Data("{}".utf8)
+        guard let service = ExactService.load(module: s.module, config: config, handoff: s.handoff()) else {
+            self.failed.insert(s.module)
+            return ExactJournal.shared.loadEnded(s.module, nil)
+        }
+        ExactJournal.shared.attach(service)
     }
 
     private func stopWatching() {
@@ -485,8 +514,14 @@ public final class ExactLaunch: NSObject {
             // From the first commit to the first node's draw receipt, which
             // starts activation (the render server's first draw).
             let receipt = marks[.commit].flatMap { c in data.first.map { ms(max(0, $0 - c)) } }
-            out["data"] = ["appModule": ms(data.module), "waited": ms(max(0, data.waited)), "polls": data.polls,
-                           "ready": ms(data.ready), "apply": ms(data.apply), "receipt": receipt as Any]
+            var report: [String: Any] = ["appModule": ms(data.module), "waited": ms(max(0, data.waited)), "polls": data.polls,
+                                         "ready": ms(data.ready), "apply": ms(data.apply), "receipt": receipt as Any]
+            // After activation's start: the evaluation's start and end, and the asks.
+            if let first = data.first {
+                if let (from, to) = data.evaluation { report["evaluation"] = [ms(from - first), ms(to - first)] }
+                if let asked = data.asked { report["asked"] = ms(asked - first) }
+            }
+            out["data"] = report
         }
         if let p = marks[.process], !spans.isEmpty {
             let ms = { (t: Double) in ((t - p) * 1000 * 10).rounded() / 10 }

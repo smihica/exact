@@ -273,6 +273,7 @@ fn the_press_rows_cross_and_the_motion_scale_does_not() {
 /// `light-dark()` one carries both appearances, and `none` nothing.
 #[test]
 fn a_gradient_crosses_as_shape_and_stops() {
+    exact_kernel::style::link_all();
     let json = |css: &str| {
         let mut s = StyleProps::default();
         s.set_dynamic(StyleId::BackgroundImage, &StyleValue::Text(css.into()))

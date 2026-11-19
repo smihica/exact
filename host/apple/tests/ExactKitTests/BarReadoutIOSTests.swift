@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// A header's readout (`role="status"`, LLP 1075.003 §9.15) over hand-built
 /// routes: what counts as one, what its face holds, and what its bar item's
@@ -140,9 +141,9 @@ final class BarReadoutIOSTests: XCTestCase {
                           kids: [4], more: [["op": "children", "id": 4, "ids": words ? [5, 6] : [5]]])
             let route = RouteController(try XCTUnwrap(p.views[1]))
             let shape = try XCTUnwrap(HeaderShape(route: route.node, back: nil, projected: true))
-            let view = try XCTUnwrap(p.navigation.barItems(shape.trailing, route).first?.customView as? ReadoutView)
+            let view = try XCTUnwrap(p.navigationHost.barItems(shape.trailing, route).first?.customView as? ReadoutView)
             window.addSubview(view)
-            p.navigation.showReadouts(shape, in: route)
+            p.navigationHost.showReadouts(shape, in: route)
             view.layoutIfNeeded()
             return view
         }
@@ -184,7 +185,7 @@ final class BarReadoutIOSTests: XCTestCase {
     }
 
     /// A status's symbol in a colour of its own keeps it behind a sheet or an alert, as its words
-    /// keep theirs: UIKit would grey it as the symbol's tint, which it leaves as it is (`.normal`)
+    /// keep theirs: its ink is in the original image, and its view inherits dimming.
     func testAStatusSymbolKeepsItsColourWhileDimmed() throws {
         let green: [Double] = [52, 199, 89, 255]
         let inked: [String: Any] = ["text_color": green, "written": ["text_color"]]
@@ -193,15 +194,15 @@ final class BarReadoutIOSTests: XCTestCase {
                       kids: [4], more: [["op": "children", "id": 4, "ids": [5, 6]]])
         let route = RouteController(try XCTUnwrap(p.views[1]))
         let shape = try XCTUnwrap(HeaderShape(route: route.node, back: nil, projected: true))
-        let view = try XCTUnwrap(p.navigation.barItems(shape.trailing, route).first?.customView as? ReadoutView)
+        let view = try XCTUnwrap(p.navigationHost.barItems(shape.trailing, route).first?.customView as? ReadoutView)
         window.addSubview(view)
-        p.navigation.showReadouts(shape, in: route)
+        p.navigationHost.showReadouts(shape, in: route)
         let symbol = try XCTUnwrap(view.stack.arrangedSubviews.compactMap { $0 as? UIImageView }.first, "the readout shows its symbol")
         view.tintAdjustmentMode = .dimmed
         defer { view.tintAdjustmentMode = .automatic }
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        XCTAssertTrue(symbol.tintColor.resolvedColor(with: symbol.traitCollection).getRed(&r, green: &g, blue: &b, alpha: &a))
-        for (got, want) in zip([r, g, b, a].map { Double($0) * 255 }, green) { XCTAssertEqual(got, want, accuracy: 2, "the symbol keeps its green while dimmed") }
+        view.layoutIfNeeded()
+        XCTAssertEqual(symbol.tintAdjustmentMode, .dimmed)
+        for (got, want) in zip(try symbolInkChannels(symbol), green) { XCTAssertEqual(got, want, accuracy: 2, "the symbol keeps its green while dimmed") }
     }
 
     /// A readout's parts in the tint are UIKit's tint, which follows the bar's and greys with it:
@@ -213,9 +214,9 @@ final class BarReadoutIOSTests: XCTestCase {
                       kids: [4], more: [["op": "children", "id": 4, "ids": [5, 6]]])
         let route = RouteController(try XCTUnwrap(p.views[1]))
         let shape = try XCTUnwrap(HeaderShape(route: route.node, back: nil, projected: true))
-        let view = try XCTUnwrap(p.navigation.barItems(shape.trailing, route).first?.customView as? ReadoutView)
+        let view = try XCTUnwrap(p.navigationHost.barItems(shape.trailing, route).first?.customView as? ReadoutView)
         window.addSubview(view)
-        p.navigation.showReadouts(shape, in: route)
+        p.navigationHost.showReadouts(shape, in: route)
         let symbol = try XCTUnwrap(view.stack.arrangedSubviews.compactMap { $0 as? UIImageView }.first, "the readout shows its symbol")
         let words = try XCTUnwrap(view.stack.arrangedSubviews.compactMap { $0 as? UILabel }.first, "the readout shows its words")
         XCTAssertEqual(words.textColor, UIColor.tintColor, "its words in UIKit's tint")
@@ -234,9 +235,9 @@ final class BarReadoutIOSTests: XCTestCase {
                       kids: [4], more: [["op": "children", "id": 4, "ids": [6]]])
         let route = RouteController(try XCTUnwrap(p.views[1]))
         let shape = try XCTUnwrap(HeaderShape(route: route.node, back: nil, projected: true))
-        let view = try XCTUnwrap(p.navigation.barItems(shape.trailing, route).first?.customView as? ReadoutView)
+        let view = try XCTUnwrap(p.navigationHost.barItems(shape.trailing, route).first?.customView as? ReadoutView)
         window.addSubview(view)
-        p.navigation.showReadouts(shape, in: route)
+        p.navigationHost.showReadouts(shape, in: route)
         let words = try XCTUnwrap(view.stack.arrangedSubviews.compactMap { $0 as? UILabel }.first, "the readout shows its words")
         XCTAssertEqual(words.textColor, UIColor.tintColor, "UIKit's tint")
         func drawn() throws -> [Double] {
@@ -260,10 +261,10 @@ final class BarReadoutIOSTests: XCTestCase {
                       kids: [4], more: [["op": "children", "id": 4, "ids": [5, 6]]])
         let route = RouteController(try XCTUnwrap(p.views[1]))
         let shape = try XCTUnwrap(HeaderShape(route: route.node, back: nil, projected: true))
-        let items = p.navigation.barItems(shape.trailing, route)
+        let items = p.navigationHost.barItems(shape.trailing, route)
         let view = try XCTUnwrap(items.first?.customView as? ReadoutView)
         window.addSubview(view)
-        p.navigation.showReadouts(shape, in: route)
+        p.navigationHost.showReadouts(shape, in: route)
         XCTAssertEqual(view.stack.semanticContentAttribute, .forceRightToLeft, "the author's direction")
         view.layoutIfNeeded()
         XCTAssertEqual(view.stack.frame.minX, 12, "padding-left stays on the left")

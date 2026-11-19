@@ -23,11 +23,39 @@ impl core::fmt::Debug for CalcOwner {
     }
 }
 
-/// Grid and multi-column fields stored apart from the common style fields.
+/// Fields stored apart from ordinary block and flex styles.
 #[derive(Clone, PartialEq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct RareStyle<S: CheapCloneStr = DefaultCheapStr> {
+    /// EXACT PATCH 75 (LLP 1123 D3): native clearance inside this container's
+    /// padding box, excluded from its absolutely positioned descendants' containing block.
+    pub absolute_clearance: Rect<f32>,
+    /// Insets referencing the same edge's safe area: top 1, right 2, bottom 4, left 8.
+    pub inset_credit: u8,
+    /// EXACT PATCH 80 (LLP 1123 D4): how far past the box its parent places this box lays its
+    /// subtree out, on each edge.
+    pub outset: Rect<f32>,
+    /// EXACT PATCH 80: the padding the subtree of a box with an `outset` is laid out with; the
+    /// box's own `padding`, which its parent sees, is this less what the outset fills.
+    pub outset_padding: Rect<LengthPercentage>,
+    /// EXACT PATCH 80: the box gives its parent no baseline, so that a parent aligning by
+    /// baselines places it the same with or without an `outset`.
+    pub no_baseline: bool,
+    /// EXACT PATCH 80: how far the host moves the box and its subtree from where its layout
+    /// places them, so that an absolutely positioned descendant its containing block holds
+    /// outside the box is placed as though it did not move.
+    pub shift: Point<f32>,
+    /// EXACT PATCH 81 (LLP 1123 D12): the edge this box is a bar of its parent on, top 0, right
+    /// 1, bottom 2, left 3, or `None`. A bar is laid out `position: absolute`, out of its
+    /// parent's flow, and its parent places it.
+    pub bar: Option<u8>,
+    /// EXACT PATCH 81: whether some child of this box is a bar, which it measures before its
+    /// algorithm lays out the others and places after.
+    pub bars: bool,
+    /// EXACT PATCH 81: how far in from this box's border its bars' slots begin on each edge: the
+    /// part of its padding that its own reservations make.
+    pub bar_inset: Rect<f32>,
     /// Keeps the custom identifier type when grid layout is disabled.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub dummy: core::marker::PhantomData<S>,
@@ -88,6 +116,15 @@ impl<S: CheapCloneStr> RareStyle<S> {
 
     /// Initial values, without allocating.
     pub const DEFAULT: Self = Self {
+        absolute_clearance: Rect::ZERO,
+        inset_credit: 0,
+        outset: Rect::ZERO,
+        outset_padding: Rect::zero(),
+        no_baseline: false,
+        shift: Point::ZERO,
+        bar: None,
+        bars: false,
+        bar_inset: Rect::ZERO,
         dummy: core::marker::PhantomData,
         #[cfg(all(feature = "calc", any(feature = "alloc", feature = "std")))]
         calc_owners: crate::sys::Vec::new(),

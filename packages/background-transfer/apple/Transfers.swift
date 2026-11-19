@@ -1,6 +1,6 @@
 // @exact/background-transfer on Apple (LLP 1133.017 D3, D4, D10, D17): Background
 // Fetch's names over the host's transfer carrier (`context.transfers`,
-// ExactKit's Transfers.swift), whose background `URLSession`s finish a
+// ExactWakeCarriers' Transfers.swift), whose background `URLSession`s finish a
 // transfer while the app is suspended or terminated and whose records
 // outlive the process.
 //

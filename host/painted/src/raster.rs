@@ -63,6 +63,9 @@ pub struct Raster {
     /// The page's colour ([`Backend::page`]); white until one is told.
     page: Option<[u8; 4]>,
     scale: f32,
+    /// The device pixel at the frame's top-left: a picture of part of the
+    /// page (`paint/box_filter.rs`) starts where that part does.
+    origin: (f32, f32),
     width: u32,
     height: u32,
     clips: Vec<Option<Rc<Mask>>>,
@@ -97,12 +100,24 @@ impl Raster {
         }
     }
 
+    /// A transparent picture whose top-left is device pixel `origin`.
+    pub(crate) fn transparent_at(origin: (f32, f32)) -> Self {
+        Self {
+            origin,
+            ..Self::transparent()
+        }
+    }
+
     fn active_clip(&self) -> Option<&Rc<Mask>> {
         self.clips.last().and_then(Option::as_ref)
     }
 
     fn device(&self, ts: Transform) -> Transform {
-        Transform::from_scale(self.scale, self.scale).pre_concat(ts)
+        let dev = Transform::from_scale(self.scale, self.scale).pre_concat(ts);
+        match self.origin {
+            (0.0, 0.0) => dev,
+            (x, y) => dev.post_translate(-x, -y),
+        }
     }
 
     fn reset(&mut self, width: f32, height: f32, scale: f32) {
@@ -848,62 +863,9 @@ impl Backend for Raster {
         clips: &[Shape],
         ts: Transform,
         tint: Option<[u8; 4]>,
+        rendering: exact_kernel::ImageRendering,
     ) {
-        let (nw, nh) = (image.width() as f32, image.height() as f32);
-        if nw <= 0.0 || nh <= 0.0 || dst.2 <= 0.0 || dst.3 <= 0.0 {
-            return;
-        }
-        let dev = self
-            .device(ts)
-            .pre_concat(Transform::from_translate(dst.0, dst.1).pre_scale(dst.2 / nw, dst.3 / nh));
-        let mask = if self.image_inside_clips(nw, nh, dev, clips, ts) {
-            self.active_clip().cloned()
-        } else {
-            self.mask_with(clips, ts).map(Rc::new)
-        };
-        let paint = PixmapPaint {
-            quality: FilterQuality::Bilinear,
-            ..PixmapPaint::default()
-        };
-        // Tint in an isolated paint layer, never by copying the decoded asset.
-        let layers = self.layers.len();
-        if tint.is_some() {
-            self.push_opacity(1.0);
-            if self.layers.len() == layers {
-                return;
-            }
-        }
-        if let Some(t) = self.target.pixels() {
-            let drawn = image_area::draw(
-                t,
-                image.pixels(),
-                dev,
-                mask.as_deref(),
-                &mut self.image_area,
-            );
-            #[cfg(target_arch = "x86_64")]
-            let drawn = drawn
-                || image_sample::draw(
-                    t,
-                    image.pixels(),
-                    dev,
-                    mask.as_deref(),
-                    &mut self.image_samples,
-                );
-            if !drawn {
-                t.draw_pixmap(0, 0, image.pixels(), &paint, dev, mask.as_deref());
-            }
-            if let Some(tint) = tint {
-                let mut ink = solid(tint);
-                ink.blend_mode = tiny_skia::BlendMode::SourceIn;
-                let rect = Rect::from_xywh(0., 0., t.width() as f32, t.height() as f32).unwrap();
-                t.fill_rect(rect, &ink, Transform::identity(), None);
-            }
-        }
-        if tint.is_some() {
-            self.pop_opacity();
-        }
-        self.recycle_clip_mask(mask);
+        self.draw_image(image, dst, clips, ts, tint, rendering);
     }
 
     // @ref LLP 1055.000 D14 — an island in its element's user space.

@@ -3,6 +3,7 @@ import UIKit
 import XCTest
 import ExactGroupedLists
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class ProgressContextsIOSTests: XCTestCase {
     private var session: ExactSession?
@@ -63,10 +64,10 @@ final class ProgressContextsIOSTests: XCTestCase {
         p.menus.action("hidePopover", ["popup"])
 
         XCTAssertTrue(s.follow("/detail"))
-        until("the pushed route is up") { p.navigation.primaryNavigation?.viewControllers.count == 2 && !p.navigation.inTransition }
+        until("the pushed route is up") { p.navigationHost.primaryNavigation?.viewControllers.count == 2 && !p.navigationHost.inTransition }
         try assertAccent(s, "busy-detail")
         XCTAssertTrue(s.follow("/sheet"))
-        until("the modal route is up") { p.navigation.presentedNavigations.count == 1 && !p.modals.inTransition && (try? self.node(s, "busy-sheet"))?.window != nil }
+        until("the modal route is up") { p.navigationHost.presentedNavigations.count == 1 && !p.modalHost.inTransition && (try? self.node(s, "busy-sheet"))?.window != nil }
         try assertAccent(s, "busy-sheet")
     }
 }

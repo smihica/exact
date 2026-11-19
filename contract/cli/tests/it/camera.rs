@@ -114,7 +114,7 @@ fn a_view_only_camera_accepts_a_typed_preferred_picture() {
         .all(|m| plan.str(m.extension) == "camera"));
     let mut r = Runner::boot(
         plan,
-        Granted(CAMERA_LINES),
+        Granted(CAMERA_LINES, false),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -187,7 +187,7 @@ fn an_unused_camera_view_does_not_admit_preferences() {
     assert!(plan.views.is_empty());
     let mut r = Runner::boot(
         plan,
-        Granted(CAMERA_LINES),
+        Granted(CAMERA_LINES, false),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -211,7 +211,7 @@ fn shelfs_viewfinder_receives_the_preferred_scan_fixture() {
     assert!(plan.view_named("exact-camera").is_some());
     let mut r = Runner::boot(
         plan,
-        Granted(CAMERA_LINES),
+        Granted(CAMERA_LINES, false),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -236,8 +236,8 @@ impl Drop for App {
     }
 }
 
-/// The app's grant lines.
-struct Granted(&'static str);
+/// The app's grant lines, and whether its source is still loading.
+struct Granted(&'static str, bool);
 impl exact_runner::DataSource for Granted {
     fn query(
         &mut self,
@@ -260,6 +260,9 @@ impl exact_runner::DataSource for Granted {
     fn grants(&self) -> &str {
         self.0
     }
+    fn ready(&self) -> bool {
+        !self.1
+    }
 }
 
 const CAMERA_LINES: &str = "device.camera purpose.camera\ndevice.microphone purpose.microphone\n";
@@ -278,7 +281,7 @@ fn boot_with(app: App, lines: &'static str) -> (App, Runner<Granted>, Calls) {
         .unwrap_or_else(|e| panic!("{e:?}"));
     let mut r = Runner::boot(
         plan,
-        Granted(lines),
+        Granted(lines, false),
         exact_kernel::Kernel::with_monospace(),
         Default::default(),
         "/",
@@ -300,6 +303,10 @@ fn boot_with(app: App, lines: &'static str) -> (App, Runner<Granted>, Calls) {
                     json!({ "path": "app:/tmp/camera/2.jpg", "type": "image/jpeg", "size": 1, "width": 1, "height": 1 })
                 }
                 Some("takePhotoWithCameraApp") => json!({ "error": "AbortError" }),
+                Some("recordVideoWithCameraApp") if v["preferred"]["tap"] == "take" => {
+                    json!({ "path": "app:/tmp/camera/1.mp4", "type": "video/mp4", "size": 1209, "duration": 1, "width": 160, "height": 120 })
+                }
+                Some("recordVideoWithCameraApp") => json!({ "error": "AbortError" }),
                 _ => json!({}),
             };
             reply.send(Outcome::Response(Response {
@@ -430,6 +437,58 @@ fn a_tool_s_capture_start_is_refused() {
     r.act("shutter", Vec::new()).unwrap();
     pump(&mut r, &mut parked);
     assert_eq!(sent(&calls, "takePhoto"), 1, "{}", logs(&r));
+}
+
+/// A send to a package made while the app's data source is still loading
+/// waits for it, then reaches the package as a later send does, not the
+/// app's source (expo/exact#829).
+#[test]
+fn a_send_kept_for_the_data_source_reaches_its_package() {
+    let (_app, mut r, calls) = boot("kept-send");
+    r.data().1 = true;
+    let mut parked = Vec::new();
+    pump(&mut r, &mut parked);
+    r.act("shutter", Vec::new()).unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(
+        sent(&calls, "takePhoto"),
+        0,
+        "kept until the source is ready"
+    );
+    r.data().1 = false;
+    r.data_ready().unwrap();
+    pump(&mut r, &mut parked);
+    assert_eq!(sent(&calls, "takePhoto"), 1, "{}", logs(&r));
+    assert!(!logs(&r).contains("UnknownSource"), "{}", logs(&r));
+}
+
+/// A kept send's failure is the mutation's, as a send made after the source
+/// is ready gives it: the camera app, which a Mac lacks, fails both alike.
+#[test]
+fn a_kept_send_to_a_package_fails_as_one_made_later_does() {
+    let mut codes = Vec::new();
+    for kept in [false, true] {
+        let (_app, mut r, _calls) = boot_with(App::with_source("kept-fail", CAMERA_APP), "");
+        r.set_module_target("macos");
+        r.data().1 = kept;
+        let mut parked = Vec::new();
+        pump(&mut r, &mut parked);
+        r.act("snap", Vec::new()).unwrap();
+        pump(&mut r, &mut parked);
+        if kept {
+            assert_eq!(r.derive("shotError"), Some(&Value::str("")), "still kept");
+            r.data().1 = false;
+            r.data_ready().unwrap();
+            pump(&mut r, &mut parked);
+        }
+        codes.push(r.derive("shotError").cloned());
+    }
+    assert_ne!(
+        codes[0],
+        Some(Value::str("")),
+        "the camera app fails on a Mac"
+    );
+    assert_eq!(codes[0], codes[1]);
 }
 
 /// An implementation's disclosure (D8 item 9): what it says through its
@@ -572,6 +631,82 @@ fn the_camera_app_needs_no_line_and_its_sheet_takes_take_or_cancel() {
         logs(&r)
     );
     assert_eq!(sent(&calls, "takePhotoWithCameraApp"), 2);
+}
+
+const VIDEO_APP: &str = r#"use recordVideoWithCameraApp, Video from "@exact/camera"
+
+component App
+  mutation clip as shape Video
+  derive clipError = match failure(clip) { case some(f) => f.code, case none => "" }
+  derive clipFacts = match clip { case some(v) => `${v.path} ${v.type} ${v.duration} ${v.width}x${v.height}`, case none => "" }
+  action record
+    send clip = recordVideoWithCameraApp(maxDuration=30)
+  view
+    column
+      text clipError
+"#;
+
+/// A video from the camera app (LLP 1133.008.000 D1, D9) is the photo's
+/// sibling: no grant line, the `camera-app` sheet holding with its options,
+/// `take` answering a `Video` and `cancel` `AbortError`, on Android, iOS and
+/// the web; every other host is `NotSupportedError` before the
+/// implementation hears of it. An app that only records derives no Android
+/// permission beyond its lines' (D5: the camera app records the sound).
+#[test]
+fn a_video_from_the_camera_app_holds_the_same_sheet_and_answers_a_video() {
+    let (app, mut r, calls) = boot_with(App::with_source("camera-video", VIDEO_APP), "");
+    let mut parked = Vec::new();
+    pump(&mut r, &mut parked);
+    let tap = |r: &mut Runner<Granted>, parked: &mut Vec<(u64, u64)>, choice: &str| {
+        let ticket = r.device_holds()[0].ticket;
+        let line = json!({ "op": "tap", "ticket": ticket, "choice": choice }).to_string();
+        exact_runner::agent::answer(r, &line).unwrap();
+        pump(r, parked);
+    };
+    for target in ["android", "ios", "web"] {
+        r.set_module_target(target);
+        r.act("record", Vec::new()).unwrap();
+        pump(&mut r, &mut parked);
+        let holds = r.device_holds();
+        assert_eq!(holds.len(), 1, "{target}: {}", logs(&r));
+        assert_eq!(holds[0].capability, "camera-app");
+        let args: Json = serde_json::from_str(&holds[0].args).unwrap();
+        assert_eq!(args["options"]["maxDuration"], 30.0, "{target}");
+        tap(&mut r, &mut parked, "take");
+        assert_eq!(
+            r.derive("clipFacts"),
+            Some(&Value::str("app:/tmp/camera/1.mp4 video/mp4 1 160x120")),
+            "{target}: {}",
+            logs(&r)
+        );
+        r.act("record", Vec::new()).unwrap();
+        pump(&mut r, &mut parked);
+        tap(&mut r, &mut parked, "cancel");
+        assert!(
+            r.derive("clipError") == Some(&Value::str("AbortError")),
+            "{target}: {}",
+            logs(&r)
+        );
+    }
+    assert_eq!(sent(&calls, "recordVideoWithCameraApp"), 6);
+    for target in ["macos", "linux", "windows"] {
+        r.set_module_target(target);
+        r.act("record", Vec::new()).unwrap();
+        pump(&mut r, &mut parked);
+        assert!(r.device_holds().is_empty(), "{target}: no sheet");
+        assert!(
+            r.derive("clipError") == Some(&Value::str("NotSupportedError")),
+            "{target}: {}",
+            logs(&r)
+        );
+    }
+    assert_eq!(sent(&calls, "recordVideoWithCameraApp"), 6, "never sent");
+
+    let plan = contract::compile_path_all(&app.0.join("app.contract"), false)
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .0;
+    let both = Some("device.camera purpose.camera\ndevice.microphone purpose.microphone");
+    assert!(contract::native::android_permissions(&plan, both, VIDEO_APP).is_empty());
 }
 
 /// Android's `CAMERA` comes from opening the camera in the app: any use of

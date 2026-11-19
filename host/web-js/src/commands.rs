@@ -85,15 +85,20 @@ pub(super) fn linked(uses: &Uses) -> Vec<String> {
         .collect()
 }
 
-/// The import of each, as `$c_<name>`.
+/// The import of each, as `$c_<name>`, and a haptic's lifecycle watcher.
 pub(super) fn import(commands: &[String]) -> String {
     format!(
-        "import{{{}}}from\"./commands.js\";",
+        "import{{{}}}from\"./commands.js\";{}",
         commands
             .iter()
             .map(|c| format!("{c} as $c_{c}"))
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        if commands.iter().any(|c| c == "haptic") {
+            "import{watchPage as $watchPage}from\"./facts.js\";"
+        } else {
+            ""
+        }
     )
 }
 
@@ -101,7 +106,15 @@ pub(super) fn import(commands: &[String]) -> String {
 /// that function as the module imported it.
 pub(super) fn install(slot: &str, commands: &[String]) -> String {
     let table: Vec<String> = commands.iter().map(|c| format!("{c}:$c_{c}")).collect();
-    format!("{slot}({{{}}});", table.join(","))
+    format!(
+        "{}{slot}({{{}}});",
+        if commands.iter().any(|c| c == "haptic") {
+            "$watchPage(true);"
+        } else {
+            ""
+        },
+        table.join(",")
+    )
 }
 
 /// Whether the node is a dialog, an alertdialog, a menu or a popover, literal
@@ -169,7 +182,18 @@ pub(super) fn format_slot(plan: &Plan, body: &mut String, locale: u32) {
 /// their compiled registries (`EXACT_JS_GPU_SURFACES`, comma-separated;
 /// host/web-js/build.mjs).
 pub(super) fn gpu_surfaces() -> Vec<String> {
-    std::env::var("EXACT_JS_GPU_SURFACES")
+    surface_list("EXACT_JS_GPU_SURFACES")
+}
+
+/// The surfaces of packages whose GPU `targets` omit the web that nothing
+/// else draws, neither a GPU module of the app nor a data source on
+/// Canvas 2D (`EXACT_JS_UNREGISTERED_SURFACES`; LLP 1153.003 D5.8).
+pub(super) fn unregistered_surfaces() -> Vec<String> {
+    surface_list("EXACT_JS_UNREGISTERED_SURFACES")
+}
+
+fn surface_list(var: &str) -> Vec<String> {
+    std::env::var(var)
         .unwrap_or_default()
         .split(',')
         .filter(|s| !s.is_empty())

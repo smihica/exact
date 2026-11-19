@@ -3,6 +3,29 @@
 
 use super::*;
 
+/// Add the session identity after an operation, preserving any clock it already reports.
+pub fn tagged<D: DataSource>(runner: &Runner<D>, mut reply: String) -> String {
+    if !reply.ends_with('}') {
+        return reply;
+    }
+    let values = [
+        ("generation", runner.generation().to_string()),
+        ("epoch", runner.kernel().epoch().to_string()),
+        ("incarnation", runner.kernel().incarnation().to_string()),
+        ("clock", num(runner.now_ms()).to_string()),
+    ];
+    for (key, value) in values {
+        if field_num(&reply, key).is_none() {
+            reply.pop();
+            if reply.len() > 1 {
+                reply.push(',');
+            }
+            let _ = write!(reply, "\"{key}\":{value}}}");
+        }
+    }
+    reply
+}
+
 pub(super) fn request<D: DataSource>(runner: &Runner<D>, request: &str) -> String {
     let shallow = match after_key(request, "shallow") {
         None => false,
@@ -49,7 +72,8 @@ fn tree_rows<D: DataSource>(
     let mut s = String::new();
     let _ = write!(
         s,
-        "{{\"epoch\":{},\"incarnation\":{},\"clock\":{},\"roots\":",
+        "{{\"generation\":{},\"epoch\":{},\"incarnation\":{},\"clock\":{},\"roots\":",
+        runner.generation(),
         kernel.epoch(),
         kernel.incarnation(),
         num(runner.now_ms())
@@ -128,4 +152,58 @@ fn tree_rows<D: DataSource>(
     }
     s.push('}');
     s
+}
+
+/// Props and SVG geometry by their schema names, with password values masked.
+pub(super) fn props_json(node: &NodeRef<'_>, s: &mut String) {
+    for (i, (id, value)) in node.props.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        quote(id.name(), s);
+        s.push(':');
+        match value {
+            PropValue::Str(t) if id == exact_kernel::PropId::Value => {
+                quote(shown_value(node.props, t), s)
+            }
+            PropValue::Str(t) => quote(t, s),
+            PropValue::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+            PropValue::Int(i) => {
+                let _ = write!(s, "{i}");
+            }
+            PropValue::Float(f) => {
+                let _ = write!(s, "{}", num(*f));
+            }
+        }
+    }
+
+    // SVG 2 geometry lives in style rows, unlike the other SVG attributes.
+    // Expose it beside those attributes on every host using the runner's tree.
+    use exact_kernel::NodeType;
+    let geometry: &[StyleId] = match node.node_type {
+        NodeType::SvgCircle => &[StyleId::Cx, StyleId::Cy, StyleId::R],
+        NodeType::SvgEllipse => &[StyleId::Cx, StyleId::Cy, StyleId::Rx, StyleId::Ry],
+        NodeType::SvgRect => &[
+            StyleId::X,
+            StyleId::Y,
+            StyleId::Width,
+            StyleId::Height,
+            StyleId::Rx,
+            StyleId::Ry,
+        ],
+        NodeType::SvgUse | NodeType::SvgViewport | NodeType::SvgForeignObject => {
+            &[StyleId::X, StyleId::Y, StyleId::Width, StyleId::Height]
+        }
+        _ => &[],
+    };
+    let mut comma = node.props.iter().next().is_some();
+    for &row in geometry.iter().filter(|row| node.style.mask.has(**row)) {
+        if comma {
+            s.push(',');
+        }
+        comma = true;
+        quote(row.name(), s);
+        s.push(':');
+        row_json(row, node.computed(row), s);
+    }
 }

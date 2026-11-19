@@ -6,6 +6,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 extension XCTestCase {
     /// The Keyboard Navigation mode this test runs in: its own, never the

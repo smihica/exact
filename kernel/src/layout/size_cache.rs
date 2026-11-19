@@ -5,7 +5,7 @@ pub use taffy::tree::{SizeCacheCounts, SizeCachePolicy};
 #[cfg(test)]
 mod cost_probe;
 #[cfg(test)]
-mod shapes;
+mod shapes_tests;
 
 impl super::LayoutTree {
     pub(crate) fn reset_size_cache_counts(&mut self) {
@@ -77,6 +77,15 @@ impl super::LayoutTree {
     }
 }
 #[cfg(test)]
+impl super::LayoutTree {
+    /// Count the engine's size computations and cache answers, which a test
+    /// build does and a shipping build does not; a timing test turns it off.
+    pub(crate) fn track_sizes(&mut self, on: bool) {
+        self.taffy.track_size_computations(on);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Kernel, Offer};
@@ -122,6 +131,7 @@ mod tests {
             .set_host_block(
                 100,
                 Some(HostBlock {
+                    tactic: Default::default(),
                     width: BlockAxis::Is(80.0),
                     height: BlockAxis::Is(60.0),
                 }),

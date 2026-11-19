@@ -1,32 +1,54 @@
 //! The root tab bar's warnings: one tab (LLP 1116 D6), and the search tab's
 //! place (LLP 1141.002 D1).
 
-use super::{computed, has, kids, literal};
+use super::{computed, has, literal};
 use crate::LowerError;
-use contract_syntax::Node;
+use contract_checking::Visit;
+
+/// `lower-tablist-conditional` (LLP 1156.006.000 D1): the root's tab bar is in
+/// a branch that can leave it out, as an app writes to hide the bar on one
+/// screen. A host finds the tab panels through the tablist (LLP 1075.003), so
+/// without it every panel shows; `display="none"` hides the bar and keeps it.
+pub(super) fn left_out(view: &[contract_syntax::Node], out: &mut Vec<LowerError>) {
+    let Some(contract_syntax::Node::Element {
+        attrs, children, ..
+    }) = view.first()
+    else {
+        return;
+    };
+    if !has(attrs, "navigationKey") {
+        return;
+    }
+    if let Some(span) = crate::routes::tablist_left_out(children) {
+        out.push(LowerError {
+            id: "lower-tablist-conditional",
+            message: "this tab bar is in a branch (`if`, `match` or `for`), and while the branch is not taken the root has no tabs: every tab's panel shows at once and no host finds the panels' routes. Keep the tablist in the tree and hide it with `display=\"none\"` (docs/contract-for-agents.md, \"Tabs and stacks\")".into(),
+            span,
+        });
+    }
+}
 
 /// `lower-single-tab`: a root tab bar (a `role="tablist"` whose tabs name
 /// their panels with `aria-controls`) with fewer than two tabs (LLP 1116
 /// D6): a bar of one tab under a single screen, which builders copied from
 /// a tab skeleton (polls, chat-rooms).
-pub(super) fn single_tab(tablist: &Node, out: &mut Vec<LowerError>) {
+pub(super) fn single_tab(tablist: Visit<'_>, out: &mut Vec<LowerError>) {
     let (mut tabs, mut controls, mut doubt) = (0, false, false);
-    let mut stack: Vec<&Node> = kids(tablist).iter().collect();
-    while let Some(node) = stack.pop() {
-        match node {
-            Node::Element {
-                attrs, children, ..
-            } => {
-                if computed(attrs, "role") {
-                    doubt = true;
-                } else if literal(attrs, "role") == Some("tab") {
-                    tabs += 1;
-                    controls |= has(attrs, "aria-controls");
-                } else {
-                    stack.extend(children);
-                }
+    for (node, ()) in tablist.regions()[0].walk_regions_with((), |node, _| {
+        let descend = node.element().is_some_and(|(_, _, attrs)| {
+            !computed(attrs, "role") && literal(attrs, "role") != Some("tab")
+        });
+        [descend.then_some(()), None]
+    }) {
+        if let Some((_, _, attrs)) = node.element() {
+            if computed(attrs, "role") {
+                doubt = true;
+            } else if literal(attrs, "role") == Some("tab") {
+                tabs += 1;
+                controls |= has(attrs, "aria-controls");
             }
-            _ => doubt = true,
+        } else {
+            doubt = true;
         }
     }
     if controls && !doubt && tabs < 2 {
@@ -47,22 +69,20 @@ pub(super) fn single_tab(tablist: &Node, out: &mut Vec<LowerError>) {
 /// ordinary tab on every host. `lower-search-tab-last`: iOS 26 draws the
 /// search tab at the trailing end, so the hosts that keep the author's
 /// order agree with it only when it is written last.
-pub(super) fn search_tab(tablist: &Node, out: &mut Vec<LowerError>) {
+pub(super) fn search_tab(tablist: Visit<'_>, out: &mut Vec<LowerError>) {
     let mut tabs: Vec<(&[contract_syntax::Attr], contract_syntax::Span)> = Vec::new();
-    let mut stack: Vec<&Node> = kids(tablist).iter().rev().collect();
-    while let Some(node) = stack.pop() {
-        match node {
-            Node::Element {
-                attrs, children, ..
-            } => {
-                if literal(attrs, "role") == Some("tab") {
-                    tabs.push((attrs, node.span()));
-                } else {
-                    stack.extend(children.iter().rev());
-                }
-            }
+    for (node, ()) in tablist.regions()[0].walk_regions_with((), |node, _| {
+        let descend = node
+            .element()
+            .is_some_and(|(_, _, attrs)| literal(attrs, "role") != Some("tab"));
+        [descend.then_some(()), None]
+    }) {
+        let Some((_, _, attrs)) = node.element() else {
             // A computed tab list is not judged.
-            _ => return,
+            return;
+        };
+        if literal(attrs, "role") == Some("tab") {
+            tabs.push((attrs, node.span()));
         }
     }
     let search: Vec<usize> = tabs

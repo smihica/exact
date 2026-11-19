@@ -4,6 +4,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 #[cfg(unix)]
 #[test]
 fn termination_signals_restore_the_terminal() {
@@ -54,20 +58,20 @@ fn signal_restores(mode: &str, signal: i32, pending: bool) {
         0
     );
 
+    let path = entry("signal");
     let mut command = if pending {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command.args(["--exact", "cli::pending_data_child", "--nocapture"]);
         command.env("EXACT_TERMINAL_PENDING_TEST", mode);
         command
     } else {
-        let path = entry("signal");
         std::fs::write(
             &path,
             "component App\n  view\n    column\n      text \"Ready\"\n",
         )
         .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_exact-terminal"));
-        command.arg(path).args(["--size", "20x6", mode]);
+        command.arg(&*path).args(["--size", "20x6", mode]);
         command
     };
     let mut child = command
@@ -225,7 +229,7 @@ fn blocked_output(trace: bool) {
         // The test harness's banner would block before entering raw mode.
         let mut command = Command::new(env!("CARGO_BIN_EXE_exact-terminal"));
         command
-            .arg(path)
+            .arg(&*path)
             .args(["--size", "200x160", "--fullscreen"]);
         command
     };
@@ -478,7 +482,7 @@ fn pending_data_child() {
         }
 
         fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
-            Ok(Answer::Later(Request::continuation(7)))
+            Ok(Answer::Later(Request::continuation::<TestWork>(7)))
         }
 
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
@@ -529,13 +533,11 @@ const APP: &str = r#"component App
               text v
 "#;
 
-fn entry(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("exact-terminal-cli-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("app.contract");
-    std::fs::write(&path, APP).unwrap();
-    path
+fn entry(name: &str) -> crate::Temp {
+    crate::Temp::entry(
+        format!("exact-terminal-cli-{}-{name}", std::process::id()),
+        APP,
+    )
 }
 
 #[test]
@@ -650,7 +652,7 @@ fn cli_color_detection_and_explicit_overrides_agree_with_the_app() {
         ("dumb", "1", "16", "depth 4"),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-            .arg(&path)
+            .arg(&*path)
             .args(["--color", flag, "--drive", "print"])
             .env("TERM", term)
             .env("NO_COLOR", no_color)
@@ -668,7 +670,6 @@ fn cli_color_detection_and_explicit_overrides_agree_with_the_app() {
             String::from_utf8_lossy(&out.stdout)
         );
     }
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -766,8 +767,9 @@ fn run(name: &str, ops: &[&str]) -> (bool, String, String) {
 }
 
 fn run_in(mode: &str, name: &str, ops: &[&str]) -> (bool, String, String) {
+    let path = entry(name);
     let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-        .arg(entry(name))
+        .arg(&*path)
         .args(["--size", "40x12", mode, "--drive"])
         .args(ops)
         .output()
@@ -788,7 +790,7 @@ fn nonbreaking_space_does_not_add_a_terminal_row() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-        .arg(path)
+        .arg(&*path)
         .args(["--size", "4x6", "--drive", "tree", "document"])
         .output()
         .unwrap();
@@ -840,10 +842,11 @@ fn a_terminal_field_is_a_filled_row() {
         !out.contains('╭') && !out.contains('│'),
         "a field drew a border:\n{out}"
     );
-    let shot = entry("field").with_file_name("field.ans");
+    let path = entry("field");
+    let shot = path.with_file_name("field.ans");
     // Full screen, the screenshot is the grid, faint included.
     let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-        .arg(entry("field"))
+        .arg(&*path)
         .args(["--size", "40x12", "--fullscreen", "--color", "truecolor"])
         .args(["--drive", "screenshot", shot.to_str().unwrap()])
         .output()
@@ -941,8 +944,7 @@ fn native_cell_look_keeps_bare_fields_and_authored_ink() {
 /// value and `░` after, across its box (HTML's 10em).
 #[test]
 fn a_progress_bar_is_a_row_of_blocks() {
-    let dir = std::env::temp_dir().join(format!("exact-terminal-cli-{}-bar", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::Temp::dir(format!("exact-terminal-cli-{}-bar", std::process::id()));
     let path = dir.join("app.contract");
     std::fs::write(
         &path,
@@ -970,7 +972,7 @@ fn headless_time_uses_agent_facts_and_survives_an_invalid_place() {
     // A refused locale falls back to en-US alone; the zone it came with stays.
     for (locale, clock) in [("en-US", "7:00 PM"), ("invalid@locale", "7:00 PM")] {
         let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-            .arg(&path)
+            .arg(&*path)
             .args(["--size", "80x6", "--drive", "print"])
             .env("EXACT_AGENT_EPOCH", "1767225600000")
             .env("EXACT_AGENT_TIME_ZONE", "America/Toronto")
@@ -988,7 +990,6 @@ fn headless_time_uses_agent_facts_and_survives_an_invalid_place() {
             "{screen}"
         );
     }
-    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 /// The terminal carrier's own `layout` and `plan` verbs (LLP 1121 stage 11 C,
@@ -1003,8 +1004,17 @@ fn layout_and_plan_answer_as_json() {
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-        .arg(&path)
-        .args(["--size", "40x10", "--drive", "plan", "layout"])
+        .arg(&*path)
+        .args([
+            "--size",
+            "40x10",
+            "--drive",
+            "plan",
+            "layout",
+            "runner-tree",
+            "node",
+            "1",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -1013,11 +1023,18 @@ fn layout_and_plan_answer_as_json() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
+    for line in text.lines() {
+        let reply: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(reply["generation"], 1, "{line}");
+        assert!(reply["epoch"].as_u64().unwrap() > 0, "{line}");
+        assert_eq!(reply["incarnation"], 1, "{line}");
+        assert!(reply["clock"].is_number(), "{line}");
+    }
     let mut lines = text.lines();
     let plan = lines.next().unwrap();
     let digest = plan
         .strip_prefix("{\"plan\":\"")
-        .and_then(|p| p.strip_suffix("\"}"))
+        .and_then(|p| p.split_once('"').map(|(digest, _)| digest))
         .unwrap_or_else(|| panic!("{plan}"));
     assert!(
         digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -1059,7 +1076,7 @@ fn type_distinguishes_offscreen_fields_from_ineligible_fields() {
     let path = entry("type-offscreen");
     std::fs::write(&path, APP.replace("button press=pick(v) commandfor=\"d\" command=\"close\" text-align=\"start\" testId=v\n              text v", "input value=v testId=v")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-        .arg(path)
+        .arg(&*path)
         .args([
             "--size", "40x12", "--drive", "tap", "open", "type", "epsilon", "hello",
         ])
@@ -1115,7 +1132,7 @@ fn modal_with_popover_refuses_background_tap_type_and_focus_command() {
         ("type", vec!["type", "page-field", "leak"]),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_exact-terminal"))
-            .arg(&path)
+            .arg(&*path)
             .args([
                 "--size",
                 "60x20",

@@ -6,11 +6,11 @@
 import ObjectiveC
 #if os(iOS) || os(tvOS)
 import UIKit
-typealias SymbolImage = UIImage
+package typealias SymbolImage = UIImage
 typealias SymbolConfig = UIImage.SymbolConfiguration
 #else
 import AppKit
-typealias SymbolImage = NSImage
+package typealias SymbolImage = NSImage
 typealias SymbolConfig = NSImage.SymbolConfiguration
 #endif
 
@@ -43,16 +43,26 @@ extension NodeView {
     }
 
     #if os(iOS) || os(tvOS)
-    /// Inks the symbol view. Where its ink is the tint, or its palette names the tint (which UIKit
-    /// resolves by the view's tint), the view has no tint of its own: it inherits the node's, and
-    /// UIKit dims it. Else its tint is its ink, which UIKit leaves as it is (`.normal`); a share of
-    /// the tint is resolved again as the tint changes (`tintColorDidChange`), since UIKit follows no
-    /// view's own tint made from the one above it.
-    func inkSymbolView() {
+    /// Explicit ink belongs to the image, leaving the view's tint and adjustment inherited.
+    /// SF Symbol ink stays dynamic; a path's bitmap is painted again when its tint changes.
+    func inkSymbolView(_ image: UIImage?) {
         guard let view = symbolView else { return }
+        if faceSymbol.map(FaceSymbol.isOriginal) == true { view.image = image; return }
         let follows = inkTintShare == 1 || style["symbol_rendering"]?.string == "palette" && style["symbol_palette"]?.namesTint == true
-        view.tintColor = follows ? nil : drawnSymbolInk
-        view.tintAdjustmentMode = follows ? .automatic : .normal
+        var ink = follows ? nil : inkTintShare.map(SystemColor.tint) ?? drawnSymbolInk
+        let path = props["symbolPath"] != nil
+        if path, ink != nil {
+            if let share = inkTintShare { ink = tintColor.withAlphaComponent(share) }
+            ink = ink?.resolvedColor(with: traitCollection)
+        }
+        let state = SymbolEffectState.of(view)
+        if state.inkSource !== image || state.inkColor != ink {
+            state.inkSource = image; state.inkColor = ink
+            state.inkImage = ink.flatMap { color in
+                image.flatMap { path ? inkedPathImage($0, color: color) : $0.withTintColor(color, renderingMode: .alwaysOriginal) }
+            } ?? image
+        }
+        if view.image !== state.inkImage { view.image = state.inkImage }
     }
 
     /// The share of the tint the symbol's ink is, nil where it is a colour of its own: a list cell's
@@ -70,7 +80,7 @@ extension NodeView {
         false
         #endif
     }
-    /// Only shape changes replace a symbol; paint is a view configuration.
+    /// The template's shape, independent of ink.
     var symbolLookKey: String {
         [style["symbol_rendering"]?.string ?? "", "\(number("symbol_value", -1))", "\(drawsListSymbol)"].joined(separator: "|")
     }
@@ -130,7 +140,7 @@ extension NodeView {
     }
 
     /// A native control configures its own image in the control tint.
-    var faceImage: SymbolImage? {
+    package var faceImage: SymbolImage? {
         guard props["symbolPath"] == nil, let name = props["symbolName"], !name.isEmpty else { return image }
         let points = number("font_size", PageFacts.defaultRootFontSize), weight = number("font_weight", 400)
         return points > 0 ? symbolImage(name, symbolConfiguration(SymbolMeasure.configuration(points: points, weight: weight), face: true)) : nil
@@ -206,6 +216,9 @@ typealias SymbolLeaf = NSImageView
 final class SymbolEffectState {
     var effect = "none"
     var value: String?
+    var pathTemplate: SymbolImage?
+    var inkSource: SymbolImage?, inkImage: SymbolImage?
+    var inkColor: PlatformColor?
     private static var key = 0
     static func of(_ leaf: SymbolLeaf) -> SymbolEffectState {
         if let s = objc_getAssociatedObject(leaf, &key) as? SymbolEffectState { return s }
@@ -218,8 +231,8 @@ final class SymbolEffectState {
 /// The platform's haptics (LLP 1077 D14): `-exact-press-haptic`'s kinds and
 /// `haptic()`'s, which adds success, warning and error. macOS plays on a
 /// Force Touch trackpad.
-enum Haptics {
-    static func play(_ kind: String) {
+package enum Haptics {
+    package static func play(_ kind: String) {
         #if os(tvOS)
         // tvOS has no haptics.
         #elseif os(iOS)

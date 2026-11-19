@@ -28,11 +28,10 @@ assesses its value to upstream, and records the measurements and open questions.
 Build the consuming app with the Linux host's `scanout` feature for direct
 presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
 `KIOSK_DIRECT=1`; select the display device with `EXACT_DRM`.
-`KIOSK_PORTRAIT=1` maps a landscape panel to a portrait UI and rotates absolute
-touch coordinates with it. GLES comparisons use `WGPU_BACKEND=gl` in a build
+Use `EXACT_ROTATE=0|90|180|270` to orient the picture and absolute input.
+Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
-Setting `EXACT_INK_GENERIC` to any value disables shader specialization for
-comparisons.
+Ink uses upstream’s eight fixed shader programs compiled at device creation.
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
@@ -71,7 +70,7 @@ Subscriptions do not start capture or change preview ownership.
   pixel-only request on that attached painter would present too. Its internal
   boot/flip measurements also lack Vulkan presentation-completion events; use
   DRM page flips for device measurements.
-- New shader classes and shadow geometries incur first-use work. Warm-frame
+- New shadow geometries incur first-use work. Warm-frame
   throughput does not measure that cost or long-running stability.
 
 ## Focused checks

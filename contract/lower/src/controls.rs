@@ -47,6 +47,17 @@ fn canonical_type_expr(value: &Expr) -> Option<Expr> {
             Box::new(canonical_type_expr(no)?),
             *span,
         )),
+        Expr::Let {
+            name,
+            value,
+            body,
+            span,
+        } => Some(Expr::Let {
+            name: name.clone(),
+            value: value.clone(),
+            body: Box::new(canonical_type_expr(body)?),
+            span: *span,
+        }),
         _ => None,
     }
 }
@@ -658,6 +669,8 @@ const NATIVE_ROWS: &[StyleId] = &[
     StyleId::Animation,
     StyleId::ExitAnimation,
     StyleId::PressScale,
+    StyleId::PressTranslate,
+    StyleId::PressTranslatePercent,
     StyleId::PressOpacity,
     StyleId::PressOpacityTo,
     StyleId::PressBackgroundColor,
@@ -683,7 +696,7 @@ fn may_be_empty(e: &Expr) -> bool {
         Expr::Str(s, _) => s.trim().is_empty(),
         Expr::None(_) => true,
         Expr::Ternary(_, a, b, _) => may_be_empty(a) || may_be_empty(b),
-        Expr::Typed(x, _, _) => may_be_empty(x),
+        Expr::Typed(x, _, _) | Expr::Let { body: x, .. } => may_be_empty(x),
         _ => false,
     }
 }
@@ -694,7 +707,7 @@ fn always_empty(e: &Expr) -> bool {
         Expr::Str(s, _) => s.trim().is_empty(),
         Expr::None(_) => true,
         Expr::Ternary(_, a, b, _) => always_empty(a) && always_empty(b),
-        Expr::Typed(x, _, _) => always_empty(x),
+        Expr::Typed(x, _, _) | Expr::Let { body: x, .. } => always_empty(x),
         _ => false,
     }
 }
@@ -708,6 +721,7 @@ fn literals(e: &Expr) -> Option<Vec<&str>> {
             out.extend(literals(b)?);
             Some(out)
         }
+        Expr::Let { body, .. } => literals(body),
         _ => None,
     }
 }
@@ -973,7 +987,7 @@ impl Lowerer<'_> {
                     || self
                         .keyframes
                         .get(&anim.name)
-                        .is_some_and(|ps| ps.iter().all(|p| native_motion(*p)));
+                        .is_some_and(|frames| frames.properties().into_iter().all(native_motion));
                 if !ok {
                     return err(
                         "lower-button-style-attr",
@@ -1076,7 +1090,7 @@ fn face_counts(
                             if tag == "text" {
                                 matches!(r, StyleId::FontSize | StyleId::FontWeight | StyleId::TextColor | StyleId::WhiteSpace | StyleId::LineClamp | StyleId::TextAlign)
                             } else {
-                                matches!(r, StyleId::TintColor | StyleId::FontSize | StyleId::FontWeight)
+                                matches!(r, StyleId::TintColor | StyleId::FontSize | StyleId::FontWeight | StyleId::SymbolRendering)
                             }
                         }),
                         _ => false,

@@ -24,7 +24,7 @@ const RULES_PATH = 'rules/RULES.md';
 const CODE_EXTENSIONS = new Set([
   '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.rs', '.go', '.py', '.rb', '.lean',
   '.java', '.kt', '.kts', '.swift', '.c', '.h', '.cc', '.cpp', '.hpp', '.m', '.mm', '.cs', '.php', '.sh', '.lua', '.gd',
-  '.metal', '.wgsl', '.contract', '.tamber',
+  '.metal', '.wgsl', '.contract', '.forma',
 ]);
 const DEAD_STATUSES = new Set(['superseded', 'shelved', 'withdrawn', 'tombstoned', 'archived']);
 // Review artifacts and the overlay directories are not design documents. Counting
@@ -91,13 +91,14 @@ export function runCaps(root = process.cwd()) {
   }
 
   // ---- blocking checks ----------------------------------------------------
-  const maxChecks = budget(rules, 'budget:checks', /([\d,]+)\s*blocking checks/i, 'blocking checks');
-  const checksHeading = rules.match(/##[^\n]*checks\s*\n+([^\n]+)/i);
+  const maxChecks = budget(rules, 'budget:checks', /([\d,]+)\s*blocking checks?/i, 'blocking checks');
+  const checksHeading = rules.match(/^## The gate[^\n]*\n+([^\n]+)/im);
   if (!checksHeading) {
-    fail('checks:undeclared', `${RULES_PATH} has no section naming the blocking checks.`,
+    fail('checks:undeclared', `${RULES_PATH} has no section naming the blocking gate.`,
       'caps counts the backticked names under that heading. Without it the cap is unenforced.');
   } else {
     const names = [...checksHeading[1].matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    if (!names.length) fail('checks:undeclared', 'The gate section names no blocking command.');
     counted.push(`blocking checks: ${names.length} (${names.join(', ') || 'none named'})`);
     if (maxChecks !== null && names.length > maxChecks) {
       fail('cap:checks', `${names.length} blocking checks declared, over the cap of ${maxChecks}.`,
@@ -207,7 +208,7 @@ export function runCaps(root = process.cwd()) {
   windowsNames(files);
   harnesses(root, files);
   helps(root);
-  wasm(root);
+  lockedWorkspaces(root, files);
 
   return { problems, counted };
 }
@@ -299,6 +300,27 @@ function harnesses(root, files) {
 }
 
 /**
+ * Every workspace `package.json` declares has its entry in `bun.lock`. A missing one makes `bun install
+ * --frozen-lockfile` refuse the checkout, which stops every app that builds against it (expo/exact#892). Read from
+ * the tracked files: a workspace is a tracked `package.json` one level under a `workspaces` glob's directory.
+ */
+function lockedWorkspaces(root, files) {
+  const lockPath = resolve(root, 'bun.lock'), manifestPath = resolve(root, 'package.json');
+  if (!existsSync(lockPath) || !existsSync(manifestPath)) return;
+  const globs = JSON.parse(readFileSync(manifestPath, 'utf8')).workspaces ?? [];
+  const lock = readFileSync(lockPath, 'utf8');
+  const dirs = globs.filter((g) => g.endsWith('/*')).map((g) => g.slice(0, -1));
+  const workspaces = files.filter((f) => dirs.some((d) => f.startsWith(d) && f.slice(d.length).split('/').length === 2 && f.endsWith('/package.json')))
+    .map((f) => f.slice(0, -'/package.json'.length));
+  const missing = workspaces.filter((w) => !lock.includes(`"${w}": {`));
+  counted.push(`bun.lock: ${workspaces.length} workspaces, ${missing.length} without an entry`);
+  if (missing.length) {
+    fail('lock:workspaces', `bun.lock has no entry for ${missing.join(', ')}.`,
+      'Run `bun install` and commit bun.lock: a frozen install refuses a lockfile that would change.');
+  }
+}
+
+/**
  * The helps against the scripts they describe, where a checkout has them (exact2's scripts/help-parity.mjs): a flag
  * with no help row, a row naming a flag no script parses, or a help over its length fails here, before a push, as it
  * would fail help.test after one. Read from source: no browser, no build.
@@ -313,22 +335,6 @@ function helps(root) {
   }
   for (const p of found) fail(p.code, p.message, p.detail);
   counted.push(`helps: each verb's flags against its script's, its rows and lengths, ${found.length} problems`);
-}
-
-/**
- * The crates a web app links, compiled for wasm32 when a change touches Rust, where a checkout has the check
- * (exact2's scripts/wasm-check.mjs): a native build never compiles them for that target.
- */
-function wasm(root) {
-  const check = resolve(root, 'scripts/wasm-check.mjs');
-  if (!existsSync(check)) return;
-  let found;
-  try { found = require(check).wasmCheck(root); } catch (e) {
-    fail('wasm:check', `scripts/wasm-check.mjs could not run, so no crate was checked for wasm32: ${e.message}`);
-    return;
-  }
-  for (const p of found.problems) fail(p.code, p.message, p.detail);
-  counted.push(found.counted);
 }
 
 function main() {

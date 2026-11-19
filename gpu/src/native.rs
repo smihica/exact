@@ -1,7 +1,8 @@
 //! The native ABI: what the presenter `dlopen`s (LLP 1009 D2).
 //!
 //! One thread-local module; calls on the main thread. Strings are UTF-8
-//! bytes with lengths. The `unsafe` this module owns: the platform target
+//! bytes with lengths; filesystem paths use native encodings. The `unsafe`
+//! this module owns: the platform target
 //! handoff (a `CAMetalLayer` pointer the presenter registered, valid until
 //! it calls `destroy`) and the byte ranges a host hands over — each checked
 //! for a null pointer before it becomes a slice, every count checked for
@@ -92,7 +93,11 @@ pub fn retier() {
 
 /// Create the device and the module. Returns 0 on success, 1 on failure
 /// (see [`error`]).
-pub fn load(registry: &'static Registry, artifact: &'static str) -> u32 {
+pub fn load(
+    registry: &'static Registry,
+    artifact: &'static str,
+    requirements: &'static [crate::grants::Requirements],
+) -> u32 {
     crate::report_panics();
     let prepared = {
         let mut slot = PREPARED.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -105,9 +110,9 @@ pub fn load(registry: &'static Registry, artifact: &'static str) -> u32 {
             _ => None,
         }
     };
-    match prepared.unwrap_or_else(create_gpu) {
+    match prepared.unwrap_or_else(|| create_gpu(requirements)) {
         Ok(gpu) => {
-            let mut module = Module::new(registry);
+            let mut module = Module::new(registry).with_requirements(requirements);
             module.cache_artifact = Some(artifact);
             module.set_gpu(gpu);
             MODULE.with(|m| *m.borrow_mut() = Some(module));
@@ -120,13 +125,20 @@ pub fn load(registry: &'static Registry, artifact: &'static str) -> u32 {
     }
 }
 
-fn create_gpu() -> Result<crate::Gpu, crate::DeviceFailure> {
+fn create_gpu(
+    requirements: &[crate::grants::Requirements],
+) -> Result<crate::Gpu, crate::DeviceFailure> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         flags: crate::device::instance_flags(),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    crate::block_on(crate::device::load_gpu_as(instance, None, true))
+    crate::block_on(crate::device::load_gpu_as(
+        instance,
+        None,
+        true,
+        requirements,
+    ))
 }
 
 enum Prepared {
@@ -145,7 +157,7 @@ static PREPARED: (std::sync::Mutex<Prepared>, std::sync::Condvar) = (
 /// (which waits for it): a host starting up makes it while it boots, and
 /// the canvas's first frame does not (LLP 1076). The device and queue are
 /// `Send`; the module itself stays on the thread that loads it.
-pub fn prepare() {
+pub fn prepare(requirements: &'static [crate::grants::Requirements]) {
     {
         let mut slot = PREPARED.0.lock().unwrap_or_else(|e| e.into_inner());
         if !matches!(*slot, Prepared::None) {
@@ -155,8 +167,8 @@ pub fn prepare() {
     }
     let made = std::thread::Builder::new()
         .name("exact-gpu-prepare".into())
-        .spawn(|| {
-            let gpu = create_gpu();
+        .spawn(move || {
+            let gpu = create_gpu(requirements);
             *PREPARED.0.lock().unwrap_or_else(|e| e.into_inner()) = Prepared::Ready(gpu);
             PREPARED.1.notify_all();
         });
@@ -210,9 +222,13 @@ pub fn recover() -> String {
 }
 
 /// Load surface ownership only; no adapter is requested.
-pub fn load_headless(registry: &'static Registry, artifact: &'static str) {
+pub fn load_headless(
+    registry: &'static Registry,
+    artifact: &'static str,
+    requirements: &'static [crate::grants::Requirements],
+) {
     crate::report_panics();
-    let mut module = Module::new(registry);
+    let mut module = Module::new(registry).with_requirements(requirements);
     module.cache_artifact = Some(artifact);
     module.set_seekable(true);
     MODULE.with(|m| *m.borrow_mut() = Some(module));
@@ -221,6 +237,52 @@ pub fn load_headless(registry: &'static Registry, artifact: &'static str) {
 /// Create a surface without presentation; zero means refusal.
 pub fn create_headless(name: &str) -> u32 {
     with(|m| m.create_headless(name)).flatten().unwrap_or(0)
+}
+
+/// Give one canvas its native session's directories before binding it.
+pub fn storage(
+    id: u32,
+    data: &std::path::Path,
+    cache: &std::path::Path,
+    temporary: &std::path::Path,
+) -> bool {
+    with(|m| m.storage(id, data, cache, temporary)).unwrap_or(false)
+}
+
+/// Decode Unix path bytes or Windows UTF-16LE code units without Unicode replacement.
+/// Lengths at the ABI are bytes on both platforms.
+pub fn storage_path(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        if bytes.contains(&0) {
+            refuse("gpu_storage: path contains NUL");
+            return None;
+        }
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        use std::os::windows::ffi::OsStringExt;
+        if !bytes.len().is_multiple_of(2) {
+            refuse("gpu_storage: odd UTF-16 byte length");
+            return None;
+        }
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        if wide.contains(&0) {
+            refuse("gpu_storage: path contains NUL");
+            return None;
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&wide))
+    };
+    if !path.is_absolute() {
+        refuse("gpu_storage: storage needs three absolute directory paths");
+        return None;
+    }
+    Some(path)
 }
 
 /// Join acquisition workers and drop the device and every canvas; [`load`] may
@@ -476,6 +538,11 @@ pub fn placement(id: u32, index: u32) -> Option<crate::Placement> {
     with(|m| m.placement(id, index as usize)).flatten()
 }
 
+/// Visual opacity for a host-composited placed child (LLP 1133.039 D8).
+pub fn placement_opacity(id: u32, index: u32) -> f32 {
+    with(|m| m.placement_opacity(id, index as usize)).unwrap_or(1.0)
+}
+
 /// The canvas's children as pixels (LLP 1014 D3) (`width`×`height` premultiplied
 /// RGBA). 0 on success.
 pub fn texture(id: u32, width: u32, height: u32, bytes: &[u8]) -> u32 {
@@ -532,7 +599,8 @@ pub fn readback(id: u32, width: f32, height: f32, scale: f32, now_ms: f64, out: 
     }
 }
 
-/// Current instance policy: bit 0 promises alpha one; bit 1 requests SDR.
+/// Current instance policy: bit 0 promises alpha one; bit 1 requests SDR;
+/// bit 2 discards the retained picture.
 /// Available before attachment, including for headless canvases.
 pub fn presentation_flags(id: u32) -> u32 {
     with(|m| m.presentation_flags(id)).unwrap_or(0)
@@ -670,6 +738,11 @@ pub fn seekable(on: bool) {
     with(|m| m.set_seekable(on));
 }
 
+/// Set the host's motion preference for every canvas.
+pub fn reduced_motion(on: bool) {
+    with(|m| m.set_reduced_motion(on));
+}
+
 /// The display's frame period in milliseconds (0 = unknown), for every frame after.
 pub fn period(period_ms: f64) {
     with(|m| m.set_period(period_ms));
@@ -756,7 +829,8 @@ pub fn error() -> String {
 /// The exports for one app's registry, C ABI (see LLP 1009 D2).
 #[macro_export]
 macro_rules! module {
-    ($registry:expr) => {
+    ($registry:expr) => { $crate::module!($registry, &[]); };
+    ($registry:expr, $requirements:expr) => {
         thread_local! {
             static EXACT_GPU_OUT: ::std::cell::RefCell<Vec<u8>> = const { ::std::cell::RefCell::new(Vec::new()) };
         }
@@ -764,13 +838,13 @@ macro_rules! module {
         /// Create the device. 0 on success.
         #[no_mangle]
         pub extern "C" fn gpu_load() -> u32 {
-            $crate::native::load(&$registry, concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")))
+            $crate::native::load(&$registry, concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")), $requirements)
         }
 
         /// Start creating the device on a thread of its own; `gpu_load` takes it.
         #[no_mangle]
         pub extern "C" fn gpu_prepare() {
-            $crate::native::prepare()
+            $crate::native::prepare($requirements)
         }
 
         /// 1 when `gpu_load` would not wait for a prepared device, 0 while it is made.
@@ -800,7 +874,25 @@ macro_rules! module {
 
         /// Load ownership without a GPU.
         #[no_mangle]
-        pub extern "C" fn gpu_load_headless() { $crate::native::load_headless(&$registry, concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION"))); }
+        pub extern "C" fn gpu_load_headless() { $crate::native::load_headless(&$registry, concat!(env!("CARGO_PKG_NAME"), "@", env!("CARGO_PKG_VERSION")), $requirements); }
+
+        /// Give a canvas its session's data, cache and temporary directories.
+        /// # Safety
+        /// Each pointer is readable for its byte length during this call.
+        /// Paths are Unix bytes or Windows UTF-16LE, without a trailing NUL.
+        #[no_mangle]
+        pub unsafe extern "C" fn gpu_storage(id: u32,
+            data: *const u8, data_len: usize, cache: *const u8, cache_len: usize,
+            temporary: *const u8, temporary_len: usize) -> bool {
+            let paths = [(data, data_len), (cache, cache_len), (temporary, temporary_len)];
+            let mut decoded = [const { ::std::path::PathBuf::new() }; 3];
+            for (out, (ptr, len)) in decoded.iter_mut().zip(paths) {
+                let Some(bytes) = (unsafe { $crate::native::bytes("gpu_storage", ptr, len) }) else { return false };
+                let Some(path) = $crate::native::storage_path(bytes) else { return false };
+                *out = path;
+            }
+            $crate::native::storage(id, &decoded[0], &decoded[1], &decoded[2])
+        }
 
         /// Create ownership without a presentation target. Zero means refusal.
         /// # Safety
@@ -860,6 +952,14 @@ macro_rules! module {
         #[no_mangle]
         pub extern "C" fn gpu_shader_names() -> u32 {
             let names = $registry.shaders.iter().map(|(name, _)| (*name).to_string()).collect::<Vec<_>>();
+            let text = $crate::json::strings(&names);
+            EXACT_GPU_OUT.with(|b| { *b.borrow_mut() = text.into_bytes(); b.borrow().len() as u32 })
+        }
+
+        /// The module's surface roster as JSON in the output buffer. Needs no device.
+        #[no_mangle]
+        pub extern "C" fn gpu_surfaces() -> u32 {
+            let names = $registry.surfaces.iter().map(|(name, _, _)| (*name).to_string()).collect::<Vec<_>>();
             let text = $crate::json::strings(&names);
             EXACT_GPU_OUT.with(|b| { *b.borrow_mut() = text.into_bytes(); b.borrow().len() as u32 })
         }
@@ -936,6 +1036,12 @@ macro_rules! module {
             $crate::native::children_mode(id)
         }
 
+        /// Visual opacity multiplier for a placed child; defaults to 1.
+        #[no_mangle]
+        pub extern "C" fn gpu_placement_opacity(id: u32, index: u32) -> f32 {
+            $crate::native::placement_opacity(id, index)
+        }
+
         /// The `index`th direct child of a canvas: its frame in points and
         /// `len` bytes of premultiplied RGBA, `width`×`height` (LLP 1014 D5).
         /// 0 on success.
@@ -970,7 +1076,7 @@ macro_rules! module {
             match $crate::native::placement(id, index) {
                 Some(p) if p.hidden => 2,
                 Some(p) => {
-                    for (i, v) in p.homography.iter().chain(std::iter::once(&p.depth)).enumerate() {
+                    for (i, v) in p.homography.iter().chain(::std::iter::once(&p.depth)).enumerate() {
                         // SAFETY: the caller's contract — `len` ≥ 10 floats at `out`, checked above.
                         unsafe { out.add(i).write_unaligned(*v) }
                     }
@@ -1056,7 +1162,7 @@ macro_rules! module {
         /// Whether a canvas reads gamepads: 1 or 0.
         #[no_mangle]
         pub extern "C" fn gpu_wants_pads(id: u32) -> u32 { u32::from($crate::native::wants_pads(id)) }
-        /// Instance policy: bit 0 promises alpha one, bit 1 requests SDR.
+        /// Instance policy: bit 0 promises alpha one, bit 1 requests SDR, bit 2 says the canvas is empty, so the host shows its styles and children instead of any retained picture.
         #[no_mangle]
         pub extern "C" fn gpu_presentation_flags(id: u32) -> u32 { $crate::native::presentation_flags(id) }
 
@@ -1183,6 +1289,9 @@ macro_rules! module {
         /// Set the host clock ownership.
         #[no_mangle]
         pub extern "C" fn gpu_seekable(on: bool) { $crate::native::seekable(on); }
+        /// Set the host's motion preference for every canvas.
+        #[no_mangle]
+        pub extern "C" fn gpu_reduced_motion(on: bool) { $crate::native::reduced_motion(on); }
 
         /// The display's frame period in milliseconds, 0 while unknown.
         #[no_mangle]

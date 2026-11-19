@@ -179,6 +179,31 @@ fn a_fragment_rides_on_the_visit_and_asks_one_scroll_per_activation() {
     assert_eq!(r.derive("fragment"), Some(&Value::str("")));
 }
 
+/// @ref LLP 1153 D5.1 — the same visit at another path is a new page: its
+/// route is asked to its opening position (no fragment), or to the fragment
+/// the location names; a new query alone keeps its place.
+#[test]
+fn a_visit_replaced_at_another_path_arrives_at_its_opening_position() {
+    let mut r = boot(fixture::plan(&table()), "/t/7");
+    let top = r.take_router_change().unwrap().top;
+    let visit = Value::Number(top as f64);
+    assert!(fragment_scrolls(&mut r).is_empty());
+    let swapped = act(&mut r, "replace", "/t/8").unwrap();
+    assert_eq!(
+        (swapped.top, swapped.fragment.as_str(), swapped.scroll),
+        (top, "", true)
+    );
+    assert_eq!(fragment_scrolls(&mut r), [scroll(&visit, "", 1)]);
+    assert!(!act(&mut r, "replace", "/t/8?q=a").unwrap().scroll);
+    assert!(fragment_scrolls(&mut r).is_empty());
+    let anchored = act(&mut r, "replace", "/t/9#moves").unwrap();
+    assert_eq!(
+        (anchored.fragment.as_str(), anchored.scroll),
+        ("moves", true)
+    );
+    assert_eq!(fragment_scrolls(&mut r), [scroll(&visit, "moves", 2)]);
+}
+
 /// @ref LLP 1153 D5 — a navigation is a router value assigned to the
 /// router's slot by a commit that lands: a `go` merely computed, or one
 /// whose commit is refused, scrolls nothing and spends no activation.
@@ -237,6 +262,47 @@ fn a_table_of_one_location_says_so() {
         1,
         "a push of the one location is no visit"
     );
+}
+
+// #527: a reloaded web page launches with the visits Back returns to beneath
+// it, one a line before the location, as `go` to each in turn leaves them.
+#[test]
+fn a_launch_after_earlier_visits_has_them_beneath_and_back_pops_to_each() {
+    let table = table();
+    let urls = |r: &Runner<Data>| -> Vec<String> {
+        nav(r).tabs[0].stack.iter().map(|e| e.url.clone()).collect()
+    };
+    let mut r = boot(fixture::plan(&table), "/\n/t/a\n/t/b\n/t/b/details");
+    let expected = ["/t/b", "/t/b/details"]
+        .into_iter()
+        .fold(Router::launch(&table, "/t/a").0, |r, v| {
+            exact_route::go(&table, r, v).0
+        });
+    assert_eq!(nav(&r), expected);
+    assert_eq!(urls(&r), ["/", "/t/a", "/t/b", "/t/b/details"]);
+    assert_eq!(r.slot("initial_url"), Some(&Value::str("/t/b/details")));
+    // The browser's Back hands the root's `navigate` the visit beneath: `go` pops to it.
+    act(&mut r, "go", "/t/b");
+    assert_eq!(urls(&r), ["/", "/t/a", "/t/b"]);
+    act(&mut r, "go", "/t/a");
+    assert_eq!(urls(&r), ["/", "/t/a"]);
+
+    // A visit the table no longer matches is left out; with none left, the launch is the location's chain.
+    let r = boot(fixture::plan(&table), "/gone\n/t/a\n/t/b/details");
+    assert_eq!(urls(&r), ["/", "/t/a", "/t/b/details"]);
+    let r = boot(fixture::plan(&table), "/gone\n/t/b/details");
+    assert_eq!(nav(&r), Router::launch(&table, "/t/b/details").0);
+
+    // A refused location launches `/` alone, whatever came before it.
+    let mut r = boot(fixture::plan(&table), "/t/a\n/absent");
+    assert_eq!(nav(&r), Router::launch(&table, "/").0);
+    assert_eq!(
+        r.journal()
+            .filter(|l| l.contains("router launch refused"))
+            .count(),
+        1
+    );
+    r.take_router_change();
 }
 
 #[test]
@@ -317,7 +383,6 @@ fn drained_changes_describe_commits_across_all_tabs_and_refusals_do_not_change_s
         2
     );
     assert!(act(&mut r, "select", "absent").is_none());
-    assert!(act(&mut r, "replace", "/t/5").is_none());
     assert_eq!(r.slot("nav"), before.as_ref());
 }
 

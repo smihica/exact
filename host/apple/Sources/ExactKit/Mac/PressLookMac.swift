@@ -39,7 +39,7 @@ extension NodeView {
         guard let parent = nodeAbove(self) else { return false }
         let list = parent.kind == "list" ? parent : parent.props["semanticTag"] == "section" ? nodeAbove(parent) : nil
         guard let list, list.kind == "list" else { return false }
-        return presenter?.collections.entries[list.id]?.snapshot.horizontal != true
+        return presenter?.collections.snapshot(list.id)?.horizontal != true
     }
 
     /// A pressable that is the author's own box, not AppKit's control and
@@ -83,7 +83,7 @@ extension NodeView {
         defer { CATransaction.commit() }
         let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let scale = pixelScale ?? layer.contentsScale
-        let tree = Capture.paintOrderLayer(of: self, root: layer, redraw: scale)
+        let tree = Capture.paintOrderLayer(of: self, root: layer)
         defer { Capture.releasePaintCopy(tree) }
         // The copy stands where the node does in its parent: here it is the wash's own box, whole and unshadowed.
         tree.transform = CATransform3DIdentity

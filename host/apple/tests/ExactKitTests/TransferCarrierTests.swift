@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactWakeCarriers
 
 // Which background tasks an abort of a registration cancels: its own, read
 // by the description `start` gives them, and none of a registration whose id

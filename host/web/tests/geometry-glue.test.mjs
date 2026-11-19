@@ -10,7 +10,7 @@ import { parseSync } from 'rolldown/utils';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('../glue.js', import.meta.url), 'utf8');
-const declarations = glueDeclarations(source, ['pageChanged', 'resizeRunner', 'mediaChanged']);
+const declarations = glueDeclarations(source, ['toldScreenReader', 'pageChanged', 'resizeRunner', 'mediaChanged']);
 // The glue's own registrations of the two `resize` listeners, as written.
 const registrations = parseSync('glue.js', source).program.body
   .filter(s => s.type === 'ExpressionStatement')
@@ -24,7 +24,9 @@ function page() {
     addEventListener: window.addEventListener.bind(window),
     readOut: value => value, applyBatch: () => {}, presence: { resize: x => x },
     now: () => 0, preferences: () => 0, foldBits: () => 0, requestAnimationFrame: () => {}, positionContexts: () => {},
-    pageFacts: { bits: () => 0, rootFontSize: () => 16, displayScale: () => 3 },
+    pageFacts: { bits: () => 0, rootFontSize: () => 16, displayScale: () => 3,
+      read: () => ({ 'screen-reader': state.reader ?? 'unknown' }),
+      screenReaderCode: () => ['unknown', 'off', 'on'].indexOf(state.reader ?? 'unknown') },
     pageGeometry: () => JSON.stringify([[state.innerWidth > state.innerHeight ? 0 : 62, 0, 21, 0], [], 0]),
     writeIn: text => { calls.push(['write', text]); return text.length; },
     incarnation: 1, syncViewportFit: () => {},
@@ -32,14 +34,28 @@ function page() {
       exact_resize: (w, h, _now, _prefs, len) => { calls.push(['resize', w, h, len]); return state.refuse ? '{"ops":[],"error":"viewport: InvalidViewport"}' : '{}'; },
       exact_set_viewport_geometry: len => { calls.push(['geometry', state.innerWidth, state.innerHeight, len]); return '{}'; },
       exact_set_page: () => '{}',
+      exact_set_screen_reader: code => { state.readerCode = code; },
     },
   };
   state.host = state;
   vm.createContext(state);
   vm.runInContext(`${declarations}\n${registrations.join('\n')}`, state);
   const rotate = () => { [state.innerWidth, state.innerHeight] = [state.innerHeight, state.innerWidth]; };
-  return { calls, window, visualViewport, rotate, state };
+  return { calls, window, visualViewport, rotate, state,
+    reader: value => { state.reader = value; vm.runInContext('pageChanged()', state); } };
 }
+
+test('a screen-reader substitute reaches the viewport at the current size', () => {
+  const p = page();
+  p.window.dispatchEvent(new Event('resize'));
+  expect(p.state.readerCode).toBe(0);
+  for (const [value, code] of [['on', 2], ['off', 1], ['unknown', 0]]) {
+    p.calls.length = 0;
+    p.reader(value);
+    expect(p.state.readerCode).toBe(code);
+    expect(told(p.calls)[0]).toEqual(['resize', 402, 874, 18]);
+  }
+});
 
 const told = calls => calls.filter(c => c[0] !== 'write');
 

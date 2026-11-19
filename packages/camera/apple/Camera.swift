@@ -20,7 +20,8 @@
 //   picture and `takePhoto` copies its file unchanged (§9). The picture is
 //   the package's test card, read from this checkout (a drive runs on this
 //   Mac or its simulators), or the app asset `prefer extension
-//   camera.picture={"path":…}` names.
+//   camera.picture={"path":…}` names. `camera.clip={"path":…}` instead selects
+//   decoded frames on the session clock; takePhoto encodes the current frame.
 // - `takePhotoWithCameraApp` on iOS is the system camera UI
 //   (`UIImagePickerController` with `.camera`), with its shutter, flash and
 //   review; the kept photo is written as JPEG with the camera's metadata. It
@@ -28,6 +29,13 @@
 //   camera's permission as the picker would. The simulator has no camera:
 //   `NotFoundError`. Under the agent the runner holds the person's sheet,
 //   and `take` writes the agent's picture. macOS has no such UI.
+// - `recordVideoWithCameraApp` is the same picker in movie mode (LLP 1133.008.000 D2): `maxDuration` is
+//   `videoMaximumDuration`, `apple.videoQuality` its `videoQuality`. It needs the microphone's usage key too (the
+//   `device.microphone` line), since iOS ends an app that records sound without it. The picker's file is moved to the
+//   path and answered as a `Video` read with `AVURLAsset`. Under the agent `take` writes the package's one-second clip.
+// - A call let go publishes nothing (LLP 1133.008.000 D7): the picker is dismissed, and a photo or video already kept
+//   is not written. The call's number is kept until the kept file is renamed over the path, on the main thread, where
+//   `cancel` runs.
 // - Tier 3 (D5): the photo output when it is added (`photoOutputHatch`, on
 //   the session's queue), each capture's settings before it is taken
 //   (`photoSettingsHatch`, main, may return a replacement), each photo
@@ -53,8 +61,13 @@ public final class CameraModule: ExactPackage {
     let context: ExactPackageContext
     private var views: [String: ViewState] = [:]
     private var picture: String?
+    private var agentClip: AgentClip?
+    private var clipPath: String?
+    private var starts: [String: Double] = [:]
+    private var cancelFrame: (() -> Void)?
     private var taken = 0
     private var photos: [[String: Any]] = []
+    private var videos: [[String: Any]] = []
 
     /// What the runner said of a viewfinder, and what it consumes.
     final class ViewState {
@@ -71,7 +84,7 @@ public final class CameraModule: ExactPackage {
     /// A viewfinder's place among its track's consumers.
     final class Sub: ExactTrackConsumer {
         let track: String, origin: String
-        var live = false
+        var live = false, isMuted = false
         var subscription: ExactSubscription?
         var onLive: (ExactVideoSource?) -> Void = { _ in }
         var onBlank: () -> Void = {}
@@ -79,8 +92,8 @@ public final class CameraModule: ExactPackage {
         var onUnmuted: () -> Void = {}
         init(track: String, origin: String) { self.track = track; self.origin = origin }
         func live(video source: ExactVideoSource?) { live = true; onLive(source) }
-        func muted(_ reason: String) { onMuted() }
-        func unmuted() { onUnmuted() }
+        func muted(_ reason: String) { isMuted = true; onMuted() }
+        func unmuted() { isMuted = false; onUnmuted() }
         func ended() { live = false; onBlank() }
         func leave() { subscription?.cancel(); subscription = nil }
     }
@@ -94,26 +107,65 @@ public final class CameraModule: ExactPackage {
     public func later(_ name: String, _ args: [String: Any], preferred: Any?, reply: @escaping ([String: Any]) -> Void) {
         switch name {
         case "takePhoto": takePhoto(args, reply)
-        case "takePhotoWithCameraApp": cameraApp(args, tap: (preferred as? [String: Any])?["tap"] as? String, reply)
+        case "takePhotoWithCameraApp": cameraApp(.photo, args, tap: (preferred as? [String: Any])?["tap"] as? String, reply)
+        case "recordVideoWithCameraApp": cameraApp(.video, args, tap: (preferred as? [String: Any])?["tap"] as? String, reply)
         case "getPhotoCapabilities": reply(capabilities(args))
         case "picture": reply(["path": picture ?? ""])
         default: reply(["error": "NotSupportedError"])
         }
     }
 
-    /// Under the agent: the picture `prefer extension camera.picture` names (D8 item 9).
+    /// A preference changes the source, never the tracks' playback phase.
     public func preferred(_ values: [String: Any]) {
+        guard context.agent else { return }
         let named = (values["picture"] as? [String: Any])?["path"] as? String
         let next = named?.isEmpty == false ? named : nil
-        guard next != picture else { return }
-        picture = next
+        let video = (values["clip"] as? [String: Any])?["path"] as? String
+        let path = video?.isEmpty == false ? video : nil
+        if next != nil && path != nil {
+            say("refused: camera.picture and camera.clip cannot both be set; clear one first")
+            return
+        }
+        guard next != picture || path != clipPath else { return }
+        var decoded: AgentClip?
+        if let path {
+            guard let url = assetURL(path) else { say("refused camera.clip: no app asset \(path)"); return }
+            do { decoded = try AgentClip(url: url) }
+            catch { say("refused camera.clip: \(error)"); return }
+        }
+        picture = next; clipPath = path; agentClip = decoded
+        if let decoded { say("clip \(path!) (\(decoded.duration) ms, sha256 \(decoded.sha256))") }
+        cancelFrame?(); cancelFrame = nil
         for (id, v) in views where v.sub?.live == true {
-            context.tracks.lookup(v.sub?.track ?? "")?.picture = agentPicture()
             v.sub?.leave(); v.sub = nil; reconcile(id)
         }
     }
 
+    private func elapsed(_ track: String) -> Double {
+        if starts[track] == nil { starts[track] = context.tracks.lookup(track)?.startedAt ?? context.now() }
+        return context.now() - starts[track]!
+    }
+
+    private func refreshClip() {
+        cancelFrame?(); cancelFrame = nil
+        guard let clip = agentClip else { return }
+        var next = Double.infinity
+        for v in views.values {
+            guard let sub = v.sub, sub.live, !sub.isMuted, let view = v.view else { continue }
+            let elapsed = elapsed(sub.track), frame = clip.frames[clip.index(elapsed)]
+            let entry = context.tracks.lookup(sub.track)
+            entry?.picture = frame.image
+            let facing = (entry?.state?()["settings"] as? [String: Any])?["facingMode"] as? String
+            view.show(picture: frame.image, mirrored: facing == "user")
+            next = min(next, clip.next(elapsed))
+        }
+        if next.isFinite {
+            cancelFrame = context.after(max(0.001, next), coalescing: true) { [weak self] in self?.refreshClip() }
+        }
+    }
+
     public func destroy(_ done: @escaping () -> Void) {
+        cancelFrame?(); cancelFrame = nil; agentClip = nil
         for v in views.values { v.sub?.leave() }
         views = [:]
         if cameraAppUp { endCameraApp("the session ended") }
@@ -184,10 +236,11 @@ public final class CameraModule: ExactPackage {
             guard let self, let v, let sub, v.sub === sub, sub.live else { return }
             let facing = (self.context.tracks.lookup(sub.track)?.state?()["settings"] as? [String: Any])?["facingMode"] as? String
             if self.context.agent {
-                let picture = self.agentPicture()
+                let picture = self.agentPicture(sub.track)
                 v.view?.show(picture: picture, mirrored: facing == "user")
                 // The track's frame is the picture drawn, unmirrored, as a sensor's is (LLP 1133.027 D17 item 2).
                 self.context.tracks.lookup(sub.track)?.picture = picture
+                self.refreshClip()
             } else if let source { v.view?.show(source: source) }
         }
         sub.onLive = { s in source = s; show() }
@@ -219,7 +272,7 @@ public final class CameraModule: ExactPackage {
         let took = { [self] (path: String, data: Data) in took(path, data, track: id, origin: origin) }
         let written = { [self] (ext: String) in place(args, ext) }
         if context.agent {
-            guard let data = agentPictureData(), let (path, url) = written("jpg") else { return reply(["error": "UnknownError"]) }
+            guard let data = agentPictureData(id), let (path, url) = written("jpg") else { return reply(["error": "UnknownError"]) }
             do { try data.write(to: url) } catch { return reply(["error": "UnknownError"]) }
             took(path, data)
             return reply(Self.photo(path: path, data: data))
@@ -255,7 +308,14 @@ public final class CameraModule: ExactPackage {
     private func took(_ path: String, _ data: Data, track: String?, origin: String) {
         say("took \(path) (\(data.count) bytes\(context.agent ? ", the agent's picture" : ""), sha256 \(Self.sha256(data)))")
         photos.append(["path": path, "sha256": Self.sha256(data), "track": track ?? NSNull(), "origin": origin])
-        context.state(["photos": photos])
+        context.state(["photos": photos, "videos": videos])
+    }
+
+    /// The agent's clip written: journaled and listed for `state.extensions` beside the photos (LLP 1133.008.000 D9).
+    private func recorded(_ path: String, _ data: Data, origin: String) {
+        say("recorded \(path) (\(data.count) bytes, the agent's clip, sha256 \(Self.sha256(data)))")
+        videos.append(["path": path, "sha256": Self.sha256(data), "origin": origin])
+        context.state(["photos": photos, "videos": videos])
     }
 
     /// Where a photo of format `ext` goes: the call's `path` with the extension, else `app:/tmp/camera/<n>.<ext>`.
@@ -267,14 +327,16 @@ public final class CameraModule: ExactPackage {
         return (path, url)
     }
 
-    // MARK: the camera app (`takePhotoWithCameraApp`)
+    // MARK: the camera app (`takePhotoWithCameraApp`, `recordVideoWithCameraApp`)
 
-    /// Whether the system's camera UI is up, or asked for, for a call: one at a time.
+    enum Shot { case photo, video }
+
+    /// Whether the system's camera UI is up, or asked for, or its kept file not yet published, for a call: one at a time.
     private var cameraAppUp = false
-    /// The runner's number for that call, which a `cancel` names.
+    /// The runner's number for that call, which a `cancel` names, kept until the kept file is published.
     private var cameraAppRequest: Int?
-    /// Moved when the call ends unanswered (let go, or the session's end): an answer to the camera's permission asked
-    /// before then shows nothing.
+    /// Moved when the call ends unanswered (let go, or the session's end): an answer to a permission asked, or a kept
+    /// file not yet published, before then shows and writes nothing.
     private var cameraAppTurn = 0
     #if os(iOS)
     private var cameraAppDelegate: CameraAppDelegate?
@@ -283,13 +345,14 @@ public final class CameraModule: ExactPackage {
     static var cameraAppPlatform = CameraAppPlatform()
     #endif
 
-    /// The send let go (LLP 1133.016 D15 item 2): its camera UI goes, and nothing answers.
+    /// The send let go (LLP 1133.016 D15 item 2): its camera UI goes, and nothing is written or answered.
     public func cancel(_ request: Int) {
         guard cameraAppUp, request == cameraAppRequest else { return }
         endCameraApp("let go")
     }
 
-    /// The camera app's call ends unanswered: the picker is dismissed and a pending permission's answer ignored.
+    /// The camera app's call ends unanswered: the picker is dismissed, and a pending permission's answer or a kept file
+    /// not yet published is ignored.
     private func endCameraApp(_ why: String) {
         cameraAppTurn += 1
         cameraAppUp = false
@@ -302,9 +365,9 @@ public final class CameraModule: ExactPackage {
         say("camera app: \(why)")
     }
 
-    /// The photo the person takes and keeps in the system's camera UI (`UIImagePickerController` with `.camera`), as
-    /// `takePhoto` answers one; `tap` is the agent's on the runner's sheet.
-    private func cameraApp(_ args: [String: Any], tap: String?, _ reply: @escaping ([String: Any]) -> Void) {
+    /// The photo or video the person takes and keeps in the system's camera UI (`UIImagePickerController` with
+    /// `.camera`), answered as `takePhoto` answers a photo, or as a `Video`; `tap` is the agent's on the runner's sheet.
+    private func cameraApp(_ shot: Shot, _ args: [String: Any], tap: String?, _ reply: @escaping ([String: Any]) -> Void) {
         guard !cameraAppUp else { return reply(["error": "InvalidStateError", "message": "the camera is showing"]) }
         let origin = context.origin
         if context.agent {
@@ -312,10 +375,19 @@ public final class CameraModule: ExactPackage {
                 say("camera app: cancelled (the agent's sheet)")
                 return reply(["error": "AbortError"])
             }
-            guard let data = agentPictureData(), let (path, url) = place(args, "jpg") else { return reply(["error": "UnknownError"]) }
-            do { try data.write(to: url) } catch { return reply(["error": "UnknownError"]) }
-            took(path, data, track: nil, origin: origin)
-            return reply(Self.photo(path: path, data: data))
+            switch shot {
+            case .photo:
+                guard let data = agentPictureData(), let (path, url) = place(args, "jpg") else { return reply(["error": "UnknownError"]) }
+                do { try data.write(to: url) } catch { return reply(["error": "UnknownError"]) }
+                took(path, data, track: nil, origin: origin)
+                return reply(Self.photo(path: path, data: data))
+            case .video:
+                guard let data = try? Data(contentsOf: Self.clip), let (path, url) = place(args, "mp4") else { return reply(["error": "UnknownError"]) }
+                do { try data.write(to: url) } catch { return reply(["error": "UnknownError"]) }
+                recorded(path, data, origin: origin)
+                Self.video(path: path, url: url) { reply($0) }
+                return
+            }
         }
         #if os(iOS)
         let platform = Self.cameraAppPlatform
@@ -325,13 +397,24 @@ public final class CameraModule: ExactPackage {
             return reply(["error": "NotFoundError"])
         }
         // Without the key iOS ends the app at the camera's first use; the `device.camera` line writes it.
-        guard platform.described() else {
+        guard platform.described("NSCameraUsageDescription") else {
             say("camera app: the app has no NSCameraUsageDescription")
             return reply(["error": "NotAllowedError", "message": "iOS shows the camera's purpose: grant `device.camera <purpose>`"])
         }
+        if shot == .video {
+            guard platform.movies() else {
+                say("camera app: this camera records no video")
+                return reply(["error": "NotSupportedError"])
+            }
+            // A movie records sound: iOS ends an app that records it without the microphone's key.
+            guard platform.described("NSMicrophoneUsageDescription") else {
+                say("camera app: the app has no NSMicrophoneUsageDescription")
+                return reply(["error": "NotAllowedError", "message": "iOS shows the microphone's purpose: grant `device.microphone <purpose>`"])
+            }
+        }
         cameraAppRequest = context.request
         switch platform.status() {
-        case .authorized: showCameraApp(args, origin: origin, reply)
+        case .authorized: showCameraApp(shot, args, origin: origin, reply)
         case .notDetermined:
             cameraAppUp = true
             let turn = cameraAppTurn
@@ -339,7 +422,7 @@ public final class CameraModule: ExactPackage {
                 DispatchQueue.main.async {
                     guard let self, turn == self.cameraAppTurn else { return }
                     self.cameraAppUp = false
-                    if granted { self.showCameraApp(args, origin: origin, reply) } else { reply(["error": "NotAllowedError"]) }
+                    if granted { self.showCameraApp(shot, args, origin: origin, reply) } else { reply(["error": "NotAllowedError"]) }
                 }
             }
         default:
@@ -352,39 +435,61 @@ public final class CameraModule: ExactPackage {
     }
 
     #if os(iOS)
-    private func showCameraApp(_ args: [String: Any], origin: String, _ reply: @escaping ([String: Any]) -> Void) {
+    private func showCameraApp(_ shot: Shot, _ args: [String: Any], origin: String, _ reply: @escaping ([String: Any]) -> Void) {
         // The session's own window, key or not (LLP 1133.027 D17 item 3), and what it presents now.
         var top = context.presentation?.rootViewController
         while let presented = top?.presentedViewController { top = presented }
         guard let top else { return reply(["error": "InvalidStateError", "message": "no window to show the camera in"]) }
         let picker = UIImagePickerController()
         picker.sourceType = .camera
-        picker.mediaTypes = ["public.image"]
+        switch shot {
+        case .photo: picker.mediaTypes = ["public.image"]
+        case .video:
+            picker.mediaTypes = ["public.movie"]
+            picker.cameraCaptureMode = .video
+            if let seconds = args["maxDuration"] as? Double, seconds > 0 { picker.videoMaximumDuration = seconds }
+            if let quality = Self.videoQuality((args["apple"] as? [String: Any])?["videoQuality"] as? String) { picker.videoQuality = quality }
+        }
         switch args["facingMode"] as? String {
         case "user" where UIImagePickerController.isCameraDeviceAvailable(.front): picker.cameraDevice = .front
         case "environment" where UIImagePickerController.isCameraDeviceAvailable(.rear): picker.cameraDevice = .rear
         default: break
         }
-        let delegate = CameraAppDelegate { [weak self] result in
-            guard let self else { return }
+        let turn = cameraAppTurn
+        let delegate = CameraAppDelegate(shot) { [weak self] result in
+            guard let self, turn == cameraAppTurn else { return }
             cameraAppDelegate = nil
             cameraAppPicker = nil
-            cameraAppUp = false
-            cameraAppRequest = nil
             switch result {
             case .failure(let failure):
+                cameraAppUp = false
+                cameraAppRequest = nil
                 say("camera app: \(failure.code == "AbortError" ? "cancelled" : failure.code)")
                 reply(["error": failure.code])
-            case .success(let data):
-                guard let (path, url) = place(args, "jpg") else { return reply(["error": "UnknownError"]) }
+            case .success(.photo(let data)):
+                // Written off the main thread beside the path, then renamed over it on the main thread.
+                guard let (path, url) = place(args, "jpg") else { return finish(turn, ["error": "UnknownError"], reply) }
+                let staged = Self.staging(url)
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let ok = (try? data.write(to: url)) != nil
+                    let ok = (try? data.write(to: staged)) != nil
                     DispatchQueue.main.async {
                         guard let self else { return }
-                        guard ok else { return reply(["error": "UnknownError"]) }
+                        guard ok, self.publish(turn, staged, over: url) else { return self.finish(turn, ["error": "UnknownError"], reply) }
                         self.took(path, data, track: nil, origin: origin)
-                        reply(Self.photo(path: path, data: data))
+                        self.finish(turn, Self.photo(path: path, data: data), reply)
                     }
+                }
+            case .success(.video(let movie)):
+                let ext = movie.pathExtension.isEmpty ? "mov" : movie.pathExtension.lowercased()
+                guard let (path, url) = place(args, ext) else {
+                    try? FileManager.default.removeItem(at: movie)
+                    return finish(turn, ["error": "UnknownError"], reply)
+                }
+                Self.video(path: path, url: movie) { [weak self] facts in
+                    guard let self else { return }
+                    guard publish(turn, movie, over: url) else { return finish(turn, ["error": "UnknownError"], reply) }
+                    say("camera app recorded \(path) (\(facts["size"] ?? 0) bytes)")
+                    finish(turn, facts, reply)
                 }
             }
         }
@@ -395,7 +500,64 @@ public final class CameraModule: ExactPackage {
         say("camera app shown")
         top.present(picker, animated: true)
     }
+
+    /// `staged` renamed over `url` (rename(2): it replaces a link there rather than writing what it names), unless the
+    /// call of `turn` was let go meanwhile; `staged` is removed when it is not published. Main thread.
+    private func publish(_ turn: Int, _ staged: URL, over url: URL) -> Bool {
+        guard turn == cameraAppTurn, rename(staged.path, url.path) == 0 else {
+            try? FileManager.default.removeItem(at: staged)
+            return false
+        }
+        return true
+    }
+
+    /// The call of `turn` answered, unless it was let go; the camera UI free for the next. Main thread.
+    private func finish(_ turn: Int, _ answer: [String: Any], _ reply: @escaping ([String: Any]) -> Void) {
+        guard turn == cameraAppTurn else { return }
+        cameraAppUp = false
+        cameraAppRequest = nil
+        reply(answer)
+    }
+
+    /// Beside `url`, in its directory, so the rename that publishes it stays on one volume.
+    private static func staging(_ url: URL) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent(".exact-camera-\(UUID().uuidString).\(url.pathExtension)")
+    }
+
+    /// `apple.videoQuality`'s word as the picker's `QualityType` (LLP 1133.008.000 D3).
+    static func videoQuality(_ word: String?) -> UIImagePickerController.QualityType? {
+        switch word {
+        case "typeHigh": return .typeHigh
+        case "typeMedium": return .typeMedium
+        case "typeLow": return .typeLow
+        case "type640x480": return .type640x480
+        case "typeIFrame1280x720": return .typeIFrame1280x720
+        case "typeIFrame960x540": return .typeIFrame960x540
+        default: return nil
+        }
+    }
     #endif
+
+    /// `Video` for the movie at `url`, answered at `path`: its type, length in seconds and size as it plays (the video
+    /// track's natural size through its preferred transform), read with `AVURLAsset`'s asynchronous loads, then `done`
+    /// on the main thread. What the file does not say is 0.
+    static func video(path: String, url: URL, _ done: @escaping ([String: Any]) -> Void) {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
+        let type = url.pathExtension.lowercased() == "mp4" ? "video/mp4" : "video/quicktime"
+        let asset = AVURLAsset(url: url)
+        Task {
+            var duration = 0.0, width = 0.0, height = 0.0
+            if let d = try? await asset.load(.duration), d.isNumeric { duration = d.seconds }
+            if let track = try? await asset.loadTracks(withMediaType: .video).first,
+               let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform) {
+                let shown = natural.applying(transform)
+                width = abs(shown.width)
+                height = abs(shown.height)
+            }
+            let facts: [String: Any] = ["path": path, "type": type, "size": size, "duration": duration, "width": width, "height": height]
+            await MainActor.run { done(facts) }
+        }
+    }
 
     /// `Photo`: its size as it is shown, its orientation applied.
     static func photo(path: String, data: Data) -> [String: Any] {
@@ -434,19 +596,30 @@ public final class CameraModule: ExactPackage {
 
     /// The package's test card in this checkout, beside this file's own directory.
     private static let card = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("fixture/card.jpg")
+    /// The package's one-second clip, beside the card (LLP 1133.008.000 D9).
+    static let clip = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("fixture/clip.mp4")
 
     private func agentPictureURL() -> URL? {
         guard let picture else { return Self.card }
+        return assetURL(picture)
+    }
+
+    private func assetURL(_ path: String) -> URL? {
+        guard !path.hasPrefix("/"), !path.contains(":"), !path.split(separator: "/").contains("..") else { return nil }
         var roots: [String] = []
         if let assets = ProcessInfo.processInfo.environment["EXACT_ASSETS"] { roots.append(assets) }
         if let resources = Bundle.main.resourcePath { roots.append(resources) }
         roots.append(Bundle.main.bundlePath)
-        return roots.map { URL(fileURLWithPath: $0).appendingPathComponent(picture) }.first { FileManager.default.fileExists(atPath: $0.path) }
+        return roots.map { URL(fileURLWithPath: $0).appendingPathComponent(path) }.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    func agentPictureData() -> Data? { agentPictureURL().flatMap { try? Data(contentsOf: $0) } }
+    func agentPictureData(_ track: String? = nil) -> Data? {
+        if let clip = agentClip, let track { return clip.frames[clip.index(elapsed(track))].jpeg }
+        return agentPictureURL().flatMap { try? Data(contentsOf: $0) }
+    }
 
-    func agentPicture() -> CGImage? {
+    func agentPicture(_ track: String? = nil) -> CGImage? {
+        if let clip = agentClip, let track { return clip.frames[clip.index(elapsed(track))].image }
         guard let url = agentPictureURL(), let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
                                         kCGImageSourceThumbnailMaxPixelSize: 2048]
@@ -548,17 +721,31 @@ final class PhotoOutput: NSObject {
 /// What the camera app reads of the platform: a camera, the usage key, the camera's permission, and asking for it.
 struct CameraAppPlatform {
     var available: () -> Bool = { UIImagePickerController.isSourceTypeAvailable(.camera) }
-    var described: () -> Bool = { Bundle.main.object(forInfoDictionaryKey: "NSCameraUsageDescription") != nil }
+    /// Whether the app's Info.plist has the usage key.
+    var described: (String) -> Bool = { Bundle.main.object(forInfoDictionaryKey: $0) != nil }
+    /// Whether the camera records movies.
+    var movies: () -> Bool = { UIImagePickerController.availableMediaTypes(for: .camera)?.contains("public.movie") == true }
     var status: () -> AVAuthorizationStatus = { AVCaptureDevice.authorizationStatus(for: .video) }
     var ask: (@escaping (Bool) -> Void) -> Void = { AVCaptureDevice.requestAccess(for: .video, completionHandler: $0) }
 }
 
-/// The system camera UI's delegate: the kept photo as JPEG with the camera's metadata, or the person's cancel, once.
-final class CameraAppDelegate: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
-    private var done: ((Result<Data, PhotoFailure>) -> Void)?
-    init(_ done: @escaping (Result<Data, PhotoFailure>) -> Void) { self.done = done }
+/// What the person kept: a photo as JPEG, or the picker's movie file.
+enum CameraAppKept {
+    case photo(Data)
+    case video(URL)
+}
 
-    func finish(_ result: Result<Data, PhotoFailure>) {
+/// The system camera UI's delegate: the kept photo as JPEG with the camera's metadata, or the kept movie's file, or the
+/// person's cancel, once.
+final class CameraAppDelegate: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+    private let shot: CameraModule.Shot
+    private var done: ((Result<CameraAppKept, PhotoFailure>) -> Void)?
+    init(_ shot: CameraModule.Shot, _ done: @escaping (Result<CameraAppKept, PhotoFailure>) -> Void) {
+        self.shot = shot
+        self.done = done
+    }
+
+    func finish(_ result: Result<CameraAppKept, PhotoFailure>) {
         let d = done
         done = nil
         d?(result)
@@ -566,7 +753,15 @@ final class CameraAppDelegate: NSObject, UIImagePickerControllerDelegate, UINavi
 
     func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
         picker.dismiss(animated: true)
-        finish(Self.kept(info))
+        switch shot {
+        case .photo: finish(Self.kept(info).map(CameraAppKept.photo))
+        case .video:
+            // The picker's file, in the app's temporary directory, which it may remove once this returns: moved now.
+            guard let movie = info[.mediaURL] as? URL else { return finish(.failure(PhotoFailure("UnknownError"))) }
+            let held = FileManager.default.temporaryDirectory.appendingPathComponent("exact-camera-\(UUID().uuidString).\(movie.pathExtension)")
+            do { try FileManager.default.moveItem(at: movie, to: held) } catch { return finish(.failure(PhotoFailure("UnknownError"))) }
+            finish(.success(.video(held)))
+        }
     }
 
     func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {

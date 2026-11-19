@@ -8,54 +8,67 @@ import AppKit
 /// chrome it is painted in the page over a backdrop, as it was. A modal route
 /// is a sheet by the same means (D7.4, RouteSheetMac.swift): an entry here
 /// whose node is the route, which navigation shows and takes away.
-final class DialogHost {
-    private(set) weak var presenter: Presenter?
-    final class Entry {
-        var dialog: NodeView
-        weak var parent: NSView?
+package final class DialogHost {
+    private(set) package weak var presenter: Presenter?
+    package final class Entry {
+        package var dialog: NodeView
+        /// Its authored parent: the container of the node it was lifted out
+        /// of, as that node has it now (`MenuHost.Entry.parent`).
+        var parent: NSView? { home?.container ?? held }
+        private weak var home: NodeView?
+        private weak var held: NSView?
         weak var previous: NSView?
-        let index: Int
+        var index: Int
         let selection: NSRange?
-        var frame: NSRect
+        package var frame: NSRect
         let backdrop = DialogBackdrop(frame: .zero)
         /// Its sheet, while AppKit presents it; nil while it is painted.
-        var sheet: DialogSheet?
+        package var sheet: DialogSheet?
         /// A modal route in its sheet, not a `dialog`: what its sheet shows
         /// of its header, and the header's nodes hidden while it does.
-        let route: Bool
-        var routeBase: NodeView?
-        var header: SheetHeader?
-        var stoodFor: [NodeView] = []
-        init(_ dialog: NodeView, previous: NSView?, route: Bool = false) {
+        package let route: Bool
+        package var routeBase: NodeView?
+        package var header: (any SheetHeading)?
+        package var stoodFor: [NodeView] = []
+        package init(_ dialog: NodeView, previous: NSView?, route: Bool = false) {
             self.dialog = dialog; self.previous = previous; self.route = route
             selection = ((previous as? NSTextField)?.currentEditor() as? NSTextView)?.selectedRange()
                 ?? (previous as? NSTextView)?.selectedRange()
-            parent = dialog.superview
-            index = parent?.subviews.firstIndex(of: dialog) ?? 0
+            held = dialog.superview
+            if let node = dialog.nodeSuperview, node.container === held { home = node }
+            index = held?.subviews.firstIndex(of: dialog) ?? 0
             frame = dialog.frame
         }
     }
-    private(set) var entries: [Entry] = []
-    var onCancel: ((UInt32) -> Void)?
+    private(set) package var entries: [Entry] = []
     /// Painted in the page, not AppKit's sheet: the driver's own chrome
     /// (`--chrome agent`), as it paints the header and the tablist. A test
     /// of the painted presentation says so.
-    var painted = ExactEnv.authoredChrome
+    package var painted = ExactEnv.authoredChrome
     /// A mouse went down on the window behind a sheet (SheetsMac.swift).
     var downBehind = false
     /// The routes' sheets are being reconciled, and a batch asked again meanwhile (RouteSheetMac.swift).
-    var routeSync = (running: false, again: false)
+    package var routeSync = (running: false, again: false)
     private var accessibilityBlocker: ObjectIdentifier?
     /// The native button drawn as the open dialog's default (DefaultButtonMac.swift).
     weak var drawnDefault: NativeButtonMac?
-    var active: NodeView? { entries.last?.dialog }
+    package var active: NodeView? { entries.last?.dialog }
     /// LLP 1080.001 D3: an open dialog's backdrop; the dialogs it lifts.
     func inspectionOwns(_ view: NSView) -> Bool { entries.contains { $0.backdrop === view } }
     func projects(_ node: NodeView) -> Bool { entries.contains { $0.dialog === node } }
     var presented: [NodeView] { entries.map(\.dialog) }
-    init(_ presenter: Presenter) { self.presenter = presenter }
+    /// A painted backdrop accepts clicks independently of its dialog's CSS.
+    /// AppKit's sheets have no authored backdrop hit in the page window.
+    var backdrop: TopLayerBackdrop? {
+        guard let presenter, let entry = entries.last, entry.sheet == nil,
+              entry.backdrop.window != nil, !entry.backdrop.isHiddenOrHasHiddenAncestor else { return nil }
+        let clip = presenter.viewport.contentView
+        let rect = clip.convertNativePresentation(entry.backdrop.visibleRect, from: entry.backdrop)
+        return (entry.dialog.id, rect.offsetBy(dx: -clip.bounds.minX, dy: -clip.bounds.minY), nil)
+    }
+    package init(_ presenter: Presenter) { self.presenter = presenter }
 
-    func owns(_ node: NodeView) -> Bool { entries.contains { $0.dialog === node } }
+    package func owns(_ node: NodeView) -> Bool { entries.contains { $0.dialog === node } }
     /// A presented dialog's authored parent, painted over its backdrop or in
     /// its sheet; nil for any other node. A modal route's is navigation's.
     func authoredParent(of node: NodeView) -> NSView? { entries.first { $0.dialog === node && !$0.route }?.parent }
@@ -80,10 +93,10 @@ final class DialogHost {
         guard let active = accessibleActive else { return false }
         return presenter?.menus.contains(active, node) != true
     }
-    func live(_ node: NodeView) -> Bool { presenter?.views[node.id] === node }
+    package func live(_ node: NodeView) -> Bool { presenter?.views[node.id] === node }
     /// The window the open dialog is in: its sheet's, or the page's.
-    var window: NSWindow? { active?.window ?? presenter?.viewport.window }
-    func focusOwner(_ window: NSWindow) -> NSView? {
+    package var window: NSWindow? { active?.window ?? presenter?.viewport.window }
+    package func focusOwner(_ window: NSWindow) -> NSView? {
         guard let view = window.firstResponder as? NSView else { return nil }
         if let editor = view as? NSTextView, editor.isFieldEditor {
             return editor.delegate as? NSView ?? editor
@@ -127,13 +140,14 @@ final class DialogHost {
     }
     /// `entry` joins the top layer: a dialog painted or in its sheet, a
     /// modal route in its sheet.
-    func present(_ entry: Entry, over front: NSWindow) {
+    package func present(_ entry: Entry, over front: NSWindow) {
         guard let presenter else { return }
         let dialog = entry.dialog
         presenter.menus.reset()
         entries.append(entry)
         if painted, !entry.route {
             entry.backdrop.host = self
+            entry.backdrop.dialog = dialog
             entry.backdrop.autoresizingMask = [.width, .height]
             presenter.viewport.addSubview(entry.backdrop)
             entry.backdrop.addSubview(dialog)
@@ -141,7 +155,7 @@ final class DialogHost {
         dialog.isHidden = false
         layout()
         presenter.mouseSwipe.cancel(); presenter.mouseDrags.height.cancel()
-        presenter.mouseDrags.transform.cancel(); presenter.mouseDrags.reorder.cancel()
+        presenter.mouseDrags.transform.cancel(); presenter.reorders.mouse.cancel()
         presenter.mouseLayoutPan.abandon(); presenter.selection.clear()
         presenter.session?.canvases.cancelMovedControls()
         refreshInputGates()
@@ -157,7 +171,7 @@ final class DialogHost {
         // holds that it has one), so it is given again.
         if entry.sheet != nil, begin(entry) { syncDefaultButton() }
     }
-    func close(_ dialog: NodeView, restoreFocus: Bool = true, notify: Bool = true) {
+    package func close(_ dialog: NodeView, restoreFocus: Bool = true, notify: Bool = true) {
         if presenter?.alerts.close(dialog) == true { return }
         guard entries.contains(where: { $0.dialog === dialog }) else { return }
         presenter?.mouseChain.bubbledPress?.cancel(in: dialog)
@@ -181,7 +195,8 @@ final class DialogHost {
             entry.backdrop.removeFromSuperview()
             if live(dialog), let parent = entry.parent {
                 let siblings = parent.subviews
-                parent.addSubview(dialog, positioned: .below, relativeTo: entry.index < siblings.count ? siblings[entry.index] : nil)
+                if entry.index < siblings.count { parent.addSubview(dialog, positioned: .below, relativeTo: siblings[entry.index]) }
+                else { parent.addSubview(dialog) }
                 dialog.frame = entry.frame
             }
         }
@@ -216,11 +231,13 @@ final class DialogHost {
     /// is in the top layer. Removing that edge retires its presentation.
     func children(_ parent: NSView, _ wanted: [NodeView]) {
         // A route's sheet leaves after the batch (`syncRoutes`), never inside it.
-        for entry in entries where !entry.route && (entry.parent === parent) != wanted.contains(where: { $0 === entry.dialog }) {
-            close(entry.dialog, notify: false)
+        for entry in entries where !entry.route {
+            let index = wanted.firstIndex(where: { $0 === entry.dialog })
+            if (entry.parent === parent) != (index != nil) { close(entry.dialog, notify: false) }
+            else if let index { entry.index = index }
         }
     }
-    func frame(_ node: NodeView, _ frame: NSRect) -> Bool {
+    package func frame(_ node: NodeView, _ frame: NSRect) -> Bool {
         guard let entry = entries.first(where: { $0.dialog === node }) else { return false }
         // In its sheet the frame is in the sheet's own space (its block's).
         if entry.sheet != nil { if node.frame != frame { node.frame = frame }; return true }
@@ -239,6 +256,11 @@ final class DialogHost {
                 close(entry.dialog, notify: false)
             }
         }
+        // A `::backdrop` colour that changed while it is open.
+        for entry in entries where !entry.route {
+            if let sheet = entry.sheet, sheet.begun { sheet.paintDim(entry.dialog.backdropColor, shown: true) }
+            else { entry.backdrop.needsDisplay = true }
+        }
         var changed = false
         for dialog in presenter.carrying("tag:dialog") where dialog.props["popover"] == nil {
             let hidden = !owns(dialog) || dialog.style["display"]?.string == "none"
@@ -250,10 +272,10 @@ final class DialogHost {
         if let window, active != nil,
            ownsFocus(window), focusOwner(window).map({ blocks($0) }) ?? true { enterFocus() }
     }
-    func refreshInputGates() {
+    package func refreshInputGates() {
         guard let presenter else { return }
         accessibilityBlocker = accessibleActive.map(ObjectIdentifier.init)
-        presenter.navigation.refreshInputGates(Array(presenter.views.values))
+        presenter.inputGates.refresh(Array(presenter.views.values))
         presenter.topLayerChanged()
     }
     func layout() {
@@ -295,7 +317,7 @@ final class DialogHost {
                 if run.canBecomeKeyView { views.append((run, run.tabOrder)) }
                 else if run === start { before = views.count }
             }
-            for case let child as NodeView in node.container.subviews { walk(child) }
+            for child in node.childNodes { walk(child) }
             for popover in presenter.menus.following(node) { walk(popover) }
         }
         walk(dialog)
@@ -309,7 +331,7 @@ final class DialogHost {
             return ap == bp ? a.offset < b.offset : ap < bp
         }.map { $0.element.view } + (entries.last?.sheet?.chrome?.stops ?? []) // then a route's sheet's own buttons
     }
-    func enterFocus() {
+    package func enterFocus() {
         guard let presenter, let dialog = active, let window = dialog.window else { return }
         let candidates = candidates(dialog)
         let autofocus = presenter.carrying("autofocus").first {
@@ -325,7 +347,7 @@ final class DialogHost {
         return owner === viewport || owner.isDescendant(of: viewport) || owner === presenter?.session?.view
     }
     /// Dismissal belongs to the sheet's modal segment; its title-row Back belongs to the pushed route.
-    func dismissalOwner(of dialog: NodeView) -> NodeView { entry(ofRoute: dialog)?.routeBase ?? dialog }
+    package func dismissalOwner(of dialog: NodeView) -> NodeView { entry(ofRoute: dialog)?.routeBase ?? dialog }
 
     /// AppKit tests charactersIgnoringModifiers for Command-period before
     /// dispatching to an Escape button. Keep Command's layout there too.
@@ -342,16 +364,20 @@ final class DialogHost {
             isARepeat: event.isARepeat, keyCode: event.keyCode) ?? event
     }
 
+    /// Escape, and Command-period, which AppKit gives a sheet's Cancel too:
+    /// the Mac's close request.
+    static func isCloseRequest(_ event: NSEvent) -> Bool {
+        event.keyCode == 53 || event.type == .keyDown && event.characters == "."
+            && event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
+    }
+
     /// Shared by real key delivery and the agent's direct NSWindow delivery.
     func key(_ event: NSEvent) -> Bool {
         guard let dialog = active, event.window === dialog.window else { return false }
         if let window = dialog.window, !ownsFocus(window) { return false }
         // Composition owns Escape and Tab until the input method commits it.
         if (dialog.window?.firstResponder as? NSTextInputClient)?.hasMarkedText() == true { return false }
-        // Escape, and Command-period, which AppKit gives a sheet's Cancel too.
-        let period = event.type == .keyDown && event.characters == "."
-            && event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
-        if event.keyCode == 53 || period {
+        if Self.isCloseRequest(event) {
             if event.type == .keyDown, !event.isARepeat, dismissalOwner(of: dialog).props["closedby"] != "none" { dismiss(dialog) }
             return true
         }
@@ -398,10 +424,7 @@ final class DialogHost {
     private func dismiss(_ dialog: NodeView) {
         guard entry(ofRoute: dialog) != nil else {
             close(dialog)
-            if live(dialog), dialog.handlers.contains("cancel") {
-                if let onCancel { onCancel(dialog.id) }
-                else if let session = presenter?.session { session.apply(session.runtime.pickerCancel(dialog.id, now: session.now())) }
-            }
+            if live(dialog), dialog.handlers.contains("cancel") { presenter?.onCancel?(dialog.id) }
             return
         }
         if let refused = presenter?.navigation.dismiss(dialog) { presenter?.session?.log("modal dismissal refused: \(refused)") }
@@ -416,9 +439,11 @@ final class DialogHost {
 
 final class DialogBackdrop: NSView {
     weak var host: DialogHost?
+    /// The dialog over it, whose `::backdrop` colour it draws (LLP 1035.001 D11).
+    package weak var dialog: NodeView?
     private var downOutside = false
     override var isFlipped: Bool { true }
-    override func draw(_ dirtyRect: NSRect) { NSColor.black.withAlphaComponent(0.18).setFill(); dirtyRect.fill() }
+    override func draw(_ dirtyRect: NSRect) { (dialog?.backdropColor ?? NSColor.black.withAlphaComponent(0.18)).setFill(); dirtyRect.fill() }
     /// A backdrop is not a control: the click that activates its window does
     /// not also dismiss the dialog (LLP 1115.000 D7.9). The agent's does.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { NodeView.everyClickCounts }
@@ -432,5 +457,53 @@ final class DialogBackdrop: NSView {
         if downOutside, outside(event) { host?.outside() }
     }
     override func scrollWheel(with event: NSEvent) {}
+}
+
+extension DialogHost {
+    /// The entry of a modal route in its sheet.
+    package func entry(ofRoute node: NodeView) -> Entry? { entries.first { $0.route && $0.dialog === node } }
+    /// Whether the open top modal is a route's sheet, not a dialog.
+    package var routeActive: Bool { entries.last?.route == true }
+
+    /// The parent supplies the percentage basis and automatic-size ceiling.
+    /// Routes subtract their chrome and retain authored sizes through Fit;
+    /// ordinary dialogs keep AtMost. Layout rows stay in the kernel.
+    package func block(of entry: Entry) -> HostBlock? {
+        guard var most = maximum else { return nil }
+        if entry.route, let chrome = entry.sheet?.chrome { most.height = max(0, most.height - chrome.rows) }
+        return entry.route ? .fit(most) : .atMost(most)
+    }
+
+    /// The driver's tap on an authored button a sheet's row stands for:
+    /// the row's own click. Nil when `node` is no such button.
+    func activate(_ node: NodeView) -> Bool? {
+        guard let entry = entries.last(where: { $0.route && ($0.header?.cancel === node || $0.header?.confirm === node) }),
+              let chrome = entry.sheet?.chrome else { return nil }
+        let button = entry.header?.cancel === node ? (chrome.backButton.isHidden ? chrome.cancelButton : chrome.backButton) : chrome.confirmButton
+        guard entry === entries.last, presenter?.alerts.presented == nil, !button.isHidden, button.isEnabled, !node.inert else { return false }
+        button.performClick(nil)
+        return true
+    }
+
+    /// Whether `node` is shown by a sheet's own row: the heading its title, a button its push button.
+    package func rowShows(_ node: NodeView) -> String? {
+        guard let header = entries.last(where: { $0.route && $0.header?.stoodFor.isEmpty == false && ($0.header?.heading === node || $0.header?.cancel === node || $0.header?.confirm === node) })?.header else { return nil }
+        return header.heading === node ? "title" : "NSButton"
+    }
+
+    #if EXACT_AGENT
+    /// `state.navigation.sheet` (the agent): the top modal route's presentation.
+    var routeObservation: [String: Any]? {
+        guard let presenter else { return nil }
+        if let entry = entries.last(where: \.route) {
+            let id = { (node: NodeView?) -> Any in node.map { Int($0.id) } ?? NSNull() }
+            let size = entry.sheet?.window.contentView?.frame.size ?? .zero
+            return ["route": Int(entry.dialog.id), "presentation": "sheet", "title": entry.header?.title ?? NSNull(),
+                    "cancel": id(entry.header?.cancel), "confirm": id(entry.header?.confirm), "header": entry.header.map { $0.whole ? "projected" : "partly" } ?? "authored",
+                    "size": [InspectionValue.r2(size.width), InspectionValue.r2(size.height)], "closedby": dismissalOwner(of: entry.dialog).props["closedby"] ?? "closerequest"]
+        }
+        return presenter.navigation.paintedModalObservation
+    }
+    #endif
 }
 #endif

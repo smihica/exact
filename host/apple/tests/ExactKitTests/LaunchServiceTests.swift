@@ -55,7 +55,14 @@ final class LaunchServiceTests: XCTestCase {
     func testAnInterruptedCommitKeepsWatchingUntilItsPresentation() {
         let launch = ExactLaunch()
         let session = ExactApp.shared.makeSession(label: "interrupted-launch")
-        defer { session.destroy() }
+        // Bring the app back to the foreground as the test ends, and let `AppBackground` read UIKit again: it keeps the
+        // edge it last heard, and later tests in the process would read the page hidden
+        defer {
+            launch.link?.invalidate()
+            session.destroy()
+            NotificationCenter.default.post(name: UIApplication.willEnterForegroundNotification, object: nil)
+            AppBackground.invalidate()
+        }
         launch.delegateInit()
         launch.didFinishLaunching()
         launch.bootEntered(session)
@@ -124,7 +131,11 @@ final class LaunchServiceTests: XCTestCase {
         let launch = ExactLaunch()
         let session = ExactApp.shared.makeSession(label: label)
         addTeardownBlock { launch.link?.invalidate(); session.destroy() }
-        XCTAssertNil(session.boot(plan: try fixturePlan("HEADLESS"), size: CGSize(width: 400, height: 800)).error)
+        XCTAssertNil(session.boot(plan: try fixturePlan("STILL_PAGE"), size: CGSize(width: 400, height: 800)).error)
+        // Settle the session first: this launch evaluates only when the test says (`ExactLaunch.shared` hears the
+        // session's work end), so work in flight when it evaluates, such as the tick that hears the page's first present,
+        // would leave the candidate unset with nothing to evaluate again when it lands
+        settleViewlessSession(session)
         launch.delegateInit()
         launch.didFinishLaunching()
         launch.bootEntered(session)

@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1134: a filter tablist right after a header whose search field the
 /// bar projects is that search bar's scope bar (`scripts/fixtures/search-scope.contract`).
@@ -38,8 +39,8 @@ final class SearchScopeIOSTests: XCTestCase {
         XCTAssertNil(session.boot(plan: plan, size: window.bounds.size).error)
         view.frame = host.view.bounds
         view.layoutIfNeeded()
-        until("the route's search is the bar's") { (session.presenter.navigation.primaryNavigation?.topViewController as? RouteController)?.search != nil }
-        return (session, try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController as? RouteController))
+        until("the route's search is the bar's") { (session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController)?.search != nil }
+        return (session, try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController))
     }
 
     private func node(_ session: ExactSession, _ testId: String) throws -> NodeView {
@@ -62,12 +63,11 @@ final class SearchScopeIOSTests: XCTestCase {
         XCTAssertEqual(search.controller.scopeBarActivation, .manual, "shown whether or not the search is active")
         XCTAssertEqual(bar.selectedScopeButtonIndex, 0)
         XCTAssertTrue(filter.isHidden, "the tablist is the bar's")
-        XCTAssertTrue(p.navigation.hiddenForBar(filter))
+        XCTAssertTrue(p.navigationHost.hiddenForBar(filter))
         XCTAssertFalse(p.segments.projects(filter.id), "no segmented control of its own")
         XCTAssertTrue(route.collapseScroll === list, "the list after it is the bar's collapse scroller")
         until("it takes no room: the list starts where the tablist did") { abs(list.frame.minY - filter.frame.minY) < 0.5 }
-        // D4: each segment carries its tab's test id; the agent aims at it.
-        until("the segments carry the tabs' test ids") { search.scopeControl?.segmentViews.map(\.accessibilityIdentifier) == ["filter-all", "filter-mine", "filter-done"] }
+        // D4: the agent aims at a scope segment (its test id, read with accessibility on, below).
         XCTAssertNotNil(p.segments.drawn(try node(session, "filter-done")), "a tap aims at the scope segment")
         let tab = try node(session, "filter-done"), agent = Agent(session: session)
         let row = try XCTUnwrap((agent.layout()["nodes"] as? [[String: Any]])?.first { $0["id"] as? Int == Int(tab.id) })
@@ -119,12 +119,12 @@ final class SearchScopeIOSTests: XCTestCase {
         guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("the scope bar is the iPhone's (D5)") }
         let (session, route) = try fixture()
         let search = try XCTUnwrap(route.search)
-        until("the scope segments carry their tabs' identifiers") { search.scopeControl?.segmentViews.map(\.accessibilityIdentifier) == ["filter-all", "filter-mine", "filter-done"] }
+        until("the scope segments carry their tabs' identifiers") { search.scopeControl?.accessibilitySegments.map(\.readIdentifier) == ["filter-all", "filter-mine", "filter-done"] }
         let control = try XCTUnwrap(search.scopeControl)
-        for (segment, name) in zip(control.segmentViews, ["All", "Mine", "Done"]) {
+        for (segment, name) in zip(control.accessibilitySegments, ["All", "Mine", "Done"]) {
             XCTAssertTrue(segment.isAccessibilityElement)
             XCTAssertEqual(segment.accessibilityLabel, name)
-            let testId = try XCTUnwrap(segment.accessibilityIdentifier)
+            let testId = try XCTUnwrap(segment.readIdentifier)
             let tab = try node(session, testId)
             let reply = Agent(session: session).accessibilityElementsTree(["target": testId])
             let ax = try XCTUnwrap(reply["ax"] as? [String: Any])
@@ -155,7 +155,7 @@ final class SearchScopeIOSTests: XCTestCase {
             XCTAssertEqual(control.selectedSegmentIndex, 0)
         }
         XCTAssertNil(route.search?.controller.searchBar.scopeButtonTitles, "no scope bar: there is no search")
-        XCTAssertTrue(filter.isHidden && p.navigation.hiddenForBar(filter), "the tablist is the bar's")
+        XCTAssertTrue(filter.isHidden && p.navigationHost.hiddenForBar(filter), "the tablist is the bar's")
         XCTAssertFalse(p.segments.projects(filter.id))
         until("the list is the collapse scroller") { route.collapseScroll === list }
         // A choice under the inline title presses its tab once and sets the other.
@@ -179,10 +179,10 @@ final class SearchScopeIOSTests: XCTestCase {
     func testASearchFieldTakesItsOwnAccentAsItsTint() throws {
         guard UIApplication.shared.connectedScenes.first is UIWindowScene else { throw missing("scene", "the bar is a scene window's") }
         let (session, route) = try fixture()
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let field = try XCTUnwrap(route.navigationItem.searchController).searchBar.searchTextField
         let source = try node(session, "search")
-        func project() { session.presenter.navigation.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav) }
+        func project() { session.presenter.navigationHost.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav) }
         func rgb() -> [CGFloat] {
             var (r, g, b, a): (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
             _ = field.tintColor.resolvedColor(with: field.traitCollection).getRed(&r, green: &g, blue: &b, alpha: &a)
@@ -207,7 +207,7 @@ final class SearchScopeIOSTests: XCTestCase {
             p.press(try node(session, "pick-\(shape)").id)
             until("\(shape): the scope bar goes") { bar.scopeButtonTitles == nil && !bar.showsScopeBar }
             until("\(shape): the tablist is the page's again") { !filter.isHidden && p.segments.projects(filter.id) }
-            XCTAssertFalse(p.navigation.hiddenForBar(filter), shape)
+            XCTAssertFalse(p.navigationHost.hiddenForBar(filter), shape)
             p.press(try node(session, "pick-scope").id)
             until("\(shape) → scope: the scope bar again") { bar.scopeButtonTitles?.count == 3 && filter.isHidden && !p.segments.projects(filter.id) }
         }

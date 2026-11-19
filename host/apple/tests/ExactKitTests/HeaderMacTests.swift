@@ -9,6 +9,8 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactImages
 
 final class HeaderMacTests: XCTestCase {
     private var window: NSWindow!
@@ -438,6 +440,21 @@ final class HeaderMacTests: XCTestCase {
         XCTAssertEqual(window.title, "Library")
         XCTAssertEqual(identifiers(), [back, "exact.command.11", "exact.command.13", "exact.command.14"])
         q.toolbar.detach()
+    }
+
+    /// A box a staged batch is preparing under the header is outside the
+    /// committed tree (LLP 1072 T13): the bar reads the header without it.
+    func testABoxHeldByAStagedBatchIsNoPartOfTheBar() throws {
+        let p = fixture(extra: view(16, "image", ["imageSource": "assets/logo.png"]) + [children(10, [11, 12, 13, 14, 16])])
+        try node(p, 16).held = true
+        XCTAssertTrue(p.toolbar.attach(to: window))
+        XCTAssertEqual(window.title, "Library")
+        XCTAssertEqual(identifiers(), [back, "exact.command.11", "exact.command.13", "exact.command.14"])
+        // Revealed, it is a picture the bar has no place for.
+        try node(p, 16).held = false
+        p.toolbar.sync()
+        XCTAssertEqual(identifiers(), [back])
+        p.toolbar.detach()
     }
 
     /// Issue #364: a header of buttons and no heading is the bar with no
@@ -1090,8 +1107,8 @@ final class HeaderMacTests: XCTestCase {
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = view
-        XCTAssertTrue(p.navigation.oneLocation)
-        XCTAssertFalse(p.navigation.backPossible)
+        XCTAssertTrue(p.navigationHost.oneLocation)
+        XCTAssertFalse(p.navigationHost.backPossible)
         XCTAssertTrue(view.attachWindowToolbar(to: window))
         XCTAssertNotNil(window.toolbar, "the root header supplies the toolbar")
         let header = try named("header"), route = try named("route-library")

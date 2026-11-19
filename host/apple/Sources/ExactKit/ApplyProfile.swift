@@ -5,7 +5,7 @@
 import Foundation
 import QuartzCore
 
-enum ApplyProfile {
+package enum ApplyProfile {
     /// On only while the boot applies its first batch (`Session.finishBoot`).
     nonisolated(unsafe) static var on = false
     /// Milliseconds by part: `op.create`, `op.style`, …, `pass.navigation`, ….
@@ -23,7 +23,7 @@ enum ApplyProfile {
     @inline(__always) static func count(_ part: String) { parts["#" + part, default: 0] += 1 }
 
     /// `body`, timed as `part` while on.
-    @inline(__always) static func time<T>(_ part: String, _ body: () -> T) -> T {
+    @inline(__always) package static func time<T>(_ part: String, _ body: () -> T) -> T {
         guard on else { return body() }
         let t = CACurrentMediaTime()
         defer { add(part, since: t) }

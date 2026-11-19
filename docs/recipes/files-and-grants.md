@@ -1,18 +1,19 @@
 # Recipe: files, SQLite and grants
 
-Where an app keeps things, and the `grants` line for each:
-
 | What | Where | Grant |
 | --- | --- | --- |
 | A setting | `state … persist` ([a remembered setting](persisted-setting.md)) | none |
-| A small collection | a JSON file, `storage.fs` (start-here's list) | `fs.read app:/data/items.json`, `fs.write …` |
-| A collection that grows or is queried | SQLite, `storage.sqlite` | `sqlite.open app:/data/journal.db` |
-| A secret: a token | `store.get`, `store.set` | `secret.keep token` |
-| A file the app ships | app.json `host.ios.resources` (and `.macos`) | `fs.read bundle:/Resources/x` (its `to`) |
+| A small collection with one writer | `storage.fs` (start-here’s list) | `fs.read app:/data/items.json`, `fs.write …` |
+| Shared or queried items | SQLite (`pattern list-detail`) | `sqlite.open app:/data/journal.db` |
+| A native token | `store.get`, `store.set` | `secret.keep token` |
+| Data the app ships | a JSON file `app.ts` imports ([shipped data](shipped-data.md)) | none |
+| A file read by path | app.json `host.ios.resources` (and `.macos`) | `fs.read bundle:/Resources/x` (its `to`) |
 | A server | `fetch` ([a REST server](rest-backend.md)) | `net.fetch https://api.example.com` |
-| A server the person names at run time | `fetch`, a socket | `net.fetch https:`, `net.websocket wss:` (any host and port); plain `http:` to a host name on Apple also needs app.json's `appTransportSecurity.allowsArbitraryLoads` |
+| A server named at run time | `fetch`, a socket | `net.fetch https:`, `net.websocket wss:` (any host and port); plain `http:` on Apple also needs `appTransportSecurity.allowsArbitraryLoads` |
 
-A journal in SQLite (its field and Add are start-here's):
+Web tokens: [HttpOnly cookies](web-sessions.md).
+
+A SQLite journal:
 
 ```contract
 shape Entry
@@ -21,7 +22,6 @@ shape Entry
 
 shape Reply
   ok: bool
-  error: string
 
 component Journal
   resource entries = loadEntries() as shape Entry[] else empty()
@@ -53,17 +53,18 @@ const sources: Sources = {
       .map(([id, text]) => ({ id: String(id), text: String(text) }))), // an INTEGER is a bigint
   addEntry: ([text], _store, storage) => use(storage, async (db) => {
     await db.execute('INSERT INTO entries (text) VALUES (?)', [text]);
-    return { ok: true, error: '' };
+    return { ok: true };
   }),
 };
 export const answer: Answer = (source, args, store, storage, native) => sources[source](args, store, storage, native);
 ```
 
-- A grant covers its path and its tree (`fs.write app:/data`); anything else is refused,
-  code `denied`. A native line names a directory (`fs.read /etc`). `app:/data` is kept,
-  `app:/cache` refetchable, `app:/tmp` scratch: a native module's `context.data`,
-  `.cache`, `.temporary` ([native module](native-module.md)).
+- A grant covers its path and tree (`fs.write app:/data`); else `denied`.
+  A native line names a directory (`fs.read /etc`). `app:/data` is kept,
+  `app:/cache` refetchable, `app:/tmp` scratch ([a native module's](native-module.md)
+  `context.data`, `.cache`, `.temporary`).
 - A file is bytes (`readFile`, `atomicWriteFile`); a missing one is code `ENOENT`: answer
   the empty collection, and branch on `e.code`, never the message.
 - SQLite: `query` reads, `execute` writes, `transaction([...])` writes several or none.
+  Close in `finally` to release the web’s cross-tab lock.
 - At build there is no storage (code `bake`): let it through.

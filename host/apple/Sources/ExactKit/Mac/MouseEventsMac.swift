@@ -205,6 +205,8 @@ extension Presenter {
 
 extension NodeView {
     package override func mouseDown(with event: NSEvent) {
+        let releases = TitleBarAreaMac.takesRelease(of: event, at: self)
+        defer { if releases { TitleBarAreaMac.release(to: self) } }
         HeldState.input(at: self) // a press on a held node lets its hold go (HeldState.swift; the window's monitor, ExactViewMac)
         let chain = holdPresenter?.mouseChain
         chain?.receivedDown(self, event: event)
@@ -225,11 +227,11 @@ extension NodeView {
         if pointerdownHeard, takesClickFocus, !keepsFocus, !focusInside(event) { takeClickFocus() }
         if isSurfaceControl { _ = control("down", point: local(event.locationInWindow), timestamp: event.timestamp); return }
         if canvasInput?.pointer(event, phase: "down") == true { return }
-        presenter?.leaves.pressed(self) // a held leaf's box was clicked: made now (LLP 1068 §5.1)
+        presenter?.leaves?.pressed(self) // a held leaf's box was clicked: made now (LLP 1068 §5.1)
         presenter?.collections.pointerDown(id, event: event)
         presenter?.mouseChain.down(self, event: event)
         guard !disabled else { pressed = false; return }
-        if let target = presenter?.svg.target(id, at: local(event.locationInWindow)) { svgPressed = target; return }
+        if let target = presenter?.svg?.target(id, at: local(event.locationInWindow)) { svgPressed = target; return }
         if isParagraph, let run = inlineTarget(at: local(event.locationInWindow), handler: "press") {
             inlinePressed = run.id
             if !keepsFocus { window?.makeFirstResponder(self); presenter?.selection.begin(self, event: event) }
@@ -312,7 +314,7 @@ extension NodeView {
         if let target = svgPressed {
             svgPressed = nil
             // The element has no view of its own: the `svg`'s view stands for it.
-            if !inert, presenter?.svg.target(id, at: local(event.locationInWindow)) == target {
+            if !inert, presenter?.svg?.target(id, at: local(event.locationInWindow)) == target {
                 presenter?.menus.activating(from: self, pressing: nil) {
                     presenter?.pressHeld = KeyCodes.held(event.modifierFlags); presenter?.pressClick = event
                     presenter?.onPress?(target); presenter?.pressHeld = ""; presenter?.pressClick = nil
@@ -552,7 +554,7 @@ extension NodeView {
         if !handlers.isDisjoint(with: FileDrag.events) { registerForDraggedTypes([.fileURL]) } else { unregisterDraggedTypes() }
     }
 
-    package override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { FileDrag.moved(self, sender) ?? [] }
+    package override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { held ? [] : FileDrag.moved(self, sender) ?? [] }
     package override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { FileDrag.moved(self, sender) ?? [] }
     package override func draggingExited(_ sender: NSDraggingInfo?) { FileDrag.exited(self, sender) }
     package override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { FileDrag.perform(self, sender) ?? false }
@@ -608,7 +610,7 @@ extension NSControl {
     /// nothing; AppKit sends the release on to the node. Chrome sends
     /// `contextmenu` from each, and changes none but a range, whose down
     /// moves its value first.
-    func contextClicked(_ event: NSEvent) -> Bool {
+    package func contextClicked(_ event: NSEvent) -> Bool {
         var view = superview
         while let at = view, !(at is NodeView) { view = at.superview }
         guard let node = view as? NodeView, node.contextClick(event) else { return false }

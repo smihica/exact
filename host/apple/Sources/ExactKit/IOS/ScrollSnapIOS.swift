@@ -18,7 +18,7 @@ extension NodeView {
         }
         #if os(iOS)
         // A painted swipe row's full swipe decides where it rests (PaintedSwipesIOS.swift).
-        defer { if swipeOwner { presenter?.swipeActions.painted.willEnd(self, scrollView, target: targetContentOffset) } }
+        defer { if swipeOwner { presenter?.swipeActions.paintedWillEnd(self, scrollView, target: targetContentOffset) } }
         #endif
         targetContentOffset.pointee = snappedOffset(targetContentOffset.pointee, in: scrollView, release: scrollView.contentOffset,
                                                     drag: (dragStart(scrollView), velocity))
@@ -152,7 +152,7 @@ extension NodeView {
         let wanted = proposed + shift
         // A virtualized list's rows past its mounted ones (LLP 1008 §9, as amended for #219).
         let distance = areas.map { abs(min($0.to, max($0.from, wanted)) - wanted) }.min() ?? .infinity
-        if distance > 0, held.isEmpty, let entry = presenter?.collections.entries[id], entry.snapshot.horizontal != vertical,
+        if distance > 0, held.isEmpty, let snapshot = presenter?.collections.snapshot(id), snapshot.horizontal != vertical,
            let position = presenter?.session?.runtime.collectionSnap(id, proposed: Double(wanted), port: Double(port),
                 minimum: Double(range.lowerBound), maximum: Double(range.upperBound), distance: Double(distance)) {
             areas.append(ScrollSnap.Area(from: CGFloat(position), to: CGFloat(position), stop: false))
@@ -166,7 +166,7 @@ extension NodeView {
         }
         guard var rest = pick() else { return nil }
         // An unmounted `always` row between the release and the rest holds it too.
-        if held.isEmpty, !keeping, abs(rest - release - shift) > 0.5, presenter?.collections.entries[id]?.snapshot.horizontal == !vertical,
+        if held.isEmpty, !keeping, abs(rest - release - shift) > 0.5, presenter?.collections.snapshot(id)?.horizontal == !vertical,
            let stop = presenter?.session?.runtime.collectionSnapStop(id, release: Double(release + shift), rest: Double(rest), port: Double(port),
                                                                      minimum: Double(range.lowerBound), maximum: Double(range.upperBound)) {
             areas.append(ScrollSnap.Area(from: CGFloat(stop), to: CGFloat(stop), stop: true))
@@ -182,19 +182,38 @@ extension NodeView {
     private func snapAreas(_ vertical: Bool, in scrollView: UIScrollView, port: CGFloat, range: ClosedRange<CGFloat>,
                            holding target: UIView? = nil) -> (areas: [ScrollSnap.Area], held: [ScrollSnap.Area]) {
         var areas: [ScrollSnap.Area] = [], held: [ScrollSnap.Area] = []
+        /// `id`'s area when it has an alignment on this axis: its border box
+        /// (`box`, in `scrollView`) grown by `scroll-margin` (§4.3).
+        func area(_ id: UInt32, _ style: NodeStyle, _ box: @autoclosure () -> CGRect) -> ScrollSnap.Area? {
+            guard let align = ScrollSnap.align(style["scroll_snap_align"]?.string, vertical: vertical) else { return nil }
+            let rect = IntoView.inset(box(), style: style, family: "scroll_margin", outward: true)
+            let area = ScrollSnap.area(lo: vertical ? rect.minY : rect.minX, hi: vertical ? rect.maxY : rect.maxX, align: align,
+                                       stop: style["scroll_snap_stop"]?.string == "always", port: port, range: range, id: id)
+            areas.append(area)
+            return area
+        }
         func visit(_ view: UIView) {
             for case let node as NodeView in view.subviews where !node.isHidden {
-                if let align = ScrollSnap.align(node.style["scroll_snap_align"]?.string, vertical: vertical) {
-                    // The area is the border box grown by `scroll-margin` (§4.3).
-                    let rect = IntoView.inset(node.convert(node.bounds, to: scrollView), style: node.style, family: "scroll_margin", outward: true)
-                    let area = ScrollSnap.area(lo: vertical ? rect.minY : rect.minX, hi: vertical ? rect.maxY : rect.maxX, align: align,
-                                               stop: node.style["scroll_snap_stop"]?.string == "always", port: port, range: range, id: node.id)
-                    areas.append(area)
-                    if let target, target === node || target.isDescendant(of: node) { held.append(area) }
-                }
+                if let found = area(node.id, node.style, node.convert(node.bounds, to: scrollView)),
+                   let target, target === node || target.isDescendant(of: node) { held.append(found) }
                 // A nested scroll container captures its own snap areas, `hidden`
                 // included without a UIScrollView; `clip` does not (CSS Overflow 3 §3.1).
-                if node.scrollView == nil && !ScrollSnap.ownsAreas(node.style["overflow_x"]?.string, node.style["overflow_y"]?.string) { visit(node.container) }
+                if node.scrollView == nil && !ScrollSnap.ownsAreas(node.style["overflow_x"]?.string, node.style["overflow_y"]?.string) {
+                    visit(node.container)
+                    visitFlat(node.id, in: node)
+                }
+            }
+        }
+        /// The flat leaves under `parent`, drawn in `host`'s container
+        /// (`FlatLeavesIOS.swift`): a marker that paints nothing is a layer,
+        /// not a view, and its area is read from its frame. None holds a view
+        /// an agent reveals, and none clips, so none owns the areas under it.
+        func visitFlat(_ parent: UInt32, in host: NodeView) {
+            guard let flats = presenter?.flats, let ids = flats.children(of: parent) else { return }
+            for id in ids {
+                guard let leaf = flats.leaves[id], !leaf.layer.isHidden else { continue }
+                _ = area(id, leaf.style, host.container.convert(flats.frameInHost(id) ?? leaf.frame, to: scrollView))
+                visitFlat(id, in: host)
             }
         }
         visit(scrollView)

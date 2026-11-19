@@ -4,7 +4,7 @@
 // `NSMutableDictionary` this marks `taken`, and an app's own native intent
 // calls `ExactTools.call` directly. Either way the call is handed to the
 // session's runner, which runs it as an invocation of origin `tool`
-// (runner/src/runner/modules/calls.rs), and the door polls it by id until it
+// (runner/src/runner/calls.rs), and the door polls it by id until it
 // ends or a reload replaces that runner. The module posts
 // `exact.tools.cancel` with the same dictionary when the system cancels the
 // intent's task: the call's `Cancellation`, which the dictionary carries,
@@ -14,6 +14,7 @@
 //
 // A call that launched the app with no scene boots the session with none,
 // as a wake does (LLP 1133.017 D7): `boot`, which the app's host sets.
+import CExact
 import Foundation
 import os
 #if os(iOS)
@@ -58,8 +59,37 @@ public enum ExactTools {
                 if let cancellation = body["cancellation"] as? Cancellation { cancellation.cancel() } else { body["cancelled"] = true }
             }
         }
+        #if EXACT_INTENT_FILES
+        NotificationCenter.default.addObserver(forName: Notification.Name("exact.tools.pickedPath"), object: nil, queue: nil) { note in
+            guard let body = note.object as? NSMutableDictionary, let name = body["name"] as? String,
+                  let reply = body["reply"] as? ([String: Any]) -> Void else { return }
+            body["taken"] = true
+            DispatchQueue.main.async { pickedPath(name: name, reply: reply) }
+        }
+        #endif
         ExactContentIndex.install()
     }
+
+    #if EXACT_INTENT_FILES
+    // Activation clears the previous launch's landing before a new intent writes there.
+    static func pickedPath(name: String, reply: @escaping ([String: Any]) -> Void) {
+        let started = Date()
+        func land() {
+            guard let session = ExactApp.shared.sessions.first(where: { $0.state != .destroyed }) else {
+                boot?()
+                if Date().timeIntervalSince(started) > bootBound { return reply(["error": "The app has no session to import a file."]) }
+                return DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: land)
+            }
+            if !session.dataActivated { boot?() }
+            guard session.booted && session.dataActivated else {
+                if Date().timeIntervalSince(started) > bootBound { return reply(["error": "The app's file storage did not start in time."]) }
+                return DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: land)
+            }
+            reply(json(session.runtime.ask(exact_picked_path, text(["name": name]))))
+        }
+        land()
+    }
+    #endif
 
     /// A call's cancellation by its caller, on the main thread (LLP 1133.023
     /// D7). Before the runner has the call, the door refuses it `cancelled`;
@@ -109,7 +139,7 @@ public enum ExactTools {
             }
             var request: [String: Any] = ["op": "call", "tool": tool, "args": args, "door": door, "cold": cold, "hidden": hidden(session)]
             if let digest { request["digest"] = digest }
-            let answer = json(session.agent(text(request)))
+            let answer = json(session.runtime.ask(exact_tool, text(request)))
             guard let id = answer["call"] as? Int else {
                 return refuse("unavailable", answer["error"] as? String ?? "The app refused the call.")
             }
@@ -123,8 +153,8 @@ public enum ExactTools {
     /// reload's runner numbers its calls from the start again, so asking
     /// the next one would read another call's outcome.
     static func runner(_ session: ExactSession) -> (String) -> String? {
-        let issued = GenerationStamp(session)
-        return { issued.session?.agent($0) }
+        let issued = SessionLease(session)
+        return { issued.session?.runtime.ask(exact_tool, $0) }
     }
 
     /// Poll call `id`, which the runner holds, through `agent` until it ends,
@@ -160,7 +190,7 @@ public enum ExactTools {
         #if os(iOS)
         return UIApplication.shared.applicationState == .background
         #elseif os(macOS)
-        return !NSApp.windows.contains { $0.isVisible && $0.occlusionState.contains(.visible) }
+        return !NSApp.windows.contains { $0.isVisible && $0.screenOcclusionState.contains(.visible) }
         #else
         return false
         #endif

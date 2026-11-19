@@ -27,7 +27,8 @@ pub enum Event {
 /// What a corpus test expects of the runner after the steps before it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expect {
-    /// `expect state path == literal`: the resolved observation value's text.
+    /// Compare a resolved state value with literals using `==`, `!=`, `>=`, `<=` or `in`.
+    /// State-path operands stop delivery under this synchronous oracle.
     State(String, contract_syntax::StateComparison, Vec<String>),
     /// `expect text "id" == "value"`.
     Text(String, String),
@@ -310,6 +311,11 @@ fn deliver(step: &Step) -> Result<Option<Item>, String> {
             value,
             ..
         } => {
+            let contract_syntax::StateOperand::Literal(value) = value else {
+                return Err(
+                    "state path operands are not delivered by the synchronous oracle".into(),
+                );
+            };
             let values = if *comparison == contract_syntax::StateComparison::In {
                 let Expr::List(values, _) = value else {
                     return Err("state membership needs literals".into());
@@ -338,8 +344,11 @@ fn deliver(step: &Step) -> Result<Option<Item>, String> {
         Step::ExpectSound { .. } => Item::Observe(step.span()),
         // Displayed wake-lock holders have no Lean oracle (LLP 1125 D11).
         Step::ExpectWakelock { .. } => Item::Observe(step.span()),
-        // A control's `disabled` is read from the host's tree (LLP 1116.010 D3), which Lean has no model of.
-        Step::ExpectDisabled { .. } => Item::Observe(step.span()),
+        // A control's `disabled` and the focus are read from the host's tree (LLP 1116.010 D3), and a box from its
+        // layout, which Lean has no model of.
+        Step::ExpectDisabled { .. } | Step::ExpectFocused { .. } | Step::ExpectLayout { .. } => {
+            Item::Observe(step.span())
+        }
         // The media session is the host's (LLP 1098 D12): an assertion on
         // it has no oracle, and a test that only asserts it still runs.
         // Its `tap` form is not a press, so it reaches `other` and the
@@ -384,6 +393,8 @@ fn delivered_kind(kind: &str) -> bool {
             | "ExpectSound"
             | "ExpectWakelock"
             | "ExpectDisabled"
+            | "ExpectFocused"
+            | "ExpectLayout"
             | "ExpectMediaSession"
             | "ExpectMediaSessionAction"
     )
@@ -437,6 +448,7 @@ pub(crate) fn state_holds(
 ) -> bool {
     use contract_syntax::StateComparison as C;
     match comparison {
+        C::NotEqual => got.is_some_and(|got| values.first().is_some_and(|value| value != got)),
         C::Equal | C::In => got.is_some_and(|got| values.iter().any(|value| value == got)),
         C::AtLeast | C::AtMost => got
             .and_then(crate::property::number)

@@ -18,7 +18,11 @@ extension NodeView {
     /// with Return (LLP 1115.000 D7.3), so it comes before a dialog's default
     /// button, as an open menu has the keys before its window does.
     var choosesOnReturn: Bool {
-        (isButton || pressable) && Self.choiceRoles.contains(props["accessibilityRole"] ?? "")
+        guard isButton || pressable else { return false }
+        // Menu rows may be ordinary buttons; their item role is optional (LLP 1021 D3).
+        if Self.choiceRoles.contains(props["accessibilityRole"] ?? "") { return true }
+        guard isButton, let menu = owningMenu else { return false }
+        return menu.menuRowsThroughSections.contains { $0 === self }
     }
     private static let choiceRoles: Set<String> = ["menuitem", "menuitemradio", "menuitemcheckbox", "option"]
 
@@ -46,7 +50,7 @@ extension DialogHost {
         if let confirm = entry(ofRoute: dialog)?.header?.confirm { return confirm }
         var buttons: [NodeView] = []
         func walk(_ node: NodeView) {
-            for case let child as NodeView in node.container.subviews
+            for child in node.childNodes
             where !child.isHidden && child.style["display"]?.string != "none" && child.props["popover"] == nil {
                 if child.isButton { buttons.append(child) } else { walk(child) }
             }
@@ -63,7 +67,7 @@ extension DialogHost {
         // The sheet's own row is drawn as the default, not the authored button it stands for;
         // it arrives in its sheet without its key equivalent too, so it is given again.
         let row = entries.last?.header?.confirm
-        if let confirm = entries.last?.sheet?.chrome?.confirm, !confirm.isHidden, confirm.keyEquivalent != "\r" { confirm.keyEquivalent = "\r" }
+        if let confirm = entries.last?.sheet?.chrome?.confirmButton, !confirm.isHidden, confirm.keyEquivalent != "\r" { confirm.keyEquivalent = "\r" }
         let next = active.flatMap(defaultButton).flatMap { $0 === row ? nil : presenter?.controls.controls[$0.id] as? NativeButtonMac }
         if let old = drawnDefault, old !== next, old.keyEquivalent == "\r" { old.keyEquivalent = "" }
         if let next, next.keyEquivalent != "\r" { next.keyEquivalent = "\r" }
@@ -93,7 +97,7 @@ extension DialogHost {
         } else if let view = responder as? NSView, view !== presenter.viewport, view !== presenter.session?.view {
             return false
         }
-        if let entry = entry(ofRoute: dialog), entry.header?.confirm === target, let row = entry.sheet?.chrome?.confirm { row.performClick(nil) }
+        if let entry = entry(ofRoute: dialog), entry.header?.confirm === target, let row = entry.sheet?.chrome?.confirmButton { row.performClick(nil) }
         else if let button = presenter.controls.controls[target.id] as? NativeButtonMac { button.pressAsDefault() }
         else if target.pressable { presenter.press(target.id) }
         else { target.activateNative() }

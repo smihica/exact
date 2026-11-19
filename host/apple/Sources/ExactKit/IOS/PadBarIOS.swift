@@ -18,7 +18,7 @@ import UIKit
 
 extension Presenter {
     /// The app's accessory occupies the first part of the reported keyboard frame.
-    var keyboardAccessoryHeight: CGFloat {
+    package var keyboardAccessoryHeight: CGFloat {
         guard keyboardPolicy == "resizes-content", keyboardTop != nil,
               let accessory = (editor?.field ?? editor?.textArea)?.inputAccessoryView, !accessory.isHidden else { return 0 }
         return max(0, accessory.bounds.height)

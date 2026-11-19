@@ -15,6 +15,7 @@ pub(crate) type Rows = Vec<(StyleId, StyleValue<'static>)>;
 
 /// A case's declarations, each its author's (`written`), as a page's CSS is.
 pub(crate) fn props(rows: &Rows) -> StyleProps {
+    exact_kernel::style::link_all();
     let mut p = StyleProps::default();
     for (row, value) in rows {
         p.set_dynamic(*row, value).unwrap();
@@ -34,7 +35,14 @@ pub(crate) fn css_rows(css: &str) -> Rows {
         // Keywords, and `line-height` in pixels (a bare number multiplies).
         let text = matches!(
             name,
-            "aspect-ratio" | "column-fill" | "break-before" | "break-after" | "break-inside"
+            "aspect-ratio"
+                | "column-fill"
+                | "break-before"
+                | "break-after"
+                | "break-inside"
+                | "overflow"
+                | "overflow-x"
+                | "overflow-y"
         );
         let v = match (px, percent, value) {
             (Ok(_), _, _) if name == "line-height" => t(value),

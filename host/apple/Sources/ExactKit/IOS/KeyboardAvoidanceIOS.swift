@@ -16,9 +16,10 @@
 import UIKit
 
 /// One keyboard contribution to a scroll view's shared bottom insets.
-final class KeyboardInset {
+package final class KeyboardInset {
     private var amount: CGFloat = 0
-    func apply(_ desired: CGFloat, to scroll: UIScrollView) {
+    package init() {}
+    package func apply(_ desired: CGFloat, to scroll: UIScrollView) {
         let change = desired - amount
         // Record the contribution before UIKit setters can reenter layout
         amount = desired
@@ -92,7 +93,7 @@ extension Presenter {
     /// below it (ExactView `paintUnderKeys`): the background of the scroller
     /// there (a grouped list's), or the nearest painted box above it (a
     /// route's backdrop), never a row's own. Nil where nothing is painted.
-    func bottomEdgeColor() -> UIColor? {
+    package func bottomEdgeColor() -> UIColor? {
         var b = viewport.bounds.inset(by: pageMargins)
         if let top = keyboardTop, let window = viewport.window {
             let edge = viewport.convert(CGPoint(x: 0, y: top), from: window).y
@@ -275,7 +276,7 @@ extension NodeView {
     /// keeps UIKit's `.none`. An authored `keyboardDismissMode` wins, `none`
     /// included: the prop has no default row, so unsaid it is absent from
     /// the node's props, and absence is the whole test.
-    var keyboardDismissal: UIScrollView.KeyboardDismissMode {
+    package var keyboardDismissal: UIScrollView.KeyboardDismissMode {
         switch props["keyboardDismissMode"] {
         case "interactive": return .interactive
         case "on-drag": return .onDrag
@@ -283,8 +284,8 @@ extension NodeView {
         default:
             guard scrollsVertically else { return .none }
             #if os(iOS)
-            let route = ViewPresentation.controllers(for: self).lazy.compactMap { $0 as? RouteController }.first
-            if route?.search?.controller.searchBar.searchTextField.isEditing == true { return .onDrag }
+            let route = ViewPresentation.controllers(for: self, layout: true).lazy.compactMap { $0 as? any RouteSurface }.first
+            if route?.searchBarEditing == true { return .onDrag }
             #endif
             return .interactive
         }
@@ -300,7 +301,7 @@ extension NodeView {
 extension Presenter {
     /// A bar's search field began or ended editing: the scrollers under it
     /// take their drag's answer again (`keyboardDismissal`).
-    func searchEditingChanged() {
+    package func searchEditingChanged() {
         for id in scrollers { views[id]?.updateKeyboardDismissal() }
     }
 
@@ -368,33 +369,4 @@ extension Presenter {
     }
 }
 
-extension NavigationHost {
-    /// The primary controller keeps its native bounds while route content avoids the keyboard.
-    func ownerFrame(_ owner: UIViewController, in root: UIView) -> CGRect {
-        let viewport = presenter.viewport
-        var frame = !ExactEnv.authoredChrome && presenter.inDocument(root) ? viewport.convert(viewport.pageBounds, to: root) : root.bounds
-        frame.size.height += ownerKeyboardExtension(owner)
-        // The authored tablist the agent paints takes its own place in the
-        // root, as on the web; the routes end at its edge, not under it.
-        if owner === tabOwner, ExactEnv.authoredChrome, let list = adoptedTablist.flatMap({ presenter.views[$0] }),
-           list.style["display"]?.string != "none", list.isDescendant(of: root) {
-            let rect = list.convert(list.bounds, to: root)
-            if rect.height > 0, rect.minY >= frame.midY {
-                frame.size.height = max(0, min(frame.maxY, rect.minY) - frame.minY)
-            } else if rect.height > 0, rect.maxY <= frame.midY {
-                let cut = max(0, rect.maxY - frame.minY)
-                frame.origin.y += cut
-                frame.size.height = max(0, frame.height - cut)
-            }
-        }
-        return frame
-    }
-
-    func ownerKeyboardExtension(_ owner: UIViewController) -> CGFloat {
-        #if os(iOS)
-        if ExactEnv.authoredChrome, owner === primaryOwner, presenter.keyboardPolicy == "resizes-content" { return presenter.keyboardAccessoryHeight }
-        #endif
-        return 0
-    }
-}
 #endif

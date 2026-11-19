@@ -23,7 +23,16 @@ impl Backend for Texts {
     fn fill(&mut self, _: &Shape, _: [u8; 4], _: Transform) {}
     fn fill_gradient(&mut self, _: &Shape, _: &GradientPaint, _: Transform) {}
     fn fill_border(&mut self, _: &exact_painted::paint::border::BorderFill, _: Transform) {}
-    fn image(&mut self, _: &Arc<Bitmap>, _: Rect4, _: &[Shape], _: Transform, _: Option<[u8; 4]>) {}
+    fn image(
+        &mut self,
+        _: &Arc<Bitmap>,
+        _: Rect4,
+        _: &[Shape],
+        _: Transform,
+        _: Option<[u8; 4]>,
+        _: exact_kernel::ImageRendering,
+    ) {
+    }
     fn text(
         &mut self,
         _: &mut TextEngine,
@@ -76,6 +85,7 @@ fn prefer(p: &mut Presenter<()>, bold_text: bool) {
     let device = Device {
         night: false,
         font_scale: 1.,
+        screen_reader: exact_painted::presenter::ScreenReader::Unknown,
         locale: "en-US".into(),
         rtl: false,
         hour24: false,

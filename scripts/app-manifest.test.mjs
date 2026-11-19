@@ -1,24 +1,182 @@
 // app.json keys the web manifest standard defines (scripts/app.schema.json).
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
-test('a widget declares fixed enum configuration choices', async () => {
+test('launch modules must provide a part for every declared host', async () => {
+  const { buildBake, readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-launch-hosts-'));
+  const read = (host, launch = ['observe']) => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Launch', app: { id: 'dev.exact.launch', name: 'Launch' }, host, launch }));
+    return readManifest(dir, 'launch');
+  };
+  try {
+    // An app's module shadows the whole SDK module, including missing parts.
+    const own = resolve(dir, 'modules/observe');
+    mkdirSync(resolve(own, 'linux'), { recursive: true });
+    writeFileSync(resolve(own, 'linux/launch.rs'), 'pub fn launch() {}');
+    assert.doesNotThrow(() => read({ linux: {} }));
+    const selected = { dir, manifest: { launch: ['observe'] } };
+    assert.throws(() => buildBake(selected, 'linux', 'aarch64-linux-android', { kind: 'android' }), /observe has no android launch part/);
+    assert.throws(() => buildBake(selected, 'windows', 'x86_64-pc-windows-msvc'), /observe has no windows launch part/);
+    for (const host of ['android', 'ios', 'macos', 'web', 'windows']) {
+      assert.throws(() => read({ linux: {}, [host]: {} }), new RegExp(`app.json launch: observe has no ${host} launch part`));
+    }
+    rmSync(own, { recursive: true });
+    assert.doesNotThrow(() => read({ android: {}, ios: {}, macos: {}, linux: {}, web: {} }));
+    assert.throws(() => read({ windows: {} }), /observe has no windows launch part/);
+    assert.throws(() => read({ android: {} }, ['missing']), /app.json launch: no module missing/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the native intents fixture declares only hosts its launch module supports', async () => {
+  const { resolveApp } = await import('./app.mjs');
+  const app = resolveApp(resolve(import.meta.dir, '../host/apple/fixtures/native-intents-app'));
+  assert.deepEqual(Object.keys(app.manifest.host).sort(), ['ios', 'macos']);
+});
+
+test('Apple Swift products require a URL, exact semantic version and named products', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const { swiftPackageGraph, assertSwiftLock } = await import('../host/apple/compose.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-swift-products-'));
+  const dependency = { url: 'https://github.com/apple/swift-collections.git', exactVersion: '1.1.4', products: ['DequeModule'] };
+  const bound = value => [{ extension: 'queue', swiftPackagesSource: '/packages/queue/apple/exact.json', swiftPackages: value }];
+  const app = value => ({ dir, manifest: { host: { macos: { swiftPackages: value } } } });
+  const read = value => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Swift', app: { id: 'dev.exact.swift', name: 'Swift' },
+      host: { macos: { swiftPackages: value }, ios: { swiftPackages: value } } }));
+    return readManifest(dir, 'swift');
+  };
+  try {
+    assert.deepEqual(read([dependency]).host.ios.swiftPackages, [dependency]);
+    for (const value of [null, {}, [null], [{ ...dependency, exactVersion: '^1.1.4' }], [{ ...dependency, exactVersion: '1.1' }],
+      [{ ...dependency, url: 'file:///tmp/package' }], [{ ...dependency, products: [] }], [{ ...dependency, products: [12] }],
+      [{ ...dependency, products: [''] }], [{ ...dependency, branch: 'main' }], [{ url: dependency.url }]]) {
+      assert.throws(() => read(value), /swiftPackages/);
+      assert.throws(() => swiftPackageGraph(app(undefined), bound(value)), /queue.*exact.json.*swiftPackages/);
+    }
+    const graph = swiftPackageGraph(app([dependency]), bound([{ ...dependency, products: ['OrderedCollections', 'DequeModule'] }]));
+    assert.equal(graph.length, 1);
+    assert.deepEqual(graph[0].products, ['DequeModule', 'OrderedCollections']);
+    assert.throws(() => swiftPackageGraph(app([dependency]), bound([{ ...dependency, exactVersion: '1.2.0' }])), /app.json.*1.1.4.*queue.*1.2.0/);
+    assert.throws(() => swiftPackageGraph(app([dependency]), bound([{ ...dependency, url: 'https://example.com/swift-collections.git' }])), /app.json.*queue/);
+    assert.throws(() => assertSwiftLock(app([dependency]), graph), /exact.mjs lock/);
+    const lock = { version: 3, pins: [{ identity: 'swift-collections', location: dependency.url,
+      state: { version: '1.1.3', revision: 'a'.repeat(40) } }] };
+    writeFileSync(resolve(dir, 'Package.resolved'), JSON.stringify(lock));
+    assert.throws(() => assertSwiftLock(app([dependency]), graph), /differs from the lock/);
+    lock.pins[0].state.version = '1.1.4';
+    writeFileSync(resolve(dir, 'Package.resolved'), JSON.stringify(lock));
+    assert.ok(assertSwiftLock(app([dependency]), graph).length);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Swift lock discovery follows reachable interfaces and inherited dependencies', async () => {
+  const { appSwiftPackageGraph } = await import('../host/apple/compose.mjs');
+  const root = mkdtempSync(resolve(tmpdir(), 'swift-workspace-')), dir = resolve(root, 'apps/fixture');
+  const put = (file, value) => {
+    const path = resolve(root, file); mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value));
+  };
+  const dependency = { url: 'https://github.com/apple/swift-collections.git', exactVersion: '1.1.4', products: ['DequeModule'] };
+  const implementation = { kind: 'implementation', implements: '@fixture/queue@1.0.0', platform: 'apple',
+    targets: ['macos', 'ios'], sources: { swift: ['Queue.swift'] }, class: 'Queue', swiftPackages: [dependency] };
+  const app = { dir, target: resolve(root, 'target'), manifest: { name: 'Queue', app: { id: 'dev.exact.queue', name: 'Queue' } } };
+  try {
+    put('package.json', { dependencies: { '@fixture/queue': '1.0.0', '@fixture/parent': '1.0.0' } });
+    put('apps/fixture/app.json', app.manifest);
+    put('apps/fixture/app.contract', 'component App\n  view\n    queue-view\n');
+    put('node_modules/@fixture/queue/package.json', { name: '@fixture/queue', version: '1.0.0',
+      exports: { '.': './exact.json', './apple': './apple/exact.json' } });
+    put('node_modules/@fixture/queue/exact.json', { kind: 'interface', name: '@fixture/queue', names: [], views: ['queue-view'] });
+    put('node_modules/@fixture/queue/apple/exact.json', implementation);
+    const { lockSwiftPackages } = await import('../host/apple/compose.mjs');
+    const game = { ...app, manifest: { name: 'Queue game', game: { audio: true } } };
+    put('apps/fixture/app.json', game.manifest);
+    assert.equal(lockSwiftPackages(game), null);
+    put('apps/fixture/app.json', app.manifest);
+    assert.deepEqual(appSwiftPackageGraph(app).map(p => p.identity), ['swift-collections']);
+    put('node_modules/@fixture/parent/package.json', { name: '@fixture/parent', version: '1.0.0', exports: './exact.json' });
+    put('node_modules/@fixture/parent/exact.json', { ...implementation, targets: ['macos'],
+      swiftPackages: [{ ...dependency, products: ['OrderedCollections'] }] });
+    assert.deepEqual(appSwiftPackageGraph(app).at(0).products, ['DequeModule', 'OrderedCollections']);
+    put('apps/fixture/package.json', { dependencies: { '@fixture/queue': '1.0.0', '@fixture/one': '1.0.0', '@fixture/two': '1.0.0' } });
+    for (const name of ['one', 'two']) {
+      put(`apps/fixture/node_modules/@fixture/${name}/package.json`, { name: `@fixture/${name}`, version: '1.0.0', exports: './exact.json' });
+      put(`apps/fixture/node_modules/@fixture/${name}/exact.json`, { ...implementation, targets: ['ios'] });
+    }
+    put('apps/fixture/app.contract', 'component App\n  view\n    text "No package views"\n');
+    assert.deepEqual(appSwiftPackageGraph(app), []);
+    put('node_modules/@fixture/library/package.json', { name: '@fixture/library', version: '1.0.0', exports: './index.contract' });
+    put('node_modules/@fixture/library/index.contract', 'component Tile\n  view\n    queue-view\n');
+    put('apps/fixture/app.contract', 'use Tile from "@fixture/library"\ncomponent App\n  view\n    text "Unused Tile"\n');
+    assert.deepEqual(appSwiftPackageGraph(app), []);
+    put('apps/fixture/app.contract', 'use Tile from "@fixture/library"\ncomponent App\n  view\n    Tile()\n');
+    assert.throws(() => appSwiftPackageGraph(app), /one.*two.*queue.*ios/);
+    put('apps/fixture/app.json', { ...app.manifest, implementations: { '@fixture/queue': { ios: '@fixture/one' } } });
+    assert.deepEqual(appSwiftPackageGraph(app).map(p => p.identity), ['swift-collections']);
+    put('apps/fixture/app.json', app.manifest);
+    const plain = { ...implementation }; delete plain.swiftPackages;
+    put('node_modules/@fixture/queue/apple/exact.json', plain);
+    for (const name of ['one', 'two']) put(`apps/fixture/node_modules/@fixture/${name}/exact.json`, { ...plain, targets: ['ios'] });
+    const { appleImplementations } = await import('../js/bake/src/typescript.mjs');
+    const extensions = { queue: '@fixture/queue' }, mac = appleImplementations(dir, 'macos', extensions);
+    assert.deepEqual(appSwiftPackageGraph(app, mac, extensions), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120000);
+
+test('Apple metadata dictionaries refuse every key together with grant or generic advice', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-apple-metadata-'));
+  const save = host => writeFileSync(resolve(dir, 'app.json'), JSON.stringify({
+    name: 'Metadata', app: { id: 'dev.exact.metadata', name: 'Metadata' }, host,
+  }));
+  try {
+    save({ ios: { infoPlist: { NSPhotoLibraryAddUsageDescription: 'Save a photo', VendorKey: true },
+      entitlements: { 'aps-environment': 'development', 'com.apple.developer.applesignin': ['Default'], 'vendor.claim': true } },
+      macos: { infoPlist: { NSMicrophoneUsageDescription: 'Record', LSUIElement: true }, entitlements: { 'com.apple.security.device.audio-input': true, 'com.apple.developer.aps-environment': 'development' } } });
+    assert.throws(() => readManifest(dir, 'metadata'), error => {
+      for (const text of [
+        'host.ios.infoPlist.NSPhotoLibraryAddUsageDescription: refused; write `device.photos-add purpose.<key>`',
+        'host.ios.entitlements.aps-environment: refused; write `device.push` beside `device.notifications purpose.<key>`',
+        'com.apple.developer.applesignin: refused; write `auth.apple <client id>`',
+        'host.macos.infoPlist.NSMicrophoneUsageDescription: refused; write `device.microphone purpose.<key>`',
+        'LSUIElement: refused; Exact writes this key itself from its declarations',
+        'host.macos.entitlements.com.apple.security.device.audio-input: refused; Exact writes this key itself from its declarations',
+        'host.macos.entitlements.com.apple.developer.aps-environment: refused; Exact writes this key itself from its declarations',
+        'feedback note', 'VendorKey', 'vendor.claim',
+      ]) assert.ok(error.message.includes(text), text + '\n' + error.message);
+      return true;
+    });
+    for (const value of [null, [], true, 'key']) {
+      save({ ios: { infoPlist: value, entitlements: value }, macos: { infoPlist: value, entitlements: value } });
+      assert.throws(() => readManifest(dir, 'metadata'), /expected object/);
+    }
+    save({ ios: { infoPlist: {}, entitlements: {} }, macos: { infoPlist: {}, entitlements: {} } });
+    assert.deepEqual(readManifest(dir, 'metadata').host.ios.infoPlist, {});
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a widget declares fixed enum choices and content-index entity choices', async () => {
   const { readManifest } = await import('./app.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'widget-configuration-'));
-  const parameter = { name: 'rows', title: 'Rows', type: 'enum', values: [{ value: 'one', title: '1' }], default: 'one' };
-  const manifest = { name: 'Choices', app: { id: 'dev.exact.choices', name: 'Choices' }, widgets: [{
-    kind: 'card', families: ['systemSmall'], component: 'Card', props: 'Props', refresh: 'refresh', preview: {},
-    configuration: { title: 'Card', parameters: [parameter] },
-  }] };
+  const fixed = { name: 'rows', title: 'Rows', type: 'enum', values: [{ value: 'one', title: '1' }], default: 'one' };
+  const entity = { name: 'book', title: 'Book', type: 'entity', entity: 'book' };
+  const read = parameters => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Choices', app: { id: 'dev.exact.choices', name: 'Choices' },
+      intents: { entities: { book: { title: 'Book' } } }, widgets: [{
+        kind: 'card', families: ['systemSmall'], component: 'Card', props: 'Props', refresh: 'refresh', preview: {},
+        configuration: { title: 'Card', parameters },
+      }] }));
+    return readManifest(dir, 'choices').widgets[0].configuration.parameters;
+  };
   try {
-    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
-    assert.deepEqual(readManifest(dir, 'choices').widgets[0].configuration.parameters[0], parameter);
-    parameter.type = 'entity';
-    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
-    assert.throws(() => readManifest(dir, 'choices'), /type/);
+    assert.deepEqual(read([fixed, entity]), [fixed, entity]);
+    for (const mixed of [{ ...entity, values: fixed.values }, { ...entity, default: 'one' }, { ...fixed, entity: 'book' }, { ...fixed, type: 'entity' }, { ...entity, type: 'list' }]) {
+      assert.throws(() => read([mixed]), /parameters\[0\]: .* matches 0 of the allowed forms/, JSON.stringify(mixed));
+    }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -194,15 +352,44 @@ test('an iOS app lists the schemes canOpenURL may ask about, and a malformed or 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('readManifest admits the app\'s design, `tamber` (LLP 1121 D2)', async () => {
+test('an app\'s other names are Siri\'s on iOS, the Mac and its watch app, and a fourth or a blank one is refused (expo/exact#712)', async () => {
+  const { infoPlist, macInfoPlist } = await import('../host/apple/build.mjs');
+  const { watchInfo } = await import('../host/apple/watch.mjs');
   const { readManifest } = await import('./app.mjs');
   const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
-  const dir = mkdtempSync(resolve(tmpdir(), 'tamber-manifest-'));
+  const names = [{ name: 'Oldname', pronunciationHint: 'old name' }, { name: 'Old' }];
+  const written = '<key>INAlternativeAppNames</key><array><dict><key>INAlternativeAppName</key><string>Oldname</string><key>INAlternativeAppNamePronunciationHint</key><string>oldname</string></dict><dict><key>INAlternativeAppName</key><string>Old</string></dict></array>';
+  const app = (host) => ({ id: 'dev.exact.renamed', displayName: 'Renamed', manifest: { host } });
+  assert.ok(infoPlist(app({ ios: { alternativeNames: names } })).replace(/\s+/g, '').includes(written));
+  assert.ok(macInfoPlist(app({ macos: { alternativeNames: names } })).replace(/\s+/g, '').includes(written));
+  for (const plist of [infoPlist(app({})), infoPlist(app({ ios: { alternativeNames: names } }), false, { tv: true }), infoPlist(app({ ios: { alternativeNames: names } }), false, { clip: true }), macInfoPlist(app({ ios: { alternativeNames: names } }))])
+    assert.doesNotMatch(plist, /INAlternativeAppNames/);
+  // Siri wants the watch app's names to be the iPhone app's, and the watch inherits none.
+  const fields = { group: 'g', entries: [], live: true, generation: 'g' }, copied = [{ INAlternativeAppName: 'Old' }];
+  assert.deepEqual(watchInfo(app({}), { ...fields, appInfo: { CFBundleVersion: '1', INAlternativeAppNames: copied } }).INAlternativeAppNames, copied);
+  assert.equal(watchInfo(app({}), { ...fields, appInfo: { CFBundleVersion: '1' } }).INAlternativeAppNames, undefined);
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-names-'));
+  try {
+    const save = (alternativeNames) => writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Renamed', app: { id: 'dev.exact.renamed', name: 'Renamed' }, host: { ios: { alternativeNames }, macos: { alternativeNames } } }));
+    save(names);
+    assert.deepEqual(readManifest(dir, 'renamed').host.ios.alternativeNames, names);
+    for (const [given, says] of [[[...names, { name: 'A' }, { name: 'B' }], /more than 3 items/], [[{ name: '' }], /alternativeNames\[0\]\.name/], [[{ pronunciationHint: 'x' }], /name/], [[{ name: 'A', hint: 'a' }], /hint/]]) {
+      save(given);
+      assert.throws(() => readManifest(dir, 'renamed'), says, JSON.stringify(given));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('readManifest admits the app\'s design, `forma` (LLP 1121 D2)', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(resolve(tmpdir(), 'forma-manifest-'));
   try {
     writeFileSync(resolve(dir, 'app.contract'), 'component App\n  view\n    text "a"\n');
-    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'D', app: { id: 'com.example.d', name: 'D' }, tamber: 'design/app.tamber' }));
-    assert.equal(readManifest(dir, 'd').tamber, 'design/app.tamber');
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'D', app: { id: 'com.example.d', name: 'D' }, forma: 'design/app.forma' }));
+    assert.equal(readManifest(dir, 'd').forma, 'design/app.forma');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -216,6 +403,26 @@ test('manifest colours follow the web and retired launch and alias keys are refu
     assert.throws(() => read({ ...manifest, background_color_dark: '#123456' }), /background_color_dark/);
     assert.throws(() => read({ ...manifest, launch: { background: '#fff' } }), /launch/);
     assert.throws(() => read({ ...manifest, typescript: { aliases: { '@/*': './*' } } }), /aliases/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('former design files and manifest keys name the required rename', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const { designPath } = await import('./forma-design-path.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'forma-name-'));
+  try {
+    writeFileSync(resolve(dir, 'app.tamber'), '');
+    for (const read of [() => readManifest(dir, 'test'), () => designPath(dir)]) {
+      assert.throws(read, /rename app.tamber to app.forma/);
+    }
+    writeFileSync(resolve(dir, 'app.forma'), 'forma app\n');
+    assert.throws(() => readManifest(dir, 'test'), /rename app.tamber to app.forma/);
+    rmSync(resolve(dir, 'app.tamber'));
+    writeFileSync(resolve(dir, 'app.json'), '{"tamber":"app.forma"}');
+    assert.throws(() => readManifest(dir, 'test'), /rename app.json's tamber key to forma/);
+    assert.throws(() => designPath(dir), /rename app.json's tamber key to forma/);
+    rmSync(resolve(dir, 'app.json'));
+    assert.equal(designPath(dir), resolve(dir, 'app.forma'));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -420,17 +627,47 @@ test('the manifest orientation locks the iPhone, and an unknown one is refused',
 });
 
 test('document handlers and TypeScript source mounts accept their manifest shapes and reject guessed ones', async () => {
-  const { readManifest } = await import('./app.mjs');
+  const { readManifest, webAppManifest } = await import('./app.mjs');
   const { documentTypes } = await import('../host/apple/documents.mjs');
   const dir = mkdtempSync(resolve(tmpdir(), 'manifest-author-shapes-'));
   const base = { name: 'Reader', app: { id: 'dev.exact.reader', name: 'Reader' } };
   const read = extra => { writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ ...base, ...extra })); return readManifest(dir, 'reader'); };
-  const file_handlers = [{ action: '/', accept: { 'text/markdown': ['.md'] } }];
+  const file_handlers = [{ action: '/', name: 'Documents', accept: {
+    'text/markdown': ['.MD', 'markdown'],
+    'application/octet-stream': ['.tar.gz', 'c++'],
+    'application/x-studio-board+json': ['board'],
+  } }];
   const sources = { backend: '../generated', snapback4: '../runtime' };
   try {
+    const suffixes = JSON.parse(readFileSync(resolve(import.meta.dir, 'fixtures/document-suffixes.json'), 'utf8'));
+    for (const { declaration, canonical, error } of suffixes) {
+      if (canonical) {
+        assert.equal(read({ file_handlers: [{ action: '/', accept: { 'text/markdown': [declaration] } }] }).file_handlers[0].accept['text/markdown'][0], canonical);
+      } else {
+        assert.throws(() => read({ file_handlers: [{ action: '/', accept: { 'text/markdown': [declaration] } }] }), new RegExp(error.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      }
+    }
     const manifest = read({ file_handlers, typescript: { sources } });
-    assert.deepEqual(manifest.file_handlers, file_handlers);
+    assert.deepEqual(manifest.file_handlers[0].accept, {
+      'text/markdown': ['.md', '.markdown'],
+      'application/octet-stream': ['.tar.gz', '.c++'],
+      'application/x-studio-board+json': ['.board'],
+    });
+    assert.deepEqual(webAppManifest(manifest, 'Reader').file_handlers, manifest.file_handlers);
+    assert.deepEqual(documentTypes({ manifest })[0].CFBundleTypeExtensions, ['board']);
+    assert.deepEqual(documentTypes({ manifest })[1].CFBundleTypeExtensions, ['md', 'markdown', 'tar.gz', 'c++']);
     assert.deepEqual(manifest.typescript.sources, sources);
+    const before = { variant: process.env.EXACT_VARIANT, app: process.env.EXACT_VARIANT_APP };
+    try {
+      process.env.EXACT_VARIANT = 'dev'; process.env.EXACT_VARIANT_APP = dir;
+      const selected = read({ variants: { dev: { idSuffix: '.dev', name: 'Reader Dev' } }, file_handlers });
+      assert.equal(selected.app.id, 'dev.exact.reader.dev');
+      assert.equal(selected.file_handlers[0].accept['text/markdown'][0], '.md');
+      assert.deepEqual(documentTypes({ id: selected.app.id, manifest: selected })[0].LSItemContentTypes, ['dev.exact.reader.studio-board']);
+    } finally {
+      if (before.variant === undefined) delete process.env.EXACT_VARIANT; else process.env.EXACT_VARIANT = before.variant;
+      if (before.app === undefined) delete process.env.EXACT_VARIANT_APP; else process.env.EXACT_VARIANT_APP = before.app;
+    }
     for (const [mime, ext, uti] of [
       ['audio/mpeg', '.mp3', 'public.mp3'], ['audio/wav', '.wav', 'com.microsoft.waveform-audio'],
       ['audio/mp4', '.m4a', 'public.mpeg-4-audio'], ['audio/ogg', '.ogg', 'org.xiph.ogg-audio'],
@@ -441,6 +678,20 @@ test('document handlers and TypeScript source mounts accept their manifest shape
     }
     assert.throws(() => read({ file_handlers: { 'text/markdown': ['.md'] } }), /file_handlers:.*array/);
     assert.throws(() => read({ file_handlers: [{ action: '/', accept: ['text/markdown'] }] }), /file_handlers\[0\].accept:.*object/);
+    for (const extension of ['', '.', '.md.', 'm*d', 'm?d', 'm[d]', 'm/d', 'm\\d', 'm_d', 'm-d', 'mé', '.1234567890123456']) {
+      assert.throws(
+        () => read({ file_handlers: [{ action: '/', accept: { 'text/markdown': [extension] } }] }),
+        /file_handlers\[0\]\.accept\.text\/markdown\[0\]:.*is not a file suffix/,
+        JSON.stringify(extension),
+      );
+    }
+    for (const name of ['', 'Markdown\0files', 'Markdown\nfiles']) {
+      assert.throws(
+        () => read({ file_handlers: [{ action: '/', name, accept: { 'text/markdown': ['.md'] } }] }),
+        /file_handlers\[0\]\.name:.*is not a label/,
+        JSON.stringify(name),
+      );
+    }
     assert.throws(() => read({ typescript: { sources: ['../generated'] } }), /typescript.sources:.*object/);
     assert.throws(() => read({ typescript: { sources: { backend: { path: '../generated' } } } }), /typescript.sources.backend:.*string/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -671,10 +922,31 @@ test('a launch colour of a host\'s own or Expo\'s splash is refused for backgrou
   };
   try {
     for (const [extra, key] of [[{ host: { android: { windowBackground: '#000' } } }, 'host.android.windowBackground'], [{ splash: { backgroundColor: '#000' } }, 'splash'], [{ host: { android: { splashScreen: {} } } }, 'host.android.splashScreen']]) {
-      assert.throws(() => read(extra), new RegExp(`${key.replaceAll('.', '\\.')}: not a known key; what shows before the first frame is background_color`));
+      assert.throws(() => read(extra), new RegExp(`${key.replaceAll('.', '\\.')}: not a known key; what shows before the first frame is background_color.*host\\.android\\.launchImage add a picture`));
     }
     assert.equal(read({ background_color: '#102839', color_scheme_dark: { background_color: '#000' } }).background_color, '#102839');
     assert.throws(() => read({ color_scheme_dark: { background_color: 'navy' } }), /color_scheme_dark\.background_color: "navy" does not match/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('host.android.launchImage takes a PNG in the app up to the starting window\'s 192 dp icon, or false', async () => {
+  const { readManifest, nativeManifestMetadata } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-launch-image-'));
+  const read = (launchImage) => {
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Launch', app: { id: 'dev.exact.launch', name: 'Launch' }, background_color: '#B50000', host: { android: { launchImage } } }));
+    return readManifest(dir, 'launch');
+  };
+  try {
+    writeFileSync(resolve(dir, 'logo.png'), 'png');
+    const manifest = read({ src: 'logo.png', width: 192 });
+    // A native input: the Android binary's record names it, so an update cannot change it.
+    assert.deepEqual(nativeManifestMetadata(manifest, 'android').host.launchImage, { src: 'logo.png', width: 192 });
+    assert.equal(read(false).host.android.launchImage, false);
+    assert.throws(() => read(true), /host\.android\.launchImage: true is not a picture/);
+    assert.throws(() => read({ src: 'logo.png', width: 200 }), /host\.android\.launchImage\.width: outside the allowed numeric range/);
+    assert.throws(() => read({ src: 'logo.svg', width: 100 }), /host\.android\.launchImage\.src: "logo\.svg" does not match/);
+    assert.throws(() => read({ src: 'logo.png' }), /host\.android\.launchImage: missing required "width"/);
+    assert.throws(() => read({ src: 'gone.png', width: 100 }), /host\.android\.launchImage: gone\.png, the launch screen's picture, does not exist/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -777,3 +1049,151 @@ test('adding and removing preload regenerates native shells with the baked acces
     assert.equal(readFileSync(source, 'utf8'), before);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 30000);
+
+test('Android may declare its own package without changing the shared app identity', async () => {
+  const { readManifest, androidPackageId, nativeManifestMetadata } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-android-id-'));
+  const save = id => writeFileSync(resolve(dir, 'app.json'), JSON.stringify({
+    name: 'Identity', app: { id: 'com.example.ios', name: 'Identity' }, host: { android: { id } },
+  }));
+  try {
+    save('com.example.android_app');
+    const manifest = readManifest(dir, 'identity');
+    assert.equal(manifest.host.android.id, 'com.example.android_app');
+    assert.equal(manifest.app.id, 'com.example.ios');
+    assert.equal(androidPackageId(manifest), 'com.example.android_app');
+    const { androidAssociation } = await import('../host/web/association.mjs');
+    const certificates = [Array(32).fill('AB').join(':')];
+    manifest.host.android.certificates = certificates;
+    assert.deepEqual(androidAssociation(manifest), {
+      relation: ['delegate_permission/common.get_login_creds'],
+      target: { namespace: 'android_app', package_name: 'com.example.android_app', sha256_cert_fingerprints: certificates },
+    });
+    assert.equal(nativeManifestMetadata(manifest, 'android').host.id, 'com.example.android_app');
+    assert.equal(nativeManifestMetadata(manifest, 'ios').app.id, 'com.example.ios');
+    save(undefined);
+    assert.equal(androidPackageId(readManifest(dir, 'identity')), 'com.example.ios');
+    const shared = { app: { id: 'com.example.shared-app' } };
+    assert.equal(androidPackageId(shared), 'com.example.shared_app');
+    assert.equal(androidAssociation(shared).target.package_name, 'com.example.shared_app');
+    for (const id of ['', 'single', 'com.example.1app', 'com.example.android-app', null, 42]) {
+      save(id);
+      assert.throws(() => readManifest(dir, 'identity'), /host.android.id/);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the auth fixture origin associates the selected Android package and shared Apple identity', async () => {
+  const { associationFiles } = await import('../apps/auth-fixture/origin.mjs');
+  const certificates = [Array(32).fill('AB').join(':')];
+  const manifest = {
+    id: 'https://example.com/', app: { id: 'com.example.shared-app' },
+    host: { ios: { team: 'TEAM' }, android: { id: 'com.example.android', certificates } },
+  };
+  for (const [id, expected] of [['com.example.android', 'com.example.android'], [undefined, 'com.example.shared_app']]) {
+    manifest.host.android.id = id;
+    const files = associationFiles(manifest);
+    assert.deepEqual(files['assetlinks.json'], [{
+      relation: ['delegate_permission/common.get_login_creds'],
+      target: { namespace: 'android_app', package_name: expected, sha256_cert_fingerprints: certificates },
+    }]);
+    assert.deepEqual(files['apple-app-site-association'], {
+      webcredentials: { apps: ['TEAM.com.example.shared-app', 'SIMULATORX.com.example.shared-app'] },
+    });
+  }
+});
+
+test('app.json variants: a suffix, a name, icons and settings per name, refused where wrong (LLP 1030.008)', async () => {
+  const { readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'manifest-variants-'));
+  const save = (variants, extra = {}) => writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'V', app: { id: 'com.example.v', name: 'V' }, env: ['API'], variants, ...extra }));
+  try {
+    const dev = { idSuffix: '.dev', name: 'V Dev', env: { API: 'https://staging.example' }, host: { ios: { icon: 'assets/Dev.icon' }, macos: { icon: 'assets/Dev.icon' } } };
+    save({ dev, 'qa-2': { idSuffix: '.qa.two', name: 'V QA' } });
+    assert.deepEqual(readManifest(dir, 'v').variants.dev, dev);
+    assert.equal(readManifest(dir, 'v').app.id, 'com.example.v');
+    for (const [variants, problem, extra] of [
+      [{ Dev: { idSuffix: '.dev', name: 'D' } }, /variants\.Dev\.name/], [{ dev: { idSuffix: 'dev', name: 'D' } }, /variants\.dev\.idSuffix/],
+      [{ dev: { idSuffix: '.1dev', name: 'D' } }, /variants\.dev\.idSuffix/], [{ dev: { idSuffix: '.dev', name: '' } }, /variants\.dev\.name/],
+      [{ dev: { name: 'D' } }, /variants\.dev: missing required "idSuffix"/], [{ dev: { idSuffix: '.dev' } }, /variants\.dev: missing required "name"/],
+      [{ dev: { ...dev, env: { api: 'x' } } }, /variants\.dev\.env\.api\.name/], [{ dev: { ...dev, env: { API: 1 } } }, /variants\.dev\.env\.API/],
+      [{ dev: { ...dev, env: { OTHER: 'x' } } }, /variants\.dev\.env\.OTHER: not a setting the manifest's "env" declares/],
+      [{ dev: { ...dev, bundleId: 'x' } }, /variants\.dev\.bundleId: not a known key/],
+      // Of `host`, a variant names its Icon Composer projects and nothing else.
+      [{ dev: { ...dev, host: { ios: { icon: 'assets/Dev.icon', minimumOS: '18.0' } } } }, /variants\.dev\.host\.ios\.minimumOS: not a known key/],
+      [{ dev: { ...dev, host: { android: { id: 'com.example.other' } } } }, /variants\.dev\.host\.android: not a known key/],
+      [{ dev: { ...dev, host: { ios: {} } } }, /variants\.dev\.host\.ios: missing required "icon"/],
+      [{ dev }, /variants\.dev\.host\.ios\.icon: assets\/Dev\.icon gives the primary icon the name of alternate_icons\[0\] \("dev"\) on Apple; rename one/, { alternate_icons: [{ name: 'dev', icons: [{ src: 'assets/missing.png' }] }] }],
+      [{ dev: { ...dev, icons: [{ src: 'assets/missing.png' }] } }, /variants\.dev\.icons\[0\]\.src: assets\/missing\.png does not exist/],
+      [{ dev }, /host\.ios\.appClip\.id com\.other\.Clip does not begin with com\.example\.v\./, { host: { ios: { appClip: { id: 'com.other.Clip' } } } }],
+      [{ dev, qa: { idSuffix: '.dev', name: 'V QA' } }, /variants\.qa\.idSuffix: variants\.dev has \.dev too/],
+      [{ dev: { ...dev, name: 'v' } }, /variants\.dev\.name: "v" installs under the same name as app\.name/],
+      [{ dev, qa: { idSuffix: '.qa', name: 'V Dev.' } }, /variants\.qa\.name: "V Dev\." installs under the same name as variants\.dev\.name/],
+      [{ dev }, /variant: not a known key/, { variant: { name: 'dev', base: 'com.example.v' } }],
+    ]) {
+      save(variants, extra);
+      assert.throws(() => readManifest(dir, 'v'), problem);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a selected variant resolves the manifest as contract/cli/src/manifest/variant.rs does', async () => {
+  const { resolveVariant, takeVariant } = await import('./variants.mjs');
+  // The Rust tests' fixture.
+  const manifest = {
+    app: { id: 'com.example.v', name: 'V' }, icons: [{ src: 'assets/icon.png' }],
+    color_scheme_dark: { background_color: '#000000', icons: [{ src: 'assets/dark.png' }] },
+    host: { android: { id: 'com.example.v_android' }, ios: { appClip: { id: 'com.example.v.Clip' }, icon: 'assets/v.icon' }, macos: { icon: 'assets/v-mac.icon' } },
+    variants: {
+      dev: { idSuffix: '.dev', name: 'V Dev', icons: [{ src: 'assets/dev.png' }] }, plain: { idSuffix: '.qa.two', name: 'V QA' },
+      project: { idSuffix: '.project', name: 'V Project', host: { ios: { icon: 'assets/project.icon' } } },
+      whole: { idSuffix: '.whole', name: 'V Whole', icons: [{ src: 'assets/whole.png' }], host: { macos: { icon: 'assets/whole.icon' } } },
+    },
+  };
+  assert.equal(resolveVariant(manifest, undefined), manifest);
+  const dev = resolveVariant(manifest, 'dev');
+  assert.deepEqual(dev.app, { id: 'com.example.v.dev', name: 'V Dev' });
+  assert.equal(dev.host.android.id, 'com.example.v_android.dev');
+  assert.deepEqual(dev.host.ios, { appClip: { id: 'com.example.v.dev.Clip' } });
+  assert.deepEqual(dev.host.macos, {});
+  assert.deepEqual(dev.icons, [{ src: 'assets/dev.png' }]);
+  assert.deepEqual(dev.color_scheme_dark, { background_color: '#000000' });
+  assert.deepEqual(dev.variant, { name: 'dev', base: 'com.example.v' });
+  assert.equal(manifest.app.id, 'com.example.v', 'the manifest itself is left alone');
+  const plain = resolveVariant(manifest, 'plain');
+  assert.equal(plain.app.id, 'com.example.v.qa.two');
+  assert.equal(plain.host.ios.icon, 'assets/v.icon');
+  // A variant's own Icon Composer project replaces the app's on that platform, and nothing else.
+  const project = resolveVariant(manifest, 'project');
+  assert.deepEqual(project.host.ios, { appClip: { id: 'com.example.v.project.Clip' }, icon: 'assets/project.icon' });
+  assert.deepEqual(project.host.macos, { icon: 'assets/v-mac.icon' });
+  assert.deepEqual([project.icons, project.color_scheme_dark], [manifest.icons, manifest.color_scheme_dark]);
+  // With `icons` too, the app's projects are not read, and the variant's own is.
+  const whole = resolveVariant(manifest, 'whole');
+  assert.deepEqual(whole.icons, [{ src: 'assets/whole.png' }]);
+  assert.deepEqual(whole.color_scheme_dark, { background_color: '#000000' });
+  assert.deepEqual(whole.host.ios, { appClip: { id: 'com.example.v.whole.Clip' } });
+  assert.deepEqual(whole.host.macos, { icon: 'assets/whole.icon' });
+  assert.equal(manifest.host.ios.icon, 'assets/v.icon', 'the manifest itself is left alone');
+  assert.throws(() => resolveVariant(manifest, 'preview'), /^Error: variant preview: app\.json has no variants\.preview \(it declares dev, plain, project, whole\)$/);
+  // The flag sets EXACT_VARIANT for this process and its children, over an exported value.
+  const env = { EXACT_VARIANT: 'plain' }, args = ['--run', '--variant', 'dev', 'shelf'];
+  assert.deepEqual(takeVariant(args, env), ['--run', 'shelf']);
+  assert.equal(env.EXACT_VARIANT, 'dev');
+  assert.throws(() => takeVariant(['--variant'], {}), /--variant needs a name/);
+  assert.equal(resolveVariant(dev, 'dev'), dev, 'a resolved manifest is never resolved again');
+});
+
+test('a variant selection names the one app the verb resolved; another app reads as it is', async () => {
+  const { claimVariant, selectedVariant } = await import('./variants.mjs');
+  const one = mkdtempSync(resolve(tmpdir(), 'variant-one-')), other = mkdtempSync(resolve(tmpdir(), 'variant-other-'));
+  try {
+    const env = { EXACT_VARIANT: 'dev' };
+    assert.equal(selectedVariant(one, env), undefined, 'a request alone selects nothing');
+    claimVariant(one, () => ({}), env);
+    claimVariant(other, () => ({}), env);
+    assert.equal(selectedVariant(one, env), 'dev');
+    assert.equal(selectedVariant(other, env), undefined);
+    assert.equal(selectedVariant(one, {}), undefined);
+  } finally { for (const dir of [one, other]) rmSync(dir, { recursive: true, force: true }); }
+});

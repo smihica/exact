@@ -38,9 +38,11 @@ internal data class Device(
     /** The device's locale with the hour cycle the person forces as its `hc` keyword ([formatLocale]); empty where
      * none is forced, for the locale itself. */
     val formatLocale: String,
+    /** Touch exploration is a proxy for a screen reader: 0 unknown, 1 off, 2 on (LLP 1039 D10). */
+    val screenReader: Int,
 ) {
     /** Tell exact2: on the thread that holds the host, or on any before it boots. */
-    fun tell() = Native.configure(night, fontScale, locale, rtl, hour24, noAnimations, boldText, highContrast, touch, tv, touchSlop, dates, formatLocale)
+    fun tell() = Native.configure(night, fontScale, locale, rtl, hour24, noAnimations, boldText, highContrast, touch, tv, touchSlop, dates, formatLocale, screenReader)
 
     companion object {
         fun read(context: Context): Device {
@@ -64,6 +66,7 @@ internal data class Device(
                 touchSlop = android.view.ViewConfiguration.get(context).scaledTouchSlop / scale(context),
                 dates = dates(config.locales[0], hour24),
                 formatLocale = formatLocale(config.locales[0], hour24),
+                screenReader = context.getSystemService(AccessibilityManager::class.java)?.let { if (it.isTouchExplorationEnabled) 2 else 1 } ?: 0,
             )
         }
 

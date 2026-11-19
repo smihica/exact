@@ -9,6 +9,35 @@ use contract_types::{Ref, Scope, Ty};
 use exact_plan::asm::Asm;
 use exact_plan::{Opcode, Stdlib};
 
+/// `observe` and `observeAttributes` as hosts receive them. A record goes
+/// positionally, each field name before its value in the order the call names
+/// them: `observe(name, Shape(a=x), sev)` is `name, sev, "a", x` (`sev` is
+/// `"info"` when left out) and `observeAttributes(Shape(a=x))` is `"a", x`.
+/// `None` for any other command. The lowerer and the Lean embedding both read
+/// it, so the plan and the semantics cannot disagree.
+pub fn observe_args(name: &str, args: &[Expr]) -> Option<Vec<Expr>> {
+    let (mut flat, record) = match name {
+        "observe" => {
+            let severity = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| Expr::Str("info".into(), args[0].span()));
+            (vec![args[0].clone(), severity], args.get(1))
+        }
+        "observeAttributes" => (Vec::new(), args.first()),
+        _ => return None,
+    };
+    if let Some(Expr::Call(_, fields, _)) = record {
+        for field in fields {
+            if let Expr::NamedArg(key, value, span) = field {
+                flat.push(Expr::Str(key.clone(), *span));
+                flat.push(value.as_ref().clone());
+            }
+        }
+    }
+    Some(flat)
+}
+
 /// A host command's arguments in the order its hosts read them. `share`'s
 /// are named (LLP 1069.003 D1) and lower as `(title, text, url, files)`,
 /// `None` for an absent one, so the plan's `Command` op stays positional.
@@ -62,8 +91,39 @@ pub fn command_args<'e>(name: &str, args: &'e [Expr]) -> Vec<Option<&'e Expr>> {
     }
     // `saveFile(id, text=, suggestedName=)` lowers as `(id, none,
     // suggestedName, text)`: four, where the copy of a file is three.
-    if name == "saveFile" && args.iter().any(|a| matches!(a, Expr::NamedArg(..))) {
-        return vec![args.first(), None, named("suggestedName"), named("text")];
+    // @ref LLP 1173 D2 — `startIn=` makes either five, `(id, from,
+    // suggestedName, none, startIn)` or `(id, none, suggestedName, text,
+    // startIn)`, and trails each picker's: `(id, multiple, startIn)`
+    // (`multiple` `none` when absent), `(id, startIn)`, `(id,
+    // suggestedName, startIn)`. A call without it lowers as before.
+    let start_in = named("startIn");
+    if name == "saveFile" {
+        let mut positional = args.iter().filter(|a| !matches!(a, Expr::NamedArg(..)));
+        let id = positional.next();
+        let mut out = match named("text") {
+            Some(text) => vec![id, None, named("suggestedName"), Some(text)],
+            None => vec![id, positional.next(), positional.next()],
+        };
+        if start_in.is_some() {
+            out.resize(4, None);
+            out.push(start_in);
+        }
+        return out;
+    }
+    if matches!(
+        name,
+        "showOpenFilePicker" | "showDirectoryPicker" | "showSaveFilePicker"
+    ) {
+        let mut out: Vec<_> = args
+            .iter()
+            .filter(|a| !matches!(a, Expr::NamedArg(..)))
+            .map(Some)
+            .collect();
+        if start_in.is_some() {
+            out.resize(if name == "showDirectoryPicker" { 1 } else { 2 }, None);
+            out.push(start_in);
+        }
+        return out;
     }
     // @ref LLP 1096 D2, LLP 1125 D10 — the sound first, then `at`, `gain`,
     // `group`, `playbackRate` and `pan`, `none` where the author left the
@@ -125,6 +185,12 @@ pub(crate) fn compile(
     scope: &Scope,
     locals: &mut u16,
 ) -> Result<Ty, LowerError> {
+    if !scope.in_action() {
+        if let Some((row, ty)) = l.shared_expression(e, scope)? {
+            asm.load_derive(row);
+            return Ok(ty);
+        }
+    }
     Ok(match e {
         Expr::Number(n, _) => {
             asm.number(*n);
@@ -142,7 +208,7 @@ pub(crate) fn compile(
         Expr::NamedArg(_, _, span) => {
             return err(
                 "lower-named-argument",
-                "named arguments go to a component use, a shape's call (`Row(title=…)`), `empty(…)`, `t(…)`, a canvas `surface=` binding and `share`, `scrollIntoView`; another call's arguments are positional",
+                "named arguments go to a component use, a shape's call (`Row(title=…)`), `empty(…)`, `t(…)`, a canvas `surface=` binding and `share`, `scrollIntoView`, `saveFile` and the file pickers' `startIn=`; another call's arguments are positional",
                 *span,
             )
         }
@@ -291,7 +357,7 @@ pub(crate) fn compile(
                 return compile(l, asm, &template, scope, locals);
             }
             if !l.fns.contains_key(name.as_str())
-                && contract_types::strings::is_text_call(name, scope)
+                && contract_types::strings::is_text_call(name, *span, scope, &l.types.shapes)
             {
                 return l.text_call(asm, args, *span, scope, locals);
             }

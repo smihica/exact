@@ -7,19 +7,31 @@ import UIKit
 extension MenuHost {
     /// Whether a bar item opening `target` is its pull-down (LLP 1021 D3):
     /// a menu-shaped popover, or a confirmation (which its rows present).
-    func pullsDown(_ target: NodeView) -> Bool { target.menuShaped || isConfirmation(target) }
+    package func pullsDown(_ target: NodeView) -> Bool { target.menuShaped || isConfirmation(target) }
+    #if os(iOS)
+    /// Whether `source` opens `pop` as UIKit's menu when the agent does not
+    /// paint it (`sync`): a native button in the page its `role="menu"`
+    /// popover, and any other invoker, a bar item included, its menu-shaped
+    /// one, as its pull-down.
+    func platformMenu(_ pop: NodeView, from source: NodeView) -> Bool {
+        guard let presenter, !isConfirmation(pop), presenter.invocation(of: source)?.target === pop else { return false }
+        let inBar: Bool
+        if case .success? = presenter.navigation.barItem(source) { inBar = true } else { inBar = false }
+        return source.isNativeButton && !inBar ? pop.props["accessibilityRole"] == "menu" : pop.menuShaped
+    }
+    #endif
     /// A bar item's popover that is no menu, opened (or closed, a second
     /// tap) from the item as a native button in the page opens one: lifted,
     /// anchored on the item (`lift`). False when the item is ineligible or
     /// names nothing it opens now.
-    func openFromBar(_ node: NodeView) -> Bool {
+    package func openFromBar(_ node: NodeView) -> Bool {
         guard let presenter, eligible(node, inBar: true), let invocation = presenter.invocation(of: node), invocation.opens,
               !isConfirmation(invocation.target), let name = invocation.target.props["id"] else { return false }
         // Open before the tap's light dismiss, which would close it first.
         let open = isOpen(invocation.target)
         if open, invocation.action == .show { return true }
         lightDismiss(node)
-        if open { drop(name) } else { agentShow(invocation.target, named: name, from: node.id) }
+        if open { drop(name) } else { agentShow(invocation.target, named: name, from: node.id, invoked: true) }
         return true
     }
     /// Under the agent's painted popovers and UIKit's bars (`--chrome
@@ -31,7 +43,7 @@ extension MenuHost {
     /// provider presents it. Nil when the agent shows UIKit's menus instead
     /// (`--touch platform`: a real touch opens them); false when it opens
     /// nothing now.
-    func agentOpen(barItem node: NodeView) -> Bool? {
+    package func agentOpen(barItem node: NodeView) -> Bool? {
         guard ExactEnv.agentPaints, let presenter else { return nil }
         guard eligible(node, inBar: true), let invocation = presenter.invocation(of: node), invocation.opens else { return false }
         let target = invocation.target
@@ -40,7 +52,7 @@ extension MenuHost {
         }
         guard let name = target.props["id"] else { return false }
         lightDismiss(node)
-        if !isOpen(target) { agentShow(target, named: name, from: node.id) } else { drop(name) }
+        if !isOpen(target) { agentShow(target, named: name, from: node.id, invoked: true) } else { drop(name) }
         return true
     }
 }

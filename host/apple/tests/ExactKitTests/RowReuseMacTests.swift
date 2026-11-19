@@ -10,6 +10,8 @@ import AppKit
 import XCTest
 import ExactCore
 @testable import ExactKit
+@testable import ExactVideo
+@testable import ExactImages
 
 final class RowReuseMacTests: XCTestCase {
     private var fixtures: [TableFixture] = []

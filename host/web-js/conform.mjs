@@ -62,7 +62,7 @@
 //   mouse to deliver a wheel, so these compare hover followed by wheel at the
 //   same viewport point, even if hovering changes the target's box.
 //   --linux adds a second reference beside the wasm page: the Rust runner
-//   headless on the Linux host (`agent.mjs linux`, the data app's release
+//   headless on the Linux host (`agent.mjs linux`, the data app's development
 //   binary, built by --build), driven by the same steps on the same plan,
 //   its state and tree compared with the wasm page's (`linux` failures).
 //   A plan marked `// linux: layout` also compares its testId boxes with the
@@ -94,7 +94,7 @@
 //   pixel-compared across engines; both are saved, for inspection, only at a
 //   checkpoint that differed (a failure or a known difference). Install
 //   the browsers outside this repo with:
-//     bunx playwright@1.64.1 install firefox webkit
+//     bunx playwright@1.65.1 install firefox webkit
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer, request } from 'node:http';
@@ -104,12 +104,13 @@ import { fileURLToPath } from 'node:url';
 import { conformArgs } from './conform-args.mjs';
 import { withoutSlots } from './conform-linux.mjs';
 import { WASM_UNBOUND, markUnbound, referenceTapRefused } from './conform-marked.mjs';
-import { clockOnAll, parseStep } from './conform-steps.mjs';
+import { clockOnAll, failedTests, parseStep } from './conform-steps.mjs';
+import { pageCut, uncut } from './conform-cut.mjs';
 import { open } from '../../scripts/agent.mjs';
 import { reloadWeb } from '../../scripts/agent-test.mjs';
 import { refuseStale, webChanges } from '../../scripts/agent-launch.mjs';
 import { poolBrowsers, probePlaywrightBrowser } from '../../scripts/agent-playwright.mjs';
-import { HOST_DEV, injectedProfiles, resolveApp } from '../../scripts/app.mjs';
+import { HOST_DEV, linuxBinary, resolveApp } from '../../scripts/app.mjs';
 import { closeFilesystemReader } from '../../scripts/filesystem.mjs';
 import { decodePng, encodePng } from '../../scripts/png.mjs';
 import { startNet } from './conformance/net.mjs';
@@ -207,7 +208,7 @@ function serve(dir) {
 // the same reason, the `Debug` text of the runner's error, a line's prefix being each host's own. Other refusals compare
 // only as refused or not (the steps' state). A refusal repeated by a host's own deliveries counts once: a list's edge
 // is asked again at each report, and the Linux host reports a settling list more often than a page does.
-const BOUND = /Instance\(Trap\((?:IterationLimit|StringTooLong|ValueTooLarge|ValueTooDeep) \{ pc: \d+ \}\)\)|Trap\((?:IterationLimit|StringTooLong|ValueTooLarge|ValueTooDeep) \{ pc: \d+ \}\)|StringTooLong \{ name: "(?:[^"\\]|\\.)*" \}/;
+const BOUND = /Instance\(Trap\((?:IterationLimit|CallLimit|CallDepth|StringTooLong|ValueTooLarge|ValueTooDeep) \{ pc: \d+ \}\)\)|Trap\((?:IterationLimit|CallLimit|CallDepth|StringTooLong|ValueTooLarge|ValueTooDeep) \{ pc: \d+ \}\)|StringTooLong \{ name: "(?:[^"\\]|\\.)*" \}/;
 const boundReasons = lines => lines.flatMap(l => {
   const m = BOUND.exec(l); if (!m) return [];
   const suffix = l.slice(m.index + m[0].length).replace(/; unset$/, '').replace(/ \}$/, '');
@@ -336,8 +337,9 @@ function diffPng(a, b, sideBySide, masks = []) {
   }
   return share;
 }
-// The document's head too: the active head's fields, as every runner reports them (runner/src/head.rs).
-const STATE_KEYS = ['slots', 'derives', 'resources', 'writes', 'head', 'reorder', 'sounds', 'transport', 'midi', 'sessionCore', 'background'];
+// The document's head too: the active head's fields, as every runner reports them (runner/src/head.rs). A child's
+// resources by instance path (`owned`, `instances`; LLP 1035.005.004 D8) too.
+const STATE_KEYS = ['slots', 'derives', 'resources', 'owned', 'instances', 'writes', 'head', 'reorder', 'sounds', 'transport', 'midi', 'sessionCore', 'background'];
 // The media session (LLP 1098 D10) by testId (each target numbers its views its own way) and the artwork's path (each
 // page has its own port): what every host records (`sessionCore`, Linux's too), and what the pages publish (`session`).
 const addSession = s => {
@@ -431,6 +433,7 @@ async function target(t, report) {
 
 async function drive(t, report, targetFail, dir, ws, js) {
   let W, J, L, current;
+  const cut = pageCut(t.dist);
   let peers = [], diverged = false;
   const live = () => peers.filter(p => p.active);
   const fail = (step, what, field = null, difference = false) => {
@@ -611,6 +614,7 @@ async function drive(t, report, targetFail, dir, ws, js) {
         const [fw, fj] = await pair(() => W.carrier.evaluate(paint), () => J.carrier.evaluate(paint));
         const op = []; diffJSON(fw, fj, 'paint', op); op.forEach(x => differ(step, x)); st += op.length;
       }
+      for (const what of await uncut(J.carrier.evaluate, cut)) { fail(step, `cut: ${other} has ${what}`); st++; }
       // Cross-browser pictures are never compared (each engine rasterizes text its own way): both are kept only as
       // evidence for a checkpoint that differed
       if (crossBrowser && st === 0) {
@@ -620,21 +624,39 @@ async function drive(t, report, targetFail, dir, ws, js) {
       driveAt = `${step} screenshot`;
       const slug = step.replace(/[^a-z0-9]+/gi, '-');
       const [pw, pj] = [resolve(dir, `${slug}-${reference}.png`), resolve(dir, `${slug}-${other}.png`)];
-      // Chrome picks how a scaled image is filtered per raster (a lower
-      // quality while it judges the layer busy, a higher one later, on its
-      // own clock); nearest-neighbour on both leaves one filter to compare.
-      const still = `document.getElementById('conform-still') || document.head.insertAdjacentHTML('beforeend', '<style id=conform-still>img{image-rendering:pixelated!important}</style>'); new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))`;
-      await pair(() => W.carrier?.evaluate(still).catch(() => {}), () => J.carrier?.evaluate(still).catch(() => {}));
-      // Each picture is the clock's, a transition where it stands, as a film's frame is (a plain
-      // screenshot shows one where it ends, LLP 1116.003 D8, which the wasm target's does not).
-      if (crossBrowser) {
-        // Preserve the other engine's picture even when Chrome's oracle
-        // cannot capture (for example a broken GPU process on Linux).
-        for (const [session, path, label] of [[J, pj, other], [W, pw, reference]]) {
-          try { if (session === W) await screenshot(); else await session.screenshot(path, false, undefined, true); }
-          catch (error) { fail(step, `${label} screenshot: ${error.message.split('\n')[0]}`); st++; }
+      // Chrome picks how an `auto` image is filtered per raster (a lower quality while it judges the layer
+      // busy, a higher one later, on its own clock). Each page reports every image's computed value, which
+      // must agree; the `auto` ones are pinned to nearest-neighbour for the capture and restored after it
+      // (`crisp-edges` and `pixelated` are already one filter).
+      const still = `(() => { const pinned = window.__conformStill = [], modes = [];
+        for (const image of document.images) {
+          const mode = getComputedStyle(image).imageRendering; modes.push(mode);
+          if (mode !== 'auto') continue;
+          pinned.push([image, image.getAttribute('style')]);
+          image.style.setProperty('image-rendering', 'pixelated', 'important');
         }
-      } else await pair(screenshot, () => J.screenshot(pj, false, undefined, true));
+        return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(modes)))); })()`;
+      const unpin = `for (const [image, attribute] of window.__conformStill ?? []) {
+        if (attribute === null) image.removeAttribute('style'); else image.setAttribute('style', attribute);
+      } delete window.__conformStill;`;
+      const [mw, mj] = await pair(() => W.carrier?.evaluate(still).catch(() => null), () => J.carrier?.evaluate(still).catch(() => null));
+      if (Array.isArray(mw) && Array.isArray(mj) && JSON.stringify(mw) !== JSON.stringify(mj)) {
+        differ(step, `image-rendering: ${reference} ${JSON.stringify(mw)} ${other} ${JSON.stringify(mj)}`); st++;
+      }
+      try {
+        // Each picture is the clock's, a transition where it stands, as a film's frame is (a plain
+        // screenshot shows one where it ends, LLP 1116.003 D8, which the wasm target's does not).
+        if (crossBrowser) {
+          // Preserve the other engine's picture even when Chrome's oracle
+          // cannot capture (for example a broken GPU process on Linux).
+          for (const [session, path, label] of [[J, pj, other], [W, pw, reference]]) {
+            try { if (session === W) await screenshot(); else await session.screenshot(path, false, undefined, true); }
+            catch (error) { fail(step, `${label} screenshot: ${error.message.split('\n')[0]}`); st++; }
+          }
+        } else await pair(screenshot, () => J.screenshot(pj, false, undefined, true));
+      } finally {
+        await pair(() => W.carrier?.evaluate(unpin).catch(() => {}), () => J.carrier?.evaluate(unpin).catch(() => {}));
+      }
       // A playing video's frames and controls are the browser's clock, not the runner's.
       if (!crossBrowser) {
         const share = diffPng(pw, pj, resolve(dir, `${slug}-side-by-side.png`), lw.nodes.filter(n => n.type === 'Video'));
@@ -794,25 +816,18 @@ async function drive(t, report, targetFail, dir, ws, js) {
   // The app's own tests on each executor.
   const tests = resolve(root, 'apps', t.app, 'app.test.contract');
   if (!t.contract && !t.urls && existsSync(tests)) {
-    const run = (url, browser = 'chrome', host = 'web') => new Promise(ok => {
-      const child = spawn('bun', ['scripts/agent.mjs', host, ...(host === 'web' ? ['--browser', browser, '--url', url] : []), '--app', t.app, '--test', tests], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+    const run = (url, browser = 'chrome', host = 'web', dist = t.dist) => new Promise(ok => {
+      const child = spawn('bun', ['scripts/agent.mjs', host, ...(host === 'web' ? ['--browser', browser, '--url', url] : []), '--app', t.app, '--test', tests], {
+        cwd: root, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...(host === 'web' ? { EXACT_WEB_DIST: dist } : {}) },
+      });
       let output = ''; child.stdout.on('data', d => { output += d; }); child.stderr.on('data', d => { output += d; });
       child.on('error', error => ok({ output: output + error.message, status: 127 })); child.on('exit', status => ok({ output, status: status ?? 128 }));
     });
     const [w2, j2] = await Promise.all([serve(crossBrowser ? t.dist : t.wasm), serve(t.dist)]);
     const browsers = crossBrowser ? readyBrowsers : ['chrome'];
-    const [rw, ...results] = await Promise.all([run(w2.url), ...browsers.map(browser => run(j2.url, browser))]);
+    const [rw, ...results] = await Promise.all([run(w2.url, 'chrome', 'web', crossBrowser ? t.dist : t.wasm), ...browsers.map(browser => run(j2.url, browser))]);
     w2.close(); j2.close();
     const lines = s => s.split('\n').filter(l => l.startsWith('test '));
-    const failedTests = output => {
-      const all = output.trim().split('\n'), found = [];
-      for (let i = 0; i < all.length; i++) if (/^test .*\bFAIL\b/.test(all[i])) {
-        const detail = [all[i]];
-        while (i + 1 < all.length && !/^test |^\d+ passed,/.test(all[i + 1])) detail.push(all[++i]);
-        found.push(detail.map(line => line.trim()).filter(Boolean).join(' | '));
-      }
-      return found;
-    };
     const lw = lines(rw.output);
     report.targets[t.name].tests = { [reference]: rw.output.trim().split('\n').at(-1) };
     const recordTests = (result, label) => {
@@ -848,14 +863,14 @@ async function activation(t, report, fail, url, browser) {
   const step = `${crossBrowser ? `${browser} ` : ''}activation ${url}`;
   let S, early = null;
   try {
-    S = await open({ host: 'web', browser, app: t.app, url });
+    S = await open({ host: 'web', browser, app: t.app, webDist: t.dist, url });
     const ev = S.carrier.evaluate, page = new URL(url);
     page.searchParams.delete('agent');
     await ev(`location.href = ${JSON.stringify(page.href)}`).catch(() => {});
     const read = () => ev(`(() => { const c = document.querySelector('script[type="application/vnd.exact.checkpoint"]'), r = document.getElementById('exact-root');
-      return c && document.readyState === 'complete' && !/[?&]agent=/.test(location.search) ? { policy: c.dataset.activate, boot: r?.dataset.bootMs == null ? null : Number(r.dataset.bootMs),
+      return c && document.readyState === 'complete' && !['', '1'].includes(new URLSearchParams(location.search).get('agent')) ? { policy: c.dataset.activate, boot: r?.dataset.bootMs == null ? null : Number(r.dataset.bootMs),
         paint: performance.getEntriesByType('paint')[0]?.startTime ?? null, load: performance.getEntriesByType('navigation')[0]?.loadEventStart ?? null,
-        modules: document.querySelectorAll('script[type=module]').length, preload: !!document.head.querySelector('link[rel=modulepreload][href="./app.js"]'),
+        modules: document.querySelectorAll('script[type=module]').length, preload: !!document.head.querySelector('link[rel=modulepreload][href="' + c.dataset.entry + '"]'),
         fetched: performance.getEntriesByType('resource').filter(e => e.initiatorType !== 'fetch' && e.name.endsWith('.js')).length,
         adopted: (globalThis.exact?.journal ?? []).some(l => l.endsWith('adopted the document')) } : null; })()`).catch(() => null);
     const until = async (ok, ms) => { const end = Date.now() + ms; let r; while (!(r = await read()) || !ok(r)) { if (Date.now() > end) return r; await new Promise(z => setTimeout(z, 50)); } return r; };
@@ -877,7 +892,7 @@ async function activation(t, report, fail, url, browser) {
         w.value = 'early'; for (const k of ['input', 'change']) w.dispatchEvent(new Event(k, { bubbles: true }));
         p.value = 'two'; for (const k of ['input', 'change']) p.dispatchEvent(new Event(k, { bubbles: true }));
         return 'on on early two'; })()`);
-    } else if (!r.preload) out.push(`${r.policy}: the head does not preload ./app.js`);
+    } else if (!r.preload) out.push(`${r.policy}: the head does not preload the entry`);
     r = await until(x => x.boot != null, 10000);
     if (r.boot == null) out.push(`${r.policy}: the runtime never came up${r.policy === 'interaction' ? ' after a press' : ' without input'}`);
     else {
@@ -908,7 +923,9 @@ async function activation(t, report, fail, url, browser) {
 // document for HOLD ms); once the runtime has adopted the settled page,
 // state holds both, the field its text, and the page one root.
 const HOLD = 1500;
+
 async function bootPress(t, report, fail, dist, browser) {
+  const cut = pageCut(dist);
   const step = `${crossBrowser ? `${browser} ` : ''}boot press`;
   const bin = `${t.app}-render`;
   const at = [['linux', `${t.app}-linux`], ['web', `${t.app}-web`]].find(([dir]) => existsSync(resolve(root, 'apps', t.app, dir, 'src/bin', `${bin}.rs`)));
@@ -946,7 +963,7 @@ async function bootPress(t, report, fail, dist, browser) {
     });
     const port = await new Promise(ok => proxy.listen(0, '127.0.0.1', () => ok(proxy.address().port)));
     const url = `http://127.0.0.1:${port}/`;
-    S = await open({ host: 'web', browser, app: t.app, url });
+    S = await open({ host: 'web', browser, app: t.app, webDist: dist, url });
     const ev = S.carrier.evaluate;
     const q = id => `document.querySelector('#exact-root[data-boot] [data-testid="${id}"]')`;
     // Twice: the field edited without focus (the page's focus on <body>),
@@ -963,6 +980,7 @@ async function bootPress(t, report, fail, dist, browser) {
           return 'pressed'; })()`).catch(() => null);
       }
       if (pressed !== 'pressed') { fail(pass, pressed === 'late' ? 'the settled page arrived before the boot document could be pressed' : 'no boot document with boot-bump and boot-words'); continue; }
+      for (const what of await uncut(ev, cut)) fail(pass, `cut: the boot document has ${what}`);
       let got = null;
       const want = `1 early|early|${focus ? 'boot-words' : ''}|1|`;
       for (const end = Date.now() + 15000; Date.now() < end; await new Promise(z => setTimeout(z, 50))) {
@@ -971,6 +989,7 @@ async function bootPress(t, report, fail, dist, browser) {
         if (got?.startsWith(want)) break;
       }
       if (!got?.startsWith(want)) fail(pass, `after adoption: ${got}, not ${want}… (state|field|focus|roots|title)`);
+      for (const what of await uncut(ev, cut)) fail(pass, `cut: the settled page has ${what}`);
       report.steps.push({ target: t.name, step: pass, ...(crossBrowser ? { browser } : {}), differences: got?.startsWith(want) ? 0 : 1 });
     }
   } catch (e) {
@@ -1013,7 +1032,7 @@ function linuxFor(t) {
   if (!crate) return { why: `not compared on Linux: ${t.app} has no Linux host` };
   if (LINUX_APART[t.name]?.[0] === null) return { why: `not compared on Linux: ${LINUX_APART[t.name][1]}` };
   // agent.mjs runs the crate's own binary; a crate that builds only other bins (a render server) has none.
-  if (!existsSync(resolve(resolveApp(t.app).target, HOST_DEV, crate))) return { why: `not compared on Linux: ${t.app}'s Linux crate has no ${crate} binary built` };
+  if (!existsSync(linuxBinary(resolveApp(t.app)))) return { why: `not compared on Linux: ${t.app}'s Linux crate has no ${crate} binary built` };
   return {};
 }
 
@@ -1108,22 +1127,10 @@ if (argv.includes('--build') && engineReady) for (const a of new Set([...apps, .
   if (b.status !== 0) report.failures.push({ target: a, step: direct ? 'plan-build' : 'wasm-build', what: b.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 300) });
 }
 if (linuxRef && argv.includes('--build') && engineReady) {
-  // Each data app's binary where agent.mjs runs it (`resolveApp(app).target`):
-  // the root workspace's crates in one build; an app in a workspace of its own
-  // (Messages, snapback4's) from its manifest into that workspace's target.
-  const own = [], rooted = [];
   for (const a of new Set([...apps, ...planFixtures.map(s => s.data)])) {
-    const crate = linuxCrate(a); if (!crate) continue;
-    const target = resolveApp(a).target;
-    if (target === resolveApp('caltrain').target) rooted.push(crate); else own.push({ a, crate, target });
-  }
-  // The development profile (Cargo.toml's `host-dev`), which a workspace of
-  // its own is given on the command line.
-  const builds = [...(rooted.length ? [{ what: rooted.join(' '), args: rooted.flatMap(c => ['-p', c]), env: {} }] : []),
-    ...own.map(o => ({ what: o.crate, args: [...injectedProfiles(resolveApp(o.a)), '--manifest-path', resolve(root, 'apps', o.a, 'linux', 'Cargo.toml')], env: { CARGO_TARGET_DIR: o.target } }))];
-  for (const { what, args, env } of builds) {
-    const b = await spawned('cargo', ['build', '-q', '--profile', HOST_DEV, ...args], { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20, env: { ...process.env, ...env } });
-    if (b.status !== 0) report.failures.push({ target: 'linux', step: `linux-build ${what}`, what: b.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 300) });
+    if (!linuxCrate(a)) continue;
+    const b = await spawned(process.execPath, [resolve(root, 'scripts/build-linux.mjs'), a], { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20, env: process.env });
+    if (b.status !== 0) report.failures.push({ target: 'linux', step: `linux-build ${a}`, what: b.stderr.trim().split('\n').slice(-3).join(' ').slice(0, 300) });
   }
 }
 const targets = apps.map(a => ({ name: a, app: a, wasm: resolve(wasmRoot, a) }));

@@ -13,6 +13,7 @@ fn close(actual: f64, expected: f64) {
 
 #[test]
 fn keywords_match_the_browser_at_the_midpoint() {
+    exact_motion::link_transitions();
     close(Easing::Linear.progress(0.5), 0.5);
     close(Easing::Ease.progress(0.5), 0.8024);
     close(Easing::EaseIn.progress(0.5), 0.3153);
@@ -22,6 +23,7 @@ fn keywords_match_the_browser_at_the_midpoint() {
 
 #[test]
 fn keywords_are_their_cubic_beziers() {
+    exact_motion::link_transitions();
     let pairs = [
         (Easing::Ease, (0.25, 0.1, 0.25, 1.0)),
         (Easing::EaseIn, (0.42, 0.0, 1.0, 1.0)),
@@ -42,6 +44,7 @@ fn keywords_are_their_cubic_beziers() {
 
 #[test]
 fn every_curve_is_pinned_at_the_ends_and_clamped_outside() {
+    exact_motion::link_transitions();
     let curves = [
         Easing::Linear,
         Easing::Ease,
@@ -83,6 +86,7 @@ fn every_curve_is_pinned_at_the_ends_and_clamped_outside() {
 
 #[test]
 fn an_overshooting_bezier_leaves_the_unit_range() {
+    exact_motion::link_transitions();
     let back = Easing::CubicBezier {
         x1: 0.68,
         y1: -0.55,
@@ -95,6 +99,7 @@ fn an_overshooting_bezier_leaves_the_unit_range() {
 
 #[test]
 fn steps_follow_the_css_step_position_table() {
+    exact_motion::link_transitions();
     let at = |count, position, x| Easing::Steps { count, position }.progress(x);
     // jump-end: floor(x·n)/n.
     close(at(4, StepPosition::JumpEnd, 0.3), 0.25);
@@ -115,6 +120,7 @@ fn steps_follow_the_css_step_position_table() {
 
 #[test]
 fn piecewise_linear_interpolates_between_stops() {
+    exact_motion::link_transitions();
     let curve = Easing::PiecewiseLinear(vec![
         LinearStop {
             input: 0.0,
@@ -140,6 +146,7 @@ fn piecewise_linear_interpolates_between_stops() {
 /// input, the second's (where CSS Easing 2's draft says the first's).
 #[test]
 fn piecewise_linear_matches_chrome_at_its_edges() {
+    exact_motion::link_transitions();
     let cases: &[(&str, &[(f64, f64)])] = &[
         (
             "linear(0 25%, 1 25%, 1)",
@@ -215,6 +222,7 @@ fn piecewise_linear_matches_chrome_at_its_edges() {
 
 #[test]
 fn invalid_easings_are_refused_by_name() {
+    exact_motion::link_transitions();
     assert_eq!(
         Easing::CubicBezier {
             x1: 1.5,
@@ -294,6 +302,8 @@ fn invalid_easings_are_refused_by_name() {
 /// read, not taken as the two before it.
 #[test]
 fn steps_takes_at_most_two_arguments() {
+    exact_motion::link_transitions();
+    exact_motion::link_animations();
     use exact_motion::{Animations, Keyframes};
     for steps in ["steps(4)", "steps(4, end)"] {
         assert!(Transitions::parse(&format!("opacity 1s {steps}")).is_ok());

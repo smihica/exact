@@ -51,6 +51,12 @@ impl DataSource for Module {
         self.document_owner = owner;
     }
 
+    /// No launch's value: a render reads the build's, as the browser does
+    /// (door 28 answers no name; LLP 1153.002 D2).
+    fn render_web(&mut self) {
+        self.host.launch.clear();
+    }
+
     fn take_logs(&mut self) -> Vec<String> {
         self.journal_lines()
     }
@@ -89,6 +95,10 @@ impl DataSource for Module {
 
     fn take_aborted(&mut self) -> Vec<u64> {
         Module::take_aborted(self)
+    }
+
+    fn take_reports(&mut self) -> Vec<exact_runner::Report> {
+        Module::take_reports(self)
     }
 
     fn background(&mut self, store: &Store) -> Option<Request> {
@@ -235,7 +245,11 @@ impl DataSource for Module {
 
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
         if token == exact_runner::BACKGROUND {
-            return Some(self.storage.as_ref()?.continuation());
+            return Some(
+                self.storage
+                    .as_ref()?
+                    .background_continuation(self.engine.as_mut()?),
+            );
         }
         // A worker's owner thread resumes a yield at once, as a host settles
         // `Dispatch::Again`, and a timer when the runner hands it out.
@@ -261,10 +275,11 @@ impl DataSource for Module {
             .iter_mut()
             .find(|(_, p)| p.call == token && p.ticket == 0 && !p.work_taken)?;
         let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let work = self
-            .storage
-            .as_ref()?
-            .continuation_for(Some(retired.clone()));
+        let work = self.storage.as_ref()?.continuation_for(
+            Some(retired.clone()),
+            self.main_thread,
+            self.engine.as_mut()?,
+        );
         parked.work_taken = true;
         self.retired.insert(token, retired);
         Some(work)

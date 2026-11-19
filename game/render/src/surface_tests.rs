@@ -232,6 +232,7 @@ fn restore_and_load_are_seen_by_render_without_a_bind_or_tick() {
 #[test]
 fn seekable_observers_make_no_clock_calls_and_long_advances_time_only_retained_ticks() {
     use crate::perf::CLOCK_READS;
+    use exact_game::TickObserver;
     let world = World::new(60, 0);
     let mut render = None;
     let mut perf = Perf::default();
@@ -248,11 +249,12 @@ fn seekable_observers_make_no_clock_calls_and_long_advances_time_only_retained_t
             &mut trace,
             &mut error,
             &mut hook_poses,
-            measure,
-            3600,
+            measure.then_some(Clock::Seekable),
+            None,
         );
         for left in (0..3600).rev() {
-            after(&world, left);
+            after.before_tick(u64::from(left) + 1);
+            after.after_tick(&world, left);
         }
         assert_eq!(CLOCK_READS.with(|n| n.get()), if measure { 480 } else { 0 });
     }
@@ -335,7 +337,10 @@ fn replacement_device_rechecks_storage_capacity_without_changing_world() {
             gpu.device.limits().max_storage_buffers_per_shader_stage
         );
         s.device_lost();
-        s.device_ready(exact_gpu::wgpu::Features::empty());
+        s.device_ready(
+            exact_gpu::wgpu::Features::empty(),
+            exact_gpu::wgpu::Limits::downlevel_defaults(),
+        );
         s.prepare_assets(limited, queue, wgpu::TextureFormat::Rgba8Unorm);
         let needed = if ASSETS {
             crate::STORAGE_BINDINGS
@@ -349,7 +354,10 @@ fn replacement_device_rechecks_storage_capacity_without_changing_world() {
         assert!(s.take_error().is_none());
         assert_eq!(s.carry().unwrap().unwrap(), saved);
         s.device_lost();
-        s.device_ready(exact_gpu::wgpu::Features::empty());
+        s.device_ready(
+            exact_gpu::wgpu::Features::empty(),
+            exact_gpu::wgpu::Limits::downlevel_defaults(),
+        );
         s.restore(&saved, Restore::Open).unwrap();
         let after = fixture::render(gpu, &mut s, &frame(0.)).unwrap().0;
         assert!(s.take_error().is_none());
@@ -510,7 +518,7 @@ fn presentation_trace_is_opt_in_read_once_and_never_advances_the_clock() {
     assert_eq!(reply.trace.stride, 37);
     assert!(!reply.trace.overflow);
     assert_eq!(reply.trace.frames.len(), 111);
-    let rows: Vec<_> = reply.trace.frames.chunks_exact(37).collect();
+    let rows: Vec<_> = reply.trace.frames.as_chunks::<37>().0.iter().collect();
     // Seekable T = [17, 25, 34] ms, L = 0, step = 1000/60 ms.
     // R = T - step = [1/3, 25/3, 52/3] ms; x = R/step = [.02, .5, 1.04].
     for (row, x) in rows.iter().zip([0.02, 0.5, 1.04]) {
@@ -688,6 +696,10 @@ fn fresh_touch_region_matches_rendered_and_headless_worlds() {
             dy: 0.,
             kind: exact_gpu::PointerKind::Touch,
             buttons: 1,
+            shift_key: false,
+            ctrl_key: false,
+            alt_key: false,
+            meta_key: false,
             at_ms: 0.,
         });
     }
@@ -712,7 +724,10 @@ fn device_state_reports_target_before_first_draw_and_after_loss() {
         .agent(r#"{"op":"state"}"#)
         .unwrap()
         .contains("\"device\":false"));
-    s.device_ready(exact_gpu::wgpu::Features::empty());
+    s.device_ready(
+        exact_gpu::wgpu::Features::empty(),
+        exact_gpu::wgpu::Limits::downlevel_defaults(),
+    );
     assert!(s.render.is_none());
     assert!(s
         .agent(r#"{"op":"state"}"#)
@@ -755,7 +770,10 @@ fn peer_assets_finish_gpu_work_before_loaded_and_restore_keeps_the_loading_windo
     let bytes = exact_game::asset::encode_model(&model);
     let fresh = || {
         let mut s = WorldSurface::<Art, crate::ModelExecutor, true>::default();
-        s.device_ready(exact_gpu::wgpu::Features::empty());
+        s.device_ready(
+            exact_gpu::wgpu::Features::empty(),
+            exact_gpu::wgpu::Limits::downlevel_defaults(),
+        );
         s.bind(&[], None).unwrap();
         s
     };
@@ -867,7 +885,10 @@ fn peer_assets_finish_gpu_work_before_loaded_and_restore_keeps_the_loading_windo
             hashes,
             "device loss does not rehash retained CPU content"
         );
-        restored.device_ready(exact_gpu::wgpu::Features::empty());
+        restored.device_ready(
+            exact_gpu::wgpu::Features::empty(),
+            exact_gpu::wgpu::Limits::downlevel_defaults(),
+        );
         restored.prepare_assets(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8Unorm);
         assert_eq!(
             crate::models::model_hash_count(),
@@ -933,7 +954,7 @@ fn performance_recording_arms_only_through_diagnostic_state() {
     let state = s.agent(r#"{"op":"state","perf":true}"#).unwrap();
     assert!(state.contains("\"p50\":4"));
     let state = s.agent(r#"{"op":"state","perf_reset":true}"#).unwrap();
-    assert!(state.contains("\"p50\":0"));
+    assert!(state.contains("\"p50\":null"));
 }
 
 #[test]
@@ -1285,7 +1306,10 @@ fn offsets_move_socketed_props_with_their_owner_and_alone() {
     // The blue prop's pixel centre, (x, y).
     let drawn = |owner_x: f64, prop_y: f64, carrier_x: f64| {
         let mut surface = WorldSurface::<Socketed, crate::ModelExecutor, true>::default();
-        surface.device_ready(exact_gpu::wgpu::Features::empty());
+        surface.device_ready(
+            exact_gpu::wgpu::Features::empty(),
+            exact_gpu::wgpu::Limits::downlevel_defaults(),
+        );
         surface
             .bind(
                 &[
@@ -1433,48 +1457,4 @@ fn srgb_target_matches_shader_transfer_after_hdr_rendering() {
         !WorldSurface::<Move>::default().srgb_target(),
         "the four-sample path is unchanged"
     );
-}
-
-#[test]
-fn world_perf_difference_reads_only_the_requested_ticks_over_the_wire() {
-    #[derive(Default, exact_game::Data)]
-    struct Sample {
-        count: u64,
-    }
-    #[derive(Default, exact_game::Data)]
-    struct Spans {
-        spans: Vec<Sample>,
-        error: String,
-    }
-    #[allow(non_snake_case)]
-    #[derive(Default, exact_game::Data)]
-    struct Metrics {
-        tickSpans: Spans,
-    }
-    #[derive(Default, exact_game::Data)]
-    struct WorldState {
-        perf: Metrics,
-    }
-    #[derive(Default, exact_game::Data)]
-    struct Reply {
-        world: WorldState,
-    }
-    let mut s = surface();
-    s.agent(r#"{"op":"clock","now":0}"#);
-    s.agent(r#"{"op":"state","perf":true}"#);
-    s.agent(r#"{"op":"clock","now":34}"#);
-    let read = |text: String| {
-        exact_game::json::from_str::<Reply>(&text)
-            .unwrap()
-            .world
-            .perf
-            .tickSpans
-    };
-    let window = read(s.agent(r#"{"op":"state","span_since":1}"#).unwrap());
-    assert!(!window.spans.is_empty());
-    assert!(window.spans.iter().all(|s| s.count == 1));
-    let all = read(s.agent(r#"{"op":"state","span_since":0}"#).unwrap());
-    assert!(all.spans.iter().all(|s| s.count == 2));
-    let backwards = read(s.agent(r#"{"op":"state","span_since":3}"#).unwrap());
-    assert!(backwards.error.contains("counters went back"));
 }

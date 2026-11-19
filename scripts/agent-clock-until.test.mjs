@@ -7,9 +7,27 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { MalformedOperation } from './agent-keys.mjs';
+import { nextCommitTasks, settleBound } from './agent-inspect.mjs';
 
 const source = readFileSync(new URL('./agent-session.mjs', import.meta.url), 'utf8');
 const start = source.indexOf("    async clock(spec = 'settle'"), end = source.indexOf('\n    /** The window', start);
+
+test('clock settle returns a busy reply before a next-commit task can open a device request', async () => {
+  const s = {
+    now: 0,
+    async state() { return { tasks: { prompt: 1 } }; },
+    async op(req) {
+      if (!req.settle) return { clock: req.to };
+      if (this.now === 0) return { clock: 0, settled: false, reason: 'busy', busy: ['17'] };
+      return { clock: this.now, settled: false, reason: 'device', tickets: [1] };
+    },
+  };
+  const session = new Function('s', 'carrier', 'CLOCK_STEP_MS', 'nextCommitTasks', 'settleBound', 'worldTells',
+    `return ({${source.slice(start, end)}});`)(s, { host: 'web' }, 250, nextCommitTasks, settleBound, (_s, r) => r);
+  const reply = await session.clock('settle');
+  expect(reply).toMatchObject({ clock: 0, settled: false, reason: 'busy', busy: ['17'] });
+  expect(reply.diagnostic).toContain('aria-busy elements (17)');
+});
 
 /** The method on a web host at clock 1000, its wall clock moving 100 ms a look; `at(ms)` runs as the wall passes ms. */
 function harness(events = {}) {

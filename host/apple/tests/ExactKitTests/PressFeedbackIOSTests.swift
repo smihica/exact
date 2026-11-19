@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactFlights
 
 /// Press feedback (LLP 1061 D2): the host eases a pressed node to its
 /// `press_scale` and back, folded into the transform the motion engine

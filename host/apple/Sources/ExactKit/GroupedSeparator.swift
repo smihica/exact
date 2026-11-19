@@ -51,7 +51,7 @@ extension NodeView {
 
     /// Whether the separator is drawn: the Mac's split hides those beside a
     /// painted list's selected row (SplitMac.swift `mark`).
-    func hideGroupedSeparator(_ hidden: Bool) {
+    package func hideGroupedSeparator(_ hidden: Bool) {
         if let line = separatorLayer, line.isHidden != hidden { line.isHidden = hidden }
     }
 

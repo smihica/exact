@@ -147,6 +147,8 @@ impl<D: DataSource> Host<D> {
         if self.mirror.remove(&id).is_some() {
             batch.destroy(id);
         }
+        // A view made for it again is ranked as a new one.
+        self.ranks.remove(&id);
         self.create(id, &events, batch);
         self.emit_children(id, batch);
         true
@@ -278,13 +280,27 @@ impl<D: DataSource> Host<D> {
                     );
                 }
                 // How far its padding box stands out from its text: what its
-                // background covers beside its glyphs.
+                // background covers beside its glyphs, and above and below
+                // them ("start end above below").
                 let reach = run.inline_background_reach();
-                if !reach.is_empty() {
+                let (over, under) = run.inline_background_block_reach();
+                if !reach.is_empty() || over != 0.0 || under != 0.0 {
                     props.insert(
                         "inlinePad",
-                        format!("{} {}", style::num(reach.start), style::num(reach.end)),
+                        format!(
+                            "{} {} {} {}",
+                            style::num(reach.start),
+                            style::num(reach.end),
+                            style::num(over),
+                            style::num(under)
+                        ),
                     );
+                }
+                // Its border's widths as its line counts them ("top right
+                // bottom left"); its style rows carry the colours and styles.
+                let border = run.inline_border_widths();
+                if border.iter().any(|w| *w > 0.0) {
+                    props.insert("inlineBorder", border.map(style::num).join(" "));
                 }
                 // A run painting an inherited `color` that moves (LLP 1062 D5).
                 let mut shown = style::Shown::default();
@@ -388,7 +404,9 @@ impl<D: DataSource> Host<D> {
                 return;
             }
         }
-        self.track_height_transition(id);
+        if let Some(motion) = self.turn.motion {
+            (motion.track_height)(self, id);
+        }
         if self.native_protected_id(id) {
             if let Some(node) = self.runner.kernel().node(id) {
                 self.keys.insert(node.key, id);
@@ -396,6 +414,10 @@ impl<D: DataSource> Host<D> {
             return;
         }
         let node = self.runner.kernel().node(id).expect("live");
+        if self.flat.nodes.contains(&id) {
+            self.keys.insert(node.key, id);
+            return;
+        }
         let key = node.key;
         // @ref LLP 1056 D10 — a 2D canvas is a plain view: its bitmap is a
         // layer's contents under ordinary children, with no Metal or overlay.
@@ -411,16 +433,19 @@ impl<D: DataSource> Host<D> {
         let env = self.runner.kernel().env_of(id);
         let (style, _skipped) = style::style_json_for(&node, &env);
         let handlers: Vec<&str> = events.iter().copied().filter_map(handler_name).collect();
-        if handlers.contains(&"heightrelease") {
-            self.track_height_handle(id);
-        }
-        if handlers.contains(&"transformgeometry") || handlers.contains(&"transformrelease") {
-            self.transform_drags.insert(
-                id,
-                key,
-                handlers.contains(&"transformgeometry"),
-                handlers.contains(&"transformrelease"),
-            );
+        if let Some(drag) = self.turn.drag {
+            if handlers.contains(&"heightrelease") {
+                (drag.track_height_handle)(self, id);
+            }
+            if handlers.contains(&"transformgeometry") || handlers.contains(&"transformrelease") {
+                (drag.register_transform)(
+                    self,
+                    id,
+                    key,
+                    handlers.contains(&"transformgeometry"),
+                    handlers.contains(&"transformrelease"),
+                );
+            }
         }
         let pairs: Vec<(&str, String)> = props.iter().map(|(k, v)| (*k, v.clone())).collect();
         batch.create(id, kind, &pairs, &style, &handlers);
@@ -447,6 +472,9 @@ impl<D: DataSource> Host<D> {
             return;
         }
         self.queue_layout(id);
+        if self.flat.nodes.contains(&id) {
+            return;
+        }
         if self.reconcile_projection(id, batch) {
             return;
         }
@@ -459,7 +487,9 @@ impl<D: DataSource> Host<D> {
                 return;
             }
         }
-        self.track_height_transition(id);
+        if let Some(motion) = self.turn.motion {
+            (motion.track_height)(self, id);
+        }
         if self.native_protected_id(id) {
             return;
         }
@@ -506,6 +536,12 @@ impl<D: DataSource> Host<D> {
     }
 
     pub(super) fn emit_children(&mut self, id: ViewId, batch: &mut Batch) {
+        if self.flat.nodes.contains(&id) {
+            if let Some(parent) = self.presented_parent(id) {
+                self.emit_children(parent, batch);
+            }
+            return;
+        }
         // An `svg`'s and a `g`'s children are its scene's (LLP 1055 D4).
         let node_type = self.runner.kernel().node(id).expect("live").node_type;
         if node_type == NodeType::Svg || node_type.is_svg_element() {
@@ -567,6 +603,7 @@ impl<D: DataSource> Host<D> {
                 !self.native_protected_id(*child) || self.native_selected_id(*child)
             });
         }
+        let children = self.flat_children(children);
         let m = self.mirror.entry(id).or_default();
         if *children != *m.children {
             batch.children(id, &children);
@@ -679,12 +716,21 @@ impl<D: DataSource> Host<D> {
         node: &NodeRef<'_>,
     ) -> exact_kernel::SortedMap<&'static str, String> {
         let mut props = props_for(node);
+        if self.native_mode() && self.runner.kernel().is_top_layer(node.id) {
+            if let Some(parent) = node.parent.filter(|p| self.native_protected_id(*p)) {
+                props.insert("popoverParent", parent.to_string());
+            }
+        }
         if let Some(line) = super::layout::separator::json(self.runner.kernel(), node.id) {
             props.insert(super::layout::separator::PROP, line);
         }
         if node.props.bool(PropId::DefaultSurface) == Some(true) {
-            if let Some((radius, shadow)) = default_surface(exact_kernel::style::metrics::column())
-            {
+            let column = exact_kernel::style::metrics::column();
+            if node.props.str(PropId::AccessibilityRole) == Some("menu") {
+                if let Some(radius) = menu_surface(column) {
+                    props.insert("defaultSurfaceRadius", radius);
+                }
+            } else if let Some((radius, shadow)) = default_surface(column) {
                 props.insert("defaultSurfaceRadius", radius);
                 props.insert("defaultSurfaceShadow", shadow);
             }
@@ -712,6 +758,15 @@ fn default_surface(column: exact_kernel::style::metrics::Column) -> Option<(Stri
     let blur = length_in(metric::POPOVER_SHADOW_BLUR, column, 0.0, 0.0)?;
     let alpha = number_in(metric::POPOVER_SHADOW_ALPHA, column)?;
     Some((radius.to_string(), format!("{y} {blur} {alpha}")))
+}
+
+/// A menu's default surface as `column` says: the corner of the platform's
+/// menu panel (`menu-radius`), which the Mac draws under a menu it paints;
+/// none where the platform's own menu is the only one shown.
+fn menu_surface(column: exact_kernel::style::metrics::Column) -> Option<String> {
+    use exact_kernel::generated::metric;
+    let radius = exact_kernel::style::metrics::length_in(metric::MENU_RADIUS, column, 0.0, 0.0)?;
+    Some(radius.to_string())
 }
 
 /// Props by their own names, including derived text advances.
@@ -779,6 +834,9 @@ pub(super) fn props_for(node: &NodeRef<'_>) -> exact_kernel::SortedMap<&'static 
                 if even_odd {
                     out.insert("symbolFillRule", "evenodd".into());
                 }
+            }
+            if let Some(svg) = crate::icon_path::asset(role) {
+                out.insert("symbolAsset", svg.into());
             }
             // Untinted, it draws in its `color` (LLP 1121 stage 9 B).
             if node.symbol_color_said() {

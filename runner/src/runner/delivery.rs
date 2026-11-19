@@ -11,7 +11,7 @@
 //! `deliveryActivate`) and the runner adds nothing for them: they reach the
 //! host through `take_commands` exactly as `setScheme` does.
 
-use super::{Carried, DataError, DataSource, Runner, RunnerError, RunnerLinks, Seed};
+use super::{Carried, DataError, DataSource, ModuleLinks, Runner, RunnerError, RunnerLinks, Seed};
 use crate::delivery::{Delivery, SOURCE};
 use exact_kernel::{CommitReceipt, Kernel};
 use exact_plan::{Plan, TypeKind, Value};
@@ -32,6 +32,7 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Runner<D>, RunnerError> {
         Runner::boot_inner(
             RunnerLinks::ALL,
+            ModuleLinks::ALL,
             plan,
             data,
             kernel,
@@ -49,7 +50,7 @@ impl<D: DataSource> Runner<D> {
     /// Delivery facts are available to the first component state initializers.
     #[allow(clippy::too_many_arguments)] // the host boot facts
     pub fn boot_at(
-        plan: Plan,
+        plan: impl Into<crate::Program>,
         data: D,
         kernel: Kernel,
         viewport: crate::Viewport,
@@ -59,6 +60,7 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Runner<D>, RunnerError> {
         Self::boot_inner(
             RunnerLinks::ALL,
+            ModuleLinks::ALL,
             plan,
             data,
             kernel,
@@ -86,6 +88,7 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Runner<D>, RunnerError> {
         Self::boot_with_delivery_linked(
             RunnerLinks::ALL,
+            ModuleLinks::ALL,
             plan,
             data,
             kernel,
@@ -102,6 +105,7 @@ impl<D: DataSource> Runner<D> {
     #[allow(clippy::too_many_arguments)] // the host boot facts
     pub fn boot_with_delivery_linked(
         links: RunnerLinks,
+        seams: ModuleLinks<D>,
         plan: Plan,
         data: D,
         kernel: Kernel,
@@ -111,10 +115,12 @@ impl<D: DataSource> Runner<D> {
         viewport: crate::Viewport,
         launch: &str,
     ) -> Result<Runner<D>, RunnerError> {
-        let snapshot = carried.map_or(snapshot, |value| value.store.clone());
-        let seed = carried.map_or(Seed::Fresh, Seed::Carried);
+        let snapshot = carried
+            .filter(|c| !c.fresh_state)
+            .map_or(snapshot, |value| value.store.clone());
+        let seed = carried.map_or(Seed::Fresh, Carried::seed);
         Self::boot_inner(
-            links, plan, data, kernel, seed, snapshot, delivery, viewport, launch,
+            links, seams, plan, data, kernel, seed, snapshot, delivery, viewport, launch,
         )
     }
 

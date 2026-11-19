@@ -4,6 +4,7 @@
 //! reading the state the action started with. LLP 1017 §11's tail call (the
 //! Signal Clone's photo viewer) is one case of it, and keeps its tests.
 
+use crate::scratch::Scratch;
 use exact_kernel::{Kernel, PropValue};
 use exact_plan::Value;
 use exact_runner::{DataError, DataSource, Event, Runner};
@@ -1060,7 +1061,7 @@ fn a_mutation_sent_twice_through_calls_names_the_calls() {
     says(
         "component App\n  mutation saved as shape string then after\n  action commit\n    send saved = save(\"a\")\n  action after\n    commit()\n  view\n    button press=commit testId=\"go\"\n      text \"go\"\n",
         "analyze-then-self-send",
-        "`after` cannot send `saved` (it calls `commit` at line 6, which sends it): it runs when that mutation answers. To repeat while a condition holds, declare a root task: `task NAME when COND`, with `every(ms, action)` on the next indented line",
+        "`after` cannot send `saved` (it calls `commit` at line 6, which sends it): it runs when that mutation answers. To repeat while a condition holds, declare a task: `task NAME when COND`, with `every(ms, action)` on the next indented line",
     );
 }
 
@@ -1084,8 +1085,7 @@ component Viewer
     button press=swiped testId="swipe"
       text "x"
 "#;
-    let dir = std::env::temp_dir().join(format!("contract-ambiguous-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new(format!("contract-ambiguous-{}", std::process::id()));
     let path = dir.join("app.contract");
     std::fs::write(&path, src).unwrap();
     let all = contract::compile_path_all(&path, false)
@@ -1199,8 +1199,7 @@ component Leaf
         "cannot infer the type of what `note` carries from this binding into `spare`, which calls it: bind `spare` to a handler or call it from one"
     );
     assert_eq!((e.span.line, e.span.col), (15, 23), "{e}");
-    let dir = std::env::temp_dir().join(format!("contract-capture-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new(format!("contract-capture-{}", std::process::id()));
     let path = dir.join("app.contract");
     std::fs::write(&path, &unbound).unwrap();
     let all = contract::compile_path_all(&path, false)

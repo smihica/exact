@@ -2,6 +2,7 @@ import { MalformedOperation, inputJSON } from './agent-keys.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { renderAx } from './agent-ax.mjs';
 import { decodePng, encodePng, shrink } from './png.mjs';
@@ -157,7 +158,7 @@ export function identifyResources(reply, maps) {
 /** LLP 1104 D2 / 1035.002 D3: list reasons only when geometry and tree
  * describe the same settlement; a target read already owns its identity. */
 export function identifyLayoutNodes(layout, tree, maps) {
-  const same = layout.epoch === tree.epoch && layout.incarnation === tree.incarnation;
+  const same = layout.generation === tree.generation && layout.epoch === tree.epoch && layout.incarnation === tree.incarnation;
   const by = new Map(tree.nodes.map(n => [n.id, n]));
   for (const node of layout.nodes) {
     const record = by.get(node.id);
@@ -204,7 +205,7 @@ const TABLE_ELEMENTS = /^(table|caption|thead|tbody|tfoot|tr|th|td|dl|dt|dd)$/;
  * `scripts/fixtures/transcript.txt` pins it. A part in [brackets] appears
  * only when its field is present (not null); strings are JSON-quoted.
  *
- *   tree    epoch E · incarnation I · clock C ms · N nodes
+ *   tree    generation G · epoch E · incarnation I · clock C ms · N nodes
  *           {"  " × depth}{Type}#{id} [<{element}>, a table's or a description list's] [{testId}] hatch="…" "{text}" value="…" label="…" checked=true|false [focused] [hidden]|[inactive] ({handlers, comma-separated})
  *           `[hidden]` under a route the host does not show (inactive too), `[inactive]` under one only a sheet covers
  *           an iframe adds url="…" loading=true|false, a partitioned one partition="…", one that
@@ -215,7 +216,7 @@ const TABLE_ELEMENTS = /^(table|caption|thead|tbody|tfoot|tr|th|td|dl|dt|dd)$/;
  *           the host's lines indented two spaces; on an iOS simulator, the newest crash report of the build
  *           on that simulator since the last `logs` (its path, how it ended, the crashing thread's top
  *           frames); "(nothing new)" when there is nothing
- *   state   [epoch E · incarnation I · clock C ms], then one line per other section: `{name} {JSON on one line}`;
+ *   state   [generation G · epoch E · incarnation I · clock C ms], then one line per other section: `{name} {JSON on one line}`;
  *           an app's state (a reply with `slots`) without its empty sections (`emptySection`), a world's whole;
  *           over STATE_CAP its small sections and the others' sizes instead (`stateCap`)
  *   tap, type  [ERROR {error} · ]tapped|typed #{id} "{target}" [· at X,Y, a contact's phase or a drag] · delivery D · epoch E
@@ -244,8 +245,8 @@ export function render(op, r, how = {}) {
     case 'screenshot': return r?.compare ? r.text : renderLine(op, r); // `compare`: the comparison with a reference (agent-compare.mjs)
     case 'tree': {
       const entities = Array.isArray(r.entities) ? r.entities : r.nodes?.some((n) => n.components) ? r.nodes : null;
-      if (entities) return [`epoch ${r.epoch} · incarnation ${r.incarnation} · clock ${r.clock} ms · tick ${r.tick} · ${entities.length} entities`, ...entities.map((e) => `${'  '.repeat(e.depth ?? 0)}${e.name ?? ''}#${e.id} (${(e.components ?? []).join(', ')})${e.tags?.length ? ' ' + e.tags.join(' ') : ''}`), ...(r.truncated ? ['(truncated)'] : [])].join('\n');
-      const lines = [`epoch ${r.epoch} · incarnation ${r.incarnation} · clock ${r.clock} ms · ${r.nodes.length} nodes`];
+      if (entities) return [`${r.generation != null ? `generation ${r.generation} · ` : ''}epoch ${r.epoch} · incarnation ${r.incarnation} · clock ${r.clock} ms · tick ${r.tick} · ${entities.length} entities`, ...entities.map((e) => `${'  '.repeat(e.depth ?? 0)}${e.name ?? ''}#${e.id} (${(e.components ?? []).join(', ')})${e.tags?.length ? ' ' + e.tags.join(' ') : ''}`), ...(r.truncated ? ['(truncated)'] : [])].join('\n');
+      const lines = [`${r.generation != null ? `generation ${r.generation} · ` : ''}epoch ${r.epoch} · incarnation ${r.incarnation} · clock ${r.clock} ms · ${r.nodes.length} nodes`];
       const rootDepth = r.nodes[0]?.depth ?? 0;
       for (const n of r.nodes) {
         const depth = Math.max(0, n.depth - rootDepth);
@@ -288,8 +289,8 @@ export function render(op, r, how = {}) {
       // Routed by what was asked: a world's `perf` has a `draws` (the last frame's count) and a `look` too.
       if (how.look) return renderLook(r);
       // One line a section: pretty-printing cost an app's state more than half again its JSON (Caltrain, 2026-10-09).
-      const { epoch, incarnation, clock, ...rest } = r, app = 'slots' in r;
-      const head = [epoch != null && `epoch ${epoch}`, incarnation != null && `incarnation ${incarnation}`, clock != null && `clock ${clock} ms`].filter(Boolean).join(' · ');
+      const { generation, epoch, incarnation, clock, ...rest } = r, app = 'slots' in r;
+      const head = [generation != null && `generation ${generation}`, epoch != null && `epoch ${epoch}`, incarnation != null && `incarnation ${incarnation}`, clock != null && `clock ${clock} ms`].filter(Boolean).join(' · ');
       const sections = Object.entries(rest).filter(([, v]) => !(app && emptySection(v)));
       return stateCap([head, ...sections.map(([k, v]) => `${k} ${q(v)}`)].filter(Boolean).join('\n'), r, how, head, sections);
     }
@@ -302,7 +303,7 @@ export function render(op, r, how = {}) {
       if (!r || typeof r !== 'object') return q(r);
       // `carrier` and `mode` are the drive's own (its host, its timing): the JSON keeps them. So does a press's `at`, a
       // point only a hit-test diagnosis reads; a contact's phase and a drag answer with where the finger is, so theirs shows.
-      const { tapped, typed, target, phase, delivery, epoch, incarnation, clock, at, carrier, mode, error, landError, answered, ticket, ...rest } = r, id = tapped ?? typed;
+      const { tapped, typed, target, phase, delivery, generation, epoch, incarnation, clock, at, carrier, mode, error, landError, answered, ticket, ...rest } = r, id = tapped ?? typed;
       // An input that did not happen (a failure, a form the carrier cannot deliver) never reads in the past tense, and a
       // failure says so first; a phase names itself (`tap down`), held or not.
       // A held request's answer (`tap @3 cancel`) was given: `answered @3 "cancel"`.
@@ -310,7 +311,7 @@ export function render(op, r, how = {}) {
       const head = `${error != null ? `ERROR ${error} · ` : ''}${verb}${ticket != null ? ` @${ticket}` : ''}${answered != null ? ` ${q(answered)}` : ''}${id != null ? ` #${id}` : ''}${target != null ? ` ${q(target)}` : ''}`;
       const where = (phase != null || r.drag != null) && at != null ? (Array.isArray(at) ? `at ${at.join(',')}` : `at=${q(at)}`) : null;
       // Delivered, but what it started did not land (`landed`): said next to the verb, which stays `tapped`.
-      return [head, landError != null && `landing failed: ${landError}`, where, delivery != null && `delivery ${delivery}`, epoch != null && `epoch ${epoch}`, incarnation != null && incarnation !== 1 && `incarnation ${incarnation}`, clock != null && `clock ${clock} ms`,
+      return [head, landError != null && `landing failed: ${landError}`, where, delivery != null && `delivery ${delivery}`, generation != null && `generation ${generation}`, epoch != null && `epoch ${epoch}`, incarnation != null && incarnation !== 1 && `incarnation ${incarnation}`, clock != null && `clock ${clock} ms`,
         ...Object.entries(rest).map(([k, v]) => `${k}=${q(v)}`)].filter(Boolean).join(' · ');
     }
     default:
@@ -323,7 +324,7 @@ export function render(op, r, how = {}) {
  * it settled, `screenshot` with its file and size. */
 function renderLine(op, r) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) return JSON.stringify(r);
-  const { epoch, incarnation, clock, carrier, mode, ...rest } = r;
+  const { generation, epoch, incarnation, clock, carrier, mode, ...rest } = r;
   const lead = [op];
   if (op === 'clock') {
     if (clock != null) lead[0] = `clock ${clock} ms`;
@@ -338,7 +339,7 @@ function renderLine(op, r) {
   const notes = op === 'screenshot' ? ['paintedNote', 'chromeNote', 'unshownNote', 'note'].filter((k) => typeof rest[k] === 'string').map((k) => {
     const said = rest[k]; delete rest[k]; return `\n  NOTE: ${said}`;
   }) : [];
-  return [...lead, epoch != null && `epoch ${epoch}`, incarnation != null && incarnation !== 1 && `incarnation ${incarnation}`, op !== 'clock' && clock != null && `clock ${clock} ms`,
+  return [...lead, generation != null && `generation ${generation}`, epoch != null && `epoch ${epoch}`, incarnation != null && incarnation !== 1 && `incarnation ${incarnation}`, op !== 'clock' && clock != null && `clock ${clock} ms`,
     ...Object.entries(rest).map(([k, v]) => `${k}=${JSON.stringify(v)}`)].filter(Boolean).join(' · ') + notes.join('');
 }
 
@@ -392,7 +393,7 @@ function rangeAndPort(scroller) {
  * part appears only when the host reported it — a space a host cannot
  * observe is absent, never a zero.
  *
- *   node #{id} [{testId}] {Type} · site {n} · instance {keys} · epoch E · incarnation I
+ *   node #{id} [{testId}] {Type} · site {n} · instance {keys} · generation G · epoch E · incarnation I
  *     {row} = {value} ({authored | inherited from #id | initial}[, applied {…}])
  *     space viewport X,Y W×H · frame X,Y W×H (kernel, in the parent or containing block) · window X,Y W×H · screen X,Y W×H · scale S
  *     scroll [viewport | #id] sx,sy of rx,ry · … (outermost first)   clip #id overflow|clip-path · …
@@ -403,7 +404,7 @@ function renderNode(n) {
   const q = JSON.stringify;
   const box = (b) => (b ? `${b.x},${b.y} ${b.w}×${b.h}` : '—');
   const instance = (n.instance ?? []).map((i) => (i.key !== undefined ? q(i.key) : `arm ${i.arm}`)).join(' / ');
-  const out = [`node #${n.id}${n.testId != null ? ` [${n.testId}]` : ''} ${n.type}${n.site != null ? ` · site ${n.site}` : ''}${instance ? ` · instance ${instance}` : ''} · epoch ${n.epoch} · incarnation ${n.incarnation}`];
+  const out = [`node #${n.id}${n.testId != null ? ` [${n.testId}]` : ''} ${n.type}${n.site != null ? ` · site ${n.site}` : ''}${instance ? ` · instance ${instance}` : ''} ${n.generation != null ? `· generation ${n.generation} ` : ''}· epoch ${n.epoch} · incarnation ${n.incarnation}`];
   if (n.bare_reason) out.push(`  bare: \`${n.bare_reason}\``);
   const source = n.sourceMap;
   if (source?.status === 'compatible') {
@@ -433,7 +434,7 @@ function renderNode(n) {
   if (n.visible) out.push(`  visible ${sorted(n.visible).map(([k, v]) => `${k}=${v}`).join(' ')}`);
   if (n.native) out.push(`  native ${sorted(n.native).filter(([k]) => k !== 'subviews').map(([k, v]) => `${k}=${typeof v === 'string' ? v : q(v)}`).join(' ')}`);
   if (n.browser) out.push(`  browser ${sorted(n.browser).map(([k, v]) => `${k}=${q(v)}`).join(' ')}`);
-  // A pressed paint, on the page's images, which the computed opacity and background don't show (LLP 1061 D7).
+  // A pressed paint, which the computed opacity and background don't show where it is on the page's images (LLP 1061 D7).
   if (n.press_shown) out.push(`  press shows opacity=${n.press_shown.opacity} background=${q(n.press_shown.backgroundColor)} color=${q(n.press_shown.color)} (paint ${n.press_shown.paint})`);
   if (n.native?.subviews) out.push(...renderSubviews(n.native.subviews));
   return out;
@@ -569,12 +570,15 @@ export async function perfOp(s, args, line, step) {
     if (live !== undefined && !(Number.isInteger(live) && live > 0 && live <= 120000)) throw new MalformedOperation('perf frames live <ms>: a whole number of milliseconds, 1–120000');
     if (live !== undefined && ['ios', 'host-ios', 'macos', 'host'].includes(s.host)) {
       if (live > 30000 || late !== undefined || args.length !== 3 || args[1] !== 'live') throw new MalformedOperation('perf frames live <1–30000 ms> on Apple; use report for hitch detail');
-      const before = await s.op({ op: 'perf', frames: true, health: true });
-      if (before.error || !before.available) return before;
-      if (before.capture?.agentLeaseRemainingMs > 0) throw new MalformedOperation('a live frame capture is already active; read health or stop that capture first');
+      const current = await s.op({ op: 'perf', frames: true, health: true });
+      if (current.error) return current;
+      if (current.capture?.agentLeaseRemainingMs > 0) throw new MalformedOperation('a live frame capture is already active; read health or stop that capture first');
+      // The lease starts an on-demand collector in a new generation, so the baseline is read once it holds.
       const capture = await s.op({ op: 'perf', frames: true, capture: 'start', durationMs: live + 5000 });
       if (!capture.capture) return capture;
       try {
+        const before = await s.op({ op: 'perf', frames: true, health: true });
+        if (before.error || !before.available) return before;
         await new Promise(resolve => setTimeout(resolve, live));
         return await s.op({ op: 'perf', frames: true, health: true, cursor: before.cursor });
       } finally { await s.op({ op: 'perf', frames: true, capture: 'stop' }); }
@@ -621,9 +625,11 @@ export async function perfOp(s, args, line, step) {
   const before = await s.perf(target);
   for (const op of ops) await step(op);
   if (target?.startsWith('world:')) {
-    const after = await s.perf(target, {spanSince: before.spanTicks});
+    const after = await s.perf(target, {spanSince: {incarnation: before.incarnation, generation: before.generation, ticks: before.spanTicks}});
+    if (after.incarnation !== before.incarnation) throw Error('perf world: world incarnation changed (remount, restart or restore); no difference is defined');
+    if (after.generation !== before.generation) throw Error('perf world: recording generation changed; no difference is defined');
     if (after.tick < before.tick || after.restarted !== before.restarted) throw Error('perf world: world restarted between reads');
-    return {...after, from:{tick:before.tick}};
+    return {...after, from:{tick:before.tick, incarnation:before.incarnation, generation:before.generation, spanTicks:before.spanTicks}};
   }
   return perfDelta(before, await s.perf(target));
 }
@@ -636,6 +642,7 @@ export function perfDelta(a, b) {
   // A bounded first read leaves sites out: their whole lifetime would read as new work.
   if (a.truncated) throw Error(`perf: the first read was partial (${a.walked} walked); name a narrower target`);
   if (a.plan !== b.plan) throw Error(`perf: the plan changed between the reads (${a.plan?.slice(0, 12)} → ${b.plan?.slice(0, 12)}); no difference is defined`);
+  if (a.generation !== b.generation) throw Error(`perf: generation ${a.generation} → ${b.generation} between the reads; no difference is defined`);
   if (a.incarnation !== b.incarnation) throw Error(`perf: incarnation ${a.incarnation} → ${b.incarnation} between the reads; no difference is defined`);
   if (b.seq < a.seq) throw Error(`perf: seq went back (${a.seq} → ${b.seq}): the runner restarted between the reads`);
   const before = new Map(a.sites.map(x => [x.site, x]));
@@ -692,6 +699,7 @@ export function hatchDelta(a, b) {
   if (!a.plan || !b.plan) throw Error('perf hatches: a read names no plan; no difference is defined');
   if (a.truncated) throw Error('perf hatches: the first read was partial; no difference is defined');
   if (a.plan !== b.plan) throw Error(`perf hatches: the plan changed between the reads (${a.plan?.slice(0, 12)} → ${b.plan?.slice(0, 12)}); no difference is defined`);
+  if (a.generation !== b.generation) throw Error(`perf hatches: generation ${a.generation} → ${b.generation} between the reads; no difference is defined`);
   if (a.incarnation !== b.incarnation) throw Error(`perf hatches: incarnation ${a.incarnation} → ${b.incarnation} between the reads; no difference is defined`);
   const less = (x, was, keys) => { const d = { ...x }; for (const k of keys) if (typeof x[k] === 'number') d[k] = x[k] - (was?.[k] ?? 0); return d; };
   const key = c => `${c.hatch}\n${c.site ?? ''}\n${c.moment}`, before = new Map(a.calls.map(c => [key(c), c]));
@@ -741,7 +749,7 @@ export function renderPerf(r) {
   if (r.format === 'exact.frame-health.metrics/2') return renderFrameHealthMetrics(r);
   if (r.format === 'exact.frame-health/2') return renderFrameHealthReport(r);
   if (typeof r.capture === 'boolean') return `frame capture ${r.capture ? 'armed' : 'paused'}${r.reason ? `: ${r.reason}` : ''}${r.agentLeaseRemainingMs ? ` · agent lease ${r.agentLeaseRemainingMs} ms` : ''}`;
-  if (r.spans) return [`${r.target} · tick ${r.from ? r.from.tick + '..' : ''}${r.tick} · exclusive ms${r.tickMs ? ` · tick p50 ${r.tickMs.p50} p95 ${r.tickMs.p95} mean ${r.tickMs.mean}` : ''}`,
+  if (r.spans) return [`${r.target} · tick ${r.from ? r.from.tick + '..' : ''}${r.tick} · world incarnation ${r.incarnation} · recording generation ${r.generation} · exclusive ms${r.tickMs ? ` · tick p50 ${r.tickMs.p50} p95 ${r.tickMs.p95} mean ${r.tickMs.mean}` : ''}`,
     ...r.spans.map(s => `  ${s.name} at ${s.at}: p50 ${s.p50} p95 ${s.p95} max ${s.max} perTick ${s.perTick} (${s.count} ticks)`)].join('\n');
   if (r.calls && r.hatches) return renderHatchPerf(r);
   if (r.streamTiming) return renderStreamTiming(r.streamTiming);
@@ -760,7 +768,13 @@ export function renderPerf(r) {
     }
     for (const w of r.world ?? []) {
       const g = n => n == null ? '—' : `${Math.round(n * 100) / 100} ms`, ms = x => x ? `p50 ${g(x.p50)} p95 ${g(x.p95)} p99 ${g(x.p99)} mean ${g(x.mean)}` : '—';
-      out.push(`  world ${w.canvas}: frame ${ms(w.perf.frameMs)} · tick ${ms(w.perf.tickMs)} · feed ${ms(w.perf.feedMs)} · encode ${ms(w.perf.encodeMs)}${w.perf.pipelineMs ? ` · pipelines ${ms(w.perf.pipelineMs)}` : ''}`);
+      let row = `  world ${w.canvas}: frame ${ms(w.perf.frameMs)} · tick ${ms(w.perf.tickMs)} · feed ${ms(w.perf.feedMs)} · encode ${ms(w.perf.encodeMs)}${w.perf.pipelineMs ? ` · pipelines ${ms(w.perf.pipelineMs)}` : ''}`;
+      if (w.renderHooks) {
+        const { cpuMs, frame } = w.renderHooks;
+        const max = (ring, unit = '') => ring?.count > 0 && ring.max != null ? `${ring.max}${unit}` : '—';
+        row += ` · hooks prepare ${ms(cpuMs?.prepare?.count ? cpuMs.prepare : null)} · draws max ${max(frame?.draws)} · triangles max ${max(frame?.triangles)} · upload max ${max(frame?.uploadBytes, ' B')} · ticks/frame max ${max(w.perf.ticksPerFrame)}`;
+      }
+      out.push(row);
     }
     for (const l of r.late ?? []) out.push(`  t=${l.t} late: ${l.missed} missed (${l.interval} ms)${l.overrun ? ` · committed ${l.overrun} ms late` : ''} · seq ${l.seq ? l.seq.join('..') : '—'}${l.apply != null ? ` · apply ${l.apply}` : ''}${l.layout != null ? ` · layout ${l.layout}` : ''}${l.loaf ? ` · loaf script ${l.loaf.script}${l.loaf.styleLayout != null ? ` style+layout ${l.loaf.styleLayout}` : ''}` : ''}${l.phases ? ` · ${[...l.phases].sort((a, b) => b.ms - a.ms).map(p => `${p.phase} ${p.ms}`).join(' ')} unattributed ${l.unattributed}` : ''}`);
     return out.join('\n');
@@ -858,8 +872,12 @@ export async function pidTrace(pid, dest, run = spawnSync, timeout = 10000) {
     if (container.status !== 0) throw new Error(`trace --pid ${pid}: ${container.stderr.trim() || 'simctl get_app_container failed'}`);
     dir = resolve(container.stdout.trim(), 'tmp');
   } else {
-    // A Mac app here is unsandboxed: its temporary directory is this user's.
-    dir = run('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout?.trim();
+    // A sandboxed app's temporary directory is its container's (`mac --sandbox`, LLP 1030.005 D4); another's, this user's.
+    const app = exe.match(/^(.*?\.app)\/Contents\/MacOS\//)?.[1];
+    const signed = app ? run('codesign', ['-d', '--entitlements', '-', '--xml', app], { encoding: 'utf8' }).stdout ?? '' : '';
+    const id = /<key>com\.apple\.security\.app-sandbox<\/key>\s*<true\/>/.test(signed)
+      && run('plutil', ['-extract', 'CFBundleIdentifier', 'raw', resolve(app, 'Contents/Info.plist')], { encoding: 'utf8' }).stdout?.trim();
+    dir = id ? resolve(homedir(), 'Library/Containers', id, 'Data/tmp') : run('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).stdout?.trim();
   }
   const ready = resolve(dir, `exact-trace-${pid}.ready`), started = Date.parse(ps('lstart'));
   if (!existsSync(ready) || (Number.isFinite(started) && statSync(ready).mtimeMs < started - 1000)) {
@@ -1369,4 +1387,13 @@ export async function lookPicture(s, path, target, view = {}) {
   const { tick, hash, w, h, look, bounds } = reply, from = Object.fromEntries(Object.entries(view).filter(([k]) => k !== 'resolution'));
   // `bounds`: the scene's centre and radius an orbit or plan view was drawn within.
   return { screenshot: resolve(path), w, h, tick, hash, canvas: at.id, look, ...(bounds ? { bounds } : {}), ...(Object.keys(from).length ? { view: from } : {}) };
+}
+
+/** A presented box, including a layout-only node read from its logical layout. */
+export async function layoutBox(s, id, layout) {
+  const box = layout.nodes.find(n => n.id === id);
+  if (box) return box;
+  if (!['ios', 'host-ios'].includes(s.host)) return undefined;
+  const node = (await s.layout(id)).node;
+  return node?.native?.layoutOnly === true ? node.space?.viewport : undefined;
 }

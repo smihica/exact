@@ -15,6 +15,8 @@ mod long_poll;
 mod native_settle;
 #[path = "abi_refusal_tests.rs"]
 mod refusals;
+#[path = "abi_wake_tests.rs"]
+mod wake;
 
 fn plan(resource: Option<&str>) -> Vec<u8> {
     let mut builder = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
@@ -62,6 +64,33 @@ fn plan_covers_viewport_reads_only_the_first_roots_literal_without_booting() {
     }
     assert!(!bridge.plan_covers_viewport(usize::MAX, &[]));
     assert!(!bridge.plan_covers_viewport(0, b"invalid"));
+}
+
+#[test]
+fn boots_and_replacements_share_the_session_generation() {
+    let mut bridge = Bridge::new();
+    let bytes = plan(None);
+    let mut epoch = 0;
+    for generation in 1..=4 {
+        let count = if generation == 2 || generation == 3 {
+            bridge.input_write(&bytes);
+            bridge.boot_plan(
+                bytes.len(),
+                StorageModule::default(),
+                Hooks::none(),
+                400.,
+                400.,
+            )
+        } else {
+            bridge.boot(&bytes, StorageModule::default(), Hooks::none(), 400., 400.)
+        };
+        let batch = String::from_utf8_lossy(bridge.output_bytes(count as usize));
+        assert!(!batch.contains("\"error\":\""), "{batch}");
+        let runner = bridge.host.as_ref().unwrap().runner();
+        assert_eq!(runner.generation(), generation);
+        assert!(runner.kernel().epoch() > epoch);
+        epoch = runner.kernel().epoch();
+    }
 }
 
 #[test]
@@ -162,7 +191,18 @@ fn plan_and_module_reloads_keep_the_document_owner() {
         file.display()
     );
     let reply = bridge.host.as_mut().unwrap().answer_hold(&request).unwrap();
-    let doc = exact_runner::agent::field_str(&reply, "doc").unwrap();
+    let doc = exact_runner::json::field_str(&reply, "doc").unwrap();
+    // A picker's `startIn` opens in the chosen file's folder (LLP 1173 D2).
+    let mut folder = |path: &str, owner: u64| {
+        let request = format!(r#"{{"op":"documentFolder","owner":{owner},"path":"{path}"}}"#);
+        bridge.host.as_mut().unwrap().answer_hold(&request).unwrap()
+    };
+    let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    assert_eq!(
+        exact_runner::json::field_str(&folder(&doc, u64::from(rt)), "folder").as_deref(),
+        parent.to_str()
+    );
+    assert_eq!(folder(&doc, u64::from(rt) + 1), "{}");
     let resolves = |bridge: &mut Bridge<DocumentOwnerSource>| {
         use ibex2::stdlib::fs::{DocumentError, DocumentLease, FsOp, FsResult};
         let owner = bridge.host.as_mut().unwrap().runner_mut().data().owner;
@@ -221,17 +261,23 @@ fn plan_and_module_reloads_keep_the_document_owner() {
     std::fs::remove_file(file).unwrap();
 }
 
+type Preloaded = Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+
 #[derive(Clone, Default)]
 struct StorageModule {
     configured: bool,
     loaded: bool,
     calls: Arc<Mutex<Vec<&'static str>>>,
     preparing: Arc<std::sync::atomic::AtomicBool>,
+    preloaded: Preloaded,
 }
 
 impl DataSource for StorageModule {
     fn preload(&self) -> Result<bool, DataError> {
         Ok(!self.preparing.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    fn when_preloaded(&self, wake: Box<dyn FnOnce() + Send>) {
+        self.preloaded.lock().unwrap().push(wake);
     }
     fn app_id(&self) -> &str {
         "test.exact.storage.reload"
@@ -275,6 +321,7 @@ impl DataSource for StorageModule {
         Ok(Self {
             calls: self.calls.clone(),
             preparing: self.preparing.clone(),
+            preloaded: self.preloaded.clone(),
             ..Self::default()
         })
     }
@@ -283,22 +330,19 @@ impl DataSource for StorageModule {
 #[test]
 fn pending_native_preparation_keeps_the_running_app_and_carries_later_input() {
     use std::sync::atomic::Ordering;
+    extern "C" fn wake(_: *mut c_void) {}
+    let mut hooks = Hooks::none();
+    hooks.wake = Some(wake);
     let bytes = contract::compile("component App\n  state count = 0\n  action increment\n    count = count + 1\n  view\n    button press=increment testId=\"increment\"\n      text `${count}`\n").unwrap().encode();
     let source = StorageModule::default();
     let mut bridge = Bridge::new();
-    bridge.boot(&bytes, source.clone(), Hooks::none(), 390.0, 844.0);
+    bridge.boot(&bytes, source.clone(), hooks, 390.0, 844.0);
     bridge.data_ready();
     source.calls.lock().unwrap().clear();
     source.preparing.store(true, Ordering::SeqCst);
     for _ in 0..2 {
         bridge.input_write(&bytes);
-        let count = bridge.prepare_module(
-            [bytes.len(), 0, 0],
-            source.clone(),
-            Hooks::none(),
-            390.0,
-            844.0,
-        );
+        let count = bridge.prepare_module([bytes.len(), 0, 0], source.clone(), hooks, 390.0, 844.0);
         let batch = String::from_utf8_lossy(bridge.output_bytes(count as usize));
         assert!(batch.contains("\"pending\":true"), "{batch}");
         assert!(bridge.prepared.is_none());
@@ -315,15 +359,16 @@ fn pending_native_preparation_keeps_the_running_app_and_carries_later_input() {
     }
     let carried = bridge.host.as_ref().unwrap().carry();
     assert_eq!(carried.slots, vec![("count".into(), Value::Number(2.0))]);
-    source.preparing.store(false, Ordering::SeqCst);
-    bridge.input_write(&bytes);
-    bridge.prepare_module(
-        [bytes.len(), 0, 0],
-        source.clone(),
-        Hooks::none(),
-        390.0,
-        844.0,
+    assert!(
+        !source.preloaded.lock().unwrap().is_empty(),
+        "the candidate must wake the session when its image finishes loading"
     );
+    source.preparing.store(false, Ordering::SeqCst);
+    for wake in std::mem::take(&mut *source.preloaded.lock().unwrap()) {
+        wake();
+    }
+    bridge.input_write(&bytes);
+    bridge.prepare_module([bytes.len(), 0, 0], source.clone(), hooks, 390.0, 844.0);
     assert!(bridge.prepared.is_some());
     let kernel = bridge.host.as_ref().unwrap().runner().kernel();
     let button = kernel
@@ -1423,76 +1468,10 @@ fn candidate_profiles_are_isolated_until_commit_and_after_discard() {
     check(&mut bridge, "icc:assets/candidate.icc");
 }
 
-#[test]
-fn block_axis_records_distinguish_size_maximum_and_route_fitting() {
-    use exact_kernel::{BlockAxis, HostBlock};
-    let plan = contract::compile(
-        "component Page\n  view\n    column\n      box testId=\"route\" width=480 height=300\n",
-    )
-    .unwrap()
-    .encode();
-    let mut bridge = Bridge::new();
-    bridge.boot(&plan, StorageModule::default(), Hooks::none(), 800.0, 600.0);
-    let k = bridge.host.as_ref().unwrap().runner().kernel();
-    let id = k.node_by_key(k.find_by_test_id("route")[0]).unwrap().id;
-    for (width, height, expected, size) in [
-        (
-            2.0_f32,
-            2.0_f32,
-            HostBlock {
-                width: BlockAxis::Fit(400.0),
-                height: BlockAxis::Fit(200.0),
-            },
-            (480.0, 300.0),
-        ),
-        (
-            1.0,
-            1.0,
-            HostBlock {
-                width: BlockAxis::AtMost(400.0),
-                height: BlockAxis::AtMost(200.0),
-            },
-            (400.0, 200.0),
-        ),
-        (
-            2.0,
-            1.0,
-            HostBlock {
-                width: BlockAxis::Fit(400.0),
-                height: BlockAxis::AtMost(200.0),
-            },
-            (480.0, 200.0),
-        ),
-        (
-            0.0,
-            0.0,
-            HostBlock {
-                width: BlockAxis::Is(400.0),
-                height: BlockAxis::Is(200.0),
-            },
-            (400.0, 200.0),
-        ),
-    ] {
-        let bytes: Vec<_> = [
-            id,
-            4,
-            400.0_f32.to_bits(),
-            200.0_f32.to_bits(),
-            width.to_bits(),
-            height.to_bits(),
-        ]
-        .into_iter()
-        .flat_map(u32::to_le_bytes)
-        .collect();
-        bridge.input_write(&bytes);
-        let len = bridge.covers(bytes.len());
-        let batch = std::str::from_utf8(bridge.output_bytes(len as usize)).unwrap();
-        assert!(batch.contains("\"error\":null"), "{batch}");
-        let k = bridge.host.as_ref().unwrap().runner().kernel();
-        assert_eq!(k.host_block(id), Some(expected));
-        assert_eq!(k.host_block_size(id), Some(size));
-    }
-}
+#[path = "abi_block_tests.rs"]
+mod blocks;
 
+#[path = "abi_role_keys_tests.rs"]
+mod role_keys;
 #[path = "abi_roles_tests.rs"]
 mod roles;

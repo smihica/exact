@@ -54,13 +54,9 @@ impl<D: DataSource> Presenter<D> {
         connector: u32,
         size: [u32; 2],
         refresh: u32,
-        turned: bool,
     ) -> Result<(), String> {
         // SAFETY: the shell upholds the display ownership contract above.
-        unsafe {
-            self.brush
-                .attach_scanout(fd, connector, size, refresh, turned)
-        }
+        unsafe { self.brush.attach_scanout(fd, connector, size, refresh) }
     }
 
     /// Whether the painter still owns direct presentation after a frame.

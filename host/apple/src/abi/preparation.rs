@@ -40,6 +40,9 @@ fn same_carried(a: &exact_runner::Carried, b: &exact_runner::Carried) -> bool {
         Carried,
     };
     let Carried {
+        generation,
+        epoch,
+        fresh_state,
         router,
         data_revision,
         picked_count,
@@ -47,27 +50,34 @@ fn same_carried(a: &exact_runner::Carried, b: &exact_runner::Carried) -> bool {
         slots,
         panels,
         resources,
+        waiting,
         streams,
         store_readers,
+        keepers,
         read_contents,
         now_ms,
         store,
         forgot_waiting,
-        faults,
+        // The commit shares the live fault table (`Runner::share_faults`), so
+        // a fault a long poll takes meanwhile does not hold the commit back.
+        faults: _,
         modes,
         uploads,
     } = a;
-    router == &b.router
+    generation == &b.generation
+        && epoch == &b.epoch
+        && fresh_state == &b.fresh_state
+        && router == &b.router
         && data_revision == &b.data_revision
         && picked_count == &b.picked_count
         && keeps_answers == &b.keeps_answers
         && streams == &b.streams
         && store_readers == &b.store_readers
+        && keepers == &b.keepers
         && read_contents == &b.read_contents
         && now_ms.to_bits() == b.now_ms.to_bits()
         && store == &b.store
         && forgot_waiting == &b.forgot_waiting
-        && faults == &b.faults
         && modes == &b.modes
         && slots.len() == b.slots.len()
         && slots
@@ -86,6 +96,12 @@ fn same_carried(a: &exact_runner::Carried, b: &exact_runner::Carried) -> bool {
             .all(|((an, asrc, aa, av), (bn, bsrc, ba, bv))| {
                 an == bn && asrc == bsrc && equivalent_all(aa, ba) && equivalent(av, bv)
             })
+        && waiting.len() == b.waiting.len()
+        && waiting.iter().zip(&b.waiting).all(
+            |((an, asrc, aa, ad, asl), (bn, bsrc, ba, bd, bsl))| {
+                an == bn && asrc == bsrc && equivalent_all(aa, ba) && ad == bd && asl == bsl
+            },
+        )
         && uploads.len() == b.uploads.len()
         && uploads.iter().zip(&b.uploads).all(|(a, b)| {
             use exact_runner::UploadEnd::{Answered, Failed, Sent};

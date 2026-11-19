@@ -15,11 +15,12 @@ const scratch = () => {
   writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'Render Settle', app: { id: 'test.render-settle', name: 'Render Settle' }, host: { web: {} } }));
   return dir;
 };
-// The app in `dir` built for the web with its pages rendered under Bun; its build names no failure.
+// The app in `dir` built for the web with its pages rendered under Bun; its build names no failure. A Rust module
+// builds into the checkout's target, warm from the last run, rather than cold into the app's own.
 async function build(dir) {
   const dist = resolve(dir, 'dist');
   const built = Bun.spawn([process.execPath, 'host/web-js/build.mjs', 'render-settle-test', '--out', dist, '--render', 'js'], {
-    cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    cwd: root, env: { ...process.env, EXACT_APP_DIR: dir, CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR ?? resolve(root, 'target') }, stdout: 'pipe', stderr: 'pipe',
   });
   const [status, stdout, stderr] = await Promise.all([built.exited, new Response(built.stdout).text(), new Response(built.stderr).text()]);
   expect(status, stdout + stderr).toBe(0);
@@ -478,4 +479,44 @@ export const answer = (name: string, _args: unknown[], store: any): any => {
     await browser?.close(); site?.stop(true); api.stop(true);
     rmSync(dir, { recursive: true, force: true });
   }
+}, 120000);
+
+test('credentialed event streams, long polls and uploads wait for the visitor during rendering', async () => {
+  const dir = scratch(), seen = [];
+  const api = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    seen.push(request.url);
+    return new Response('data: anonymous\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const manifest = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'));
+    manifest.app.origin = 'https://site.test/';
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify(manifest));
+    writeFileSync(resolve(dir, 'app.contract'), `routes nav
+  home "/" render=build
+component App
+  resource events = read("events") as shape string
+  resource poll = read("poll") as shape string
+  resource upload = read("upload") as shape string
+  view
+    column
+      text events
+      text poll
+      text upload
+`);
+    writeFileSync(resolve(dir, 'app.ts'), `export const grants = 'net.fetch ${api.url.origin}';
+export const answer = (_source: string, [mode]: string[]): any => fetch('${api.url.origin}/' + mode, {
+  credentials: 'include', method: mode === 'upload' ? 'POST' : 'GET',
+  exactStream: (event: any) => event.data,
+  ...(mode === 'poll' ? { exactLongPoll: { cursor: 'since', from: 'seq' } } : mode === 'upload' ? { exactUploadProgress: true } : {}),
+});
+`);
+    const dist = await build(dir);
+    const { renderer } = await import('./render.mjs');
+    const render = renderer(dist); render.ahead = false;
+    const reply = await render('/', 1000);
+    const checkpoint = JSON.parse(/<script type="application\/vnd.exact.checkpoint"[^>]*>([^<]*)<\/script>/.exec(reply.html)[1]);
+    expect({ status: reply.status, settled: reply.settled, pending: checkpoint.pending, refused: reply.refused, seen })
+      .toEqual({ status: 200, settled: true, pending: ['events', 'poll', 'upload'],
+        refused: ['events', 'poll', 'upload'].map(name => [name, 'fetch() with credentials']), seen: [] });
+  } finally { api.stop(true); rmSync(dir, { recursive: true, force: true }); }
 }, 120000);

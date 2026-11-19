@@ -1,25 +1,24 @@
 # Recipe: a GPU module (a canvas drawn in Rust)
 
-A `canvas surface=name(…)` that no data module draws is drawn by the app's GPU module: a crate
-`gpu/` beside app.json whose surfaces implement `exact_gpu::Surface` (wgpu), loaded after the first
-pixel (`apps/caltrain/gpu` is a whole one). See `gpu/README.md` for performance,
-color-space requests, grants and shader encoding.
+For a package, `bun exact.mjs add <package>` then `canvas surface=name(…)`. For limits and
+features, see [device requirements](../reference.md#gpu-device-requirements).
 
-**It is Rust of the app's own, so the app writes its Cargo workspace** (LLP 1153 D1.4). Start from
-the generated one; don't write a root `Cargo.toml` by hand:
+A `canvas surface=name(…)` that no data module draws uses `gpu/` beside `app.json`,
+loaded after first pixel. Implement `exact_gpu::Surface`; see `apps/caltrain/gpu`.
+`exact_gpu::wgpu` is wgpu 30; `gpu/README.md` covers its use.
 
-1. Run a native verb once (`bun exact.mjs mac`, `ios`…): it writes `.exact/shells/`. It writes it
-   only while the app has no crate of its own, so move an existing `gpu/` aside until step 2 is done.
-2. Copy it up: `cp -R .exact/shells/. . && rm -rf .exact/shells .stamp.json`.
-3. Write `gpu/` (below) and add `"gpu"` to `members` in `Cargo.toml`, then run `bun exact.mjs update`
-   (it settles the copied crates' paths and `<exact2>`) and `bun exact.mjs lock`.
-4. The web build's wasm-bindgen must be the version `exact setup` installed. When `lock` says the
-   GPU module links another, write the `=` requirement it names in `gpu/Cargo.toml` and
-   run `bun exact.mjs lock` again.
-5. Draw it from the view (below), then `bun exact.mjs web-build`, or `mac`, as any app.
+**It joins a workspace exact2 generates for the app's GPU crates** (LLP 1153.003 D5.1), `.exact/gpu/`, apart
+from the host's: write no root `Cargo.toml` and copy nothing up.
+
+1. Write `gpu/` (below). Its `package.workspace = "../.exact/gpu"` makes it a member.
+2. Draw it from the view (below), then `bun exact.mjs web-build`, or `mac`, as any app. The first build
+   writes `.exact/gpu/`, whose lock is exact2's.
+3. When `gpu/` depends on a crate, or a version, that exact2's lock does not hold, the build stops and says
+   to run `bun exact.mjs lock`, which captures `Cargo.gpu.lock` beside app.json. Commit it.
 
 `gpu/Cargo.toml`. Its package is the app's name plus `-gpu`; `module!` exports through the three web
-dependencies, so they are required:
+dependencies, so they are required, at the workspace's versions (the web build's wasm-bindgen CLI
+refuses others):
 
 ```toml
 [package]
@@ -28,17 +27,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+workspace = "../.exact/gpu"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-exact-gpu = { path = "<exact2>/gpu" }
+exact-gpu.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
 ```
 
 `gpu/src/lib.rs`, one surface that clears its canvas:
@@ -69,7 +69,6 @@ fn clear() -> Box<dyn Surface> {
     Box::new(Clear)
 }
 
-/// Each surface: its name, its number of inputs, its factory.
 pub static REGISTRY: Registry = Registry { surfaces: &[("clear", 0, clear)], shaders: &[] };
 
 exact_gpu::module!(REGISTRY);
@@ -78,3 +77,7 @@ exact_gpu::module!(REGISTRY);
 ```text
 canvas surface=clear() width=200 height=120 testId="sky"
 ```
+
+Native files: [implement `Surface::storage`](../reference.md#gpu-storage) for the session's paths.
+The web does not receive these paths or an Exact storage bridge; persistence there
+requires the GPU module's own browser API integration.

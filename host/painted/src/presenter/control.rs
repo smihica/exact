@@ -1006,3 +1006,7 @@ mod range_tests;
 #[cfg(test)]
 #[path = "select_tests.rs"]
 mod select_tests;
+
+#[cfg(test)]
+#[path = "material_touch_tests.rs"]
+mod material_touch_tests;

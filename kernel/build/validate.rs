@@ -1,4 +1,5 @@
 fn validate(schema: &Schema) {
+    validate_roles(schema);
     validate_controls(schema);
     validate_style_hosts(schema);
     let mut roles = BTreeSet::new();
@@ -161,17 +162,22 @@ fn validate(schema: &Schema) {
             "schema: ends applies to animations rows (`{}`)",
             row.field
         );
-        if row.admits_auto || row.refuses_percent {
+        assert!(
+            matches!(row.size_keywords.as_deref(), None | Some("size" | "basis")),
+            "schema: sizeKeywords is \"size\" or \"basis\" (`{}`)",
+            row.field
+        );
+        if row.admits_auto || row.size_keywords.is_some() || row.refuses_percent {
             assert!(
                 matches!(codec, Codec::Dimension),
-                "schema: admitsAuto and refusesPercent only apply to dimension rows (`{}`)",
+                "schema: admitsAuto, sizeKeywords and refusesPercent only apply to dimension rows (`{}`)",
                 row.field
             );
         }
     }
     assert!(
-        schema.styles.len() <= 64 * 4,
-        "schema: more style rows than the mask can carry"
+        schema.styles.len() <= 1 << 16,
+        "schema: more style rows than a style id (u16) can name"
     );
     for row in &schema.styles {
         match parse_codec(&row.codec) {
@@ -242,6 +248,7 @@ fn write_validate_domain(w: &mut String, schema: &Schema) {
                 if row.refuses_percent {
                     writeln!(w, "        if self.mask.has(StyleId::{id}) && self.{field}.has_percent() {{ return Err(StyleDomainError::PercentNotAdmitted(StyleId::{id})); }}").unwrap();
                 }
+                writeln!(w, "        if self.mask.has(StyleId::{id}) && matches!(self.{field}, Dimension::Keyword(k) if !StyleId::{id}.admits_size_keyword(k)) {{ return Err(StyleDomainError::KeywordNotAdmitted(StyleId::{id})); }}").unwrap();
             }
             Codec::Tracks => {
                 writeln!(w, "        if self.mask.has(StyleId::{id}) && !self.{field}.is_valid() {{ return Err(StyleDomainError::InvalidGridTrack(StyleId::{id})); }}").unwrap();
@@ -250,10 +257,10 @@ fn write_validate_domain(w: &mut String, schema: &Schema) {
                 writeln!(w, "        if self.mask.has(StyleId::{id}) && !self.{field}.is_valid() {{ return Err(StyleDomainError::InvalidGridSpan(StyleId::{id})); }}").unwrap();
             }
             Codec::Transitions => {
-                writeln!(w, "        if self.mask.has(StyleId::{id}) {{ self.{field}.validate().map_err(StyleDomainError::InvalidTransition)?; }}").unwrap();
+                writeln!(w, "        if self.mask.has(StyleId::{id}) {{ self.{field}.validate_linked().map_err(StyleDomainError::InvalidTransition)?; }}").unwrap();
             }
             Codec::Animations => {
-                let check = ["validate", "validate_ending"][row.ends as usize];
+                let check = ["validate_linked", "validate_ending_linked"][row.ends as usize];
                 writeln!(w, "        if self.mask.has(StyleId::{id}) {{ self.{field}.{check}().map_err(StyleDomainError::InvalidAnimation)?; }}").unwrap();
             }
             _ => {}

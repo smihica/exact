@@ -69,15 +69,23 @@ impl Pixels {
     /// How many pixels satisfy `pred`.
     pub fn count(&self, pred: impl Fn([u8; 4]) -> bool) -> usize {
         self.data
-            .chunks_exact(4)
-            .filter(|p| pred([p[0], p[1], p[2], p[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| pred(**p))
             .count()
     }
 
     /// The pixels as a binary PPM (P6), alpha dropped.
     pub fn ppm(&self) -> Vec<u8> {
         let mut out = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
-        out.extend(self.data.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        out.extend(
+            self.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]]),
+        );
         out
     }
 
@@ -101,6 +109,18 @@ impl Pixels {
 /// This machine's device, or why there is none — a fixture skips, saying so.
 pub fn device() -> Result<Gpu, String> {
     block_on(load_gpu(wgpu::Instance::default(), None)).map_err(|error| error.to_string())
+}
+
+/// This machine's device with the packages' declared requirements.
+pub fn device_with_requirements(
+    requirements: &[crate::grants::Requirements],
+) -> Result<Gpu, String> {
+    block_on(crate::load_gpu_with_requirements(
+        wgpu::Instance::default(),
+        None,
+        requirements,
+    ))
+    .map_err(|error| error.to_string())
 }
 
 /// This machine's device without the `withheld` features: what a device that
@@ -225,7 +245,12 @@ pub fn read(gpu: &Gpu, texture: &wgpu::Texture) -> Result<Pixels, String> {
         let start = (y * row) as usize;
         let line = &mapped[start..start + (width * 4) as usize];
         if bgra {
-            data.extend(line.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]));
+            data.extend(
+                line.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[2], p[1], p[0], p[3]]),
+            );
         } else {
             data.extend_from_slice(line);
         }

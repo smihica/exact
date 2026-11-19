@@ -7,11 +7,20 @@
     "device.camera"
   ],
   "substitute": "implementation",
+  "agent": { "picture": "CameraPicture", "clip": "CameraPicture" },
   "shapes": {
     "Photo": {
       "path": "string",
       "type": "string",
       "size": "number",
+      "width": "number",
+      "height": "number"
+    },
+    "Video": {
+      "path": "string",
+      "type": "string",
+      "size": "number",
+      "duration": "number",
       "width": "number",
       "height": "number"
     },
@@ -84,6 +93,39 @@
         }
       },
       "answers": "Photo",
+      "substitute": {
+        "choose": {
+          "ticket": "camera-app",
+          "choices": [
+            "take"
+          ],
+          "typed": false
+        },
+        "unsupported": [
+          "macos",
+          "linux",
+          "tvos",
+          "windows",
+          "terminal"
+        ]
+      }
+    },
+    {
+      "send": "recordVideoWithCameraApp",
+      "grants": [],
+      "origin": "app",
+      "foreground": true,
+      "gesture": true,
+      "options": {
+        "facingMode": "option<enum<user|environment>>",
+        "maxDuration": "option<number>",
+        "path": {
+          "type": "path",
+          "access": "write",
+          "optional": true
+        }
+      },
+      "answers": "Video",
       "substitute": {
         "choose": {
           "ticket": "camera-app",

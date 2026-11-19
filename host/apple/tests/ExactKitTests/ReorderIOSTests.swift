@@ -3,13 +3,13 @@ import UIKit
 import UIKit.UIGestureRecognizerSubclass
 import XCTest
 @testable import ExactKit
-@testable import ExactDrag
+@testable import ExactCollections
 
 /// UIKit recognizes Arrange: a handle whose touch-action keeps the List's
 /// pan off starts on a vertical drag; any handle starts on a long press. The
 /// recognizer's phases make the web host's sequence (`ReorderMacTests`).
 final class ReorderIOSTests: XCTestCase {
-    override class func setUp() { super.setUp(); ExactDrag.install() } // LLP 1047.001 D4
+    override class func setUp() { super.setUp(); ExactCollections.install() } // LLP 1047.001 D10
     private var window: UIWindow!
 
     /// A pan whose phase, location and velocity the test sets.
@@ -29,7 +29,7 @@ final class ReorderIOSTests: XCTestCase {
         window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
         p.viewport.frame = window.bounds
         window.addSubview(p.viewport)
-        p.reorderCalls = calls
+        p.reorderHost!.calls = calls
         p.apply(wireBatch([
             ["op": "collections", "items": [["view": 1, "revision": 1, "scrollSequence": 0, "count": 50,
                 "totalExtent": 2000, "rows": [["view": 2, "root": 3, "epoch": 7]], "correction": NSNull()]]],
@@ -72,9 +72,9 @@ final class ReorderIOSTests: XCTestCase {
         let (p, grip) = fixture(calls)
         XCTAssertNotNil(grip.window)
         XCTAssertTrue(SwipeInput.allows(grip))
-        XCTAssertEqual(p.collections.owningCollection(3), 1)
+        XCTAssertEqual(p.listHost.owningCollection(3), 1)
         XCTAssertNotNil(p.views[1]?.scroll)
-        XCTAssertNotNil(p.collections.geometry(1))
+        XCTAssertNotNil(p.listHost.geometry(1))
         let drag = Drag()
         drag.at = CGPoint(x: 20, y: 120)
         drag.state = .began
@@ -85,11 +85,11 @@ final class ReorderIOSTests: XCTestCase {
         XCTAssertEqual(p.views[2]?.layer.zPosition, 0.001, "the lifted row paints above later rows")
         drag.at.y = 180; drag.state = .ended; grip.reorderDragged(drag)
         XCTAssertEqual(calls.log, ["begin 3 top=0.0", "move 7 dy=50.0", "drop 7 dy=60.0"])
-        let hold = try XCTUnwrap(p.reorder as? ReorderHold)
+        let hold = try XCTUnwrap(p.reorderHost!.lift)
         XCTAssertEqual(hold.phase, .settling)
-        XCTAssertEqual(p.collections.interaction, 3, "the pin stays while the source returns")
+        XCTAssertEqual(p.listHost.interaction, 3, "the pin stays while the source returns")
         hold.observe(ReorderRecorder.finished())
-        XCTAssertNil(p.reorder)
+        XCTAssertNil(p.reorderHost!.lift)
         XCTAssertEqual(p.views[2]?.layer.zPosition, 0)
     }
 
@@ -102,7 +102,7 @@ final class ReorderIOSTests: XCTestCase {
         drag.at = CGPoint(x: 360, y: 150); drag.state = .changed; grip.reorderDragged(drag)
         drag.state = .cancelled; grip.reorderDragged(drag)
         XCTAssertEqual(calls.log, ["begin 3 top=0.0", "move 7 dy=30.0 outside", "cancel 7"])
-        XCTAssertEqual((p.reorder as? ReorderHold)?.phase, .settling)
+        XCTAssertEqual(p.reorderHost!.lift?.phase, .settling)
     }
 }
 #endif

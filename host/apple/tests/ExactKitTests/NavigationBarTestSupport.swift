@@ -2,6 +2,8 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactNativeViews
 
 extension NavigationBarIOSTests {
     func spin(_ seconds: Double) { RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
@@ -34,10 +36,10 @@ extension NavigationBarIOSTests {
         view.frame = host.view.bounds
         view.layoutIfNeeded()
         if module {
-            session.natives.installArtifact(try XCTUnwrap(env["EXACT_FIXTURE_MODULE"], "build.mjs --test --ios builds the fixture's module"))
+            session.nativeViews!.installArtifact(try XCTUnwrap(env["EXACT_FIXTURE_MODULE"], "build.mjs --test --ios builds the fixture's module"))
         }
         until("fixture route and native work ready") {
-            session.presenter.navigation.primaryNavigation?.topViewController is RouteController &&
+            session.presenter.navigationHost.primaryNavigation?.topViewController is RouteController &&
                 !Agent(session: session).nativeInFlight()
         }
         return session

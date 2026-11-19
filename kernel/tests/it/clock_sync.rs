@@ -6,6 +6,7 @@ use exact_kernel::MotionSync;
 use exact_motion::{Animations, Engine, Keyframes};
 
 fn row(text: &str) -> Animations {
+    exact_kernel::style::link_all();
     let pulse = Keyframes::parse("from{opacity:0.4}to{opacity:1}").unwrap();
     let mut a = Animations::parse(text).unwrap();
     a.resolve(|name| (name == "pulse").then_some(&pulse));

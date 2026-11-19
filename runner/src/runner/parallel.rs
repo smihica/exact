@@ -9,7 +9,7 @@ impl<D: DataSource> Runner<D> {
     /// The target a send of `m` made now answers: a parallel mutation's next
     /// send number, or the mutation itself.
     pub(super) fn send_target(&mut self, m: usize) -> Target {
-        if self.plan.mutations[m].mode != MutationMode::Parallel {
+        if self.mutation_row(m).mode != MutationMode::Parallel {
             return Target::Mutation(m);
         }
         self.queues.sends += 1;
@@ -32,6 +32,13 @@ impl<D: DataSource> Runner<D> {
         true
     }
 
+    /// Whether a later send of `target`'s parallel mutation has already
+    /// concluded, so that this one's answer leaves the slot and the failure
+    /// (D4). [`Self::conclude_send`] would say no for it.
+    pub(super) fn concluded_after(&self, target: Target) -> bool {
+        matches!(target, Target::Sent(m, n) if self.queues.concluded[m] > n)
+    }
+
     /// Refuse a send of parallel mutation `m` that would be the 65th in
     /// flight, counting `more` of this commit not yet handed out (D2), as
     /// a queue refuses its 65th waiting send.
@@ -46,13 +53,13 @@ impl<D: DataSource> Runner<D> {
             return Ok(());
         }
         Err(RunnerError::QueueFull {
-            mutation: self.plan.str(self.plan.mutations[m].name).to_string(),
+            mutation: self.mutation_name(m).to_string(),
         })
     }
 
     /// Whether `m` sends newest-wins: a send, an answer at once or an
     /// assignment lets go of its request in flight.
     pub(super) fn newest_wins(&self, m: usize) -> bool {
-        self.plan.mutations[m].mode == MutationMode::Newest
+        self.mutation_row(m).mode == MutationMode::Newest
     }
 }

@@ -16,7 +16,7 @@ impl<D: DataSource> Runner<D> {
     /// for [`Runner::transport_stood`]. A trap, or a key that is no key,
     /// refuses the commit.
     pub(super) fn sequence_step(&mut self) -> Result<(), RunnerError> {
-        self.transport.pending = None;
+        self.audio.transport.pending = None;
         if self.plan.sequences.is_empty() {
             return Ok(());
         }
@@ -59,7 +59,7 @@ impl<D: DataSource> Runner<D> {
             }
             seen.push(Seen { on, key, args });
         }
-        self.transport.pending = Some(seen);
+        self.audio.transport.pending = Some(seen);
         Ok(())
     }
 
@@ -67,25 +67,25 @@ impl<D: DataSource> Runner<D> {
     /// A background stop the commit asked for (`set_page`) is applied here
     /// too, after the gates, so a refused commit leaves it unmade.
     pub(super) fn transport_stood(&mut self) {
-        let suspend = std::mem::take(&mut self.transport.suspend);
-        let seen = self.transport.pending.take();
+        let suspend = std::mem::take(&mut self.audio.transport.suspend);
+        let seen = self.audio.transport.pending.take();
         if seen.is_none() && !suspend {
             return;
         }
-        let before = self.transport.answer();
+        let before = self.audio.transport.answer();
         let (now, live) = (self.now_ms, self.clock_live());
         let mut lines = Vec::new();
+        let a = &mut *self.audio;
         let mut out = Out {
-            sounds: &mut self.sounds,
-            midi: &mut self.midi,
+            sounds: &mut a.sounds,
+            midi: &mut a.midi,
         };
         if let Some(seen) = seen {
-            self.transport
+            a.transport
                 .stood(&self.plan, &mut out, now, live, seen, &mut lines);
         }
         if suspend {
-            self.transport
-                .suspend(&self.plan, &mut out, now, &mut lines);
+            a.transport.suspend(&self.plan, &mut out, now, &mut lines);
         }
         self.transport_said(lines, before);
     }
@@ -93,40 +93,43 @@ impl<D: DataSource> Runner<D> {
     /// Journal what the transport said, and answer `exactTransport` again
     /// when what it answers changed.
     fn transport_said(&mut self, mut lines: Vec<String>, before: Answer) {
-        self.sounds.settle(&mut lines);
+        self.audio.sounds.settle(&mut lines);
         lines.into_iter().for_each(|l| self.log(l));
-        self.transport.publish();
-        if !self.transport.readers.is_empty() && self.transport.answer() != before {
-            self.transport.answer_due = self.transport.answer_due.min(self.now_ms);
+        self.audio.transport.publish();
+        let now = self.now_ms;
+        let t = &mut self.audio.transport;
+        if !t.readers.is_empty() && t.answer() != before {
+            t.answer_due = t.answer_due.min(now);
         }
     }
 
     /// Its own wake at `at` (a fill, the count-in's end): no action, no
     /// commit, no receipt.
     pub(super) fn transport_wake(&mut self, at: f64) {
-        let before = self.transport.answer();
+        let before = self.audio.transport.answer();
         let live = self.clock_live();
         let mut lines = Vec::new();
+        let a = &mut *self.audio;
         let mut out = Out {
-            sounds: &mut self.sounds,
-            midi: &mut self.midi,
+            sounds: &mut a.sounds,
+            midi: &mut a.midi,
         };
-        self.transport
-            .wake(&self.plan, &mut out, at, live, &mut lines);
+        a.transport.wake(&self.plan, &mut out, at, live, &mut lines);
         self.transport_said(lines, before);
     }
 
     /// One delivery's clock messages from the followed input (LLP 1125 D9),
     /// `(stamp, bytes)` each in arrival order: no action, no commit.
     pub(super) fn transport_clock(&mut self, msgs: &[(f64, Vec<u8>)]) {
-        let before = self.transport.answer();
+        let before = self.audio.transport.answer();
         let (now, live) = (self.now_ms, self.clock_live());
         let mut lines = Vec::new();
+        let a = &mut *self.audio;
         let mut out = Out {
-            sounds: &mut self.sounds,
-            midi: &mut self.midi,
+            sounds: &mut a.sounds,
+            midi: &mut a.midi,
         };
-        self.transport
+        a.transport
             .follow(&self.plan, &mut out, now, live, msgs, &mut lines);
         self.transport_said(lines, before);
     }
@@ -134,19 +137,19 @@ impl<D: DataSource> Runner<D> {
     /// The last finite track ended at the clock's time: the `ended=`
     /// action, if any, to run as a timer's.
     pub(super) fn transport_end(&mut self) -> Option<ActionsId> {
-        let before = self.transport.answer();
+        let before = self.audio.transport.answer();
         let mut lines = Vec::new();
         let now = self.now_ms;
-        let action = self
-            .transport
-            .end(&self.plan, &mut self.midi, now, &mut lines);
+        let a = &mut *self.audio;
+        let action = a.transport.end(&self.plan, &mut a.midi, now, &mut lines);
         self.transport_said(lines, before);
         action
     }
 
-    /// The transport record, for `state.transport` and a test.
+    /// The transport record, for `state.transport` and a test: it panics on a
+    /// runner without the audio code ([`Runner::plays_audio`]).
     pub fn transport(&self) -> &crate::transport::Transport {
-        &self.transport
+        &self.audio.transport
     }
 
     /// `exactTransport()`'s answer, by the declared fields.
@@ -164,7 +167,7 @@ impl<D: DataSource> Runner<D> {
                 self.plan.str(ty.name)
             )));
         }
-        let answer = self.transport.answer();
+        let answer = self.audio.transport.answer();
         let mut fields = Vec::with_capacity(ty.fields.len as usize);
         for f in ty.fields.iter() {
             let name = self.plan.str(self.plan.field(f).name);
@@ -175,31 +178,24 @@ impl<D: DataSource> Runner<D> {
         Ok(Value::record(fields))
     }
 
-    /// The voice table (LLP 1096 D5), for `state.sounds` and a test.
+    /// The voice table (LLP 1096 D5), for `state.sounds` and a test: it
+    /// panics on a runner without the audio code ([`Runner::plays_audio`]).
     pub fn sounds(&self) -> &crate::sound::Sounds {
-        &self.sounds
+        &self.audio.sounds
     }
 
-    /// What the output plays since the last take: a `Play` per new voice,
-    /// an `End` per voice whose end changed (LLP 1096 D5; LLP 1125 D3), and a
-    /// sequence's timed haptics (LLP 1125 D3).
-    pub fn take_sounds(&mut self) -> Vec<crate::sound::SoundOp> {
-        self.sounds.take()
-    }
-
-    /// End every live voice before this runner is replaced (a dev reload,
-    /// LLP 1096 D5); the host drains `take_sounds` before the restart.
-    pub fn end_sounds(&mut self) {
+    /// [`Runner::end_sounds`]'s work.
+    pub(super) fn end_audio(&mut self) {
         // The host's time now, not the last commit's: what its output has
         // handed since is handed here too, so no note-off it needs is taken
         // back.
         self.sample();
         let mut lines = Vec::new();
         if !self.plan.sounds.is_empty() {
-            self.sounds.reload(self.now_ms, &mut lines);
+            self.audio.sounds.reload(self.now_ms, &mut lines);
         }
         // The MIDI queue as at a stop: every note ends (LLP 1125 D4).
-        self.midi.reload(self.now_ms, &mut lines);
+        self.audio.midi.reload(self.now_ms, &mut lines);
         lines.into_iter().for_each(|l| self.log(l));
     }
 }

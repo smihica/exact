@@ -2,7 +2,8 @@
 //! (LLP 1041 D1–D4): grant-checked transport, the ordered and independent
 //! lanes, streams, sockets, uploads and child processes. Reads and parallel
 //! sends overlap on shared workers, retaining their place in the ordered
-//! lane (LLP 1162 D1). Each worker owns its transport.
+//! lane (LLP 1162 D1). Each lane has one transport, and so one connection
+//! pool: the ordered owner's, and the independent workers' (`lane.rs`).
 //!
 //! A host wraps [`Core`] in an executor of its own, which gives it a wake
 //! and transports and decides which [`WorkerBudget`] its workers count against.
@@ -19,7 +20,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 
-/// Shared HTTP workers, each with its own transport: a browser's six
+/// Shared HTTP workers over one transport (`lane.rs`): a browser's six
 /// connections a host, so a source's `Promise.all` of reads overlaps.
 const INDEPENDENT: usize = build_number(option_env!("EXACT_HTTP_WORKERS"), 6);
 /// The ordered owner and the independent ones.
@@ -48,7 +49,10 @@ const MAX_BODY: usize = 64 << 20;
 const MAX_HEADERS: usize = 64 << 10;
 
 type Work = Box<dyn FnOnce() -> Outcome + Send>;
+type ResponseWork = Arc<dyn Fn() -> Outcome + Send + Sync>;
 type Wake = Box<dyn Fn() + Send + Sync>;
+#[cfg(test)]
+type ScheduledRetry = (u32, u64, String);
 struct Job {
     ticket: u64,
     request: Request,
@@ -59,6 +63,8 @@ struct Job {
     charge: usize,
     /// Request buffers in the backlog, excluding a preload waiter's reply reservation.
     waiting_charge: usize,
+    /// A hold's end must not let later hits take this read's room (LLP 1162.000 D1).
+    waited_for_preload: bool,
     /// The ceiling: request buffers plus the response allowance.
     limit: usize,
     /// The runner no longer wants its reply (`Core::forget`).
@@ -66,6 +72,7 @@ struct Job {
     queued_deadline: Option<forget::QueuedDeadline>,
     overlap: bool,
     class: RequestClass,
+    cache_store_withheld: bool,
 }
 /// A job a worker took, until its outcome is complete.
 struct Running {
@@ -91,7 +98,7 @@ struct Running {
     read: bool,
     overlap: bool,
     class: RequestClass,
-    /// The asynchronous core's (LLP 1120 D3, D5); workers leave them be.
+    /// The asynchronous core's lifecycle (LLP 1120 D3, D5).
     /// The outcome is published.
     terminal: bool,
     /// Physical work still running: hops on the wire, a reader.
@@ -109,6 +116,7 @@ struct Running {
     cache_exchange: Option<cache::Exchange>,
     cache_barrier: bool,
     cache_replacing: Option<cache::Key>,
+    refresh: Option<preload::Refresh>,
     invalidates: Option<(String, bool)>,
 }
 struct Completed {
@@ -135,7 +143,7 @@ struct Completed {
 /// A place behind the ordered barrier.
 enum Fenced {
     /// A request, its retained buffers, and whether its outcome is forgotten.
-    Held(Box<RequestOut>, Option<OwnedWork>, usize, bool),
+    Held(Box<RequestOut>, Option<OwnedWork>, usize, bool, bool),
     /// A request refused while the barrier was up: refused when its turn
     /// comes, after the held requests before it are admitted.
     Refused(u64, &'static str),
@@ -216,11 +224,20 @@ struct Shared {
     /// boot: opening makes the directories, and a cold boot opens no app
     /// storage (fieldnotes' `apple_module_replacement_…` test).
     roots: std::sync::OnceLock<Result<ibex2::stdlib::app_fs::AppDirectories, String>>,
+    #[cfg(test)]
+    roots_checked: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    deadline_armed: Mutex<Option<std::sync::mpsc::Sender<Deadline>>>,
+    #[cfg(test)]
+    before_stream_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Open two-way sockets by stream ticket (LLP 1016.000 D7; `stream.rs`).
     sockets: Mutex<std::collections::HashMap<u64, stream::Socket>>,
     /// Long polls waiting to ask again, by stream ticket (LLP 1016.000 D8;
     /// `longpoll.rs`): the attempt, when it asks, and what failed.
     retrying: Mutex<std::collections::HashMap<u64, (u32, std::time::Instant, String)>>,
+    fetch_fault: Mutex<Option<exact_runner::runner::faults::FetchFault>>,
+    #[cfg(test)]
+    retry_scheduled: Mutex<Option<std::sync::mpsc::Sender<ScheduledRetry>>>,
     /// What upload streams hold in memory (LLP 1016.000 D10; `stream.rs`).
     uploads: stream::Uploads,
     /// This, for a path that frees room uploads wait for holding only a
@@ -236,8 +253,17 @@ impl Shared {
     /// request, which leaves them unopened, or when the host named none.
     pub(crate) fn roots_for(&self, request: &Request) -> body::Roots<'_> {
         request.body_from.as_ref().or(request.body_to.as_ref())?;
+        self.app_roots()
+    }
+    fn app_roots(&self) -> body::Roots<'_> {
         let paths = self.root_paths.get()?;
-        Some(self.roots.get_or_init(|| body::open(paths)))
+        Some(self.roots.get_or_init(|| {
+            body::open(
+                paths,
+                #[cfg(test)]
+                self.roots_checked.lock().unwrap().clone(),
+            )
+        }))
     }
 }
 
@@ -264,6 +290,9 @@ pub struct Core {
     grants: String,
     /// A stream's own transport (the platform's; a test's scripted one).
     stream_host: StreamHost,
+    /// The independent lane's one transport, the launch's preloads' once
+    /// adopted (`lane.rs`).
+    lane: Mutex<Arc<Lane>>,
     /// The asynchronous core instead of workers (LLP 1120), not yet started.
     machine: Option<Arc<asynch::Machine>>,
     preloads: Mutex<Option<preload::Preloads>>,
@@ -274,11 +303,11 @@ pub type StreamHost = Arc<dyn Fn() -> ibex2::host::Host + Send + Sync>;
 
 // With no I/O grants there is nothing to endow. Refusal must not wait
 // for platform initialization, including the default stores' bundle identity.
-fn independent_bindings(grants: &str, host: &StreamHost) -> Option<ibex2::host::Bindings> {
+fn independent_bindings(grants: &str, lane: &Lane) -> Option<ibex2::host::Bindings> {
     ibex2::grant::GrantSet::parse(&exact_runner::io_grants(grants))
         .ok()
         .filter(|grants| !grants.is_empty())
-        .map(|grants| host().endow(grants))
+        .map(|grants| lane.endow(grants))
 }
 
 /// The ordered owner (the boot's bindings) and the independent ones. The
@@ -409,11 +438,20 @@ impl Core {
             http_cache: std::sync::OnceLock::new(),
             root_paths: std::sync::OnceLock::new(),
             roots: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            roots_checked: Mutex::default(),
+            #[cfg(test)]
+            deadline_armed: Mutex::default(),
+            #[cfg(test)]
+            before_stream_release: Mutex::default(),
             sockets: Mutex::default(),
             retrying: Mutex::default(),
+            fetch_fault: Mutex::default(),
+            #[cfg(test)]
+            retry_scheduled: Mutex::default(),
             uploads: stream::Uploads::default(),
             me: me.clone(),
-            processes: process::Processes::new(),
+            processes: process::Processes::new(budget),
         });
         let (lanes, count) = match lanes {
             Some((lanes, threads)) => (Some(lanes), threads),
@@ -425,8 +463,9 @@ impl Core {
                 (n + count <= MAX_WORKERS).then_some(n + count)
             })
             .is_ok();
+        let lane = Lane::new(host.clone());
         let machine = lanes.map(|lanes| {
-            asynch::Machine::new(shared.clone(), owners.clone(), grants, host.clone(), &lanes)
+            asynch::Machine::new(shared.clone(), owners.clone(), grants, &lane, &lanes)
         });
         // Reserved now, so a core past the bound is refused at once; started
         // by the first request ([`Core::start_workers`]).
@@ -449,6 +488,7 @@ impl Core {
             failed: std::sync::atomic::AtomicBool::new(false),
             grants: grants.to_string(),
             stream_host: host,
+            lane: Mutex::new(lane),
             machine,
             preloads: Mutex::new(None),
         }
@@ -497,12 +537,12 @@ impl Core {
         for (index, bindings, guard) in idle {
             let shared = self.shared.clone();
             let grants = self.grants.clone();
-            let host = self.stream_host.clone();
+            let lane = self.lane.lock().unwrap().clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("exact-io-{index}"))
                 .spawn(move || {
                     let _guard = guard;
-                    worker(shared, usize::from(index != 0), bindings, grants, host);
+                    worker(shared, usize::from(index != 0), bindings, grants, &lane);
                 });
             if spawned.is_err() {
                 self.failed.store(true, Ordering::Release);
@@ -525,7 +565,10 @@ impl Core {
     /// whose body is one of the app's files (LLP 1108 D6 R2). Set once,
     /// before the first request; without it such a request is refused.
     pub fn set_app_roots(&self, roots: [std::path::PathBuf; 3]) {
-        let _ = self.shared.root_paths.set(roots);
+        if self.shared.root_paths.set(roots).is_ok() {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            self.refresh_storage_roots();
+        }
         process::launched(&self.shared);
     }
 
@@ -536,7 +579,7 @@ impl Core {
 
     /// Admit work, or return a refusal without an overflow queue.
     pub fn run_owned(&self, r: RequestOut, work: Option<OwnedWork>) -> Result<(), &'static str> {
-        self.admit(r, work, false, false)
+        self.admit(r, work, false, false, None)
             .map_err(|(reason, _work)| reason)
     }
 
@@ -679,7 +722,7 @@ impl Core {
             let mut state = self.shared.state.lock().unwrap();
             state.retired = true;
             if let Some(cache) = state.cache.as_mut() {
-                preload::cancel_all(cache);
+                preload::close(cache);
             }
             state.cache = None;
             for run in &mut state.running {
@@ -691,9 +734,17 @@ impl Core {
             // Queued closures are destroyed by their executor owner. Doing
             // it here could run an arbitrary destructor on the UI thread.
             if self.machine.is_none() {
-                for queue in &mut state.completed {
-                    queue.clear();
+                for lane in 0..2 {
+                    let outcomes = std::mem::take(&mut state.completed[lane]);
+                    for done in outcomes.iter().filter(|done| !done.message) {
+                        state.counts[lane] -= 1;
+                        state.bytes[lane] -= done.bytes;
+                        state.streams -= usize::from(done.stream);
+                    }
                 }
+                state.light = 0;
+                state.agains = 0;
+                state.ordered.clear();
             } else if let Some(machine) = &self.machine {
                 machine.stop(&mut state);
             }
@@ -789,7 +840,7 @@ fn fenced_bytes(fenced: &VecDeque<Fenced>) -> usize {
     fenced
         .iter()
         .map(|f| match f {
-            Fenced::Held(_, _, charge, _) => *charge,
+            Fenced::Held(_, _, charge, _, _) => *charge,
             Fenced::Refused(..) => 0,
         })
         .sum()
@@ -836,7 +887,7 @@ fn settle_again(state: &mut State, ticket: u64) -> bool {
 }
 
 /// An ordered request that may wait among the 128: a plain read with no
-/// work beside it (RFC 9110 §9.2.1's safe methods; not auth, a surface, or
+/// opaque work beside it (RFC 9110 §9.2.1's safe methods; not auth, a surface, or
 /// a native call).
 fn read(request: &Request, work: bool) -> bool {
     !work
@@ -872,9 +923,7 @@ fn complete(shared: &Shared, ticket: u64, outcome: Outcome) {
     let finished_at = std::time::Instant::now();
     let mut state = shared.state.lock().unwrap();
     if state.retired {
-        if state.book.retiring {
-            asynch::external_end(shared, &mut state, ticket);
-        }
+        asynch::external_end(shared, &mut state, ticket);
         return;
     }
     let Some(at) = state.running.iter().position(|run| run.ticket == ticket) else {
@@ -941,10 +990,6 @@ fn complete(shared: &Shared, ticket: u64, outcome: Outcome) {
 /// and a long native call it hands to the app's native module.
 fn handoff(request: &Request) -> bool {
     (request.continuation.is_some() && request.storage.is_none()) || request.is_native()
-}
-
-fn handed_off(job: &Job) -> bool {
-    handoff(&job.request) && matches!(job.work, Some(OwnedWork::Later(_)))
 }
 
 /// An HTTP read with no effect to lose if it is never sent (RFC 9110 §9.2.1).
@@ -1018,7 +1063,7 @@ fn reservation(request: &Request) -> Result<(usize, usize, usize), &'static str>
         bytes = bytes.checked_add(n).ok_or("request size overflow")?;
     }
     if bytes > MAX_REQUEST {
-        return Err("native request exceeds 4 MiB");
+        return Err("native request exceeds 4 MiB (URL, headers and body together): send a larger body from an app file with exactBodyFrom");
     }
     // A plain independent reply is read into one buffer of its ceiling
     // (`body_to::receive`; the asynchronous core grows its buffer only up to
@@ -1061,11 +1106,11 @@ fn worker(
     lane: usize,
     bindings: Option<ibex2::host::Bindings>,
     grants: String,
-    host: StreamHost,
+    transport: &Lane,
 ) {
     let parsed = || ibex2::grant::GrantSet::parse(&exact_runner::io_grants(&grants));
     let bindings = if lane == 1 && bindings.is_none() {
-        independent_bindings(&grants, &host)
+        independent_bindings(&grants, transport)
     } else {
         bindings
     };
@@ -1081,7 +1126,10 @@ fn worker(
             loop {
                 if state.retired {
                     let abandoned = std::mem::take(&mut state.jobs[lane]);
+                    state.counts[lane] -= abandoned.len();
+                    state.bytes[lane] -= abandoned.iter().map(|job| job.charge).sum::<usize>();
                     let fenced = std::mem::take(&mut state.fenced);
+                    state.fenced_bytes = 0;
                     let discarded = std::mem::take(&mut state.discard);
                     drop(state);
                     drop((abandoned, fenced, discarded));
@@ -1130,7 +1178,7 @@ fn worker(
                 continue;
             }
         }
-        let work = match work {
+        let (work, fixture) = match work {
             Some(OwnedWork::Later(hand)) if handoff(&request) => {
                 let owner = shared.clone();
                 let reply = Reply::new(move |outcome| complete(&owner, ticket, outcome));
@@ -1144,8 +1192,9 @@ fn worker(
                 rouse(&shared, &state);
                 continue;
             }
-            Some(OwnedWork::Now(work)) => Some(work),
-            _ => None,
+            Some(OwnedWork::Now(work)) => (Some(work), None),
+            Some(OwnedWork::HttpResponse(work)) => (None, Some(work)),
+            _ => (None, None),
         };
         // Retirement aborts every job; forgetting aborts a safe read.
         let _retiring = {
@@ -1153,28 +1202,24 @@ fn worker(
             shared.abort.signal().register(move || abort.abort())
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let files = Files {
-                roots: shared.roots_for(&request),
-                grants: &grants,
-            };
-            // A source's narrower scope runs on this worker's own transport,
-            // so it reuses the connections that transport keeps.
+            let fixture = fixture.map(|work| outcome::fixture_fetch(&grants, work));
+            let fetch = fixture
+                .as_ref()
+                .or_else(|| bindings.as_ref().map(|b| &b.fetch));
+            // A source's narrower scope uses the selected transport.
             let scoped = match scoped_grants(&grants, request.grants.as_deref()) {
                 Some(Err(message)) => return failed(FailureKind::Refused, message),
-                Some(Ok(scope)) => Some(bindings.as_ref().map(|b| b.fetch.with_grants(scope))),
+                Some(Ok(scope)) => fetch.map(|f| f.with_grants(scope)),
                 None => None,
             };
-            let fetch = match &scoped {
-                Some(scoped) => scoped.as_ref(),
-                None => bindings.as_ref().map(|b| &b.fetch),
-            };
+            let fetch = scoped.as_ref().or(fetch);
             execute(
                 fetch.ok_or(unbound.as_str()),
                 request,
                 forced,
                 work,
                 &abort,
-                &files,
+                &grants,
                 overlap && class == RequestClass::Read,
                 (&shared, ticket, class),
             )
@@ -1201,15 +1246,9 @@ impl Core {
     /// Streams open on `host`'s transport: a test's scripted one.
     fn streams_on(mut self, host: impl Fn() -> ibex2::host::Host + Send + Sync + 'static) -> Self {
         self.stream_host = Arc::new(host);
+        *self.lane.get_mut().unwrap() = Lane::new(self.stream_host.clone());
         self
     }
-}
-
-/// What a body read from an app file needs: where the files are, and the
-/// app's grants (the request's own scope narrows them).
-struct Files<'a> {
-    roots: body::Roots<'a>,
-    grants: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1219,7 +1258,7 @@ fn execute(
     forced: bool,
     work: Option<Work>,
     abort: &AbortController,
-    files: &Files<'_>,
+    grants: &str,
     overlap: bool,
     cache_job: (&Arc<Shared>, u64, RequestClass),
 ) -> Outcome {
@@ -1243,8 +1282,7 @@ fn execute(
             |work| work(),
         );
     }
-    // Work beside a plain request is a driver fault's failure (LLP 1103 D1):
-    // it runs instead of the transport, so the request never goes out.
+    // A connection fault replaces transport without preparing a response.
     if let Some(work) = work {
         return work();
     }
@@ -1268,9 +1306,17 @@ fn execute(
         // A deadline that cannot be kept is refused, never silently none.
         Err(why) => return failed(FailureKind::Refused, why),
     };
-    // The body from an app file, read now, as late as can be, and refused
-    // before anything is sent (LLP 1108 D6 R2). The deadline or an abort
-    // ends the request while the file is read, and nothing is sent.
+    #[cfg(test)]
+    if let (Some(armed), Some(deadline)) = (
+        cache_job.0.deadline_armed.lock().unwrap().as_ref(),
+        deadline.as_ref(),
+    ) {
+        let _ = armed.send(deadline.clone());
+    }
+    // The body from an app file, opened now, as late as can be, and refused
+    // before anything is sent (LLP 1108 D6 R2); the transport streams it
+    // (LLP 1133.008.000 D4). The deadline or an abort ends the request while
+    // the file is opened, and nothing is sent.
     let ended = || {
         if deadline.as_ref().is_some_and(Deadline::passed) {
             Some(failed(
@@ -1283,11 +1329,23 @@ fn execute(
             None
         }
     };
-    if let Err(outcome) = body::resolve(files.roots, files.grants, &mut request, &ended) {
-        return outcome;
-    }
+    let roots = match body::prepare(cache_job.0, &request, &ended, None) {
+        Ok(roots) => roots,
+        Err(outcome) => return outcome,
+    };
+    let body_file = match body::resolve(
+        roots.as_ref(),
+        grants,
+        &mut request,
+        &ended,
+        None,
+        abort.signal(),
+    ) {
+        Ok(file) => file,
+        Err(outcome) => return outcome,
+    };
     // The file a 2xx body goes to (LLP 1108 D6 R2): staged before sending.
-    let staged = match body_to::stage(files.roots, files.grants, &request) {
+    let staged = match body_to::stage(roots.as_ref(), grants, &request) {
         Ok(staged) => staged,
         Err(outcome) => return outcome,
     };
@@ -1312,7 +1370,7 @@ fn execute(
         request.cache
     };
     if shared_cache.is_some() {
-        if let Err(outcome) = cache::granted(files.grants, &request) {
+        if let Err(outcome) = cache::granted(grants, &request) {
             return outcome;
         }
         if let Err(error) = reach::admit_cached(&request) {
@@ -1320,8 +1378,11 @@ fn execute(
         }
     }
     let mut req = fetch_request(request, forced);
+    req.body_file = body_file;
     cache::observe(cache_job.0, &mut req);
     req.max_body = Some(limit);
+    // Read whole into memory, as it arrives, unless a file takes it.
+    req.collected = staged.is_none();
     // The platform's idle timeout (URLSession's, 60 s by default) follows
     // the deadline a second later: it never ends a request before the
     // deadline does (so the reply says Timeout, not a network error), and a
@@ -1349,7 +1410,11 @@ fn execute(
     } else {
         result
     }
-    .and_then(|r| body_to::receive(r, staged, limit, within));
+    .and_then(|r| {
+        body_to::receive(r, staged, limit, within, || {
+            body_to::admit(cache_job.0, cache_job.1, abort, deadline.as_ref())
+        })
+    });
     match result {
         Ok(r) => {
             let mut response = Response {
@@ -1402,7 +1467,9 @@ use outcome::{
 };
 
 mod forget;
+mod lane;
 mod reach;
+use lane::Lane;
 
 mod body;
 mod body_to;
@@ -1421,6 +1488,11 @@ mod read_tests;
 #[cfg(test)]
 mod idle_tests;
 #[cfg(test)]
+mod lane_tests;
+#[cfg(test)]
 mod scope_tests;
 #[cfg(test)]
 mod tests;
+
+/// Session-free file transfers for a native package carrier.
+pub mod transfer;

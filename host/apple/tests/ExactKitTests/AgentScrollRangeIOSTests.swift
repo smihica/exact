@@ -1,6 +1,8 @@
 #if os(iOS)
 import XCTest
 @testable import ExactKit
+@testable import ExactCollections
+import ExactSurfaces
 import UIKit
 
 /// The agent's `layout` reports each scroller's range beside its offset (LLP 1012 `rx`/`ry`): how far the offset
@@ -10,6 +12,9 @@ import UIKit
 final class AgentScrollRangeIOSTests: XCTestCase {
     private var window: UIWindow?
     private var session: ExactSession?
+    // A canvas places its children only in the overlay the surfaces module
+    // makes (LLP 1047.001 D4).
+    override class func setUp() { super.setUp(); ExactSurfaces.install() }
     override func tearDown() { session?.destroy(); session = nil; window?.isHidden = true; window = nil; super.tearDown() }
 
     /// What a person sees of a port past the bars over it: a bar across the
@@ -293,8 +298,8 @@ final class AgentScrollRangeIOSTests: XCTestCase {
         XCTAssertNil(action["radii"], "the authored fallback is not the native action's geometry")
         XCTAssertTrue(owner.scrollDormant, "reading the range made no scroll view")
         XCTAssertNil(owner.scroll)
-        p.swipeActions.touch(owner)
-        XCTAssertNotNil(p.swipeActions.cell(of: owner))
+        p.swipeHost.touch(owner)
+        XCTAssertNotNil(p.swipeHost.cell(of: owner))
         XCTAssertNil(try node(agent.layout(), 4)["radii"], "projection still owns the action's corners")
     }
 }

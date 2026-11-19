@@ -13,6 +13,15 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
 class DeviceTest {
+    @Test fun touchExplorationIsTheScreenReaderProxy() {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = context.getSystemService(android.view.accessibility.AccessibilityManager::class.java)
+        val shadow = org.robolectric.Shadows.shadowOf(manager)
+        for (enabled in listOf(false, true, false)) {
+            shadow.setTouchExplorationEnabled(enabled)
+            assertEquals(if (enabled) 2 else 1, Device.read(context).screenReader)
+        }
+    }
     @Test fun aClockTheLocaleKeepsAddsNoCycle() {
         assertEquals("", Device.formatLocale(Locale.US, hour24 = false))
         assertEquals("", Device.formatLocale(Locale.GERMANY, hour24 = true))

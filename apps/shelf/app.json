@@ -5,6 +5,10 @@
   "id": "com.exact.shelf",
   "start_url": "/",
   "display": "standalone",
+  "icons": [{ "src": "assets/icon.png", "purpose": "any maskable" }],
+  "alternate_icons": [
+    { "name": "Paper", "icons": [{ "src": "assets/icon-paper.png", "purpose": "any maskable" }] }
+  ],
   "preload": {
     "discover": { "url": "https://openlibrary.org/subjects/science_fiction.json?limit=20" }
   },
@@ -82,7 +86,7 @@
     {
       "kind": "library",
       "title": "Your Shelf",
-      "description": "Your book count and latest addition.",
+      "description": "Your book count, and your latest addition or a book you choose.",
       "families": [
         "systemSmall",
         "accessoryRectangular"
@@ -93,6 +97,13 @@
       "preview": {
         "count": 7,
         "latest": "The Dispossessed"
+      },
+      "configuration": {
+        "title": "Your Shelf",
+        "description": "Choose a book to keep in view.",
+        "parameters": [
+          { "name": "book", "title": "Book", "type": "entity", "entity": "book" }
+        ]
       }
     }
   ]

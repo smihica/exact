@@ -26,7 +26,7 @@ package struct OrientationLock {
     /// orientations as bits, 0 for UIKit's own answer.
     var mask = 0
     /// What they answer for `prefersInterfaceOrientationLocked`.
-    var locked = false
+    package var locked = false
     /// Why the lock does not hold as asked, for the readback.
     var why: String?
     /// The host's resolution found a conflict.
@@ -48,10 +48,10 @@ extension OrientationLock {
     static func mask(_ bits: Int) -> UIInterfaceOrientationMask {
         masks.indices.reduce(into: []) { m, i in if bits & (1 << i) != 0 { m.insert(masks[i]) } }
     }
-    static func bits(_ mask: UIInterfaceOrientationMask) -> Int {
+    package static func bits(_ mask: UIInterfaceOrientationMask) -> Int {
         masks.indices.reduce(0) { b, i in mask.contains(masks[i]) ? b | (1 << i) : b }
     }
-    static func bit(_ orientation: UIInterfaceOrientation) -> Int {
+    package static func bit(_ orientation: UIInterfaceOrientation) -> Int {
         switch orientation {
         case .portrait: 1
         case .portraitUpsideDown: 2

@@ -5,6 +5,7 @@ import ObjectiveC
 import XCTest
 import UserNotifications
 @testable import ExactKit
+@testable import ExactNotifications
 
 private final class StubNotification: UNNotification {
     static var requestValue: UNNotificationRequest!
@@ -309,12 +310,12 @@ final class LaunchURLMacTests: XCTestCase {
                                   "LSItemContentTypes": ["public.html", "public.xhtml"], "ExactWebPage": true]
         let markdown: [String: Any] = ["CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["net.daringfireball.markdown"], "CFBundleTypeExtensions": ["md"]]
         let browser: [String: Any] = ["CFBundleDocumentTypes": [web]]
-        XCTAssertTrue(Picker.declarations(in: browser).isEmpty)
-        XCTAssertEqual(Picker.types(in: browser), [])
+        XCTAssertTrue(DocumentTypes.declarations(in: browser).isEmpty)
+        XCTAssertEqual(DocumentTypes.types(in: browser), [])
         XCTAssertFalse(ExactDocuments.accepts(page, metadata: browser))
         let both: [String: Any] = ["CFBundleDocumentTypes": [markdown, web]]
-        XCTAssertEqual(Picker.declarations(in: both).count, 1)
-        XCTAssertFalse(Picker.types(in: both).contains(.html))
+        XCTAssertEqual(DocumentTypes.declarations(in: both).count, 1)
+        XCTAssertFalse(DocumentTypes.types(in: both).contains(.html))
         XCTAssertFalse(ExactDocuments.accepts(page, metadata: both))
         XCTAssertTrue(ExactDocuments.accepts(notes, metadata: both))
         let viewer: [String: Any] = ["CFBundleDocumentTypes": [["CFBundleTypeRole": "Viewer", "LSItemContentTypes": ["public.html"]], web]]
@@ -402,12 +403,13 @@ final class LaunchURLMacTests: XCTestCase {
         XCTAssertEqual(activations, 0)
     }
 
-    func testNotificationClickSelectsItsOwnerWhenDefaultLabelsRepeat() {
+    func testNotificationClickSelectsItsOwnerWhenLabelsRepeat() {
         let app = ExactApp.shared
-        let a = app.makeSession()
-        let b = app.makeSession()
-        a.destroy()
-        let c = app.makeSession()
+        // Default labels no longer repeat (4e0758cd5, "A package's context names the session's directories and a label
+        // the same at every launch": each is the first free session-N), so the collision is two sessions given one label.
+        let label = "repeat-\(UUID().uuidString)"
+        let b = app.makeSession(label: label)
+        let c = app.makeSession(label: label)
         defer { b.destroy(); c.destroy(); NotificationPresenter.shared.app = nil; NotificationPresenter.shared.activate = nil }
         XCTAssertEqual(b.label, c.label, "the label collision this click must survive")
         let presenter = NotificationPresenter.shared

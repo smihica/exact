@@ -109,6 +109,7 @@ final class TextBoxTests: XCTestCase {
         XCTAssertEqual(p.lineBottoms.last ?? -1, p.height, accuracy: 0.01)
     }
 
+    #if os(macOS)
     /// A registered region's worker cuts a paragraph as the ordinary one is
     /// cut, each trim and edge, on one line and several, with short lines,
     /// and not at all when empty.
@@ -138,4 +139,5 @@ final class TextBoxTests: XCTestCase {
             }
         }
     }
+    #endif
 }

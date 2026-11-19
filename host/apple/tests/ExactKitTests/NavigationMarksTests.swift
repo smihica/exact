@@ -2,12 +2,15 @@
 import XCTest
 import QuartzCore
 @testable import ExactKit
+@testable import ExactEffects
+@testable import ExactSvg
 
 final class NavigationMarksTests: XCTestCase {
     func testTheRenderLinkStopsWhileTTIWaitsForWork() throws {
         let session = ExactApp.shared.makeSession(label: "navigation-marks")
         defer { session.destroy() }
-        XCTAssertNil(session.boot(plan: try fixturePlan("HEADLESS"), size: CGSize(width: 400, height: 800)).error)
+        XCTAssertNil(session.boot(plan: try fixturePlan("STILL_PAGE"), size: CGSize(width: 400, height: 800)).error)
+        settleViewlessSession(session)
         let marks = NavigationMarks()
         marks.routerChanged(session, payload: ["top": 1, "pattern": "/"])
         session.holdFillForTests()
@@ -15,7 +18,7 @@ final class NavigationMarksTests: XCTestCase {
         waitFor("the navigation's first frame") { marks.recent.contains { $0.hasPrefix("cold_ttr ") } }
         XCTAssertNil(marks.link, "only the first frame needs a display link")
         XCTAssertFalse(marks.recent.contains { $0.hasPrefix("tti ") }, "native work still holds TTI")
-        session.publishFillForTests(1, wireBatch([]), generation: session.generation)
+        session.publishFillForTests(1, wireBatch([]), lease: session.runtime.completionLease)
         waitFor("the slice's landing") { !session.fillInFlight }
         marks.workEnded(session)
         waitFor("TTI after the work clears") { marks.recent.contains { $0.hasPrefix("tti ") } }
@@ -33,7 +36,7 @@ final class NavigationMarksTests: XCTestCase {
         let session = try heldNavigation("/landed") { $0.holdFillForTests() }
         defer { session.destroy() }
         let applied = session.appliedBatches
-        session.publishFillForTests(1, wireBatch([]), generation: session.generation)
+        session.publishFillForTests(1, wireBatch([]), lease: session.runtime.completionLease)
         waitForTTI("/landed")
         XCTAssertEqual(session.appliedBatches, applied, "the slice shows nothing and skips the pass")
     }
@@ -72,7 +75,7 @@ final class NavigationMarksTests: XCTestCase {
         let session = try heldNavigation("/destroyed") { $0.holdFillForTests() }
         session.destroy()
         // A slice that lands after the session is gone, and the evaluation it asks for
-        session.publishFillForTests(1, wireBatch([]), generation: session.generation)
+        session.publishFillForTests(1, wireBatch([]), lease: session.runtime.completionLease)
         waitFor("the slice's landing") { !session.fillInFlight }
         waitForMainQueue("the evaluation it asked for")
         XCTAssertFalse(NavigationMarks.shared.recent.contains { $0.hasPrefix("tti /destroyed ") }, "a destroyed session's runtime has no outstanding work to read")
@@ -82,7 +85,8 @@ final class NavigationMarksTests: XCTestCase {
     /// what `hold` left outstanding.
     private func heldNavigation(_ route: String, _ hold: (ExactSession) -> Void) throws -> ExactSession {
         let session = ExactApp.shared.makeSession(label: "navigation-marks\(route)")
-        XCTAssertNil(session.boot(plan: try fixturePlan("HEADLESS"), size: CGSize(width: 400, height: 800)).error)
+        XCTAssertNil(session.boot(plan: try fixturePlan("STILL_PAGE"), size: CGSize(width: 400, height: 800)).error)
+        settleViewlessSession(session)
         let marks = NavigationMarks.shared
         marks.routerChanged(session, payload: ["top": 1, "pattern": "/"])
         hold(session)

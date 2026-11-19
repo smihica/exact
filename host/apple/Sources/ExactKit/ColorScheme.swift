@@ -3,6 +3,25 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
+/// Retains a command delivered by a background session until its scene attaches.
+public final class ExactWindowScheme {
+    public weak var window: UIWindow? {
+        didSet { window?.overrideUserInterfaceStyle = style }
+    }
+    private var style: UIUserInterfaceStyle = .unspecified
+
+    public init() {}
+
+    public func set(_ scheme: String?) {
+        style = switch scheme {
+        case "dark": .dark
+        case "light": .light
+        default: .unspecified
+        }
+        window?.overrideUserInterfaceStyle = style
+    }
+}
+
 extension NodeView {
     /// `color-scheme` on a subtree (LLP 1034 §8): the view's own
     /// appearance, which UIKit's trait inheritance carries to every view
@@ -41,7 +60,7 @@ extension NodeView {
     }
 
     /// Its computed `color-scheme` (inherited, so a node under one that sets it has it too).
-    var colorScheme: UIUserInterfaceStyle {
+    package var colorScheme: UIUserInterfaceStyle {
         switch style["color_scheme"]?.string {
         case "dark": .dark
         case "light": .light

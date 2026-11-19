@@ -1,20 +1,20 @@
 // @ref LLP 1123 D1 — while a native container owns the screen, the
-// session's document is mounted where no scroll view holds it. A scroll view
-// above a container changes where UIKit places its bars: inside one (the
+// session's document is mounted outside the viewport's implicit scroll view.
+// A scroll view above a container changes where UIKit places its bars: inside one (the
 // session's viewport), a bar's search field stays in its column behind the
 // keys, where a hand-built app's rises above them and spans a split (iOS
 // 27.1, measured with the split moved into an empty `UIScrollView` and into
 // a plain view). The viewport stays the document's coordinate space; the
 // mount takes its place, frame and bounds alike, so every conversion
-// through the viewport holds.
+// through the viewport holds. An authored scroller still holds the native
+// container and gives it the author's box (LLP 1115 D1).
 #if os(iOS) || os(tvOS)
 import UIKit
 
 /// The document's mount while a native container owns the screen: in the
 /// viewport's place, transparent to a touch on nothing, and answering
-/// UIKit's focus search as the viewport does. The container takes the whole
-/// view, so the page has no bands past its area (`Presenter.pageMargins`)
-/// while it is here.
+/// UIKit's focus search as the viewport does. The document covers the session
+/// view, so the page has no bands past its area (`Presenter.pageMargins`).
 package final class DocumentMount: UIView {
     package override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
@@ -37,11 +37,15 @@ extension Presenter {
 
     /// The document in the viewport, which scrolls it as a page, or (`fixed`)
     /// in its mount, where a native container's bars are UIKit's to place.
-    func hostDocument(fixed: Bool) {
+    package func hostDocument(fixed: Bool) {
         let host: UIView = fixed ? documentMount : viewport
         guard root.superview !== host else { return }
         host.addSubview(root)
         viewport.isScrollEnabled = !fixed
+        // UIKit can keep the hidden edge effect's container views. The
+        // viewport holds no document while the native container owns it.
+        viewport.accessibilityElementsHidden = fixed
+        if #available(iOS 26.0, tvOS 26.0, *) { viewport.topEdgeEffect.isHidden = fixed }
         placeDocumentMount()
         // A fixed document takes no keyboard range; a scrolling one does again.
         setKeyboardInset(keyboardInset)
@@ -59,4 +63,5 @@ extension Presenter {
         if mount.center != viewport.center { mount.center = viewport.center }
     }
 }
+
 #endif

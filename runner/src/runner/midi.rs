@@ -68,9 +68,10 @@ impl MidiMessage {
 }
 
 impl<D: DataSource> Runner<D> {
-    /// The MIDI queue and record, for `state.midi` and a test.
+    /// The MIDI queue and record, for `state.midi` and a test: it panics on a
+    /// runner without the audio code ([`Runner::plays_audio`]).
     pub fn midi(&self) -> &Midi {
-        &self.midi
+        &self.audio.midi
     }
 
     /// Whether the plan keeps a MIDI queue the agent shows
@@ -119,7 +120,8 @@ impl<D: DataSource> Runner<D> {
                 })
                 .unwrap_or_default();
             fields.push(
-                self.midi
+                self.audio
+                    .midi
                     .field(name, &port_fields, self.now_ms)
                     .ok_or_else(|| {
                         DataError::Unavailable(format!("{SOURCE} has no field `{name}`"))
@@ -133,12 +135,12 @@ impl<D: DataSource> Runner<D> {
     /// changed, its readers are asked again in one commit.
     pub fn set_midi(&mut self, ports: Ports) -> Result<Option<CommitReceipt>, RunnerError> {
         let mut lines = Vec::new();
-        let changed = self.midi.set_ports(ports, &mut lines);
+        let changed = self.audio.midi.set_ports(ports, &mut lines);
         lines.into_iter().for_each(|l| self.log(l));
         if !changed {
             return Ok(None);
         }
-        let readers = self.midi.readers.clone();
+        let readers = self.audio.midi.readers.clone();
         self.recommit(readers, "midi")
     }
 
@@ -146,8 +148,8 @@ impl<D: DataSource> Runner<D> {
     /// request the agent answered), as `exactTransport`'s are.
     pub(super) fn midi_answered(&mut self) -> Result<CommitReceipt, RunnerError> {
         // A reader of `sent` is answered again when the next message goes.
-        self.midi.answer_due = self.midi.next_sent(self.now_ms);
-        let readers = self.midi.readers.clone();
+        self.audio.midi.answer_due = self.audio.midi.next_sent(self.now_ms);
+        let readers = self.audio.midi.readers.clone();
         self.commit_again(readers, "midi")
     }
 
@@ -199,7 +201,7 @@ impl<D: DataSource> Runner<D> {
                 }
             }
         }
-        if let Some(i) = self.transport.clock_input() {
+        if let Some(i) = self.audio.transport.clock_input() {
             if !open.iter().any(|o| o == i) {
                 open.push(i.to_string());
             }
@@ -211,15 +213,8 @@ impl<D: DataSource> Runner<D> {
     /// forwards: an `Open` when they changed.
     pub(super) fn midi_open(&mut self) {
         let open = self.midi_inputs();
-        let clock = self.transport.clock_input().map(str::to_string);
-        self.midi.set_open(open, clock.into_iter().collect());
-    }
-
-    /// What MIDI does since the last take: sends and retractions, the
-    /// inputs to open, a request (LLP 1125 D7).
-    pub fn take_midi(&mut self) -> Vec<crate::midi::MidiOp> {
-        self.midi_open();
-        self.midi.take()
+        let clock = self.audio.transport.clock_input().map(str::to_string);
+        self.audio.midi.set_open(open, clock.into_iter().collect());
     }
 
     /// One host delivery of input messages (D8): the followed input's clock
@@ -232,8 +227,8 @@ impl<D: DataSource> Runner<D> {
         &mut self,
         batch: Vec<Incoming>,
     ) -> (Vec<CommitReceipt>, Option<RunnerError>) {
-        let clock: Vec<(f64, Vec<u8>)> = match self.transport.clock_input() {
-            Some(input) if self.midi.ports().connected_input(input) => batch
+        let clock: Vec<(f64, Vec<u8>)> = match self.audio.transport.clock_input() {
+            Some(input) if self.audio.midi.ports().connected_input(input) => batch
                 .iter()
                 .filter(|m| m.input == input && clock_message(&m.data))
                 .map(|m| (m.time_stamp, m.data.clone()))
@@ -250,7 +245,7 @@ impl<D: DataSource> Runner<D> {
         lines.into_iter().for_each(|l| self.log(l));
         let (mut receipts, mut first) = (Vec::new(), None);
         for m in batch {
-            if !self.midi.ports().connected_input(&m.input) {
+            if !self.audio.midi.ports().connected_input(&m.input) {
                 self.log(format!(
                     "midi in dropped: {} is not a connected input",
                     m.input
@@ -261,16 +256,16 @@ impl<D: DataSource> Runner<D> {
             if listeners.is_empty() {
                 continue;
             }
-            let beat = self.transport.beat_at(m.time_stamp);
+            let beat = self.audio.transport.beat_at(m.time_stamp);
             let line = format!(
                 "midi in {} {} at {} beat {}",
                 m.input,
                 crate::midi::hex(&m.data),
-                crate::agent::num(m.time_stamp),
-                crate::agent::num(beat)
+                crate::json::num(m.time_stamp),
+                crate::json::num(beat)
             );
             self.log(line);
-            self.midi.heard(Received {
+            self.audio.midi.heard(Received {
                 input: m.input.clone(),
                 data: m.data.clone(),
                 time_stamp: m.time_stamp,
@@ -299,11 +294,8 @@ impl<D: DataSource> Runner<D> {
         (receipts, first)
     }
 
-    /// A host's message (its MIDI arm's, or the agent's on its behalf):
-    /// `{"ports":{…}}` ([`Ports::from_json`]) or `{"messages":[[input,
-    /// timeStamp, [bytes…]], …]}`, one delivery. The receipts and the first
-    /// refusal, or why the message is none.
-    pub fn midi_host(
+    /// [`Runner::midi_host`]'s work.
+    pub(super) fn midi_from_host(
         &mut self,
         json: &str,
     ) -> Result<(Vec<CommitReceipt>, Option<RunnerError>), String> {
@@ -341,12 +333,8 @@ impl<D: DataSource> Runner<D> {
         Ok(self.midi_input(batch))
     }
 
-    /// The agent's MIDI (LLP 1125 §4): `{"op":"prefer","midi":{"state"?,
-    /// "inputs"?, "outputs"?}}`, the ports a request finds, by name; and
-    /// `{"op":"midi","input":…,"data":[…]}`, a message from that input now
-    /// (`tap midi`). `None` for any other request; else the receipts and
-    /// the reply, or the refusal.
-    pub fn midi_agent(
+    /// [`Runner::midi_agent`]'s work.
+    pub(super) fn midi_from_agent(
         &mut self,
         request: &str,
     ) -> Option<(Vec<CommitReceipt>, Result<String, String>)> {
@@ -388,11 +376,12 @@ impl<D: DataSource> Runner<D> {
         };
         let mut lines = Vec::new();
         let changed = self
+            .audio
             .midi
             .prefer(access, names("inputs"), names("outputs"), &mut lines);
         lines.into_iter().for_each(|l| self.log(l));
         let receipts = if changed {
-            let readers = self.midi.readers.clone();
+            let readers = self.audio.midi.readers.clone();
             match self.recommit(readers, "midi") {
                 Ok(r) => r.into_iter().collect(),
                 Err(e) => return (Vec::new(), Err(format!("prefer midi: {e:?}"))),
@@ -434,7 +423,7 @@ impl<D: DataSource> Runner<D> {
             return (Vec::new(), Err(why));
         }
         if self.midi_listeners(Some(input)).is_empty()
-            && self.transport.clock_input() != Some(input)
+            && self.audio.transport.clock_input() != Some(input)
         {
             return (
                 Vec::new(),
@@ -461,10 +450,10 @@ impl<D: DataSource> Runner<D> {
 
     /// Why `tap midi` cannot deliver from `input`, unless it can.
     fn midi_unconnected(&self, input: &str) -> Option<String> {
-        if self.midi.ports().connected_input(input) {
+        if self.audio.midi.ports().connected_input(input) {
             return None;
         }
-        let why = match self.midi.ports().access {
+        let why = match self.audio.midi.ports().access {
             Access::Granted => format!("{input:?} is not a connected input (prefer midi.inputs)"),
             a => format!(
                 "MIDI access is {} (requestMIDIAccess, prefer midi.state)",
@@ -481,7 +470,7 @@ impl<D: DataSource> Runner<D> {
         input: &str,
         list: &serde_json::Value,
     ) -> (Vec<CommitReceipt>, Result<String, String>) {
-        let Some(follow) = self.transport.follower().filter(|f| f.input == input) else {
+        let Some(follow) = self.audio.transport.follower().filter(|f| f.input == input) else {
             return (
                 Vec::new(),
                 Err(format!("tap midi: no sequence follows {input:?} (clock=)")),
@@ -513,8 +502,8 @@ impl<D: DataSource> Runner<D> {
                     Vec::new(),
                     Err(format!(
                         "tap midi: clock stamps rise from the last tick to now ({}), not {}",
-                        crate::agent::num(now),
-                        crate::agent::num(stamp)
+                        crate::json::num(now),
+                        crate::json::num(stamp)
                     )),
                 );
             }
@@ -534,14 +523,14 @@ impl<D: DataSource> Runner<D> {
 
     /// `{"midi":{"state":…,"inputs":[…],"outputs":[…]}}`: the ports now.
     fn midi_reply(&self) -> String {
-        let p = self.midi.ports();
+        let p = self.audio.midi.ports();
         let names = |ports: &[Port]| {
             let mut s = String::from("[");
             for (i, port) in ports.iter().enumerate() {
                 if i > 0 {
                     s.push(',');
                 }
-                crate::agent::quote(&port.id, &mut s);
+                crate::json::quote(&port.id, &mut s);
             }
             s.push(']');
             s

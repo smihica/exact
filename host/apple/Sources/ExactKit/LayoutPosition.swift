@@ -9,11 +9,11 @@ extension NodeView {
     /// read of the row that means layout goes through this;
     /// `scripts/position-reads.test.mjs` fails on a new direct read outside
     /// its allowlist.
-    var layoutPosition: String { Self.layoutPosition(style, popover: props["popover"] != nil) }
+    package var layoutPosition: String { Self.layoutPosition(style, popover: props["popover"] != nil) }
 
     /// `layoutPosition` from a box's rows, before or after a change, and
     /// whether it is a popover.
-    static func layoutPosition(_ style: NodeStyle, popover: Bool) -> String {
+    package static func layoutPosition(_ style: NodeStyle, popover: Bool) -> String {
         let authored = style["position_type"]?.string ?? "static"
         let sticky = authored == "sticky" && style["written"]?.array?.contains(.string("position_type")) == true
         return popover && !sticky ? "absolute" : authored

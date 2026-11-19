@@ -1,6 +1,5 @@
-//! Layout viewport facts in CSS pixels (points on Apple), and the user's
-//! display preferences — what CSS's `@media` answers an app about the
-//! screen it is on.
+//! Layout viewport facts in CSS pixels (points on Apple), and the host's
+//! display and accessibility readings.
 //! @ref LLP 1039 D1–D4; LLP 1061 D4; LLP 1069.000 D1; LLP 1078 D2
 
 use exact_plan::Value;
@@ -33,6 +32,7 @@ pub const FIELDS: &[&str] = &[
     "hover",
     "gpuTier",
     "accessibilityTextSize",
+    "screenReader",
     "update",
 ];
 
@@ -49,8 +49,7 @@ pub struct Viewport {
     /// the page avoids it, in CSS pixels: `env(keyboard-inset-height)`, 0
     /// with no keyboard (LLP 1039 D9).
     pub keyboard_height: f64,
-    /// The user's display preferences; a host that cannot read them says
-    /// `no-preference`, as a browser does.
+    /// The host's display and accessibility readings.
     pub preferences: Preferences,
     /// The device's posture and the segments a fold makes of the viewport
     /// (LLP 1078 D2); a host without a fold says `continuous`, 1 × 1.
@@ -177,14 +176,18 @@ pub fn even_segments(
     Ok(out)
 }
 
-/// CSS's user-preference media features (Media Queries 5 §11) a host reads
-/// from the platform: `prefers-reduced-motion: reduce`,
+/// The host's display and accessibility readings, including CSS's
+/// user-preference media features (Media Queries 5 §11): `prefers-reduced-motion: reduce`,
 /// `prefers-reduced-transparency: reduce`, `prefers-contrast` and
 /// `prefers-color-scheme`. The runner has no policy of its own
 /// (`rules/DEFERRED.md` §Motion): the app reads these and chooses.
 /// @ref LLP 1061 D5; LLP 1069.000 D1
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Preferences {
+    /// The platform's screen-reader reading, or unknown where it cannot detect one.
+    pub screen_reader: ScreenReader,
+    /// Android's system font scale is at least 1.3 (LLP 1039 D10).
+    pub accessibility_text_size: bool,
     /// The user asked for less motion.
     pub reduced_motion: bool,
     /// The user asked for less transparency (materials, blur).
@@ -212,6 +215,38 @@ pub struct Preferences {
     pub bold_text: bool,
     /// `update`: how often the output can change once shown.
     pub update: Update,
+}
+
+/// A detected screen reader; inability to detect one never means off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScreenReader {
+    /// The host cannot detect a screen reader.
+    #[default]
+    Unknown,
+    /// The platform reports no screen reader running.
+    Off,
+    /// The platform reports a screen reader running.
+    On,
+}
+
+impl ScreenReader {
+    /// The viewport fact's keyword.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// The hosts' wire form: 0 unknown, 1 off, 2 on; invalid readings are unknown.
+    pub fn from_bits(bits: u32) -> Self {
+        match bits {
+            1 => Self::Off,
+            2 => Self::On,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Media Queries 4's `update` values (§6.4): how often the output device
@@ -385,6 +420,8 @@ impl Preferences {
     /// No preference stated, a light system: what a host that reads nothing
     /// reports.
     pub const NONE: Preferences = Preferences {
+        screen_reader: ScreenReader::Unknown,
+        accessibility_text_size: false,
         reduced_motion: false,
         reduced_transparency: false,
         contrast: Contrast::NoPreference,
@@ -404,10 +441,13 @@ impl Preferences {
     /// pointer `none` (over bit 5), bit 7 hover `none`, bits 8–9 the gamut
     /// (0 sRGB, 1 P3, 2 rec2020), bit 10 a high dynamic range, bits 11–13
     /// the [`DisplayMode`] discriminant, bit 14 Bold Text, bits 15–16
-    /// `update` (0 `fast`, 1 `slow`, 2 `none`); other bits are ignored.
+    /// `update` (0 `fast`, 1 `slow`, 2 `none`), bits 17–18 screen reader
+    /// (0 unknown, 1 off, 2 on), bit 19 Android's large-text range.
     /// Zero is a mouse's `fine` and `hover` on a screen.
     pub fn from_bits(bits: u32) -> Self {
         Self {
+            screen_reader: ScreenReader::from_bits((bits >> 17) & 3),
+            accessibility_text_size: bits & (1 << 19) != 0,
             reduced_motion: bits & 1 != 0,
             reduced_transparency: bits & 2 != 0,
             contrast: match (bits & 4 != 0, bits & 8 != 0) {
@@ -452,6 +492,8 @@ impl Preferences {
             Contrast::Custom => 12,
         };
         u32::from(self.reduced_motion)
+            | ((self.screen_reader as u32) << 17)
+            | (u32::from(self.accessibility_text_size) << 19)
             | (u32::from(self.reduced_transparency) << 1)
             | contrast
             | (u32::from(self.dark) << 4)
@@ -534,6 +576,7 @@ impl Viewport {
                     .map_or(Value::NONE, |s| Value::some(Value::Number(s))),
             ),
             "keyboardHeight" => Some(Value::Number(self.keyboard_height)),
+            "screenReader" => Some(Value::str(self.preferences.screen_reader.keyword())),
             "prefersReducedMotion" => Some(Value::Bool(self.preferences.reduced_motion)),
             "prefersReducedTransparency" => {
                 Some(Value::Bool(self.preferences.reduced_transparency))
@@ -677,6 +720,15 @@ mod tests {
         assert_eq!(Preferences::from_bits(8).contrast.keyword(), "less");
         assert_eq!(Preferences::from_bits(12).contrast.keyword(), "custom");
         assert_eq!(Preferences::from_bits(16).color_scheme(), "dark");
+        for (code, name) in [(0, "unknown"), (1, "off"), (2, "on"), (3, "unknown")] {
+            let preferences = Preferences::from_bits((code << 17) | (1 << 19) | 31);
+            assert_eq!(preferences.screen_reader.keyword(), name);
+            assert!(preferences.accessibility_text_size);
+            assert_eq!(
+                preferences.bits(),
+                ((if code == 3 { 0 } else { code }) << 17) | (1 << 19) | 31
+            );
+        }
         // LLP 1100 D9: the display's gamut and range.
         for bits in [0, 256, 512, 1024, 256 | 1024] {
             assert_eq!(Preferences::from_bits(bits).bits(), bits);

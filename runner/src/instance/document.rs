@@ -11,7 +11,6 @@
 //! refused here too, and so is what the fold doesn't cover (a virtualized
 //! list, a relative length): the render then renders again with a kernel.
 
-use super::collection::views::ListChild;
 use super::*;
 use exact_kernel::id::IdMap;
 use exact_kernel::{NodeFacts, PropList, SortedMap, StyleId};
@@ -164,7 +163,7 @@ impl DocTree {
                 && n.props.str(PropId::SemanticTag) == Some("header")
                 && up.is_some_and(|p| p.props.get(PropId::NavigationKey).is_some())
                 || alert(n)
-                || up.is_some_and(&alert) && !button(n)
+                || up.is_some_and(alert) && !button(n)
                 || surface(n)
         };
         let mut at = Some(node);
@@ -321,7 +320,7 @@ impl Build<'_> {
             )));
         }
         let (style, props) = self.fold(n)?;
-        let list = match n.collection() {
+        let list = match n.list() {
             Some(list) => Some(
                 list.document_children(self.plan)
                     .map_err(|e| DocTreeError::Refused(format!("{e:?}")))?,
@@ -332,7 +331,9 @@ impl Build<'_> {
             Some(list) => list
                 .iter()
                 .map(|child| match child {
-                    ListChild::Spacer(view, _) | ListChild::Row(view, ..) => *view,
+                    ListChild::Fixed(view, _)
+                    | ListChild::Spacer(view, _)
+                    | ListChild::Row(view, ..) => *view,
                 })
                 .collect(),
             None => roots_of(&n.children),
@@ -366,9 +367,37 @@ impl Build<'_> {
             )));
         }
         for child in list {
+            if let ListChild::Fixed(view, hidden) = child {
+                if let Some(root) = super::find::locate(&n.children, view, &mut Vec::new(), &mut 0)
+                {
+                    self.node(root, here, depth + 1)?;
+                    if hidden {
+                        let index = self
+                            .doc
+                            .index
+                            .get(&view)
+                            .copied()
+                            .expect("fixed root emitted");
+                        self.doc.nodes[index as usize].props.set(
+                            exact_kernel::PropId::Inert,
+                            exact_kernel::PropValue::Bool(true),
+                        );
+                        self.doc.nodes[index as usize].props.set(
+                            exact_kernel::PropId::AccessibilityElementsHidden,
+                            exact_kernel::PropValue::Bool(true),
+                        );
+                    }
+                }
+                continue;
+            }
             let (view, style, props, roots) = match child {
+                ListChild::Fixed(..) => unreachable!(),
                 ListChild::Spacer(view, style) => {
                     let mut props = PropList::new();
+                    props.set(
+                        exact_kernel::PropId::Dataset,
+                        exact_kernel::PropValue::Str(r#"{"exact-list-spacer":""}"#.into()),
+                    );
                     props.set(
                         exact_kernel::PropId::AccessibilityElementsHidden,
                         exact_kernel::PropValue::Bool(true),
@@ -412,7 +441,7 @@ impl Build<'_> {
     fn fold(&mut self, n: &NodeInst) -> Result<(Rc<StyleProps>, PropList), DocTreeError> {
         let plan = self.plan;
         let row = plan.node(n.node);
-        let deps = &self.sites.deps;
+        let deps = &self.sites.data.deps;
         let constant = row.bindings.iter().all(|b| {
             plan.binding(b).kind != BindingKind::Style || deps.bindings[b.0 as usize].is_constant()
         });
@@ -477,6 +506,16 @@ impl Build<'_> {
                         Ok(StyleId::ExitAnimation) => {
                             self.sites.keyframes.resolve(&mut patch.rare.exit_animation);
                         }
+                        Ok(StyleId::ViewTransitionNew) => {
+                            self.sites
+                                .keyframes
+                                .resolve(&mut patch.rare.view_transition_new);
+                        }
+                        Ok(StyleId::ViewTransitionOld) => {
+                            self.sites
+                                .keyframes
+                                .resolve(&mut patch.rare.view_transition_old);
+                        }
                         Ok(_) => {}
                         // A value its row refuses is unset, its declaration's
                         // intent kept, as on a kernel (`ClearStyle`).
@@ -519,4 +558,17 @@ impl Build<'_> {
         }
         Ok((style, props))
     }
+}
+
+/// One child of a virtualized list's view, as a document written without a
+/// kernel holds it (LLP 1048.004): a spacer, or a mounted row's wrapper
+/// around its root.
+pub(in crate::instance) enum ListChild<'a> {
+    /// A spacer: its view and style (its props are fixed: hidden).
+    Spacer(ViewId, StyleProps),
+    /// An authored fixed root, emitted by the owning node's ordinary children.
+    Fixed(ViewId, bool),
+    /// A mounted row: its wrapper, the wrapper's style and props, and the
+    /// row's roots.
+    Row(ViewId, StyleProps, exact_kernel::PropList, &'a [Child]),
 }

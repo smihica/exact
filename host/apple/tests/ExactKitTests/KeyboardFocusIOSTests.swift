@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 /// A hardware keyboard reaches and operates controls, as on macOS: Tab and
 /// Shift-Tab walk the sequential order — inputs and pressables in tree

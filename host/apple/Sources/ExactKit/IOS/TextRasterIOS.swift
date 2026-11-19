@@ -20,7 +20,7 @@ final class TextRasterizer {
             case queued, running, abandoned, finished(TextRasterImage?), consumed
         }
         private var state = State.queued
-        init(_ node: NodeView, key: TextRasterKey, namespace: Int) {
+        package init(_ node: NodeView, key: TextRasterKey, namespace: Int) {
             self.node = node; self.key = key; self.namespace = namespace; incarnation = node.incarnation
             diagnosticNode = node.id
             group.enter()
@@ -456,7 +456,14 @@ final class TextRasterizer {
 }
 
 extension NodeView {
-    var canRasterText: Bool { rastersText && !rollsNumerals }
+    /// Moving an ancestor under a canvas changes how every paragraph beneath it paints.
+    static func textRasterAncestryChanged(_ root: UIView) {
+        guard canvasOverlays.count > 0 else { return }
+        visitParagraphs(in: [root]) { node in node.presenter?.noteOwedText(node) }
+    }
+    var canRasterText: Bool { !Capture.capturing && usesTextRaster }
+    /// A capture draws directly for its duration; it does not change what the next frame owes.
+    var usesTextRaster: Bool { rastersText && !usesNumerals }
     /// What a paragraph's raster needs of its structure, whether or not its
     /// numerals roll instead.
     private var rastersText: Bool {
@@ -465,7 +472,7 @@ extension NodeView {
         // does (LLP 1053 G5): a label stretched across a row rasters its text,
         // not a backing store of the row's width. A `line-clamp`'s last line
         // is made again from the range it broke at (`LineGeometry.clamped`).
-        guard isParagraph && flowShapes.isEmpty && columnRecord == nil && !Capture.capturing && window != nil && backgroundClip != "text"
+        guard isParagraph && flowShapes.isEmpty && columnRecord == nil && window != nil && backgroundClip != "text"
             && bounds.width > 0 && bounds.height > 0 else { return false }
         return canvasAbove == nil && !paintsVisibleInlineRun
     }
@@ -483,13 +490,14 @@ extension NodeView {
     ///   runs' backgrounds on the painted baseline, lies within the box;
     /// - its paint is what `Text` draws from an attributed string (font,
     ///   colour, kerning, underline, line-through) and the backgrounds
-    ///   `showNumerals` paints: no shadow, no stroke, nothing hidden.
+    ///   `showNumerals` paints: no shadow, stroke or inline opacity group, nothing hidden.
     /// Any other paragraph is drawn as any other; where it rasters, the
     /// raster rolls whole.
-    var rollsNumerals: Bool {
+    var rollsNumerals: Bool { !Capture.capturing && usesNumerals }
+    private var usesNumerals: Bool {
         guard NumeralLink.installed != nil, hasContentTransition, rastersText, !cssVisibilityHidden else { return false }
         let spec = paragraphSpec()
-        guard spec.shadow == nil, !spec.runs.contains(where: { $0.box != nil || $0.hidden || $0.stroke != nil || $0.shadow != nil }),
+        guard spec.shadow == nil, !spec.runs.contains(where: { $0.box != nil || $0.hidden || $0.stroke != nil || $0.shadow != nil || !$0.opacity.isEmpty }),
               let p = paragraphLayout(), p.lines.count <= 1 else { return false }
         guard let first = p.lines.first else { return true }
         let box = paragraphBox()
@@ -506,22 +514,30 @@ extension NodeView {
         return ink.isNull || bounds.contains(ink)
     }
     /// The paragraph as the Numerals capability draws it: its line at the
-    /// line's place and baseline. SwiftUI's
-    /// `Text` reads no inline box's background, so those are painted here,
-    /// under it, for the text as it now reads; they do not roll.
+    /// line's place and baseline, on the display's pixel grid as the raster
+    /// is. Its box is where `textPlace` puts the raster's, and its line
+    /// starts on the device pixel Core Graphics paints the raster's first
+    /// glyph on, the one at or before the line's start. SwiftUI rounds its
+    /// text to device pixels only within its own view, so a view that starts
+    /// between two leaves the glyphs there. SwiftUI's `Text` reads no inline
+    /// box's background, so those are painted here, under it, for the text
+    /// as it now reads; they do not roll.
     func showNumerals(_ ctx: CGContext) {
         guard let engine = text, let capability = NumeralLink.installed else { return }
         dropTextRaster()
-        let spec = paragraphSpec(), box = paragraphBox(), mode = style["content_transition"]?.string ?? "numeric"
+        let spec = paragraphSpec(), mode = style["content_transition"]?.string ?? "numeric"
         let shown = engine.attributed(spec)
         guard let p = paragraphLayout(), let line = p.lines.first else {
             return capability.show(self, attributed: shown, box: contentBox(), baseline: nil, align: spec.align, mode: mode)
         }
+        // The display's scale, not `ctx`'s: a picture of this layer at another scale draws it too.
+        let scale = max(1, window?.screen.scale ?? traitCollection.displayScale)
+        let box = CGRect(origin: textPlace(scale: scale), size: paragraphBox().size)
         TextEngine.draw(p, spec: spec, in: box, context: ctx, pass: .backgrounds)
-        let baseline = TextEngine.paintedLine(p.baselines[0], top: box.minY, scale: TextEngine.deviceScale(ctx), lineScale: p.lineScale)
+        let baseline = TextEngine.paintedLine(p.baselines[0], top: box.minY, scale: scale, lineScale: p.lineScale)
         let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
-        let lineBox = CGRect(x: box.minX + p.origin(0, align: spec.align, width: box.width), y: box.minY,
-                             width: max(1, width), height: max(1, p.height, baseline - box.minY))
+        let start = (p.origin(0, align: spec.align, width: box.width) * scale).rounded(.down) / scale
+        let lineBox = CGRect(x: box.minX + start, y: box.minY, width: max(1, width), height: max(1, p.height, baseline - box.minY))
         capability.show(self, attributed: shown, box: lineBox, baseline: baseline - box.minY, align: spec.align, mode: mode)
     }
     /// The whole paragraph's pixels are up for its current text and box: a
@@ -621,13 +637,14 @@ extension NodeView {
             imageView = nil; ink = textRasterLayer ?? InkLayer()
         }
         hostText(ink)
+        // The fade snapshots the old image at its old frame, before either changes.
+        textBoxLayer?.show(from: shown, to: key.spec)
         // The box follows UIKit's resize; the cropped ink rectangle changes atomically with its image
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         ink.frame = result.frame
         ink.contentsScale = key.scale
         CATransaction.commit()
-        textBoxLayer?.show(from: shown, to: key.spec)
         let roll = NumeralRoll.roll(ink, node: self)
         UIView.performWithoutAnimation {
             if let coverage, let imageView {
@@ -638,7 +655,7 @@ extension NodeView {
         ink.applyTextRange(headroom: result.headroom, limit: style["dynamic_range_limit"]?.string)
         ink.applyTextCast(result.cast, headroom: result.castHeadroom, limit: style["dynamic_range_limit"]?.string, rolling: roll)
         textRasterLayer = ink
-        presenter?.boxFilters.changed(self)
+        presenter?.boxFilters?.changed(self)
         switch result.content {
         case .pixels(let pixels):
             TextRenderMetrics.shared.end(diagnostic, kind: .publishPixels, node: id, width: pixels.width, height: pixels.height,
@@ -682,7 +699,7 @@ extension NodeView {
         textMore.rasterInk = (.null, .null); textMore.rasterFrame = .zero; textMore.rasterScale = 1
         mountTextBox()
         CATransaction.commit()
-        presenter?.boxFilters.changed(self)
+        presenter?.boxFilters?.changed(self)
     }
 
     /// The paragraph's ink in the lines layer inside its text's box
@@ -780,7 +797,7 @@ final class TextClips {
     /// No reach, the travel the next frames will show, and the lead's.
     let reaches: [CGFloat]
     var soon: CGFloat { reaches[1] }
-    init(_ viewport: UIView, soon: CGFloat, reach: CGFloat) {
+    package init(_ viewport: UIView, soon: CGFloat, reach: CGFloat) {
         self.viewport = viewport; reaches = [0, soon, reach]
     }
 
@@ -807,7 +824,7 @@ final class TextClips {
         return CGPoint(x: s.x + view.frame.minX - view.bounds.minX, y: s.y + view.frame.minY - view.bounds.minY)
     }
     /// `node`'s bounds in viewport space.
-    func frame(_ node: NodeView) -> CGRect {
+    package func frame(_ node: NodeView) -> CGRect {
         rect(node.bounds, of: node, shift: shift(node, above: entry(node.superview).shift))
     }
     /// What `Presenter.textBand` finds by walking, for this reach or none;
@@ -830,6 +847,15 @@ final class TextClips {
 }
 
 extension Presenter {
+    func noteOwedText(_ node: NodeView) {
+        // Invalidation precedes the op's new style. Numerals eligibility reads
+        // text caches, so wait until the batch has installed the new values.
+        if applying && changedText.contains(node.id) { return }
+        if node.isParagraph && textViews[node.id] === node && !node.textRasterSettled && node.usesTextRaster {
+            owedText.insert(node.id)
+        } else { owedText.remove(node.id) }
+    }
+
     /// Every clipping ancestor participates; an inner scroller can itself sit
     /// outside an outer viewport. All geometry stays in the paragraph's space.
     private func textBand(_ node: NodeView, reach: CGFloat) -> CGRect {
@@ -859,12 +885,25 @@ extension Presenter {
     /// Before the frame commits (the scroll callback, a rescue): a paragraph
     /// that shows without pixels for what shows gets them now, from its
     /// worker if that has finished or is running, else painted here — the
-    /// reader never sees it blank (LLP 1050.000 D1). A settled paragraph
-    /// costs one flag; the rest, their frame against the port. True while
+    /// reader never sees it blank (LLP 1050.000 D1). When every attached
+    /// paragraph that uses a raster has it whole, no geometry is read. True while
     /// some paragraph lacks pixels: the pump's refresh has work then.
     @discardableResult
-    func paintVisibleText() -> Bool {
+    package func paintVisibleText() -> Bool {
         guard !applying else { return true }
+        // UIKit may paint a transition after changing the window but before
+        // delivering the descendants’ didMoveToWindow callbacks.
+        for id in movingText {
+            if let node = textViews[id] { noteOwedText(node) }
+        }
+        #if DEBUG
+        let expected = Set(textViews.values.filter { !$0.textRasterSettled && $0.usesTextRaster }.map(\.id))
+        assert(owedText == expected, "text owed: missing \(expected.subtracting(owedText).sorted()), extra \(owedText.subtracting(expected).sorted())")
+        #endif
+        guard !owedText.isEmpty else { return false }
+        #if DEBUG
+        textSurfaceBuilds += 1
+        #endif
         let port = viewport.bounds
         let culls = viewport.clipsToBounds
         let presentations = surfaces(includingRetiring: true).filter { $0.kind != .document }
@@ -895,7 +934,7 @@ extension Presenter {
     /// Paint motion's colour reaches the screen with its value (LLP 1062
     /// D6): a paragraph whose presented colour a batch changed is painted
     /// as the batch ends, where it shows, not on a worker a frame later.
-    /// The paragraphs a batch gave new words (`changedText`) show them in
+    /// The paragraphs a batch invalidated (`changedText`) show their current text in
     /// the batch's frame, where they show (LLP 1116.005 D4), as UIKit draws a
     /// label's new text in the commit that sets it, never the old words a
     /// frame longer while a worker paints.
@@ -934,6 +973,7 @@ extension Presenter {
     @discardableResult
     func refreshVisibleText(deadline: TimeInterval? = nil, velocity: CGFloat = 0, interval: TimeInterval = 1.0 / 60) -> Bool {
         guard !applying else { return true }
+        guard !owedText.isEmpty else { return false }
         let port = viewport.bounds
         let soon = min(port.height, abs(velocity) * CGFloat(interval) * 2)
         // A quarter second of travel, at least a viewport.

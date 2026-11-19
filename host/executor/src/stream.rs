@@ -100,7 +100,8 @@ fn opened(
         Ok(deadline) => deadline,
         Err(why) => return complete(shared, ticket, failed(FailureKind::Refused, why)),
     };
-    // A socket's idle timeout counts from here, its opening included (LLP 1016.000 D11).
+    // An idle timeout counts from here (LLP 1016.000 D11): a socket's
+    // opening counts as received, an HTTP stream's head does not.
     let quiet = match (request.idle_timeout_ms)
         .map(|ms| Quiet::arm(ms, &abort))
         .transpose()
@@ -134,21 +135,38 @@ fn opened(
             Ok(b) if is_socket(&request.url) => open_socket(&b, request, &abort).map(|s| (s, b)),
             // A body from an app file, read as the stream opens (LLP 1108 D6 R2).
             Ok(b) => {
-                super::body::resolve(shared.roots_for(&request), grants, &mut request, &|| {
+                let ended = || {
                     abort
                         .signal()
                         .aborted()
                         .then(|| failed(FailureKind::Aborted, "native request aborted"))
-                })
-                .and_then(|()| {
-                    // An upload's place in the budget, held until its
-                    // exchange ends (`open` reads it whole), is its body's.
-                    if let Some(held) = held.as_mut() {
-                        held.keep(request.body.len().saturating_mul(COPIES));
-                    }
-                    open(Ok(&b), request, forced, &abort, sent, shared)
-                })
-                .map(|opened| (opened, b))
+                };
+                let place = held.as_mut().and_then(upload::Held::place);
+                super::body::prepare(shared, &request, &ended, place.as_ref())
+                    .and_then(|roots| {
+                        super::body::resolve(
+                            roots.as_ref(),
+                            grants,
+                            &mut request,
+                            &ended,
+                            place,
+                            abort.signal(),
+                        )
+                    })
+                    .and_then(|file| {
+                        // An upload's place in the budget, held until its
+                        // exchange ends, is its body's: an inline one's
+                        // copies, or a file's reader (LLP 1133.008.000 D4).
+                        if let Some(held) = held.as_mut() {
+                            held.keep(match file {
+                                Some(_) => super::body::READ_BOUND,
+                                None => request.body.len().saturating_mul(COPIES),
+                            });
+                        }
+                        let quiet = quiet.as_ref();
+                        open(Ok(&b), request, file, forced, &abort, sent, quiet, shared)
+                    })
+                    .map(|opened| (opened, b))
             }
             Err(message) => Err(failed(FailureKind::Refused, message)),
         }
@@ -159,16 +177,16 @@ fn opened(
     let opened = opened
         .map_err(|end| timed_out(end, passed, timeout.unwrap_or(0)))
         .map_err(|end| Quiet::finish(quiet.as_ref(), end));
-    if let (Ok(_), Some(quiet)) = (&opened, &quiet) {
+    if let (Ok((Opened::Socket(..), _)), Some(quiet)) = (&opened, &quiet) {
         quiet.heard();
     }
     match opened {
         // The bindings live as long as the body they opened.
         Ok((Opened::Events(response, limit), _bindings)) => {
-            read_events(shared, ticket, response, limit, abort)
+            read_events(shared, ticket, response, limit, abort, quiet)
         }
         Ok((Opened::Bytes(response, limit), _bindings)) => {
-            bytes::read(shared, ticket, response, limit, abort)
+            bytes::read(shared, ticket, response, limit, abort, quiet)
         }
         Ok((Opened::Socket(socket, limit), _bindings)) if two_way => {
             socket::read(shared, ticket, socket, limit, abort, quiet)
@@ -409,13 +427,17 @@ pub fn socket_closed(code: u16, reason: &str) -> String {
 /// anything else is the stream's one answer, whole: a status that is not
 /// 2xx, a body that is not `text/event-stream` (unless `bytes`), an
 /// upload's reply, or the failure that kept it from opening. `sent` is told
-/// an upload's bytes as they are sent.
+/// an upload's bytes as they are sent; `quiet` hears each read of a reply
+/// read whole.
+#[allow(clippy::too_many_arguments)]
 fn open(
     bindings: Result<&ibex2::host::Bindings, &str>,
     request: Request,
+    file: Option<ibex2::stdlib::fetch::BodyFile>,
     forced: bool,
     abort: &AbortController,
     sent: Option<Sent>,
+    quiet: Option<&Quiet>,
     shared: &Arc<Shared>,
 ) -> Result<Opened, Outcome> {
     if abort.signal().aborted() {
@@ -432,6 +454,7 @@ fn open(
     let upload = request.upload_progress;
     let timeout = request.timeout_ms.filter(|_| upload);
     let mut req = fetch_request(request, forced);
+    req.body_file = file;
     super::cache::observe(shared, &mut req);
     if !upload && !req.headers.has("accept") {
         req.headers.set("accept", "text/event-stream");
@@ -444,6 +467,9 @@ fn open(
     // the whole exchange and URLSession's 60 s without data never end it
     // first.
     req.timeout = timeout.map(|ms| Duration::from_millis(u64::from(ms) + 1_000));
+    // Any other stream stays open as long as the server holds it: no limit
+    // of the transport's own ends it (LLP 1016.000 D11).
+    req.open_ended = !upload;
     let r = b
         .fetch
         .stream(req, &abort.signal())
@@ -473,7 +499,12 @@ fn open(
                 body.cancel();
                 return Err(failed(FailureKind::Refused, "HTTP response exceeds limit"));
             }
-            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                if let Some(quiet) = quiet {
+                    quiet.heard();
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+            }
             Err(e) => return Err(fetch_failure(e, abort)),
         }
     }
@@ -493,13 +524,20 @@ fn read_events(
     response: StreamingResponse,
     limit: usize,
     abort: AbortController,
+    quiet: Option<Quiet>,
 ) {
     let mut body = response.body;
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut events = EventStream::new(limit);
         let mut chunk = [0; 16 * 1024];
         loop {
-            match body.read(&mut chunk) {
+            let read = body.read(&mut chunk);
+            // Any bytes count, a comment's too: a server keeps a quiet
+            // stream alive with comments (LLP 1016.000 D11).
+            if let (Ok(1..), Some(quiet)) = (&read, &quiet) {
+                quiet.heard();
+            }
+            match read {
                 Ok(0) => return failed(FailureKind::Network, "the event stream ended"),
                 Ok(n) => match events.push(&chunk[..n]) {
                     Ok(messages) => {
@@ -533,6 +571,7 @@ fn read_events(
         }
     }))
     .unwrap_or_else(|_| failed(FailureKind::Aborted, "the stream reader panicked"));
+    let run = Quiet::finish(quiet.as_ref(), run);
     body.cancel();
     complete(shared, ticket, run);
 }
@@ -657,7 +696,7 @@ mod long_poll;
 #[path = "socket.rs"]
 mod socket;
 #[path = "upload.rs"]
-mod upload;
+pub(super) mod upload;
 
 #[cfg(test)]
 #[path = "stream_tests.rs"]

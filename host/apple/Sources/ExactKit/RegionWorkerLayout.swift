@@ -1,28 +1,36 @@
+#if os(macOS)
 import Foundation
 import CoreText
 import CryptoKit
+
+package enum RegionFlowFallback: Error { case incomplete }
+
 // Only live layouts own this preparation. It never crosses the worker queue or
 // attaches to Sendable source/metadata. Attributed and opaque typesetter storage
 // now live as long as their last layout; pixel/index budgets do not cover them.
-final class RegionPreparedSource {
-    let source: RegionTextSource
-    let sourceSHA256: String
-    let attributed: NSAttributedString
-    let typesetter: CTTypesetter
-    let sourceMap: SourceMap
-    let emergencyBreaks: [Int]
+package final class RegionPreparedSource {
+    package let source: RegionTextSource
+    package let sourceSHA256: String
+    package let attributed: NSAttributedString
+    package let typesetter: CTTypesetter
+    package let sourceMap: SourceMap
+    package let emergencyBreaks: [Int]
+    package let emergencyHyphens: Bool
+    package lazy var flow = TextFlowSource(attributed: attributed, typesetter: typesetter,
+                                  overflowWrap: source.overflowWrap, whiteSpace: source.whiteSpace)
     // Unicode opportunities depend on this exact source, never its width.
-    lazy var lineBreakBoundaries: [Int] = TextEngine.lineBreaks(attributed.string as NSString, length: attributed.length)
-    lazy var breakPlan: LineBreakPlan = {
+    package lazy var lineBreakBoundaries: [Int] = TextEngine.lineBreaks(attributed.string as NSString, length: attributed.length)
+    package lazy var breakPlan: LineBreakPlan = {
         var plan = LineBreakPlan()
         plan.boundaries = lineBreakBoundaries
         plan.prepare(attributed.string as NSString, length: attributed.length, emergency: emergencyBreaks)
         return plan
     }()
 
-    init(_ source: RegionTextSource) {
+    package init(_ source: RegionTextSource, allowEmergency: Bool = true) {
         precondition(!Thread.isMainThread, "region preparation must be worker-owned")
         self.source = source
+        emergencyHyphens = allowEmergency && source.emergencyHyphens
         // Diagnostic identity belongs to this live preparation, not UI capture
         // or a width/history cache. Metadata retains only the immutable string.
         sourceSHA256 = SHA256.hash(data: Data(source.text.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -32,7 +40,7 @@ final class RegionPreparedSource {
             overflowWrap: source.overflowWrap, hyphens: source.hyphens, language: source.language)
         // An ordinary reader can capture an already expanded Spec. Its shaped
         // offsets are the captured source's offsets, including emergency points.
-        if !source.hyphenated { spec.hyphenateAuto() }
+        if !source.hyphenated { spec.hyphenateAuto(allowEmergency: allowEmergency) }
         sourceMap = spec.source
         emergencyBreaks = source.hyphenated ? source.emergencyBreaks : spec.emergencyBreaks
         let value = NSMutableAttributedString(attributedString: source.attributed())
@@ -48,16 +56,16 @@ final class RegionPreparedSource {
 }
 // This record is deliberately NOT Sendable. CTLines and index survive all
 // viewport queries on one queue, then die there before metadata publication.
-final class RegionWorkerLayout {
-    let source: RegionTextSource
-    let lines: [CTLine]
-    let baselines: [CGFloat]
-    let metadata: RegionParagraph
-    let preparation: RegionPreparedSource
+package final class RegionWorkerLayout {
+    package let source: RegionTextSource
+    package let lines: [CTLine]
+    package let baselines: [CGFloat]
+    package let metadata: RegionParagraph
+    package let preparation: RegionPreparedSource
     private var viewportLines: [Int: CTLine] = [:]
-    var lineCount: Int { metadata.lines.count }
-    func beginViewport() { viewportLines.removeAll(keepingCapacity: true) }
-    func line(at index: Int) -> CTLine {
+    package var lineCount: Int { metadata.lines.count }
+    package func beginViewport() { viewportLines.removeAll(keepingCapacity: true) }
+    package func line(at index: Int) -> CTLine {
         if !lines.isEmpty { return lines[index] }
         if let cached = viewportLines[index] { return cached }
         let r = metadata.lines[index].range
@@ -68,7 +76,7 @@ final class RegionWorkerLayout {
         return value
     }
     /// Immutable event geometry; CoreText stays on this worker.
-    func selectionRects(_ selection: NSRange, in box: CGRect) -> [CGRect] {
+    package func selectionRects(_ selection: NSRange, in box: CGRect) -> [CGRect] {
         precondition(!Thread.isMainThread)
         guard selection.location >= 0, selection.length > 0,
               selection.location <= source.utf16Count,
@@ -102,11 +110,11 @@ final class RegionWorkerLayout {
         self.source = source; self.lines = lines; self.baselines = baselines; self.metadata = metadata
         self.preparation = preparation
     }
-    static func shape(_ source: RegionTextSource, width: CGFloat, retainHits: Bool = true,
+    package static func shape(_ source: RegionTextSource, width: CGFloat, retainHits: Bool = true,
                       preparation: RegionPreparedSource? = nil, compact: Bool = false) -> RegionWorkerLayout {
         shape(source, width: width, retainHits: retainHits, preparation: preparation, compact: compact, beforeMetadata: {})
     }
-    static func shape(_ source: RegionTextSource, width: CGFloat, retainHits: Bool = true,
+    package static func shape(_ source: RegionTextSource, width: CGFloat, retainHits: Bool = true,
                       preparation: RegionPreparedSource? = nil, compact: Bool = false,
                       beforeMetadata: () throws -> Void) rethrows -> RegionWorkerLayout {
         precondition(!Thread.isMainThread, "region shape must be worker-owned")
@@ -138,8 +146,13 @@ final class RegionWorkerLayout {
         func removed(_ line: CTLine, _ room: CGFloat) -> CGFloat {
             TextEngine.uncountedTrailingWidth(line, whiteSpace: source.whiteSpace, source: attributed, room: room)
         }
+        // The line `TextEngine.layout` measures and `line(at:)` draws, its rooms placed.
+        func made(_ range: CFRange) -> CTLine {
+            TextEngine.finishedLine(CTTypesetterCreateLine(typesetter, range), source: attributed, range: range, justify: nil)
+        }
         let balanced = source.balance && spec.lineClamp == 0 && width.isFinite && width > 0
-            ? plan.balance(limit, length: length, inset: { Double(source.insets.at($0).width) }, removed: removed,
+            ? plan.balance(limit, length: length, fontSize: source.strut.map { CTFontGetSize($0.value) } ?? 0, justified: spec.align == 3,
+                           insets: source.insets, line: made, removed: removed,
                            next: next, typesetter: typesetter, source: attributed) : nil
         while start < length {
             if lineCount % 128 == 0 { try beforeMetadata() }
@@ -150,13 +163,13 @@ final class RegionWorkerLayout {
                 count = length - start
             } else if source.whiteSpace == 4 {
                 count = CTTypesetterSuggestLineBreak(typesetter, start, Double.greatestFiniteMagnitude)
+            } else if let balanced, lineCount < balanced.counts.count {
+                count = balanced.counts[lineCount]
             } else {
-                let room = (balanced.map { start < $0.until ? $0.room : limit } ?? limit) - Double(inset.width)
-                count = next(&plan, start, room)
+                count = next(&plan, start, limit - Double(inset.width))
             }
             if count <= 0 { count = length - start }
-            var line = TextEngine.inkedSoftHyphen(CTTypesetterCreateLine(typesetter, CFRangeMake(start, count)),
-                                                  source: attributed, range: CFRangeMake(start, count))
+            var line = made(CFRangeMake(start, count))
             var clamps = false
             let room = limit - Double(inset.width)
             var natural: CGFloat? // as TextEngine.layout: a too-long word keeps its width
@@ -214,7 +227,7 @@ final class RegionWorkerLayout {
             maxWidth = max(maxWidth, w)
             if retainHits {
                 if compact {
-                    summaries.append(RegionLine(line, flush: flush, width: width, rtl: source.direction == 1, whiteSpace: source.whiteSpace,
+                    summaries.append(RegionLine(line, flush: flush, width: width, rtl: source.base(at: CTLineGetStringRange(line).location), whiteSpace: source.whiteSpace,
                                                 text: attributed, inset: inset, captureHits: false,
                                                 conservativeInk: lineInk.isNull ? .zero : lineInk))
                 } else { lines.append(line) }
@@ -249,17 +262,52 @@ final class RegionWorkerLayout {
                                   metadata: metadata, preparation: preparation)
     }
 
-    func exactIndex(at point: CGPoint, in bounds: CGRect) -> Int {
+    package static func shapeFlow(_ source: RegionTextSource, width: CGFloat, exclusions: [TextFlowShape],
+                          preparation: RegionPreparedSource? = nil,
+                          beforeMetadata: () throws -> Void = {}) throws -> RegionWorkerLayout {
+        precondition(!Thread.isMainThread)
+        try beforeMetadata()
+        let preparation = preparation ?? RegionPreparedSource(source, allowEmergency: false)
+        precondition(preparation.source === source && !preparation.emergencyHyphens)
+        let flow = preparation.flow
+        let box = flow.box ?? TextLineBox.paragraph(flow.line, strut: source.strut?.box ?? TextLineBox(), scale: source.lineScale) { range in
+            let lo = preparation.sourceMap.source(range.location)
+            let hi = preparation.sourceMap.source(range.location + range.length)
+            return source.runs(overlapping: NSRange(location: lo, length: hi - lo)).map { $0.font.box }
+        }
+        flow.box = box
+        guard let laid = try flow.layout(width: width, flow: exclusions, box: box, fontSize: source.flowFontSize,
+            clamp: source.lineClamp, direction: source.direction, align: source.align, whiteSpace: source.whiteSpace,
+            checkpoint: beforeMetadata) else { throw RegionFlowFallback.incomplete }
+        var baselines = laid.baselines, bottoms = laid.lineBottoms, height = laid.height
+        var fragments = laid.fragments
+        if source.textBox.trim != 0, let first = baselines.first, let last = baselines.last, let root = source.strut?.value {
+            let top = fragments.first.map { CGFloat($0.y) } ?? 0
+            let cut = TextEngine.textBoxTrim(source.textBox, root: root, first: first - top, last: last - top, height: height - top)
+            TextEngine.trimLines(cut, baselines: &baselines, lineBottoms: &bottoms, height: &height)
+            for i in fragments.indices { fragments[i].y -= Float(cut.0) }
+        }
+        let metadata = try RegionParagraph(source: source, sourceSHA256: preparation.sourceSHA256,
+            lines: laid.lines, baselines: baselines, width: laid.width, height: height,
+            lineBottoms: bottoms, offeredWidth: width, captureHits: false, attributed: flow.attributed,
+            inserted: preparation.sourceMap.inserted, origins: laid.origins, exclusions: exclusions,
+            fragments: fragments, flowLineHeight: laid.flowLineHeight, metadataCheckpoint: beforeMetadata)
+        return RegionWorkerLayout(source: source, lines: laid.lines, baselines: baselines,
+                                  metadata: metadata, preparation: preparation)
+    }
+
+    package func exactIndex(at point: CGPoint, in bounds: CGRect) -> Int {
         precondition(!Thread.isMainThread)
         if point.y < bounds.minY { return 0 }
         if point.y > bounds.maxY { return source.utf16Count }
-        guard let i = metadata.lineIndex(at: point.y - bounds.minY) else { return 0 }
+        guard let i = metadata.lineIndex(at: CGPoint(x: point.x - bounds.minX, y: point.y - bounds.minY)) else { return 0 }
+        if metadata.lines[i].range.length == 0 { return metadata.sourceIndex(metadata.lines[i].range.location) }
         let value = CTLineGetStringIndexForPosition(line(at: i),CGPoint(
             x: point.x - bounds.minX - metadata.lines[i].flushOffset,y: 0))
         return metadata.sourceIndex(value)
     }
 
-    static func minimumWidth(_ source: RegionTextSource) -> CGFloat {
+    package static func minimumWidth(_ source: RegionTextSource) -> CGFloat {
         precondition(!Thread.isMainThread)
         if source.whiteSpace == 2 || source.whiteSpace == 4 {
             return shape(source, width: .infinity, retainHits: false).metadata.width
@@ -282,8 +330,8 @@ final class RegionWorkerLayout {
         let emergency = Set(preparation.emergencyBreaks.map { $0 + 1 })
         let boundaries = preparation.lineBreakBoundaries.filter { !emergency.contains($0) }
         struct Piece: Hashable {
-            let text: NSAttributedString
-            let hyphenated: Bool
+            package let text: NSAttributedString
+            package let hyphenated: Bool
         }
         var words: [Piece: CGFloat] = [:]
         var bytes = 0
@@ -307,3 +355,4 @@ final class RegionWorkerLayout {
     }
 
 }
+#endif

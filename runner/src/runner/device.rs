@@ -186,7 +186,7 @@ impl<D: DataSource> Runner<D> {
             // an absolute path on the driver's machine, never journalled.
             HoldAnswer::Value(v) if hold.capability == "export" => {
                 let v = v.trim();
-                if !(v.starts_with('/') || v.get(1..3) == Some(":\\")) || v.ends_with(['/', '\\']) {
+                if !crate::file_pickers::is_absolute_path(v) || v.ends_with(['/', '\\']) {
                     return Err(format!(
                         "@{ticket} (export): type an absolute file path to save to"
                     ));
@@ -203,7 +203,11 @@ impl<D: DataSource> Runner<D> {
             {
                 let paths = crate::file_pickers::answer_paths(v);
                 let multiple = hold.args.contains("\"multiple\":true");
-                if paths.is_empty() || paths.iter().any(|p| !p.starts_with('/')) {
+                if paths.is_empty()
+                    || paths
+                        .iter()
+                        .any(|p| !crate::file_pickers::is_absolute_path(p))
+                {
                     return Err(format!(
                         "@{ticket} ({}): type an absolute path",
                         hold.capability
@@ -302,6 +306,7 @@ impl<D: DataSource> Runner<D> {
     /// Retire every hold whose node is gone (after a commit).
     pub(super) fn retire_holds(&mut self) {
         self.retire_modules();
+        self.prune_origins();
         self.views_committed();
         let kernel = &self.kernel;
         let pending = &self.pending;

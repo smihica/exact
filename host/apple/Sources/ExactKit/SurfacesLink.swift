@@ -37,10 +37,12 @@ package protocol SurfacesCapability: AnyObject {
 package struct WorldClock {
     package var pending = false
     package var settleAt: Double?
+    package var nextTickAt: Double?
     package var reply: [String: Any] = [:]
-    package init(pending: Bool = false, settleAt: Double? = nil, reply: [String: Any] = [:]) {
+    package init(pending: Bool = false, settleAt: Double? = nil, nextTickAt: Double? = nil, reply: [String: Any] = [:]) {
         self.pending = pending
         self.settleAt = settleAt
+        self.nextTickAt = nextTickAt
         self.reply = reply
     }
 }
@@ -61,7 +63,7 @@ package protocol Canvases: AnyObject {
     var awaitingDrawable: Bool { get }
     var frameNow: Double? { get set }
     func reset()
-    func surface(view: NodeView, name: String, values: Any)
+    func surface(view: NodeView, name: String, values: Data)
     func destroy(view: UInt32)
     func loadIfNeeded()
     func surfaceWork(_ op: [String: Any], generation: Int)
@@ -103,8 +105,10 @@ package protocol Canvases: AnyObject {
     func restoreReply(_ reply: [String: Any]) -> [String: Any]
     func releaseContact(_ request: [String: Any]) -> [String: Any]?
     func clock(settle: Bool) -> WorldClock
+    #if EXACT_AGENT
     func world(_ agent: Agent, _ request: [String: Any]) -> [String: Any]
     func type(_ agent: Agent, _ view: NodeView, _ request: [String: Any]) -> [String: Any]
+    #endif
     #if os(macOS)
     func occlusionChanged()
     func readback(view: NodeView) -> NSBitmapImageRep?
@@ -140,11 +144,15 @@ package protocol Canvas2DCanvases: AnyObject {
     func place(_ id: UInt32, in box: CGRect, radii: [CGSize])
     func forget(_ id: UInt32)
     func load(_ srcs: [String])
+    /// Lets go handles no mounted canvas asks for any more.
+    func drop(_ srcs: [String])
+    func pictureChanged(_ src: String)
     func waitForReplays(timeout: TimeInterval)
-    /// The kept bitmap of canvas `id` as a PNG, nil when it cannot be
-    /// encoded (LLP 1056 D9, as amended for expo/exact#188). `snapshot` runs
+    /// The kept bitmap of canvas `id` encoded as `type` at `quality`, or as a
+    /// PNG where ImageIO cannot write that type; nil when it cannot be encoded
+    /// (LLP 1056 D9, as amended for expo/exact#188 and #504). `snapshot` runs
     /// the copy synchronously and marks it owned before encoding begins.
-    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, snapshot: @escaping (() -> Bool) -> Bool, done: @escaping (Data?) -> Void)
+    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, type: String, quality: Double?, snapshot: @escaping (() -> Bool) -> Bool, done: @escaping (Data?) -> Void)
 }
 
 extension Canvas2DCanvases {
@@ -206,7 +214,7 @@ final class NoCanvases: Canvases {
     var awaitingDrawable: Bool { false }
     var frameNow: Double?
     func reset() {}
-    func surface(view: NodeView, name: String, values: Any) {}
+    func surface(view: NodeView, name: String, values: Data) {}
     func destroy(view: UInt32) {}
     func loadIfNeeded() {}
     func surfaceWork(_ op: [String: Any], generation: Int) {}
@@ -238,8 +246,10 @@ final class NoCanvases: Canvases {
     func restoreReply(_ reply: [String: Any]) -> [String: Any] { reply }
     func releaseContact(_ request: [String: Any]) -> [String: Any]? { nil }
     func clock(settle: Bool) -> WorldClock { WorldClock() }
+    #if EXACT_AGENT
     func world(_ agent: Agent, _ request: [String: Any]) -> [String: Any] { ["error": "view \(request["id"] ?? "undefined") has no world"] }
     func type(_ agent: Agent, _ view: NodeView, _ request: [String: Any]) -> [String: Any] { ["error": "view \(view.id) has no world"] }
+    #endif
     #if os(macOS)
     func occlusionChanged() {}
     func readback(view: NodeView) -> NSBitmapImageRep? { nil }
@@ -263,6 +273,8 @@ final class NoCanvas2D: Canvas2DCanvases {
     func place(_ id: UInt32, in box: CGRect, radii: [CGSize]) {}
     func forget(_ id: UInt32) {}
     func load(_ srcs: [String]) {}
+    func drop(_ srcs: [String]) {}
+    func pictureChanged(_ src: String) {}
     func waitForReplays(timeout: TimeInterval) {}
-    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, snapshot: @escaping (() -> Bool) -> Bool, done: @escaping (Data?) -> Void) { done(nil) }
+    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, type: String, quality: Double?, snapshot: @escaping (() -> Bool) -> Bool, done: @escaping (Data?) -> Void) { done(nil) }
 }

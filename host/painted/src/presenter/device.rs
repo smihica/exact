@@ -11,6 +11,8 @@ pub struct Device {
     pub night: bool,
     /// The person's font scale: 1 unless they asked for larger or smaller text.
     pub font_scale: f32,
+    /// Android's touch-exploration reading, a proxy for a screen reader (LLP 1039 D10).
+    pub screen_reader: exact_runner::ScreenReader,
     /// The first of the device's locales, a BCP 47 tag (`en-GB`).
     pub locale: String,
     /// That locale is laid out right to left.
@@ -42,6 +44,12 @@ pub struct Device {
 
 /// The root font size at a font scale of 1: CSS's `medium`.
 const ROOT_FONT_SIZE: f64 = 16.0;
+
+impl Device {
+    pub(crate) fn accessibility_text_size(&self) -> bool {
+        self.font_scale.is_finite() && self.font_scale >= 1.3
+    }
+}
 
 impl<D: DataSource> Presenter<D> {
     /// The shell's text-size preference, independent of display DPI. Authored
@@ -100,6 +108,10 @@ impl<D: DataSource> Presenter<D> {
             false => exact_runner::Contrast::NoPreference,
         };
         preferences.bold_text = device.bold_text;
+        if !self.agent {
+            preferences.screen_reader = device.screen_reader;
+        }
+        preferences.accessibility_text_size = device.accessibility_text_size();
         (preferences.pointer, preferences.hover) = match (device.tv, device.touch) {
             (true, _) => (exact_runner::Pointer::None, exact_runner::Hover::None),
             (false, true) => (exact_runner::Pointer::Coarse, exact_runner::Hover::None),
@@ -156,6 +168,9 @@ impl<D: DataSource> Presenter<D> {
     pub fn reader_replaced(&mut self, backend: Box<dyn Backend>) {
         self.brush.replace_backend(backend);
         self.brush.forget_rows();
+        // Nor a source for a flight under way, nor any named definition.
+        self.host.reader_lost_flights();
+        self.brush.shared.recorded.clear();
         // Nor of what it was told of the scrollers: the new one asks again.
         self.reader = Default::default();
         // Nor of Back, the keyboard, the wake lock and the orientation lock,

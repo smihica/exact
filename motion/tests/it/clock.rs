@@ -9,6 +9,7 @@ const ENGINE: u64 = 4;
 const SPINNER: u64 = 5;
 
 fn row(text: &str) -> Animations {
+    exact_motion::link_animations();
     let pulse = Keyframes::parse("from{opacity:0.4}to{opacity:1}").unwrap();
     let mut a = Animations::parse(text).unwrap();
     a.resolve(|name| (name == "pulse").then_some(&pulse));

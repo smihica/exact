@@ -42,6 +42,7 @@ fn boot() -> Host<NoData> {
     )
     .unwrap();
     host.svg.box_motion = true;
+    host.svg.play_transitions = false;
     host.engine.set_lowered_properties(&svg::lowered(true));
     host.start_on_frame(true, 0.0);
     host
@@ -104,7 +105,7 @@ fn a_transition_shows_its_start_at_the_first_frame_then_one_interval() {
     assert!((opacity(&host) - 0.984).abs() < 1e-9, "then one interval");
 }
 
-/// LLP 1055.001 §3: iOS hands a box's opacity transition to Core Animation
+/// LLP 1055.001 §3: Apple hands a box's opacity transition to Core Animation
 /// at the frame that starts it, and takes it back when it is retargeted.
 #[test]
 fn core_animation_plays_a_started_transition_until_it_is_retargeted() {
@@ -920,9 +921,6 @@ fn box_transform_transitions_play_without_sampling_and_reclaim_for_the_agent() {
         844.0,
     )
     .unwrap();
-    host.svg.box_motion = true;
-    host.svg.play_transitions = true;
-    host.engine.set_lowered_properties(&svg::lowered(true));
     host.start_on_frame(true, 0.0);
     host.dispatch_at(id(&host, "go"), Event::Press, 100.0);
     let batch = host.tick_at(112.0, 116.0);
@@ -934,18 +932,24 @@ fn box_transform_transitions_play_without_sampling_and_reclaim_for_the_agent() {
         ("turn", Property::Rotate, "transform.rotation.z"),
         ("grow", Property::Scale, "transform.scale"),
     ] {
-        assert!(
+        // LLP 1126 D10: watchOS has no render server, so they stay sampled.
+        assert_eq!(
             host.engine.is_played(key(&host, name), property),
+            svg::render_server(),
             "{name}: {batch}"
         );
-        assert_eq!(spec(&batch, id(&host, name))["k"], path);
+        if svg::render_server() {
+            assert_eq!(spec(&batch, id(&host, name))["k"], path);
+        }
     }
-    assert_eq!(
-        spec(&batch, id(&host, "move"))["v"],
-        serde_json::json!([0, 50])
-    );
-    let radians = spec(&batch, id(&host, "turn"))["v"][1].as_f64().unwrap();
-    assert!((radians - std::f64::consts::PI).abs() < 1e-5);
+    if svg::render_server() {
+        assert_eq!(
+            spec(&batch, id(&host, "move"))["v"],
+            serde_json::json!([0, 50])
+        );
+        let radians = spec(&batch, id(&host, "turn"))["v"][1].as_f64().unwrap();
+        assert!((radians - std::f64::consts::PI).abs() < 1e-5);
+    }
     for (name, property) in [
         ("hit", Property::Translate),
         ("invoker-parent", Property::Translate),
@@ -1150,4 +1154,34 @@ fn a_box_moving_when_a_control_is_measured_stays_where_it_shows() {
         .value(exact_kernel::motion::motion_node(key), Property::Layout)
         .unwrap();
     assert_eq!(shown.y, moved, "it ends at the measured box");
+}
+
+/// LLP 1003.001 D9 on Apple: a hidden page releases what is held at its
+/// commit and holds nothing new; hiding never clears `presented`.
+#[test]
+fn a_hidden_page_releases_holds_at_their_commit_and_holds_nothing() {
+    let mut host = boot();
+    let go = id(&host, "go");
+    host.dispatch_at(go, Event::Press, 100.0);
+    assert_eq!(opacity(&host), 1.0, "held");
+    let hidden = exact_runner::Page {
+        hidden: true,
+        ..host.runner.page()
+    };
+    host.advance(400.0);
+    let out = host.set_page(hidden);
+    assert!(out.contains("\"ops\""), "{out}");
+    assert!(
+        (opacity(&host) - 0.7).abs() < 1e-9,
+        "timed from its commit: {}",
+        opacity(&host)
+    );
+    host.dispatch_at(go, Event::Press, 500.0);
+    let back = opacity(&host);
+    host.advance(600.0);
+    assert!(
+        opacity(&host) > back,
+        "a commit while hidden starts at once"
+    );
+    assert!(host.runner.presented().seen);
 }

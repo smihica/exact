@@ -53,7 +53,7 @@ impl Running {
     }
 
     fn record(&self, launch: &LaunchPreloads, outcome: PreloadEvent) {
-        launch.0.journal.lock().unwrap().push(PreloadFact {
+        launch.record_fact(PreloadFact {
             name: self.name.into(),
             origin: String::new(),
             outcome,
@@ -353,7 +353,13 @@ impl LaunchContext for Context<'_> {
             Some((PreloadEvent::InvalidHeader, "invalid launch preload header"))
         } else if !crate::executor::valid_request(&request) {
             Some((PreloadEvent::Refused, "invalid launch preload request"))
-        } else if exact_runner::grants::admitting_request(self.grants, &request).is_none() {
+        } else if exact_runner::grants::admitting_request(
+            Some(&exact_runner::grants::LINKED),
+            self.grants,
+            &request,
+        )
+        .is_none()
+        {
             Some((PreloadEvent::RefusedGrant, "launch preload grant refused"))
         } else if self
             .used
@@ -376,7 +382,7 @@ impl LaunchContext for Context<'_> {
         if let Some((outcome, reason)) = refusal {
             if valid_name {
                 self.launch.0.set.get().unwrap().control.defined(&name);
-                self.launch.0.journal.lock().unwrap().push(PreloadFact {
+                self.launch.record_fact(PreloadFact {
                     name,
                     origin: origin(&request),
                     outcome,

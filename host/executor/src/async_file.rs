@@ -15,6 +15,24 @@ pub(in super::super) enum ReaderPhase {
 pub(in super::super) type ReaderHook =
     Arc<dyn Fn(ReaderPhase, Run) -> Result<(), Outcome> + Send + Sync>;
 
+/// What the asynchronous executor reads whole as a file body, since it
+/// does not stream one (LLP 1133.008.000 D4): a larger file is refused,
+/// naming the executor.
+pub(super) const WHOLE_BODY_FROM_BYTES: u64 = 64 << 20;
+
+/// `size`, or the refusal of a file larger than [`WHOLE_BODY_FROM_BYTES`].
+fn whole(path: &str, size: u64) -> Result<u64, Outcome> {
+    if size > WHOLE_BODY_FROM_BYTES {
+        return Err(failed(
+            FailureKind::Unsupported,
+            format!(
+                "exactBodyFrom {path}: too-large: the asynchronous executor reads a file body whole, at most {WHOLE_BODY_FROM_BYTES} bytes, and this one is {size}"
+            ),
+        ));
+    }
+    Ok(size)
+}
+
 impl Machine {
     #[cfg(test)]
     pub(in super::super) fn queued_uploads(&self) -> (usize, usize) {
@@ -44,6 +62,7 @@ impl Machine {
         let path = request.body_from.clone().expect("a file job");
         let (scope, app) = (request.grants.clone(), self.grants.clone());
         let probe = request.clone();
+        let abort = file.abort.clone();
         let (decide, decision) = mpsc::channel();
         // The read stops between chunks once the request has ended.
         let cancel = Arc::new(AtomicBool::new(false));
@@ -92,12 +111,16 @@ impl Machine {
                 // The app's directories open here, on the reader, never on the
                 // starter: a stalled disk holds a reader, not a lane.
                 let roots = m.shared.roots_for(&probe);
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let size = match size {
                     Some(size) => Some(size),
                     None => {
                         #[cfg(test)]
                         m.reader_phase(ReaderPhase::Size, run)?;
-                        let answer = body::size(roots, &app, scope.as_deref(), &path);
+                        let answer = body::size(roots, &app, scope.as_deref(), &path)
+                            .and_then(|size| whole(&path, size));
                         let ok = answer.as_ref().ok().copied();
                         // A failure claims the run when it happens, as any outcome.
                         if ok.is_some()
@@ -124,7 +147,12 @@ impl Machine {
                         size,
                         true,
                         &cancel,
-                    );
+                    )
+                    .and_then(|bytes| {
+                        m.body_destination(lane, run, &probe, &abort)
+                            .map(|destination| PreparedUpload { bytes, destination })
+                            .map_err(Some)
+                    });
                     #[cfg(test)]
                     m.reader_phase(ReaderPhase::Finished(cancel.load(Ordering::Acquire)), run)?;
                     if read.is_ok()
@@ -241,6 +269,7 @@ impl Machine {
             abort,
             retiring,
             fetch,
+            fixture,
             ..
         } = state.book.files.remove(&run).expect("a file job");
         state.book.trash.push(Box::new((abort, retiring, fetch)));
@@ -254,10 +283,12 @@ impl Machine {
             at,
             Job {
                 ticket: run.0,
+                cache_store_withheld: false,
                 request,
                 forced,
-                work: None,
+                work: fixture.map(OwnedWork::HttpResponse),
                 waiting_charge: r.charge,
+                waited_for_preload: false,
                 charge: r.charge,
                 limit: r.limit,
                 forgotten: r.forgotten,
@@ -269,17 +300,17 @@ impl Machine {
         Some(Box::new(move |m: &Arc<Machine>| m.timer.remove(run)))
     }
 
-    /// A file read for `run`: its upload made and its first exchange queued
-    /// for the starter, or its failure settled.
+    /// A file read for `run`: its upload and destination prepared and its
+    /// first exchange queued for the starter, or its failure settled.
     pub(super) fn read(
         self: &Arc<Self>,
         state: &mut State,
         lane: usize,
         run: Run,
-        read: Result<Vec<u8>, Option<Outcome>>,
+        read: Result<PreparedUpload, Option<Outcome>>,
     ) -> Option<After> {
-        let bytes = match read {
-            Ok(bytes) => bytes,
+        let PreparedUpload { bytes, destination } = match read {
+            Ok(prepared) => prepared,
             Err(e) => {
                 // The reader claimed it.
                 let path = state
@@ -311,7 +342,7 @@ impl Machine {
         let file = match (open, file) {
             (true, Some(file)) => file,
             (_, file) => {
-                state.book.trash.push(Box::new((upload, file)));
+                state.book.trash.push(Box::new((upload, file, destination)));
                 return None;
             }
         };
@@ -330,6 +361,8 @@ impl Machine {
                 file.limit,
                 file.fetch,
                 None,
+                destination,
+                file.fixture,
             )
         });
         let origin = origin(&url);
@@ -372,10 +405,12 @@ mod tests {
             let (lane, charge, limit) = super::super::super::reservation(&request).unwrap();
             state.jobs[lane].push_back(Job {
                 ticket,
+                cache_store_withheld: false,
                 request,
                 forced: false,
                 work: None,
                 waiting_charge: charge,
+                waited_for_preload: false,
                 charge,
                 limit,
                 forgotten: false,

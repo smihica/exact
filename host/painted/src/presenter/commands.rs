@@ -3,6 +3,7 @@
 //! something (a haptic, the clipboard, a link out, the share sheet) is asked
 //! of the host's shell where it has one (`requests.rs`, LLP 1115.001 D5).
 
+use super::replacement::Waiting;
 use super::Presenter;
 use crate::host::HostError;
 use exact_plan::EventKind;
@@ -37,12 +38,22 @@ impl<D: DataSource> Presenter<D> {
         self.orientation_unavailable();
         self.package_turn();
         self.run_queued_commands();
-        if self.pending_update {
-            self.pending_update = false;
+        self.resume_reload();
+        if self.update_ready() && !self.activation_deferred() {
+            let Some(Waiting::Update { explicit, .. }) = self.waiting.take() else {
+                return;
+            };
+            let waits = |hold| {
+                Some(Waiting::Update {
+                    explicit,
+                    hold: Some(hold),
+                })
+            };
             match self.activate_update(data()) {
                 Ok(true) => {}
                 Ok(false) => eprintln!("exact update: nothing is staged"),
-                Err(HostError::PreparingModule) => self.pending_update = true,
+                Err(HostError::PreparingModule) => self.waiting = waits("module"),
+                Err(HostError::RequestsPending) => self.waiting = waits("requests"),
                 Err(e) => eprintln!("exact update: activate: {e}"),
             }
         }
@@ -59,6 +70,7 @@ impl<D: DataSource> Presenter<D> {
         // A hot key's press, the host's to raise (LLP 1133.025 D11 item 3).
         crate::desktop::raise(self.host.runner_mut());
         self.modules_in();
+        self.agent_reader_turn();
     }
 
     /// `postMessage(text, name)` into the named surface's canvas, stamped now
@@ -86,19 +98,13 @@ impl<D: DataSource> Presenter<D> {
                         eprintln!("exact update: no store, or a check is already running");
                     }
                 }
-                "deliveryActivate" => self.pending_update = true,
+                "deliveryActivate" => self.owe_update(true),
                 "relaunch" => self.host.log(if self.agent {
                     "relaunch refused: the agent owns this process; start a new drive on the same storage"
                 } else {
                     "relaunch refused: process relaunch is unsupported on Linux"
                 }),
-                // The app's chosen appearance is what a `light-dark()` colour
-                // resolves to here (LLP 1034 D2); `system` is no override.
-                "setScheme" => self.app_scheme(match c.args.first() {
-                    Some(v) if v.as_str() == Some("dark") => Some(true),
-                    Some(v) if v.as_str() == Some("light") => Some(false),
-                    _ => None,
-                }),
+                "setScheme" => self.app_scheme(super::preferences::app_dark(c.args.first())),
                 // The shell's haptic engine (LLP 1077 D14); desktop Linux has
                 // none, and there is nothing to feel there.
                 "haptic" => {
@@ -184,6 +190,10 @@ impl<D: DataSource> Presenter<D> {
                 // The shell's clipboard, and its browser, mail app and dialer.
                 "copyText" if self.clipboard.is_some() || self.has_shell() => self.copy_text(&c.args),
                 "openURL" if self.has_shell() || self.url_opener.is_some() => self.open_url(&c.args),
+                // A reader's players take them (LLP 1042.001 §5, piece 4).
+                name @ ("fastSeek" | "load" | "requestFullscreen") if cfg!(target_os = "android") => {
+                    self.media_command(name, &c.args)
+                }
                 // With no shell there is no clipboard or browser; and no
                 // editor, dev menu or window to close on any Linux host, and
                 // no media player (LLP 1042 §8) or floating window (§9): known, and named so.

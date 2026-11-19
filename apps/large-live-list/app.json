@@ -1,0 +1,12 @@
+{
+  "$schema": "../../scripts/app.schema.json",
+  "name": "Large Live List",
+  "id": "com.exact.large-live-list",
+  "start_url": "/",
+  "app": { "id": "com.exact.large-live-list", "name": "Large Live List" },
+  "env": ["MESSAGE_SOCKET"],
+  "host": {
+    "web": {},
+    "macos": { "minimumOS": "14.0", "window": { "width": 760, "height": 700 } }
+  }
+}

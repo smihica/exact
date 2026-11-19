@@ -1,0 +1,181 @@
+// @ref LLP 1069.010 D3 — export is a copy the host makes. `saveFile(id,
+// from, suggestedName)`: the runner rules first (bad data or an ungranted
+// `from` refused into the journal; under the agent the request held as
+// `export`, answered by `type @t <path>` or `tap @t cancel`), then macOS
+// shows an NSSavePanel sheet and copies the `app:/` file to the chosen URL,
+// and iOS copies it into a scratch file and hands that to the exporting
+// document picker. The chosen name arrives as `change` on the element `id`
+// names; a dismissed panel is HTML's `cancel` there. `saveFile(id, text=…,
+// suggestedName=…)` saves the text itself: the host writes it to a scratch
+// file and goes on as for a copy (x2apps notes #4).
+import ExactCore
+import ExactKit
+import Foundation
+import UniformTypeIdentifiers
+#if canImport(UIKit)
+import UIKit
+#else
+import AppKit
+#endif
+
+extension Picker {
+    /// `saveFile(id, from, suggestedName)`, or `(id, none, suggestedName,
+    /// text)` for `text=`, from any action; `startIn=` makes either five
+    /// (`none` in the fourth for a copy; LLP 1173 D2).
+    func save(_ args: [Any]) {
+        let ruling = session.runtime.command(PickerRequests.save(args, agent: ExactEnv.agentMode))
+        let view = (ruling["view"] as? NSNumber)?.uint32Value
+        if ruling["refused"] != nil { if let view { saveCancelled(view) }; return }
+        guard ruling["present"] as? Bool == true, let view, let name = ruling["suggestedName"] as? String else { return }
+        let startIn = startFolder(ruling["startIn"] as? String, "saveFile")
+        if let text = ruling["text"] as? String {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("exact-text-\(UUID().uuidString)", isDirectory: true)
+            let file = dir.appendingPathComponent(name)
+            // The scratch copy holds the app's text, so it goes when the save ends.
+            let discard: () -> Void = { _ = try? FileManager.default.removeItem(at: dir) }
+            do {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try Data(text.utf8).write(to: file)
+            } catch {
+                discard()
+                session.log("saveFile: refused: \(error.localizedDescription)"); saveCancelled(view); return
+            }
+            do {
+                presentSave(view: view, file: try FileHandle(forReadingFrom: file), name: name, startIn: startIn, done: discard)
+            } catch {
+                discard()
+                session.log("saveFile: refused: \(error.localizedDescription)"); saveCancelled(view)
+            }
+            return
+        }
+        guard let from = ruling["from"] as? String else { return }
+        guard let file = appFile(from) else {
+            session.log("saveFile: refused: \(from) is not a readable app file"); saveCancelled(view); return
+        }
+        presentSave(view: view, file: file, name: name, startIn: startIn)
+    }
+
+    /// The agent's answer to a held export (LLP 1069.007 D4): the copy goes
+    /// to the driver's path, as the panel's would go to the chosen URL.
+    func saveAnswered(_ reply: [String: Any], request: [String: Any]) {
+        guard reply["capability"] as? String == "export", let view = (reply["node"] as? NSNumber)?.uint32Value else { return }
+        if reply["answered"] as? String == "cancel" { saveCancelled(view); return }
+        let destination = URL(fileURLWithPath: (request["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
+        if let text = (reply["request"] as? [String: Any])?["text"] as? String {
+            do { try Data(text.utf8).write(to: destination) } catch {
+                session.log("saveFile: refused: \(error.localizedDescription)"); saveCancelled(view); return
+            }
+            saved(view, name: destination.lastPathComponent)
+            return
+        }
+        guard let from = (reply["request"] as? [String: Any])?["from"] as? String, let file = appFile(from) else {
+            session.log("saveFile: refused: no app file to copy"); saveCancelled(view); return
+        }
+        copyOut(view: view, file: file, to: destination)
+    }
+
+    /// Keep the opened file while a panel is showing: replacing its name
+    /// must not change what the person exports.
+    func appFile(_ path: String) -> FileHandle? {
+        AppFileWalk.open(path, roots: session.appFileRoots.mapValues { URL(fileURLWithPath: $0, isDirectory: true) })
+    }
+
+    /// Replace whatever is at `destination` with a copy of `file`, then fire
+    /// `change` with the chosen name.
+    func copyOut(view: UInt32, file: FileHandle, to destination: URL) {
+        do {
+            try Self.copy(file, to: destination)
+        } catch {
+            session.log("saveFile: refused: \(error.localizedDescription)"); saveCancelled(view); return
+        }
+        saved(view, name: destination.lastPathComponent)
+    }
+
+    private static func copy(_ file: FileHandle, to destination: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+        let fd = Darwin.open(destination.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let output = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? output.close() }
+        try file.seek(toOffset: 0)
+        while let bytes = try file.read(upToCount: 64 * 1024), !bytes.isEmpty { try output.write(contentsOf: bytes) }
+    }
+
+    func saved(_ view: UInt32, name: String) {
+        session.log("saveFile: saved")
+        session.apply(session.runtime.valueChange(view, name, now: session.now()))
+    }
+
+    func saveCancelled(_ view: UInt32) {
+        session.log("saveFile: cancelled")
+        session.apply(session.runtime.pickerCancel(view, now: session.now()))
+    }
+}
+
+#if os(tvOS)
+extension Picker {
+    func presentSave(view: UInt32, file _: FileHandle, name _: String, startIn _: URL?, done: () -> Void = {}) {
+        // tvOS has no document picker to export through.
+        done()
+        session.log("saveFile: refused: no document picker"); saveCancelled(view)
+    }
+}
+#elseif canImport(UIKit)
+extension Picker {
+    /// iOS: a scratch copy under the suggested name, handed to the
+    /// exporting document picker, which moves a copy where the person says.
+    /// `done` runs once `file` is copied or refused: the picker reads only its copy.
+    func presentSave(view: UInt32, file: FileHandle, name: String, startIn: URL?, done: () -> Void = {}) {
+        defer { done() }
+        guard let controller = ViewPresentation.presenter(for: session.presenter.views[view] ?? session.presenter.root) else {
+            session.log("saveFile: refused: no window"); saveCancelled(view); return
+        }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("exact-export-\(UUID().uuidString)", isDirectory: true)
+        let staged = dir.appendingPathComponent(name)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Self.copy(file, to: staged)
+        } catch {
+            try? FileManager.default.removeItem(at: dir)
+            session.log("saveFile: refused: \(error.localizedDescription)"); saveCancelled(view); return
+        }
+        let picker = UIDocumentPickerViewController(forExporting: [staged], asCopy: true)
+        picker.directoryURL = startIn
+        picker.delegate = self
+        exports[ObjectIdentifier(picker)] = (view, dir)
+        controller.present(picker, animated: true)
+    }
+
+    /// The exporting picker's outcome; `false` when `controller` is not one.
+    func exportFinished(_ controller: UIDocumentPickerViewController, urls: [URL]?) -> Bool {
+        guard let (view, dir) = exports.removeValue(forKey: ObjectIdentifier(controller)) else { return false }
+        try? FileManager.default.removeItem(at: dir)
+        if let url = urls?.first { saved(view, name: url.lastPathComponent) } else { saveCancelled(view) }
+        return true
+    }
+}
+#else
+extension Picker {
+    /// macOS: an NSSavePanel sheet on the window, typed by the suggested
+    /// name's extension; the copy replaces what the person agreed to replace.
+    /// `done` runs when the panel ends, saved or cancelled.
+    func presentSave(view: UInt32, file: FileHandle, name: String, startIn: URL?, done: @escaping () -> Void = {}) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = name
+        if let startIn { panel.directoryURL = startIn }
+        panel.canCreateDirectories = true
+        let ext = (name as NSString).pathExtension
+        if !ext.isEmpty, let type = UTType(filenameExtension: ext) { panel.allowedContentTypes = [type] }
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
+            defer { done() }
+            guard let self else { return }
+            guard response == .OK, let url = panel?.url else { self.saveCancelled(view); return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            self.copyOut(view: view, file: file, to: url)
+            if scoped { url.stopAccessingSecurityScopedResource() }
+        }
+        if let window = session.presenter.root.window { panel.beginSheetModal(for: window, completionHandler: finish) }
+        else { panel.begin(completionHandler: finish) }
+    }
+}
+#endif

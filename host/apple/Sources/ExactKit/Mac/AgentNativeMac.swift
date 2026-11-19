@@ -87,6 +87,7 @@ extension Presenter {
             if sub === o.clipBox { return ("clip", id) }
             if sub === o.metal || sub === o.overlay { return ("canvas", id) }
             if sub === o.field || sub === o.textArea || sub === o.textAreaScroll { return ("editor", id) }
+            if o.inlineKeyViews.values.contains(where: { $0 === sub }) { return ("editor", id) }
             if sub === o.scroll { return ("scroll", id) }
             if sub === o.video || sub === o.web || sub is FrameScaleHolder { return ("heavy", id) }
             if sub === controls.controls[id] { return ("control", id) }
@@ -95,7 +96,7 @@ extension Presenter {
         }
         // A content region's surface (`RegionController.flush`): this
         // session's, by its controller; its interior is the region's own.
-        if let surface = sub as? RegionSurfaceMac, let regions = session?.regions, surface.owner === regions { return ("region", owner?.id) }
+        if session?.regions.ownsSurface(sub) == true { return ("region", owner?.id) }
         if menus.inspectionOwns(sub) { return ("menu", owner?.id) }
         if dialogs.inspectionOwns(sub) { return ("dialog", owner?.id) }
         if navigation.inspectionOwns(sub) { return ("ground", owner?.id) }
@@ -139,6 +140,7 @@ extension Presenter {
             }
             let n = liveView(v)
             if let n { e["node"] = Int(n.id) }
+            else if let staged = v as? NodeView, staged.held { e["role"] = "staged"; entries.append(e); return } // LLP 1072 T13
             else if leaving.contains(ObjectIdentifier(v)) { e["role"] = "leaving" }
             else if let parent, let a = inspectionAccount(v, in: parent, owner: owner) { e["role"] = a.role; if let o = a.owner { e["owner"] = Int(o) } }
             else { e["role"] = "unaccounted" }
@@ -174,7 +176,7 @@ extension Presenter {
                 if report.views > AgreementReport.walkCap { report.incomplete("walk-cap"); break walk }
                 if judged { report.judged += 1 } else {
                     report.opaque += 1
-                    if let what = elements.regions.owner(of: sub) { report.opaqueBy[what, default: 0] += 1 }
+                    if let what = elements.regionOwner(of: sub) { report.opaqueBy[what, default: 0] += 1 }
                 }
                 if let n = sub as? NodeView {
                     // In the presenter's map is not alive: the kernel must

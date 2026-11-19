@@ -16,19 +16,19 @@ import CExact
 /// The view a native container shows a subtree in: flipped, as node views
 /// are, clipping what overflows the block, and saying when the container
 /// (a divider, a window) gave it another size.
-final class BlockView: NSView {
-    var sizeChanged: ((CGSize) -> Void)?
-    var positionChanged: (() -> Void)?
+package final class BlockView: NSView {
+    package var sizeChanged: ((CGSize) -> Void)?
+    package var positionChanged: (() -> Void)?
     /// The moves of a free pointer over a window of the session's own (a
     /// popover's, a sheet's), as the page's viewport reports its window's
     /// (PageScrollView.swift): an authored ancestor out in the page hears
     /// them, though no tracking area of its own is in this window.
-    var pointerTracking: ((NSEvent) -> Void)? { didSet { updateTrackingAreas() } }
+    package var pointerTracking: ((NSEvent) -> Void)? { didSet { updateTrackingAreas() } }
     private var pointerArea: NSTrackingArea?
-    override var isFlipped: Bool { true }
-    override init(frame: NSRect) { super.init(frame: frame); clipsToBounds = true }
-    required init?(coder: NSCoder) { nil }
-    override func updateTrackingAreas() {
+    package override var isFlipped: Bool { true }
+    package override init(frame: NSRect) { super.init(frame: frame); clipsToBounds = true }
+    package required init?(coder: NSCoder) { nil }
+    package override func updateTrackingAreas() {
         super.updateTrackingAreas()
         guard pointerTracking != nil, pointerArea == nil else { return }
         // In the active app, not only the key window: a popover need not be
@@ -36,15 +36,15 @@ final class BlockView: NSView {
         let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeInActiveApp, .inVisibleRect], owner: self, userInfo: nil)
         addTrackingArea(area); pointerArea = area
     }
-    override func mouseEntered(with event: NSEvent) { pointerTracking?(event) }
-    override func mouseMoved(with event: NSEvent) { pointerTracking?(event) }
-    override func mouseExited(with event: NSEvent) { pointerTracking?(event) }
-    override func setFrameOrigin(_ newOrigin: NSPoint) {
+    package override func mouseEntered(with event: NSEvent) { pointerTracking?(event) }
+    package override func mouseMoved(with event: NSEvent) { pointerTracking?(event) }
+    package override func mouseExited(with event: NSEvent) { pointerTracking?(event) }
+    package override func setFrameOrigin(_ newOrigin: NSPoint) {
         let old = frame.origin
         super.setFrameOrigin(newOrigin)
         if newOrigin != old { positionChanged?() }
     }
-    override func setFrameSize(_ newSize: NSSize) {
+    package override func setFrameSize(_ newSize: NSSize) {
         let old = frame.size
         super.setFrameSize(newSize)
         if newSize != old { sizeChanged?(newSize) }
@@ -52,7 +52,7 @@ final class BlockView: NSView {
 }
 
 /// The subtrees shown in views of their own.
-final class BlockHost {
+package final class BlockHost {
     private weak var presenter: Presenter?
     private struct Entry {
         let node: NodeView
@@ -86,11 +86,11 @@ final class BlockHost {
     private(set) var rects: [UInt32: CGRect] = [:]
     /// A block's used size changed: a sheet sizes its window from it.
     var onUsed: ((UInt32, CGSize) -> Void)?
-    init(_ presenter: Presenter) { self.presenter = presenter }
+    package init(_ presenter: Presenter) { self.presenter = presenter }
 
     /// Whether `node`'s view lives in a container's view: a `children` op of
     /// its authored parent leaves it there.
-    func owns(_ node: NodeView) -> Bool { entries[node.id]?.node === node }
+    package func owns(_ node: NodeView) -> Bool { entries[node.id]?.node === node }
 
     /// The subtrees in containers of their own, in the order they were
     /// shown: the page a walk of the root does not reach.
@@ -98,7 +98,7 @@ final class BlockHost {
 
     /// Event paths keep the authored parent across a native container.
     /// A home that has disappeared ends the path.
-    func parent(of node: NodeView) -> NSView? {
+    package func parent(of node: NodeView) -> NSView? {
         guard let entry = entries[node.id], entry.node === node else { return node.superview }
         return entry.home
     }
@@ -108,7 +108,7 @@ final class BlockHost {
     /// for a reader of the tree's shape (a stack's routes). Each goes after
     /// the nearest sibling that was before it and is still there, so a
     /// sibling mounted since (a route pushed over it) comes after it.
-    func authored(_ mounted: [NodeView], in home: NSView) -> [NodeView] {
+    package func authored(_ mounted: [NodeView], in home: NSView) -> [NodeView] {
         guard !entries.isEmpty else { return mounted }
         var out = mounted
         for entry in entries.values.sorted(by: { $0.turn < $1.turn }) where entry.home === home && !out.contains(where: { $0 === entry.node }) {
@@ -123,7 +123,7 @@ final class BlockHost {
     /// `placeholder`: `node` is a split's own placeholder, `display: none`
     /// but where its container shows it (LLP 1116.006 D2). `owner`: its
     /// container is a content owner, not a popover (LLP 1123 D2).
-    func show(_ node: NodeView, in container: NSView, block: HostBlock, placement: BlockPlacement? = nil, owner: Bool = true,
+    package func show(_ node: NodeView, in container: NSView, block: HostBlock, placement: BlockPlacement? = nil, owner: Bool = true,
               used: ((CGSize) -> Void)? = nil, placeholder: Bool = false) {
         guard let presenter, presenter.views[node.id] === node else { return }
         // Outside the root (a sheet, a popover, a split's pane), still this
@@ -134,7 +134,7 @@ final class BlockHost {
             let home = node.superview, siblings = home?.subviews ?? []
             let next = siblings.firstIndex(of: node).flatMap { $0 + 1 < siblings.count ? siblings[$0 + 1] : nil }
             // Its authored siblings, those already in containers of their own among them.
-            let nodes = home.map { authored($0.subviews.compactMap { $0 as? NodeView }, in: $0) } ?? []
+            let nodes = home.map { authored(NodeView.structural($0.subviews), in: $0) } ?? []
             let before = nodes.prefix { $0 !== node }.map { Sibling(node: $0) }
             turns += 1
             entries[node.id] = Entry(node: node, home: home, next: next, before: before, turn: turns, block: block, placement: placement, used: used,
@@ -167,14 +167,14 @@ final class BlockHost {
     /// A split's placeholder this shows was restyled by a commit: its shown
     /// style is asked for again, which the runner answers with nothing
     /// where it stands.
-    func showAgain(_ node: NodeView) {
+    package func showAgain(_ node: NodeView) {
         guard entries[node.id]?.node === node, entries[node.id]?.placeholder == true else { return }
         tell([], shows: [(node.id, true)])
     }
 
     /// The container gave the subtree another box: a divider moved, a
     /// sheet's maximum changed with its parent window.
-    func resize(_ node: NodeView, _ block: HostBlock, placement: BlockPlacement? = nil) {
+    package func resize(_ node: NodeView, _ block: HostBlock, placement: BlockPlacement? = nil) {
         guard owns(node), entries[node.id]?.block != block || entries[node.id]?.placement != placement else { return }
         entries[node.id]?.block = block
         entries[node.id]?.placement = placement
@@ -183,9 +183,9 @@ final class BlockHost {
     }
 
     /// Give the subtree back to the page, where its authored parent has it.
-    func release(_ node: NodeView) {
+    package func release(_ node: NodeView) {
         guard owns(node), let entry = entries[node.id] else { return }
-        let siblings = entry.home.map { authored($0.subviews.compactMap { $0 as? NodeView }, in: $0) } ?? []
+        let siblings = entry.home.map { authored(NodeView.structural($0.subviews), in: $0) } ?? []
         let following = siblings.drop { $0 !== node }.dropFirst().first { $0.superview === entry.home }
         entries[node.id] = nil
         used[node.id] = nil
@@ -222,7 +222,7 @@ final class BlockHost {
 
     /// A subtree's root is being destroyed, its view still in its container:
     /// a sheet keeps what it showed while it leaves (RouteSheetMac.swift).
-    var onDestroyed: ((NodeView) -> Void)?
+    package var onDestroyed: ((NodeView) -> Void)?
 
     /// The runtime is replaced: no rectangle it sent stands.
     func forgetRects() { rects = [:] }

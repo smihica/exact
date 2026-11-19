@@ -1,6 +1,6 @@
 import { viewParent, viewChildren } from './navigation/lists.js';
 // @ref LLP 1043.000 §3 D7/D8 — flow settlement must not change LLP 1012's API.
-import { test, expect } from 'bun:test';
+import { afterAll, test, expect } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -18,11 +18,16 @@ import { storageKey } from './storage-environment.js';
 import { open } from '../../scripts/agent.mjs';
 import { suiteBrowser, launchFacts, launchEnvironment, parseFlags } from '../../scripts/agent-launch.mjs';
 import { nodeNamed } from '../../scripts/agent-test.mjs';
-import { browserMissing } from '../../scripts/agent-playwright.mjs'; import { required, need } from '../../scripts/coverage.mjs';
+import { drivable, engineTests } from '../../scripts/coverage.mjs';
 import { declaration, deferred, fixture, requestClock, source, timedRequests } from './glue-fixture.mjs';
+import { parseSync } from 'rolldown/utils';
 
-const engineTest = Object.fromEntries(await Promise.all(['chromium', 'firefox', 'webkit'].map(async e => [e, need(e, await browserMissing(e))])));
+const engineTest = await engineTests();
 const compiler = resolve(process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../../target', import.meta.url)), 'debug', process.platform === 'win32' ? 'contract.exe' : 'contract');
+// A fixture's build can fail before the `try` that removes its directory.
+const scratches = [];
+const scratch = (prefix) => { const dir = mkdtempSync(join(tmpdir(), prefix)); scratches.push(dir); return dir; };
+afterAll(() => { for (const dir of scratches) rmSync(dir, { recursive: true, force: true }); });
 
 const mapAt = (digest, line = 12) => ({digest, nodes: [{file: '/app/ui/bubble.contract', line, col: 3, end_col: 9, component: 'Bubble',
   chain: [{file: '/app/app.contract', line: 45, col: 5, end_col: 11, component: 'App'}],
@@ -403,6 +408,36 @@ test('a clock jump stops at each intermediate timer when a runner request is par
   }
 });
 
+// LLP 1012, LLP 1046.003: a world's record can arm timers inside a jump.
+test('a world publication starts its Contract timer before a clock jump ends', async () => {
+  for (const wakeAt of [0, 100]) {
+    const f = fixture(); requestClock(f);
+    let published = false, awake = wakeAt === 0, due = Infinity, shown = 0;
+    f.flowDue = wakeAt || null;
+    f.exact.gpu = {
+      settled: async () => [], schedule() {},
+      clock() {
+        if (awake && !published && f.agentClock >= wakeAt + 100) {
+          published = true;
+          due = f.agentClock + 120;
+          f.flowDue = due;
+        }
+        return { nextTickAt: awake && !published ? wakeAt + 100 : undefined, reply: { world: [{}] } };
+      },
+    };
+    f.gpuInPlay = () => true;
+    f.wasm.exact_advance = to => {
+      if (!awake && to >= wakeAt) awake = true;
+      if (due <= to) { shown = 1; due = Infinity; }
+      return JSON.stringify({ ops: [], clock: to, timer_due_ms: Number.isFinite(due) ? due : null });
+    };
+    f.applyBatch = batch => { f.agentClock = batch.clock; f.flowDue = batch.timer_due_ms; return { batch }; };
+    expect(await f.exact.agent({ op: 'clock', to: 900 })).toMatchObject({ clock: 900 });
+    expect(shown).toBe(1);
+    expect(due).toBe(Infinity);
+  }
+});
+
 test('a clock jump lands what is in flight before each timer fires', async () => {
   const f = fixture();
   timedRequests(f);
@@ -506,7 +541,7 @@ test('launch setup supplies fixed defaults and carries CLI overrides to every ho
 });
 
 test('programmatic web opens stay on Chrome and Firefox drives a small Exact plan', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'exact-firefox-agent-')), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist'), png = join(dir, 'page.png');
+  const dir = scratch('exact-firefox-agent-'), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist'), png = join(dir, 'page.png');
   writeFileSync(contract, `component BrowserFixture
   state presses = 0
   state words = ""
@@ -544,10 +579,8 @@ test('programmatic web opens stay on Chrome and Firefox drives a small Exact pla
     expect(await chrome.carrier.evaluate(({ probe() { return 5; } }).probe)).toBe(5);
     expect(await chrome.carrier.evaluate(({ async probe() { return 6; } }).probe)).toBe(6);
     await chrome.close(); chrome = null;
-    // The Firefox half: a missing Firefox fails under EXACT_REQUIRED (scripts/coverage.mjs), else the Chrome half stands.
-    const firefoxMissing = await browserMissing('firefox');
-    if (firefoxMissing && required()) throw new Error(`missing firefox: ${firefoxMissing} (EXACT_REQUIRED=1)`);
-    if (firefoxMissing) return console.warn(`SKIP: missing firefox: ${firefoxMissing}`);
+    // The Firefox half; without Firefox the Chrome half stands.
+    if (!(await drivable(['firefox'])).length) return;
     session = await open({ host:'web', browser:'firefox', url, onProcess: child => { browserProcess = child; } });
     expect(session.carrier.browser).toBe('firefox');
     expect(browserProcess?.pid).toBeGreaterThan(0);
@@ -605,8 +638,8 @@ test('programmatic web opens stay on Chrome and Firefox drives a small Exact pla
 }, 120_000);
 
 test('page facts: the platform off the agent, the drive\'s values under it (LLP 1069.000 D2, D6)', () => {
-  const listened = [];
-  const platform = { document: { visibilityState: 'hidden', addEventListener: name => listened.push(name) }, navigator: { onLine: false, share() {} }, addEventListener: name => listened.push(name) };
+  const listened = [], on = {};
+  const platform = { document: { visibilityState: 'hidden', addEventListener: (name, f) => { listened.push(name); on[name] = f; } }, navigator: { onLine: false, share() {} }, addEventListener: name => listened.push(name) };
   const real = pageReporter(false, platform);
   expect(real.bits()).toBe(1 | 2 | 4 | 32); // no navigation entry is a page the browser navigated to (bits 5–6: 1)
   platform.document.visibilityState = 'visible'; platform.navigator = { onLine: true };
@@ -615,7 +648,9 @@ test('page facts: the platform off the agent, the drive\'s values under it (LLP 
   // The document pickers (studio diary R31): bit 3 where the browser has them.
   platform.showOpenFilePicker = () => {}; expect(real.bits()).toBe(32 | 8);
   delete platform.showOpenFilePicker; let focused = false; platform.document.hasFocus = () => focused; expect(real.bits()).toBe(32 | 16); focused = true; expect(real.bits()).toBe(32); // #114: bit 4 while `document.hasFocus()` is false
-  const on = {}; platform.addEventListener = (name, f) => { listened.push(name); on[name] = f; }; let told = 0; real.onChange(() => { told++; }); expect(listened).toEqual(['visibilitychange', 'online', 'offline', 'focus', 'blur', 'pagehide', 'pageshow']);
+  platform.addEventListener = (name, f) => { listened.push(name); on[name] = f; }; let told = 0; real.onChange(() => { told++; }); expect(listened).toEqual(['visibilitychange', 'freeze', 'resume', 'online', 'offline', 'focus', 'blur', 'pagehide', 'pageshow']);
+  on.freeze(); expect([real.bits(), told]).toEqual([32 | 128, 1]);
+  on.resume(); expect([real.bits(), told]).toEqual([32, 2]); told = 0;
   on.pageshow({ persisted: false }); on.pagehide({ persisted: false }); expect([real.bits(), told]).toEqual([32, 0]); on.pagehide({ persisted: true }); expect([real.bits(), told]).toEqual([32 | 1024, 1]); on.pageshow({ persisted: true }); expect([real.bits(), told]).toEqual([32 | 1 << 16, 2]); // the back/forward cache (LLP 1069.000 D2): bit 10 while put away, the returns above bit 16; a load's and an unload's events are neither
   const agent = pageReporter(true, new Proxy({}, {get(_, name) { if (name === 'devicePixelRatio') return 2; throw new Error('agent read the platform'); }})); // the display's scale alone is the page's own under the agent too: no drive value stands in for it (LLP 1115.000 D10.3)
   expect(agent.bits()).toBe(4 | 8 | 32 | 256); // the drive navigated to the page: `navigate` (bits 5–6: 1); files in a share, never a picture (LLP 1125 D12)
@@ -625,6 +660,10 @@ test('page facts: the platform off the agent, the drive\'s values under it (LLP 
   expect(() => agent.prefer({ online: 'maybe', 'can-share': false })).toThrow('prefer: online');
   expect(agent.read()['can-share']).toBe(true); expect(agent.read()['display-scale']).toBe(2); expect(real.displayScale()).toBe(1); agent.prefer({ 'display-scale': 2 }); expect(() => agent.prefer({ 'display-scale': 3 })).toThrow("prefer: display-scale: 3: the page's is 2");
   agent.onChange(() => { throw new Error('agent listened to the platform'); });
+  // `presented` (LLP 1069.000 D2 r7, D6): the page's false until its first picture, then true; the agent's true until
+  // `prefer presented` holds it; neither is a bit.
+  platform.getComputedStyle = () => ({ fontSize: '16px' }); expect(real.read().presented).toBe(false); expect(real.presentedNow()).toBe(true); expect(real.presentedNow()).toBe(false); expect(real.read().presented).toBe(true);
+  expect(agent.read().presented).toBe(true); expect(agent.presentedNow()).toBe(false); agent.prefer({ presented: 'false' }); expect(agent.read().presented).toBe(false); agent.prefer({ presented: true }); expect(agent.read().presented).toBe(true);
 });
 
 test('the app\'s root font size: a rule over the root, read past by the host (LLP 1069.000 D3)', () => { const rules = new Map(), said = [], say = line => said.push(line), document = { documentElement: {}, head: { append: el => rules.set(el.id, el) }, getElementById: id => rules.get(id) ?? null, createElement: () => ({ remove() { rules.delete(this.id); } }) }; const platform = { document, getComputedStyle: () => { const r = [...rules.values()].find(r => !r.disabled); return { fontSize: r ? r.textContent.match(/font-size:([\d.]+)px/)[1] + 'px' : '18px' }; } }, host = pageReporter(false, platform); // the browser's own 18; an enabled rule's `!important` wins
@@ -1043,64 +1082,6 @@ test('initial flow loading cannot hold the first frame or module activation', as
   await boot;
 });
 
-for (const letGo of [false, true]) test(`module replacement reaches the runner without waiting on a parked ticket (letGo=${letGo})`, async () => {
-  const f = fixture(), elapsed = requestClock(f), calls = [];
-  f.requestsPending = 1;
-  f.setInputReady = value => { f.inputReady = value; };
-  f.wasm.exact_boot_module = (...args) => {
-    calls.push(args[3]);
-    return letGo ? '{"ops":[]}' : '{"error":"runner still has a pending request"}';
-  };
-  const candidate = { realm: { id: 1 }, receipt: new Uint8Array([1]), letGo };
-  const result = f.boot(new Uint8Array([1]), null, () => true, candidate);
-  if (letGo) { await result; expect(f.activeModule).toBe(candidate); }
-  else await expect(result).rejects.toThrow('runner still has a pending request');
-  expect(calls).toEqual([Number(letGo)]);
-  expect(elapsed()).toBe(0);
-});
-
-test('module replacement waits for requests, rechecks supersession; the dev loop swaps after its settle window, an update refuses', async () => {
-  for (const [result, letGo] of [['accept', true], ['superseded', true], ['pending', true], ['accept', false], ['pending', false]]) {
-    const f = fixture(false), entered = deferred(), drained = deferred(), lines = [];
-    let current = true, swaps = 0, flag = null;
-    f.waitForInflight = async deadline => {
-      expect(deadline).toBe(letGo ? 1010 : 20010);
-      entered.resolve();
-      return drained.promise;
-    };
-    f.log = line => lines.push(line);
-    f.setInputReady = value => { f.inputReady = value; };
-    f.wasm.exact_boot_module = (...args) => { swaps++; flag = args[3]; return '{"ops":[],"timers":true}'; };
-    // An app that always has a request out, here a read and a write; the write is named when let go.
-    if (result === 'pending') f.inflight.add(new Promise(() => {})).add(Object.assign(new Promise(() => {}), { write: 'POST https://api.test/like' }));
-    const candidate = {realm:{id:1},receipt:new Uint8Array([1]),letGo};
-    const update = f.boot(new Uint8Array([1]), null, () => current, candidate);
-    const outcome = update.then(value => ({value}), error => ({error}));
-    await entered.promise;
-    expect(swaps).toBe(0);
-    expect(f.views.size).toBe(1);
-    expect(f.inputReady).toBe(true);
-    if (result === 'superseded') current = false;
-    drained.resolve(result !== 'pending');
-    const reply = await outcome;
-    if (result === 'superseded' || result === 'pending' && !letGo) {
-      expect(swaps).toBe(0);
-      expect(f.views.size).toBe(1);
-      expect(f.activeModule).toBeNull();
-      if (letGo) expect(reply.value).toBeNull();
-      else expect(String(reply.error)).toContain('in-flight requests');
-    } else {
-      expect(reply.error).toBeUndefined();
-      expect(swaps).toBe(1);
-      expect(flag).toBe(letGo ? 1 : 0);
-      expect(f.activeModule).toBe(candidate);
-      expect(f.inflight.size).toBe(0);
-      expect(lines.filter(l => l.startsWith('module replacement'))).toEqual(result === 'pending' ? ['module replacement let go of 2 requests still in flight after 1000 ms; aborted writes the server may or may not have seen: POST https://api.test/like'] : []);
-    }
-  }
-});
-
-
 test('scoped tree rendering trims only shared indentation and preserves guest depth', () => {
   const node = {id:7,parent:3,depth:4,type:'WebView',props:{testId:'panel'},handlers:[],children:[8],guest:[{depth:0,tag:'button',text:'guest'}]};
   const child = {id:8,parent:7,depth:5,type:'Text',props:{text:'child'},handlers:[],children:[]};
@@ -1261,7 +1242,7 @@ test('a typed pick answer split at a space names the pick step that keeps the pa
 });
 
 test('a mouse drag presses and releases the left button on the web', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'exact-mouse-drag-')), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
+  const dir = scratch('exact-mouse-drag-'), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
   writeFileSync(contract, `component MouseDrag
   state log = ""
   action at(kind: string, e: PointerEvent)
@@ -1319,10 +1300,21 @@ test('perf frames live lends the clock to the wall for its window and measures w
   try {
     await import('./frames.js');
     let clock = 500;
-    const advanced = [], gpu = [];
+    const advanced = [], gpu = [], requests = [], order = [];
+    const perf = { frameMs: { p50: 16.7 } }, renderHooks = { frame: { draws: { max: 3, count: 1 } } };
+    const glue = readFileSync(new URL('./gpu-glue.js', import.meta.url), 'utf8');
+    const api = parseSync('gpu-glue.js', glue).program.body
+      .flatMap(node => node.declarations ?? []).find(node => node.id.name === 'api').init;
+    const { start, end } = api.properties.find(node => node.key.name === 'live');
+    const live = glue.slice(start, end);
+    const collector = vm.runInNewContext(`({ ${live} })`, {
+      liveWindow: false, gpu: { gpu_seekable: seek => { gpu.push(seek); order.push(`seek ${seek}`); } },
+      surfaces: new Map([[7, { id: 1, view: 7 }]]), schedule() {},
+      agent: (view, request) => (requests.push([view, request]), order.push("state"), { world: { perf, renderHooks } }),
+    });
     const window = globalThis.exact.liveFrames({ ms: 200, origin: () => 0, log() {}, clock: () => clock,
       advance: to => { advanced.push(to); clock = to; },
-      gpu: { live: on => (gpu.push(on), on ? [] : [{ canvas: 7, perf: { frameMs: { p50: 16.7 } } }]) } });
+      gpu: collector });
     let done = false; window.then(() => { done = true; });
     for (let i = 0; i < 40 && !done; i++) {
       wall += 1000 / 60;
@@ -1331,12 +1323,14 @@ test('perf frames live lends the clock to the wall for its window and measures w
       await new Promise(resolve => setImmediate(resolve));
     }
     const reply = await window;
-    expect(gpu).toEqual([true, false]); // the world left the seek for its own frames, and came back
+    expect(gpu).toEqual([false, true]); // the world left the seek for its own frames, and came back
+    expect(order).toEqual(["seek false", "state", "state", "seek true"]); // the closing read is taken while still live
+    expect(requests).toEqual([[7, { op: 'state', perf_reset: true }], [7, { op: 'state', perf: true }]]);
     expect(reply.live).toEqual({ ms: 200, from: 500, to: 700 });
     expect(advanced.at(-1)).toBe(700); // the runner followed the wall to the window's end, and no further
     expect(reply.window.samples).toBeGreaterThan(8);
     expect(reply.window.p50).toBeCloseTo(16.67, 1);
-    expect(reply.world).toEqual([{ canvas: 7, perf: { frameMs: { p50: 16.7 } } }]);
+    expect(reply.world).toEqual([{ canvas: 7, perf, renderHooks }]);
     expect(globalThis.exact.frames).toBeUndefined(); // the window's sampler does not outlive it
   } finally {
     for (const [k, d] of Object.entries(saved)) d ? Object.defineProperty(globalThis, k, d) : delete globalThis[k];

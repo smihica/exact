@@ -3,6 +3,8 @@ test "each reconnect obtains a new single-use ticket"
   clock until state feed.status == "connected" within 15000
   expect text "protocol" == "events.v1"
   expect text "message" == "connection 1"
+  drop stream "ws://127.0.0.1:"
+  clock until state feed.status == "error" within 15000
   tap "connect"
   clock until state feed.text == "connection 2" within 15000
   expect text "protocol" == "events.v1"

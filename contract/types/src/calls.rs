@@ -20,10 +20,24 @@ fn action_head<'e>(e: &'e Expr, scope: &Scope, shapes: &Shapes) -> Option<(&'e s
         return None;
     }
     matches!(
-        scope.lookup(name),
+        callee(name, *span, scope, shapes),
         Some((Ref::Action(_) | Ref::Prop(_), Ty::Action(_)))
     )
     .then_some((name.as_str(), *span))
+}
+
+/// What a call of `name` at `span` finds in `scope`. A call a child wrote of
+/// a name it holds no action of ([`Shapes::free_calls`]) finds nothing: in
+/// the expanded root, the root's action of that name would capture it.
+pub(crate) fn callee<'s>(
+    name: &str,
+    span: Span,
+    scope: &'s Scope,
+    shapes: &Shapes,
+) -> Option<(Ref, &'s Ty)> {
+    scope
+        .lookup(name)
+        .filter(|_| !shapes.free_calls.contains(&span))
 }
 
 /// The first call of an action inside `e`, at any depth.
@@ -452,9 +466,16 @@ pub(super) fn unknown_function(
         } else {
             format!("{name}()")
         };
+        // A child may declare the device's facts itself (`reads_device`, contract/syntax
+        // inline.rs); every other source is the root's.
+        let owner = if matches!(name, "exactViewport" | "exactPage") {
+            "this component"
+        } else {
+            "the root component"
+        };
         message.push_str(&format!(
-            "; `{name}` is a source the runner answers: declare `resource r = {call} as shape S` in the \
-             root component, with a shape S of the fields you read, and read `r.field`"
+            "; `{name}` is a source the runner answers: declare `resource r = {call} as shape S` in \
+             {owner}, with a shape S of the fields you read, and read `r.field`"
         ));
     } else if let Some(candidate) = similar_function(name, scope, shapes) {
         // A method's name is offered as the method (LLP 1116.015 D2).

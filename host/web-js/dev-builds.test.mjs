@@ -7,13 +7,19 @@ import { afterEach, expect, test } from 'bun:test';
 import { spawnOwned, stopAll } from '../../scripts/test-children.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { INPUT_TREE, OUTPUT, suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { shaderWatchRoots } from '../../scripts/app.mjs';
+import { within } from '../../scripts/paths.mjs';
+import { runInNewContext } from 'node:vm';
+import { installLock } from '../../scripts/filesystem.mjs';
 import { appSources } from '../web/serve.mjs';
+import { loopWebDist } from '../../scripts/web-build.mjs';
+import { engagement } from '../web/engagement.js';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const sha = text => createHash('sha256').update(text).digest('hex');
@@ -28,12 +34,13 @@ async function devLoop(dir, env = {}) {
   await new Promise(ok => listener.listen(0, '127.0.0.1', ok));
   const port = listener.address().port;
   await new Promise(ok => listener.close(ok));
-  const dist = mkdtempSync(join(tmpdir(), 'exact-js-builds-'));
+  // The build's lock and kept generations go beside its dist (serve.mjs `replaceBuild`): the dist sits in a directory of its own.
+  const dist = env.EXACT_WEB_DIST === '' ? loopWebDist({ dir, target: resolve(dir, 'target') }, 'js') : join(mkdtempSync(join(tmpdir(), 'exact-js-builds-')), 'dist');
   // Owned: ended with what it starts when the test ends, a timeout included (scripts/test-children.mjs).
   const dev = spawnOwned(process.execPath, [resolve(ROOT, 'host/web/dev.mjs'), '--app', dir, '--port', String(port)], { cwd: ROOT, env: { ...process.env, EXACT_WEB_DIST: dist, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   const stop = async () => {
     await dev.stop(30_000);
-    rmSync(dist, { recursive: true, force: true });
+    rmSync(dirname(dist), { recursive: true, force: true });
   };
   let out = '', err = '';
   dev.stderr.on('data', d => { err = (err + d).slice(-4000); });
@@ -46,6 +53,7 @@ async function devLoop(dir, env = {}) {
   } catch (e) { await stop(); throw e; }
   return { base: `http://127.0.0.1:${port}`, stop, said: () => out, dist };
 }
+
 
 test('the JS loop carries a checkpoint literally across document probes and retries', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-checkpoint-dollars-'));
@@ -86,7 +94,434 @@ test('the JS loop carries a checkpoint literally across document probes and retr
   }
 }, 180000);
 
-test.each([false, true])('a blurred autofocus field stays blurred after a carried reload (bound: %s)', async bound => {
+test('replacement generations never repeat through A, B, A and a carried reboot', async () => {
+  const dir = mkdtempSync(resolve(ROOT, 'target/replacement-js-'));
+  const source = join(dir, 'app.contract');
+  const contract = (label, second = false) => `component App
+  state kept = 1
+  state retyped = ${second ? '"new"' : '1'}
+${second ? '' : '  state removed = 1\n'}  action bump
+    kept = kept + 1
+  view
+    column
+      button press=bump testId="bump"
+        text "Bump"
+      text "${label}" testId="label"
+`;
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Replacement', app: { id: 'test.replacement', name: 'Replacement' } }));
+  writeFileSync(source, contract('A'));
+  let loop, browser;
+  try {
+    loop = await devLoop(dir);
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(loop.base + '?agent=1');
+    await page.waitForFunction(() => globalThis.exact?.agentSettled);
+    const read = () => page.evaluate(() => exact.agentSettled({ op: 'state' }));
+    let before = await read();
+    expect(before.generation).toBe(1);
+    expect(before.replacement).toBeNull();
+    for (const [label, generation] of [['B', 2], ['A', 3], ['reboot', 4]]) {
+      await page.getByTestId('bump').click();
+      before = await read();
+      if (label === 'reboot') {
+        // The same plan, with the same carry handoff as the loop's document replacement.
+        const checkpoint = await page.evaluate(() => ({ generation: exact.clock.generation, epoch: exact.clock.epoch, time: exact.clock.now,
+          slots: exact.state[0].map(s => [s.n.devName, s.n.devType, s()]), answers: [], carryAnswers: false }));
+        expect((await fetch(`${loop.base}/__dev/checkpoint?id=4-5-6-7&seq=3`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(checkpoint) })).status).toBe(204);
+        await page.goto(loop.base + '?agent=1&__exactDev=4-5-6-7');
+      } else {
+        writeFileSync(source, contract(label, label === 'B'));
+        await page.waitForFunction(label => document.querySelector('[data-testid="label"]')?.textContent === label, label);
+      }
+      await page.waitForFunction(() => globalThis.exact?.agentSettled);
+      const after = await read();
+      expect(after.generation).toBe(generation);
+      expect(after.epoch).toBeGreaterThanOrEqual(before.epoch);
+      expect(after.incarnation).toBe(1);
+      expect(after.slots.kept).toBe(before.slots.kept);
+      if (generation === 2) expect(after.replacement.dropped).toEqual([
+        { what: 'state', name: 'retyped', why: 'type changed' },
+        { what: 'state', name: 'removed', why: 'no place' },
+      ]);
+      expect((await page.evaluate(() => exact.agentSettled({ op: 'logs' }))).generation).toBe(generation);
+    }
+  } finally { await browser?.close(); await loop?.stop(); rmSync(dir, { recursive: true, force: true }); }
+}, 180000);
+
+test('a document replacement waits for composition and carries the completed text', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-composition-reload-'));
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Composition', app: { id: 'test.composition', name: 'Composition' } }));
+  const contract = label => `component App
+  state draft = ""
+  action edit(value)
+    draft = value
+  view
+    column
+      input value=draft input=edit testId="draft"
+      text "${label}" testId="label"
+`;
+  writeFileSync(join(dir, 'app.contract'), contract('before'));
+  let loop, browser;
+  try {
+    loop = await devLoop(dir);
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.goto(loop.base);
+    await page.getByTestId('draft').focus();
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+    const built = new Promise(ok => page.on('console', message => {
+      if (message.text().includes('exact dev reload: held')) ok();
+    }));
+    writeFileSync(join(dir, 'app.contract'), contract('after'));
+    await Promise.race([built, page.waitForFunction(() => document.querySelector('[data-testid="label"]')?.textContent === 'after')]);
+    expect(await page.getByTestId('label').textContent()).toBe('before');
+    await cdp.send('Input.insertText', { text: '日本' });
+    await page.waitForFunction(() => document.querySelector('[data-testid="label"]')?.textContent === 'after');
+    expect(await page.getByTestId('draft').inputValue()).toBe('日本');
+  } finally {
+    await browser?.close();
+    await loop?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 180000);
+
+/** An expression for each target's boundary over the one `engagement` both ask (host/web/engagement.js). */
+function replacementSource(target) {
+  const source = readFileSync(join(ROOT, target === 'js' ? 'host/web-js/dev.mjs' : 'host/web/wasm/boot.js'), 'utf8');
+  const start = target === 'js' ? source.indexOf('function replacementBoundary(engagement)') : source.indexOf('export const replacements = (() => {');
+  return target === 'js' ? `(${source.slice(start)})(${engagement})`
+    : `(engagement => ${source.slice(start + 'export const replacements = '.length, source.indexOf('})();', start) + 4)})(${engagement})`;
+}
+
+test.each(['js', 'wasm'])('a %s replacement keeps a held pointer across field focus changes', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<input id="a"><input id="b">');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)}` });
+    await page.locator('#a').focus();
+    const box = await page.locator('#b').boundingBox();
+    await page.mouse.move(box.x + 5, box.y + 5);
+    await page.mouse.down();
+    expect(await page.evaluate(async () => {
+      globalThis.cleared = false;
+      boundary.wait().then(() => globalThis.cleared = true);
+      const channel = new MessageChannel();
+      await new Promise(ok => { channel.port1.onmessage = ok; channel.port2.postMessage(null); });
+      channel.port1.close(); channel.port2.close();
+      return { active: document.activeElement.id, pending: boundary.pending, cleared };
+    })).toEqual({ active: 'b', pending: 'pointer', cleared: false });
+    await page.mouse.up();
+    await page.waitForFunction(() => globalThis.cleared);
+  } finally { await browser.close(); }
+});
+
+test.each(['js', 'wasm'])('a %s replacement waits for a scrolling touch to lift', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage({ hasTouch: true, isMobile: true, viewport: { width: 400, height: 600 } });
+    await page.setContent('<meta name="viewport" content="width=device-width"><div style="height:3000px">Scroll</div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.cancelled = false;
+      addEventListener('pointercancel', () => cancelled = true);` });
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 100, y: 400 }] });
+    await page.evaluate(() => { globalThis.cleared = false; boundary.wait().then(() => cleared = true); });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 100, y: 100 }] });
+    await page.waitForFunction(() => cancelled);
+    expect(await page.evaluate(() => ({ cleared, pending: boundary.pending }))).toEqual({ cleared: false, pending: 'pointer' });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await page.waitForFunction(() => cleared);
+  } finally { await browser.close(); }
+});
+
+test.each(['js', 'wasm'])('a %s replacement is not held by a drag its handler cancelled', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="grip" draggable="true" style="width:120px;height:120px;background:#888"></div>');
+    // As Exact's transform handler does: the browser then sends no dragend and no drop.
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.cancelled = 0;
+      document.getElementById('grip').addEventListener('dragstart', e => { cancelled++; e.preventDefault(); });` });
+    const box = await page.locator('#grip').boundingBox();
+    await page.mouse.move(box.x + 20, box.y + 20);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 70, box.y + 70, { steps: 8 });
+    await page.waitForFunction(() => cancelled > 0);
+    await page.evaluate(() => { globalThis.cleared = false; boundary.wait().then(() => cleared = true); });
+    expect(await page.evaluate(() => ({ cleared, pending: boundary.pending }))).toEqual({ cleared: false, pending: 'pointer' });
+    await page.mouse.up();
+    await page.waitForFunction(() => cleared, null, { timeout: 3000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+// The window's blur ends no hold: the button, the finger or Safari's pinch is still down, and its release, a
+// buttonless move or `pagehide` ends it.
+test.each(['js', 'wasm'])('a %s replacement stays held when the window blurs mid-interaction', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage({ hasTouch: true });
+    await page.setContent('<div id="photo" style="width:200px;height:200px"></div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.pinch = type => document.getElementById('photo').dispatchEvent(new Event(type, { bubbles: true }));` });
+    const cdp = await page.context().newCDPSession(page);
+    const blurred = () => page.evaluate(async () => {
+      globalThis.cleared = false;
+      boundary.wait().then(() => cleared = true);
+      dispatchEvent(new FocusEvent('blur'));
+      const channel = new MessageChannel();
+      await new Promise(ok => { channel.port1.onmessage = ok; channel.port2.postMessage(null); });
+      channel.port1.close(); channel.port2.close();
+      return { cleared, pending: boundary.pending };
+    });
+    const ended = () => page.waitForFunction(() => cleared && boundary.pending === null, null, { timeout: 3000 });
+    await page.mouse.move(50, 50);
+    await page.mouse.down();
+    expect(await blurred()).toEqual({ cleared: false, pending: 'pointer' });
+    await page.mouse.up();
+    await ended();
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 50, y: 50 }] });
+    expect(await blurred()).toEqual({ cleared: false, pending: 'pointer' });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await ended();
+    await page.evaluate(() => pinch('gesturestart'));
+    expect(await blurred()).toEqual({ cleared: false, pending: 'gesture' });
+    await page.evaluate(() => pinch('gestureend'));
+    await ended();
+  } finally { await browser.close(); }
+});
+
+// Safari brackets a trackpad pinch with its own events, which both targets' zoom handlers hear (zoom.js,
+// motion-glue.js); no pointer is down. Dispatched here as Safari does, on the element under the gesture.
+test.each(['js', 'wasm'])("a %s replacement waits for Safari's trackpad pinch to end", async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="photo" style="width:200px;height:200px"></div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.pinch = type => document.getElementById('photo').dispatchEvent(new Event(type, { bubbles: true }));` });
+    const state = () => page.evaluate(async () => {
+      const channel = new MessageChannel();
+      await new Promise(ok => { channel.port1.onmessage = ok; channel.port2.postMessage(null); });
+      channel.port1.close(); channel.port2.close();
+      return { cleared, pending: boundary.pending };
+    });
+    await page.evaluate(() => { pinch('gesturestart'); globalThis.cleared = false; boundary.wait().then(() => cleared = true); });
+    expect(await state()).toEqual({ cleared: false, pending: 'gesture' });
+    await page.evaluate(() => pinch('gesturechange'));
+    expect(await state()).toEqual({ cleared: false, pending: 'gesture' });
+    await page.evaluate(() => pinch('gestureend'));
+    await page.waitForFunction(() => cleared, null, { timeout: 3000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+// The event that ends an interaction goes to the element it began on, and to no ancestor once that element has left
+// the document (a touch's, https://w3c.github.io/touch-events/#event-touchend; a drag's, at its source node,
+// https://html.spec.whatwg.org/multipage/dnd.html#dndevents).
+test.each(['js', 'wasm'])('a %s replacement resumes when a touched element is removed before the finger lifts', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage({ hasTouch: true, isMobile: true, viewport: { width: 400, height: 600 } });
+    await page.setContent('<meta name="viewport" content="width=device-width"><div id="row" style="height:120px;background:#888"></div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)}` });
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 100, y: 60 }] });
+    await page.evaluate(() => { globalThis.cleared = false; boundary.wait().then(() => cleared = true); document.getElementById('row').remove(); });
+    expect(await page.evaluate(() => ({ cleared, pending: boundary.pending }))).toEqual({ cleared: false, pending: 'pointer' });
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await page.waitForFunction(() => cleared, null, { timeout: 3000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+test.each(['js', 'wasm'])("a %s replacement resumes when a drag's source is removed before the drop", async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="grip" draggable="true" style="width:120px;height:120px;background:#888"></div><div style="height:300px"></div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.ended = false;
+      const grip = document.getElementById('grip');
+      grip.addEventListener('dragend', () => ended = true);` });
+    await page.mouse.move(20, 20);
+    await page.mouse.down();
+    await page.mouse.move(80, 200, { steps: 8 });
+    await page.evaluate(() => { globalThis.cleared = false; boundary.wait().then(() => cleared = true); grip.remove(); });
+    expect(await page.evaluate(() => ({ cleared, pending: boundary.pending }))).toEqual({ cleared: false, pending: 'gesture' });
+    await page.mouse.up();
+    await page.waitForFunction(() => ended);
+    await page.waitForFunction(() => cleared, null, { timeout: 3000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+// As Safari sends a pinch's end: to the element the gesture began on.
+test.each(['js', 'wasm'])('a %s replacement resumes when a pinched element is removed before the pinch ends', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<div id="photo" style="width:200px;height:200px"></div>');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)};
+      globalThis.photo = document.getElementById('photo');` });
+    await page.evaluate(() => {
+      photo.dispatchEvent(new Event('gesturestart', { bubbles: true }));
+      globalThis.cleared = false; boundary.wait().then(() => cleared = true);
+      photo.remove();
+    });
+    expect(await page.evaluate(() => ({ cleared, pending: boundary.pending }))).toEqual({ cleared: false, pending: 'gesture' });
+    await page.evaluate(() => photo.dispatchEvent(new Event('gestureend', { bubbles: true })));
+    await page.waitForFunction(() => cleared, null, { timeout: 3000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+test.each(['js', 'wasm'])('a %s replacement resumes when its composing field is removed', async target => {
+  const browser = await suiteBrowser();
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<input id="draft">');
+    await page.addScriptTag({ content: `globalThis.boundary = ${replacementSource(target)}` });
+    await page.locator('#draft').focus();
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+    await page.evaluate(() => { globalThis.cleared = false; boundary.wait().then(() => cleared = true); });
+    expect(await page.evaluate(() => boundary.pending)).toBe('composition');
+    await page.locator('#draft').evaluate(el => el.remove());
+    await page.waitForFunction(() => cleared, null, { timeout: 2000 });
+    expect(await page.evaluate(() => boundary.pending)).toBeNull();
+  } finally { await browser.close(); }
+});
+
+test.each(['input', 'composition', 'background', 'candidate', 'failure'])('a checkpoint handoff handles late %s', async interaction => {
+  const composing = interaction === 'composition', background = interaction === 'background';
+  const dir = mkdtempSync(join(tmpdir(), 'exact-late-composition-'));
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Handoff', app: { id: 'test.handoff', name: 'Handoff' } }));
+  const contract = label => `component App
+  state draft = ""
+  state count = 0
+  action edit(value)
+    draft = value
+  action tick
+    count = count + 1
+  task pulse mount
+    every(100000, tick)
+  view
+    column
+      input value=draft input=edit testId="draft"
+      text count.toString() testId="count"
+      text "${label}" testId="label"
+`;
+  writeFileSync(join(dir, 'app.contract'), contract('before'));
+  let loop, browser;
+  try {
+    loop = await devLoop(dir);
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    // Deliver a new generation through the page's stream without depending on file watching.
+    await page.addInitScript(() => {
+      globalThis.documentToken = crypto.randomUUID();
+      const Stream = EventSource;
+      globalThis.EventSource = class extends Stream {
+        constructor(...args) { super(...args); if (args[0] === '/__dev/page') globalThis.devStream = this; }
+      };
+    });
+    await page.goto(loop.base);
+    await page.getByTestId('draft').focus();
+    let reached, release;
+    const intercepted = new Promise(ok => reached = ok), gate = new Promise(ok => release = ok);
+    let posts = 0;
+    await page.route('**/__dev/checkpoint?**', async route => {
+      if (background) {
+        // Fire the app's timer on every POST. Background writes must not
+        // turn a handoff into an endless sequence of newer checkpoints.
+        await page.evaluate(() => globalThis.exact.clock.timers[0].action());
+        if (++posts === 6) { reached(); await gate; }
+        await route.continue();
+        return;
+      }
+      if (++posts === 1) {
+        await page.evaluate(() => globalThis.exact.clock.timers[0].action());
+        reached(); await gate;
+      }
+      if (interaction === 'failure') { await route.fulfill({ status: 500, body: 'handoff refused' }); return; }
+      await route.continue();
+    });
+    const documentToken = await page.evaluate(() => globalThis.documentToken);
+    const retained = interaction === 'failure' ? page.waitForEvent('console', { predicate: m => m.text().includes('checkpoint handoff failed') }) : null;
+    await page.evaluate(() => devStream.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ reload: 2 }) })));
+    if (background) {
+      await Promise.race([intercepted, page.waitForFunction(token => globalThis.documentToken !== token, documentToken)]);
+      release();
+      expect(posts).toBe(1);
+    } else await intercepted;
+    const cdp = await page.context().newCDPSession(page);
+    if (composing) await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+    else if (interaction === 'input') await page.getByTestId('draft').fill('late input');
+    else if (interaction === 'candidate') await page.evaluate(() => devStream.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ reload: 3 }) })));
+    release();
+    if (retained) {
+      await retained;
+      expect(await page.evaluate(() => globalThis.documentToken)).toBe(documentToken);
+      expect(await page.getByTestId('count').textContent()).toBe('1');
+      expect(posts).toBe(1);
+      return;
+    }
+    if (composing) {
+      await page.waitForFunction(token => globalThis.__exactDevReplacement?.pending === 'composition' || globalThis.documentToken !== token, documentToken);
+      expect(await page.evaluate(() => globalThis.documentToken)).toBe(documentToken);
+      await cdp.send('Input.insertText', { text: '日本' });
+    }
+    await page.waitForFunction(token => globalThis.documentToken !== token, documentToken);
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    await page.evaluate(() => globalThis.exact.ready);
+    expect(await page.getByTestId('draft').inputValue()).toBe(composing ? '日本' : interaction === 'input' ? 'late input' : '');
+    expect(await page.getByTestId('count').textContent()).toBe(background ? '0' : '1');
+    expect(posts).toBe(background ? 1 : 2);
+  } finally {
+    await browser?.close(); await loop?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 180000);
+
+test('a held reload abandoned at pagehide runs when the page is shown again', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-pagehide-reload-'));
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Pagehide', app: { id: 'test.pagehide', name: 'Pagehide' } }));
+  writeFileSync(join(dir, 'app.contract'), 'component App\n  view\n    text "label" testId="label"\n');
+  let loop, browser;
+  try {
+    loop = await devLoop(dir);
+    browser = await suiteBrowser();
+    const page = await browser.newPage();
+    await page.addInitScript(() => {
+      globalThis.documentToken = crypto.randomUUID();
+      const Stream = EventSource;
+      globalThis.EventSource = class extends Stream {
+        constructor(...args) { super(...args); if (args[0] === '/__dev/page') globalThis.devStream = this; }
+      };
+    });
+    await page.goto(loop.base);
+    await page.waitForFunction(() => globalThis.exact?.ready);
+    const documentToken = await page.evaluate(() => globalThis.documentToken);
+    await page.mouse.move(5, 5);
+    await page.mouse.down();
+    await page.evaluate(() => devStream.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ reload: 2 }) })));
+    await page.waitForFunction(() => globalThis.__exactDevReplacement?.pending === 'pointer');
+    // Into the back-forward cache with the reload held, and back: the document is the same one.
+    await page.evaluate(() => { dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); });
+    await page.evaluate(() => { dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); });
+    await page.waitForFunction(token => globalThis.documentToken !== token, documentToken, { timeout: 15000 });
+  } finally {
+    await browser?.close(); await loop?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 180000);
+
+test.each([['literal', false], ['bound', true]])('a blurred autofocus field stays blurred after a carried reload (%s)', async (_mode, bound) => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-blurred-carry-'));
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Blurred carry', app: { id: 'test.blurred.carry', name: 'Blurred carry' } }));
   const contract = label => `component App
@@ -102,13 +537,17 @@ test.each([false, true])('a blurred autofocus field stays blurred after a carrie
     loop = await devLoop(dir);
     expect(loop.said()).not.toContain('does not build');
     browser = await suiteBrowser();
-    const page = await browser.newPage();
+    const page = await browser.newPage(), messages = [];
+    page.on('console', m => messages.push(`${m.type()}: ${m.text()}`));
+    page.on('pageerror', e => messages.push(`pageerror: ${e.message}`));
     await page.goto(loop.base);
     await page.waitForFunction(() => document.activeElement === document.querySelector('[data-testid="draft"]'));
     await page.getByTestId('draft').blur();
     expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
     writeFileSync(join(dir, 'app.contract'), contract('after'));
-    await page.waitForFunction(() => document.querySelector('[data-testid="label"]')?.textContent === 'after');
+    await page.waitForFunction(() => document.querySelector('[data-testid="label"]')?.textContent === 'after').catch(e => {
+      throw new Error(`${e.message}\n${messages.join('\n')}\n${loop.said()}`);
+    });
     // Let the browser flush its own autofocus candidates as well as the runtime's mount work.
     await page.evaluate(() => new Promise(ok => requestAnimationFrame(() => requestAnimationFrame(ok))));
     expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
@@ -118,6 +557,7 @@ test.each([false, true])('a blurred autofocus field stays blurred after a carrie
     rmSync(dir, { recursive: true, force: true });
   }
 }, 180000);
+
 
 test('the JS loop drops settled answers when a page module or its imported helper changes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-native-carry-'));
@@ -183,7 +623,7 @@ test('the JS loop: a build an edit lands during is set aside, never published, a
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Superseded', app: { id: 'com.exact.superseded', name: 'Superseded' } }));
   const view = (text) => `component App\n  view\n    column background-color="surface.card" min-height=40\n      text "${text}"\n`;
   writeFileSync(join(dir, 'app.contract'), view('qz-first'));
-  writeFileSync(join(dir, 'app.tamber'), 'tamber superseded\n\ntheme\n  surface.card = light-dark(#f1f3f5, #16181c)\n');
+  writeFileSync(join(dir, 'app.forma'), 'forma superseded\n\ntheme\n  surface.card = light-dark(#f1f3f5, #16181c)\n');
   let loop = null;
   try {
     // Each build's end comes 2 s after it: an edit lands as one ends.
@@ -221,9 +661,9 @@ test('the JS loop: an edit stops a young build, leaving dist as it was; a value 
   const dir = mkdtempSync(join(tmpdir(), 'exact-stopped-'));
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Stopped', app: { id: 'com.exact.stopped', name: 'Stopped' } }));
   const view = (text) => `component App\n  view\n    column background-color="surface.card" min-height=40\n      text "${text}"\n`;
-  const design = (dark) => `tamber stopped\n\ntheme\n  surface.card = light-dark(#f1f3f5, ${dark})\n`;
+  const design = (dark) => `forma stopped\n\ntheme\n  surface.card = light-dark(#f1f3f5, ${dark})\n`;
   writeFileSync(join(dir, 'app.contract'), view('qz-one'));
-  writeFileSync(join(dir, 'app.tamber'), design('#16181c'));
+  writeFileSync(join(dir, 'app.forma'), design('#16181c'));
   let loop = null;
   try {
     loop = await devLoop(dir, { EXACT_DEV_BUILD_HOLD_MS: '4000' });
@@ -279,11 +719,11 @@ test('the JS loop: an edit stops a young build, leaving dist as it was; a value 
     // behind its lock while another build holds it: a build's bound.)
     await until(() => count(/design reader ready/g) >= 3, 300_000);
     const supersededBefore = count(/edit → a build superseded/g);
-    writeFileSync(join(dir, 'app.tamber'), design('#202020'));
+    writeFileSync(join(dir, 'app.forma'), design('#202020'));
     await until(() => count(/edit → batch ready/g) >= 1, 60_000);
     await new Promise(ok => setTimeout(ok, 500));
     const held = Date.now();
-    writeFileSync(join(dir, 'app.tamber'), design('#303030'));
+    writeFileSync(join(dir, 'app.forma'), design('#303030'));
     // Its batch from the design read, not a build's, before the held
     // build could end.
     await until(() => count(/edit → batch ready .*no build/g) >= 2, 60_000);
@@ -313,7 +753,7 @@ test('the JS loop: an edit stops a young build, leaving dist as it was; a value 
       if (count(/edit → plan ready|edit → checked/g) === settled) break;
     }
     const full = Date.now();
-    writeFileSync(join(dir, 'app.tamber'), design('#404040'));
+    writeFileSync(join(dir, 'app.forma'), design('#404040'));
     await until(() => count(/edit → batch ready .*no build/g) > batches, 60_000);
     expect(Date.now() - full).toBeLessThan(3000);
     await until(() => count(/edit → plan ready|edit → checked/g) > settled, 300_000);
@@ -329,8 +769,8 @@ test('the JS loop: a value-only design edit while the design reader builds waits
   const dir = mkdtempSync(join(tmpdir(), 'exact-reader-wait-'));
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Reader wait', app: { id: 'com.exact.readerwait', name: 'Reader wait' } }));
   writeFileSync(join(dir, 'app.contract'), 'component App\n  view\n    column background-color="surface.card" min-height=40\n      text "qz-wait"\n');
-  const design = (light) => `tamber readerwait\n\ntheme\n  surface.card = light-dark(${light}, #16181c)\n`;
-  writeFileSync(join(dir, 'app.tamber'), design('#f1f3f5'));
+  const design = (light) => `forma readerwait\n\ntheme\n  surface.card = light-dark(${light}, #16181c)\n`;
+  writeFileSync(join(dir, 'app.forma'), design('#f1f3f5'));
   let loop = null;
   try {
     // The reader's first build is taken 3 minutes after cargo ends (a reader building again after any other edit, on
@@ -341,7 +781,7 @@ test('the JS loop: a value-only design edit while the design reader builds waits
     const until = async (pass, ms) => { const end = Date.now() + ms; while (!pass()) { if (Date.now() > end) throw new Error(`not seen in: ${said().slice(-2000)}`); await new Promise(ok => setTimeout(ok, 100)); } };
     await until(() => said().includes('plan ready'), 900_000);
     if (said().includes('design reader ready')) throw new Error(`the reader was ready before the first build; the hold is too short: ${said().slice(-1500)}`);
-    writeFileSync(join(dir, 'app.tamber'), design('#e0f7e9'));
+    writeFileSync(join(dir, 'app.forma'), design('#e0f7e9'));
     await until(() => said().includes('edit → waiting for the design reader'), 60_000);
     // Nothing builds while it waits.
     expect(count(/edit → building/g)).toBe(0);
@@ -364,10 +804,10 @@ test("the JS loop: an edit to theme-fixture's `when` token builds with setMode a
   const dir = mkdtempSync(join(tmpdir(), 'exact-axes-'));
   writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Axes', app: { id: 'com.exact.axes', name: 'Axes' } }));
   writeFileSync(join(dir, 'app.contract'), 'component App\n  action dim\n    setMode("dark-style", "dim")\n  view\n    column background-color="surface.page" min-height=40\n      button press=dim\n        text "dim"\n      column -exact-mode="dark-style=black" background-color="surface.page"\n        text "pinned"\n');
-  const design = readFileSync(resolve(ROOT, 'apps/theme-fixture/app.tamber'), 'utf8');
+  const design = readFileSync(resolve(ROOT, 'apps/theme-fixture/app.forma'), 'utf8');
   const page = '  surface.page = light-dark(#ffffff, #000000)\n    when dark-style=dim: light-dark(#ffffff, #15202b)\n';
   expect(design).toContain(page);
-  writeFileSync(join(dir, 'app.tamber'), design);
+  writeFileSync(join(dir, 'app.forma'), design);
   let loop = null;
   try {
     loop = await devLoop(dir);
@@ -378,15 +818,15 @@ test("the JS loop: an edit to theme-fixture's `when` token builds with setMode a
     // The `when` line's dark side: its batch, then its build, which checks
     // setMode and the pin against the design's axes.
     const checks = count(/edit → checked|edit → batch ready .*built in|edit → plan ready/g);
-    writeFileSync(join(dir, 'app.tamber'), design.replace(page, page.replace('#15202b', '#16212c')));
+    writeFileSync(join(dir, 'app.forma'), design.replace(page, page.replace('#15202b', '#16212c')));
     await until(() => count(/edit → checked|edit → batch ready .*built in|edit → plan ready/g) > checks || said().includes('build failed'), 300_000);
     expect(said()).not.toContain('build failed');
     expect(JSON.stringify(await (await fetch(`${base}/__dev/design`)).json())).toContain('#16212c');
     // The default's light side alone, which `under scheme=dark` refuses:
     // the build says so, and not that the design declares no axes.
-    writeFileSync(join(dir, 'app.tamber'), design.replace(page, page.replace('#ffffff, #000000', '#fefefe, #000000')));
-    await until(() => said().includes('build failed') && said().includes('[tamber-'), 300_000);
-    expect(said()).toContain('tamber-under-light');
+    writeFileSync(join(dir, 'app.forma'), design.replace(page, page.replace('#ffffff, #000000', '#fefefe, #000000')));
+    await until(() => said().includes('build failed') && said().includes('[forma-'), 300_000);
+    expect(said()).toContain('forma-under-light');
     expect(said()).not.toContain('declares no axes');
   } finally {
     await loop?.stop().catch(() => {});
@@ -399,7 +839,7 @@ test('the JS loop: two loops on two apps under one target/ build at once, each i
     const dir = mkdtempSync(join(tmpdir(), `exact-stage-${name}-`));
     writeFileSync(join(dir, 'app.json'), JSON.stringify({ name, app: { id: `com.exact.${name}`, name } }));
     writeFileSync(join(dir, 'app.contract'), `component App\n  view\n    text "${name}"\n`);
-    writeFileSync(join(dir, 'app.tamber'), `tamber ${name}\n\ntheme\n  ink = #000000\n`);
+    writeFileSync(join(dir, 'app.forma'), `forma ${name}\n\ntheme\n  ink = #000000\n`);
     return dir;
   };
   const dirs = [app('stagea'), app('stageb')];
@@ -477,5 +917,84 @@ test("the JS loop: an edit to a copied file: library rebuilds with the library's
   } finally {
     await loop?.stop().catch(() => {});
     rmSync(dir, { recursive: true, force: true });
+    // The lock the reinstall took, kept in TMPDIR by the app's path (filesystem.mjs `installLock`).
+    rmSync(installLock(dir), { force: true });
   }
 }, 1_200_000);
+
+
+test('real loops keep their pages while test, verify and agent build the same app privately', async () => {
+  const dir = mkdtempSync(resolve(ROOT, 'target/receipt-entrypoints-')), loops = [];
+  try {
+    const apps = ['one', 'two'].map(name => resolve(dir, name));
+    for (const [n, app] of apps.entries()) {
+      mkdirSync(app);
+      writeFileSync(resolve(app, 'app.json'), JSON.stringify({ name: `Receipt ${n}`, app: { id: `test.receipt${n}`, name: `Receipt ${n}` } }));
+      writeFileSync(resolve(app, 'app.contract'), `component App\n  view\n    text "Ready ${n}" testId="ready"\n`);
+      writeFileSync(resolve(app, 'app.test.contract'), `test "ready"\n  expect text "ready" == "Ready ${n}"\n`);
+      writeFileSync(resolve(app, 'exact.mjs'), `import {run} from ${JSON.stringify(resolve(ROOT, 'scripts/app-cli.mjs'))};\nprocess.exitCode = await run({dir:import.meta.dir, name:${JSON.stringify(app.split("/").at(-1))}, exact2:${JSON.stringify(ROOT)}, args:process.argv.slice(2)});\n`);
+    }
+    loops.push(...await Promise.all(apps.map(app => devLoop(app, { EXACT_WEB_DIST: '' }))));
+    const receipts = loops.map(loop => readFileSync(resolve(loop.dist, '.exact-build.json'), 'utf8'));
+    const checks = ['test', 'agent', 'verify'].map(verb => {
+      const child = spawnOwned(process.execPath, [resolve(apps[0], 'exact.mjs'), verb, 'web', ...(verb === 'agent' ? ['tree'] : ['--json'])],
+        { cwd: apps[0], env: { ...process.env, EXACT_WEB_DIST: '', EXACT_BAKE_OUTPUT: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let output = ''; for (const stream of [child.stdout, child.stderr]) stream.on('data', bytes => { output += bytes; });
+      return new Promise((ok, fail) => { child.once('error', fail); child.once('exit', code => ok({ verb, code, output })); });
+    });
+    writeFileSync(resolve(apps[0], 'unused.contract'), 'component Unused\n  text "not imported"\n');
+    for (const result of await Promise.all(checks)) expect(result.code, result.verb + ': ' + result.output).toBe(0);
+    for (const [n, loop] of loops.entries()) {
+      const page = await (await fetch(loop.base)).text();
+      expect(page).toContain('/__dev/page');
+      expect(JSON.parse(readFileSync(resolve(loop.dist, '.exact-build.json'))).app).toEqual(JSON.parse(receipts[n]).app);
+      expect(readFileSync(resolve(loop.dist, 'index.html'), 'utf8')).toContain(`Receipt ${n}`);
+    }
+    const runs = readFileSync(resolve(apps[0], '.exact/runs.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(new Set(runs.map(run => run.receipt)).size).toBeGreaterThanOrEqual(3);
+    expect(runs.every(run => run.receipt && readFileSync(run.receipt, 'utf8').includes('"reads"'))).toBe(true);
+  } finally {
+    await Promise.all(loops.map(loop => loop.stop())); rmSync(dir, { recursive: true, force: true });
+  }
+}, 180_000);
+
+test('the JS watcher rebuilds for included Rust files and declared inputs with output extensions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-output-watch-'));
+  const manifest = { gpu: { shaderRoots: ['shader-gen'] }, host: { macos: { resources: [{ from: 'declared.out' }, { from: 'tools/declared.err' }] } } };
+  const app = { dir, manifest };
+  const source = readFileSync(new URL('./dev.mjs', import.meta.url), 'utf8');
+  const begin = source.indexOf('  const outputIsInput = (name)');
+  const end = source.indexOf('  // The resident loop', begin);
+  expect(begin).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(begin);
+  try {
+    for (const name of ['local-crate/src', 'assets', 'shader-gen', 'tools']) mkdirSync(join(dir, name), { recursive: true });
+    writeFileSync(join(dir, 'app.json'), JSON.stringify(manifest));
+    writeFileSync(join(dir, 'local-crate/Cargo.toml'), '[package]\nname = "included"\nversion = "0.1.0"\n');
+    writeFileSync(join(dir, 'local-crate/src/lib.rs'), 'pub const MESSAGE: &str = include_str!("messages.err");\n');
+    let pending, rebuilds = 0;
+    const context = {
+      app, OUTPUT, INPUT_TREE, shaderWatchRoots, within, existsSync, dirname,
+      stopping: false, skipped: /^\.exact(?:\/|$)/, contractInput: () => false, settingsFile: () => false,
+      temporaryOfDesign: () => false, movedSince: () => true, since: Date.now() + 1000,
+      resolve, statSync, timer: null, saved: 0, edited: new Set(), residentChild: null,
+      starting: { failure: null }, inputs: 0, movedSinceBuild: new Set(), appeared: new Set(),
+      stopYoungBuild() {}, clearTimeout() {}, setTimeout: callback => { pending = callback; return 1; },
+      rebuild: () => { rebuilds++; },
+    };
+    runInNewContext(source.slice(begin, end) + '\nglobalThis.notify = changed(app.dir);', context);
+    for (const name of ['app.contract', 'app.forma', 'app.ts', 'unused.ts', 'helper.js', 'local-crate/src/messages.err', 'local-crate/src/captured.out', 'assets/captured.err', 'shader-gen/captured.out', 'declared.out', 'tools/declared.err']) {
+      writeFileSync(join(dir, name), 'edited');
+      context.notify('change', name);
+      expect(context.edited.has(join(dir, name)), name).toBe(true);
+      expect(pending, name).toBeFunction();
+      pending(); pending = null;
+    }
+    expect(rebuilds).toBe(11);
+    for (const name of ['macos.out', 'macos.err', 'other.OUT', '.exact/evidence.err']) {
+      context.notify('change', name);
+      expect(context.edited.has(join(dir, name)), name).toBe(false);
+      expect(pending, name).toBeNull();
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

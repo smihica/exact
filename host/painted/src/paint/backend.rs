@@ -79,9 +79,10 @@ pub trait Backend {
         Err("this painter cannot present to a CAMetalLayer".into())
     }
     /// Copy the last compose target, without another paint or resize in between.
+    /// False means no retained frame is available.
     #[cfg(target_os = "macos")]
-    fn repeat_apple_frame(&mut self) -> Result<(), String> {
-        Err("this painter has no retained Metal frame".into())
+    fn repeat_apple_frame(&mut self) -> Result<bool, String> {
+        Ok(false)
     }
     /// A lost device whose carrier can present CPU pixels without that device.
     fn lost_device_needs_cpu(&self) -> bool {
@@ -116,6 +117,11 @@ pub trait Backend {
     fn displayed_process_ms(&self) -> Result<Option<f64>, String> {
         Ok(None)
     }
+    /// The swap chain's present statistics, when the device presents directly.
+    #[cfg(windows)]
+    fn present_statistics(&self) -> Option<exact_ink::device::d3d11::PresentStatistics> {
+        None
+    }
     /// Attach the carrier's owned window when the device can present directly.
     #[cfg(windows)]
     fn attach_window(
@@ -139,7 +145,6 @@ pub trait Backend {
         _connector: u32,
         _size: [u32; 2],
         _refresh: u32,
-        _turned: bool,
     ) -> Result<(), String> {
         Err("this painter cannot present to a KMS display".into())
     }
@@ -165,8 +170,8 @@ pub trait Backend {
     /// A new frame of this size in points at this scale, cleared to the
     /// page's colour ([`Backend::page`]; white until one is told).
     fn begin(&mut self, width: f32, height: f32, scale: f32);
-    /// Release idle renderer storage on memory pressure or backgrounding.
-    fn trim(&mut self) {}
+    /// Release idle renderer storage, keeping the visible frame unless hidden.
+    fn trim(&mut self, _hidden: bool) {}
     /// Storage from a presented frame after its last reader releases it.
     fn recycle_frame(&mut self, _pixels: Pixmap) {}
     /// Seed a clipped repaint from an accepted frame; false means full repaint.
@@ -240,10 +245,15 @@ pub trait Backend {
         clips: &[Shape],
         ts: Transform,
         tint: Option<[u8; 4]>,
+        rendering: exact_kernel::ImageRendering,
     );
     /// Whether this backend places a CPU island: the walk makes none it
     /// would not (a text stroke's band).
     fn supports_island_image(&self) -> bool;
+    /// Whether an island can blend with previously painted pixels.
+    fn supports_blend(&self) -> bool {
+        true
+    }
     /// An SVG island's pixels over `dst` in `ts`'s space, blended by `mode`.
     fn island_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4, ts: Transform, mode: u8);
     /// Draw through a row-major projective matrix until `plane_end`. A backend
@@ -259,6 +269,21 @@ pub trait Backend {
     }
     /// End the innermost accepted projective matrix.
     fn plane_end(&mut self) {}
+    /// A box's CSS `filter` run by the backend itself (LLP 1172.023.001 D1):
+    /// what the walk paints until [`Self::pop_filter`] goes through
+    /// `primitives`, a box filter's chain, over `region` in `ts`'s space.
+    /// Whether it took them; else the painter rasterizes the box and runs
+    /// the chain on the CPU.
+    fn push_filter(
+        &mut self,
+        _primitives: &[exact_kernel::svg::filter::Primitive],
+        _region: Rect4,
+        _ts: Transform,
+    ) -> bool {
+        false
+    }
+    /// End the filter [`Self::push_filter`] took.
+    fn pop_filter(&mut self) {}
     /// Composite a rendered canvas child (not a decoded image asset).
     fn surface_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4);
     /// Composite a 2D canvas's bitmap into `dst`, clipped (LLP 1056 D7).
@@ -333,6 +358,11 @@ pub trait Backend {
     fn pointer(&mut self, x: f32, y: f32);
     /// The frame's pixels.
     fn finish(&mut self) -> Result<Pixmap, String>;
+    /// Rotate a retained GPU target before readback, when this backend supports it.
+    /// Other backends return pixels for the output's GPU blit.
+    fn finish_rotated(&mut self, _rotation: exact_ink::Rotation) -> Option<Result<Pixmap, String>> {
+        None
+    }
     /// Complete a paint for its consumer. `Pixels` requires an image; `Window`
     /// permits `None` after submission. `Geometry` updates only geometry.
     /// CPU backends return pixels.
@@ -341,6 +371,12 @@ pub trait Backend {
     }
     /// Whether this backend keeps rows' recordings ([`rows`]).
     fn rows(&self) -> bool {
+        false
+    }
+    /// Whether a kept drawing ([`tape`](super::tape)) may hold this
+    /// backend's rows by reference, drawing them through its transform
+    /// ([`Backend::row_draw_through`]); otherwise it records their draw calls.
+    fn rows_through(&self) -> bool {
         false
     }
     /// Whether recordings can be made at the local origin. Device-rasterized
@@ -367,6 +403,11 @@ pub trait Backend {
     }
     /// Draw kept row `id` with its top-left at `origin`, covering `bounds`.
     fn row_draw(&mut self, _id: u32, _origin: (f32, f32), _bounds: Rect4) {}
+    /// Draw kept row `id` through `ts`, which maps the row's space (its
+    /// top-left at the origin, in the units it was recorded in) into the
+    /// page; `bounds` is what the row covers in its space. A kept drawing
+    /// scaled or turned (`tape.rs`).
+    fn row_draw_through(&mut self, _id: u32, _ts: Transform, _bounds: Rect4) {}
     /// Kept row `id` is not drawn again.
     fn row_free(&mut self, _id: u32) {}
     /// The rows of scroller `id`, painted at its `scroll` offset, follow
@@ -407,6 +448,14 @@ pub trait Backend {
     }
     /// The layer ends.
     fn layer_end(&mut self) {}
+    /// Shared-element identity and engine progress, before this frame's destroys.
+    fn shared_frame(&mut self, _state: &super::SharedState) {}
+    /// Keep this live subtree apart from its normal slot on a native reader.
+    fn shared_begin(&mut self, _element: &super::SharedElement<'_>) -> bool {
+        false
+    }
+    /// Finish a named live subtree.
+    fn shared_end(&mut self) {}
     /// The last frame's (encode + render, readback) milliseconds, on a
     /// backend that has them.
     fn last_frame_ms(&self) -> Option<(f64, f64)> {
@@ -423,7 +472,7 @@ impl super::Painter {
         self.backend.attach_apple_layer(layer)
     }
     #[cfg(target_os = "macos")]
-    pub(crate) fn repeat_apple_frame(&mut self) -> Result<(), String> {
+    pub(crate) fn repeat_apple_frame(&mut self) -> Result<bool, String> {
         self.backend.repeat_apple_frame()
     }
     pub(crate) fn lost_device_needs_cpu(&self) -> bool {
@@ -455,13 +504,9 @@ impl super::Painter {
         connector: u32,
         size: [u32; 2],
         refresh: u32,
-        turned: bool,
     ) -> Result<(), String> {
         // SAFETY: the caller's contract.
-        unsafe {
-            self.backend
-                .attach_scanout(fd, connector, size, refresh, turned)
-        }
+        unsafe { self.backend.attach_scanout(fd, connector, size, refresh) }
     }
     #[cfg(all(feature = "scanout", target_os = "linux"))]
     pub(crate) fn presents(&self) -> bool {
@@ -476,6 +521,10 @@ impl super::Painter {
         self.backend.displayed_process_ms()
     }
     #[cfg(windows)]
+    pub(crate) fn present_statistics(&self) -> Option<exact_ink::device::d3d11::PresentStatistics> {
+        self.backend.present_statistics()
+    }
+    #[cfg(windows)]
     pub(crate) fn attach_window(
         &mut self,
         window: exact_ink::device::d3d11::Window,
@@ -484,9 +533,13 @@ impl super::Painter {
         self.backend.attach_window(window, size)
     }
 
-    /// Release idle renderer storage while preserving kept rows.
-    pub fn trim(&mut self) {
-        self.backend.trim();
+    /// Release rebuildable drawing storage on memory pressure or while hidden.
+    /// Keep the accepted content picture until its replacement is published.
+    pub fn trim(&mut self, hidden: bool) {
+        // Rows must release their texture pins before the backend trims its images.
+        self.discard_rows();
+        self.damage.pixels = None;
+        self.backend.trim(hidden);
     }
 }
 

@@ -167,6 +167,7 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         focused: true,
         cursor: CursorIcon::Default,
         buttons: 0,
+        unheard: false,
         clicks: Default::default(),
         touches: Default::default(),
         scale: 1.,
@@ -194,11 +195,14 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         ime: Default::default(),
         appearance: Default::default(),
         modal: Default::default(),
+        dialogs: Default::default(),
         desktop: crate::desktop::Desktop::install("Ink caret regression"),
         closing: false,
         keep_running: false,
         hidden: false,
         instance: None,
+        tray: None,
+        presents: Default::default(),
     };
     assert!(!state.presenter.as_ref().unwrap().dirty());
     state.blink(due).unwrap();
@@ -305,6 +309,7 @@ fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) 
         focused: true,
         cursor: CursorIcon::Default,
         buttons: 0,
+        unheard: false,
         clicks: Default::default(),
         touches: Default::default(),
         scale: 1.,
@@ -332,11 +337,14 @@ fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) 
         ime: Default::default(),
         appearance: Default::default(),
         modal: Default::default(),
+        dialogs: Default::default(),
         desktop: crate::desktop::Desktop::install("Frame scheduling regression"),
         closing: false,
         keep_running: false,
         hidden: false,
         instance: None,
+        tray: None,
+        presents: Default::default(),
     }
 }
 

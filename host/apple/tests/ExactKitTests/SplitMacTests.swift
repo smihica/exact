@@ -8,6 +8,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class SplitMacTests: XCTestCase {
     private var window: NSWindow?
@@ -258,7 +259,7 @@ final class SplitMacTests: XCTestCase {
             let reply = agent.tap(["id": Int(try node(name).id), "hover": true])
             XCTAssertNil(reply["error"], "\(name): \(reply)")
         }
-        let split = session.presenter.navigation.split
+        let split = session.presenter.navigationHost.split
         XCTAssertEqual(window?.title, "About a")
         XCTAssertTrue(try node("title-a").isHiddenOrHasHiddenAncestor)
         XCTAssertFalse(try node("title-library").isHiddenOrHasHiddenAncestor)
@@ -355,12 +356,12 @@ final class SplitMacTests: XCTestCase {
         let view = ExactView(session: session)
         let columns = compose(view, width: 1100, sidebar: true)
         let window = try XCTUnwrap(self.window), detail = try XCTUnwrap(columns.splitViewItems.last)
-        XCTAssertFalse(session.presenter.navigation.split.active)
+        XCTAssertFalse(session.presenter.navigationHost.split.active)
         XCTAssertFalse(columns.splits)
         // AppKit can restore a divider after the controller's initial collapse.
         detail.isCollapsed = false
         window.layoutIfNeeded()
-        session.presenter.navigation.split.sync()
+        session.presenter.navigationHost.split.sync()
         window.layoutIfNeeded()
         XCTAssertTrue(detail.isCollapsed)
         XCTAssertFalse(columns.splits)
@@ -412,12 +413,12 @@ final class SplitMacTests: XCTestCase {
         XCTAssertFalse(route.isHiddenOrHasHiddenAncestor)
         XCTAssertTrue(route.routeInert)
         XCTAssertTrue(route.isAccessibilityHidden())
-        XCTAssertTrue(p.navigation.split.holds(route))
+        XCTAssertTrue(p.navigationHost.split.holds(route))
         p.apply(wireBatch([]))
         XCTAssertTrue(route.superview === pane, "a later batch must not release it either")
         p.apply(wireBatch([["op": "destroy", "id": Int(panel.id)]]))
         XCTAssertNil(route.superview)
-        XCTAssertFalse(p.navigation.split.holds(route))
+        XCTAssertFalse(p.navigationHost.split.holds(route))
     }
 
     func testDetailFocusBubblesThroughItsAuthoredAncestorsAndStops() throws {
@@ -484,7 +485,7 @@ final class SplitMacTests: XCTestCase {
 
     func testAListAndItsDetailAreTwoPanesBesideTheSidebar() throws {
         let session = try boot(tabs: true, size: CGSize(width: 1100, height: 500))
-        let p = session.presenter, split = p.navigation.split
+        let p = session.presenter, split = p.navigationHost.split
         let view = ExactView(session: session)
         // Wanted by the runner's rule; nothing is claimed by mounting, and the stack pushes.
         XCTAssertTrue(view.wantsWindowSplit)
@@ -505,7 +506,7 @@ final class SplitMacTests: XCTestCase {
         XCTAssertEqual(columns.detail.saysNothing, SplitDetail.noSelection)
         XCTAssertEqual(SplitDetail.noSelection, "No Selection")
         XCTAssertEqual(window.title, "Library")
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
 
         // A row is pressed: its route is in the detail's pane, laid out at the pane's size, beside a list that stays live.
         let feed = try XCTUnwrap(p.tables.feeds[books.id])
@@ -548,7 +549,7 @@ final class SplitMacTests: XCTestCase {
         p.apply(wireBatch([["op": "props", "id": Int(count.id), "set": ["accessibilityDisabled": "false"]]]))
         XCTAssertTrue(try element("Count").isAccessibilityEnabled())
         // The detail has no Back: nothing was pushed from it.
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
 
         // Another row, which this app pushes over the first: it is that row's detail, and still nothing leads Back.
         feed.table.selectRowIndexes([2], byExtendingSelection: false)
@@ -557,7 +558,7 @@ final class SplitMacTests: XCTestCase {
         XCTAssertTrue(other.superview === pane)
         XCTAssertTrue(book.isHidden)
         XCTAssertEqual(split.shown?.base, 2)
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
         XCTAssertEqual(feed.table.selectedRow, 2)
 
         // A push inside the detail: the window's Back leads from it, and the row stays selected.
@@ -565,24 +566,24 @@ final class SplitMacTests: XCTestCase {
         let pushed = try node("route-notes")
         XCTAssertTrue(pushed.superview === pane)
         XCTAssertEqual(pushed.frame.size, pane.bounds.size)
-        XCTAssertTrue(p.navigation.canGoBack)
+        XCTAssertTrue(p.navigationHost.canGoBack)
         XCTAssertEqual(feed.table.selectedRow, 2)
         XCTAssertEqual(window.title, "Library")
         // Back is at the bar's leading end, after the sidebar's own items, and came with the push.
         XCTAssertEqual(Array(items(window).prefix(3)), ["NSToolbarToggleSidebarItem", "NSToolbarSidebarTrackingSeparatorItemIdentifier", "exact.navigation.history"])
-        XCTAssertTrue(p.navigation.goBack())
+        XCTAssertTrue(p.navigationHost.goBack())
         XCTAssertFalse(has("route-notes"))
         XCTAssertFalse(other.isHidden)
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
         // Back to the detail's base leaves the notes ahead: the group stays for its Forward, which pushes them again.
         XCTAssertEqual(Array(items(window).prefix(3)), ["NSToolbarToggleSidebarItem", "NSToolbarSidebarTrackingSeparatorItemIdentifier", "exact.navigation.history"])
         XCTAssertFalse(p.toolbar.backEnabled)
         XCTAssertTrue(p.toolbar.forwardEnabled)
-        XCTAssertTrue(p.navigation.goForward())
+        XCTAssertTrue(p.navigationHost.goForward())
         XCTAssertTrue(try node("route-notes").superview === pane)
         XCTAssertTrue(p.toolbar.backEnabled)
         XCTAssertFalse(p.toolbar.forwardEnabled)
-        XCTAssertTrue(p.navigation.goBack())
+        XCTAssertTrue(p.navigationHost.goBack())
         XCTAssertFalse(has("route-notes"))
         XCTAssertFalse(other.isHidden)
 
@@ -683,7 +684,7 @@ final class SplitMacTests: XCTestCase {
                 .replacingOccurrences(of: "testId=`row-${id}`", with: "testId=`row-${id}` display=(id == \"d\" and hidden ? \"none\" : \"flex\")")
             let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source, location: "/book/b")
             let columns = compose(ExactView(session: session), width: 1000, sidebar: false, window: KeyedWindow.self)
-            let p = session.presenter, split = p.navigation.split
+            let p = session.presenter, split = p.navigationHost.split
             let feed = p.tables.feeds[try node("books").id]
             XCTAssertEqual(feed == nil, painted)
             func selected(_ id: String?, index: Int = -1) throws {
@@ -739,7 +740,7 @@ final class SplitMacTests: XCTestCase {
             try press("replace-detail")
             XCTAssertTrue(split.shown?.detail === detail, "replace keeps the route's identity")
             XCTAssertEqual(split.shown?.base, base)
-            XCTAssertFalse(p.navigation.canGoBack)
+            XCTAssertFalse(p.navigationHost.canGoBack)
             try selected("c", index: 0)
             if let feed { XCTAssertTrue(feed.pressRow(1)) } else { try press("row-d") }
             try selected("d", index: 1)
@@ -812,7 +813,7 @@ final class SplitMacTests: XCTestCase {
         // The window stops at the list's 200, the divider and the detail's minimum.
         width(window, 200)
         XCTAssertEqual(window.contentView?.frame.width ?? 0, 200 + 320 + columns.splitView.dividerThickness, accuracy: 1)
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
     }
 
     /// The list is never pushed: its header's Back control (the root's
@@ -913,7 +914,7 @@ final class SplitMacTests: XCTestCase {
                     text "Detail"
         """
         let session = try boot(tabs: false, size: CGSize(width: 900, height: 500), source: source)
-        let split = session.presenter.navigation.split
+        let split = session.presenter.navigationHost.split
         let columns = compose(ExactView(session: session), width: 900, sidebar: false)
         let list = try node("changing-list")
         XCTAssertTrue(split.active)
@@ -1026,7 +1027,7 @@ final class SplitMacTests: XCTestCase {
 
     func testUnderTheDriversOwnChromeTheStackPushesAndTheDriverSeesTheSplit() throws {
         let session = try boot(tabs: true, size: CGSize(width: 1100, height: 500))
-        let p = session.presenter, split = p.navigation.split
+        let p = session.presenter, split = p.navigationHost.split
         let view = ExactView(session: session)
         let columns = compose(view, width: 1100, sidebar: true)
         try press("row-a")
@@ -1037,11 +1038,11 @@ final class SplitMacTests: XCTestCase {
         XCTAssertEqual(summary["row"] as? Int, Int(try node("row-a").id))
         XCTAssertEqual(summary["listWidth"] as? Double, 320)
         // The driver's `back` from a split's detail: as a person leaves it, the selection off its row.
-        let went = try XCTUnwrap(p.navigation.agentBack())
+        let went = try XCTUnwrap(p.navigationHost.agentBack())
         XCTAssertEqual(went.way, "route")
         XCTAssertEqual(went.refused, "")
         XCTAssertFalse(has("route-book-a"))
-        XCTAssertNil(p.navigation.agentBack(), "and from the list there is nowhere to go back to")
+        XCTAssertNil(p.navigationHost.agentBack(), "and from the list there is nowhere to go back to")
 
         // The driver's own chrome: the stack pushes in the page, as authored.
         try press("row-a")
@@ -1052,7 +1053,7 @@ final class SplitMacTests: XCTestCase {
         XCTAssertFalse(columns.splits)
         XCTAssertFalse(again.superview === columns.detailPane)
         XCTAssertTrue(library.isHidden, "a pushed route covers its list")
-        XCTAssertTrue(p.navigation.canGoBack)
+        XCTAssertTrue(p.navigationHost.canGoBack)
         summary = split.summary
         XCTAssertEqual(summary["installed"] as? Bool, false)
         split.painted = false
@@ -1082,7 +1083,7 @@ final class SplitMacTests: XCTestCase {
             let p = session.presenter
             p.menus.painted = painted
             try press("row-a")
-            settle("the book is in the detail pane") { view("route-book-a").map { p.navigation.split.holds($0) } == true }
+            settle("the book is in the detail pane") { view("route-book-a").map { p.navigationHost.split.holds($0) } == true }
             window.layoutIfNeeded()
             let pop = try node("bookpop"), opener = try node("pop-open")
             XCTAssertFalse(opener.isDescendant(of: p.root), "its invoker is under no page root")
@@ -1091,7 +1092,7 @@ final class SplitMacTests: XCTestCase {
             if !painted { XCTAssertEqual(p.menus.windowed.count, 1) }
             if painted {
                 // In the pane's own layer, beside its invoker: not clamped into the list.
-                let pane = try XCTUnwrap(p.navigation.split.pane(holding: opener))
+                let pane = try XCTUnwrap(p.navigationHost.split.pane(holding: opener))
                 XCTAssertTrue(pop.isDescendant(of: pane))
                 let shown = pop.convert(pop.bounds, to: nil), invoker = opener.convert(opener.bounds, to: nil)
                 XCTAssertEqual(shown.minX, invoker.minX, accuracy: 1, "\(shown) under \(invoker)")
@@ -1124,9 +1125,9 @@ final class SplitMacTests: XCTestCase {
                 pane.addSubview(retained, positioned: .below, relativeTo: nil)
                 retained.setRank(2)
                 XCTAssertGreaterThan(paneLayer.layer?.zPosition ?? 0, 0.0015, "deeper by the pane's own ranking")
-                p.navigation.split.painted = true
+                p.navigationHost.split.painted = true
                 settle("the split ends, the popover's layer follows the route into the page, and the regions are told") {
-                    !p.navigation.split.active && pop.isDescendant(of: p.viewport) && p.regionsUntold.isEmpty
+                    !p.navigationHost.split.active && pop.isDescendant(of: p.viewport) && p.regionsUntold.isEmpty
                 }
                 XCTAssertTrue(p.menus.isOpen(pop) && p.menus.isOpen(later))
                 let layers = p.viewport.subviews
@@ -1158,11 +1159,11 @@ final class SplitMacTests: XCTestCase {
         let p = session.presenter
         p.menus.painted = true
         try press("row-a")
-        settle("the book is in the detail pane") { view("pane-pop-open").map { p.navigation.split.pane(holding: $0) != nil } == true }
+        settle("the book is in the detail pane") { view("pane-pop-open").map { p.navigationHost.split.pane(holding: $0) != nil } == true }
         let pop = try node("panepop")
         try press("pane-pop-open")
         settle("the popover opens") { p.menus.isOpen(pop) }
-        let pane = try XCTUnwrap(p.navigation.split.pane(holding: try node("pane-pop-open")))
+        let pane = try XCTUnwrap(p.navigationHost.split.pane(holding: try node("pane-pop-open")))
         let layer = try XCTUnwrap(pop.superview)
         XCTAssertTrue(layer.superview === pane)
         try press("notes-a")
@@ -1199,7 +1200,7 @@ final class SplitMacTests: XCTestCase {
         ], in: app(tabs: false))
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
         let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
-        let split = session.presenter.navigation.split, pane = columns.detailPane
+        let split = session.presenter.navigationHost.split, pane = columns.detailPane
         let own = try node("own"), library = try node("route-library")
         func shown() throws {
             XCTAssertTrue(own.superview === pane)
@@ -1264,7 +1265,7 @@ final class SplitMacTests: XCTestCase {
     func testAPaintedListBesideItsDetailDrawsNoChevrons() throws {
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
         _ = compose(ExactView(session: session), width: 1000, sidebar: false)
-        let p = session.presenter, split = p.navigation.split
+        let p = session.presenter, split = p.navigationHost.split
         XCTAssertTrue(split.active)
         XCTAssertNil(p.tables.feeds[try node("books").id], "the grouped form is painted")
         func drawn(_ id: String) throws -> CGFloat? { try node(id).symbolView?.alphaValue }
@@ -1287,7 +1288,7 @@ final class SplitMacTests: XCTestCase {
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: paintedList())
         let columns = compose(ExactView(session: session), width: 1000, sidebar: false, window: KeyedWindow.self)
         let window = try XCTUnwrap(self.window)
-        let p = session.presenter, split = p.navigation.split
+        let p = session.presenter, split = p.navigationHost.split
         func mark(_ id: String) throws -> RowSelectionLayer? {
             let row = try node(id)
             return row.superview?.layer?.sublayers?.lazy.compactMap { $0 as? RowSelectionLayer }.first { $0.row === row }
@@ -1329,7 +1330,7 @@ final class SplitMacTests: XCTestCase {
         // Another row, whose press pushes over the first: it is that row's detail, with no Back, and the
         // selection moves, and so do the separators it hides.
         try press("row-c")
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
         XCTAssertNil(try mark("row-b"))
         XCTAssertNotNil(try mark("row-c"))
         XCTAssertEqual(try separated("row-a"), true)
@@ -1375,7 +1376,7 @@ final class SplitMacTests: XCTestCase {
         let swapped = try node("route-book-a")
         XCTAssertTrue(swapped.superview === columns.detailPane)
         XCTAssertEqual(split.shown?.detail, swapped)
-        XCTAssertFalse(p.navigation.canGoBack)
+        XCTAssertFalse(p.navigationHost.canGoBack)
         XCTAssertNil(try mark("row-c"))
         XCTAssertNil(try mark("row-a"))
         XCTAssertTrue(split.summary["marked"] is NSNull)
@@ -1414,7 +1415,7 @@ final class SplitMacTests: XCTestCase {
         let source = app(tabs: false).replacingOccurrences(of: "list testId=\"books\"", with: "list testId=\"books\" appearance=\"none\"")
         let session = try boot(tabs: false, size: CGSize(width: 1000, height: 500), source: source)
         let columns = compose(ExactView(session: session), width: 1000, sidebar: false)
-        let split = session.presenter.navigation.split
+        let split = session.presenter.navigationHost.split
         XCTAssertNil(session.presenter.tables.feeds[try node("books").id])
         try press("row-a")
         XCTAssertTrue(try node("route-book-a").superview === columns.detailPane)

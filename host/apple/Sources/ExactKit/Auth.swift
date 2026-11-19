@@ -75,7 +75,7 @@ extension ExactSession {
         // listener's receiver on macOS; iOS waits on a device measurement (§8).
         if let loopback = op["loopback"] as? [String: Any] {
             #if os(macOS)
-            let opened = authLoopback(ticket, url: url, state: op["state"] as? String ?? "", ephemeral: op["ephemeral"] as? Bool ?? false,
+            let opened = authLoopback(ticket, url: url, state: op["state"] as? String ?? "", logout: op["logout"] as? Bool ?? false, ephemeral: op["ephemeral"] as? Bool ?? false,
                                       loopback: loopback, done: { [weak self] in self?.authCompleted(ticket, $0) })
             switch opened {
             case .success(let sheet): authSessions.live[ticket] = sheet
@@ -92,7 +92,7 @@ extension ExactSession {
             return authDone(ticket, AuthFailure(status: 501, message: "this build links no sign-in sheet (auth_session): rebuild with the `auth.session` grant"))
         }
         let opened = link.open(url: url, callback: parts, ephemeral: op["ephemeral"] as? Bool ?? false,
-                               anchor: { [weak self] in self?.presenter.shareAnchor(nil).0?.window },
+                               anchor: { [weak self] in self?.presenter.presentationAnchor(nil).0?.window },
                                done: { [weak self] in self?.authCompleted(ticket, $0) })
         switch opened {
         case .success(let sheet): authSessions.live[ticket] = sheet

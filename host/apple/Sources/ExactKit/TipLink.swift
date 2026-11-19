@@ -88,7 +88,7 @@ extension Presenter {
     /// holds and `--reset-storage` forgets the tips too.
     private func tipStore() -> URL? {
         guard ExactEnv.agentMode, let session else { return nil }
-        let data = URL(fileURLWithPath: NativeViews.roots(session: session).data, isDirectory: true)
+        let data = URL(fileURLWithPath: AppRoots.of(session: session).data, isDirectory: true)
         return data.deletingLastPathComponent().appendingPathComponent("tips", isDirectory: true)
     }
 
@@ -161,30 +161,16 @@ private extension UIView {
 }
 private extension UIWindow { var contentBounds: CGRect { bounds } }
 
-private extension UIViewController {
+extension UIViewController {
     /// Whether nothing is presented over this controller's screen: it is in
     /// the topmost presentation (a tip's own popover covers nothing).
-    var isTopForTips: Bool {
+    package var isTopForTips: Bool {
         guard var top = viewIfLoaded?.window?.rootViewController else { return false }
         while let next = top.presentedViewController, !(next is TipPresentation), !next.isBeingDismissed { top = next }
         return sequence(first: self, next: { $0.parent }).contains { $0 === top }
     }
 }
 
-extension NavigationHost {
-    /// The navigation bar item a shown route's bar draws for `node`, and
-    /// the route it is in; nil when no shown bar stands for it, or something
-    /// is presented over its route.
-    func tipItem(_ node: NodeView) -> (UIBarButtonItem, UIViewController)? {
-        for c in controllers.values {
-            guard let nav = c.navigationController, nav.topViewController === c, barShows(nav), c.viewIfLoaded?.window != nil,
-                  c.isTopForTips, let item = c.barItemsMade[node.id]?.bar else { continue }
-            let shown = (c.navigationItem.leftBarButtonItems ?? []) + (c.navigationItem.rightBarButtonItems ?? [])
-            if shown.contains(where: { $0 === item }) { return (item, c) }
-        }
-        return nil
-    }
-}
 #else
 private typealias TipView = NSView
 private extension NSView {

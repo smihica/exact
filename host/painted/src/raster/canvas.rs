@@ -5,6 +5,7 @@ use super::*;
 impl Raster {
     pub(super) fn split_window(&mut self, dst: Rect4, clips: &[Shape], ts: Transform) -> bool {
         if self.window_underlay.is_some()
+            || self.origin != (0., 0.)
             || !self.layers.is_empty()
             || !ts.is_identity()
             || dst
@@ -41,6 +42,7 @@ impl Raster {
     // whose every coverage byte would be 255.
     pub(super) fn viewport_clip(&self, shape: &Shape, ts: Transform) -> bool {
         ts.is_identity()
+            && self.origin == (0., 0.)
             && self.width <= 8191
             && self.height <= 8191
             && self.scale.is_finite()
@@ -65,6 +67,7 @@ impl Raster {
         };
         if dst.0 != 0.
             || dst.1 != 0.
+            || self.origin != (0., 0.)
             || dst.2 <= 0.
             || dst.3 <= 0.
             || image.width() != target.width()
@@ -92,7 +95,12 @@ impl Raster {
                         || mask.height() != target.height()
                         || mask.data().iter().any(|&a| a != 255)
                 })
-            || image.data().chunks_exact(4).any(|pixel| pixel[3] != 255)
+            || image
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 255)
         {
             return false;
         }
@@ -186,7 +194,7 @@ mod tests {
 
     fn image(w: u32, h: u32) -> Arc<Pixmap> {
         let mut p = Pixmap::new(w, h).unwrap();
-        for (i, pixel) in p.data_mut().chunks_exact_mut(4).enumerate() {
+        for (i, pixel) in p.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
             pixel.copy_from_slice(&[(i * 17) as u8, (i * 41) as u8, (i * 7) as u8, 255]);
         }
         Arc::new(p)

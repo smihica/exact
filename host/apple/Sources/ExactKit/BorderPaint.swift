@@ -18,7 +18,7 @@ import QuartzCore
 
 package enum BorderPaint {
     /// Percentages use the border box's width and height independently.
-    static func radii(_ style: NodeStyle, in rect: CGRect, inset: CGFloat = 0) -> [CGSize] {
+    package static func radii(_ style: NodeStyle, in rect: CGRect, inset: CGFloat = 0) -> [CGSize] {
         ["top_left", "top_right", "bottom_right", "bottom_left"].map { name in
             let value = style["border_radius_" + name] ?? style["border_radius"]
             func length(_ basis: CGFloat) -> CGFloat {
@@ -31,7 +31,7 @@ package enum BorderPaint {
     /// A private material/media layer owns its mask. Keep the circular fast
     /// path; percentages on non-square boxes need the resolved elliptical path.
     @discardableResult
-    static func clip(_ layer: CALayer, in rect: CGRect, radii: [CGSize]) -> CGFloat {
+    package static func clip(_ layer: CALayer, in rect: CGRect, radii: [CGSize]) -> CGFloat {
         let corners = reduced(radii, in: rect)
         let first = corners[0]
         let circular = first.width == first.height && corners.allSatisfy { $0 == first }
@@ -54,7 +54,7 @@ package enum BorderPaint {
     /// reduce again in the content box, as `paint` reduces the padding
     /// edge's in the padding box. So the content meets the border's inner
     /// curve, as in Chrome, which reduces both inner curves.
-    static func contentRadii(_ radii: [CGSize], outer: CGRect, inner: CGRect) -> [CGSize] {
+    static package func contentRadii(_ radii: [CGSize], outer: CGRect, inner: CGRect) -> [CGSize] {
         let r = reduced(radii, in: outer)
         let left = inner.minX - outer.minX, right = outer.maxX - inner.maxX
         let top = inner.minY - outer.minY, bottom = outer.maxY - inner.maxY

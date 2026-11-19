@@ -15,7 +15,7 @@ fn patch(rows: &[(StyleId, &str)]) -> Box<StyleProps> {
             let row = crate::keyframed(text);
             match id {
                 StyleId::ExitAnimation => s.rare.exit_animation = row,
-                _ => s.animation = row,
+                _ => s.animation = row.into(),
             }
             s.mask.set(*id);
             continue;
@@ -444,6 +444,7 @@ fn an_appearance_change_transitions_and_a_dropped_row_retires() {
 
 #[test]
 fn paint_transition_names_and_colour_keyframes_round_trip_the_wire() {
+    exact_kernel::style::link_all();
     let t = Transitions::parse("border-color 1s, box-shadow 2s, -exact-tint-color 3s, color 4s")
         .unwrap();
     assert_eq!(t.0[0].property, TransitionProperty::BorderColor);
@@ -460,7 +461,7 @@ fn paint_transition_names_and_colour_keyframes_round_trip_the_wire() {
             patch: Box::new({
                 let mut s = StyleProps::default();
                 s.transition = t.clone();
-                s.animation = a.clone();
+                s.animation = a.clone().into();
                 s.mask.set(StyleId::Transition);
                 s.mask.set(StyleId::Animation);
                 s

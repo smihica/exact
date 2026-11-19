@@ -48,6 +48,14 @@ impl Session {
 }
 
 impl<D: DataSource> Runner<D> {
+    /// The session, as the list engine made it.
+    pub(super) fn session(&self) -> Option<&Session> {
+        self.reorder_session.as_deref()?.downcast_ref()
+    }
+    pub(super) fn session_mut(&mut self) -> Option<&mut Session> {
+        self.reorder_session.as_deref_mut()?.downcast_mut()
+    }
+
     /// A list's non-empty `reorderGroup` (D1).
     pub(super) fn reorder_group(&self, list: NodeKey) -> Option<String> {
         let node = self.kernel.node_by_key(list)?;
@@ -86,7 +94,7 @@ impl<D: DataSource> Runner<D> {
     /// so the row itself hides until `finish_reorder`. A key's or a custom
     /// action's session (D9) has no ghost. `None` for a list without a
     /// group, or whatever `begin_reorder` refuses.
-    pub fn begin_group_reorder(
+    pub(super) fn begin_group_reorder_linked(
         &mut self,
         binding: ReorderBinding,
         geometry: ReorderGeometry,
@@ -100,8 +108,7 @@ impl<D: DataSource> Runner<D> {
 
     /// The active grouped session `token` names.
     fn grouped(&self, token: ReorderToken) -> Option<&Session> {
-        self.reorder_session
-            .as_deref()
+        self.session()
             .filter(|s| s.token == token && s.group.is_some())
     }
 
@@ -111,7 +118,7 @@ impl<D: DataSource> Runner<D> {
     /// over in one commit (`Outgoing` on the source, `Incoming` on it). A
     /// list that already holds the row is no target: the sticky target
     /// stays and the journal says so once (D1).
-    pub fn preview_reorder_into(
+    pub(super) fn preview_reorder_into_linked(
         &mut self,
         token: ReorderToken,
         target: NodeKey,
@@ -187,7 +194,7 @@ impl<D: DataSource> Runner<D> {
             ok == Some(true)
         };
         if accepted {
-            if let Some(s) = self.reorder_session.as_deref_mut() {
+            if let Some(s) = self.session_mut() {
                 s.target = target;
                 s.touch(target);
             }
@@ -230,7 +237,7 @@ impl<D: DataSource> Runner<D> {
 
     /// The journal's one line a drag about a list that holds the row (D1).
     fn refuse_holder(&mut self, list: NodeKey) {
-        let Some(s) = self.reorder_session.as_deref_mut() else {
+        let Some(s) = self.session_mut() else {
             return;
         };
         if std::mem::replace(&mut s.warned, true) {
@@ -240,14 +247,6 @@ impl<D: DataSource> Runner<D> {
         self.log(format!(
             "reorderdrop: {id} already holds the dragged row, so it is not a target"
         ));
-    }
-
-    /// A list's `id`, as `ReorderEvent` names it.
-    pub(super) fn list_id(&self, list: NodeKey) -> String {
-        self.kernel
-            .node_by_key(list)
-            .and_then(|n| n.props.str(PropId::Id).map(str::to_owned))
-            .unwrap_or_default()
     }
 
     /// A grouped drop (D2, D8): the target's eligibility consumed once,
@@ -295,7 +294,7 @@ impl<D: DataSource> Runner<D> {
             .and_then(|c| c.place_of(&format!("s:{item}")))
             .map(|(a, b)| (source, a, b));
         let deadline = self.now_ms + HOLD_MS;
-        if let Some(s) = self.reorder_session.as_deref_mut() {
+        if let Some(s) = self.session_mut() {
             s.phase = ReorderPhase::Holding;
             s.deadline_ms = Some(deadline);
             s.before = ident(&before);
@@ -312,24 +311,6 @@ impl<D: DataSource> Runner<D> {
             self.apply_reorder_ops(ops)?;
         }
         result.map(Some)
-    }
-
-    /// `reorderdrop`'s `ReorderEvent` (D2): the list the row came from and
-    /// the one it was dropped on, by `id`; the same list for a drop within
-    /// one and for a host's own `reorderdrop`.
-    pub(super) fn reorder_record(&self, view: exact_kernel::ViewId) -> exact_plan::Value {
-        let to = self
-            .kernel
-            .node(view)
-            .and_then(|n| n.props.str(PropId::Id).map(str::to_owned))
-            .unwrap_or_default();
-        let from = self
-            .dropping_from
-            .map_or_else(|| to.clone(), |l| self.list_id(l));
-        exact_plan::Value::record(vec![
-            exact_plan::Value::str(&from),
-            exact_plan::Value::str(&to),
-        ])
     }
 
     /// Where a hold stands (D8): landed (where it was dropped, or where
@@ -366,7 +347,7 @@ impl<D: DataSource> Runner<D> {
         ending: Option<ReorderEnding>,
         instant: bool,
     ) -> Result<Vec<Op>, RunnerError> {
-        let Some(s) = self.reorder_session.as_deref() else {
+        let Some(s) = self.session() else {
             return Ok(Vec::new());
         };
         let (source, target, touched, item, ghost, dropped) = (
@@ -393,7 +374,7 @@ impl<D: DataSource> Runner<D> {
             let (_, o) = self.edit_reorder(list, |c, u, _| c.set_hidden(u, hide.clone()))?;
             ops.extend(o);
         }
-        if let Some(s) = self.reorder_session.as_deref_mut() {
+        if let Some(s) = self.session_mut() {
             s.phase = if dropped || ending.is_some() {
                 ReorderPhase::Settling
             } else {
@@ -410,11 +391,7 @@ impl<D: DataSource> Runner<D> {
     /// target went goes home, and a hold ends at the first commit that
     /// shows the move or loses the row.
     pub(super) fn reconcile_group(&mut self) -> Result<Vec<Op>, RunnerError> {
-        let Some(s) = self
-            .reorder_session
-            .as_deref()
-            .filter(|s| s.group.is_some())
-        else {
+        let Some(s) = self.session().filter(|s| s.group.is_some()) else {
             return Ok(Vec::new());
         };
         let (token, target, phase) = (s.token, s.target, s.phase);
@@ -433,7 +410,7 @@ impl<D: DataSource> Runner<D> {
                 if target != token.list && self.reorder_collection(target).is_none() {
                     let (_, ops) =
                         self.edit_reorder(token.list, |c, u, _| c.set_outgoing(u, false))?;
-                    if let Some(s) = self.reorder_session.as_deref_mut() {
+                    if let Some(s) = self.session_mut() {
                         s.target = token.list;
                     }
                     return Ok(ops);
@@ -446,9 +423,8 @@ impl<D: DataSource> Runner<D> {
 
     /// The hold's deadline, which `timer_due_ms` reports beside the plan's
     /// timers so a host wakes for it (D8).
-    pub(super) fn reorder_deadline(&self) -> Option<f64> {
-        self.reorder_session
-            .as_deref()
+    pub(super) fn reorder_deadline_linked(&self) -> Option<f64> {
+        self.session()
             .filter(|s| s.phase == ReorderPhase::Holding)
             .and_then(|s| s.deadline_ms)
     }
@@ -456,7 +432,7 @@ impl<D: DataSource> Runner<D> {
     /// The deadline passed (D8): the previews close, the row springs onto
     /// wherever it is, and the journal says so. One commit, `ending:
     /// timeout`.
-    pub(super) fn reorder_timeout(&mut self) -> Result<CommitReceipt, RunnerError> {
+    pub(super) fn reorder_timeout_linked(&mut self) -> Result<CommitReceipt, RunnerError> {
         self.log("reorderdrop: the move did not show within 1 s");
         let ops = self.end_session(Some(ReorderEnding::Timeout), false)?;
         self.apply(ops)
@@ -467,7 +443,7 @@ impl<D: DataSource> Runner<D> {
     /// grouped list in tree order that does not hold the row, clamped to
     /// its end; then the gap is kept in view (`scrollIntoView`'s
     /// `nearest`). Its drop needs no measured sample.
-    pub fn reorder_step(
+    pub(super) fn reorder_step_linked(
         &mut self,
         token: ReorderToken,
         step: ReorderStep,
@@ -527,7 +503,7 @@ impl<D: DataSource> Runner<D> {
                     ops.extend(o);
                     ops.extend(self.leave_target(current, source)?);
                 }
-                if let Some(s) = self.reorder_session.as_deref_mut() {
+                if let Some(s) = self.session_mut() {
                     s.target = target;
                     s.touch(target);
                 }
@@ -543,8 +519,8 @@ impl<D: DataSource> Runner<D> {
             receipts.push(self.scroll_into_view(IntoView {
                 list: format!("#{view}"),
                 key: exact_plan::Value::str(&key),
-                block: crate::instance::collection::Align::Nearest,
-                inline: crate::instance::collection::Align::Nearest,
+                block: crate::list_api::Align::Nearest,
+                inline: crate::list_api::Align::Nearest,
                 row: None,
                 view: Some(view),
                 smooth: false,
@@ -556,8 +532,8 @@ impl<D: DataSource> Runner<D> {
 
     /// `state.reorder` (D12): the session's row, its two lists, the key the
     /// gap is before and its phase; `null` with none.
-    pub fn reorder_json(&self) -> String {
-        let Some(s) = self.reorder_session.as_deref() else {
+    pub(super) fn reorder_json_linked(&self) -> String {
+        let Some(s) = self.session() else {
             return "null".into();
         };
         let before = match s.phase {
@@ -567,21 +543,21 @@ impl<D: DataSource> Runner<D> {
             _ => s.before.clone(),
         };
         let mut out = String::from("{\"item\":");
-        crate::agent::quote(&s.key, &mut out);
+        crate::json::quote(&s.key, &mut out);
         out.push_str(",\"from\":");
-        crate::agent::quote(&self.list_id(s.token.list), &mut out);
+        crate::json::quote(&self.list_id(s.token.list), &mut out);
         out.push_str(",\"to\":");
-        crate::agent::quote(&self.list_id(s.target), &mut out);
+        crate::json::quote(&self.list_id(s.target), &mut out);
         out.push_str(",\"before\":");
         match before.as_deref().and_then(|b| b.strip_prefix("s:")) {
-            Some(key) => crate::agent::quote(key, &mut out),
+            Some(key) => crate::json::quote(key, &mut out),
             None => out.push_str("null"),
         }
         out.push_str(",\"phase\":");
-        crate::agent::quote(s.phase.name(), &mut out);
+        crate::json::quote(s.phase.name(), &mut out);
         out.push_str(",\"ending\":");
         match s.ending {
-            Some(e) => crate::agent::quote(e.name(), &mut out),
+            Some(e) => crate::json::quote(e.name(), &mut out),
             None => out.push_str("null"),
         }
         out.push('}');

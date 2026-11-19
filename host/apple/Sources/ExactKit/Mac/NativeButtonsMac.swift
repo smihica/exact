@@ -200,8 +200,8 @@ final class NativeButtonMac: NSButton {
                 title.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: title.length))
                 attributedTitle = title
             }
-            if let color = ButtonConfigurationMac.color(rows.symbol["tint_color"], appearance: owner.effectiveAppearance, accent: written.accent), let base = image {
-                let path = written.face.symbol.map(FaceSymbol.isPath) == true
+            if written.face.symbol.map(FaceSymbol.isOriginal) != true, let color = ButtonConfigurationMac.color(rows.symbol["tint_color"], appearance: owner.effectiveAppearance, accent: written.accent), let base = image {
+                let path = written.face.symbol.map(FaceSymbol.isCustom) == true
                 let shown = path ? FaceSymbol.tinted(base, color)
                     : base.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [color]))
                         ?? (base.isTemplate ? FaceSymbol.tinted(base, color) : nil)
@@ -263,8 +263,8 @@ final class NativeButtonMac: NSButton {
             return
         }
         if name == "Enter" { return }
-        // An authored radio group's arrows (Radios.swift, `ariaRadioKey`).
-        if owner.presenter?.controls.radioKey(owner, name, held: KeyCodes.held(event.modifierFlags)) == true { return }
+        // A painted radio group's or tablist's keys (RoleKeys.swift).
+        if owner.presenter?.controls.roleKey(owner, name, held: KeyCodes.held(event.modifierFlags)) == true { return }
         super.keyDown(with: event)
     }
     /// Return's press of a dialog's default button: AppKit's own click, its
@@ -327,11 +327,11 @@ final class NativeButtonMac: NSButton {
 
 extension NodeView {
     /// A `button appearance="auto"` (LLP 1069.011 D3).
-    var isNativeButton: Bool { kind == "control" && props["type"] == "button" }
+    package var isNativeButton: Bool { kind == "control" && props["type"] == "button" }
 
     /// Where a native control sits: the isolation container's content when
     /// the glass-group pass made one (D9), else the node.
-    var controlMount: NSView {
+    package var controlMount: NSView {
         if #available(macOS 26.0, *), let isolation = glassIsolation as? NSGlassEffectContainerView, let content = isolation.contentView {
             return content
         }
@@ -399,13 +399,13 @@ extension NodeView {
     /// LLP 1121 D9).
     /// A field of the author's own (`appearance="none"`) is their box, and
     /// inherits as text does.
-    var fieldInk: NSColor {
+    package var fieldInk: NSColor {
         showsOwnTextColor || !isNativeTextControl ? color("text_color", SystemColor.canvasText) : ThemeRoles.color("FieldText", in: self, or: SystemColor.canvasText)
     }
 
     /// Whether the author wrote the style row `key` on this node (it is false of a value the node only
     /// inherits and of a row the compiler implied), as iOS reads it.
-    func wrote(_ key: String) -> Bool {
+    package func wrote(_ key: String) -> Bool {
         guard case .array(let rows)? = style["written"] else { return false }
         return rows.contains(.string(key))
     }
@@ -490,7 +490,7 @@ extension ControlHost {
                 "symbol": FaceSymbol.observed(face.symbol, icon: face.symbolIcon) as Any, "enabled": button.isEnabled,
                 "rows": rows, "standIns": standIns, "imagePosition": button.imagePosition.rawValue,
                 "pointerEvents": button.written?.interactive == false ? "none" : "auto",
-                "size": [Agent.r2(button.frame.width), Agent.r2(button.frame.height)]]
+                "size": [InspectionValue.r2(button.frame.width), InspectionValue.r2(button.frame.height)]]
     }
 }
 extension Presenter {

@@ -6,7 +6,7 @@
 //! Parley's re-breaking is cheap and a layout's breaking state is its own —
 //! and copies out what painting needs ([`super::lines`]). The line box is
 //! the host's: the strut plus each face's ascent, descent and gap.
-use super::lines::{self, LayoutGlyph, LayoutLine, Lines};
+use super::lines::{self, LayoutGlyph, LayoutLine, Lines, Room, RoomKind};
 use super::*;
 use parley::{
     Alignment, AlignmentOptions, BaseDirection, IndentOptions, LineBreakContext, RangedBuilder,
@@ -70,10 +70,13 @@ pub(super) fn push_style(
     run: &Run,
     range: Range<usize>,
     index: u32,
-    family: &FamilyChoice,
+    family: &[FamilyChoice],
 ) {
     builder.push(StyleProperty::Brush(index), range.clone());
-    builder.push(StyleProperty::FontFamily(family.family()), range.clone());
+    builder.push(
+        StyleProperty::FontFamily(FamilyChoice::stack(family)),
+        range.clone(),
+    );
     builder.push(StyleProperty::FontSize(run.size.max(0.5)), range.clone());
     builder.push(
         StyleProperty::FontWeight(parley::FontWeight::new(f32::from(run.weight))),
@@ -202,21 +205,32 @@ pub(super) struct HardLine {
     inset: (f32, f32),
     /// The first visual line's indent as Parley applies it.
     indent: f32,
-    /// The room before a run's first cluster and before an image's box,
-    /// which its glyphs or its box are drawn past (`run_edges`).
-    leads: Vec<(usize, f32)>,
+    /// The inline boxes' room beside its runs (`run_edges`), in logical
+    /// order, and before its images' boxes.
+    rooms: Vec<Room>,
     box_leads: Vec<(u32, f32)>,
 }
 
-/// A hard line's layout and the width, balanced width and alignment it was
-/// last broken and aligned at (`None` until a width breaks it): breaking it
+/// A hard line's layout and the width, alignment and balancing it was last
+/// broken and aligned at (`None` until a width breaks it): breaking it
 /// again at the same ones leaves the same lines, so a width painted after it
 /// was measured is not broken twice. `balance` is the last width's
 /// [`ShapedSource::balanced`].
 struct Broken {
     layout: parley::Layout<u32>,
-    at: Option<(Option<u32>, Option<u32>, Alignment)>,
-    balance: Option<(u32, Option<(f32, f32)>)>,
+    at: Option<(Option<u32>, bool, Alignment)>,
+    balance: Option<(u32, Option<(Balanced, f32)>)>,
+}
+
+/// Where a balanced paragraph's first hard line breaks
+/// ([`ShapedSource::balanced`]).
+#[derive(Clone)]
+enum Balanced {
+    /// Its scorer's breaks: where each line before the first forced break
+    /// ends, the last at that break or the text's end.
+    Breaks(Vec<parley::BreakOpportunity>),
+    /// Its bisection's width for the lines, the inset apart.
+    Width(f32),
 }
 
 pub(super) struct ShapedSource {
@@ -241,22 +255,29 @@ pub(super) struct ShapeData {
 type Pieces = Vec<(Range<usize>, usize)>;
 /// A hard line's inline boxes: (byte offset in the line, run index).
 type Boxes = Vec<(usize, usize)>;
+/// A hard line's runs with no text: (byte offset in the line, run index).
+type Empties = Vec<(usize, usize)>;
 
 /// The paragraph's text split into hard lines as cosmic-text split it: at
 /// each paragraph separator (`\r\n` one), the last empty piece dropped,
 /// and one empty line for no text. Each line keeps its byte offset and
 /// pieces: (range in the line, run index). An inline box's run has no text,
-/// only its place in the line (LLP 1011.002).
-fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes)> {
-    let mut out: Vec<(usize, String, Pieces, Boxes)> =
-        vec![(0, String::new(), Vec::new(), Vec::new())];
+/// only its place in the line (LLP 1011.002), and so has a run with no text.
+fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes, Empties)> {
+    let mut out: Vec<(usize, String, Pieces, Boxes, Empties)> =
+        vec![(0, String::new(), Vec::new(), Vec::new(), Vec::new())];
     let mut offset = 0;
     let mut after_cr = false;
     for (index, run) in spec.runs.iter().enumerate() {
         if run.inline.is_some() {
             after_cr = false;
-            let (_, text, _, boxes) = out.last_mut().expect("one line");
+            let (_, text, _, boxes, _) = out.last_mut().expect("one line");
             boxes.push((text.len(), index));
+            continue;
+        }
+        if run.text.is_empty() {
+            let (_, text, _, _, empties) = out.last_mut().expect("one line");
+            empties.push((text.len(), index));
             continue;
         }
         let mut rest = run.text.as_str();
@@ -274,7 +295,7 @@ fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes)> {
             let consumed = sep.map_or(rest.len(), |(at, ch)| at + ch.len_utf8());
             if !piece.is_empty() {
                 after_cr = false;
-                let (_, text, pieces, _) = out.last_mut().expect("one line");
+                let (_, text, pieces, _, _) = out.last_mut().expect("one line");
                 let start = text.len();
                 text.push_str(piece);
                 pieces.push((start..text.len(), index));
@@ -286,7 +307,7 @@ fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes)> {
                     if ch == '\n' && after_cr && piece.is_empty() {
                         out.last_mut().expect("one line").0 = next;
                     } else {
-                        out.push((next, String::new(), Vec::new(), Vec::new()));
+                        out.push((next, String::new(), Vec::new(), Vec::new(), Vec::new()));
                     }
                     after_cr = ch == '\r';
                     rest = &rest[at + ch.len_utf8()..];
@@ -296,25 +317,30 @@ fn hard_lines(spec: &Spec) -> Vec<(usize, String, Pieces, Boxes)> {
             offset += consumed;
         }
     }
-    if out.len() > 1 && out.last().is_some_and(|l| l.1.is_empty() && l.3.is_empty()) {
+    if out.len() > 1
+        && out
+            .last()
+            .is_some_and(|l| l.1.is_empty() && l.3.is_empty() && l.4.is_empty())
+    {
         out.pop();
     }
     out
 }
 
-/// A hard line's inline-box room (`Run::edges`): advance after the cluster
-/// holding a run's last character (its end), and before the cluster
-/// holding its first (its start), kept with that cluster where a line
-/// breaks, as Chrome keeps a `<span>`'s padding with its text; and for an
-/// image, its start before its box, by run.
+/// A hard line's inline-box room (`Run::edges`), each room shaped as advance
+/// on one cluster, which line breaking keeps it with: a run's start on the
+/// cluster holding its first character, so that it goes to the next line
+/// with its text wherever the line breaks before it, as Chrome keeps a
+/// `<span>`'s padding with its text, and its end on the cluster holding its
+/// last; and for an image, its start before its box, by run. Where the room
+/// is drawn is the line's to decide once it is broken ([`lines::extract`]).
 #[derive(Default)]
 struct Edges {
-    after: Vec<(usize, f32)>,
-    leads: Vec<(usize, f32)>,
+    rooms: Vec<Room>,
     box_leads: Vec<(u32, f32)>,
 }
 
-fn run_edges(spec: &Spec, pieces: &[(usize, String, Pieces, Boxes)]) -> Vec<Edges> {
+fn run_edges(spec: &Spec, pieces: &[(usize, String, Pieces, Boxes, Empties)]) -> Vec<Edges> {
     let mut out: Vec<Edges> = (0..pieces.len()).map(|_| Edges::default()).collect();
     if spec.runs.iter().all(|r| r.edges.is_empty()) {
         return out;
@@ -322,12 +348,24 @@ fn run_edges(spec: &Spec, pieces: &[(usize, String, Pieces, Boxes)]) -> Vec<Edge
     // Each run's first and last place: its hard line and its byte range there.
     let mut first: Vec<Option<(usize, usize)>> = vec![None; spec.runs.len()];
     let mut last: Vec<Option<(usize, usize)>> = vec![None; spec.runs.len()];
-    for (h, (_, _, runs, _)) in pieces.iter().enumerate() {
+    for (h, (_, _, runs, _, empties)) in pieces.iter().enumerate() {
         for (range, index) in runs {
             first[*index].get_or_insert((h, range.start));
             last[*index] = Some((h, range.end));
         }
+        for &(at, index) in empties {
+            first[index] = Some((h, at));
+        }
     }
+    // A run's bytes in hard line `h`: the characters its room is drawn beside.
+    let span = |h: usize, index: usize| {
+        let mut owned = pieces[h].2.iter().filter(|(_, i)| *i == index);
+        let lo = owned.next().map(|(r, _)| r.clone());
+        lo.map(|lo| {
+            let hi = owned.last().map_or(lo.end, |(r, _)| r.end);
+            lo.start..hi
+        })
+    };
     for (index, run) in spec.runs.iter().enumerate() {
         if run.inline.is_some() {
             if run.edges.start != 0.0 {
@@ -337,21 +375,58 @@ fn run_edges(spec: &Spec, pieces: &[(usize, String, Pieces, Boxes)]) -> Vec<Edge
             }
             continue;
         }
-        if run.edges.end != 0.0 {
-            if let Some((h, end)) = last[index] {
-                if let Some((at, _)) = pieces[h].1[..end].char_indices().last() {
-                    out[h].after.push((at, run.edges.end));
-                }
+        if run.text.is_empty() {
+            let room = run.edges.start + run.edges.end;
+            if let Some((h, at)) = first[index].filter(|_| room != 0.0) {
+                let text = &pieces[h].1;
+                let (at, kind) = if at < text.len() {
+                    (at, RoomKind::Before)
+                } else if let Some((before, _)) = text[..at].char_indices().last() {
+                    (before, RoomKind::After)
+                } else {
+                    continue;
+                };
+                out[h].rooms.push(Room {
+                    at,
+                    w: room,
+                    run: index as u32,
+                    kind,
+                    span: at..at,
+                });
             }
+            continue;
         }
         if run.edges.start != 0.0 {
             if let Some((h, start)) = first[index] {
-                out[h].leads.push((start, run.edges.start));
+                if let Some(span) = span(h, index) {
+                    out[h].rooms.push(Room {
+                        at: start,
+                        w: run.edges.start,
+                        run: index as u32,
+                        kind: RoomKind::Start,
+                        span,
+                    });
+                }
+            }
+        }
+        if run.edges.end != 0.0 {
+            if let Some((h, end)) = last[index] {
+                let at = pieces[h].1[..end].char_indices().last().map(|(at, _)| at);
+                if let (Some(at), Some(span)) = (at, span(h, index)) {
+                    out[h].rooms.push(Room {
+                        at,
+                        w: run.edges.end,
+                        run: index as u32,
+                        kind: RoomKind::End,
+                        span,
+                    });
+                }
             }
         }
     }
     for edges in &mut out {
-        edges.leads.sort_by_key(|l| l.0);
+        // In logical order: by place, then by run (a stable sort).
+        edges.rooms.sort_by_key(|r| r.at);
     }
     out
 }
@@ -386,7 +461,7 @@ impl ShapedSource {
         let half = (minimum - ascent - descent - leading) / 2.0;
         let strut = (ascent + half, descent + leading + half);
         let run_metrics: Vec<_> = spec.runs.iter().map(|r| catalog.font_metrics(r)).collect();
-        let families: Vec<FamilyChoice> =
+        let families: Vec<Vec<FamilyChoice>> =
             spec.runs.iter().map(|r| catalog.choice(r.family)).collect();
         let wrap = if spec.white_space.model().wraps() {
             parley::TextWrapMode::Wrap
@@ -411,7 +486,7 @@ impl ShapedSource {
         let pieces = hard_lines(&spec);
         let mut edges = run_edges(&spec, &pieces);
         let mut lines = Vec::with_capacity(pieces.len());
-        for (h, (start, text, runs, boxes)) in pieces.into_iter().enumerate() {
+        for (h, (start, text, runs, boxes, _)) in pieces.into_iter().enumerate() {
             #[cfg(test)]
             SHAPE_LINES.with(|n| n.set(n.get() + 1));
             text_bytes += text.len();
@@ -465,16 +540,9 @@ impl ShapedSource {
             });
             builder.set_line_break_override(Some(CHROME));
             let mut layout = builder.build(&text);
-            let Edges {
-                after,
-                leads,
-                box_leads,
-            } = std::mem::take(&mut edges[h]);
-            for &(index, amount) in &after {
-                layout.add_advance_after(index, amount);
-            }
-            for &(index, amount) in &leads {
-                layout.add_lead(index, amount);
+            let Edges { rooms, box_leads } = std::mem::take(&mut edges[h]);
+            for room in &rooms {
+                layout.add_lead(room.at, room.w);
             }
             let inset = line_inset(&spec, &runs, &mut layout);
             // CSS `text-indent`: the paragraph's first line only.
@@ -499,7 +567,7 @@ impl ShapedSource {
                 }),
                 inset,
                 indent,
-                leads,
+                rooms,
                 box_leads,
             });
         }
@@ -606,27 +674,42 @@ impl ShapedSource {
         let mut left = (spec.line_clamp > 0).then_some(spec.line_clamp as usize);
         let mut cut = false;
         let count = self.data.lines.len();
-        let balanced = self.balanced(width).map(|(narrow, _)| narrow);
+        let balanced = self.balanced(width).map(|(balanced, _)| balanced);
         #[cfg(test)]
         BREAKS.with(|n| n.set((n.get().0 + 1, n.get().1)));
         'hard: for (h, hard) in self.data.lines.iter().enumerate() {
             let (_, rest) = hard.inset;
             let mut broken = hard.layout.lock().expect("layout lock");
-            let narrow = balanced.filter(|_| h == 0);
-            let at = Some((width.map(f32::to_bits), narrow.map(f32::to_bits), align));
+            let balanced = balanced.as_ref().filter(|_| h == 0);
+            let at = Some((width.map(f32::to_bits), balanced.is_some(), align));
             if broken.at != at {
                 #[cfg(test)]
                 BREAKS.with(|n| n.set((n.get().0, n.get().1 + 1)));
                 broken.at = None;
-                if let (Some(narrow), Some(width)) = (narrow, width) {
-                    // Broken at the balanced width, each line aligned (and
-                    // justified) in the box's, as Chrome's are.
+                if let (Some(balanced), Some(width)) = (balanced, width) {
+                    // Each line is aligned (and justified) in the box's
+                    // width wherever it breaks, as Chrome's are.
+                    let room = (width - rest).max(0.0);
                     let mut breaker = broken.layout.break_lines();
-                    let state = breaker.state_mut();
-                    state.set_layout_max_advance((narrow - rest).max(0.0));
-                    state.set_line_max_advance((narrow - rest).max(0.0));
-                    while breaker.break_next().is_some() {
-                        breaker.set_prior_line_width((width - rest).max(0.0));
+                    match balanced {
+                        Balanced::Breaks(ends) => {
+                            let state = breaker.state_mut();
+                            state.set_layout_max_advance(room);
+                            state.set_line_max_advance(room);
+                            for end in ends {
+                                breaker.break_next_at(end);
+                            }
+                            // Past a forced break the lines are greedy.
+                            while breaker.break_next().is_some() {}
+                        }
+                        Balanced::Width(narrow) => {
+                            let state = breaker.state_mut();
+                            state.set_layout_max_advance(*narrow);
+                            state.set_line_max_advance(*narrow);
+                            while breaker.break_next().is_some() {
+                                breaker.set_prior_line_width(room);
+                            }
+                        }
                     }
                     breaker.finish();
                 } else {
@@ -648,7 +731,11 @@ impl ShapedSource {
                     &line,
                     styles,
                     shift,
-                    (&hard.leads, &hard.box_leads),
+                    lines::Rooms {
+                        rooms: &hard.rooms,
+                        boxes: &hard.box_leads,
+                        rtl,
+                    },
                     &mut out,
                 );
                 let m = line.metrics();
@@ -692,13 +779,17 @@ impl ShapedSource {
         (out, cut)
     }
 
-    /// CSS `text-wrap-style: balance` (LLP 1001 §6): the width the first
-    /// hard line's lines break at, the narrowest that keeps the count they
-    /// have at `width` (two to six, `exact_textflow::balanced_width`; Chrome
-    /// balances only the lines before the first forced break), and those
-    /// lines' widest broken greedily, which the paragraph still measures:
-    /// balancing moves breaks, never the box. A clamp keeps greedy lines.
-    fn balanced(&self, width: Option<f32>) -> Option<(f32, f32)> {
+    /// CSS `text-wrap-style: balance` (LLP 1001 §6) as Blink does it: where
+    /// the lines before the first forced break end (Chrome balances only
+    /// those), and those lines' widest broken greedily, which the paragraph
+    /// still measures: balancing moves breaks, never the box. A forced break
+    /// is a separator `hard_lines` splits at or a newline Parley breaks at
+    /// inside the first hard line (U+2028). `None` keeps the greedy lines: a
+    /// clamp, one line or more than six, a line that overflows the box, or
+    /// neither Blink's scorer nor its bisection moving a break. A tab in
+    /// those lines keeps the scorer out, and a forced break the bisection,
+    /// as in Blink.
+    fn balanced(&self, width: Option<f32>) -> Option<(Balanced, f32)> {
         let spec = &self.spec;
         if spec.text_wrap_style != exact_kernel::TextWrapStyle::Balance
             || spec.line_clamp > 0
@@ -710,22 +801,78 @@ impl ShapedSource {
         let hard = self.data.lines.first()?;
         let (_, rest) = hard.inset;
         let mut broken = hard.layout.lock().expect("layout lock");
-        if let Some((bits, balanced)) = broken.balance {
-            if bits == width.to_bits() {
-                return balanced;
+        if let Some((bits, balanced)) = &broken.balance {
+            if *bits == width.to_bits() {
+                return balanced.clone();
             }
         }
         broken.at = None;
-        let mut widest = 0.0;
-        let narrow = exact_textflow::balanced_width(width, |w| {
-            broken.layout.break_all_lines(Some((w - rest).max(0.0)));
-            if w == width {
-                widest = broken.layout.width() + rest;
+        let room = (width - rest).max(0.0);
+        // The greedy lines in `room` before the first forced break: their
+        // count, their widths' sum and widest, whether one overflows (the
+        // breaker fits a line under 1/32 px over its room, `fit_limit`) or
+        // breaks inside a word (`overflow-wrap`), and whether that break
+        // ends them.
+        let greedy = |layout: &mut parley::Layout<u32>, room: f32| {
+            layout.break_all_lines(Some(room));
+            let (mut count, mut total, mut widest) = (0, 0.0, 0.0f32);
+            let (mut overflows, mut forced) = (false, false);
+            for (i, line) in layout.lines().enumerate() {
+                let m = line.metrics();
+                let indent = if i == 0 { hard.indent } else { 0.0 };
+                let w = m.advance - m.trailing_whitespace + indent;
+                count += 1;
+                total += w;
+                widest = widest.max(w);
+                let reason = line.break_reason();
+                overflows |= w > room + 1.0 / 32.0 || reason == parley::BreakReason::Emergency;
+                if reason == parley::BreakReason::Explicit {
+                    forced = true;
+                    break;
+                }
             }
-            broken.layout.len()
-        });
-        let balanced = narrow.map(|narrow| (narrow, widest));
-        broken.balance = Some((width.to_bits(), balanced));
+            (count, total, widest, overflows, forced)
+        };
+        let (count, total, widest, overflows, forced) = greedy(&mut broken.layout, room);
+        // `hard_lines` keeps no separator, so with one, a trailing one
+        // too, the first hard line's text is shorter than the runs'.
+        let source = spec.runs.iter().filter(|r| r.inline.is_none());
+        let forced = forced || source.map(|r| r.text.len()).sum::<usize>() != hard.text.len();
+        let scored = || {
+            let opportunities = broken.layout.break_lines().opportunities();
+            let places: Vec<_> = opportunities
+                .iter()
+                .map(|o| (o.end, o.next, o.hyphen))
+                .collect();
+            let breaks = exact_textflow::balanced_breaks(
+                room,
+                hard.indent,
+                spec.strut.size,
+                self.alignment() == Alignment::Justify,
+                &places,
+                count,
+            )?;
+            let ends = breaks.iter().map(|&at| opportunities[at]);
+            Some(ends.chain(opportunities.last().copied()).collect())
+        };
+        // The lines to balance end at the hard line's first U+2028.
+        let before = hard.text.split('\u{2028}').next().unwrap_or("");
+        let tab = before.contains('\t');
+        let balanced = if overflows || !(2..=exact_textflow::BALANCE_MAX_LINES).contains(&count) {
+            None
+        } else if let Some(ends) = (!tab).then(scored).flatten() {
+            Some(Balanced::Breaks(ends))
+        } else if !forced {
+            exact_textflow::balanced_width(room, count, total, |w| {
+                let (lines, .., overflows, _) = greedy(&mut broken.layout, w);
+                lines <= count && !overflows
+            })
+            .map(Balanced::Width)
+        } else {
+            None
+        };
+        let balanced = balanced.map(|balanced| (balanced, widest + rest));
+        broken.balance = Some((width.to_bits(), balanced.clone()));
         balanced
     }
 
@@ -777,7 +924,7 @@ impl ShapedSource {
         let mut ink = Lines::default();
         let mut advance = 0.0;
         if let Some(l) = symbol.lines().next() {
-            advance = lines::extract(&l, symbol.styles(), 0.0, (&[], &[]), &mut ink);
+            advance = lines::extract(&l, symbol.styles(), 0.0, lines::Rooms::NONE, &mut ink);
         }
         // Visual clusters, kept from the line's start edge.
         let extent = |g: &LayoutGlyph| (g.x, g.x + g.w);
@@ -1099,6 +1246,8 @@ pub struct LayoutRun<'a> {
     pub line_height: f32,
     /// Its width.
     pub line_w: f32,
+    /// Its inline boxes' room beside their text, as it draws them.
+    pub rooms: &'a [lines::LayoutRoom],
 }
 
 pub(super) struct Runs<'a> {
@@ -1142,6 +1291,11 @@ impl<'a> Iterator for Runs<'a> {
             line_top,
             line_height,
             line_w: line.w,
+            rooms: {
+                let from = record.rooms.partition_point(|r| (r.line as usize) < i);
+                let to = record.rooms.partition_point(|r| (r.line as usize) <= i);
+                &record.rooms[from..to]
+            },
         })
     }
 }

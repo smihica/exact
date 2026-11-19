@@ -1,5 +1,15 @@
 use super::*;
 use ibex2::stdlib::sqlite::{Database, ForeignKeys, Provider};
+
+#[test]
+fn sqlite_is_the_bundled_version_with_the_wal_page_size_fix() {
+    assert!(rusqlite::version_number() >= 3_054_001);
+    assert_eq!(
+        rusqlite::version_number(),
+        rusqlite::ffi::SQLITE_VERSION_NUMBER
+    );
+}
+
 fn open(dir: &tempfile::TempDir) -> Database {
     let path = dir.path().canonicalize().unwrap().join("app.db");
     Database::new(SqliteProvider.open(Location { path }).unwrap())
@@ -63,6 +73,58 @@ fn transactions_roll_back_and_deny_manual_control() {
     assert_eq!(db.transaction(&batch[..1]).unwrap()[0].changes, 1);
     for sql in ["BEGIN", "COMMIT", "SAVEPOINT x", "ROLLBACK"] {
         assert!(db.execute(sql, &[]).is_err(), "{sql}");
+    }
+}
+/// Exact patch 51: an execution says whether it changed the database, a row or
+/// the schema, and counts no rows after a statement that changed none.
+#[test]
+fn an_execution_changed_the_database_when_a_row_or_the_schema_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    let run = |sql: &str| {
+        let result = db.execute(sql, &[]).unwrap();
+        (result.changes, result.changed)
+    };
+    assert_eq!(run("CREATE TABLE notes (body TEXT)"), (0, true));
+    assert_eq!(run("INSERT INTO notes VALUES ('a'), ('b')"), (2, true));
+    // `sqlite3_changes` would still say 2 here.
+    assert_eq!(
+        run("CREATE TABLE IF NOT EXISTS notes (body TEXT)"),
+        (0, false)
+    );
+    assert_eq!(
+        run("UPDATE notes SET body = 'c' WHERE body = 'none'"),
+        (0, false)
+    );
+    assert_eq!(run("DELETE FROM notes WHERE body = 'none'"), (0, false));
+    assert_eq!(run("ALTER TABLE notes ADD COLUMN at INTEGER"), (0, true));
+    // A view's rows change only through its trigger, which `changes` leaves out.
+    run("CREATE VIEW shown AS SELECT body FROM notes");
+    run("CREATE TRIGGER hide INSTEAD OF DELETE ON shown BEGIN DELETE FROM notes WHERE body = old.body; END");
+    assert_eq!(run("DELETE FROM shown WHERE body = 'a'"), (0, true));
+    assert_eq!(run("DROP TABLE notes"), (0, true));
+    let batch = db
+        .transaction(&[
+            Command {
+                sql: "CREATE TABLE IF NOT EXISTS kept (x)".into(),
+                params: vec![],
+            },
+            Command {
+                sql: "INSERT INTO kept VALUES (1)".into(),
+                params: vec![],
+            },
+            Command {
+                sql: "CREATE TABLE IF NOT EXISTS kept (x)".into(),
+                params: vec![],
+            },
+        ])
+        .unwrap();
+    let batch: Vec<_> = batch.iter().map(|r| (r.changes, r.changed)).collect();
+    assert_eq!(batch, [(0, true), (1, true), (0, false)]);
+    // The version is the provider's to read, not app SQL's.
+    for sql in ["PRAGMA schema_version", "PRAGMA schema_version = 1"] {
+        assert!(db.execute(sql, &[]).is_err(), "{sql}");
+        assert!(db.query(sql, &[]).is_err(), "{sql}");
     }
 }
 #[test]

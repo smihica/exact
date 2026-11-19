@@ -33,8 +33,10 @@ impl<D: DataSource> Host<D> {
                     property,
                     Property::Translate | Property::Scale | Property::Rotate
                 ) {
-                    self.reconcile_transform_drags(&mut batch);
-                    self.emit_transform_drags(&mut batch);
+                    if let Some(drag) = self.turn.drag {
+                        (drag.reconcile_transforms)(self, &mut batch);
+                        (drag.emit_transforms)(self, &mut batch);
+                    }
                 }
                 self.height_layout_if_needed(&mut batch).err()
             }
@@ -112,12 +114,14 @@ impl<D: DataSource> Host<D> {
         let layout_error = if matches!(result, Ok(true)) {
             self.now_ms = now_ms;
             self.holds.remove(&handle);
-            self.transform_member_ended(handle);
-            if matches!(
-                token.property(),
-                Property::Translate | Property::Scale | Property::Rotate
-            ) {
-                self.emit_transform_drags(&mut batch);
+            if let Some(drag) = self.turn.drag {
+                (drag.member_ended)(self, handle);
+                if matches!(
+                    token.property(),
+                    Property::Translate | Property::Scale | Property::Rotate
+                ) {
+                    (drag.emit_transforms)(self, &mut batch);
+                }
             }
             self.height_layout_if_needed(&mut batch).err()
         } else {

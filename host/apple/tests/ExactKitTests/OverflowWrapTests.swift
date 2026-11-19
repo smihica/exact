@@ -205,6 +205,7 @@ final class OverflowWrapTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 1)
     }
 
+    #if os(macOS)
     /// The region worker breaks as the ordinary paragraph does, forced
     /// breaks and emergency breaks included.
     func testRegionWorkerBreaksAsTheParagraphDoes() {
@@ -227,4 +228,5 @@ final class OverflowWrapTests: XCTestCase {
             }
         }
     }
+    #endif
 }

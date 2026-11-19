@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { zipSync } from 'fflate';
-import { fetchLibrary, libraryFor, prepareLibrary, sharedObjectName } from './package-libraries.mjs';
+import { directDependencies, fetchLibrary, libraryFor, missingDependencies, prepareLibrary, sharedObjectName } from './package-libraries.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'exact-package-libraries-'));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
@@ -219,4 +219,16 @@ test.skipIf(process.platform !== 'darwin')('an Apple view is checked against a l
   mkdirSync(join(outside, '..'), { recursive: true });
   writeFileSync(outside, 'the destination on disk, outside the extraction');
   expect(refusal(() => prepareLibrary(chained, 'aarch64-apple-darwin', { cache, ...quiet }))).toBe('vault: chained.xcframework.zip holds a link that leaves it (vault.xcframework/l -> a/b/c/up/../../../../outside)');
+});
+
+// LLP 1156.006.000 D8: a declared dependency that is not installed is named before a build compiles; the bake's own
+// refusal of it comes after Cargo. The lookup is the bake's: node_modules of the app and of each directory above it.
+test('an app\'s dependencies that are not installed are named', () => {
+  const root = join(scratch, 'missing-deps'), app = join(root, 'apps/one');
+  mkdirSync(join(root, 'node_modules/@scope/above'), { recursive: true }); mkdirSync(join(app, 'node_modules/here'), { recursive: true });
+  for (const at of [join(root, 'node_modules/@scope/above'), join(app, 'node_modules/here')]) writeFileSync(join(at, 'package.json'), '{}');
+  writeFileSync(join(app, 'package.json'), JSON.stringify({ dependencies: { here: '1', '@scope/above': '1', absent: '1', 'also-absent': '1' }, devDependencies: { 'dev-only': '1' } }));
+  expect(missingDependencies(app)).toEqual(['absent', 'also-absent']);
+  expect(directDependencies(app).map((d) => d.name)).toEqual(['@scope/above', 'here']);
+  expect(missingDependencies(join(scratch, 'no-package-json-here'))).toEqual([]);
 });

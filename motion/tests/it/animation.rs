@@ -7,6 +7,7 @@ use exact_motion::{Animations, Change, Engine, Keyframes, NamedTimeline, Propert
 const NODE: u64 = 3;
 
 fn row(text: &str) -> Animations {
+    exact_motion::link_animations();
     let fade = Keyframes::parse("from{opacity:0}to{opacity:1}").unwrap();
     let grow = Keyframes::parse("from{r:3}to{r:9}").unwrap();
     let mut a = Animations::parse(text).unwrap();
@@ -219,6 +220,7 @@ fn a_running_transition_wins_over_an_animation() {
 /// a set `currentTime` (local time, delay included), rounded as Chrome prints.
 #[test]
 fn samples_match_chrome() {
+    exact_motion::link_animations();
     let breathe = Keyframes::parse("0%{r:3;opacity:0.5}100%{r:9;opacity:0}").unwrap();
     let k3 = Keyframes::parse(
         "0%{opacity:0}50%{opacity:1;animation-timing-function:linear}100%{opacity:0}",
@@ -367,6 +369,7 @@ fn samples_match_chrome() {
 /// `currentTime` (alpha to Chrome's 8-bit rounding).
 #[test]
 fn colour_samples_match_chrome() {
+    exact_motion::link_animations();
     let c1 = Keyframes::parse("from{color:#ff0000}to{color:rgba(0,0,255,0.5)}").unwrap();
     let c2 =
         Keyframes::parse("from{background-color:#16a34a}to{background-color:#000000}").unwrap();
@@ -717,7 +720,7 @@ fn an_unbound_consumer_is_sampled_on_the_clock_again() {
             }
             assert!(!e.quiescent() && e.next_change().is_some(), "{case}");
             if first_frame {
-                e.present_frame(0.0).unwrap();
+                e.present_frame(0.0, 0.0).unwrap();
             }
             for (t, want) in [(0.25, 0.5), (0.5, 0.75)] {
                 e.advance(t).unwrap();

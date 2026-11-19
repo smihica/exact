@@ -106,6 +106,31 @@ fn compat_cli_validates_all_options_before_reading_the_manifest() {
         std::fs::read_to_string(app.0.join("app.json")).unwrap(),
         manifest
     );
+    for (javascript, rust) in [
+        ("", ""),
+        ("net.fetch https://api.example", "fs.read app:/data"),
+    ] {
+        let result = run(&[
+            ".",
+            "--platform",
+            "ios",
+            "--grants",
+            javascript,
+            "--rust-grants",
+            rust,
+            "--json",
+        ]);
+        assert!(result.status.success(), "{result:?}");
+        let json: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(json["inputs"]["javascriptGrants"], javascript);
+        assert_eq!(json["inputs"]["rustGrants"], rust);
+        for grant in [javascript, rust] {
+            assert!(json["inputs"]["grantCeiling"]
+                .as_str()
+                .unwrap()
+                .contains(grant));
+        }
+    }
 
     app.write("app.json", "invalid JSON");
     for args in [
@@ -122,6 +147,20 @@ fn compat_cli_validates_all_options_before_reading_the_manifest() {
         vec![".", "--platform", "web", "--target", ""],
         vec![".", "--platform", "web", "--target", "a", "--target", "b"],
         vec![".", "--platform", "web", "--json", "--json"],
+        vec![".", "--platform", "web", "--grants"],
+        vec![".", "--platform", "web", "--grants", "--json"],
+        vec![".", "--platform", "web", "--grants", "", "--grants", ""],
+        vec![".", "--platform", "web", "--rust-grants", ""],
+        vec![".", "--platform", "web", "--grants", "", "--rust-grants"],
+        vec![
+            ".",
+            "--platform",
+            "web",
+            "--grants",
+            "",
+            "--rust-grants",
+            "--json",
+        ],
     ] {
         let result = run(&args);
         assert_eq!(result.status.code(), Some(2), "{args:?}: {result:?}");
@@ -170,5 +209,54 @@ fn versions_default_only_when_unset_and_do_not_change_the_cohort() {
         assert_eq!(changed["embedded"]["buildNumber"], build);
         assert_eq!(changed["id"], default["id"]);
         assert_eq!(changed["inputs"], default["inputs"]);
+    }
+}
+
+#[test]
+fn compat_uses_recorded_settings_instead_of_its_own_environment() {
+    let app = App::new("preload-settings");
+    app.write("app.json", r#"{"app":{"id":"test.preload-settings","name":"Settings"},"deploy":{"store":{"ios":"0","linux":"0","web":"0"}},"env":[{"name":"EONE_API","launch":true},"EONE_NOTE"],"preload":{"feed":{"url":"{env:EONE_API}/feed","headers":{"X-Note":"{env:EONE_NOTE}"}}}}"#);
+    let settings = serde_json::json!({
+        "EONE_API":{"value":"https://built.example","source":"default","launch":true},
+        "EONE_NOTE":{"value":"built","source":"environment"}
+    })
+    .to_string();
+    for platform in ["ios", "linux", "web"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_exact-bake"))
+            .args([
+                "compat",
+                ".",
+                "--platform",
+                platform,
+                "--grants",
+                "net.fetch https:",
+                "--settings",
+                &settings,
+                "--json",
+            ])
+            .current_dir(&app.0)
+            .env("EXACT_UPDATE_TRUST", "development")
+            .env("EONE_API", "https://unrelated.example")
+            .env_remove("OUT_DIR")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let compat: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let preload = &compat["inputs"]["preload"][0];
+        assert_eq!(
+            preload["headers"][0][1],
+            serde_json::json!([["literal", "built"]])
+        );
+        assert_eq!(
+            preload["url"],
+            if platform == "web" {
+                serde_json::json!([["literal", "https://built.example/feed"]])
+            } else {
+                serde_json::json!([
+                    ["env", "EONE_API", "https://built.example"],
+                    ["literal", "/feed"]
+                ])
+            }
+        );
     }
 }

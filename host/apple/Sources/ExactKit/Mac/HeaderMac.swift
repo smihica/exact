@@ -51,7 +51,7 @@ struct WindowHeader {
     let route: NodeView, header: NodeView, heading: NodeView?
     /// The heading's text: the window's title, under an authored document
     /// title (the head's) and over the app's name.
-    let title: String
+    package let title: String
     /// The header's buttons before its heading, which lead the bar after
     /// Back as navigational items, and those after it, its trailing items.
     let leading: [NodeView], trailing: [NodeView]
@@ -87,7 +87,7 @@ struct WindowHeader {
     /// this route. `shown`: whether a node is shown as authored.
     static func read(route: NodeView, back: String?, pushed: Bool, shown: (NodeView) -> Bool) -> Read {
         guard let rule = HeaderRule(route: route, back: back, backIsPlatforms: pushed, projected: true) else { return .none }
-        let children = { (node: NodeView) in node.container.subviews.compactMap { $0 as? NodeView } }
+        let children = { (node: NodeView) in node.childNodes }
         let items = Set(rule.items.map(ObjectIdentifier.init))
         let backs = rule.items.filter { item in !rule.leading.contains { $0 === item } && !rule.trailing.contains { $0 === item } }
         var passedHeading = false
@@ -149,7 +149,7 @@ struct WindowHeader {
     /// two or more and nothing else, each a pressable tab that shows its
     /// title alone. AppKit's toolbar group is made of titles.
     static func titleTabs(of list: NodeView) -> [NodeView]? {
-        let children = { (node: NodeView) in node.container.subviews.compactMap { $0 as? NodeView } }
+        let children = { (node: NodeView) in node.childNodes }
         func textOnly(_ node: NodeView) -> Bool { node.kind == "text" && children(node).allSatisfy(textOnly) }
         let tabs = children(list).filter { $0.style["display"]?.string != "none" }
         let titled = { (tab: NodeView) -> Bool in
@@ -175,7 +175,7 @@ struct WindowHeader {
     static func showable(_ button: NodeView) -> Bool {
         if BadgeFace(button) != nil || MacBarFace(button) != nil { return true }
         if button.isNativeButton { return button.face?.raster != true }
-        let children = { (node: NodeView) in node.container.subviews.compactMap { $0 as? NodeView } }
+        let children = { (node: NodeView) in node.childNodes }
         let content = children(button)
         func textOnly(_ node: NodeView) -> Bool { node.kind == "text" && children(node).allSatisfy(textOnly) }
         let images = content.filter { $0.kind == "image" && children($0).isEmpty }
@@ -304,48 +304,4 @@ final class HeaderSearch {
     }
 }
 
-extension NavigationHost {
-    /// The route whose header the window's bar shows, with its navigation
-    /// root: the route the root shows, or under a modal route the route it
-    /// stands over (`NavigationRules.segments`); and whether that route is
-    /// pushed, so the bar's Back is its way back. Read from what the last
-    /// batch showed (`selection`).
-    var headerRoute: (root: NodeView, route: NodeView, pushed: Bool)? {
-        // A stack that splits: one of its two routes owns the window.
-        if let routes = splitHeaderRoutes { return (routes.root, routes.owner, splitPushed(routes.owner)) }
-        return windowRoute
-    }
-
-    /// Whether a split's route is pushed, so the bar's Back stands for its
-    /// header's Back control: the list never is, and a detail only above
-    /// where its pane begins, the base detail having no Back (LLP 1115.002
-    /// D4). Both headers of a split read it, whichever owns the window.
-    func splitPushed(_ route: NodeView) -> Bool {
-        route !== split.shown?.list && windowRoute?.pushed == true
-    }
-
-    /// The route under any modal or fullscreen segments: the window's
-    /// toolbar still belongs to it while a cover is selected. A split's
-    /// base detail is not pushed.
-    var windowRoute: (root: NodeView, route: NodeView, pushed: Bool)? {
-        guard let selection, let root = presenter.views[selection.root], selection.stack.indices.contains(selection.at) else { return nil }
-        let stack = selection.stack[...selection.at].compactMap { presenter.views[$0] }
-        guard stack.count == selection.at + 1,
-              let base = NavigationRules.segments(presentations: stack.map { $0.props["navigationPresentation"] }).first,
-              let route = stack[base].last else { return nil }
-        return (root, route, base.count - 1 > split.base)
-    }
-
-    /// @ref LLP 1115.002 D4, §5 Q10 — the two headers of a window that shows
-    /// a list beside its detail. One route owns the window: its heading is
-    /// the window's title and its whole header is the bar's. The other is
-    /// beside it: its heading stays the first line of its pane, and its
-    /// buttons are the bar's over its own column, after the separator that
-    /// follows the divider. Which is which is `SplitHost.listOwns`.
-    var splitHeaderRoutes: (root: NodeView, owner: NodeView, beside: NodeView?)? {
-        guard split.active, let shown = split.shown else { return nil }
-        guard let detail = shown.detail else { return (shown.root, shown.list, nil) }
-        return split.listOwns ? (shown.root, shown.list, detail) : (shown.root, detail, shown.list)
-    }
-}
 #endif

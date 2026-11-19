@@ -33,6 +33,11 @@ evdev = "0.13"
 scanout = ["exact-painted/scanout"]
 
 [dev-dependencies]
+exact-logic = { path = "../../logic" }
+exact-plan = { path = "../../plan" }
+sha2 = "0.10"
+serde_json = "1"
+libc = "0.2"
 contract = { path = "../../contract/cli" }
 exact-kernel = { path = "../../kernel" }
 des = "0.8"

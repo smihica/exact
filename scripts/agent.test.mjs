@@ -1022,6 +1022,14 @@ test('a native named store is kept unless the drive resets it, under its lock; a
       assert.deepEqual([lock?.storage, env?.EXACT_AGENT_STORAGE_FRESH], ['default', '1'], host);
     }
     await assert.rejects(main(['web', '--reset-storage', 'state'], injected), /need --storage <name>/);
+    // LLP 1156.006.000 D16: a page served elsewhere keeps its own API address, so its drive starts no server here.
+    let started = 0;
+    const counting = { ...injected, driveServer: async () => { started++; return null; } };
+    assert.equal(await main(['web', '--url', 'http://127.0.0.1:9/app/', 'state'], counting), 0);
+    assert.equal(started, 0, 'no server for a page served elsewhere');
+    assert.equal(await main(['web', '--url', '/item/7', 'state'], counting), 0);
+    assert.equal(await main(['ios', '--url', 'http://127.0.0.1:9/app/', 'state'], counting), 0);
+    assert.equal(started, 2, 'a path, and a native host, start it as before');
   } finally { [console.log, console.error] = quiet; }
 });
 

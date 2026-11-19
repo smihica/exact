@@ -1,6 +1,7 @@
 import XCTest
 import UniformTypeIdentifiers
 @testable import ExactKit
+@testable import ExactPickers
 
 final class PickerAcceptIOSTests: XCTestCase {
     func testUnrestrictedFileInputUsesDocumentItem() {

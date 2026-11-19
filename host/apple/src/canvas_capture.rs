@@ -6,7 +6,7 @@
 //! `exactBodyTo` writes a reply.
 
 use super::Host;
-use exact_runner::canvas_capture::{refused, CanvasCapture};
+use exact_runner::canvas_capture::{media_type_of, refused, CanvasCapture};
 use exact_runner::{DataSource, Outcome, RequestOut};
 
 /// A capture the presenter was handed: the canvas and the request's grant
@@ -81,9 +81,16 @@ impl<D: DataSource> Host<D> {
         }
     }
 
-    /// The presenter's PNG for capture `ticket` (empty: it could not encode
-    /// one), written; or the refusal it handed back.
-    pub fn canvas_captured(&mut self, ticket: u64, png: &[u8]) -> Outcome {
+    /// The presenter's image for capture `ticket` (empty: it could not encode
+    /// one), written through `write`, the I/O link's; or the refusal it
+    /// handed back. An archive without I/O writes nothing, and refuses as
+    /// grants that name no `fs.write` do.
+    pub fn canvas_captured(
+        &mut self,
+        ticket: u64,
+        image: &[u8],
+        write: Option<crate::link::AppFileWrite>,
+    ) -> Outcome {
         self.forget_canvas_captures();
         let PendingCapture {
             canvas: c,
@@ -99,7 +106,7 @@ impl<D: DataSource> Host<D> {
                 )
             }
         };
-        if !copied || png.is_empty() {
+        if !copied || image.is_empty() {
             return refused("EncodingError", "the canvas's bitmap could not be encoded");
         }
         let Some(roots) = self.app_roots() else {
@@ -108,14 +115,22 @@ impl<D: DataSource> Host<D> {
                 "this host has no app files (no storage here)",
             );
         };
-        match write(&roots, &self.grants(), scope.as_deref(), &c.path, png) {
-            Ok(()) => c.captured(),
+        let written = match write {
+            Some(write) => write(&roots, &self.grants(), scope.as_deref(), &c.path, image),
+            None => Err((
+                "NotAllowedError",
+                format!("no grant covers it; grant `fs.write {}`", c.path),
+            )),
+        };
+        match written {
+            // ImageIO wrote the type asked for, or PNG in its place.
+            Ok(()) => c.captured(media_type_of(image).unwrap_or(&c.encoding.media_type)),
             Err((name, why)) => refused(name, &format!("{}: {why}", c.path)),
         }
     }
 }
 
-fn write(
+pub(crate) fn write(
     roots: &[std::path::PathBuf; 3],
     grants: &str,
     scope: Option<&str>,
@@ -243,7 +258,7 @@ component App
                 host.canvas_captures.is_empty(),
                 "forgotten capture {n} is retained"
             );
-            let outcome = host.canvas_captured(ticket, b"late PNG");
+            let outcome = host.canvas_captured(ticket, b"late PNG", Some(super::write));
             assert!(exact_runner::canvas_capture::captured_image(&outcome)
                 .unwrap_err()
                 .starts_with("InvalidStateError:"));

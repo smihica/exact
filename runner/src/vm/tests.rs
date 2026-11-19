@@ -37,6 +37,47 @@ fn run_reusing(body: Asm, scratch: &mut Scratch) -> Result<Outcome, Trap> {
 }
 
 #[test]
+fn constant_environments_refuse_runtime_reads_only_when_reached() {
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let ty = b.primitive(exact_plan::TypeKind::Number);
+    let init = b.constant(&Value::Number(0.5));
+    let slot = b.slot("amount", ty, init);
+    for taken in [false, true] {
+        let mut body = Asm::new();
+        let end = body.label();
+        body.bool(taken)
+            .jump_if_false(end)
+            .load_slot(slot)
+            .place(end)
+            .load_param(0);
+        let result = eval_constant(&body.finish(), b.plan(), &[Value::Number(0.25)]).0;
+        if taken {
+            assert_eq!(result.unwrap_err().read.as_deref(), Some("amount"));
+        } else {
+            assert_eq!(result.unwrap(), Value::Number(0.25));
+        }
+    }
+    for f in Stdlib::ALL
+        .into_iter()
+        .filter(|f| *f == Stdlib::PerformanceNow || *f == Stdlib::T || f.localized())
+    {
+        let mut body = Asm::new();
+        body.call(f);
+        let error = eval_constant(&body.finish(), b.plan(), &[]).0.unwrap_err();
+        assert_eq!(error.read, Some(format!("{}()", f.name())));
+    }
+    let mut body = Asm::new();
+    body.number(20.0).number(2.0).call(Stdlib::ToFixed);
+    assert_eq!(
+        eval_constant(&body.finish(), b.plan(), &[]).0.unwrap(),
+        Value::str("20.00")
+    );
+    let mut body = Asm::new();
+    body.call(Stdlib::PerformanceNow);
+    assert_eq!(run(body).unwrap().value, Value::Number(0.0));
+}
+
+#[test]
 fn reused_storage_does_not_carry_locals_stacks_or_failed_callbacks() {
     let mut scratch = Scratch::default();
     for _ in 0..100 {

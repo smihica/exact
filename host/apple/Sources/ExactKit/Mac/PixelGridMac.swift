@@ -98,11 +98,11 @@ extension Presenter {
     package var gridScale: CGFloat { session?.devicePixelScale ?? root.pixelScale ?? 1 }
     /// The scale to place a box under `parent` at: the parent's own, so a
     /// subtree stays on one grid until the scale pass reaches it; else the page's.
-    func gridScale(under parent: GridOrigin) -> CGFloat { parent.scale > 0 ? parent.scale : gridScale }
+    package func gridScale(under parent: GridOrigin) -> CGFloat { parent.scale > 0 ? parent.scale : gridScale }
 
     /// The absolute origin `view` is placed from: that of the node whose
     /// children it is among, else a container on the grid.
-    func gridOrigin(above view: NSView) -> GridOrigin {
+    package func gridOrigin(above view: NSView) -> GridOrigin {
         guard let holder = view.superview else { return .zero }
         var ancestor: NSView? = holder
         while let a = ancestor, !(a is NodeView) { ancestor = a.superview }
@@ -116,7 +116,7 @@ extension Presenter {
     func gridPlace(_ v: NodeView, _ rect: CGRect) -> GridPlace {
         if hostPlaces(v) { return GridPlace(layout: rect, drawn: rect, origin: GridOrigin(scale: PixelGrid.scale(v.superview?.pixelScale ?? gridScale))) }
         // A flying box is placed from its slot, where it lands.
-        let at: NSView = flights[v.id].flatMap { $0.view === v ? $0.slot : nil } ?? v
+        let at: NSView = flightHost.slot(of: v) ?? v
         let origin = gridOrigin(above: at)
         return PixelGrid.place(rect, in: origin, scale: gridScale(under: origin))
     }
@@ -132,7 +132,7 @@ extension Presenter {
         v.grid = place
         defer { if moved { if isApplying { gridMoved.append(v) } else { regridChildren(of: v) } } }
         let frame = v.frameInScrollDocument(place.drawn)
-        if flightFrame(v.id, frame) { return }
+        if flightHost.frame(v.id, frame) { return }
         // A host that places the box is given layout's frame, as before the grid.
         let laid = v.frameInScrollDocument(rect)
         if !dialogs.frame(v, laid) && !menus.frame(v, laid) && !tables.frame(v, laid) { v.frame = frame }
@@ -155,7 +155,7 @@ extension Presenter {
     /// `parent`'s children drawn again from its origin: those whose drawn
     /// frame changes, and theirs in turn.
     func regridChildren(of parent: NodeView) {
-        for case let child as NodeView in parent.container.subviews {
+        for child in parent.structuralChildren {
             guard let old = child.grid, gridPlace(child, old.layout) != old else { continue }
             applyFrame(child, old.layout)
         }
@@ -173,20 +173,9 @@ extension Presenter {
             gridMoved = []
             for (v, _) in round where v.grid != nil { regridChildren(of: v) }
         }
-        regridSlots()
+        flightHost.regridSlots()
     }
 
-    /// Each flight's slot, where its view lands, from its parent's final
-    /// origin: the slot is no node, so no parent's pass reaches it.
-    func regridSlots() {
-        for f in flights.values {
-            guard let view = f.view, let slot = f.slot, slot.superview != nil, let layout = view.grid?.layout else { continue }
-            let origin = gridOrigin(above: slot)
-            let place = PixelGrid.place(layout, in: origin, scale: gridScale(under: origin))
-            view.grid = place
-            _ = flightFrame(view.id, view.frameInScrollDocument(place.drawn))
-        }
-    }
 
     /// Every box drawn again on a new grid (another display's backing scale,
     /// another page zoom), parents first; a flying view is placed from its
@@ -200,7 +189,7 @@ extension Presenter {
     }
 
     /// `view`, newly among its parent's children (or the roots), drawn from there.
-    func regrid(_ view: NodeView) {
+    package func regrid(_ view: NodeView) {
         guard let old = view.grid, gridPlace(view, old.layout) != old else { return }
         applyFrame(view, old.layout)
     }

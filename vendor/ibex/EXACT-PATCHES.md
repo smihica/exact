@@ -2,8 +2,8 @@
 
 ## Android 10 and Intl
 
-Android selects Intl from the validated bundle receipt. The published v5
-bundle builds without it. A receipt enabling Hermes Intl must authenticate the
+Android selects Intl from the validated bundle receipt. The pinned v6
+bundle enables it. A receipt enabling Hermes Intl must authenticate the
 base, English and full ICU data tiers, as on Linux. `hermes-lean-sys` exports
 that availability to both the Ibex installer and Exact's Rust/C++ script lists.
 Only the selected data archive links; Exact selects English. The link directives
@@ -11,10 +11,11 @@ keep the receipt’s VM, ICU, then platform-runtime order. Ibex supplies
 NumberFormat and DateTimeFormat; Hermes's ICU backend supplies Collator.
 Stub builds emit empty Intl bytecode beside the other binding placeholders.
 
-The release pin remains v5. A rebuilt bundle can be selected through
-`HERMES_LEAN_SYS_DIR_aarch64_linux_android`; the upstream Android builder must
-support `IBEX_ANDROID_INTL=true` and target API 29. Publishing and authenticating
-its successor is separate from this integration.
+The pinned Android bundle targets API 29. The resolver applies Android's ICU
+layout and receipt requirements to arm64 and x86_64. Local development bundles
+can be selected through `HERMES_LEAN_SYS_DIR_aarch64_linux_android` and
+`HERMES_LEAN_SYS_DIR_x86_64_linux_android`; the pinned v6 release supplies only
+Android arm64.
 
 The installer’s `--check-dir <directory> <rust-triple>` validates a local cross
 bundle with the build resolver and cached host compiler, without installing or
@@ -24,28 +25,35 @@ receipt-listed archive, header, compiler and ICU filter against its digest,
 independently of the selected Intl data tier. Android’s JSI, Boost and base ICU archives
 must be present in the manifest.
 
+## Android certificate verification
+
+HTTP and WebSocket TLS share `transport/tls.rs`. Android uses
+`rustls-platform-verifier`, initialized with the application's JVM context before
+network work starts. The local Kotlin companion in `crates/ibex2/android` uses
+`AndroidCAStore` for the phone's system and user-installed roots unless the base
+APK's manifest declares a network security configuration; it makes that trust
+manager again after `KeyChain.ACTION_TRUST_STORE_CHANGED`, because a manager
+over an explicit keystore copies its anchors once. With that declaration,
+it initializes the default trust manager with a null keystore to honor the app's
+anchors and exclusions. Both paths pass the hostname to
+`X509TrustManagerExtensions`. The companion implements the 0.7 JNI interface,
+unchanged in 0.7.1 (Android artifact 0.2.0); `CertificateVerifierTest` checks its
+static method, result fields and status codes. The Canvas reader compiles these
+classes and keeps them through R8. Other Android consumers must compile these
+classes instead of the published Android AAR and call
+`transport::initialize_android` before TLS; an uninitialized consumer receives
+an error.
+
 ## Distrusted emSign keys
 
-The portable transports trust what `webpki-roots` compiles in when the system
-has no roots, and verify with `rustls-webpki`. Both locks, like Exact's root
+Off Android, the portable transports trust what `webpki-roots` compiles in when
+the system has no roots, and verify with `rustls-webpki`. Both locks, like Exact's root
 lock, hold `webpki-roots` 1.0.12, without the emSign roots Mozilla removed
 (RUSTSEC-2026-0381), and `rustls-webpki` 0.103.17, which refuses a path holding
 the distrusted emSign intermediate keys (RUSTSEC-2026-0382). Exact's
 `transport/trust_tests.rs`, with its certificates in
 `transport/testdata/distrusted/`, checks both against either kind of store;
 replay it on a refresh unless upstream carries the same check.
-
-## Portable event-stream timeouts
-
-`transport/rustls_http.rs` removes implicit read deadlines after a successful
-`text/event-stream` response identifies an event stream without an explicit
-request timeout. Connection and header limits and explicit timeouts still apply.
-Cancellation interrupts blocked reads; ordinary requests keep their limits.
-The last `Content-Type` controls classification when it is repeated.
-`transport/rustls_timeout_tests.rs` probes both default deadlines and expired
-deadlines, explicit-timeout policy and agent reuse. `transport/stream_tests.rs`
-exercises later events, explicit timeout expiry, cancellation and release
-against loopback peers.
 
 ## Repeated portable HTTP response fields
 
@@ -88,7 +96,7 @@ with substituted Security calls; signed Keychain access still needs profiles.
 - Source trees: `crates/{ibex2,ibex2-sqlite,hermes-lean-sys,hermes-lean-sys-installer}`.
 - Data inputs: `scripts/icu74-filter-{root-en,en-intl}.json` and
   `third_party/wpt/urltestdata.json`.
-- Hermes bundle is `hermes-vanilla-d412d3bd8512-v5`, source
+- Hermes bundle is `hermes-vanilla-d412d3bd8512-v6`, source
   `d412d3bd…` / Hermes `260318099.0.4`. Repository engine-output directories
   remain absent; builds validate the paired compiler and VM in the bundle cache.
 - The two standalone `Cargo.lock` files under `ibex2` and
@@ -202,14 +210,20 @@ snapshot. Exact's render and non-Apple executors consume that portable path.
 
 Patch 9's app interface stays Exact's and is replayed on a refresh:
 `bindings/storage.d.ts` declares `compressImage(from, to, {maxDimension,
-maxBytes, type})` resolving to `{path, type, size, width, height}`, as Exact's docs
+maxBytes, quality, type})` resolving to `{path, type, size, width, height}`, as Exact's docs
 give it, and Exact's prelude (`js/src/prelude.js`) adapts that to upstream's
 positional binding (`compressImage(from, to, maxDimension, maxBytes)`, replying
 `width\theight\tsize`). Exact adds a fifth positional argument, the media type
 (exact2 LLP 1069.002 A1.11, 2026-10-20): `boundary_abi.rs` reads it into
 `fs_image::ImageRequest::format` (`ImageFormat::Jpeg` when absent, `Png`; any
-other value is an invalid argument), and the codec is Exact's. Replay both on a
-refresh. The October 13 refresh replaced the declaration with
+other value is an invalid argument), and the codec is Exact's. The fourth,
+`maxBytes`, may be undefined or null (exact2 LLP 1069.002 A1.12, 2026-11-14):
+`ImageRequest::max_bytes` is an `Option`, `None` for no byte target, and the
+codec's output is then bounded by the service's `max_output_bytes`
+(`ImageJob::prepare`, `execute`); the call's `quality` rides in patch 9a's
+options JSON, which the codec reads.
+`fs_image.rs`'s `a_compression_without_a_byte_target_is_bounded_by_the_service`
+pins it. Replay all three on a refresh. The October 13 refresh replaced the declaration with
 the positional form; `contract/cli/tests/it/typescript.rs` now pins it. Upstream
 now preserves Exact's app error branches: a source over the read cap is
 `compressImage: too-large:`, and a trial deadline before publication is
@@ -340,6 +354,11 @@ cache or temporary directories. `exact-js` selects it only for a snapshot;
 is the direct consumer test. This is LLP 1126 D8 application policy and
 remains local.
 
+Unix app roots open with `O_DIRECTORY | O_NOFOLLOW`, including snapshot
+roots. A root substituted by a symlink before its first open is refused;
+opened roots stay pinned. `tests/app_storage.rs` covers both acquisition modes
+and pinning after replacement.
+
 The standalone locks above remain local. Application policy stays in Exact:
 request scheduling and byte budgets, whole-exchange deadlines, source grants,
 document session identity, JSON result vocabulary, native image codec, and
@@ -467,9 +486,9 @@ refresh.
 ## Local patch 23, an upload's bytes sent
 
 `stdlib/fetch.rs` gives `Request` an optional `sent` hook (`Sent`), told
-`(loaded, total)` as the body goes out and `(total, total)` by the time the
-headers have arrived (exact2 LLP 1016.000 D10, XMLHttpRequest's upload
-progress), and an optional start hook beside it. `fetch_stream_gated` tells
+`(loaded, total)` as the body goes out, reaching `(total, total)` once it has
+all gone (exact2 LLP 1016.000 D10, XMLHttpRequest's upload progress; patch 46
+stops it at the bytes written when the reply comes first), and an optional start hook beside it. `fetch_stream_gated` tells
 the start hook once, when `admit_hop` has passed the first hop's grant check
 and local-network gate, so a request they refuse never started (the
 embedder's `exact:sending`). The hook answers whether the upload may go out:
@@ -485,8 +504,8 @@ resend (`rustls_http.rs`'s `send`; tested in
 exchange, and `ibex2_darwin_http_headers` takes the bytes the caller last saw,
 returning 2 when they change before the headers, so `transport/darwin.rs`
 tells the hook on the opening thread and waits again.
-`transport/rustls_http.rs` sends such a body through a reader that tells the
-hook each read ureq takes, with an explicit `content-length`. Without a hook
+`transport/rustls_http.rs` sends such a body through a counted reader, with an
+explicit `content-length`, and tells the hook after each write (patch 46). Without a hook
 nothing changes. `fetch_stream_gated`, every request's hop loop, moves the
 body into each hop's request and back instead of cloning it, so a request
 holds one copy of its body while it goes out, the platform's aside.
@@ -518,6 +537,17 @@ putting them in place, and `fork` runs with every signal blocked until the
 child's handlers are defaults. A `PATH` lookup skips relative entries.
 On macOS a group's member list uses libproc's PID count to size its buffer
 and retries a full buffer, so growth cannot silently truncate the list.
+Exit observation uses `waitid(WNOWAIT)`, leaving the leader's identity
+reserved until the supervisor and quit finish signalling, then `wait`
+reaps it. `try_observe_exit` polls without waiting or reaping. Group liveness
+and member lists exclude zombies on both platforms; Linux checks a zombie
+leader's remaining threads. Failed inspection leaves liveness unknown and
+is treated as alive for signalling and escalation. On Linux, membership is
+`getpgid`'s answer, so a process outside the group that `/proc`'s
+`hidepid` makes unreadable does not fail the scan (`process/scan.rs`).
+`signal_process_if` replaces `signal_process`: it signals a pid only if a
+test holds for it, and on Linux holds the process by a pidfd across the
+test, so a pid reused after the test is not signalled.
 `stdlib/fs.rs` resolves `home:/` and `bundle:/` (the namespaces `grant.rs`
 reads) against roots the host sets (`set_roots`), the bundle read only,
 each path admitted as spelt and run from its root's retained descriptor
@@ -950,6 +980,87 @@ a second removal made `??a=1` the name `a` rather than `?a`. `url.rs`
 tests the parse; `js/tests/it/pure.rs` compares construction, a URL's
 view, lookup and mutation with Chrome. Replay on a refresh.
 
+## Local patch 42, an app folder read or copied as a file is `EISDIR`
+
+`stdlib/app_fs_unix.rs` refuses `readFile` of an `app:/` folder, and
+`copyFile` from one, with `EISDIR` (os error 21), as a write to one already
+is and as the web's store refuses all three, so the app's `code` is the same
+on Unix hosts as on the web. Windows still answers `failed` for these
+(`windows_directory.rs` refuses with no filesystem code), and the test
+asserts the folder codes only under `cfg(unix)`. `copy` checks its source before it opens the target, so a
+folder's copy no longer leaves an empty file behind. `js/tests/it/storage.rs`
+checks both codes and that no file is made. Replay on a refresh unless
+upstream refuses folders so.
+
+## Local patch 43, bundled SQLite on Apple
+
+`ibex2-sqlite` bundles SQLite 3.54.1 on Apple too: the minimum supported OS
+libraries are older than rusqlite's 3.45.3 floor (#565). Exact's Apple Cargo
+driver sets `SQLITE_ENABLE_LOCKING_STYLE=0` and renames `fstatfs` to
+`exact_sqlite_fstatfs` for iOS, tvOS and watchOS. `src/apple.c`, compiled by
+`build.rs` under the same SDK declaration, returns a zero-filled `statfs` and
+success. This removes the FAT/exFAT inode workaround and filesystem-specific
+locking, including proxy locks, for app-container storage. macOS app builds
+retain SQLite's defaults. The replacement is available to Mac build tools too,
+since `LIBSQLITE3_FLAGS` also reaches an iOS build's host dependencies.
+
+Recheck every filesystem probe when updating the amalgamation. Replay the
+bundled dependency, C replacement and build driver together on a refresh.
+
+## Local patch 44, the events binding's engine hooks for an embedder
+
+`InstallOptions::events_hooks` names a global through which the installer
+publishes the events binding's engine hooks (`reportException`, `onUnhandled`,
+`onHandled`, `configure`), frozen, as it publishes the other bootstrap outputs.
+Exact's data module reads them before its code runs (exact2 LLP 1175).
+Installed so, the binding reads no clock, since that realm refuses one to its
+code: `Event.timeStamp` is 0. `configure({ report, result, during })`, allowed
+once, makes the embedder hear every report with whether a listener cancelled
+it, in place of `nativeReport`; hear each listener's and `on…` handler's
+return value; and run the host's own dispatches of `error`,
+`unhandledrejection` and `rejectionhandled` inside `during`. `reportException`
+and `onUnhandled` return whether a listener cancelled. Without the option the
+binding behaves as upstream's. `js/tests/it/error_events.rs` covers it. Offer
+upstream; replay on a refresh until it lands.
+
+## Local patch 45, ibex2 takes Exact's private copy of ureq
+
+`ibex2` depends on `ureq = { package = "exact-ureq", path = "../../../ureq" }`,
+ureq 3.4.0 vendored under another name (`vendor/ureq/EXACT-PATCHES.md`): the
+portable transport implements ureq's `unversioned` traits, which change
+between minor releases, and an app's own `ureq` must resolve apart from it
+(LLP 1153.003 D6.5). `hermes-lean-sys` and its installer use only ureq's
+stable API (an agent and its TLS roots, local patch 47) and require `"3"`. The atomics call `try_update`, Rust's current name for the
+deprecated `fetch_update`. Replay on a refresh.
+
+## Local patch 46, a request body streamed from a file
+
+`Request::body_file` is a body read from a file as it goes out (exact2 LLP
+1133.008.000 D4): a `BodyFile` over the embedder's `FileBody`, which gives the
+body's length and a reader from its first byte for each attempt. A redirect
+that drops the body drops it; a request with both it and `body` is refused, as
+is one on the asynchronous fetch. Its length is the `Content-Length`.
+
+The portable transport sends it through `SendBody::from_reader`. A request
+whose body is a file and which names no timeout has no limit on the whole
+exchange: each write may wait 60 s (`IDLE_SEND`), then the reply has its usual
+15 s and 15 s. A resend on a new connection opens a new reader. Progress, for
+any counted body, is told after each write that succeeds (`Written`), never on
+the read before it, and is no longer filled to `(total, total)` when the
+response arrives: a reply before the whole body went out tells only the bytes
+written.
+
+Darwin sends it as `uploadTaskWithStreamedRequest:`. `needNewBodyStream`
+supplies each attempt's stream, the first included: the input half of a 64 KiB
+bound stream pair, with a thread (`Ibex2FilePump`) copying the reader's bytes
+into the output half and never writing when there is no space. URLSession's
+own stream lets it read a reply that comes before the body has gone (a 413 in
+under a second, measured); an `NSInputStream` subclass left it waiting 60 s for
+its timeout. A reader that fails fails the exchange with its words unless a
+reply came first. Progress stops at `didSendBodyData`'s last count.
+
+Replay on a refresh.
+
 ## Terminal heap exhaustion
 
 The borrowed adapter propagates native engine exceptions through installation,
@@ -957,6 +1068,190 @@ checkpoints and task delivery. These changes adopt the consumer contract from
 upstream `6ce0bf09495cee43fdc9fb2ee00ca5520796d2ef`: Hermes heap OOM requires
 immediate adapter and runtime destruction, without JavaScript, job draining or
 collection. Exact's shim recognizes that exception only when the bundle receipt
-enables exception-on-OOM and RTTI. The v5 release pins remain unchanged.
-Exact's heap tests exercise retirement and replacement with the local v6 bundle,
+enables exception-on-OOM and RTTI. The pinned v6 release enables both.
+Exact's heap tests exercise retirement and replacement with the published bundle,
 including timers, stream mappers, worker placement and in-flight storage.
+
+## Socket close confirmation
+
+`MessageSender::wait_close` distinguishes submission from completion. URLSession
+confirms receipt of the peer's closing frame through its delegate; the portable
+pump confirms that the close frame reached TCP. The native executor waits across
+this boundary before a suspending host returns, with a bounded deadline. Ordinary
+resource releases wait on a worker. Replay on a refresh.
+
+## Session-free file transfers
+
+`Fetch::admit` checks the binding's grants and hop gate without sending a
+request; a later `stream` checks them again at every hop. HTTP admission
+refuses non-HTTP schemes and, at the first hop and at every redirect, a URL
+with userinfo: Fetch throws a `TypeError` for a
+[request URL that includes credentials](https://fetch.spec.whatwg.org/#dom-request)
+and answers a network error for a
+[redirect to one](https://fetch.spec.whatwg.org/#http-redirect-fetch) in
+another origin, which every server is to an app. The background-transfer
+carrier refuses userinfo in its own hop gate as well, beside the source's
+grant and gate. Redirects rewrite POST on 301/302,
+rewrite non-GET/HEAD on 303, and drop body headers when dropping the body,
+as Fetch's redirect algorithm requires. Authorization remains removed after
+any origin change.
+Redirect credential stripping compares parsed URL origins, leaving hostless
+and non-HTTP targets to hop admission. Such targets fail URL validation,
+not HTTP-origin extraction, so a carrier never retries them as network faults.
+
+`Request::idle_timeout` lets a portable file transfer outlive the ordinary
+total deadline while bounding DNS (including the wait for a lookup helper)
+and each socket wait. An explicit total timeout
+wins; a reused connection restores the next request's own timeouts. TLS,
+trust selection and HTTP framing are unchanged. The Android carrier uses
+this through the same endowed fetch binding as ordinary requests (LLP
+1133.017). Replay on a refresh.
+
+`AppDirectories::publish_file` admits a destination under pinned directories and
+renames a completed host-owned file into it on the same filesystem. Recovery
+recognizes an already-published destination; storage errors preserve the source
+for retry. This avoids requiring another response-sized allocation at publication.
+
+## Windows known folders
+
+LLP 1173 D4's create-only namespaces use an OS-selected root, UNC included,
+and retain handles below it. Their walk refuses name-surrogate reparse tags
+and reopens admitted directories with normal reparse processing so cloud
+filters can recall placeholders. The reopened handle must identify the same
+object; tags are checked again before use. Every directory is reopened because
+Windows can hide cloud tags. The app and native drive walks keep refusing all
+reparse points. Leaf validation shares the native path rule. Exclusive
+creation uses `FILE_CREATE`; atomic publication uses the retained parent and
+`FileRenameInformation` with `ReplaceIfExists` false. Known-folder `mkdir`
+creates every component exclusively, with `FILE_CREATE` on Windows and
+`mkdirat` on Unix; app walks keep their open-or-create behavior. Replay on a refresh.
+
+The portable tag and name tests run on macOS. Windows tests cover collisions,
+retained parents and agent roots. Native qualification remains pending:
+`cargo run -p exact-windows --example known-folders` probes OneDrive and UNC
+redirection before a Windows app drive claims the cell. Append
+`-- pictures OnlineOnly` to exercise an existing dehydrated child directory.
+
+## Local patch 47, the Hermes download trusts `SSL_CERT_FILE`
+
+`build_support.rs` downloads a pinned bundle with Mozilla's roots, or, when
+`SSL_CERT_FILE` names a PEM file, with that file's certificates in their place,
+as OpenSSL and curl read the variable. `exact setup` then works behind a
+TLS-intercepting proxy whose CA is private. The pinned SHA-256 still decides
+what is extracted. Replay on a refresh.
+
+## Content codings off Apple
+
+The rustls transport builds ureq with `gzip` and `brotli`: a request names
+`Accept-Encoding: gzip, br`, and a response with that `Content-Encoding` reaches
+`fetch` decoded, as NSURLSession gives it on Apple and Fetch requires
+([HTTP-network fetch](https://fetch.spec.whatwg.org/#http-network-fetch)). A server may
+send a stored coding unasked: Cloud Storage serves a `br` object to a request that
+names only `identity`. Without the features Android, Linux and Windows handed the
+coded bytes to `text()`. Replay on a refresh.
+
+## Local patch 48, an open-ended response
+
+`Request::open_ended` marks a response its caller reads for as long as it
+holds it: exact2's event streams and byte streams (LLP 1016.000). Without an
+explicit `timeout`, no limit of the transport's own ends it, on the whole
+exchange or on a quiet body, whatever its status. An explicit timeout keeps
+its meaning, and ordinary requests keep their limits.
+
+The portable transport (`transport/rustls_http.rs`) keeps its limits on
+connecting (10 s) and on the head (15 s), and lifts every read deadline ureq
+would apply to the body (its 30 s global and 15 s body limits) once the head
+arrives, for an `open_ended` request and for a successful response whose
+last `Content-Type` is `text/event-stream`. Cancellation still interrupts a
+blocked read, and a pooled agent restores its deadlines when it is leased
+again. `transport/rustls_timeout_tests.rs` probes the deadlines passed to the
+wire, default and expired, and agent reuse; `transport/stream_tests.rs`
+exercises later events, explicit timeout expiry, cancellation and release
+against loopback peers.
+
+Darwin (`transport/darwin_http.mm`) sets an open-ended request's
+`timeoutInterval`, which ends a task after that long without data (60 s by
+default), to a limit nothing reaches (`Ibex2Unbounded`). The head goes
+without a limit too: URLSession calls `didReceiveResponse` only with the
+first body bytes or the body's end (content sniffing; measured for
+`text/event-stream`, `application/octet-stream` and `text/plain`), so a
+server that answers and then waits shows no head until it sends. Its
+session's `timeoutIntervalForResource` (seven days by default) is the same
+unreached limit; that limit is a session's, so the pool leases an open-ended
+exchange only a session of its kind and every other request one that keeps
+the seven days, and at its four sessions an idle one of the other kind gives
+up its place.
+
+exact2's `host/executor/src/stream_quiet_tests.rs` holds an event stream and
+a byte stream quiet past each transport's limits against a loopback peer, on
+rustls and on URLSession. Replay on a refresh.
+
+## Local patch 49, one connection pool a transport
+
+exact2 runs its independent lane's six workers, its scoped requests and its
+launch preloads over one transport (LLP 1162 D5), so its reads share their
+connections.
+
+Darwin (`transport/darwin_http.mm`) ran each exchange on one of four
+sessions leased to it alone, because its delegate waits while the exchange's
+reader is behind, which would stall every task of a shared session; each
+session had its own connection pool. `Request::collected` says the caller
+reads the reply to its end as it arrives, into memory (exact2's plain reads
+and preloads, not a reply written to a file). Such an exchange, if not
+open-ended and its limit at most 64 MiB, a plain request's ceiling, now runs
+on one `shared` session per transport, whose delegate waits only while the
+reply is a mebibyte ahead of its reader, which a collecting reader never is
+for long: the session's other exchanges are not held, and what it holds of
+each reply stays bounded. The reader takes the reply from an offset and drops
+what it has taken once that is half the buffer. URLSession task suspension is
+no substitute: suspended in `didReceiveData`, a loopback task kept delivering
+its whole 8 MiB. The shared session's `HTTPMaximumConnectionsPerHost` is 32:
+URLSession's six (macOS) or four (iOS) would queue a read behind replies its
+origin holds, which sessions of their own never did, and 32 is more than
+exact2 runs at once on one transport (six workers, eight launch preloads,
+eight prefetches). HTTP/2 and HTTP/3
+carry an origin's exchanges on one connection. Any other exchange still
+leases a session of its own (local patch 48's kinds), so a stream, an unread
+reply or a slow file write never holds back the shared session.
+`transport/darwin_stream_tests.rs` has eight collected exchanges at once take
+their heads, which the peer sends only once all eight are in, beside four
+open-ended ones, and eight more after them open no connection.
+
+The portable transport (`transport/rustls_http.rs`) leases each exchange an
+idle agent of its own, each agent with its own pool. A lease now takes the
+newest idle agent whose last requests went to the request's origin (the
+eight it remembers), so a request finds a connection another left open to
+it. Replay on a refresh.
+
+## Local patch 50, a URL the web would encode
+
+`fetch("…&details->>status=eq.open")` reaches a browser's server with `>`
+percent-encoded: the URL Standard's parser encodes what a query, a path or a
+fragment may not hold as written. The portable transport parses a URI and
+refused the request, "invalid uri character", so one line of app code worked
+on the web and Apple and failed on Android, Linux and Windows. `prepare_body`,
+which both the blocking and the asynchronous fetch pass a request through,
+replaces a URL that holds a character RFC 3986 gives no URI with the `url`
+crate's serialization of it. A URL that is already a URI is sent as written,
+so no request that worked changes. Replay on a refresh
+(`stdlib/fetch.rs`, `a_url_the_web_would_encode_is_sent_encoded`).
+
+## Local patch 51, an execution says whether it changed the database
+
+exact2 tells an app's other windows of a SQLite write (exact2 LLP 1030.004
+D2) when the statement changed the database, a row or the schema, so a
+`DROP` or an `ALTER` counts and a `CREATE TABLE IF NOT EXISTS` that finds
+its table does not. `stdlib::sqlite::ExecuteResult` gains `changed`:
+`ibex2-sqlite`'s `execute` reads the connection's `total_changes` (which
+moves for a trigger's rows too) and `PRAGMA schema_version` before and
+after the statement, and `changed` is either moving. The authorizer admits
+`PRAGMA schema_version` only while the provider reads it, as it admits the
+provider's own `BEGIN` and `COMMIT`. `changes` is zero when the total did
+not move: `sqlite3_changes` keeps the last `INSERT`, `UPDATE` or `DELETE`'s
+count after any other statement (https://www.sqlite.org/c3ref/changes.html).
+`sqlite_abi` result field 9 carries `changed`, and the JS binding's
+execution has it beside `changes` and `lastInsertRowid`; exact2's prelude
+reads it and gives the app the other two, so `storage.d.ts` leaves it out.
+exact2's web worker answers alike. `src/tests.rs` covers each statement
+kind, and exact2's `exact-js` `topics` test what announces. Replay on a
+refresh.

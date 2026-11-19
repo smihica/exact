@@ -1,15 +1,16 @@
 // Bounded optional interaction acceleration. Missing coverage is not an index
 // and never prevents the worker from drawing the complete text.
+#if os(macOS)
 import Foundation
 import CoreText
 
-struct RegionHitStats { var bytes = 0; var owners = 0; var peak = 0; var drops = 0 }
-final class RegionHitAccount: @unchecked Sendable {
-    static let outputBytes = 4 * 1024 * 1024
+package struct RegionHitStats { package var bytes = 0; package var owners = 0; package var peak = 0; package var drops = 0 }
+package final class RegionHitAccount: @unchecked Sendable {
+    package static let outputBytes = 4 * 1024 * 1024
     private let lock = NSLock()
     private var value = RegionHitStats()
-    var stats: RegionHitStats { lock.lock(); defer { lock.unlock() }; return value }
-    func reserve() -> RegionHitCharge? {
+    package var stats: RegionHitStats { lock.lock(); defer { lock.unlock() }; return value }
+    package func reserve() -> RegionHitCharge? {
         lock.lock(); defer { lock.unlock() }
         guard value.owners < 2, value.bytes <= 8 * 1024 * 1024 - Self.outputBytes else { return nil }
         value.bytes += Self.outputBytes; value.owners += 1; value.peak = max(value.peak,value.bytes)
@@ -19,9 +20,9 @@ final class RegionHitAccount: @unchecked Sendable {
         lock.lock(); value.bytes -= Self.outputBytes; value.owners -= 1; value.drops += 1; lock.unlock()
     }
 }
-final class RegionHitCharge: Sendable {
+package final class RegionHitCharge: Sendable {
     private let account: RegionHitAccount
-    init(_ account: RegionHitAccount) { self.account = account }
+    package init(_ account: RegionHitAccount) { self.account = account }
     deinit { account.release() }
 }
 private struct RegionHitRecord {
@@ -50,16 +51,16 @@ private struct RegionHitArena {
 /// All mutation ends before publication. The one slab includes the directory,
 /// edges, answers AND temporary sort/enumeration space (retained and charged).
 /// No CoreText objects, borrowed source buffers or mutable shared cache escape.
-final class RegionViewportHits: @unchecked Sendable {
-    static let maximumLines = 512
-    static let maximumCaretUnits = 8192
+package final class RegionViewportHits: @unchecked Sendable {
+    package static let maximumLines = 512
+    package static let maximumCaretUnits = 8192
     private let charge: RegionHitCharge?
     private let memory: UnsafeMutableRawPointer?
     private let records: UnsafeMutablePointer<RegionHitRecord>?
     private(set) var cachedLines = 0
     private(set) var caretUnits = 0
 
-    init(request: RegionRasterRequest, lookup: (UInt64) -> RegionWorkerLayout?, account: RegionHitAccount) {
+    package init(request: RegionRasterRequest, lookup: (UInt64) -> RegionWorkerLayout?, account: RegionHitAccount) {
         precondition(!Thread.isMainThread)
         charge = account.reserve()
         guard charge != nil else { memory = nil; records = nil; return }
@@ -76,7 +77,7 @@ final class RegionViewportHits: @unchecked Sendable {
             // Upper-bound lookup is the hit rule, not the conservative ink rule.
             guard bottom >= 0, top <= row.box.height,
                   let lo = p.lineIndex(at: max(0,top)),
-                  let hi = p.lineIndex(at: min(row.box.height,bottom)) else { continue }
+                  let hi = p.lineIndex(at: min(row.box.height,bottom), lastInBand: true) else { continue }
             guard lo <= hi else { continue }
             // Zero-height/overlapping lines cannot turn admission into a full scan.
             for i in lo...hi {
@@ -137,7 +138,7 @@ final class RegionViewportHits: @unchecked Sendable {
         return RegionHitRecord(artifact: artifact,line: lineIndex,count: edgeCount,
                                edges: edges,points: points,intervals: intervals)
     }
-    static func sortedUnique(_ buffer: UnsafeMutablePointer<CGFloat>, count: Int) -> Int {
+    package static func sortedUnique(_ buffer: UnsafeMutablePointer<CGFloat>, count: Int) -> Int {
         // Swift's stable sort allocates auxiliary arrays even for an unsafe
         // buffer. Heap-sort these finite scalars in their charged storage;
         // equal values are deduplicated below, so stability is immaterial.
@@ -164,7 +165,7 @@ final class RegionViewportHits: @unchecked Sendable {
         }
         return n
     }
-    func index(artifact: UInt64, line: Int, x: CGFloat) -> CFIndex? {
+    package func index(artifact: UInt64, line: Int, x: CGFloat) -> CFIndex? {
         guard x.isFinite, let records else { return nil }
         for i in 0..<cachedLines where records[i].artifact == artifact && records[i].line == line {
             let row = records[i], edges = row.edges!
@@ -182,27 +183,30 @@ final class RegionViewportHits: @unchecked Sendable {
 
 // Only scalar points/indices cross the queue; the enclosing raster request
 // certifies generation/publication/artifacts and the complete native phase.
-struct RegionPointRequest: Sendable, Equatable {
-    let gesture: UInt64
-    let sequence: UInt64
-    let artifact: UInt64
-    let anchor: Int?
-    let begin: CGPoint?
-    let point: CGPoint
-    let terminal: Bool
-    let dragged: Bool
-    let selectAll: Bool
+package struct RegionPointRequest: Sendable, Equatable {
+    package let gesture: UInt64
+    package let sequence: UInt64
+    package let artifact: UInt64
+    package let anchor: Int?
+    package let begin: CGPoint?
+    package let point: CGPoint
+    package let terminal: Bool
+    package let dragged: Bool
+    package let selectAll: Bool
 }
-struct RegionPointReply: Sendable {
-    let query: RegionPointRequest
-    let anchor: Int
-    let index: Int
-    let link: String?
-    let selection: NSRange?
+package struct RegionPointReply: Sendable {
+    package let query: RegionPointRequest
+    package let anchor: Int
+    package let index: Int
+    package let link: String?
+    package let selection: NSRange?
+    package init(query: RegionPointRequest, anchor: Int, index: Int, link: String?, selection: NSRange?) {
+        self.query = query; self.anchor = anchor; self.index = index; self.link = link; self.selection = selection
+    }
 }
-struct RegionContact {
-    let gesture: UInt64
-    let artifact: UInt64
+package struct RegionContact {
+    package let gesture: UInt64
+    package let artifact: UInt64
     private(set) var sequence: UInt64 = 1
     private var accepted: UInt64 = 0
     private var begin: CGPoint?
@@ -212,23 +216,24 @@ struct RegionContact {
     private var terminal = false
     private var selectAll = false
     private(set) var finished = false
-    init(gesture: UInt64, artifact: UInt64, point: CGPoint, selectAll: Bool = false) {
+    package init(gesture: UInt64, artifact: UInt64, point: CGPoint, selectAll: Bool = false) {
         self.gesture = gesture; self.artifact = artifact; begin = point; self.point = point; self.selectAll = selectAll
     }
-    var query: RegionPointRequest? {
+    package var query: RegionPointRequest? {
         guard !finished, accepted != sequence else { return nil }
         return RegionPointRequest(gesture: gesture,sequence: sequence,artifact: artifact,anchor: anchor,
             begin: begin,point: point,terminal: terminal,dragged: dragged,selectAll: selectAll)
     }
-    mutating func update(point: CGPoint, dragged: Bool, terminal: Bool) -> Bool {
+    package mutating func update(point: CGPoint, dragged: Bool, terminal: Bool) -> Bool {
         guard !finished, !self.terminal, sequence < UInt64.max, point.x.isFinite, point.y.isFinite else { return false }
         sequence += 1; self.point = point; self.dragged = self.dragged || dragged; self.terminal = terminal
         return true
     }
-    mutating func accept(_ reply: RegionPointReply) -> Bool {
+    package mutating func accept(_ reply: RegionPointReply) -> Bool {
         guard let query, reply.query == query, reply.anchor >= 0, reply.index >= 0 else { return false }
         anchor = reply.anchor; begin = nil; accepted = sequence
         finished = query.terminal
         return true
     }
 }
+#endif

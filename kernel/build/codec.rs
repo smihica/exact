@@ -1,4 +1,4 @@
-const CODEC_PATHS: [&str; 11] = [
+const CODEC_PATHS: [&str; 12] = [
     "../vendor/taffy/src/style/grid.rs",
     "build.rs",
     "build/codec.rs",
@@ -6,6 +6,7 @@ const CODEC_PATHS: [&str; 11] = [
     "src/style/calc/parse.rs",
     "src/style/relative.rs",
     "src/style/relative/wire.rs",
+    "src/style/viewport.rs",
     "src/style/grid.rs",
     "src/style/grid/parse.rs",
     "src/wire/codec.rs",
@@ -13,6 +14,45 @@ const CODEC_PATHS: [&str; 11] = [
 ];
 const SCHEMA_PATH: &str = "tables/schema.json";
 const DIGEST_DOMAIN: &[u8] = b"exact-kernel-schema-v1\0";
+
+/// The codecs whose text an artifact parses only through a grammar it links
+/// by use (`style::effects`, `style::grid`, `gradient`, and `exact_motion`'s
+/// animations and transitions), and the capability that links each: a row
+/// with one of them names it, so a plan that writes the row, constant, bound
+/// or computed, selects the grammar, and an artifact that links it by use
+/// and lacks it refuses the plan by that name. (Apple links `clip-path`'s
+/// always.)
+const LINKED_CODECS: &[(&str, &str)] = &[
+    ("animations", "animations"),
+    ("filter", "effects"),
+    ("clip-path", "effects"),
+    ("tracks", "grid"),
+    ("placement", "grid"),
+    ("transitions", "transitions"),
+    ("background-image", "gradients"),
+    ("mask-image", "gradients"),
+];
+
+fn emit_style_capabilities(w: &mut String, schema: &Schema) {
+    for row in &schema.styles {
+        for (codec, capability) in LINKED_CODECS {
+            assert!(
+                row.codec != *codec || row.capability.as_deref() == Some(*capability),
+                "style `{}` parses by the `{codec}` grammar, which is linked by use: \
+                 give it `\"capability\": \"{capability}\"` in kernel/tables/schema.json",
+                row.field
+            );
+        }
+    }
+    w.push_str("    /// The parser family a bound row links, if any (LLP 1047 D2).\n");
+    w.push_str("    pub fn capability(self) -> Option<&'static str> {\n        match self {\n");
+    for row in &schema.styles {
+        if let Some(name) = &row.capability {
+            writeln!(w, "            StyleId::{} => Some({name:?}),", pascal(&row.field)).unwrap();
+        }
+    }
+    w.push_str("            _ => None,\n        }\n    }\n");
+}
 
 enum GridSeam {
     Decode,
@@ -250,6 +290,12 @@ fn parse_codec(s: &str) -> Codec {
             path: "crate::timeline::TimelineScope",
             variant: "TimelineScope",
             error: "BadTimelineScope",
+        },
+        // @ref LLP 1123 D5 — runtime custom properties, CSS Variables 1.
+        "safe-area-properties" => Codec::CssValue {
+            path: "crate::style::safe_area_properties::SafeAreaProperties",
+            variant: "SafeAreaProperties",
+            error: "BadSafeAreaProperties",
         },
         other => match other.strip_prefix("enum:") {
             Some(name) => Codec::Enum(name.to_string()),
@@ -729,15 +775,21 @@ fn write_metrics(w: &mut String, metrics: &[MetricRow], taken: &[&str]) {
         "    /// The metric's name, without `-exact-`.\n    pub name: &'static str,\n",
         "    /// What its values are.\n    pub kind: MetricKind,\n",
         "    /// Its values are lengths: a `length` row, or a `style` row written on a length property (`style length` in the schema, theme2's unit flag), whose number is px.\n    pub length: bool,\n",
-        "    /// On iOS.\n    pub ios: MetricValue,\n",
-        "    /// On the Mac.\n    pub macos: MetricValue,\n",
-        "    /// In the web's first look, which a process reads until its host says otherwise.\n    pub web: MetricValue,\n",
-        "    /// In the neutral look: the web's, and a host's that paints its own controls.\n    pub neutral: MetricValue,\n",
-        "    /// In Android's Material look: the web's first look unless the row says otherwise.\n    pub material: MetricValue,\n",
-        "    /// In the terminal (LLP 1121 stage 11 B): the web's first look, which it read before it had a column.\n    pub terminal: MetricValue,\n",
+        "    /// iOS's, the Mac's, the web's, the neutral look's and Material's value, each its place in\n",
+        "    /// [`METRIC_VALUES`], which holds each distinct value once.\n",
+        "    cells: [u8; 5],\n",
+        "}\n",
+        "impl Metric {\n",
+        "    /// On iOS.\n    pub fn ios(&self) -> MetricValue { METRIC_VALUES[self.cells[0] as usize] }\n",
+        "    /// On the Mac.\n    pub fn macos(&self) -> MetricValue { METRIC_VALUES[self.cells[1] as usize] }\n",
+        "    /// In the web's first look, which a process reads until its host says otherwise.\n    pub fn web(&self) -> MetricValue { METRIC_VALUES[self.cells[2] as usize] }\n",
+        "    /// In the neutral look: the web's, and a host's that paints its own controls.\n    pub fn neutral(&self) -> MetricValue { METRIC_VALUES[self.cells[3] as usize] }\n",
+        "    /// In Android's Material look: the web's first look unless the row says otherwise.\n    pub fn material(&self) -> MetricValue { METRIC_VALUES[self.cells[4] as usize] }\n",
+        "    /// In the terminal (LLP 1121 stage 11 B): the web's first look's.\n    pub fn terminal(&self) -> MetricValue { self.web() }\n",
         "}\n",
     ));
     let mut names = BTreeSet::new();
+    let mut values: Vec<String> = Vec::new();
     let mut rows = String::new();
     let mut ids = String::new();
     for (index, row) in metrics.iter().enumerate() {
@@ -768,10 +820,16 @@ fn write_metrics(w: &mut String, metrics: &[MetricRow], taken: &[&str]) {
             [ios, macos, web, neutral, material] => [ios, macos, web, neutral, material],
             _ => panic!("schema: metric {name}: a row is its name, its kind and a value for iOS, the Mac, the web and the neutral look (and Android's Material look where it is not the web's), or for the neutral look alone"),
         }
-        .map(|cell| metric_cell(name, kind, cell));
-        // The terminal reads the web's first look's value (it did before it had a column).
+        .map(|cell| {
+            let value = metric_cell(name, kind, cell);
+            let place = values.iter().position(|v| *v == value).unwrap_or_else(|| {
+                values.push(value);
+                values.len() - 1
+            });
+            u8::try_from(place).expect("schema: the metrics hold at most 256 distinct values")
+        });
         rows.push_str(&format!(
-            "Metric {{ name: {name:?}, kind: MetricKind::{variant}, length: {length}, ios: {ios}, macos: {macos}, web: {web}, neutral: {neutral}, material: {material}, terminal: {web} }},\n"
+            "Metric {{ name: {name:?}, kind: MetricKind::{variant}, length: {length}, cells: [{ios}, {macos}, {web}, {neutral}, {material}] }},\n"
         ));
         if variant != "Style" {
             ids.push_str(&format!(
@@ -780,6 +838,11 @@ fn write_metrics(w: &mut String, metrics: &[MetricRow], taken: &[&str]) {
             ));
         }
     }
+    w.push_str("/// Every value a metric has in some column, once.\npub const METRIC_VALUES: &[MetricValue] = &[\n");
+    for value in &values {
+        w.push_str(&format!("{value},\n"));
+    }
+    w.push_str("];\n");
     w.push_str("/// Every metric, in the schema's order.\npub const METRICS: &[Metric] = &[\n");
     w.push_str(&rows);
     w.push_str("];\n");

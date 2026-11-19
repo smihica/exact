@@ -4,6 +4,8 @@ import ImageIO
 import XCTest
 import CExact
 @testable import ExactKit
+@testable import ExactVideo
+@testable import ExactImages
 
 /// A box Core Animation can paint keeps no bitmap on AppKit, as on UIKit
 /// (`BoxLayerIOSTests`): background, one radius over a mask of corners, a
@@ -315,7 +317,7 @@ final class BoxLayerMacTests: XCTestCase {
     func testAPaddingResolvedAtLayoutReadsTheKernelsContentBox() throws {
         let padding = try XCTUnwrap(CalculatedLength([
             "calc": .string("min(10%, 20px)"),
-            "env": [0, 0, 0, 0, 300, 600, 1, 1, 0, 0]
+            "env": [0, 0, 0, 0, 300, 600, 1, 1, 0, 0, 16]
         ]))
         let knots: NodeStyle = ["padding_top": .calculation(padding)]
         var style = knots

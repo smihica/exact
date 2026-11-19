@@ -38,11 +38,12 @@ function pixel(png, scale, x, y) {
   return [png.data[i], png.data[i + 1], png.data[i + 2]];
 }
 
-/** What a text stands on: the commonest of its box's four corners (a glyph rarely reaches one), or null where they disagree (an image). */
+/** What a text stands on: the commonest of its box's four corners (a glyph rarely reaches one), or null where they disagree (an image).
+ *  A corner the host says another view is drawn over (`drawnOver`) is not read. */
 function backdrop(png, scale, it) {
   const inset = Math.min(1.5, it.w / 4, it.h / 4);
   const corners = [[it.x + inset, it.y + inset], [it.x + it.w - inset, it.y + inset], [it.x + inset, it.y + it.h - inset], [it.x + it.w - inset, it.y + it.h - inset]]
-    .map(([x, y]) => pixel(png, scale, x, y)).filter(Boolean);
+    .map(([x, y], k) => (it.drawnOver?.includes(k) ? null : pixel(png, scale, x, y))).filter(Boolean);
   let best = null, count = 0;
   for (const c of corners) { const n = corners.filter((d) => near(c, d, 12)).length; if (n > count || (n === count && best && ratio(c, it.fg) > ratio(best, it.fg))) { best = c; count = n; } }
   return count >= 2 ? best : null;
@@ -124,7 +125,7 @@ export function judge(obs, png, { host = 'web', nodes = new Map() } = {}) {
       if (bg) {
         const ink = over(it.fg, bg), got = ratio(ink, bg);
         if (got < need - 0.005) add('contrast', it, { got: Math.floor(got * 10) / 10, need, fg: hex(ink), bg: hex(bg), ...(it.bg ? { on: it.on ?? 'page' } : {}) },
-          it.onAccent || it.onAccentFill ? 'the platform draws a filled button\'s label white on the accent: leave the accent unsaid (the platform\'s blue; a brand is an `app.tamber`)'
+          it.onAccent || it.onAccentFill ? 'the platform draws a filled button\'s label white on the accent: leave the accent unsaid (the platform\'s blue; a brand is an `app.forma`)'
             : it.label ? 'name a `color` for the label, or a fill it reads on in this scheme' : role(it.fgRole) ? `-exact-${role(it.fgRole)} is too light for text on this: use -exact-label or -exact-secondary-label, or keep the colour for a fill or a symbol` : 'use a role (`-exact-label`, `-exact-secondary-label`) or a colour that changes with the scheme');
       }
     }
@@ -245,9 +246,11 @@ export function line(f, nodes) {
   return `  ${f.kind.padEnd(8)} ${who(f, nodes)} ${box}: ${what}${f.hint ? `; ${f.hint}` : ''}`;
 }
 
-/** An advisory line (LLP 1116.004 D1.3): a phone's layout at a desktop width, which a composed page may mean. Never a finding. */
+/** An advisory line, never a finding: a phone's layout at a desktop width, which a composed page may mean (LLP 1116.004 D1.3), or an
+ *  open menu the platform presents and the driver paints (`menu`, iOS). */
 function advise(a, width, nodes) {
   const who = named(a.id, nodes);
+  if (a.kind === 'menu') return `  advice   ${who}: a person sees this open menu as UIKit's ${a.context ? 'context menu' : 'pull-down'}, which the system places, sizes and scrolls to fit the screen; the driver paints it in the page to drive it, so its rows are not judged (\`--touch platform\` presents UIKit's)`;
   return `  advice   ${who}: ${a.kind === 'tabbar'
     ? `a bottom tab bar ${r0(a.w)} px wide along a ${width}-px window; placed as docs/recipes/tabs.md places it (the last child of the root's flex column, unpositioned) a wide window draws it as a sidebar, or lay out a rail of your own when the window is wide`
     : `the list beneath pushed this detail over the whole ${width}-px window where they would fit side by side; a row that pushes draws the disclosure (\`image "symbol:forward-chevron"\`, last in the row) and a wide window shows the list beside its detail, or set \`navigationSplit\` on the list's route (contract vocab navigationSplit)`}`;
@@ -278,7 +281,11 @@ export async function checkOp(s, args = [], { shots, accept = [] } = {}) {
   if (!['current', 'light', 'dark', 'both'].includes(word) || args.length > 1) throw new MalformedOperation('check [light|dark|both]: the presented screen, judged in text; `check dark` under prefers-color-scheme dark, `check both` under each');
   if (!['web', 'ios', 'host-ios'].includes(s.host)) throw new Error(`check: the web and iOS hosts carry it, not ${s.host}`);
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-check-'));
-  const first = await s.op({ op: 'check' });
+  // The web's wasm target answers the runner's op table, which has no `check`: name that, not the wire's reply.
+  const first = await s.op({ op: 'check' }).catch((e) => {
+    if (e?.reply?.error !== 'unknown op: check') throw e;
+    throw new Error('check: this web build is the wasm target (a game, or `--wasm`), which carries no check; the JS web target and iOS do, so run `agent ios check`');
+  });
   const asked = word === 'both' ? ['light', 'dark'] : word === 'current' ? [first.scheme] : [word];
   const runs = [], trees = [];
   let preferred = null;
@@ -287,7 +294,15 @@ export async function checkOp(s, args = [], { shots, accept = [] } = {}) {
       let obs = first;
       if (scheme !== first.scheme || preferred) { await s.prefer({ 'prefers-color-scheme': scheme }); preferred = scheme; obs = await s.op({ op: 'check' }); }
       const path = shots?.(obs.viewport, scheme) ?? resolve(dir, `${scheme}.png`);
-      const taken = await s.carrier.screenshot(path, obs.capture?.window === true); // iOS observes in the window's points: a sheet is not in the viewport's picture
+      // Keep UIKit's menu substitutes hidden through the carrier's display composition.
+      const held = s.host !== 'web';
+      let taken;
+      try {
+        if (held) obs = await s.op({ op: 'check', capture: true });
+        taken = await s.carrier.screenshot(path, obs.capture?.window === true);
+      } finally {
+        if (held) await s.op({ op: 'check', release: true });
+      }
       const png = decodePng(readFileSync(path));
       // The tree as this scheme shows it: a view only one scheme shows is named, and accepted, by its own testId.
       const nodes = new Map(((await s.op({ op: 'tree' })).nodes ?? []).map((n) => [n.id, n]));

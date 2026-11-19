@@ -100,9 +100,7 @@ pub(super) struct State {
 }
 
 impl State {
-    /// A new tree: what the bars were read from is the old one's, though
-    /// the new kernel may be at the same epoch, and a held or focused
-    /// target stood for one of its nodes.
+    /// A replacement invalidates node references held by the old bars.
     pub(super) fn replaced(&mut self) {
         self.read = None;
         self.scroller = None;
@@ -279,6 +277,7 @@ impl<D: DataSource> Presenter<D> {
         Some(Button {
             node: id,
             title: row.title,
+            direction: row.direction,
             symbol: row.symbol,
             enabled: row.enabled,
             destructive: row.destructive,
@@ -307,9 +306,20 @@ impl<D: DataSource> Presenter<D> {
                 Top {
                     route: r.route,
                     heading: r.shape.heading,
+                    direction: kernel
+                        .node(r.shape.header)
+                        .unwrap()
+                        .computed_row(exact_kernel::StyleId::Direction, |s| s.direction),
                     title: (r.shape.heading)
                         .and_then(|heading| kernel.bar_text(heading))
                         .unwrap_or_default(),
+                    title_direction: r
+                        .shape
+                        .heading
+                        .and_then(|id| kernel.node(id))
+                        .map_or(exact_kernel::Direction::Ltr, |node| {
+                            node.computed_row(exact_kernel::StyleId::Direction, |s| s.direction)
+                        }),
                     up: r.pushed,
                     leading: buttons(&r.shape.leading),
                     trailing: buttons(&r.shape.trailing),
@@ -318,6 +328,10 @@ impl<D: DataSource> Presenter<D> {
             });
         let bottom = bars.tabs.as_ref().map(|tabs| Bottom {
             tablist: tabs.tablist,
+            direction: kernel
+                .node(tabs.tablist)
+                .unwrap()
+                .computed_row(exact_kernel::StyleId::Direction, |s| s.direction),
             tabs: (tabs.tabs.iter())
                 .filter_map(|id| {
                     let node = kernel.node(*id)?;
@@ -325,6 +339,7 @@ impl<D: DataSource> Presenter<D> {
                     Some(Tab {
                         node: *id,
                         label: row.title,
+                        direction: row.direction,
                         symbol: row.symbol,
                         selected: node.props.bool(PropId::AccessibilitySelected) == Some(true),
                         enabled: row.enabled && !self.host.authored_visibility(*id).1,
@@ -654,6 +669,15 @@ impl<D: DataSource> Presenter<D> {
     /// the bar's own top left. A target is lit while a finger holds it and
     /// chosen when the finger lifts in it; a finger that leaves it lets go.
     pub fn bar_event(&mut self, which: i32, action: i32, x: f32, y: f32, now_ms: f64) {
+        // The finger itself, which a move off its target leaves down: only
+        // its lift or its cancel ends it. Each bar is a view of its own, with
+        // a finger of its own.
+        let bit = if which == BOTTOM { 64 } else { 32 };
+        match action {
+            0 => self.pressed |= bit,
+            1 | 3 => self.pressed &= !bit,
+            _ => {}
+        }
         // Under a sheet the bars are the page's, under its scrim, and inert.
         if self.sheet_open() {
             return;

@@ -1,5 +1,6 @@
 //! Wrapper/spacer views use the same kernel operations and styles as authored UI.
 use super::*;
+use crate::instance::document::ListChild;
 use exact_kernel::{PropValue, StyleId};
 pub(super) fn style(
     u: &mut Update<'_>,
@@ -177,13 +178,22 @@ fn spacer(u: &mut Update<'_>, axis: ListAxis, size: f64) -> Result<ViewId, Insta
         prop: PropId::AccessibilityElementsHidden,
         value: PropValue::Bool(true),
     });
+    u.ops.push(Op::SetProp {
+        id: view,
+        prop: PropId::Dataset,
+        value: PropValue::Str(r#"{"exact-list-spacer":""}"#.into()),
+    });
     style(u, view, &spacer_rows(axis, size))?;
     Ok(view)
 }
 impl Collection {
     pub(super) fn emit_children(&mut self, u: &mut Update<'_>) -> Result<(), InstanceError> {
         self.sync_undisplayed(u)?;
+        self.fixed_accessibility(u);
         let mut children = Vec::with_capacity(self.mounted.len() + 4);
+        if let Some(fixed) = &self.fixed {
+            children.extend_from_slice(&fixed.roots[0]);
+        }
         let mut cursor = 0;
         let mut spacer_count = 0;
         for i in 0..=self.mounted.len() {
@@ -214,6 +224,9 @@ impl Collection {
         for (view, _) in self.spacers.drain(spacer_count..) {
             u.ops.push(Op::DestroyView { id: view });
         }
+        if let Some(fixed) = &self.fixed {
+            children.extend_from_slice(&fixed.roots[1]);
+        }
         if children != self.children {
             u.ops.push(Op::SetChildren {
                 id: self.view,
@@ -224,17 +237,6 @@ impl Collection {
         Ok(())
     }
 }
-/// One child of a virtualized list's view, as a document written without a
-/// kernel holds it (LLP 1048.004): a spacer, or a mounted row's wrapper
-/// around its root.
-pub(in crate::instance) enum ListChild<'a> {
-    /// A spacer: its view and style (its props are fixed: hidden).
-    Spacer(ViewId, StyleProps),
-    /// A mounted row: its wrapper, the wrapper's style and props, and the
-    /// row's roots.
-    Row(ViewId, StyleProps, exact_kernel::PropList, &'a [Child]),
-}
-
 impl Collection {
     /// The list view's children, in order, with what their ops left in a
     /// kernel: each spacer's rows at its size, each wrapper's rows and its
@@ -245,6 +247,18 @@ impl Collection {
     ) -> Result<Vec<ListChild<'_>>, InstanceError> {
         let mut out = Vec::with_capacity(self.children.len());
         for view in &self.children {
+            if self
+                .fixed
+                .as_ref()
+                .is_some_and(|f| f.roots.iter().any(|roots| roots.contains(view)))
+            {
+                let hidden = self
+                    .fixed
+                    .as_ref()
+                    .is_some_and(|f| f.trail_hidden && f.roots[1].contains(view));
+                out.push(ListChild::Fixed(*view, hidden));
+                continue;
+            }
             if let Some((_, size)) = self.spacers.iter().find(|(v, _)| v == view) {
                 out.push(ListChild::Spacer(
                     *view,

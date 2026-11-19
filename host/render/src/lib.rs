@@ -20,6 +20,7 @@
 
 mod activation;
 mod best;
+mod cli;
 mod compare;
 mod delivery;
 mod direct;
@@ -37,11 +38,12 @@ mod source;
 mod stream;
 mod viewport;
 
+pub use cli::{main, main_with};
 pub use direct::boot_swap_js;
 pub use executor::{pump, Executor};
 pub use page::{capture, capture_js, page, page_with_rules, scroll_document_js};
-pub use pages::pages;
-pub use requests::settle;
+pub use pages::{pages, Listed};
+pub use requests::{render_with_at, settle};
 pub use serve::{expire_renders, Serve, Server, Stopper};
 pub use source::Anonymous;
 
@@ -122,6 +124,11 @@ pub struct Rendered {
     /// (written so without a kernel, LLP 1048.004): the page doesn't
     /// rewrite it (`page::for_runtime`), and the digest is over this form.
     pub runtime_form: bool,
+    /// Whether the document restores the reader's saved appearance before paint.
+    pub chooses_scheme: bool,
+    /// The render drew secure randomness, which is the device's (LLP
+    /// 1069.005 D2): its page is its reader's alone.
+    pub drew: bool,
 }
 
 /// Render `plan` at `location` with a source from `data`, waiting at most
@@ -184,17 +191,17 @@ fn project_for<D: DataSource>(
 pub fn projects_as_booted(plan: &Plan) -> bool {
     use exact_plan::Opcode::*;
     plan.slots.iter().all(|slot| {
-        exact_runner::vm::instructions(plan.code(slot.init)).all(|i| {
+        exact_runner::vm::transitive_instructions(plan, plan.code(slot.init)).all(|i| {
             i.is_ok_and(|i| {
-                !matches!(
-                    i.op,
-                    LoadResource
-                        | LoadDerive
-                        | PendingResource
-                        | FailedResource
-                        | FailureResource
-                        | PendingMutation
-                )
+                !(i.op == LoadDerive && plan.unsettled_body(i.args[0] as u32).is_none())
+                    && !matches!(
+                        i.op,
+                        LoadResource
+                            | PendingResource
+                            | FailedResource
+                            | FailureResource
+                            | PendingMutation
+                    )
             })
         })
     })
@@ -288,12 +295,9 @@ pub fn render_with<D: DataSource + 'static, F: Fn() -> D>(
     )
 }
 
-/// [`render_with`], with a fixed render timestamp in milliseconds since the
-/// Unix epoch, including every initializer, resource argument and checkpoint,
-/// and the web build's delivery facts available before any initializer runs.
 #[allow(clippy::too_many_arguments)]
-pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
-    plan: &Plan,
+pub(crate) fn render_with_faults_at<D: DataSource + 'static, F: Fn() -> D>(
+    plan: impl Into<exact_runner::Program>,
     data: &F,
     viewport: exact_runner::Viewport,
     location: &str,
@@ -303,10 +307,13 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
     projection: Projection,
     now_ms: f64,
     delivery: &exact_runner::delivery::Delivery,
+    faults: Option<&exact_runner::runner::faults::Faults>,
 ) -> Result<Rendered, String> {
+    let program = plan.into();
+    let plan = &program;
     let direct = direct_for(plan, ids, projection)?;
     let mut page = settle_at(
-        plan, data, viewport, location, deadline, direct, now_ms, delivery, None,
+        plan, data, viewport, location, deadline, direct, now_ms, delivery, None, faults,
     )?;
     let settled_tree = if direct {
         match page.runner.document_tree() {
@@ -328,7 +335,7 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
             Err(why) if projection == Projection::Auto => {
                 crate::log(format_args!("render {location}: with a kernel ({why})"));
                 retire(page, data);
-                return render_with_at(
+                return render_with_faults_at(
                     plan,
                     data,
                     viewport,
@@ -339,6 +346,7 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
                     Projection::Kernel,
                     now_ms,
                     delivery,
+                    faults,
                 );
             }
             Err(why) => {
@@ -355,13 +363,15 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
         None
     };
     let (checkpoint, settled, clocked) = (page.checkpoint.clone(), page.settled, page.clocked);
+    let mut drew = page.runner.store().entropy_draws() > 0;
     retire(page, data);
     // @ref LLP 1048.000 D6 — the document is the checkpoint's projection,
     // from a runner booted from the page's checkpoint with a fresh source,
     // as the runtime boots: its first tree is built in one pass, so its view
     // ids are the runtime's, a pending answer's placeholder included. The
-    // runner that settled built its tree as answers arrived. What the boot
-    // asks is never run. A document whose ids nobody keeps is the settled
+    // runner that settled built its tree as answers arrived. The boot may
+    // ask a source again (an open stream's answer, `ask_at_launch`), which a
+    // ready source answers. A document whose ids nobody keeps is the settled
     // tree's projection where that is the same ([`Ids::Any`]).
     let state = read_checkpoint(&checkpoint).map_err(|e| format!("the checkpoint: {e}"))?;
     let (document, handlers) = match settled_tree {
@@ -381,6 +391,8 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
             booted
                 .build_every_tab()
                 .map_err(|e| format!("boot from the checkpoint: {e:?}"))?;
+            // An open stream is asked again at boot, and its source may draw
+            drew |= booted.store().entropy_draws() > 0;
             (
                 project_for(ids)(&booted).map_err(|e| e.to_string())?,
                 booted.handlers(),
@@ -392,6 +404,7 @@ pub fn render_with_at<D: DataSource + 'static, F: Fn() -> D>(
     let clocked = clocked || ids != Ids::Any;
     finish(
         plan, site, location, document, handlers, checkpoint, state, settled, clocked, viewport,
+        drew,
     )
 }
 
@@ -423,7 +436,7 @@ pub(crate) type OnBoot<'a, D> = &'a mut dyn FnMut(&mut Runner<Anonymous<D>>);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
-    plan: &Plan,
+    plan: &exact_runner::Program,
     data: &F,
     viewport: exact_runner::Viewport,
     location: &str,
@@ -432,6 +445,7 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     now_ms: f64,
     delivery: &exact_runner::delivery::Delivery,
     on_boot: Option<OnBoot<'_, D>>,
+    faults: Option<&exact_runner::runner::faults::Faults>,
 ) -> Result<Settling<D>, String> {
     // Both complete documents and streamed JS pages settle through this entry.
     exact_kernel::style::roles::set_column(exact_kernel::style::roles::Column::Neutral);
@@ -443,7 +457,7 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     // with it, instead of building a realm per render (LLP 1048.000 D10's
     // fresh realm). For anonymous pages only: a realm's module state (its
     // caches, counters) carries from one render to the next.
-    let warm = warm_realms();
+    let warm = warm_realms() && faults.is_none();
     // The last render's runner, if its worker did not drop it after sending.
     retire_renders();
     let pooled = warm
@@ -471,13 +485,17 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     // (LLP 1153.001 D7); no runner or module state enters that cache.
     let grants =
         exact_runner::grants::with_declared(exact_runner::DataSource::grants(&settling), plan);
-    let executor = EXECUTORS
-        .with(|pool| {
-            let mut pool = pool.borrow_mut();
-            let at = pool.iter().position(|(g, _)| *g == grants)?;
-            Some(pool.swap_remove(at).1)
-        })
-        .unwrap_or_else(|| Executor::start(&grants));
+    let executor = if faults.is_some() {
+        Executor::start_with_cache(&grants, exact_executor::SharedHttpCache::new())
+    } else {
+        EXECUTORS
+            .with(|pool| {
+                let mut pool = pool.borrow_mut();
+                let at = pool.iter().position(|(g, _)| *g == grants)?;
+                Some(pool.swap_remove(at).1)
+            })
+            .unwrap_or_else(|| Executor::start(&grants))
+    };
     let until = Instant::now() + deadline;
     let watchdog = Watchdog::arm(settling.interrupt(), until);
     let kernel = || {
@@ -511,6 +529,8 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
         ),
         Err(e) => return Err(format!("boot: {e:?}")),
     };
+    // A render takes its table from this request, never the process environment.
+    runner.share_faults(&faults.cloned().unwrap_or_default());
     // The page is the web's: its packages answer as there, not as on this machine.
     runner.set_module_target("web");
     // A rendered page holds every tab panel, which the JS target adopts at
@@ -539,7 +559,7 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
     // Whatever is still in flight is abandoned with the render; an executor
     // with nothing in flight goes back to this worker's pool, its open
     // streams let go.
-    if matches!(settled, Settled::Deadline) {
+    if matches!(settled, Settled::Deadline) || faults.is_some() {
         drop(executor);
     } else {
         executor.forget(|_| false);
@@ -557,16 +577,21 @@ pub(crate) fn settle_at<D: DataSource + 'static, F: Fn() -> D>(
 }
 
 /// A settled render's runner, done with: its realm kept warm
-/// (`EXACT_RENDER_REALMS=warm`, a render that settled), and the runner
-/// dropped once the page is sent ([`retire_renders`]), off the response's
-/// path.
+/// (`EXACT_RENDER_REALMS=warm`, a render that settled and drew nothing,
+/// since its module may hold a draw, which is the device's: LLP 1069.005
+/// D2), and the runner dropped once the page is sent ([`retire_renders`]),
+/// off the response's path.
 pub(crate) fn retire<D: DataSource + 'static, F: Fn() -> D>(page: Settling<D>, data: &F) {
     let Settling {
         mut runner,
         settled,
         ..
     } = page;
-    if warm_realms() && !matches!(settled, Settled::Deadline) {
+    if warm_realms()
+        && runner.faults().is_empty()
+        && !matches!(settled, Settled::Deadline)
+        && runner.store().entropy_draws() == 0
+    {
         let used = std::mem::replace(runner.data(), Anonymous::new(data()));
         REALMS.with(|p| p.borrow_mut().push(Box::new(used)));
     }
@@ -586,6 +611,7 @@ pub(crate) fn finish(
     settled: Settled,
     clocked: bool,
     viewport: exact_runner::Viewport,
+    drew: bool,
 ) -> Result<Rendered, String> {
     let head = document
         .page_head(plan, site, location)
@@ -602,6 +628,8 @@ pub(crate) fn finish(
         wake,
         activate: activation,
         runtime_form: false,
+        chooses_scheme: exact_runner::uses::chooses_scheme(plan),
+        drew,
     })
 }
 
@@ -849,302 +877,6 @@ fn run(executor: &Executor, held: &mut Held, r: RequestOut, dispatch: Dispatch) 
     }
 }
 
-/// An app's pages as documents, for the web build and the parity check:
-///
-/// `<app>-render [--plan <app.plan>] [--viewport <w>x<h>] [--name <name>]
-/// [--origin <url>] [--deadline <ms>] [--shell <index.html>] (--build |
-/// <location>…)`
-///
-/// renders each location with a fresh runner and executor at the page
-/// viewport (the bake's 390 × 844 unless told) within the deadline (2 s
-/// unless told), and prints one JSON line each: `location`, `notfound`,
-/// `status` (503 when the deadline passed with requests in flight),
-/// `settled`, `robots`, `root` (what `#exact-root` holds), `head` (what
-/// `<head>` holds after the shell's charset and base), `checkpoint`,
-/// `digest`, and with `--shell` the whole `page` ([`page`]), or `error`.
-/// `--compare` renders each location with a kernel and without one (LLP
-/// 1048.004 D6) and prints `same`, or the first difference (`differs`), or
-/// why the page has no kernel-free render (`direct`) — with `--shell` the
-/// streamed page too; any difference fails the run.
-/// `--build` renders every location the plan declares `render=build`
-/// (`exact_web::document::build_locations`) and every page a build route's
-/// `pages=` source lists. `baked` is the app's own plan; the web build
-/// passes the one it extracted from the shipped wasm instead. `data` makes
-/// the app's source: a fresh one for each render (two per render, D6), for
-/// each enumeration, and for the server's grants — so an entry is one call,
-/// `exact_render::main(PLAN, || …)`, with no wrapper to forward the source's
-/// methods.
-///
-/// `--serve <dist> [--port <n>] [--renders <n>] [--queue <n>] [--lifetime
-/// <s>] [--generations <dir>]` is the server instead ([`Server`]): the built
-/// web app on loopback, its plan the dist's own `app.plan` unless `--plan`
-/// names one; `--generations` keeps builds at their versioned URLs and sends
-/// deltas between them ([`Serve::generations`]).
-/// It prints `serving http://127.0.0.1:<port>/`, then a line per render.
-pub fn main<D: DataSource + 'static>(baked: &[u8], data: fn() -> D) -> std::process::ExitCode {
-    use std::process::ExitCode;
-    let mut args = std::env::args().skip(1);
-    let mut plan = baked.to_vec();
-    let mut viewport = exact_runner::Viewport::default();
-    let (mut name, mut origin) = (String::new(), None::<String>);
-    let mut locations: Vec<(String, bool)> = Vec::new();
-    let mut build = false;
-    let mut compare = false;
-    let mut deadline = DEADLINE;
-    let (mut shell, mut rules) = (None::<String>, None::<String>);
-    let (mut serve, mut planned) = (None::<std::path::PathBuf>, false);
-    let mut generations = None::<std::path::PathBuf>;
-    let mut plan_path = None::<std::path::PathBuf>;
-    let (mut port, mut renders, mut queue, mut lifetime) = (0u16, 4usize, 32usize, 60u64);
-    let usage = || {
-        eprintln!("usage: render [--plan <app.plan>] [--viewport <w>x<h>] [--name <name>] [--origin <url>] [--deadline <ms>] ([--shell <index.html>] [--compare] (--build | <location>…) | --serve <dist> [--port <n>] [--renders <n>] [--queue <n>] [--lifetime <s>] [--generations <dir>])");
-        ExitCode::from(2)
-    };
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--plan" => match args.next().map(|path| {
-                plan_path = Some(path.clone().into());
-                std::fs::read(path)
-            }) {
-                Some(Ok(bytes)) => {
-                    plan = bytes;
-                    planned = true;
-                }
-                Some(Err(e)) => {
-                    eprintln!("render: --plan: {e}");
-                    return ExitCode::FAILURE;
-                }
-                None => return usage(),
-            },
-            "--viewport" => {
-                let size = args.next().and_then(|v| {
-                    let (w, h) = v.split_once('x')?;
-                    Some((w.parse().ok()?, h.parse().ok()?))
-                });
-                let Some((width, height)) = size else {
-                    return usage();
-                };
-                viewport = exact_runner::Viewport::sized(width, height);
-            }
-            "--name" => match args.next() {
-                Some(value) => name = value,
-                None => return usage(),
-            },
-            "--origin" => match args.next() {
-                Some(value) => origin = Some(value),
-                None => return usage(),
-            },
-            "--deadline" => match args.next().and_then(|ms| ms.parse().ok()) {
-                Some(ms) => deadline = Duration::from_millis(ms),
-                None => return usage(),
-            },
-            "--shell" => match args.next().map(|path| {
-                // The build's analyzed sheet beside it (LLP 1048.007 D4).
-                let beside = std::path::Path::new(&path).with_file_name(".gen/page-style.json");
-                rules = std::fs::read_to_string(beside).ok();
-                std::fs::read_to_string(path)
-            }) {
-                Some(Ok(text)) => shell = Some(text),
-                Some(Err(e)) => {
-                    eprintln!("render: --shell: {e}");
-                    return ExitCode::FAILURE;
-                }
-                None => return usage(),
-            },
-            "--build" => build = true,
-            "--compare" => compare = true,
-            "--serve" => match args.next() {
-                Some(dist) => serve = Some(dist.into()),
-                None => return usage(),
-            },
-            "--generations" => match args.next() {
-                Some(dir) => generations = Some(dir.into()),
-                None => return usage(),
-            },
-            "--port" | "--renders" | "--queue" | "--lifetime" => {
-                let Some(n) = args.next().and_then(|n| n.parse::<u64>().ok()) else {
-                    return usage();
-                };
-                match arg.as_str() {
-                    "--port" => port = n.try_into().unwrap_or(0),
-                    "--renders" => renders = n as usize,
-                    "--queue" => queue = n as usize,
-                    _ => lifetime = n,
-                }
-            }
-            _ if arg.starts_with('/') => locations.push((arg, false)),
-            _ => return usage(),
-        }
-    }
-    if let (Some(dist), false) = (&serve, planned) {
-        match std::fs::read(dist.join("app.plan")) {
-            Ok(bytes) => plan = bytes,
-            Err(e) => {
-                eprintln!("render: {}/app.plan: {e}", dist.display());
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    if let Some(dist) = &serve {
-        plan_path = Some(dist.join("app.plan"));
-    }
-    let delivery = match plan_path.as_deref().map(delivery::beside).transpose() {
-        Ok(delivery) => delivery.unwrap_or_default(),
-        Err(e) => {
-            eprintln!("render: version: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let decoded = match Plan::decode(&plan) {
-        Ok(decoded) => decoded,
-        Err(e) => {
-            eprintln!("render: the plan: {e:?}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(dist) = serve {
-        let grants = exact_runner::grants::with_declared(data().grants(), &decoded);
-        let config = Serve {
-            dist,
-            port,
-            name,
-            origin,
-            deadline,
-            renders,
-            queue,
-            viewport,
-            lifetime: Duration::from_secs(lifetime),
-            generations,
-        };
-        let server = match Server::bind(config, decoded, &grants) {
-            Ok(server) => server,
-            Err(e) => {
-                eprintln!("render: serve: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        return run_server(server, data);
-    }
-    if build {
-        match build_locations(&decoded) {
-            Ok(found) => locations.extend(found),
-            Err(e) => {
-                eprintln!("render: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        // @ref LLP 1048.000 D2 — and every page a build route's source lists.
-        for row in decoded
-            .routes
-            .iter()
-            .filter(|r| r.render == RenderPolicy::Build)
-        {
-            match pages(&decoded, data(), row, deadline) {
-                Ok(found) => locations.extend(found.into_iter().map(|l| (l, false))),
-                Err(e) => {
-                    eprintln!("render: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    } else if locations.is_empty() {
-        return usage();
-    }
-    let site = Site {
-        name: &name,
-        origin: origin.as_deref(),
-    };
-    let mut failed = false;
-    for (location, listed) in &locations {
-        // The not-found document, or any location the router sends there.
-        let notfound = *listed || route_at(&decoded, location).is_some_and(|r| r.notfound);
-        let mut line = format!("{{\"location\":{}", json(location));
-        if compare {
-            let fields = compare::location(
-                &decoded,
-                &data,
-                viewport,
-                location,
-                &site,
-                deadline,
-                shell.as_deref(),
-                &delivery,
-            );
-            failed |= fields.starts_with(",\"same\":false");
-            line.push_str(&fields);
-            line.push('}');
-            println!("{line}");
-            continue;
-        }
-        let ids = if shell.as_deref().is_some_and(page::is_js) {
-            Ids::Any
-        } else {
-            Ids::Runtime
-        };
-        let rendered = render_with_at(
-            &decoded,
-            &data,
-            viewport,
-            location,
-            &site,
-            deadline,
-            ids,
-            Projection::Kernel,
-            render_time(),
-            &delivery,
-        )
-        .and_then(|rendered| {
-            let page = shell
-                .as_deref()
-                .map(|shell| match &rules {
-                    Some(rules) => page_with_rules(shell, rules, &rendered),
-                    None => page(shell, &rendered),
-                })
-                .transpose()?;
-            Ok((rendered, page))
-        });
-        match rendered {
-            Ok((rendered, page)) => {
-                let settled = rendered.settled == Settled::Complete;
-                let status = rendered.status(notfound);
-                let _ = write!(
-                    line,
-                    ",\"notfound\":{notfound},\"status\":{status},\"settled\":{settled},\"robots\":{}",
-                    rendered
-                        .document
-                        .head
-                        .robots
-                        .as_deref()
-                        .map_or_else(|| "null".into(), json)
-                );
-                for (field, value) in [
-                    ("root", &rendered.document.root),
-                    ("head", &rendered.head),
-                    ("checkpoint", &rendered.checkpoint),
-                    ("digest", &rendered.digest),
-                ] {
-                    let _ = write!(line, ",\"{field}\":{}", json(value));
-                }
-                if let Some(page) = &page {
-                    let _ = write!(line, ",\"page\":{}", json(page));
-                }
-            }
-            Err(error) => {
-                failed = true;
-                let _ = write!(line, ",\"error\":{}", json(&error));
-            }
-        }
-        line.push('}');
-        println!("{line}");
-    }
-    shutdown_render_thread();
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
 // Losing the log reader must not interrupt a response or SIGTERM's drain.
 fn log(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
@@ -1283,6 +1015,9 @@ mod fence_tests {
     use exact_plan::Value;
     use exact_runner::{Answer, DataError, Outcome, Request, Store};
     use std::sync::atomic::AtomicUsize;
+    /// The host work these tests hand out (LLP 1047.001 D12).
+    struct TestWork;
+    impl exact_runner::HostWork for TestWork {}
 
     static GOOD: AtomicUsize = AtomicUsize::new(0);
 
@@ -1300,8 +1035,8 @@ mod fence_tests {
             _: &[Value],
         ) -> Result<Answer, DataError> {
             Ok(Answer::Later(match source {
-                "bad" => Request::continuation(1).independent_http(4096),
-                _ => Request::continuation(2),
+                "bad" => Request::continuation::<TestWork>(1).independent_http(4096),
+                _ => Request::continuation::<TestWork>(2),
             }))
         }
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
@@ -1334,7 +1069,7 @@ mod fence_tests {
             _: &[Value],
         ) -> Result<Answer, DataError> {
             let n: u64 = source[1..].parse().unwrap();
-            Ok(Answer::Later(Request::continuation(n + 1)))
+            Ok(Answer::Later(Request::continuation::<TestWork>(n + 1)))
         }
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
             Some(Box::new(|| Outcome::Storage(vec![])))
@@ -1388,7 +1123,7 @@ mod fence_tests {
             _: &[Value],
         ) -> Result<Answer, DataError> {
             let n: u64 = source[1..].parse().unwrap_or(0);
-            Ok(Answer::Later(Request::continuation(n + 1)))
+            Ok(Answer::Later(Request::continuation::<TestWork>(n + 1)))
         }
         fn dispatch(&mut self, _: u64, _: &Store) -> Dispatch {
             Dispatch::Again
@@ -1401,7 +1136,7 @@ mod fence_tests {
             _: Outcome,
         ) -> Result<Answer, DataError> {
             if source == "forever" {
-                return Ok(Answer::Later(Request::continuation(9999)));
+                return Ok(Answer::Later(Request::continuation::<TestWork>(9999)));
             }
             AGAINS.fetch_add(1, Ordering::SeqCst);
             Ok(Answer::Now(Value::Number(1.)))

@@ -87,12 +87,14 @@ fn page(rows: &[(StyleId, StyleValue)], text: &str) -> Kernel {
 
 fn fit(w: f32, h: f32) -> HostBlock {
     HostBlock {
+        tactic: Default::default(),
         width: BlockAxis::Fit(w),
         height: BlockAxis::Fit(h),
     }
 }
 fn region(w: f32, h: f32) -> HostBlock {
     HostBlock {
+        tactic: Default::default(),
         width: BlockAxis::Region(w),
         height: BlockAxis::Region(h),
     }
@@ -150,10 +152,12 @@ fn a_measure_is_the_used_size_the_block_would_give() {
             region(90.0, 20.0),
             region(250.0, 600.0),
             HostBlock {
+                tactic: Default::default(),
                 width: BlockAxis::AtMost(200.0),
                 height: BlockAxis::AtMost(40.0),
             },
             HostBlock {
+                tactic: Default::default(),
                 width: BlockAxis::Is(300.0),
                 height: BlockAxis::Is(500.0),
             },
@@ -220,6 +224,7 @@ fn a_measure_changes_nothing() {
             fit(90.0, 600.0),
             region(60.0, 50.0),
             HostBlock {
+                tactic: Default::default(),
                 width: BlockAxis::Is(300.0),
                 height: BlockAxis::AtMost(10.0),
             },
@@ -306,7 +311,9 @@ fn a_measure_reads_whether_it_shows_now() {
 
 /// A measurer that keeps paragraphs by stamp, as the Mac's reader does: the
 /// stamps it is asked with.
-struct Stamps(std::rc::Rc<std::cell::RefCell<Vec<crate::text::ParagraphStamp>>>);
+pub(super) struct Stamps(
+    pub(super) std::rc::Rc<std::cell::RefCell<Vec<crate::text::ParagraphStamp>>>,
+);
 impl TextMeasurer for Stamps {
     fn measure(&mut self, request: &TextMeasureRequest<'_>) -> TextMetrics {
         MonospaceMeasurer::default().measure(request)
@@ -335,6 +342,36 @@ fn a_measure_asks_with_the_paragraphs_own_stamps() {
     let asked = seen.borrow();
     assert!(!asked.is_empty(), "the paragraph measured at a new width");
     assert!(asked.iter().all(|s| *s == live), "{asked:?} {live:?}");
+}
+
+/// A measurer whose heights are nonfinite while `failing` is set.
+struct Failing(std::rc::Rc<std::cell::Cell<bool>>);
+impl TextMeasurer for Failing {
+    fn measure(&mut self, request: &TextMeasureRequest<'_>) -> TextMetrics {
+        let metrics = MonospaceMeasurer::default().measure(request);
+        match self.0.get() {
+            true => TextMetrics {
+                height: f32::NAN,
+                ..metrics
+            },
+            false => metrics,
+        }
+    }
+}
+
+/// A trial that fails leaves the kernel as it was: its own arena, engine
+/// tree and content region are back before the error returns.
+#[test]
+fn a_failed_measure_changes_nothing() {
+    let failing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut k = page(&[], "one two three").rehydrate(Box::new(Failing(failing.clone())));
+    k.compute_layout(1, OFFER).unwrap();
+    let before = digest(&k, true);
+    failing.set(true);
+    assert!(k.measure_block(3, region(60.0, 50.0)).is_err());
+    failing.set(false);
+    assert_eq!(digest(&k, true), before);
+    assert!(k.measure_block(3, region(60.0, 50.0)).is_ok());
 }
 
 /// What only the next layout prepares is refused, not guessed: a box that
@@ -404,4 +441,44 @@ fn a_measure_refuses_what_is_no_blocks_root() {
     assert!(k.measure_block(3, fit(f32::NAN, 100.0)).is_err());
     assert!(k.measure_block(3, fit(-1.0, 100.0)).is_err());
     assert!(k.measure_block(99, fit(100.0, 100.0)).is_err());
+}
+
+#[test]
+fn flip_start_sizes_the_trial_and_final_box_with_transformed_rows() {
+    let mut k = page(
+        &[
+            (StyleId::Width, n(60.0)),
+            (StyleId::Height, n(180.0)),
+            (StyleId::MinWidth, n(90.0)),
+            (StyleId::MinHeight, n(140.0)),
+            (StyleId::MaxWidth, n(110.0)),
+            (StyleId::MaxHeight, n(160.0)),
+            (StyleId::MarginTop, n(4.0)),
+            (StyleId::MarginRight, t("5%")),
+            (StyleId::MarginBottom, n(8.0)),
+            (StyleId::MarginLeft, t("10%")),
+        ],
+        "",
+    );
+    let mut block = region(260.0, 100.0);
+    block.tactic = crate::position_try::BlockTactic::from_sides([3, 2, 1, 0]).unwrap();
+    let before = digest(&k, true);
+    let measured = k.measure_block(3, block).unwrap();
+    assert_eq!(digest(&k, true), before, "the trial changes nothing");
+    assert_eq!(measured.border, (160.0, 90.0));
+    assert_eq!(measured.margin, [26.0, 8.0, 13.0, 4.0]);
+    k.set_host_block(3, Some(block)).unwrap();
+    k.compute_layout(1, OFFER).unwrap();
+    let frame = k.node(3).unwrap().frame;
+    assert_eq!((frame.width, frame.height), measured.border);
+    assert_eq!((frame.x, frame.y), (4.0, 26.0));
+    assert_eq!(k.host_block_size(3), Some(measured.used));
+    k.set_host_block(3, None).unwrap();
+    k.compute_layout(1, OFFER).unwrap();
+    let frame = k.node(3).unwrap().frame;
+    assert_eq!(
+        (frame.width, frame.height),
+        (90.0, 160.0),
+        "authored rows survive the tactic"
+    );
 }

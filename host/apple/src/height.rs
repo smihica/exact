@@ -115,8 +115,10 @@ impl<D: DataSource> Host<D> {
         let mut batch = Batch::new();
         // Publish retirement/rebinding now, without auto-selecting over explicit
         // None. Ordinary future receipts may admit authored handles again.
-        self.reconcile_height_handles(&mut batch, false);
-        self.cancel_invalid_height_drag();
+        if let Some(drag) = self.turn.drag {
+            (drag.reconcile_heights)(self, &mut batch, false);
+            (drag.cancel_invalid_height)(self);
+        }
         let error = self.height_layout_if_needed(&mut batch).err();
         self.present(&mut batch, false);
         Ok(HeightOwnerChange {
@@ -158,7 +160,7 @@ impl<D: DataSource> Host<D> {
     /// Track declarations during the existing receipt walk, never scan all
     /// mounted nodes on a motion frame. Keep ineligible declarations so an
     /// inherited opt-in or ancestor visibility change can admit them later.
-    pub(super) fn track_height_transition(&mut self, view: ViewId) {
+    pub(crate) fn track_height_transition(&mut self, view: ViewId) {
         let Some(node) = self.runner.kernel().node(view) else {
             return;
         };
@@ -174,7 +176,7 @@ impl<D: DataSource> Host<D> {
     /// Target measurement is per authored/viewport/intrinsic change, not tick.
     /// Admission and first layout snap to the target. Subsequent height changes
     /// use the shared engine's interruption and CSS reversal rules.
-    pub(super) fn sync_height_transitions(&mut self) -> Result<(), String> {
+    pub(crate) fn sync_height_transitions(&mut self) -> Result<(), String> {
         let epoch = self.runner.kernel().epoch();
         if !self.height_targets_dirty && self.height_transition_epoch == Some(epoch) {
             return Ok(());
@@ -286,7 +288,18 @@ impl<D: DataSource> Host<D> {
         Ok(())
     }
 
-    pub(super) fn collect_height_samples(&mut self) -> Result<(), String> {
+    /// The height transitions' targets, then the heights the engine presents
+    /// (a drag's owner's too), where the motion is linked. Where it is not,
+    /// no height moves, and layout takes every authored height.
+    pub(super) fn sync_height_motion(&mut self) -> Result<(), String> {
+        if let Some(motion) = self.turn.motion {
+            (motion.heights)(self)?;
+            (motion.height_samples)(self)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn collect_height_samples(&mut self) -> Result<(), String> {
         self.height_sampling.clear();
         let owners = self.height_owner.into_iter().chain(
             self.height_transitions
@@ -317,8 +330,7 @@ impl<D: DataSource> Host<D> {
     /// True when it laid out.
     pub(super) fn height_layout_if_needed(&mut self, batch: &mut Batch) -> Result<bool, String> {
         self.sync_height_owner()?;
-        self.sync_height_transitions()?;
-        self.collect_height_samples()?;
+        self.sync_height_motion()?;
         if self.height_sampling == self.height_projection {
             return Ok(false);
         }

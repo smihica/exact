@@ -2,6 +2,10 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactCollections
+@testable import ExactNativeViews
+@testable import ExactFlights
 
 final class PopoverSheetIOSTests: XCTestCase {
     private final class Touch: UITouch {
@@ -26,10 +30,10 @@ final class PopoverSheetIOSTests: XCTestCase {
 
     override func tearDown() {
         if let p = kept {
-            settle { !p.menus.inTransition && !p.modals.inTransition }
+            settle { !p.menus.inTransition && !p.modalHost.inTransition }
             p.menus.reset()
-            p.modals.reset()
-            settle { self.window?.rootViewController?.presentedViewController == nil && !p.menus.inTransition && !p.modals.inTransition }
+            p.modalHost.reset()
+            settle { self.window?.rootViewController?.presentedViewController == nil && !p.menus.inTransition && !p.modalHost.inTransition }
         }
         session?.destroy()
         session = nil
@@ -60,13 +64,13 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertEqual(scrolled.1.size, entry.1.size)
         XCTAssertEqual(scrolled.2, clip, "scrolling moves the border box, not the card's clip")
 
-        p.menus.sheets.close(dialog, animated: true)
-        XCTAssertTrue(p.menus.sheets.owns(dialog), "UIKit still holds the closing sheet")
-        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        p.dialogHost.close(dialog, animated: true)
+        XCTAssertTrue(p.dialogHost.owns(dialog), "UIKit still holds the closing sheet")
+        XCTAssertFalse(p.dialogHost.isOpen(dialog))
         XCTAssertTrue(p.openTopLayer.frames.isEmpty)
         XCTAssertNil(p.openTopLayer.modal)
         settle { !p.menus.inTransition && self.window?.rootViewController?.presentedViewController == nil }
-        XCTAssertFalse(p.menus.sheets.owns(dialog))
+        XCTAssertFalse(p.dialogHost.owns(dialog))
         XCTAssertTrue(p.openTopLayer.frames.isEmpty)
         XCTAssertNil(p.openTopLayer.modal)
     }
@@ -117,6 +121,15 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertEqual(outside["hit"] as? String, "none")
         XCTAssertEqual(outside["hits"] as? String, "")
         XCTAssertTrue(content.isDescendant(of: sheet.scroller))
+        let container = try XCTUnwrap(sheet.presentationController?.containerView)
+        let dimmed = CGPoint(x: container.bounds.minX + 5, y: container.bounds.minY + 5)
+        let native = try XCTUnwrap(container.hitTest(dimmed, with: nil))
+        XCTAssertFalse(native.isDescendant(of: sheet.view), "UIKit delivers the point to the backdrop outside the sheet")
+        let at = p.viewportPoints(container.convert(CGRect(origin: dimmed, size: .zero), to: p.viewport)).origin
+        XCTAssertFalse(clip.contains(at))
+        let backdrop = try read(at)
+        XCTAssertEqual(backdrop["hit"] as? String, "form")
+        XCTAssertEqual(backdrop["hits"] as? String, "form")
     }
 
     /// A route presentation whose routes show no box yet (not in the window
@@ -132,15 +145,15 @@ final class PopoverSheetIOSTests: XCTestCase {
         ]))
         let route = try XCTUnwrap(p.views[30]), owner = try XCTUnwrap(window?.rootViewController)
         let navigation = UINavigationController(rootViewController: RouteController(route))
-        p.modals.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
+        p.modalHost.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
         XCTAssertNil(navigation.view.window, "UIKit has not put it in the window yet")
         XCTAssertEqual(p.openTopLayer.frames.map { $0.0 }, [])
         XCTAssertEqual(p.openTopLayer.modal, 0, "the page is inert behind it already")
-        settle { !p.modals.inTransition }
+        settle { !p.modalHost.inTransition }
         XCTAssertEqual(p.openTopLayer.frames.map { $0.0 }, [30])
         XCTAssertEqual(p.openTopLayer.modal, 0)
-        p.modals.closeTop(animated: false)
-        settle { !p.modals.inTransition }
+        p.modalHost.closeTop(animated: false)
+        settle { !p.modalHost.inTransition }
     }
 
     func testRouteDialogAndPopoverReportTheirUIKitStackOrder() throws {
@@ -154,8 +167,8 @@ final class PopoverSheetIOSTests: XCTestCase {
         ]))
         let route = try XCTUnwrap(p.views[30]), owner = try XCTUnwrap(window?.rootViewController)
         let navigation = UINavigationController(rootViewController: RouteController(route))
-        p.modals.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
-        settle { !p.modals.inTransition }
+        p.modalHost.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
+        settle { !p.modalHost.inTransition }
         XCTAssertEqual(p.openTopLayer.frames.map { $0.0 }, [30])
         XCTAssertEqual(p.openTopLayer.modal, 0)
         let sheet = try show(in: p)
@@ -166,13 +179,13 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertEqual(p.openTopLayer.frames.map { $0.0 }, [30, 2, 5])
         XCTAssertEqual(p.openTopLayer.modal, 1)
         p.menus.action("hidePopover", ["choices"])
-        p.menus.sheets.close(try XCTUnwrap(p.views[2]), animated: false)
+        p.dialogHost.close(try XCTUnwrap(p.views[2]), animated: false)
         settle { !p.menus.inTransition && sheet.presentingViewController == nil }
         XCTAssertEqual(p.openTopLayer.frames.map { $0.0 }, [30])
         XCTAssertEqual(p.openTopLayer.modal, 0)
-        p.modals.closeTop(animated: true)
+        p.modalHost.closeTop(animated: true)
         XCTAssertNil(p.openTopLayer.modal, "a retiring route no longer owns the modal boundary")
-        settle { !p.modals.inTransition }
+        settle { !p.modalHost.inTransition }
     }
 
     func testPopoverAboveSheetKeepsItsAnchorAndReportedFrame() throws {
@@ -196,7 +209,7 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertEqual(reported.minY, expected.minY, accuracy: 0.5)
         XCTAssertEqual(reported.size, expected.size)
         XCTAssertTrue(Agent.shows(session, content))
-        XCTAssertTrue(p.menus.sheets.shows(content))
+        XCTAssertTrue(p.dialogHost.shows(content))
         XCTAssertEqual(Agent(session: session).presentedOverApp(), "sheet", "a screenshot includes the window's sheet and popover")
 
         p.menus.action("showPopover", ["submenu", "sub-opener"])
@@ -279,7 +292,7 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertEqual(p.openTopLayer.modal, 2)
         let covered = p.axElements(roots: p.accessibilitySurfaces)
         XCTAssertNil((covered["elements"] as? [[String: Any]])?.first { $0["testId"] as? String == "choice" }, "hidden under the later sheet, as its card is")
-        p.menus.sheets.close(try XCTUnwrap(p.views[20]), animated: false)
+        p.dialogHost.close(try XCTUnwrap(p.views[20]), animated: false)
         settle { sheet.presentedViewController == nil && !p.menus.inTransition }
         XCTAssertNil(upper.view.window)
         XCTAssertEqual(try choice(modal: 2)["outsideModal"] as? Bool, false, "exposed again once the later sheet closes")
@@ -314,16 +327,16 @@ final class PopoverSheetIOSTests: XCTestCase {
         let route = try XCTUnwrap(p.views[30]), owner = try XCTUnwrap(window?.rootViewController)
         let navigation = UIViewController()
         navigation.view.addSubview(route)
-        p.modals.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
-        settle { !p.modals.inTransition }
-        let modal = try XCTUnwrap(p.modals.owner)
+        p.modalHost.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
+        settle { !p.modalHost.inTransition }
+        let modal = try XCTUnwrap(p.modalHost.owner)
         p.menus.sync()
         XCTAssertTrue(p.menus.isOpen(pop))
         XCTAssertTrue(pop.isDescendant(of: modal.view), "above the route modal, where the runner's order puts it")
         let point = pop.convert(CGPoint(x: pop.bounds.midX, y: pop.bounds.midY), to: window)
         XCTAssertTrue(try XCTUnwrap(window?.hitTest(point, with: nil)).isDescendant(of: pop))
-        p.modals.closeTop(animated: false)
-        settle { !p.modals.inTransition }
+        p.modalHost.closeTop(animated: false)
+        settle { !p.modalHost.inTransition }
     }
 
     private func retiringRouteModal(withLower: Bool) throws {
@@ -338,12 +351,12 @@ final class PopoverSheetIOSTests: XCTestCase {
             ["op": "children", "id": 1, "ids": [2, 20, 30, 31]],
         ]))
         func present(_ id: UInt32) throws -> UIViewController {
-            let route = try XCTUnwrap(p.views[id]), owner = try XCTUnwrap(p.modals.owner ?? window?.rootViewController)
+            let route = try XCTUnwrap(p.views[id]), owner = try XCTUnwrap(p.modalHost.owner ?? window?.rootViewController)
             let navigation = UIViewController()
             navigation.view.addSubview(route)
-            p.modals.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
-            settle { !p.modals.inTransition }
-            let modal = try XCTUnwrap(p.modals.owner)
+            p.modalHost.present(route, navigation: navigation, from: owner, preceding: nil, owner: owner)
+            settle { !p.modalHost.inTransition }
+            let modal = try XCTUnwrap(p.modalHost.owner)
             XCTAssertTrue(route.isDescendant(of: modal.view))
             XCTAssertTrue(modal.view.window === window)
             return modal
@@ -356,9 +369,9 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertTrue(p.menus.isOpen(pop))
 
         let layer = try XCTUnwrap(pop.superview)
-        p.modals.closeTop(animated: true)
+        p.modalHost.closeTop(animated: true)
         // No run-loop turn: retirement has started, but UIKit has not detached the view.
-        XCTAssertTrue(p.modals.isDismissing)
+        XCTAssertTrue(p.modalHost.isDismissing)
         XCTAssertTrue(upper.view.window === window)
         p.menus.sync()
         XCTAssertTrue(pop.superview === layer)
@@ -372,7 +385,7 @@ final class PopoverSheetIOSTests: XCTestCase {
             // The retiring route's content is behind the live modal, inert (`inertBehind`): it opens nothing.
             XCTAssertTrue(pop.inert)
             XCTAssertFalse(p.menus.isOpen(pop))
-            settle { !p.modals.inTransition }
+            settle { !p.modalHost.inTransition }
             return
         }
         XCTAssertFalse(pop.superview === layer, "reopening captures a new set of hosts during retirement")
@@ -380,7 +393,7 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertFalse(pop.isDescendant(of: upper.view))
         XCTAssertTrue(p.menus.isOpen(pop))
         XCTAssertTrue(upper.view.window === window)
-        settle { !p.modals.inTransition }
+        settle { !p.modalHost.inTransition }
     }
 
     func testPressBubblesThroughTheLiftAndClosingReturnsToAuthoredParent() throws {
@@ -425,11 +438,11 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertNotNil(upper.view.window)
         let covered = pop.convert(CGPoint(x: pop.bounds.midX, y: pop.bounds.midY), to: window)
         XCTAssertFalse(try XCTUnwrap(window?.hitTest(covered, with: nil)).isDescendant(of: pop))
-        p.menus.sheets.close(try XCTUnwrap(p.views[20]), animated: false)
+        p.dialogHost.close(try XCTUnwrap(p.views[20]), animated: false)
         settle { lower.presentedViewController == nil && !p.menus.inTransition }
         try assertAbove(pop, lower)
         XCTAssertTrue(p.menus.isOpen(pop))
-        p.menus.sheets.close(try XCTUnwrap(p.views[2]), animated: false)
+        p.dialogHost.close(try XCTUnwrap(p.views[2]), animated: false)
         settle { self.window?.rootViewController?.presentedViewController == nil && !p.menus.inTransition }
         XCTAssertTrue(p.menus.isOpen(pop))
         XCTAssertTrue(pop.superview?.superview === p.viewport)
@@ -502,7 +515,7 @@ final class PopoverSheetIOSTests: XCTestCase {
                 sheet.dismiss(animated: true) { dismissed.fulfill() }
                 wait(for: [dismissed], timeout: 5)
             } else {
-                p.menus.sheets.close(try XCTUnwrap(p.views[2]), animated: true)
+                p.dialogHost.close(try XCTUnwrap(p.views[2]), animated: true)
             }
             settle { self.window?.rootViewController?.presentedViewController == nil && !p.menus.inTransition }
             XCTAssertTrue(p.menus.isOpen(pop))
@@ -678,7 +691,7 @@ final class PopoverSheetIOSTests: XCTestCase {
                 XCTAssertFalse(chain.contains { $0.hasSuffix("Controller") && $0 != "UIApplication" }, "UIKit's chain from the layer reaches no controller: \(chain)")
             }
             XCTAssertTrue(ViewPresentation.controller(for: button) === sheet)
-            XCTAssertTrue(p.rowCells.screen(of: button) === sheet)
+            XCTAssertTrue(p.rowCellsHost.screen(of: button) === sheet)
             var pressed: [UInt32] = []
             p.onPress = { pressed.append($0) }
             activate(button)
@@ -709,7 +722,7 @@ final class PopoverSheetIOSTests: XCTestCase {
             activate(button)
             settle { lower.presentedViewController is DialogSheetController && !p.menus.inTransition }
             let upper = try XCTUnwrap(lower.presentedViewController as? DialogSheetController)
-            XCTAssertTrue(p.menus.sheets.top === upper)
+            XCTAssertTrue(p.dialogHost.top === upper)
             XCTAssertTrue(try XCTUnwrap(p.views[20]).isDescendant(of: upper.view))
             XCTAssertEqual(pressed, [40])
             tearDown()
@@ -845,34 +858,34 @@ final class PopoverSheetIOSTests: XCTestCase {
             dialog.handlers.formUnion(["close", "cancel"])
             var closed: [UInt32] = [], cancelled: [UInt32] = []
             p.onClose = { closed.append($0) }
-            p.menus.sheets.onCancel = { cancelled.append($0) }
+            p.onCancel = { cancelled.append($0) }
             let sheet = try show(in: p)
             XCTAssertTrue(sheet.presentingViewController === route, "authored in the route: \(authoredInRoute)")
             p.menus.action("showPopover", ["choices", "opener"])
             let pop = try XCTUnwrap(p.views[5]), field = try XCTUnwrap(p.views[11]?.field)
             try assertAbove(pop, sheet)
             XCTAssertTrue(field.becomeFirstResponder())
-            p.modals.closeTop(animated: true)
-            settle { !p.modals.inTransition && !p.menus.inTransition && route.presentingViewController == nil }
+            p.modalHost.closeTop(animated: true)
+            settle { !p.modalHost.inTransition && !p.menus.inTransition && route.presentingViewController == nil }
             XCTAssertNil(route.presentingViewController, "the route has gone (authored in the route: \(authoredInRoute))")
             XCTAssertNil(sheet.presentingViewController, "and the original sheet over it")
             XCTAssertFalse(route.view.accessibilityElementsHidden)
             XCTAssertTrue(p.menus.isOpen(pop))
             if authoredInRoute {
-                XCTAssertFalse(p.menus.sheets.isOpen(dialog))
-                XCTAssertFalse(p.menus.sheets.owns(dialog))
-                XCTAssertNil(p.menus.sheets.top)
+                XCTAssertFalse(p.dialogHost.isOpen(dialog))
+                XCTAssertFalse(p.dialogHost.owns(dialog))
+                XCTAssertNil(p.dialogHost.top)
                 XCTAssertTrue(dialog.isHidden)
                 XCTAssertTrue(dialog.superview === home)
                 XCTAssertEqual(dialog.frame, frame)
                 XCTAssertFalse(dialog.accessibilityViewIsModal)
                 XCTAssertTrue(pop.isDescendant(of: p.viewport))
             } else {
-                let replacement = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+                let replacement = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
                 XCTAssertFalse(replacement === sheet)
                 XCTAssertTrue(replacement.presentingViewController === window?.rootViewController)
-                XCTAssertTrue(p.menus.sheets.isOpen(dialog), "the page's dialog stays open as on the web")
-                XCTAssertTrue(p.menus.sheets.authoredParent(of: dialog) === home)
+                XCTAssertTrue(p.dialogHost.isOpen(dialog), "the page's dialog stays open as on the web")
+                XCTAssertTrue(p.dialogHost.authoredParent(of: dialog) === home)
                 XCTAssertTrue(dialog.superview === replacement.scroller)
                 XCTAssertFalse(dialog.isHidden)
                 XCTAssertTrue(dialog.accessibilityViewIsModal)
@@ -895,18 +908,18 @@ final class PopoverSheetIOSTests: XCTestCase {
         for dialog in dialogs { dialog.handlers.formUnion(["close", "cancel"]) }
         var closed: [UInt32] = [], cancelled: [UInt32] = []
         p.onClose = { closed.append($0) }
-        p.menus.sheets.onCancel = { cancelled.append($0) }
+        p.onCancel = { cancelled.append($0) }
         let owner = try XCTUnwrap(route.presentingViewController)
         let dismissed = expectation(description: "the embedder dismissed the stack")
         owner.dismiss(animated: true) { dismissed.fulfill() }
         wait(for: [dismissed], timeout: 5)
-        settle { !p.menus.inTransition && dialogs.allSatisfy { !p.menus.sheets.owns($0) } }
+        settle { !p.menus.inTransition && dialogs.allSatisfy { !p.dialogHost.owns($0) } }
         XCTAssertNil(route.presentingViewController)
         XCTAssertNil(first.presentingViewController)
         XCTAssertNil(second.presentingViewController)
-        XCTAssertNil(p.menus.sheets.top)
+        XCTAssertNil(p.dialogHost.top)
         for dialog in dialogs {
-            XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+            XCTAssertFalse(p.dialogHost.isOpen(dialog))
             XCTAssertTrue(dialog.isHidden)
             XCTAssertTrue(dialog.superview === p.views[30]?.container)
             XCTAssertFalse(dialog.accessibilityViewIsModal)
@@ -922,25 +935,25 @@ final class PopoverSheetIOSTests: XCTestCase {
         guard hasScene else { throw missing("scene", "a later full-screen dialog covers the first sheet") }
         let p = try page(), firstOwner = SheetPresenter(try XCTUnwrap(window?.rootViewController))
         let dialog = try XCTUnwrap(p.views[2]), secondDialog = try XCTUnwrap(p.views[20])
-        XCTAssertTrue(p.menus.sheets.show(dialog, from: nil, over: firstOwner))
+        XCTAssertTrue(p.dialogHost.show(dialog, from: nil, over: firstOwner))
         settle { !p.menus.inTransition }
-        let first = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+        let first = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
         // Full screen makes UIKit deliver viewDidDisappear to the covered sheet.
         let owner = SheetPresenter(first)
-        XCTAssertTrue(p.menus.sheets.show(secondDialog, from: nil, over: owner))
+        XCTAssertTrue(p.dialogHost.show(secondDialog, from: nil, over: owner))
         settle { !p.menus.inTransition }
-        let second = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+        let second = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
         flushCallbacks()
         XCTAssertTrue(first.presentedViewController === second)
         XCTAssertNotNil(first.presentingViewController)
-        XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.dialogHost.isOpen(dialog))
         XCTAssertTrue(dialog.superview === first.scroller)
         XCTAssertFalse(dialog.isHidden)
         XCTAssertTrue(first.view.accessibilityElementsHidden)
-        p.menus.sheets.close(secondDialog, animated: true)
+        p.dialogHost.close(secondDialog, animated: true)
         settle { !p.menus.inTransition }
-        XCTAssertTrue(p.menus.sheets.top === first)
-        XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.dialogHost.top === first)
+        XCTAssertTrue(p.dialogHost.isOpen(dialog))
         XCTAssertFalse(first.view.accessibilityElementsHidden)
         XCTAssertTrue(dialog.accessibilityViewIsModal)
     }
@@ -949,26 +962,26 @@ final class PopoverSheetIOSTests: XCTestCase {
         guard hasScene else { throw missing("scene", "UIKit must run and cancel an interactive dismissal") }
         let p = try page(), dialog = try XCTUnwrap(p.views[2])
         let transition = SheetDismissal(), owner = SheetPresenter(try XCTUnwrap(window?.rootViewController), transition: transition)
-        XCTAssertTrue(p.menus.sheets.show(dialog, from: nil, over: owner))
+        XCTAssertTrue(p.dialogHost.show(dialog, from: nil, over: owner))
         settle { !p.menus.inTransition }
-        let sheet = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+        let sheet = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
         dialog.handlers.formUnion(["close", "cancel"])
         var closed: [UInt32] = [], cancelled: [UInt32] = []
         p.onClose = { closed.append($0) }
-        p.menus.sheets.onCancel = { cancelled.append($0) }
+        p.onCancel = { cancelled.append($0) }
         sheet.dismiss(animated: true)
         settle { sheet.transitionCoordinator?.isInteractive == true && transition.started }
         transition.interaction.update(0.4)
-        XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.dialogHost.isOpen(dialog))
         transition.interaction.cancel()
         settle { sheet.transitionCoordinator == nil && !p.menus.inTransition }
         flushCallbacks()
         XCTAssertNotNil(sheet.presentingViewController)
-        XCTAssertTrue(p.menus.sheets.top === sheet)
-        XCTAssertTrue(p.menus.sheets.isOpen(dialog))
+        XCTAssertTrue(p.dialogHost.top === sheet)
+        XCTAssertTrue(p.dialogHost.isOpen(dialog))
         XCTAssertTrue(dialog.superview === sheet.scroller)
         XCTAssertFalse(dialog.isHidden)
-        XCTAssertTrue(p.menus.sheets.controllers(holding: dialog).contains { $0 === sheet }, "the returned sheet may host popovers again")
+        XCTAssertTrue(p.dialogHost.controllers(holding: dialog).contains { $0 === sheet }, "the returned sheet may host popovers again")
         XCTAssertEqual(closed, [])
         XCTAssertEqual(cancelled, [])
         transition.interactive = false
@@ -997,23 +1010,23 @@ final class PopoverSheetIOSTests: XCTestCase {
             settle { !p.menus.inTransition && presenting.presentedViewController is UIAlertController }
             let alert = try XCTUnwrap(presenting.presentedViewController as? UIAlertController)
             XCTAssertTrue(p.menus.nativeConfirmation === confirm)
-            p.modals.closeTop(animated: true)
-            settle { !p.modals.inTransition && !p.menus.inTransition && route.presentingViewController == nil }
+            p.modalHost.closeTop(animated: true)
+            settle { !p.modalHost.inTransition && !p.menus.inTransition && route.presentingViewController == nil }
             XCTAssertNil(route.presentingViewController)
             XCTAssertNil(sheet?.presentingViewController)
             XCTAssertNil(alert.presentingViewController)
             if authoredInRoute {
                 XCTAssertNil(p.menus.nativeConfirmation)
                 XCTAssertFalse(p.menus.isOpen(confirm))
-                XCTAssertNil(p.menus.sheets.top)
+                XCTAssertNil(p.dialogHost.top)
             } else {
-                let replacement = try XCTUnwrap(withSheet ? p.menus.sheets.top : window?.rootViewController)
+                let replacement = try XCTUnwrap(withSheet ? p.dialogHost.top : window?.rootViewController)
                 let replacementAlert = try XCTUnwrap(replacement.presentedViewController as? UIAlertController)
                 XCTAssertFalse(replacementAlert === alert)
                 XCTAssertTrue(p.menus.nativeConfirmation === confirm)
                 XCTAssertTrue(p.menus.isOpen(confirm))
                 XCTAssertTrue(replacementAlert.presentingViewController === replacement)
-                if !withSheet { XCTAssertNil(p.menus.sheets.top) }
+                if !withSheet { XCTAssertNil(p.dialogHost.top) }
             }
             flushCallbacks()
             XCTAssertEqual(closed, [])
@@ -1029,15 +1042,15 @@ final class PopoverSheetIOSTests: XCTestCase {
         dialog.handlers.insert("close")
         var closed: [UInt32] = []
         p.onClose = { closed.append($0) }
-        p.modals.closeTop(animated: true)
+        p.modalHost.closeTop(animated: true)
         XCTAssertTrue(p.menus.isOpen(dialog), "relocation preserves logical visibility")
         p.dialogCommand("close", "form")
-        settle { !p.modals.inTransition && !p.menus.inTransition && closed.count == 1 }
+        settle { !p.modalHost.inTransition && !p.menus.inTransition && closed.count == 1 }
         flushCallbacks()
         XCTAssertNil(route.presentingViewController)
         XCTAssertNil(sheet.presentingViewController)
-        XCTAssertNil(p.menus.sheets.top)
-        XCTAssertFalse(p.menus.sheets.isOpen(dialog))
+        XCTAssertNil(p.dialogHost.top)
+        XCTAssertFalse(p.dialogHost.isOpen(dialog))
         XCTAssertEqual(closed, [2], "the author's close fires once despite viewDidDisappear")
         XCTAssertTrue(dialog.superview === p.views[1]?.container)
         XCTAssertTrue(dialog.isHidden)
@@ -1103,9 +1116,9 @@ final class PopoverSheetIOSTests: XCTestCase {
         guard hasScene else { throw missing("scene", "a share sheet must be presented from the lifted control") }
         let p = try page(), sheet = try show(in: p)
         p.menus.action("showPopover", ["choices", "opener"])
-        let button = try XCTUnwrap(p.views[7]), anchor = p.shareAnchor(button.id)
+        let button = try XCTUnwrap(p.views[7]), anchor = p.presentationAnchor(button.id)
         XCTAssertTrue(anchor.0 === button)
-        let fallback = p.shareAnchor(nil)
+        let fallback = p.presentationAnchor(nil)
         XCTAssertTrue(fallback.0 === sheet.view)
         XCTAssertEqual(fallback.1.midX, sheet.view.bounds.midX, accuracy: 0.5)
         XCTAssertEqual(fallback.1.midY, sheet.view.bounds.midY, accuracy: 0.5)
@@ -1132,14 +1145,14 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertFalse(surfaces.contains { $0.view === foreign.viewport })
         foreign.viewport.removeFromSuperview()
         p.menus.action("hidePopover", ["choices"])
-        p.menus.sheets.close(try XCTUnwrap(p.views[2]), animated: true)
+        p.dialogHost.close(try XCTUnwrap(p.views[2]), animated: true)
         XCTAssertFalse(p.surfaces().contains { $0.view === sheet.view })
         XCTAssertTrue(p.surfaces(includingRetiring: true).contains { $0.view === sheet.view })
         settle { !p.menus.inTransition }
-        p.modals.closeTop(animated: true)
+        p.modalHost.closeTop(animated: true)
         XCTAssertFalse(p.surfaces().contains { $0.view === route.view })
         XCTAssertTrue(p.surfaces(includingRetiring: true).contains { $0.view === route.view })
-        settle { !p.modals.inTransition }
+        settle { !p.modalHost.inTransition }
         XCTAssertEqual(p.surfaces(includingRetiring: true).count, 1)
     }
 
@@ -1258,9 +1271,9 @@ final class PopoverSheetIOSTests: XCTestCase {
             XCTAssertEqual(p.menus.activate(action), true)
             XCTAssertTrue(p.menus.choosing)
             XCTAssertTrue(alert.isBeingDismissed)
-            p.modals.closeTop(animated: true)
+            p.modalHost.closeTop(animated: true)
             if disabled { p.apply(wireBatch([["op": "props", "id": 42, "set": ["disabled": "true"]]])) }
-            settle { !p.modals.inTransition && !p.menus.inTransition }
+            settle { !p.modalHost.inTransition && !p.menus.inTransition }
             flushCallbacks()
             XCTAssertEqual(pressed, disabled ? [] : [42])
             XCTAssertEqual(closed, [41])
@@ -1282,13 +1295,13 @@ final class PopoverSheetIOSTests: XCTestCase {
         var closed: [UInt32] = [], pressed: [UInt32] = []
         p.onClose = { closed.append($0) }
         p.onPress = { pressed.append($0) }
-        p.modals.closeTop(animated: true)
-        XCTAssertTrue(p.modals.inTransition)
+        p.modalHost.closeTop(animated: true)
+        XCTAssertTrue(p.modalHost.inTransition)
         XCTAssertTrue(p.menus.isOpen(dialog))
         p.dialogCommand("close", "confirm")
         p.dialogCommand("close", "confirm")
         XCTAssertFalse(p.menus.isOpen(dialog))
-        settle { !p.modals.inTransition && !p.menus.inTransition }
+        settle { !p.modalHost.inTransition && !p.menus.inTransition }
         flushCallbacks()
         XCTAssertEqual(closed, [41])
         XCTAssertEqual(pressed, [])
@@ -1304,39 +1317,39 @@ final class PopoverSheetIOSTests: XCTestCase {
             let dialog = try XCTUnwrap(p.views[2])
             dialog.handlers.formUnion(["close", "cancel"])
             let transition = SheetDismissal(), owner = SheetPresenter(route, transition: transition)
-            XCTAssertTrue(p.menus.sheets.show(dialog, from: nil, over: owner))
+            XCTAssertTrue(p.dialogHost.show(dialog, from: nil, over: owner))
             settle { !p.menus.inTransition }
-            let sheet = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+            let sheet = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
             let presentation = try XCTUnwrap(sheet.presentationController)
             var closed: [UInt32] = [], cancelled: [UInt32] = []
             p.onClose = { closed.append($0) }
-            p.menus.sheets.onCancel = { cancelled.append($0) }
+            p.onCancel = { cancelled.append($0) }
             sheet.dismiss(animated: true)
             settle { sheet.transitionCoordinator?.isInteractive == true && transition.started }
             let coordinator = try XCTUnwrap(sheet.transitionCoordinator)
             XCTAssertTrue(coordinator.animate(alongsideTransition: nil) { context in
                 // A custom programmatic transition does not send the adaptive delegate's swipe callback.
-                if !context.isCancelled { p.menus.sheets.presentationControllerDidDismiss(presentation) }
+                if !context.isCancelled { p.dialogHost.presentationControllerDidDismiss(presentation) }
             })
             transition.interaction.update(0.4)
-            p.modals.closeTop(animated: true)
-            XCTAssertTrue(p.modals.inTransition)
+            p.modalHost.closeTop(animated: true)
+            XCTAssertTrue(p.modalHost.inTransition)
             transition.interactive = false
             if completed { transition.interaction.finish() }
             else { transition.interaction.cancel() }
-            settle { !p.modals.inTransition && !p.menus.inTransition }
+            settle { !p.modalHost.inTransition && !p.menus.inTransition }
             flushCallbacks()
             XCTAssertNil(route.presentingViewController)
             XCTAssertNil(sheet.presentingViewController)
             XCTAssertEqual(closed, completed ? [2] : [])
             XCTAssertEqual(cancelled, completed ? [2] : [])
             if completed {
-                XCTAssertFalse(p.menus.sheets.owns(dialog))
+                XCTAssertFalse(p.dialogHost.owns(dialog))
                 XCTAssertFalse(p.menus.isOpen(dialog))
                 XCTAssertTrue(dialog.isHidden)
                 XCTAssertNil(window?.rootViewController?.presentedViewController)
             } else {
-                let replacement = try XCTUnwrap(p.menus.sheets.top)
+                let replacement = try XCTUnwrap(p.dialogHost.top)
                 XCTAssertFalse(replacement === sheet)
                 XCTAssertTrue(replacement.presentingViewController === window?.rootViewController)
                 XCTAssertTrue(p.menus.isOpen(dialog))
@@ -1362,24 +1375,24 @@ final class PopoverSheetIOSTests: XCTestCase {
         let alert = try XCTUnwrap(secondSheet.presentedViewController as? UIAlertController)
         var closed: [UInt32] = []
         p.onClose = { closed.append($0) }
-        p.modals.closeTop(animated: true)
+        p.modalHost.closeTop(animated: true)
         settle {
-            guard let top = p.menus.sheets.top else { return false }
+            guard let top = p.dialogHost.top else { return false }
             return top !== firstSheet && top !== secondSheet && top.isBeingPresented
         }
-        let replacement = try XCTUnwrap(p.menus.sheets.top)
-        XCTAssertTrue(p.menus.sheets.topDialog === dialog)
+        let replacement = try XCTUnwrap(p.dialogHost.top)
+        XCTAssertTrue(p.dialogHost.topDialog === dialog)
         XCTAssertTrue(replacement.isBeingPresented)
         p.dialogCommand("close", "form")
-        settle { !p.modals.inTransition && !p.menus.inTransition }
+        settle { !p.modalHost.inTransition && !p.menus.inTransition }
         flushCallbacks()
         XCTAssertEqual(closed, [2])
         XCTAssertNil(replacement.presentingViewController)
         XCTAssertNil(route.presentingViewController)
-        XCTAssertFalse(p.menus.sheets.owns(dialog))
+        XCTAssertFalse(p.dialogHost.owns(dialog))
         XCTAssertTrue(dialog.isHidden)
-        let remaining = try XCTUnwrap(p.menus.sheets.top)
-        XCTAssertTrue(p.menus.sheets.topDialog === second)
+        let remaining = try XCTUnwrap(p.dialogHost.top)
+        XCTAssertTrue(p.dialogHost.topDialog === second)
         XCTAssertTrue(remaining.presentingViewController === window?.rootViewController)
         let resumedAlert = try XCTUnwrap(remaining.presentedViewController as? UIAlertController)
         XCTAssertFalse(resumedAlert === alert)
@@ -1405,8 +1418,8 @@ final class PopoverSheetIOSTests: XCTestCase {
             let selection = text.isEmpty ? NSRange(location: 0, length: 0) : NSRange(location: 2, length: 4)
             XCTAssertTrue(node.showSelection(selection))
             XCTAssertEqual(node.props["value"], "original", "the app has not written the edit into props")
-            p.modals.closeTop(animated: true)
-            settle { !p.modals.inTransition && !p.menus.inTransition }
+            p.modalHost.closeTop(animated: true)
+            settle { !p.modalHost.inTransition && !p.menus.inTransition }
             let replacement = try XCTUnwrap(window?.rootViewController?.presentedViewController as? UIAlertController)
             let restored = try XCTUnwrap(replacement.textFields?.first)
             XCTAssertFalse(replacement === alert)
@@ -1437,9 +1450,9 @@ final class PopoverSheetIOSTests: XCTestCase {
         XCTAssertTrue(p.authored(node, inside: dialog))
         XCTAssertTrue(field.becomeFirstResponder())
         XCTAssertTrue(p.focusedNode === node)
-        p.modals.closeTop(animated: true)
-        settle { !p.modals.inTransition && !p.menus.inTransition }
-        let replacement = try XCTUnwrap(p.menus.sheets.top as? DialogSheetController)
+        p.modalHost.closeTop(animated: true)
+        settle { !p.modalHost.inTransition && !p.menus.inTransition }
+        let replacement = try XCTUnwrap(p.dialogHost.top as? DialogSheetController)
         XCTAssertFalse(replacement === sheet)
         XCTAssertNil(route.presentingViewController)
         try assertAbove(pop, replacement)

@@ -30,9 +30,9 @@ export const LIBRARY_CACHE = resolve(homedir(), '.cache/exact/package-libraries'
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const inside = (root, path) => { const at = relative(root, path); return at !== '' && !isAbsolute(at) && at !== '..' && !at.startsWith(`..${sep}`); };
 
-/** The app's direct dependencies (the `dependencies` of the nearest `package.json` above it, as
- * contract/cli/src/package_views.rs reads them) that are installed: each one's name and directory, as installed. */
-export function directDependencies(appDir) {
+/** Each direct dependency of the app (the `dependencies` of the nearest `package.json` above it, as
+ * contract/cli/src/package_views.rs reads them) with the directory it is installed in, or null. */
+function dependencyRoots(appDir) {
   let manifest = null;
   for (let dir = resolve(appDir); ; dir = dirname(dir)) {
     if (existsSync(join(dir, 'package.json'))) { try { manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')); } catch { /* none */ } break; }
@@ -45,8 +45,14 @@ export function directDependencies(appDir) {
       if (dirname(dir) === dir) return null;
     }
   };
-  return Object.keys(manifest?.dependencies ?? {}).sort().flatMap(name => { const root = located(name); return root ? [{ name, root }] : []; });
+  return Object.keys(manifest?.dependencies ?? {}).sort().map(name => ({ name, root: located(name) }));
 }
+/** The app's direct dependencies that are installed: each one's name and directory, as installed. */
+export const directDependencies = (appDir) => dependencyRoots(appDir).filter(d => d.root);
+/** The names of the app's direct dependencies that are not installed. The bake refuses the first
+ * (`bake-native-missing`, contract/cli/src/native/slot.rs) only after Cargo has compiled, so a build asks first
+ * (LLP 1156.006.000 D8). */
+export const missingDependencies = (appDir) => dependencyRoots(appDir).filter(d => !d.root).map(d => d.name);
 
 /** The app's direct dependencies whose `exact.json`, at the package's root, declares `native`, as the bake reads them
  * (contract/cli/src/native/slot.rs). The bake is the one that refuses: two of them (`bake-native-twice`), and a

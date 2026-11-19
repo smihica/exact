@@ -6,6 +6,7 @@ mod clock;
 mod descriptor;
 mod easing;
 mod engine;
+mod filter;
 mod first_frame;
 mod height;
 mod hold;
@@ -23,6 +24,7 @@ use exact_motion::{Animations, Keyframes};
 /// A shorthand then the `@keyframes name{…}` rules it names, resolved as a
 /// runner resolves a row against its plan's table (LLP 1055 D5).
 pub fn keyframed(text: &str) -> Result<Animations, String> {
+    exact_motion::link_animations();
     let (head, rules) = text.split_at(text.find("@keyframes").unwrap_or(text.len()));
     let mut table = Vec::new();
     for rule in rules.split("@keyframes").skip(1) {

@@ -119,7 +119,7 @@ public enum DevMenu {
     nonisolated(unsafe) static weak var session: ExactSession?
     nonisolated(unsafe) static weak var controller: UIViewController?
     nonisolated(unsafe) static weak var frameHealthContainer: UIView?
-    /// Where a reload without a connection restarts from (`EXACT_DEV_PLAN`, `EXACT_PLAN`), else the baked plan.
+    /// Where a development build's reload without a connection restarts from (`EXACT_DEV_PLAN`, `EXACT_PLAN`), else the baked plan.
     nonisolated(unsafe) static var planPath: String?
 
     /// The gestures, on the window: above every node, indifferent to what
@@ -212,6 +212,7 @@ public enum DevMenu {
     /// controller has presented (a route's sheet, a UIKit sheet), never
     /// refused for it.
     static var presenter: UIViewController? {
+        session?.presenter.navigation.finishBootOwner()
         guard var top = controller else { return nil }
         while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
         return top
@@ -302,17 +303,22 @@ public enum DevMenu {
     }
 
     /// Restart: a live connection re-fetches; else from the dev loop's plan
-    /// when one is named (the watcher's own path, state carried), else from
-    /// the baked plan, fresh.
+    /// when one is named in a development build (the watcher's own path,
+    /// state carried), else from the baked plan, fresh.
     public static func reload() {
         pending += 1
         sheet?.dismiss(animated: false)
+        // The person's own act: it ends a composition and commits now (LLP 1029.000.002 D9).
+        ExactApp.shared.endCompositions()
         if ExactApp.shared.connectionStatus != nil { ExactApp.shared.reloadConnection(); return }
         guard let session else { return }
+        // A production build takes no development plan, and reloads the baked one.
+        #if EXACT_INSPECT
         if let path = planPath {
-            ExactDevelopmentPlan(path).apply(to: ExactApp.shared)
+            ExactDevelopmentPlan(path).apply(to: ExactApp.shared, now: true)
             return
         }
+        #endif
         let started = CACurrentMediaTime()
         let batch = session.boot(size: session.presenter.viewportSize)
         // stderr, as on macOS, where stdout is the agent's reply channel.

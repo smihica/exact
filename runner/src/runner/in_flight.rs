@@ -4,6 +4,15 @@
 
 use super::*;
 
+impl PendingReq {
+    /// An upload the host has not refused at admission, through its reply's
+    /// turns. It holds the app open as a request with effects does, but one
+    /// let go is aborted, never kept (LLP 1133.008.000 D8).
+    fn admitted_upload(&self) -> bool {
+        self.upload && self.refusal.is_none() && !self.refused
+    }
+}
+
 impl<D: DataSource> Runner<D> {
     /// Whether resource `i` has a stream open that has committed a value: it is not
     /// pending, but a newer answer must still let its ticket go.
@@ -49,10 +58,11 @@ impl<D: DataSource> Runner<D> {
         if s.placeholder || s.slept {
             return false;
         }
-        let context = self.resource_row(i).context as usize;
-        let identity = |a: &[Value]| a.len().saturating_sub(context).min(a.len());
-        let asked = s.answered_args();
-        asked[..identity(asked)] == now[..identity(now)]
+        // The row's count, not each list's: a kept seed's list holds only
+        // the identifying arguments (LLP 1027.005 D6).
+        let n = self.identity_len(i);
+        let asked = s.answered_args().get(..n);
+        asked.is_some_and(|asked| now.get(..n) == Some(asked))
     }
 
     /// The pending flags `pending(x)` reads, from the tickets in flight and
@@ -61,7 +71,7 @@ impl<D: DataSource> Runner<D> {
         for row in &mut self.resources {
             row.pending = false;
         }
-        self.pending_mut = vec![false; self.plan.mutations.len()];
+        self.pending_mut = vec![false; self.mutation_rows()];
         // A stream is pending until its first value commits (LLP 1016.000 D1).
         for p in self.pending.iter().filter(|p| p.in_flight()) {
             match p.target {
@@ -88,10 +98,13 @@ impl<D: DataSource> Runner<D> {
     /// A target's resource or mutation name.
     pub(super) fn target_name(&self, t: Target) -> String {
         match t {
-            Target::Resource(i) => self.plan.str(self.resource_row(i).name).to_string(),
-            Target::Mutation(m) | Target::Sent(m, _) => {
-                self.plan.str(self.plan.mutations[m].name).to_string()
+            // A child's resource by the name its component declares
+            // (LLP 1035.005.004 D8).
+            Target::Resource(i) if self.owned_row(i).is_some() => {
+                crate::agent::declared_name(self.plan.str(self.resource_row(i).name)).to_string()
             }
+            Target::Resource(i) => self.plan.str(self.resource_row(i).name).to_string(),
+            Target::Mutation(m) | Target::Sent(m, _) => self.mutation_name(m).to_string(),
         }
     }
 
@@ -143,12 +156,15 @@ impl<D: DataSource> Runner<D> {
 
     /// Work an answer started that the app must finish before it is
     /// suspended or ends: a request with effects in flight, an answer's, a
-    /// kept one or a handler's (LLP 1146 D2), or the module's storage still
-    /// landing (LLP 1097 D10). A host keeps the app running while there is
-    /// (an iOS background task, a quit held), so a reply lands and what its
-    /// turn writes is persisted.
+    /// kept one or a handler's (LLP 1146 D2), an upload the host admitted
+    /// (LLP 1133.008.000 D8), or the module's storage still landing (LLP
+    /// 1097 D10). A host keeps the app running while there is (an iOS
+    /// background task, a quit held), so a reply lands and what its turn
+    /// writes is persisted.
     pub fn must_finish(&self) -> bool {
-        self.effects_in_flight() || self.background_operations() > 0
+        self.effects_in_flight()
+            || self.pending.iter().any(PendingReq::admitted_upload)
+            || self.background_operations() > 0
     }
 
     /// Whether a request with effects the host has not refused is in flight
@@ -184,8 +200,10 @@ impl<D: DataSource> Runner<D> {
     /// or a queued mutation's next send. A repeating timer is not: an
     /// `every` spinner never ends, so it cannot hold a run open.
     pub fn one_shot_armed(&self) -> bool {
-        (self.timers.iter().zip(&self.plan.timers))
-            .any(|(t, row)| row.once && t.next_ms.is_finite())
+        self.timers
+            .iter()
+            .enumerate()
+            .any(|(i, t)| self.timer_row(i).once && t.next_ms.is_finite())
             || self.then_due.iter().any(|due| due.is_finite())
             || self.queues.next_due.iter().any(|due| due.is_finite())
     }
@@ -211,7 +229,7 @@ impl<D: DataSource> Runner<D> {
     /// A request held for the agent: a device's, or a module's (LLP 1133.002 §6).
     fn held_for_agent(&self, p: &PendingReq) -> bool {
         self.device_holds.iter().any(|h| h.ticket == p.ticket)
-            || self.extensions.holds_token(p.continuation)
+            || self.holds_token(p.continuation)
             || self.presence_holds(p.ticket)
     }
 

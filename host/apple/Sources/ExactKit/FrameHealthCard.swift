@@ -581,7 +581,7 @@ enum FrameHealthShare {
     /// The choices for a face that shows the screen's frames, or Exact's.
     static func choices(screen: Bool) -> [Self] { screen ? [.report, .clockReport, .summary, .image] : [.report, .summary, .image] }
 
-    func title(screen: Bool) -> String {
+    package func title(screen: Bool) -> String {
         switch self {
         case .report: screen ? "Agent Report: Screen" : "Agent Report"
         case .clockReport: "Agent Report: Exact's Frames"

@@ -77,6 +77,12 @@ export const sections: NavSection[] = [
         description: 'Clear fields and close forms only on ok: true.',
       },
       {
+        route: 'recipeAlternateAppIcons',
+        path: '/recipes/alternate-app-icons',
+        source: 'recipes/alternate-app-icons.md',
+        description: 'Icons the person chooses for the Home Screen: alternate_icons in app.json, and @exact/app-icon reads and asks for the choice on iOS.',
+      },
+      {
         route: 'recipeAppJson',
         path: '/recipes/app-json',
         source: 'recipes/app-json.md',
@@ -99,6 +105,12 @@ export const sections: NavSection[] = [
         path: '/recipes/chat-thread',
         source: 'recipes/chat-thread.md',
         description: 'A transcript open at its newest message, over Messages\' composer.',
+      },
+      {
+        route: 'recipeCombobox',
+        path: '/recipes/combobox',
+        source: 'recipes/combobox.md',
+        description: 'Filter options while a field keeps focus and names its active option.',
       },
       {
         route: 'recipeContentDesign',
@@ -383,6 +395,12 @@ export const sections: NavSection[] = [
         description: 'A WebSocket whose server checks the signed-in person at connect opens with a single-use ticket bought over HTTPS with @exact/oauth.',
       },
       {
+        route: 'recipeSuspendingFeed',
+        path: '/recipes/suspending-feed',
+        source: 'recipes/suspending-feed.md',
+        description: 'A WebSocket feed that stays open while a desktop window is hidden and closes when the host freezes the page.',
+      },
+      {
         route: 'recipeSymbols',
         path: '/recipes/symbols',
         source: 'recipes/symbols.md',
@@ -395,10 +413,10 @@ export const sections: NavSection[] = [
         description: 'Use tabs for at least two top-level sections, each with its own route stack.',
       },
       {
-        route: 'recipeTamber',
-        path: '/recipes/tamber',
-        source: 'recipes/tamber.md',
-        description: 'An app\'s own colours are its design, app.tamber beside app.contract (LLP 1121).',
+        route: 'recipeForma',
+        path: '/recipes/forma',
+        source: 'recipes/forma.md',
+        description: 'An app\'s own colours are its design, app.forma beside app.contract (LLP 1121).',
       },
       {
         route: 'recipeTests',
@@ -416,7 +434,7 @@ export const sections: NavSection[] = [
         route: 'recipeTimerInAComponent',
         path: '/recipes/timer-in-a-component',
         source: 'recipes/timer-in-a-component.md',
-        description: 'Only the root may declare a task (type-child-resource): a timer is the app\'s.',
+        description: 'A bounded child owns its timer; an activity gate stops it while hidden.',
       },
       {
         route: 'recipeTimerThatSurvivesRelaunch',

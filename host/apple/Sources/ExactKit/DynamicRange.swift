@@ -36,7 +36,7 @@ package enum DisplayRange {
 /// `contentHeadroom` model it (LLP 1100 D2, D8). A colour in an extended or
 /// PQ/HLG space is tagged with its own peak, so an untagged PQ white doesn't
 /// draw at Core Graphics' implied 1000 nits.
-enum ColorRange {
+package enum ColorRange {
     /// A colour's peak over SDR white, at least 1; 0 for a standard space.
     static func headroom(_ color: CGColor?) -> Float {
         guard let color, let space = color.colorSpace,
@@ -58,7 +58,7 @@ enum ColorRange {
     static func isHDR(_ color: CGColor?) -> Bool { headroom(color) > 1 }
 
     /// The colour tagged with its headroom (`CGColor(headroom:)`), components unchanged.
-    static func tagged(_ color: CGColor) -> CGColor {
+    package static func tagged(_ color: CGColor) -> CGColor {
         guard #available(iOS 26, macOS 26, tvOS 26, *), let space = color.colorSpace, space.model == .rgb,
               let c = color.components, c.count == 4, case let h = headroom(color), h >= 1,
               let tagged = CGColor(headroom: h, colorSpace: space, red: c[0], green: c[1], blue: c[2], alpha: c[3]) else { return color }
@@ -95,7 +95,7 @@ extension CALayer {
 
     /// An HDR colour this layer paints asks for what `limit` allows; `deep`
     /// does the same for every sublayer (a shadow caster, an SVG scene).
-    func applyColorRange(limit: String?, deep: Bool = false) {
+    package func applyColorRange(limit: String?, deep: Bool = false) {
         setColorRange(hdr: ownColors.contains { ColorRange.isHDR($0) || ColorRange.needsExtendedComponents($0) }, limit: limit)
         if self is CAGradientLayer { mapsExtendedRange(ownColors.contains(where: ColorRange.isHDR)) }
         if deep { sublayers?.forEach { $0.applyColorRange(limit: limit, deep: true) } }
@@ -144,7 +144,7 @@ extension CALayer {
     /// An HDR bitmap's layer asks for what `limit` allows, with its headroom.
     /// Anything else stays standard: an EDR layer costs the compositor even
     /// when its content is SDR.
-    func applyDynamicRange(hdr: Bool, headroom: Float, limit: String?) {
+    package func applyDynamicRange(hdr: Bool, headroom: Float, limit: String?) {
         if #available(iOS 26, macOS 26, tvOS 26, *) {
             let range: CALayer.DynamicRange = hdr ? layerRange(limit) : .standard
             if preferredDynamicRange != range { preferredDynamicRange = range }
@@ -160,7 +160,7 @@ extension CALayer {
     }
 
     /// What the agent reports of a layer's range (LLP 1100 D12).
-    var dynamicRangeFacts: [String: Any] {
+    package var dynamicRangeFacts: [String: Any] {
         if #available(iOS 26, macOS 26, tvOS 26, *) {
             let names: [CALayer.DynamicRange: String] = [.standard: "standard", .constrainedHigh: "constrained", .high: "high", .automatic: "automatic"]
             return ["dynamicRange": names[preferredDynamicRange] ?? "\(preferredDynamicRange)", "contentsHeadroom": contentsHeadroom]
@@ -176,7 +176,7 @@ extension CALayer {
 extension NodeView {
     /// UIKit puts fitted bitmaps inside a clipping layer; flights and AppKit
     /// use the image layer itself.
-    var imageContentLayer: CALayer? {
+    package var imageContentLayer: CALayer? {
         #if os(iOS) || os(tvOS)
         return imageLayer?.contents != nil ? imageLayer : imageLayer?.sublayers?.first
         #else
@@ -190,7 +190,7 @@ extension NodeView {
         guard old["dynamic_range_limit"] != style["dynamic_range_limit"] else { return }
         applyColorRanges()
         guard kind == "image" else { return }
-        presenter?.session?.rasters.rangeChanged(self)
+        presenter?.session?.rasters?.rangeChanged(self)
         if let bitmap = raster?.image {
             imageContentLayer?.applyDynamicRange(hdr: bitmap.isHDR, headroom: bitmap.headroom, limit: style["dynamic_range_limit"]?.string)
         }
@@ -224,7 +224,7 @@ extension NodeView {
         #if os(macOS)
         if textRaster != nil && textRasterOverflowLayer == nil { own?.applyTextRange(limit: limit) }
         #endif
-        for l in own?.sublayers ?? [] where l.name == SvgHost.rootName { l.applyColorRange(limit: limit, deep: true) }
+        for l in own?.sublayers ?? [] where l.name == SvgLink.rootName { l.applyColorRange(limit: limit, deep: true) }
     }
 
     func paragraphHeadroom(drawing: Bool) -> Float {
@@ -246,7 +246,7 @@ extension NodeView {
         #endif
         var h: Float = 0
         if box {
-            for gradient in Gradient.layers(style["background_image"]) {
+            for gradient in GradientLink.layers(style["background_image"], tint: gradientTint) {
                 for c in gradient.stops(dark: drawsDark).1 { h = max(h, ColorRange.headroom(c)) }
             }
             for key in ["background_color", "border_color_top", "border_color_right", "border_color_bottom", "border_color_left"] {
@@ -264,7 +264,7 @@ extension NodeView {
         let box = boxNeedsDraw
         #endif
         guard box else { return false }
-        let stops = Gradient.layers(style["background_image"]).flatMap { $0.stops(dark: drawsDark).1 }
+        let stops = GradientLink.layers(style["background_image"], tint: gradientTint).flatMap { $0.stops(dark: drawsDark).1 }
         return stops.contains { ColorRange.needsExtendedComponents($0) }
             || ["background_color", "border_color_top", "border_color_right", "border_color_bottom", "border_color_left"].contains { ColorRange.needsExtendedComponents(cgColor($0)) }
     }

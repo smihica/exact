@@ -77,15 +77,15 @@ extension Presenter {
     /// bubble to their authored parent outside the presentation. The agent
     /// and accessibility activation take the same steps as a real touch.
     func listenerParent(of view: UIView) -> UIView? {
-        if let node = view as? NodeView, let parent = menus.sheets.authoredParent(of: node) { return parent }
+        if let node = view as? NodeView, let parent = dialogs.authoredParent(of: node) { return parent }
         if let parent = menus.logicalParent(of: view) { return parent }
-        if let node = view as? NodeView, navigation.controllers[node.id]?.node === node, modals.mounts(node) {
+        if let node = view as? NodeView, navigation.routeSurfaces[node.id]?.node === node, modals.mounts(node) {
             return eventParent(of: node)
         }
         return view.superview
     }
 
-    func authored(_ view: UIView, inside ancestor: UIView) -> Bool {
+    package func authored(_ view: UIView, inside ancestor: UIView) -> Bool {
         sequence(first: view, next: listenerParent).contains { $0 === ancestor }
     }
 
@@ -182,12 +182,13 @@ extension Presenter {
 
 #if os(iOS) || os(tvOS)
 /// The view whose UIKit placement orders a top-layer box (LLP 1123 D2).
-struct TopLayerBox {
+package struct TopLayerBox {
     let view: UIView
     /// None: the top route presentation, which shows no box yet (its routes
     /// are mounting, or laid out empty), still begins the modal boundary.
     let frame: TopLayerFrame?
     let modal: UIViewController?
+    var backdrop: (bounds: CGRect, excluding: CGRect?)? = nil
 }
 
 /// Each route's root laid out in its controller's view (LLP 1123 D2): the
@@ -198,12 +199,13 @@ struct TopLayerBox {
 /// any other by a placement, its block in the routes' owner's local
 /// coordinates, sent with the block when either changes, so that it keeps
 /// its place among its siblings.
-final class OwnerBlocks {
+package final class OwnerBlocks {
     private unowned let presenter: Presenter
     /// What the runtime was last told, by route: its block, and its
     /// placement unless it is presented.
     private(set) var told: [UInt32: (block: HostBlock, placement: BlockPlacement?)] = [:]
     private var resetting = false, revealOwed = false
+    private var viewChanges = 0
     /// Each block's rectangle in its root's coordinates (`BatchOp.blockRect`),
     /// as the last layout sent it: what an open popover is reported by.
     private(set) var blockRects: [UInt32: CGRect] = [:]
@@ -220,17 +222,17 @@ final class OwnerBlocks {
     /// its controller's view, its block in that view's coordinates, and
     /// whether a window shows that view: a route under a pushed one, or in a
     /// tab not selected, is out of the window.
-    private var routes: [(route: RouteController, view: UIView, block: CGRect, shown: Bool, presented: Bool)] {
+    private var routes: [(route: any RouteSurface, view: UIView, block: CGRect, shown: Bool, presented: Bool)] {
         presenter.navigation.primaryStacks.flatMap { routes(of: $0, presented: false) } + presenter.modals.navigations.flatMap { routes(of: $0, presented: true) }
     }
 
     /// A stack's routes: a navigation controller's, or a plain tab's one route.
-    private func routes(of stack: UIViewController, presented: Bool) -> [(route: RouteController, view: UIView, block: CGRect, shown: Bool, presented: Bool)] {
+    private func routes(of stack: UIViewController, presented: Bool) -> [(route: any RouteSurface, view: UIView, block: CGRect, shown: Bool, presented: Bool)] {
         var controllers = stack.stackRoutes
         if let leaving = (stack as? UINavigationController)?.transitionCoordinator?.viewController(forKey: .from),
            !controllers.contains(where: { $0 === leaving }) { controllers.append(leaving) }
         return controllers.compactMap { controller in
-            guard let route = controller as? RouteController, let view = route.viewIfLoaded,
+            guard let route = controller as? any RouteSurface, let view = route.bootSurface ?? route.viewIfLoaded,
                   presenter.views[route.node.id] === route.node else { return nil }
             let block = self.block(in: view)
             route.fitContentViewport(in: block)
@@ -240,7 +242,7 @@ final class OwnerBlocks {
 
     /// A native route keeps its controller's bounds and avoids only its own keyboard.
     /// Authored chrome keeps the document's allocation.
-    func block(in view: UIView) -> CGRect {
+    package func block(in view: UIView) -> CGRect {
         var block = view.bounds
         if ExactEnv.authoredChrome, let document = presenter.navigation.container, view.isDescendant(of: document) {
             let end = view.convert(CGPoint(x: 0, y: document.bounds.height), from: document).y
@@ -270,14 +272,24 @@ final class OwnerBlocks {
     var presented: [TopLayerBox] {
         let top = presenter.modals.topNavigation
         var boxes = presenter.modals.navigations.flatMap { nav in
-            routes(of: nav, presented: true).filter(\.shown).map { route in
+            let backdrop = (nav === top ? nav.parent?.presentationController : nil)
+                .flatMap { NativeGeometry.sheetBackdrop(of: $0, in: presenter.viewport) }
+                .map { (presenter.viewportPoints($0.bounds), $0.excluding.map(presenter.viewportPoints)) }
+            return routes(of: nav, presented: true).filter(\.shown).map { route in
                 TopLayerBox(view: route.view,
                             frame: (route.route.node.id, presenter.viewportPoints(NativeGeometry.convert(route.block, from: route.view, to: presenter.viewport)), nil),
-                            modal: nav === top ? nav : nil)
+                            modal: nav === top ? nav : nil, backdrop: backdrop)
             }
         }
         if let top, !boxes.contains(where: { $0.modal === top }) { boxes.append(TopLayerBox(view: top.view, frame: nil, modal: top)) }
         return boxes
+    }
+
+    /// UIKit may report several routes while a viewport change lays out its containers.
+    func beginViewChange() { viewChanges += 1 }
+    func endViewChange() {
+        viewChanges -= 1
+        if viewChanges == 0 { publish() }
     }
 
     /// Gives each route a window shows its block, and an ordinary one its
@@ -286,8 +298,8 @@ final class OwnerBlocks {
     /// applied, as `fit` does, and for a slice in flight (`whenIdle`), and
     /// samples what to tell when it tells it, so a report that waited tells
     /// what is current, and the ones behind it what changed since: none.
-    func publish() {
-        guard !resetting, !presenter.resetting else { return } // (a sheet a reset dismisses is the old tree's: never told the runtime replacing it)
+    package func publish() {
+        guard viewChanges == 0, !resetting, !presenter.resetting else { return } // (a sheet a reset dismisses is the old tree's: never told the runtime replacing it)
         presenter.nativeGeometry.changed()
         if presenter.applying {
             presenter.afterBatch { [weak self] in self?.publish() }
@@ -301,15 +313,28 @@ final class OwnerBlocks {
 
     /// What changed since the runtime was last told, told now.
     private func tell() {
-        guard !resetting, !presenter.resetting, let session = presenter.session, session.state != .destroyed else { return }
+        guard viewChanges == 0, !resetting, !presenter.resetting, let session = presenter.session, session.state != .destroyed else { return }
         // A callback the runtime waits on can make no runtime call: tell
         // once it returns, as `ExactView.fit` resizes then
         if Owner.shared.isServingMain {
             DispatchQueue.main.async { [weak self] in self?.publish() }
             return
         }
+        let records = takeChanges()
+        if !records.isEmpty {
+            session.applyUnlessEmpty(session.runtime.blocks(records), scrolled: true)
+        }
+        revealIfOwed()
+    }
+
+    /// Sample after UIKit has established containing bounds. A pending fill keeps
+    /// its deferred report, which samples again when that fill lands.
+    func takeChanges() -> Data {
+        guard !resetting, !presenter.resetting, !presenter.applying,
+              !Owner.shared.isServingMain, let session = presenter.session,
+              session.state != .destroyed, !session.fillInFlight else { return Data() }
         var now: [UInt32: (block: HostBlock, placement: BlockPlacement?)] = [:]
-        for (id, block) in presenter.menus.sheets.containingBlocks { now[id] = (block, nil) }
+        for (id, block) in presenter.dialogs.containingBlocks { now[id] = (block, nil) }
         for (route, view, block, shown, presented) in routes {
             let id = route.node.id
             guard shown else {
@@ -335,9 +360,10 @@ final class OwnerBlocks {
         // A block taken back forgets its placement with it
         blocks += told.keys.filter { now[$0] == nil && presenter.views[$0] != nil }.map { ($0, nil) }
         told = now
-        if !blocks.isEmpty || !placements.isEmpty {
-            session.applyUnlessEmpty(session.runtime.blocks(blocks, placements: placements), scrolled: true)
-        }
+        return Runtime.blockRecords(blocks, placements: placements)
+    }
+
+    private func revealIfOwed() {
         // Reveal against the blocks just told, after their pending fill
         if revealOwed {
             revealOwed = false
@@ -362,7 +388,7 @@ final class OwnerBlocks {
     /// turned panel would be its bounding box. The conversion leaves out
     /// the owner's transform and every ancestor's, which the runner applies
     /// itself. None while the owner is not in the window.
-    private func placement(of route: RouteController, block: CGRect, in view: UIView) -> BlockPlacement? {
+    private func placement(of route: any RouteSurface, block: CGRect, in view: UIView) -> BlockPlacement? {
         guard let owner = presenter.navigation.container, owner.window != nil, owner.window === view.window else { return nil }
         return BlockPlacement(rect: NativeGeometry.convert(block, from: view, to: owner), within: owner.id, contentOffset: route.contentViewport?.contentOffset)
     }
@@ -384,8 +410,8 @@ extension Presenter {
     /// 1123 D2). A popover's current host decides which sheet it is above:
     /// one opened earlier or outside the dialog stays beneath its card.
     /// The last modal boundary leaves only it and what is above it live.
-    package var openTopLayer: (frames: [TopLayerFrame], modal: Int?) {
-        let boxes = owners.presented + menus.sheets.presented + menus.presented.map {
+    package var openTopLayer: TopLayerGeometry {
+        let boxes = owners.presented + dialogs.presented + menus.presented.map {
             // Reported by its block, the viewport's (stage 14 B), as a dialog's sheet is.
             TopLayerBox(view: $0, frame: ($0.id, $0.topLayerFrame(in: viewport, containingBlock: owners.blockRects[$0.id]), nil), modal: nil)
         }
@@ -411,10 +437,14 @@ extension Presenter {
         let modal = topModal.flatMap { controller in
             ordered.firstIndex { $0.modal === controller }.map { at in ordered[..<at].filter { $0.frame != nil }.count }
         }
-        if let confirmation = menus.nativeConfirmation {
-            return (frames + [(confirmation.id, CGRect.zero, nil)], menus.openModally(confirmation) == true ? frames.count : modal)
+        let backdrop = ordered.last { $0.modal === topModal && $0.modal != nil }.flatMap { box -> TopLayerBackdrop? in
+            guard let id = box.frame?.0, let region = box.backdrop else { return nil }
+            return (id, region.bounds, region.excluding)
         }
-        return (frames, modal)
+        if let confirmation = menus.nativeConfirmation {
+            return (frames + [(confirmation.id, CGRect.zero, nil)], menus.openModally(confirmation) == true ? frames.count : modal, menus.openModally(confirmation) == true ? nil : backdrop)
+        }
+        return (frames, modal, backdrop)
     }
     package var openTopLayerFrames: [(UInt32, CGRect)] { openTopLayer.frames.map { ($0.0, $0.1) } }
 

@@ -256,7 +256,7 @@ final class MouseChain {
     /// Rule 4's rank on one node, the tie-break after depth.
     var ranked: [MouseRecognizer] {
         guard let p = presenter else { return [] }
-        return [p.mouseDrags.reorder, p.mouseDrags.transform, p.mouseDrags.height, p.mouseLayoutPan, p.mouseSwipe]
+        return [p.reorders.mouse, p.mouseDrags.transform, p.mouseDrags.height, p.mouseLayoutPan, p.mouseSwipe]
     }
     /// Arms every recognizer once per event (forwarding reaches the
     /// ancestors' overrides with the same event). The `press` arms too, as on
@@ -615,7 +615,7 @@ extension Presenter {
     var pointerHolds: Bool { pointerHeld != nil || !pointerPath.isEmpty }
     /// A window point from the viewport's top-left, the page scroll applied:
     /// DOM's `clientX`/`clientY`, `frame()`'s space (LLP 1094 D11).
-    func client(_ windowPoint: NSPoint) -> NSPoint {
+    package func client(_ windowPoint: NSPoint) -> NSPoint {
         let clip = viewport.contentView, p = clip.convert(windowPoint, from: nil)
         return NSPoint(x: p.x - clip.bounds.minX, y: p.y - clip.bounds.minY)
     }
@@ -708,7 +708,7 @@ extension Presenter {
     /// Ancestor tracking exits cannot evict a child under visible overflow.
     func hoverAt(_ point: NSPoint) -> NodeView? {
         // The page, or a split's detail pane beside it (LLP 1115.002 D4).
-        let pane = navigation.split.active ? navigation.split.controller?.detailPane : nil
+        let pane = navigation.stackSplit.active ? navigation.stackSplit.detailPane : nil
         let ports = [viewport] + [pane].compactMap { $0 }
         guard let content = viewport.window?.contentView,
               ports.contains(where: { $0.bounds.contains($0.convert(point, from: nil)) }) else {
@@ -724,7 +724,7 @@ extension Presenter {
             if let node = current as? NodeView, !node.inert {
                 if leaf == nil { leaf = node }
                 path.append(node)
-            } else if leaf == nil, current is RegionSurfaceMac { region = true }
+            } else if leaf == nil, ContentRegionLink.isSurface?(current) == true { region = true }
             // A subtree in the pane is its authored parent's, out in the page.
             view = pane != nil && current.superview === pane ? authoredSuperview(of: current) : current.superview
         }
@@ -733,7 +733,7 @@ extension Presenter {
         pointerCursor(over: leaf, at: point, region: region)
         return leaf
     }
-    func trackPointer(_ event: NSEvent) {
+    package func trackPointer(_ event: NSEvent) {
         guard trackedPointerEvent !== event else { return }
         // A move in a popover's or a sheet's own window is that window's
         // (`BlockView.pointerTracking`); the page's hover is left as it is.

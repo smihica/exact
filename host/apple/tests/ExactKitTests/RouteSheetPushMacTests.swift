@@ -2,6 +2,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class RouteSheetPushMacTests: XCTestCase {
     private func make(navigate: Bool = false, closedby: String = "closerequest", detail: String = "", detailClosedby: String = "closerequest", bar: Bool = true, heading: Bool = true) throws -> SheetFixture {
@@ -82,8 +83,8 @@ final class RouteSheetPushMacTests: XCTestCase {
                     XCTAssertGreaterThan(chrome.back.frame.minY, 0)
                     XCTAssertLessThan(chrome.back.frame.maxY, RouteChrome.titleRow)
                     chrome.back.performClick(nil); f.settle()
-                    XCTAssertNil(f.presenter.navigation.pushedRoute)
-                } else { XCTAssertTrue(f.presenter.navigation.goBack()) }
+                    XCTAssertNil(f.presenter.navigationHost.pushedRoute)
+                } else { XCTAssertTrue(f.presenter.navigationHost.goBack()) }
             }
         }
     }
@@ -123,7 +124,7 @@ final class RouteSheetPushMacTests: XCTestCase {
         key(47, ".", .command, in: none)
         XCTAssertTrue(none.presenter.dialogs.active === detail)
         XCTAssertFalse(outside(none))
-        XCTAssertTrue(none.presenter.navigation.goBack()); none.settle()
+        XCTAssertTrue(none.presenter.navigationHost.goBack()); none.settle()
         let modal = try none.node("modal")
         key(53, "\u{1b}", in: none)
         XCTAssertTrue(none.presenter.dialogs.active === modal)
@@ -133,7 +134,7 @@ final class RouteSheetPushMacTests: XCTestCase {
             let any = try make(closedby: "any", detailClosedby: "none")
             defer { any.close() }
             try any.press("open"); try any.press("push")
-            if popFirst { XCTAssertTrue(any.presenter.navigation.goBack()); any.settle() }
+            if popFirst { XCTAssertTrue(any.presenter.navigationHost.goBack()); any.settle() }
             XCTAssertTrue(outside(any))
             XCTAssertNil(any.window.attachedSheet)
         }
@@ -145,23 +146,23 @@ final class RouteSheetPushMacTests: XCTestCase {
             defer { f.close() }
             try f.press("open"); try f.press("push")
             let route = try f.node("detail")
-            XCTAssertTrue(f.presenter.navigation.canGoBack)
+            XCTAssertTrue(f.presenter.navigationHost.canGoBack)
             try f.press("ask")
             XCTAssertNotNil(f.presenter.alerts.modal)
-            XCTAssertFalse(f.presenter.navigation.canGoBack)
-            XCTAssertFalse(try XCTUnwrap(f.presenter.navigation.agentBack()).refused.isEmpty)
-            XCTAssertTrue(f.presenter.navigation.pushedRoute?.route === route)
+            XCTAssertFalse(f.presenter.navigationHost.canGoBack)
+            XCTAssertFalse(try XCTUnwrap(f.presenter.navigationHost.agentBack()).refused.isEmpty)
+            XCTAssertTrue(f.presenter.navigationHost.pushedRoute?.route === route)
             XCTAssertTrue(f.presenter.alerts.key("Enter")); f.settle()
             let sheet = try XCTUnwrap(route.window), cover = NSWindow()
             sheet.beginSheet(cover)
-            XCTAssertFalse(f.presenter.navigation.canGoBack)
-            XCTAssertFalse(f.presenter.navigation.goBack())
-            XCTAssertTrue(f.presenter.navigation.pushedRoute?.route === route)
+            XCTAssertFalse(f.presenter.navigationHost.canGoBack)
+            XCTAssertFalse(f.presenter.navigationHost.goBack())
+            XCTAssertTrue(f.presenter.navigationHost.pushedRoute?.route === route)
             sheet.endSheet(cover)
             let limit = Date().addingTimeInterval(2)
             while sheet.attachedSheet != nil && Date() < limit { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01)) }
-            XCTAssertTrue(f.presenter.navigation.goBack()); f.settle()
-            XCTAssertNil(f.presenter.navigation.pushedRoute)
+            XCTAssertTrue(f.presenter.navigationHost.goBack()); f.settle()
+            XCTAssertNil(f.presenter.navigationHost.pushedRoute)
         }
     }
 }

@@ -2,6 +2,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 /// x2apps survey #2 on AppKit: `input type="radio"` is AppKit's radio button
 /// in a group Exact owns by `name` — a click checks it and unchecks the rest

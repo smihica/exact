@@ -93,7 +93,24 @@ pub type NativeCall = std::sync::Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + 
 /// JSON body and the reply to send when it is done.
 pub type NativeHandler = std::sync::Arc<dyn Fn(Vec<u8>, crate::Reply) + Send + Sync>;
 
+thread_local! {
+    static LIBRARY_LOAD_TIME: std::cell::Cell<std::time::Duration> = const {
+        std::cell::Cell::new(std::time::Duration::ZERO)
+    };
+}
+
 impl Native {
+    /// The host's library mapping inside this thread's synchronous calls
+    /// (LLP 1067.000.001 D7), excluded only from a turn's wall backstop.
+    pub fn record_library_load(time: std::time::Duration) {
+        LIBRARY_LOAD_TIME.with(|total| total.set(total.get().saturating_add(time)));
+    }
+
+    /// Cumulative mapping time on the calling thread, independent of its source.
+    pub fn library_load_time() -> std::time::Duration {
+        LIBRARY_LOAD_TIME.with(std::cell::Cell::get)
+    }
+
     /// Fill the slot (activation) or empty it (unload).
     pub fn set(&self, handler: Option<NativeHandler>) {
         *self.0.handler.lock().unwrap_or_else(|e| e.into_inner()) = handler;
@@ -110,6 +127,27 @@ impl Native {
         own.or_else(|| {
             self.0
                 .hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+    }
+
+    /// The handler for a module's (package's) calls: the host's app module,
+    /// where packages live, before the source's own. A data module's native
+    /// module (a Rust library in the slot, LLP 1154 D3) answers its own
+    /// `native.later` through [`Native::handler`], so it cannot shadow every
+    /// package when the app links both.
+    pub fn extension_handler(&self) -> Option<NativeHandler> {
+        let hosted = self
+            .0
+            .hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        hosted.or_else(|| {
+            self.0
+                .handler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
@@ -142,10 +180,9 @@ impl Native {
             let named = serde_json::from_slice::<serde_json::Value>(body)
                 .ok()
                 .and_then(|v| {
+                    let (extension, sync) = Native::sync_form(&v)?;
                     Some(format!(
-                        "{}.{}{}",
-                        v.get("extension")?.as_str()?,
-                        v.get("sync")?.as_str()?,
+                        "{extension}.{sync}{}",
                         v["owner"]
                             .as_str()
                             .map(|s| format!("#{s}"))
@@ -163,6 +200,18 @@ impl Native {
                 None => Ok(br#"{"error":"NotSupportedError"}"#.to_vec()),
             }
         }))
+    }
+
+    /// A module's (package's) synchronous form, `{"extension", "sync",
+    /// "args"}`: its extension and sync names, or `None` for any other
+    /// request, such as an app's own `native.call` that carries an
+    /// `extension` field. [`Native::hosted_call`] answers by it and a source
+    /// with a native module of its own sends the host only what it accepts.
+    pub fn sync_form(request: &serde_json::Value) -> Option<(&str, &str)> {
+        Some((
+            request.get("extension")?.as_str()?,
+            request.get("sync")?.as_str()?,
+        ))
     }
 
     /// The modules' synchronous answers now (the runner's).
@@ -277,6 +326,32 @@ pub struct Overlaid {
     pub keep: Vec<u64>,
 }
 
+/// A data module's report (LLP 1175 D3): a plain HTTP request a listener for
+/// its global's error events made while it was dispatched. No answer waits
+/// for it. The runner runs it as module work ([`DataSource::take_reports`]),
+/// with the authority its own records give `by`.
+#[derive(Debug)]
+pub struct Report {
+    /// The source's token for the reply ([`DataSource::module_delivery`]).
+    pub token: u64,
+    /// The request, with no reach yet: the runner stamps it.
+    pub request: crate::request::Request,
+    /// Whose turn the listener interrupted.
+    pub by: Reporter,
+}
+
+/// Whose turn a report was made in, as the source knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reporter {
+    /// The answer for this target was running when the event was dispatched.
+    Answer(Target),
+    /// A tool's handler was running.
+    Tool,
+    /// No answer was: a background round, a module turn, or a step of an
+    /// answer outside its own turn.
+    None,
+}
+
 /// What a request answers: a runtime resource row, a plan mutation, or one
 /// send of a `parallel` mutation. The runner keeps one answer
 /// in flight per target, with a set of requests for a resource (LLP 1162 D2).
@@ -364,7 +439,7 @@ macro_rules! data_source {
         /// The app's data source: the one seam through which computation enters
         /// (LLP 1004 D4). Leaves implement this trait; sources that wrap another
         /// implement [`DataSourceWrapper`] to handle host capabilities explicitly.
-        pub trait DataSource {
+        pub trait DataSource: 'static {
             $(
                 $(#[$new_doc])*
                 fn $new(&mut $new_self, $($new_arg: $new_type),*) -> $new_result $new_body
@@ -410,7 +485,7 @@ macro_rules! data_source {
             )*
         }
 
-        impl<T: DataSourceWrapper + ?Sized> DataSource for T {
+        impl<T: DataSourceWrapper + ?Sized + 'static> DataSource for T {
             $(
                 fn $new(&mut $new_self, $($new_arg: $new_type),*) -> $new_result {
                     <T as DataSourceWrapper>::$new($new_self, $($new_arg),*)
@@ -475,6 +550,12 @@ data_source! {
         let _ = owner;
     }
 
+    /// This source answers a process that renders the web's pages, at build
+    /// or while serving: what it renders must be what the browser's bundle
+    /// reads, so a setting a launch may give reads the build's value (LLP
+    /// 1153.002 D2). Called before activation; a wrapper passes it on.
+    fn render_web(&mut self) {}
+
     /// Host-selected application directories. Configuration records paths only;
     /// implementations must defer opening storage until after first pixel.
     fn configure_storage(
@@ -498,7 +579,9 @@ data_source! {
 
     /// Take native work for an executor-local continuation exactly once. The
     /// closure owns its inputs and runs on the host worker, never the renderer.
-    /// Missing or consumed tokens are refused by that executor.
+    /// Missing or consumed tokens are refused by that executor. A source that
+    /// hands one out declares it ([`crate::HostWork`]), which the bake reads
+    /// to link the executor into an Apple production binary (LLP 1047.001 D12).
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
         let _ = token;
         None
@@ -599,7 +682,10 @@ data_source! {
     /// go. A call this source set aside is dropped unless `let_go` names it;
     /// after a `refused` commit, one whose request is in flight again is put
     /// back instead, and its replacement dropped. A source that forwards
-    /// `background` forwards this and `module_landed`.
+    /// `background` forwards this and `module_landed`. `store` is the Store
+    /// as committed when the requests were let go, read-only and outside a
+    /// worker's ordered set (LLP 1027.002 Change 2): nothing here may depend on
+    /// what a turn still in flight could change.
     fn keep_sent(
         &mut self,
         store: &Store,
@@ -642,6 +728,15 @@ data_source! {
         Ok(())
     }
 
+    /// The reports the module made since the last take (LLP 1175 D3). The
+    /// runner takes them after every call into the source and runs each as
+    /// module work, its reply delivered under its token
+    /// ([`DataSource::module_delivery`]). A source that forwards
+    /// `module_landed` forwards this.
+    fn take_reports(&mut self) -> Vec<Report> {
+        Vec::new()
+    }
+
     /// The module's background storage now, or `None` for a source that
     /// has none (LLP 1097 D8).
     fn background_state(&self) -> Option<BackgroundState> {
@@ -652,6 +747,10 @@ data_source! {
     /// D8): console output, including a refused answer's turn, plus failed
     /// storage and unhandled rejections. The runner writes them to the
     /// journal after each answer and reply, and after a background round.
+    /// A line the app's `console` wrote is marked with its method
+    /// ([`Console::mark`](crate::Console::mark)): the runner journals it as
+    /// `console: …` and hands it to the host's sink
+    /// ([`Runner::set_console`](crate::Runner::set_console), LLP 1027.009).
     fn take_logs(&mut self) -> Vec<String> {
         Vec::new()
     }
@@ -1055,6 +1154,49 @@ impl std::fmt::Display for DataError {
             | Self::Overrun(reason)
             | Self::Failed(_, reason, _) => f.write_str(reason),
         }
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    #[test]
+    fn a_module_call_reaches_the_host_module_beside_a_source_native_module() {
+        let slot = super::Native::default();
+        let tag = |t: &'static str| -> super::NativeHandler {
+            std::sync::Arc::new(move |_body, reply: crate::Reply| {
+                reply.send(crate::Outcome::Response(crate::Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: t.as_bytes().to_vec(),
+                }))
+            })
+        };
+        let run = |h: Option<super::NativeHandler>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            h.expect("a handler")(Vec::new(), crate::Reply::new(move |o| tx.send(o).unwrap()));
+            match rx.recv().unwrap() {
+                crate::Outcome::Response(r) => String::from_utf8(r.body).unwrap(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(slot.extension_handler().is_none());
+        slot.set(Some(tag("source")));
+        assert_eq!(
+            run(slot.extension_handler()),
+            "source",
+            "no host module: the source's own answers"
+        );
+        slot.host(Some(tag("host")));
+        assert_eq!(
+            run(slot.extension_handler()),
+            "host",
+            "packages live in the host's module"
+        );
+        assert_eq!(
+            run(slot.handler()),
+            "source",
+            "the source's own native.later stays its own"
+        );
     }
 }
 

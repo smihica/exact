@@ -78,7 +78,7 @@ extension NodeView {
         }
         return found
     }
-    private static let controlRoles: Set<String> = ["button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+    static let controlRoles: Set<String> = ["button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
                                                     "option", "checkbox", "radio", "switch", "treeitem", "slider", "spinbutton"]
     private static let chromeRoles: Set<String> = ["toolbar", "tablist", "menubar", "menu", "listbox", "tree"]
     /// A control: a node a press acts on, a button, or one in a control's role
@@ -88,7 +88,7 @@ extension NodeView {
     #if !os(macOS)
     /// Whether a press here does something: its own action, its link, or
     /// the popover or command a button names (the Mac's `pressable`).
-    var pressable: Bool { handlers.contains("press") || defaultLink != nil || presenter?.invocation(of: self) != nil }
+    package var pressable: Bool { handlers.contains("press") || defaultLink != nil || presenter?.invocation(of: self) != nil }
     #endif
     #if os(tvOS)
     // tvOS has no text selection (`TextSelectionIOS.swift` is iOS's).

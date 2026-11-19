@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactVideo
 
 /// Chrome 154's rule for a muted video its autoplay attribute started (LLP 1042 §3).
 final class OffscreenAutoplayTests: XCTestCase {

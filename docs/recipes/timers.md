@@ -1,6 +1,6 @@
 # Recipe: timers
 
-A `task`, the root's ([a child's](timer-in-a-component.md)), is the only timer: `every(ms,
+A `task`, in the root or [a child at a bounded use](timer-in-a-component.md), is the only timer: `every(ms,
 action)` repeats, `after(ms, action)` fires once, `when cond` arms it while it holds, so
 start and stop are a state. A countdown, its readout and button in the list's first row:
 
@@ -33,7 +33,7 @@ component Tea
     minutes = m
     finished = false
   view
-    main navigationKey=`${top(nav).id}` navigationBack="back" testId="app" width="100%" height="100%"
+    main navigationKey=`${top(nav).id}` testId="app" width="100%" height="100%"
       for e in stack(nav) key=e.id
         column navigationKey=`${e.id}` navigationScroll="presets" position="absolute" inset=0
           display="flex" flex-direction="column"

@@ -16,6 +16,7 @@ pub(crate) mod button;
 pub(crate) mod control_text;
 pub(crate) mod defaults;
 mod inline_image;
+mod styles;
 pub mod text_style;
 
 use taffy::NodeId;
@@ -64,6 +65,16 @@ pub struct NodeArena {
     // @ref LLP 1043.000 §3 D4 — no per-node vector or allocation.
     pub(crate) flow: IdMap<u32, crate::flow::FlowState>,
     pub(crate) exclusion_slots: SlotSet,
+    /// The boxes that reserve on some edge (LLP 1123 D11): none, in most
+    /// documents, lets layout and observations skip asking each box.
+    pub(crate) reserving: SlotSet,
+    /// The boxes that ignore the container region on some edge (LLP 1123
+    /// D4), which the solve measures.
+    pub(crate) ignoring: SlotSet,
+    /// What each node's lengths read of its own environment (LLP 1123 D9).
+    pub(crate) readers: crate::kernel::readers::Readers,
+    /// The owners' bands and the readers' observations (LLP 1123 D9).
+    pub(crate) observations: crate::kernel::observe::Observations,
     /// @ref LLP 1093 D7 — multi-column containers and their last cuts.
     pub(crate) frag: crate::fragment::FragState,
     /// Relative rows and the slots whose inputs changed (LLP 1069.000 D3).
@@ -83,6 +94,8 @@ pub struct NodeArena {
     pub(crate) bar_symbols: Vec<(u32, f32)>,
     /// Slots that are `position: sticky` (LLP 1083 D3).
     pub(crate) sticky_slots: SlotSet,
+    /// Slots whose node carries `navigationBack`, attached or not (bars.rs).
+    pub(crate) navigation_slots: SlotSet,
     /// Slots in HTML's top layer: popovers, unless their author made them
     /// sticky (`top_layer::lifted`). Each is laid out in the viewport, a
     /// block the kernel implies (`Kernel::imply_blocks`).
@@ -102,6 +115,7 @@ pub struct NodeArena {
     /// host says and its next commit applies.
     pub(crate) bold_text: bool,
     pub(crate) bold_text_next: Option<bool>,
+    pub(crate) natural_text: bool, // `Kernel::set_natural_text` (LLP 1060.000 D3)
     /// Which font stacks are the system's, by id, as the plan says.
     pub(crate) system_stacks: Vec<bool>,
     /// Scrollable overflow from the last layout: the content's extent in the
@@ -183,6 +197,10 @@ impl Clone for NodeArena {
             frames: self.frames.clone(),
             flow: self.flow.clone(),
             exclusion_slots: self.exclusion_slots.clone(),
+            reserving: self.reserving.clone(),
+            ignoring: self.ignoring.clone(),
+            readers: self.readers.clone(),
+            observations: self.observations.clone(),
             frag: self.frag.clone(),
             relative: self.relative.clone(),
             symbols_owed: self.symbols_owed.clone(),
@@ -191,6 +209,7 @@ impl Clone for NodeArena {
             mark_reports: self.mark_reports.clone(),
             bar_symbols: self.bar_symbols.clone(),
             sticky_slots: self.sticky_slots.clone(),
+            navigation_slots: self.navigation_slots.clone(),
             top_layer_slots: self.top_layer_slots.clone(),
             timelines: self.timelines.clone(),
             root_font_size_next: self.root_font_size_next,
@@ -198,6 +217,7 @@ impl Clone for NodeArena {
             display_scale_next: self.display_scale_next,
             bold_text: self.bold_text,
             bold_text_next: self.bold_text_next,
+            natural_text: self.natural_text,
             system_stacks: self.system_stacks.clone(),
             contents: self.contents.clone(),
             insets: self.insets.clone(),
@@ -258,6 +278,8 @@ impl NodeArena {
     /// kernel's to re-derive (`Kernel::set_env`).
     pub fn set_env(&mut self, env: Env) {
         self.env = env;
+        self.readers.invalidate();
+        self.observations.invalidate();
         self.refresh_control_styles();
     }
     /// Forget every allocation while retaining each slot's generation.
@@ -274,6 +296,10 @@ impl NodeArena {
         self.fit_scales.clear();
         self.flow.clear();
         self.exclusion_slots.clear();
+        self.reserving.clear();
+        self.ignoring.clear();
+        self.readers.clear();
+        self.observations = self.observations.after_reset();
         self.frag = Default::default();
         self.relative = Default::default();
         self.symbols_owed.clear();
@@ -283,6 +309,7 @@ impl NodeArena {
         self.bar_symbols.clear();
         self.sticky_slots.clear();
         self.top_layer_slots.clear();
+        self.navigation_slots.clear();
         self.timelines = Default::default();
         for slot in 0..self.live.len() {
             self.live[slot] = false;
@@ -581,6 +608,17 @@ impl NodeArena {
         copy
     }
 
+    /// Take as spent the text revisions a trial copied from this arena gave
+    /// (`trial_copy`), so that no later revision here gives one again. A
+    /// trial that renewed its namespace leaves this arena to renew its own
+    /// at its next revision.
+    pub(crate) fn spend_text_revisions(&mut self, trial: &Self) {
+        self.text_serial = match trial.text_domain == self.text_domain {
+            true => self.text_serial.max(trial.text_serial),
+            false => u64::MAX,
+        };
+    }
+
     pub(crate) fn renew_text_namespace(&mut self) {
         self.text_domain = TextDomain::default();
         self.text_serial = 0;
@@ -657,7 +695,9 @@ impl NodeArena {
                 self.copy_inherited(slot, rows, take)
             });
         paragraph.markup = self.markup(slot);
-        // Bold Text, as its runs are (LLP 1115.000 D12.3).
+        paragraph.natural = crate::text::natural::is_natural(self, slot)
+            && paragraph.markup != crate::text::Markup::Markdown; // its source is not what it shows
+                                                                  // Bold Text, as its runs are (LLP 1115.000 D12.3).
         self.embolden(slot, &mut paragraph.strut);
         if scale != 1.0 {
             paragraph.strut = paragraph.strut.scaled(scale);
@@ -922,6 +962,10 @@ impl NodeArena {
         self.field_content.remove(&slot);
         self.mark_reports.remove(&slot);
         self.exclusion_slots.remove(slot);
+        self.reserving.remove(slot);
+        self.ignoring.remove(slot);
+        self.readers.forget(slot);
+        self.observations.forget(slot);
         self.frag.forget(slot);
         self.relative.forget(slot);
         self.symbols_owed.remove(slot);
@@ -970,6 +1014,8 @@ impl NodeArena {
         }
         if self.parents[slot as usize] != parent {
             self.relative.invalidate(slot);
+            self.readers.moved();
+            self.observations.moved(slot);
         }
         self.parents[slot as usize] = parent;
     }
@@ -1034,50 +1080,6 @@ impl NodeArena {
         }
     }
 
-    /// A test's write in place, copied first when shared. Production writes
-    /// go through [`set_style`](Self::set_style), which keeps an unset row
-    /// at its initial value, as sharing assumes.
-    #[cfg(test)]
-    pub(crate) fn style_mut(&mut self, slot: u32) -> &mut StyleProps {
-        Rc::make_mut(&mut self.styles[slot as usize])
-    }
-
-    /// Replace the slot's style, sharing an equal one's allocation.
-    pub(crate) fn set_style(&mut self, slot: u32, style: StyleProps) {
-        let style = self.shared.intern(style);
-        self.set_shared_style(slot, style);
-    }
-
-    /// Patch a slot without copying a style another node already holds.
-    pub(crate) fn patch_style(&mut self, slot: u32, patch: &StyleProps) {
-        let style = self.shared.patch(&self.styles[slot as usize], patch);
-        self.set_shared_style(slot, style);
-    }
-
-    /// Clear rows without copying a style another node already holds.
-    pub(crate) fn clear_style(&mut self, slot: u32, mask: crate::StyleMask, written: bool) {
-        let style = self
-            .shared
-            .clear(&self.styles[slot as usize], mask, written);
-        self.set_shared_style(slot, style);
-    }
-
-    fn set_shared_style(&mut self, slot: u32, style: Rc<StyleProps>) {
-        self.relative.update(slot, !style.relative.is_empty());
-        if crate::fragment::is_multicol(&style) {
-            self.frag.containers.insert(slot);
-        } else {
-            self.frag.containers.remove(slot);
-        }
-        self.styles[slot as usize] = style;
-        self.refresh_sticky(slot);
-    }
-
-    /// Distinct styles the arena holds for its nodes, beyond the initial one.
-    pub fn shared_style_count(&self) -> usize {
-        self.shared.len()
-    }
-
     /// Set a prop; the previous value.
     pub(crate) fn set_prop(
         &mut self,
@@ -1088,6 +1090,7 @@ impl NodeArena {
         let old = self.props[slot as usize].set(id, value);
         if old.is_none() {
             bump(&mut self.prop_counts, id as usize, true);
+            self.note_navigation(slot, id, true);
         }
         old
     }
@@ -1097,6 +1100,7 @@ impl NodeArena {
         let old = self.props[slot as usize].remove(id);
         if old.is_some() {
             bump(&mut self.prop_counts, id as usize, false);
+            self.note_navigation(slot, id, false);
         }
         old
     }
@@ -1105,6 +1109,7 @@ impl NodeArena {
         for (id, _) in self.props[slot as usize].iter() {
             bump(&mut self.prop_counts, id as usize, false);
         }
+        self.navigation_slots.remove(slot);
     }
 
     /// Whether any live node (attached or not) has prop `id`.
@@ -1211,9 +1216,7 @@ impl NodeArena {
             }
             Some(inset) => {
                 self.insets.insert(slot);
-                // Bitwise, so a -0 comes back as it went in.
-                let zero = |v: &[f32; 4]| v.iter().all(|x| x.to_bits() == 0);
-                if zero(&inset.padding) && zero(&inset.border) && zero(&inset.cover) {
+                if inset.is_zero() {
                     self.nonzero_insets.remove(&slot);
                 } else {
                     self.nonzero_insets.insert(slot, inset);
@@ -1333,6 +1336,7 @@ mod tests {
             (StyleId::TextColor, text("light-dark(#112233, #ffffff)")),
             (StyleId::WhiteSpace, text("pre-wrap")),
             (StyleId::DynamicRangeLimit, text("constrained")),
+            (StyleId::ImageRendering, text("pixelated")),
             (StyleId::ColorScheme, text("dark")),
             // LLP 1121 D5: the app tuple, plus one.
             (StyleId::Mode, number(2.0)),

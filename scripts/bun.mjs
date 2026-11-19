@@ -1,7 +1,8 @@
 // @ref LLP 1086 D12 — launchers use the pinned Bun independently of login-shell PATH.
 import { noteBunLoaded } from '../js/bake/src/__exact_env.mjs';
-/** Self-contained so generated app launchers carry the same resolver. */
+import { preservePaths } from './paths.mjs';
 export function ensureBun(pin) {
+  preservePaths();
   const {existsSync, realpathSync} = require('node:fs');
   const {dirname, resolve, delimiter} = require('node:path');
   const {homedir} = require('node:os');

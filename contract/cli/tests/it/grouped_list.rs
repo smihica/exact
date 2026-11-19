@@ -8,6 +8,8 @@ use exact_kernel::{
 };
 use exact_runner::{DataError, DataSource, Runner, Value};
 
+mod cards;
+
 pub(super) struct NoData;
 impl DataSource for NoData {
     fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
@@ -77,7 +79,7 @@ const SETTINGS: &str = "list appearance=\"auto\" testId=\"list\" flex=1
     button press=go testId=\"profile\"
       image \"symbol:sf/person.circle\"
       text \"Profile\" testId=\"profile-title\"
-      image \"symbol:sf/chevron.right\"
+      image \"symbol:sf/chevron.right\" testId=\"profile-chevron\"
     button press=go testId=\"notes\"
       image \"symbol:sf/bell\"
       text \"Notifications\"
@@ -122,6 +124,7 @@ fn the_kernel_reads_sections_and_rows_as_a_native_list_draws_them() {
             symbol: Some("person.circle".into()),
             title: Some("Profile".into()),
             accessory: Accessory::Disclosure,
+            accessory_view: Some(id(&r, "profile-chevron")),
             pressable: true,
             ..GroupedRow::default()
         }
@@ -726,7 +729,7 @@ fn a_field_goes_under_its_label_when_both_do_not_fit() {
         let style = |t: &str| k.node(id(&r, t)).unwrap().computed_style(StyleMask::ALL);
         let wrap = style("menu-row").flex_wrap;
         assert_eq!(wrap, exact_kernel::FlexWrap::Wrap, "{root}: wraps");
-        let basis = style("aisle").flex_basis;
+        let basis = style("aisle").flex_basis.clone();
         assert_eq!(basis, exact_kernel::Dimension::Auto, "{root}: grown");
         for (label, field) in [("date-label", "date"), ("menu-label", "menu")] {
             let (l, f) = (frame(label), frame(field));
@@ -758,48 +761,6 @@ fn a_hidden_text_in_a_subtitle_column_and_a_hidden_first_line() {
         size(&r) < alone,
         "the title alone, then the 15-pt second line under `Privacy`"
     );
-}
-
-#[test]
-fn a_transparent_section_has_no_card() {
-    let r = boot("list appearance=\"auto\" testId=\"list\" flex=1\n  section background-color=\"transparent\" testId=\"head\"\n    row testId=\"profile\"\n      image \"avatar.png\" width=80 height=80\n      text \"Maya Chen\"\n  section\n    button press=go testId=\"mute\"\n      text \"Mute\"");
-    let k = r.kernel();
-    let list = k.grouped_list(id(&r, "list")).unwrap();
-    assert!(
-        !list.sections[0].card,
-        "background-color=\"transparent\" drops the card"
-    );
-    assert!(list.sections[1].card, "a section is on a card by default");
-    // The sheet's group (the rows' column) takes the colour; the section
-    // itself keeps none, so the web and the sheet's hosts draw no card either.
-    let head = k.node(id(&r, "head")).unwrap();
-    let group = k.node(head.children()[0]).unwrap();
-    let transparent = group
-        .style
-        .background_color
-        .is_some_and(|c| c.resolve(false).a() == 0 && c.resolve(true).a() == 0);
-    assert!(transparent, "the group's background is the section's");
-    assert!(
-        head.style
-            .background_color
-            .is_none_or(|c| c.resolve(false).a() == 0),
-        "and the section paints none of its own"
-    );
-}
-
-#[test]
-fn a_cardless_section_draws_no_separators_and_takes_only_transparent() {
-    let r = boot("list appearance=\"auto\" testId=\"list\" flex=1\n  section background-color=\"transparent\"\n    button press=go testId=\"a\"\n      text \"A\"\n    button press=go testId=\"b\"\n      text \"B\"");
-    let k = r.kernel();
-    assert_eq!(
-        k.grouped_separator(id(&r, "a")),
-        None,
-        "no separator under a card-less row"
-    );
-    let m = refused(
-        "list appearance=\"auto\" flex=1\n  section background-color=\"#ff0000\"\n    text \"A\"",
-    );
-    assert!(m.contains("transparent"), "{m}");
 }
 
 #[test]
@@ -1496,4 +1457,32 @@ image "photo.png" color="-exact-system-red" width=20 height=20 testId="photo""#,
         "a symbol's `color` is its colour"
     );
     assert!(tint("photo").is_some(), "a raster is given no tint");
+}
+
+#[test]
+fn a_list_animates_its_changes_only_when_its_rows_ask_for_motion() {
+    // As a UIKit list applies its snapshots at once unless its code asks
+    // (`apply(_:animatingDifferences: true)`), a native list moves its rows
+    // only when they carry the motion a column's rows would: a layout
+    // transition (a move) or an exit animation (a removal).
+    let animates = |extra: &str| {
+        let r = boot_source(&format!(
+            "keyframes leave\n  to opacity=0\n\n{}",
+            app(&format!("list appearance=\"auto\" testId=\"list\" flex=1\n  section\n    button press=go {extra}\n      text \"Account\"\n    button press=go\n      text \"Chats\""))
+        ));
+        r.kernel().grouped_list(id(&r, "list")).unwrap().animates
+    };
+    assert!(!animates(""), "rows with no motion apply at once");
+    assert!(
+        !animates("-exact-layout-transition=\"none\""),
+        "nor with `none`"
+    );
+    assert!(
+        animates("-exact-layout-transition=\"320ms ease\""),
+        "a row's layout transition animates the list's moves"
+    );
+    assert!(
+        animates("-exact-exit-animation=\"leave 200ms ease-in both\""),
+        "a row's exit animation animates its removals"
+    );
 }

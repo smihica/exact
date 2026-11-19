@@ -23,13 +23,19 @@ use crate::request::{Reply, Request};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(super) fn with_authority(body: &[u8], scope: &str) -> Vec<u8> {
+    let mut body: Json = serde_json::from_slice(body).expect("forwarded module call");
+    body["authority"] = json!(scope);
+    body.to_string().into_bytes()
+}
+
 impl<D: DataSource> Runner<D> {
     /// The host's implementations answer `real` as in production, and
     /// `agent`, told they run under the agent, answer an interface that is
     /// its own substitute: their names' readers are asked again, of the
     /// module now, and each `agent` implementation is given the preferred
     /// values the agent set.
-    pub fn bind_extensions(&mut self, real: &[&str], agent: &[&str]) {
+    pub(super) fn bind_extensions_linked(&mut self, real: &[&str], agent: &[&str]) {
         self.extensions.bound = real.iter().map(|e| e.to_string()).collect();
         self.extensions.agent = (agent.iter())
             .filter(|e| !real.contains(e))
@@ -83,7 +89,7 @@ impl<D: DataSource> Runner<D> {
 
     /// A provider reports its physical name; every active declaration of
     /// that name watches its own qualified topic.
-    pub(in crate::runner) fn declaration_topics(&self, topics: Vec<String>) -> Vec<String> {
+    pub(super) fn declaration_topics_linked(&self, topics: Vec<String>) -> Vec<String> {
         let mut out = topics.clone();
         for topic in topics {
             for row in &self.plan.modules {
@@ -219,6 +225,15 @@ impl<D: DataSource> Runner<D> {
         if self.route(implementation) == Route::Agent {
             if let Some(preferred) = self.extensions.preferred.get(&self.key(implementation)) {
                 body["preferred"] = preferred.clone();
+            } else if let Some(from) = self.substitute(implementation)["from"]
+                .as_str()
+                .and_then(|key| self.plan.modules.iter().find(|row| self.key(row) == key))
+            {
+                // A substitute may consume another package's fixture, as
+                // still capture consumes window management's display list.
+                if let Some(value) = self.value_of(from) {
+                    body["preferred"] = value;
+                }
             }
         }
         let origin = match reader {
@@ -241,6 +256,11 @@ impl<D: DataSource> Runner<D> {
                     "denied": sub["permission"]["denied"],
                 });
             }
+        }
+        // A person's input stands (`provenance.rs`): the implementation may take
+        // the call as their act.
+        if self.user_activation(origin) {
+            body["userActivation"] = json!(true);
         }
         // A send's number, which `cancel` names if it is let go (LLP 1133.016 D15 item 2).
         if row.send {
@@ -271,7 +291,7 @@ impl<D: DataSource> Runner<D> {
 
     /// Request `ticket` went out with `body`: a send to an implementation
     /// is kept by its number until its reply lands.
-    pub(in crate::runner) fn note_send(&mut self, ticket: u64, body: &[u8]) {
+    pub(super) fn note_send_linked(&mut self, ticket: u64, body: &[u8]) {
         let Ok(v) = serde_json::from_slice::<Json>(body) else {
             return;
         };
@@ -289,7 +309,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Request `ticket`'s reply landed: its send is no longer cancelled.
-    pub(in crate::runner) fn landed_send(&mut self, ticket: u64) {
+    pub(super) fn landed_send_linked(&mut self, ticket: u64) {
         if let Some((_, n)) = self.extensions.sent.remove(&ticket) {
             self.unanchor(n);
         }
@@ -297,7 +317,7 @@ impl<D: DataSource> Runner<D> {
 
     /// Request `ticket` runs on with no answer awaiting it (module work): its
     /// send is not cancelled, and its anchor goes with its reply.
-    pub(in crate::runner) fn keep_send(&mut self, ticket: u64) {
+    pub(super) fn keep_send_linked(&mut self, ticket: u64) {
         self.extensions.sent.remove(&ticket);
     }
 
@@ -313,7 +333,7 @@ impl<D: DataSource> Runner<D> {
             })
             .map(|(t, _)| *t)
             .collect();
-        let handler = self.native_slot().handler();
+        let handler = self.native_slot().extension_handler();
         for ticket in gone {
             let Some((key, n)) = self.extensions.sent.remove(&ticket) else {
                 continue;
@@ -333,7 +353,7 @@ impl<D: DataSource> Runner<D> {
     /// whenever one changes, whether or not anything reads the name (LLP
     /// 1133.008 D8 item 9), as `{"extension", "preferred": {name: value}}`.
     pub(in crate::runner) fn tell_preferred(&self, extension: &str) {
-        let Some(handler) = self.native_slot().handler() else {
+        let Some(handler) = self.native_slot().extension_handler() else {
             return;
         };
         let prefix = format!("{extension}.");
@@ -402,8 +422,8 @@ impl<D: DataSource> Runner<D> {
     /// answers here is told, `{"extension", "foreground": bool}`, as the
     /// fact admission reads (LLP 1133.009 D10 item 3). An implementation
     /// begins in the foreground.
-    pub(in crate::runner) fn tell_foreground(&self) {
-        let Some(handler) = self.native_slot().handler() else {
+    pub(super) fn tell_foreground_linked(&self) {
+        let Some(handler) = self.native_slot().extension_handler() else {
             return;
         };
         let told: std::collections::BTreeSet<&str> = (self.plan.modules.iter())
@@ -455,6 +475,8 @@ impl<D: DataSource> Runner<D> {
                     self.extensions.live.remove(key);
                     self.extensions.readers.remove(key);
                     self.extensions.groups.remove(key);
+                    // A reader asking again polls it again (`note_poll`).
+                    self.extensions.polls.remove(key);
                 }
                 self.log(format!("release {key}: no reader is left"));
                 released.push(json!({ "extension": extension, "release": name }));
@@ -496,7 +518,7 @@ impl<D: DataSource> Runner<D> {
                 released.push(json!({ "extension": extension, "release": name, "args": args }));
             }
         }
-        let handler = self.native_slot().handler();
+        let handler = self.native_slot().extension_handler();
         for mut body in released {
             let key = format!(
                 "{}.{}",
@@ -550,9 +572,12 @@ impl<D: DataSource> Runner<D> {
             return false;
         };
         let source = self.plan.sources[row.source.0 as usize].name;
+        // A child's declared row and a destroyed instance's read nothing
+        // (LLP 1035.005.004 D4).
         (0..self.resources.len()).any(|i| {
             let asleep = (self.resources[i].state.as_ref()).is_some_and(|s| s.asleep);
             !asleep
+                && !self.settles_to_nothing(i)
                 && (self.resource_row(i).source == source
                     || self.resources[i].watching.iter().any(|t| t == key))
         }) || self.pending.iter().any(|p| {

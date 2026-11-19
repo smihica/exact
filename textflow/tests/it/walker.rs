@@ -44,11 +44,12 @@ fn hard_breaks_blank_lines_and_terminal_newline() {
         },
     );
     let ls = lines(&p, 1000.0);
-    assert_eq!(ls.len(), 4);
+    // Edge renders three lines: U+2028 is not a segment break in CSS, only the line feeds are.
+    assert_eq!(ls.len(), 3);
     assert!(ls.iter().all(|l| l.hard_break));
     assert_eq!(
         ls.iter().map(|l| l.width).collect::<Vec<_>>(),
-        [24.0, 24.0, 0.0, 40.0]
+        [24.0, 24.0, 40.0]
     );
     assert_eq!(
         ls.last().unwrap().end.byte,
@@ -694,4 +695,137 @@ fn a_break_before_no_break_glue_after_a_space_stays() {
     let text = "hello \u{a0}world";
     assert_eq!(exact_textflow::line_breaks(text, &[]), [6, text.len()]);
     assert_eq!(exact_textflow::line_breaks("a\u{a0}b c", &[]), [5, 6]);
+}
+
+/// `|` in `marked` must be an opportunity, `/` must not.
+fn assert_marked_breaks(marked: &str) {
+    let text: String = marked.chars().filter(|c| !matches!(c, '|' | '/')).collect();
+    let found = exact_textflow::line_breaks(&text, &[]);
+    let mut at = 0;
+    for ch in marked.chars() {
+        match ch {
+            '|' => assert!(
+                found.contains(&at),
+                "no break at {at} in {marked:?}: {found:?}"
+            ),
+            '/' => assert!(
+                !found.contains(&at),
+                "break at {at} in {marked:?}: {found:?}"
+            ),
+            _ => at += ch.len_utf8(),
+        }
+    }
+}
+
+/// Chrome breaks before a full-width opening bracket after a letter or digit
+/// (UAX #14 LB30) and before an opening or after a closing quotation mark
+/// between East Asian characters (Unicode 15.1 LB19a).
+#[test]
+fn east_asian_brackets_and_quotes_break_as_chrome() {
+    for marked in [
+        "iPhone|（アイフォーン）",
+        "2024|（令和6年）",
+        "他说|“你好”|然后",
+        "他说：|“你好。”",
+        "abc/“def/”ghi",
+        "a/“本/”a",
+        "日「/“本",
+        "日“本”/。",
+        "本”/“本",
+    ] {
+        assert_marked_breaks(marked);
+    }
+}
+
+/// LB19a's East Asian neighbours are East_Asian_Width F, W or H: `㉈` is A,
+/// so a quote beside it stays glued.
+#[test]
+fn a_quote_beside_an_ambiguous_width_character_stays_glued() {
+    assert_marked_breaks("本”/㉈");
+    assert_marked_breaks("㉈/“本");
+}
+
+/// A combining mark takes its base's class and width (UAX #14 LB9), so
+/// decomposed text breaks where its composed form does.
+#[test]
+fn decomposed_text_breaks_as_composed() {
+    let marks = |c: &char| matches!(c, '\u{301}' | '\u{3099}');
+    // Each break as the number of base characters before it.
+    let bases = |text: &str| -> Vec<usize> {
+        let found = exact_textflow::line_breaks(text, &[]);
+        found
+            .iter()
+            .map(|&at| text[..at].chars().filter(|c| !marks(c)).count())
+            .collect()
+    };
+    for (composed, decomposed) in [
+        ("café（本）", "cafe\u{301}（本）"),
+        ("本が“本”が", "本か\u{3099}“本”か\u{3099}"),
+        ("が”本", "か\u{3099}”本"),
+    ] {
+        assert_eq!(bases(composed), bases(decomposed), "{decomposed:?}");
+    }
+    for marked in [
+        "cafe\u{301}|（本）",
+        "か\u{3099}|“本",
+        "a\u{3099}/“本",
+        "a\u{3099}”/本",
+    ] {
+        assert_marked_breaks(marked);
+    }
+}
+
+/// A run of combining marks is walked once, not once per mark, so a long one
+/// still prepares at once, with or without a quote after it.
+#[test]
+fn a_long_combining_mark_run_breaks_in_linear_time() {
+    let started = std::time::Instant::now();
+    let plain = format!("a{}", "\u{301}".repeat(50_000));
+    assert_eq!(exact_textflow::line_breaks(&plain, &[]), [plain.len()]);
+    let quoted = format!("本{}“本", "\u{3099}".repeat(50_000));
+    let quote = quoted.len() - "“本".len();
+    assert_eq!(
+        exact_textflow::line_breaks(&quoted, &[]),
+        [quote, quoted.len()]
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "took {elapsed:?}"
+    );
+}
+
+/// Preserved text forces a break only at a line feed, as Chrome renders it
+/// (Edge 157, a 500px `pre-wrap` div): `"a\nb"` is two lines, while a lone CR,
+/// form feed, NEL, U+2028 or U+2029 keeps one.
+#[test]
+fn preserved_text_breaks_only_at_line_feeds_as_chrome_renders() {
+    for white_space in [
+        exact_textflow::WhiteSpace::PreWrap,
+        exact_textflow::WhiteSpace::Pre,
+    ] {
+        let count = |s: &str| {
+            lines(
+                &prepare(
+                    s,
+                    Options {
+                        white_space,
+                        ..Options::default()
+                    },
+                ),
+                1000.0,
+            )
+            .len()
+        };
+        assert_eq!(count("a\nb"), 2);
+        for s in [
+            "a\rb",
+            "a\u{000C}b",
+            "a\u{0085}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            assert_eq!(count(s), 1, "{white_space:?} {s:?}");
+        }
+    }
 }

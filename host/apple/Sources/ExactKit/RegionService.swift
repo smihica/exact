@@ -1,47 +1,38 @@
 // One active job, one replaceable latest request, one completion awaiting UI.
 // No CTLine/CTTypesetter crosses this queue. Immutable glyph/caret values do.
+// The Mac's region text service: its reader paragraphs and content
+// regions use it (`RegionReaderMac.swift`, ExactContentRegions); iOS has
+// neither.
+#if os(macOS)
+import CExact
 import Foundation
 
-/// The existing raster workers also execute region preparation. Per-region
-/// dependencies preserve CoreText confinement without a second worker pool.
-enum RegionTextExecutor {
-    static let queue: OperationQueue = {
-        let q = OperationQueue()
-        q.name = "exact.text"; q.qualityOfService = .userInitiated
-        #if os(iOS) || os(tvOS)
-        q.maxConcurrentOperationCount = TextRasterizer.concurrency
-        #else
-        q.maxConcurrentOperationCount = 2
-        #endif
-        return q
-    }()
-}
-
-final class RegionArtifact: Sendable {
-    let id: UInt64
-    let sourceID: UInt64
-    let metadata: RegionParagraph
-    let generation: Int
+package final class RegionArtifact: Sendable {
+    package let id: UInt64
+    package let sourceID: UInt64
+    package let metadata: RegionParagraph
+    package let generation: Int
     private let service: RegionService
-    init(id: UInt64, sourceID: UInt64, metadata: RegionParagraph, generation: Int, service: RegionService) {
+    package init(id: UInt64, sourceID: UInt64, metadata: RegionParagraph, generation: Int, service: RegionService) {
         self.id = id; self.sourceID = sourceID; self.metadata = metadata; self.generation = generation; self.service = service
     }
     deinit { service.retire(id) }
 }
-struct RegionSelectionRequest: Sendable, Equatable {
-    let artifact: UInt64
-    let ranges: [NSRange]
+package struct RegionSelectionRequest: Sendable, Equatable {
+    package let artifact: UInt64
+    package let ranges: [NSRange]
 }
-enum RegionJob: Sendable {
+package enum RegionJob: Sendable {
     case shape(RegionShapeRequest)
     case raster(RegionRasterRequest)
     case selection(RegionSelectionRequest)
 }
-enum RegionAnswer: Sendable {
+package enum RegionAnswer: Sendable {
     case shape(RegionArtifact)
     case raster(RegionRaster)
     case selection(RegionSelectionRequest, [RegionSelectionSnapshot])
     case abandoned(id: UInt64, generation: Int)
+    case nativeFlow(RegionShapeRequest)
     case pixelsBusy(RegionRasterRequest)
     case refused(RegionJob, String)
 }
@@ -56,7 +47,7 @@ private struct RegionLayoutBinding {
 /// Sendable admission endpoint, NOT a Sendable CoreText cache. Only queue bodies
 /// access layouts/paint. close() retains self until those owners die on queue;
 /// every controller calls it on reset/destroy, including undelivered completion.
-final class RegionService: @unchecked Sendable {
+package final class RegionService: @unchecked Sendable {
     private let scheduling = NSLock()
     private weak var tail: Operation?
     private func enqueue() {
@@ -85,18 +76,18 @@ final class RegionService: @unchecked Sendable {
     // Queue-confined fields, never read even for UI diagnostics.
     private var layouts: [UInt64: RegionLayoutBinding] = [:]
     private var paint: RegionPaintIndex?
-    let pixels = RegionPixelAccount()
-    let ink = InkAccount()
-    let hits = RegionHitAccount()
+    package let pixels = RegionPixelAccount()
+    package let ink = InkAccount()
+    package let hits = RegionHitAccount()
 
-    init(beforeShape: @escaping @Sendable () -> Void = {},
+    package init(beforeShape: @escaping @Sendable () -> Void = {},
          beforeLayoutConstruction: @escaping @Sendable () -> Void = {},
          deliver: @escaping @MainActor @Sendable (RegionAnswer) -> Void) {
         self.beforeShape = beforeShape
         self.beforeLayoutConstruction = beforeLayoutConstruction
         self.deliver = deliver
     }
-    func submit(_ job: RegionJob) {
+    package func submit(_ job: RegionJob) {
         lock.lock()
         guard !closed else { lock.unlock(); return }
         latest = job
@@ -107,7 +98,7 @@ final class RegionService: @unchecked Sendable {
     }
     /// Publish accepted receipt intent even while a previous shape owns the
     /// serial slot. No source capture, allocation refund or queue submission.
-    func updateShapeRequest(_ id: UInt64, generation: Int) {
+    package func updateShapeRequest(_ id: UInt64, generation: Int) {
         lock.lock(); defer { lock.unlock() }
         guard !closed else { return }
         desiredShape = (id, generation)
@@ -123,7 +114,7 @@ final class RegionService: @unchecked Sendable {
         mayAbandonShape = false
         return true
     }
-    func retire(_ id: UInt64) {
+    package func retire(_ id: UInt64) {
         lock.lock()
         guard !closed else { lock.unlock(); return }
         retired.insert(id)
@@ -134,7 +125,7 @@ final class RegionService: @unchecked Sendable {
     }
     /// Generation reset never replaces queue/admission/accounts. An old active
     /// shape continues to occupy the slot until its actual allocations unwind.
-    func reset() {
+    package func reset() {
         lock.lock()
         guard !closed, epoch < UInt64.max else { lock.unlock(); return }
         epoch += 1; latest = nil; resetStorage = true
@@ -147,7 +138,7 @@ final class RegionService: @unchecked Sendable {
         withExtendedLifetime(abandoned) {}
         if start { enqueue() }
     }
-    func close() {
+    package func close() {
         lock.lock()
         guard !closed else { lock.unlock(); return }
         closed = true; latest = nil; desiredShape = nil
@@ -185,15 +176,19 @@ final class RegionService: @unchecked Sendable {
                         // owners or keep a separate source/width history.
                         for binding in layouts.values where binding.generation == request.generation &&
                             binding.sourceID == request.sourceID && binding.layout.source === request.source {
-                            if preparation == nil { preparation = binding.layout.preparation }
-                            if binding.layout.metadata.offeredWidth == request.width {
+                            if preparation == nil && binding.layout.preparation.emergencyHyphens ==
+                                (request.exclusions.isEmpty && request.source.emergencyHyphens) {
+                                preparation = binding.layout.preparation
+                            }
+                            if binding.layout.metadata.offeredWidth == request.width &&
+                                binding.layout.metadata.exclusions == request.exclusions {
                                 existing = binding.layout; break
                             }
                         }
                     }
                     if let existing {
-                        // Shape depends on captured source and width, not the
-                        // height offer. The fresh artifact still answers only
+                        // Shape depends on captured source, width and resolved
+                        // exclusions. The fresh artifact still answers only
                         // this exact request ID/full kernel offer.
                         layout = existing
                     } else {
@@ -201,10 +196,19 @@ final class RegionService: @unchecked Sendable {
                             : request.width < 0 ? CGFloat.infinity : request.width
                         beforeLayoutConstruction()
                         do {
-                            layout = try RegionWorkerLayout.shape(request.source, width: width, retainHits: request.width >= 0,
-                                                                 preparation: preparation, compact: request.compact, beforeMetadata: {
+                            let checkpoint = {
                                 if self.abandonShape(request, epoch: jobEpoch) { throw RegionShapeCheckpoint.abandoned }
-                            })
+                            }
+                            if request.exclusions.isEmpty {
+                                layout = try RegionWorkerLayout.shape(request.source, width: width, retainHits: request.width >= 0,
+                                    preparation: preparation, compact: request.compact, beforeMetadata: checkpoint)
+                            } else {
+                                guard request.width >= 0 else { return .nativeFlow(request) }
+                                layout = try RegionWorkerLayout.shapeFlow(request.source, width: width, exclusions: request.exclusions,
+                                    preparation: preparation, beforeMetadata: checkpoint)
+                            }
+                        } catch RegionFlowFallback.incomplete {
+                            return .nativeFlow(request)
                         } catch RegionShapeCheckpoint.abandoned {
                             // The shape's partial allocations unwind inside
                             // this turn's autoreleasepool before UI delivery.
@@ -265,11 +269,13 @@ final class RegionService: @unchecked Sendable {
 }
 
 // UI-owned lifetime boundary, tested with an actual blocked serial worker.
-final class RegionServiceLifetime {
-    let service: RegionService
-    init(beforeShape: @escaping @Sendable () -> Void = {}, deliver: @escaping @MainActor @Sendable (RegionAnswer) -> Void) {
+package final class RegionServiceLifetime {
+    package let service: RegionService
+    package init(beforeShape: @escaping @Sendable () -> Void = {}, deliver: @escaping @MainActor @Sendable (RegionAnswer) -> Void) {
         service = RegionService(beforeShape: beforeShape, deliver: deliver)
     }
-    func reset() { service.reset() }
+    package func reset() { service.reset() }
     deinit { service.close() }
 }
+
+#endif

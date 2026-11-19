@@ -1169,7 +1169,7 @@ fn the_scopes_are_told_a_change_once_end_in_order_and_are_built_again_after_a_re
     // A reload (§4.3): every node, then the window, then the app, ends; the
     // old incarnation's registrations are dropped; all are built again.
     let plan = contract::compile(WORDS).unwrap().encode();
-    assert!(p.reload(&plan, ()).unwrap().is_none());
+    assert!(p.reload(&plan, ()).unwrap() == crate::presenter::ReloadResult::Applied(None));
     assert_eq!(
         notes(),
         [
@@ -1281,6 +1281,30 @@ fn moments(words: &[i32]) -> Vec<Told> {
         out.push((scope, moment, node, word, data));
     }
     out
+}
+
+#[test]
+fn a_readers_package_timer_runs_without_app_hatches() {
+    let mut p = boot::<()>("component App\n  view\n    text \"Record\"\n", &[]);
+    p.set_hatches(None);
+    first_pixel(&mut p);
+    assert!(!p.hatches.connected());
+    agent(&mut p, json!({"op": "clock", "to": 1000.0}));
+    let ticket = p.reader_hatch_act(0, 6, Some("5000"));
+    assert!(
+        ticket >= 0,
+        "ExtensionContext.after must register without app hatches"
+    );
+    let cancelled = p.reader_hatch_act(0, 6, Some("100"));
+    assert_eq!(p.reader_hatch_act(0, 8, Some(&cancelled.to_string())), 1);
+    crate::hatches::reader::take();
+    assert_eq!(p.timer_due_ms(), Some(6000.0));
+    agent(&mut p, json!({"op": "clock", "to": 5999.0}));
+    assert!(crate::hatches::reader::take().is_none());
+    agent(&mut p, json!({"op": "clock", "to": 6000.0}));
+    assert_eq!(crate::hatches::reader::take(), Some(vec![6, ticket as i32]));
+    agent(&mut p, json!({"op": "clock", "to": 7000.0}));
+    assert!(crate::hatches::reader::take().is_none());
 }
 
 #[test]

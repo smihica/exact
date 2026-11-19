@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactAnimations
 
 /// A CSS animation that has ended affects its property only with a forwards
 /// fill, as CSS has it. Held on the agent's clock, an ended entrance with no

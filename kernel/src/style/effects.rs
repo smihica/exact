@@ -1,45 +1,55 @@
 //! `filter` and `clip-path` (LLP 1055.000 D10, D14; CSS Filter Effects and
-//! CSS Masking): their grammars, linked by use on the web (LLP 1047 D2).
+//! CSS Masking): their grammars, each linked by use (LLP 1047 D2).
 //!
-//! The two parsers, and the path grammar `clip-path: path()` reads, are
-//! ~4 KiB of a web core that none of Caltrain, RealWorld or the video player
-//! uses. A web artifact links them when its plan binds either row, and a
-//! plan that binds one unlinked is refused at boot (D6), so an unlinked
-//! artifact never parses one. Native artifacts and the compiler parse
-//! without it.
+//! An artifact links them when its plan binds the row (and `filter`'s when
+//! it draws SVG, whose filters read it), and a plan that needs one unlinked
+//! is refused at boot (D6), so an unlinked artifact never parses one. The
+//! web links both with the `effects` capability; Apple draws `clip-path` in
+//! its core and links that grammar always. [`crate::Kernel::new`] and the
+//! compiler link both. The kernel's own tests parse directly.
 
 use crate::clip::ClipPath;
 use crate::svg::filter::FilterList;
 
 /// A row's grammar: its value, or `None` when CSS refuses the text.
+#[cfg(not(test))]
 type Grammar<T> = fn(&str) -> Option<T>;
 
-/// The grammars a link registers.
-pub(crate) struct Effects {
-    pub(crate) filter: Grammar<FilterList>,
-    pub(crate) clip_path: Grammar<ClipPath>,
-}
+#[cfg(not(test))]
+static FILTER: std::sync::OnceLock<Grammar<FilterList>> = std::sync::OnceLock::new();
+#[cfg(not(test))]
+static CLIP_PATH: std::sync::OnceLock<Grammar<ClipPath>> = std::sync::OnceLock::new();
 
-const GRAMMARS: Effects = Effects {
-    filter: FilterList::grammar,
-    clip_path: ClipPath::grammar,
-};
-
-/// The grammars, once linked ([`link`]). Only a wasm artifact reads it.
-#[cfg(target_arch = "wasm32")]
-static LINKED: std::sync::OnceLock<&'static Effects> = std::sync::OnceLock::new();
-
-/// Link `filter`'s and `clip-path`'s grammars: until a web artifact calls
-/// this, a value for either row does not parse.
+/// Link both grammars: what the `effects` capability links.
 pub fn link() {
-    #[cfg(target_arch = "wasm32")]
-    let _ = LINKED.set(&GRAMMARS);
+    link_filter();
+    link_clip_path();
 }
 
-/// `css` by the grammar `pick` names, on the web once linked.
-pub(crate) fn parse<T>(css: &str, pick: fn(&Effects) -> Grammar<T>) -> Option<T> {
-    #[cfg(target_arch = "wasm32")]
-    return LINKED.get().and_then(|effects| pick(effects)(css));
-    #[cfg(not(target_arch = "wasm32"))]
-    pick(&GRAMMARS)(css)
+/// Link `filter`'s grammar, which SVG's filters read too.
+pub fn link_filter() {
+    #[cfg(not(test))]
+    let _ = FILTER.set(FilterList::grammar);
+}
+
+/// Link `clip-path`'s grammar (and the path grammar its `path()` reads).
+pub fn link_clip_path() {
+    #[cfg(not(test))]
+    let _ = CLIP_PATH.set(ClipPath::grammar);
+}
+
+/// `css` by `filter`'s grammar, once linked.
+pub(crate) fn filter(css: &str) -> Option<FilterList> {
+    #[cfg(not(test))]
+    return FILTER.get().and_then(|grammar| grammar(css));
+    #[cfg(test)]
+    FilterList::grammar(css)
+}
+
+/// `css` by `clip-path`'s grammar, once linked.
+pub(crate) fn clip_path(css: &str) -> Option<ClipPath> {
+    #[cfg(not(test))]
+    return CLIP_PATH.get().and_then(|grammar| grammar(css));
+    #[cfg(test)]
+    ClipPath::grammar(css)
 }

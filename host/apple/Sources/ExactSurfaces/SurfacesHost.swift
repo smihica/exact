@@ -10,7 +10,13 @@ import CExact
 import ExactKit
 
 public enum ExactSurfaces {
-    public static func install() { SurfacesLink.installed = SurfacesHost() }
+    public static func install() {
+        SurfacesLink.installed = SurfacesHost()
+        // A canvas's audio claims the audio session.
+        #if os(iOS) || os(tvOS)
+        MediaLink.claimsAudioSession()
+        #endif
+    }
 }
 
 final class SurfacesHost: SurfacesCapability {

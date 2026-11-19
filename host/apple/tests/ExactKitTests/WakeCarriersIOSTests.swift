@@ -1,6 +1,7 @@
 #if os(iOS)
 import XCTest
 @testable import ExactKit
+@testable import ExactWakeCarriers
 
 // Which BackgroundTasks identifier carries a wake request (LLP 1133.017 D8):
 // the task `schedule` submits for a request is the one whose arrival takes

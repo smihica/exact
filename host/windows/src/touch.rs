@@ -17,10 +17,31 @@ pub(crate) enum Phase {
 }
 
 /// The pointer the presenter's one contact follows: the first to touch
-/// down, a pen's or a finger's.
+/// down, a pen's or a finger's, and where it is.
 #[derive(Default)]
 pub(crate) struct Touches {
-    held: Option<(u64, PointerKind)>,
+    held: Option<(u64, PointerKind, (f32, f32))>,
+    pinch: Option<Pinch>,
+    /// Every finger and pen down, the contact's or not.
+    down: Vec<u64>,
+}
+
+/// Two fingers on a zoomable scroller: its pinch (LLP 1057.001.000 §5,
+/// step 6), each finger's pointer id and where it is.
+struct Pinch {
+    container: u32,
+    fingers: [(u64, (f32, f32)); 2],
+}
+
+impl Pinch {
+    /// The fingers' midpoint and how far apart they are.
+    fn focal(&self) -> ((f32, f32), f32) {
+        let [(_, a), (_, b)] = self.fingers;
+        (
+            ((a.0 + b.0) / 2., (a.1 + b.1) / 2.),
+            (a.0 - b.0).hypot(a.1 - b.1),
+        )
+    }
 }
 
 impl Touches {
@@ -28,9 +49,38 @@ impl Touches {
     /// whether a new contact is a pen's; it is asked only of a touch down.
     /// A pen's hover (an update with no contact) does nothing, nor does a
     /// finger after the first, except that its touch down cancels the
-    /// first's press, as Android's reader does. Answers whether a contact
-    /// went down.
+    /// first's press, as Android's reader does, and over a zoomable
+    /// scroller the two fingers pinch it until either lifts. Answers
+    /// whether a contact went down.
     pub(crate) fn contact<D: DataSource>(
+        &mut self,
+        p: &mut Presenter<D>,
+        (id, phase): (u64, Phase),
+        at: (f32, f32),
+        now: f64,
+        pen: impl FnOnce() -> bool,
+    ) -> bool {
+        match phase {
+            Phase::Started => self.down.push(id),
+            Phase::Moved => {}
+            Phase::Ended | Phase::Cancelled => self.down.retain(|down| *down != id),
+        }
+        // Said before the routing below, which follows one contact: a
+        // replacement waits for every finger and pen (LLP 1029.000.002 D9).
+        if phase != Phase::Moved {
+            p.set_touching(!self.down.is_empty());
+        }
+        let went_down = self.route(p, (id, phase), at, now, pen);
+        // A cancelled touch has no up, and after a second finger took the
+        // contact neither lift is routed: the press the presenter heard
+        // ends with the last of them.
+        if phase != Phase::Moved && self.down.is_empty() {
+            p.pointer_released();
+        }
+        went_down
+    }
+
+    fn route<D: DataSource>(
         &mut self,
         p: &mut Presenter<D>,
         (id, phase): (u64, Phase),
@@ -38,6 +88,9 @@ impl Touches {
         now: f64,
         pen: impl FnOnce() -> bool,
     ) -> bool {
+        if self.pinched(p, (id, phase), (x, y)) {
+            return false;
+        }
         let kind = match (phase, self.held) {
             (Phase::Started, None) => {
                 let kind = if pen() {
@@ -45,16 +98,30 @@ impl Touches {
                 } else {
                     PointerKind::Touch
                 };
-                self.held = Some((id, kind));
+                self.held = Some((id, kind, (x, y)));
                 kind
             }
-            (Phase::Started, Some((_, kind))) => {
+            (Phase::Started, Some((first, kind, at))) => {
                 self.held = None;
                 p.set_pointer_kind(kind);
                 let _ = p.pointer_cancel(now);
+                let both = [(first, at), (id, (x, y))];
+                let under = |p: &mut Presenter<D>, at: (f32, f32)| p.zoomable_under(at.0, at.1);
+                if kind == PointerKind::Touch {
+                    if let Some(container) = under(p, at).filter(|c| under(p, (x, y)) == Some(*c)) {
+                        p.zoom_pinch_began(container);
+                        self.pinch = Some(Pinch {
+                            container,
+                            fingers: both,
+                        });
+                    }
+                }
                 return false;
             }
-            (_, Some((held, kind))) if held == id => kind,
+            (_, Some((held, kind, _))) if held == id => {
+                self.held = Some((held, kind, (x, y)));
+                kind
+            }
             _ => return false,
         };
         // The mouse may have moved since: its events say it is a mouse again.
@@ -71,9 +138,67 @@ impl Touches {
         phase == Phase::Started
     }
 
-    /// The window lost the focus, and its contact with it.
-    pub(crate) fn forget(&mut self) {
+    /// A finger of the pinch moved or lifted: the zoom follows the two, the
+    /// point between them staying under them, and either's lift ends it.
+    /// Whether the event was the pinch's.
+    fn pinched<D: DataSource>(
+        &mut self,
+        p: &mut Presenter<D>,
+        (id, phase): (u64, Phase),
+        at: (f32, f32),
+    ) -> bool {
+        let Some(pinch) = self.pinch.as_mut() else {
+            return false;
+        };
+        let Some(k) = pinch.fingers.iter().position(|f| f.0 == id) else {
+            // A third finger is no part of it.
+            return true;
+        };
+        if phase == Phase::Moved {
+            let (from, was) = pinch.focal();
+            pinch.fingers[k].1 = at;
+            let (to, now) = pinch.focal();
+            let factor = if was > 1. { now / was } else { 1. };
+            p.zoom_pinched(pinch.container, factor, from, to);
+        } else {
+            p.zoom_pinch_ended(pinch.container);
+            self.pinch = None;
+        }
+        true
+    }
+
+    /// The window lost the focus: the contact ends, its lift perhaps going
+    /// to another window. Each finger and pen stays down for a replacement
+    /// (LLP 1029.000.002 D9) until its own lift or cancel, or until
+    /// [`Touches::prune`] finds it up.
+    pub(crate) fn forget<D: DataSource>(&mut self, p: &mut Presenter<D>, now: f64) {
         self.held = None;
+        if let Some(pinch) = self.pinch.take() {
+            p.zoom_pinch_ended(pinch.container);
+        }
+        let _ = p.pointer_abandoned(now);
+    }
+
+    /// Whether a finger or a pen is down.
+    pub(crate) fn any_down(&self) -> bool {
+        !self.down.is_empty()
+    }
+
+    /// Lets go of each finger or pen that `down` says is no longer in
+    /// contact, for one whose lift another window heard.
+    pub(crate) fn prune<D: DataSource>(
+        &mut self,
+        p: &mut Presenter<D>,
+        down: impl Fn(u64) -> bool,
+    ) {
+        if self.down.is_empty() {
+            return;
+        }
+        self.down.retain(|id| down(*id));
+        if self.down.is_empty() {
+            p.set_touching(false);
+            p.pointer_released();
+        }
     }
 
     /// winit's touch, at the window's `scale`.
@@ -98,6 +223,21 @@ impl Touches {
         );
         self.contact(p, (touch.id, phase), at, now, || pen(touch.id))
     }
+}
+
+/// Whether pointer `id` is still in contact, as Windows has it now
+/// ([GetPointerInfo](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getpointerinfo)
+/// fails for a pointer no longer active).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn in_contact(id: u64) -> bool {
+    use windows_sys::Win32::UI::Input::Pointer::{
+        GetPointerInfo, POINTER_FLAG_INCONTACT, POINTER_INFO,
+    };
+    // SAFETY: POINTER_INFO is plain data, all zeros valid; the call writes it.
+    let mut info: POINTER_INFO = unsafe { std::mem::zeroed() };
+    let active = unsafe { GetPointerInfo(id as u32, &mut info) } != 0;
+    active && info.pointerFlags & POINTER_FLAG_INCONTACT != 0
 }
 
 /// Whether pointer `id` is a pen's: winit's touch id is the message's
@@ -195,19 +335,97 @@ mod tests {
             (60., 120.),
             false
         ));
+        // Both are still down, and hold a replacement until the last lifts.
+        let held = |p: &mut Presenter<()>| {
+            let result = p.reload(&plan, ()).unwrap();
+            result == exact_painted::presenter::ReloadResult::Held("pointer")
+        };
+        assert!(held(&mut p));
+        // A third finger is a contact of its own, and its lift leaves two down.
+        send(&mut p, &mut t, 20, Phase::Started, (200., 250.), false);
+        send(&mut p, &mut t, 20, Phase::Ended, (200., 250.), false);
+        assert!(held(&mut p));
         send(&mut p, &mut t, 11, Phase::Ended, (60., 120.), false);
+        assert!(held(&mut p));
         send(&mut p, &mut t, 10, Phase::Ended, (20., 120.), false);
-        // Nor does a cancelled touch, or one the window's blur let go.
+        assert!(!held(&mut p));
+        // Nor does a cancelled touch.
         send(&mut p, &mut t, 12, Phase::Started, (20., 120.), false);
         send(&mut p, &mut t, 12, Phase::Cancelled, (20., 120.), false);
+        assert!(!held(&mut p));
+        // The window's blur ends the contact, so the lift presses nothing, and
+        // the finger holds a replacement until it lifts.
         send(&mut p, &mut t, 13, Phase::Started, (20., 120.), false);
-        t.forget();
-        p.pointer_lost(1000.).unwrap();
+        t.forget(&mut p, 1000.);
+        assert!(held(&mut p), "the finger is still down");
         assert!(!send(&mut p, &mut t, 13, Phase::Ended, (20., 120.), false));
+        assert!(!held(&mut p));
+        assert_eq!(seen(&p), Some(Value::str(" touch pen press")));
+        // One whose lift another window heard is let go when Windows says it is up.
+        send(&mut p, &mut t, 15, Phase::Started, (20., 120.), false);
+        t.forget(&mut p, 1001.);
+        t.prune(&mut p, |_| true);
+        assert!(held(&mut p));
+        t.prune(&mut p, |_| false);
+        assert!(!held(&mut p));
         assert_eq!(seen(&p), Some(Value::str(" touch pen press")));
         // Then a finger presses again.
         send(&mut p, &mut t, 14, Phase::Started, (20., 120.), false);
         send(&mut p, &mut t, 14, Phase::Ended, (20., 120.), false);
         assert_eq!(seen(&p), Some(Value::str(" touch pen press press")));
+    }
+
+    #[test]
+    fn two_fingers_on_a_zoomable_scroller_pinch_it_about_their_midpoint() {
+        let source = "component App
+  state zoom = 1
+  action zoomed(x: number, y: number, e: ScrollEvent)
+    zoom = e.scrollZoom
+  view
+    scroll width=300 height=200 -exact-max-zoom=4 scrollZoom=zoom scroll=zoomed testId=\"port\"
+      box width=300 height=200
+";
+        let plan = contract::compile(source).unwrap().encode();
+        let (mut p, warning) = Presenter::boot_with(
+            &plan,
+            (),
+            (400., 300.),
+            1.,
+            Default::default(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(warning.is_none());
+        let mut t = Touches::default();
+        let mut at = 0.;
+        let mut send = |p: &mut Presenter<()>, t: &mut Touches, id, phase, xy| {
+            at += 10.;
+            t.contact(p, (id, phase), xy, at, || false)
+        };
+        // Fingers 100 apart about (150, 100), spread to 200 apart.
+        send(&mut p, &mut t, 1, Phase::Started, (100., 100.));
+        send(&mut p, &mut t, 2, Phase::Started, (200., 100.));
+        send(&mut p, &mut t, 1, Phase::Moved, (75., 100.));
+        send(&mut p, &mut t, 2, Phase::Moved, (225., 100.));
+        send(&mut p, &mut t, 1, Phase::Moved, (50., 100.));
+        send(&mut p, &mut t, 2, Phase::Moved, (250., 100.));
+        send(&mut p, &mut t, 2, Phase::Ended, (250., 100.));
+        send(&mut p, &mut t, 1, Phase::Ended, (50., 100.));
+        let port = p.host().kernel();
+        let port = port
+            .node_by_key(port.find_by_test_id("port")[0])
+            .unwrap()
+            .id;
+        // Twice the zoom, the midpoint kept: the child's point at (150, 100) stays there.
+        let offset = p.scroll_of(port);
+        assert!(
+            (offset.0 - 150.).abs() < 0.01 && (offset.1 - 100.).abs() < 0.01,
+            "{offset:?}"
+        );
+        let zoom = p.host().runner().slot("zoom").cloned();
+        assert!(
+            matches!(zoom, Some(Value::Number(z)) if (z - 2.).abs() < 1e-4),
+            "{zoom:?}"
+        );
     }
 }

@@ -69,13 +69,14 @@ pub(crate) unsafe extern "C" fn host_door(
             None => Err("store.forget: no store at bake".into()),
         },
         // Storage's availability, as the prelude's refusal code (kanban
-        // F28): none at bake; none for a drive that names no scratch store;
-        // none where the host configured no directories.
+        // F28): none at bake or in a validation pass (the device answers what
+        // either leaves pending); none for a drive that names no scratch
+        // store; none where the host configured no directories.
         5 => match state.store {
             Some(store) => {
                 // A read even at bake: the build compiles no answer that tried.
                 (*store).observe_external_read();
-                if state.baking {
+                if state.deferring() {
                     Err("bake".into())
                 } else {
                     // `a` is the path a file operation names: a document
@@ -83,7 +84,8 @@ pub(crate) unsafe extern "C" fn host_door(
                     // `home:` or `bundle:` path (LLP 1133.007 D6).
                     let document = (state.documents && a.starts_with("doc:/"))
                         || a.starts_with("home:/")
-                        || a.starts_with("bundle:/");
+                        || a.starts_with("bundle:/")
+                        || ibex2::stdlib::fs::is_known_folder(&a);
                     super::storage::refusal(true, state.storage || document, state.agent.is_some())
                 }
             }
@@ -93,9 +95,10 @@ pub(crate) unsafe extern "C" fn host_door(
             None if state.between_answers => {
                 let document = (state.documents && a.starts_with("doc:/"))
                     || a.starts_with("home:/")
-                    || a.starts_with("bundle:/");
+                    || a.starts_with("bundle:/")
+                    || ibex2::stdlib::fs::is_known_folder(&a);
                 super::storage::refusal(
-                    !state.baking,
+                    !state.deferring(),
                     state.storage || document,
                     state.agent.is_some(),
                 )
@@ -122,6 +125,14 @@ pub(crate) unsafe extern "C" fn host_door(
                     (*store).observe_topic(&b);
                 }
                 Ok(None)
+            } else if a == "announce" {
+                // A durable write the app's other sessions are told of (LLP
+                // 1030.004 D2). With no store (between answers) the prelude
+                // keeps it for the next call that has one.
+                Ok(state.store.map(|store| {
+                    (*store).announce_topic(&b);
+                    "announced".into()
+                }))
             } else if a == "kept" {
                 // What the app keeps across launches (LLP 1069.010.000 D5):
                 // the device's, and a candidate on trial changes none of it.
@@ -139,7 +150,19 @@ pub(crate) unsafe extern "C" fn host_door(
                 if let Some(store) = state.store {
                     (*store).observe_external_read();
                 }
+                // A package's synchronous form is the host's app module's,
+                // beside a native module too.
+                let extension = state.native.is_some()
+                    && state.hosted_call.is_some()
+                    && serde_json::from_str::<serde_json::Value>(&b)
+                        .ok()
+                        .is_some_and(|v| exact_runner::Native::sync_form(&v).is_some());
                 match (&mut state.native, state.store) {
+                    (Some(_), Some(_)) if extension => {
+                        let call = state.hosted_call.as_ref().expect("checked above");
+                        call(b.as_bytes())
+                            .map(|reply| Some(String::from_utf8_lossy(&reply).into_owned()))
+                    }
                     (Some(module), Some(_)) => exact_js_value::json::parse(b.as_bytes())
                         .map(serde_json::Value::from)
                         .map_err(|error| error.to_string())
@@ -197,6 +220,12 @@ pub(crate) unsafe extern "C" fn host_door(
         // Whether this is a bake: the prelude marks a stream's refused
         // options there, as storage's refusal is (LLP 1016.000 D11).
         12 if a == "bake" => Ok(state.baking.then(|| "1".into())),
+        12 if a == "host" => {
+            if let Some(store) = state.store {
+                (*store).observe_external_read();
+            }
+            Ok((state.store.is_some() && !state.deferring()).then(|| "native".into()))
+        }
         12 => Ok(crypto::auth_callback(state, &a)),
         // A journal line the runtime writes (LLP 1097 D8): a failed or
         // refused storage operation, an unhandled rejection. `logs` reads
@@ -295,6 +324,28 @@ pub(crate) unsafe extern "C" fn host_door(
                 .into(),
         ),
         24..=26 => state.secrets.door(op, &a, &b, state.store.map(|s| &mut *s)),
+        // A setting a launch may give (LLP 1153.002 D2): the launch's value
+        // for the name `a`, which the bundle's launch module asks for.
+        28 => Ok(super::launch::value(state, &a)),
+        // A fetch an error event's listener made (LLP 1175 D3): its request
+        // goes out as a report, not with an answer. `b` is "1" when the
+        // listener interrupted the turn the engine runs now, whose reporter
+        // it then takes; else no answer's.
+        29 => {
+            let ticket = a.parse::<u64>().ok();
+            match state.requests.iter().position(|(t, _)| Some(*t) == ticket) {
+                Some(at) => {
+                    let (ticket, request) = state.requests.remove(at);
+                    let by = match (&*b, state.turn) {
+                        ("1", Some(by)) => by,
+                        _ => exact_runner::Reporter::None,
+                    };
+                    state.reports.push((ticket, request, by));
+                    Ok(None)
+                }
+                None => Err("report: no such request".into()),
+            }
+        }
         other => Err(format!("__exact_host: no op {other}")),
     };
     *out = std::ptr::null_mut();

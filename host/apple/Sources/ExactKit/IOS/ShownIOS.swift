@@ -53,7 +53,7 @@ extension Presenter {
     /// while its window is one a scene shows, the only windows on screen.
     /// A view `shown(_:)` found shown earlier in the turn stays shown,
     /// though an animation may since have moved its copy.
-    private func committed() {
+    package func committed() {
         let waiting = awaitingFrame
         awaitingFrame = []
         for entry in waiting {
@@ -115,7 +115,7 @@ extension NodeView {
     /// scroller's band, a native control or a cell over it) by
     /// `Presenter.moveOrPlace`: a view `new` under it, made or put there
     /// since the last frame, takes its place at once.
-    func moveOrPlace(new: Bool = false, _ change: () -> Void) {
+    package func moveOrPlace(new: Bool = false, _ change: () -> Void) {
         guard let presenter else { return change() }
         presenter.moveOrPlace(new ? nil : self, change)
     }

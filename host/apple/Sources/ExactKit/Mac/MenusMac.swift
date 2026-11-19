@@ -19,7 +19,7 @@ final class AccessibleMenuItem: NSMenuItem {
     }
 }
 
-final class MenuHost: NSObject {
+package final class MenuHost: NSObject {
     var invocationOwner: NodeView?
     private(set) weak var presenter: Presenter?
     final class Entry {
@@ -29,12 +29,18 @@ final class MenuHost: NSObject {
         let bubbled: Bool
         /// The run of `source` that opened it as its context menu (X77): its anchor.
         let run: UInt32?
-        weak var parent: NSView?
+        /// Its authored parent: the container of the node it was lifted out
+        /// of, as that node has it now. A material's arrival or departure
+        /// replaces a node's container (`updateMaterial`) while the popover
+        /// is out of it.
+        var parent: NSView? { home?.container ?? held }
+        private weak var home: NodeView?
+        private weak var held: NSView?
         weak var previous: NSView?
         var index: Int
         let selection: NSRange?
         let value: String?
-        var frame: NSRect
+        package var frame: NSRect
         var placement = PositionArea.History()
         /// The region its option sized it in, as the kernel was told it (`PositionArea.place`).
         var block: HostBlock?
@@ -47,11 +53,12 @@ final class MenuHost: NSObject {
         var tracking = false
         /// An alertdialog presented as a menu: what each action showed.
         var confirmation: Confirmation?
-        init(_ popover: NodeView, source: NodeView?, previous: NSView?, run: UInt32?, bubbled: Bool = false) {
+        package init(_ popover: NodeView, source: NodeView?, previous: NSView?, run: UInt32?, bubbled: Bool = false) {
             self.popover = popover; self.source = source; sourced = source != nil; self.previous = previous; self.run = run
             self.bubbled = bubbled
-            parent = popover.superview
-            index = parent?.subviews.firstIndex(of: popover) ?? 0
+            held = popover.superview
+            if let node = popover.nodeSuperview, node.container === held { home = node }
+            index = held?.subviews.firstIndex(of: popover) ?? 0
             frame = popover.frame; value = popover.props["popover"]
             hasFallbacks = popover.style["position_try_fallbacks"] != nil
             selection = ((previous as? NSTextField)?.currentEditor() as? NSTextView)?.selectedRange()
@@ -149,9 +156,9 @@ final class MenuHost: NSObject {
             return belongs(view, seen: &seen)
         }
     }
-    init(presenter: Presenter) { self.presenter = presenter }
+    package init(presenter: Presenter) { self.presenter = presenter }
 
-    func isOpen(_ node: NodeView) -> Bool { entries.contains { $0.popover === node } }
+    package func isOpen(_ node: NodeView) -> Bool { entries.contains { $0.popover === node } }
     /// Open as a popover, here or as the alert a confirmation becomes
     func showsAsPopover(_ node: NodeView) -> Bool { isOpen(node) || presenter?.alerts.isOpenAsPopover(node) == true }
     /// Open by `show-modal`, which HTML's popover commands leave open
@@ -165,7 +172,7 @@ final class MenuHost: NSObject {
     }
     /// A focus command in the opening action chooses AppKit's initial row.
     /// The authored subtree stays hidden while NSMenu presents its items.
-    func focus(_ node: NodeView) -> Bool {
+    package func focus(_ node: NodeView) -> Bool {
         guard let entry = entries.last(where: { $0.menu != nil && contains($0.popover, node) }),
               let item = entry.menu?.items.first(where: { ($0 as? AccessibleMenuItem)?.owner === node }) else { return false }
         guard !entry.tracking else {
@@ -179,12 +186,12 @@ final class MenuHost: NSObject {
     var presentedConfirmation: Confirmation? { entries.last?.confirmation }
     func owns(_ node: NodeView) -> Bool { entries.contains { $0.popover === node && $0.menu == nil } }
     /// Input inheritance follows the authored tree after top-layer reparenting.
-    func parent(of view: NSView) -> NSView? { authoredParent(of: view) ?? view.superview }
+    package func parent(of view: NSView) -> NSView? { authoredParent(of: view) ?? view.superview }
     /// An open popover's authored parent, nil for any other view.
     func authoredParent(of view: NSView) -> NSView? {
         entries.first(where: { $0.popover === view && $0.menu == nil })?.parent
     }
-    func contains(_ ancestor: NSView, _ view: NSView) -> Bool {
+    package func contains(_ ancestor: NSView, _ view: NSView) -> Bool {
         var next: NSView? = view
         while let current = next {
             if current === ancestor { return true }
@@ -222,7 +229,7 @@ final class MenuHost: NSObject {
     }
     func refresh() {
         guard let presenter else { return }
-        presenter.navigation.refreshInputGates(Array(presenter.views.values))
+        presenter.inputGates.refresh(Array(presenter.views.values))
         presenter.topLayerChanged()
         presenter.syncKeyViewLoop()
         presenter.syncAccessibility()
@@ -448,7 +455,7 @@ final class MenuHost: NSObject {
         if let presenter, let at = PositionArea.inset(of: pop, viewport: presenter.clientSize) {
             return presenter.point(fromClient: at, in: source)
         }
-        let column = presenter.map { $0.navigation.split.pane(holding: source) ?? $0.viewport }
+        let column = presenter.map { $0.navigation.stackSplit.pane(holding: source) ?? $0.viewport }
         let bounds = column.map { source.convert($0.bounds, from: $0) } ?? .infinite
         return PositionArea.origin(PositionArea.of(pop), anchor: anchor(source, in: source), size: menu.size,
                                    margins: PositionArea.margins(of: pop), overflow: .platform, in: bounds)
@@ -487,11 +494,17 @@ final class MenuHost: NSObject {
         // the hidden popover leaves; VoiceOver is sent to it after
         // (`tellLanding`, Accessibility.swift).
         if hadFocus, let window {
-            if restoreFocus, let previous = entry.previous, previous.window === window,
+            let invoker = pop.isMenu ? entry.source.flatMap { source -> NSView? in
+                guard live(source), !source.disabled, !source.inert,
+                      let target = presenter?.keyView(of: source), target.acceptsFirstResponder,
+                      !target.isHiddenOrHasHiddenAncestor, presenter?.dialogs.blocks(target) != true else { return nil }
+                return target
+            } : nil
+            if restoreFocus, let previous = invoker ?? entry.previous, previous.window === window,
                !previous.isHiddenOrHasHiddenAncestor, presenter?.dialogs.blocks(previous) != true,
                !((previous as? NodeView)?.inert ?? false) {
                 window.makeFirstResponder(previous)
-                if let range = entry.selection, let editor = window.firstResponder as? NSTextView { editor.setSelectedRange(range) }
+                if previous === entry.previous, let range = entry.selection, let editor = window.firstResponder as? NSTextView { editor.setSelectedRange(range) }
             } else { window.makeFirstResponder(presenter?.viewport) }
         }
         if let native = entry.native {
@@ -517,7 +530,7 @@ final class MenuHost: NSObject {
             else if let index { entry.index = index }
         }
     }
-    func frame(_ node: NodeView, _ frame: NSRect) -> Bool {
+    package func frame(_ node: NodeView, _ frame: NSRect) -> Bool {
         guard let entry = entries.first(where: { $0.popover === node && $0.menu == nil }) else { return false }
         // In AppKit's popover its box is the popover's content, whatever margins the block put before it.
         if entry.native != nil { let box = NSRect(origin: .zero, size: frame.size); if node.frame != box { node.frame = box }; return true }
@@ -525,7 +538,7 @@ final class MenuHost: NSObject {
         layout()
         return true
     }
-    func rejectActiveMenuProperties(in pop: NodeView) {
+    package func rejectActiveMenuProperties(in pop: NodeView) {
         for row in pop.menuRowsThroughSections where row.isButton {
             row.rejectNativeActiveProperties(on: "NSMenuItem")
         }
@@ -570,7 +583,7 @@ final class MenuHost: NSObject {
         if changed { refresh() }
         layout()
     }
-    func layout() {
+    package func layout() {
         guard let presenter else { return }
         // Each owner's painted layers stay last among its views, in the order
         // they opened: a layer moved to a new owner (a split ending), or a
@@ -630,7 +643,7 @@ final class MenuHost: NSObject {
         // A sheet's window and a popover's hold this session's nodes alone.
         if window !== viewport.window {
         } else if let owner = focusOwner(window) {
-            guard owner === viewport || owner.isDescendant(of: viewport) || presenter?.navigation.split.holdsFocus(owner) == true else { return false }
+            guard owner === viewport || owner.isDescendant(of: viewport) || presenter?.navigation.stackSplit.holdsFocus(owner) == true else { return false }
         } else if presenter?.session?.view?.ownsShortcutFocus() == false { return false }
         guard let last = entries.last(where: { $0.value != "manual" }),
               (window.firstResponder as? NSTextInputClient)?.hasMarkedText() != true else { return false }
@@ -895,8 +908,8 @@ final class MenuHost: NSObject {
     private struct MenuOpener {
         var pops: [Weak] = []
         weak var opener: NodeView?
-        init() {}
-        init(_ pop: NodeView, opener: NodeView?) { pops = [Weak(pop: pop)]; self.opener = opener }
+        package init() {}
+        package init(_ pop: NodeView, opener: NodeView?) { pops = [Weak(pop: pop)]; self.opener = opener }
     }
     private var menuOpener = MenuOpener()
     private final class Picked { var taken = false }
@@ -904,7 +917,7 @@ final class MenuHost: NSObject {
     private struct Step {
         weak var opener: NodeView?
         weak var parent: NodeView?
-        init(_ opener: NodeView, in parent: NodeView) { self.opener = opener; self.parent = parent }
+        package init(_ opener: NodeView, in parent: NodeView) { self.opener = opener; self.parent = parent }
     }
     /// An item's row as the menu showed it, in which presentation, opened
     /// from which invoker, through which submenus.
@@ -919,7 +932,7 @@ final class MenuHost: NSObject {
         let title: String
         let once: Picked
         var cancelled = false
-        init(_ row: NodeView, in pop: NodeView, path: [Step], from source: NodeView?, presentation: Int, title: String, once: Picked, bubbled: Bool) {
+        package init(_ row: NodeView, in pop: NodeView, path: [Step], from source: NodeView?, presentation: Int, title: String, once: Picked, bubbled: Bool) {
             self.row = row; self.pop = pop; self.path = path; self.source = source; invoked = source != nil
             self.bubbled = bubbled
             self.presentation = presentation; self.title = title; self.once = once
@@ -973,7 +986,7 @@ final class MenuHost: NSObject {
             (view as? NodeView)?.style["display"]?.string == "none" || (view.isHidden && !pops.contains { $0 === view })
         }
     }
-    func title(of v: NodeView) -> String {
+    package func title(of v: NodeView) -> String {
         if v.kind == "text" { return v.paragraphSpec().runs.map(\.text).joined() }
         // A native button's children are its face, not views: its title, else its label.
         if v.isNativeButton { return [v.face?.shown, v.face?.subtitle].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " — ") }
@@ -982,8 +995,7 @@ final class MenuHost: NSObject {
         if v.isButton, let face = v.face, face.fits, let shown = face.shown { return shown }
         // Its accessible name: an `aria-hidden` child (a submenu row's `›`,
         // which the platform menu draws itself) is not part of it.
-        return v.container.subviews
-            .compactMap { $0 as? NodeView }
+        return v.childNodes
             .filter { $0.props["accessibilityElementsHidden"] != "true" }
             .map(title(of:))
             .filter { !$0.isEmpty }
@@ -998,13 +1010,13 @@ final class InvokerMenu: NSMenu {
 }
 
 extension MenuHost: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) {
+    package func menuNeedsUpdate(_ menu: NSMenu) {
         if let menu = menu as? InvokerMenu { fill(menu) }
     }
     /// A key's search for its menu item fills no toolbar menu: a row's
     /// shortcut is the page's (ShortcutsMac.swift), and filling presses the
     /// button.
-    func menuHasKeyEquivalent(_ menu: NSMenu, for event: NSEvent, target: AutoreleasingUnsafeMutablePointer<AnyObject?>, action: UnsafeMutablePointer<Selector?>) -> Bool { false }
+    package func menuHasKeyEquivalent(_ menu: NSMenu, for event: NSEvent, target: AutoreleasingUnsafeMutablePointer<AnyObject?>, action: UnsafeMutablePointer<Selector?>) -> Bool { false }
 }
 
 /// Transparent space passes through, so light dismiss never swallows the

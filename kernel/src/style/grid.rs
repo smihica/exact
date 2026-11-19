@@ -32,8 +32,9 @@ use super::{
 use crate::error::{DecodeError, StyleValueError};
 use crate::wire::codec::{Reader, Writer};
 
-/// The grid grammars, once linked ([`link`]). Only a wasm artifact reads
-/// this table; native hosts and the compiler call the parsers directly.
+/// The grid grammars, once linked ([`link`]). A wasm artifact reads this
+/// table, whose value forms are the grammar's; a native one keeps its value
+/// forms and reads only the two parsers ([`NATIVE`]).
 #[cfg(target_arch = "wasm32")]
 struct Parsers {
     tracks: fn(&str, bool) -> Option<GridTracks>,
@@ -50,11 +51,23 @@ struct Parsers {
 #[cfg(target_arch = "wasm32")]
 static LINKED: std::sync::OnceLock<Parsers> = std::sync::OnceLock::new();
 
-/// Link CSS grid's grammars (LLP 1047 D2, linked by use). A web artifact
-/// links them when its plan binds any grid row, and admission refuses such a
-/// plan before boot when they are absent (D6). Native artifacts and the
-/// compiler parse directly.
+/// A native artifact's grid parsers, once linked: tracks and placement. The
+/// kernel's own tests parse directly.
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
+type NativeParsers = (
+    fn(&str, bool) -> Option<GridTracks>,
+    fn(&str) -> Option<GridPlacement>,
+);
+#[cfg(all(not(target_arch = "wasm32"), not(test)))]
+static NATIVE: std::sync::OnceLock<NativeParsers> = std::sync::OnceLock::new();
+
+/// Link CSS grid's grammars (LLP 1047 D2, linked by use). An artifact links
+/// them when its plan binds any grid row (on Apple, with the grid algorithm,
+/// LLP 1047.001 D10), and admission refuses such a plan before boot when
+/// they are absent (D6). The compiler and [`crate::Kernel::new`] link them.
 pub fn link() {
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    let _ = NATIVE.set((GridTracks::check, GridPlacement::check));
     #[cfg(target_arch = "wasm32")]
     let _ = LINKED.set(Parsers {
         tracks: GridTracks::check,
@@ -243,7 +256,9 @@ impl GridTracks {
         return LINKED
             .get()
             .and_then(|parsers| (parsers.tracks)(text, canonical));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        return NATIVE.get().and_then(|(tracks, _)| tracks(text, canonical));
+        #[cfg(all(not(target_arch = "wasm32"), test))]
         Self::check(text, canonical)
     }
 
@@ -845,7 +860,9 @@ impl GridPlacement {
     pub fn parse(text: &str) -> Option<Self> {
         #[cfg(target_arch = "wasm32")]
         return LINKED.get().and_then(|parsers| (parsers.placement)(text));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+        return NATIVE.get().and_then(|(_, placement)| placement(text));
+        #[cfg(all(not(target_arch = "wasm32"), test))]
         Self::check(text)
     }
 
@@ -1089,7 +1106,7 @@ fn check_set_dynamic(
                 .ok_or(StyleValueError::UnknownEnumValue { style: id })?;
         }
         StyleId::GridTemplateColumns | StyleId::GridTemplateRows => {
-            let parsed = GridTracks::check(&value.css_text(id)?, false)
+            let parsed = GridTracks::parse(&value.css_text(id)?)
                 .ok_or(StyleValueError::BadGridTracks { style: id })?;
             if id == StyleId::GridTemplateColumns {
                 style.rare.grid_template_columns = parsed;
@@ -1098,7 +1115,7 @@ fn check_set_dynamic(
             }
         }
         StyleId::GridColumn | StyleId::GridRow => {
-            let parsed = GridPlacement::check(&value.css_text(id)?)
+            let parsed = GridPlacement::parse(&value.css_text(id)?)
                 .ok_or(StyleValueError::BadGridPlacement { style: id })?;
             if id == StyleId::GridColumn {
                 style.rare.grid_column = parsed;

@@ -1,8 +1,8 @@
-import { listItem, syncListItemRoles, sheetLeaves, sheetFrame, useSheets, liveById, sourceField, popoverCommand, contextAt, placePopovers, grantOrigins, createGrantSet, grantError, rawGrantText, scopedGrantSet, deferredFulfill, refusal, commitGuestOrigin, guestMessageAuthorized, pageGivenFiles, focusController, runFocusCommands, controlEvent, environment, onKeyboard, preferences, updateCode, onPreferences, inertAncestor, modalLayers, editMenu, navigation, afterPaintPieces, afterPaint, presenceLoader, animationClock, scrollFollowers, renderMarkup, navigableURL, navigates, refuseURL, frameURL, dataURL, releaseAssets, devFirst, reportPlace, reportTime, launchLocation, pageReporter, appRootFontSize, valuedControl, typedControl, settleValue, foldBits, foldEnv, onFold, preferFold, fold, animationClocks, onSelection, noteFit, refitTexts, pageTitle, pageStore, routeFlags, scrollDrag } from "./navigation.js";
+import { listItem, syncListItemRoles, sheetLeaves, liveById, sourceField, popoverCommand, contextAt, placePopovers, grantOrigins, createGrantSet, grantError, rawGrantText, scopedGrantSet, deferredFulfill, refusal, commitGuestOrigin, guestMessageAuthorized, pageGivenFiles, focusController, runFocusCommands, controlEvent, environment, onKeyboard, preferences, updateCode, onPreferences, inertAncestor, modalLayers, editMenu, navigation, afterPaintPieces, afterPaint, presenceLoader, animationClock, scrollFollowers, renderMarkup, navigableURL, navigates, refuseURL, frameURL, dataURL, releaseAssets, devFirst, reportPlace, reportTime, launchLocation, pageReporter, appRootFontSize, valuedControl, typedControl, settleValue, foldBits, foldEnv, onFold, preferFold, fold, animationClocks, onSelection, noteFit, refitTexts, pageTitle, pageStore, routeFlags, scrollDrag } from "./navigation.js";
 import { send, applyBatch } from "./wasm/commit.js";
 import { positionContexts, contextPanel } from "./wasm/context.js";
 import { syncViewportFit } from "./wasm/views.js";
-import { boot, loadRust, main, reportColors } from "./wasm/boot.js";
+import { boot, loadRust, main, reportColors, replacements } from "./wasm/boot.js";
 import { agentInputReady, agent, agentSettled } from "./wasm/agent.js";
 placePopovers();
 // @ref LLP 1007 §3: the wasm DOM host and its live session state.
@@ -20,8 +20,10 @@ host.typeControl = undefined;
 host.glidesSettled = undefined;
 host.scrollsSeen = undefined;
 host.agentInputLoading = undefined;
-export const AGENT_ADMITTED = true;
-// false in a production bake: host/web/build.mjs rewrites this line (LLP 1069.007 D2)
+export const AGENT_ADMITTED = true; // false in a release, as the release gate writes it (agent-gate.mjs, LLP 1069.007 D2)
+// The page's launch URL, its navigation's, which history entries the app pushes leave as it was (Navigation Timing):
+// agent mode and a drive's facts are the launch's (LLP 1069.007 D2)
+const launchURL = () => new URL(globalThis.performance?.getEntriesByType?.("navigation")[0]?.name ?? location.href);
 host.httpModule = undefined;
 host.pickerModule = undefined;
 host.documentsModule = undefined;
@@ -142,6 +144,9 @@ host.pointerEvent = null;
 host.pointerDepth = 0;
 // keyEvent: the keydown (or wheel, beforeunload, clipboard event) a handler is running for, which its `preventDefault()` command prevents; pointerEvent: the pointer's down or up, which only its `stopPropagation()` reaches (its default is the browser's), from its own batch alone (`pointerDepth`, `send`)
 host.wasm = null;
+// The module's own exports, which a stage imports; `host.wasm` is what the page calls (boot.js `guardedExports`).
+host.exports = null;
+host.trapped = null;
 host.memory = null;
 host.inputReady = false;
 host.inputHandlers = undefined;
@@ -208,8 +213,8 @@ export const dataImports = {
     crypto.getRandomValues(new Uint8Array(host.wasm.memory.buffer, ptr, len));
   },
   agent_seed: () => {
-    const url = new URL(location.href), seed = Number(url.searchParams.get("seed") ?? 1);
-    if (!url.searchParams.has("agent") || ![
+    const url = launchURL(), seed = Number(url.searchParams.get("seed") ?? 1);
+    if (!(AGENT_ADMITTED && ["", "1"].includes(url.searchParams.get("agent"))) || ![
       "localhost",
       "127.0.0.1",
       "[::1]"
@@ -293,7 +298,7 @@ export function moduleCall(op, ptr, len) {
 export const encoder = new TextEncoder();
 export const decoder = new TextDecoder();
 export const t0 = performance.now();
-export const agentMode = AGENT_ADMITTED && new URL(location.href).searchParams.has("agent"), agentKeepsStore = !agentMode || new URL(location.href).searchParams.has("storage"), pendingStore = pageStore(loadAfterPaint);
+export const agentMode = AGENT_ADMITTED && ["", "1"].includes(launchURL().searchParams.get("agent")), agentKeepsStore = !agentMode || launchURL().searchParams.has("storage"), pendingStore = pageStore(loadAfterPaint);
 // `--storage` on the page (platformer R10); a nameless drive stays in memory
 // The driver's fetch faults (LLP 1103, faults.js, loaded with the first request): an injected failure's journal line is the runner's.
 if (agentMode) {
@@ -413,6 +418,11 @@ export function assetNamespace(cards) {
     otf: "font/otf"
   };
   for (const [name, card] of cards) {
+    // A file the page reads when asked (dev.js `later`) loads from its generation's URL.
+    if (card.read) {
+      assets.set(name, card);
+      continue;
+    }
     const type = types[name.split(".").pop().toLowerCase()];
     assets.set(name, {
       ...card,
@@ -448,8 +458,14 @@ export const contextTransforms = new Set();
 export const contextAnchors = new Map();
 // preview view id -> mounted source and entry box
 // @ref LLP 1039 D2, LLP 1061 D4 — viewport facts and display preferences, on every change, without debounce.
+let toldScreenReader = "unknown";
 export const pageFacts = pageReporter(agentMode), pageChanged = () => {
   if (host.wasm?.exact_set_page && host.incarnation) {
+    const screenReader = pageFacts.read()["screen-reader"];
+    if (screenReader !== toldScreenReader) {
+      resizeRunner();
+      toldScreenReader = screenReader;
+    }
     applyBatch(JSON.parse(readOut(host.wasm.exact_set_page(pageFacts.bits()))));
     if (host.wasm.exact_set_root_font_size) {
       applyBatch(JSON.parse(readOut(host.wasm.exact_set_root_font_size(pageFacts.rootFontSize()))));
@@ -477,6 +493,7 @@ const resizeRunner = () => {
   if (host.wasm && host.incarnation && innerWidth > 0 && innerHeight > 0) {
     const told = host.wasm.exact_set_viewport_geometry && document.body ? writeIn(pageGeometry()) : 0;
     host.wasm.exact_set_update?.(updateCode());
+    host.wasm.exact_set_screen_reader(pageFacts.screenReaderCode());
     const batch = JSON.parse(readOut(host.wasm.exact_resize(innerWidth, innerHeight, now(), preferences() | foldBits(), told)));
     // Only a size the runner took is told: a refused one is asked again, never followed by geometry alone.
     if (!batch.error) {
@@ -575,7 +592,8 @@ export function track(p, ticket) {
     p.owner = host.incarnation;
   }
   inflight.add(p);
-  p.finally(() => inflight.delete(p));
+  // Its end may be what a replacement waits for (wasm/boot.js).
+  p.finally(() => { inflight.delete(p); replacements.changed(); });
 }
 export const holds = (ticket, owner = host.incarnation) => owner === host.incarnation && host.wasm?.exact_request_active(ticket) === 1;
 export const waiting = () => [...inflight].filter((p) => p.ticket == null || holds(p.ticket, p.owner));
@@ -654,7 +672,7 @@ export function loadStage(name) {
   }
   load = { loaded: false };
   stageLoads.set(name, load);
-  return load.promise = WebAssembly.instantiateStreaming(fetch(new URL(host.stages[name], import.meta.url)), { primary: host.wasm }).then(() => {
+  return load.promise = WebAssembly.instantiateStreaming(fetch(new URL(host.stages[name], import.meta.url)), { primary: host.exports }).then(() => {
     load.loaded = true;
   }, (error) => {
     stageLoads.delete(name);
@@ -734,12 +752,13 @@ globalThis.exact = {
       send(host.wasm.exact_collect_aborts());
     });
   },
+  replacementChanged: () => replacements.changed(),
   keptChanged: () => {
     if (host.wasm?.exact_changed) {
       applyBatch(JSON.parse(readOut(host.wasm.exact_changed(writeIn("doc-watch:doc:/")))));
     }
   },
-  // the GPU tier's reader and teller (gpu-tier.js); a fetch a realm aborted between batches (module-glue.js door 23); the kept documents' list changed (documents-glue.js, LLP 1069.010.000 D5)
+  // the GPU tier's reader and teller (gpu-tier.js); a fetch a realm aborted between batches (module-glue.js door 23); a commit ended, which may settle a request a replacement waits for (wasm/commit.js `applyBatch`); the kept documents' list changed (documents-glue.js, LLP 1069.010.000 D5)
   // @ref LLP 1038 D8/D11 — synchronous for the serialized popstate caller.
   navigate: (location) => {
     const nav = root.firstElementChild;
@@ -776,16 +795,21 @@ globalThis.exact = {
     if (rust && globalThis.exact.compat?.inputs?.rustMode !== "browser") {
       throw new Error("Rust replacement is disabled in this client; rebuild it");
     }
-    const assets = assetNamespace(cards);
-    let candidate = null;
+    if (!current()) return false;
+    const ticket = replacements.begin();
+    let assets = null, candidate = null;
     try {
+      if (!await replacements.wait(ticket) || !current()) return false;
+      assets = assetNamespace(cards);
       if (module) {
+        replacements.preparing(ticket, "module");
         candidate = {
           ...module,
           realm: await host.moduleLoader.prepare(module, host.logicInfo)
         };
       }
       if (rust) {
+        replacements.preparing(ticket, "module");
         await loadRust();
         if (candidate) {
           const js = new TextEncoder().encode(JSON.stringify(candidate.realm.id));
@@ -814,9 +838,12 @@ globalThis.exact = {
       if (candidate) {
         candidate.letGo = letGo;
       }
-      return await boot(bytes, assets, current, candidate) !== null;
+      replacements.preparing(ticket, null);
+      if (!current()) return false;
+      return await boot(bytes, assets, current, candidate, false, ticket) !== null;
     } finally {
-      if (host.devAssets !== assets) {
+      replacements.end(ticket);
+      if (assets && host.devAssets !== assets) {
         releaseAssets(assets);
       }
       if (candidate && host.activeModule !== candidate) {
@@ -852,6 +879,9 @@ globalThis.exact = {
   } : {},
   get wasm() {
     return host.wasm;
+  },
+  get trapped() {
+    return host.trapped;
   },
   assetURL: localAssetURL,
   stages: () => Object.fromEntries(Object.keys(host.stages).map((name) => [name, stageLoaded(name) ? "loaded" : "staged"])),
@@ -901,8 +931,6 @@ const hostGo = (location) => {
   applyBatch(batch);
   return batch;
 };
-// Any plan the wasm host runs may present a sheet (navigation/routes.js `sheetFrame`).
-useSheets(sheetFrame);
 // the runner's own `go` (LLP 1115.000 D4.3): Forward, and a link to a route (input-glue.js)
 navigation.connect(root, navigate, log, (id) => {
   if (host.inputReady) {

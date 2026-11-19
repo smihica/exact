@@ -12,7 +12,7 @@
 #if os(macOS)
 import AppKit
 
-final class HostCovers {
+package final class HostCovers {
     private unowned let presenter: Presenter
     /// What each presentation covers, as it last reported, by its name.
     private var claims: [String: [UInt32: HostCover]] = [:]
@@ -24,7 +24,7 @@ final class HostCovers {
 
     /// `presentation` covers exactly these boxes now; an empty report ends
     /// its covers. Told to the kernel after the batch being applied.
-    func report(_ presentation: String, _ covers: [UInt32: HostCover]) {
+    package func report(_ presentation: String, _ covers: [UInt32: HostCover]) {
         guard claims[presentation] ?? [:] != covers else { return }
         claims[presentation] = covers.isEmpty ? nil : covers
         guard !queued else { return }

@@ -76,6 +76,36 @@ pub struct Admitted {
 }
 
 impl<D: DataSource> Runner<D> {
+    /// The plan's timers at boot. A gated task starts idle; the gate step
+    /// arms the ones whose gate holds, over the settled state (LLP 1092 D8).
+    pub(super) fn boot_timers(&self) -> Vec<Timer> {
+        let now = self.now_ms;
+        self.plan
+            .timers
+            .iter()
+            .enumerate()
+            .map(|(site, t)| Timer {
+                site,
+                instance: 0,
+                owner: None,
+                path: String::new(),
+                next_ms: if t.owner.is_some() || t.gated || t.keyed {
+                    f64::INFINITY
+                } else if t.frame {
+                    virtual_frame(now, 1)
+                } else {
+                    now + t.interval_ms as f64
+                },
+                armed: !(t.owner.is_some() || t.gated || t.keyed),
+                generation: 0,
+                completion: Default::default(),
+                key: None,
+                base: now,
+                k: 1,
+            })
+            .collect()
+    }
+
     /// Declare supported waits before installing the live clock.
     pub fn hold_waits(&mut self, kinds: WaitKinds) {
         self.clock.waits = kinds;
@@ -84,11 +114,11 @@ impl<D: DataSource> Runner<D> {
     /// Read wait observations; caps remain visible through `timer_due_ms`.
     pub fn waits(&self) -> Waits {
         let mut result = Waits::default();
-        if !self.clock_live() || self.poisoned || self.wake_stops_timers() {
+        if !self.clock_live() || self.poisoned || self.invocation_stops_timers() {
             return result;
         }
         for (i, t) in self.timers.iter().enumerate() {
-            let kind = self.plan.timers[i].wait;
+            let kind = self.timer_row(i).wait;
             if !t.next_ms.is_finite() || !self.clock.waits.contains(kind) {
                 continue;
             }
@@ -129,7 +159,7 @@ impl<D: DataSource> Runner<D> {
                 continuing: false,
             };
         }
-        let resumed = self.clock.admission == Some(cutoff) && !self.wake_stops_timers();
+        let resumed = self.clock.admission == Some(cutoff) && !self.invocation_stops_timers();
         if !resumed {
             let advanced = self.advance_timed(cutoff);
             if advanced.error.is_some() || !advanced.receipts.is_empty() {
@@ -145,7 +175,7 @@ impl<D: DataSource> Runner<D> {
             }
         }
         self.clock.admission = Some(cutoff);
-        let stopped = self.wake_stops_timers();
+        let stopped = self.invocation_stops_timers();
         let candidate = self
             .timers
             .iter()
@@ -153,11 +183,16 @@ impl<D: DataSource> Runner<D> {
             .filter(|(i, t)| {
                 !stopped
                     && t.next_ms <= cutoff
-                    && self.clock.waits.contains(self.plan.timers[*i].wait)
-                    && kinds.contains(self.plan.timers[*i].wait)
-                    && (self.plan.timers[*i].wait != 4 || kinds == WaitKinds::IDLE)
+                    && self.clock.waits.contains(self.timer_row(*i).wait)
+                    && kinds.contains(self.timer_row(*i).wait)
+                    && (self.timer_row(*i).wait != 4 || kinds == WaitKinds::IDLE)
             })
-            .min_by(|(ia, a), (ib, b)| a.next_ms.total_cmp(&b.next_ms).then(ia.cmp(ib)))
+            .min_by(|(_, a), (_, b)| {
+                a.next_ms
+                    .total_cmp(&b.next_ms)
+                    .then(a.site.cmp(&b.site))
+                    .then(a.instance.cmp(&b.instance))
+            })
             .map(|(i, t)| (i, t.next_ms));
         let mut advanced = Advanced {
             receipts: Vec::new(),
@@ -189,14 +224,15 @@ impl<D: DataSource> Runner<D> {
 
     /// Scheduling details, including held state and absolute caps.
     pub fn task_timing(&self) -> Vec<TaskTiming> {
-        self.plan
-            .timers
+        self.timers
             .iter()
             .enumerate()
-            .map(|(i, row)| {
+            .filter(|(i, t)| self.timer_row(*i).owner.is_none() || t.owner.is_some())
+            .map(|(i, _)| {
+                let row = self.timer_row(i);
                 let due_ms = Some(self.timers[i].next_ms).filter(|at| at.is_finite());
                 TaskTiming {
-                    name: self.plan.str(row.name).to_string(),
+                    name: self.task_name(i),
                     wait: row.wait,
                     due_ms,
                     held: !self.poisoned
@@ -218,7 +254,7 @@ impl<D: DataSource> Runner<D> {
     }
 
     pub(super) fn timer_cap(&self, i: usize) -> f64 {
-        let row = &self.plan.timers[i];
+        let row = self.timer_row(i).clone();
         let bound = match row.wait {
             1 | 2 => 100.0,
             3 if row.max_ms == 0 => f64::INFINITY,
@@ -230,7 +266,7 @@ impl<D: DataSource> Runner<D> {
 
     pub(super) fn timer_execution(&self, i: usize) -> f64 {
         let t = &self.timers[i];
-        let row = &self.plan.timers[i];
+        let row = self.timer_row(i).clone();
         if !t.next_ms.is_finite() {
             return t.next_ms;
         }
@@ -263,7 +299,7 @@ impl<D: DataSource> Runner<D> {
         cutoff: f64,
         admitted: bool,
     ) -> Result<CommitReceipt, RunnerError> {
-        let row = &self.plan.timers[i];
+        let row = self.timer_row(i).clone();
         let (once, frame, interval, waiting) =
             (row.once, row.frame, row.interval_ms as f64, row.wait != 0);
         let live = self.clock_live();
@@ -303,10 +339,10 @@ impl<D: DataSource> Runner<D> {
         if !self.ids.work.sites.is_empty() {
             self.ids.work.timer_firings[kind] += 1;
         }
-        let instance = self.timers[i].key.clone();
-        let action = self.plan.timers[i].action;
+        let owner = self.timers[i].owner.clone();
+        let instance = (self.timers[i].generation, self.timers[i].key.clone());
         let fire = |r: &mut Self| {
-            let result = r.traced_action("task", action, Vec::new(), &[]);
+            let result = r.task_action(i);
             if !r.ids.work.sites.is_empty() {
                 r.journal_only(format!(
                     "timer row={i} kind={kind} nominal_ms={nominal:.3} cutoff_ms={cutoff:.3} commit_ms={:.3}",
@@ -326,8 +362,8 @@ impl<D: DataSource> Runner<D> {
         };
         let done = self.now_ms;
         let t = &mut self.timers[i];
-        if coalesce && t.armed {
-            let same = t.key == instance && t.next_ms == next_ms;
+        if coalesce && t.armed && owned_tasks::same_owner(&t.owner, &owner) {
+            let same = (t.generation, t.key.clone()) == instance && t.next_ms == next_ms;
             t.next_ms = if frame {
                 (t.base, t.k) = (done, 1);
                 virtual_frame(done, 1)

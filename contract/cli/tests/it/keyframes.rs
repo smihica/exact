@@ -4,6 +4,7 @@
 //! keyframes, computed times and `for` positions — proven on the rows the
 //! runner resolves after boot, and on what the compiler refuses.
 
+use crate::scratch::Scratch;
 use exact_kernel::{Kernel, StyleId};
 use exact_motion::{Animations, Direction, Easing, FillMode, Property, Value};
 use exact_plan::{Plan, Value as PlanValue};
@@ -22,12 +23,48 @@ fn fixture() -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+#[test]
+fn keyframes_accept_a_rotation_axis_and_angle_units() {
+    for rotation in ["-90deg x", "y -0.25turn", "1 1 0 100grad", "1.5rad"] {
+        let source = format!("keyframes fold\n  to rotate=\"{rotation}\"\ncomponent App\n  view\n    view animation=\"fold 1s linear both\"\n");
+        contract::compile(&source).unwrap_or_else(|e| panic!("{rotation}: {e}"));
+    }
+}
+
+#[test]
+fn spatial_keyframes_on_svg_elements_name_the_unsupported_hosts() {
+    let source = "keyframes fold\n  to rotate=\"-90deg x\"\ncomponent App\n  view\n    svg viewBox=\"0 0 100 100\"\n      rect width=100 height=100 animation=\"fold 1s linear both\"\n";
+    let e = contract::compile(source).unwrap_err();
+    assert_eq!(e.id, "lower-animation-target");
+    assert!(
+        e.message.contains("Apple or painted hosts"),
+        "{}",
+        e.message
+    );
+    assert!(e.message.contains("box around the `svg`"), "{}", e.message);
+}
+
+#[test]
+fn svg_angle_keyframes_refuse_an_inherited_spatial_axis() {
+    for row in ["0deg x", "0deg y", "1 1 0 0deg", "0deg z"] {
+        let source = format!("keyframes fold\n  to rotate=-90\ncomponent App\n  view\n    svg\n      rect rotate=\"{row}\" animation=\"fold 1s linear\"\n");
+        let result = contract::compile(&source);
+        if row == "0deg z" {
+            result.unwrap();
+        } else {
+            let e = result.unwrap_err();
+            assert_eq!(e.id, "lower-animation-target");
+            assert!(e.message.contains("Apple or painted hosts"));
+        }
+    }
+}
+
 fn animation(r: &Runner<NoData>, test_id: &str) -> (bool, Animations) {
     let k = r.kernel();
     let node = k.node_by_key(k.find_by_test_id(test_id)[0]).unwrap();
     (
         node.style.mask.has(StyleId::Animation),
-        node.style.animation.clone(),
+        (*node.style.animation).clone(),
     )
 }
 
@@ -441,6 +478,273 @@ fn a_branching_palette_stops_with_a_compile_diagnostic() {
 }
 
 #[test]
+fn keyframe_numeric_formatting_uses_the_runtime_formatter() {
+    for (body, expected) in [
+        ("`${i.toFixed(2)}% 0%`", "20.00% 0%"),
+        ("`${formatDecimal(i, 2)}% 0%`", "0.20% 0%"),
+        ("`${min(0.2, 0.8)}% 0%`", "0.2% 0%"),
+    ] {
+        let source = format!(
+            "fn slot(i: number): string = {body}\nkeyframes k\n  to translate=slot(20)\ncomponent App\n  view\n    text slot(20) testId=\"a\" animation=\"k 1s\"\n"
+        );
+        let r = booted(&source);
+        let (_, row) = animation(&r, "a");
+        assert_eq!(
+            row.0[0].keyframes,
+            exact_motion::Keyframes::parse(&format!("100%{{translate:{expected};}}")).unwrap(),
+            "{body}"
+        );
+        let k = r.kernel();
+        let node = k.node_by_key(k.find_by_test_id("a")[0]).unwrap();
+        assert_eq!(node.text_runs()[0].text, expected, "{body}");
+    }
+}
+
+#[test]
+fn deep_keyframe_calls_report_a_limit() {
+    let mut direct = String::from("fn f0(): number = 0.5\n");
+    for n in 1..300 {
+        direct.push_str(&format!("fn f{n}(): number = f{}()\n", n - 1));
+    }
+    direct.push_str("keyframes k\n  to opacity=f299()\ncomponent App\n  view\n    text \"a\"\n");
+    let error = contract::compile(&direct).unwrap_err();
+    assert_eq!(error.id, "lower-keyframes");
+    assert!(error.message.contains("call depth limit"), "{error}");
+
+    let mut source = String::from("fn f0(): number = 0.5\n");
+    for n in 1..300 {
+        let mut body = format!("f{}()", n - 1);
+        for _ in 0..16 {
+            body = format!("false ? 0.5 : ({body})");
+        }
+        source.push_str(&format!("fn f{n}(): number = {body}\n"));
+    }
+    source.push_str("component App\n  view\n    text \"a\"\n");
+    contract::compile(&source).unwrap();
+    source.push_str("keyframes k\n  to opacity=f299()\n");
+    let error = contract::compile(&source).unwrap_err();
+    assert_eq!(error.id, "lower-keyframes");
+    assert!(error.message.contains("limit"), "{error}");
+    let skipped = source.replace("false ?", "true ?");
+    let plan = contract::compile(&skipped).unwrap();
+    assert_eq!(plan.str(plan.keyframes[0].css), "100%{opacity:0.5;}");
+}
+
+#[test]
+fn keyframe_arithmetic_does_not_spend_call_depth() {
+    let body = format!("0.5{}", " + 0".repeat(70));
+    let source = format!(
+        "fn value(): number = {body}\nkeyframes k\n  to opacity=value()\ncomponent App\n  view\n    text `${{value()}}` testId=\"a\" animation=\"k 1s\"\n"
+    );
+    let r = booted(&source);
+    let (_, row) = animation(&r, "a");
+    assert_eq!(row.0[0].keyframes.css(), "100%{opacity:0.5;}");
+    let k = r.kernel();
+    let node = k.node_by_key(k.find_by_test_id("a")[0]).unwrap();
+    assert_eq!(node.text_runs()[0].text, "0.5");
+}
+
+#[test]
+fn keyframe_functions_fold_constant_tables_and_pure_calls() {
+    for (functions, value, expected) in [
+        (
+            r#"fn slot(i: number): string = match ["0% 0%", "100% 0%", "200% 0%"].at(i) { case some(x) => x, case none => "0% 0%" }"#,
+            "slot(2)",
+            "200% 0%",
+        ),
+        (
+            r#"fn slot(i: number): string = match ["0% 0%", "100% 0%", "200% 0%"].at(i) { case some(x) => x, case none => "0% 0%" }"#,
+            "slot(8)",
+            "0% 0%",
+        ),
+        (
+            r#"fn cell(row: number, col: number): string = match [["0% 0%", "100% 0%"], ["0% 100%", "100% 100%"]].at(row) { case some(cells) => match cells.at(col) { case some(x) => x, case none => "200% 0%" }, case none => "0% 200%" }"#,
+            "cell(1, 1)",
+            "100% 100%",
+        ),
+        (
+            r#"fn cell(row: number, col: number): string = match [["0% 0%", "100% 0%"], ["0% 100%", "100% 100%"]].at(row) { case some(cells) => match cells.at(col) { case some(x) => x, case none => "200% 0%" }, case none => "0% 200%" }"#,
+            "cell(1, 8)",
+            "200% 0%",
+        ),
+        (
+            "fn offset(i: number): number = round(min(i, 2.4)) * 100\nfn slot(i: number): string = `${offset(i)}% 0%`",
+            "slot(3)",
+            "200% 0%",
+        ),
+        (
+            r#"fn slot(i: number): string = ["0% 0%", "100% 0%", "200% 0%"].slice(i).join(" ")"#,
+            "slot(2)",
+            "200% 0%",
+        ),
+        (
+            r#"fn slot(i: number): string = range(i).filter(x => x > 0).map(x => `${x * 100}%`).join(" ")"#,
+            "slot(3)",
+            "100% 200%",
+        ),
+        (
+            r#"fn slot(xs: string[]): string = xs.map(x => x.toUpperCase()).join("") == "" ? "200% 0%" : "100% 0%""#,
+            "slot([])",
+            "200% 0%",
+        ),
+        (
+            r#"fn slot(x: option<string>): string = match x { case some(s) => s.toUpperCase(), case none => "0% 0%" }"#,
+            "slot(none)",
+            "0% 0%",
+        ),
+        (
+            r#"fn slot(i: number): string = (i == 0 ? [] : ["100% 0%"]).map(x => x.toUpperCase()).join("") == "" ? "0% 0%" : "100% 0%""#,
+            "slot(0)",
+            "0% 0%",
+        ),
+    ] {
+        let source = format!(
+            "{functions}\nkeyframes slide\n  0% translate=\"0% 0%\"\n  100% translate={value}\ncomponent App\n  view\n    text {value} testId=\"a\" animation=\"slide 1s linear both\"\n"
+        );
+        let r = booted(&source);
+        let k = r.kernel();
+        let node = k.node_by_key(k.find_by_test_id("a")[0]).unwrap();
+        assert_eq!(node.text_runs()[0].text, expected, "{value}");
+        let (_, row) = animation(&r, "a");
+        let frames = &row.0[0].keyframes;
+        assert_eq!(
+            frames,
+            &exact_motion::Keyframes::parse(&format!(
+                "0%{{translate:0% 0%;}}100%{{translate:{expected};}}"
+            ))
+            .unwrap(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn keyframe_functions_evaluate_only_taken_branches() {
+    let dir = Scratch::new(format!("keyframe-constant-branches-{}", std::process::id()));
+    std::fs::create_dir(dir.join("strings")).unwrap();
+    std::fs::write(dir.join("strings/en.json"), r#"{"key":"100% 0%"}"#).unwrap();
+    for (body, accepted) in [
+        (r#"true ? "0% 0%" : t("key")"#, true),
+        (
+            r#"[0].map(i => i == 0 ? "0% 0%" : t("key")).join("")"#,
+            true,
+        ),
+        (
+            r#"(true ? [] : [t("key")]).join("") == "" ? "0% 0%" : "100% 0%""#,
+            true,
+        ),
+        (
+            r#"match (true ? none : some(t("key"))) { case some(x) => x, case none => "0% 0%" }"#,
+            true,
+        ),
+        (r#"true ? "0% 0%" : formatNumber(20, "compact")"#, true),
+        (r#"false ? "0% 0%" : t("key")"#, false),
+        (
+            r#"[1].map(i => i == 0 ? "0% 0%" : t("key")).join("")"#,
+            false,
+        ),
+        (r#"false ? "0% 0%" : formatNumber(20, "compact")"#, false),
+    ] {
+        std::fs::write(dir.join("app.contract"), format!(
+            "fn slot(): string = {body}\nkeyframes k\n  to translate=slot()\ncomponent App\n  view\n    text \"a\"\n"
+        )).unwrap();
+        let result = contract::compile_path_all(&dir.join("app.contract"), false);
+        if accepted {
+            let (plan, _) = result.unwrap_or_else(|errors| panic!("{body}: {errors:?}"));
+            assert_eq!(plan.str(plan.keyframes[0].css), "100%{translate:0px 0px;}");
+        } else {
+            let errors = result.err().expect("runtime input is refused");
+            let error = errors.iter().find(|e| e.id == "lower-keyframes").unwrap();
+            let read = if body.contains("t(") {
+                "t()"
+            } else {
+                "formatNumber()"
+            };
+            assert!(
+                error.message.contains(&format!("read `{read}`")),
+                "{body}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyframe_runtime_inputs_keep_their_checked_types() {
+    for (declaration, input, read) in [
+        ("state amount = 0.5", "amount", "amount"),
+        (
+            "resource amount = amount() as shape number",
+            "amount",
+            "amount",
+        ),
+        (
+            "resource amount = amount() as shape number",
+            "(match failure(amount) { case some(e) => e.message.length, case none => 0 })",
+            "failure()",
+        ),
+        (
+            "state reading = Reading(amount=0.5)",
+            "reading.amount",
+            "reading",
+        ),
+    ] {
+        for (value, accepted) in [
+            (
+                format!("sum([0].map(i => i == 0 ? 0.5 : min({input}, 1)))"),
+                true,
+            ),
+            (format!("min({input}, 1)"), false),
+            (
+                format!("sum([1].map(i => i == 0 ? 0.5 : min({input}, 1)))"),
+                false,
+            ),
+        ] {
+            let source = format!(
+                "shape Reading\n  amount: number\nkeyframes k\n  to opacity={value}\ncomponent App\n  {declaration}\n  view\n    text \"a\"\n"
+            );
+            let result = contract::compile(&source);
+            if accepted {
+                let plan = result.unwrap_or_else(|error| panic!("{source}: {error}"));
+                assert_eq!(plan.str(plan.keyframes[0].css), "100%{opacity:0.5;}");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.id, "lower-keyframes", "{source}: {error}");
+                assert!(
+                    error.message.contains(&format!("read `{read}`")),
+                    "{source}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn keyframe_functions_refuse_runtime_inputs() {
+    for (value, read) in [
+        ("tone(on ? 25 : 75)", "on"),
+        ("tone(amount)", "amount"),
+        ("tone(performanceNow())", "performanceNow()"),
+        ("clock()", "performanceNow()"),
+        ("hiddenClock(1)", "performanceNow()"),
+        ("hiddenCallback()", "performanceNow()"),
+    ] {
+        let source = format!(
+            "fn tone(x: number): number = x / 100\nfn clock(): number = performanceNow()\nfn hiddenClock(x: number): number = x == 0 ? 0.5 : clock()\nfn hiddenCallback(): number = sum([1].map(i => i == 0 ? 0.5 : clock()))\nkeyframes k\n  from opacity={value}\ncomponent App\n  state on = true\n  resource amount = amount() as shape number\n  view\n    text \"a\"\n"
+        );
+        let error = contract::compile(&source).unwrap_err();
+        assert_eq!(error.id, "lower-keyframes", "{value}: {error}");
+        assert!(
+            error.message.contains("known when the app compiles"),
+            "{value}: {error}"
+        );
+        assert!(
+            error.message.contains(&format!("read `{read}`")),
+            "{value}: {error}"
+        );
+    }
+}
+
+#[test]
 fn keyframe_folding_matches_the_vms_operators_and_number_text() {
     for condition in [
         "-0 == 0",
@@ -461,9 +765,19 @@ fn keyframe_folding_matches_the_vms_operators_and_number_text() {
         "`${1 / 0}` == \"Infinity\"",
         "`${0 / 0}` == \"NaN\"",
         "`${true}:${false}:${1.25}` == \"true:false:1.25\"",
+        "[1, 2] == [1, 2]",
+        "some(1) == some(1)",
+        "\"ab\" < \"cd\"",
+        "min(2, 3) == 2 && round(-0.5) == 0",
+        "true || range(65537).length > 0",
+        "false && range(65537).length > 0",
+        "sum([0].map(i => i == 0 ? 0.5 : id(sum(range(65537))))) == 0.5",
+        "sum([0].map(i => match [0.5].at(i) { case some(x) => x, case none => id(sum(range(65537))) })) == 0.5",
+        "[0].filter(i => i == 0 || id(sum(range(65537))) > 0).length == 1",
+        "[0].filter(i => i != 0 && id(sum(range(65537))) > 0).length == 0",
     ] {
         let source = format!(
-            "fn value(): number = ({condition}) ? 0.25 : 0.75\nkeyframes k\n  from opacity=value()\ncomponent App\n  view\n    text `${{value()}}` testId=\"a\" animation=\"k 1s\"\n"
+            "fn id(x: number): number = x\nfn value(): number = ({condition}) ? 0.25 : 0.75\nkeyframes k\n  from opacity=value()\ncomponent App\n  view\n    text `${{value()}}` testId=\"a\" animation=\"k 1s\"\n"
         );
         let r = booted(&source);
         let (_, row) = animation(&r, "a");
@@ -541,12 +855,13 @@ fn a_bare_hex_color_is_its_quoted_string_and_another_hash_says_why() {
 }
 
 /// Chess diary #4: `translate` takes percentages of the box's own border
-/// box, as CSS does — in an attribute, bound to state, and in a keyframe —
-/// and the engine's `translate` carries them beside the lengths (x, y, then
-/// percentages), interpolated componentwise as CSS interpolates `calc()`.
+/// box, as CSS does — in an attribute, bound to state, and in a keyframe,
+/// alone or in a `calc()` with px — and the engine's `translate` carries them
+/// beside the lengths (x, y, then percentages), interpolated componentwise as
+/// CSS interpolates `calc()`.
 #[test]
 fn translate_takes_percentages_of_the_box_everywhere_it_takes_lengths() {
-    let source = "keyframes slide\n  from translate=\"-50% 0\"\n  to translate=\"10px 25%\"\ncomponent App\n  state wide = false\n  action widen\n    wide = true\n  view\n    column\n      box testId=\"centred\" position=\"absolute\" left=\"50%\" top=\"50%\" width=120 height=40 translate=\"-50% -50%\"\n      box testId=\"one\" position=\"absolute\" left=\"50%\" width=20 height=10 translate=\"-50%\"\n      box testId=\"bound\" width=80 height=10 translate=wide ? \"12px -100%\" : \"0\"\n      box testId=\"slides\" width=10 height=10 animation=\"slide 1s\"\n      button testId=\"widen\" press=widen\n        text \"w\"\n";
+    let source = "keyframes slide\n  from translate=\"calc(-50% + 4px) 0\"\n  to translate=\"10px 25%\"\ncomponent App\n  state wide = false\n  action widen\n    wide = true\n  view\n    column\n      box testId=\"centred\" position=\"absolute\" left=\"50%\" top=\"50%\" width=120 height=40 translate=\"-50% -50%\"\n      box testId=\"one\" position=\"absolute\" left=\"50%\" width=20 height=10 translate=\"-50%\"\n      box testId=\"bound\" width=80 height=10 translate=wide ? \"12px calc(-100% + 3px)\" : \"0\"\n      box testId=\"slides\" width=10 height=10 animation=\"slide 1s\"\n      button testId=\"widen\" press=widen\n        text \"w\"\n";
     let mut r = booted(source);
     let rows = |r: &Runner<NoData>, id: &str| {
         let k = r.kernel();
@@ -574,9 +889,9 @@ fn translate_takes_percentages_of_the_box_everywhere_it_takes_lengths() {
     assert_eq!(
         rows(&r, "bound"),
         (
-            (12.0, 0.0),
+            (12.0, 3.0),
             (0.0, -100.0),
-            Value::four(12.0, 0.0, 0.0, -100.0)
+            Value::four(12.0, 3.0, 0.0, -100.0)
         )
     );
     let (_, row) = animation(&r, "slides");
@@ -584,7 +899,7 @@ fn translate_takes_percentages_of_the_box_everywhere_it_takes_lengths() {
     assert_eq!(
         frames,
         [
-            (Property::Translate, Value::four(0.0, 0.0, -50.0, 0.0)),
+            (Property::Translate, Value::four(4.0, 0.0, -50.0, 0.0)),
             (Property::Translate, Value::four(10.0, 0.0, 0.0, 25.0)),
         ]
     );
@@ -597,7 +912,7 @@ fn translate_takes_percentages_of_the_box_everywhere_it_takes_lengths() {
         exact_motion::animation::value_css(Property::Translate, Value::four(-4.0, 0.0, -50.0, 0.0)),
         "calc(-4px + -50%) 0px"
     );
-    for refused in ["-50%%", "calc(10px + 5%)", "50% 50% 10%"] {
+    for refused in ["-50%%", "calc(1rem + 5%)", "calc(5% * 5%)", "50% 50% 10%"] {
         let error = contract::compile(&format!(
             "component App\n  view\n    box translate=\"{refused}\"\n"
         ))
@@ -655,11 +970,10 @@ fn a_colour_keyframe_takes_the_designs_tokens() {
     let from = &row.0[0].keyframes.0[0];
     assert_eq!(get(&from.values, Property::Color), Some([255, 0, 0, 255]));
     assert_eq!(get(&from.dark, Property::Color), Some([255, 255, 255, 255]));
-    let dir = std::env::temp_dir().join(format!("keyframe-token-axis-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new(format!("keyframe-token-axis-{}", std::process::id()));
     std::fs::write(
-        dir.join("app.tamber"),
-        "tamber t\n\naxes\n  tone = calm | loud\n\ntheme\n  c.chip = #cfced4\n    when tone=loud: #ff0000\n",
+        dir.join("app.forma"),
+        "forma t\n\naxes\n  tone = calm | loud\n\ntheme\n  c.chip = #cfced4\n    when tone=loud: #ff0000\n",
     )
     .unwrap();
     std::fs::write(
@@ -678,7 +992,7 @@ fn a_colour_keyframe_takes_the_designs_tokens() {
     .unwrap_err();
     assert_eq!(scale.id, "lower-keyframes");
     assert!(
-        scale.message.contains("one factor for both axes"),
+        scale.message.contains("one factor for both axes") && scale.message.contains("-90deg x"),
         "{scale}"
     );
 }

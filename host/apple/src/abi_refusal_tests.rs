@@ -2,6 +2,10 @@ use super::*;
 use exact_runner::exact_canvas::{Context2d, DrawError, Frame};
 use serde_json::{json, Value as Json};
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 struct Dot;
 
 impl DataSource for Dot {
@@ -292,6 +296,81 @@ fn view_words(mask: u32, regions: &[f32], tail: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+#[test]
+fn a_view_lays_out_its_viewport_and_owner_blocks_once() {
+    let plan = contract::compile(
+        "component App\n  view\n    column width=\"100%\" height=\"100%\"\n      column testId=\"route\" width=\"100%\" height=\"100%\"\n        box width=\"50vw\" height=10\n",
+    ).unwrap().encode();
+    let mut bridge = Bridge::new();
+    bridge.boot(&plan, Dot, Hooks::none(), 402., 874.);
+    let host = bridge.host.as_ref().unwrap();
+    let kernel = host.runner().kernel();
+    let id = kernel
+        .node_by_key(kernel.find_by_test_id("route")[0])
+        .unwrap()
+        .id;
+    let before = host.layout_calls;
+    let mut wire = view_words(8 | 32 | 64, &[], &[200.0f32.to_bits()]);
+    wire[28..36].copy_from_slice(&[380.0f32.to_le_bytes(), 700.0f32.to_le_bytes()].concat());
+    for word in [id, 4, 360.0f32.to_bits(), 600.0f32.to_bits(), 0, 0, 228] {
+        wire.extend(word.to_le_bytes());
+    }
+    let len = bridge.input_write(&wire);
+    let len = bridge.view(len);
+    let batch = output(&bridge, len);
+    assert!(batch["error"].is_null(), "{batch}");
+    let host = bridge.host.as_ref().unwrap();
+    assert_eq!(host.layout_calls - before, 1);
+    let frame = host.runner().kernel().node(id).unwrap().frame;
+    assert_eq!((frame.width, frame.height), (360., 600.));
+    assert_eq!(host.runner().viewport().keyboard_height, 200.);
+    assert_eq!(host.runner().kernel().env().viewport_width, 380.);
+    // Taking the block back without a viewport change still lays out once.
+    let before = host.layout_calls;
+    let len = bridge.input_write(&view_words(64, &[], &[id, 5, 0, 0, 0, 0]));
+    let len = bridge.view(len);
+    assert!(output(&bridge, len)["error"].is_null());
+    let host = bridge.host.as_ref().unwrap();
+    assert_eq!(host.layout_calls - before, 1);
+    assert!(host.runner().kernel().host_block(id).is_none());
+    assert_eq!(host.runner().kernel().node(id).unwrap().frame.width, 380.);
+}
+
+#[test]
+fn a_view_refuses_truncated_or_non_owner_records_before_changing_geometry() {
+    // A block without its tactic word, or with one that is no permutation
+    for tail in [
+        vec![1, 4],
+        vec![1, 4, 0, 0, 0, 0],
+        vec![1, 4, 0, 0, 0, 0, 0],
+        vec![1, 6, 0, 0, 0, 0],
+        vec![1, 2, 0, 0, 0, 0],
+    ] {
+        preserves_state(
+            |bridge, _| {
+                let mut bytes = view_words(8 | 64, &[], &tail);
+                bytes[28..36]
+                    .copy_from_slice(&[300.0f32.to_le_bytes(), 500.0f32.to_le_bytes()].concat());
+                let len = bridge.input_write(&bytes);
+                let len = bridge.view(len);
+                assert_eq!(
+                    bridge
+                        .host
+                        .as_ref()
+                        .unwrap()
+                        .runner()
+                        .kernel()
+                        .env()
+                        .viewport_width,
+                    390.
+                );
+                len
+            },
+            "view:",
+        );
+    }
+}
+
 /// The segments' rects (mask 16) without their count, or with a count the
 /// buffer does not hold or holds more than, are refused, never read past
 /// the buffer.
@@ -546,7 +625,9 @@ fn live_batches_flush_presenter_and_executor_work() {
             Err(DataError::UnknownSource(name.into()))
         }
         fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
-            Ok(Answer::Later(exact_runner::Request::continuation(1)))
+            Ok(Answer::Later(
+                exact_runner::Request::continuation::<TestWork>(1),
+            ))
         }
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
             let ran = self.0.clone();
@@ -603,7 +684,7 @@ component App
         let len = bridge.input_write(b"{}");
         let len = bridge.design_rows(len);
         let invalid: Json = serde_json::from_slice(bridge.output_bytes(len as usize)).unwrap();
-        assert_eq!(invalid["error"], "live: not a tamber batch or snapshot");
+        assert_eq!(invalid["error"], "live: not a forma batch or snapshot");
         assert!(received.try_recv().is_err());
 
         let len = bridge.input_write(frame.json().as_bytes());
@@ -696,4 +777,50 @@ fn a_pick_after_preparation_refuses_a_candidate_that_would_reuse_its_path() {
             .picked_path("photo.jpg"),
         path
     );
+}
+
+#[test]
+fn module_validation_keeps_the_live_sequence_and_root_drop_report() {
+    let plan = |second: bool| {
+        contract::compile(&format!(
+        "component App\n  state kept = 1\n  state retyped = {}\n{}  view\n    text `${{kept}}`\n",
+        if second { "\"new\"" } else { "1" },
+        if second { "" } else { "  state removed = 1\n" },
+    ))
+        .unwrap()
+        .encode()
+    };
+    let mut bridge = Bridge::new();
+    bridge.boot(
+        &plan(false),
+        StorageModule::default(),
+        Hooks::none(),
+        400.,
+        400.,
+    );
+    bridge.data_ready();
+    let epoch = bridge.host.as_ref().unwrap().runner().kernel().epoch();
+    let bytes = plan(true);
+    bridge.input_write(&bytes);
+    bridge.prepare_module(
+        [bytes.len(), 0, 0],
+        StorageModule::default(),
+        Hooks::none(),
+        400.,
+        400.,
+    );
+    assert_eq!(bridge.host.as_ref().unwrap().runner().generation(), 1);
+    assert!(bridge.prepared.is_some());
+    bridge.commit_plan();
+    let runner = bridge.host.as_ref().unwrap().runner();
+    let state: Json = serde_json::from_str(&exact_runner::agent::state(runner)).unwrap();
+    assert_eq!(
+        state["replacement"]["dropped"],
+        json!([
+            {"what": "state", "name": "retyped", "why": "type changed"},
+            {"what": "state", "name": "removed", "why": "no place"},
+        ])
+    );
+    assert_eq!(runner.generation(), 2);
+    assert!(runner.kernel().epoch() > epoch);
 }

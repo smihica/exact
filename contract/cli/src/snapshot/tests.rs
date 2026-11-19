@@ -3,7 +3,11 @@ use crate::{Manifest, Widget};
 use exact_plan::Plan;
 use serde_json::json;
 
-fn widget() -> Widget {
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
+pub(super) fn widget() -> Widget {
     Widget {
         requires_secrets: false,
         kind: "next-trains".into(),
@@ -19,7 +23,7 @@ fn widget() -> Widget {
     }
 }
 
-fn source(view: &str, declarations: &str, members: &str) -> String {
+pub(super) fn source(view: &str, declarations: &str, members: &str) -> String {
     format!("shape Props\n  title: string\n{declarations}\ncomponent App\n  state nowMs = 0\n  action tick\n    nowMs = performanceNow()\n  task ticker mount\n    every(1000, tick)\n  view\n    scroll height=100\n      text nowMs.toString()\ncomponent Card\n  props\n    title: string\n{members}  view\n{view}\n")
 }
 
@@ -802,7 +806,10 @@ fn refresh_checks_distinguish_pending_sources_and_result_mismatches() {
             plan,
         },
     )]);
-    let mut pending = Data(Ok(Answer::Later(Request::continuation(7))), false);
+    let mut pending = Data(
+        Ok(Answer::Later(Request::continuation::<TestWork>(7))),
+        false,
+    );
     check_refreshes(&entries, &mut pending).unwrap();
     assert!(pending.1);
     check_refreshes(
@@ -1283,17 +1290,14 @@ fn watch_configuration_refuses_more_than_64_recommendations() {
 
 #[test]
 fn a_configuration_is_read_fills_its_defaults_and_refuses_with_an_edit() {
+    use exact_plan::Value;
+    use exact_runner::{DataError, DataSource};
     let widget = configured();
     let configuration = widget.configuration.clone().unwrap();
     assert_eq!(configuration.description, None);
-    assert_eq!(
-        configuration.parameters[0].default, "automatic",
-        "the first value"
-    );
-    assert_eq!(
-        configuration.json()["parameters"][0]["values"][1],
-        json!({"value":"one","title":"1"})
-    );
+    let written = &configuration.json()["parameters"][0];
+    assert_eq!(written["default"], "automatic", "the first value");
+    assert_eq!(written["values"][1], json!({"value":"one","title":"1"}));
     let manifest = |configuration: serde_json::Value| Manifest {
         json: json!({"widgets":[{"kind":"card","families":["systemSmall"],"component":"Card","props":"Props",
             "refresh":"refreshCard","preview":{"title":"Preview"},"configuration":configuration}]}),
@@ -1345,9 +1349,9 @@ fn a_configuration_is_read_fills_its_defaults_and_refuses_with_an_edit() {
         ),
         (
             row(
-                json!({"name":"rows","type":"entity","title":"Rows","values":[{"value":"a","title":"A"}]}),
+                json!({"name":"rows","type":"list","title":"Rows","values":[{"value":"a","title":"A"}]}),
             ),
-            "parameters[0].type must be `enum`",
+            "parameters[0].type must be `enum` (a fixed list of values) or `entity`",
         ),
         (
             row(
@@ -1376,11 +1380,45 @@ fn a_configuration_is_read_fills_its_defaults_and_refuses_with_an_edit() {
         assert!(slot.owner.is_none(), "{field}");
         assert!(plan.strings.iter().any(|s| s == "automatic"), "{field}");
         // The app's plan is untouched by the entry's slot.
-        assert!(!crate::compile(&src)
-            .unwrap()
+        let app = crate::compile(&src).unwrap();
+        assert!(!app
             .slots
             .iter()
-            .any(|s| crate::compile(&src).unwrap().str(s.name) == CONFIGURATION_SLOT));
+            .any(|s| app.str(s.name) == CONFIGURATION_SLOT));
+        // The refresh takes the date, then the slot's record; the bake asks with the defaults.
+        let refresh = plan.source(plan.snapshot_refresh.unwrap());
+        let parameters: Vec<_> = refresh.params.iter().collect();
+        assert_eq!(parameters.len(), 2, "{field}");
+        assert_eq!(plan.source_param(parameters[1]).ty, slot.ty, "{field}");
+        struct Asked(Vec<Value>);
+        impl DataSource for Asked {
+            fn query(&mut self, _: &str, args: &[Value]) -> Result<Value, DataError> {
+                self.0 = args.to_vec();
+                Err(DataError::Unavailable("checked by declarations".into()))
+            }
+        }
+        let entry = |kind: &str, widget: &Widget, plan: Plan| {
+            let declaration = Declaration::Widget(widget.clone());
+            (kind.to_owned(), Entry { declaration, plan })
+        };
+        let mut entries = std::collections::BTreeMap::from([entry("card", &widget, plan)]);
+        let mut asked = Asked(vec![]);
+        check_refreshes(&entries, &mut asked).unwrap();
+        let defaults = Value::record(vec![Value::str("automatic")]);
+        assert_eq!(asked.0, [Value::Number(0.0), defaults], "{field}");
+        let declarations = crate::typescript(&source_plan(&entries, &app).unwrap()).unwrap();
+        let written =
+            r#"refreshCard: (args: [number, { rows: "automatic" | "one" | "three" }]) =>"#;
+        assert!(declarations.contains(written), "{field}: {declarations}");
+        // One refresh name has one signature, so one configuration.
+        let plain = compile(&source("    text title", "", ""), &super::tests::widget()).unwrap();
+        entries.extend([entry("plain", &super::tests::widget(), plain)]);
+        let error = source_plan(&entries, &app).unwrap_err();
+        let edit = "widgets `card` and `plain` share refresh `refreshCard`";
+        assert!(
+            error.contains(edit) && error.contains("`configuration`"),
+            "{error}"
+        );
     }
     let inject = "  inject\n    snapshot_configuration: Configuration\n";
     for (shape, members, widget, edit) in [

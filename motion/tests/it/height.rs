@@ -28,6 +28,7 @@ fn spring(delay: f64) -> Transitions {
 
 #[test]
 fn height_appends_wire_value_and_has_no_numeric_css_initial() {
+    exact_motion::link_transitions();
     assert_eq!(Property::ALL.len(), Property::COUNT);
     for (wire, p) in Property::ALL.into_iter().enumerate() {
         assert_eq!(Property::from_wire(wire as u8), Some(p));
@@ -60,6 +61,7 @@ fn height_appends_wire_value_and_has_no_numeric_css_initial() {
 
 #[test]
 fn retirement_is_property_scoped_and_stale_before_clock_or_validation() {
+    exact_motion::link_transitions();
     let mut e = Engine::new();
     e.set_transitions(NODE, spring(0.0)).unwrap();
     target(&mut e, HEIGHT, 180.0);
@@ -109,6 +111,7 @@ fn retirement_is_property_scoped_and_stale_before_clock_or_validation() {
 
 #[test]
 fn height_catch_latest_target_delay_and_velocity_keep_existing_hold_semantics() {
+    exact_motion::link_transitions();
     let mut e = Engine::new();
     e.set_transitions(NODE, spring(0.0)).unwrap();
     target(&mut e, HEIGHT, 640.0);
@@ -155,6 +158,7 @@ fn height_catch_latest_target_delay_and_velocity_keep_existing_hold_semantics() 
 
 #[test]
 fn height_invalid_shape_does_not_replace_live_hold_and_easing_is_active() {
+    exact_motion::link_transitions();
     let mut e = Engine::new();
     target(&mut e, HEIGHT, 200.0);
     let old = e.begin_hold(NODE, HEIGHT, 0.0, None).unwrap().unwrap();

@@ -13,8 +13,8 @@
 import Foundation
 import QuartzCore
 
-final class NavigationMarks: NSObject {
-    static let shared = NavigationMarks()
+package final class NavigationMarks: NSObject {
+    package static let shared = NavigationMarks()
     /// The last input's timestamp, in seconds on the `CACurrentMediaTime` clock.
     private var lastInput: Double?
     private var pending: Pending?
@@ -58,7 +58,7 @@ final class NavigationMarks: NSObject {
     /// UIKit begins showing a screen itself (`willShow` outside Exact's
     /// projection): its first frame is the next vsync after this turn, as
     /// Core Animation commits the transition at the turn's end.
-    func platformBeganShowing() {
+    package func platformBeganShowing() {
         platformShowing = nil
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -68,7 +68,7 @@ final class NavigationMarks: NSObject {
     }
 
     /// That transition was cancelled (a swipe let go): it showed nothing.
-    func platformCancelled() {
+    package func platformCancelled() {
         platformShowing = nil
         platformTurnEnded = nil
         platformLink?.invalidate()

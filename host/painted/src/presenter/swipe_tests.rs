@@ -28,7 +28,7 @@ fn source() -> String {
 "#.into()
 }
 fn boot(src: &str) -> Presenter<()> {
-    let (p, error) = Presenter::boot_with(
+    let (p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(src),
         (),
         (400., 500.),
@@ -181,9 +181,18 @@ fn deletion_remount_and_runtime_replacement_cannot_receive_old_release() {
         .unwrap()
         .primary
         .token;
-    p.reload(&crate::test_plan(&src), ()).unwrap();
-    assert!(!p.host.hold_update(token, Value::ZERO, f64::NAN).unwrap());
-    assert!(!p.pointer_up(150., 40., 200.).unwrap());
+    // A replacement waits for the press to end (LLP 1029.000.002 D9): here
+    // the device loses its pointer, and a late release follows.
+    assert_eq!(
+        p.reload(&crate::test_plan(&src), ()).unwrap(),
+        crate::presenter::ReloadResult::Held("pointer")
+    );
+    assert!(p.host.has_hold(token));
+    p.pointer_lost(200.).unwrap();
+    p.run_commands(|| ());
+    assert_eq!(p.replacement_pending(), None);
+    assert!(!p.host.has_hold(token));
+    assert!(!p.pointer_up(150., 40., 210.).unwrap());
     assert_eq!(count(&p), "0");
 }
 
@@ -548,7 +557,7 @@ component MessageBubble
         let (mut p, error) = if region {
             // A region an earlier boot in this test dropped retires first.
             crate::content_region::test_wait_idle();
-            Presenter::boot_with_content_region(
+            Presenter::boot_region_with_fixture_fonts(
                 &plan,
                 data,
                 (400., 500.),
@@ -564,7 +573,15 @@ component MessageBubble
             )
             .unwrap()
         } else {
-            Presenter::boot_with(&plan, data, (400., 500.), 1., assets, PainterChoice::Cpu).unwrap()
+            Presenter::boot_with_fixture_fonts(
+                &plan,
+                data,
+                (400., 500.),
+                1.,
+                assets,
+                PainterChoice::Cpu,
+            )
+            .unwrap()
         };
         assert!(error.is_none(), "{error:?}");
         ack(&mut p);
@@ -790,7 +807,7 @@ component MessageBubble
     fn budget_frame(lengths: Vec<usize>) -> bool {
         crate::content_region::test_wait_idle();
         let plan = contract::compile(budget_source()).unwrap().encode();
-        let (mut p, error) = Presenter::boot_with_content_region(
+        let (mut p, error) = Presenter::boot_region_with_fixture_fonts(
             &plan,
             Rows {
                 extra_lengths: lengths,

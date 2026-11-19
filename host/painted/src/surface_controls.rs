@@ -743,9 +743,10 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// The web's focusable nodes: controls, inputs, buttons and links, a
-    /// node with a `focus`, `blur` or `key` handler (the web gives it a
-    /// `tabindex`), and any node with an explicit `tabindex`, a negative one
-    /// included (LLP 1088 D7.3), as the Apple hosts take the first
+    /// media player's controller (`controller`), a node with a `focus`,
+    /// `blur` or `key` handler (the web gives it a `tabindex`), and any node
+    /// with an explicit `tabindex`, a negative one included (LLP 1088
+    /// D7.3), as the Apple hosts take the first
     /// responder. What tap, `autofocus` and `focus()` may focus; Tab takes
     /// only the `tabbable` ones.
     /// Windows also focuses overflowing scroll containers for keyboard navigation.
@@ -768,6 +769,7 @@ impl<D: DataSource> Presenter<D> {
                     || self.focus == Some(id) && self.alert_message(id)
                     || n.props.str(PropId::Action).is_some()
                     || n.node_type == NodeType::TextInput
+                    || self.controller(&n)
                     // A native button is a button under any role (LLP 1069.011.000 D1).
                     // Every other control is one of HTML's focusable areas
                     // ("input elements whose type attribute are not in the
@@ -795,6 +797,9 @@ impl<D: DataSource> Presenter<D> {
                         n.props.str(PropId::AccessibilityRole),
                         Some("button" | "link")
                     )
+                    // An `a` with an `href` (HTML, "The tabindex attribute"),
+                    // a run in a line of text too, which lowers with no role.
+                    || n.props.link().is_some()
                     || self
                         .host
                         .runner()
@@ -821,30 +826,22 @@ impl<D: DataSource> Presenter<D> {
     /// Pointer activation returns HUD button focus to its input canvas after press.
     pub fn press_at(&mut self, x: f32, y: f32, now_ms: f64) -> Option<ViewId> {
         self.touched();
-        self.press_at_after_down(x, y, now_ms, None, false)
+        self.press_at_after_down(x, y, now_ms, None)
     }
 
-    /// A press released at (`x`, `y`); `finger`, a finger's, which under the
-    /// Material look reaches the nearest control whose 48 dp touch box it is
-    /// in when it reached nothing that takes it ([`Presenter::touch_target`]).
+    /// A geometric press after down; Material contacts keep their down target.
     pub(crate) fn press_at_after_down(
         &mut self,
         x: f32,
         y: f32,
         now_ms: f64,
         focus_before_down: Option<Option<ViewId>>,
-        finger: bool,
     ) -> Option<ViewId> {
         // An open select menu takes the press: a row, or light dismiss.
         if let Some(select) = self.menu_press(x, y) {
             return Some(select);
         }
-        let hit = self.hit(x, y);
-        let hit = if finger {
-            self.touch_target(hit, x, y)
-        } else {
-            hit
-        }?;
+        let hit = self.hit(x, y)?;
         self.press_hit_after_down(hit, (x, y), now_ms, focus_before_down, false)
     }
 

@@ -40,6 +40,7 @@ fn close(actual: f64, expected: f64) {
 
 #[test]
 fn a_property_seen_for_the_first_time_takes_its_value_without_a_transition() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_transitions(
@@ -58,6 +59,7 @@ fn a_property_seen_for_the_first_time_takes_its_value_without_a_transition() {
 
 #[test]
 fn without_a_matching_declaration_a_change_is_immediate() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(
         TransitionProperty::Property(Property::Scale),
         1.0,
@@ -73,6 +75,7 @@ fn without_a_matching_declaration_a_change_is_immediate() {
 
 #[test]
 fn a_matching_declaration_transitions_from_the_current_value() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(
         TransitionProperty::Property(Property::Opacity),
         1.0,
@@ -93,6 +96,7 @@ fn a_matching_declaration_transitions_from_the_current_value() {
 
 #[test]
 fn an_unchanged_target_keeps_its_curve_only_while_transition_property_covers_it() {
+    exact_motion::link_transitions();
     for curve in ["opacity 1s linear", "opacity -exact-spring()"] {
         for played in [false, true] {
             for (next, covered) in [
@@ -141,6 +145,7 @@ fn an_unchanged_target_keeps_its_curve_only_while_transition_property_covers_it(
 
 #[test]
 fn the_clock_is_a_seek() {
+    exact_motion::link_transitions();
     let run = |steps: &[f64]| {
         let mut engine = engine_with(vec![ease(TransitionProperty::All, 1.0, Easing::EaseInOut)]);
         engine.observe(opacity(0.0)).unwrap();
@@ -162,6 +167,7 @@ fn the_clock_is_a_seek() {
 /// its lowered frames do (LLP 1003 §4, §7).
 #[test]
 fn a_spring_ends_at_its_settle_time_at_any_frame_rate() {
+    exact_motion::link_transitions();
     let run = |hz: Option<f64>, end: f64| {
         let mut engine = engine_with(vec![Transition::new(
             TransitionProperty::Property(Property::Opacity),
@@ -191,6 +197,7 @@ fn a_spring_ends_at_its_settle_time_at_any_frame_rate() {
 
 #[test]
 fn the_same_inputs_give_the_same_bits() {
+    exact_motion::link_transitions();
     let run = || {
         let mut engine = engine_with(vec![
             ease(TransitionProperty::All, 0.4, Easing::Ease),
@@ -232,6 +239,7 @@ fn the_same_inputs_give_the_same_bits() {
 
 #[test]
 fn a_change_to_the_running_end_value_does_nothing() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(TransitionProperty::All, 1.0, Easing::Linear)]);
     engine.observe(opacity(0.0)).unwrap();
     engine.advance(0.5).unwrap();
@@ -247,6 +255,7 @@ fn a_change_to_the_running_end_value_does_nothing() {
 
 #[test]
 fn an_interruption_restarts_from_the_current_value() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(TransitionProperty::All, 1.0, Easing::Linear)]);
     engine.observe(opacity(0.0)).unwrap();
     engine.advance(0.5).unwrap();
@@ -263,6 +272,7 @@ fn an_interruption_restarts_from_the_current_value() {
 
 #[test]
 fn a_reversal_is_shortened_by_the_css_reversing_rule() {
+    exact_motion::link_transitions();
     // CSS Transitions §3.2: reversing an ease-in-out at 25% elapsed, where the
     // curve's output is ≈0.129, yields a new transition of ≈0.129 × 1s — not a
     // full second back — so a hover-off that follows a brief hover-on is brief.
@@ -283,6 +293,7 @@ fn a_reversal_is_shortened_by_the_css_reversing_rule() {
 
 #[test]
 fn a_reversal_of_a_reversal_compounds_the_factor() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(TransitionProperty::All, 1.0, Easing::Linear)]);
     engine.observe(opacity(0.0)).unwrap();
     engine.advance(0.5).unwrap();
@@ -294,6 +305,7 @@ fn a_reversal_of_a_reversal_compounds_the_factor() {
 
 #[test]
 fn delay_holds_the_start_value_and_negative_delay_starts_partway() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![Transition {
         property: TransitionProperty::All,
         duration: 1.0,
@@ -319,6 +331,7 @@ fn delay_holds_the_start_value_and_negative_delay_starts_partway() {
 
 #[test]
 fn a_zero_combined_duration_starts_nothing() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(TransitionProperty::All, 0.0, Easing::Ease)]);
     engine.observe(opacity(0.0)).unwrap();
     assert!(engine.quiescent());
@@ -330,6 +343,7 @@ fn a_zero_combined_duration_starts_nothing() {
 
 #[test]
 fn the_last_covering_declaration_wins() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![
         ease(TransitionProperty::All, 2.0, Easing::Linear),
         ease(
@@ -344,6 +358,7 @@ fn the_last_covering_declaration_wins() {
 
 #[test]
 fn a_spring_inherits_velocity_across_an_interruption() {
+    exact_motion::link_transitions();
     let spring = Transition::new(
         TransitionProperty::All,
         0.0,
@@ -371,6 +386,7 @@ fn a_spring_inherits_velocity_across_an_interruption() {
 
 #[test]
 fn a_gesture_holds_then_releases_into_a_spring_with_its_velocity() {
+    exact_motion::link_transitions();
     let spring = Transition::new(
         TransitionProperty::Property(Property::Translate),
         0.0,
@@ -418,6 +434,7 @@ fn a_gesture_holds_then_releases_into_a_spring_with_its_velocity() {
 
 #[test]
 fn frame_drains_in_node_order_and_only_what_changed() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_transitions(
@@ -455,6 +472,7 @@ fn frame_drains_in_node_order_and_only_what_changed() {
 
 #[test]
 fn removing_a_node_forgets_it() {
+    exact_motion::link_transitions();
     let mut engine = engine_with(vec![ease(TransitionProperty::All, 1.0, Easing::Linear)]);
     engine.observe(opacity(0.0)).unwrap();
     engine.remove(NODE);
@@ -491,6 +509,7 @@ fn removing_a_node_forgets_it() {
 
 #[test]
 fn the_engine_refuses_bad_input_by_name() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine.advance(1.0).unwrap();
     assert_eq!(engine.advance(0.5), Err(EngineError::ClockWentBackwards));
@@ -537,10 +556,12 @@ fn the_engine_refuses_bad_input_by_name() {
 /// engine removes the slots it knows the node has, not one probe a property.
 #[test]
 fn a_removed_node_holds_no_property_and_one_removed_property_leaves_the_rest() {
+    exact_motion::link_transitions();
     let mut engine = Engine::default();
     let every = Property::ALL
         .into_iter()
-        .chain([Property::Layout, Property::D]);
+        .chain([Property::Layout])
+        .chain(Property::TRANSITION_ONLY);
     let slots = Property::SLOTS;
     for (node, held) in [(1u64, 0..slots), (2, 0..4), (3, slots - 6..slots)] {
         for property in every.clone().skip(held.start).take(held.len()) {
@@ -578,6 +599,7 @@ fn a_removed_node_holds_no_property_and_one_removed_property_leaves_the_rest() {
 /// the values that changed.
 #[test]
 fn a_node_at_rest_observed_again_is_as_one_forgotten_first() {
+    exact_motion::link_transitions();
     let observe = |engine: &mut Engine, node: u64, opacity: f64, scale: f64| {
         for (property, value) in [(Property::Opacity, opacity), (Property::Scale, scale)] {
             let change = Change {

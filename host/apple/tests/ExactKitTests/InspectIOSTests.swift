@@ -1,6 +1,7 @@
 #if os(iOS) && EXACT_INSPECT
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 import UIKit
 
 /// Inspect mode's hit test (LLP 1122 D5, T2c; InspectIOS.swift): a tap
@@ -54,7 +55,7 @@ final class InspectIOSTests: XCTestCase {
     /// The native fixture's plan, Chat pushed on Home's stack.
     private func chat() throws -> (ExactSession, UIWindow, UINavigationController, RouteController) {
         let (session, window) = try home()
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         let nav = try XCTUnwrap(tabs.selectedViewController as? UINavigationController)
         let chat = try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == "chat" })
         _ = Agent(session: session).tap(["id": Int(chat.id)])
@@ -104,8 +105,8 @@ final class InspectIOSTests: XCTestCase {
 
     func testATapOnTheTabBarSelectsTheTabUnderItAndItsEmptySpaceNothing() throws {
         let (session, window) = try home()
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
-        let root = try XCTUnwrap(session.presenter.navigation.container)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        let root = try XCTUnwrap(session.presenter.navigationHost.container)
         let tablist = try XCTUnwrap(NavigationTabs.of(root, session.presenter))
         // Each item's box, in order (no accessibility client runs here to make
         // elements): the bar's buttons, or the floating bar's item cells.
@@ -152,7 +153,7 @@ final class InspectIOSTests: XCTestCase {
 
     func testInspectModeEndsEditingAndTheStatusBarsScrollToTopTillItEnds() throws {
         let (session, window, _, route) = try chat()
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         let field = UITextField(frame: CGRect(x: 20, y: 300, width: 200, height: 40))
         route.view.addSubview(field)
         defer { field.removeFromSuperview() }
@@ -199,7 +200,7 @@ final class InspectIOSTests: XCTestCase {
         XCTAssertNil(Inspect.select(session, id: node.id, clicked: true), "no selection outside inspect mode")
     }
 
-    /// `select {up}` (tamber/1.17) by the runner's own tree and the plan's copies, as the web pages' and the Mac's
+    /// `select {up}` (forma/1.17) by the runner's own tree and the plan's copies, as the web pages' and the Mac's
     /// (InspectMacTests, over apps/select-walk-fixture's shapes): each new copy owning an ancestor a step, at step `up`
     /// that copy's outermost node, past the last the root, with `moved`; an ask for a selection that moved, or with no
     /// copies for its plan, is nil, the selection as it is now. (The copies here stand in for the server's map: every

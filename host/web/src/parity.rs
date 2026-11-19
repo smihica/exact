@@ -335,6 +335,8 @@ const SOURCE: u64 = 2;
 
 /// Every case, in fixture order.
 pub fn cases() -> Vec<Case> {
+    exact_motion::link_animations();
+    exact_motion::link_transitions();
     let o = |v: f64| Value::scalar(v);
     let mid = [0.1, 0.25, 0.5, 0.75, 0.9];
     let off_grid = [0.1, 0.3, 0.55, 0.7, 0.9];

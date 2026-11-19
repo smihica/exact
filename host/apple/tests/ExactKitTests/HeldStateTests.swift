@@ -746,7 +746,7 @@ final class HeldStateTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        if let design { try design.write(to: dir.appendingPathComponent("app.tamber"), atomically: true, encoding: .utf8) }
+        if let design { try design.write(to: dir.appendingPathComponent("app.forma"), atomically: true, encoding: .utf8) }
         try """
         component App
           state n = 0
@@ -776,7 +776,7 @@ final class HeldStateTests: XCTestCase {
         _ = NSApplication.shared
         let app = ExactApp.shared, session = app.makeSession(label: "held-tokens")
         defer { session.destroy() }
-        let first = try plan("Glow", look: ":hover\n          background-color = \"glow\"", design: "tamber t\n\ntheme\n  glow = #ffff00\n")
+        let first = try plan("Glow", look: ":hover\n          background-color = \"glow\"", design: "forma t\n\ntheme\n  glow = #ffff00\n")
         XCTAssertNil(session.boot(plan: first, size: CGSize(width: 400, height: 300)).error)
         let view = ExactView(session: session)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
@@ -827,7 +827,7 @@ final class HeldStateTests: XCTestCase {
         let answer = try XCTUnwrap(HeldState.rows(for: label, in: p))
         XCTAssertEqual(answer["node"] as? Int, Int(card.id))
         XCTAssertEqual((answer["site"] as? NSNumber)?.intValue, (try node(card.id)["site"] as? NSNumber)?.intValue)
-        XCTAssertTrue(app.apply(first))
+        XCTAssertEqual(app.apply(first), .applied)
         XCTAssertEqual(heard.count, 2, "\(heard)")
         XCTAssertEqual(heard.last?["state"] as? String, "active")
         XCTAssertEqual(heard.last?["revision"] as? Int, 7)
@@ -835,7 +835,7 @@ final class HeldStateTests: XCTestCase {
         let again = try XCTUnwrap(HeldState.view)
         XCTAssertFalse(again === card, "the new generation's card")
         XCTAssertEqual(again.props["testId"], "card")
-        XCTAssertTrue(app.apply(try plan("Another")))
+        XCTAssertEqual(app.apply(try plan("Another")), .applied)
         XCTAssertEqual(heard.count, 2, "\(heard)")
         XCTAssertNil(HeldState.view)
     }
@@ -860,7 +860,7 @@ final class HeldStateTests: XCTestCase {
         HeldState.heard = { heard.append($0) }
         app.holdCommand(["kind": "hold", "revision": 8, "hold": ["site": node["site"]!, "instance": node["instance"] ?? [], "state": "hover"]])
         XCTAssertTrue(card.holds("hover"), "\(heard)")
-        XCTAssertTrue(app.apply(first))
+        XCTAssertEqual(app.apply(first), .applied)
         let again = try XCTUnwrap(HeldState.view)
         XCTAssertFalse(again === card)
         var path: [NodeView] = []

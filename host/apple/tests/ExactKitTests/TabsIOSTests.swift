@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// Exact's tab container built from `UITab`s (TabsIOS.swift) over
 /// `scripts/fixtures/search-tabs.contract`: the search tab a `UISearchTab`
@@ -59,7 +60,7 @@ final class TabsIOSTests: XCTestCase {
         view.frame = host.view.bounds
         view.layoutIfNeeded()
         until("the navigation is ready") {
-            let selected = session.presenter.navigation.tabController?.selectedViewController ?? session.presenter.navigation.primaryNavigation
+            let selected = session.presenter.navigationHost.tabController?.selectedViewController ?? session.presenter.navigationHost.primaryNavigation
             return selected?.viewIfLoaded?.window != nil && !Agent(session: session).nativeInFlight()
         }
         return session
@@ -71,7 +72,7 @@ final class TabsIOSTests: XCTestCase {
     }
 
     private func topRoute(_ session: ExactSession) -> String? {
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let stack = navigation.tabController?.selectedViewController ?? navigation.primaryNavigation
         return (stack?.stackRoutes.last as? RouteController)?.node.props["testId"]
     }
@@ -89,7 +90,7 @@ final class TabsIOSTests: XCTestCase {
     func testTheSearchTabIsAUISearchTabWithItsFace() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let tabs = try XCTUnwrap(navigation.tabController)
         XCTAssertNil(tabs.viewControllers, "the container holds UITabs")
         XCTAssertEqual(tabs.tabs.count, 3)
@@ -124,7 +125,7 @@ final class TabsIOSTests: XCTestCase {
     func testATabKeepsItsStackAndAReselectPopsIt() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         XCTAssertFalse(tabs.tabs.isEmpty)
         _ = Agent(session: session).tap(["id": Int(try node(session, "open-detail").id)])
         until("Detail pushed") { self.topRoute(session) == "route-detail" }
@@ -134,7 +135,7 @@ final class TabsIOSTests: XCTestCase {
         until("Home's stack kept its Detail") { self.topRoute(session) == "route-detail" }
         tapTab(tabs, 0)
         until("a tap above the root pops to it") { self.topRoute(session) == "route-home" }
-        XCTAssertEqual(session.presenter.navigation.selectedKey, (tabs.selectedViewController?.stackRoutes.first as? RouteController)?.key,
+        XCTAssertEqual(session.presenter.navigationHost.selectedKey, (tabs.selectedViewController?.stackRoutes.first as? RouteController)?.key,
                        "the router followed the pop")
     }
 
@@ -145,7 +146,7 @@ final class TabsIOSTests: XCTestCase {
     func testATabSelectedInCodeIsFollowedWithinTheSelection() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let tabs = try XCTUnwrap(navigation.tabController)
         XCTAssertFalse(tabs.tabs.isEmpty)
         tabs.selectedTab = tabs.tabs[1]
@@ -162,7 +163,7 @@ final class TabsIOSTests: XCTestCase {
     func testAPopAndADeclinedSelectionInCodeInOneTurn() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let tabs = try XCTUnwrap(navigation.tabController)
         let home = try XCTUnwrap(navigation.primaryNavigation)
         let agent = Agent(session: session)
@@ -189,7 +190,7 @@ final class TabsIOSTests: XCTestCase {
         turned = true
         turn(.landscapeRight)
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         XCTAssertEqual(tabs.mode, .tabSidebar)
         tabs.sidebar.isHidden = false
         let route = try XCTUnwrap(tabs.selectedViewController?.stackRoutes.first as? RouteController)
@@ -212,7 +213,7 @@ final class TabsIOSTests: XCTestCase {
     func testASearchTabLosingItsFaceAndFieldIsUIKitsAgain() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         let search = try XCTUnwrap(tabs.tabs.last as? UISearchTab)
         until("the authored label") { search.title == "Speakers" }
         if #available(iOS 26.0, *) { until("its field activates") { search.automaticallyActivatesSearch } }
@@ -229,7 +230,7 @@ final class TabsIOSTests: XCTestCase {
     func testTheAgentsTapAsksTheAppsDelegateByTab() throws {
         guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
         let session = try fixture("EXACT_SEARCH_TABS_PLAN")
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let tabs = try XCTUnwrap(navigation.tabController)
         let app = RecordingTabDelegate()
         navigation.setAppDelegate(tabs, app)
@@ -250,9 +251,121 @@ final class TabsIOSTests: XCTestCase {
     func testAPhoneTabBarWithNoSearchTabKeepsItsControllers() throws {
         guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("an iPad builds UITabs for its sidebar") }
         let session = try fixture("EXACT_TAB_EDGE_PLAN")
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         XCTAssertNotNil(tabs.viewControllers)
-        XCTAssertTrue(session.presenter.navigation.builtTabs.isEmpty)
+        XCTAssertTrue(session.presenter.navigationHost.builtTabs.isEmpty)
+    }
+
+    /// The tabs of a container built from `UITab`s are Exact's (LLP 1075.003
+    /// §3.7): the development check journals a change made outside Exact
+    /// once, by the next batch.
+    func testTabsChangedOutsideExactAreJournaledOnce() throws {
+        guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
+        let session = try fixture("EXACT_SEARCH_TABS_PLAN")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        let line = "tabs: tabs changed outside Exact, which owns it"
+        try journaledOnce(session, line, tabs) {
+            tabs.tabs = tabs.tabs + [UITab(title: "Extra", image: nil, identifier: "extra") { _ in UIViewController() }]
+        }
+    }
+
+    /// The same for a container built from controllers: its
+    /// `viewControllers` are Exact's.
+    func testATabControllerAddedOutsideExactIsJournaledOnce() throws {
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("an iPad builds UITabs for its sidebar") }
+        let session = try fixture("EXACT_TAB_EDGE_PLAN")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        XCTAssertTrue(session.presenter.navigationHost.builtTabs.isEmpty)
+        let line = "tabs: viewControllers changed outside Exact, which owns it"
+        try journaledOnce(session, line, tabs) { tabs.viewControllers = (tabs.viewControllers ?? []) + [UIViewController()] }
+    }
+
+    /// A container's controllers are compared as members: a reorder, as
+    /// More's Edit makes, is no change, and a controller put in place of one
+    /// of Exact's is.
+    func testTabControllersAreComparedAsMembers() throws {
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("an iPad builds UITabs for its sidebar") }
+        let session = try fixture("EXACT_TAB_EDGE_PLAN")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        let line = "tabs: viewControllers changed outside Exact, which owns it"
+        let count = { session.agent(#"{"op":"logs","since":0}"#).components(separatedBy: line).count - 1 }
+        var shown = try XCTUnwrap(tabs.viewControllers)
+        tabs.viewControllers = shown.reversed()
+        tapTab(tabs, of: try XCTUnwrap(session.presenter.navigationHost.tabStack(1)))
+        until("a selection after the reorder") { !Agent(session: session).nativeInFlight() && session.presenter.navigationHost.routerTab == 1 }
+        XCTAssertEqual(count(), 0, "a reorder is no change")
+        shown = try XCTUnwrap(tabs.viewControllers)
+        let kept = try XCTUnwrap(tabs.selectedViewController)
+        let index = try XCTUnwrap(shown.firstIndex { $0 !== kept })
+        shown[index] = UIViewController()
+        tabs.viewControllers = shown
+        tapTab(tabs, of: kept)
+        until("journaled by the next batch") { count() == 1 }
+    }
+
+    /// A container built from controllers whose `viewControllers` the app
+    /// clears holds none of Exact's: the check names it at the next batch.
+    func testTabControllersClearedOutsideExactAreJournaled() throws {
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("an iPad builds UITabs for its sidebar") }
+        let session = try fixture("EXACT_TAB_EDGE_PLAN")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        let line = "tabs: viewControllers changed outside Exact, which owns it"
+        let count = { session.agent(#"{"op":"logs","since":0}"#).components(separatedBy: line).count - 1 }
+        XCTAssertEqual(count(), 0)
+        tabs.viewControllers = nil
+        XCTAssertEqual(tabs.viewControllers?.count, 0, "UIKit reads no controllers back, not nil")
+        session.presenter.apply(wireBatch([]))
+        XCTAssertEqual(count(), 1, "journaled at the next batch")
+    }
+
+    /// A container built from controllers on which the app sets `tabs`
+    /// holds `UITab`s, and its `viewControllers` reads nil: the check names
+    /// `tabs` at the next batch.
+    func testTabsSetOnAContainerBuiltFromControllersAreJournaled() throws {
+        guard #available(iOS 18.0, *) else { throw XCTSkip("UITab is iOS 18") }
+        guard UIDevice.current.userInterfaceIdiom == .phone else { throw XCTSkip("an iPad builds UITabs for its sidebar") }
+        let session = try fixture("EXACT_TAB_EDGE_PLAN")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
+        XCTAssertTrue(session.presenter.navigationHost.builtTabs.isEmpty)
+        let logs = { session.agent(#"{"op":"logs","since":0}"#) }
+        let line = "tabs: tabs changed outside Exact, which owns it"
+        XCTAssertFalse(logs().contains(line))
+        // The app's own tabs, which hand back Exact's controllers
+        let controllers = try XCTUnwrap(tabs.viewControllers)
+        tabs.tabs = controllers.enumerated().map { index, controller in UITab(title: "Tab \(index)", image: nil, identifier: "app-\(index)") { _ in controller } }
+        XCTAssertNil(tabs.viewControllers, "a container that holds UITabs reads no controllers")
+        session.presenter.apply(wireBatch([]))
+        XCTAssertEqual(logs().components(separatedBy: line).count - 1, 1, "journaled at the next batch")
+        XCTAssertFalse(logs().contains("tabs: viewControllers changed outside Exact"), "named by the property the app set")
+    }
+
+    /// `line` is journaled by no selection before `change`, once by the
+    /// selection after it, and not again at the next.
+    private func journaledOnce(_ session: ExactSession, _ line: String, _ tabs: UITabBarController, change: () -> Void) throws {
+        let count = { session.agent(#"{"op":"logs","since":0}"#).components(separatedBy: line).count - 1 }
+        tapTab(tabs, 1)
+        until("the second tab selected") { session.presenter.navigationHost.routerTab == 1 && !Agent(session: session).nativeInFlight() }
+        XCTAssertEqual(count(), 0, "a selection changes nothing Exact owns")
+        change()
+        tapTab(tabs, 0)
+        until("journaled at the next batch") { count() == 1 }
+        tapTab(tabs, 1)
+        until("the second tab selected again") { session.presenter.navigationHost.routerTab == 1 && !Agent(session: session).nativeInFlight() }
+        XCTAssertEqual(count(), 1, "once")
+    }
+
+    /// LLP 1115.001 D11: the root's tabs are the first tablist in tree order
+    /// whose tabs name a panel, as the kernel and every other host take them,
+    /// though one made later than another has the higher view id.
+    func testTheRootsTabsAreTheFirstTablistInTreeOrder() throws {
+        let session = try fixture("EXACT_ROOT_TABS_ORDER_PLAN")
+        let navigation = session.presenter.navigationHost
+        let panels = { (names: [String]) in names.compactMap { name in session.presenter.views.values.first { $0.props["id"] == "panel-\(name)" }?.id } }
+        XCTAssertEqual(navigation.tabPanels, panels(["other", "home"]), "the one tablist's order")
+        try tapNode(session, "show-home")
+        until("the tablist added ahead is the root's") {
+            navigation.tabPanels == panels(["home", "other"]) && !Agent(session: session).nativeInFlight()
+        }
     }
 
     /// LLP 1083.000 D4: a column the author placed beside routes offset past it paints
@@ -261,7 +374,7 @@ final class TabsIOSTests: XCTestCase {
     /// CSS's order, under the container that stands for the routes.
     func testABoxBesideTheRoutesPaintsOverTheNativeContainer() throws {
         let session = try fixture("EXACT_BESIDE_ROUTES_PLAN")
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let holder = try XCTUnwrap(navigation.primaryOwner?.view)
         let sidebar = try node(session, "sidebar"), over = try node(session, "over")
         until("the column beside the routes is over the container") { sidebar.layer.zPosition > holder.layer.zPosition }

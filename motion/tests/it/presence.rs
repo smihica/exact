@@ -30,6 +30,7 @@ fn sized(engine: &mut Engine, node: u64, x: f64, y: f64, w: f64, h: f64) {
 
 #[test]
 fn a_layout_change_is_first_seen_then_moves_under_its_own_row_only() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_transitions(NODE, Transitions::parse("all 1s linear").unwrap())
@@ -69,6 +70,7 @@ fn a_layout_change_is_first_seen_then_moves_under_its_own_row_only() {
 
 #[test]
 fn a_declaration_naming_a_property_does_not_cover_layout() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_layout_transition(NODE, &Transitions::parse("opacity 1s").unwrap())
@@ -81,6 +83,7 @@ fn a_declaration_naming_a_property_does_not_cover_layout() {
 
 #[test]
 fn a_box_that_grows_grows_under_its_layout_transition() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_layout_transition(NODE, &Transitions::parse("1s linear").unwrap())
@@ -97,6 +100,7 @@ fn a_box_that_grows_grows_under_its_layout_transition() {
 
 #[test]
 fn a_spring_layout_rests_in_points_on_every_axis() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_layout_transition(
@@ -122,6 +126,7 @@ fn a_spring_layout_rests_in_points_on_every_axis() {
 
 #[test]
 fn an_exit_restarts_even_under_the_entry_keyframes_and_reports_its_end() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .observe(Change {
@@ -154,6 +159,7 @@ fn an_exit_restarts_even_under_the_entry_keyframes_and_reports_its_end() {
 
 #[test]
 fn an_exit_composites_over_the_animations_the_node_already_plays() {
+    exact_motion::link_transitions();
     const SPIN: &str = "@keyframes spin{from{rotate:0deg}to{rotate:360deg}}";
     let mut engine = Engine::new();
     for (property, value) in [(Property::Rotate, 0.0), (Property::Opacity, 1.0)] {
@@ -190,6 +196,7 @@ fn an_exit_composites_over_the_animations_the_node_already_plays() {
 
 #[test]
 fn an_exit_must_end() {
+    exact_motion::link_transitions();
     for endless in ["fade 1s infinite", "fade 1s paused"] {
         let a = keyframed(&format!("{endless} {FADE}")).unwrap();
         assert_eq!(a.validate(), Ok(()));
@@ -208,6 +215,7 @@ fn an_exit_must_end() {
 /// one moving stops at the new box; outside it the next moves again.
 #[test]
 fn a_still_layout_change_jumps_and_stops_one_moving() {
+    exact_motion::link_transitions();
     let mut engine = Engine::new();
     engine
         .set_layout_transition(NODE, &Transitions::parse("1s linear").unwrap())

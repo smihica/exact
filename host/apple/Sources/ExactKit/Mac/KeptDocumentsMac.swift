@@ -225,7 +225,7 @@ extension ExactSession {
     /// keeps documents: the path that names it for good (a document chosen
     /// again is the path it was kept by), under its security scope. Nil for
     /// one this app does not keep.
-    func keptChoice(_ url: URL) -> String? {
+    package func keptChoice(_ url: URL) -> String? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         ExactDocuments.noteRecent(url.path)
         return keepDocument(url)

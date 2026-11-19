@@ -385,7 +385,7 @@ impl<J: DataSource, R: DataSource> Mixed<J, R> {
             .entry((k, fetch))
             .or_default()
             .push_back(Stage::Turn(token));
-        let mut request = Request::continuation(token);
+        let mut request = Request::continuation::<crate::host_work::OrderedTurn>(token);
         request.fetch = fetch;
         request.module = instance;
         Ok(Answer::Later(request))
@@ -412,9 +412,9 @@ impl<J: DataSource, R: DataSource> Mixed<J, R> {
         if self.child_placement(rust) == Placement::Worker {
             let mut scratch = Store::new(&grants, []);
             let answer = match recorded {
-                Recorded::WorkerTurn { child, .. } => {
-                    Ok(Answer::Later(Request::continuation(child)))
-                }
+                Recorded::WorkerTurn { child, .. } => Ok(Answer::Later(Request::continuation::<
+                    crate::host_work::WorkerTurn,
+                >(child))),
                 Recorded::Answer {
                     target,
                     source,
@@ -590,6 +590,11 @@ impl<J: DataSource, R: DataSource> exact_runner::DataSourceWrapper for Mixed<J, 
     fn set_document_owner(&mut self, owner: u64) {
         self.javascript.set_document_owner(owner);
         self.rust.set_document_owner(owner);
+    }
+
+    fn render_web(&mut self) {
+        self.javascript.render_web();
+        self.rust.render_web();
     }
 
     fn take_logs(&mut self) -> Vec<String> {
@@ -1239,7 +1244,9 @@ impl<J: DataSource, R: DataSource> exact_runner::DataSourceWrapper for Mixed<J, 
                 let next = self.token()?;
                 self.deliveries.insert(next, (token, outcome));
                 self.delivery_phases.insert(token, false);
-                return Ok(Some(Request::continuation(next)));
+                return Ok(Some(
+                    Request::continuation::<crate::host_work::OrderedTurn>(next),
+                ));
             }
             Some(false) => {
                 let mut logs = Vec::new();
@@ -1300,6 +1307,18 @@ impl<J: DataSource, R: DataSource> exact_runner::DataSourceWrapper for Mixed<J, 
         store.with_grants(&grants, |store| {
             self.javascript.module_landed(store, token, outcome)
         })
+    }
+
+    /// The JavaScript member's, under its own grants as its answers' requests
+    /// are (`route_answer`); its replies come back through `module_delivery`,
+    /// which delivers to that member. A Rust member makes none.
+    fn take_reports(&mut self) -> Vec<exact_runner::Report> {
+        let grants = self.javascript.grants().to_string();
+        let mut reports = DataSource::take_reports(&mut self.javascript);
+        for report in &mut reports {
+            report.request.grants = Some(grants.clone());
+        }
+        reports
     }
 
     fn continuation(&mut self, token: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {

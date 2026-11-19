@@ -18,7 +18,7 @@ import { copyStaticTreeIfPresent, syncStaticTree } from '../host/web/serve.mjs';
 test.each([
   ['host/web-js/build.mjs', "// Launch modules' web services", '\nif (devReload)', '', ['assets', 'deck'], false],
   ['host/windows/build.mjs', "  for (const name of ['assets','deck'])", '\n  copyShaders', '', ['assets', 'deck'], true],
-  ['host/apple/watch.mjs', '    for (const entry of entries) copyFileSync', '\n    const appInfo', '', ['assets', 'deck'], false],
+  ['host/apple/watch.mjs', '  for (const entry of entries) copyFileSync', '\n  const appInfo', '', ['assets', 'deck'], false],
   ['host/apple-painted/build.mjs', "  writeFileSync(resolve(bundle, 'Contents/Info.plist')", "\n  run('codesign'", 'Contents/Resources', ['assets'], true],
   ['scripts/agent-android.mjs', "  copyStaticTreeIfPresent(resolve(app.dir, 'assets')", "\n  // The modules' shader text", 'assets/app', ['assets'], false],
 ])('%s packages static files without Finder metadata', async (file, start, end, prefix, folders, reused) => {
@@ -489,40 +489,46 @@ test.each(['rlib', 'staticlib', 'executable', 'windows-executable', 'build-scrip
   } finally { rmSync(root, {recursive:true, force:true}); }
 });
 
-test.each([null, 'intermediate', 'output/intermediate'])('copied wasm with build directory %s requires unique compiler evidence', async split => {
-  const { unitDepInfo } = await import('./app.mjs');
-  const root = mkdtempSync(resolve(tmpdir(), 'exact-wasm-dep-'));
+test.each(['wasm', 'executable', 'windows-executable'].flatMap(kind => [null, 'intermediate', 'output/intermediate'].map(split => [kind, split])))('copied %s with build directory %s requires unique compiler evidence', async (kind, split) => {
+  const { compilerPaths, unitDepInfo } = await import('./app.mjs');
+  const root = mkdtempSync(resolve(tmpdir(), 'exact-copied-dep-'));
   try {
     const metadata = {target_directory:resolve(root, 'output'), build_directory:resolve(root, split ?? 'output'),
       packages:[{id:'game-id', name:'game-gpu'}]};
-    const dir = resolve(metadata.target_directory, 'wasm32-unknown-unknown/web'), src = resolve(root, 'gpu/src/lib.rs');
+    const executable = kind !== 'wasm', extension = executable ? (kind === 'windows-executable' ? '.exe' : '') : '.wasm';
+    const folder = executable ? 'release' : 'wasm32-unknown-unknown/web', name = 'game_gpu' + extension;
+    const dir = resolve(metadata.target_directory, folder), src = resolve(root, executable ? 'gpu/src/main.rs' : 'gpu/src/lib.rs');
     mkdirSync(dir, {recursive:true});
-    const artifact = resolve(dir, 'game_gpu.wasm');
-    writeFileSync(artifact, 'selected wasm');
-    const message = {package_id:'game-id', filenames:[artifact], target:{name:'game_gpu', src_path:src}};
+    const artifact = resolve(dir, executable ? 'game-gpu' + extension : name);
+    writeFileSync(artifact, 'selected product');
+    const message = {package_id:'game-id', filenames:[artifact], executable:executable ? artifact : null, target:{name:executable ? 'game-gpu' : 'game_gpu', src_path:src}};
     const unit = (hash, bytes, source = src) => {
-      const out = resolve(metadata.build_directory, 'wasm32-unknown-unknown/web/build/game-gpu', hash, 'out');
+      const out = resolve(metadata.build_directory, folder, 'build/game-gpu', hash, 'out');
       mkdirSync(out, {recursive:true});
-      writeFileSync(resolve(out, 'game_gpu.wasm'), bytes);
+      writeFileSync(resolve(out, name), bytes);
       const dep = resolve(out, 'game_gpu.d');
-      writeFileSync(dep, `${dep}: ${source}\n# env-dep:EXACT_GAME_PARANOID=0\n`);
+      writeFileSync(dep, `${dep}: ${source} ${root}/gpu/src/nested.rs\n# env-dep:EXACT_GAME_PARANOID=0\n`);
       return dep;
     };
-    unit('deadbeef', 'another wasm');
+    unit('deadbeef', 'another product');
     assert.throws(() => unitDepInfo(message, root, metadata), /no matching rustc unit/);
-    const expected = unit('a11ce', 'selected wasm', resolve(root, 'old/lib.rs'));
+    const expected = unit('a11ce', 'selected product', resolve(root, 'old/lib.rs'));
     assert.throws(() => unitDepInfo(message, root, metadata), /no matching rustc unit/);
-    unit('a11ce', 'selected wasm');
+    unit('a11ce', 'selected product');
     writeFileSync(expected, `${artifact}: ${src}\n`);
     assert.throws(() => unitDepInfo(message, root, metadata), /no matching rustc unit/);
-    unit('a11ce', 'selected wasm');
-    const deps = resolve(metadata.build_directory, 'wasm32-unknown-unknown/web/deps'), stale = resolve(deps, 'game_gpu.d'); // another toolchain's unit: the JS target's stable GPU build
-    mkdirSync(deps, {recursive:true}); writeFileSync(resolve(deps, 'game_gpu.wasm'), 'stable wasm'); writeFileSync(stale, `${stale}: ${src}\n`);
+    unit('a11ce', 'selected product');
+    const deps = resolve(metadata.build_directory, folder, 'deps'), stale = resolve(deps, 'game_gpu.d');
+    mkdirSync(deps, {recursive:true}); writeFileSync(resolve(deps, name), 'another toolchain'); writeFileSync(stale, `${stale}: ${src}\n`);
     assert.equal(unitDepInfo(message, root, metadata), expected);
+    assert.deepEqual(compilerPaths(readFileSync(expected, 'utf8'), root), [src, resolve(root, 'gpu/src/nested.rs')]);
     assert.match(readFileSync(expected, 'utf8'), /env-dep:EXACT_GAME_PARANOID=0/);
-    unit('aabbcc', 'selected wasm');
+    unit('aabbcc', 'selected product');
     assert.throws(() => unitDepInfo(message, root, metadata), /ambiguous rustc unit/);
-    writeFileSync(resolve(deps, 'game_gpu.wasm'), 'selected wasm'); assert.equal(unitDepInfo(message, root, metadata), stale, 'the unit Cargo copied out of deps/');
+    if (!executable) {
+      writeFileSync(resolve(deps, name), 'selected product');
+      assert.equal(unitDepInfo(message, root, metadata), stale, 'the unit Cargo copied out of deps/');
+    }
   } finally { rmSync(root, {recursive:true, force:true}); }
 });
 
@@ -726,6 +732,9 @@ test.each([false, true])('ordinary buildBake with split directories=%s streams p
     diagnostics(built.stderr);
     const receipt = JSON.parse(built.stdout);
     assert.ok(receipt.products.some(p=>basename(p.path) === `plain-linux${process.platform === 'win32' ? '.exe' : ''}`));
+    assert.ok(receipt.binary.sourceInputs.files.some(file => file.root === 'app' && file.path === 'linux/src/main.rs'));
+    assert.equal(JSON.stringify(receipt.binary.sourceInputs).includes(dir), false);
+    assert.deepEqual(receipt.binary.sourceInputs.metadata, receipt.binary.metadata);
     assert.ok(existsSync(resolve(dir,'Cargo.lock')));
     const warm = await bake();
     assert.equal(warm.code, 0, warm.stderr);
@@ -827,6 +836,21 @@ test('D6 GPU modules bake beside the primary and each surface has one owner', as
     assert.throws(manifest({modules:{World:['world']}}), /gpu\.modules\.World: a module name/);
     assert.throws(manifest({modules:{world:[]}}), /gpu\.modules\.world: names no surface/);
   } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('a package supplies a GPU module without an app GPU crate', async () => {
+  const { gpuModules, readManifest } = await import('./app.mjs');
+  const dir = mkdtempSync(resolve(import.meta.dir, '../target/package-gpu-'));
+  const pkg = resolve(dir, 'node_modules/@fixture/sky');
+  try {
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(resolve(dir, 'package.json'), JSON.stringify({ dependencies: { '@fixture/sky': '1.0.0' } }));
+    writeFileSync(resolve(pkg, 'package.json'), JSON.stringify({ exports: { '.': './exact.json' } }));
+    writeFileSync(resolve(pkg, 'exact.json'), JSON.stringify({ kind: 'interface', name: '@fixture/sky', version: '1.0.0',
+      gpu: { crate: 'rust', exactGpu: '0.4', surfaces: { sky: { arity: 1, factory: 'sky::surface' } } } }));
+    const modules = gpuModules(readManifest(dir, 'sky'));
+    assert.deepEqual(modules.map(({ name, surfaces }) => ({ name, surfaces })), [{ name: 'fixture-sky', surfaces: ['sky'] }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('declared shader packs merge, reject duplicates and links, and preserve a rejected live candidate', async () => {
@@ -1091,7 +1115,7 @@ impl Game for BuildInputs {
           packages: ['web', 'gpu'].map(kind => ({ id: kind, name: app.crate(kind), manifest_path: resolve(app.workspace, kind, 'Cargo.toml') })),
           resolve: { nodes: ['web', 'gpu'].map(id => ({ id, deps: [] })) } });
         return app;
-      }, buildBake(app, platform, target, { env }) {
+      }, buildBake(app, platform, target, { env, capture }) {
         const started = Date.now();
         const source = resolve(app.dir, 'app.contract');
         const header = Buffer.alloc(36);
@@ -1127,7 +1151,9 @@ impl Game for BuildInputs {
         }
         receipt.embedded.assets = serve.listAssets(app.dir);
         writeFileSync(resolve(env.EXACT_BAKE_OUTPUT, platform + '-' + target + '.json'), JSON.stringify(receipt));
-        return { started, binary: { sha256: 'fixture', inputs: [] } };
+        const built = { started, products: [], binary: { sha256: 'fixture', inputs: [] } };
+        capture?.(built);
+        return built;
       } }));
       process.argv = [process.execPath, ${JSON.stringify(resolve(import.meta.dir, '../host/web/build.mjs'))}, ${JSON.stringify(dir)}, '--bake'];
       await import(${JSON.stringify(resolve(import.meta.dir, '../host/web/build.mjs'))});
@@ -1328,8 +1354,8 @@ test('game web, release and unwired gpu-dev bakes never open registry generation
       const dir=${JSON.stringify(dir)};
       for(const [platform,profile,target] of [['web','web','wasm32-unknown-unknown'],['linux','release',${JSON.stringify(bakeTarget('linux'))}],['linux','gpu-dev',${JSON.stringify(bakeTarget('linux'))}]]) {
         const name='fixture-'+platform;
-        const host={id:name,name,targets:[{kind:[platform==='web'?'cdylib':'bin'],name:'fixture'}]};
-        const gpu={id:'fixture-gpu',name:'fixture-gpu',targets:[{kind:['cdylib'],name:'surface'}]};
+        const host={id:name,name,manifest_path:dir+'/host/Cargo.toml',targets:[{kind:[platform==='web'?'cdylib':'bin'],name:'fixture'}]};
+        const gpu={id:'fixture-gpu',name:'fixture-gpu',manifest_path:dir+'/gpu/Cargo.toml',targets:[{kind:['cdylib'],name:'surface'}]};
         const metadata={workspace_root:dir,packages:[host,gpu],resolve:{nodes:[{id:host.id,deps:[]},{id:gpu.id,deps:[]}]}};
         const app={dir,workspace:dir,target:dir+'/target',hasGpu:true,manifest:{app:{id:'fixture'},rust:false,game:{}},crate:kind=>'fixture-'+kind,prepare:()=>metadata};
         const before=builds.length;

@@ -2,7 +2,8 @@
 //! process group of the child's own, its output read by a thread per pipe
 //! and handed to the supervisor a few chunks ahead at most (so a full queue
 //! stops the reading and the child waits on its pipe), its stdin written by
-//! a thread from a queue, and its exit reaped by another. Its group is
+//! a thread from a queue, and its exit observed by another. The leader is
+//! reaped only after every owner finishes signalling its group. Its group is
 //! recorded for the quit and for the next launch after a crash
 //! (`groups.rs`).
 use super::supervise::{exec_reply, Child, Seen};
@@ -30,6 +31,11 @@ const LAUNCHCTL_LIMIT: Duration = Duration::from_secs(2);
 /// `app:/data`, `app:/cache` and `app:/tmp` the app's directories,
 /// `bundle:/` the app bundle's `Contents` on macOS; an absolute path itself.
 pub(crate) fn native(shared: &Shared, path: &str) -> Result<PathBuf, String> {
+    if ibex2::stdlib::fs::is_known_folder(path) {
+        return super::storage_roots(&shared.processes)
+            .resolve_known_folder(path)
+            .map_err(|e| e.to_string());
+    }
     if let Some(rest) = path.strip_prefix("home:/") {
         return Ok(home(shared)?.join(rest));
     }
@@ -208,8 +214,8 @@ struct Stdin {
 }
 
 /// One running incarnation.
-struct RealChild {
-    pid: i32,
+pub(super) struct RealChild {
+    group: Arc<super::groups::Group>,
     stdin: Option<Arc<Stdin>>,
     cancel: Arc<AtomicBool>,
     credit: Arc<Credit>,
@@ -218,7 +224,7 @@ struct RealChild {
 
 impl Child for RealChild {
     fn pid(&self) -> u64 {
-        self.pid as u64
+        self.group.pid as u64
     }
     fn write(&mut self, bytes: Vec<u8>) {
         if let Some(stdin) = &self.stdin {
@@ -235,7 +241,7 @@ impl Child for RealChild {
     }
     fn signal(&mut self, signal: &str) -> Vec<Seen> {
         if let Some(n) = os::signal_number(signal) {
-            let _ = os::signal_group(self.pid, n);
+            let _ = os::signal_group(self.group.pid, n);
         }
         Vec::new()
     }
@@ -245,7 +251,7 @@ impl Child for RealChild {
             .map_or(0, |s| s.queued.load(Ordering::Acquire))
     }
     fn group_alive(&self) -> bool {
-        os::group_alive(self.pid)
+        os::group_alive(self.group.pid)
     }
     fn close_pipes(&mut self) {
         self.cancel.store(true, Ordering::Release);
@@ -259,8 +265,8 @@ impl Drop for RealChild {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         self.end();
-        if !os::group_alive(self.pid) {
-            super::groups::forget(&self.shared, self.pid);
+        if !self.group_alive() {
+            super::groups::forget(&self.shared, self.group.pid);
         }
     }
 }
@@ -293,7 +299,7 @@ pub(super) fn spawn(
     spec: &Spec,
     _ran: &Ran,
     ctl: &Arc<ChildCtl>,
-) -> Result<Box<dyn Child>, Outcome> {
+) -> Result<Box<RealChild>, Outcome> {
     let program = spec
         .native
         .clone()
@@ -343,7 +349,7 @@ pub(super) fn spawn(
         _ => failed(FailureKind::Refused, format!("spawn {}: {e}", spec.program)),
     })?;
     let pid = child.pid;
-    super::groups::remember(shared, pid, &spec.kill_signal, spec.force_kill_after);
+    let group = super::groups::remember(shared, pid, &spec.kill_signal, spec.force_kill_after);
     let cancel = Arc::new(AtomicBool::new(false));
     let credit = Arc::new(Credit {
         taken: Mutex::new(0),
@@ -358,8 +364,9 @@ pub(super) fn spawn(
         }
         let stdin = child.stdin.map(|fd| write(spec, fd, n, ctl)).transpose()?;
         let waiter = ctl.clone();
+        let leader = group.clone();
         thread(spec, "wait", format!("exact-child-{pid}"), move || {
-            let seen = match os::wait(pid) {
+            let seen = match os::observe_exit(leader.pid) {
                 Ok(os::Exit::Code(code)) => Seen::Exit(Some(i64::from(code)), None),
                 Ok(os::Exit::Signal(signal)) => Seen::Exit(None, Some(os::signal_name(signal))),
                 Err(_) => Seen::Exit(None, None),
@@ -370,7 +377,7 @@ pub(super) fn spawn(
     })();
     match started {
         Ok(stdin) => Ok(Box::new(RealChild {
-            pid,
+            group,
             stdin,
             cancel,
             credit,
@@ -382,8 +389,8 @@ pub(super) fn spawn(
         Err(e) => {
             cancel.store(true, Ordering::Release);
             let _ = os::signal_group(pid, os::SIGKILL);
-            let _ = os::wait(pid);
             super::groups::forget(shared, pid);
+            drop(group);
             Err(failed(
                 FailureKind::Refused,
                 format!("spawn {}: cannot start its thread: {e}", spec.program),
@@ -597,7 +604,7 @@ pub(super) fn exec(
         }
     }
     // Its leader has closed; what is left of its group ends before the answer.
-    super::groups::end(child.pid() as i32, &spec.kill_signal, spec.force_kill_after);
+    super::groups::end(&child.group);
     drop(child);
     if abort.signal().aborted() {
         return failed(FailureKind::Aborted, "the execFile was let go");
@@ -614,8 +621,8 @@ pub(super) fn exec(
 
 /// The `fs.write` line of the app's grants `app` under which it may write
 /// `path`'s directory entry or `real`, what it names, compared by realized
-/// whole names: a native line, or a `home:` or `app:` one. Where the grants
-/// do not parse, or a line names no directory here, the answer is the parse
+/// whole names, using storage's host roots. Where the grants do not parse,
+/// or a line names no directory here, the answer is the parse
 /// error or that line, and `path` is refused as if a line covered it.
 fn writable(shared: &Shared, app: &str, path: &Path, real: &Path) -> Option<String> {
     let realize = ibex2::stdlib::fs::realize;
@@ -773,7 +780,7 @@ const AFTER_EXIT: Duration = Duration::from_millis(200);
 
 /// Run a fixed program in a session of its own with no controlling
 /// terminal: its stdout (lossily UTF-8) once it exits and its output stops,
-/// or `None` past `limit`. Its group is ended either way.
+/// or `None` past `limit`. End its group if the shell or output times out.
 fn run(program: &Path, args: &[String], home: &Path, limit: Duration) -> Option<String> {
     let env = app_environment();
     let child = os::spawn(os::Command {
@@ -789,6 +796,7 @@ fn run(program: &Path, args: &[String], home: &Path, limit: Duration) -> Option<
     })
     .ok()?;
     let pid = child.pid;
+    let group = super::groups::Group::new(pid, "SIGKILL", 0.0);
     let mut out = std::fs::File::from(child.stdout?);
     enum Got {
         Bytes(Vec<u8>),
@@ -813,10 +821,11 @@ fn run(program: &Path, args: &[String], home: &Path, limit: Duration) -> Option<
             }
             let _ = reader.send(Got::End);
         });
+    let leader = group.clone();
     let _ = std::thread::Builder::new()
         .name("exact-login-shell-wait".into())
         .spawn(move || {
-            let _ = os::wait(pid);
+            let _ = os::observe_exit(leader.pid);
             let _ = tx.send(Got::Exit);
         });
     let deadline = Instant::now() + limit;
@@ -834,10 +843,8 @@ fn run(program: &Path, args: &[String], home: &Path, limit: Duration) -> Option<
         }
     }
     let finished = exited_at.is_some();
-    // Past the limit, or an rc file's background job holds the pipe: its
-    // session's group ends.
     if !(finished && ended) {
-        let _ = os::signal_group(pid, os::SIGKILL);
+        super::groups::end(&group);
     }
     finished.then(|| String::from_utf8_lossy(&bytes).into_owned())
 }

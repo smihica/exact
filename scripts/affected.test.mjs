@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import { GLOBAL, Graph, Repo, auditProfile, cargoTests, commands, jsSources, rustLiterals, rustSource, select, suites } from './affected.mjs';
+import { GLOBAL, Graph, Repo, auditProfile, cargoTests, commands, gameAppleLeg, jsSources, rustLiterals, rustSource, select, suites } from './affected.mjs';
 import { classesReached, hostedTests } from '../host/apple/xctest.mjs';
 
 /** A repository of `files` (path → text) and Cargo packages (`{ name, dir, deps }`), with its metadata given; a package
@@ -292,6 +292,24 @@ test('hosted touch tests run on the simulator whose XCTest runner injects their 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a hosted test in an extension of its class, in another file, runs hosted', () => {
+  const dir = realpathSync(mkdtempSync(resolve(tmpdir(), 'hosted-extension-')));
+  writeFileSync(resolve(dir, 'History.swift'), `final class HistoryTests: XCTestCase {
+    func testStack() {}
+  }
+  extension XCTestCase {
+    func tap() {}
+  }`);
+  writeFileSync(resolve(dir, 'HistorySheets.swift'), `extension HistoryTests {
+    func testSheet() {
+      throw missing("scene", "a sheet")
+    }
+  }`);
+  try {
+    expect(hostedTests(dir)).toEqual(['ExactKitTests/HistoryTests/testSheet']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('the commands run each workspace once, the Bun files together and every app test file', () => {
   const run = commands([
     { suite: { kind: 'cargo', name: 'a', manifest: 'Cargo.toml' } }, { suite: { kind: 'cargo', name: 'b', manifest: 'Cargo.toml' } },
@@ -319,6 +337,9 @@ function commandFixture() {
     writeFileSync(resolve(root, file), '');
   }
   copyFileSync(resolve(import.meta.dir, 'affected.mjs'), resolve(root, 'scripts/affected.mjs'));
+  for (const file of ['filesystem.mjs', 'paths.mjs']) {
+    symlinkSync(resolve(import.meta.dir, file), resolve(root, 'scripts', file));
+  }
   mkdirSync(resolve(root, 'host/apple'), { recursive: true });
   symlinkSync(resolve(import.meta.dir, '../host/apple/xctest.mjs'), resolve(root, 'host/apple/xctest.mjs'));
   symlinkSync(resolve(import.meta.dir, '../node_modules'), resolve(root, 'node_modules'), 'dir');
@@ -455,7 +476,31 @@ test("the lane runs the iOS classes a commit's test files reach, and every class
   }
 });
 
-test('a path dependency outside both workspaces selects its consumer and the game lane', async () => {
+test('shader uniform tests are selected and run hourly from their own workspace', async () => {
+  const { checks, laneSelection, owners, retainSkippedFailures } = await import('./async.mjs');
+  const repo = new Repo(), graph = new Graph(repo);
+  const name = 'exact-shader-uniforms', dir = 'packages/shader/uniforms';
+  const catalogue = suites(repo).filter(s => s.id === `cargo:${name}`);
+  const command = ['cargo', 'test', '--manifest-path', `${dir}/Cargo.toml`, '--tests', '--no-fail-fast', '-p', name];
+  for (const file of ['src/reader.rs', 'tests/uniforms.rs', 'Cargo.toml', 'Cargo.lock']) {
+    const picked = select(graph, [`${dir}/${file}`], catalogue);
+    expect(picked.map(s => s.suite.id), file).toEqual([`cargo:${name}`]);
+    expect(commands(picked), file).toEqual([command]);
+  }
+  const lane = laneSelection([`${dir}/src/reader.rs`], { root: repo.root, repo });
+  expect(checks('', null, { ...lane, lane: [] }).find(([id]) => id === `cargo:${name}`))
+    .toEqual([`cargo:${name}`, command[0], command.slice(1)]);
+  const id = `cargo:${name}`, failure = `${id}: -p ${name} --test uniforms wgsl_blankspace`;
+  const owned = owners(id, '', [failure]);
+  expect(owned).toEqual({ [failure]: [id] });
+  for (const complete of [false, true]) {
+    const result = { checks: complete ? { [id]: { status: 0, complete } } : {}, failures: [] };
+    retainSkippedFailures([failure], result, owned, new Set());
+    expect(result.failures).toEqual(complete ? [] : [failure]);
+  }
+}, 120_000);
+
+test('a path dependency outside the tested workspaces selects its consumer and the game lane', async () => {
   const { laneSelection } = await import('./async.mjs');
   const repo = new Repo(), graph = new Graph(repo);
   const cargo = suites(repo).filter(s => s.kind === 'cargo');
@@ -486,6 +531,18 @@ test("this checkout's selection keeps an app's change to that app's suites", () 
   expect(only(['host/apple/tests/ExactKitTests/EventWaits.swift'])).toEqual({ 'xctest:ios': 'every class', 'xctest:macos': 'every class' });
   expect(picked(['docs/testing.md'])).toEqual([]);
   expect(picked(['kernel/src/lib.rs'])).toEqual([...watched].sort());
+}, 120_000);
+
+// The shared game Apple shell is in no workspace's metadata (#559): what it compiles selects its check.
+test("this checkout selects the shared game Apple shell's check for what it compiles", () => {
+  const repo = new Repo(), graph = new Graph(repo);
+  const catalogue = suites(repo).filter(s => s.id === 'compile:game-apple');
+  const picked = file => select(graph, [file], catalogue).map(s => s.suite.id);
+  for (const file of ['game/app/apple/src/lib.rs', 'game/app/apple/Cargo.toml', 'host/apple/src/lib.rs', 'runner/src/lib.rs', 'game/app/shells.mjs']) {
+    expect(picked(file), file).toEqual(['compile:game-apple']);
+  }
+  for (const file of ['host/apple/Sources/ExactKit/Mac/CaptureMac.swift', 'docs/testing.md']) expect(picked(file), file).toEqual([]);
+  expect(commands(catalogue.map(suite => ({ suite })))).toEqual([['sh', '-c', gameAppleLeg]]);
 }, 120_000);
 
 // A parity smoke's Linux leg runs for the paint walk and its own gallery, and for no Apple change.

@@ -9,6 +9,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class TableFeedKeyMacTests: XCTestCase {
     private var fixture: TableFixture?
@@ -421,7 +422,7 @@ final class TableFeedKeyMacTests: XCTestCase {
         // A click on a row pushes its route when the mouse comes up.
         click(try f.node("title-7"), in: f)
         XCTAssertEqual(try f.node("detail").accessibleText, "Item 7")
-        XCTAssertNotNil(f.presenter.navigation.pushedRoute, "the row's press pushed a route")
+        XCTAssertNotNil(f.presenter.navigationHost.pushedRoute, "the row's press pushed a route")
         XCTAssertEqual(f.table.selectedRow, 7, "under the pushed route the row is still selected")
         let row = try XCTUnwrap(f.cells[7]?.row)
         // Back: the list's table is the one it was, the row the runner's
@@ -431,7 +432,7 @@ final class TableFeedKeyMacTests: XCTestCase {
         f.settle()
         pump(0.6) { false }
         f.settle()
-        XCTAssertNil(f.presenter.navigation.pushedRoute)
+        XCTAssertNil(f.presenter.navigationHost.pushedRoute)
         XCTAssertFalse(f.presenter.views.values.contains { $0.props["testId"] == "detail" }, "the pushed route is gone")
         XCTAssertTrue(f.presenter.tables.feeds[f.list.id] === f.feed, "the same feed")
         XCTAssertEqual(f.table.selectedRow, 7)
@@ -459,7 +460,7 @@ final class TableFeedKeyMacTests: XCTestCase {
         f.settle()
         pump(0.6) { false }
         f.settle()
-        XCTAssertNil(f.presenter.navigation.pushedRoute)
+        XCTAssertNil(f.presenter.navigationHost.pushedRoute)
         XCTAssertTrue(f.window.makeFirstResponder(f.table))
         // Through the application's queue, as a person's key arrives.
         queued(125, "\u{F701}", [.function, .numericPad], in: f)

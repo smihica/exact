@@ -1,0 +1,121 @@
+test "a duplicate and a burst arrive in server order"
+  request POST "/control" {"action":"reset"}
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "connect"
+  clock until state feed.status == "open" within 10000
+  clock data
+  request POST "/control" {"action":"expect-resume","count":1000}
+  request POST "/control" {"action":"arrive","id":"first","body":"First arrival"}
+  request POST "/control" {"action":"arrive","id":"first","body":"First arrival"}
+  clock until state feed.serial == 3 within 10000
+  clock data
+  expect state window.total == 1001
+  expect state window.unread == 1
+  expect state window.rows.199.id == "first"
+  request POST "/control" {"action":"burst","count":200}
+  clock until state window.total == 1201 within 10000
+  expect state window.unread == 201
+  expect state window.rows.0.id == "burst-1"
+  expect state window.rows.99.id == "burst-100"
+  expect state window.rows.199.id == "burst-200"
+  expect no failures
+
+test "a gap commits the prefix and resumes from it"
+  request POST "/control" {"action":"reset"}
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "connect"
+  clock until state feed.status == "open" within 10000
+  clock data
+  request POST "/control" {"action":"expect-resume","count":1000}
+  request POST "/control" {"action":"gap"}
+  clock until state window.total == 1001 within 10000
+  clock +1
+  clock until state window.total == 1003 within 10000
+  request POST "/control" {"action":"expect-resume","count":1001}
+  expect state attempt == 2
+  expect state window.rows.197.id == "prefix"
+  expect state window.rows.198.id == "withheld"
+  expect state window.rows.199.id == "after-gap"
+  expect no failures
+
+test "reconnect fills the gap after the committed cursor"
+  request POST "/control" {"action":"reset"}
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "connect"
+  request POST "/control" {"action":"arrive","id":"before","body":"Before disconnect"}
+  clock until state window.total == 1001 within 10000
+  request POST "/control" {"action":"disconnect"}
+  clock until state feed.status == "close" within 10000
+  request POST "/control" {"action":"arrive","id":"missed-1","body":"First missed arrival"}
+  request POST "/control" {"action":"arrive","id":"missed-2","body":"Second missed arrival"}
+  tap "disconnect"
+  tap "connect"
+  clock until state window.total == 1003 within 10000
+  request POST "/control" {"action":"expect-resume","count":1001}
+  request POST "/control" {"action":"arrive","id":"after","body":"After reconnect"}
+  clock until state window.total == 1004 within 10000
+  expect state window.rows.196.id == "before"
+  expect state window.rows.197.id == "missed-1"
+  expect state window.rows.198.id == "missed-2"
+  expect state window.rows.199.id == "after"
+  expect state window.unread == 4
+  expect no failures
+
+test "a pre-connect send retries by client ID after a lost acknowledgement"
+  request POST "/control" {"action":"reset"}
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  type "draft" "Saved before any connection"
+  tap "send"
+  clock data
+  expect text "queued" == "1 queued"
+  expect state window.total == 1000
+  request POST "/control" {"action":"expect-sends","body":"Saved before any connection","count":0}
+  request POST "/control" {"action":"drop-ack"}
+  tap "connect"
+  clock until state feed.status == "close" within 10000
+  request POST "/control" {"action":"expect-sends","body":"Saved before any connection","count":1}
+  expect state window.queued == 1
+  tap "disconnect"
+  tap "connect"
+  clock until state window.queued == 0 within 10000
+  request POST "/control" {"action":"expect-sends","body":"Saved before any connection","count":2}
+  expect state window.rows.199.body == "Saved before any connection"
+  request POST "/control" {"action":"echo","body":"Saved before any connection"}
+  clock until state feed.serial == 4 within 10000
+  clock data
+  expect state window.total == 1001
+  expect state window.unread == 0
+  expect no failures
+
+test "a quiet reconnect wakes the persisted outbox"
+  request POST "/control" {"action":"reset"}
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "connect"
+  clock until state feed.serial == 1 within 10000
+  clock data
+  tap "disconnect"
+  type "draft" "Queued between connections"
+  tap "send"
+  clock data
+  expect state feed.serial == 1
+  expect text "queued" == "1 queued"
+  tap "connect"
+  clock until state window.queued == 0 within 10000
+  request POST "/control" {"action":"expect-sends","body":"Queued between connections","count":1}
+  expect state window.rows.199.body == "Queued between connections"
+  expect no failures

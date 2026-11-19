@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1141.001 D4 over `scripts/fixtures/edge-effect.contract`: content
 /// scrolled under the bar takes iOS 26's scroll edge effect, as a hand-built
@@ -51,7 +52,7 @@ final class EdgeEffectIOSTests: XCTestCase {
         let session = try XCTUnwrap(session), agent = Agent(session: session)
         let deadline = Date().addingTimeInterval(5)
         func ready() -> Bool {
-            let top = session.presenter.navigation.primaryNavigation?.topViewController as? RouteController
+            let top = session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController
             return top?.node.props["testId"] == "route-\(name)" && !agent.nativeInFlight()
         }
         while !ready() && Date() < deadline {
@@ -65,8 +66,8 @@ final class EdgeEffectIOSTests: XCTestCase {
     /// an enclosing document scroller.
     private func assertEffectOverContent(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws {
         let session = try XCTUnwrap(self.session)
-        let route = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController as? RouteController)
-        let sv = try XCTUnwrap(session.presenter.navigation.shownScroll(try node("content-\(name)")), file: file, line: line)
+        let route = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController)
+        let sv = try XCTUnwrap(session.presenter.navigationHost.shownScroll(try node("content-\(name)")), file: file, line: line)
         XCTAssertNotNil(sv.refreshControl, "the scroller pulls to refresh", file: file, line: line)
         sv.contentOffset.y = -sv.adjustedContentInset.top + 400
         // Lay the scroller out at its new offset now: UIKit adds and moves its views in that layout, and `keepPlatformViewsOver` follows it
@@ -108,8 +109,8 @@ final class EdgeEffectIOSTests: XCTestCase {
     func testAuthoredEffectsStayWithTheNativeContentScroller() throws {
         guard #available(iOS 26.0, *) else { throw XCTSkip("scroll edge effects require iOS 26") }
         let session = try fixture(), p = session.presenter
-        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
-        let node = try node("content-large"), scroll = try XCTUnwrap(p.navigation.shownScroll(node))
+        let route = try XCTUnwrap(p.navigationHost.primaryNavigation?.topViewController as? RouteController)
+        let node = try node("content-large"), scroll = try XCTUnwrap(p.navigationHost.shownScroll(node))
         for style in ["hard", "none", "soft", "automatic"] {
             var changed = node.style
             changed["scroll_edge_effect"] = .string(style)
@@ -139,7 +140,7 @@ final class EdgeEffectIOSTests: XCTestCase {
         let session = try fixture()
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node("tab-mixed").id)])["error"])
         try waitForRoute("mixed")
-        let route = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController as? RouteController)
+        let route = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController as? RouteController)
         XCTAssertNil(route.contentViewport)
         let document = try XCTUnwrap(try node("document-mixed").scrollView)
         let inner = try XCTUnwrap(try node("content-mixed").scrollView)
@@ -162,7 +163,7 @@ final class EdgeEffectIOSTests: XCTestCase {
     /// the edge effect beside it is: not a stray.
     func testTheLargeTitleInTheScrollerIsTheBarsNotAStray() throws {
         let session = try fixture()
-        let sv = try XCTUnwrap(session.presenter.navigation.shownScroll(try node("content-large")))
+        let sv = try XCTUnwrap(session.presenter.navigationHost.shownScroll(try node("content-large")))
         sv.layoutIfNeeded()
         let title = { sv.subviews.first { String(describing: type(of: $0)) == "_UINavigationBarLargeTitleView" } }
         guard title() != nil else { throw XCTSkip("this UIKit keeps the large title in the bar") }

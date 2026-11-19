@@ -18,7 +18,7 @@ import UIKit
 /// through it, when no destination is left in the tree and no deferred
 /// sync owes it, or at the next contact, key, typed text, focus choice (Tab,
 /// `focus(id)`) or the scene leaving the foreground.
-final class PressHandoff {
+package final class PressHandoff {
     /// The responder the press left focused (`focusForPress`): the innermost
     /// node that asked for focus, a field the press focused, else the
     /// press's target.
@@ -30,16 +30,16 @@ final class PressHandoff {
     /// Its dispatch is running.
     private var dispatching = true
     /// A sync its dispatch deferred is owed (`pending`) or running (`syncing`).
-    var pending = false
-    var syncing = false
+    package var pending = false
+    package var syncing = false
     private struct Destination { weak var route: NodeView? }
     private var destinations: [Destination] = []
     fileprivate init(_ presenter: Presenter, control: UIView?) { self.presenter = presenter; self.control = control }
     /// Whether its own work is running now: what that work presents or
     /// pushes is its destination.
-    var working: Bool { dispatching || syncing }
+    package var working: Bool { dispatching || syncing }
     /// The press's dispatch returned.
-    func dispatched() {
+    package func dispatched() {
         dispatching = false
         settle()
     }
@@ -47,7 +47,7 @@ final class PressHandoff {
         if !destinations.contains(where: { $0.route === route }) { destinations.append(Destination(route: route)) }
     }
     /// A destination left (its sheet was dismissed); any other stays.
-    func drop(_ route: NodeView) {
+    package func drop(_ route: NodeView) {
         destinations.removeAll { $0.route === route }
         settle()
     }
@@ -64,11 +64,11 @@ final class PressHandoff {
     private func prune() {
         destinations.removeAll { d in
             guard let route = d.route, let presenter, presenter.views[route.id] === route else { return true }
-            guard let controller = presenter.navigation.controllers[route.id], controller.node === route else { return false }
+            guard let controller = presenter.navigation.routeSurfaces[route.id], controller.node === route else { return false }
             return controller.stack == nil
         }
     }
-    func settle() {
+    package func settle() {
         prune()
         if !working, !pending, destinations.isEmpty, let presenter, presenter.pressHandoff === self { presenter.pressHandoff = nil }
     }
@@ -83,7 +83,7 @@ extension Presenter {
         return handoff
     }
     /// A route the live press's own work presents or pushes.
-    func pressShows(_ route: NodeView?) {
+    package func pressShows(_ route: NodeView?) {
         guard let route, let handoff = pressHandoff, handoff.working else { return }
         handoff.record(route)
     }

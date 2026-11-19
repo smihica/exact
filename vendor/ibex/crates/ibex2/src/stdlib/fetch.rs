@@ -269,6 +269,9 @@ pub struct Request {
     pub url: String,
     pub headers: Headers,
     pub body: Option<Vec<u8>>,
+    /// A body read from a file as it is sent, in place of `body` (Exact
+    /// patch 46): never held whole, whatever its length.
+    pub body_file: Option<BodyFile>,
     /// An engine-free `FormData` request body. Prefer [`Request::set_body`]
     /// when constructing one; this field remains public to match the rest of
     /// the request value. It is encoded exactly once before the first hop.
@@ -289,6 +292,22 @@ pub struct Request {
     /// The platform transport's own request timeout. A caller that needs the
     /// whole exchange bounded also aborts its signal (LLP 0068.000 §4).
     pub timeout: Option<std::time::Duration>,
+    /// Portable file transfers may outlive the ordinary total deadline while
+    /// still bounding each socket wait. An explicit `timeout` takes precedence.
+    pub idle_timeout: Option<std::time::Duration>,
+    /// The response is read for as long as the caller holds it, as an
+    /// event stream or a byte stream is: no limit of the transport's own
+    /// ends it, neither on the whole exchange nor on a quiet body. The
+    /// portable transport keeps its limits on connecting and on the head;
+    /// URLSession, which shows a head only with the first body bytes, can
+    /// keep none (Exact patch 48). An explicit `timeout` still applies.
+    pub open_ended: bool,
+    /// The caller reads the reply to its end as it arrives, into memory, as
+    /// a plain request's `collect` does. On Apple such an exchange may share
+    /// a session with others, which holds at most a mebibyte of its reply
+    /// ahead of the reader (Exact patch 49); any other exchange has a
+    /// session of its own while it runs.
+    pub collected: bool,
     /// Told the body's bytes as they are sent (Exact patch 23).
     pub sent: Option<Sent>,
     /// Each hop's response head, before redirects or body reads (LLP 1162 D4).
@@ -304,8 +323,9 @@ pub struct Request {
 /// An upload's progress, XMLHttpRequest's `upload` events: the body's bytes
 /// sent so far and its length, `(loaded, total)`. A transport calls it on
 /// the thread that opened the request, as the platform reports bytes
-/// written, and with `(total, total)` by the time the response's headers
-/// have arrived. A redirect, or a resend on a new connection, that sends the
+/// written: `(total, total)` once the whole body has gone out, and no more
+/// than the bytes written when the response arrives before it has (Exact
+/// patch 46). A redirect, or a resend on a new connection, that sends the
 /// body again counts from zero.
 /// The second hook, if any, is the upload's start: told once, by the hop
 /// loop, when the first hop's grant and gate have admitted it and its
@@ -321,6 +341,29 @@ pub struct Sent(
 impl std::fmt::Debug for Sent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Sent")
+    }
+}
+
+/// A request body read from a file as it goes out (Exact patch 46): its
+/// length, which the transport sends as `Content-Length`, and a reader from
+/// its first byte for each attempt, since a redirect that keeps the body
+/// (307, 308) and a resend on a new connection send it again whole. A reader
+/// gives at most `len` bytes, and fails rather than end early.
+pub trait FileBody: Send + Sync {
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn reader(&self) -> std::io::Result<Box<dyn std::io::Read + Send>>;
+}
+
+/// A [`FileBody`] as a request holds it.
+#[derive(Clone)]
+pub struct BodyFile(pub std::sync::Arc<dyn FileBody>);
+
+impl std::fmt::Debug for BodyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BodyFile({} bytes)", self.0.len())
     }
 }
 
@@ -340,10 +383,14 @@ impl Request {
             url: url.into(),
             headers: Headers::new(),
             body: None,
+            body_file: None,
             form_data: None,
             redirect: RedirectMode::Follow,
             max_body: None,
             timeout: None,
+            idle_timeout: None,
+            open_ended: false,
+            collected: false,
             sent: None,
             received: None,
             response_body: None,
@@ -537,6 +584,7 @@ pub fn fetch_stream_gated(
         step.apply(&mut current.method, &mut current.headers);
         if step.drops_body {
             current.body = None;
+            current.body_file = None;
         }
         current.url = step.url;
         redirected = true;
@@ -556,6 +604,14 @@ pub(crate) fn admit_hop(
 }
 
 fn admit_hop_grant(grants: &GrantSet, url: &str, redirected: bool) -> Result<(), HostError> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| HostError::Failed("TypeError: invalid URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(HostError::Failed("TypeError: invalid HTTP URL".into()));
+    }
     let origin = origin_of(url)?;
     // Through boundary::admit, not an inline permits() check: the
     // capability name and the shape of a denial belong in one place, or
@@ -578,7 +634,7 @@ fn admit_hop_grant(grants: &GrantSet, url: &str, redirected: bool) -> Result<(),
 pub(crate) struct RedirectStep {
     /// The next hop's URL, resolved against the one just used.
     pub(crate) url: String,
-    /// 303, and 301/302 of a non-GET/HEAD: the next hop is a GET with no body.
+    /// 303 of a non-GET/HEAD, and 301/302 of POST: GET with no body.
     pub(crate) drops_body: bool,
     /// The next hop is another origin: credentials are dropped.
     drops_credentials: bool,
@@ -589,6 +645,14 @@ impl RedirectStep {
     pub(crate) fn apply(&self, method: &mut String, headers: &mut Headers) {
         if self.drops_body {
             *method = "GET".into();
+            for name in [
+                "content-encoding",
+                "content-language",
+                "content-location",
+                "content-type",
+            ] {
+                headers.delete(name);
+            }
         }
         if self.drops_credentials {
             for name in ["authorization", "cookie", "proxy-authorization"] {
@@ -638,12 +702,14 @@ pub(crate) fn redirect_step(
     // 303, and 301/302 on POST, become GET and drop the body — the web's
     // long-standing behaviour, which surprises people who expect the
     // method to be preserved.
-    let drops_body = status == 303
-        || (matches!(status, 301 | 302) && current.method != "GET" && current.method != "HEAD");
+    let drops_body = (status == 303 && current.method != "GET" && current.method != "HEAD")
+        || (matches!(status, 301 | 302) && current.method == "POST");
     // A redirect to another origin drops the credentials this request
     // carried, as the Fetch standard does for `Authorization`.
     // @ref LLP 0059.000#35-fetch--delegating-capability-bearing — a subdomain grant admits sibling hosts, which must not receive a token meant for the first
-    let drops_credentials = origin_of(next.as_str())? != origin_of(&current.url)?;
+    // A non-HTTP target still reaches admit_hop's URL validation. Computing
+    // an HTTP origin here would fail first for hostless schemes such as file:.
+    let drops_credentials = next.origin() != base.origin();
     Ok(Some(RedirectStep {
         url: next.to_string(),
         drops_body,
@@ -651,7 +717,30 @@ pub(crate) fn redirect_step(
     }))
 }
 
+/// Whether every byte of `url` is one a URI may hold (RFC 3986's reserved
+/// and unreserved characters, and `%`).
+fn is_uri(url: &str) -> bool {
+    url.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&b))
+}
+
 pub(crate) fn prepare_body(mut request: Request) -> Result<Request, HostError> {
+    // A URL holding a character a URI cannot (`>`, a space, a quote) is sent
+    // as the web sends it, percent-encoded by the URL Standard's parser
+    // (https://url.spec.whatwg.org/#query-state); the portable transport
+    // refused it as "invalid uri character" (Exact patch 50). Any other URL
+    // goes out as written, and one the parser refuses is left for the hop's
+    // own checks to refuse.
+    if !is_uri(&request.url) {
+        if let Ok(parsed) = url::Url::parse(&request.url) {
+            request.url = parsed.into();
+        }
+    }
+    if request.body_file.is_some() && (request.body.is_some() || request.form_data.is_some()) {
+        return Err(HostError::InvalidArgument(
+            "request has both a file body and another".into(),
+        ));
+    }
     let Some(form) = request.form_data.take() else {
         return Ok(request);
     };
@@ -777,6 +866,33 @@ mod tests {
             assert_eq!(seen.len(), 2);
             assert_eq!(seen[0].1.as_deref(), Some("Bearer secret"));
             assert_eq!(seen[1].1.is_some(), kept, "{start} → {}", seen[1].0);
+        }
+    }
+
+    /// A URL that includes credentials is refused where Fetch refuses it: at
+    /// the request (<https://fetch.spec.whatwg.org/#dom-request>, "includes
+    /// credentials") and at a redirect to another origin
+    /// (<https://fetch.spec.whatwg.org/#http-redirect-fetch>). No server shares
+    /// an app's origin, so every redirect is one.
+    #[test]
+    fn a_url_with_userinfo_is_refused_at_the_request_and_at_a_redirect() {
+        for url in [
+            "https://user:password@host.example/file",
+            "https://user@host.example/file",
+        ] {
+            let refused = |start: &str, transport: &StubTransport| {
+                let error = fetch(transport, &granted("host.example"), Request::get(start))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.ends_with("TypeError: invalid HTTP URL"), "{error}");
+            };
+            let transport = StubTransport::new(vec![response(200, None)]);
+            refused(url, &transport);
+            assert!(transport.seen().is_empty());
+            let transport = StubTransport::new(vec![response(302, Some(url)), response(200, None)]);
+            let start = "https://host.example/start";
+            refused(start, &transport);
+            assert_eq!(transport.seen(), vec![("GET".into(), start.into())]);
         }
     }
 
@@ -1167,5 +1283,29 @@ mod tests {
             origin_of("https://example.com:8443/x").unwrap(),
             Origin::new("https", "example.com", 8443)
         );
+    }
+
+    /// Exact patch 50: a URL with a character a URI cannot hold goes out as a
+    /// browser serializes it; any other is sent as written, to both transports.
+    #[test]
+    fn a_url_the_web_would_encode_is_sent_encoded() {
+        let sent = |url: &str| prepare_body(Request::get(url)).unwrap().url;
+        assert_eq!(
+            sent("https://api.example.test/rows?select=*&details->>status=eq.open&q=a b"),
+            "https://api.example.test/rows?select=*&details-%3E%3Estatus=eq.open&q=a%20b"
+        );
+        assert_eq!(
+            sent("https://api.example.test/a path/\"x\""),
+            "https://api.example.test/a%20path/%22x%22"
+        );
+        for written in [
+            "https://api.example.test",
+            "https://api.example.test/rows?id=eq.1&select=a,b#top",
+            "http://[::1]:8787/x%20y",
+        ] {
+            assert_eq!(sent(written), written);
+        }
+        // Not a URL: left for the hop's checks.
+        assert_eq!(sent("not a url >"), "not a url >");
     }
 }

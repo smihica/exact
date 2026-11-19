@@ -2,7 +2,7 @@
 //! (CSS Values 4 §10.8–§10.10). `cssparser` handles CSS tokenization; numeric
 //! values are read from the source as `f64` because its tokens store `f32`.
 //!
-//! Unsupported: `em`/`rem` (font resolution happens after commit) and unit
+//! Unsupported: `em` (font resolution happens after commit) and unit
 //! algebra beyond multiplying or dividing a length by a number.
 
 use super::super::env::{self, EnvRefusal};
@@ -19,10 +19,12 @@ pub(crate) mod refusal {
     pub(crate) const RELATIVE: &str =
         "em is not supported inside calc(), min(), max() or clamp(); write rem or px";
     pub(crate) const UNITLESS: &str = "a number where a length goes inside calc(), min(), max() or clamp() takes a unit, as CSS requires, zero too: 0px, 15px";
-    pub(crate) const NOT_A_LENGTH: &str = "calc(), min(), max() and clamp() take px (or rem, in, cm, mm, q, pt, pc, ch, lh) lengths, percentages, env(safe-area-inset-*), env(viewport-segment-* x y), env(titlebar-area-*), var(--exact-safe-area-inset-*), viewport lengths (vw, vh, vmin, vmax, svh, lvh, dvh, …), numbers and e, pi, infinity and NaN";
+    pub(crate) const NOT_A_LENGTH: &str = "calc(), min(), max() and clamp() take px (or rem, in, cm, mm, q, pt, pc, ch, lh) lengths, percentages, env(safe-area-inset-*), env(viewport-segment-* x y), env(titlebar-area-*), var(--name) of a custom property a node declares, var(--exact-safe-area-inset-*), var(--exact-keyboard-inset-*), var(--exact-keyboard-undocked-inset-*), viewport lengths (vw, vh, vmin, vmax, svh, lvh, dvh, …), numbers and e, pi, infinity and NaN";
     pub(crate) const FUNCTION: &str =
-        "inside a length the functions are calc(), min(), max(), clamp(), env() and var(--exact-safe-area-inset-*)";
-    pub(crate) const VAR: &str = "a length reads one custom property, its content owner's safe-area inset: var(--exact-safe-area-inset-top), -right, -bottom or -left";
+        "inside a length the functions are calc(), min(), max(), clamp(), env() and var()";
+    pub(crate) const VAR: &str = "a length's var() reads a custom property a node declares (var(--name)), the content owner's safe-area inset (var(--exact-safe-area-inset-top), -right, -bottom or -left), or the keyboard's reach into the box (var(--exact-keyboard-inset-top), -right, -bottom or -left, and var(--exact-keyboard-undocked-inset-*) for a keyboard undocked too); other --exact- names are the host's and none is defined";
+    pub(crate) const VAR_LENGTH: &str =
+        "a custom property here is a length, so its fallback is a length too";
     pub(crate) const VAR_FALLBACK: &str =
         "var(--exact-safe-area-inset-*) takes no fallback: every host defines it";
     pub(crate) const NONE: &str =
@@ -332,7 +334,7 @@ impl Calc {
                 match name.as_str() {
                     // `env()` substitutes a length: no level of the calculation
                     "env" if !self.grid => p.parse_nested_block(|p| self.env(p, depth)),
-                    "var" if !self.grid => p.parse_nested_block(|p| self.var(p)),
+                    "var" if !self.grid => p.parse_nested_block(|p| self.var(p, depth)),
                     "calc" => {
                         let depth = self.deeper(p, depth)?;
                         p.parse_nested_block(|p| self.whole(p, depth))
@@ -475,24 +477,64 @@ impl Calc {
         Ok((node, ty))
     }
 
-    /// `var(--exact-safe-area-inset-<edge>)`, the local inset (LLP 1123 D9):
-    /// the one custom property a length reads, without a fallback. Its name
-    /// is matched as written, as a custom property's is.
-    fn var<'i>(&mut self, p: &mut Parser<'i, '_>) -> Parsed<'i, (Node, Ty)> {
+    /// `var(--exact-safe-area-inset-<edge>)`, the local inset (LLP 1123 D9),
+    /// without a fallback; or with an optional fallback, a length,
+    /// `var(--exact-keyboard-inset-<edge>)` and
+    /// `var(--exact-keyboard-undocked-inset-<edge>)`, the keyboard's readings
+    /// (D7), or `var(--name)`, an author's custom property (D5). A name is
+    /// matched as written, as a custom property's is.
+    fn var<'i>(&mut self, p: &mut Parser<'i, '_>, depth: usize) -> Parsed<'i, (Node, Ty)> {
         self.count(p)?;
-        let edge = match p.expect_ident() {
-            Ok(name) => name
-                .strip_prefix(env::LOCAL_PREFIX)
-                .and_then(env::Edge::from_name),
-            Err(_) => None,
+        let name = match p.expect_ident_cloned() {
+            Ok(name) => name,
+            Err(_) => return why(p, refusal::VAR),
         };
-        let Some(edge) = edge else {
-            return why(p, refusal::VAR);
-        };
-        if !p.is_exhausted() {
-            return why(p, refusal::VAR_FALLBACK);
+        if let Some(edge) = name
+            .strip_prefix(env::LOCAL_PREFIX)
+            .and_then(env::Edge::from_name)
+        {
+            if !p.is_exhausted() {
+                return why(p, refusal::VAR_FALLBACK);
+            }
+            return Ok((Node::Env(EnvTerm::Local(edge)), Ty::Length));
         }
-        Ok((Node::Env(EnvTerm::Local(edge)), Ty::Length))
+        // The safe area's name is the local inset above until activation
+        // retires it, so only the keyboard's readings are observations here
+        let observed = super::Family::named(&name);
+        if observed.is_none() && !crate::style::safe_area_properties::is_author_name(&name) {
+            return why(p, refusal::VAR);
+        }
+        let fallback = match p.is_exhausted() {
+            true => None,
+            false => {
+                p.expect_comma()?;
+                // One value, a tree's operand wherever the call stands: CSS substitutes a
+                // fallback's tokens, so a sum written bare would group differently
+                let (fallback, ty) = self.value(p, depth)?;
+                p.expect_exhausted()?;
+                if ty != Ty::Length {
+                    return why(p, refusal::VAR_LENGTH);
+                }
+                Some(Box::new(fallback))
+            }
+        };
+        let node = match observed {
+            Some((family, edge)) => {
+                let target = crate::style::targets::Target::Box;
+                let leaf = super::Observe {
+                    target,
+                    family,
+                    edge,
+                    fallback,
+                };
+                Node::Observe(leaf)
+            }
+            None => Node::Var(super::Var {
+                name: name.as_ref().into(),
+                fallback,
+            }),
+        };
+        Ok((node, Ty::Length))
     }
 
     /// `env(<name> <index>*)`: the variable. One with a fallback makes the
@@ -580,16 +622,25 @@ pub(super) fn env_parts(
     let (name, indices) = p
         .parse_until_before(Delimiter::Comma, |p| {
             let (mut name, mut indices) = (None, Vec::new());
-            while let Ok(token) = p.next() {
+            loop {
+                let start = p.position();
+                let Ok(token) = p.next().cloned() else {
+                    break;
+                };
                 let word = match token {
                     Token::Ident(text) if name.is_none() => text.to_string(),
                     // An index, `+0` as CSS's integers allow; a negative one
                     // as written, which `env::named` refuses
                     Token::Number {
                         int_value: Some(n), ..
-                    } if *n >= 0 => n.to_string(),
-                    // Anything else as written, which `env::named` refuses
-                    t => cssparser::ToCss::to_css_string(t),
+                    } if n >= 0 => n.to_string(),
+                    // Anything else as written, which `env::named` refuses;
+                    // only CSS's whitespace is trimmed, since a no-break
+                    // space is part of an identifier or a unit
+                    _ => p
+                        .slice_from(start)
+                        .trim_matches([' ', '\t', '\n', '\r', '\u{c}'])
+                        .to_string(),
                 };
                 match name {
                     None => name = Some(word),
@@ -758,6 +809,10 @@ pub fn nonnegative_row(style: crate::StyleId) -> bool {
             | PaddingRight
             | PaddingBottom
             | PaddingLeft
+            | SafeAreaPaddingTop
+            | SafeAreaPaddingRight
+            | SafeAreaPaddingBottom
+            | SafeAreaPaddingLeft
             | FlexGrow
             | FlexShrink
             | RowGap

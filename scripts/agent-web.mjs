@@ -3,6 +3,7 @@
 import {
   Cdp,
   agentPage,
+  faultSpec,
   browserDiagnosticNoise,
   launchLog,
   launchFailure,
@@ -50,8 +51,9 @@ import {
   cdpWheel,
 } from './agent-keys.mjs';
 import { waitAtMost } from './agent-wire.mjs';
+import { withBase } from '../host/web-js/route-pattern.js';
 import { builtAppMatches, jsTargetBuild, serveBuildTree, serveStatic } from '../host/web/serve.mjs';
-import { bootedGeneration, leaseGeneration } from '../host/web/generations.mjs';
+import { buildBase, bootedGeneration, leaseGeneration } from '../host/web/generations.mjs';
 import { resolveApp, webDist as defaultWebDist } from './app.mjs';
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -217,7 +219,7 @@ async function openWebUnlocked({
   const pinned = js ? await bootedGeneration(served) : null,
     release = pinned ? leaseGeneration(served, pinned) : () => {};
   let gone = null;
-  const server = createServer((req, res) => {
+  const server = createServer({ maxHeaderSize: 128 * 1024 }, (req, res) => {
     if (req.url === '/__plan' && plan) {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
       res.end(readFileSync(plan));
@@ -251,9 +253,11 @@ async function openWebUnlocked({
   const port = server.address().port;
   if (!openWeb.said)
     console.error(
-      `${(openWeb.said = `web: ${selected.name} served at http://127.0.0.1:${port}/`)}${fixed ? '' : ' (--port <n> or EXACT_PORT picks the port)'}`,
+      `${(openWeb.said = `web: ${selected.name} served at http://127.0.0.1:${port}${js ? buildBase(served) : "/"}`)}${fixed ? '' : ' (--port <n> or EXACT_PORT picks the port)'}`,
     );
-  const chrome = chromium({ needs: webNeeds(selected) }).executable,
+  const { executable: chrome, unavailable } = chromium({ needs: webNeeds(selected) }),
+    // What the pinned browser's absence says, the Chrome installed here included (LLP 1156.006.000 D9).
+    missing = (error) => `web carrier unavailable: ${error.code === 'ENOENT' && unavailable ? unavailable : `${chrome}: ${error.code}; install Playwright's Chromium, or set CHROME`} (docs/testing.md, Browsers)`,
     // LLP 1115.000 D10.3: EXACT_SCALE, the Linux host's variable, launches Chrome at that device scale factor too, its
     // own and not CDP's emulated one (which leaves a 0.5px border 1px): an override's 0 keeps it
     scale = Number(env?.EXACT_SCALE ?? process.env.EXACT_SCALE) || 0;
@@ -303,9 +307,7 @@ async function openWebUnlocked({
   } catch (error) {
     server.close();
     if (!kept) rmSync(profile, { recursive: true, force: true });
-    throw new Error(
-      `web carrier unavailable: ${chrome}: ${error.code}; install Playwright's Chromium (docs/testing.md, Browsers), or set CHROME`,
-    );
+    throw new Error(missing(error));
   }
   onProcess?.(child);
   const hostLines = pageURL ? [] : builtSettingLines(dist),
@@ -333,9 +335,7 @@ async function openWebUnlocked({
       r();
     });
     child.on('error', error => {
-      cdp.fail(
-        `web carrier unavailable: ${chrome}: ${error.code}; install Playwright's Chromium (docs/testing.md, Browsers), or set CHROME`,
-      );
+      cdp.fail(missing(error));
       r();
     });
   });
@@ -448,11 +448,43 @@ async function openWebUnlocked({
     }
     // The page: this carrier's own server over dist/, or a URL the caller
     // named — the dev server, so a drive can watch an edit arrive.
-    const page = agentPage(pageURL ? new URL(pageURL) : new URL(location ?? '/', `http://127.0.0.1:${port}/`), {
+    const page = agentPage(pageURL ? new URL(pageURL) : new URL(withBase(location ?? '/', js ? buildBase(served) : '/'), `http://127.0.0.1:${port}/`), {
       facts,
       storage,
       env,
     });
+    let faultScript, faultHeader = '';
+    const { frameTree } = await call('Page.getFrameTree');
+    cdp.listeners.push(msg => {
+      if (msg.sessionId !== sessionId || msg.method !== 'Fetch.requestPaused') return;
+      const { requestId, request, frameId } = msg.params, url = new URL(request.url);
+      const carried = faultHeader && frameId === frameTree.frame.id && url.origin === page.origin
+        && ['', '1'].includes(url.searchParams.get('agent')) && url.searchParams.get('failFetch') === '1';
+      const headers = Object.entries(request.headers).filter(([name]) => name.toLowerCase() !== 'x-exact-faults');
+      if (carried) headers.push(['X-Exact-Faults', faultHeader]);
+      call('Fetch.continueRequest', { requestId, headers: headers.map(([name, value]) => ({ name, value })) })
+        .catch(error => hostLines.push(`fixture request: ${error.message}`));
+    });
+    const installFaults = async spec => {
+      if (spec === undefined && faultScript) return;
+      spec = faultSpec(spec ?? '');
+      if (spec && !faultHeader) await call('Fetch.enable', { patterns: [{ resourceType: 'Document', requestStage: 'Request' }] });
+      if (!spec && faultHeader) await call('Fetch.disable');
+      faultHeader = Buffer.from(spec).toString('base64');
+      const source = `if (window === window.top && location.origin === ${JSON.stringify(page.origin)}) globalThis.__exactLaunchFaults = ${JSON.stringify(spec)};`;
+      if (faultScript) await call('Page.removeScriptToEvaluateOnNewDocument', { identifier: faultScript });
+      faultScript = (await call('Page.addScriptToEvaluateOnNewDocument', { source })).identifier;
+    };
+    await installFaults(facts.failFetch);
+    // `prefer display-mode`'s substitute (LLP 1039 D7), set in each new document before the page's scripts run, as
+    // CDP's emulated media are in place at boot: a reload keeps it, and a new session starts without it.
+    let displayScript;
+    const carryDisplayMode = async value => {
+      if (displayScript) await call('Page.removeScriptToEvaluateOnNewDocument', { identifier: displayScript });
+      displayScript = value == null ? undefined : (await call('Page.addScriptToEvaluateOnNewDocument', {
+        source: `if (window === window.top && location.origin === ${JSON.stringify(page.origin)}) globalThis.__exactDisplayMode = ${JSON.stringify(value)};`,
+      })).identifier;
+    };
     // Display preferences are the agent's from launch, never the machine's (LLP 1069.007 D2); `prefer` changes them.
     const emulated = { ...LAUNCH_MEDIA };
     await call('Emulation.setEmulatedMedia', {
@@ -548,6 +580,7 @@ async function openWebUnlocked({
        * never the last session's `prefer` (LLP 1069.007 D2; agent-prefer.mjs). */
       async reset({ keep = false, failFetch, epoch, session = false } = {}) {
         if (session) {
+          await carryDisplayMode(null);
           for (const name of Object.keys(emulated)) delete emulated[name];
           Object.assign(emulated, LAUNCH_MEDIA);
           await call('Emulation.setEmulatedMedia', {
@@ -576,6 +609,7 @@ async function openWebUnlocked({
         await evaluate('sessionStorage.clear()');
         if (!keep) await call('Storage.clearDataForOrigin', { origin: page.origin, storageTypes: 'all' });
         const destination = withEpoch(withFaults(keep ? await evaluate('location.href') : page.href, failFetch), epoch);
+        await installFaults(failFetch ?? (keep ? undefined : facts.failFetch ?? ''));
         const previousLoader = documentLoader,
           deadline = Date.now() + 30000;
         hostLines.length = 0;
@@ -600,9 +634,11 @@ async function openWebUnlocked({
         if (r.scrolled) await frame();
         return r;
       },
-      prefer: (media, page, fold, mode) =>
-        // the browser's emulation through CDP, the glue's substitute where it offers none (agent-prefer.mjs)
-        preferWeb({ media, page, fold, mode, emulated, call, evaluate, frame, ask, scale }),
+      // the browser's emulation through CDP, the glue's substitute where it offers none (agent-prefer.mjs)
+      async prefer(media, page, fold, mode) {
+        if (media['display-mode'] != null) await carryDisplayMode(media['display-mode']);
+        return preferWeb({ media, page, fold, mode, emulated, call, evaluate, frame, ask, scale });
+      },
       // A click with modifiers named holds them as a keyboard does (`heldForClick`; Charlie, 2026-10-07).
       input(id, kind, opts) {
         return heldForClick(call, kind, opts, () => this.deliverInput(id, kind, opts));
@@ -805,6 +841,13 @@ async function openWebUnlocked({
           // Chrome's own drag (agent-drag.mjs)
           dragged = await fileDrag({ kind, opts, id, x, y, dragged, call, evaluate });
         else if (kind === 'hover') await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+        else if (kind === 'dblclick' && opts.touch)
+          // a finger's double tap (LLP 1057.001.000 §6): two touches 80 ms apart
+          for (const k of [0, 1]) {
+            await call('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+            await call('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await (k ? frame() : sleep(80));
+          }
         else if (['contextmenu', 'dblclick', 'mouse', 'auxclick', 'clicks'].includes(kind)) {
           await call('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, modifiers });
           // The right button, the middle (`auxclick`), or the left n times, each press counting the run so far.

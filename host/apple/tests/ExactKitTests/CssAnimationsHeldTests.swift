@@ -1,6 +1,7 @@
 import QuartzCore
 import XCTest
 @testable import ExactKit
+@testable import ExactAnimations
 
 /// A held CSS animation (an authored pause, or a play waiting for the first
 /// presented frame, LLP 1003.001 D4): on screen it is held at `speed` 0; in

@@ -216,11 +216,13 @@ mod tests {
                 channel: "development".into(),
                 origin: None,
                 activate: "next-launch".into(),
+                check_interval: None,
                 target: target.into(),
                 embedded: Value::Null,
                 reach: Value::Null,
                 painter: None,
                 game: false,
+                host_work: false,
             };
             crate::receipt::emit(
                 &mut compat,
@@ -285,11 +287,13 @@ mod tests {
                 channel: "development".into(),
                 origin: None,
                 activate: "next-launch".into(),
+                check_interval: None,
                 target: String::new(),
                 embedded: Value::Null,
                 reach: Value::Null,
                 painter: None,
                 game: false,
+                host_work: false,
             };
             crate::receipt::emit(
                 &mut compat,
@@ -384,11 +388,13 @@ mod tests {
                 channel: "development".into(),
                 origin: None,
                 activate: "next-launch".into(),
+                check_interval: None,
                 target: target.into(),
                 embedded: Value::Null,
                 reach: Value::Null,
                 painter: None,
                 game: false,
+                host_work: false,
             };
             crate::receipt::emit(
                 &mut compat,

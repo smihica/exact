@@ -43,12 +43,12 @@ final class LoopbackSheet: AuthSheet {
     }
 
     /// Bind `loopback`'s port for `state`; a failure is the request's answer.
-    fileprivate func bind(_ loopback: [String: Any], state: String) -> AuthFailure? {
+    fileprivate func bind(_ loopback: [String: Any], state: String, logout: Bool) -> AuthFailure? {
         guard let library = LoopbackLibrary.shared else {
             return AuthFailure(status: 501, message: "this build carries no listener for a loopback callback: rebuild with its auth.callback grant")
         }
         let host = loopback["host"] as? String ?? "", port = (loopback["port"] as? NSNumber)?.intValue ?? 0
-        let config = Array([host, String(port), loopback["path"] as? String ?? "", state, ExactEnv.appName, loopback["message"] as? String ?? ""]
+        let config = Array([host, String(port), loopback["path"] as? String ?? "", state, logout ? "1" : "0", ExactEnv.appName, loopback["message"] as? String ?? ""]
             .joined(separator: "\0").utf8)
         var error: Int32 = 0
         let context = Unmanaged.passUnretained(self).toOpaque()
@@ -69,9 +69,9 @@ final class LoopbackSheet: AuthSheet {
 extension ExactSession {
     /// Open a loopback sign-in for `ticket` (D9): bind, then the default
     /// browser; the callback brings the window forward.
-    func authLoopback(_ ticket: UInt64, url: URL, state: String, ephemeral: Bool, loopback: [String: Any], done: @escaping (Result<URL, AuthFailure>) -> Void) -> Result<AuthSheet, AuthFailure> {
+    func authLoopback(_ ticket: UInt64, url: URL, state: String, logout: Bool, ephemeral: Bool, loopback: [String: Any], done: @escaping (Result<URL, AuthFailure>) -> Void) -> Result<AuthSheet, AuthFailure> {
         let sheet = LoopbackSheet()
-        if let failure = sheet.bind(loopback, state: state) { return .failure(failure) }
+        if let failure = sheet.bind(loopback, state: state, logout: logout) { return .failure(failure) }
         // Opening a URL carries no "no shared cookies" request (LLP 1069.006 D3).
         if ephemeral { log("auth \(ticket): ephemeral is not asked of the default browser") }
         sheet.answered = { [weak self, weak sheet] text in
@@ -96,7 +96,7 @@ extension ExactSession {
     /// The window that asked comes forward (LLP 1133.005 D10), best effort
     /// under macOS 14's cooperative activation.
     private func bringForward() {
-        guard let window = presenter.shareAnchor(nil).0?.window else { return }
+        guard let window = presenter.presentationAnchor(nil).0?.window else { return }
         if NSApp.isHidden { NSApp.unhide(nil) }
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)

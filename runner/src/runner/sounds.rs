@@ -16,7 +16,8 @@ impl<D: DataSource> Runner<D> {
             .collect();
         let mut lines = Vec::new();
         if !calls.is_empty() {
-            self.sounds
+            self.audio
+                .sounds
                 .apply(&self.plan, self.now_ms, &calls, &mut lines);
         }
         // An iframe's `reload(id)` reloads its page, not the app (LLP 1020.002 D3).
@@ -25,17 +26,17 @@ impl<D: DataSource> Runner<D> {
             .any(|c| c.name == "reload" && c.args.is_empty())
         {
             if !self.plan.sounds.is_empty() {
-                self.sounds.reload(self.now_ms, &mut lines);
+                self.audio.sounds.reload(self.now_ms, &mut lines);
             }
             // Every note the queue turned on ends, handed now (LLP 1125 D4).
-            self.midi.reload(self.now_ms, &mut lines);
+            self.audio.midi.reload(self.now_ms, &mut lines);
         }
         // `sendMIDI` and `requestMIDIAccess` (LLP 1125 D6, D7): the queue's.
         let seek = !self.clock_live();
         for c in commands {
             match c.name.as_str() {
-                "sendMIDI" => self.midi.send(&c.args, self.now_ms, &mut lines),
-                "requestMIDIAccess" => self.midi.request(self.now_ms, seek, &mut lines),
+                "sendMIDI" => self.audio.midi.send(&c.args, self.now_ms, &mut lines),
+                "requestMIDIAccess" => self.audio.midi.request(self.now_ms, seek, &mut lines),
                 _ => {}
             }
         }

@@ -103,6 +103,18 @@ pub(crate) fn call(m: &mut Module, s: &mut Store, op: &str, value: &str) -> Stri
 }
 
 #[test]
+fn application_code_cannot_obtain_a_raw_storage_promise() {
+    let root = Root::new();
+    let mut module = root.module();
+    module.activate().unwrap();
+    let mut store = Store::new(GRANTS, []);
+    assert_eq!(
+        call(&mut module, &mut store, "storage-handoff", ""),
+        "private"
+    );
+}
+
+#[test]
 fn native_modules_are_deferred_retired_and_unavailable_to_validation() {
     struct Native {
         data: Option<PathBuf>,
@@ -161,6 +173,29 @@ fn native_modules_are_deferred_retired_and_unavailable_to_validation() {
         std::fs::read_to_string(root.0.join("data/native.txt")).unwrap(),
         "after fetch"
     );
+}
+
+/// A validation pass has no storage, so a resource that reads a file or opens
+/// SQLite at boot is left pending, as at bake, and the generation boots
+/// (#676); the committed session asks it again with storage.
+#[test]
+fn validation_leaves_a_boot_read_of_storage_pending() {
+    for op in ["read", "count"] {
+        let root = Root::new();
+        let src = format!("shape Result\n  text: string\ncomponent App\n  resource r = work(\"{op}\", \"x\") as shape Result\n  view\n    text r.text\n");
+        let mut m = root.module();
+        m.activate_for_validation().unwrap();
+        let r = Runner::boot(
+            contract::compile(&src).unwrap(),
+            m,
+            Kernel::with_monospace(),
+            Default::default(),
+            "/",
+        )
+        .unwrap_or_else(|e| panic!("{op}: {e:?}"));
+        assert!(r.failed_resources().is_empty(), "{op}");
+        assert!(!root.0.exists(), "{op}: validation touched storage");
+    }
 }
 
 #[test]
@@ -1064,8 +1099,9 @@ fn storage_refusals_carry_a_stable_code() {
         .lines()
         .map(|l| l.split(' ').take(2).collect::<Vec<_>>().join(" "))
         .collect();
+    let (common, folder) = codes.split_at(5);
     assert_eq!(
-        codes,
+        common,
         [
             "Unavailable ENOENT",
             "Unavailable denied",
@@ -1074,6 +1110,20 @@ fn storage_refusals_carry_a_stable_code() {
             "Unavailable denied"
         ]
     );
+    // A folder read or copied from as a file is EISDIR, and the copy leaves
+    // no file. Unix only: the Windows app filesystem still refuses both with
+    // a message that carries no filesystem code, so they read as `failed`.
+    #[cfg(unix)]
+    assert_eq!(
+        folder,
+        [
+            "Unavailable EISDIR",
+            "Unavailable EISDIR",
+            "Unavailable ENOENT"
+        ]
+    );
+    #[cfg(not(unix))]
+    let _ = folder;
 }
 
 /// No later UI request is needed to finish writes these answers already
@@ -1387,5 +1437,31 @@ fn bundled_sqlite_has_the_wal_page_size_fix() {
         rusqlite::version_number() >= 3_054_000,
         "{}",
         rusqlite::version()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configuring_storage_refuses_a_symlink_root() {
+    let root = Root::new();
+    std::fs::create_dir_all(root.0.join("outside")).unwrap();
+    std::fs::write(root.0.join("outside/secret"), b"outside").unwrap();
+    std::os::unix::fs::symlink(root.0.join("outside"), root.0.join("data")).unwrap();
+    let mut module = Module::new(HBC.to_vec(), APP, GRANTS);
+    module
+        .configure_storage(
+            root.0.join("data"),
+            root.0.join("cache"),
+            root.0.join("tmp"),
+        )
+        .unwrap();
+    assert!(module.activate().is_err());
+    assert_eq!(
+        std::fs::read(root.0.join("outside/secret")).unwrap(),
+        b"outside"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.0.join("outside")).unwrap().count(),
+        1
     );
 }

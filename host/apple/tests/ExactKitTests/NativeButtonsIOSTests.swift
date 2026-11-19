@@ -2,6 +2,9 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactNativeViews
+@testable import ExactControls
 
 /// LLP 1069.011 on UIKit: a `Control` of type `button` is UIKit's own
 /// `UIButton` with the configuration its `buttonStyles` row names, its title
@@ -17,6 +20,25 @@ final class NativeButtonsIOSTests: XCTestCase {
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return nil }
         return [r, g, b, a]
+    }
+
+    func testHighlightedTranslationFollowsLayout() throws {
+        let p = presenter(box(1) + native(2) + [["op": "children", "id": 1, "ids": [2]], ["op": "roots", "ids": [1]]], faces: [2: face("Go")])
+        p.apply(wireBatch([["op": "style", "id": 2, "style": ["press_translate_percent": [50, 25]]]]))
+        let owner = try XCTUnwrap(p.views[2])
+        let button = try XCTUnwrap(p.controls.controls[2] as? NativeButtonIOS)
+        button.isHighlighted = true; button.updateConfiguration()
+        for size in [CGSize(width: 100, height: 80), CGSize(width: 200, height: 160)] {
+            owner.frame.size = size
+            owner.layoutSubviews()
+            let animation = try XCTUnwrap(owner.layer.animation(forKey: "pressTranslation") as? CABasicAnimation)
+            let point = try XCTUnwrap(animation.toValue as? NSValue).cgPointValue
+            XCTAssertEqual(point, CGPoint(x: size.width / 2, y: size.height / 4))
+            XCTAssertTrue(animation.isAdditive)
+            XCTAssertEqual(animation.duration, .greatestFiniteMagnitude, "native highlighting adds no press ease")
+        }
+        button.isHighlighted = false; button.updateConfiguration()
+        XCTAssertNil(owner.layer.animation(forKey: "pressTranslation"))
     }
 
     func testActivePropertiesKeepNativeCustomizationAndConfigurationCallbacks() throws {
@@ -218,7 +240,7 @@ final class NativeButtonsIOSTests: XCTestCase {
                           faces: [2: face("Second")])
         XCTAssertNotNil(p.controls.controls[2])
         let list = try XCTUnwrap(p.views[1])
-        p.navigation.covers[1] = .whole
+        p.navigationHost.covers[1] = .whole
         list.isHidden = true
         p.controls.sync()
         XCTAssertNil(p.controls.controls[2], "the bar's item stands for it")
@@ -825,6 +847,7 @@ final class NativeButtonsIOSTests: XCTestCase {
 
     func testSelectAlignmentMovesItsNativeTitleWithoutRebuildingTheMenu() throws {
         let menu = selectMenu(), p = selectPresenter(selectMenu())
+        p.apply(wireBatch([["op": "style", "id": 3, "style": ["field_sizing": "fixed", "written": ["field_sizing"]]]]))
         let node = try XCTUnwrap(p.views[3]), select = try XCTUnwrap(p.controls.controls[3] as? UIButton)
         let natural = p.controls.naturalSize(select, node)
         var widestMenu = menu
@@ -840,7 +863,8 @@ final class NativeButtonsIOSTests: XCTestCase {
         defer { reference.removeFromSuperview() }
         var titleRects: [String: CGRect] = [:]
         for alignment in [nil, "right", "left", "center", nil] as [String?] {
-            let style: [String: Any] = alignment.map { ["text_align": $0] } ?? [:]
+            var style: [String: Any] = ["field_sizing": "fixed", "written": ["field_sizing"]]
+            if let alignment { style["text_align"] = alignment }
             p.apply(wireBatch([["op": "style", "id": 3, "style": style]]))
             let actual = try popupTitleRect(select)
             XCTAssertEqual(try popupIndicatorRect(select), try popupIndicatorRect(reference), "alignment leaves the native indicator at the inline end")
@@ -949,8 +973,8 @@ final class NativeButtonsIOSTests: XCTestCase {
         let p = selectPresenter(menu)
         p.selectOptions = { _ in menu }
         let node = try XCTUnwrap(p.views[3]), select = try XCTUnwrap(p.controls.controls[3] as? UIButton)
+        p.apply(wireBatch([["op": "style", "id": 3, "style": ["text_align": "right", "field_sizing": "fixed", "written": ["field_sizing"]]]]))
         let natural = p.controls.naturalSize(select, node)
-        p.apply(wireBatch([["op": "style", "id": 3, "style": ["text_align": "right"]]]))
         var heard: [String] = []
         p.onControlValue = { id, value, input, change in
             XCTAssertEqual(id, 3)

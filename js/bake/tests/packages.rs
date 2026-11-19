@@ -558,11 +558,11 @@ fn package_code_no_executor_runs_is_refused_by_package_and_file() {
         // `?.` or not, is refused by its place in the package.
         (
             "export default (() => import.meta.env.API_BASE_URL)();\n",
-            "bad@3.1.0 (index.js:2:23) reads import.meta.env, which only app.ts may",
+            "bad@3.1.0 (index.js:2:23) reads import.meta.env, which only app-local modules may",
         ),
         (
             "export default (() => String(import.meta?.env))();\n",
-            "bad@3.1.0 (index.js:2:30) reads import.meta.env, which only app.ts may",
+            "bad@3.1.0 (index.js:2:30) reads import.meta.env, which only app-local modules may",
         ),
     ];
     app.put(
@@ -879,7 +879,7 @@ fn app_facts_are_read_without_running_the_module_and_aliases_replay() {
     for result in every(&app) {
         let error = result.expect_err("computed grants");
         assert!(
-            error.contains("grants must be a constant the build reads without running the module"),
+            error.contains("app.ts:6:23: grants cannot call code; only a literal array .join(separator) is allowed"),
             "{error}"
         );
     }

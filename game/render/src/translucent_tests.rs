@@ -92,7 +92,7 @@ fn frame() -> Frame {
 }
 fn surface(args: &[Value]) -> WorldSurface<Halos> {
     let mut s = WorldSurface::default();
-    s.device_ready(wgpu::Features::empty());
+    s.device_ready(wgpu::Features::empty(), wgpu::Limits::downlevel_defaults());
     s.bind(args, None).unwrap();
     s
 }
@@ -545,7 +545,9 @@ fn signed_axes_match_opaque_silhouettes_at_endpoints_and_between_ticks() {
     };
     let mask = |p: &fixture::Pixels| {
         p.data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| p[0] > 10)
             .collect::<Vec<_>>()
     };

@@ -11,11 +11,7 @@ impl<D: DataSource> Bridge<D> {
 
     fn pump_with_clock(&mut self, now_ms: f64, clock: impl Fn() -> Instant) -> u32 {
         if let Some(host) = self.host.as_mut() {
-            if host
-                .launch_store
-                .as_ref()
-                .is_some_and(|store| store.take_changed())
-            {
+            if host.take_launch_store_change() {
                 if let Some(executor) = self.executor.as_deref() {
                     executor.begin_pump();
                 }
@@ -46,6 +42,20 @@ impl<D: DataSource> Bridge<D> {
                 if host.has_request_refusals(executor.ordered_idle()) {
                     executor.notify();
                 }
+                out
+            }
+            // An archive without I/O: what settles is what the bridge
+            // refused for want of it (`without_io`), within the same budget,
+            // waking again for the rest.
+            (Some(host), None) if self.links.io.is_none() => {
+                host.runner_mut().collect_aborts();
+                let mut pump = Pump::new(clock);
+                let turn = &mut self.refusal_turn;
+                let out = host
+                    .fulfill_ready(|runner| pump.ready(runner, turn, || true, Vec::new), now_ms);
+                // Cancellations are an executor's to act on; none runs.
+                host.runner_mut().take_explicit_aborts();
+                Self::wake_for_refusals(host, self.wake);
                 out
             }
             (Some(host), None) => host.fulfill_all(vec![], now_ms),

@@ -65,7 +65,7 @@ final class CanvasesHost {
     final class Entry {
         let view: NodeView
         let name: String
-        var values: Any
+        var values: Data
         var id: UInt32 = 0
         var presentable = true
         var wants = false
@@ -109,7 +109,7 @@ final class CanvasesHost {
         var waiting = false
         /// The artifact whose surface this canvas is (LLP 1009 D6), once created.
         var module: GpuModule?
-        init(view: NodeView, name: String, values: Any) { self.view = view; self.name = name; self.values = values }
+        init(view: NodeView, name: String, values: Data) { self.view = view; self.name = name; self.values = values }
     }
     var entries: [UInt32: Entry] = [:]
     var publishers: [String: Entry] = [:]
@@ -183,7 +183,7 @@ final class CanvasesHost {
     }
 
     /// A surface op: new inputs for a canvas node.
-    func surface(view: NodeView, name: String, values: Any) {
+    func surface(view: NodeView, name: String, values: Data) {
         if let e = entries[view.id], e.view !== view || e.name != name { destroy(view: view.id) }
         if let e = entries[view.id] {
             e.values = values
@@ -205,6 +205,7 @@ final class CanvasesHost {
             haptics.remove(view)
             if e.id != 0 { e.module?.destroy(e.id) }
             releasePublisher(e)
+            lifecycle.removedCanvas()
         }
     }
 
@@ -214,6 +215,7 @@ final class CanvasesHost {
     /// Load the module — once, after the first painted frame, only when a
     /// canvas exists. Returns whether a frame source is now wanted.
     func loadIfNeeded() {
+        updatePerformanceTimer()
         guard !entries.isEmpty, session?.firstDrawMs != nil else { return }
         // Each artifact the first time one of its canvases exists (LLP 1009
         // D6). A declared module loads on the next turn, after the frame that
@@ -264,8 +266,10 @@ final class CanvasesHost {
         e.id = bytes.withUnsafeBufferPointer { m.create($0.baseAddress, bytes.count, ptr, w, h) }
         e.presentable = e.id != 0
         if e.id == 0 { FileHandle.standardError.write(Data("exact gpu: \(m.error())\n".utf8)); return }
-        e.performance = publishers[e.name] === e && session?.canvasPerformanceRequested(e.name) == true
-        if e.performance { _ = m.performanceReporting?(e.id, true) }
+        if let session, !m.giveStorage(e.id, session: session) {
+            failed = m.error(); m.destroy(e.id); e.id = 0; e.presentable = false; return
+        }
+        e.performance = false
         e.module = m
         updatePerformanceTimer()
         lifecycle.deliver(e.id, module: m)
@@ -428,7 +432,7 @@ final class CanvasesHost {
         let scale = CGFloat(metal.layer?.contentsScale ?? 2)
         let w = Int((metal.bounds.width * scale).rounded()), h = Int((metal.bounds.height * scale).rounded())
         guard w > 0, h > 0,
-              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32),
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: w * 4, bitsPerPixel: 32)?.retagging(with: .sRGB),
               let data = rep.bitmapData
         else { return nil }
         rep.size = metal.bounds.size
@@ -456,7 +460,7 @@ final class CanvasesHost {
     var visible: Bool {
         guard let viewport = session?.presenter.viewport else { return false }
         // An unmounted view wants no frames (LLP 1031 D3).
-        return !NSApplication.shared.isHidden && (viewport.window?.occlusionState.contains(.visible) ?? false)
+        return !NSApplication.shared.isHidden && (viewport.window?.screenOcclusionState.contains(.visible) ?? false)
     }
 
     /// Whether any surface has something to render — or an edit is under a
@@ -537,7 +541,7 @@ final class CanvasesHost {
             rendered(e, r)
             rendered += 1
             // A render that drew nothing, as without its drawable, draws when one lands (`renderStarved`)
-            e.waiting = !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
+            e.waiting = (m.presentationFlags?(e.id) ?? 0) & 4 == 0 && !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
             if !e.waiting { drawn += 1 }
             more = more || e.wants
             readPlacements(m, e)
@@ -574,7 +578,7 @@ final class CanvasesHost {
             rendered(e, r)
             rendered += 1
             // A render that drew nothing, as without its drawable, draws when one lands (`renderStarved`)
-            e.waiting = !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
+            e.waiting = (m.presentationFlags?(e.id) ?? 0) & 4 == 0 && !(m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1))
             if !e.waiting { drawn += 1 }
             readPlacements(m, e)
             messages(e)

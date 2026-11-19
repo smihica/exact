@@ -23,7 +23,10 @@ extension Presenter {
         get { focusEvents.onEvent }
         set { focusEvents.onEvent = newValue }
     }
-    func focus(_ id: UInt32) {
+    package func focus(_ id: UInt32) {
+        #if os(iOS)
+        navigation.finishBootOwner()
+        #endif
         #if os(macOS)
         tabStart = nil
         #endif
@@ -33,7 +36,7 @@ extension Presenter {
         #endif
         MainActor.assumeIsolated { HeldState.focusMoved(to: textHost(id)) } // the focus coming into a held focus's node or leaving it lets it go (HeldState.swift)
     }
-    func blur(_ id: UInt32) {
+    package func blur(_ id: UInt32) {
         #if os(iOS) || os(tvOS)
         if menus.preservesFocus(id) { return }
         #endif
@@ -59,6 +62,8 @@ final class FocusEvents {
 
     init(_ presenter: Presenter) { self.presenter = presenter }
     func reset() { current = nil; pending = nil }
+    /// The node that has the focus, as the page was told.
+    var focused: UInt32? { current?.node }
 
     private func snapshot(_ id: UInt32) -> FocusSnapshot? {
         guard let presenter, let view = presenter.textHost(id) else { return nil }

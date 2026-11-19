@@ -110,7 +110,7 @@ enum ScrollAnchoring {
         // A view leaving with an exit animation stays in the window but is no
         // longer the presenter's: the DOM has removed it, so it is no candidate.
         let live = { (n: NodeView) in scroller.presenter?.views[n.id] === n }
-        let roots = space.subviews.compactMap { $0 as? NodeView }
+        let roots = NodeView.committed(space.subviews)
         let rect = { (n: NodeView) in n.convert(n.bounds, to: space) }
         let children = { (node: NodeView) -> [NodeView] in
             #if os(iOS) || os(tvOS)
@@ -118,7 +118,7 @@ enum ScrollAnchoring {
             #else
             let scrolls = node.scroll != nil
             #endif
-            return scrolls ? [] : node.container.subviews.compactMap { $0 as? NodeView }
+            return scrolls ? [] : node.childNodes
         }
         // CSS Scroll Anchoring §2.1 examines a viable focused editor before
         // tree-order candidates, including when it is only partly visible.

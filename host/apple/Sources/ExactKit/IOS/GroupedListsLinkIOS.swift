@@ -69,6 +69,10 @@ package protocol GroupedLists: AnyObject {
     func projects(_ view: UIView) -> Bool
     /// The authored parent of a row carried into a cell.
     func logicalParent(of view: UIView) -> UIView?
+    #if os(iOS)
+    /// Close the swipe actions revealed in the list that draws row `id`.
+    func closeSwipe(row id: UInt32)
+    #endif
 }
 
 /// Where a finger aimed at a row a list draws lands (LLP 1080.000 D4): a
@@ -77,7 +81,11 @@ package enum GroupedAim { case view(UIView, port: UIScrollView), refused(String)
 
 /// A grouped list's collection view, which scrolls in its list's place
 /// (LLP 1084 D8).
-package protocol GroupedScroller: UIScrollView {}
+package protocol GroupedScroller: UIScrollView {
+    /// The list's node while this collection view is its `scrollView`: nil before the list
+    /// mounts and after it is removed.
+    var scrollingNode: NodeView? { get }
+}
 
 /// The grouped lists module's hooks, installed by the composition.
 package enum GroupedListsLink {

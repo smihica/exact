@@ -2,10 +2,10 @@
 // the dense sibling rank. Every layer standing for a node takes this value.
 #if os(macOS)
 import AppKit
-typealias PaintView = NSView
+package typealias PaintView = NSView
 #else
 import UIKit
-typealias PaintView = UIView
+package typealias PaintView = UIView
 #endif
 
 private var paintRanksKey: UInt8 = 0
@@ -27,7 +27,7 @@ private final class DensePaintRanks {
 
 /// All callers run on the UI thread. Nested presenter applies share the
 /// transaction; a standalone lift/ghost change is its own transaction.
-enum PaintOrder {
+package enum PaintOrder {
     private static var depth = 0
     private static var dirty: [ObjectIdentifier: PaintView] = [:]
 
@@ -44,7 +44,7 @@ enum PaintOrder {
         dirty = [:]
         for parent in parents { NodeView.rankChildren(of: parent) }
     }
-    static func changed(_ parent: PaintView) {
+    package static func changed(_ parent: PaintView) {
         if depth > 0 { dirty[ObjectIdentifier(parent)] = parent }
         else { NodeView.rankChildren(of: parent) }
     }
@@ -147,8 +147,8 @@ extension NodeView {
         #if os(macOS)
         let place = { (child: PaintView) in position(child.siblingPaintRank)! }
         #else
-        // A navigation root's children beside the routes go above the native container, whose box is the page's
-        // where the routes' are not (`NavigationHost.clearBesideRoutes`): those at or below its rank into the step
+        // A navigation root's children beside the routes go above the native container where its box extends
+        // past the routes' boxes (`NavigationHost.clearBesideRoutes`): those at or below its rank go into the step
         // above it, in their own ranks' order, so their `z-index` still orders them among themselves
         let plane = position(1)
         let lowest = plane == nil ? nil : children.lazy.compactMap { ($0 as? NodeView)?.clearsNavigation == true ? position($0.siblingPaintRank) : nil }.min()
@@ -179,7 +179,7 @@ extension NodeView {
     /// parent (the Mac's table under a list's rows) is no sibling of theirs.
     static func keepingGhosts(_ children: [NodeView], in parent: PaintView) -> [NodeView] {
         var result = children
-        for (index, node) in parent.subviews.compactMap({ $0 as? NodeView }).enumerated() where node.paintGhost {
+        for (index, node) in NodeView.structural(parent.subviews).enumerated() where node.paintGhost {
             result.insert(node, at: min(index, result.count))
         }
         return result
@@ -231,7 +231,7 @@ extension PaintView {
     /// the root's children — so a later positioned sibling, a root sheet
     /// with no `z-index`, paints and takes touches over it, as on the web
     /// (chat2 diary; LLP 1083.000 D4, the kernel's `paint_order::rank`).
-    func setPaintForeground(_ on: Bool = true, aboveAuthored: Bool = true) {
+    package func setPaintForeground(_ on: Bool = true, aboveAuthored: Bool = true) {
         #if os(macOS)
         if on { wantsLayer = true }
         #endif
@@ -331,18 +331,27 @@ extension NodeView {
     /// The same front-to-back order, with flat layers in their actual tree
     /// slots. Decoration layers never become input targets.
     static func hitChildren(in holder: UIView, at point: CGPoint, with event: UIEvent?,
-                            visit: ((UIView) -> UIView?)? = nil) -> UIView? {
+                            visit: ((UIView) -> UIView?)? = nil, captureLayoutHit: ((LayoutHit) -> Void)? = nil) -> UIView? {
         let views = holder.subviews
         func hit(_ view: UIView) -> UIView? {
             if let visit { return visit(view) }
             return view.hitTest(holder.convert(point, to: view), with: event)
         }
         let layers = holder.layer.sublayers ?? []
-        guard layers.contains(where: { $0.flatHit != nil }) else {
+        let layoutHits = LayoutHits.at(holder)
+        guard layoutHits != nil || layers.contains(where: { $0.flatHit != nil }) else {
             for view in hitOrder(views) { if let found = hit(view) { return found } }
             return nil
         }
         let byLayer = Dictionary(uniqueKeysWithValues: views.map { (ObjectIdentifier($0.layer), $0) })
+        func hitLayer(_ layer: CALayer) -> UIView? {
+            if let view = byLayer[ObjectIdentifier(layer)] { return hit(view) }
+            if !layer.isHidden, let flat = layer.flatHit, let owner = flat.owner,
+               !owner.inert, owner.style["pointer_events"]?.string != "none",
+               flat.frames.contains(where: { $0.contains(point) }) { return owner }
+            return nil
+        }
+        if let boxes = layoutHits { return boxes.hit(in: holder, at: point, layers: layers, visit: hitLayer, capture: captureLayoutHit) }
         let depth = layers.first?.zPosition ?? 0
         let ordered: [CALayer]
         if layers.allSatisfy({ $0.zPosition == depth }) { ordered = layers.reversed() }
@@ -352,11 +361,7 @@ extension NodeView {
             }.map(\.element)
         }
         for layer in ordered {
-            if let view = byLayer[ObjectIdentifier(layer)] {
-                if let found = hit(view) { return found }
-            } else if !layer.isHidden, let flat = layer.flatHit, let owner = flat.owner,
-                      !owner.inert, owner.style["pointer_events"]?.string != "none",
-                      flat.frames.contains(where: { $0.contains(point) }) { return owner }
+            if let found = hitLayer(layer) { return found }
         }
         return nil
     }

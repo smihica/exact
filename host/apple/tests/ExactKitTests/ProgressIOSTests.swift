@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 /// LLP 1069.001, amended 2026-10-07, on UIKit: an indeterminate `progress`
 /// is a `UIActivityIndicatorView`, `.medium` in the default 20 × 20 box and

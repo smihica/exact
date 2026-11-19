@@ -1,7 +1,7 @@
 // @ref LLP 1116.003 D8 — `check`: what is wrong with the presented screen, in text (scripts/agent-check.mjs judging
 // host/web-js/check.js's observations and a capture's pixels): one fixture view per finding class, found on the page in
 // each scheme and absent from a page that has none; and a screenshot shows a transition where it ends, unless filmed.
-import { test, expect } from 'bun:test';
+import { afterAll, test, expect } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -261,11 +261,16 @@ const TOAST = `component ToastFixture
       text "Past the screen's bottom" position="absolute" left=16 bottom=-24 height=48 pointer-events="none" testId="low"
 `;
 
+const fixtures = [];
+afterAll(() => { for (const dir of fixtures) rmSync(dir, { recursive: true, force: true }); });
+
 const built = (() => {
   const ready = new Map();
   return (name, source) => {
     if (!ready.has(name)) ready.set(name, (async () => {
-      const dir = mkdtempSync(join(tmpdir(), `exact-check-${name}-`)), contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
+      const dir = mkdtempSync(join(tmpdir(), `exact-check-${name}-`));
+      fixtures.push(dir);
+      const contract = join(dir, 'app.contract'), plan = join(dir, 'app.plan'), dist = join(dir, 'dist');
       writeFileSync(contract, source);
       const compile = spawnSync(compiler, ['build', contract, '-o', plan], { encoding: 'utf8' });
       if (compile.status !== 0) throw new Error(compile.stderr);
@@ -631,6 +636,7 @@ test('a text is judged on the fill under it in each scheme, and a row its scroll
   const session = await open({ host: 'web', url: await built('bubbles', BUBBLES) });
   try {
     const dir = mkdtempSync(join(tmpdir(), 'exact-check-bubbles-'));
+    fixtures.push(dir);
     const [light, dark] = (await checkOp(session, ['both'], { shots: (_, scheme) => join(dir, `${scheme}.png`) })).check;
     expect(kinds(light)).toEqual({}); // white on the indigo bubble reads, though its box's corners show the white page
     expect(kinds(dark)).toEqual({ own: ['contrast'], in: ['contrast'], 'own-light': ['contrast'] }); // on the pale bubbles, not the black page
@@ -693,6 +699,7 @@ test('a screenshot shows a transition where it ends, the clock unmoved; a film\'
   const session = await open({ host: 'web', url: await built('broken', BROKEN) });
   try {
     const dir = mkdtempSync(join(tmpdir(), 'exact-check-shot-'));
+    fixtures.push(dir);
     const swatch = (await session.layout('swatch')).node.space.viewport;
     const at = (file) => { const png = decodePng(readFileSync(file)), x = Math.floor(swatch.x + swatch.w / 2), y = Math.floor(swatch.y + swatch.h / 2), i = (y * png.width + x) * 4; return [...png.data.slice(i, i + 3)]; };
     await session.tap('swatch');
@@ -742,6 +749,53 @@ test('folded captions over pictures use captured pixels unless their own fill co
       [['Caption on a picture', 'contrast']], [['Caption on a picture', 'contrast']],
     ]);
     for (const run of runs) expect(run.findings[0].detail.bg).toBe('#00ff00');
+  } finally { await session.close(); }
+}, 120_000);
+
+// Spark's swipe stamps: `pointer-events: none` takes a text out of hit testing, so the scan starts at its card.
+test('a text outside hit testing stands on its own fill, and on captured pixels without one', async () => {
+  const picture = `"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='48'%3E%3Cpath fill='%2300ff00' d='M0 0h400v48H0z'/%3E%3C/svg%3E"`;
+  const source = `component Stamps
+  view
+    column background-color="black" color="white" padding=16 gap=16
+      column position="relative" height=48
+        image ${picture} position="absolute" inset=0 width="100%" height="100%"
+        column position="relative" testId="card"
+          text testId="stamp" pointer-events="none" background-color="black" "Stamp on its own fill"
+      column position="relative" height=48
+        image ${picture} position="absolute" inset=0 width="100%" height="100%"
+        column position="relative"
+          text pointer-events="none" "Stamp on a picture"
+`;
+  const session = await open({ host: 'web', url: await built('unhit-stamps', source) });
+  try {
+    const ids = new Map((await session.op({ op: 'tree' })).nodes.map(n => [n.props.testId, n.id]));
+    const obs = await session.op({ op: 'check' });
+    expect(obs.items.find(it => it.text === 'Stamp on its own fill')).toMatchObject({ bg: [0, 0, 0], on: 'own', solid: true });
+    expect(obs.items.find(it => it.text === 'Stamp on a picture').bg).toBeUndefined();
+    expect(ids.has('stamp')).toBe(true);
+  } finally { await session.close(); }
+}, 120_000);
+
+// Spark's card beneath the one being dragged: its name's right corners lie under the top card's white name.
+test('a corner another view is drawn over is not read as the ground of the text under it', async () => {
+  const source = `component Overdrawn
+  view
+    column background-color="black" padding=16
+      column position="relative" width=300 height=48
+        image "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='48'%3E%3Cpath fill='%2300ff00' d='M0 0h300v48H0z'/%3E%3C/svg%3E" position="absolute" inset=0 width="100%" height="100%"
+        text position="relative" color="white" font-size=24 "Partly under a card"
+        column position="absolute" top=24 left=0 right=0 bottom=0 background-color="white"
+        column position="absolute" top=0 left=150 right=0 bottom=0 background-color="white"
+`;
+  const session = await open({ host: 'web', url: await built('overdrawn', source) });
+  try {
+    const item = (await session.op({ op: 'check' })).items.find(it => it.text === 'Partly under a card');
+    expect(item.bg).toBeUndefined();
+    expect(item.drawnOver).toEqual([1, 2, 3]);
+    // Its one uncovered corner is no majority: the text is left unjudged, never judged white on white.
+    const runs = (await checkOp(session, ['both'])).check;
+    expect(runs.map(run => run.findings.filter(f => f.kind === 'contrast'))).toEqual([[], []]);
   } finally { await session.close(); }
 }, 120_000);
 
@@ -817,3 +871,10 @@ test('Shared Elements keeps Zoom Close painted, observed and usable after repeat
     await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
   }
 }, 120_000);
+
+test('check on the wasm web target names the target and where check runs', async () => {
+  const session = { host: 'web', op: async () => { throw Object.assign(new Error('check: unknown op: check'), { reply: { error: 'unknown op: check' } }); } };
+  await expect(checkOp(session)).rejects.toThrow('this web build is the wasm target (a game, or `--wasm`), which carries no check; the JS web target and iOS do, so run `agent ios check`');
+  const failed = { host: 'web', op: async () => { throw new Error('display failed'); } };
+  await expect(checkOp(failed)).rejects.toThrow('display failed');
+});

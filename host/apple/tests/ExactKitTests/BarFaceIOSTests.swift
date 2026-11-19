@@ -1,7 +1,9 @@
 #if os(iOS)
 import UIKit
 import XCTest
+@testable import ExactImages
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// A header button's face as its author painted it (`ChipFace`, LLP 1115
 /// §2): a dot beside a label, or a label in the author's font, is the bar
@@ -47,6 +49,84 @@ final class BarFaceIOSTests: XCTestCase {
         XCTAssertLessThan(pixel.0, 15)
     }
 
+    func testABadgeOnAGlassButtonKeepsItsOwnGlass() throws {
+        guard #available(iOS 26.0, *) else { throw XCTSkip("bar item glass is iOS 26") }
+        let p = Presenter()
+        defer { p.reset() }
+        let fill: [String: Any] = ["background_color": [[255, 0, 0, 255], [0, 0, 255, 255]], "width": 36, "height": 36]
+        p.apply(wireBatch([
+            ["op": "create", "id": 100, "kind": "view", "props": ["semanticTag": "header"]],
+            ["op": "create", "id": 1, "kind": "button", "props": ["testId": "plain"]],
+            ["op": "create", "id": 2, "kind": "view", "style": fill],
+            ["op": "create", "id": 3, "kind": "text", "props": ["text": "A"]],
+            ["op": "create", "id": 4, "kind": "button", "props": ["testId": "glass", "backgroundMaterial": "glass"]],
+            ["op": "create", "id": 5, "kind": "view", "style": fill],
+            ["op": "create", "id": 6, "kind": "text", "props": ["text": "A"]],
+            ["op": "children", "id": 2, "ids": [3]], ["op": "children", "id": 1, "ids": [2]],
+            ["op": "children", "id": 5, "ids": [6]], ["op": "children", "id": 4, "ids": [5]],
+            ["op": "children", "id": 100, "ids": [1, 4]], ["op": "roots", "ids": [100]],
+        ]))
+        let shape = try [1, 4].map { HeaderShape.Item(try XCTUnwrap(p.views[$0])) }
+        XCTAssertNotNil(shape[0].badge)
+        XCTAssertNotNil(shape[1].badge)
+        XCTAssertFalse(shape[0].ownGlass)
+        XCTAssertTrue(shape[1].ownGlass)
+        let items = p.navigationHost.barItems(shape, RouteController(try XCTUnwrap(p.views[100])))
+        XCTAssertEqual(items.count, 2)
+        XCTAssertTrue(items[0].hidesSharedBackground, "a badge alone is its own shape, with no glass")
+        XCTAssertFalse(items[1].hidesSharedBackground, "a badge on a glass button shows glass")
+        XCTAssertFalse(items[1].sharesBackground, "and that glass is its own capsule")
+    }
+
+    /// A box holding a picture (an avatar's photo) is a badge: its fill until the picture loads, then the
+    /// picture clipped to the box's corners. The header the bar draws is hidden, and the picture still loads.
+    func testABadgesPictureLoadsInAHeaderTheBarDraws() throws {
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let png = try XCTUnwrap(UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20), format: format).image { context in
+            UIColor.red.setFill(); context.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        }.pngData())
+        let source = "data:image/png;base64," + png.base64EncodedString()
+        let p = Presenter(), loader = RasterLoader(), resolver = AssetResolver(root: URL(fileURLWithPath: NSTemporaryDirectory()))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 200, height: 200))
+        defer { loader.shutdown(); window.isHidden = true; p.reset() }
+        p.viewport.frame = window.bounds; window.addSubview(p.viewport); window.makeKeyAndVisible()
+        let round: [String: Any] = ["border_radius_top_left": 18, "border_radius_top_right": 18, "border_radius_bottom_left": 18, "border_radius_bottom_right": 18]
+        p.apply(wireBatch([
+            ["op": "create", "id": 100, "kind": "view", "props": ["semanticTag": "header"]],
+            ["op": "create", "id": 1, "kind": "button", "props": ["testId": "avatar"]],
+            ["op": "create", "id": 2, "kind": "view", "style": round.merging(["background_color": [0, 0, 255, 255], "width": 36, "height": 36]) { $1 }],
+            ["op": "create", "id": 3, "kind": "image", "props": ["imageSource": source], "style": ["object_fit": "cover", "width": 36, "height": 36]],
+            ["op": "children", "id": 2, "ids": [3]], ["op": "children", "id": 1, "ids": [2]],
+            ["op": "children", "id": 100, "ids": [1]], ["op": "roots", "ids": [100]],
+        ]))
+        let header = try XCTUnwrap(p.views[100]), box = try XCTUnwrap(p.views[2]), image = try XCTUnwrap(p.views[3])
+        defer { image.raster = nil }
+        image.frame = CGRect(x: 0, y: 0, width: 36, height: 36)
+        let pending = try XCTUnwrap(BadgeFace(box: box), "a box holding only a picture is a badge before it loads")
+        XCTAssertNil(pending.picture)
+        XCTAssertEqual(pending.pictureNode, 3)
+        // As the bar marks it when it stands for the header (`project`).
+        header.isHidden = true; image.drawnByBar = true
+        let fill = try XCTUnwrap(pending.image.cgImage)
+        let blue = try XCTUnwrap(SharePictureCase.rgba(fill, x: fill.width / 2, y: fill.height / 2))
+        XCTAssertGreaterThan(blue.2, 240, "the box's fill while the picture loads")
+
+        loader.load(image, source: source, resolver: resolver)
+        let deadline = Date(timeIntervalSinceNow: 5)
+        while image.raster == nil, Date() < deadline { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02)) }
+        XCTAssertNotNil(image.raster, "a picture in a hidden header the bar draws loads")
+
+        let face = try XCTUnwrap(BadgeFace(box: box))
+        XCTAssertNotNil(face.picture)
+        XCTAssertNotEqual(face.source, pending.source, "the bar item is drawn again with the picture")
+        let drawn = try XCTUnwrap(face.image.cgImage)
+        let centre = try XCTUnwrap(SharePictureCase.rgba(drawn, x: drawn.width / 2, y: drawn.height / 2))
+        XCTAssertGreaterThan(centre.0, 240, "the picture fills the face")
+        XCTAssertLessThan(centre.2, 15)
+        let corner = try XCTUnwrap(SharePictureCase.rgba(drawn, x: 0, y: 0))
+        XCTAssertEqual(corner.3, 0, "the box's corners clip the picture")
+    }
+
     func testADotBesideALabelIsDrawnAsPainted() throws {
         let (p, node) = button([dot, label(["written": ["text_color"]])])
         let face = try XCTUnwrap(ChipFace(node, engine: TextEngine(resolve: { _ in nil })))
@@ -75,8 +155,7 @@ final class BarFaceIOSTests: XCTestCase {
         XCTAssertEqual(color?[0], red, "the colour its author wrote, not its grey")
     }
 
-    /// A dot whose fill names the tint takes its node's tint, undimmed while UIKit dims tints: the
-    /// bar item's image is baked once and kept
+    /// The face's source keeps its node's undimmed tint so the bar can bake it in either adjustment mode.
     func testATintDotTakesItsNodesTintUndimmed() throws {
         let tinted: [String: Any] = ["op": "create", "id": 3, "kind": "view", "handlers": [], "props": [:],
                                      "style": ["background_color": ["sys": "@tint", "c": [0, 122, 255, 255]], "width": 14, "height": 6]]
@@ -113,6 +192,10 @@ final class BarFaceIOSTests: XCTestCase {
         withExtendedLifetime(p) {}
         guard case .text(_, _, let color) = face.parts[1] else { return XCTFail("\(face.parts)") }
         XCTAssertNil(color, "inherited: unsaid")
+        if #available(iOS 26.0, *) { XCTAssertNil(face.shares[1], "unwritten ink uses the label colour") }
+        else { XCTAssertEqual(face.shares[1], 1, "unwritten ink uses the tint and follows its dimming") }
+        let readout = try XCTUnwrap(ChipFace(node, engine: TextEngine(resolve: { _ in nil }), readout: true))
+        XCTAssertNil(readout.shares[1], "a readout's unwritten ink is always the label colour")
     }
 
     func testASymbolOnlyUsesColourWrittenInsideTheBarButton() throws {
@@ -184,6 +267,35 @@ final class BarFaceIOSTests: XCTestCase {
         XCTAssertNotEqual(shown.source, faded.source)
     }
 
+    /// The button's left and right padding is room the face keeps inside
+    /// the item's glass: the image is that much wider and its parts start
+    /// after the left padding. A readout's face is its parts alone.
+    func testAButtonsSidePaddingWidensItsFace() throws {
+        let engine = TextEngine(resolve: { _ in nil })
+        let (p, node) = button([dot, label(["written": ["text_color"]])])
+        defer { p.reset() }
+        let tight = try XCTUnwrap(ChipFace(node, engine: engine))
+        let tightReadout = try XCTUnwrap(ChipFace(node, engine: engine, readout: true))
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["text_color": [0, 0, 0, 255], "padding_left": 7, "padding_right": 3]]]))
+        let padded = try XCTUnwrap(ChipFace(node, engine: engine))
+        XCTAssertEqual(padded.insetLeft, 7)
+        XCTAssertEqual(padded.insetRight, 3)
+        XCTAssertNotEqual(padded.source, tight.source, "the bar draws it again")
+        let before = tight.image(tint: .systemBlue), after = padded.image(tint: .systemBlue)
+        XCTAssertEqual(after.size.width, before.size.width + 7 + 3, accuracy: 0.001, "wider by left and right")
+        XCTAssertEqual(after.size.height, before.size.height, accuracy: 0.001)
+        let cg = try XCTUnwrap(after.cgImage), row = Int(after.size.height * after.scale / 2)
+        let gutter = try XCTUnwrap(SharePictureCase.rgba(cg, x: Int(3 * after.scale), y: row))
+        XCTAssertEqual(gutter.3, 0, "nothing is drawn in the left padding")
+        let green = try XCTUnwrap(SharePictureCase.rgba(cg, x: Int((7 + 7) * after.scale), y: row))
+        XCTAssertGreaterThan(green.1, 150, "the dot starts after it")
+        let readout = try XCTUnwrap(ChipFace(node, engine: engine, readout: true))
+        XCTAssertEqual(readout.insetLeft, 0)
+        XCTAssertEqual(readout.insetRight, 0)
+        XCTAssertEqual(readout.image(tint: .systemBlue).size.width, tightReadout.image(tint: .systemBlue).size.width,
+                       accuracy: 0.001, "a readout ignores the padding")
+    }
+
     /// A native button's title size and weight, written on it or on its
     /// text, are its bar item's title font (LLP 1069.011.001 D4): the "●
     /// Clock" glass chip at 12 pt, in every state UIKit draws it in. A
@@ -212,7 +324,7 @@ final class BarFaceIOSTests: XCTestCase {
         let shape = buttons.map { HeaderShape.Item($0) }
         XCTAssertEqual(shape.map(\.title), ["● Clock", "Done", "Edit"])
         XCTAssertTrue(shape[0].ownGlass)
-        let items = p.navigation.barItems(shape, RouteController(header)).filter { $0.title != nil }
+        let items = p.navigationHost.barItems(shape, RouteController(header)).filter { $0.title != nil }
         XCTAssertEqual(items.count, 3)
         let unsaid = HeaderShape.Item.titleFont(bold: false)
         for state: UIControl.State in [.normal, .highlighted, .disabled] {
@@ -246,15 +358,15 @@ final class BarFaceIOSTests: XCTestCase {
         header.container.addSubview(node)
         let route = RouteController(header)
         XCTAssertNotNil(HeaderShape.Item(node).chip)
-        let item = try XCTUnwrap(p.navigation.barItems([HeaderShape.Item(node)], route).first)
+        let item = try XCTUnwrap(p.navigationHost.barItems([HeaderShape.Item(node)], route).first)
         let first = try XCTUnwrap(item.image)
-        let kept = try XCTUnwrap(p.navigation.barItems([HeaderShape.Item(node)], route).first)
+        let kept = try XCTUnwrap(p.navigationHost.barItems([HeaderShape.Item(node)], route).first)
         XCTAssertTrue(kept === item, "the item is changed in place")
         if #available(iOS 26.0, *) { XCTAssertTrue(kept.image === first, "its face kept as drawn") }
         else { XCTAssertFalse(kept.image === first, "its face drawn again in the tint") }
         let shown = try XCTUnwrap(kept.image)
         p.apply(wireBatch([["op": "style", "id": 3, "style": ["background_color": [255, 59, 48, 255], "width": 14, "height": 6]]]))
-        let recoloured = try XCTUnwrap(p.navigation.barItems([HeaderShape.Item(node)], route).first)
+        let recoloured = try XCTUnwrap(p.navigationHost.barItems([HeaderShape.Item(node)], route).first)
         XCTAssertTrue(recoloured === item)
         XCTAssertFalse(recoloured.image === shown, "a new dot colour: its face drawn again")
     }
@@ -274,11 +386,11 @@ final class BarFaceIOSTests: XCTestCase {
         button.props["type"] = "button"
         header.container.addSubview(button)
         let route = RouteController(header)
-        let item = try XCTUnwrap(p.navigation.barItems([HeaderShape.Item(button)], route).first)
+        let item = try XCTUnwrap(p.navigationHost.barItems([HeaderShape.Item(button)], route).first)
         XCTAssertEqual((item.titleTextAttributes(for: .normal)?[.font] as? UIFont)?.pointSize, 12)
         done.rows.title = [:]
         p.apply(facesBatch())
-        let kept = try XCTUnwrap(p.navigation.barItems([HeaderShape.Item(button)], route).first)
+        let kept = try XCTUnwrap(p.navigationHost.barItems([HeaderShape.Item(button)], route).first)
         XCTAssertTrue(kept === item, "the item is changed in place")
         for state: UIControl.State in [.normal, .highlighted, .disabled, .selected, .focused] {
             XCTAssertNil(kept.titleTextAttributes(for: state)?[.font], "state \(state.rawValue)")

@@ -9,6 +9,11 @@ pub(super) fn publish(
     measurer: &mut dyn TextMeasurer,
     root: u32,
 ) -> LayoutReceipt {
+    for (node, _) in tree.pending_text_changes.drain() {
+        if let Some(context) = tree.taffy.get_node_context(node) {
+            arena.layout_dirty.insert(context.slot);
+        }
+    }
     #[cfg(test)]
     {
         tree.publication_visits = 0;
@@ -59,7 +64,7 @@ pub(super) fn publish(
     let full = !arena.exclusion_slots.is_empty() || !arena.flow.is_empty();
     arena.begin_layout_publication(root);
     // A block's root: hidden with what holds it, whole when it took its block.
-    let (hidden, whole) = crate::kernel::publication_start(arena, root);
+    let (hidden, whole, (x, y)) = crate::kernel::publication_start(arena, root);
     let mut changed = Vec::new();
     let mut updated = Vec::new();
     let mut exclusions = Vec::new();
@@ -70,15 +75,7 @@ pub(super) fn publish(
     // `t` is the translation its subtree inherits; (ox, oy) stay flow-thread
     // origins, so a child is placed from its parent's unfragmented box.
     let mut stack = if full || has_sources || whole {
-        vec![(
-            root,
-            0.0,
-            0.0,
-            hidden,
-            full || whole,
-            false,
-            Shift::default(),
-        )]
+        vec![(root, x, y, hidden, full || whole, false, Shift::default())]
     } else {
         Vec::new()
     };
@@ -90,6 +87,11 @@ pub(super) fn publish(
         }
         let own_hidden = arena.style(slot).display == crate::Display::None;
         let hidden = hidden || own_hidden;
+        if !hidden && tree.text_pending(arena, slot) {
+            arena.flags_mut(slot).insert(NodeFlags::TEXT_PENDING);
+        } else {
+            arena.flags_mut(slot).remove(NodeFlags::TEXT_PENDING);
+        }
         // Its paragraph placed an image in its text, published (below), or,
         // holding a string, has none to place.
         if !hidden && arena.is_inline_image(slot) {
@@ -123,9 +125,19 @@ pub(super) fn publish(
         };
         // Publish the padding and border with the frame for readers that
         // must not reach into a tree a content region's nodes are not in
-        let inset = arena
-            .taffy(slot)
-            .map(|node| crate::id::BoxInset::of(arena, slot, tree.layout(node)));
+        let ignores = arena.ignoring.contains(slot);
+        let inset = arena.taffy(slot).map(|node| {
+            let inset =
+                crate::id::BoxInset::of(arena, slot, tree.layout(node), tree.text_item(node));
+            match ignores {
+                true => crate::kernel::ignore::inset(arena, tree, slot, node, inset),
+                false => inset,
+            }
+        });
+        // A box that ignores keeps its margins, which say where it touches
+        if let Some(node) = arena.taffy(slot).filter(|_| ignores) {
+            arena.observations.set_margins(slot, tree.margins(node));
+        }
         let inset_changed = arena.inset(slot) != inset;
         arena.set_inset(slot, inset);
         let frame = if hidden {
@@ -174,6 +186,18 @@ pub(super) fn publish(
             }
             None => (frame.x, frame.y),
         };
+        // A box that ignores takes the band past its place (LLP 1123 D4),
+        // its children placed from its extended or moved box
+        let (frame, fx, fy) = match ignores && !hidden && !inline {
+            true => {
+                let placed = arena.content(slot);
+                let (frame, (x, y), content) =
+                    crate::kernel::ignore::place(arena, slot, frame, placed);
+                arena.set_content(slot, content);
+                (frame, fx + x, fy + y)
+            }
+            false => (frame, fx, fy),
+        };
         let republish = arena.frag.republish.remove(slot);
         let shift = if arena.frag.multicol.contains_key(&slot) {
             Shift {
@@ -212,6 +236,14 @@ pub(super) fn publish(
             || flags.has(NodeFlags::CHILDREN_DIRTY)
             || tree.tables.anon(slot).is_some();
         arena.set_frame(slot, frame);
+        // A bar's slot depth is what it reserves of its parent (LLP 1123 D12), and one that
+        // took no slot reserves none
+        if arena.observations.bars.styled.contains(slot) {
+            match arena.taffy(slot).and_then(|n| tree.bar_depth(n)) {
+                Some(depth) => arena.observations.bars.depths.insert(slot, depth),
+                None => arena.observations.bars.depths.remove(&slot),
+            };
+        }
         arena.consume_layout_flags(slot);
         if moved {
             arena.mark_geometry_changed(slot, root);
@@ -299,6 +331,44 @@ pub(super) fn publish(
         fragment_skipped: crate::fragment::skipped(arena),
         flow_passes: 0,
         flow_comparisons: 0,
+    }
+}
+
+impl LayoutTree {
+    /// The padding `node`'s subtree was last laid out with where it is
+    /// outset (Taffy patch 80).
+    pub(crate) fn outset_padding(&self, node: NodeId) -> Option<taffy::geometry::Rect<f32>> {
+        self.taffy.outset_padding(node)
+    }
+
+    /// Whether `node`'s engine style lays bars out (Taffy patch 81, LLP 1123 D12).
+    pub(crate) fn has_bars(&self, node: NodeId) -> bool {
+        self.taffy.style(node).is_ok_and(|s| s.rare.bars)
+    }
+
+    /// The depth of the slot the bar `node` was last laid out in.
+    pub(crate) fn bar_depth(&self, node: NodeId) -> Option<f32> {
+        self.taffy.bar_depth(node)
+    }
+
+    /// `node`'s used margins on its last layout, top right bottom left, an
+    /// `auto` one 0 since it only aligns the box (LLP 1123 D4).
+    pub(crate) fn margins(&self, node: NodeId) -> [f32; 4] {
+        let (m, style) = (self.layout(node).margin, self.taffy.style(node));
+        let Ok(style) = style else {
+            return [0.0; 4];
+        };
+        let s = style.margin;
+        let used = |side: taffy::style::LengthPercentageAuto, m: f32| match side.is_auto() {
+            true => 0.0,
+            false => m,
+        };
+        [
+            used(s.top, m.top),
+            used(s.right, m.right),
+            used(s.bottom, m.bottom),
+            used(s.left, m.left),
+        ]
     }
 }
 

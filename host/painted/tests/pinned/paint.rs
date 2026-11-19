@@ -417,7 +417,10 @@ fn a_screenshot_is_the_viewport_as_a_png() {
         let mut p = boot(choice);
         let path = std::env::temp_dir().join(format!("exact-paint-{}.png", std::process::id()));
         let reply = p.screenshot(path.to_str().unwrap()).unwrap();
-        assert!(reply.ends_with(",\"w\":390,\"h\":844}"), "{reply}");
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["w"], 390);
+        assert_eq!(reply["h"], 844);
+        assert_eq!(reply["rotation"], 0);
         let png = Pixmap::load_png(&path).unwrap();
         assert_eq!((png.width(), png.height()), (390, 844));
         assert_eq!(
@@ -864,7 +867,12 @@ fn damage_clearing_preserves_the_page_colour_at_fractional_scales() {
             raster.begin(width, 80.0, scale);
             let background = raster.finish().unwrap();
             let page = page.unwrap_or([255; 4]);
-            assert!(background.data().chunks_exact(4).all(|px| px == page));
+            assert!(background
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| *px == page));
 
             let red = [255, 0, 0, 255];
             raster.begin(width, 80.0, scale);
@@ -1375,10 +1383,12 @@ fn full_window_split_preserves_premultiplied_composition_and_refuses_clips() {
     let above = split.finish().unwrap();
     for (((b, g), a), expected) in below
         .data()
-        .chunks_exact(4)
-        .zip(game.data().chunks_exact(4))
-        .zip(above.data().chunks_exact(4))
-        .zip(expected.data().chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(game.data().as_chunks::<4>().0)
+        .zip(above.data().as_chunks::<4>().0)
+        .zip(expected.data().as_chunks::<4>().0)
     {
         for channel in 0..4 {
             let composed = a[channel] as f32

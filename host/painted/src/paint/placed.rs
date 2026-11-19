@@ -19,6 +19,7 @@ impl Painter {
             h,
             canvas,
             clip_depth,
+            opacity,
             ..
         } = p
         else {
@@ -30,6 +31,13 @@ impl Painter {
         let Some(parent) = walk.scene.kernel.node(canvas) else {
             return true;
         };
+        let (hit_ts, hit_clip) = walk.hit_space.unwrap_or((ts, clip));
+        let hit_h = placement::compose(
+            h,
+            hit_ts,
+            parent.frame.x - offset.0,
+            parent.frame.y - offset.1,
+        );
         let h = placement::compose(h, ts, parent.frame.x - offset.0, parent.frame.y - offset.1);
         let Some(inv) = placement::inverse(h) else {
             return true;
@@ -42,6 +50,7 @@ impl Painter {
         painter.placements.remove(&id);
         let mut child_walk = Walk {
             scene: walk.scene,
+            hit_space: None,
             boxes: Vec::new(),
             text: BTreeMap::new(),
             fields: HashMap::new(),
@@ -61,10 +70,28 @@ impl Painter {
             if let Some((pixels, rect)) =
                 placement::warp_clipped(&source, h, clip_depth, self.scale, self.viewport)
             {
+                if opacity < 1. {
+                    self.backend.push_opacity(opacity);
+                }
                 self.backend.surface_image(Arc::new(pixels), rect);
+                if opacity < 1. {
+                    self.backend.pop_opacity();
+                }
             }
         }
         for mut b in child_walk.boxes {
+            let mut hit = b.for_hit();
+            hit.map_clips(placement::inverse(hit_h).unwrap_or(inv));
+            b.map_clips(inv);
+            hit.projective = Some((
+                placement::inverse(hit_h).unwrap_or(inv),
+                hit.rect,
+                hit.clip,
+                clip_depth,
+            ));
+            hit.rect = placement::clipped_bounds(&hit_h, clip_depth, hit.rect);
+            hit.clip = hit_clip;
+            b.hit = Some(hit.geometry());
             b.projective = Some((inv, b.rect, b.clip, clip_depth));
             b.rect = placement::clipped_bounds(&h, clip_depth, b.rect);
             b.clip = clip;
@@ -88,7 +115,7 @@ mod tests {
         text "Prefix "
         text "Tail" testId="tail"
 "#;
-        let (p, error) = Presenter::boot_with(
+        let (p, error) = Presenter::boot_with_fixture_fonts(
             &crate::test_plan(source),
             (),
             (200., 200.),
@@ -114,6 +141,7 @@ mod tests {
             crate::placement::Placement::Visible {
                 h: [1., 0., 10., 0., 0.8, 20., 0., 0., 1.],
                 depth: 0.,
+                opacity: 1.,
                 clip_depth: [[0., 0., 1.]; 2],
                 canvas: id("canvas"),
             },
@@ -124,6 +152,7 @@ mod tests {
             hidden: &|_| false,
             presented: &|_| Presented::IDENTITY,
             paths: &|_| None,
+            filters: &|_| None,
             scroll: &BTreeMap::new(),
             page: (0., 0.),
             images: &BTreeMap::new(),
@@ -144,7 +173,7 @@ mod tests {
             .expect("placed inline capture");
         assert!(inline.views().any(|view| view == tail));
         let local = inline.frame(tail).unwrap();
-        let rect = painted.with_scroll_rect(local).unwrap().rect;
+        let rect = painted.clone().with_scroll_rect(local).unwrap().rect;
         assert!((rect.0 - local.0 - 10.).abs() < 0.01, "{local:?}: {rect:?}");
         assert!(
             (rect.1 - local.1 * 0.8 - 20.).abs() < 0.01,

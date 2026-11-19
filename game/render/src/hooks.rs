@@ -4,6 +4,7 @@ use crate::{FrameInput, RenderError};
 use exact_game::{Component, Entity, Mat4, Ref, Resource, Target, Transform, World};
 use exact_gpu::wgpu;
 
+pub(crate) mod budget;
 pub(crate) mod gpu_timing;
 mod materials;
 pub(crate) mod metrics;
@@ -80,6 +81,9 @@ impl Needs {
     pub const ANIMATE: Self = Self(8);
     /// Presentation resources are still preparing. Does not stop simulation ticks.
     pub const PENDING: Self = Self(16);
+    /// Pending only for want of allowance. A redraw at the same time cannot help.
+    /// Has effect only with `PENDING`.
+    pub const STARVED: Self = Self(32);
     /// Whether all the requested bits are present.
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -95,9 +99,39 @@ impl std::ops::BitOr for Needs {
     }
 }
 
+/// A live frame's time limit for hook preparation (LLP 1182.000 D6).
+#[derive(Clone, Copy, Debug)]
+pub struct Deadline {
+    start: crate::perf::Stamp,
+    offset_ms: f64,
+}
+impl Deadline {
+    pub(crate) fn new(start: crate::perf::Stamp, offset_ms: f64) -> Self {
+        Self { start, offset_ms }
+    }
+
+    pub(crate) fn remaining_at(&self, now: crate::perf::Stamp) -> f64 {
+        self.offset_ms - self.start.elapsed_at(now)
+    }
+
+    /// Whether the frame has reached its preparation deadline.
+    pub fn passed(&self) -> bool {
+        self.remaining_at(crate::perf::Stamp::now()) <= 0.
+    }
+
+    /// Milliseconds left for preparation, or zero after the deadline.
+    pub fn remaining_ms(&self) -> f64 {
+        self.remaining_at(crate::perf::Stamp::now()).max(0.)
+    }
+}
+
 /// Host clock and lifecycle facts, separate from saved game time.
 #[derive(Clone, Copy, Debug)]
 pub struct HookTime {
+    /// Bounded units this call to prepare may complete.
+    pub allowance: u32,
+    /// The preparation deadline for a live canvas with a known frame period.
+    pub deadline: Option<Deadline>,
     /// Seconds since the last draw; zero on resets, clamped to 100 ms on live gaps.
     pub dt: f32,
     /// Histories must be primed before this draw.
@@ -126,6 +160,8 @@ pub struct HookTime {
 impl Default for HookTime {
     fn default() -> Self {
         Self {
+            allowance: 0,
+            deadline: None,
             dt: 0.,
             reset: true,
             seekable: true,
@@ -232,11 +268,26 @@ impl HookWork {
     }
 }
 
+/// Game-reported counters cumulative since this hook value was made (LLP 1182.000 D1).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameWork {
+    /// Draw calls issued by the hook in opaque, background, surface, and post.
+    pub draws: u64,
+    /// Submitted triangles, including instances, before culling or clipping.
+    pub triangles: u64,
+    /// Bytes passed to `write_buffer`, `write_texture`, and `create_buffer_init`.
+    pub upload_bytes: u64,
+    /// Game-defined items that issued a draw, counted once per frame across layers.
+    pub items: u64,
+}
+
 /// Optional game rendering. Every callback borrows resources for this frame only.
 /// @ref llp/1046.006.000-render-hooks.rfc.md#d1-the-shape-a-type-parameter-like-presentation
 pub trait Hooks: Default {
     /// Compile away all hook preparation for the default implementation.
     const ENABLED: bool = true;
+    /// Maximum bounded units per advancing frame, or zero to opt out.
+    const ALLOWANCE: u32 = 0;
     /// Allocate/resize resources, extract immutable world data, and upload uniforms.
     fn prepare(
         &mut self,
@@ -262,6 +313,10 @@ pub trait Hooks: Default {
     fn pending_reason(&self) -> &str {
         "render hook resources pending"
     }
+    /// A JSON object of the game's own presentation counters, read with `state`. Diagnostics only.
+    fn report(&self) -> Option<&str> {
+        None
+    }
     /// Last rejected shader/pipeline update, even if a previous set still draws.
     fn error(&self) -> Option<&str> {
         None
@@ -269,6 +324,14 @@ pub trait Hooks: Default {
     /// Cumulative work performed through the raw GPU handles.
     fn work(&self) -> Option<HookWork> {
         None
+    }
+    /// Cumulative draw and upload counts, read after the last hook stage of a frame.
+    fn frame_work(&self) -> Option<FrameWork> {
+        None
+    }
+    /// Name of the game-defined unit counted by `FrameWork::items`.
+    fn item_name(&self) -> &'static str {
+        "items"
     }
     /// Custom shading for loaded unskinned opaque model materials.
     fn materials(&self) -> &[CustomMaterial] {
@@ -345,17 +408,19 @@ pub(crate) struct Poses {
 }
 impl Poses {
     pub fn track(&mut self, entities: &[Entity], world: &World) {
+        let poses = std::cell::LazyCell::new(|| crate::world::scene::PoseRows::new(world));
         self.entries.retain(|(e, _)| entities.contains(e));
         for &e in entities {
             if self.entries.iter().any(|(old, _)| *old == e) {
                 continue;
             }
-            if let Some(p) = crate::world::scene::pose(world, e) {
+            if let Some(p) = poses.pose(e) {
                 self.entries.push((e, [p; 2]));
             }
         }
     }
     pub fn sync(&mut self, world: &World) {
+        let poses = std::cell::LazyCell::new(|| crate::world::scene::PoseRows::new(world));
         let reset = self.generation != world.presentation_generation();
         self.generation = world.presentation_generation();
         let parent_revision = world.revision::<exact_game::Parent>();
@@ -364,14 +429,14 @@ impl Poses {
         let next = self.tick != Some(world.tick());
         self.tick = Some(world.tick());
         self.entries.retain_mut(|(e, pair)| {
-            let Some(pose) = crate::world::scene::pose(world, *e) else {
+            let Some(pose) = poses.pose(*e) else {
                 return false;
             };
             if next {
                 pair[0] = pair[1];
             }
             pair[1] = pose;
-            if reset || crate::world::scene::snap(world, *e, parent_changed) {
+            if reset || poses.snap(*e, parent_changed) {
                 pair[0] = pose;
             }
             true
@@ -388,10 +453,43 @@ impl Poses {
     }
 }
 
+#[cfg(test)]
+mod pose_tests {
+    use super::*;
+    use crate::world::scene::resolution_count;
+
+    #[test]
+    fn hook_feeds_resolve_pose_columns_once() {
+        let mut world = World::new(60, 0);
+        let mut poses = Poses::default();
+        let before = resolution_count();
+        poses.track(&[], &world);
+        poses.sync(&world);
+        assert_eq!(resolution_count() - before, 0);
+        let entities: Vec<_> = (0..16)
+            .map(|i| world.spawn(Transform::at(i as f32, 0., 0.)))
+            .collect();
+        world.propagate();
+        let before = resolution_count();
+        poses.track(&entities, &world);
+        assert_eq!(resolution_count() - before, 1);
+        for _ in 0..2 {
+            let before = resolution_count();
+            poses.sync(&world);
+            assert_eq!(resolution_count() - before, 1);
+            assert_eq!(poses.entries.len(), entities.len());
+        }
+        for (i, &e) in entities.iter().enumerate() {
+            assert_eq!(poses.at(e, 0.5).unwrap().w_axis.x, i as f32);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HookClock {
     last: Option<(f64, bool)>,
     generation: Option<u64>,
+    pub budget: Option<Box<budget::Budget>>,
 }
 impl HookClock {
     pub fn reset(&mut self) {
@@ -418,6 +516,8 @@ impl HookClock {
         self.last = Some((frame.now_ms, frame.seekable));
         self.generation = Some(generation);
         HookTime {
+            allowance: 0,
+            deadline: None,
             dt,
             reset,
             paused,

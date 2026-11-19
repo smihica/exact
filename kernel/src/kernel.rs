@@ -22,18 +22,28 @@ use crate::text::{MonospaceMeasurer, TextMeasurer, TextRun, TextStyle};
 use crate::txn::{self, CommitReceipt, Target};
 use crate::wire::{self, Op};
 mod alert;
-mod block;
+pub(crate) mod area;
+pub(crate) mod bar;
+pub(crate) mod block;
 mod cover;
 mod document;
 mod environment;
 mod geometry;
+mod height_targets;
 mod history;
 use history::RetainedReceipt;
+pub(crate) mod ignore;
 mod intrinsic;
+mod keyboard;
+pub(crate) mod observe;
 pub(crate) mod owner;
+mod provenance;
+pub(crate) mod readers;
+pub(crate) mod targets;
 pub(crate) use intrinsic::apply_projection;
 mod row_memo;
 mod sticky;
+mod table;
 mod trim;
 mod wide;
 
@@ -45,7 +55,10 @@ pub(crate) use cover::{
     style_changed as cover_style_changed,
 };
 pub use cover::{credited_edges, HostCover};
+pub use keyboard::{Keyboard, KeyboardPolicy};
+pub use provenance::{Contribution, Operation};
 pub use sticky::StickyConstraint;
+pub use table::TablePlace;
 
 /// How many receipts the kernel retains for late readers.
 pub const RECEIPT_RING: usize = 64;
@@ -209,6 +222,11 @@ impl<'a> NodeRef<'a> {
     /// copying unrelated style rows.
     pub fn paragraph(&self) -> crate::text::Paragraph {
         self.arena.paragraph(self.slot)
+    }
+
+    /// [`crate::text::Paragraph::natural`] alone, without the paragraph.
+    pub fn is_natural_text(&self) -> bool {
+        crate::text::natural::is_natural(self.arena, self.slot)
     }
 
     /// The nearest explicit HTML spelling-check hint in the logical tree.
@@ -397,8 +415,17 @@ impl Kernel {
         engine(&mut self.layout)
     }
 
-    /// A kernel with the given host text measurer.
+    /// A kernel with the given host text measurer. It links every grammar
+    /// and grid layout ([`crate::style::link_all`]).
     pub fn new(measurer: Box<dyn TextMeasurer>) -> Self {
+        crate::style::link_all();
+        Self::by_use(measurer)
+    }
+
+    /// [`Kernel::new`] for a host that links grid layout and the style
+    /// grammars by use (LLP 1047.001 D10): a grid, or a row whose grammar is
+    /// linked by use, needs the host to have linked it.
+    pub fn by_use(measurer: Box<dyn TextMeasurer>) -> Self {
         let mut kernel = Self::on_demand(measurer);
         kernel.layout = Some(Box::new(LayoutTree::new()));
         kernel.on_demand = false;
@@ -409,7 +436,8 @@ impl Kernel {
     /// for, when it builds one from the arena. For a host whose platform lays
     /// out (the browser): commits then create no engine nodes and derive no
     /// engine styles, and a kernel that never lays out links no engine code.
-    /// Layout, when asked for, is the same.
+    /// Layout, when asked for, is the same, a grid's once linked; it links
+    /// no grammar ([`Kernel::by_use`]).
     pub fn on_demand(measurer: Box<dyn TextMeasurer>) -> Self {
         Kernel {
             arena: NodeArena::new(),
@@ -436,8 +464,10 @@ impl Kernel {
         Self::new(Box::new(MonospaceMeasurer::default()))
     }
 
-    /// [`Kernel::on_demand`] with the deterministic reference measurer.
+    /// [`Kernel::on_demand`] with the deterministic reference measurer,
+    /// linking grid layout as [`Kernel::new`] does.
     pub fn with_monospace_on_demand() -> Self {
+        crate::layout::link_grid_layout();
         Self::on_demand(Box::new(MonospaceMeasurer::default()))
     }
 
@@ -450,26 +480,7 @@ impl Kernel {
             self.layout = Some(Box::new(LayoutTree::rebuild(&mut self.arena)));
         }
         self.measure_symbols(true);
-    }
-
-    /// The published epoch: bumps on every commit that changed something.
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    /// What moves whenever a trial measure (`Kernel::measure_block`) could
-    /// answer differently: the incarnation, the epoch (a commit that changed
-    /// something) and the layout publications. A host that keeps measures
-    /// keeps them while this stands: a change a trial would read either is
-    /// such a commit or waits for a layout (`measure_block` refuses until).
-    pub fn layout_stamp(&self) -> (u64, u64, u64) {
-        (self.incarnation, self.epoch, self.arena.last_pass())
-    }
-
-    /// The kernel incarnation: bumps on every [`Kernel::reset`]. Keys from an
-    /// earlier incarnation never resolve.
-    pub fn incarnation(&self) -> u64 {
-        self.incarnation
+        self.reopen_whole();
     }
 
     /// Live node count.
@@ -549,8 +560,6 @@ impl Kernel {
             })
             .transpose()?;
         self.region = next;
-        // A popover under the region stays in its trial; one it no longer
-        // holds is in the viewport again (`imply_blocks`).
         self.imply_blocks();
         // The previous region cut its owner's ordinary child edge. Restore
         // current authored topology when replacing or removing it, only AFTER
@@ -582,6 +591,20 @@ impl Kernel {
         }
         self.replace_env(self.arena.env().with_viewport(offer))?;
         self.imply_blocks();
+        let withheld = self.withhold_observations();
+        let mut result = self.region_pass(slot, offer, inputs)?;
+        self.solve_region_observations(slot, offer, inputs, &withheld, &mut result)?;
+        Ok(result)
+    }
+
+    /// One layout of the root `slot` with its content region: the region's
+    /// shell and content, then the top-layer subtrees.
+    fn region_pass(
+        &mut self,
+        slot: u32,
+        offer: Offer,
+        inputs: crate::RegionInputs,
+    ) -> Result<crate::RegionLayoutReceipt, KernelError> {
         let region = self
             .region
             .as_mut()
@@ -604,8 +627,7 @@ impl Kernel {
             self.provisional_layouts += 1;
         }
         let mut result = result?;
-        // The shell's popovers, each in its block: recovered, and counted
-        // when provisional, as the region's own pass is.
+        // Top-layer subtrees are independent of the region's publication.
         if let Err(e) = self.lay_out_blocks(slot, &mut result.shell) {
             self.layout = Some(Box::new(LayoutTree::rebuild(&mut self.arena)));
             return Err(e.into());
@@ -689,7 +711,12 @@ impl Kernel {
         self.imply_blocks();
         engine(&mut self.layout).present_heights(&self.arena, presented);
         // The root, then each subtree a host gave a block (LLP 1115.002 D8.2).
-        let result = match self.lay_out_roots(slot, offer) {
+        let first = self.lay_out_roots(slot, offer);
+        // Measure every observation again after a pass that failed, whose frames no receipt names
+        if first.is_err() {
+            self.arena.observations.invalidate();
+        }
+        let result = match first {
             ok @ Ok(_) => ok,
             Err(LayoutError::Engine(_)) => {
                 // The engine tree is derived state: rebuild it from the columns and retry once.
@@ -709,101 +736,13 @@ impl Kernel {
                 return Err(e.into());
             }
         };
+        let relayout = &mut |k: &mut Kernel| Ok(k.lay_out_roots(slot, offer)?);
+        self.solve_observations(slot, relayout, &[], &mut receipt)?;
         receipt.epoch = self.epoch;
         if engine(&mut self.layout).provisional_chrome() {
             self.provisional_layouts += 1;
         }
         Ok(receipt)
-    }
-
-    /// Measure current authored border-box heights without publishing layout.
-    /// Active presentations are temporarily removed for this pass and restored
-    /// before returning, including after failure. Frames, overflow, flags,
-    /// authored styles, receipts and epoch remain unchanged, but for what the
-    /// next layout at `offer` would set first: the viewport, and each
-    /// popover's block in it (`imply_blocks`). Results are used
-    /// border-box sizes after constraints, not unconstrained CSS intrinsic sizes.
-    ///
-    /// Call when a target's content or offer changes, not on every motion tick.
-    /// This does not register owners or define an automatic `height: auto`
-    /// transition policy. The caller still chooses which targets to animate.
-    pub fn measure_height_targets(
-        &mut self,
-        root: ViewId,
-        offer: Offer,
-        owners: &[NodeKey],
-    ) -> Result<Vec<PresentedHeight>, KernelError> {
-        self.mirror();
-        let slot = self.layout_root_slot(root, offer)?;
-        for (i, owner) in owners.iter().enumerate() {
-            self.validate_presented_height(
-                slot,
-                PresentedHeight {
-                    node: *owner,
-                    epoch: self.epoch,
-                    px: 0.0,
-                },
-            )?;
-            if self.arena.style(owner.index).box_sizing != BoxSizing::BorderBox {
-                return Err(LayoutError::UnsupportedHeightMeasurement(*owner).into());
-            }
-            if owners[..i].contains(owner) {
-                return Err(LayoutError::DuplicatePresentedHeight(*owner).into());
-            }
-        }
-        if owners.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The offer's viewport, as the layout that follows will have it: a
-        // popover's block is that viewport (`imply_blocks`).
-        self.replace_env(self.arena.env().with_viewport(offer))?;
-        self.imply_blocks();
-        let previous = engine(&mut self.layout).height_samples(self.epoch);
-        engine(&mut self.layout).present_heights(&self.arena, &[]);
-        let measure = |kernel: &mut Self| {
-            let root = kernel
-                .arena
-                .taffy(slot)
-                .ok_or_else(|| LayoutError::Engine("root has no engine node".into()))?;
-            engine(&mut kernel.layout).compute(
-                root,
-                offer,
-                &kernel.arena,
-                kernel.measurer.as_mut(),
-            )?;
-            kernel.lay_out_blocks_unpublished(slot)?;
-            owners
-                .iter()
-                .map(|node| {
-                    let engine_node = kernel.arena.taffy(node.index).ok_or_else(|| {
-                        LayoutError::Engine("height target has no engine node".into())
-                    })?;
-                    let px = engine(&mut kernel.layout).layout(engine_node).size.height;
-                    if !px.is_finite() || px < 0.0 {
-                        return Err(LayoutError::InvalidPresentedHeight);
-                    }
-                    Ok(PresentedHeight {
-                        node: *node,
-                        epoch: kernel.epoch,
-                        px,
-                    })
-                })
-                .collect()
-        };
-        let result = match measure(self) {
-            Err(LayoutError::Engine(_)) => {
-                self.layout = Some(Box::new(LayoutTree::rebuild(&mut self.arena)));
-                measure(self)
-            }
-            result => result,
-        };
-        if result.is_err() {
-            // A contained invalid metric may have populated Taffy's cache with
-            // zero. Rebuild so the next measurement actually invokes the host.
-            self.layout = Some(Box::new(LayoutTree::rebuild(&mut self.arena)));
-        }
-        engine(&mut self.layout).present_heights(&self.arena, &previous);
-        result.map_err(KernelError::from)
     }
 
     fn layout_root_slot(&self, root: ViewId, offer: Offer) -> Result<u32, KernelError> {

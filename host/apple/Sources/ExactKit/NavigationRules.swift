@@ -10,10 +10,10 @@
 import CExact
 import Foundation
 
-enum NavigationRules {
+package enum NavigationRules {
     /// @ref LLP 1038 D6 — controller identities, not URLs: animate a
     /// push/pop only when either complete list is a prefix of the other.
-    static func isPushOrPop<T: Equatable>(from: [T], to: [T]) -> Bool {
+    package static func isPushOrPop<T: Equatable>(from: [T], to: [T]) -> Bool {
         from.starts(with: to) || to.starts(with: from)
     }
 
@@ -21,7 +21,7 @@ enum NavigationRules {
     /// `navigationKey`, in tree order, and the stack is the prefix through
     /// the one whose key is the root's. `nil` when the root's key matches
     /// no route: the stack is left alone and the refusal is journaled.
-    static func stack(routeKeys: [String], selected: String) -> Range<Int>? {
+    package static func stack(routeKeys: [String], selected: String) -> Range<Int>? {
         guard let index = routeKeys.firstIndex(of: selected) else { return nil }
         return 0..<(index + 1)
     }
@@ -32,13 +32,13 @@ enum NavigationRules {
     /// is still declared in one of the stacks is the selected one, so a
     /// closed sheet or a popped screen never leaves the route beneath it
     /// covered. `nil` when none is (nothing shown yet): nothing changes.
-    static func survivor(of shown: [String], declared: [[String]]) -> String? {
+    package static func survivor(of shown: [String], declared: [[String]]) -> String? {
         shown.last { key in declared.contains { $0.contains(key) } }
     }
 
     /// D4: presentation boundaries split the selected prefix into retained
     /// owners. A later push stays in the most recent presentation's stack.
-    static func segments(presentations: [String?]) -> [Range<Int>] {
+    package static func segments(presentations: [String?]) -> [Range<Int>] {
         var starts = [0]
         for (index, kind) in presentations.enumerated() where kind == "modal" || kind == "fullscreen" {
             starts.append(index)
@@ -57,7 +57,7 @@ enum NavigationRules {
     /// node gone — a finished screen giving way to its result). The person
     /// swiped that position away, so the gesture applies to its replacement:
     /// otherwise the replacement is pushed back in the moment the pop lands.
-    static func dispatchesBack(shownKey: String, rootKey: String, sourceKey: String?, sourceReplaced: Bool = false, modalActive: Bool) -> Bool {
+    package static func dispatchesBack(shownKey: String, rootKey: String, sourceKey: String?, sourceReplaced: Bool = false, modalActive: Bool) -> Bool {
         !modalActive && shownKey != rootKey && (sourceKey == rootKey || sourceReplaced)
     }
 
@@ -67,14 +67,14 @@ enum NavigationRules {
     /// down that is (one is the authored Back; more, a history jump). Nil
     /// when the pop took not the selected route but routes under it, which
     /// the app pushed past meanwhile.
-    static func backTarget(shownKeys: [String], popped: Set<String>, selected: String) -> (to: String, steps: Int)? {
+    package static func backTarget(shownKeys: [String], popped: Set<String>, selected: String) -> (to: String, steps: Int)? {
         guard popped.contains(selected), let from = shownKeys.firstIndex(of: selected),
               let to = shownKeys[..<from].lastIndex(where: { !popped.contains($0) }) else { return nil }
         return (shownKeys[to], from - to)
     }
 
     /// What a route shows of the platform's navigation bar.
-    enum Bar: Equatable {
+    package enum Bar: Equatable {
         /// The route's `header`, projected: its heading the title, its
         /// buttons the items, and the system Back when it is pushed.
         case header
@@ -98,7 +98,7 @@ enum NavigationRules {
     /// header, has nothing to show.
     /// The rule itself is the kernel's (`exact_kernel::Bar::of`), which
     /// the Android host reads too (LLP 1115.001 D11).
-    static func bar(asked: String?, header: Bool, pushed: Bool, backButton: Bool = true) -> Bar {
+    package static func bar(asked: String?, header: Bool, pushed: Bool, backButton: Bool = true) -> Bar {
         switch exact_route_bar((asked == "none" ? 1 : 0) | (header ? 2 : 0) | (pushed ? 4 : 0) | (backButton ? 8 : 0)) {
         case 0: return .header
         case 1: return .back
@@ -109,7 +109,7 @@ enum NavigationRules {
     /// D1: whether an interactive pop may begin at all — a stack to pop, no
     /// transition in flight, no sheet, a way back (`back`), and no
     /// context preview anywhere in the session.
-    static func popMayBegin(depth: Int, changing: Bool, modalActive: Bool, hasBackControl: Bool, contextPreviewActive: Bool) -> Bool {
+    package static func popMayBegin(depth: Int, changing: Bool, modalActive: Bool, hasBackControl: Bool, contextPreviewActive: Bool) -> Bool {
         depth > 1 && !changing && !modalActive && hasBackControl && !contextPreviewActive
     }
 
@@ -121,11 +121,11 @@ enum NavigationRules {
     /// travel there), having judged the direction themselves.
     /// The direction a pop's `shouldBegin` judges: the pan's velocity, or
     /// its travel so far when the velocity is still zero (LLP 1057.001 §7).
-    static func popDirection(velocity: CGPoint, travel: CGPoint) -> CGPoint {
+    package static func popDirection(velocity: CGPoint, travel: CGPoint) -> CGPoint {
         velocity == .zero ? travel : velocity
     }
 
-    static func panMayBegin(startX: CGFloat, overSwipeRight: Bool, velocity: CGPoint) -> Bool {
+    package static func panMayBegin(startX: CGFloat, overSwipeRight: Bool, velocity: CGPoint) -> Bool {
         if startX >= 20 && overSwipeRight { return false }
         if velocity == .zero { return true }
         return velocity.x > abs(velocity.y)
@@ -134,7 +134,7 @@ enum NavigationRules {
     /// D1: `closedby="none"` refuses the platform's dismissal gesture and
     /// Escape; anything else (`closerequest`, absent) permits them. Explicit
     /// Close is the app's own control either way.
-    static func modalRefusesDismissal(closedby: String?) -> Bool {
+    package static func modalRefusesDismissal(closedby: String?) -> Bool {
         closedby == "none"
     }
 

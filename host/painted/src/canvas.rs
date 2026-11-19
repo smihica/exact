@@ -7,12 +7,10 @@
 //! `Canvas.drawGlyphs` from the same font files Parley shaped with, so
 //! measurement and pixels agree (below API 31, which has no `drawGlyphs`,
 //! with each glyph's outline from those files: `canvas/legacy.rs`).
-//! The presenter lives on the Android main thread ([`CanvasHost`]); every
-//! call comes from there.
+//! The presenter lives on the Android main thread ([`CanvasHost`]); every call comes from there.
 //! The stream is `u32` words (floats as bits), little-endian:
-//! - `1 MATRIX a b c d e f` — device pixels; the rest of the stream until
-//!   the next MATRIX is drawn under it (saved/restored by the reader around
-//!   each clip scope as Canvas does).
+//! - `1 MATRIX a b c d e f` — device pixels; the rest of the stream until the next MATRIX is
+//!   drawn under it (saved/restored by the reader around each clip scope as Canvas does).
 //! - `2 RRECT color x y w h r0x r0y r1x r1y r2x r2y r3x r3y`
 //! - `3 PATH color rule n (tag coords…)×n` — tags 0 move 1 line 2 cubic 3 close
 //! - `4 CLIP_RRECT x y w h radii×8` (save + clip)
@@ -50,9 +48,12 @@
 //!   outside the border box `b…` (`canvas/shadow.rs`)
 //! - `43 SHADER len …` — the next RRECT, PATH or STROKE paints with a gradient shader (`canvas/gradient.rs`)
 //! - `44 BLUR sigma` — the next GLYPHS draws through a blur of `sigma`, local units (`canvas/glyphs.rs`)
+//! - `53 FILTER len x y w h n (kind args…)×n` … `54 FILTER_END` — what is drawn between them goes
+//!   through a box's CSS `filter`, run by the reader over that region (`canvas/filter.rs`)
 //! - `45 CLIP_UNION len n (rule path)×n` — save and clip to the union of independently filled paths
 //! - `46 MASK_LAYER` — save a layer composited through destination-in at its RESTORE
 //! - `47 IMAGE_TINT color` — the next IMAGE or IMAGE_RRECT uses this colour through the image's alpha
+//! - `49 IMAGE_RENDERING mode` — the next image samples as auto (0), crisp-edges (1), or pixelated (2)
 //! - `48 MATRIX3 a b c d e f g h i` — a row-major projective matrix, in device pixels
 //! - `25 DASH phase n d×n` — the next STROKE is dashed: `n` (even) on/off lengths and the
 //!   offset into them, in the stroke's own units (SVG `stroke-dasharray`, `stroke-dashoffset`)
@@ -105,13 +106,20 @@ const BACKDROP: u32 = 42;
 const NATIVE: u32 = 28;
 /// A row's recording: id, the id of the row it replaces (0 for none; the top
 /// bit set when the row shows in this frame, so the reader makes it before
-/// drawing), width and height (device pixels), then the count of words up to
-/// and including its `ROW_END`. Kept by the reader until freed; a row not in
-/// view may be made later, the row it replaces drawn meanwhile.
+/// drawing; [`UNCLIPPED`] when the reader does not clip it to its bounds),
+/// width and height (device pixels), then the count of words up to and
+/// including its `ROW_END`. Kept by the reader until freed; a row not in view
+/// may be made later, the row it replaces drawn meanwhile.
 const ROW_BEGIN: u32 = 15;
+/// In `ROW_BEGIN`'s second word: a filter in the row reaches past the room
+/// left of or above its origin ([`ROW_PAD`]).
+const UNCLIPPED: u32 = 1 << 30;
 const ROW_END: u32 = 16;
 /// Draw a kept row: id, x, y (device pixels).
 const ROW_DRAW: u32 = 17;
+/// Draw a kept row through a matrix: id, then a b c d e f as `MATRIX`'s,
+/// mapping the row's node into the device. A kept drawing scaled or turned.
+const ROW_DRAW_THROUGH: u32 = 55;
 /// A kept row no longer drawn: freed once the next stream arrives.
 const ROW_FREE: u32 = 18;
 /// A filled ring: color, outer x y w h and radii, inner x y w h and radii.
@@ -155,8 +163,14 @@ mod access;
 #[cfg(target_os = "android")]
 #[path = "canvas/agent.rs"]
 pub mod agent;
+#[cfg(target_os = "android")]
+#[path = "canvas/boot.rs"]
+mod boot;
 #[path = "canvas/clip.rs"]
 mod clip;
+#[cfg(any(target_os = "android", test))]
+#[path = "canvas/clock.rs"]
+mod clock;
 #[cfg(target_os = "android")]
 #[path = "canvas/codec.rs"]
 mod codec;
@@ -187,6 +201,12 @@ mod plane;
 #[cfg(target_os = "android")]
 #[path = "canvas/presence.rs"]
 pub mod presence;
+#[cfg(any(target_os = "android", test))]
+#[path = "canvas/present.rs"]
+mod present;
+#[cfg(target_os = "android")]
+#[path = "canvas/secrets.rs"]
+pub mod secrets;
 #[cfg(target_os = "android")]
 #[path = "canvas/time.rs"]
 pub mod time;
@@ -198,18 +218,23 @@ pub use device::{configure, window, Told};
 #[cfg(target_os = "android")]
 #[path = "canvas/jni.rs"]
 pub mod jni;
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 #[path = "canvas/journal.rs"]
 mod journal;
 #[cfg(any(target_os = "android", test))]
 #[path = "canvas/keys.rs"]
 mod keys;
 #[path = "canvas/layer.rs"]
-mod layer;
+pub(crate) mod layer;
 #[path = "canvas/legacy.rs"]
 pub mod legacy;
 #[cfg(target_os = "android")]
+#[path = "canvas/tls.rs"]
+pub mod tls;
+#[cfg(target_os = "android")]
 pub use jni_sys;
+#[path = "canvas/filter.rs"]
+mod filter;
 #[path = "canvas/picture.rs"]
 mod picture;
 #[cfg(target_os = "android")]
@@ -226,6 +251,7 @@ mod requests;
 mod scroll;
 #[path = "canvas/shadow.rs"]
 mod shadow;
+mod shared;
 #[path = "canvas/slot.rs"]
 mod slot;
 #[path = "canvas/stream.rs"]
@@ -234,13 +260,15 @@ mod stream;
 mod undrawn;
 use undrawn::{path_bounds, undrawn};
 #[cfg(target_os = "android")]
+#[path = "canvas/forma.rs"]
+mod forma;
+#[cfg(target_os = "android")]
 #[path = "canvas/surface.rs"]
 mod surface;
 #[path = "canvas/svg.rs"]
 mod svg;
-#[cfg(target_os = "android")]
-#[path = "canvas/tamber.rs"]
-mod tamber;
+#[cfg(test)]
+pub(crate) use filter::filtered_row_draws;
 pub use picture::Picture;
 use picture::WeakPicture;
 #[cfg(target_os = "android")]
@@ -257,11 +285,25 @@ thread_local! {
 /// Pictures the reader has not fetched yet, by id: one map for the process,
 /// as a reader may fetch them on its own thread while the host runs on
 /// another (LLP 1072 on Android).
+#[cfg(not(test))]
 static PENDING: std::sync::Mutex<std::collections::BTreeMap<u32, Picture>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-fn pending() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u32, Picture>> {
-    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+#[cfg(test)]
+thread_local! {
+    // Each test has its own reader, whose image ids start at one.
+    static PENDING: RefCell<std::collections::BTreeMap<u32, Picture>> = const { RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn with_pending<T>(f: impl FnOnce(&mut std::collections::BTreeMap<u32, Picture>) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut PENDING.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        PENDING.with(|p| f(&mut p.borrow_mut()))
+    }
 }
 
 /// The recording backend.
@@ -303,6 +345,15 @@ pub struct Recorder {
     /// Each kept row's recording, so one recorded again the same is kept,
     /// and the pictures it draws (by allocation), drawn whenever it is.
     kept: HashMap<u32, (Vec<u32>, Vec<usize>)>,
+    /// The device pixels each kept row's filters hold on the reader, and the
+    /// page's in this stream (`canvas/filter.rs`).
+    filter_areas: HashMap<u32, f32>,
+    page_area: f32,
+    /// Freed rows' filter pixels, and the frame from which each no longer
+    /// counts (`canvas/filter.rs`, `RELEASE`).
+    filter_leaving: Vec<(f32, u64)>,
+    /// Deletions may arrive between frames; keep them until a stream is finished.
+    freed_rows: Vec<u32>,
     /// While a picture slot records: the row's ops so far, its matrix, and
     /// which clips were written when it began.
     slot: Option<SlotRecording>,
@@ -315,6 +366,7 @@ pub struct Recorder {
     again: Option<slot::Again>,
     /// Nodes the reader animates, apart (`crate::host::lower`).
     layers: layer::Layers,
+    shared: shared::Shared,
     /// The blur the next glyphs are drawn through, local units (`glyphs.rs`).
     blur: f32,
 }
@@ -335,6 +387,10 @@ struct RowRecording {
     previous: Option<u32>,
     images: Vec<usize>,
     slots: Vec<(ViewId, slot::Context)>,
+    /// Whether it draws a box's filter, and the device pixels of those the
+    /// reader runs.
+    filtered: bool,
+    area: f32,
 }
 
 impl Default for Recorder {
@@ -368,12 +424,17 @@ impl Recorder {
             row: None,
             recorded: None,
             kept: HashMap::new(),
+            filter_areas: HashMap::new(),
+            page_area: 0.0,
+            filter_leaving: Vec::new(),
+            freed_rows: Vec::new(),
             slot: None,
             slots: HashMap::new(),
             slot_sets: Vec::new(),
             slot_contexts: HashMap::new(),
             again: None,
             layers: Default::default(),
+            shared: Default::default(),
             blur: 0.0,
         }
     }
@@ -501,8 +562,10 @@ impl Backend for Recorder {
         self.slot_sets.clear();
         self.layers.begin();
         self.recorded = None;
+        self.page_area = 0.0;
         GROUPS.with(|g| g.borrow_mut().clear());
         self.frames += 1;
+        self.filter_frame();
         // Pictures the presenter dropped, and those not drawn for a while
         // that the reader copied: its copy goes, and is sent again when it
         // draws again. Kept rows hold their own reference.
@@ -518,7 +581,7 @@ impl Backend for Recorder {
         for (k, id) in dead {
             self.images.remove(&k);
             self.ops.extend([IMAGE_FREE, id]);
-            pending().remove(&id);
+            with_pending(|p| p.remove(&id));
         }
     }
 
@@ -587,11 +650,19 @@ impl Backend for Recorder {
         clips: &[Shape],
         ts: Transform,
         tint: Option<[u8; 4]>,
+        rendering: exact_kernel::ImageRendering,
     ) {
         if dst.2 <= 0.0 || dst.3 <= 0.0 {
             return;
         }
-        self.picture(&Picture::Bitmap(image.clone()), dst, clips, ts, tint);
+        self.picture(
+            &Picture::Bitmap(image.clone()),
+            dst,
+            clips,
+            ts,
+            tint,
+            rendering,
+        );
     }
 
     fn blurred_shadow(
@@ -603,6 +674,19 @@ impl Backend for Recorder {
         ts: Transform,
     ) -> bool {
         self.shadow(shape, color, sigma, outer, ts)
+    }
+
+    fn push_filter(
+        &mut self,
+        primitives: &[exact_kernel::svg::filter::Primitive],
+        region: Rect4,
+        ts: Transform,
+    ) -> bool {
+        self.filter_open(primitives, region, ts)
+    }
+
+    fn pop_filter(&mut self) {
+        self.filter_close();
     }
 
     fn backdrop_filter(
@@ -654,7 +738,14 @@ impl Backend for Recorder {
         if dst.2 <= 0.0 || dst.3 <= 0.0 || pixels.width() == 0 || pixels.height() == 0 {
             return;
         }
-        self.picture(&Picture::Canvas(pixels.clone()), dst, clips, ts, None);
+        self.picture(
+            &Picture::Canvas(pixels.clone()),
+            dst,
+            clips,
+            ts,
+            None,
+            exact_kernel::ImageRendering::Auto,
+        );
     }
 
     /// A picture the paint walk rasterised itself (an SVG filter, a text
@@ -665,9 +756,13 @@ impl Backend for Recorder {
         true
     }
 
+    fn supports_blend(&self) -> bool {
+        false
+    }
+
     fn island_image(&mut self, pixels: Arc<Pixmap>, dst: Rect4, ts: Transform, mode: u8) {
         if mode != 0 {
-            undrawn("`mix-blend-mode`");
+            undrawn("`mix-blend-mode` with a backdrop outside its SVG; put the backdrop inside the same SVG or Canvas 2D surface");
         }
         self.canvas(&pixels, dst, &[], ts);
     }
@@ -740,8 +835,12 @@ impl Backend for Recorder {
     fn rows(&self) -> bool {
         self.planes.is_empty()
     }
+    fn rows_through(&self) -> bool {
+        self.rows()
+    }
 
     fn row_begin(&mut self, id: u32, origin: (f32, f32), previous: Option<u32>) {
+        self.shared_row_begin();
         self.row = Some(RowRecording {
             clips: std::mem::take(&mut self.clips),
             matrix: self.matrix.take(),
@@ -750,6 +849,8 @@ impl Backend for Recorder {
             previous,
             images: Vec::new(),
             slots: Vec::new(),
+            filtered: false,
+            area: 0.0,
         });
         self.origin = (origin.0 - ROW_PAD, origin.1 - ROW_PAD);
         self.ops
@@ -765,6 +866,8 @@ impl Backend for Recorder {
             previous,
             images,
             slots,
+            filtered,
+            area,
         }) = self.row.take()
         else {
             return 0;
@@ -780,6 +883,11 @@ impl Backend for Recorder {
         };
         self.ops[at + 3] = (w.max(1.0) * s).to_bits();
         self.ops[at + 4] = (h.max(1.0) * s).to_bits();
+        // The node cannot reach further left or up than the pad: a filter that
+        // does is drawn unclipped (LLP 1172.023.001 D1).
+        if filtered && (bounds.0 < -ROW_PAD || bounds.1 < -ROW_PAD) {
+            self.ops[at + 2] |= UNCLIPPED;
+        }
         self.ops.push(ROW_END);
         self.ops[at + 5] = (self.ops.len() - at - 6) as u32;
         self.clips = clips;
@@ -796,14 +904,19 @@ impl Backend for Recorder {
             self.kept.get_mut(&old).expect("kept").1 = images;
             self.keep_slots(old, slots);
             self.layers.row_end(old);
+            self.shared_row_end(old);
             return old;
         }
         let body = body.to_vec();
         self.kept.insert(id, (body, images));
+        if area > 0.0 {
+            self.filter_areas.insert(id, area);
+        }
         self.keep_slots(id, slots);
         self.recorded = Some((id, at));
         self.ops.extend(sets);
         self.layers.row_end(id);
+        self.shared_row_end(id);
         id
     }
 
@@ -848,6 +961,18 @@ impl Backend for Recorder {
     fn layer_end(&mut self) {
         self.layer_close();
     }
+    fn shared_frame(&mut self, s: &crate::paint::SharedState) {
+        self.shared_state(s);
+    }
+    fn shared_begin(&mut self, e: &crate::paint::SharedElement<'_>) -> bool {
+        self.shared_open(e)
+    }
+    fn shared_end(&mut self) {
+        self.shared_close();
+    }
+    fn row_reusable(&self, id: u32, _: (f32, f32)) -> bool {
+        self.shared_row_reusable(id)
+    }
 
     fn row_culled(&self, bounds: Rect4) -> bool {
         // A scroller's rows all draw so a move needs no paint, unless its
@@ -866,42 +991,50 @@ impl Backend for Recorder {
         }
         self.group = Some(id);
         self.ops.extend([GROUP_BEGIN, id]);
+        // The group records on a fresh Canvas, independently of the outer matrix.
+        self.matrix = None;
         GROUPS.with(|g| g.borrow_mut().push((id, scroll)));
     }
 
     fn group_end(&mut self) {
         self.group = None;
         self.ops.push(GROUP_END);
+        // The reader returns to the outer Canvas, whose matrix may differ.
+        self.matrix = None;
     }
 
     fn row_draw(&mut self, id: u32, origin: (f32, f32), bounds: Rect4) {
-        // Just recorded and in view: the reader makes it before this frame.
-        if let Some((_, at)) = self.recorded.take().filter(|(r, _)| *r == id) {
-            if !self.culled(Some(bounds)) {
-                self.ops[at + 2] |= 1 << 31;
-            }
-        }
-        // Its pictures are drawn too: the reader keeps them.
-        if let Some((_, images)) = self.kept.get(&id) {
-            for key in images {
-                if let Some(image) = self.images.get_mut(key) {
-                    image.2 = self.frames;
-                }
-            }
-        }
-        self.need(Some(bounds));
-        self.layers.row_drawn(id);
+        self.row_shown(id, bounds);
         let s = self.scale;
         self.ops.extend([ROW_DRAW, id]);
         self.f((origin.0 - ROW_PAD) * s);
         self.f((origin.1 - ROW_PAD) * s);
     }
 
+    fn row_draw_through(&mut self, id: u32, ts: Transform, bounds: Rect4) {
+        self.row_shown(id, crate::paint::bbox(ts, bounds));
+        // The reader's node is in device pixels, its origin `ROW_PAD` above
+        // and left of the row's.
+        let s = self.scale;
+        let pad = (
+            ts.sx * ROW_PAD + ts.kx * ROW_PAD,
+            ts.ky * ROW_PAD + ts.sy * ROW_PAD,
+        );
+        self.ops.extend([ROW_DRAW_THROUGH, id]);
+        for v in [ts.sx, ts.ky, ts.kx, ts.sy] {
+            self.f(v);
+        }
+        self.f((ts.tx - pad.0) * s);
+        self.f((ts.ty - pad.1) * s);
+    }
+
     fn row_free(&mut self, id: u32) {
         self.kept.remove(&id);
+        self.filter_free(id);
         self.slot_contexts.remove(&id);
         self.layers.row_free(id);
-        self.ops.extend([ROW_FREE, id]);
+        self.shared.rows.remove(&id);
+        self.freed_rows.push(id);
     }
 
     fn finish(&mut self) -> Result<Pixmap, String> {
@@ -991,6 +1124,9 @@ pub struct CanvasHost<D: DataSource> {
     tracks_epoch: u64,
     /// The reader's window and what it was last told to draw around the page.
     shell: device::Shell,
+    /// Pictures the reader will report presented (LLP 1003.001 D9), by token.
+    presents: present::Pictures,
+    launch: crate::launch_marks::LaunchMarks,
 }
 
 #[cfg(target_os = "android")]
@@ -1011,137 +1147,10 @@ const MOVES_MOUNTED: u32 = 6;
 
 #[cfg(target_os = "android")]
 impl<D: DataSource + Default> CanvasHost<D> {
-    /// Boot `D`'s app in a window of `size` pixels at `scale` pixels per
-    /// point, with the insets the reader told for it (`device.rs`). Assets
-    /// use the Linux environment; the carrier directly selects its Canvas
-    /// recorder and enables the reader's native motion lowering.
-    pub fn boot(
-        plan: &'static [u8],
-        compat: &'static str,
-        size: (u32, u32),
-        scale: f32,
-        hatches: Option<crate::hatches::Install>,
-    ) -> Result<CanvasHost<D>, String> {
-        let started = std::time::Instant::now();
-        let origin_ns = monotonic_ns();
-        // Eleven viewports of decoded pictures: the reader's copy is a GPU
-        // buffer (no heap copy, no upload), a picture decoded again costs
-        // more than the memory it holds, and pictures are kept at the size
-        // they show at (`image::png_decode::DecodePlan`). Twelve until they
-        // were asked for at mount (below): heavy then ended 10 MB higher.
-        if std::env::var_os("EXACT_IMAGE_VIEWPORTS").is_none() {
-            std::env::set_var("EXACT_IMAGE_VIEWPORTS", "11");
-        }
-        // A picture is asked for when its row is built (`presenter::images`).
-        if std::env::var_os("EXACT_PICTURES_AT_MOUNT").is_none() {
-            std::env::set_var("EXACT_PICTURES_AT_MOUNT", "1");
-        }
-        std::env::set_var("EXACT_SCALE", scale.to_string());
-        let told = device::windowed(size, scale);
-        let whole = (size.0 as f32 / scale, size.1 as f32 / scale);
-        let viewport = told.map_or(whole, |told| told.inside());
-        // The first frame realizes only the rows that show; the window's lead
-        // follows once it is out ([`CanvasHost::frame`]).
-        exact_runner::set_lead_scale(0.0);
-        // A new list builds the rows the view can show before its first
-        // layout, not in a second commit after it.
-        exact_runner::set_bootstrap_extent(size.1.max(size.0) as f64 / scale as f64);
-        // A retiring row is rebound to the next item instead of a row built
-        // for it (LLP 1078), unless `EXACT_ROW_REUSE=0`.
-        crate::app::row_reuse_from_env(true);
-        crate::surfaces::prepare_gpu(compat);
-        // The device's colours, before anything is resolved by a role (D4).
-        let palette = colors::palette();
-        if let Some(palette) = &palette {
-            palette.tell();
-        }
-        let mut config = crate::app::Config::from_env_static(plan, compat);
-        let painter = crate::presenter::PainterBoot::canvas(
-            crate::presenter::PainterChoice::from_baked(compat),
-        )?;
-        // Motion lowering reads this after the requested painter has been checked.
-        std::env::set_var("EXACT_PAINTER", "canvas");
-        (config.scale, config.hatches, config.clock_started) = (scale, hatches, Some(started));
-        let (mut p, error) =
-            crate::app::boot_presenter_with_painter::<D>(&mut config, viewport, painter)?;
-        if let Some(e) = error {
-            eprintln!("exact: {e}");
-        }
-        agent::own_time(&mut p, started);
-        crate::surfaces::acquire_fd();
-        // What the reader read of the device, before the first frame (D3.1).
-        if let Some(e) = device::configured().and_then(|d| p.set_device(&d)) {
-            eprintln!("exact: device: {e}");
-        }
-        // The reader takes what the presenter asks of the platform (D5),
-        // and makes the top layer's windows (D10) and the bars (D11).
-        p.serve_requests();
-        surface::serve(&mut p);
-        if let Some(palette) = &palette {
-            p.set_palette(palette);
-        }
-        eprintln!(
-            "exact: canvas {}x{} px, scale {scale}, boot {:.1} ms",
-            size.0,
-            size.1,
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        let mut host = CanvasHost {
-            p,
-            started,
-            scale,
-            viewport,
-            painted: None,
-            moved: 0,
-            moved_at: 0.0,
-            scrolled_at: 0.0,
-            waiting: false,
-            leftover: false,
-            led: false,
-            settling: false,
-            force: false,
-            scrolled: false,
-            prefetching: false,
-            quiet: None,
-            travel: crate::travel::Travel::default(),
-            rows_before: Vec::new(),
-            rows_after: Vec::new(),
-            paint_by: None,
-            move_tracks: std::env::var("EXACT_MOVE_TRACKS").is_ok_and(|v| v == "1"),
-            sliced: false,
-            moves: std::env::var("EXACT_MOVES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(MOVES),
-            surfaces: false,
-            borrowed: false,
-            owed_surfaces: false,
-            origin_ns,
-            clock_sent: false,
-            tracks: HashMap::new(),
-            feed: None,
-            tracks_epoch: 0,
-            lead: false,
-            painted_once: false,
-            gpu_waiting: false,
-            responding: false,
-            shell: Default::default(),
-        };
-        // The page's place in the window, once its root is known (D3.3).
-        if let Some(told) = told {
-            host.set_window(told);
-        }
-        Ok(host)
-    }
-
-    fn now(&self) -> f64 {
-        agent::clock(&self.p)
-            .unwrap_or_else(|| self.started.elapsed().as_secs_f64() * 1000.0 - agent::offset())
-    }
-
     /// One turn: the presenter's work, then a recording when anything
     /// changed. `Some` is the new op stream (valid until the next call).
     pub fn frame(&mut self) -> Option<Vec<u32>> {
+        self.p.timer_visibility(false);
         // After the first frame: the windows' lead, realized off the frame.
         if self.painted_once && !self.lead && !self.responding {
             self.lead = true;
@@ -1240,9 +1249,21 @@ impl<D: DataSource + Default> CanvasHost<D> {
             p.display_frame()
         }?;
         p.display_complete(&frame);
+        let wanted = p.present_wanted() || !self.launch.done();
+        if !self.launch.done() {
+            self.launch.recorded();
+        }
+        self.presents.painted(
+            frame.carried(),
+            wanted,
+            !self.launch.done()
+                && !p.module_pending()
+                && crate::launch_marks::items(&p.host().runner().outstanding()).is_empty(),
+        );
         if p.module_pending() {
             p.first_pixel();
         }
+        p.update_launched();
         self.painted_once = true;
         self.painted = p.still().map(|still| Painted {
             still,
@@ -1312,13 +1333,17 @@ impl<D: DataSource + Default> CanvasHost<D> {
         }
     }
 
-    /// Drain the wakes (executor replies, decoded images) without painting;
-    /// whether a frame is now wanted.
+    /// Drain the wakes (executor replies, decoded images, the update store's
+    /// line) without painting; whether a frame is now wanted.
     pub fn poll(&mut self) -> bool {
         let now = self.now();
         if let Some(e) = self.p.pump(now) {
             eprintln!("exact: {e}");
         }
+        // Read on an idle screen too, or its level-triggered descriptor
+        // wakes the looper forever (LLP 1030.006 D5); a line asks for a
+        // turn, which applies an `immediate` activation it staged.
+        let updated = self.p.poll_update();
         self.p.poll_development(D::default);
         self.p.run_commands(D::default);
         self.p.poll_images();
@@ -1326,7 +1351,7 @@ impl<D: DataSource + Default> CanvasHost<D> {
         if self.p.module_pending() {
             self.p.first_pixel();
         }
-        self.animating()
+        updated || self.animating()
     }
     /// Whether another display frame is wanted.
     pub fn animating(&self) -> bool {
@@ -1412,6 +1437,8 @@ impl<D: DataSource + Default> CanvasHost<D> {
     pub fn roles_here(&mut self, here: bool) {
         let runner = self.p.host_mut().runner_mut();
         if here {
+            // A reload on this thread boots a runner that awaits its present too.
+            present::await_present();
             runner.install_roles();
         } else {
             runner.uninstall_roles();
@@ -1430,12 +1457,23 @@ impl<D: DataSource + Default> CanvasHost<D> {
         if (self.painted_once && !self.lead) || self.owed_surfaces {
             return Some(0.0);
         }
-        self.settle_due(self.p.turn_due_ms(self.now()))
+        let due = self.settle_due(self.p.turn_due_ms(self.now()));
+        match (due, self.launch.timeout_ms()) {
+            (Some(due), Some(launch)) => Some(due.min(f64::from(launch))),
+            (None, Some(launch)) => Some(f64::from(launch)),
+            (due, None) => due,
+        }
     }
 
     /// The descriptors that wake the presenter (executor replies, decoded images).
     pub fn fds(&self) -> [i32; 2] {
         [self.p.executor_fd(), self.p.image_fd()]
+    }
+
+    /// The update store's completion descriptor, or -1 with no store: last
+    /// in `Native.fds`, after the acquire descriptor (LLP 1030.006 D5).
+    pub fn update_fd(&self) -> i32 {
+        self.p.update_fd().unwrap_or(-1)
     }
 
     /// A picture announced by `IMAGE_DEF`, once (premultiplied RGBA rows).
@@ -1446,14 +1484,15 @@ impl<D: DataSource + Default> CanvasHost<D> {
 
 /// The pictures announced and not yet fetched: id, width, height.
 pub fn pending_pictures() -> Vec<[u32; 3]> {
-    pending()
-        .iter()
-        .map(|(id, p)| [*id, p.width(), p.height()])
-        .collect()
+    with_pending(|p| {
+        p.iter()
+            .map(|(id, p)| [*id, p.width(), p.height()])
+            .collect()
+    })
 }
 
 /// A picture announced by `IMAGE_DEF`, once (premultiplied RGBA rows).
-#[cfg(target_os = "android")]
-fn image(id: u32) -> Option<Picture> {
-    pending().remove(&id)
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn image(id: u32) -> Option<Picture> {
+    with_pending(|p| p.remove(&id))
 }

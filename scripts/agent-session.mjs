@@ -192,7 +192,8 @@ export async function open({
         : host === 'host-ios'
           ? await openIOS({ plan, app, env, session, hostFixture: true, touch, ax, onProcess })
           : host === 'linux' || host === 'android'
-            ? await openStdio({ host, plan, size: size ?? VIEWPORT, env, app, reader, onProcess })
+            ? // The APK runs at the phone's size, and refuses another (`readerDeploy`).
+              await openStdio({ host, plan, size: size ?? (host === 'android' && (reader ?? !!process.env.EXACT_ANDROID_READER) ? undefined : VIEWPORT), env, app, reader, onProcess })
             : host === 'windows'
               ? await openStdio({ host: 'windows', plan, size: size ?? VIEWPORT, env, app, onProcess })
               : host === 'ios'
@@ -227,7 +228,7 @@ export async function open({
     const a = resolveApp(app);
     const bin =
       host === 'windows'
-        ? (process.env.EXACT_WINDOWS_BIN ?? resolve(a.dir, 'dist-windows', `${executableName(a)}.exe`))
+        ? (process.env.EXACT_WINDOWS_BIN ?? resolve(process.env.EXACT_WINDOWS_OUTPUT ?? resolve(a.dir, 'dist-windows'), `${executableName(a)}.exe`))
         : host === 'android'
           ? (process.env.EXACT_ANDROID_BIN ?? androidBinary(a, undefined, reader))
           : (process.env.EXACT_LINUX_BIN ?? linuxBinary(a));
@@ -346,10 +347,14 @@ export async function open({
     /** What happened since the last read: the runner's journal (`lines`, from index `from` up to `next`) and the
      * host's own output (`host`). `dropped` counts lines the journal ring let go before this read caught up. */
     async logs({ all = false } = {}) {
-      const since = all ? 0 : s.logCursor;
+      let since = all ? 0 : s.logCursor;
       let r;
       try {
         r = await s.op({ op: 'logs', since, ...(all ? { all: true } : {}) });
+        if (r.generation != null && r.generation !== s.logGeneration) {
+          if (since > 0) { since = 0; r = await s.op({ op: 'logs', since }); }
+          s.logGeneration = r.generation;
+        }
       } catch (e) {
         if ((carrier.host !== 'web' || !carrier.hostLines.length) && !e.message.startsWith(AWAY)) throw e;
         r = { lines: [], from: since, next: since, refused: e.reply?.refused, error: e.message };
@@ -363,6 +368,7 @@ export async function open({
       s.hostLogCursor = carrier.hostLines.length;
       const crash = carrier.crashes?.() ?? [];
       return {
+        ...(r.generation != null ? { generation: r.generation, epoch: r.epoch, incarnation: r.incarnation, clock: r.clock } : {}),
         ...(r.error ? { error: r.error, refused: r.refused } : {}),
         lines: [...notes, ...r.lines],
         host,
@@ -385,8 +391,10 @@ export async function open({
           perf: true,
           ...(frames?.spanSince != null ? { span_since: frames.spanSince } : {}),
         });
-        if (r.world.perf.tickSpans.error) throw Error(r.world.perf.tickSpans.error);
-        return { target, tick: r.world.tick, restarted: r.world.restarted, ...r.world.perf.tickSpans };
+        const spans = r.world.perf.tickSpans;
+        if (spans.error) throw Error(spans.error);
+        if (!spans.incarnation || !spans.generation) throw Error('perf world: a read names no world incarnation or recording generation; no difference is defined');
+        return { target, tick: r.world.tick, restarted: r.world.restarted, ...spans };
       }
       if (frames?.live != null) {
         // A live window (LLP 1079 D4): the page's clock follows the wall for `live` ms, and the driver's follows the
@@ -645,8 +653,13 @@ export async function open({
                   ? `clock settle stops at held device requests (${(r.tickets ?? []).map(t => '@' + t).join(' ')}); state shows them under pending; answer with tap @N <choice> or type @N <value>`
                   : r.reason === 'requests'
                     ? 'clock settle gave up on requests still in flight at its bound (20 s native); state shows them under pending, and logs a `request N` with no `fulfil N`'
-                    : `clock settle did not reach quiescence: ${JSON.stringify(r.world ?? r)}; state world:* busy shows moving values and busy reasons; state shows held input; logs shows reload/refusals`;
-      // an `after(1, …)` the settle's last commit armed
+                    : r.reason === 'busy'
+                      ? `clock settle is held by aria-busy elements (${r.busy.join(', ')}), named by test ID or view ID. ` +
+                        '`aria-busy` marks an element as still loading. An indeterminate `progress` (no `value`) implies `aria-busy`. ' +
+                        'A closed `dialog` keeps its content mounted, so busy elements inside it count. ' +
+                        'Use `layout <id>` to find the element and its source line in a development build.'
+                      : `clock settle did not reach quiescence: ${JSON.stringify(r.world ?? r)}; state world:* busy shows moving values and busy reasons; state shows held input; logs shows reload/refusals`;
+      // An `after(1, …)` the settle's last commit armed.
       const soon = req.settle && r.settled !== false ? await nextCommitTasks(s, r.clock) : [];
       if (soon.length && round < 16) {
         await this.clock(String(soon[soon.length - 1][1]));
@@ -707,7 +720,8 @@ export async function open({
     /** The device facts by their web names (LLP 1061 D5; LLP 1069.000 D6), grouped on the wire as LLP 1069.007 D2
      * groups them. `media`: `{"prefers-reduced-motion": "reduce"}`, `"prefers-reduced-transparency"` likewise,
      * `"prefers-contrast": "more"|"less"|"custom"|"no-preference"`, `"prefers-color-scheme": "dark"|"light"` (the
-     * system's; an app's `setScheme` still wins). `page`: `"visibility-state": "visible"|"hidden"`, `online`,
+     * system's; an app's `setScheme` still wins). `page`: `"visibility-state": "visible"|"hidden"` and `frozen`;
+     * each substitutes a fact and its defined transitions, not process suspension (LLP 1012 §1). Also `online`,
      * `can-share`, `can-share-files`, `can-share-pictures`, `can-open-files` and `has-focus` `"true"|"false"`,
      * `"root-font-size"` in px (what `rem` follows), `"bold-text"` `"true"|"false"` (Apple's Bold Text, refused by
      * name elsewhere). `fold` (LLP 1078 D7): `posture folded|continuous`, `segments <cols>x<rows>`, `gap <points>` —
@@ -816,6 +830,7 @@ export async function open({
         r.settled = false;
         r.reason = l.reason;
       }
+      delete r.generation;
       delete r.epoch;
       delete r.incarnation;
       delete r.clock;
@@ -837,11 +852,11 @@ export async function open({
       }
       return s.tagged(r);
     },
-    /** Every reply carries the runner's `epoch`, `incarnation` and `clock` (LLP 1035.002 D3). A host that answered
+    /** Every reply carries the runner's `generation`, `epoch`, `incarnation` and `clock` (LLP 1035.002 D3). A host that answered
      * the operation itself stamps them; the web carrier's input and capture are the driver's own (CDP), so the driver
-     * reads the tags after the operation and adds what the reply lacks. An error is left alone. */
+     * reads the tags after the operation and adds what the reply lacks.  */
     async tagged(r) {
-      if (r == null || r.error != null || r.epoch != null) return r;
+      if (r == null || r.generation != null) return r;
       const tags = await s.op({ op: 'tags' });
       for (const key of Object.keys(tags)) if (r[key] === undefined) r[key] = tags[key];
       return r;

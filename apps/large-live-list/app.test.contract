@@ -1,0 +1,94 @@
+test "the window pages both ways"
+  size 760x700
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock settle
+  expect text "range" == "200 loaded / 1000 total"
+  expect state window.rows.0.id == "seed-801"
+  expect state window.rows.99.id == "seed-900"
+  expect state window.rows.199.id == "seed-1000"
+  expect text "message-seed-1000" == "Message 1000"
+  tap "transcript" wheel 0 -10000
+  clock settle
+  expect state cursor == "801/seed-801"
+  expect state window.rows.0.id == "seed-702"
+  expect state window.rows.99.id == "seed-801"
+  expect state window.rows.199.id == "seed-901"
+  expect text "message-seed-801" == "Message 801"
+  expect state offset >= 2770
+  expect state offset <= 3100
+  tap "transcript" wheel 0 10000
+  clock settle
+  expect state cursor == "901/seed-901"
+  expect state window.rows.0.id == "seed-802"
+  expect state window.rows.99.id == "seed-901"
+  expect state window.rows.198.id == "seed-1000"
+  expect text "message-seed-901" == "Message 901"
+  expect state offset >= 2050
+  expect state offset <= 2500
+  tap "latest"
+  clock settle
+  expect state cursor == ""
+  expect state window.rows.0.id == "seed-801"
+  expect state window.rows.99.id == "seed-900"
+  expect state window.rows.199.id == "seed-1000"
+  expect text "message-seed-1000" == "Message 1000"
+
+test "an arrival updates the tail and unread count"
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "arrive"
+  clock data
+  expect text "range" == "200 loaded / 1001 total"
+  expect text "message-arrival-1001" == "Arrival 1001"
+  expect text "unread" == "1 unread"
+  tap "read"
+  clock data
+  expect text "unread" == "0 unread"
+
+test "a queued send survives relaunch and replays once"
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "offline"
+  type "draft" "Saved while offline"
+  tap "send"
+  clock data
+  expect text "draft" == ""
+  expect text "queued" == "1 queued"
+  expect text "range" == "200 loaded / 1000 total"
+  reload
+  clock data
+  expect text "queued" == "1 queued"
+  tap "online"
+  clock settle
+  expect text "queued" == "0 queued"
+  expect text "range" == "200 loaded / 1001 total"
+  expect text "unread" == "0 unread"
+  expect state window.rows.199 .body == "Saved while offline"
+  tap "offline"
+  tap "online"
+  clock settle
+  expect text "range" == "200 loaded / 1001 total"
+
+test "an online relaunch replays a committed outbox"
+  tap "prepare-1000"
+  clock data
+  tap "open"
+  clock data
+  tap "offline"
+  type "draft" "Saved before relaunch"
+  tap "send"
+  clock data
+  tap "online"
+  expect state online == true
+  expect state window.queued == 1
+  reload
+  clock settle
+  expect state window.queued == 0
+  expect state window.total == 1001
+  expect state window.rows.199.body == "Saved before relaunch"

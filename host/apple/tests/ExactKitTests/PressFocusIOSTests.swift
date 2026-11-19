@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// A press and the focus it takes on UIKit. A tap focuses only a node that
 /// asked for focus (`focusesOnPress`), as UIKit's buttons take none from a
@@ -767,8 +768,8 @@ final class PressFocusIOSTests: XCTestCase {
         _ = Agent(session: session).clock(["take": true])
         let opener = try XCTUnwrap(fixtureNode(p, "open-focused-note"))
         tap(opener)
-        until { self.window.rootViewController?.presentedViewController != nil && !p.modals.inTransition }
-        XCTAssertFalse(p.modals.inTransition, "the sheet finished presenting before dismissal")
+        until { self.window.rootViewController?.presentedViewController != nil && !p.modalHost.inTransition }
+        XCTAssertFalse(p.modalHost.inTransition, "the sheet finished presenting before dismissal")
         let sheet = try XCTUnwrap(window.rootViewController?.presentedViewController)
         XCTAssertNil(fixtureNode(p, "note-text"), "dismissed before the answer")
         XCTAssertNotNil(p.pressHandoff, "the sheet's route holds the handoff till then")
@@ -777,7 +778,7 @@ final class PressFocusIOSTests: XCTestCase {
         let dismissed = expectation(description: "the sheet finished dismissing")
         let presenting = try XCTUnwrap(sheet.presentingViewController)
         presenting.dismiss(animated: false) {
-            p.modals.presentationControllerDidDismiss(controller)
+            p.modalHost.presentationControllerDidDismiss(controller)
             dismissed.fulfill()
         }
         wait(for: [dismissed], timeout: 10)

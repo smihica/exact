@@ -8,11 +8,42 @@ import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 // where the press was on the popover for a look's sheet to place it by (the neutral one opens it there,
 // which neutral-look.test.mjs holds; LLP 1116 D1's reads neither, and its menu stays where the user agent
 // puts a popover). The page's stylesheet is a default build's (look.mjs).
-import { test, expect } from 'bun:test';
+import { expect } from 'bun:test';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
+import { engineTests } from '../../../scripts/coverage.mjs';
+
+const engineTest = await engineTests();
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
+
+engineTest.chromium('state identifies an alert only while the browser presents it modally', async () => {
+  const browser = await suiteBrowser('chromium');
+  try {
+    const tab = await browser.newPage();
+    await tab.setContent(`<div id="exact-root">
+      <dialog data-view="1" id="alert" role="alertdialog"><button>Cancel</button></dialog>
+      <dialog data-view="2" id="sheet"><input aria-label="Name"></dialog>
+      <div data-view="3" id="menu" popover role="menu">Choices</div>
+      <div data-view="4" id="chooser" popover role="alertdialog">Choose</div></div>
+      <script type="module">${read('../navigation.js')}
+        window.observed = () => navigation.observation(document.getElementById('exact-root')).popover;
+      </script>`);
+    await tab.waitForFunction('typeof observed === "function"');
+    expect(await tab.evaluate('observed()')).toBeNull();
+    await tab.evaluate('document.getElementById("alert").show()');
+    expect(await tab.evaluate('observed()')).toBeNull();
+    await tab.evaluate('document.getElementById("alert").close(); document.getElementById("alert").showModal()');
+    expect(await tab.evaluate('observed()')).toMatchObject({ kind: 'confirmation', popover: 1, phase: 'open' });
+    await tab.evaluate('document.getElementById("alert").close(); document.getElementById("sheet").showModal()');
+    expect(await tab.evaluate('observed()')).toBeNull();
+    await tab.evaluate('document.getElementById("sheet").close(); document.getElementById("menu").showPopover()');
+    expect(await tab.evaluate('observed()')).toEqual({ popover: 3, phase: 'open', source: null });
+    await tab.evaluate('document.getElementById("menu").hidePopover(); document.getElementById("chooser").showPopover()');
+    expect(await tab.evaluate('observed()')).toEqual({ popover: 4, phase: 'open', source: null });
+  } finally { await browser.close(); }
+});
+
 const page = `<style>${withLook(read('../index.html')).match(/<style>([\s\S]*?)<\/style>/)[1]}</style>
 <div id="exact-root"><div id="row" style="height:60px">A row</div><div id="gone" style="height:60px">A row whose menu is gone</div>
   <div popover="auto" role="menu" id="menu"><button type="button" id="item">Rename</button></div></div>
@@ -26,7 +57,7 @@ const page = `<style>${withLook(read('../index.html')).match(/<style>([\s\S]*?)<
   window.ready = true;
 </script>`;
 
-for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a right click opens the context menu's popover, once the press is over, and says where it was`, async () => {
+for (const engine of ['chromium', 'firefox', 'webkit']) engineTest[engine](`${engine}: a right click opens the context menu's popover, once the press is over, and says where it was`, async () => {
   const playwright = await import('playwright-core');
   const browser = await suiteBrowser(engine);
   try {
@@ -66,7 +97,7 @@ const nested = `<style>${withLook(read('../index.html')).match(/<style>([\s\S]*?
   window.ready = true;
 </script>`;
 
-for (const engine of ['chromium', 'firefox', 'webkit']) test(`${engine}: a context menu inside an open popover leaves that popover open`, async () => {
+for (const engine of ['chromium', 'firefox', 'webkit']) engineTest[engine](`${engine}: a context menu inside an open popover leaves that popover open`, async () => {
   const browser = await suiteBrowser(engine);
   try {
     const tab = await browser.newPage({ viewport: { width: 600, height: 400 } });

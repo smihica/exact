@@ -102,7 +102,7 @@ function configure(sqlite, session) {
         : refuse(`PRAGMA ${first}: the host sets the connection's options; app SQL may run only PRAGMA ${[...allowedPragmas].join(', ')}; ${foreignKeysCheck}`);
     }
     if (action === c.SQLITE_PRAGMA && !allowedPragmas.has(String(first).toLowerCase())
-      && !(session.serializing && first === 'page_count')) {
+      && !(session.serializing && first === 'page_count') && !(session.internal && first === 'schema_version')) {
       return refuse(`PRAGMA ${first}: the host sets the connection's options; app SQL may run only PRAGMA ${[...allowedPragmas].join(', ')}`);
     }
     return c.SQLITE_OK;
@@ -171,8 +171,14 @@ function step(sqlite, session, sql, values, query) {
     if (!query && statement.columnCount) fail('execute does not accept a statement returning rows; use query');
     if (values.length) statement.bind(values);
     if (!query) {
+      // As the native provider (ibex2-sqlite `execute`) answers: `sqlite3_changes` keeps the last INSERT, UPDATE or
+      // DELETE's count after any other statement (https://www.sqlite.org/c3ref/changes.html), and `changed` (a row,
+      // or the schema) is what tells the app's other tabs, not the app.
+      const p = session.db.pointer, rows = c.sqlite3_total_changes(p), schema = schemaVersion(session);
       statement.step();
-      return { changes: c.sqlite3_changes(session.db.pointer), lastInsertRowid: c.sqlite3_last_insert_rowid(session.db.pointer) };
+      const moved = c.sqlite3_total_changes(p) !== rows;
+      return { changes: moved ? c.sqlite3_changes(p) : 0, lastInsertRowid: c.sqlite3_last_insert_rowid(p),
+        changed: moved || schemaVersion(session) !== schema };
     }
     const columns = statement.getColumnNames([]), rows = [];
     let budget = columns.reduce((n, s) => n + new TextEncoder().encode(s).length, 0);
@@ -195,6 +201,11 @@ function step(sqlite, session, sql, values, query) {
 function internal(session, sql) {
   session.internal = true;
   try { session.db.exec(sql); } finally { session.internal = false; }
+}
+// Moved by SQLite at each change to the schema (https://www.sqlite.org/pragma.html#pragma_schema_version).
+function schemaVersion(session) {
+  session.internal = true;
+  try { return session.db.selectValue('PRAGMA schema_version'); } finally { session.internal = false; }
 }
 async function close(databases, id) {
   const session = databases.get(id);

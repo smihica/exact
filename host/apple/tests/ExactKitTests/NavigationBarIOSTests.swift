@@ -2,6 +2,8 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactNativeViews
 
 /// LLP 1075.003 Stage 1 over the native fixture's own plan and hatch module,
 /// which `build.mjs --test --ios` compiles for this simulator: Exact's bar on
@@ -121,7 +123,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("keyboard-pop", module: false)
         let p = session.presenter
         let view = try XCTUnwrap(session.view)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let returning = try XCTUnwrap(nav.topViewController as? RouteController)
         let returningSize = returning.node.bounds.size
         let full = p.documentHost.frame
@@ -153,12 +155,12 @@ final class NavigationBarIOSTests: XCTestCase {
         }
         let session = try fixture("keyboard-gesture-ownership", module: false)
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         p.press(try node(session, "open-focused-plain").id)
         let field = try XCTUnwrap(try node(session, "plain-first").field)
         until("the outgoing editor is focused") { field.isFirstResponder && p.keyboardInset > 0 && nav.transitionCoordinator == nil }
         let recognizer = try XCTUnwrap(nav.interactivePopGestureRecognizer)
-        XCTAssertTrue(p.navigation.popMayBegin(recognizer, from: nil, in: nil, velocity: CGPoint(x: 200, y: 0)))
+        XCTAssertTrue(p.navigationHost.popMayBegin(recognizer, from: nil, in: nil, velocity: CGPoint(x: 200, y: 0)))
         XCTAssertTrue(field.isFirstResponder, "recognizing a swipe must leave responder decisions to the screens and UIKit")
         XCTAssertGreaterThan(p.keyboardInset, 0)
     }
@@ -171,7 +173,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let p = session.presenter
         let root = try XCTUnwrap(p.root.subviews.first as? NodeView)
         p.apply(wireBatch([["op": "props", "id": Int(root.id), "set": ["interactiveWidget": "resizes-visual"]]]))
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let shown = expectation(forNotification: UIResponder.keyboardDidShowNotification, object: nil)
         p.press(try node(session, "open-focused-plain").id)
         let field = try XCTUnwrap(try node(session, "plain-first").field)
@@ -299,7 +301,7 @@ final class NavigationBarIOSTests: XCTestCase {
     private func screenResponderDecision(_ decision: String, legacy: Bool) throws {
         let session = try fixture("keyboard-screen-\(decision)", module: false)
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let opener = try node(session, "open-focused-plain").id
         let firstShown = awaiting(UIResponder.keyboardDidShowNotification)
         p.press(opener)
@@ -338,7 +340,7 @@ final class NavigationBarIOSTests: XCTestCase {
                 p.focusNode(outgoingNode)
             }
         }
-        p.navigation.setAppDelegate(nav, app)
+        p.navigationHost.setAppDelegate(nav, app)
         app.interactive = true
         nav.popViewController(animated: true)
         settle("the interactive pop to begin") { nav.transitionCoordinator?.isInteractive == true && app.animatorStarted }
@@ -394,7 +396,7 @@ final class NavigationBarIOSTests: XCTestCase {
         }
         let session = try fixture("synchronous-push", module: false)
         let presenter = session.presenter
-        let nav = try XCTUnwrap(presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(presenter.navigationHost.primaryNavigation)
         // The hide notification can follow the press that ended editing. A
         // remaining keyboard inset must not postpone UIKit's stack change.
         setKeyboard(presenter, top: 540)
@@ -411,7 +413,7 @@ final class NavigationBarIOSTests: XCTestCase {
     func testAPushFocusesTheRealFirstAutofocusField() throws {
         let session = try fixture("synchronous-autofocus", module: false)
         let presenter = session.presenter
-        let nav = try XCTUnwrap(presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(presenter.navigationHost.primaryNavigation)
         presenter.press(try node(session, "open-focused-plain").id)
         let first = try XCTUnwrap(try node(session, "plain-first").field)
         let second = try XCTUnwrap(try node(session, "plain-second").field)
@@ -425,7 +427,7 @@ final class NavigationBarIOSTests: XCTestCase {
     func testAppearanceNoneKeepsTheHeaderAndItsButtonAuthored() throws {
         let session = try fixture("authored-header", module: false)
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let header = try node(session, "header-home")
         let button = try node(session, "compose-home")
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
@@ -441,7 +443,7 @@ final class NavigationBarIOSTests: XCTestCase {
         XCTAssertNil(route.navigationItem.rightBarButtonItems)
         XCTAssertNil(route.navigationItem.leftBarButtonItems)
         XCTAssertNil(Agent(session: session).barItem(button))
-        XCTAssertEqual(p.navigation.bar(of: route.node, pushed: true), .hidden,
+        XCTAssertEqual(p.navigationHost.bar(of: route.node, pushed: true), .hidden,
                        "an authored header does not gain a system Back bar when pushed")
         p.press(button.id)
         p.apply(wireBatch([["op": "style", "id": Int(header.id), "style": ["appearance": "auto", "written": ["appearance"]]]]))
@@ -454,7 +456,7 @@ final class NavigationBarIOSTests: XCTestCase {
     func testAppearanceNoneOnAButtonKeepsOnlyThatButtonAuthored() throws {
         let session = try fixture("authored-header-button", module: false)
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let header = try node(session, "header-home")
         let button = try node(session, "compose-home")
@@ -481,7 +483,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("authored-title-tap", module: false)
         let p = session.presenter
         p.press(try node(session, "chat").id)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         until("chat is pushed") { nav.transitionCoordinator == nil }
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let tap = try node(session, "title-group")
@@ -510,7 +512,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("authored-back-title", module: false)
         let p = session.presenter
         p.press(try node(session, "chat").id)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         until("chat is pushed") { nav.transitionCoordinator == nil && (nav.topViewController as? RouteController)?.node.props["testId"] == "route-chat" }
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let back = try XCTUnwrap(p.views.values.first { $0.props["testId"] == "back" && $0.isDescendant(of: route.node) })
@@ -530,7 +532,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("authored-back", module: false)
         let p = session.presenter
         p.press(try node(session, "chat").id)
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         until("chat is pushed") { nav.transitionCoordinator == nil }
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let back = try node(session, "back")
@@ -552,7 +554,7 @@ final class NavigationBarIOSTests: XCTestCase {
     func testAppearanceNoneOnSearchAndSegmentsKeepsTheirControlsAuthored() throws {
         let session = try fixture("authored-header-controls", module: false)
         let p = session.presenter
-        let route = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController as? RouteController)
+        let route = try XCTUnwrap(p.navigationHost.primaryNavigation?.topViewController as? RouteController)
         let search = try node(session, "header-search"), segments = try node(session, "header-segments")
         p.apply(wireBatch([search, segments].map { ["op": "style", "id": Int($0.id), "style": ["appearance": "none", "written": ["appearance"]]] }))
         XCTAssertNil(route.navigationItem.searchController)
@@ -576,7 +578,7 @@ final class NavigationBarIOSTests: XCTestCase {
             let tab = try node(session, id)
             p.apply(wireBatch([["op": "style", "id": Int(tab.id), "style": ["appearance": "auto", "written": ["appearance"]]]]))
         }
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let header = try node(session, "header-home")
         let search = try XCTUnwrap(route.navigationItem.searchController)
@@ -598,7 +600,7 @@ final class NavigationBarIOSTests: XCTestCase {
 
     func testAHeaderShapedRouteIsTheBarOnFrameOneWithNoAppCode() throws {
         let session = try fixture("bar-frame-one", module: false)
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let nav = try XCTUnwrap(navigation.primaryNavigation)
         let top = try XCTUnwrap(nav.topViewController)
         XCTAssertFalse(nav.isNavigationBarHidden, "the first route is header-shaped")
@@ -629,7 +631,7 @@ final class NavigationBarIOSTests: XCTestCase {
     /// the hidden authored node in the content.
     func testARealTouchAimsAtTheBarItemUIKitDraws() throws {
         let session = try fixture("bar-aim", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let compose = try node(session, "compose-home")
         let header = try node(session, "header-home")
         XCTAssertTrue(header.isHidden, "the bar shows the header: its authored button is hidden")
@@ -655,7 +657,7 @@ final class NavigationBarIOSTests: XCTestCase {
     /// identifier in another session's view, or outside the session, included.
     func testABarItemsOwnButtonOutsideTheBarDoesNotCoverIt() throws {
         let session = try fixture("bar-glass", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let compose = try node(session, "compose-home")
         let item = try XCTUnwrap(nav.topViewController?.navigationItem.rightBarButtonItems?.first)
         let frame = try XCTUnwrap(item.frame(in: nav.navigationBar))
@@ -745,7 +747,7 @@ final class NavigationBarIOSTests: XCTestCase {
     /// pressing its authored button.
     func testABadgeButtonIsAnImageItemAndAPopoverInvokerAMenuItem() throws {
         let session = try fixture("bar-badge-menu", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let top = try XCTUnwrap(nav.topViewController)
         let left = top.navigationItem.leftBarButtonItems ?? []
         let badge = try XCTUnwrap(left.first { $0.accessibilityLabel == "Profile" }, "the badge button is an item")
@@ -768,7 +770,7 @@ final class NavigationBarIOSTests: XCTestCase {
         // (as here), its tap on that item says what it cannot do, by name:
         // UIKit's pull-down opens from the bar under a real touch alone.
         let invoker = try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == "menu-item" })
-        let refusal = session.presenter.navigation.activateChrome(invoker)?["error"] as? String
+        let refusal = session.presenter.navigationHost.activateChrome(invoker)?["error"] as? String
         XCTAssertTrue(refusal?.hasPrefix("unsupported: bar item") == true, "\(refusal ?? "nil")")
         // A change only to whether the invoker is available is made on the
         // item in place, as UIKit's own `isEnabled` is: the menu stays.
@@ -793,7 +795,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("bar-popover", module: false)
         let agent = Agent(session: session)
         XCTAssertNil(agent.tap(["id": Int(try node(session, "open-plain").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the plain route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let plain = try XCTUnwrap(nav.topViewController)
         let about = try XCTUnwrap(plain.navigationItem.rightBarButtonItems?.first { $0.accessibilityLabel == "About" }, "the invoker is an item")
@@ -825,7 +827,7 @@ final class NavigationBarIOSTests: XCTestCase {
         // one on the item that opened it is not outside it, so the item's
         // tap toggles it; one elsewhere on the bar is.
         let invoker = try node(session, "about-plain")
-        guard case .success(let (barView, itemRect))? = session.presenter.navigation.barItem(invoker) else { return XCTFail("the item's rect") }
+        guard case .success(let (barView, itemRect))? = session.presenter.navigationHost.barItem(invoker) else { return XCTFail("the item's rect") }
         let onItem = UIView(frame: itemRect), elsewhere = UIView(frame: CGRect(x: 0, y: 0, width: 20, height: 20))
         barView.addSubview(onItem); barView.addSubview(elsewhere)
         defer { onItem.removeFromSuperview(); elsewhere.removeFromSuperview() }
@@ -851,10 +853,10 @@ final class NavigationBarIOSTests: XCTestCase {
         guard UIApplication.shared.connectedScenes.first is UIWindowScene else { throw missing("scene", "UIKit presents an alert only from a window a scene holds") }
         let session = try fixture("bar-command", module: false), agent = Agent(session: session)
         XCTAssertNil(agent.tap(["id": Int(try node(session, "open-plain").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the plain route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let invoker = try node(session, "clear-plain")
-        XCTAssertNil(session.presenter.navigation.unshownByBar()[invoker.id], "the bar shows it")
+        XCTAssertNil(session.presenter.navigationHost.unshownByBar()[invoker.id], "the bar shows it")
         func alert() -> UIAlertController? {
             var at = window?.rootViewController
             while let next = at?.presentedViewController { if let a = next as? UIAlertController { return a }; at = next }
@@ -877,7 +879,7 @@ final class NavigationBarIOSTests: XCTestCase {
             throw missing("scene", "native search editing needs the hosted app responder lifecycle")
         }
         let session = try fixture("bar-search", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let top = try XCTUnwrap(nav.topViewController)
         let search = try XCTUnwrap(top.navigationItem.searchController, "the header's search field")
         XCTAssertEqual(search.searchBar.placeholder, "Search the fixture")
@@ -943,14 +945,14 @@ final class NavigationBarIOSTests: XCTestCase {
     /// A search colour changes only the ink; clearing it restores UIKit's placeholder.
     func testSearchPlaceholderColourKeepsTheFontAndResets() throws {
         let session = try fixture("search-placeholder", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let search = try XCTUnwrap(nav.topViewController?.navigationItem.searchController)
         let field = search.searchBar.searchTextField
         let source = try node(session, "header-search")
         let original = field.attributedPlaceholder
         let font = try XCTUnwrap(field.font)
         func project() {
-            session.presenter.navigation.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav)
+            session.presenter.navigationHost.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav)
         }
         func ink() -> UIColor? { field.attributedPlaceholder?.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? UIColor }
         // Unsaid, the search field's own ink, darker than a text field's
@@ -980,7 +982,7 @@ final class NavigationBarIOSTests: XCTestCase {
     /// a segmented control; a segment's tap presses its tab.
     func testAHeaderTablistIsTheItemsSegmentedTitleView() throws {
         let session = try fixture("bar-segments", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let top = try XCTUnwrap(nav.topViewController)
         let control = try XCTUnwrap(top.navigationItem.titleView as? UISegmentedControl, "the tablist is the title view")
         XCTAssertEqual(control.numberOfSegments, 2)
@@ -1028,7 +1030,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("aria-header-item", module: false)
         let button = try node(session, "compose-home")
         session.presenter.apply(wireBatch([["op": "props", "id": Int(button.id), "set": ["accessibilityDisabled": "true"]]]))
-        let top = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController)
+        let top = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController)
         let item = try XCTUnwrap(top.navigationItem.rightBarButtonItems?.first { $0.accessibilityLabel == "Compose" })
         XCTAssertTrue(item.isEnabled)
         XCTAssertTrue(item.accessibilityTraits.contains(.notEnabled))
@@ -1047,7 +1049,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("kept-item-in-place", module: false)
         let button = try node(session, "compose-home")
         let heading = try XCTUnwrap(session.presenter.views.values.first { $0.props["text"] == "Fixture" })
-        let top = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController)
+        let top = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController)
         session.presenter.apply(wireBatch([["op": "props", "id": Int(button.id), "set": ["accessibilityDisabled": "true"]]]))
         let item = try XCTUnwrap(top.navigationItem.rightBarButtonItems?.first { $0.accessibilityLabel == "Compose" })
         XCTAssertTrue(item.accessibilityTraits.contains(.notEnabled))
@@ -1065,11 +1067,11 @@ final class NavigationBarIOSTests: XCTestCase {
     func testAShareFromABarItemPresentsFromTheItem() throws {
         guard hostedWindowScene() != nil else { throw missing("scene", "a share sheet presents from a scene's window") }
         let session = try fixture("bar-share", module: false, plan: "BAR_SHARE")
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         nav.view.layoutIfNeeded()
         let share = try node(session, "share-home")
         let item = try XCTUnwrap(nav.topViewController?.navigationItem.rightBarButtonItems?.first { $0.accessibilityIdentifier == "share-home" })
-        XCTAssertTrue(session.presenter.navigation.shownBarItem(share.id) === item, "the control's item in the bar that shows")
+        XCTAssertTrue(session.presenter.navigationHost.shownBarItem(share.id) === item, "the control's item in the bar that shows")
         // The item's press runs the control's `share(…)`, which the runner asks the session for
         UIApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item, for: nil)
         let shown = { self.window?.rootViewController?.presentedViewController as? UIActivityViewController }
@@ -1081,14 +1083,15 @@ final class NavigationBarIOSTests: XCTestCase {
     }
 
     func testARIAUnavailableHeaderTabCarriesStateToTitleSegment() throws {
+        guard Presenter.axRuntimeLoaded else { throw missing("accessibility", "UIKit makes a segment's element only for an assistive client") }
         let session = try fixture("aria-header-segment", module: false)
         let tab = try node(session, "segment-missed")
         session.presenter.apply(wireBatch([["op": "props", "id": Int(tab.id), "set": ["accessibilityDisabled": "true"]]]))
-        let top = try XCTUnwrap(session.presenter.navigation.primaryNavigation?.topViewController)
+        let top = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation?.topViewController)
         let control = try XCTUnwrap(top.navigationItem.titleView as? LabelledSegmentedControl)
         control.layoutIfNeeded()
         XCTAssertTrue(control.isEnabledForSegment(at: 1))
-        XCTAssertTrue(try XCTUnwrap(control.segmentViews.last).accessibilityTraits.contains(.notEnabled))
+        XCTAssertTrue(try XCTUnwrap(control.accessibilitySegments.last).accessibilityTraits.contains(.notEnabled))
     }
 
     func testAPushedRouteShowsBackAsTheAuthoredControlAndAPopPressesItOnce() throws {
@@ -1098,7 +1101,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let reply = agent.tap(["id": Int(tapped.id)])
         XCTAssertNil(reply["error"], "\(reply)")
         XCTAssertEqual(reply["pressed"] as? Int, Int(tapped.id), "the native projection stays above its authored holders")
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the detail route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let detail = try XCTUnwrap(nav.topViewController), home = nav.viewControllers[0]
         XCTAssertEqual(detail.navigationItem.title, "Detail")
@@ -1131,14 +1134,14 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("bar-back-always", module: false)
         let agent = Agent(session: session)
         XCTAssertNil(agent.tap(["id": Int(try node(session, "open-plain").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the plain route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let plain = try XCTUnwrap(nav.topViewController)
         XCTAssertEqual(plain.navigationItem.title, "Plain")
         XCTAssertFalse(plain.navigationItem.hidesBackButton, "Back is always there")
-        XCTAssertTrue(session.presenter.navigation.canInvokeBack)
+        XCTAssertTrue(session.presenter.navigationHost.canInvokeBack)
         let pop = try XCTUnwrap(nav.interactivePopGestureRecognizer)
-        XCTAssertTrue(session.presenter.navigation.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)),
+        XCTAssertTrue(session.presenter.navigationHost.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)),
                       "the edge swipe may begin")
         // UIKit's own pop (its back button) is a completed pop.
         nav.popViewController(animated: true)
@@ -1162,16 +1165,16 @@ final class NavigationBarIOSTests: XCTestCase {
         root.props["navigationBack"] = ""
         let agent = Agent(session: session)
         XCTAssertNil(agent.tap(["id": Int(try node(session, "detail").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("Detail is pushed onto the native stack") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let detail = try XCTUnwrap(nav.topViewController), home = nav.viewControllers[0]
         XCTAssertFalse(nav.isNavigationBarHidden)
         XCTAssertFalse(detail.navigationItem.hidesBackButton, "the system Back, with no control named")
         XCTAssertEqual(home.navigationItem.backButtonDisplayMode, .default, "no authored control shapes it")
         XCTAssertEqual(detail.navigationItem.leftBarButtonItems?.first?.accessibilityIdentifier, "back", "Detail's `id=\"back\"` button is an item like any other")
-        XCTAssertTrue(session.presenter.navigation.canInvokeBack)
+        XCTAssertTrue(session.presenter.navigationHost.canInvokeBack)
         let pop = try XCTUnwrap(nav.interactivePopGestureRecognizer)
-        XCTAssertTrue(session.presenter.navigation.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)))
+        XCTAssertTrue(session.presenter.navigationHost.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)))
         nav.popViewController(animated: true)
         until("the root's navigate went back and the stack follows the router") {
             (state(session, "nav") as? [String: Any]).map { (($0["tabs"] as? [[String: Any]])?.first?["stack"] as? [Any])?.count == 1 } ?? false
@@ -1186,18 +1189,20 @@ final class NavigationBarIOSTests: XCTestCase {
     /// a tab bar item's `accessibilityIdentifier` is its authored `testId`,
     /// so XCUITest and Maestro address them as any other node.
     func testBarItemsTheSearchFieldSegmentsAndTabsCarryTheirTestIds() throws {
+        guard Presenter.axRuntimeLoaded else { throw missing("accessibility", "UIKit makes a segment's element only for an assistive client") }
         let session = try fixture("bar-test-ids", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let top = try XCTUnwrap(nav.topViewController)
         let items = (top.navigationItem.leftBarButtonItems ?? []) + (top.navigationItem.rightBarButtonItems ?? [])
         XCTAssertEqual(Set(items.compactMap(\.accessibilityIdentifier)), ["badge-item", "menu-item", "compose-home"])
         XCTAssertEqual(top.navigationItem.searchController?.searchBar.searchTextField.accessibilityIdentifier, "header-search")
+        XCTAssertEqual(top.navigationItem.searchController?.searchBar.searchTextField.accessibilityLabel, "Search fixture rows", "its aria-label names it")
         let control = try XCTUnwrap(top.navigationItem.titleView as? LabelledSegmentedControl)
         XCTAssertEqual(control.accessibilityIdentifier, "header-segments")
         control.layoutIfNeeded()
-        XCTAssertEqual(control.segmentViews.map(\.accessibilityIdentifier), ["segment-all", "segment-missed"])
-        XCTAssertEqual(control.segmentViews.map(\.accessibilityLabel), [nil, nil], "no name of their own: UIKit's, their words")
-        let tabs = try XCTUnwrap(session.presenter.navigation.tabController)
+        XCTAssertEqual(control.accessibilitySegments.map(\.readIdentifier), ["segment-all", "segment-missed"])
+        XCTAssertEqual(control.accessibilitySegments.map(\.accessibilityLabel), (0..<control.numberOfSegments).map(control.titleForSegment(at:)), "no name of their own: UIKit's, their words")
+        let tabs = try XCTUnwrap(session.presenter.navigationHost.tabController)
         XCTAssertEqual(tabs.tabControllers?.map(\.tabBarItem.accessibilityIdentifier), ["tab-home", "tab-second"])
     }
 
@@ -1209,12 +1214,12 @@ final class NavigationBarIOSTests: XCTestCase {
         let root = try node(session, "navigation")
         root.handlers.remove("navigate")
         XCTAssertNil(Agent(session: session).tap(["id": Int(try node(session, "open-plain").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the plain route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         root.handlers.remove("navigate") // a batch may have written the root's handlers again
         XCTAssertFalse(try XCTUnwrap(nav.topViewController).navigationItem.hidesBackButton, "Back is always there")
         let pop = try XCTUnwrap(nav.interactivePopGestureRecognizer)
-        XCTAssertTrue(session.presenter.navigation.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)))
+        XCTAssertTrue(session.presenter.navigationHost.popMayBegin(pop, from: CGPoint(x: 4, y: 400), in: nav.view, velocity: CGPoint(x: 600, y: 20)))
         nav.popViewController(animated: true)
         until("the runner went back and the stack follows the router") {
             (state(session, "nav") as? [String: Any]).map { (($0["tabs"] as? [[String: Any]])?.first?["stack"] as? [Any])?.count == 1 } ?? false
@@ -1237,7 +1242,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("bar-back-gone", module: false)
         let agent = Agent(session: session)
         XCTAssertNil(agent.tap(["id": Int(try node(session, "detail").id)])["error"])
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         until("the detail route is pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
         let p = session.presenter
         let name = try XCTUnwrap(p.views.values.first { $0.props["navigationBack"] != nil }?.props["navigationBack"])
@@ -1252,7 +1257,7 @@ final class NavigationBarIOSTests: XCTestCase {
 
     func testAForwardedCustomTransitionPopsOnceAndACancelledOneNever() throws {
         let session = try fixture("bar-delegate", module: false)
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         _ = Agent(session: session).tap(["id": Int(try node(session, "detail").id)])
         let nav = try XCTUnwrap(navigation.primaryNavigation)
         until("pushed") { nav.viewControllers.count == 2 && nav.transitionCoordinator == nil }
@@ -1294,7 +1299,7 @@ final class NavigationBarIOSTests: XCTestCase {
         let session = try fixture("hatch-content-mount-\(policy)", module: true)
         let p = session.presenter, root = try XCTUnwrap(p.root.subviews.first as? NodeView)
         p.apply(wireBatch([["op": "props", "id": Int(root.id), "set": ["interactiveWidget": policy]]]))
-        let navigation = p.navigation
+        let navigation = p.navigationHost
         until("the route hatch is connected") { journal(session).contains("hatch route 0: built") }
         _ = Agent(session: session).clock(["settle": true])
         let route = try XCTUnwrap(navigation.primaryNavigation?.topViewController as? RouteController)
@@ -1322,13 +1327,13 @@ final class NavigationBarIOSTests: XCTestCase {
         let lines = log()
         let navigationAt = try XCTUnwrap(lines.range(of: "hatch navigation #1: built"))
         XCTAssertLessThan(navigationAt.lowerBound, try XCTUnwrap(lines.range(of: "hatch route 0: built")).lowerBound, "a stack's hatch runs before its routes'")
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         XCTAssertEqual(nav.navigationBar.tintColor, .systemIndigo, "the long tail is the hatch's")
         let home = try XCTUnwrap(nav.topViewController)
         // A route prepared again with nothing changed keeps its projected
         // items and runs no hatch.
         let items = home.navigationItem.rightBarButtonItems ?? []
-        session.presenter.navigation.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav)
+        session.presenter.navigationHost.prepareRoutes(nav.viewControllers.compactMap { $0 as? RouteController }, in: nav)
         spin(0.2)
         XCTAssertFalse(log().contains("hatch route 0: changed"), "an unchanged route runs no hatch")
         XCTAssertTrue(items.elementsEqual(home.navigationItem.rightBarButtonItems ?? [], by: ===), "an unchanged route is not projected again")
@@ -1373,23 +1378,23 @@ final class NavigationBarIOSTests: XCTestCase {
         }
         let shape = buttons.map { HeaderShape.Item($0) }
         XCTAssertEqual(shape.map(\.toolbarGroup), [101, 102, 102, 103])
-        let items = presenter.navigation.barItems(shape, route)
+        let items = presenter.navigationHost.barItems(shape, route)
         XCTAssertEqual(items.compactMap(\.accessibilityIdentifier), ["share", "favorite", "bookmark", "info"])
         if #available(iOS 26.0, *) {
             XCTAssertEqual(items.count, 6, "two system spaces split three groups")
             XCTAssertEqual(items[1].width, 0)
             XCTAssertEqual(items[4].width, 0)
         } else { XCTAssertEqual(items.count, 4) }
-        XCTAssertTrue(NavigationHost.same(presenter.navigation.barItems(shape, route), items), "the same groups keep their items and the spaces between them")
+        XCTAssertTrue(NavigationHost.same(presenter.navigationHost.barItems(shape, route), items), "the same groups keep their items and the spaces between them")
         for button in buttons { header.container.addSubview(button) }
         let plain = buttons.map { HeaderShape.Item($0) }
         XCTAssertNotEqual(shape[0].source, plain[0].source, "regrouping invalidates the projected bar")
-        XCTAssertEqual(presenter.navigation.barItems(plain, route).count, 4)
+        XCTAssertEqual(presenter.navigationHost.barItems(plain, route).count, 4)
     }
 
     func testActionsFocusAndBlurTheProjectedSearchField() throws {
         let session = try fixture("action-search", module: false)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let search = try XCTUnwrap(nav.topViewController?.navigationItem.searchController)
         let source = try node(session, "header-search")
         source.props["id"] = "action-search"
@@ -1407,8 +1412,8 @@ final class NavigationBarIOSTests: XCTestCase {
         guard hostedWindowScene() != nil else { throw missing("scene", "a search controller presents only in a scene's window") }
         let session = try fixture("bar-search", module: false)
         let presenter = session.presenter
-        let nav = try XCTUnwrap(presenter.navigation.primaryNavigation)
-        let owner = try XCTUnwrap(presenter.navigation.primaryOwner?.view)
+        let nav = try XCTUnwrap(presenter.navigationHost.primaryNavigation)
+        let owner = try XCTUnwrap(presenter.navigationHost.primaryOwner?.view)
         let route = try XCTUnwrap(nav.topViewController as? RouteController)
         let search = try XCTUnwrap(route.navigationItem.searchController)
         let frame = owner.convert(owner.bounds, to: nil)

@@ -145,6 +145,8 @@ fn every_author_motion_name_is_a_style_name() {
 
 #[test]
 fn no_old_spelling_is_accepted_by_any_table() {
+    exact_motion::link_transitions();
+    exact_motion::link_animations();
     // The first fourteen are the property names; the rest are values.
     for (old, new) in RENAMED_TOKENS.iter().take(14) {
         assert!(

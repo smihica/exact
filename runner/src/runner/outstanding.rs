@@ -56,7 +56,7 @@ impl Outstanding {
                 if i > 0 {
                     out.push(',');
                 }
-                crate::agent::quote(item, &mut out);
+                crate::json::quote(item, &mut out);
             }
             out.push(']');
         }
@@ -112,7 +112,8 @@ impl<D: DataSource> Runner<D> {
                 out.awaiting.push(name());
             }
         }
-        for (t, row) in self.timers.iter().zip(&self.plan.timers) {
+        for (i, t) in self.timers.iter().enumerate() {
+            let row = self.timer_row(i);
             if row.once
                 && t.next_ms.is_finite()
                 && row.interval_ms as f64 <= STARTUP_TIMER_WINDOW_MS

@@ -37,15 +37,38 @@ pub(super) struct MapperTurns {
 
 #[derive(Default)]
 struct Behind {
+    target: Option<crate::Target>,
+    completion: Option<super::CompletionReply>,
     /// The request out for the stream: its ticket, and whether it hands
     /// back a held outcome rather than resuming the mapper.
     out: Option<(u64, bool)>,
     /// The mapper request's fetch, distinct from the stream's.
     fetch: Option<u64>,
+    continuation: Option<u64>,
     held: VecDeque<Outcome>,
     /// The messages held, a batch counting each of its own, and their bytes.
     messages: usize,
     bytes: usize,
+}
+
+impl MapperTurns {
+    pub(super) fn completion(
+        &mut self,
+        ticket: u64,
+    ) -> Option<(
+        super::completion::Owner,
+        &mut Option<super::CompletionReply>,
+    )> {
+        let (stream, behind) = self
+            .by_stream
+            .iter_mut()
+            .find(|(_, b)| b.out.is_some_and(|(t, _)| t == ticket))?;
+        let owner = super::completion::Owner::Mapper {
+            stream: *stream,
+            target: behind.target?,
+        };
+        Some((owner, &mut behind.completion))
+    }
 }
 
 impl Behind {
@@ -85,12 +108,7 @@ impl<D: DataSource> Runner<D> {
     pub(super) fn fail_mapper_turn(&mut self, stream: u64, message: &str) {
         if let Some(behind) = self.mapper_turns.by_stream.remove(&stream) {
             if let Some((ticket, _)) = behind.out {
-                if let Some(token) = self
-                    .requests
-                    .iter()
-                    .find(|r| r.ticket == ticket)
-                    .and_then(|r| r.request.continuation)
-                {
+                if let Some(token) = behind.continuation {
                     self.data.discard(token);
                 }
                 self.explicit_aborts.push(ticket);
@@ -141,14 +159,19 @@ impl<D: DataSource> Runner<D> {
         let Some(p) = self.pending.iter().find(|p| p.ticket == stream) else {
             return;
         };
-        let name = self.target_name(p.target);
+        let target = p.target;
+        let name = self.target_name(target);
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         self.log(super::lines::enqueued(ticket, &name, &request));
         let behind = self.mapper_turns.by_stream.entry(stream).or_default();
         behind.out = Some((ticket, held));
+        behind.target = Some(target);
+        behind.completion = None;
         behind.fetch = request.fetch;
+        behind.continuation = if held { None } else { request.continuation };
         self.requests.push(RequestOut {
+            completion: None,
             class: crate::RequestClass::Ordered,
             ticket,
             target: name,
@@ -233,6 +256,7 @@ impl<D: DataSource> Runner<D> {
     ) -> Result<Option<CommitReceipt>, RunnerError> {
         let behind = (self.mapper_turns.by_stream.get_mut(&stream)).expect("found by turn_stream");
         let (_, held) = behind.out.take().expect("found by turn_stream");
+        behind.completion = None;
         let fetch = behind.fetch.take();
         let result = if !held {
             self.run_turn(stream, fetch, outcome)
@@ -247,7 +271,11 @@ impl<D: DataSource> Runner<D> {
             if !open || b.out.is_none() && b.held.is_empty() {
                 self.mapper_turns.by_stream.remove(&stream);
             } else if b.out.is_none() {
-                self.send_turn(stream, Request::continuation(HELD), true);
+                self.send_turn(
+                    stream,
+                    Request::continuation::<crate::host_work::StreamTurn>(HELD),
+                    true,
+                );
             }
         }
         result

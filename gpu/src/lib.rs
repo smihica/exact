@@ -15,7 +15,9 @@
 //! - [`Module`] — the device and the instances, one per canvas node.
 //! - [`json`] — the values as the batch carries them.
 //! - [`shaders`] — the WGSL by name, registered at run time (LLP 1030 D8).
+//! - [`dynamic_offset`] — opt a reflected buffer binding into dynamic offsets.
 //! - [`module!`] — the exports for one app's registry.
+//! - [`android_init!`] — an artifact's Android initialization entry.
 //! - `fixture` (native) — a surface rendered and read back, for fixtures.
 
 #![deny(missing_docs)]
@@ -23,7 +25,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 // Web surfaces stay on the browser thread; native acquisition shares them with a worker.
@@ -32,11 +34,14 @@ use std::rc::Rc as SurfaceRef;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc as SurfaceRef;
 
+pub use exact_color as color;
 pub use exact_plan::{surface_arguments, Value};
 pub use wgpu;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod acquire;
+mod bind_layout;
+pub use bind_layout::dynamic_offset;
 mod binding;
 #[cfg(target_os = "android")]
 mod buffers;
@@ -47,6 +52,7 @@ mod frame;
 #[cfg(all(test, target_os = "macos"))]
 mod hdr_tests;
 mod input;
+mod instance;
 mod pace;
 mod performance;
 pub use pace::{lower_cap, FrameTiming, HostTiming, ThermalState};
@@ -63,6 +69,8 @@ mod target;
 pub use target::ColorSpace;
 pub mod tier;
 pub use tier::{set_thread_tier, set_tier, tier, GpuTier};
+#[cfg(not(target_arch = "wasm32"))]
+mod storage;
 mod uniform;
 #[cfg(windows)]
 mod window;
@@ -129,6 +137,10 @@ pub enum Lifecycle {
     Interrupted,
     /// The external interruption ended; device work may resume.
     Resumed,
+    /// A trusted press anywhere in the page, delivered inside it: a browser
+    /// starts audio output only in a user gesture, and a press on the app's
+    /// own controls is one even when it never reaches the canvas.
+    Activated,
 }
 
 /// Delivery failure, independent of GPU readiness.
@@ -207,6 +219,17 @@ impl AssetChanges {
 
 /// What an app implements per canvas.
 pub trait Surface {
+    /// This canvas's native session directories, once before its first bind.
+    /// Copy paths you keep; create directories only when needed. The paths map
+    /// to `app:/data`, `app:/cache` and `app:/tmp`, including named agent stores.
+    /// Not called on the web, which has no native filesystem paths.
+    fn storage(
+        &mut self,
+        _data: &std::path::Path,
+        _cache: &std::path::Path,
+        _temporary: &std::path::Path,
+    ) {
+    }
     /// Presented raster size relative to device pixels; layout stays in CSS pixels.
     /// The compositor stretches it to the canvas box. Finite (0, 1]; invalid values
     /// use 1. Explicit readback/fixture sizes are unaffected.
@@ -227,10 +250,21 @@ pub trait Surface {
     /// Clock ownership, before first input and whenever it changes. A seekable
     /// chart/video uses explicit time and must not open a live device.
     fn clock(&mut self, _seekable: bool) {}
-    /// Named inputs and their defaults, in bind order. An empty declaration
-    /// accepts positional inputs only. Names are resolved before `bind` runs.
+    /// The person prefers reduced motion (CSS `prefers-reduced-motion: reduce`).
+    /// Told when the surface is made and whenever the preference changes.
+    fn reduced_motion(&mut self, _reduce: bool) {}
+    /// Named inputs and their defaults, in bind order. Without `rest_arguments`,
+    /// an empty declaration accepts positional inputs only. Names are resolved
+    /// before `bind` runs.
     fn arguments(&self) -> Vec<(&'static str, Value)> {
         Vec::new()
+    }
+    /// Whether a named bind may carry arguments `arguments` does not declare.
+    /// When true, `bind` receives one more input after the declared ones: a
+    /// list of `[name, value]` pairs, in the order the canvas wrote them.
+    /// Changed binds retain omitted pairs; positional binds supply an empty list.
+    fn rest_arguments(&self) -> bool {
+        false
     }
     /// The canvas's inputs from the plan, as typed values; before the
     /// first render and whenever they change. A refusal names the input.
@@ -292,13 +326,37 @@ pub trait Surface {
         target: &wgpu::TextureView,
         format: wgpu::TextureFormat,
     ) -> bool;
-    /// Whether the last render produced a complete image. On native targets,
-    /// false retains the last image and retries; the browser owns web presentation.
+    /// Whether the last render completed the current picture, qualifying its
+    /// `presented` record. Native presentation follows [`Surface::frame_presentable`].
     fn frame_ready(&self) -> bool {
         true
     }
+    /// Whether the last render may be shown, including a retained picture while
+    /// its replacement prepares. Only `frame_ready` qualifies the current generation.
+    fn frame_presentable(&self) -> bool {
+        self.frame_ready()
+    }
+    /// The canvas has no picture, including any previously presented image.
+    /// Hosts show its styles and children until a new complete frame is presented.
+    fn is_empty(&self) -> bool {
+        false
+    }
     /// The commands the last `render` recorded were submitted: map what it
     /// copied for reading (a map cannot precede the submit of the copy).
+    ///
+    /// On native hosts, a surface may call `device.poll(wgpu::PollType::Poll)`
+    /// in later `render` calls to drive map callbacks without waiting for the
+    /// GPU. Keep returning `true` from `render` while a readback is pending.
+    /// Later queue submits also drive callbacks, but the host promises no
+    /// polling after the surface rests. Android's buffered path polls to
+    /// retire buffers; native capture and `Module::sync` wait on the device.
+    /// Direct presentation has no additional per-frame device poll. On the
+    /// web, WebGPU drives callbacks when control returns to the browser.
+    ///
+    /// Do not block a live frame with `PollType::Wait` or a channel receive,
+    /// or spin until a map completes. Keep callbacks short, consume completed
+    /// bytes in a later frame, drop mapped views and unmap before reusing the
+    /// buffer. See `gpu/README.md`, "Reading GPU results" for an example.
     fn submitted(&mut self) {}
     /// A display frame the module does not render, the GPU holding as many as
     /// it may: bring the surface's state up to `frame`, so the next `render`
@@ -306,8 +364,8 @@ pub trait Surface {
     /// the next rendered frame's commands.
     fn advance(&mut self, _frame: &Frame, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
     /// A presentation target acquired a device, before its first draw. Its
-    /// granted features (e.g. block-compressed textures) choose what to fetch.
-    fn device_ready(&mut self, _features: wgpu::Features) {}
+    /// granted features and limits choose the resources and compute tier to use.
+    fn device_ready(&mut self, _features: wgpu::Features, _limits: wgpu::Limits) {}
     /// Presentation was lost; release device resources without discarding owned state.
     fn device_lost(&mut self) {}
     /// The GPU tier changed (`gpu_retier`, LLP 1139.003 D2): true when the
@@ -444,6 +502,11 @@ pub trait Surface {
     fn placement(&self, _index: usize) -> Option<Placement> {
         None
     }
+    /// The opacity a host compositing the `index`th placed child multiplies into
+    /// it, 0 to 1. Visual only: hit-testing and accessibility are unchanged.
+    fn placement_opacity(&self, _index: usize) -> f32 {
+        1.0
+    }
     /// The canvas's children as a texture (LLP 1014 D2, D3) — laid
     /// out by the kernel in the canvas's box, painted by the host at the
     /// canvas's scale, premultiplied RGBA — for the surface to sample;
@@ -491,6 +554,8 @@ pub struct Module {
     #[cfg(windows)]
     window: Option<window::WindowFrame>,
     registry: &'static Registry,
+    requirements: &'static [grants::Requirements],
+    refused: HashMap<&'static str, String>,
     #[cfg(not(target_arch = "wasm32"))]
     pipeline_cache: PipelineCache,
     #[cfg(not(target_arch = "wasm32"))]
@@ -498,10 +563,14 @@ pub struct Module {
     gpu: Option<Gpu>,
     instance: Option<wgpu::Instance>,
     device_lost: Arc<AtomicBool>,
+    /// The first validation error no scope caught since the last
+    /// [`Module::flush`] ([`Module::set_gpu`]).
+    uncaptured: Arc<Mutex<Option<String>>>,
     instances: HashMap<u32, Instance>,
     next: u32,
     error: String,
     seekable: bool,
+    reduced_motion: bool,
     period_ms: f64,
     /// The host's last display callback and the device's thermal state ([`pace`]).
     host: (HostTiming, ThermalState),
@@ -553,6 +622,7 @@ mod recovery;
 const FRAME_LATENCY: u32 = if cfg!(target_os = "android") { 4 } else { 2 };
 
 struct Instance {
+    name: String,
     surface: Box<dyn Surface>,
     messages: Vec<String>,
     published: Option<String>,
@@ -608,32 +678,6 @@ pub(crate) fn view_format(config: &wgpu::SurfaceConfiguration) -> wgpu::TextureF
         .unwrap_or(config.format)
 }
 
-impl Instance {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn offscreen_format(&self) -> wgpu::TextureFormat {
-        if self.surface.srgb_target() {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        }
-    }
-
-    fn has_ring(&self) -> bool {
-        #[cfg(target_os = "android")]
-        return self.ring.is_some();
-        #[cfg(not(target_os = "android"))]
-        false
-    }
-
-    fn drain(&mut self) {
-        self.messages.extend(self.surface.messages());
-        if let Some(record) = self.surface.published() {
-            self.published = Some(record);
-        }
-        self.presented.generation(self.surface.generation());
-    }
-}
-
 /// One direct child's texture on the device (LLP 1014 D5).
 struct ChildTexture {
     texture: wgpu::Texture,
@@ -662,6 +706,8 @@ impl Module {
             #[cfg(windows)]
             window: None,
             registry,
+            requirements: &[],
+            refused: HashMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pipeline_cache: PipelineCache::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -669,10 +715,12 @@ impl Module {
             gpu: None,
             instance: None,
             device_lost: Arc::new(AtomicBool::new(false)),
+            uncaptured: Arc::default(),
             instances: HashMap::new(),
             next: 0,
             error: String::new(),
             seekable: false,
+            reduced_motion: false,
             period_ms: 0.0,
             host: Default::default(),
             open: None,
@@ -702,11 +750,24 @@ impl Module {
             #[cfg(target_arch = "wasm32")]
             crate::web::notify_loss(&lost);
         });
+        // Rendering and readback hold error scopes (`frame::Recording`); an
+        // error outside them (preparing assets, say) is kept for the next
+        // flush to report, where wgpu's default handler would abort.
+        self.uncaptured = Arc::default();
+        let uncaptured = self.uncaptured.clone();
+        gpu.device.on_uncaptured_error(Arc::new(move |error| {
+            let mut kept = uncaptured.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get_or_insert_with(|| error.to_string());
+        }));
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.pipeline_cache = PipelineCache::for_module(&gpu.device, self.cache_artifact);
         }
+        self.refused = grants::refusals(self.requirements, &gpu);
         for inst in self.instances.values_mut() {
+            if self.refused.contains_key(inst.name.as_str()) {
+                continue;
+            }
             let format =
                 if let (Some(target), Some(config)) = (&inst.presentation, &mut inst.config) {
                     let caps = target.get_capabilities(&gpu.adapter);
@@ -725,7 +786,8 @@ impl Module {
                     #[cfg(not(target_arch = "wasm32"))]
                     inst.offscreen_format()
                 };
-            inst.surface.device_ready(gpu.device.features());
+            inst.surface
+                .device_ready(gpu.device.features(), gpu.device.limits());
             inst.report_color_space();
             inst.surface.prepare_assets(&gpu.device, &gpu.queue, format);
             inst.dirty = true;
@@ -764,6 +826,15 @@ impl Module {
         self.gpu
             .as_ref()
             .filter(|_| !self.device_lost.load(Ordering::Acquire))
+    }
+
+    /// Move an error no scope caught into [`Module::take_error`]; whether
+    /// there was one.
+    fn take_uncaptured(&mut self) -> bool {
+        let kept = (self.uncaptured.lock())
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        kept.map(|e| self.error = e).is_some()
     }
 
     /// Consume the last failure's text, for the presenter to report once.
@@ -819,23 +890,28 @@ impl Module {
 
     /// Create surface ownership without a device, target, or registered shaders.
     pub fn create_headless(&mut self, name: &str) -> Option<u32> {
+        if let Some(error) = self.refused.get(name).cloned() {
+            return self.fail(error);
+        }
         let Some((_, _, factory)) = self.registry.surfaces.iter().find(|(n, _, _)| *n == name)
         else {
             return self.fail(format!("no surface named `{name}` in this module"));
         };
-        self.insert(factory(), None)
+        self.insert(name, factory(), None)
     }
 
     fn insert(
         &mut self,
+        name: &str,
         mut surface: Box<dyn Surface>,
         presentation: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
     ) -> Option<u32> {
         self.next += 1;
         let id = self.next;
         surface.clock(self.seekable);
+        surface.reduced_motion(self.reduced_motion);
         if let Some(gpu) = &self.gpu {
-            surface.device_ready(gpu.device.features());
+            surface.device_ready(gpu.device.features(), gpu.device.limits());
             surface.color_space_granted(target::granted(presentation.as_ref().map(|(_, c)| c)));
         }
         let (presentation, config) = presentation.map_or((None, None), |(target, config)| {
@@ -844,6 +920,7 @@ impl Module {
         self.instances.insert(
             id,
             Instance {
+                name: name.into(),
                 surface,
                 messages: Vec::new(),
                 published: None,
@@ -934,8 +1011,22 @@ impl Module {
         }
     }
 
-    /// Deliver host lifecycle codes: 0 hidden, 1 visible, 2 interrupted, 3 resumed.
-    /// Unknown codes are ignored, including from a newer host.
+    /// Tell every canvas the host's motion preference (LLP 1181 D7).
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        if self.reduced_motion == reduce {
+            return;
+        }
+        self.flush();
+        self.reduced_motion = reduce;
+        for inst in self.instances.values_mut() {
+            inst.surface.reduced_motion(reduce);
+            inst.dirty = true;
+            inst.drain();
+        }
+    }
+
+    /// Deliver host lifecycle codes: 0 hidden, 1 visible, 2 interrupted, 3 resumed,
+    /// 4 activated. Unknown codes are ignored, including from a newer host.
     pub fn lifecycle(&mut self, id: u32, code: u32) {
         self.settle(id);
         let event = match code {
@@ -943,6 +1034,7 @@ impl Module {
             1 => Lifecycle::Visible,
             2 => Lifecycle::Interrupted,
             3 => Lifecycle::Resumed,
+            4 => Lifecycle::Activated,
             _ => return,
         };
         if let Some(inst) = self.instances.get_mut(&id) {
@@ -1001,6 +1093,10 @@ impl Module {
                 inst.bound = true;
                 inst.inputs = inputs.to_vec();
                 inst.dirty = true;
+                #[cfg(windows)]
+                if inst.surface.is_empty() {
+                    self.discard_window_picture(id);
+                }
                 true
             }
             Err(SurfaceError(e)) => {
@@ -1357,10 +1453,13 @@ pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
 mod pipeline_cache;
 pub use pipeline_cache::PipelineCache;
 mod device;
+pub mod grants;
 pub use device::{
-    load_gpu, requested_features, requested_limits, DeviceFailure, DeviceFailureKind,
+    load_gpu, load_gpu_with_requirements, requested_features, requested_limits, DeviceFailure,
+    DeviceFailureKind,
 };
 
+pub mod android;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fixture;
 #[cfg(not(target_arch = "wasm32"))]

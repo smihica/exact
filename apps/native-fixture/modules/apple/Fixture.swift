@@ -271,15 +271,31 @@ final class FixtureModule: ExactModule {
     }
 
     /// The app's own container, when the environment asks for it (the UIKit
-    /// tests': `EXACT_FIXTURE_CONTAINER=app`): a segmented control over the
-    /// selected tab's stack, through the seam alone.
+    /// tests'): `EXACT_FIXTURE_CONTAINER=app`, a segmented control over the
+    /// selected tab's stack, through the seam alone; `tab-bar`, a tab bar
+    /// controller that is its own delegate.
     override func tabContainer(_ contents: ExactTabContents) -> UIViewController? {
-        return ProcessInfo.processInfo.environment["EXACT_FIXTURE_CONTAINER"] == "app" ? FixtureTabs(contents) : nil
+        switch ProcessInfo.processInfo.environment["EXACT_FIXTURE_CONTAINER"] {
+        case "app": return FixtureTabs(contents)
+        case "tab-bar": return FixtureTabBar(contents)
+        default: return nil
+        }
     }
     #endif
 }
 
 #if os(iOS)
+/// A tab bar controller the app owns, its delegate slot its own.
+final class FixtureTabBar: UITabBarController, UITabBarControllerDelegate {
+    init(_ contents: ExactTabContents) {
+        super.init(nibName: nil, bundle: nil)
+        setViewControllers(contents.tabs.map(\.controller), animated: false)
+        selectedIndex = contents.selected
+        delegate = self
+    }
+    required init?(coder: NSCoder) { nil }
+}
+
 /// A container the app owns: every tab's stack a child, the selected one
 /// shown; its control asks Exact to select, and Exact says what it chose.
 final class FixtureTabs: UIViewController {
@@ -289,9 +305,32 @@ final class FixtureTabs: UIViewController {
         self.contents = contents
         control = UISegmentedControl(items: contents.tabs.map { $0.item.title ?? $0.name })
         super.init(nibName: nil, bundle: nil)
-        contents.onSelect = { [weak self] _ in self?.show() }
+        contents.onSelect = { [weak self] _ in
+            guard let self else { return }
+            show()
+            if let url = openOnNextSelect {
+                openOnNextSelect = nil
+                open(url)
+                selectedJustAfterOpen = self.contents.selected
+            }
+            if backOnNextSelect {
+                backOnNextSelect = false
+                goBack()
+            }
+        }
     }
     required init?(coder: NSCoder) { nil }
+    /// A Back of the app's own and a link it opens (the UIKit tests call
+    /// these), and whether Exact took the last one.
+    @objc private(set) var intentTaken = false
+    /// A URL the container opens from inside the next `onSelect` (a UIKit test sets it).
+    @objc var openOnNextSelect: String?
+    /// The tab Exact's contents said was selected just after that open, inside the same `onSelect`.
+    @objc private(set) var selectedJustAfterOpen = -1
+    /// Whether the container goes back from inside the next `onSelect` (a UIKit test sets it).
+    @objc var backOnNextSelect = false
+    @objc func goBack() { intentTaken = contents.back() }
+    @objc func open(_ url: String) { intentTaken = contents.open(url) }
     override func viewDidLoad() {
         super.viewDidLoad()
         for tab in contents.tabs {

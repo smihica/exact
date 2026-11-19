@@ -559,6 +559,7 @@ fn the_largest_font_scale_clips_neither_bar() {
     let device = Device {
         night: false,
         font_scale: 2.0,
+        screen_reader: exact_runner::ScreenReader::Unknown,
         locale: "en-US".into(),
         rtl: false,
         hour24: false,
@@ -664,6 +665,7 @@ fn tv() -> Device {
     Device {
         night: false,
         font_scale: 1.0,
+        screen_reader: exact_runner::ScreenReader::Unknown,
         locale: "en-US".into(),
         rtl: false,
         hour24: false,
@@ -986,17 +988,16 @@ fn a_reselected_tabs_scroll_to_the_top_gives_way_to_a_request_its_press_made() {
     );
 }
 
-/// A reload before anyone touched the app boots the new kernel to the
-/// epoch the old one had: the bars are read from the new tree all the same.
+/// A reload advances the epoch and reads the bars from the new tree.
 #[test]
-fn a_reload_at_the_same_epoch_reads_the_bars_again() {
+fn a_reload_advances_the_epoch_and_reads_the_bars_again() {
     let (mut p, _) = barred(APP);
     assert_eq!(top(&mut p).title, "Home");
     let epoch = p.host().kernel().epoch();
     let next = APP.replace("text \"Home\" role", "text \"Start\" role");
     p.reload(&crate::test_plan(&next), Nothing).unwrap();
     settle(&mut p);
-    assert_eq!(p.host().kernel().epoch(), epoch, "the case: the same epoch");
+    assert!(p.host().kernel().epoch() > epoch);
     assert_eq!(text(&p, "home-title"), "Start");
     assert_eq!(top(&mut p).title, "Start");
 }
@@ -1205,4 +1206,76 @@ fn a_sheets_route_reads_the_sheets_own_inset() {
     let form = kernel.node_by_key(form).unwrap().id;
     let local = kernel.local_insets(form).unwrap();
     assert_eq!(local[0], SHEET_HANDLE, "{local:?}");
+}
+
+#[test]
+fn rtl_bars_follow_their_own_direction_and_hit_the_mirrored_targets() {
+    for override_ltr in [false, true] {
+        let mut source = APP.replace("main navigationKey", "main direction=\"rtl\" navigationKey");
+        if override_ltr {
+            source = source
+                .replace("header display", "header direction=\"ltr\" display")
+                .replace(
+                    "row role=\"tablist\"",
+                    "row direction=\"ltr\" role=\"tablist\"",
+                );
+        }
+        let (mut p, _) = barred(&source);
+        let more = id(&p, "more");
+        let home = id(&p, "tab-home");
+        let other = id(&p, "tab-other");
+        let heading = id(&p, "home-title");
+        let (bar, bottom) = p.bars();
+        let shown = bar.unwrap();
+        let button = shown
+            .targets
+            .iter()
+            .find(|t| t.what == What::Item(more))
+            .unwrap()
+            .rect;
+        let title = shown.texts.iter().find(|t| t.0 == heading).unwrap().1;
+        assert_eq!(title.0 > button.0, !override_ltr, "heading and action");
+        let bottom = bottom.unwrap();
+        let x = |id| {
+            bottom
+                .targets
+                .iter()
+                .find(|t| t.what == What::Tab(id))
+                .unwrap()
+                .rect
+                .0
+        };
+        assert_eq!(x(home) > x(other), !override_ltr, "tab order");
+        touch(&mut p, BOTTOM, Some("tab-other"));
+        assert_eq!(top(&mut p).title, "Other");
+    }
+}
+
+#[test]
+fn bars_remeasure_when_direction_changes_without_replacing_the_route() {
+    let source = APP
+        .replace("state said = \"nothing\"", "state said = \"rtl\"")
+        .replace("said = \"edited\"", "said = \"ltr\"")
+        .replace("main navigationKey", "main direction=said navigationKey");
+    let (mut p, _) = barred(&source);
+    tap(&mut p, "open").unwrap();
+    p.reader_bars(1.).unwrap();
+    let up = |p: &mut Presenter<Nothing>| {
+        p.bars()
+            .0
+            .unwrap()
+            .targets
+            .iter()
+            .find(|t| t.what == What::Up)
+            .unwrap()
+            .rect
+            .0
+    };
+    let right = up(&mut p);
+    assert!(right > 300.);
+    touch(&mut p, TOP, Some("edit"));
+    assert!(p.reader_bars(1.).is_some());
+    assert!(up(&mut p) < 10.);
+    touch(&mut p, TOP, None);
+    assert_eq!(top(&mut p).title, "Home");
 }

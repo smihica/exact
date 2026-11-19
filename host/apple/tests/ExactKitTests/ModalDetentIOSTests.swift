@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1075.003 §9.11: `navigationDetent`'s words as UIKit detents,
 /// `fit-content` resolving to the route's content height within the sheet's
@@ -211,7 +212,7 @@ final class ModalDetentIOSTests: XCTestCase {
         until("the note is presented as a sheet") { sheet()?.sheetPresentationController != nil }
         let presented = try XCTUnwrap(sheet())
         let controller = try XCTUnwrap(presented.presentationController)
-        let modals = session.presenter.modals
+        let modals = session.presenter.modalHost
         XCTAssertTrue(modals.presentationControllerShouldDismiss(controller), "the swipe may dismiss it")
         // A finished swipe: UIKit dismisses the sheet, then tells its
         // delegate (this window finishes no transition, so it is told here).
@@ -268,7 +269,7 @@ final class ModalDetentIOSTests: XCTestCase {
         let controller = try XCTUnwrap(presented.sheetPresentationController)
         let route = try node(session, "scrolling-menu")
         let scroll = try XCTUnwrap(route.scroll)
-        let routeView = try XCTUnwrap(session.presenter.navigation.controllers[route.id]?.view)
+        let routeView = try XCTUnwrap(session.presenter.navigationHost.controllers[route.id]?.view)
         let detent = try XCTUnwrap(controller.detents.first)
         until("the menu is fitted and settled") { route.fitContentHeight == 208 && !Agent(session: session).nativeInFlight() }
         let short = routeView.bounds.height
@@ -317,17 +318,17 @@ final class ModalDetentIOSTests: XCTestCase {
         XCTAssertFalse(controller.prefersGrabberVisible, "one detent, unsaid: none")
         for (word, shown) in [("visible", true), ("hidden", false), ("auto", false)] {
             route.props["navigationGrabber"] = word
-            session.presenter.modals.updatePermissions()
+            session.presenter.modalHost.updatePermissions()
             XCTAssertEqual(controller.prefersGrabberVisible, shown, word)
         }
         route.props["navigationDetent"] = "medium large"
-        session.presenter.modals.updatePermissions()
+        session.presenter.modalHost.updatePermissions()
         XCTAssertTrue(controller.prefersGrabberVisible, "several detents, auto: the platform's grabber")
         // Dragged to large (a drag sets the selection): a grabber change
         // leaves the sheet where the person put it.
         controller.selectedDetentIdentifier = .large
         route.props["navigationGrabber"] = "hidden"
-        session.presenter.modals.updatePermissions()
+        session.presenter.modalHost.updatePermissions()
         XCTAssertFalse(controller.prefersGrabberVisible, "several detents, hidden")
         XCTAssertEqual(controller.selectedDetentIdentifier, .large, "still large")
     }
@@ -346,7 +347,7 @@ final class ModalDetentIOSTests: XCTestCase {
         let set = { (detents: String, initial: String?) in
             route.props["navigationInitialDetent"] = initial
             route.props["navigationDetent"] = detents
-            session.presenter.modals.updatePermissions()
+            session.presenter.modalHost.updatePermissions()
         }
         for (detents, initial, opened) in [
             ("medium large", "large", UISheetPresentationController.Detent.Identifier.large),
@@ -367,17 +368,17 @@ final class ModalDetentIOSTests: XCTestCase {
         XCTAssertFalse(journal.contains(#"navigationInitialDetent \"large\""#), "the platform's large is a sheet's one detent unsaid")
         XCTAssertFalse(journal.contains(#"navigationInitialDetent \"\""#), "empty is unsaid, as `navigationDetent`'s is")
         route.props["navigationInitialDetent"] = "500"
-        session.presenter.modals.updatePermissions()
+        session.presenter.modalHost.updatePermissions()
         XCTAssertEqual(controller.selectedDetentIdentifier, .init("authored-0"), "the initial detent alone changed: still the first")
         // A route that says no `navigationDetent`, as its sheet is made
         // (UIKit's `large`, nothing selected): a bound initial detent that
         // names none is journaled there too.
         route.props["navigationDetent"] = nil
         route.props["navigationInitialDetent"] = nil
-        session.presenter.modals.updatePermissions()
+        session.presenter.modalHost.updatePermissions()
         route.props["navigationInitialDetent"] = "medum"
         controller.selectedDetentIdentifier = nil
-        session.presenter.modals.updatePermissions()
+        session.presenter.modalHost.updatePermissions()
         XCTAssertEqual(controller.selectedDetentIdentifier, .large)
         XCTAssertTrue(session.agent(#"{"op":"logs","since":0}"#).contains(#"navigationInitialDetent \"medum\""#), "journaled when the sheet is made")
     }
@@ -397,7 +398,7 @@ final class ModalDetentIOSTests: XCTestCase {
             presented.view.frame = CGRect(x: 0, y: 400, width: 402, height: 474)
             presented.view.layoutIfNeeded()
             let route = try node(session, "route-menu")
-            let routeView = try XCTUnwrap(session.presenter.navigation.controllers[route.id]?.view)
+            let routeView = try XCTUnwrap(session.presenter.navigationHost.controllers[route.id]?.view)
             until("the route has its block") { session.presenter.owners.told[route.id]?.block == .size(routeView.bounds.size) && !routeView.bounds.isEmpty }
             let detent = { controller.detents.first?.resolvedValue(in: Context(800)) }
             until("at its rows' height") { detent() == rows(1) }

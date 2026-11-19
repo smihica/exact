@@ -11,7 +11,7 @@ final class NativeTaskTimers {
         var row: NativeTimerWake
         let timer: Timer
         var pending = false
-        init(_ row: NativeTimerWake, _ timer: Timer) { self.row = row; self.timer = timer }
+        package init(_ row: NativeTimerWake, _ timer: Timer) { self.row = row; self.timer = timer }
     }
     private var entries: [UInt32: Entry] = [:]
     private var queue: [Delivery] = []
@@ -22,7 +22,7 @@ final class NativeTaskTimers {
     private let ready: () -> Void
     private(set) var rows: [NativeTimerWake] = []
 
-    init(now: @escaping () -> Double, date: @escaping () -> Date = Date.init, ready: @escaping () -> Void) {
+    package init(now: @escaping () -> Double, date: @escaping () -> Date = Date.init, ready: @escaping () -> Void) {
         self.now = now; self.date = date; self.ready = ready
     }
     deinit { for entry in entries.values { entry.timer.invalidate() } }
@@ -86,18 +86,30 @@ final class NativeTaskTimers {
     }
     #if DEBUG
     func timerForTests(_ index: UInt32) -> Timer? { entries[index]?.timer }
+    func pendingForTests(_ index: UInt32) -> Bool { entries[index]?.pending == true }
     #endif
 }
 
 extension ExactSession {
-    /// A batch that changes nothing: it shows nothing new (`showsNothing`), has no orientation readback or error to log and moves no hold, the
-    /// wake lock (LLP 1125 D11) or word on work the app must finish (`Holds.swift`). Its timer deadline is the caller's to compare.
-    func changesNothing(_ batch: Batch) -> Bool { showsNothing(batch) && batch.orientation == nil && batch.error == nil && batch.wakelock == nil && batch.mustFinish == nil }
+    /// A batch that changes nothing: it shows nothing new (`showsNothing`), has no orientation
+    /// readback or error and moves no wake lock (LLP 1125 D11) or work the app must
+    /// finish (`Holds.swift`). Its timer deadline is the caller's to compare. Its alerts and
+    /// journal lines are no change: a caller that skips it logs them (`logSkipped`).
+    func changesNothing(_ batch: Batch) -> Bool {
+        showsNothing(batch) && batch.orientation == nil && batch.error == nil && batch.wakelock == nil && batch.mustFinish == nil
+    }
+    /// A skipped batch's alerts and journal lines, written as `apply` writes them (LLP 1171 D1: never dropped).
+    func logSkipped(_ batch: Batch) {
+        logAlerts(batch.alerts); logJournal(batch.journal)
+        #if DEBUG
+        onSkippedLogForTests?(batch.alerts, batch.journal)
+        #endif
+    }
     /// A batch that changes nothing the presenter shows: it leaves the screen as it is (no ops, control's
-    /// viewless contents, LLP 1069.011 §9, page facts, or an orientation request that changes the lock or
-    /// turns the scene), asks for no canvas image, and leaves the motion, spatial, frame-task, canvas and owed-draw state as they stand.
+    /// viewless contents, LLP 1069.011 §9, page facts, navigation roots' tabs, or an orientation request that changes the lock or
+    /// turns the scene), asks for or lets go no canvas image, and leaves the motion (and whether it only awaits the page's present), spatial, frame-task, canvas and owed-draw state as they stand.
     func showsNothing(_ batch: Batch) -> Bool {
-        !batch.changesScreen && !presenter.orientationChangesScreen(batch) && batch.canvasImages.isEmpty && batch.motion == frames.motion && batch.spatial == frames.spatial
+        !batch.changesScreen && !presenter.orientationChangesScreen(batch) && batch.canvasImages.isEmpty && batch.canvasImagesDropped.isEmpty && batch.motion == frames.motion && batch.spatial == frames.spatial && batch.presentOnly == frames.presentOnly
             && batch.canvasOwed == canvasOwed && batch.canvas == frames.canvas2d && batch.frames == frames.tasks
     }
     func clockUnchanged(_ batch: Batch) -> Bool {
@@ -107,17 +119,23 @@ extension ExactSession {
         taskTimers.update(batch.nativeTimers, epoch: generation, enabled: clock == nil && !ExactEnv.agentFreezes && state != .destroyed)
         timerAdmissions.update(batch.timerWaits)
     }
+    /// A task's native firing that waited while a batch applied or owner work was in flight (`deliverNativeTimer`) is
+    /// asked for again once neither holds it, whatever ended the hold: an answer applied, held or stale, or a check
+    /// that withdrew its advance.
+    func releaseWaitingFirings() { if !applying, !ownerInFlight { taskTimers.resume() } }
+    /// A firing waits in its queue while a batch applies or owner work is in flight, and is asked for again once neither
+    /// holds it (`releaseWaitingFirings`).
     func deliverNativeTimer() {
         guard state != .destroyed, clock == nil, !ExactEnv.agentFreezes, !applying, !ownerInFlight,
               let timer = taskTimers.take() else { return }
+        followOffset()
         if ExactSession.asyncFills {
             advanceInFlight = true
-            let captured = generation
-            runtime.fireNativeTimerAsync(timer.row, now: timer.cutoff) { [weak self] batch in
-                self?.publish(.advance, batch, captured)
+            runtime.fireNativeTimerAsync(timer.row, now: timer.cutoff) { [weak self] completion in
+                self?.publish(.advance, completion)
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, self.generation == captured else { return }
-                    taskTimers.complete(timer, retry: batch.busy || batch.held)
+                    guard let self, runtime.accepts(completion.lease) else { return }
+                    taskTimers.complete(timer, retry: completion.batch.busy || completion.batch.held)
                 }
             }
         } else {

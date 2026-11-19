@@ -17,7 +17,7 @@ pub(super) struct HeightDrag {
 }
 
 impl<D: DataSource> Host<D> {
-    pub(super) fn track_height_handle(&mut self, id: ViewId) {
+    pub(crate) fn track_height_handle(&mut self, id: ViewId) {
         let Some(node) = self.runner.kernel().node(id) else {
             return;
         };
@@ -31,7 +31,7 @@ impl<D: DataSource> Host<D> {
     }
 
     // Called only after boot/tree commits, never by ordinary compositor ticks.
-    pub(super) fn reconcile_height_handles(&mut self, batch: &mut Batch, auto_register: bool) {
+    pub(crate) fn reconcile_height_handles(&mut self, batch: &mut Batch, auto_register: bool) {
         let kernel = self.runner.kernel();
         let single_root = kernel.roots().len() == 1;
         let candidates: Vec<_> = self
@@ -99,7 +99,7 @@ impl<D: DataSource> Host<D> {
                 && self.height_binding_matches(drag.handle, drag.target)
         })
     }
-    pub(super) fn cancel_invalid_height_drag(&mut self) {
+    pub(crate) fn cancel_invalid_height_drag(&mut self) {
         let Some(drag) = self.height_drag else { return };
         if self.live_height_drag(drag.token.serial()).is_none() {
             self.height_drag = None;
@@ -113,6 +113,19 @@ impl<D: DataSource> Host<D> {
 
     /// Begin only the exported generational binding, before advancing any clock.
     pub fn height_drag_begin(&mut self, handle: NodeKey, target: NodeKey, now_ms: f64) -> String {
+        match self.turn.drag {
+            Some(drag) => (drag.height_begin)(self, handle, target, now_ms),
+            None => self.hold_refusal(super::transform_drag::UNLINKED),
+        }
+    }
+
+    /// [`Host::height_drag_begin`], where drags are linked.
+    pub(crate) fn height_drag_begin_linked(
+        &mut self,
+        handle: NodeKey,
+        target: NodeKey,
+        now_ms: f64,
+    ) -> String {
         if !self.height_binding_matches(handle, target) {
             return self.finish(Batch::new(), None);
         }
@@ -147,6 +160,19 @@ impl<D: DataSource> Host<D> {
 
     /// Update only a live header/target/token triple; stale values are ignored.
     pub fn height_drag_update(&mut self, serial: u64, height: f64, now_ms: f64) -> String {
+        match self.turn.drag {
+            Some(drag) => (drag.height_update)(self, serial, height, now_ms),
+            None => self.hold_refusal(super::transform_drag::UNLINKED),
+        }
+    }
+
+    /// [`Host::height_drag_update`], where drags are linked.
+    pub(crate) fn height_drag_update_linked(
+        &mut self,
+        serial: u64,
+        height: f64,
+        now_ms: f64,
+    ) -> String {
         let Some(drag) = self.live_height_drag(serial).filter(|drag| !drag.released) else {
             return self.finish(Batch::new(), None);
         };
@@ -170,12 +196,28 @@ impl<D: DataSource> Host<D> {
         velocity: f64,
         now_ms: f64,
     ) -> String {
+        if self.turn.drag.is_none() {
+            return self.hold_refusal(super::transform_drag::UNLINKED);
+        }
         self.dispatch_height(serial, height, Some(velocity), now_ms)
     }
 
     /// The same, at the velocity the engine measured over the heights shown
     /// (LLP 1057.001 §3): what the native bridge sends.
     pub fn dispatch_height_measured(&mut self, serial: u64, height: f64, now_ms: f64) -> String {
+        match self.turn.drag {
+            Some(drag) => (drag.height_release)(self, serial, height, now_ms),
+            None => self.hold_refusal(super::transform_drag::UNLINKED),
+        }
+    }
+
+    /// [`Host::dispatch_height_measured`], where drags are linked.
+    pub(crate) fn dispatch_height_measured_linked(
+        &mut self,
+        serial: u64,
+        height: f64,
+        now_ms: f64,
+    ) -> String {
         self.dispatch_height(serial, height, None, now_ms)
     }
 

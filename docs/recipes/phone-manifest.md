@@ -2,7 +2,7 @@
 
 `app.json` names the app and what it ships; `$schema` gives an editor every key.
 A portrait phone app with a light appearance and HTTP access (a name in `env`
-needs its `const` in `app.ts`, below, or the bake refuses):
+needs its `const` in `app.ts` or its transitive app-local imports, or the bake refuses):
 
 ```json
 {
@@ -33,8 +33,8 @@ needs its `const` in `app.ts`, below, or the bake refuses):
 - `host.ios` and `host.android` name the native platforms the app ships.
 - Set `app.id` and `app.name` before building (`exact new --name --bundle-id`).
 
-`env` declares public settings inlined at build. In `app.ts`, read each directly
-in a top-level `const`, then derive from it:
+`env` declares public settings inlined at build. In `app.ts` or an app-local module it
+imports transitively, read each directly in a top-level `const`, then derive from it:
 
 ```ts
 const BUILT = import.meta.env.API_BASE_URL ?? '';

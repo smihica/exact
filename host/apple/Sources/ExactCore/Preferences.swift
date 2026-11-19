@@ -20,6 +20,8 @@ public struct Preferences: OptionSet, Sendable {
     public static let rec2020 = Self(rawValue: 2 << 8)
     public static let highDynamicRange = Self(rawValue: 1 << 10)
     public static let boldText = Self(rawValue: 1 << 14)
+    public static let screenReaderOff = Self(rawValue: 1 << 17)
+    public static let screenReaderOn = Self(rawValue: 2 << 17)
 
     public enum DisplayMode: UInt32, Sendable {
         case standalone, browser, fullscreen, minimalUI, windowControlsOverlay, pictureInPicture, tabbed
@@ -47,7 +49,8 @@ public struct Preferences: OptionSet, Sendable {
     }
     public init(reducedMotion: Bool, reducedTransparency: Bool, contrast: String,
                 dark: Bool, input: Self = .platformInput, gamut: String,
-                highDynamicRange: Bool, displayMode: DisplayMode = .standalone, boldText: Bool) {
+                highDynamicRange: Bool, displayMode: DisplayMode = .standalone, boldText: Bool,
+                screenReader: String = "unknown") {
         self = input.union(Self.displayMode(displayMode))
         if reducedMotion { insert(.reducedMotion) }
         if reducedTransparency { insert(.reducedTransparency) }
@@ -58,6 +61,8 @@ public struct Preferences: OptionSet, Sendable {
         if gamut == "rec2020" { insert(.rec2020) }
         if highDynamicRange { insert(.highDynamicRange) }
         if boldText { insert(.boldText) }
+        if screenReader == "off" { insert(.screenReaderOff) }
+        if screenReader == "on" { insert(.screenReaderOn) }
     }
 }
 
@@ -70,11 +75,12 @@ extension Preferences {
                 reducedTransparency: Bool = UIAccessibility.isReduceTransparencyEnabled,
                 increasedContrast: Bool = UIAccessibility.isDarkerSystemColorsEnabled,
                 boldText: Bool = UIAccessibility.isBoldTextEnabled,
+                screenReader: Bool = UIAccessibility.isVoiceOverRunning,
                 highDynamicRange: Bool = false, displayMode: DisplayMode = .standalone) {
         self.init(reducedMotion: reducedMotion, reducedTransparency: reducedTransparency,
                   contrast: increasedContrast ? "more" : "no-preference", dark: traits.userInterfaceStyle == .dark,
                   gamut: traits.displayGamut == .P3 ? "p3" : "srgb", highDynamicRange: highDynamicRange,
-                  displayMode: displayMode, boldText: boldText)
+                  displayMode: displayMode, boldText: boldText, screenReader: screenReader ? "on" : "off")
     }
 }
 extension SessionFacts {

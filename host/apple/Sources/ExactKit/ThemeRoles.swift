@@ -39,10 +39,10 @@ package enum ThemeRoles {
     /// The boot's table (`{"op": "roles"}`), the last plan's replaced, for
     /// the presenter at `root` (none: the last to apply's); whether it changed.
     @discardableResult
-    static func apply(_ batch: Batch, root: PlatformView? = nil) -> Bool {
+    static func apply(_ op: BatchOp?, root: PlatformView? = nil) -> Bool {
         let table = root.map(table(of:)) ?? last
         last = table
-        guard let op = batch.ops.last(where: { $0.op == .roles }), op.style != table.style else { return false }
+        guard let op, op.style != table.style else { return false }
         table.style = op.style
         generation += 1
         return true
@@ -60,7 +60,7 @@ package enum ThemeRoles {
     /// `view`, a surface a presenter presents outside its root (a sheet's),
     /// resolves by the table of the presenter at `root` (none: the one
     /// applying now).
-    static func adopt(_ view: PlatformView, from root: PlatformView?) {
+    package static func adopt(_ view: PlatformView, from root: PlatformView?) {
         guard let table = root.map(table(of:)) ?? applying else { return }
         own(view, table)
     }
@@ -138,7 +138,7 @@ extension Presenter {
         // shows outside its root, resolves the theme's `AccentColor` again
         // (a live edit, LLP 1121 stage 5).
         for view in [root] + ThemeRoles.adopted(by: root) {
-            for case let node as NodeView in view.subviews {
+            for node in NodeView.structural(view.subviews) {
                 node.retint(changed: true)
                 node.accentChanged()
             }

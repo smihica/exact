@@ -15,10 +15,11 @@
 // such menu and takes none of its chords; EXACT_DEV_MENU=0 or =1, at build
 // or launch, says otherwise for either). Native AppKit above the presenter, so it is
 // alive even when the plan is broken; reload re-fetches a live connection,
-// else restarts from the dev loop's plan when one is named (the watcher's
-// own path, state carried), else from the baked plan, fresh. Host
+// else restarts from the dev loop's plan when a development build names one
+// (the watcher's own path, state carried), else from the baked plan, fresh. Host
 // apparatus for the standalone adapter (LLP 1031 D11): an embedder installs
 // none of this.
+import CExact
 #if os(macOS)
 import AppKit
 import ExactCore
@@ -137,8 +138,9 @@ public enum DevMenu {
     /// The session the menu reloads, describes and opens into: the key
     /// window's. Installing the menu follows that window's key notifications.
     nonisolated(unsafe) public static weak var session: ExactSession?
-    /// Where a reload without a connection restarts from: the dev loop's
-    /// plan file (`EXACT_DEV_PLAN`) or `EXACT_PLAN`, else the baked plan.
+    /// Where a development build's reload without a connection restarts
+    /// from: the dev loop's plan file (`EXACT_DEV_PLAN`) or `EXACT_PLAN`,
+    /// else the baked plan.
     nonisolated(unsafe) static var planPath: String?
 
     nonisolated(unsafe) private static var windowKeyObserver: NSObjectProtocol?
@@ -436,13 +438,18 @@ public enum DevMenu {
     }
 
     public static func reload() {
+        // The person's own act: it ends a composition and commits now (LLP 1029.000.002 D9).
+        ExactApp.shared.endCompositions()
         // A live URL session re-fetches (and clears a rebuilt stop).
         if ExactApp.shared.connectionStatus != nil { ExactApp.shared.reloadConnection(); return }
         guard let session else { return }
+        // A production build takes no development plan, and reloads the baked one.
+        #if EXACT_INSPECT
         if let path = planPath {
-            ExactDevelopmentPlan(path).apply(to: ExactApp.shared)
+            ExactDevelopmentPlan(path).apply(to: ExactApp.shared, now: true)
             return
         }
+        #endif
         let started = CACurrentMediaTime()
         let batch = session.boot(size: session.presenter.viewportSize)
         // stderr, never stdout: stdout is the agent's reply channel on macOS,
@@ -468,7 +475,7 @@ public enum DevMenu {
             lines.append("session: \(session.label) · viewport: \(Int(size.width))×\(Int(size.height)) · \(session.viewCount) views")
             lines.append("boot: \(String(format: "%.1f", session.bootMs)) ms")
             // A resource whose answers are refused keeps showing its last value (LLP 1142 D4).
-            if let state = (try? JSONSerialization.jsonObject(with: Data(session.agent("{\"op\":\"state\"}").utf8))) as? [String: Any],
+            if let state = (try? JSONSerialization.jsonObject(with: Data(session.runtime.ask(exact_state, "{}").utf8))) as? [String: Any],
                let failed = state["failed"] as? [String: String] {
                 let counts = state["failures"] as? [String: [String: Any]] ?? [:]
                 for (name, why) in failed.sorted(by: { $0.key < $1.key }) {
@@ -530,5 +537,33 @@ public enum DevMenu {
         f.dateFormat = "HH:mm:ss"
         return f
     }()
+}
+
+/// Go ▸ Back ⌘[ and Forward ⌘]: the ways of the session in the key window,
+/// which the adapter that owns the windows keeps current (`DevMenu.session`);
+/// each enabled only while that session has somewhere to go.
+final class GoMenuTarget: NSObject, NSMenuItemValidation {
+    @objc func back(_ sender: Any?) { DevMenu.session?.presenter.navigation.goBack() }
+    @objc func forward(_ sender: Any?) { DevMenu.session?.presenter.navigation.goForward() }
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard let navigation = DevMenu.session?.presenter.navigation else { return false }
+        return item.action == #selector(forward(_:)) ? navigation.canGoForward : navigation.canGoBack
+    }
+}
+
+extension Presenter {
+    /// A mouse's back or forward button came up (`buttonNumber` 3 or 4): Back
+    /// or Forward, after the event's `pointerup` has run, unless one of its
+    /// handlers prevented it (LLP 1115.000 D5.5). Chrome steps history at
+    /// the release and lets a `mouseup` or `pointerup` cancel it; a press, a
+    /// `pointerdown` or an `auxclick` does not.
+    func historyButton(_ event: NSEvent) {
+        guard event.type == .otherMouseUp, [3, 4].contains(event.buttonNumber) else { return }
+        // A turn later: the window dispatches the up after this monitor.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.mouseChain.upPrevented !== event else { return }
+            if event.buttonNumber == 3 { self.navigation.goBack() } else { self.navigation.goForward() }
+        }
+    }
 }
 #endif

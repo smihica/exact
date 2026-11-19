@@ -47,6 +47,21 @@ impl<D: DataSource> Presenter<D> {
     /// A secondary click's default menu. Authored context menus and handlers
     /// run first; disabled, covered and hosted fields have no painted-field menu.
     pub fn edit_menu_at(&mut self, point: (f32, f32)) -> Option<EditMenu> {
+        let id = self.context_menu_field_at(point)?;
+        self.open_edit_menu(id, point, true)
+    }
+
+    pub(super) fn agent_contextmenu_at(&mut self, point: (f32, f32)) -> Result<(), String> {
+        if let Some(id) = self.context_menu_field_at(point) {
+            if self.field_menu_default(id, point) {
+                // The desktop agent runs headless: it cannot show a native menu.
+                return Err("native text editing menu is unavailable through the agent".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn context_menu_field_at(&mut self, point: (f32, f32)) -> Option<ViewId> {
         if self.page_inert() {
             return None;
         }
@@ -55,7 +70,7 @@ impl<D: DataSource> Presenter<D> {
             self.long_press(point.0, point.1, self.host.now());
             return None;
         }
-        self.open_edit_menu(id, point, true)
+        Some(id)
     }
 
     /// Handle the context-menu key or Shift+F10, including key handlers and
@@ -106,10 +121,43 @@ impl<D: DataSource> Presenter<D> {
     }
 
     fn open_edit_menu(&mut self, id: ViewId, point: (f32, f32), mouse: bool) -> Option<EditMenu> {
-        if !self.menu_field(id) {
+        if !self.menu_field(id) || !self.field_menu_default(id, point) {
             return None;
         }
         let key = self.host.kernel().node(id)?.key;
+        let now = self.host.now();
+        if let Some(error) = self.set_focus(Some(id), now) {
+            self.host.log(error);
+        }
+        if self.focus != Some(id) || !self.input_live(key) || !self.menu_field(id) {
+            return None;
+        }
+        if mouse {
+            let value = self.field_text(id);
+            let selection = self.field_selection(id);
+            let field_point = self
+                .boxes
+                .iter()
+                .find(|b| b.id == id)
+                .map_or(point, |b| b.field_point(point.0, point.1));
+            let hit = self
+                .current_field(id, &value)
+                .and_then(|f| f.hit(field_point.0, field_point.1));
+            if selection.start == selection.end
+                || hit.is_none_or(|c| c.offset < selection.start || c.offset > selection.end)
+            {
+                self.press_field(id, point.0, point.1);
+            }
+        }
+        Some(self.make_edit_menu(id, point))
+    }
+
+    /// Dispatch authored menus and report whether the native default is needed.
+    fn field_menu_default(&mut self, id: ViewId, point: (f32, f32)) -> bool {
+        let Some(node) = self.host.kernel().node(id) else {
+            return false;
+        };
+        let key = node.key;
         let now = self.host.now();
         // Snapshot the context path before any handler changes the tree.
         let mut path = Vec::new();
@@ -151,7 +199,7 @@ impl<D: DataSource> Presenter<D> {
             }
         }
         if prevented || !self.input_live(key) || !self.menu_field(id) || self.page_inert() {
-            return None;
+            return false;
         }
         if let Some((invoker, name)) = popover {
             self.present(
@@ -162,32 +210,9 @@ impl<D: DataSource> Presenter<D> {
                 false,
                 now,
             );
-            return None;
+            return false;
         }
-        if let Some(error) = self.set_focus(Some(id), now) {
-            self.host.log(error);
-        }
-        if self.focus != Some(id) || !self.input_live(key) || !self.menu_field(id) {
-            return None;
-        }
-        if mouse {
-            let value = self.field_text(id);
-            let selection = self.field_selection(id);
-            let field_point = self
-                .boxes
-                .iter()
-                .find(|b| b.id == id)
-                .map_or(point, |b| b.field_point(point.0, point.1));
-            let hit = self
-                .current_field(id, &value)
-                .and_then(|f| f.hit(field_point.0, field_point.1));
-            if selection.start == selection.end
-                || hit.is_none_or(|c| c.offset < selection.start || c.offset > selection.end)
-            {
-                self.press_field(id, point.0, point.1);
-            }
-        }
-        Some(self.make_edit_menu(id, point))
+        true
     }
 
     fn make_edit_menu(&self, id: ViewId, point: (f32, f32)) -> EditMenu {
@@ -305,8 +330,8 @@ mod tests {
         }
     }
     fn fixture(extra: &str, attrs: &str) -> (Presenter<()>, ViewId, Rc<RefCell<String>>) {
-        let source = format!("component App\n{extra}  view\n    input value=\"café 界 🦀\" testId=\"editor\" width=300 height=48 appearance=\"none\" {attrs}\n");
-        let (mut p, error) = Presenter::boot_with(
+        let source = format!("component App\n{extra}  view\n    column\n      input value=\"café 界 🦀\" testId=\"editor\" width=300 height=48 appearance=\"none\" {attrs}\n");
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
             &crate::test_plan(&source),
             (),
             (400., 200.),
@@ -458,6 +483,75 @@ mod tests {
             p.field_selection(id),
             FieldSelection::at_end(&p.field_text(id))
         );
+    }
+
+    #[test]
+    fn agent_contextmenu_refuses_native_editing_menus_without_moving_focus_or_selection() {
+        for (focused, end) in [(false, 0), (true, 0), (true, 1)] {
+            let (mut p, id, _) = fixture("", "");
+            p.serve_overlays();
+            if !focused {
+                p.set_focus(None, 0.);
+            }
+            let selection = FieldSelection {
+                end,
+                ..FieldSelection::caret(0)
+            };
+            p.mark_field(id, &p.field_text(id), selection, false);
+            let focus = p.focus;
+            let reply: serde_json::Value = serde_json::from_str(&crate::agent::answer(
+                &mut p,
+                &format!(r#"{{"op":"tap","id":{id},"contextmenu":true,"at":[250,20]}}"#),
+            ))
+            .unwrap();
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("native text editing menu")),
+                "{reply}"
+            );
+            assert_eq!(p.focus, focus);
+            assert_eq!(p.field_selection(id), selection);
+            let menu = p.edit_menu_at((250., 20.)).unwrap();
+            assert!(p.edit_menu_valid(&menu));
+            assert_eq!(p.focus, Some(id));
+            assert_eq!(
+                p.field_selection(id),
+                FieldSelection::at_end(&p.field_text(id))
+            );
+        }
+    }
+
+    #[test]
+    fn agent_contextmenu_keeps_authored_field_menus_and_cancellation() {
+        for named in [false, true] {
+            let extra = format!(
+                "  state opened = 0\n  action open\n    opened = opened + 1\n{}",
+                if named { "" } else { "    preventDefault()\n" }
+            );
+            let attrs = if named {
+                "contextmenu=open contextPopover=\"menu\"\n      column id=\"menu\" popover=\"auto\" role=\"menu\"\n        button \"Item\" press=open"
+            } else {
+                "contextmenu=open"
+            };
+            let (mut p, id, _) = fixture(&extra, attrs);
+            p.serve_overlays();
+            p.set_focus(None, 0.);
+            let selection = p.field_selection(id);
+            let reply: serde_json::Value = serde_json::from_str(&crate::agent::answer(
+                &mut p,
+                &format!(r#"{{"op":"tap","id":{id},"contextmenu":true}}"#),
+            ))
+            .unwrap();
+            assert_eq!(reply["tapped"], id, "{reply}");
+            assert_eq!(
+                p.host.runner().slot("opened"),
+                Some(&exact_runner::Value::Number(1.))
+            );
+            assert_eq!(p.surface().is_some(), named);
+            assert_eq!(p.focus, None);
+            assert_eq!(p.field_selection(id), selection);
+        }
     }
 
     #[test]

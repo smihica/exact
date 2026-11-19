@@ -128,3 +128,39 @@ pub(crate) fn take_baked(baked: &Path, out: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+impl crate::Baked {
+    /// Publish the complete result to a *new* directory. Existing output is
+    /// never replaced; a dev server selects an accepted generation separately.
+    pub fn write_new(&self, output: &Path) -> Result<(), String> {
+        let output = std::path::absolute(output).map_err(|e| e.to_string())?;
+        if output.exists() {
+            return Err(format!("output already exists: {}", output.display()));
+        }
+        // Reserve the destination before writing, so another producer cannot
+        // be overwritten by a later rename. The receipt is written last; this
+        // directory is not a candidate until that complete receipt exists.
+        std::fs::create_dir(&output).map_err(|e| e.to_string())?;
+        let result = (|| {
+            contract::snapshot::write_entries(&self.entries, &output)?;
+            if let Some(map) = &self.source_map {
+                std::fs::write(output.join("app.plan.map.json"), map).map_err(|e| e.to_string())?;
+            }
+            for (name, bytes) in [
+                ("app.plan", &self.plan[..]),
+                ("app.js", &self.script),
+                ("app.hbc", &self.bytecode),
+                ("app.contract.d.ts", self.declarations.as_bytes()),
+                ("app.sources.json", &self.source_inputs),
+                ("app.module.json", self.receipt.as_bytes()),
+            ] {
+                std::fs::write(output.join(name), bytes).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&output);
+        }
+        result
+    }
+}

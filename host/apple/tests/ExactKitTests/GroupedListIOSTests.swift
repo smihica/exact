@@ -2,12 +2,13 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
+@testable import ExactCollections
 @testable import ExactGroupedLists
-/// LLP 1084 on UIKit: a grouped list (`listStyle`) is a UICollectionView
-/// with a list layout as the list's only scroller;
-/// its rows are list cells configured from the kernel's model (D5); a tap
-/// selects, highlights and presses; a toggle flips its control; a custom
-/// row's views are carried into their cell and given back before a batch.
+/// LLP 1084 on UIKit: a grouped list (`listStyle`) is a UICollectionView with a list layout as the
+/// list's only scroller; its rows are list cells configured from the kernel's model (D5); a tap
+/// selects, highlights and presses; a toggle flips its control; a custom row's views are carried
+/// into their cell and given back before a batch.
 /// UIKit, so a simulator runs it: bun host/apple/build.mjs --test --ios
 class GroupedListFixture: XCTestCase {
     var window: UIWindow!
@@ -724,8 +725,8 @@ final class GroupedListIOSTests: GroupedListFixture {
         XCTAssertFalse(toggle.isOn)
     }
 
-    /// A carried custom row given a new box outside a batch keeps it, and is
-    /// carried into its cell again on the next turn.
+    /// A carried custom row given a new box outside a batch keeps it, and is carried into its cell again on the next turn;
+    /// a regrid (a new display scale), which draws every box again, carries it again before it returns.
     func testAReplayedBoxReachesACarriedRow() throws {
         let p = presenter { self.model(custom: true) }
         let row = try XCTUnwrap(p.views[21])
@@ -736,6 +737,8 @@ final class GroupedListIOSTests: GroupedListFixture {
         let after = try cell(p, 21)
         XCTAssertEqual(row.frame.height, 80, "the replayed box, not the one saved at the last carry")
         XCTAssertTrue(row.superview === after.contentView, "carried again")
+        p.regridAll()
+        XCTAssertTrue(row.superview === (try cell(p, 21)).contentView, "carried again before the regrid returns")
     }
 
     /// A card-less section (`section background-color="transparent"`): its
@@ -1060,14 +1063,14 @@ final class GroupedListIOSTests: GroupedListFixture {
         var pressed: [UInt32] = []
         let p = swipeRow { pressed.append($0) }
         let owner = try XCTUnwrap(p.views[21]), delete = try XCTUnwrap(p.views[23])
-        XCTAssertNil(p.swipeActions.refusal(of: owner), "a grouped row's content need not fill it")
+        XCTAssertNil(p.swipeHost.refusal(of: owner), "a grouped row's content need not fill it")
         XCTAssertTrue(delete.isHidden, "the cell's action stands for the control")
         XCTAssertNil(owner.scroll, "no scroll to pan: the cell's swipe takes the touch")
-        XCTAssertTrue(p.swipeActions.ownsAction(23))
+        XCTAssertTrue(p.swipeHost.ownsAction(23))
         let c = try cell(p, 21)
         XCTAssertTrue(owner.isDescendant(of: c.contentView), "carried into its list cell")
-        p.swipeActions.touch(owner)
-        XCTAssertNil(p.swipeActions.cell(of: owner), "no table projected: the list cell is UIKit's own")
+        p.swipeHost.touch(owner)
+        XCTAssertNil(p.swipeHost.cell(of: owner), "no table projected: the list cell is UIKit's own")
         XCTAssertFalse(owner.subviews.contains { $0 is UITableView })
 
         let l = try list(p)
@@ -1089,12 +1092,12 @@ final class GroupedListIOSTests: GroupedListFixture {
         p.apply(wireBatch([["op": "props", "id": 21, "set": ["testId": "swipe-row"], "clear": [String]()]]))
         XCTAssertTrue(delete.isHidden)
         XCTAssertTrue(owner.isDescendant(of: try cell(p, 21).contentView))
-        XCTAssertEqual(p.swipeActions.perform(23), true)
+        XCTAssertEqual(p.swipeHost.perform(23), true)
         XCTAssertEqual(pressed, [23, 23])
         // An inert section offers no action.
         p.apply(wireBatch([["op": "props", "id": 2, "set": ["inert": "true"], "clear": [String]()]]))
         XCTAssertNil(l.swipeActions(at: IndexPath(item: 0, section: 0), leading: false), "inert: nothing offered")
-        XCTAssertEqual(p.swipeActions.perform(23), false)
+        XCTAssertEqual(p.swipeHost.perform(23), false)
     }
 
     /// LLP 1116.008 D4 (grocery-list, round 10): the row's own horizontal snap
@@ -1111,7 +1114,7 @@ final class GroupedListIOSTests: GroupedListFixture {
         let scroll = try XCTUnwrap(owner.scroll, "a `scroll` handler wants the scroll view")
         XCTAssertFalse(scroll.isScrollEnabled, "its pan is off: the cell's swipe takes the touch")
         XCTAssertEqual(scroll.contentOffset.x, -scroll.adjustedContentInset.left, "at its start")
-        XCTAssertNil(p.swipeActions.refusal(of: owner))
+        XCTAssertNil(p.swipeHost.refusal(of: owner))
         XCTAssertTrue(owner.isDescendant(of: try cell(p, 21).contentView), "the cell is UIKit's")
         for _ in 0..<2 {
             p.apply(wireBatch([["op": "props", "id": 21, "set": ["testId": "swipe-row"], "clear": [String]()]]))
@@ -1209,8 +1212,8 @@ final class GroupedListIOSTests: GroupedListFixture {
             ["op": "create", "id": 95, "kind": "view", "props": [:], "style": [:]],
             ["op": "roots", "ids": [95]],
         ]))
-        p.modals.present(try XCTUnwrap(p.views[90]), navigation: UIViewController(), from: background, preceding: nil, owner: owner)
-        XCTAssertEqual(p.modals.routes.count, 1, "the sheet is up")
+        p.modalHost.present(try XCTUnwrap(p.views[90]), navigation: UIViewController(), from: background, preceding: nil, owner: owner)
+        XCTAssertEqual(p.modalHost.routes.count, 1, "the sheet is up")
 
         // The refresh, under the sheet: a "next up" section first, a new row
         // under the others, and row 21 grown.
@@ -1239,11 +1242,11 @@ final class GroupedListIOSTests: GroupedListFixture {
         let l = try list(p)
         p.onViewportFit = {
             l.mount()
-            p.modals.closeTop(animated: false)
+            p.modalHost.closeTop(animated: false)
         }
         p.apply(wireBatch([["op": "props", "id": 95, "set": ["viewportFit": "cover"], "clear": [String]()]]))
         p.onViewportFit = nil
-        XCTAssertTrue(p.modals.routes.isEmpty, "the sheet closed")
+        XCTAssertTrue(p.modalHost.routes.isEmpty, "the sheet closed")
         func shown(_ id: UInt32, _ height: CGFloat, _ what: String) throws {
             let cell = try self.cell(p, id), row = try XCTUnwrap(p.views[id])
             XCTAssertTrue(row.superview === cell.contentView, "\(what): carried into its cell")
@@ -1462,7 +1465,7 @@ final class GroupedListIOSTests: GroupedListFixture {
         view.frame = root.view.bounds
         view.layoutIfNeeded()
         let spin = { (seconds: Double) in RunLoop.main.run(until: Date().addingTimeInterval(seconds)) }
-        let p = session.presenter, nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let p = session.presenter, nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         func node(_ testId: String) throws -> NodeView { try XCTUnwrap(p.views.values.first { $0.props["testId"] == testId }, "no \(testId)") }
         func settle(_ count: Int, _ what: String) {
             let deadline = Date().addingTimeInterval(5)

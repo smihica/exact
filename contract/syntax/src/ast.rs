@@ -1,7 +1,7 @@
 //! The abstract syntax tree.
 pub use crate::colours::{ColorProfileDecl, DesignSource, ThemeDecl};
 pub use crate::tap::TapForm;
-pub use crate::test_steps::{StateComparison, Step, TestDecl};
+pub use crate::test_steps::{StateComparison, StateOperand, Step, TestDecl};
 use crate::Span;
 use std::collections::BTreeMap;
 /// Identifier ranges that are distinct from their AST construct's diagnostic span.
@@ -24,8 +24,15 @@ impl NameSpans {
 pub struct Hidden {
     /// The name, as written.
     pub name: String,
+    /// The word that declared it (`fn`, `state`, `action`), or `use` for a
+    /// name a refused `use` line imported.
+    pub kind: String,
     /// The component whose member it named; `None` for a declaration.
     pub component: Option<String>,
+    /// The first and last lines of that component, where alone its member's
+    /// name is read; `None` for a declaration, and for a member of a
+    /// component some of whose members are in another file.
+    pub lines: Option<(u32, u32)>,
 }
 
 /// One source file.
@@ -64,10 +71,10 @@ pub struct File {
     pub color_profiles: Vec<ColorProfileDecl>,
     /// The app's `theme` (LLP 1095 D4): the root file's only.
     pub theme: Option<ThemeDecl>,
-    /// The app's design, `app.tamber` (LLP 1121 D2), set by the driver.
+    /// The app's design, `app.forma` (LLP 1121 D2), set by the driver.
     pub design: Option<DesignSource>,
     /// The designs of the packages the app's sources link (LLP 1121 D11),
-    /// each `<name>.tamber` beside its package's entry, set by the driver.
+    /// each `<name>.forma` beside its package's entry, set by the driver.
     pub package_designs: Vec<DesignSource>,
     /// The identities of the exported library components (LLP 1139 D0):
     /// each component a private package that ships a design declares in
@@ -1059,6 +1066,7 @@ pub fn unsupported_input_type(value: &Expr) -> Option<&str> {
         Expr::Match { some, none, .. } => {
             unsupported_input_type(some).or_else(|| unsupported_input_type(none))
         }
+        Expr::Let { body, .. } => unsupported_input_type(body),
         _ => None,
     }
 }
@@ -1068,16 +1076,20 @@ pub fn unsupported_input_type(value: &Expr) -> Option<&str> {
 /// (`shown ? "text" : "password"`, a password's show and hide). The node is
 /// a text field either way, so the choice can be made as the app runs, as
 /// the attribute can be set on the web; any other expression could name a
-/// control the compiler has to know (LLP 1069.001 D1).
+/// control the compiler has to know (LLP 1069.001 D1). A `let` around the
+/// choice (a prop read twice, evaluated once) is the same choice.
 pub fn text_input_type(value: &Expr) -> bool {
     match value {
         Expr::Str(t, _) => control_type(t).is_none() && unsupported_input_type(value).is_none(),
         Expr::Ternary(_, a, b, _) => text_input_type(a) && text_input_type(b),
+        Expr::Let { body, .. } => text_input_type(body),
         _ => false,
     }
 }
 
-pub use crate::part::{part_attr, PLACEHOLDER_COLOR};
+pub use crate::part::{
+    part_attr, BACKDROP_COLOR, PLACEHOLDER_COLOR, VIEW_TRANSITION_NEW, VIEW_TRANSITION_OLD,
+};
 
 /// `name=expr`.
 #[derive(Debug, Clone, PartialEq)]

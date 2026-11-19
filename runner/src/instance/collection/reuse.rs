@@ -299,7 +299,7 @@ impl Collection {
     ) -> Result<Mounted, InstanceError> {
         let plan = u.env.plan;
         let token = self.index.invalidate_row(text).map_err(index_error)?;
-        let slots: RowSlots = Rc::new(RefCell::new(BTreeMap::new()));
+        let slots: RowSlots = crate::vm::Owned::shared();
         let row = &mut mounted.row;
         row.frame = Frame {
             item: Some(self.items[position].clone()),
@@ -334,7 +334,7 @@ impl Collection {
                         plan.str(s.name),
                     ));
                 }
-                slots.borrow_mut().insert(i as u32, value);
+                slots.borrow_mut().slots.insert(i as u32, value);
             }
         }
         row.slots = Some(slots);
@@ -351,7 +351,7 @@ impl Collection {
         // create emits, less what the row already shows.
         let full = std::mem::replace(&mut u.full, true);
         let around = std::mem::replace(&mut u.theme, self.around.clone());
-        let body = &u.sites.deps.bodies[self.region.0 as usize];
+        let body = &u.sites.data.deps.bodies[self.region.0 as usize];
         let updated = update_row(u, row, frames, !0, body);
         u.full = full;
         u.theme = around;

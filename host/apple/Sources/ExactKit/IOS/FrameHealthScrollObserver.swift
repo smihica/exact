@@ -96,11 +96,11 @@ extension FrameHealth {
             }
         } else { nativeCoverage = "native-scroll observer requires iOS/tvOS 18" }
     }
-    func beginScroll(_ view: UIScrollView, session: ExactSession) {
+    package func beginScroll(_ view: UIScrollView, session: ExactSession) {
         prepareScrollObservation(session: session)
         if #available(iOS 18.0, tvOS 18.0, *) { (scrollObserver as? FrameHealthScrollObserver)?.begin(view) }
     }
-    func endScroll(_ view: UIScrollView) {
+    package func endScroll(_ view: UIScrollView) {
         if #available(iOS 18.0, tvOS 18.0, *) { (scrollObserver as? FrameHealthScrollObserver)?.end(view) }
     }
     func stopScroll() {

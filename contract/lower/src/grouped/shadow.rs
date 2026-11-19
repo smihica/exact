@@ -132,12 +132,13 @@ fn select(value: &Expr, card: bool) -> Expr {
 /// A shadow track needs the card's underlying value and paint target on every host.
 pub(crate) fn check_animations(
     attrs: &[Attr],
-    keyframes: &std::collections::BTreeMap<String, Vec<Property>>,
+    keyframes: &std::collections::BTreeMap<String, exact_motion::Keyframes>,
+    constants: &crate::keyframes::Context<'_>,
 ) -> Result<(), crate::LowerError> {
     let shadows = |name: &str| {
         keyframes
             .get(name)
-            .is_some_and(|rows| rows.contains(&Property::BoxShadow))
+            .is_some_and(|rows| rows.properties().contains(&Property::BoxShadow))
     };
     if !keyframes.keys().any(|name| shadows(name)) {
         return Ok(());
@@ -147,8 +148,9 @@ pub(crate) fn check_animations(
         names: bool,
         absent: Option<&Expr>,
         shadows: &impl Fn(&str) -> bool,
+        constants: &crate::keyframes::Context<'_>,
     ) -> bool {
-        if let Some(text) = crate::keyframes::constant(value, &[]) {
+        if let Ok(text) = constants.constant(value) {
             if names {
                 return text.split(',').all(|name| !shadows(name.trim()));
             }
@@ -161,9 +163,14 @@ pub(crate) fn check_animations(
                 some: yes,
                 none: no,
                 ..
-            } => allowed(yes, names, absent, shadows) && allowed(no, names, absent, shadows),
-            Expr::Typed(inner, ..) => allowed(inner, names, absent, shadows),
-            Expr::None(_) => absent.is_none_or(|base| allowed(base, false, None, shadows)),
+            } => {
+                allowed(yes, names, absent, shadows, constants)
+                    && allowed(no, names, absent, shadows, constants)
+            }
+            Expr::Typed(inner, ..) => allowed(inner, names, absent, shadows, constants),
+            Expr::None(_) => {
+                absent.is_none_or(|base| allowed(base, false, None, shadows, constants))
+            }
             _ => false,
         }
     }
@@ -175,7 +182,7 @@ pub(crate) fn check_animations(
     for a in names.or(short).into_iter().chain(exit) {
         let names = a.name == "animation-name";
         let absent = names.then_some(short).flatten().map(|a| &a.value);
-        if !allowed(&a.value, names, absent, &shadows) {
+        if !allowed(&a.value, names, absent, &shadows, constants) {
             return crate::err(
                 "lower-grouped-shadow-animation",
                 "a grouped section's shadow belongs to the card; keyframe shadow animation on a grouped section is not supported yet. Use `transition` for shadow changes. Name other animations with literals or choices of literals so their keyframes can be checked",

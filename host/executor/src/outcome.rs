@@ -5,8 +5,9 @@ use super::{failed, MAX_HEADERS};
 use exact_runner::{FailureKind, Outcome, Request};
 use ibex2::stdlib::abort::AbortController;
 
+/// The running ceiling includes the outcome's queue record.
 pub(super) fn bounded_outcome(outcome: Outcome, limit: usize) -> Outcome {
-    if retained(&outcome) > limit {
+    if retained(&outcome).saturating_add(std::mem::size_of::<super::Completed>()) > limit {
         failed(
             FailureKind::Refused,
             "native outcome exceeds retention limit",
@@ -72,6 +73,31 @@ pub(super) fn fetch_failure(e: ibex2::boundary::HostError, abort: &AbortControll
             e.to_string().chars().take(2048).collect::<String>(),
         ),
     }
+}
+
+/// Validate HTTP syntax before either a transport or a driver fixture can answer.
+pub(super) fn request_refusal(request: &Request) -> Option<&'static str> {
+    if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
+        return None;
+    }
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+    };
+    if !token(&request.method)
+        || ["CONNECT", "TRACE", "TRACK"]
+            .iter()
+            .any(|m| request.method.eq_ignore_ascii_case(m))
+    {
+        return Some("TypeError: invalid method");
+    }
+    if request.headers.iter().any(|(name, value)| {
+        !ibex2::stdlib::fetch::is_valid_name(name) || !ibex2::stdlib::fetch::is_valid_value(value)
+    }) {
+        return Some("TypeError: invalid header name or value");
+    }
+    None
 }
 
 /// The transport's request for a runner's.
@@ -154,15 +180,20 @@ pub(super) const fn build_number(set: Option<&str>, default: usize) -> usize {
 
 /// A request's deadline: a thread that aborts the request when it passes,
 /// and ends at once when the request finishes first (the sender drops).
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct Deadline {
     passed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _done: std::sync::mpsc::Sender<()>,
+    #[cfg(test)]
+    abort: AbortController,
 }
 
 impl Deadline {
     pub(super) fn arm(ms: u32, abort: &AbortController) -> Result<Deadline, String> {
         let (done, wait) = std::sync::mpsc::channel::<()>();
         let passed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let controlled_abort = abort.clone();
         let (flag, abort) = (passed.clone(), abort.clone());
         std::thread::Builder::new()
             .name("exact-fetch-deadline".into())
@@ -182,17 +213,29 @@ impl Deadline {
         Ok(Deadline {
             passed,
             _done: done,
+            #[cfg(test)]
+            abort: controlled_abort,
         })
     }
 
     pub(super) fn passed(&self) -> bool {
         self.passed.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(super) fn expire(&self) {
+        if !self.abort.signal().aborted() {
+            self.passed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.abort.abort();
+        }
+    }
 }
 
-/// A WebSocket stream's idle timeout (LLP 1016.000 D11): a thread that
-/// ends the stream when nothing has arrived for `ms`, measured from the
-/// instant of each [`Quiet::heard`] and not from when the thread next runs.
+/// A stream's idle timeout (LLP 1016.000 D11): a thread that ends the
+/// stream when nothing has arrived for `ms`, measured from the instant of
+/// each [`Quiet::heard`] and not from when the thread next runs. Between
+/// [`Quiet::hold`] and the next `heard` nothing is counted.
 ///
 /// The stream ends once, by whichever claims it first: the watch, which
 /// then aborts the read, or its reader, with what it found
@@ -206,8 +249,8 @@ pub(super) struct Quiet {
 }
 
 struct QuietState {
-    /// When something last arrived.
-    heard: std::sync::Mutex<std::time::Instant>,
+    /// When something last arrived, or `None` while the count is held.
+    heard: std::sync::Mutex<Option<std::time::Instant>>,
     /// [`ARMED`], then [`TIMED_OUT`] or [`FINISHED`], once.
     end: std::sync::atomic::AtomicU8,
 }
@@ -221,7 +264,7 @@ impl Quiet {
         use std::sync::atomic::Ordering;
         let (done, wait) = std::sync::mpsc::channel::<()>();
         let shared = std::sync::Arc::new(QuietState {
-            heard: std::sync::Mutex::new(std::time::Instant::now()),
+            heard: std::sync::Mutex::new(Some(std::time::Instant::now())),
             end: std::sync::atomic::AtomicU8::new(ARMED),
         });
         let (state, abort) = (shared.clone(), abort.clone());
@@ -233,7 +276,9 @@ impl Quiet {
                 // arrival takes, so an arrival is either counted or comes
                 // after the timeout, never between the two.
                 let heard = state.heard.lock().unwrap();
-                let left = (*heard + limit).saturating_duration_since(std::time::Instant::now());
+                let left = heard.map_or(limit, |at| {
+                    (at + limit).saturating_duration_since(std::time::Instant::now())
+                });
                 if left.is_zero() {
                     // A stream already let go stays Aborted: the quiet did
                     // not end it. The claim is made before the abort, so the
@@ -264,9 +309,17 @@ impl Quiet {
         })
     }
 
-    /// Something arrived now: the opening, or a complete data message.
+    /// Something arrived now: a socket's opening or one of its complete
+    /// data messages, or bytes of an HTTP stream's body.
     pub(super) fn heard(&self) {
-        *self.shared.heard.lock().unwrap() = std::time::Instant::now();
+        *self.shared.heard.lock().unwrap() = Some(std::time::Instant::now());
+    }
+
+    /// The host stops reading for a while (a byte stream waiting for a
+    /// drain), so it cannot tell a quiet peer: nothing counts until the
+    /// next [`Quiet::heard`].
+    pub(super) fn hold(&self) {
+        *self.shared.heard.lock().unwrap() = None;
     }
 
     /// The stream's end: `end`, which its reader found, unless the watch
@@ -285,6 +338,53 @@ impl Quiet {
             _ => end,
         }
     }
+}
+
+/// A driver's response at the transport boundary, after ordinary request preparation.
+pub(super) struct Fixture(pub(super) super::ResponseWork);
+
+impl Fixture {
+    pub(super) fn response(&self) -> Result<exact_runner::Response, ibex2::boundary::HostError> {
+        match self.0() {
+            Outcome::Response(response) => Ok(response),
+            Outcome::Failed { message, .. } => {
+                Err(ibex2::boundary::HostError::NotAllowed { reason: message })
+            }
+            _ => unreachable!("an HTTP fixture returns a response or refusal"),
+        }
+    }
+}
+
+impl ibex2::stdlib::fetch::Transport for Fixture {
+    fn open(
+        &self,
+        request: &ibex2::stdlib::fetch::Request,
+        signal: &ibex2::stdlib::abort::AbortSignal,
+    ) -> Result<ibex2::stdlib::fetch::StreamingResponse, ibex2::boundary::HostError> {
+        let response = self.response()?;
+        let mut headers = ibex2::stdlib::fetch::Headers::new();
+        for (name, value) in response.headers {
+            headers.append(&name, &value);
+        }
+        Ok(ibex2::stdlib::fetch::Response {
+            status: response.status,
+            status_text: String::new(),
+            headers,
+            body: response.body,
+            url: request.url.clone(),
+            redirected: false,
+        }
+        .into_stream(request.body_limit(), signal.clone()))
+    }
+}
+
+pub(super) fn fixture_fetch(grants: &str, work: super::ResponseWork) -> ibex2::host::Fetch {
+    ibex2::host::Host::with_transport(Box::new(Fixture(work)))
+        .endow(
+            ibex2::grant::GrantSet::parse(&exact_runner::io_grants(grants))
+                .expect("admitted grants"),
+        )
+        .fetch
 }
 
 #[cfg(test)]

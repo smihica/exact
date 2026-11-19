@@ -109,7 +109,7 @@ fn literal_str(plan: &Plan, n: NodesId, prop: PropId) -> Option<&str> {
         if b.kind != BindingKind::Prop || b.id != prop as u16 {
             return None;
         }
-        match crate::vm::instructions(plan.code(b.expr))
+        match crate::vm::instructions(plan.read_code(plan.code(b.expr)).0)
             .collect::<Result<Vec<_>, _>>()
             .as_deref()
         {
@@ -188,10 +188,7 @@ impl Index {
                             }
                         }
                     }
-                    let kids = match n.collection() {
-                        Some(_) => Vec::new(),
-                        None => roots_of(&n.children),
-                    };
+                    let kids = roots_of(&n.children);
                     let node_type = NodeType::from_wire(row.node_type).unwrap_or(NodeType::View);
                     self.nodes.insert(n.view, (node_type, props, kids));
                     if let Some(p) = parent {
@@ -234,7 +231,7 @@ impl Index {
 
 /// The instance tree's tab state, kept in [`Ids`], which lasts the
 /// runner's life and every update reaches.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Tabs {
     /// The plan's [`panel_sites`], found when first asked; none once every
     /// tab is built ([`Tabs::build_every_tab`]).
@@ -458,9 +455,12 @@ fn open_panel(
         .as_ref()
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let mut frame = ArmFrame::default();
-    if plan.slots.iter().any(|s| s.owner == Some(contents)) {
-        let slots: RowSlots = Rc::new(RefCell::new(BTreeMap::new()));
+    let mut frame = ArmFrame {
+        region: Some(region.0),
+        ..ArmFrame::default()
+    };
+    if super::region::owns_slots(plan, contents) {
+        let slots: RowSlots = crate::vm::Owned::shared();
         frame.region = Some(region.0);
         frame.row = Some(slots.clone());
         let inner = with_frame(frames, frame.scope());
@@ -483,8 +483,9 @@ fn open_panel(
             if !v.conforms(plan, s.ty) {
                 return Err(InstanceError::slot_type(plan, &v, s.ty, name));
             }
-            slots.borrow_mut().insert(i as u32, v);
+            slots.borrow_mut().slots.insert(i as u32, v);
         }
+        super::region::init_requests(u, contents, &slots);
     }
     let roots = realize(u, None, Some(contents), &with_frame(frames, frame.scope()))?;
     Ok(vec![Child::Region(RegionInst {
@@ -525,7 +526,7 @@ impl Tree {
                         } = &r.active
                         {
                             if sites.binary_search(&n.node).is_ok() {
-                                for (i, v) in slots.borrow().iter() {
+                                for (i, v) in slots.borrow().slots.iter() {
                                     let name = plan.str(plan.slots[*i as usize].name);
                                     out.push((id.to_owned(), name.to_owned(), v.clone()));
                                 }
@@ -567,21 +568,19 @@ fn open_in(
                     // A virtualized list that is a panel makes its window's
                     // rows now, as it would have when made.
                     match u.env.lists {
-                        Some(lists) => (lists.create)(u, n.node, n.view, frames)
-                            .map(|made| n.set_collection(made)),
+                        Some(lists) => (lists.create)(u, n.node, n.view, frames, &mut n.children)
+                            .map(|made| n.set_list(made)),
                         None => Ok(()),
                     }
-                    .and_then(|()| match n.collection() {
+                    .and_then(|()| match n.list() {
                         Some(_) => Ok(()),
                         None => open_panel(u, n, frames).map(|made| {
                             n.children = made;
                             n.emit_children(u);
                         }),
                     })
-                } else if n.collection().is_none() {
-                    open_in(u, &mut n.children, frames, open, left)
                 } else {
-                    Ok(())
+                    open_in(u, &mut n.children, frames, open, left)
                 };
                 u.theme = saved;
                 done.map_err(|e| e.at_view(n.view, n.node))?;

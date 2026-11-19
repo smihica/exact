@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { open } from '../../scripts/agent.mjs';
+import { open, runTests } from '../../scripts/agent.mjs';
 import { webCompiler } from './module.mjs';
 
 // Uses the already-built exact-web-js compiler. The fixture and peer are
@@ -9,16 +9,21 @@ import { webCompiler } from './module.mjs';
 test('JS target socket mutations, mapper replies and answers echo ordered frames and obey commits and resource lifetime', async () => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
   const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/socket-test-'));
-  const received = [], connections = new Set(), acks = [], unowned = [], asked = [];
+  const received = [], connections = new Set(), acks = [], unowned = [], asked = [], cancelledHttp = new Set();
   let counted = 0, ackedClosed = false;
   const peer = Bun.serve({ hostname: '127.0.0.1', port: 0,
     fetch(req, server) {
-      if (new URL(req.url).pathname === '/count') { counted++; return new Response('counted', { headers: { 'access-control-allow-origin': '*' } }); }
-      if (new URL(req.url).pathname === '/body') return req.text().then(body => new Response('body:' + body, { headers: { 'access-control-allow-origin': '*' } }));
-      if (new URL(req.url).pathname === '/events') return new Response(new ReadableStream({
-        start(controller) { controller.enqueue(new TextEncoder().encode('data: initial\n\n')); },
-      }), { headers: { 'content-type': 'text/event-stream', 'access-control-allow-origin': '*' } });
-      return server.upgrade(req, { data: { path: new URL(req.url).pathname } }) ? undefined : new Response('websocket only');
+      const path = new URL(req.url).pathname;
+      if (path === '/count') { counted++; return new Response('counted', { headers: { 'access-control-allow-origin': '*' } }); }
+      if (path === '/body') return req.text().then(body => new Response('body:' + body, { headers: { 'access-control-allow-origin': '*' } }));
+      if (['/events', '/drop-events', '/drop-bytes'].includes(path)) {
+        const bytes = path === '/drop-bytes';
+        return new Response(new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode(bytes ? 'initial' : 'data: initial\n\n')); },
+          cancel() { cancelledHttp.add(path); },
+        }), { headers: { 'content-type': bytes ? 'application/octet-stream' : 'text/event-stream', 'access-control-allow-origin': '*' } });
+      }
+      return server.upgrade(req, { data: { path } }) ? undefined : new Response('websocket only');
     },
     websocket: {
       open(ws) { if (!['/acked', '/mutation', '/answers'].includes(ws.data.path)) connections.add(ws); },
@@ -54,6 +59,9 @@ test('JS target socket mutations, mapper replies and answers echo ordered frames
   resource answers = answers() as shape string else empty()
   resource asked = ask(q) as shape string else empty()
   resource gate = gate(q) as shape string else empty()
+  resource drop = droppable(q) as shape string else empty()
+  resource events = httpStream(q, "events") as shape string else empty()
+  resource bytes = httpStream(q, "bytes") as shape string else empty()
   mutation sent as shape string queue
   mutation second as shape string
   mutation watched as shape string
@@ -159,11 +167,34 @@ test('JS target socket mutations, mapper replies and answers echo ordered frames
         text "send, wait, fetch"
       button press=rollbackAsync testId="rollback-async"
         text "rollback a promise"
+      button press=askFor("drop") testId="open-drop"
+        text "open drop socket"
+      button press=write("release-drop") testId="release-drop"
+        text "release the paused mapper"
+      button press=write("drop-calls") testId="drop-calls"
+        text "read the mapper calls"
 `);
   writeFileSync(resolve(dir, 'app.ts'), `export const appId = 'test.socket';
 export const grants = ${JSON.stringify(`net.websocket ${url}\nnet.fetch http://127.0.0.1:${peer.port}`)};
 const sockets = new Map(), controllers = new Map(), waiters = new Map(); let previous: any, answers: any, leaked = '', holds = 0;
+const dropCalls: string[] = [];
 export function answer(name: string, args: any): any {
+  if (name === 'httpStream') {
+    if (args[0] !== 'drop') return '';
+    return fetch(${JSON.stringify(`http://127.0.0.1:${peer.port}/drop-`)} + args[1], { exactStream(event: any) {
+      return event.type === 'error' ? event.kind : typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+    }});
+  }
+  if (name === 'droppable') {
+    if (args[0] !== 'drop') return '';
+    return fetch(${JSON.stringify(`${url}/drop`)}, { exactStream(event: any) {
+      if (event.type === 'error') { dropCalls.push(event.type + ':' + event.kind); return event.kind; }
+      if (event.type === 'open') return 'open';
+      dropCalls.push(event.data);
+      if (event.data === 'pause') return new Promise(resolve => waiters.set('drop', resolve));
+      return event.data;
+    }});
+  }
   if (name === 'answers') return fetch(${JSON.stringify(`${url}/answers`)}, { exactStream(event: any, socket?: any) {
     if (event.type === 'open') { answers = socket; return 'open'; }
     if (event.type === 'message') { const [, n, got] = event.data.split(' '); waiters.get(n)?.(got); }
@@ -234,6 +265,8 @@ export function answer(name: string, args: any): any {
   if (name === 'denied') return fetch('ws://localhost:' + ${peer.port}, { exactStream: (e: any) => e.kind });
   if (name === 'refuse') throw Object.assign(new Error('deliberate commit refusal'), { refuse: true });
   const mode = args[0], s = mode === 'stale' ? previous : sockets.get(1), t = sockets.get(2);
+  if (mode === 'release-drop') { waiters.get('drop')?.('released'); return 'released'; }
+  if (mode === 'drop-calls') return dropCalls.join(',');
   const counter = ${JSON.stringify(`http://127.0.0.1:${peer.port}/count`)};
   if (mode === 'probe') { const before = t.bufferedAmount; t.send('abc'); return before + ':' + t.bufferedAmount; }
   if (mode === 'read') return 'read:' + t.bufferedAmount;
@@ -470,6 +503,39 @@ export function answer(name: string, args: any): any {
     await browser.tap('leaked');
     await until(s => JSON.stringify(s.slots.sent).includes('hold1: the answer was let go before this fetch'));
     expect(counted).toBe(2);
+
+    await browser.tap('open-drop');
+    await until(s => s.resources.drop === 'open' && s.resources.events === 'initial' && s.resources.bytes === 'initial');
+    const socket = [...connections].find(ws => ws.data.path === '/drop');
+    await browser.op({ op: 'perf', streams: true, start: true });
+    socket.send('pause');
+    socket.send('queued');
+    const deadline = performance.now() + 15000;
+    while ((await browser.op({ op: 'perf', streams: true })).streamTiming.streams.find(s => s.name === 'drop')?.messages !== 2) {
+      if (performance.now() >= deadline) throw new Error('the two frames did not reach the stream');
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const drop = { op: 'prefer', faults: { dropStream: url + '/drop' } };
+    expect(await browser.op(drop)).toMatchObject({ dropped: true });
+    const dropped = await until(s => s.resources.drop === 'Network' && !connections.has(socket));
+    expect(dropped.streams.map(s => s.name)).toContain('other');
+    expect(dropped.streams.map(s => s.name)).not.toContain('drop');
+    await browser.tap('release-drop');
+    await browser.tap('drop-calls');
+    await until(s => JSON.stringify(s.slots.sent).includes('"pause,error:Network"'));
+    expect((await browser.state()).resources.drop).toBe('Network');
+    const httpDrop = { op: 'prefer', faults: { dropStream: `http://127.0.0.1:${peer.port}/drop-` } };
+    expect(await browser.op(httpDrop)).toMatchObject({ dropped: true });
+    const ended = await until(s => s.resources.events === 'Network' && s.resources.bytes === 'Network'
+      && cancelledHttp.has('/drop-events') && cancelledHttp.has('/drop-bytes'));
+    expect(ended.streams.map(s => s.name)).not.toContain('events');
+    expect(ended.streams.map(s => s.name)).not.toContain('bytes');
+
+    const file = resolve(dir, 'missing.test.contract');
+    writeFileSync(file, 'test "missing stream"\n  drop stream "ws://unmatched.test/"\n');
+    const missing = await runTests({ host: 'web', app: dir, file, url: server.url.href, webDist: resolve(dir, 'dist') });
+    expect(missing.failed).toBe(1);
+    expect(missing.results[0].failures.join('\n')).toContain('line 2: drop stream "ws://unmatched.test/" matched no open stream');
   } finally {
     await browser?.close(); server?.stop(true); peer.stop(true); rmSync(dir, { recursive: true, force: true });
   }

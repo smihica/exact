@@ -10,7 +10,12 @@ use super::*;
 /// A list route that holds an `id="moves"` of its own, beneath a detail with
 /// a link to its `#moves`, buttons that commit or scroll, and a scroller of
 /// ten 50 px rows, the `moves` box, a button, then ten more.
-fn boot() -> Presenter<()> {
+fn plan() -> Vec<u8> {
+    plan_with("")
+}
+
+/// The plan with `port` written on the detail's scroller.
+fn plan_with(port: &str) -> Vec<u8> {
     let rows = |from: usize| -> String {
         (from..from + 10)
             .map(|i| format!("                box height=50 id=\"row-{i}\"\n"))
@@ -43,13 +48,15 @@ component App
               text "Nothing"
             box id="moves" height=50
           if e.name == "detail"
+            button press=open("/detail?next") testId="plain"
+              text "Next"
             link href="#moves" testId="to-moves"
               text "Moves"
             button press=bump tabindex=1 testId="bump"
               text "Bump"
             button press=aim testId="aim"
               text "Aim"
-            scroll testId="port" height=100
+            scroll testId="port" height=100{port}
               column
 {}                box id="moves" testId="target" height=50
                 button tabindex=2 testId="after"
@@ -58,8 +65,16 @@ component App
         rows(0),
         rows(10)
     );
-    let (mut p, error) = Presenter::boot_with(
-        &crate::test_plan(&source),
+    crate::test_plan(&source)
+}
+
+fn boot() -> Presenter<()> {
+    boot_with("")
+}
+
+fn boot_with(port: &str) -> Presenter<()> {
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan_with(port),
         (),
         (400., 800.),
         1.,
@@ -148,6 +163,111 @@ fn the_authors_scroll_into_view_ends_the_fragments_hold() {
 }
 
 #[test]
+fn a_new_router_activation_ends_the_previous_fragments_hold() {
+    let mut p = boot();
+    let _ = open(&mut p, "moves", None);
+    // Hold the previous fragment as while its pictures load.
+    p.fragment_anchor = Some((id(&p, "target"), p.person_scrolls));
+    let activation = p.fragment_seen;
+    p.tap(id(&p, "to-moves")).unwrap();
+    assert!(p.fragment_seen > activation);
+    assert!(
+        p.fragment_anchor.is_none(),
+        "the old target stops holding before the new scroll runs"
+    );
+    assert!(
+        p.fragment_armed.is_some(),
+        "the new fragment still waits for its content"
+    );
+}
+
+#[test]
+fn navigation_without_a_fragment_retires_the_previous_hold() {
+    let mut p = boot();
+    let _ = open(&mut p, "moves", None);
+    p.fragment_anchor = Some((id(&p, "target"), p.person_scrolls));
+    assert!(p
+        .host
+        .dispatch_at(id(&p, "plain"), exact_runner::Event::Press, p.host.now())
+        .is_none());
+    assert!(p.after_commit().is_none());
+    assert_eq!(p.host.router_op().unwrap().activation, 0);
+    assert!(p.fragment_anchor.is_none());
+    assert!(p.fragment_armed.is_none());
+}
+
+#[test]
+fn a_replacement_runner_arms_its_first_activation_and_checks_person_scrolls() {
+    let mut p = boot();
+    let _ = open(&mut p, "moves", None);
+    let _ = open(&mut p, "to-moves", None);
+    assert!(p.fragment_seen > 1);
+    assert!(p.reload(&plan(), ()).unwrap() == crate::presenter::ReloadResult::Applied(None));
+    settle(&mut p);
+    assert_eq!(p.fragment_seen, 1);
+    assert!(p.fragment_armed.is_some());
+    p.person_scrolls += 1;
+    p.run_commands(|| ());
+    assert_eq!(p.scroll_of(id(&p, "port")).1, 0.);
+    assert!(p.fragment_armed.is_none());
+}
+
+#[test]
+fn an_activation_already_taken_or_superseded_scrolls_nothing() {
+    let mut p = boot();
+    let _ = open(&mut p, "moves", None);
+    let port = open(&mut p, "to-moves", None);
+    let visit = p.host.router_op().unwrap().top as f64;
+    let taken = p.fragment_seen as f64;
+    assert!(taken > 1., "an older activation to replay");
+    let target = id(&p, "target");
+    // As while the route's pictures load.
+    p.fragment_anchor = Some((target, p.person_scrolls));
+    for activation in [taken, taken - 1.] {
+        p.scroll_to_fragment(&[
+            exact_plan::Value::Number(visit),
+            exact_plan::Value::str("nothing"),
+            exact_plan::Value::Number(activation),
+        ]);
+        assert_eq!(
+            p.scroll_of(port).1,
+            500.,
+            "activation {activation}: still at #moves"
+        );
+        assert_eq!(
+            p.fragment_anchor.map(|(t, _)| t),
+            Some(target),
+            "activation {activation}: the current hold stays"
+        );
+    }
+}
+
+/// LLP 1153 D5.1: with no fragment, a page's scroller starts over: at its
+/// start with nothing written, at the offset `scrollTop` gives, and under
+/// `scroll-restoration="manual"` where it was.
+#[test]
+fn a_page_that_arrives_without_a_fragment_starts_its_scroller_over() {
+    for (port, expected) in [
+        ("", 0.),
+        (" scrollTop=120", 120.),
+        (r#" scroll-restoration="manual""#, 500.),
+    ] {
+        let mut p = boot_with(port);
+        let port_id = open(&mut p, "moves", None);
+        assert_eq!(p.scroll_of(port_id).1, 500.);
+        let visit = p.host.router_op().unwrap().top as f64;
+        let next = p.fragment_seen as f64 + 1.;
+        p.scroll_to_fragment(&[
+            exact_plan::Value::Number(visit),
+            exact_plan::Value::str(""),
+            exact_plan::Value::Number(next),
+        ]);
+        settle(&mut p);
+        assert_eq!(p.scroll_of(port_id).1, expected, "{port}");
+    }
+}
+
+#[test]
 fn no_such_element_says_so_and_leaves_the_route_at_its_top() {
     let mut p = boot();
     let port = open(&mut p, "nothing", None);
@@ -229,7 +349,7 @@ fn nested_scroll_styled(
 {rows}      box height=2000 flex-shrink=0
 "#
     );
-    let (p, error) = Presenter::boot_with(
+    let (p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(&source),
         (),
         (400., 300.),
@@ -328,7 +448,7 @@ fn nested_scroll_into_view_projects_both_axes_through_two_ports_and_the_page() {
     let mut expected = Vec::new();
     for display in [false, true] {
         for already_scrolled in [false, true] {
-            let (mut p, error) = Presenter::boot_with(
+            let (mut p, error) = Presenter::boot_with_fixture_fonts(
                 &plan,
                 (),
                 (400., 300.),
@@ -492,7 +612,7 @@ fn scroll_into_view_uses_the_page_offset_of_an_immediate_frame() {
       box height=2000
 "#,
     );
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &plan,
         (),
         (400., 300.),
@@ -568,7 +688,7 @@ fn scroll_into_view_reveals_an_inline_targets_glyphs() {
 "#,
             "Line\\n".repeat(12)
         ));
-        let (mut p, error) = Presenter::boot_with(
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
             &plan,
             (),
             (400., 300.),
@@ -612,7 +732,7 @@ fn scroll_into_view_reveals_the_visible_part_of_a_projective_target() {
 "#
         ));
         for mode in ["headless", "acknowledged", "pending"] {
-            let (mut p, error) = Presenter::boot_with(
+            let (mut p, error) = Presenter::boot_with_fixture_fonts(
                 &plan,
                 (),
                 (400., 300.),

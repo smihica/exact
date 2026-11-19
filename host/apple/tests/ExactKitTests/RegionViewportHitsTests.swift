@@ -1,3 +1,5 @@
+// The region text service is the Mac's (RegionService.swift).
+#if os(macOS)
 import Foundation
 import CoreText
 import CoreGraphics
@@ -303,3 +305,4 @@ private final class ViewportShapeGate: @unchecked Sendable {
 private final class ViewportHitOwners: @unchecked Sendable {
     var first: RegionViewportHits?, second: RegionViewportHits?, third: RegionViewportHits?
 }
+#endif

@@ -1,16 +1,18 @@
-// `prefer`, the ninth operation's facts (LLP 1061 D5; LLP 1069.000 D6; LLP
-// 1069.007 D2; LLP 1078 D7): the device facts by their web names, grouped
-// on the wire as `media`, `page` and `fold`; and the web carrier's own path
-// for them — the browser's emulation through CDP where it has one, the
-// glue's substitute where it does not. agent.mjs re-exports the tables.
+// `prefer`, the ninth operation's facts (LLP 1039 D7; LLP 1061 D5; LLP
+// 1069.000 D6; LLP 1069.007 D2; LLP 1078 D7): the device facts by their web
+// names, grouped on the wire as `media`, `page` and `fold`; and the web
+// carrier's own path for them — the browser's emulation through CDP where it
+// has one, the glue's substitute where it does not. agent.mjs re-exports the
+// tables.
 import { MalformedOperation } from './agent-keys.mjs';
 /** A root font size as its help writes it (`53px`) or as a number; px is its only unit. */
 const px = (name, value) => name === 'root-font-size' ? String(value).replace(/px$/, '') : value;
 
 /** Every host's display preferences at launch under the agent (LLP 1069.007 D2). */
 export const LAUNCH_MEDIA = { 'prefers-reduced-motion': 'no-preference', 'prefers-reduced-transparency': 'no-preference', 'prefers-color-scheme': 'light', 'prefers-contrast': 'no-preference', 'color-gamut': 'srgb', 'dynamic-range': 'standard' };
+// `visibility-state hidden` and `frozen` substitute page facts and their defined transitions; neither suspends the drive (LLP 1012 §1).
 export const PREFERENCES = { 'display-mode': ['standalone', 'browser', 'fullscreen', 'minimal-ui', 'window-controls-overlay', 'picture-in-picture', 'tabbed'], 'prefers-reduced-motion': ['reduce', 'no-preference'], 'prefers-reduced-transparency': ['reduce', 'no-preference'], 'prefers-contrast': ['more', 'less', 'custom', 'no-preference'], 'prefers-color-scheme': ['dark', 'light'], 'color-gamut': ['srgb', 'p3', 'rec2020'], 'dynamic-range': ['standard', 'high'], pointer: ['coarse', 'fine', 'none'], hover: ['none', 'hover'] }; // `prefer`'s CSS media features and values (the display's two: LLP 1100 D9; the primary input's two, `exactViewport().pointer` and `.hover`: LLP 1132 D10)
-export const PAGE_FACTS = { 'visibility-state': ['visible', 'hidden'], online: ['true', 'false'], 'can-share': ['true', 'false'], 'can-share-files': ['true', 'false'], 'can-share-pictures': ['true', 'false'], 'can-open-files': ['true', 'false'], 'iframe-partition': ['true', 'false'], 'has-focus': ['true', 'false'], 'keyboard-navigation': ['true', 'false'], 'bold-text': ['true', 'false'], 'root-font-size': ['<px>'], 'display-scale': ['<device pixels a px>'], 'gpu-tier': ['low', 'mid', 'high'] }; // `prefer`'s page group (LLP 1069.000 D2, D3, D6; LLP 1069.007 D2; `has-focus`: #114; `keyboard-navigation`: the Mac's setting, whether Tab reaches every control, LLP 1115.000 D7.2, refused by name on the other hosts; `bold-text`: Apple's Bold Text, which the kernel weights the system font by, LLP 1115.000 D12.3, refused by name elsewhere; `display-scale`: what a hairline is one device pixel of, LLP 1115.000 D10.3; `gpu-tier`: `exactViewport().gpuTier`, `high` from launch, and the rung a world's renderer is made at, LLP 1139.003 D2; `iframe-partition`: `exactPage().iframePartition`, LLP 1020.002 D1)
+export const PAGE_FACTS = { 'screen-reader': ['on', 'off', 'unknown'], frozen: ['true', 'false'], 'visibility-state': ['visible', 'hidden'], online: ['true', 'false'], 'can-share': ['true', 'false'], 'can-share-files': ['true', 'false'], 'can-share-pictures': ['true', 'false'], 'can-open-files': ['true', 'false'], 'iframe-partition': ['true', 'false'], 'has-focus': ['true', 'false'], 'keyboard-navigation': ['true', 'false'], 'bold-text': ['true', 'false'], 'root-font-size': ['<px>'], 'display-scale': ['<device pixels a px>'], 'gpu-tier': ['low', 'mid', 'high'], presented: ['true', 'false'] }; // `prefer`'s page group (LLP 1069.000 D2, D3, D6; LLP 1069.007 D2; `has-focus`: #114; `keyboard-navigation`: the Mac's setting, whether Tab reaches every control, LLP 1115.000 D7.2, refused by name on the other hosts; `bold-text`: Apple's Bold Text, which the kernel weights the system font by, LLP 1115.000 D12.3, refused by name elsewhere; `display-scale`: what a hairline is one device pixel of, LLP 1115.000 D10.3; `gpu-tier`: `exactViewport().gpuTier`, `high` from launch, and the rung a world's renderer is made at, LLP 1139.003 D2; `iframe-partition`: `exactPage().iframePartition`, LLP 1020.002 D1; `presented`: `exactPage().presented`, held at the value named, which moves no animation, LLP 1069.000 D6)
 export const FOLD_FACTS = { posture: ['folded', 'continuous'], segments: ['<cols>x<rows>'], gap: ['<points>'] }; // `prefer`'s fold group (LLP 1078 D7): a host without a fold splits its viewport evenly; one with a fold refuses
 export const MIDI_FACTS = { 'midi.state': ['prompt', 'granted', 'denied', 'unavailable'], 'midi.inputs': ['<name,…>'], 'midi.outputs': ['<name,…>'] }; // `prefer`'s midi group (LLP 1125 §4): what a request finds under the agent — its state (granted unless named) and the ports, by name; a port named no longer is disconnected
 export const MODE_FACT = { mode: ['<axis>=<value>'] }; // `prefer`'s mode group (LLP 1121 D5, D13): the app's own modes, `setMode` for each pin; `prefers-color-scheme` stays as it is
@@ -100,12 +102,12 @@ export function mediaHeard(features, preferences, token) {
 }
 
 export async function preferWeb({ media, page, fold = {}, mode = {}, emulated, call, evaluate, frame, ask, scale = 0 }) {
-  if (media['display-mode'] != null) throw new Error(`Chrome prefer cannot emulate display-mode ${media['display-mode']}: use the browser's fullscreen controls`);
   // LLP 1115.000 D10.3: a browser's scale is fixed when it launches (`EXACT_SCALE=2 bun scripts/agent.mjs web …`: Chrome's own device scale factor). CDP's emulated one moves `devicePixelRatio` and the resolution queries but not the device pixel a border snaps to (Chrome 154: a 0.5px border stays 1px under it), so it is not offered as the scale.
   if (page['display-scale'] != null) { const now = await evaluate('devicePixelRatio'); if (Math.abs(now - page['display-scale']) > 0.01) throw new Error(`prefer: display-scale ${page['display-scale']}: a browser's scale is fixed when it launches, and this one's is ${now}; launch it at another with EXACT_SCALE=${page['display-scale']}`); }
   // Chrome's media emulation ignores `pointer` and `hover`; its touch emulation answers them, together: a touch screen is `coarse` with
   // `none`, the mouse it replaces `fine` with `hover` (Chrome 155), and nothing emulates `pointer: none`.
-  const { pointer, hover, ...rest } = media;
+  // Chrome takes CDP's `display-mode` emulation and changes nothing, so the glue substitutes that fact (LLP 1039 D7).
+  const { pointer, hover, 'display-mode': display, ...rest } = media;
   if (pointer != null || hover != null) {
     const touch = pointer != null ? pointer === 'coarse' : hover === 'none';
     if (pointer === 'none' || (pointer != null && hover != null && touch !== (hover === 'none')))
@@ -145,10 +147,10 @@ export async function preferWeb({ media, page, fold = {}, mode = {}, emulated, c
     await frame();
   }
   const hasMode = Object.keys(mode).length > 0;
-  const pageReply = Object.keys(page).length || foldRequest || hasMode ? await ask({ op: 'prefer', ...(Object.keys(page).length ? { page } : {}), ...(foldRequest ? { fold: foldRequest } : {}), ...(hasMode ? { mode } : {}) }) : null;
+  const pageReply = Object.keys(page).length || foldRequest || hasMode || display != null ? await ask({ op: 'prefer', ...(Object.keys(page).length ? { page } : {}), ...(foldRequest ? { fold: foldRequest } : {}), ...(hasMode ? { mode } : {}), ...(display != null ? { media: { 'display-mode': display } } : {}) }) : null;
   if (pageReply?.error) throw new Error(pageReply.error);
   if (pageReply) await frame();
-  return { media: await evaluate(`Object.fromEntries(${JSON.stringify(Object.entries(PREFERENCES))}.map(([name, values]) => [name, values.find(v => matchMedia('(' + name + ': ' + v + ')').matches) ?? values.at(-1)]))`), ...(pageReply ? { page: pageReply.page, fold: pageReply.fold, ...(hasMode ? { mode: pageReply.mode } : {}) } : {}) };
+  return { media: await evaluate(`({ ...Object.fromEntries(${JSON.stringify(Object.entries(PREFERENCES))}.map(([name, values]) => [name, values.find(v => matchMedia('(' + name + ': ' + v + ')').matches) ?? values.at(-1)])), ...(globalThis.__exactDisplayMode ? { 'display-mode': globalThis.__exactDisplayMode } : {}) })`), ...(pageReply ? { page: pageReply.page, fold: pageReply.fold, ...(hasMode ? { mode: pageReply.mode } : {}) } : {}) };
 }
 
 export function faultRequest(op, args) {

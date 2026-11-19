@@ -65,7 +65,8 @@ const grantTupleValid = (grant) => {
       "app:",
       "doc:",
       "home:",
-      "bundle:"
+      "bundle:",
+      "desktop:", "documents:", "downloads:", "music:", "pictures:", "videos:", "screenshots:"
     ].includes(grant[1]) || nativeNamespace(grant[1])) && grant.slice(2).every((component) => nativeNamespace(grant[1]) ? nativeLeaf(component) : typeof component === "string" && component && component !== "." && component !== ".." && !component.includes("/"));
   }
   if (!nameGrants.has(grant[0]) || grant.length !== 2 || typeof grant[1] !== "string") {
@@ -73,7 +74,9 @@ const grantTupleValid = (grant) => {
   }
   return grant[0] === "env-read" || validGrantName(grant[1]);
 };
+export const knownFolderPath = (path) => typeof path === "string" && /^(desktop|documents|downloads|music|pictures|videos|screenshots):\//.test(path);
 const pathTuple = (kind, target) => {
+  if (knownFolderPath(target) && kind !== "fs-write") return null;
   const native = target.startsWith("\\\\?\\") ? target.slice(4) : target;
   if (/^[a-z]:[/\\]/i.test(native)) {
     const parts = native.slice(3).split(/[/\\]/).filter(Boolean);
@@ -90,7 +93,8 @@ const pathTuple = (kind, target) => {
     "app:",
     "doc:",
     "home:",
-    "bundle:"
+    "bundle:",
+    "desktop:", "documents:", "downloads:", "music:", "pictures:", "videos:", "screenshots:"
   ].includes(namespace)) {
     return null;
   }
@@ -193,7 +197,7 @@ const sourceTuple = (source) => {
   }
   return null;
 };
-const exactOnly = (source) => /^(#|surface\.read |surface\.write |device\.|runtime\.|auth\.|net\.dns-sd |process\.spawn |secret\.hold |env\.read login:|doc\.keep$|browser\.automation$|payment\.google-pay$|payment\.apple-pay )/.test(source);
+const exactOnly = (source) => /^(#|surface\.read |surface\.write |device\.|runtime\.|auth\.|net\.dns-sd |process\.spawn |secret\.hold |env\.read login:|env\.launch |doc\.keep$|browser\.automation$|payment\.google-pay$|payment\.apple-pay )/.test(source);
 const entryMatchesSource = ([, source, grant, error]) => {
   if (grant === null) {
     return error !== null || exactOnly(source);
@@ -350,7 +354,8 @@ function grantPathParts(path) {
     "app:",
     "doc:",
     "home:",
-    "bundle:"
+    "bundle:",
+    "desktop:", "documents:", "downloads:", "music:", "pictures:", "videos:", "screenshots:"
   ].includes(namespace)) {
     return null;
   }

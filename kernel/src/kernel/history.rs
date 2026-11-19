@@ -172,6 +172,7 @@ mod tests {
 
     #[test]
     fn history_keeps_every_receipt_field() {
+        exact_motion::link_transitions();
         let keys: Vec<_> = (0..128).map(|i| key(i, 99)).collect();
         let mut reverse = keys.clone();
         reverse.reverse();

@@ -10,23 +10,23 @@ import AppKit
 import UIKit
 #endif
 
-struct TabFace: Equatable {
+package struct TabFace: Equatable {
     /// The symbol without a `.fill` ending: a bar chooses the variant it
     /// draws (UIKit's the filled one for the selected tab). An svg-only
     /// icon's path token (`FaceSymbol`, stage 9 A2) has no variant.
     /// `accessibilityDisabled`: `aria-disabled`, which reads as disabled
     /// and still presses.
-    let base: String?, title: String, disabled: Bool, accessibilityDisabled: Bool
+    package let base: String?, title: String, disabled: Bool, accessibilityDisabled: Bool
     /// A child image's bundled raster (`app:/…` or a bundle-relative name)
     /// where the tab has no symbol: drawn as the item's template glyph.
-    let raster: String?
+    package let raster: String?
     /// A filled box holding a text among the tab's children: the item's
     /// badge (LLP 1075.003 §9.9), as the web paints it on the tab.
-    let badge: String?
+    package let badge: String?
     /// An svg-only icon's token name (`icon.reply`) where the face says it:
     /// the agent's name for a path `base`.
-    let icon: String?
-    init(_ tab: NodeView) {
+    package let icon: String?
+    package init(_ tab: NodeView) {
         var icon: String?, raster: String?
         var symbol: String?, label = tab.props["accessibilityLabel"] ?? "", badges: [String] = []
         if tab.isNativeButton, let face = tab.face {
@@ -37,7 +37,7 @@ struct TabFace: Equatable {
             // Its children are its face and draw no views: the kernel reads its badge.
             if let badge = face.badge { badges.append(badge) }
         }
-        for case let child as NodeView in tab.container.subviews {
+        for child in tab.childNodes {
             if child.kind == "image", let name = child.faceSymbol { symbol = name }
             else if child.kind == "image", let source = child.props["imageSource"], Self.isLocalRaster(source) { raster = source }
             else if child.isParagraph, !child.accessibleText.isEmpty { label = child.accessibleText }
@@ -53,8 +53,8 @@ struct TabFace: Equatable {
         accessibilityDisabled = tab.ariaUnavailable
     }
     /// `symbol` without a `.fill` ending (`base`); a path token as it is.
-    static func base(_ symbol: String) -> String {
-        symbol.hasSuffix(".fill") && !FaceSymbol.isPath(symbol) ? String(symbol.dropLast(5)) : symbol
+    package static func base(_ symbol: String) -> String {
+        symbol.hasSuffix(".fill") && !FaceSymbol.isCustom(symbol) ? String(symbol.dropLast(5)) : symbol
     }
     /// A source the bar can read without fetching: the app's own file or a
     /// bundled asset, never a `symbol:`, `data:` or remote one.
@@ -65,14 +65,14 @@ struct TabFace: Equatable {
     #if canImport(UIKit)
     /// A tab bar's selected glyph for `base`: its `.fill` variant, nil for a
     /// path or a symbol without one.
-    static func filled(_ base: String) -> UIImage? {
-        FaceSymbol.isPath(base) ? nil : UIImage(systemName: base + ".fill")
+    package static func filled(_ base: String) -> UIImage? {
+        FaceSymbol.isCustom(base) ? nil : UIImage(systemName: base + ".fill")
     }
     /// `image` as a tab bar item's glyph: fitted in `points` square at the
     /// screen's scale and template-rendered, so the bar tints it as it tints
     /// an SF Symbol (UIKit renders a tab's image as a template whatever its
     /// mode). Nil for an empty image.
-    static func rasterImage(_ image: UIImage, points: CGFloat) -> UIImage? {
+    package static func rasterImage(_ image: UIImage, points: CGFloat) -> UIImage? {
         guard points > 0, image.size.width > 0, image.size.height > 0 else { return nil }
         let fit = min(points / image.size.width, points / image.size.height)
         let size = CGSize(width: (image.size.width * fit).rounded(), height: (image.size.height * fit).rounded())
@@ -90,7 +90,7 @@ struct TabFace: Equatable {
         let shown = { (v: NodeView) in !v.isHidden && v.style["display"]?.string != "none" && v.shownAlpha > 0 }
         guard !box.isParagraph, box.kind != "image", shown(box),
               let fill = box.channels("background_color"), fill[3] > 0, !box.holdsFlatLeaves else { return nil }
-        let children = box.container.subviews.compactMap { $0 as? NodeView }
+        let children = box.childNodes
         guard children.count == 1, let text = children.first, text.isParagraph, shown(text),
               !text.accessibleText.isEmpty else { return nil }
         return text.accessibleText

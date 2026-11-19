@@ -340,6 +340,10 @@ impl<D: DataSource> Host<D> {
             canvas2d: Default::default(),
             layers: Default::default(),
         };
+        // LLP 1057.001.000 §5: the JS target zooms; this host does not.
+        if exact_runner::uses::zooms(host.runner.plan()) {
+            host.runner.log("this host has no zoomable scroller: each draws at zoom 1, reports 1 and drops a `scrollZoom` write (LLP 1057.001.000 §5)");
+        }
         // Everything live is new to the page.
         let roots = host.runner.roots();
         let mut stack: Vec<ViewId> = roots.iter().rev().copied().collect();
@@ -353,6 +357,9 @@ impl<D: DataSource> Host<D> {
         }
         host.relayer(&order, &mut batch);
         let handlers = host.runner.handlers();
+        for (id, kinds) in &handlers {
+            host.mirror.entry(*id).or_default().handled = !kinds.is_empty();
+        }
         for id in &order {
             host.create(*id, &mut batch, handlers.get(id).map_or(&[], Vec::as_slice));
         }
@@ -501,7 +508,7 @@ impl<D: DataSource> Host<D> {
     /// and a resource's re-ask.
     /// CSS transitions are the browser's; the glue folds their end times in.
     pub fn agent(&self, request: &str) -> String {
-        if exact_runner::agent::field_str(request, "op").as_deref() == Some("settle") {
+        if exact_runner::json::field_str(request, "op").as_deref() == Some("settle") {
             // A re-ask after a turn over its budget: no I/O to wait on, so the
             // clock goes to it (exact-runner's `overrun.rs`).
             return match (self.springs.settle_time().map(|t| t * 1000.0))
@@ -511,13 +518,13 @@ impl<D: DataSource> Host<D> {
                 .chain(self.runner.data_timer_due_ms())
                 .reduce(f64::max)
             {
-                Some(t) => format!("{{\"settle\":{}}}", exact_runner::agent::num(t)),
+                Some(t) => format!("{{\"settle\":{}}}", exact_runner::json::num(t)),
                 None => "{\"settle\":null}".to_string(),
             };
         }
         match self.inspect {
             Some(inspect) => inspect(&self.runner, request),
-            None => exact_runner::agent::error("this build links no inspection (LLP 1047 D6)"),
+            None => exact_runner::json::error("this build links no inspection (LLP 1047 D6)"),
         }
     }
 
@@ -639,8 +646,64 @@ impl<D: DataSource> Host<D> {
     /// The page's visibility, connectivity or share sheet (LLP 1069.000 D2):
     /// the `exactPage()` readers, in one batch.
     pub fn set_page(&mut self, page: exact_runner::Page) -> String {
+        let freeze = page.frozen && !self.runner.page().frozen;
         let answer = self.runner.set_page(page);
-        self.told(answer, "page")
+        let freeze = freeze && self.runner.page().frozen;
+        let mut batch = Batch::new().freeze(freeze);
+        // A hidden or frozen page presents nothing: what waits for the
+        // browser's ready time starts at its commit (LLP 1003.001 D9).
+        let now = self.runner.page();
+        self.springs.set_presentable(!now.hidden && !now.frozen);
+        self.emit_springs(&mut batch, &[], self.now_ms / 1000.0);
+        self.told_in(batch, answer, "page")
+    }
+
+    /// The present of the page's first picture since this runner booted
+    /// (LLP 1069.000 D2 r7): `exactPage().presented` is true from here.
+    pub fn page_presented(&mut self) -> String {
+        let answer = self.runner.page_presented();
+        self.told(answer, "presented")
+    }
+
+    /// `prefer presented` (LLP 1069.000 D6): the fact held at a value, or
+    /// given back to the page.
+    pub fn prefer_presented(&mut self, preferred: Option<bool>) -> String {
+        let answer = self.runner.prefer_presented(preferred);
+        self.told(answer, "presented")
+    }
+
+    /// The browser made a held spring's animation ready at `at_ms` (LLP
+    /// 1003.001 D9, "The web"): the engine's curve starts there, and the
+    /// batch re-emits it pinned at that instant. `None` when it was not held.
+    pub fn present_curve(
+        &mut self,
+        view: ViewId,
+        property: exact_motion::Property,
+        at_ms: f64,
+        now_ms: f64,
+    ) -> Option<String> {
+        let kernel = self.runner.kernel();
+        if !self
+            .springs
+            .present_curve(kernel, view, property, at_ms / 1000.0)
+        {
+            return None;
+        }
+        Some(self.hold_batch(now_ms.max(self.now_ms)))
+    }
+
+    /// What waited [`exact_motion::HOLD_DEADLINE`] by `now_ms` for a ready
+    /// time starts at its commit (LLP 1003.001 D9, "The bound").
+    pub fn release_overdue(&mut self, now_ms: f64) -> String {
+        let now_ms = now_ms.max(self.now_ms);
+        self.springs.release_overdue(now_ms / 1000.0);
+        self.hold_batch(now_ms)
+    }
+
+    /// The first-frame rule on (the page's clock owns time) or off (the
+    /// agent's), for this host's engine (LLP 1003.001 D7, D9).
+    pub fn set_start_on_frame(&mut self, on: bool) {
+        self.springs.set_start_on_frame(on);
     }
 
     /// The root font size `rem` follows (LLP 1069.000 D3): a relayout in one
@@ -674,6 +737,15 @@ impl<D: DataSource> Host<D> {
     /// A told fact's answer as one batch: its commit, nothing when the
     /// fact is unchanged, or the refusal named by `what`.
     fn told(&mut self, answer: Result<Option<CommitReceipt>, RunnerError>, what: &str) -> String {
+        self.told_in(Batch::new(), answer, what)
+    }
+
+    fn told_in(
+        &mut self,
+        batch: Batch,
+        answer: Result<Option<CommitReceipt>, RunnerError>,
+        what: &str,
+    ) -> String {
         let (receipts, error) = match answer {
             Ok(Some(receipt)) => (
                 vec![Timed {
@@ -685,7 +757,7 @@ impl<D: DataSource> Host<D> {
             Ok(None) => (vec![], None),
             Err(e) => (vec![], Some(format!("{what}: {e:?}"))),
         };
-        self.batch_for(&receipts, error.as_deref())
+        self.batch_from(batch, &receipts, error.as_deref())
     }
 
     /// Actual nested scrollport and mounted row geometry, in the shared LE wire
@@ -764,6 +836,15 @@ impl<D: DataSource> Host<D> {
             .filter_map(|key| self.runner.kernel().node_by_key(*key).map(|n| n.id))
             .collect();
         self.relayer(&changed, batch);
+        let handlers = if receipts.iter().any(|t| !t.receipt.created.is_empty()) {
+            self.runner.handlers()
+        } else {
+            SortedMap::new()
+        };
+        // A parent's text fold needs its children's handlers before their creates.
+        for (id, kinds) in &handlers {
+            self.mirror.entry(*id).or_default().handled = !kinds.is_empty();
+        }
         for t in receipts {
             let r = &t.receipt;
             batch.at(t.at_ms);
@@ -776,7 +857,7 @@ impl<D: DataSource> Host<D> {
                         .runner
                         .kernel()
                         .node(*id)
-                        .is_some_and(|n| crate::css::press_composes(n.style));
+                        .is_some_and(|n| crate::css::press_animations(n.style));
                     batch.exit(*id, &(link.list)(&exit.animations, press));
                 }
             }
@@ -795,11 +876,6 @@ impl<D: DataSource> Host<D> {
                     batch.destroy(id);
                 }
             }
-            let handlers = if r.created.is_empty() {
-                SortedMap::new()
-            } else {
-                self.runner.handlers()
-            };
             for key in &r.created {
                 if let Some(node) = self.runner.kernel().node_by_key(*key) {
                     let id = node.id;
@@ -833,6 +909,8 @@ impl<D: DataSource> Host<D> {
         }
         // Earlier receipts also read the final tree, whose children can be
         // created by a later receipt in this seek. Attach only after all creates.
+        // Creates and updates already projected the final tree with final handler metadata.
+        let mut visited = changed.iter().copied().collect();
         let mut refold = std::collections::BTreeSet::new();
         for id in changed {
             let parent = self.runner.kernel().node(id).and_then(|n| n.parent);
@@ -842,7 +920,7 @@ impl<D: DataSource> Host<D> {
         // One parent visit per batch: a theme flip touches every text row,
         // but their shared parent's fold needs to be decided only once.
         for id in refold {
-            self.refold(id, batch);
+            self.refold(id, batch, &mut visited);
         }
         let roots = self.page_roots();
         if roots != self.roots {
@@ -1076,6 +1154,24 @@ impl<D: DataSource> Host<D> {
                         property.name(),
                         (delay * 1000.0, duration * 1000.0),
                         &pairs,
+                    );
+                }
+                Lowered::Held {
+                    view,
+                    property,
+                    delay,
+                    duration,
+                    values,
+                    due,
+                } => {
+                    let pairs: Vec<[f64; 4]> =
+                        values.iter().map(|v| [v.x, v.y, v.z, v.w]).collect();
+                    batch.held_spring(
+                        view,
+                        property.name(),
+                        (delay * 1000.0, duration * 1000.0),
+                        &pairs,
+                        due * 1000.0,
                     );
                 }
                 Lowered::Cancel { view, property } => {

@@ -18,37 +18,18 @@ mod atlas;
 mod cache;
 #[cfg(target_os = "macos")]
 mod present;
+mod programs;
 #[cfg(all(feature = "scanout", target_os = "linux"))]
 mod scanout;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
 const SHADER: &str = include_str!("../../shaders/ink.wgsl");
-const GENERIC: &str = "const SPECIALIZED = false; const KIND_BRUSH = 0u; const FLAGS = 0u;";
 const ATTRIBUTES: [::wgpu::VertexAttribute; 12] = ::wgpu::vertex_attr_array![
     0 => Float32x4, 1 => Float32x4, 2 => Uint32x4, 3 => Float32x4,
     4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Uint32x4,
     8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4
 ];
-
-/// One fragment program per primitive class. A tile GPU such as V3D otherwise
-/// pays for the whole portable program, its varyings and its register spills on
-/// every fragment. `class` is kind/brush and the flags without the ramp row;
-/// `None` is the portable program (`EXACT_INK_GENERIC=1`, for comparison).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Variant {
-    class: Option<(u32, u32)>,
-    replace: bool,
-}
-
-impl Variant {
-    fn new(specialized: bool, instance: &Instance, replace: bool) -> Self {
-        Self {
-            class: specialized.then_some((instance.kind_brush, instance.flags & !flags::RAMP_MASK)),
-            replace,
-        }
-    }
-}
 
 // The fixed instance ABI and bind group in ink.wgsl. Scene-sized allocations
 // are checked separately when textures and buffers are made.
@@ -107,16 +88,17 @@ pub struct Wgpu {
     instance: ::wgpu::Instance,
     #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
     adapter: ::wgpu::Adapter,
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    scanout: Option<scanout::Scanout>,
     #[cfg(target_os = "macos")]
     window: Option<present::Window>,
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    scanout: Option<scanout::Scanout>,
     device: ::wgpu::Device,
     queue: ::wgpu::Queue,
-    variants: HashMap<Variant, ::wgpu::RenderPipeline>,
-    specialized: bool,
-    pipeline_layout: ::wgpu::PipelineLayout,
-    cache: Option<(::wgpu::PipelineCache, Option<std::path::PathBuf>)>,
+    pipeline: ::wgpu::RenderPipeline,
+    replace_pipeline: ::wgpu::RenderPipeline,
+    programs: Vec<::wgpu::RenderPipeline>,
+    #[cfg(test)]
+    pub(super) general_only: bool,
     layout: ::wgpu::BindGroupLayout,
     sampler: ::wgpu::Sampler,
     repeat_sampler: ::wgpu::Sampler,
@@ -234,6 +216,10 @@ impl Wgpu {
                 })
             }
         });
+        let shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("ink.wgsl"),
+            source: ::wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
         let mut entries = vec![::wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: ::wgpu::ShaderStages::VERTEX,
@@ -271,24 +257,61 @@ impl Wgpu {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let specialized = std::env::var_os("EXACT_INK_GENERIC").is_none();
-        // The commonest class is compiled here, so a refused shader refuses the device.
-        let first = Variant::new(
-            specialized,
-            &Instance::new(Kind::RoundedRect, Brush::Solid, [0.; 4]),
-            false,
-        );
-        let variants = HashMap::from([(
-            first,
-            pipeline(&device, &pipeline_layout, cache.as_ref(), first),
-        )]);
+        let make_pipeline = |blend, constants: &[(&str, f64)]| {
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("ink"),
+                layout: Some(&pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(::wgpu::VertexBufferLayout {
+                        array_stride: size_of::<Instance>() as u64,
+                        step_mode: ::wgpu::VertexStepMode::Instance,
+                        attributes: &ATTRIBUTES,
+                    })],
+                },
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(::wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: ::wgpu::PipelineCompilationOptions {
+                        constants,
+                        ..Default::default()
+                    },
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: ::wgpu::TextureFormat::Rgba8Unorm,
+                        blend,
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: cache.as_ref(),
+            })
+        };
+        let pipeline = make_pipeline(Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING), &[]);
+        let replace_pipeline = make_pipeline(None, &[]);
+        let programs = programs::CLASSES
+            .iter()
+            .map(|class| {
+                make_pipeline(
+                    Some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    &class.constants(),
+                )
+            })
+            .collect();
         if let Some(e) = errors.pop().await {
             return Err(Error::Device(e.to_string()));
         }
         let shaders_ms = started.elapsed().as_secs_f64() * 1000.;
-        if let (Some(cache), Some(path)) = (cache.as_ref(), path.as_ref()) {
+        if let (Some(cache), Some(path)) = (cache.as_ref(), path) {
             if let Some(bytes) = cache.get_data() {
-                cache::save(path, &bytes, data.as_deref());
+                cache::save(&path, &bytes, data.as_deref());
             }
         }
         let sampler = device.create_sampler(&::wgpu::SamplerDescriptor {
@@ -342,16 +365,17 @@ impl Wgpu {
             instance,
             #[cfg(any(target_os = "macos", all(feature = "scanout", target_os = "linux")))]
             adapter,
-            #[cfg(all(feature = "scanout", target_os = "linux"))]
-            scanout: None,
             #[cfg(target_os = "macos")]
             window: None,
+            #[cfg(all(feature = "scanout", target_os = "linux"))]
+            scanout: None,
             device,
             queue,
-            variants,
-            specialized,
-            pipeline_layout,
-            cache: cache.map(|cache| (cache, path)),
+            pipeline,
+            replace_pipeline,
+            programs,
+            #[cfg(test)]
+            general_only: false,
             layout,
             sampler,
             repeat_sampler,
@@ -452,28 +476,6 @@ impl Wgpu {
         }))
     }
 
-    /// Compile the classes used for the first time.
-    fn prepare(&mut self, variants: impl IntoIterator<Item = Variant>) -> Result<()> {
-        let mut compiled = false;
-        for variant in variants {
-            if self.variants.contains_key(&variant) {
-                continue;
-            }
-            let cache = self.cache.as_ref().map(|(cache, _)| cache);
-            let made = checked(&self.device, &self.errors, || {
-                pipeline(&self.device, &self.pipeline_layout, cache, variant)
-            })?;
-            self.variants.insert(variant, made);
-            compiled = true;
-        }
-        if let (true, Some((cache, Some(path)))) = (compiled, &self.cache) {
-            if let Some(bytes) = cache.get_data() {
-                cache::save(path, &bytes, None);
-            }
-        }
-        Ok(())
-    }
-
     fn submit(&mut self, commands: ::wgpu::CommandBuffer) -> Result<Submission> {
         failure(&self.errors)?;
         self.submitted.0 += 1;
@@ -543,22 +545,43 @@ impl Wgpu {
             color_attachments: &attachments,
             ..Default::default()
         });
+        pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buffer.slice(..));
         for (batch, bindings) in batches.iter().zip(groups) {
             let s = batch.scissor;
             if s.width == 0 || s.height == 0 || batch.instances.is_empty() {
                 continue;
             }
+            pass.set_pipeline(if batch.replace {
+                &self.replace_pipeline
+            } else {
+                &self.pipeline
+            });
             pass.set_scissor_rect(s.x, s.y, s.width, s.height);
             pass.set_bind_group(0, bindings, &[]);
-            // Paint order is kept: each run of one class is one draw.
+            let class = |i: &Instance| {
+                #[cfg(test)]
+                if self.general_only {
+                    return None;
+                }
+                (!batch.replace).then(|| programs::class(i)).flatten()
+            };
             let mut start = batch.instances.start;
-            let variant = |i: &Instance| Variant::new(self.specialized, i, batch.replace);
             for run in instances[start as usize..batch.instances.end as usize]
-                .chunk_by(|a, b| variant(a) == variant(b))
+                .chunk_by(|a, b| class(a) == class(b))
             {
+                let pipeline = class(&run[0]).map_or_else(
+                    || {
+                        if batch.replace {
+                            &self.replace_pipeline
+                        } else {
+                            &self.pipeline
+                        }
+                    },
+                    |index| &self.programs[index],
+                );
+                pass.set_pipeline(pipeline);
                 let end = start + run.len() as u32;
-                pass.set_pipeline(&self.variants[&variant(&run[0])]);
                 pass.draw(0..4, start..end);
                 start = end;
             }
@@ -765,8 +788,6 @@ impl Device for Wgpu {
 
     fn generate_mips(&mut self, id: TextureId) -> Result<Submission> {
         self.completed()?;
-        let quad = Instance::new(Kind::Downsample, Brush::Solid, [0.; 4]);
-        self.prepare([Variant::new(self.specialized, &quad, false)])?;
         let texture = self.texture(id)?;
         if texture.desc.format != Format::Rgba {
             return Err(Error::Unsupported("alpha mip chain"));
@@ -924,12 +945,6 @@ impl Device for Wgpu {
                 ));
             }
         }
-        let specialized = self.specialized;
-        self.prepare(frame.batches.iter().flat_map(|batch| {
-            frame.instances[batch.instances.start as usize..batch.instances.end as usize]
-                .iter()
-                .map(move |instance| Variant::new(specialized, instance, batch.replace))
-        }))?;
         let slot = self.next_buffer;
         self.next_buffer = (slot + 1) % self.buffers.len();
         self.wait(Submission(
@@ -1049,6 +1064,8 @@ impl Device for Wgpu {
     }
 
     fn trim(&mut self) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wait(self.submitted)?;
         self.completed()?;
         for slot in &mut self.buffers {
             if slot.capacity > 192 {
@@ -1064,61 +1081,9 @@ impl Device for Wgpu {
                     .push((Submission(old.last.load(Ordering::Acquire)), old.raw));
             }
         }
+        self.completed()?;
         Ok(())
     }
-}
-
-fn pipeline(
-    device: &::wgpu::Device,
-    layout: &::wgpu::PipelineLayout,
-    cache: Option<&::wgpu::PipelineCache>,
-    variant: Variant,
-) -> ::wgpu::RenderPipeline {
-    let source = match variant.class {
-        Some((kind_brush, flags)) => SHADER.replacen(
-            GENERIC,
-            &format!("const SPECIALIZED = true; const KIND_BRUSH = {kind_brush}u; const FLAGS = {flags}u;"),
-            1,
-        ),
-        None => SHADER.into(),
-    };
-    let shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
-        label: Some("ink.wgsl"),
-        source: ::wgpu::ShaderSource::Wgsl(source.into()),
-    });
-    device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-        label: Some("ink"),
-        layout: Some(layout),
-        vertex: ::wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(::wgpu::VertexBufferLayout {
-                array_stride: size_of::<Instance>() as u64,
-                step_mode: ::wgpu::VertexStepMode::Instance,
-                attributes: &ATTRIBUTES,
-            })],
-        },
-        primitive: ::wgpu::PrimitiveState {
-            topology: ::wgpu::PrimitiveTopology::TriangleStrip,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: Default::default(),
-        fragment: Some(::wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(::wgpu::ColorTargetState {
-                format: ::wgpu::TextureFormat::Rgba8Unorm,
-                blend: (!variant.replace)
-                    .then_some(::wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: ::wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache,
-    })
 }
 
 fn instance_buffer(

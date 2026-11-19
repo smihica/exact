@@ -8,11 +8,11 @@ import UIKit
 /// What the bar shows (D1, D4) and how a change reaches it, with the node
 /// that decided it (the agent's `layout`, D7); and whether the status bar
 /// and the home indicator give way, from the node that decided that.
-struct StatusBarChoice: Equatable {
-    var style: UIStatusBarStyle = .default
+package struct StatusBarChoice: Equatable {
+    package var style: UIStatusBarStyle = .default
     var fade = false
     var source: UInt32?
-    var hidden = false
+    package var hidden = false
     var hiddenFade = false
     var hiddenSource: UInt32?
 }
@@ -25,7 +25,7 @@ extension Presenter {
     /// `settled`: a transition's own end, whose coordinator may still be
     /// installed (a sheet's); only a push or pop that navigation starts next
     /// holds the style.
-    func resolveStatusBar(settled: Bool = false) {
+    package func resolveStatusBar(settled: Bool = false) {
         guard !(settled ? navigation.changing : navigation.transitioning), !modals.inTransition else { return }
         let choice = statusBarChoice()
         guard choice != statusBar else { return }
@@ -90,7 +90,7 @@ extension Presenter {
         // popovers lifted over a dialog's sheet, as over the page. The sheet
         // leaves the bar to the screen under it.
         let roots = [session?.view].compactMap { $0 } + modals.surfaces(includingRetiring: false).map(\.view) + menus.sheetLayers
-        let lifted = Set(navigation.controllers.values.compactMap { $0.lifted.map(ObjectIdentifier.init) })
+        let lifted = Set(navigation.routeSurfaces.values.compactMap { $0.lifted.map(ObjectIdentifier.init) })
         func shows(_ node: NodeView) -> Bool {
             // `visibility` is inherited and a child may show again: the node's own.
             guard node.window != nil, !node.cssVisibilityHidden else { return false }

@@ -1,0 +1,267 @@
+shape Message
+  id: string
+  body: string
+
+shape Window
+  rows: Message[]
+  conversation: string
+  earlier: string
+  later: string
+  anchor: string
+  total: number
+  unread: number
+  queued: number
+
+shape Change
+  op: string
+  conversation: string
+
+shape Feed
+  status: string
+  serial: number
+
+shape SocketBatch
+  attempt: number
+  changed: bool
+  more: bool
+  recover: bool
+  advanced: bool
+
+component Transcript
+  state conversation = "" persist
+  state opened = false persist
+  state revision = 0
+  state cursor = ""
+  state pin = ""
+  state pinEdge = ""
+  state offset = 0
+  state edge = ""
+  state edgeWindow = ""
+  state draft = ""
+  state draftEdits = 0
+  state submittedEdit = 0
+  state online = true persist
+  state attempt = 0
+  state connected = false
+  state recovering = false
+  state recovery = ""
+  state stopped = false
+  state queued = 0
+  state retry = 0
+  state drain = 0
+
+  // The initial empty read lets the bake see that this source reads storage.
+  resource window = loadWindow(conversation, cursor) with revision when opened or conversation == "" as shape Window else empty()
+  resource mode = socketMode() as shape string else empty() transient
+  resource feed = events(conversation, attempt) when connected and not stopped as shape Feed else empty() transient
+  mutation changed as shape Change then didChange
+  mutation replayed as shape Change queue then didReplay
+  mutation synced as shape SocketBatch queue then didSync
+  mutation delivered as shape bool queue
+  derive fixture = mode == "fixture"
+  derive syncing = `${attempt}/${feed.serial}/${queued}/${retry}/${failed(feed)}`
+  derive pendingWindow = pending(window) or failed(window) or not current(window) or window.conversation != conversation or window.anchor != cursor
+  derive moreFrames = match synced { case some(reply) => reply.more, case none => false }
+  derive firstId = match window.rows.at(0) { case some(row) => row.id, case none => "" }
+  derive lastId = match window.rows.at(-1) { case some(row) => row.id, case none => "" }
+
+  action prepare(id: string)
+    if not pending(changed)
+      send changed = change("seed", id, "")
+  action openThread
+    opened = true
+  action closeThread
+    opened = false
+    connected = false
+    cursor = ""
+    pin = ""
+    pinEdge = ""
+    offset = 0
+    edge = ""
+  action earlier
+    requestPage("earlier")
+  action later
+    requestPage("later")
+  action requestPage(direction: string)
+    if pendingWindow
+      edge = direction
+      edgeWindow = `${window.conversation}/${window.anchor}`
+    else
+      page(direction)
+  task pageWhenReady when opened and edge != "" and not pendingWindow key=`${cursor}/${revision}/${edge}`
+    after(1, pageDeferred)
+  action pageDeferred
+    if edgeWindow == `${conversation}/${cursor}`
+      page(edge)
+    edge = ""
+  action page(direction: string)
+    if direction == "earlier" and window.earlier != ""
+      pin = firstId
+      pinEdge = "earlier"
+      cursor = window.earlier
+    if direction == "later" and window.later != ""
+      pin = lastId
+      pinEdge = "later"
+      cursor = window.later
+  action scrolled(x: number, y: number)
+    offset = y
+  task restoreAnchor when opened and window.anchor == cursor and lastId != "" key=`${conversation}/${cursor}`
+    change(restoreScroll)
+  action restoreScroll
+    if cursor == ""
+      scrollIntoView("transcript", lastId, block="end", behavior="instant")
+    else if pinEdge == "earlier"
+      scrollIntoView("transcript", pin, block="start", behavior="instant")
+    else if pinEdge == "later"
+      scrollIntoView("transcript", pin, block="end", behavior="instant")
+  action latest
+    edge = ""
+    pin = ""
+    pinEdge = ""
+    if cursor == ""
+      scrollIntoView("transcript", lastId, block="end", behavior="instant")
+    else
+      cursor = ""
+  action edit(text: string)
+    draft = text
+    draftEdits = draftEdits + 1
+  action sendDraft
+    if mode != "" and draft.trim() != "" and draft.length <= 512 and not pending(changed)
+      submittedEdit = draftEdits
+      send changed = change("queue", conversation, draft.trim())
+  action arrive
+    if not pending(changed)
+      send changed = change("arrive", conversation, "")
+  action markRead
+    if not pending(changed)
+      send changed = change("read", conversation, "")
+  action disconnect
+    connected = false
+  action connect
+    connected = true
+    recovering = false
+    stopped = false
+    recovery = ""
+    attempt = attempt + 1
+  action offline
+    online = false
+  action resumeFixture
+    online = true
+  task replayWhenOnline when opened and fixture and online and not pendingWindow and window.queued > 0 and not pending(replayed) and not failed(replayed) key=conversation
+    after(1, replayCurrent)
+  action replayCurrent
+    send replayed = change("replay", conversation, "")
+  action didReplay
+    revision = revision + 1
+  action didChange
+    let op = match changed { case some(reply) => reply.op, case none => "" }
+    let id = match changed { case some(reply) => reply.conversation, case none => "" }
+    if op == "seed"
+      conversation = id
+    if op == "queue"
+      if draftEdits == submittedEdit
+        draft = ""
+      queued = queued + 1
+    revision = revision + 1
+  task syncWhenReady when connected and not stopped and (failed(feed) or (current(feed) and feed.serial > 0)) key=syncing
+    change(sync)
+  task drainMore when connected and not stopped and moreFrames key=drain
+    after(1, sync)
+  action sync
+    send synced = syncSocket(conversation, attempt, failed(feed))
+  action didSync
+    match synced
+      case some(reply)
+        if reply.changed
+          revision = revision + 1
+        if connected and attempt == reply.attempt
+          if reply.more
+            drain = drain + 1
+          else if reply.recover
+            recovery = recovering and not reply.advanced ? "stop" : "resume"
+          else if current(feed)
+            send delivered = sendSocket(conversation, attempt)
+      case none
+  task recoverAfterSync when connected and recovery != "" key=attempt
+    after(1, recoverSocket)
+  action recoverSocket
+    if recovery == "stop"
+      stopped = true
+    else if recovery == "resume"
+      recovering = true
+      attempt = attempt + 1
+    recovery = ""
+  action retrySync
+    if stopped
+      connect()
+    else
+      retry = retry + 1
+
+  view
+    column width="100%" height="100%"
+      if not opened
+        header
+          h1 "Large Live List"
+        column padding=16 gap=12
+          text "Prepare a conversation"
+          row gap=8
+            button press=prepare("1000") disabled=pending(changed) testId="prepare-1000"
+              text "1,000"
+            button press=prepare("10000") disabled=pending(changed) testId="prepare-10000"
+              text "10,000"
+            button press=prepare("100000") disabled=pending(changed) testId="prepare-100000"
+              text "100,000"
+          if conversation != ""
+            button press=openThread testId="open"
+              text `Open conversation ${conversation}`
+      else
+        header
+          button press=closeThread testId="close"
+            text "Close"
+          h1 "Conversation"
+          button press=latest testId="latest"
+            text "Latest"
+        row gap=8 padding=8 flex-wrap="wrap"
+          if fixture
+            button press=arrive disabled=pending(changed) testId="arrive"
+              text "Inject arrival"
+            if online
+              button press=offline testId="offline"
+                text "Go offline"
+            else
+              button press=resumeFixture disabled=pending(changed) testId="online"
+                text "Go online"
+            if failed(replayed)
+              button press=replayCurrent testId="retry-replay"
+                text "Retry queued sends"
+          if mode == "socket"
+            if connected
+              button press=disconnect testId="disconnect"
+                text "Disconnect socket"
+              if failed(feed) or stopped
+                text "The socket could not sync." role="status" testId="socket-failed"
+              else
+                text feed.status testId="socket-status"
+            else
+              button press=connect testId="connect"
+                text "Connect socket"
+          button press=markRead disabled=pending(changed) testId="read"
+            text "Mark read"
+          if failed(feed) or stopped or failed(synced) or failed(delivered)
+            button press=retrySync testId="retry-sync"
+              text "Retry sync"
+        row gap=12 padding="0 8px 8px" flex-wrap="wrap"
+          text `${window.rows.length} loaded / ${window.total} total` testId="range" font-variant-numeric="tabular-nums"
+          text `${window.unread} unread` testId="unread" font-variant-numeric="tabular-nums"
+          text `${window.queued} queued` testId="queued" font-variant-numeric="tabular-nums"
+        list id="transcript" testId="transcript" appearance="none" virtualized=true estimated-item-height=28 reach-margin="0px" scroll-start="end" scrollFollowEnd=(cursor == "") scroll=scrolled reachstart=earlier reachend=later flex=1 min-height=0
+          for message in window.rows key=message.id
+            text message.body testId=`message-${message.id}` padding="4px 12px" min-height=28 box-sizing="border-box"
+        row gap=8 padding=8
+          input value=draft input=edit submit=sendDraft aria-label="Message" placeholder="Message" flex=1 testId="draft"
+          button press=sendDraft disabled=(mode == "" or pending(changed) or draft.trim() == "" or draft.length > 512) testId="send"
+            text "Send"
+      if failed(changed) or failed(replayed)
+        text "The change could not be saved. Try again." role="status" testId="change-failed"
+      if failed(window)
+        text "The window could not be loaded." role="status" testId="window-failed"

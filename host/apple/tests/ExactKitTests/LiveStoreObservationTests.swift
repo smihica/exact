@@ -3,6 +3,11 @@ import XCTest
 @testable import ExactKit
 
 private func checkLiveFiles(scratch: String?) throws {
+    // The storage observation, without the GPU surfaces the bundle installs
+    // (`TestsInstall.swift`): with them a live `state` gave this read no reply.
+    let surfaces = SurfacesLink.installed
+    SurfacesLink.installed = nil
+    defer { SurfacesLink.installed = surfaces }
     let session = ExactApp.shared.makeSession()
     defer { session.destroy() }
     XCTAssertNil(session.boot(size: CGSize(width: 390, height: 844)).error)
@@ -26,6 +31,21 @@ private func checkLiveFiles(scratch: String?) throws {
 
 final class LiveStoreObservationTests: XCTestCase {
     func testRealSecretsDoNotClaimRealAppFiles() throws { try checkLiveFiles(scratch: nil) }
+
+    /// `--live` keeps the wall clock: every clock request but an input's landing is refused.
+    func testLiveRefusesTheClockAndTakesALanding() throws {
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        XCTAssertNil(session.boot(size: CGSize(width: 390, height: 844)).error)
+        for request: [String: Any] in [["op": "clock", "to": 1000.0], ["op": "clock", "take": true], ["op": "clock", "settle": true], ["op": "clock", "data": true]] {
+            XCTAssertEqual(session.agentInstance.clock(request)["code"] as? String, "live-clock", "\(request)")
+        }
+        XCTAssertNil(session.clock)
+        let landed = session.agentInstance.clock(["op": "clock", "land": true])
+        XCTAssertNil(landed["error"])
+        XCTAssertEqual(landed["wall"] as? Bool, true)
+        XCTAssertNil(session.clock)
+    }
 }
 final class LiveScratchStoreObservationTests: XCTestCase {
     func testRealSecretsKeepAppFilesInTheNamedScratchTree() throws { try checkLiveFiles(scratch: "agent2-live") }

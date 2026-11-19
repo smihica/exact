@@ -9,6 +9,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 final class NavigationRulesTests: XCTestCase {
     func testRawSymbolMissKeepsImageOnlySegmentsBlank() throws {
@@ -90,24 +91,24 @@ final class NavigationRulesTests: XCTestCase {
         input.field = NSTextField(); area.textArea = NSTextView()
         p.views = [1: owner, 2: input, 3: area]
         p.root.addSubview(owner); owner.addSubview(input); owner.addSubview(area)
-        p.navigation.sync(batchFixture(ops: [["op": "roots", "ids": [1]]], timers: false, motion: false, clock: nil, error: nil))
+        p.navigationHost.sync(batchFixture(ops: [["op": "roots", "ids": [1]]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertFalse(input.isAccessibilityHidden())
         XCTAssertTrue(input.field!.isEnabled); XCTAssertTrue(area.textArea!.isEditable)
-        owner.props["inert"] = "true"; p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        owner.props["inert"] = "true"; p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertTrue(input.isAccessibilityHidden()); XCTAssertTrue(area.isAccessibilityHidden())
         XCTAssertFalse(input.field!.isEnabled); XCTAssertFalse(area.textArea!.isEditable)
-        owner.props.removeValue(forKey: "inert"); p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        owner.props.removeValue(forKey: "inert"); p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertFalse(input.isAccessibilityHidden()); XCTAssertTrue(input.field!.isEnabled)
         XCTAssertTrue(area.textArea!.isEditable)
-        input.props["disabled"] = "true"; area.props["editable"] = "false"; p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        input.props["disabled"] = "true"; area.props["editable"] = "false"; p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertFalse(input.field!.isEnabled); XCTAssertFalse(area.textArea!.isEditable)
-        owner.isHidden = true; p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        owner.isHidden = true; p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertTrue(input.isAccessibilityHidden())
-        owner.isHidden = false; p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        owner.isHidden = false; p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertFalse(input.isAccessibilityHidden())
         // Another native projection can change state between identical batches.
         input.setAccessibilityHidden(true); input.field!.isEnabled = true
-        area.textArea!.isEditable = true; p.navigation.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
+        area.textArea!.isEditable = true; p.navigationHost.sync(batchFixture(ops: [["op": "props", "id": 1], ["op": "props", "id": 2], ["op": "props", "id": 3]], timers: false, motion: false, clock: nil, error: nil))
         XCTAssertFalse(input.isAccessibilityHidden())
         XCTAssertFalse(input.field!.isEnabled); XCTAssertFalse(area.textArea!.isEditable)
     }
@@ -372,7 +373,7 @@ final class MacShortcutTests: XCTestCase {
             NSApp.helpMenu = previous.2; NSApp.servicesMenu = previous.3; w.close()
         }
         let root = NodeView(id: 900, kind: "view", presenter: p)
-        root.props = ["menuRemove": "close-all autofill show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows"]
+        root.props = ["menuRemove": "close-all show-tab-bar show-all-tabs enter-full-screen minimize zoom bring-all-to-front show-previous-tab show-next-tab move-tab-to-new-window merge-all-windows"]
         p.views[root.id] = root; p.root.addSubview(root)
         let bar = DevMenu.makeMenu(shortcuts: p.shortcuts, documents: false, develop: true)
         NSApp.mainMenu = bar
@@ -384,8 +385,7 @@ final class MacShortcutTests: XCTestCase {
         // AppKit's own inserted items, not facsimiles, retain their identifiers.
         file.update(); edit.update()
         let closeAll = try XCTUnwrap(file.items.first { $0.action == Selector(("closeAll:")) })
-        let autofill = try XCTUnwrap(edit.items.first { $0.identifier?.rawValue == "_NSMenuItemAutoFillIdentifier" })
-        XCTAssertTrue(closeAll.isHidden); XCTAssertTrue(autofill.isHidden)
+        XCTAssertTrue(closeAll.isHidden)
         XCTAssertFalse(closeAll.allowsKeyEquivalentWhenHidden)
         // A later AppKit insertion is filtered too, without an app batch or English title.
         view.title = "Présentation"; windows.title = "Fenêtre"
@@ -418,7 +418,7 @@ final class MacShortcutTests: XCTestCase {
         // Root replacement restores the same objects; no commands accumulate.
         root.removeFromSuperview(); p.shortcuts.sync()
         file.update(); edit.update(); view.update(); windows.update()
-        XCTAssertFalse(closeAll.isHidden); XCTAssertFalse(autofill.isHidden)
+        XCTAssertFalse(closeAll.isHidden)
         XCTAssertFalse(tab.isHidden); XCTAssertFalse(next.isHidden)
         p.root.addSubview(root); p.shortcuts.sync(); view.update()
         XCTAssertTrue(tab.isHidden)

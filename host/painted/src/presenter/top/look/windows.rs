@@ -2,6 +2,10 @@
 //! https://github.com/microsoft/microsoft-ui-xaml/blob/winui3/main/controls/dev/CommonStyles/ContentDialog_themeresources.xaml
 use super::*;
 
+#[cfg(test)]
+#[path = "typography_tests.rs"]
+mod typography_tests;
+
 pub(super) struct Content {
     texts: Vec<Item>,
     viewport: Rect4,
@@ -139,6 +143,7 @@ impl Content {
 pub(super) fn alert(
     engine: &mut TextEngine,
     (title, message): (Option<&str>, Option<&str>),
+    font_family: Option<u16>,
     rows: &[Row],
     pop: ViewId,
     inputs: &Inputs,
@@ -149,7 +154,11 @@ pub(super) fn alert(
     let room = (inputs.window.0 - 48.).max(1.);
     let desired = [(title, heading), (message, body)]
         .into_iter()
-        .filter_map(|(text, style)| text.map(|t| paragraph(engine, t, style, scale, None).width))
+        .filter_map(|(text, style)| {
+            text.map(|t| {
+                family_paragraph(engine, t, style, scale, None, Direction::Ltr, font_family).width
+            })
+        })
         .fold(272., f32::max)
         + 48.;
     let width = desired.min(548.).min(room);
@@ -175,7 +184,15 @@ pub(super) fn alert(
     let mut y = 24.;
     for (text, style, gap) in [(title, heading, 12.), (message, body, 0.)] {
         if let Some(text) = text {
-            let p = paragraph(engine, text, style, scale, Some(inner));
+            let p = family_paragraph(
+                engine,
+                text,
+                style,
+                scale,
+                Some(inner),
+                Direction::Ltr,
+                font_family,
+            );
             y += p.height + gap;
             texts.push(Item::Text(p.clone(), (24., y - p.height - gap), ink, pop));
         }
@@ -186,7 +203,15 @@ pub(super) fn alert(
     let labels: Vec<_> = rows
         .iter()
         .map(|row| {
-            let p = paragraph(engine, &row.title, body, scale, None);
+            let p = family_paragraph(
+                engine,
+                &row.title,
+                body,
+                scale,
+                None,
+                Direction::Ltr,
+                font_family,
+            );
             p.ellipsized((button_width - 24.).max(1.)).unwrap_or(p)
         })
         .collect();
@@ -306,7 +331,10 @@ mod tests {
 
     fn plan(message: String, count: usize) -> Plan {
         Plan::Alert {
+            font_family: None,
             title: Some("Delete message?".into()),
+            title_direction: Direction::Ltr,
+            message_directions: message.split('\n').map(|_| Direction::Ltr).collect(),
             message: Some(message),
             rows: ["Cancel", "Delete", "Keep a copy"]
                 .into_iter()
@@ -315,6 +343,7 @@ mod tests {
                 .map(|(i, title)| Row {
                     node: i as ViewId + 2,
                     title: title.into(),
+                    direction: exact_kernel::Direction::Ltr,
                     symbol: None,
                     destructive: i == 1,
                     enabled: true,
@@ -352,9 +381,10 @@ mod tests {
 
     #[test]
     fn button_feedback_distinguishes_hover_press_focus_and_disabled() {
-        let engine = TextEngine::shared();
+        let engine = crate::text::fixtures::shared();
         for dark in [false, true] {
             let inputs = Inputs {
+                direction: exact_kernel::Direction::Ltr,
                 bold_text: false,
                 contrast: None,
                 dark,
@@ -426,11 +456,12 @@ mod tests {
 
     #[test]
     fn windows_alerts_keep_actions_visible_and_scroll_long_content() {
-        let engine = TextEngine::shared();
+        let engine = crate::text::fixtures::shared();
         for dark in [false, true] {
             for font_scale in [1., 1.5, 2.] {
                 for width in [240., 400., 1100.] {
                     let inputs = Inputs {
+                        direction: exact_kernel::Direction::Ltr,
                         bold_text: false,
                         contrast: None,
                         dark,
@@ -476,7 +507,7 @@ mod tests {
 
     #[test]
     fn contrast_dialogs_use_opaque_system_pairs_and_two_pixel_edges() {
-        let engine = TextEngine::shared();
+        let engine = crate::text::fixtures::shared();
         let palette = crate::presenter::ContrastPalette {
             window: [32, 32, 32, 255],
             text: [255; 4],
@@ -489,6 +520,7 @@ mod tests {
         };
         for dark in [false, true] {
             let inputs = Inputs {
+                direction: exact_kernel::Direction::Ltr,
                 bold_text: false,
                 contrast: Some(palette),
                 dark,
@@ -538,8 +570,9 @@ mod tests {
 
     #[test]
     fn windows_alerts_size_to_content_and_put_one_button_at_the_trailing_edge() {
-        let engine = TextEngine::shared();
+        let engine = crate::text::fixtures::shared();
         let inputs = Inputs {
+            direction: exact_kernel::Direction::Ltr,
             bold_text: false,
             contrast: None,
             dark: false,

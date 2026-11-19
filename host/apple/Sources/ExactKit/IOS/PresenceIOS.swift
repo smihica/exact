@@ -7,22 +7,22 @@
 #if os(iOS) || os(tvOS)
 import UIKit
 
-struct Leaving {
-    let view: NodeView
-    let members: [NodeView]
+package struct Leaving {
+    package let view: NodeView
+    package let members: [NodeView]
 }
 
 extension Presenter {
     /// Retirement follows lifted content as well as routes. Event ancestry
     /// retains its own inertness rules across a modal presentation.
-    func retirementParent(of view: UIView) -> UIView? {
-        if let node = view as? NodeView, let parent = menus.sheets.authoredParent(of: node) ?? menus.logicalParent(of: node) { return parent }
+    package func retirementParent(of view: UIView) -> UIView? {
+        if let node = view as? NodeView, let parent = dialogs.authoredParent(of: node) ?? menus.logicalParent(of: node) { return parent }
         return eventParent(of: view)
     }
 
     func beginExit(_ id: UInt32) {
         guard let view = views[id] else { return }
-        landFlights(inside: view)
+        flightHost.landInside(view)
         var children: [ObjectIdentifier: [NodeView]] = [:]
         var displaced = Set<ObjectIdentifier>()
         for node in views.values {
@@ -41,7 +41,7 @@ extension Presenter {
         for member in members where member === view || displaced.contains(ObjectIdentifier(member)) { _ = member.endEditing(true) }
         for member in members { member.holdGone() }
         for member in members {
-            release(member.id) { _ in }
+            release(member.id, exiting: true) { _ in }
             member.isUserInteractionEnabled = false
             member.accessibilityElementsHidden = true
             member.accessibilityViewIsModal = false
@@ -51,15 +51,15 @@ extension Presenter {
     }
 
     /// The host's `destroy` of a leaving view: its exit ended.
-    func endExit(_ id: UInt32) -> Bool {
+    package func endExit(_ id: UInt32) -> Bool {
         guard let ended = leaving.removeValue(forKey: id) else { return false }
         ended.view.setGhost(false)
-        for member in ended.members { member.forget() }
+        for member in ended.members { svg?.forget(member.id); member.forget() }
         ended.view.removeFromSuperview()
         return true
     }
 
-    func isLeaving(_ view: NodeView) -> Bool { leaving[view.id]?.view === view }
+    package func isLeaving(_ view: NodeView) -> Bool { leaving[view.id]?.view === view }
 
     /// Presented surface boxes and opacity, including ghosts absent from `tree`.
     func presenceObservation() -> [[String: Any]] {

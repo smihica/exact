@@ -1,260 +1,222 @@
-//! Logical text and key lookups over virtualized lists. LLP 1010 §6.
+//! The list engine's half of the list seam (LLP 1047.001 D11): each method
+//! reaches the engine, which no core function names.
+use super::list_seam::Lists;
 use super::*;
+use crate::list_api::{
+    CollectionEdges, CollectionFeedback, CollectionFill, CollectionSnapshot, ListTextPolicy,
+    ListTextPosition, ReorderBinding, ReorderFrame, ReorderGeometry, ReorderProgress, ReorderStart,
+    ReorderStep, ReorderToken,
+};
+use exact_kernel::{Kernel, NodeKey, Op};
 
-/// The host's paragraph and `user-select: auto` rules for logical copies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListTextPolicy {
-    /// DOM paragraphs, with the host stylesheet's unselectable control labels.
-    Web,
-    /// AppKit labels/chrome are unselectable; native titles have no paragraph.
-    MacOS,
-}
+/// The list engine, for a runner whose entry links lists.
+pub(crate) struct LinkedLists;
 
-/// A text position that survives retirement of a list row's native views.
-#[derive(Debug, Clone, Copy)]
-pub struct ListTextPosition<'a> {
-    /// The opaque key published on the row wrapper.
-    pub key: &'a str,
-    /// Zero-based paragraph within the row.
-    pub paragraph: usize,
-    /// UTF-16 offset within that paragraph, as on the DOM and Apple text APIs.
-    pub offset: usize,
-}
-
-impl<D: DataSource> Runner<D> {
-    /// Nearest unmounted row snap area in a collection, along its axis, using
-    /// its measured sizes or current estimates. At most 64 local rows are
-    /// evaluated; no row is mounted. `geometry`: the snapport start's
-    /// projected rest, the snapport's length, the least and greatest rests,
-    /// and the distance of the nearest mounted target (infinity when there is
-    /// none), which bounds the search.
-    pub fn collection_snap(&self, view: ViewId, geometry: [f64; 5]) -> Option<f64> {
-        let [proposed, port, minimum, maximum, distance] = geometry;
-        if self.poisoned
-            || ![proposed, port, minimum, maximum]
-                .into_iter()
-                .all(f64::is_finite)
-            || port <= 0.0
-            || maximum < minimum
-            || distance.is_nan()
-            || distance <= 0.0
-        {
-            return None;
+impl<D: DataSource> Lists<D> for LinkedLists {
+    fn linked(&self) -> bool {
+        true
+    }
+    fn collections(&self, tree: &Tree, rows: usize) -> Vec<CollectionSnapshot> {
+        match rows {
+            1 => tree.collections_shallow(),
+            _ => tree.collections(),
         }
-        let mut ids = Ids::default();
-        let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-        u.fonts = Some(self.fonts.clone());
-        self.tree
-            .as_ref()?
-            .collection_snap(&mut u, &self.kernel, view, geometry)
+    }
+    fn collection(&self, tree: &Tree, view: ViewId) -> Option<CollectionSnapshot> {
+        tree.collection(view)
+    }
+    fn collection_mounted(&self, tree: &Tree, view: ViewId, out: &mut Vec<(ViewId, u64)>) {
+        tree.collection_mounted(view, out)
+    }
+    fn collection_data(&self, tree: &Tree) -> Vec<(ViewId, u64, bool)> {
+        tree.collection_data()
+    }
+    fn collections_bounded(
+        &self,
+        tree: &Tree,
+        [collections, rows, traversal, json_bytes]: [usize; 4],
+    ) -> Result<Vec<CollectionSnapshot>, &'static str> {
+        tree.collections_bounded(collections, rows, traversal, json_bytes)
+    }
+    fn collection_travel(
+        &self,
+        tree: &mut Tree,
+        view: ViewId,
+        (revision, sequence, offset): (u64, u64, f64),
+    ) {
+        tree.collection_travel(view, revision, sequence, offset)
+    }
+    fn update_collection(
+        &self,
+        tree: &mut Tree,
+        u: &mut Update<'_>,
+        feedback: CollectionFeedback,
+        fill: CollectionFill,
+    ) -> Result<(bool, Option<CollectionEdges>), InstanceError> {
+        tree.update_collection(u, feedback, fill)
+    }
+    fn collection_edges(
+        &self,
+        r: &mut Runner<D>,
+        view: ViewId,
+        edges: CollectionEdges,
+        result: &mut Advanced,
+    ) {
+        r.collection_edges_linked(view, edges, result)
+    }
+    fn show_collection(&self, tree: &mut Tree, u: &mut Update<'_>, view: ViewId, offset: f64) {
+        tree.show_collection(u, view, offset)
+    }
+    fn release_held_edges(&self, r: &mut Runner<D>) -> Result<(), RunnerError> {
+        r.release_held_edges_linked()
+    }
+    fn wake_deferred_edges(&self, r: &mut Runner<D>) -> Result<(), RunnerError> {
+        r.wake_deferred_edges_linked()
+    }
+    fn collection_snap(
+        &self,
+        tree: &Tree,
+        u: &mut Update<'_>,
+        kernel: &Kernel,
+        view: ViewId,
+        geometry: [f64; 5],
+    ) -> Option<f64> {
+        tree.collection_snap(u, kernel, view, geometry)
             .ok()
             .flatten()
     }
-
-    /// The positions each unmounted row root with a snap alignment along a
-    /// collection's axis rests at, first to last, in
-    /// [`Runner::collection_snap`]'s coordinates: of the rows `window` covers,
-    /// at most `cap` up to and including the one at `around` and `cap` after
-    /// it. `snapport`: its length and the least and greatest positions of its
-    /// start. No row is mounted.
-    pub fn collection_snap_areas(
+    fn collection_snap_areas(
         &self,
+        tree: &Tree,
+        u: &mut Update<'_>,
+        kernel: &Kernel,
         view: ViewId,
-        (around, window, cap): (f64, [f64; 2], usize),
+        around: (f64, [f64; 2], usize),
         snapport: [f64; 3],
     ) -> Vec<(f64, f64, bool)> {
-        let [port, minimum, maximum] = snapport;
-        if self.poisoned
-            || ![around, window[0], window[1], port, minimum, maximum]
-                .into_iter()
-                .all(f64::is_finite)
-            || port <= 0.0
-            || maximum < minimum
-        {
-            return Vec::new();
-        }
-        let mut ids = Ids::default();
-        let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-        u.fonts = Some(self.fonts.clone());
-        self.tree
-            .as_ref()
-            .and_then(|tree| {
-                tree.collection_snap_areas(
-                    &mut u,
-                    &self.kernel,
-                    view,
-                    (around, window, cap),
-                    snapport,
-                )
-                .ok()
-            })
+        tree.collection_snap_areas(u, kernel, view, around, snapport)
             .unwrap_or_default()
     }
-
-    /// The first position past `release` toward `rest` an unmounted row
-    /// root with `scroll-snap-stop: always` holds a snap at, in
-    /// [`Runner::collection_snap`]'s coordinates; `snapport`: its length and
-    /// the least and greatest positions of its start. At most 256 rows past
-    /// the release are read; no row is mounted.
-    pub fn collection_snap_stop(
+    fn collection_snap_stop(
         &self,
+        tree: &Tree,
+        u: &mut Update<'_>,
+        kernel: &Kernel,
         view: ViewId,
-        [release, rest]: [f64; 2],
-        snapport: [f64; 3],
+        geometry: [f64; 5],
     ) -> Option<f64> {
-        let [port, minimum, maximum] = snapport;
-        if self.poisoned
-            || ![release, rest, port, minimum, maximum]
-                .into_iter()
-                .all(f64::is_finite)
-            || port <= 0.0
-            || maximum < minimum
-        {
-            return None;
-        }
-        let mut ids = Ids::default();
-        let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-        u.fonts = Some(self.fonts.clone());
-        self.tree
-            .as_ref()?
-            .collection_snap_stop(
-                &mut u,
-                &self.kernel,
-                view,
-                [release, rest, port, minimum, maximum],
-            )
+        tree.collection_snap_stop(u, kernel, view, geometry)
             .ok()
             .flatten()
     }
-
-    /// Resolve an opaque row key without materializing that row.
-    pub fn list_index(&self, view: ViewId, key: &str) -> Option<usize> {
-        self.tree.as_ref()?.list_index(view, key)
+    fn list_index(&self, tree: &Tree, view: ViewId, key: &str) -> Option<usize> {
+        tree.list_index(view, key)
     }
-
-    /// Copy all logical text, or the range between two stable endpoints.
-    /// At most one unmounted row is realized at a time; its operations are
-    /// never committed. No data query, clock advance, or native view is created.
-    pub fn list_text(
+    fn list_text(
         &self,
+        tree: &Tree,
+        u: &mut Update<'_>,
         view: ViewId,
         range: Option<(ListTextPosition<'_>, ListTextPosition<'_>)>,
         policy: ListTextPolicy,
-    ) -> Result<String, RunnerError> {
-        if self.poisoned {
-            return Err(RunnerError::Poisoned);
-        }
-        let mut ids = Ids::default();
-        let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-        u.fonts = Some(self.fonts.clone());
-        Ok(self
-            .tree
-            .as_ref()
-            .expect("booted")
-            .list_text(&mut u, view, range, policy)?)
+    ) -> Result<String, InstanceError> {
+        tree.list_text(u, view, range, policy)
     }
-    /// Re-evaluate every site and apply one batch. A failure here means the
-    /// instance tree and the kernel may disagree; the runner is poisoned and
-    /// the host restarts it — never a half-applied frame.
-    pub(super) fn update(&mut self) -> Result<CommitReceipt, RunnerError> {
-        let requests = std::mem::take(&mut self.into_view);
-        let receipt = if requests.is_empty() {
-            self.update_tree(true, |tree, u| tree.update(u))?
-        } else {
-            self.update_into_views(&requests, true)?
-        };
-        self.release_compiled();
-        Ok(receipt)
+    fn reorder_binding(
+        &self,
+        tree: &Tree,
+        kernel: &Kernel,
+        list: ViewId,
+        handle: NodeKey,
+    ) -> Option<ReorderBinding> {
+        tree.reorder_collection(list)?
+            .reorder_binding(kernel, handle)
     }
-
-    pub(super) fn update_tree(
-        &mut self,
-        settled: bool,
-        update: impl FnOnce(&mut Tree, &mut Update<'_>) -> Result<(), crate::instance::InstanceError>,
-    ) -> Result<CommitReceipt, RunnerError> {
-        let (ops, surfaces, _) = self.update_ops(settled, update)?;
-        match self.apply(ops) {
-            Ok(receipt) => {
-                self.publish_surfaces(surfaces);
-                if settled && !self.held_edges.is_empty() {
-                    if let Err(error) = self.release_held_edges() {
-                        self.poison();
-                        return Err(error);
-                    }
-                }
-                Ok(receipt)
-            }
-            Err(e) => {
-                self.poison();
-                Err(e)
-            }
+    fn reorder_geometry(
+        &self,
+        tree: &Tree,
+        view: ViewId,
+        list: NodeKey,
+    ) -> Option<ReorderGeometry> {
+        tree.reorder_collection(view)?.reorder_geometry(list)
+    }
+    fn begin_reorder(
+        &self,
+        r: &mut Runner<D>,
+        binding: ReorderBinding,
+        geometry: ReorderGeometry,
+        group: Option<bool>,
+    ) -> Result<Option<ReorderStart>, RunnerError> {
+        match group {
+            None => r.begin_session(binding, geometry, None, false),
+            Some(ghost) => r.begin_group_reorder_linked(binding, geometry, ghost),
         }
     }
-    /// Evaluate one phase without publishing it. Ordinary settlement runs once;
-    /// a request phase only realizes the requested windows.
-    pub(super) fn update_ops(
-        &mut self,
-        settled: bool,
-        update: impl FnOnce(&mut Tree, &mut Update<'_>) -> Result<(), crate::instance::InstanceError>,
-    ) -> Result<UpdateOps, RunnerError> {
-        let mut tree = self.tree.take().expect("booted");
-        let mut ids = std::mem::take(&mut self.ids);
-        let rows = std::mem::take(&mut self.row_writes);
-        let result = {
-            let cell_margins = |view| super::collection::cell_margins(&self.kernel, view);
-            let scroll_margin = |view| super::collection::scroll_margin(&self.kernel, view);
-            let scroll_padding = |view| super::collection::scroll_padding(&self.kernel, view);
-            let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-            u.fonts = Some(self.fonts.clone());
-            u.scroll_padding = Some(&scroll_padding);
-            u.scroll_margin = Some(&scroll_margin);
-            if self.kernel.arena().env().cell_spaces {
-                u.cell_margins = Some(&cell_margins);
-            }
-            u.full = self.full;
-            u.discard = self.kernel.is_detached();
-            u.rows = rows;
-            u.reuse = self.reuse;
-            update(&mut tree, &mut u)
-                .map(|_| (u.ops, u.surfaces, u.notes, u.renewed, u.shown, u.work))
-        };
-        self.ids = ids;
-        self.tree = Some(tree);
-        let (ops, surfaces, work) = match result {
-            Ok((ops, surfaces, notes, renewed, shown, work)) => {
-                self.notes = notes;
-                self.renewed = renewed;
-                self.shown.extend(shown);
-                if settled {
-                    let tree = self.tree.as_mut().expect("booted");
-                    tree.last_work.rows_scanned += self.lookup_rows.take();
-                    tree.last_work.derives_evaluated = self.derives_evaluated;
-                    tree.last_work.store_bytes_copied =
-                        self.store.copied_bytes() - self.copied_at_checkpoint;
-                }
-                (ops, surfaces, work)
-            }
-            Err(e) => {
-                if settled || e != crate::instance::InstanceError::InvalidCollectionFeedback {
-                    self.poison();
-                }
-                return Err(e.into());
-            }
-        };
-        // Only ordinary settlement wakes deferred collection edges; geometry-only
-        // feedback must not replenish this work.
-        if settled {
-            if let Err(error) = self.wake_deferred_edges() {
-                self.poison();
-                return Err(error);
-            }
-        }
-        Ok((ops, surfaces, work))
+    fn has_reorder(&self, r: &Runner<D>, token: ReorderToken) -> bool {
+        r.has_reorder_linked(token)
+    }
+    fn preview_reorder(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+        geometry: ReorderGeometry,
+        y: f64,
+    ) -> Result<ReorderProgress, RunnerError> {
+        r.preview_reorder_linked(token, geometry, y)
+    }
+    fn preview_reorder_into(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+        target: NodeKey,
+        geometry: ReorderGeometry,
+        y: f64,
+    ) -> Result<ReorderProgress, RunnerError> {
+        r.preview_reorder_into_linked(token, target, geometry, y)
+    }
+    fn drop_reorder(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+        geometry: ReorderGeometry,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        r.drop_reorder_now(token, geometry)
+    }
+    fn cancel_reorder(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        r.cancel_reorder_linked(token)
+    }
+    fn reorder_frame(&self, r: &Runner<D>, token: ReorderToken) -> Option<ReorderFrame> {
+        r.reorder_frame_linked(token)
+    }
+    fn finish_reorder(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+    ) -> Result<Option<CommitReceipt>, RunnerError> {
+        r.finish_reorder_linked(token)
+    }
+    fn reorder_step(
+        &self,
+        r: &mut Runner<D>,
+        token: ReorderToken,
+        step: ReorderStep,
+    ) -> Result<Vec<CommitReceipt>, RunnerError> {
+        r.reorder_step_linked(token, step)
+    }
+    fn reorder_json(&self, r: &Runner<D>) -> String {
+        r.reorder_json_linked()
+    }
+    fn reconcile_reorder(&self, r: &mut Runner<D>) -> Result<Vec<Op>, RunnerError> {
+        r.reconcile_reorder_linked()
+    }
+    fn reorder_deadline(&self, r: &Runner<D>) -> Option<f64> {
+        r.reorder_deadline_linked()
+    }
+    fn reorder_timeout(&self, r: &mut Runner<D>) -> Result<CommitReceipt, RunnerError> {
+        r.reorder_timeout_linked()
     }
 }
-
-type UpdateOps = (
-    Vec<exact_kernel::Op>,
-    Vec<crate::SurfaceUpdate>,
-    crate::instance::InstanceWork,
-);

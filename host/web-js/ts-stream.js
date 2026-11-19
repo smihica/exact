@@ -42,8 +42,8 @@ function request(input, init, redirect, protocols) {
   // Read again as the stream opens: what `fetch` checked may have changed since (LLP 1016.000 D11).
   const idle = init.exactIdleTimeout;
   if (idle !== undefined && (!Number.isInteger(idle) || idle < 1 || idle > 3600000)) throw new TypeError('exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000');
-  if (idle !== undefined && (upload || init.exactLongPoll !== undefined || !/^wss?:/i.test(url))) throw new TypeError('exactIdleTimeout: only a WebSocket stream takes an idle timeout');
-  return { method, url, signal, headers: [...new Headers(init.headers ?? request?.headers ?? [])], raw, bodyFrom, cache: init.cache ?? request?.cache, mode: init.mode ?? request?.mode, redirect, maxResponseBytes: independent ?? 1048576, longPoll: longPollOf(init.exactLongPoll, method, url), upload, timeoutMs, idleTimeoutMs: idle, protocols };
+  if (idle !== undefined && (upload || init.exactLongPoll !== undefined || !(/^(wss?|https?):/i.test(url) || !/^[a-z][a-z0-9+.-]*:/i.test(url)))) throw new TypeError('exactIdleTimeout: only a WebSocket, event or byte stream takes an idle timeout');
+  return { method, url, signal, headers: [...new Headers(init.headers ?? request?.headers ?? [])], raw, bodyFrom, credentials: init.credentials ?? request?.credentials, cache: init.cache ?? request?.cache, mode: init.mode ?? request?.mode, redirect, maxResponseBytes: independent ?? 1048576, longPoll: longPollOf(init.exactLongPoll, method, url), upload, timeoutMs, idleTimeoutMs: idle, protocols };
 }
 // `exactUploadProgress` (LLP 1016.000 D10), as js/src/binary.js `uploadOf` checks it.
 function uploadOf(init, method, url, redirect) {
@@ -210,7 +210,7 @@ export function open({ input, init, redirect, protocols, origin }, conv, grantSe
     answering.call = null;
     // Settled once it has answered or its stream was let go: entropy is then refused (ts-fetch.js `answerOnly`).
     let ended = false;
-    const call = answering.mapperCall = { get settled() { return ended || controller.active?.() === false; } };
+    const call = answering.mapperCall = { get settled() { return ended || frame && controller.dropped || controller.active?.() === false; } };
     try {
       const v = map(event, socket);
       if (turn?.overload) throw turn.overload;
@@ -241,8 +241,12 @@ export function open({ input, init, redirect, protocols, origin }, conv, grantSe
   let batch = [];
   const each = (ms, i = 0) => {
     for (;; i++) {
+      if (controller.dropped) return;
       const r = value(event(ms[i]), true), at = i, last = r => r.error !== undefined || at === ms.length - 1;
-      const done = r => last(r) ? deliver({ ...r, coalesced: ms[at].coalesced, messages: at + 1 }) : each(ms, at + 1);
+      const done = r => {
+        if (controller.dropped) return;
+        return last(r) ? deliver({ ...r, coalesced: ms[at].coalesced, messages: at + 1 }) : each(ms, at + 1);
+      };
       if (r && typeof r.then === 'function') return r.then(done);
       if (last(r)) return done(r);
     }
@@ -253,7 +257,7 @@ export function open({ input, init, redirect, protocols, origin }, conv, grantSe
   const bytesOf = m => typeof m.data === 'string' ? utf8.encode(m.data).length : m.data.byteLength;
   const message = m => {
     controller.sent ||= !!req.upload;
-    if (fellBehind || req.longPoll && m.event === 'exact:reply' || req.upload && m.event === 'exact:sending') return;
+    if (controller.dropped || fellBehind || req.longPoll && m.event === 'exact:reply' || req.upload && m.event === 'exact:sending') return;
     batch.push(m);
     if (m.more) return;
     const ms = batch; batch = [];
@@ -276,11 +280,14 @@ export function open({ input, init, redirect, protocols, origin }, conv, grantSe
   return streamed(req, grantSet, timed, controller, (path, set) => readBodyFile(path, set, controller), protocol)
     .then(o => {
       gate()?.ended(controller.streamName);
+      if (o.refused) return o;
       if (o.close) journal.push(`t=${clock.now} socket close: ${o.close.code} ${o.close.reason} (${controller.streamName})`);
-      return inOrder(() => value(o.close ? { type: 'close', data: '', lastEventId: '', coalesced: 0, ...o.close } : o.kind
+      const end = () => value(o.close ? { type: 'close', data: '', lastEventId: '', coalesced: 0, ...o.close } : o.kind
       ? { type: 'error', data: '', lastEventId: '', coalesced: 0, kind: KINDS[o.kind], message: said.decode(o.body), status: 0 }
       : req.upload ? { type: 'load', status: o.status, data: said.decode(o.body), lastEventId: '', coalesced: 0 }
-      : { type: 'error', data: said.decode(o.body), lastEventId: '', coalesced: 0, kind: 'Response', message: `HTTP ${o.status}`, status: o.status }));
+      : { type: 'error', data: said.decode(o.body), lastEventId: '', coalesced: 0, kind: 'Response', message: `HTTP ${o.status}`, status: o.status });
+      // An injected end overtakes frames waiting on an unfinished mapper.
+      return controller.dropped ? end() : inOrder(end);
     })
     .finally(() => heard?.removeEventListener('abort', abort));
 }

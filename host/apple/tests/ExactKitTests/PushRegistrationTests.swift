@@ -8,6 +8,7 @@ import AppKit
 private typealias TestApp = NSApplication
 #endif
 @testable import ExactKit
+@testable import ExactNotifications
 
 /// The system's answers to a registration, forwarded to ExactKit from any
 /// thread, are kept app-wide and announced on the main thread

@@ -34,8 +34,8 @@ public enum ExactDocuments {
     public static var declared: Bool { !types.isEmpty }
 
     /// Every `LSItemContentTypes` entry across the declared document types,
-    /// and the type this Mac gives each declared extension (`Picker`).
-    static var types: [UTType] { Picker.documentTypes }
+    /// and the type this Mac gives each declared extension (`DocumentTypes`).
+    static var types: [UTType] { DocumentTypes.documentTypes }
 
     /// The adapter that owns the windows hears of a document chosen in a
     /// session (a picker's open or save): the window shows it.
@@ -45,7 +45,7 @@ public enum ExactDocuments {
     /// each joins Open Recent — a save's once it is written, since AppKit
     /// lists only files that exist — and is kept for an app granted
     /// `doc.keep` (LLP 1069.010.000 D3); the window shows the last.
-    static func chosen(_ urls: [URL], in session: ExactSession) {
+    package static func chosen(_ urls: [URL], in session: ExactSession) {
         // One that exists was noted and kept as it was chosen (`keptChoice`).
         for url in urls where !FileManager.default.fileExists(atPath: url.path) {
             noteWhenWritten(url) { [weak session] in session?.keepDocument(url) }
@@ -68,10 +68,15 @@ public enum ExactDocuments {
     /// these (LLP 1069.010 D2). An extension another app's type owns on this
     /// Mac (`.board`, Freeform's) still counts when the manifest names it.
     public static func accepts(_ url: URL, metadata: [String: Any] = ExactEnv.appMetadata) -> Bool {
+        let filename = url.lastPathComponent.lowercased()
+        if DocumentTypes.declarations(in: metadata).contains(where: {
+            ($0["CFBundleTypeExtensions"] as? [String] ?? []).contains {
+                filename.hasSuffix("." + $0.lowercased())
+            }
+        }) { return true }
         let ext = url.pathExtension.lowercased()
-        if !ext.isEmpty, Picker.declarations(in: metadata).contains(where: { ($0["CFBundleTypeExtensions"] as? [String] ?? []).contains { $0.lowercased() == ext } }) { return true }
         let type = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType) ?? UTType(filenameExtension: ext)
-        return type.map { t in Picker.types(in: metadata).contains { t.conforms(to: $0) } } ?? false
+        return type.map { t in DocumentTypes.types(in: metadata).contains { t.conforms(to: $0) } } ?? false
     }
 
     /// The paths in `arguments` that name something on disk, made absolute
@@ -120,11 +125,13 @@ public enum ExactDocuments {
         metadata["ExactLaunchMode"] as? String != "navigate-new" && !(hiding && keepsRunning(metadata))
     }
 
-    /// Whether the app's window is put away rather than closed: it is the
-    /// `only` one, and the app keeps running without it (`keepsRunning`), or
-    /// a one-window app's status item is placed (LLP 1133.025 D4).
-    public static func keepsWindow(only: Bool, placesStatusItems: Bool, _ metadata: [String: Any] = ExactEnv.appMetadata) -> Bool {
-        only && (keepsRunning(metadata) || (metadata["ExactLaunchMode"] as? String != "navigate-new" && placesStatusItems))
+    /// Whether a window is put away rather than closed: it is the window
+    /// named `main`, which holds the app's session (LLP 1030.004 D3), and
+    /// the app keeps running without it (`keepsRunning`), or a non-document
+    /// app's status item is placed (LLP 1133.025 D4), whatever other windows
+    /// are open.
+    public static func keepsWindow(main: Bool, placesStatusItems: Bool, _ metadata: [String: Any] = ExactEnv.appMetadata) -> Bool {
+        main && (keepsRunning(metadata) || (metadata["ExactLaunchMode"] as? String != "navigate-new" && placesStatusItems))
     }
 
     /// The person closes `window` (⌘W, File ▸ Close Window, the red button):

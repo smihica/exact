@@ -10,6 +10,19 @@ use super::*;
 use exact_runner::{DataError, DataSource, Runner};
 
 #[test]
+fn field_sizing_reaches_native_control_measurement() {
+    for sizing in ["content", "fixed"] {
+        let mut style = StyleProps::default();
+        style
+            .set_dynamic(StyleId::FieldSizing, &StyleValue::Text(sizing.into()))
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&style_json(&style, &Env::default()).0).unwrap();
+        assert_eq!(json["field_sizing"], sizing);
+    }
+}
+
+#[test]
 fn only_dialogs_keep_viewport_positioning_rows() {
     use exact_kernel::{Kernel, MonospaceMeasurer, Op, PropId};
     let mut kernel = Kernel::new(Box::new(MonospaceMeasurer::default()));
@@ -245,4 +258,25 @@ component App
         "{moving}"
     );
     assert!(json("still").get("written").is_none());
+}
+
+#[test]
+fn basic_clips_cross_as_relative_geometry() {
+    exact_kernel::style::link_all();
+    let mut style = StyleProps::default();
+    style
+        .set_dynamic(
+            StyleId::ClipPath,
+            &StyleValue::Text("polygon(evenodd, 4px 25%, 100% 0, 0 100%)".into()),
+        )
+        .unwrap();
+    let (text, skipped) = style_json(&style, &Env::default());
+    assert!(skipped.is_empty());
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        json["clip_path"],
+        serde_json::json!({
+            "shape": "polygon", "values": [4,0,0,25,0,100,0,0,0,0,0,100], "rule":"evenodd"
+        })
+    );
 }

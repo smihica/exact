@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 #if os(macOS)
 import AppKit
 #elseif os(iOS)
@@ -111,10 +112,10 @@ final class IntersectionIOSTests: IntersectionFixture {
             try XCTUnwrap(p.views.values.first { $0.props["testId"] == name })
         }
         func facts(_ name: String) -> String { p.views.values.first { $0.props["testId"] == name }?.props["text"] ?? "" }
-        waitFor("home appears") { p.navigation.activeRoute != nil && !p.navigation.inTransition }
+        waitFor("home appears") { p.navigationHost.activeRoute != nil && !p.navigationHost.inTransition }
         p.press(try node("open").id)
-        waitFor("the pushed page appears") { p.navigation.activeRoute?.pushed == true && !p.navigation.inTransition }
-        let route = try XCTUnwrap(p.navigation.activeRoute)
+        waitFor("the pushed page appears") { p.navigationHost.activeRoute?.pushed == true && !p.navigationHost.inTransition }
+        let route = try XCTUnwrap(p.navigationHost.activeRoute)
         let scroll = try XCTUnwrap(route.contentViewport, "the route's native page scrolls")
         waitFor("initial observations") { facts("route-facts") == "1:true" && facts("marker-facts") == "1:false" }
         scroll.setContentOffset(CGPoint(x: 0, y: 500), animated: false)
@@ -128,7 +129,7 @@ final class IntersectionIOSTests: IntersectionFixture {
         scroll.setContentOffset(.zero, animated: false)
         waitFor("the paging marker leaves once") { facts("marker-facts") == "3:false" }
         p.press(try node("open-list").id)
-        waitFor("the virtual list appears") { facts("list-facts") == "true:false" && !p.navigation.inTransition }
+        waitFor("the virtual list appears") { facts("list-facts") == "true:false" && !p.navigationHost.inTransition }
         let list = try XCTUnwrap(try node("virtual-list").scrollView)
         list.setContentOffset(CGPoint(x: 0, y: 250), animated: false)
         waitFor("a preloaded list row enters as the first leaves") { facts("list-facts") == "false:true" }

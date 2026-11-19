@@ -356,6 +356,9 @@ impl Lowerer<'_> {
     /// the evaluator that will sample it.
     pub(crate) fn declare_keyframes(&mut self, file: &File) -> Vec<LowerError> {
         let mut errors = Vec::new();
+        let scope = self
+            .types
+            .component_scope(self.root, &self.types.components[0]);
         // A keyframe takes any colour a row does (`values.rs` links them for rows).
         exact_kernel::style::link_wide_colors();
         for decl in &file.keyframes {
@@ -414,19 +417,21 @@ impl Lowerer<'_> {
                         });
                         continue;
                     }
-                    // A literal, or a palette function of literal arguments
-                    // folded to one (LLP 1062 D9).
-                    let Some(value) = crate::keyframes::constant(&a.value, &file.fns) else {
-                        ok = false;
-                        errors.push(LowerError {
-                            id: "lower-keyframes",
-                            message: format!(
-                                "`{}` in `keyframes {}` is a number or a string known when the app compiles: written, or returned by a function of literal arguments",
+                    let value = match self.constants(&scope).constant(&a.value) {
+                        Ok(value) => value,
+                        Err(reason) => {
+                            ok = false;
+                            let message = format!(
+                                "`{}` in `keyframes {}` is a number or a string known when the app compiles: written, or returned by a function of literal arguments; {reason}",
                                 a.name, decl.name
-                            ),
-                            span: a.span,
-                        });
-                        continue;
+                            );
+                            errors.push(LowerError {
+                                id: "lower-keyframes",
+                                message,
+                                span: a.span,
+                            });
+                            continue;
+                        }
                     };
                     // @ref LLP 1121 D3 — a motion token the fold returned.
                     let value =
@@ -447,7 +452,7 @@ impl Lowerer<'_> {
                         ok = false;
                         errors.push(LowerError {
                             id: "lower-keyframes",
-                            message: format!("`scale=\"{value}\"` in `keyframes {}`: exact2's `scale` is one factor for both axes, here and on a row; a per-axis scale is not built. A bar can grow by `translate` inside a box that clips (`overflow=\"hidden\"`)", decl.name),
+                            message: format!("`scale=\"{value}\"` in `keyframes {}`: exact2's `scale` is one factor for both axes, here and on a row; a per-axis scale is not built. For a fold, animate `rotate=\"-90deg x\"` or `rotate=\"90deg y\"`; for a bar, animate `translate` inside `overflow=\"hidden\"`", decl.name),
                             span: a.span,
                         });
                         continue;
@@ -499,7 +504,7 @@ impl Lowerer<'_> {
             match Keyframes::parse(&css) {
                 Ok(rule) => {
                     self.b.keyframes(&decl.name, &rule.css());
-                    self.keyframes.insert(decl.name.clone(), rule.properties());
+                    self.keyframes.insert(decl.name.clone(), rule);
                 }
                 Err(e) => errors.push(LowerError {
                     id: "lower-keyframes",
@@ -517,11 +522,12 @@ impl Lowerer<'_> {
         tag: &str,
         parent_tag: Option<&str>,
         attrs: &[Attr],
+        scope: &contract_types::Scope,
     ) -> Result<(), LowerError> {
         let in_svg = in_svg(self.svg_depth > 0, parent_tag);
-        check_svg_attrs_with(tag, in_svg, attrs, &|a| {
+        check_svg_attrs_with(tag, in_svg, attrs, &self.constants(scope), &|a| {
             if matches!(a.name.as_str(), "animation" | "-exact-exit-animation") {
-                self.check_animation_names(tag, &a.value)?;
+                self.check_animation_names(tag, in_svg, attrs, &a.value)?;
             }
             if a.name == "animation" && timeline_bound(attrs) {
                 self.check_timeline_rows(&a.value)?;
@@ -533,13 +539,19 @@ impl Lowerer<'_> {
         })
     }
 
-    fn check_animation_names(&self, tag: &str, value: &Expr) -> Result<(), LowerError> {
+    fn check_animation_names(
+        &self,
+        tag: &str,
+        in_svg: bool,
+        attrs: &[Attr],
+        value: &Expr,
+    ) -> Result<(), LowerError> {
         each_literal(value, &mut |text, span| {
             let Ok(list) = Animations::parse(text) else {
                 return Ok(()); // the row's own check names the grammar
             };
             for a in &list.0 {
-                let Some(properties) = self.keyframes.get(&a.name) else {
+                let Some(frames) = self.keyframes.get(&a.name) else {
                     return err(
                         "lower-animation-name",
                         format!(
@@ -549,6 +561,27 @@ impl Lowerer<'_> {
                         span,
                     );
                 };
+                let mut spatial_axis = false;
+                for row in attrs.iter().filter(|a| a.name == "rotate") {
+                    each_literal(&row.value, &mut |text, _| {
+                        spatial_axis |= exact_motion::rotation::parse(text)
+                            .is_some_and(|v| v.y != 0.0 || v.z != 0.0);
+                        Ok(())
+                    })?;
+                }
+                let takes_axis = frames.0.iter().any(|f| {
+                    f.values
+                        .iter()
+                        .any(|(p, v)| *p == Property::Rotate && [v.y, v.z, v.w] == [0.0; 3])
+                });
+                if in_svg && (frames.spatial_rotation() || spatial_axis && takes_axis) {
+                    return err(
+                        "lower-animation-target",
+                        format!("`keyframes {}` rotates outside the screen plane, which an SVG element cannot draw on Apple or painted hosts (Linux, Android, Windows); animate a box around the `svg` instead", a.name),
+                        span,
+                    );
+                }
+                let properties = frames.properties();
                 // An SVG element's transform animates as CSS says (LLP
                 // 1055.000 D5); `r` is a circle's alone.
                 if properties.contains(&Property::R) && !matches!(tag, "circle") && is_element(tag)
@@ -591,7 +624,7 @@ impl Lowerer<'_> {
                     );
                 }
                 let unpainted = self.keyframes.get(&a.name).and_then(|properties| {
-                    properties.iter().copied().find(|p| {
+                    properties.properties().into_iter().find(|p| {
                         !matches!(
                             p,
                             Property::Opacity
@@ -771,10 +804,11 @@ pub(crate) fn check_svg_with(
     parent_tag: Option<&str>,
     attrs: &[Attr],
     span: Span,
+    constants: &crate::keyframes::Context<'_>,
     animation: &dyn Fn(&Attr) -> Result<(), LowerError>,
 ) -> Result<(), LowerError> {
     check_svg_content(tag, in_svg, parent_tag, span)?;
-    check_svg_attrs_with(tag, in_svg, attrs, animation)
+    check_svg_attrs_with(tag, in_svg, attrs, constants, animation)
 }
 
 /// Refuse an invalid SVG structure before checking its attributes.
@@ -815,10 +849,28 @@ pub(crate) fn check_svg_content(
     Ok(())
 }
 
+fn native_clip(value: &Expr) -> bool {
+    match value {
+        Expr::None(_) => true,
+        Expr::Str(v, _) => {
+            exact_kernel::clip::ClipPath::parse(v).is_none_or(|clip| clip.shape_data().is_none())
+        }
+        Expr::Ternary(_, yes, no, _)
+        | Expr::Match {
+            some: yes,
+            none: no,
+            ..
+        } => native_clip(yes) && native_clip(no),
+        Expr::Let { body, .. } | Expr::Typed(body, _, _) => native_clip(body),
+        _ => true,
+    }
+}
+
 fn check_svg_attrs_with(
     tag: &str,
     in_svg: bool,
     attrs: &[Attr],
+    constants: &crate::keyframes::Context<'_>,
     animation: &dyn Fn(&Attr) -> Result<(), LowerError>,
 ) -> Result<(), LowerError> {
     let element = is_element(tag) || (matches!(tag, "svg" | "text") && in_svg);
@@ -829,7 +881,7 @@ fn check_svg_attrs_with(
             continue;
         }
         // A `clipPath` by reference clips SVG elements (LLP 1055.000 D10);
-        // a box's `clip-path` is a path.
+        // a box takes a path or a basic shape.
         if matches!(tag, "text" | "tspan") && element && a.name == "rotate" {
             return err(
                 "lower-svg-attr",
@@ -855,9 +907,28 @@ fn check_svg_attrs_with(
         {
             return err(
                 "lower-attr-value",
-                "`clip-path: url(#…)` clips SVG elements; a box takes `path(\"…\")`",
+                "`clip-path: url(#…)` clips SVG elements; a box takes a basic shape or `path(\"…\")`",
                 a.span,
             );
+        }
+        if element && a.name == "clip-path" && !native_clip(&a.value) {
+            let native: Vec<_> = crate::icons::shipped()
+                .into_iter()
+                .filter(|t| {
+                    matches!(
+                        t.name.as_str(),
+                        "ios" | "macos" | "tvos" | "watchos" | "linux" | "windows" | "android"
+                    )
+                })
+                .map(|t| t.described())
+                .collect();
+            if !native.is_empty() {
+                return err(
+                    "lower-svg-clip-host",
+                    format!("basic-shape `clip-path` on SVG elements is not implemented on {}. Use `path()` in CSS pixels on a surrounding box, or `url(#id)` on the SVG element with a `clipPath` in `userSpaceOnUse` coordinates without percentages; computed `url()`, `path()` and `none` also work. Basic shapes work on boxes on every host and on SVG elements on the web", native.join(", ")),
+                    a.span,
+                );
+            }
         }
         if let Some(owners) = owners(&a.name) {
             if !owners.contains(&tag) {
@@ -928,7 +999,7 @@ fn check_svg_attrs_with(
             _ => None,
         };
         if let Some(name) = length.filter(|_| element) {
-            check_length(name, &a.value)?;
+            check_length(name, &a.value, constants)?;
         }
         animation(a)?;
     }
@@ -963,110 +1034,74 @@ fn exit_ends(value: &Expr) -> Result<(), LowerError> {
 
 /// Each string literal `value` can be: through a ternary's or a `match`'s
 /// arms, a type ascription, and a `let`'s body, where a read of the bound
-/// name is its value. Like the length checks, the visits are bounded, as
-/// shared derives can expand exponentially; past the bound the rest is the
-/// runtime's.
+/// name is its value. Shared initializers are visited once.
 fn each_literal(
     value: &Expr,
     check: &mut dyn FnMut(&str, Span) -> Result<(), LowerError>,
 ) -> Result<(), LowerError> {
-    /// `bindings`: each `let` name in scope with its value; `None` for a
-    /// `match` arm's binding, which shadows it.
-    fn visit<'a>(
-        value: &'a Expr,
-        bindings: &mut Vec<(&'a str, Option<&'a Expr>)>,
-        budget: &mut usize,
-        check: &mut dyn FnMut(&str, Span) -> Result<(), LowerError>,
-    ) -> Result<(), LowerError> {
-        if *budget == 0 {
-            return Ok(());
-        }
-        *budget -= 1;
-        match value {
-            Expr::Str(text, span) => check(text, *span),
-            Expr::Ternary(_, yes, no, _) => {
-                visit(yes, bindings, budget, check)?;
-                visit(no, bindings, budget, check)
-            }
-            Expr::Match {
-                var, some, none, ..
-            } => {
-                bindings.push((var, None));
-                let some = visit(some, bindings, budget, check);
-                bindings.pop();
-                some?;
-                visit(none, bindings, budget, check)
-            }
-            Expr::Typed(inner, ..) => visit(inner, bindings, budget, check),
-            Expr::Let {
-                name,
-                value: bound,
-                body,
-                ..
-            } => {
-                bindings.push((name, Some(bound)));
-                let body = visit(body, bindings, budget, check);
-                bindings.pop();
-                body
-            }
-            Expr::Ident(name, _) => {
-                let Some(i) = bindings.iter().rposition(|(bound, _)| bound == name) else {
-                    return Ok(());
-                };
-                let Some(bound) = bindings[i].1 else {
-                    return Ok(());
-                };
-                visit(bound, &mut bindings[..i].to_vec(), budget, check)
-            }
-            _ => Ok(()),
+    for leaf in contract_checking::value_leaves(value) {
+        if let Expr::Str(text, span) = leaf {
+            check(text, *span)?;
         }
     }
-    visit(value, &mut Vec::new(), &mut 4096, check)
+    Ok(())
+}
+
+struct LengthCheck<'a, 'b> {
+    constants: &'a crate::keyframes::Context<'b>,
+    remaining: Cell<usize>,
 }
 
 // These props bypass CSS length resolution. NUL represents only unknown text;
 // literal neighbors, including empty strings and separators, stay intact.
-fn length_text(value: &Expr, bindings: &[(&str, &Expr)], budget: &Cell<usize>) -> String {
-    if budget.get() == 0 {
+fn length_text(value: &Expr, bindings: &[(&str, &Expr)], check: &LengthCheck<'_, '_>) -> String {
+    if check.remaining.get() == 0 {
         return "\0".into();
     }
-    budget.set(budget.get() - 1);
+    check.remaining.set(check.remaining.get() - 1);
     match value {
         Expr::Str(text, _) => text.clone(),
         Expr::Number(n, _) => exact_num::Shortest(*n).to_string(),
         Expr::Ident(name, _) => bindings
             .iter()
             .rposition(|(bound, _)| *bound == name)
-            .map(|i| length_text(bindings[i].1, &bindings[..i], budget))
+            .map(|i| length_text(bindings[i].1, &bindings[..i], check))
             .unwrap_or_else(|| "\0".into()),
         Expr::Template(parts, _) => parts
             .iter()
             .map(|part| match part {
                 TemplatePart::Text(text) => text.clone(),
-                TemplatePart::Expr(value) => length_text(value, bindings, budget),
+                TemplatePart::Expr(value) => length_text(value, bindings, check),
             })
             .collect(),
-        Expr::Binary(BinOp::Add, a, b, _) => {
-            crate::keyframes::constant(value, &[]).unwrap_or_else(|| {
-                length_text(a, bindings, budget) + &length_text(b, bindings, budget)
-            })
-        }
+        Expr::Binary(BinOp::Add, a, b, _) => check
+            .constants
+            .constant(value)
+            .unwrap_or_else(|_| length_text(a, bindings, check) + &length_text(b, bindings, check)),
         Expr::Let {
             name, value, body, ..
         } => {
             let mut bindings = bindings.to_vec();
             bindings.push((name, value));
-            length_text(body, &bindings, budget)
+            length_text(body, &bindings, check)
         }
-        Expr::Typed(body, ..) => length_text(body, bindings, budget),
+        Expr::Typed(body, ..) => length_text(body, bindings, check),
         _ => "\0".into(),
     }
 }
 
-fn check_length(name: &str, value: &Expr) -> Result<(), LowerError> {
+fn check_length(
+    name: &str,
+    value: &Expr,
+    constants: &crate::keyframes::Context<'_>,
+) -> Result<(), LowerError> {
     // Shared derives can expand exponentially. Stop static inspection after a
     // bounded number of visits; larger expressions stay unchecked like dynamic inputs.
-    check_length_fragment(name, value, "", "", &[], &Cell::new(4096))
+    let check = LengthCheck {
+        constants,
+        remaining: Cell::new(4096),
+    };
+    check_length_fragment(name, value, "", "", &[], &check)
 }
 
 fn check_length_fragment(
@@ -1075,11 +1110,11 @@ fn check_length_fragment(
     prefix: &str,
     suffix: &str,
     bindings: &[(&str, &Expr)],
-    budget: &Cell<usize>,
+    check: &LengthCheck<'_, '_>,
 ) -> Result<(), LowerError> {
-    check_length_choices(name, value, prefix, suffix, bindings, budget)?;
-    let text = format!("{prefix}{}{suffix}", length_text(value, bindings, budget));
-    if budget.get() == 0 {
+    check_length_choices(name, value, prefix, suffix, bindings, check)?;
+    let text = format!("{prefix}{}{suffix}", length_text(value, bindings, check));
+    if check.remaining.get() == 0 {
         return Ok(());
     }
     check_length_text(name, &text, value.span())
@@ -1093,12 +1128,12 @@ fn check_length_choices(
     prefix: &str,
     suffix: &str,
     bindings: &[(&str, &Expr)],
-    budget: &Cell<usize>,
+    check: &LengthCheck<'_, '_>,
 ) -> Result<(), LowerError> {
-    if budget.get() == 0 {
+    if check.remaining.get() == 0 {
         return Ok(());
     }
-    budget.set(budget.get() - 1);
+    check.remaining.set(check.remaining.get() - 1);
     match value {
         Expr::Ternary(_, yes, no, _)
         | Expr::Match {
@@ -1106,12 +1141,12 @@ fn check_length_choices(
             none: no,
             ..
         } => {
-            check_length_fragment(name, yes, prefix, suffix, bindings, budget)?;
-            check_length_fragment(name, no, prefix, suffix, bindings, budget)
+            check_length_fragment(name, yes, prefix, suffix, bindings, check)?;
+            check_length_fragment(name, no, prefix, suffix, bindings, check)
         }
         Expr::Ident(bound, _) => {
             if let Some(i) = bindings.iter().rposition(|(name, _)| *name == bound) {
-                check_length_choices(name, bindings[i].1, prefix, suffix, &bindings[..i], budget)?;
+                check_length_choices(name, bindings[i].1, prefix, suffix, &bindings[..i], check)?;
             }
             Ok(())
         }
@@ -1123,15 +1158,15 @@ fn check_length_choices(
         } => {
             let mut bindings = bindings.to_vec();
             bindings.push((bound, value));
-            check_length_choices(name, body, prefix, suffix, &bindings, budget)
+            check_length_choices(name, body, prefix, suffix, &bindings, check)
         }
-        Expr::Typed(body, ..) => check_length_choices(name, body, prefix, suffix, bindings, budget),
+        Expr::Typed(body, ..) => check_length_choices(name, body, prefix, suffix, bindings, check),
         Expr::Template(parts, _) => {
             let text: Vec<_> = parts
                 .iter()
                 .map(|part| match part {
                     TemplatePart::Text(text) => text.clone(),
-                    TemplatePart::Expr(value) => length_text(value, bindings, budget),
+                    TemplatePart::Expr(value) => length_text(value, bindings, check),
                 })
                 .collect();
             for (i, part) in parts.iter().enumerate() {
@@ -1142,7 +1177,7 @@ fn check_length_choices(
                         &format!("{prefix}{}", text[..i].concat()),
                         &format!("{}{suffix}", text[i + 1..].concat()),
                         bindings,
-                        budget,
+                        check,
                     )?;
                 }
             }
@@ -1153,17 +1188,17 @@ fn check_length_choices(
                 name,
                 a,
                 prefix,
-                &format!("{}{suffix}", length_text(b, bindings, budget)),
+                &format!("{}{suffix}", length_text(b, bindings, check)),
                 bindings,
-                budget,
+                check,
             )?;
             check_length_choices(
                 name,
                 b,
-                &format!("{prefix}{}", length_text(a, bindings, budget)),
+                &format!("{prefix}{}", length_text(a, bindings, check)),
                 suffix,
                 bindings,
-                budget,
+                check,
             )
         }
         _ => Ok(()),

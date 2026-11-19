@@ -8,7 +8,7 @@ use exact_update::{gpu_code_digest as code_digest, Baked, Envelope};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-mod watch;
+pub(crate) mod watch;
 
 /// A development bake's map from plan node to Contract source (LLP 1035.002
 /// D6; LLP 1012.001.000 D6), `OUT_DIR/app.plan.map.json`: beside the plan,
@@ -114,6 +114,46 @@ pub(crate) fn emit(
     assets.extend(rust_assets);
     assets.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     let mut graph = artifact_graph(&plan, &compat.inputs, &assets, pictures, target)?;
+    let required = crate::link::apple_requirement(
+        app,
+        &plan,
+        entries.values().map(|entry| &entry.plan),
+        &compat.inputs,
+        manifest,
+        compat.host_work,
+    )?;
+    if let Some(required) = required {
+        graph["artifacts"][0]["requires"]["appleUses"] = required;
+    }
+    // What the binary links for its plan and, on Apple, its entries' plans,
+    // as `link::name_into` decides it.
+    let entry_plans = entries.values().map(|entry| &entry.plan);
+    let uses =
+        crate::link::production_uses(app, &plan, entry_plans, &compat.inputs, compat.host_work);
+    graph["uses"] = json!(uses.iter().map(|c| c.name()).collect::<Vec<_>>());
+    if matches!(platform, "ios" | "macos") {
+        let mut icons = apple_icons(&plan)?;
+        for entry in entries.values() {
+            icons.extend(apple_icons(&entry.plan)?);
+        }
+        icons.sort_by_key(|i| i["svg"].as_str().unwrap_or("").to_owned());
+        icons.dedup();
+        graph["appleIcons"] = json!(icons);
+    }
+    for (kind, entry) in entries {
+        let entry_graph = artifact_graph(&entry.plan, &compat.inputs, &[], false, target)?;
+        let raster = &entry_graph["artifacts"][0]["requires"]["appleRasterIcons"];
+        if raster.is_null() {
+            continue;
+        }
+        if let Some(card) = graph["artifacts"].as_array_mut().and_then(|cards| {
+            cards
+                .iter_mut()
+                .find(|card| card["name"] == format!("plans/{kind}.plan"))
+        }) {
+            card["requires"]["appleRasterIcons"] = raster.clone();
+        }
+    }
     graph["contractSources"] = json!(contract::source_graph(&app.join("app.contract"))
         .sources
         .into_iter()
@@ -532,12 +572,33 @@ fn shape(plan: &exact_plan::Plan, ty: exact_plan::TypesId, depth: usize) -> Resu
     })
 }
 
+/// Files that need raster renditions in an Apple asset catalog. Template
+/// paths and SF Symbols keep their vector presentation.
+pub(crate) fn apple_icons(plan: &exact_plan::Plan) -> Result<Vec<Value>, String> {
+    let mut icons = std::collections::BTreeMap::new();
+    crate::icon_rules::visit(plan, |icon| {
+        if let Some(svg) = icon.apple_asset() {
+            icons.insert(svg.to_owned(), json!({"svg":svg,"viewBox":icon.view_box}));
+        }
+    })?;
+    Ok(icons.into_values().collect())
+}
+
 /// The plan's requirement graph against a cohort's compatibility inputs
 /// (`exact-bake graph`): what a publisher that starts from a signed stream
 /// head, not a native bake, checks a new plan against.
-pub fn plan_graph(plan_bytes: &[u8], inputs: &Value, target: &str) -> Result<Value, String> {
+pub fn plan_graph(
+    plan_bytes: &[u8],
+    inputs: &Value,
+    target: &str,
+    app: &Path,
+) -> Result<Value, String> {
     let plan = exact_plan::Plan::decode(plan_bytes).map_err(|e| format!("the plan: {e:?}"))?;
-    let mut graph = artifact_graph(&plan, inputs, &[], false, target)?;
+    let mut inputs = inputs.clone();
+    if !target.contains("watchos") {
+        crate::icon_rules::raster_inputs(app, &mut inputs, [&plan])?;
+    }
+    let mut graph = artifact_graph(&plan, &inputs, &[], false, target)?;
     let node = &mut graph["artifacts"][0];
     node["sha256"] = json!(hash(plan_bytes));
     node["bytes"] = json!(plan_bytes.len());
@@ -549,6 +610,15 @@ pub fn plan_graph(plan_bytes: &[u8], inputs: &Value, target: &str) -> Result<Val
     requires["formatVersion"] = json!(exact_plan::FORMAT_VERSION);
     requires["formatDigest"] = json!(format!("{:016x}", exact_plan::FORMAT_DIGEST));
     requires["kernelSchema"] = json!(format!("{:016x}", plan.kernel_schema_digest));
+    // What it needs the cohort to link, from the manifest and the grants
+    // `inputs` name as a bake composes it. A plan pushed alone brings no Rust
+    // source (that is native code, a binary change), so no declared host work.
+    let manifest = contract::Manifest::read(app)?;
+    if let Some(required) =
+        crate::link::apple_requirement(app, &plan, std::iter::empty(), &inputs, &manifest, false)?
+    {
+        requires["appleUses"] = required;
+    }
     Ok(graph)
 }
 
@@ -589,6 +659,24 @@ fn artifact_graph(
         }
     }
     let mut requires = serde_json::Map::new();
+    let apple =
+        matches!(inputs["platform"].as_str(), Some("ios" | "macos")) && !target.contains("watchos");
+    let icons = if apple {
+        apple_icons(plan)?
+    } else {
+        Vec::new()
+    };
+    if !icons.is_empty() {
+        let roster = icons
+            .iter()
+            .map(|icon| {
+                let svg = icon["svg"].as_str().expect("icon source");
+                (svg.to_owned(), inputs["appleRasterIcons"][svg].clone())
+            })
+            .collect::<serde_json::Map<_, _>>();
+        requires.insert("appleRasterIcons".into(), json!(roster));
+    }
+
     requires.insert("surfaceCalls".into(), Value::Object(calls.clone()));
     for key in ["app", "kernelSchema", "formatVersion", "formatDigest"] {
         requires.insert(key.into(), inputs[key].clone());
@@ -625,8 +713,19 @@ fn artifact_graph(
     if !marked.is_empty() {
         requires.insert("hatches".into(), json!(marked));
     }
-    // A purpose's text is in the installed binary's Info.plist: a bundle
-    // whose purposes differ is a binary release (LLP 1069.008 D5).
+    // What the APK was composed from (LLP 1030.006 D4a): a plan that uses a
+    // capability or a package extension the installed APK did not link is a
+    // new APK. The classifier compares these as subsets of `androidLinked`.
+    if inputs.get("androidLinked").is_some() {
+        requires.insert(
+            "androidUses".into(),
+            json!(crate::compat::android_uses(plan)),
+        );
+        requires.insert(
+            "androidExtensions".into(),
+            json!(crate::compat::plan_extensions(plan)),
+        );
+    }
     // What a TypeScript module may ask of the binary's prelude (compat.rs
     // `TYPESCRIPT_RUNTIME`): an older cohort's prelude would ignore it
     // silently (`exactBodyFrom` sent as an empty body), so it takes no bundle.
@@ -636,8 +735,13 @@ fn artifact_graph(
             inputs["typescriptRuntime"].clone(),
         );
     }
-    if inputs.get("grantPurposes").is_some() {
-        requires.insert("grantPurposes".into(), inputs["grantPurposes"].clone());
+    // A purpose's text and the bundle's languages are in the installed
+    // binary's Info.plist: a bundle whose purposes or tables differ is a
+    // binary release (LLP 1069.008 D5).
+    for key in ["grantPurposes", "localizations", "watchSync"] {
+        if inputs.get(key).is_some() {
+            requires.insert(key.into(), inputs[key].clone());
+        }
     }
     let rust = assets
         .iter()
@@ -745,7 +849,7 @@ fn artifact_graph(
     });
     // The linked tier the plan uses (LLP 1047 D2), by name: a native build
     // whose plan is fixed links these and no other (LLP 1047.001 D2).
-    let uses: Vec<&str> = exact_runner::uses(plan)
+    let uses: Vec<&str> = crate::link::plan_uses(plan, inputs)
         .with_grants(inputs["grantCeiling"].as_str().unwrap_or(""))
         .iter()
         .map(|c| c.name())
@@ -769,7 +873,7 @@ fn artifact_graph(
         }
     }
     Ok(
-        json!({"version":1,"sources":sources,"extensions":extensions,"surfaceCalls":calls,"loads":loads,"uses":uses,"mediaSession":media_session,"launchBackground":launch_background(plan),"artifacts":artifacts}),
+        json!({"version":1,"appleIcons":icons,"sources":sources,"extensions":extensions,"surfaceCalls":calls,"loads":loads,"uses":uses,"mediaSession":media_session,"launchBackground":launch_background(plan),"artifacts":artifacts}),
     )
 }
 

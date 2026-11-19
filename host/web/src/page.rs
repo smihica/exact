@@ -294,7 +294,7 @@ pub fn checkpoint<D: DataSource>(runner: &Runner<D>, location: &str) -> String {
     let _ = write!(
         json,
         ",\"time\":{},\"logic\":",
-        exact_runner::agent::num(checkpoint.now_ms)
+        exact_runner::json::num(checkpoint.now_ms)
     );
     match &checkpoint.logic {
         Some(logic) => crate::batch::quote(logic, &mut json),
@@ -315,7 +315,18 @@ pub fn checkpoint<D: DataSource>(runner: &Runner<D>, location: &str) -> String {
         push_value(value, &mut json);
         json.push(']');
     }
-    json.push_str("],\"pending\":");
+    json.push(']');
+    if !runner.delivery().production {
+        json.push_str(",\"urls\":[");
+        for (i, urls) in checkpoint.urls.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            push_names(urls, &mut json);
+        }
+        json.push(']');
+    }
+    json.push_str(",\"pending\":");
     push_names(&checkpoint.pending, &mut json);
     for (field, indices) in [("open", &checkpoint.open), ("readers", &checkpoint.readers)] {
         if !indices.is_empty() {
@@ -352,7 +363,7 @@ fn push_value(value: &Value, out: &mut String) {
         Value::Number(n) if n.is_infinite() && *n > 0.0 => out.push_str("{\"n\":\"Infinity\"}"),
         Value::Number(n) if n.is_infinite() => out.push_str("{\"n\":\"-Infinity\"}"),
         Value::Number(n) if *n == 0.0 && n.is_sign_negative() => out.push_str("-0"),
-        Value::Number(n) => exact_runner::agent::num(*n).push_to(out),
+        Value::Number(n) => exact_runner::json::num(*n).push_to(out),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         text @ exact_plan::str_value!() => crate::batch::quote(text.text(), out),
         Value::Unit => out.push_str("null"),
@@ -486,6 +497,10 @@ pub fn read_checkpoint(text: &str) -> Result<Checkpoint, String> {
                 }
                 json.expect(b']')?;
             }
+            "urls" => {
+                checkpoint.urls =
+                    read_list(&mut json, |json| read_list(json, |json| json.string()))?
+            }
             "pending" => checkpoint.pending = read_list(&mut json, |json| json.string())?,
             "open" => checkpoint.open = read_list(&mut json, read_index)?,
             "readers" => checkpoint.readers = read_list(&mut json, read_index)?,
@@ -548,6 +563,7 @@ impl<D: DataSource> crate::Host<D> {
             data,
             page,
             page_digest,
+            None,
             snapshot,
             compat,
             viewport,
@@ -564,6 +580,7 @@ impl<D: DataSource> crate::Host<D> {
         data: D,
         page: &str,
         page_digest: &str,
+        sequence: Option<&exact_runner::Carried>,
         snapshot: Vec<(String, Vec<u8>)>,
         compat: Option<&str>,
         viewport: exact_runner::Viewport,
@@ -573,11 +590,11 @@ impl<D: DataSource> crate::Host<D> {
         // on a wall clock (the renderer's time, LLP 1048.000 D5): the glue
         // marks the digest ` driven` under the agent, as the JS runtime starts
         // a drive at zero. The digest still covers the page as it is.
-        let (page_digest, driven) = match page_digest.strip_suffix(" driven") {
-            Some(digest) => (digest, true),
-            None => (page_digest, false),
-        };
-        let checkpoint = match read_checkpoint(page) {
+        let (page_digest, driver) = page_digest
+            .split_once(" driven")
+            .map_or((page_digest, None), |(digest, facts)| (digest, Some(facts)));
+        let driven = driver.is_some();
+        let mut checkpoint = match read_checkpoint(page) {
             Ok(checkpoint) if driven => Checkpoint {
                 now_ms: 0.0,
                 ..checkpoint
@@ -585,17 +602,32 @@ impl<D: DataSource> crate::Host<D> {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
                 let (mut host, batch) = crate::Host::boot_linked(
-                    links, plan_bytes, data, None, snapshot, compat, viewport, launch,
+                    links, plan_bytes, data, sequence, snapshot, compat, viewport, launch,
                 )?;
                 host.log(&format!("document: the checkpoint doesn't read ({error})"));
                 return Ok((host, batch));
             }
         };
+        // The agent carries affected answer indices beside the digest, leaving the rendered bytes intact.
+        if let Some(indices) = driver.and_then(|s| s.strip_prefix(':')) {
+            for index in indices.split(',').filter(|s| !s.is_empty()) {
+                let index = index
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&i| i < checkpoint.answers.len())
+                    .ok_or_else(|| {
+                        crate::HostError::Runner(exact_runner::RunnerError::InvalidFaults(
+                            "invalid checkpoint answer index".into(),
+                        ))
+                    })?;
+                checkpoint.open.push(index);
+            }
+        }
         // A page served at another path (a static host's 404.html, or its
         // fallback to `/`) isn't this location's document: render fresh.
         let Some(launch) = page_launch(launch, &checkpoint.location) else {
             let (mut host, batch) = crate::Host::boot_linked(
-                links, plan_bytes, data, None, snapshot, compat, viewport, launch,
+                links, plan_bytes, data, sequence, snapshot, compat, viewport, launch,
             )?;
             host.log(&format!(
                 "document: rendered at {}, not {launch}; rendering fresh",
@@ -612,10 +644,12 @@ impl<D: DataSource> crate::Host<D> {
         let boot = || {
             Runner::boot_checkpoint_linked(
                 crate::link::runner_links(),
+                exact_runner::ModuleLinks::ALL,
                 plan,
                 data,
                 crate::host::browser_kernel(),
                 &checkpoint,
+                sequence,
                 snapshot,
                 delivery,
                 viewport,
@@ -736,11 +770,10 @@ impl Murmur128 {
             self.block(&tail);
             self.fill = 0;
         }
-        let mut blocks = bytes.chunks_exact(16);
-        for block in &mut blocks {
+        let (blocks, rest) = bytes.as_chunks::<16>();
+        for block in blocks {
             self.block(block);
         }
-        let rest = blocks.remainder();
         self.tail[..rest.len()].copy_from_slice(rest);
         self.fill = rest.len();
     }
@@ -840,12 +873,13 @@ pub fn route_at<'p>(plan: &'p Plan, location: &str) -> Option<&'p exact_plan::Ro
     plan.routes.iter().find(|r| plan.str(r.name) == hit.name)
 }
 
-/// Where route `name` is with `value` for its one parameter: a listed page
-/// (LLP 1048.000 D2).
+/// Where route `name`'s pattern puts `value` for its one parameter (LLP
+/// 1048.000 D2): a listed page only where the router gives that location back
+/// to the route (`exact_render::pages`).
 pub fn route_location(plan: &Plan, name: &str, value: &str) -> Result<String, String> {
     route_table(plan)
         .path(name, &[value])
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| e.message)
 }
 
 /// The locations a build renders: every route declared `render=build` but

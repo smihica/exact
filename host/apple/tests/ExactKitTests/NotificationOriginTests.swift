@@ -4,6 +4,7 @@ import ObjectiveC
 import XCTest
 import UserNotifications
 @testable import ExactKit
+@testable import ExactNotifications
 
 private final class StubRequest: UNNotificationRequest {
     static var triggerValue: UNNotificationTrigger?
@@ -103,6 +104,29 @@ final class NotificationOriginTests: XCTestCase {
             XCTAssertNil(session.launchLocation, "\(info)")
             XCTAssertTrue(session.heldModuleEvents.isEmpty, "\(info)")
             XCTAssertEqual(activations(), 0, "\(info)")
+        }
+    }
+
+    /// The Expo push service sends a message's `data` as the payload's `body`
+    /// object, beside keys of its own: a push opens that object's `navigate`,
+    /// and a top-level `navigate` comes first. Another sender's `body` is not
+    /// read.
+    func testAPushFromTheExpoPushServiceOpensItsBodysNavigate() {
+        let expo: [AnyHashable: Any] = ["aps": ["alert": ["title": "Deploy", "body": "Finished in 2 minutes"]],
+                                        "experienceId": "@owner/app", "scopeKey": "@owner/app", "projectId": "p",
+                                        "body": ["workflowRunId": "7", "navigate": "/workflows/7"]]
+        var both = expo
+        both["navigate"] = "/top"
+        for (info, opened) in [(expo, "/workflows/7"), (both, "/top"),
+                               (["scopeKey": "@owner/app", "body": ["navigate": 42]] as [AnyHashable: Any], nil),
+                               (["scopeKey": "@owner/app", "body": "/workflows/7"] as [AnyHashable: Any], nil),
+                               (["scopeKey": "@owner/app", "body": ["workflowRunId": "7"]] as [AnyHashable: Any], nil),
+                               (["body": ["navigate": "/workflows/7"]] as [AnyHashable: Any], nil)] {
+            let (session, activations) = self.session()
+            push(info, to: session)
+            XCTAssertEqual(session.launchLocation, opened, "\(info)")
+            XCTAssertTrue(session.heldModuleEvents.isEmpty, "\(info)")
+            XCTAssertEqual(activations(), opened == nil ? 0 : 1, "\(info)")
         }
     }
 

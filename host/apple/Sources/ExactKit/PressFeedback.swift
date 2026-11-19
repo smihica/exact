@@ -229,10 +229,12 @@ extension NodeView {
         ease.timingFunction = PressFeedback.timing
         layer.add(ease, forKey: "press")
         press.easedAbout = CGPoint(x: o.x - bounds.midX, y: o.y - bounds.midY)
+        // A one-axis clip above fits the ease's extent, not the model's.
+        overflowClipGeometryChanged()
     }
     /// No ease of the press on the render server: a view taken for another
     /// node, or one a flight carries, shows its own transform alone.
-    func stopPressEase() {
+    package func stopPressEase() {
         #if os(iOS)
         dimPress(false, instantly: true)
         #endif
@@ -294,6 +296,10 @@ extension NodeView {
 
     #if os(iOS) || os(tvOS)
     package func applyTransform() {
+        defer { refreshPressTranslation() }
+        defer { overflowClipGeometryChanged() }
+        let before = layer.transform
+        defer { if !CATransform3DEqualToTransform(before, layer.transform) { ImageLink.pixelated?.refresh(under: self) } }
         // Flying scaled whole in its clip (LLP 1013.000 D4.4): the
         // flight's scale only.
         if flightLook != nil { stopPressEase() }
@@ -324,7 +330,13 @@ extension NodeView {
     /// transform: a layout transition's offset, a sticky box's scroll offset
     /// (LLP 1083), a keyboard toolbar's lift and a context preview's projection.
     var hostPlacement: CGAffineTransform {
-        CGAffineTransform(translationX: layoutOffset.x + stickyOffset.x, y: layoutOffset.y - keyboardLift + stickyOffset.y + controlRide).concatenating(contextTransform)
+        let placed = CGAffineTransform(translationX: layoutOffset.x + stickyOffset.x, y: layoutOffset.y - keyboardLift + stickyOffset.y + controlRide).concatenating(contextTransform)
+        // A zoomable scroller's child, scaled about its box's top left and
+        // moved to where its zoom centres it (`ScrollZoomIOS.swift`); UIKit
+        // scales about the centre.
+        let z = zoomFactor, shift = zoomShift
+        guard z != 1 || shift != .zero else { return placed }
+        return placed.concatenating(CGAffineTransform(a: z, b: 0, c: 0, d: z, tx: (z - 1) * bounds.width / 2 + shift.x, ty: (z - 1) * bounds.height / 2 + shift.y))
     }
     /// The border box in `viewport`'s visible space as an open top-layer box
     /// is told to the runner: before its own transform, which the runner
@@ -349,7 +361,36 @@ extension NodeView {
         return bounds.contains(CGPoint(x: o.x + (p.x - o.x) * f, y: o.y + (p.y - o.y) * f))
     }
     #else
+    /// The one place the layer's anchor moves. Core Animation's transform
+    /// animations replace the layer's translate, rotate and scale about its
+    /// anchor, so while it plays them the anchor is CSS's centre; otherwise
+    /// it is AppKit's top left, which a flight's scale turns about too. The
+    /// position moves with it so the untransformed box stays put, and the
+    /// `perspective` the layer may hold for its children, which is about
+    /// its anchor, is placed again. Layout can reset the anchor, so each
+    /// placement restores it.
+    private func anchorLayer(centre: Bool) {
+        guard let layer else { return }
+        let anchor = centre ? CGPoint(x: 0.5, y: 0.5) : .zero
+        guard layer.anchorPoint != anchor else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer.position = CGPoint(x: layer.position.x + (anchor.x - layer.anchorPoint.x) * layer.bounds.width,
+                                 y: layer.position.y + (anchor.y - layer.anchorPoint.y) * layer.bounds.height)
+        layer.anchorPoint = anchor
+        applyPerspective()
+        CATransaction.commit()
+    }
+
+    /// Every write of the layer's transform comes here, which also decides
+    /// its anchor and whether its transform animations play: a flight's
+    /// scale takes them off until it lands.
     package func applyTransform() {
+        let flying = flightLook?.scale != nil
+        anchorLayer(centre: presenter?.boxAnimations.playsTransform(id, flying: flying, clock: presenter?.session?.clock) == true)
+        defer { refreshPressTranslation() }
+        defer { overflowClipGeometryChanged() }
+        let before = layer?.transform ?? CATransform3DIdentity
+        defer { if !CATransform3DEqualToTransform(before, layer?.transform ?? CATransform3DIdentity) { ImageLink.pixelated?.refresh(under: self) } }
         // A backdrop mirrors its box as the transform moves and scales it.
         defer { if !backdropOperations.isEmpty { applyBackdrop() } }
         // A frame's web view takes its scale by geometry (`FrameScaleMac.swift`).
@@ -363,7 +404,7 @@ extension NodeView {
         // A lifted Arrange row moves by its frame: AppKit paints and culls a
         // view where its frame is, never where its layer was moved. So does
         // a sticky box by its scroll offset (LLP 1083).
-        let lift = presenter?.reorder?.lifts(id) == true ? translate : .zero
+        let lift = presenter?.reorders.lifts(id) == true ? translate : .zero
         let shift = CGPoint(x: lift.x + stickyOffset.x, y: lift.y + stickyOffset.y)
         if shift != arrangeShift {
             // Recorded first: moving the frame can lay the view out again,
@@ -374,7 +415,10 @@ extension NodeView {
         }
         // The layer turns about its own origin: move `transform-origin`
         // there, turn, move it back. A press folds into the scale.
-        let o = transformOriginPoint, s = scale / frameGeometryScale * pressFactor
+        let anchor = layer?.anchorPoint ?? .zero
+        let origin = transformOriginPoint
+        let o = CGPoint(x: origin.x - bounds.width * anchor.x, y: origin.y - bounds.height * anchor.y)
+        let s = scale / frameGeometryScale * pressFactor
         if let space = spaceTransform(origin: o, scale: s, shift: lift) {
             // A 3D rotation or a z translation (LLP 1077 D8).
             layer?.transform = CATransform3DConcat(space, CATransform3DMakeTranslation(layoutOffset.x, layoutOffset.y, 0))
@@ -433,7 +477,7 @@ extension NodeView {
     /// (the author paints its pressed state), and not a scrim covering the
     /// window (a backdrop that closes a sheet shows nothing in UIKit). A
     /// native button is UIKit's own and never comes here.
-    var platformPressDims: Bool {
+    package var platformPressDims: Bool {
         guard !authorsPress, !isNativeButton, !isSurfaceControl,
               handlers.contains("press") || defaultLink != nil || pressContact?.invokerLook == true || overlayHoldsPress,
               !handlers.contains("pointerdown"), !handlers.contains("pointerup") else { return false }
@@ -456,7 +500,7 @@ extension NodeView {
     }
 
     /// Dim (`down`) or fade back. `instantly` drops it without the fade.
-    func dimPress(_ down: Bool, instantly: Bool = false) {
+    package func dimPress(_ down: Bool, instantly: Bool = false) {
         let key = "pressDim"
         let now = CACurrentMediaTime()
         if down {

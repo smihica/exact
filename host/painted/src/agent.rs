@@ -15,14 +15,14 @@ mod sensors;
 mod stdio;
 
 use crate::presenter::Presenter;
-use exact_runner::agent::{error, field_bool, field_num, field_str, num};
-use exact_runner::instance::collection::Align;
+use exact_runner::json::{error, field_bool, field_num, field_str, num};
+use exact_runner::Align;
 use exact_runner::DataSource;
 use std::io::Write;
 
 /// The host this agent runs on, as a refusal names it: the Windows host and
 /// the Android reader run this code too.
-const HOST_NAME: &str = if cfg!(windows) {
+pub(crate) const HOST_NAME: &str = if cfg!(windows) {
     "Windows"
 } else if cfg!(target_os = "android") {
     "Android"
@@ -93,7 +93,7 @@ pub fn serve<D: DataSource + Default>(
         p.node_count()
     );
     match boot_error {
-        Some(e) => exact_runner::agent::quote(e, &mut ready),
+        Some(e) => exact_runner::json::quote(e, &mut ready),
         None => ready.push_str("null"),
     }
     ready.push('}');
@@ -118,44 +118,15 @@ pub fn serve<D: DataSource + Default>(
 
 pub use stdio::{handle, handle_for_window};
 
-/// Every reply carries the runner's `epoch`, `incarnation` and `clock`
-/// (LLP 1035.002 D3), read after the operation; a reply that already has a
-/// `clock` (where a `clock` call landed) keeps it. The runner's own replies
-/// (`tree`, `state`, `node`) are tagged at the source; an error is left
-/// alone.
-fn tagged<D: DataSource>(p: &Presenter<D>, line: &str, mut reply: String) -> String {
-    let op = field_str(line, "op");
-    let host_reply = op.is_some();
-    if !host_reply || !reply.ends_with('}') || reply.starts_with("{\"error\"") {
-        return reply;
-    }
-    if field_num(&reply, "epoch").is_some() {
-        return reply;
-    }
-    let tags = p.host().agent("{\"op\":\"tags\"}");
-    let (Some(epoch), Some(incarnation), Some(clock)) = (
-        field_num(&tags, "epoch"),
-        field_num(&tags, "incarnation"),
-        field_num(&tags, "clock"),
-    ) else {
-        return reply;
-    };
-    reply.pop();
-    reply.push_str(&format!(
-        ",\"epoch\":{},\"incarnation\":{}",
-        num(epoch),
-        num(incarnation)
-    ));
-    if !reply.contains("\"clock\":") {
-        reply.push_str(&format!(",\"clock\":{}", num(clock)));
-    }
-    reply.push('}');
-    reply
+/// Add the session identity after the host's operation (LLP 1029.000.002 D10).
+fn tagged<D: DataSource>(p: &Presenter<D>, _line: &str, reply: String) -> String {
+    exact_runner::agent::tagged(p.host().runner(), reply)
 }
 
 pub(crate) fn answer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
     // An agent's taps and contacts reach a canvas as a finger, as on the web
-    // and iOS. Explicit mouse/contextmenu use device mouse buttons (LLP 1015.000).
+    // and iOS. Explicit mouse and desktop contextmenu use device mouse buttons
+    // (LLP 1015.000); Android contextmenu is a recognized long press.
     p.agent_finger(!field_bool(line, "contextmenu") && !field_bool(line, "mouse"));
     let reply = answer_line(p, line);
     p.agent_finger(false);
@@ -206,12 +177,13 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
         Some("perf") => p.hatch_sites(p.host().agent(line)),
         Some("state") => {
             p.boxes();
+            p.tell_replacement_pending();
             // Host-only sections report `unavailable` instead of disappearing
             // (LLP 1035.002 D2), distinguishing no keyboard from no report.
             let mut s = p.host().agent(line);
             if s.ends_with('}') && !s.starts_with("{\"error\"") {
                 s.pop();
-                s.push_str(&format!(",\"painter\":{}", p.painter_state()));
+                s.push_str(&p.state_sections());
                 let mut decorations: Vec<_> = p
                     .brush
                     .field_text
@@ -255,18 +227,8 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
                         ",\"paint\":{{\"ms\":{paint},\"readbackMs\":{readback}}}"
                     ));
                 }
-                // A `video` or `audio` (LLP 1042 §5, §8): this host has no
-                // decoder and no audio output, so each is reported as an
-                // element that never plays would read, and says why.
-                let media: Vec<_> = p
-                    .host()
-                    .kernel()
-                    .rows(None)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|r| r.node_type == exact_kernel::NodeType::Video)
-                    .map(|r| serde_json::json!({"id": r.id, "state": {"unavailable": "no media decoder or audio output on this host", "paused": true, "currentTime": 0, "duration": null, "readyState": 0}}))
-                    .collect();
+                // A `video` or `audio` (LLP 1042 §8, LLP 1042.001 D7): as its player reports it.
+                let media = p.media_json();
                 s.push_str(&format!(",\"media\":{}", serde_json::json!(media)));
                 // The media session's record; nothing is published (LLP 1098 D9).
                 let session = crate::media_session::state(p);
@@ -395,6 +357,9 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
             }
             if let Some(reply) = p.control_tap(&request) {
                 return reply.to_string();
+            }
+            if let Some(reply) = p.zoom_tap(&request) {
+                return reply;
             }
             if phased {
                 return contact::answer(p, &request);
@@ -606,7 +571,21 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
         Some("clock") => clock(p, line),
         Some("share") => p.receive_share(&q).unwrap_or_else(|e| error(&e)),
         // A fetch fault (LLP 1103) is the runner's; the device facts are this presenter's.
-        Some("prefer") if top_level(line, "faults") => p.host().agent(line),
+        Some("prefer") if top_level(line, "faults") => {
+            match exact_runner::agent::drop_stream(p.host_mut().runner_mut(), line) {
+                Some(Ok(drop)) => {
+                    let host_error = p
+                        .host_mut()
+                        .commit(&drop.receipts, drop.error.map(|e| format!("{e:?}")));
+                    let present_error = p.after_commit();
+                    host_error
+                        .or(present_error)
+                        .map_or_else(|| r#"{"dropped":true}"#.into(), |e| error(&e))
+                }
+                Some(Err(e)) => error(&e),
+                None => p.host().agent(line),
+            }
+        }
         // @ref LLP 1125 §4 — MIDI ports the agent names, and a message from one.
         Some("prefer" | "midi") if top_level(line, "midi") || top_level(line, "input") => {
             match p.midi_agent(line) {
@@ -679,6 +658,7 @@ fn prefer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
     let mut root_font_size = None;
     let mut display_scale = None;
     let mut retier = None;
+    let mut presented = None;
     let mut dark = p.scheme.1;
     for (name, value) in media {
         match (name.as_str(), value.as_str().unwrap_or_default()) {
@@ -735,6 +715,13 @@ fn prefer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
             .map(str::to_owned)
             .unwrap_or_else(|| value.to_string());
         match (name.as_str(), text.as_str()) {
+            ("screen-reader", v @ ("on" | "off" | "unknown")) => {
+                preferences.screen_reader = match v {
+                    "on" => exact_runner::ScreenReader::On,
+                    "off" => exact_runner::ScreenReader::Off,
+                    _ => exact_runner::ScreenReader::Unknown,
+                };
+            }
             ("visibility-state", v @ ("visible" | "hidden")) => page.hidden = v == "hidden",
             ("online", v @ ("true" | "false")) => page.on_line = v == "true",
             ("can-share", v @ ("true" | "false")) => page.can_share = v == "true",
@@ -743,7 +730,10 @@ fn prefer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
             ("can-open-files", v @ ("true" | "false")) => page.can_open_files = v == "true",
             // @ref LLP 1020.002 D1 — false here, where no iframe loads.
             ("iframe-partition", v @ ("true" | "false")) => page.iframe_partition = v == "true",
+            ("frozen", v @ ("true" | "false")) => page.frozen = v == "true",
             ("has-focus", v @ ("true" | "false")) => page.has_focus = v == "true",
+            // @ref LLP 1069.000 D6 — held at the value named; no animation moves.
+            ("presented", v @ ("true" | "false")) => presented = Some(v == "true"),
             // @ref LLP 1139.003 D2 — the fact, and the modules' tier: their
             // renderers are made again at the new rung.
             ("gpu-tier", v @ ("high" | "mid" | "low")) => {
@@ -779,6 +769,9 @@ fn prefer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
         p.retier_surfaces(code);
     }
     if let Some(e) = p.set_page(page) {
+        return error(&e);
+    }
+    if let Some(e) = presented.and_then(|v| p.prefer_presented(Some(v))) {
         return error(&e);
     }
     if let Some(px) = root_font_size {
@@ -824,7 +817,10 @@ fn prefer<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
         "can-open-files": page.can_open_files,
         "iframe-partition": page.iframe_partition,
         "has-focus": page.has_focus,
+        "frozen": page.frozen,
+        "presented": p.host().runner().presented().value(),
         "root-font-size": p.host().runner().root_font_size(),
+        "screen-reader": preferences.screen_reader.keyword(),
         "display-scale": p.host().runner().display_scale(),
         "gpu-tier": page.gpu_tier(),
     }, "fold": {
@@ -1019,7 +1015,7 @@ fn clock<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
         let reply = match e {
             Some(e) => {
                 let mut s = String::from("{\"error\":");
-                exact_runner::agent::quote(&format!("clock: {e}"), &mut s);
+                exact_runner::json::quote(&format!("clock: {e}"), &mut s);
                 format!("{s},\"clock\":{}}}", num(landed))
             }
             None => format!("{{\"clock\":{}}}", num(landed)),
@@ -1050,7 +1046,7 @@ fn land_data<D: DataSource>(p: &mut Presenter<D>, bound: std::time::Duration) ->
     };
     let refused = |p: &Presenter<D>, error: &str| {
         let mut s = String::from("{\"error\":");
-        exact_runner::agent::quote(&format!("clock data: {error}"), &mut s);
+        exact_runner::json::quote(&format!("clock data: {error}"), &mut s);
         format!("{s},\"clock\":{}}}", num(p.host().now()))
     };
     for _ in 0..16 {
@@ -1074,7 +1070,7 @@ fn land_data<D: DataSource>(p: &mut Presenter<D>, bound: std::time::Duration) ->
         p.sync_surfaces();
         if let Some(e) = e {
             let mut s = String::from("{\"error\":");
-            exact_runner::agent::quote(&format!("clock: {e}"), &mut s);
+            exact_runner::json::quote(&format!("clock: {e}"), &mut s);
             return format!("{s},\"clock\":{}}}", num(landed));
         }
         // A `then` that sent asks again; what it sends lands in the next round.
@@ -1139,7 +1135,7 @@ fn clock_within<D: DataSource>(
         let (landed, e) = sensors::clock_framed(p, to, deadline);
         if let Some(e) = e {
             let mut s = String::from("{\"error\":");
-            exact_runner::agent::quote(&format!("clock: {e}"), &mut s);
+            exact_runner::json::quote(&format!("clock: {e}"), &mut s);
             return format!("{s},\"clock\":{}}}", num(landed));
         }
         p.sync_surfaces();
@@ -1309,15 +1305,14 @@ fn clock_stepped<D: DataSource>(
 }
 
 /// Pump the executor and packages until no polled module source's ask is in flight, or the
-/// deadline. Not on Android's reader, whose extensions answer on its main thread:
-/// `agent-android.mjs` waits there.
+/// deadline. The reader hands requests to its UI thread and takes answers on this thread.
 fn wait_for_polls<D: DataSource>(p: &mut Presenter<D>, deadline: std::time::Instant) {
     let asking = |p: &Presenter<D>| {
         p.host()
             .agent("{\"op\":\"polls\"}")
             .contains("\"asking\":true")
     };
-    while !crate::reader_driven() && asking(p) && std::time::Instant::now() < deadline {
+    while asking(p) && std::time::Instant::now() < deadline {
         p.package_turn();
         std::thread::sleep(std::time::Duration::from_millis(5));
         if let Some(e) = p.pump(p.host().now()) {

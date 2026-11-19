@@ -121,6 +121,7 @@ pub struct Notifier {
     native: Slot,
     extension: &'static str,
     seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    picture: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 /// The session's current runner's native slot. A reload or an activated
@@ -129,6 +130,12 @@ pub struct Notifier {
 pub(crate) type Slot = std::sync::Arc<std::sync::Mutex<exact_runner::Native>>;
 
 impl Notifier {
+    /// A published image file changed: ask the presentation thread to
+    /// reload its image and canvas handles.
+    pub fn picture_changed(&self, source: &str) {
+        (self.picture)(source);
+    }
+
     /// The readers of `topic` (`extension.name`) are asked again (LLP 1016.002).
     pub fn changed(&self, topic: &str) {
         let native = self
@@ -172,11 +179,13 @@ impl Context {
         native: Slot,
         now: Rc<Cell<f64>>,
         lines: Rc<RefCell<Vec<String>>>,
+        picture: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
     ) -> Context {
         let notifier = Notifier {
             native,
             extension,
             seq: Default::default(),
+            picture,
         };
         Context(Rc::new(Shared {
             extension,
@@ -289,6 +298,12 @@ impl Context {
     /// item 2), or `None` on a host that keeps none.
     pub fn desktop(&self) -> Option<std::rc::Rc<dyn crate::desktop::Services>> {
         crate::desktop::services()
+    }
+
+    /// The host's displays and pointer (LLP 1178 D6), or `None` on a host
+    /// that reports none.
+    pub fn displays(&self) -> Option<std::rc::Rc<dyn crate::desktop::Displays>> {
+        crate::desktop::displays()
     }
 
     /// The host's pads (LLP 1133.022 D4): the process's one registry, which

@@ -623,6 +623,79 @@ fn linked_tabs(children: &[Node]) -> (Vec<Expr>, bool) {
     (controls, tabbed)
 }
 
+/// The first linked tablist that some branch leaves out of a tabbed root's
+/// `children`, when none is on every path: one under an `if` or `match` whose
+/// other arm has none, or under a `for` (LLP 1156.006.000 D1). A host finds the
+/// panels through the tablist, so while it is out of the tree the root has no
+/// tabs. `None` where a tablist is always there, or might be (a computed role).
+pub(crate) fn tablist_left_out(children: &[Node]) -> Option<Span> {
+    if !linked_tabs(children).1 || always_has_tablist(children) {
+        return None;
+    }
+    conditional_tablist(children, false)
+}
+
+/// Whether `attrs` may make a tablist that names panels in `children`, and
+/// whether its role is written out.
+fn names_panels(attrs: &[Attr], children: &[Node]) -> Option<bool> {
+    let literal = match attrs
+        .iter()
+        .rev()
+        .find(|a| a.name == "role")
+        .map(|a| &a.value)?
+    {
+        Expr::Str(role, _) if role == "tablist" => true,
+        Expr::Str(..) => return None,
+        _ => false,
+    };
+    Node::walk(children)
+        .any(|n| matches!(n, Node::Element { attrs, .. } if attrs.iter().any(|a| a.name == "aria-controls")))
+        .then_some(literal)
+}
+
+fn always_has_tablist(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::Element {
+            attrs, children, ..
+        } => {
+            !attrs.iter().any(|a| a.name == "navigationKey")
+                && (names_panels(attrs, children).is_some() || always_has_tablist(children))
+        }
+        Node::When {
+            then, otherwise, ..
+        } => always_has_tablist(then) && always_has_tablist(otherwise),
+        Node::Match { some, none, .. } => always_has_tablist(&some.1) && always_has_tablist(none),
+        Node::Each { .. } | Node::Use { .. } | Node::Children { .. } => false,
+    })
+}
+
+fn conditional_tablist(nodes: &[Node], conditional: bool) -> Option<Span> {
+    nodes.iter().find_map(|node| match node {
+        Node::Element {
+            attrs,
+            children,
+            span,
+            ..
+        } => {
+            if attrs.iter().any(|a| a.name == "navigationKey") {
+                None
+            } else if names_panels(attrs, children) == Some(true) {
+                conditional.then_some(*span)
+            } else {
+                conditional_tablist(children, conditional)
+            }
+        }
+        Node::When {
+            then, otherwise, ..
+        } => conditional_tablist(then, true).or_else(|| conditional_tablist(otherwise, true)),
+        Node::Match { some, none, .. } => {
+            conditional_tablist(&some.1, true).or_else(|| conditional_tablist(none, true))
+        }
+        Node::Each { body, .. } => conditional_tablist(body, true),
+        Node::Use { .. } | Node::Children { .. } => None,
+    })
+}
+
 fn may_name(control: &Expr, panel: &Expr) -> bool {
     match (control, panel) {
         (Expr::Str(a, _), Expr::Str(b, _)) => a == b,

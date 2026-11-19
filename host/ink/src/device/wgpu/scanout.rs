@@ -16,11 +16,9 @@ const COPY: &str = "
 }
 @fragment fn fs_main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let at = vec2<i32>(p.xy);
-    return textureLoad(frame, AT, 0);
+    return textureLoad(frame, at, 0);
 }
 ";
-// A panel mounted sideways shows the logical portrait frame turned clockwise.
-const TURNED: &str = "vec2<i32>(at.y, i32(textureDimensions(frame).y) - 1 - at.x)";
 
 impl Wgpu {
     /// Take the connector's display for presentation. `size` and `refresh`
@@ -36,7 +34,6 @@ impl Wgpu {
         connector: u32,
         size: [u32; 2],
         refresh: u32,
-        turned: bool,
     ) -> Result<()> {
         // SAFETY: the caller's contract above.
         let surface = unsafe {
@@ -92,10 +89,7 @@ impl Wgpu {
                 .device
                 .create_shader_module(::wgpu::ShaderModuleDescriptor {
                     label: Some("ink scanout"),
-                    source: ::wgpu::ShaderSource::Wgsl(
-                        COPY.replace("AT", if turned { TURNED } else { "at" })
-                            .into(),
-                    ),
+                    source: ::wgpu::ShaderSource::Wgsl(COPY.into()),
                 });
             let pipeline_layout =
                 self.device

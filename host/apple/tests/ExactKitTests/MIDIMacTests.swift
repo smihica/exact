@@ -14,6 +14,7 @@ import CoreMIDI
 import QuartzCore
 import XCTest
 @testable import ExactKit
+@testable import ExactMIDI
 
 final class MIDIMacTests: XCTestCase {
     private var client = MIDIClientRef()

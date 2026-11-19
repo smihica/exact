@@ -4,11 +4,12 @@
 // and the checkout's node_modules, installed from its lock when it has none or one did not finish (`installedModules`).
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { RustMissing, fromSets, rustMissing } from './tools.mjs';
 
 // The macOS deployment target every cargo call on a Mac gives what it builds for the Mac
 // itself: build scripts, proc macros and the developer tools (the bake tool, the filesystem
@@ -33,7 +34,7 @@ export function freeSpace(path, places = [resolve(homedir(), '.cache/exact')]) {
 // write a dylib that dyld on macOS 27.0.1 refuses: "mis-aligned LINKEDIT string pool". rustc then fails
 // on the proc macro it cannot load, with that message or as "can't find crate for `zerofrom_derive`".
 // A deployment target is not in a proc macro's fingerprint, so a plain cargo call sharing the target
-// directory (caps' wasm check, a release build) takes such a dylib too. So the scripts' cargo calls run
+// directory (the hourly wasm check, a release build) takes such a dylib too. So the scripts' cargo calls run
 // rustc through `scripts/rustc/exact-rustc`, which links proc macros with `-no_fixup_chains`. Cargo
 // leaves RUSTC_WRAPPER out of its fingerprints, so plain and scripted calls still share every unit; it
 // is a name found on PATH so that kept modules' groups, which read it (scripts/kept.mjs), are the same
@@ -55,13 +56,24 @@ export function withHostDeployment(env) {
 const root = fileURLToPath(new URL('../', import.meta.url));
 /** What an offline Cargo says when a source it needs is not in its cache. */
 export const OFFLINE_MISSING = /--offline was specified|attempting to make an HTTP request|in the offline mode|offline mode \(via `--offline`\)/;
+/** What to add to an offline Cargo failure that is not fetched and retried: this checkout's own setup, by path, since
+ * an app's launcher has no `setup` verb (LLP 1156.006.000 D11). Empty when Cargo's words are of another failure. */
+export const SETUP_FETCHES = `\`bun ${/^[\w./@:+-]+$/.test(resolve(root, 'scripts/exact.mjs')) ? resolve(root, 'scripts/exact.mjs') : `'${resolve(root, 'scripts/exact.mjs').replaceAll("'", "'\\''")}'`} setup\` fetches the crates this checkout locks`;
+export const offlineMiss = (stderr) => (OFFLINE_MISSING.test(stderr ?? '') ? `\n${SETUP_FETCHES}` : '');
 let binary;
 const HELPER = 'EXACT_FILESYSTEM_HELPER';
 /** The helper this process runs, checked current: the bake names it to the Bun processes it spawns. */
 export const filesystemHelper = () => executable();
-function executable() {
+/** The helper as Cargo builds it here, never a tool set's: what `tools.mjs keep` keeps, with the directory it built in. */
+export const builtFilesystemHelper = () => ({ path: executable(false), directory: helperDirectory() });
+// A deploy recreates its capture but keeps its Cargo cache. Separate each
+// checkout's bootstrap there, including when that cache holds several apps.
+const helperDirectory = () => process.env.CARGO_TARGET_DIR
+  ? resolve(process.env.CARGO_TARGET_DIR, 'exact-filesystem-tool', createHash('sha256').update(realpathSync(root)).digest('hex').slice(0, 24))
+  : resolve(root, 'target/exact-filesystem-tool');
+function executable(fromSet = true) {
   if (binary) return binary;
-  const directory = resolve(root, 'target/exact-filesystem-tool');
+  const directory = helperDirectory();
   const suffix = process.platform === 'win32' ? '.exe' : '';
   // A caller that checked the helper itself may name its captured copy in `EXACT_FILESYSTEM_HELPER`
   // for the processes it spawns (the bake does, once per process, for its many Bun calls). The copy
@@ -72,16 +84,6 @@ function executable() {
     const digest = new RegExp(`^exact-filesystem-([0-9a-f]{64})${suffix.replace('.', '\\.')}$`).exec(basename(inherited))?.[1];
     if (digest && existsSync(inherited) && createHash('sha256').update(readFileSync(inherited)).digest('hex') === digest) return binary = inherited;
   }
-  // A helper another process checked from these same inputs: a record named by the digest of what the build reads
-  // (`helperInputs`, never trusted by time), naming a capture whose bytes still have the digest its name gives.
-  const checked = helperCapture(directory, suffix, helperInputs());
-  if (checked) return binary = checked;
-  const target = resolve(directory, `debug/exact-filesystem${suffix}`);
-  // A separate tooling target also permits calls from an active app Cargo
-  // build script: the helper has no compiler/app dependency and never waits
-  // on that app build directory lock. Otherwise Cargo checks sources, lockfile
-  // and toolchain when no checked capture is available.
-  // An mtime-only shortcut can silently reuse an obsolete helper dependency.
   // The host's deployment target always, whether a build script's (an app's macOS minimum) or not: its own target directory.
   const own = { ...process.env, HERMES_LEAN_SYS_OFFLINE: '1' };
   delete own.MACOSX_DEPLOYMENT_TARGET;
@@ -91,6 +93,22 @@ function executable() {
     if (env[name] && basename(env[name]) === 'clippy-driver') delete env[name];
   }
   delete env.CLIPPY_ARGS;
+  // A helper another process checked from these same inputs: a record named by the digest of what the build reads
+  // (`helperInputs`, never trusted by time), naming a capture whose bytes still have the digest its name gives.
+  const checked = helperCapture(directory, suffix, helperInputs(env));
+  if (checked) return binary = checked;
+  // Else a tool set's whose inputs are this checkout's, and Cargo only after it (LLP 1174 D5).
+  if (fromSet) {
+    const set = fromSets('exact-filesystem');
+    if (set) return binary = set.path;
+    if (rustMissing()) throw new RustMissing('exact-filesystem');
+  }
+  const target = resolve(directory, `debug/exact-filesystem${suffix}`);
+  // A separate tooling target also permits calls from an active app Cargo
+  // build script: the helper has no compiler/app dependency and never waits
+  // on that app build directory lock. Otherwise Cargo checks sources, lockfile
+  // and toolchain when no checked capture is available.
+  // An mtime-only shortcut can silently reuse an obsolete helper dependency.
   // Cargo protects compilation, but releases its lock before we can exec.
   // Another profile can replace its public binary in that gap. Hold this
   // bootstrap claim through capture, then execute immutable captured bytes.
@@ -110,7 +128,7 @@ function executable() {
   process.once('exit', release);
   try {
     // A builder ahead of us may have published a capture. Inputs may have changed while we waited.
-    const inputs = helperInputs(), record = inputs && resolve(directory, `checked-${inputs}`);
+    const inputs = helperInputs(env), record = inputs && resolve(directory, `checked-${inputs}`);
     const checked = helperCapture(directory, suffix, inputs);
     if (checked) return binary = checked;
     const build = () => spawnSync('cargo', ['build', '--quiet', '--locked', '--offline', '-p', 'exact-filesystem', '--target-dir', directory], { cwd: root, env, encoding: 'utf8' });
@@ -136,7 +154,7 @@ function executable() {
     }
     binary = captured;
     // Recorded only when the inputs are what they were before the build: an edit while it ran could be in either.
-    if (record && helperInputs() === inputs) {
+    if (record && helperInputs(env) === inputs) {
       const temporary = `${record}.${owner}.tmp`;
       try { writeFileSync(temporary, basename(captured)); renameSync(temporary, record); } catch { rmSync(temporary, { force: true }); }
     }
@@ -153,15 +171,16 @@ function helperCapture(directory, suffix, inputs) {
   } catch { /* none checked yet */ }
 }
 
-/** The digest of what building the helper reads: its crate's files, the workspace manifest, lock and toolchain pin,
- * and Cargo's configuration (the checkout's, its parents', `CARGO_HOME`'s), with the platform it is built for; null
- * where the checkout has no helper crate to read. */
-function helperInputs() {
+/** The digest of what building the helper with `env` reads: its crate's files, the workspace manifest, lock and
+ * toolchain pin, the compiler Cargo runs and Cargo's configuration (the checkout's, its parents', `CARGO_HOME`'s), with
+ * the platform it is built for; null where the checkout has no helper crate to read. */
+function helperInputs(env) {
   const hash = createHash('sha256').update(`${process.platform} ${process.arch} ${HOST_MACOS}\n`);
   const files = (dir) => readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
     .flatMap((entry) => entry.isDirectory() ? files(resolve(dir, entry.name)) : [resolve(dir, entry.name)]);
   let crate;
   try { crate = files(resolve(root, 'filesystem')); } catch { return null; }
+  hash.update(`${env.RUSTUP_TOOLCHAIN ?? ''}\n${compilerIdentity(env)}\n`);
   const configs = [];
   for (let at = root; ; at = dirname(at)) { configs.push(resolve(at, '.cargo/config.toml'), resolve(at, '.cargo/config')); if (at === dirname(at)) break; }
   const home = process.env.CARGO_HOME ?? resolve(homedir(), '.cargo');
@@ -171,6 +190,19 @@ function helperInputs() {
     hash.update('\n');
   }
   return hash.digest('hex').slice(0, 32);
+}
+
+// What `rustc -vV` says of the compiler Cargo would run with `env` from the checkout: by `RUSTC`, or the toolchain
+// rustup resolves there, which names its release and commit, so a `stable` that an update moved is another compiler.
+// One process asks once (about 20 ms through rustup); `build.rustc` in a Cargo config is hashed as the file only.
+let compiler;
+function compilerIdentity(env) {
+  const rustc = env.RUSTC || env.CARGO_BUILD_RUSTC || 'rustc';
+  if (compiler?.rustc !== rustc) {
+    const run = spawnSync(rustc, ['-vV'], { cwd: root, env, encoding: 'utf8' });
+    compiler = { rustc, identity: `${rustc}\n${run.status ?? run.error?.code}\n${run.stdout ?? ''}` };
+  }
+  return compiler.identity;
 }
 
 /** The wait for the helper's build claim. It ends when the owner releases the claim, and

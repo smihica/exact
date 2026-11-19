@@ -120,8 +120,8 @@
     if (method === "GET" || method === "HEAD") return "exactUploadProgress: a GET or HEAD request sends no body";
     return true;
   }
-  // `exactIdleTimeout` (LLP 1016.000 D11): why it is refused, if it is. `socket`: a WebSocket stream that is no
-  // listener, child, upload or long poll.
+  // `exactIdleTimeout` (LLP 1016.000 D11): why it is refused, if it is. `taken`: a WebSocket, event or byte stream,
+  // a `ws:`, `wss:`, `http:` or `https:` one that is no listener, child, upload or long poll.
   // Protocol names, never credentials (LLP 1016.000; RFC 7230 token).
   function socketProtocols(value, socket) {
     if (value === undefined) return [];
@@ -137,11 +137,11 @@
     return names;
   }
 
-  function idleRefusal(idle, socket) {
+  function idleRefusal(idle, taken) {
     if (idle === undefined) return undefined;
     if (!Number.isInteger(idle) || idle < 1 || idle > 3600000)
       return "exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000";
-    return socket ? undefined : "exactIdleTimeout: only a WebSocket stream takes an idle timeout";
+    return taken ? undefined : "exactIdleTimeout: only a WebSocket, event or byte stream takes an idle timeout";
   }
   // An upload's event for its mapper, as XMLHttpRequest names them: `progress` for the host's count of the body's
   // bytes sent, and `load` for the reply, whatever its status, which ends the stream.
@@ -498,7 +498,8 @@
     names = Object.getOwnPropertyNames;
   var symbols = Object.getOwnPropertySymbols,
     describe = Object.getOwnPropertyDescriptor;
-  var unbox = Function.prototype.call.bind(String.prototype.valueOf);
+  var unbox = Function.prototype.call.bind(String.prototype.valueOf),
+    hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
   var PLAIN = [Object.prototype, Array.prototype, null],
     keptJson = new WeakMap();
   // Every Proxy made from here on, natively (the prelude's, then the app's): a trap can answer a later read
@@ -570,7 +571,9 @@
       if (kept !== undefined) out = "\u0000" + texts.push(kept);
       else if (step) out = step.call(this, key, item);
       if (!keeps) return out;
-      if (out !== null && typeof out === "object") {
+      // String boxes always own length, even with another prototype. Exclude Proxies before inspecting it,
+      // and arrays before the lookup; neither has the String brand.
+      if (out !== null && typeof out === "object" && !proxies.has(out) && !Array.isArray(out) && hasOwn(out, "length")) {
         // A boxed string: converted here, once, as JSON would (its own toString honored), so its text is known.
         var boxed = false;
         try {
@@ -1102,20 +1105,25 @@
   });
 })(globalThis);
 
-// `captureCanvas(surface, path)` (LLP 1056 D9, as amended for #188): the host
-// that keeps the one mounted 2D canvas of `surface` writes what it has drawn
-// as a PNG at `path`, an `app:/` file under `fs.write`, and answers `{path,
-// width, height, scale}`; a refusal rejects with a DOMException by name
-// (runner/src/canvas_capture.rs). It is a request to `exact-canvas:`, made with
-// the prelude's `fetch`, which the runner turns into the host's work.
+// `captureCanvas(surface, path, type, quality)` (LLP 1056 D9, as amended for
+// #188 and #504): the host that keeps the one mounted 2D canvas of `surface`
+// writes what it has drawn at `path`, an `app:/` file under `fs.write`,
+// encoded as `toBlob` would encode it (`type` and `quality` are its; a type
+// the host's system encoder does not write is a PNG), and answers `{path,
+// width, height, scale, type}`; a refusal rejects with a DOMException by name
+// (runner/src/canvas_capture.rs). It is a request to `exact-canvas:`, made
+// with the prelude's `fetch`, which the runner turns into the host's work.
 (function (global) {
   "use strict";
-  global.captureCanvas = function captureCanvas(surface, path) {
-    if (typeof surface !== "string" || typeof path !== "string") return Promise.reject(new TypeError("captureCanvas(surface, path): a surface name and an app:/ path"));
-    return global.fetch("exact-canvas:", { method: "POST", body: JSON.stringify({ surface: surface, path: path }), exactIndependentHttp: { maxResponseBytes: 65536 } })
+  global.captureCanvas = function captureCanvas(surface, path, type, quality) {
+    if (typeof surface !== "string" || typeof path !== "string") return Promise.reject(new TypeError("captureCanvas(surface, path, type, quality): a surface name and an app:/ path"));
+    var body = { surface: surface, path: path };
+    if (type !== undefined) body.type = String(type);
+    if (typeof quality === "number") body.quality = quality;
+    return global.fetch("exact-canvas:", { method: "POST", body: JSON.stringify(body), exactIndependentHttp: { maxResponseBytes: 65536 } })
       .then(function (r) {
         return r.json().then(function (j) {
-          if (r.status === 200) return { path: j.path, width: j.width, height: j.height, scale: j.scale };
+          if (r.status === 200) return { path: j.path, width: j.width, height: j.height, scale: j.scale, type: j.type };
           throw new DOMException("captureCanvas: " + j.message, j.name);
         });
       });

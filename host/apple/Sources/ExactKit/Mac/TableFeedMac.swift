@@ -36,7 +36,7 @@ import AppKit
 private final class TableSeparatorRowView: NSTableRowView {
     var separates = true { didSet { if separates != oldValue { needsDisplay = true } } }
     weak var appearanceSource: NodeView? { didSet { if appearanceSource !== oldValue { needsDisplay = true } } }
-    override func drawSelection(in dirtyRect: NSRect) {
+    package override func drawSelection(in dirtyRect: NSRect) {
         guard (view(atColumn: 0) as? TableRowCell)?.paintsSelection != false else { return }
         super.drawSelection(in: dirtyRect)
     }
@@ -284,14 +284,14 @@ final class RunnerTableView: NSTableView {
 }
 
 /// One list's rows in a table.
-final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// A mounted row: its item's index, the runner's view for it and that
     /// view's authored root, where layout has it in the document, and the
     /// table's row for it there (`top`, `height`: layout's box, with half
     /// of any room layout left between it and a mounted neighbour).
-    struct Row {
+    package struct Row {
         let index: Int
-        let node: NodeView
+        package let node: NodeView
         let root: UInt32
         var kernel = NSRect.zero
         var top: CGFloat = 0, height: CGFloat = 0
@@ -302,12 +302,12 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private weak var presenter: Presenter?
     private weak var list: NodeView?
     /// The mounted rows, by index.
-    private(set) var rows: [Row] = []
+    private(set) package var rows: [Row] = []
     private var count = 0
     /// The children of a list the runner does not window, as its last
     /// `children` op named them: each with a box in the flow is a row, and
     /// the feed mounts them all (`TableHost.owns`).
-    var children: [NodeView]? { didSet { dirty = true } }
+    package var children: [NodeView]? { didSet { dirty = true } }
     /// How tall the table has a row that is not mounted: the commonest
     /// height among the mounted rows when the table was last loaded, or the
     /// runner's own estimate (its extent shared among its items) while none
@@ -375,8 +375,8 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         table.doubleAction = #selector(doubleClicked)
         table.feed = self
         // A list the runner does not window: its children are in its document, in order.
-        if presenter.collections.entries[id] == nil {
-            children = list.container.subviews.compactMap { view in (view as? NodeView).flatMap { presenter.views[$0.id] === $0 ? $0 : nil } }
+        if !presenter.collections.owns(id) {
+            children = list.childNodes.filter { presenter.views[$0.id] === $0 }
         }
         sync()
     }
@@ -474,8 +474,8 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// feed's to mount: one of the rows the runner windows, as it has them
     /// in the batch being applied; any child of a list it does not window.
     func expects(_ node: NodeView) -> Bool {
-        guard let entry = presenter?.collections.entries[id] else { return children != nil }
-        return entry.snapshot.rows.contains { $0.view == node.id }
+        guard let snapshot = presenter?.collections.snapshot(id) else { return children != nil }
+        return snapshot.rows.contains { $0.view == node.id }
     }
     private func kernel(_ node: NodeView) -> NSRect { (node.superview as? TableRowCell)?.kernel ?? node.frame }
 
@@ -484,7 +484,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// a box in the flow is a row, and all of them are mounted).
     private func read(_ presenter: Presenter) -> (count: Int, rows: [Row], stamp: [UInt64]) {
         var next: [Row] = []
-        if let snapshot = presenter.collections.entries[id]?.snapshot {
+        if let snapshot = presenter.collections.snapshot(id) {
             // A table made before the runner said it windows the list.
             if children != nil { children = nil }
             next.reserveCapacity(snapshot.rows.count)
@@ -572,7 +572,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         if recount {
             // The items changed: every row is asked again.
             count = items
-            let extent = CGFloat(presenter.collections.entries[id]?.snapshot.extent ?? 0)
+            let extent = CGFloat(presenter.collections.snapshot(id)?.extent ?? 0)
             estimate = common()?.height ?? max(Self.least, (extent / CGFloat(max(1, items)) / pixel).rounded() * pixel)
         } else if differed >= 16, differed > agreed {
             // Most rows that came were not the estimate. Where most mounted
@@ -725,7 +725,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
     /// The port moved the least that shows `row` whole; the list's first
     /// row with the padding before it, its last with the padding after.
-    func show(row: Int) {
+    package func show(row: Int) {
         guard row >= 0, row < count else { return }
         guard let scroll = list?.scroll, let home else { table.scrollToVisible(table.rect(ofRow: row)); return }
         let clip = scroll.contentView, port = clip.bounds
@@ -747,7 +747,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private func span(ofRow row: Int) -> ClosedRange<CGFloat> {
         if let mounted = self.row(at: row) { return mounted.top...(mounted.top + mounted.height) }
         let content = list?.contentBox().minY ?? 0
-        let extent = content + CGFloat(presenter?.collections.entries[id]?.snapshot.extent ?? 0)
+        let extent = content + CGFloat(presenter?.collections.snapshot(id)?.extent ?? 0)
         var before: Row?, after: Row?
         for mounted in rows { if mounted.index < row { before = mounted } else { after = mounted; break } }
         let from = before.map { $0.top + $0.height } ?? content, first = (before?.index ?? -1) + 1
@@ -787,7 +787,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         if kept { presenter?.orderChildren(all, in: home) }
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { count }
+    package func numberOfRows(in tableView: NSTableView) -> Int { count }
     private func separates(at index: Int) -> Bool {
         guard index >= 0, index < count else { return false }
         // An estimated, unmounted row has no authored intent to read yet.
@@ -805,7 +805,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             view.separates = self.separates(at: index)
         }
     }
-    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+    package func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let identifier = NSUserInterfaceItemIdentifier("exact.row.separator")
         let view = tableView.makeView(withIdentifier: identifier, owner: self) as? TableSeparatorRowView ?? TableSeparatorRowView()
         view.identifier = identifier
@@ -813,19 +813,19 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         view.separates = separates(at: row)
         return view
     }
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { self.row(at: row)?.height ?? estimate }
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+    package func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { self.row(at: row)?.height ?? estimate }
+    package func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let cell = tableView.makeView(withIdentifier: Self.column, owner: nil) as? TableRowCell ?? TableRowCell(feed: self)
         cell.identifier = Self.column
         if let mounted = self.row(at: row) { cell.adopt(mounted.node) } else { cell.sendHome() }
         return cell
     }
-    func tableView(_ tableView: NSTableView, didAdd rowView: NSTableRowView, forRow row: Int) {
+    package func tableView(_ tableView: NSTableView, didAdd rowView: NSTableRowView, forRow row: Int) {
         (rowView.view(atColumn: 0) as? TableRowCell)?.place()
     }
     /// The table let a row's view go: the runner's row, if it is still
     /// mounted, stays in the document.
-    func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
+    package func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
         (rowView as? TableSeparatorRowView)?.appearanceSource = nil
         (rowView.view(atColumn: 0) as? TableRowCell)?.sendHome()
     }
@@ -839,10 +839,10 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// no selection. A row that is not mounted may be reached by a key (the
     /// list's last row): what it is shows when the runner has made it.
     private func selectable(_ row: Row) -> Bool { pressing(row).map { !$0.disabled && !$0.inert } ?? false }
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { self.row(at: row).map(selectable) ?? true }
+    package func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { self.row(at: row).map(selectable) ?? true }
     /// A mounted row's text, for the table's type-select. A row that is not
     /// mounted has none here: the runner has its item, not the host.
-    func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
+    package func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
         self.row(at: row).map(\.node.accessibleName).flatMap { $0.isEmpty ? nil : $0 }
     }
     private func remember(_ row: Row?) {
@@ -857,7 +857,7 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let url = pressing(row)?.defaultLink else { return false }
         return url.hasPrefix("/") && !url.hasPrefix("//")
     }
-    func tableViewSelectionDidChange(_ notification: Notification) {
+    package func tableViewSelectionDidChange(_ notification: Notification) {
         guard !syncing else { return }
         let row = table.selectedRow, mounted = self.row(at: row)
         remember(mounted)
@@ -869,13 +869,13 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         if let mounted, table.keying, navigates(mounted) { pressRow(row) }
         // The person took the selection off its row (a Command-click): a
         // split's pane then shows nothing (LLP 1115.002 D4, SplitMac.swift).
-        if row < 0 { presenter?.navigation.split.deselected(id) }
+        if row < 0 { presenter?.navigation.stackSplit.deselected(id) }
     }
     /// The split's word on the selection (SplitMac.swift): the owning row,
     /// else the current row for a detail no row owns, is selected, and with
     /// no detail none is. A row that is not mounted leaves what is selected.
     /// True when the table shows it.
-    @discardableResult func show(selected press: UInt32?) -> Bool {
+    @discardableResult package func show(selected press: UInt32?) -> Bool {
         let index = press.flatMap { id in
             let node = presenter?.views[id]
             return rows.first { pressing($0)?.id == id || node?.isDescendant(of: $0.node) == true }?.index
@@ -958,9 +958,9 @@ final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func pressRow(_ row: Int) -> Bool {
         guard let pressing = self.row(at: row).flatMap(pressing), !pressing.disabled, !pressing.inert else { return false }
         // The list of a split (SplitMac.swift): a route this press brings is this row's detail.
-        let split = presenter?.navigation.split
-        if split?.shown?.table == id { split?.pressing = pressing.id }
-        defer { split?.pressing = nil }
+        let split = presenter?.navigation.stackSplit
+        if let split, split.table == id { split.pressing = pressing.id }
+        defer { if let split { split.pressing = nil } }
         presenter?.press(pressing.id)
         return true
     }
@@ -982,11 +982,11 @@ extension NodeView {
     /// the list-rows recipe writes: a snap scroller holding the row and its
     /// swipe action), the content it names, when that has one. Nil for a
     /// row of text.
-    var rowPress: NodeView? {
+    package var rowPress: NodeView? {
         if pressable { return self }
         guard let name = props["swipeContent"], !name.isEmpty else { return nil }
         func find(_ view: NSView) -> NodeView? {
-            for case let node as NodeView in (view as? NodeView)?.container.subviews ?? view.subviews {
+            for node in (view as? NodeView)?.childNodes ?? NodeView.committed(view.subviews) {
                 if node.props["id"] == name { return node.pressable ? node : nil }
                 if let found = find(node) { return found }
             }
@@ -994,5 +994,13 @@ extension NodeView {
         }
         return find(self)
     }
+}
+
+extension Presenter {
+    /// What is under `point`, in the viewport's superview, asked as the hover
+    /// path asks (`TableRowCell.whatIsThere`).
+    package func viewUnder(_ point: NSPoint) -> NSView? { TableRowCell.whatIsThere { viewport.hitTest(point) } }
+    /// A press a native table holds ends unanswered: its window resigned key.
+    package func cancelTablePress() { tables.cancelPress() }
 }
 #endif

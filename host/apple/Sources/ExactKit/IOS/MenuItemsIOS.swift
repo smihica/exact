@@ -2,7 +2,7 @@
 import UIKit
 
 extension MenuHost {
-    func rejectActiveMenuProperties(in pop: NodeView) {
+    package func rejectActiveMenuProperties(in pop: NodeView) {
         for row in pop.menuRowsThroughSections {
             row.rejectNativeActiveProperties(on: "UIAction")
         }

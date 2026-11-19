@@ -14,7 +14,7 @@
 //! one's late events.
 use super::{
     body, bounded_outcome, failed, fetch_failure, fetch_request, handoff, retained, scoped_grants,
-    Completed, Job, Running, Shared, State, StreamHost, BYTES, MAX_HEADERS,
+    Completed, Job, Running, Shared, State, BYTES, MAX_HEADERS,
 };
 use exact_runner::{FailureKind, Outcome, Reply, Request, Response, Work as OwnedWork};
 use ibex2::boundary::HostError;
@@ -97,7 +97,7 @@ pub(super) enum Claim {
 }
 
 /// Claim `run`'s transition for `claim`, if nothing has: whether it won.
-fn claim(state: &mut State, run: Run, claim: Claim) -> bool {
+pub(super) fn claim(state: &mut State, run: Run, claim: Claim) -> bool {
     match find(&mut state.running, run) {
         Some(r) if !r.terminal && r.claim == Claim::None => {
             r.claim = claim;
@@ -128,7 +128,7 @@ pub(super) struct Book {
     held_counts: HashSet<Run>,
     /// Each ended hop's places wait for the destination's physical release.
     download_ends: HashMap<Run, Vec<(usize, String, bool)>>,
-    /// Redirects and uploads waiting for admission at their destination origin.
+    /// Redirects and prepared file bodies waiting for admission at their origin.
     hops: [VecDeque<Hop>; 2],
     /// Places held from selection until transport preparation consumes them.
     reserved: HashMap<Run, (usize, String)>,
@@ -155,6 +155,15 @@ pub(super) struct Book {
 }
 
 impl Book {
+    #[cfg(test)]
+    pub(super) fn reservations(&self) -> (usize, usize, usize) {
+        (
+            self.in_flight,
+            self.reserved.len(),
+            self.origins.iter().map(HashMap::len).sum(),
+        )
+    }
+
     /// The bytes the parked uploads in `jobs` still need, which admission
     /// counts as taken (LLP 1120 §6 question 8, provisional), wherever in
     /// the queue they wait.
@@ -225,7 +234,7 @@ impl Charged {
     }
 }
 
-/// What a file job's fetch needs once its file is read.
+/// What a file job's fetch needs once its upload or destination is prepared.
 struct FileJob {
     request: Request,
     forced: bool,
@@ -233,6 +242,12 @@ struct FileJob {
     abort: AbortController,
     retiring: AbortRegistration,
     fetch: ibex2::host::Fetch,
+    fixture: Option<super::ResponseWork>,
+}
+
+struct PreparedUpload {
+    bytes: Vec<u8>,
+    destination: Option<ibex2::stdlib::fetch_async::ResponseBody>,
 }
 
 /// What the finisher tells a sizing reader.
@@ -254,6 +269,7 @@ type Lane = (Arc<dyn AsyncTransport>, ibex2::host::Fetch);
 enum Event {
     /// A run's outcome: a fetch's, a closure's, a handoff's, the timer's.
     Outcome(Run, Done),
+    Fixture(Box<dyn FnOnce() + Send>),
     /// A hop's end names its own transport lane and origin: a later hop may
     /// have changed routes (LLP 1162 D1). Readers and starts have no origin.
     Ended(Run, Option<(usize, String)>, bool, bool),
@@ -264,9 +280,9 @@ enum Event {
     Protocol(usize, String, String),
     /// A sizing reader's answer.
     Sized(Run, Result<u64, Outcome>),
-    /// A reader's file, or why not (`None`: it grew past its charge).
-    Read(Run, Result<Vec<u8>, Option<Outcome>>),
-    /// A redirect's next hop.
+    /// A reader's upload and destination, or why not (`None`: it grew past its charge).
+    Read(Run, Result<PreparedUpload, Option<Outcome>>),
+    /// A prepared file body's first hop, or a redirect's next hop.
     Hop(Run, String, Box<dyn FnOnce() + Send>),
 }
 
@@ -311,7 +327,7 @@ impl Machine {
         shared: Arc<Shared>,
         owners: Vec<Option<ibex2::host::Bindings>>,
         grants: &str,
-        host: StreamHost,
+        lane: &super::Lane,
         lanes: &Lanes,
     ) -> Arc<Machine> {
         let parsed = || ibex2::grant::GrantSet::parse(&exact_runner::io_grants(grants));
@@ -324,7 +340,7 @@ impl Machine {
         let independent = owners
             .next()
             .flatten()
-            .or_else(|| super::independent_bindings(grants, &host));
+            .or_else(|| super::independent_bindings(grants, lane));
         let worker_budget = Arc::new(workers::Budget::default());
         let transport = |lane: usize, b: Option<ibex2::host::Bindings>| {
             b.map(|b| {
@@ -485,22 +501,27 @@ impl Machine {
             let previous_lane = r.transport_lane;
             let overlap = r.overlap;
             let hop = &state.book.hops[lane][at];
+            // A destination prepared off-thread keeps its first hop's places.
+            let reserved = state.book.reserved.contains_key(&run);
             // LLP 1162 D1: every shared hop can fall back when held independent
             // exchanges occupy its adapter. An ordered route keeps its slot.
-            let transport_lane = if lane == 0 && overlap && previous_lane == 1 {
+            let transport_lane = if !reserved && lane == 0 && overlap && previous_lane == 1 {
                 shared_route(state, &hop.origin)
             } else {
                 previous_lane
             };
-            if (transport_lane == 0 && previous_lane != 0 && state.book.blocking)
-                || (transport_lane == 1 && state.book.in_flight >= IN_FLIGHT)
-                || at_limit(state, transport_lane, &hop.origin)
+            if !reserved
+                && ((transport_lane == 0 && previous_lane != 0 && state.book.blocking)
+                    || (transport_lane == 1 && state.book.in_flight >= IN_FLIGHT)
+                    || at_limit(state, transport_lane, &hop.origin))
             {
                 at += 1;
                 continue;
             }
             let hop = state.book.hops[lane].remove(at).expect("index");
-            hold(&mut state.book, transport_lane, hop.run, hop.origin);
+            if !reserved {
+                hold(&mut state.book, transport_lane, hop.run, hop.origin);
+            }
             // The start holds its run until it has run (`starter`).
             let r = find(&mut state.running, hop.run).expect("open");
             r.transport_lane = transport_lane;
@@ -596,7 +617,8 @@ impl Machine {
         if sized {
             state.book.uploads.insert(run, Charged::new(lane, upload));
         }
-        if kind == Kind::Http && job.request.body_from.is_none() {
+        let http = kind == Kind::Http;
+        if http && job.request.body_from.is_none() {
             hold(
                 &mut state.book,
                 transport_lane,
@@ -615,13 +637,18 @@ impl Machine {
             charge: job.charge,
             limit: job.limit,
             // Only an exchange is cancelled by a forget (a safe read's).
-            abort: (kind == Kind::Http && super::reads::safe_to_forget(&job.request, job.class))
+            abort: (http && super::reads::safe_to_forget(&job.request, job.class))
                 .then(|| abort.clone()),
-            exchange: (kind == Kind::Http).then(|| abort.clone()),
+            exchange: http.then(|| abort.clone()),
             forgotten: job.forgotten,
             stream: false,
             waiting: false,
-            read: lane == 0 && super::reads::safe_read(&job.request, job.work.is_some(), job.class),
+            read: lane == 0
+                && super::reads::safe_read(
+                    &job.request,
+                    super::reads::opaque(&job.work),
+                    job.class,
+                ),
             overlap: job.overlap,
             class: job.class,
             terminal: false,
@@ -632,15 +659,20 @@ impl Machine {
             generation: run.1,
             claim: Claim::None,
             cached: false,
-            cache_exchange: None,
+            cache_exchange: super::cache::exchange(state, &job),
             cache_replacing: super::cache::replacing(
                 &job.request,
                 job.class,
                 job.forced,
-                job.work.is_some(),
+                super::reads::opaque(&job.work),
             ),
-            cache_barrier: super::cache::barrier(&job.request, job.class, job.work.is_some()),
-            invalidates: super::cache::invalidates(&job.request, job.work.is_some()),
+            cache_barrier: super::cache::barrier(
+                &job.request,
+                job.class,
+                super::reads::opaque(&job.work),
+            ),
+            refresh: super::preload::Refresh::of(&job.request, job.class, job.forced),
+            invalidates: super::cache::invalidates(&job.request, super::reads::opaque(&job.work)),
         });
         let start: Start =
             Box::new(move |m: &Arc<Machine>| m.run(lane, run, kind, job, sized, abort));
@@ -711,14 +743,12 @@ impl Machine {
             Kind::Closure => {
                 // Run here (a driver fault's, a continuation, storage): the
                 // lane's starts wait for it (a declared change, D3).
-                let work = match work {
-                    Some(OwnedWork::Now(work)) => Some(work),
-                    _ => None,
-                };
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    closure(request, work, &abort)
-                }))
-                .unwrap_or_else(|_| failed(FailureKind::Aborted, "native work panicked"));
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
+                        Some(OwnedWork::Now(work)) => closure(request, Some(work), &abort),
+                        _ => closure(request, None, &abort),
+                    }))
+                    .unwrap_or_else(|_| failed(FailureKind::Aborted, "native work panicked"));
                 refuse(outcome);
             }
             Kind::Http => {
@@ -728,7 +758,20 @@ impl Machine {
                 {
                     return refuse(outcome);
                 }
-                self.http(lane, run, request, forced, sized, abort, retiring, scoped)
+                self.http(
+                    lane,
+                    run,
+                    request,
+                    forced,
+                    sized,
+                    abort,
+                    retiring,
+                    scoped,
+                    match work {
+                        Some(OwnedWork::HttpResponse(work)) => Some(work),
+                        _ => None,
+                    },
+                )
             }
         }
     }
@@ -764,6 +807,7 @@ impl Machine {
     /// Apply one event under the lock; anything to run after it, unlocked.
     fn apply(self: &Arc<Self>, state: &mut State, lane: usize, event: Event) -> Option<After> {
         match event {
+            Event::Fixture(deliver) => Some(Box::new(move |_| deliver())),
             Event::Outcome(run, done) => {
                 // Only the claimant settles: a fetch's outcome claims when it
                 // is posted, as the timer and a forget do.
@@ -972,7 +1016,7 @@ impl Kind {
     fn of(job: &Job) -> Kind {
         if handoff(&job.request) && matches!(job.work, Some(OwnedWork::Later(_))) {
             Kind::Handoff
-        } else if job.work.is_some()
+        } else if super::reads::opaque(&job.work)
             || job.request.storage.is_some()
             || job.request.continuation.is_some()
         {
@@ -998,12 +1042,10 @@ fn at_limit(state: &State, lane: usize, origin: &str) -> bool {
 }
 
 /// What starting `job` charges more: response bytes, and a sized upload's
-/// file. A handoff charges no response bytes, a job sizing its file only
-/// the request buffers it holds (D5).
+/// file. A job sizing its file holds only its request buffers (D5).
 fn charge(book: &Book, lane: usize, job: &Job, kind: Kind) -> (usize, usize) {
     let sized = book.sized.get(&job.ticket).map(|n| *n as usize);
     let more = match kind {
-        Kind::Handoff => 0,
         Kind::Http if job.request.body_from.is_some() && sized.is_none() => 0,
         _ => job.limit - job.charge,
     };
@@ -1017,7 +1059,7 @@ fn charge(book: &Book, lane: usize, job: &Job, kind: Kind) -> (usize, usize) {
 /// Whether `job` fits the lane's free bytes now.
 fn fits(state: &State, lane: usize, job: &Job, kind: Kind) -> bool {
     let (more, upload) = charge(&state.book, lane, job, kind);
-    more + upload <= BYTES[lane].saturating_sub(state.bytes[lane])
+    super::reads::has_room(state, lane, more + upload)
 }
 
 /// The same shared admission for a read's first hop and its redirects (LLP 1162 D1).

@@ -8,13 +8,13 @@ use exact_plan::{
 use exact_runner::{
     Answer, CacheMode, DataError, DataSource, FailureKind, HttpScheduling, LongPoll, Outcome,
     Overlaid, Redirect, Request, Response, Socket, SocketCall, SocketOp, Store, SurfaceOutcome,
-    SurfaceRequest, Write,
+    SurfaceRequest, Target, Write,
 };
 
 pub mod draw;
 
 /// Seam version, independent of the plan format version.
-pub const ABI: u32 = 11;
+pub const ABI: u32 = 12;
 /// Maximum request or response bytes, enforced on both sides.
 pub const MAX_MESSAGE: usize = exact_runner::MAX_HOST_WORK_BYTES;
 
@@ -109,8 +109,9 @@ pub fn bind_request(plan: &[u8]) -> Result<Vec<u8>, String> {
 pub fn activate_request() -> Vec<u8> {
     header(2).into_vec()
 }
-/// Encode an answer or parse operation with a grant-filtered snapshot.
+/// Encode an answer or parse operation with its target and grant-filtered snapshot.
 pub fn call_request(
+    target: Option<Target>,
     store: &Store,
     source: &str,
     args: &[Value],
@@ -119,6 +120,24 @@ pub fn call_request(
     let mut w = header(if outcome.is_some() { 4 } else { 3 });
     w.string(source);
     Value::list(args.to_vec()).encode(&mut w);
+    // No target (query/answer/parse), resource, mutation, or parallel send.
+    // Row indices are u32; a parallel send's sequence is u64.
+    match target {
+        None => w.u8(0),
+        Some(Target::Resource(i)) => {
+            w.u8(1);
+            w.u32(u32::try_from(i).map_err(error)?);
+        }
+        Some(Target::Mutation(i)) => {
+            w.u8(2);
+            w.u32(u32::try_from(i).map_err(error)?);
+        }
+        Some(Target::Sent(i, send)) => {
+            w.u8(3);
+            w.u32(u32::try_from(i).map_err(error)?);
+            w.u64(send);
+        }
+    }
     w.u32(store.granted().len() as u32);
     for name in store.granted() {
         w.string(name);
@@ -546,10 +565,23 @@ fn encode_result(w: &mut Writer, result: Result<Answer, DataError>) {
                     w.string(name);
                     bytes(w, payload);
                 }
-                SurfaceRequest::Canvas { name, path, .. } => {
-                    w.u8(16);
+                // A type or quality asked for is additive tag 17, which an
+                // older host refuses; the default PNG stays tag 16.
+                SurfaceRequest::Canvas {
+                    name,
+                    path,
+                    encoding,
+                    ..
+                } => {
+                    let png = *encoding == exact_runner::canvas_capture::Encoding::default();
+                    w.u8(if png { 16 } else { 17 });
                     w.string(name);
                     w.string(path);
+                    if !png {
+                        w.string(&encoding.media_type);
+                        w.u8(u8::from(encoding.quality.is_some()));
+                        w.f64(encoding.quality.unwrap_or(0.0));
+                    }
                 }
             }
             w.u8(u8::from(r.grants.is_some()));
@@ -708,12 +740,24 @@ fn read_result(r: &mut Reader<'_>) -> Result<Result<Answer, DataError>, String> 
             };
             Ok(Answer::Later(request))
         }
-        tag @ (7 | 8 | 16) => {
+        tag @ (7 | 8 | 16 | 17) => {
             let name = r.string().map_err(error)?;
-            let path = if tag == 16 {
+            let path = if tag >= 16 {
                 Some(r.string().map_err(error)?)
             } else {
                 None
+            };
+            let (media_type, quality) = if tag == 17 {
+                let media_type = r.string().map_err(error)?;
+                let present = r.u8().map_err(error)?;
+                let quality = r.f64().map_err(error)?;
+                match present {
+                    0 => (media_type, None),
+                    1 => (media_type, Some(quality)),
+                    _ => return Err("invalid canvas quality tag".into()),
+                }
+            } else {
+                (String::new(), None)
             };
             let payload = if tag == 8 {
                 Some(read_bytes(r)?.to_vec())
@@ -724,7 +768,7 @@ fn read_result(r: &mut Reader<'_>) -> Result<Result<Answer, DataError>, String> 
             let scope = r.string().map_err(error)?;
             let mut request = match (payload, path) {
                 (Some(bytes), _) => Request::restore_surface(name, bytes),
-                (None, Some(path)) => Request::capture_canvas(name, path),
+                (None, Some(path)) => Request::capture_canvas_as(name, path, &media_type, quality),
                 (None, None) => Request::capture_surface(name),
             };
             request.grants = match present {
@@ -988,6 +1032,16 @@ impl<D: DataSource> Session<D> {
                 let Value::List(args) = Value::decode(&mut r).map_err(error)? else {
                     return Err("arguments must be a list".into());
                 };
+                let target = match r.u8().map_err(error)? {
+                    0 => None,
+                    1 => Some(Target::Resource(r.u32().map_err(error)? as usize)),
+                    2 => Some(Target::Mutation(r.u32().map_err(error)? as usize)),
+                    3 => Some(Target::Sent(
+                        r.u32().map_err(error)? as usize,
+                        r.u64().map_err(error)?,
+                    )),
+                    _ => return Err("invalid call target tag".into()),
+                };
                 let count = r.count().map_err(error)?;
                 let scope = (0..count)
                     .map(|_| {
@@ -1005,12 +1059,13 @@ impl<D: DataSource> Session<D> {
                 };
                 read_socket_turn(&mut r, &mut store)?;
                 end(&r)?;
-                let result = store.with_grants(&scope, |store| {
-                    if let Some(outcome) = outcome {
-                        self.data.parse(store, &source, &args, outcome)
-                    } else {
-                        self.data.answer(store, &source, &args)
+                let result = store.with_grants(&scope, |store| match (target, outcome) {
+                    (Some(target), Some(outcome)) => {
+                        self.data.parse_for(target, store, &source, &args, outcome)
                     }
+                    (Some(target), None) => self.data.answer_for(target, store, &source, &args),
+                    (None, Some(outcome)) => self.data.parse(store, &source, &args, outcome),
+                    (None, None) => self.data.answer(store, &source, &args),
                 });
                 // An answer that read a locked presence name with `get` fails,
                 // as it does in process (LLP 1133.010 D5).
@@ -1018,7 +1073,9 @@ impl<D: DataSource> Session<D> {
                     Some(name) => Err(exact_runner::StoreError::Locked(name).into()),
                     None => result,
                 };
-                w.u8(u8::from(store.reads() > 0));
+                // A read beyond its draws: each draw counts a read, and the
+                // draws cross apart below (LLP 1069.005 D2)
+                w.u8(u8::from(store.reads() > store.entropy_draws()));
                 let topics = store.take_topics();
                 w.u32(topics.len() as u32);
                 for topic in &topics {

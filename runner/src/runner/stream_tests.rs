@@ -21,9 +21,15 @@ struct Scripted {
     failing_end: bool,
     /// … whose request is the same for every wave.
     same_request: bool,
+    dropped: usize,
+    discarded: Vec<u64>,
 }
 
 impl DataSource for Scripted {
+    fn discard(&mut self, token: u64) {
+        self.discarded.push(token);
+    }
+
     fn query(&mut self, _: &str, _: &[Value]) -> Result<Value, DataError> {
         unreachable!("the fixture implements answer")
     }
@@ -89,6 +95,13 @@ impl DataSource for Scripted {
             )),
             Outcome::Failed { .. } if self.failing_end => {
                 Err(DataError::Unavailable("the upload failed".into()))
+            }
+            Outcome::Failed {
+                kind: crate::FailureKind::Network,
+                message,
+            } if message == "stream dropped by test" => {
+                self.dropped += 1;
+                Ok(Answer::Now(Value::Number(-3.)))
             }
             // An upload's reply answers its status.
             Outcome::Response(r) if self.upload => Ok(Answer::Now(Value::Number(r.status.into()))),
@@ -242,6 +255,55 @@ fn three_messages_then_a_close_commit_four_times() {
 }
 
 #[test]
+fn drop_stream_ends_only_the_matching_tickets_and_discards_queued_frames() {
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, 1);
+    let number = b.primitive(TypeKind::Number);
+    for wave in [11., 12., 21.] {
+        let arg = b.constant(&Value::Number(wave));
+        b.resource(&format!("photo{wave}"), "photo", &[arg], number, None);
+    }
+    b.node(NodeType::View as u8, None, None, 0, &[], &[], None);
+    let mut r = Runner::boot(
+        b.finish().unwrap(),
+        Scripted::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let requests = r.take_requests();
+    let (first, second, other) = (requests[0].ticket, requests[1].ticket, requests[2].ticket);
+    for ticket in [first, second, other] {
+        r.fulfill(ticket, message("10", 0)).unwrap();
+    }
+    r.mapper_turn(
+        first,
+        Request::continuation::<crate::host_work::StreamTurn>(42),
+    );
+    let turn = r.take_requests()[0].ticket;
+    assert!(r.fulfill(first, message("99", 0)).unwrap().is_none());
+    let op = r#"{"op":"prefer","faults":{"dropStream":"https://example.test/events?wave=1"}}"#;
+    let result = crate::agent::drop_stream(&mut r, op).unwrap().unwrap();
+    assert_eq!(result.receipts.len(), 2);
+    assert!(result.error.is_none());
+    assert_eq!(r.data.dropped, 2);
+    assert_eq!(r.data.discarded, [42]);
+    assert_eq!(value(&r, "photo11"), Value::Number(-3.));
+    assert!(!r.holds(first) && !r.holds(second) && !r.holds(turn));
+    assert!(r.take_explicit_aborts().contains(&first));
+    assert!(r.holds(other));
+    r.fulfill(other, message("11", 0)).unwrap();
+    assert_eq!(value(&r, "photo21"), Value::Number(11.));
+    assert!(r.fulfill(turn, message("98", 0)).unwrap().is_none());
+    assert!(r.fulfill(first, message("97", 0)).unwrap().is_none());
+    assert_eq!(value(&r, "photo11"), Value::Number(-3.));
+    assert!(crate::agent::drop_stream(&mut r, op)
+        .unwrap()
+        .unwrap_err()
+        .contains("matched no open stream"));
+}
+
+#[test]
 fn forgetting_mid_stream_lets_the_ticket_go_and_drops_late_messages() {
     let mut r = boot();
     let old = one_stream(&mut r);
@@ -367,6 +429,8 @@ fn a_long_poll_s_replies_hold_it_and_each_counts() {
     assert!(r.is_open_stream(ticket));
     assert_eq!(listed(&r), (vec![], vec!["progress".into()]));
     assert_eq!(r.held_replies(), [("progress".to_string(), 2)]);
+    assert!(r.drop_streams("https://example.test/changes").is_err());
+    assert!(r.holds(ticket));
     let state = crate::agent::state(&r);
     assert!(
         state.contains(&format!(
@@ -504,6 +568,39 @@ fn an_upload_is_pending_until_its_reply_while_its_progress_commits() {
     );
     assert_eq!(value(&r, "busy"), Value::Bool(false));
     assert!(!r.has_pending() && r.in_flight().is_empty() && !r.holds(ticket));
+}
+
+/// An upload in flight holds the app open until its reply, as a request with
+/// effects does; one let go is aborted and holds nothing (LLP 1133.008.000 D8).
+#[test]
+fn an_upload_must_finish_until_its_reply_and_not_once_let_go() {
+    let mut r = boot_with(Scripted {
+        upload: true,
+        ..Scripted::default()
+    });
+    let ticket = r.take_requests()[0].ticket;
+    assert!(r.must_finish(), "admitted");
+    started(&mut r, ticket);
+    r.fulfill(
+        ticket,
+        Outcome::Message(Message::upload_progress(1024, 4096)),
+    )
+    .unwrap();
+    assert!(r.must_finish(), "going out");
+    let reply = Outcome::Response(Response {
+        status: 201,
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+    });
+    r.fulfill(ticket, reply).unwrap();
+    assert!(!r.must_finish(), "replied");
+    r.act("wave", vec![Value::Number(2.)]).unwrap();
+    let second = r.take_requests()[0].ticket;
+    assert!(r.must_finish());
+    // Wave 0 answers now, letting the running upload go.
+    r.act("wave", vec![Value::Number(0.)]).unwrap();
+    assert!(!r.holds(second), "the host aborts what the runner let go");
+    assert!(!r.must_finish(), "a let-go upload is not kept");
 }
 
 /// An upload is asked once for its arguments (LLP 1016.000 D10): neither a
@@ -1143,4 +1240,58 @@ fn a_stream_asked_at_readiness_is_pending_only_until_its_first_message() {
         assert_eq!(r.resource(name), Some(&Value::Bool(false)), "{name}");
     }
     assert!(r.in_flight().is_empty() && !r.has_pending());
+}
+
+#[test]
+fn frozen_page_releases_a_gated_stream_in_the_transition_commit() {
+    let plan = contract::compile(
+        r#"shape Page
+  frozen: bool
+component App
+  resource page = exactPage() as shape Page
+  resource feed = progress(1) when not page.frozen as shape number else empty()
+  view
+    text `${page.frozen} ${feed}`
+"#,
+    )
+    .unwrap();
+    let mut r = Runner::boot(
+        plan,
+        Scripted::default(),
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(value(&r, "page"), Value::record(vec![Value::Bool(false)]));
+    let first = one_stream(&mut r);
+    r.fulfill(first, message("5", 0)).unwrap();
+    let hidden = crate::Page {
+        hidden: true,
+        ..r.page()
+    };
+    assert!(
+        r.set_page(hidden).unwrap().is_none(),
+        "visibility alone has no reader"
+    );
+    assert!(r.holds(first), "a hidden desktop keeps its socket");
+    let before = r.kernel().epoch();
+    let frozen = crate::Page {
+        frozen: true,
+        ..hidden
+    };
+    let receipt = r.set_page(frozen).unwrap().unwrap();
+    assert_eq!(receipt.epoch, before + 1);
+    assert_eq!(value(&r, "page"), Value::record(vec![Value::Bool(true)]));
+    assert!(!r.holds(first) && r.streams().is_empty());
+    assert!(r.take_requests().is_empty());
+    assert_eq!(r.fulfill(first, message("99", 0)).unwrap(), None);
+    assert_eq!(value(&r, "feed"), Value::Number(5.));
+    assert!(r.set_page(frozen).unwrap().is_none());
+    r.set_page(hidden).unwrap().unwrap();
+    assert_ne!(
+        one_stream(&mut r),
+        first,
+        "resume asks again while still hidden"
+    );
 }

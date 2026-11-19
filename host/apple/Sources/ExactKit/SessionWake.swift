@@ -1,5 +1,8 @@
-// A session booted for a wake, with no view presented (LLP 1133.017 D7).
+// A session booted with no view presented (LLP 1133.017 D7), for what
+// launches the app with no scene: a wake, a notification's background action
+// or a tool call. Core, since each of those families boots through it.
 #if os(iOS)
+import OSLog
 import UIKit
 
 extension ExactSession {
@@ -20,12 +23,19 @@ extension ExactSession {
         let started = ExactEnv.wall()
         if !booted {
             boot(size: UIScreen.main.bounds.size)
-            guard booted else { return WakeStore.log("wakes: the boot with no view was refused: \(bootError ?? "?")") }
-            WakeStore.log("wakes: booted \(view == nil ? "with no view" : "under an undrawn view") in \(Int(ExactEnv.wall() - started)) ms")
+            guard booted else { return Self.wakeLog("wakes: the boot with no view was refused: \(bootError ?? "?")") }
+            Self.wakeLog("wakes: booted \(view == nil ? "with no view" : "under an undrawn view") in \(Int(ExactEnv.wall() - started)) ms")
         }
         guard activatedGeneration != generation else { return }
-        WakeStore.log("wakes: the module and the data open for the wake, \(view == nil ? "no view" : "a view") attached")
+        Self.wakeLog("wakes: the module and the data open for the wake, \(view == nil ? "no view" : "a view") attached")
         firstDrawn(generation: generation, token: updateToken)
+    }
+
+    /// A line to every live session's journal and the system log, as the
+    /// wakes family journals.
+    private static func wakeLog(_ line: String) {
+        ExactApp.shared.sessions.filter { $0.state != .destroyed }.forEach { $0.log(line) }
+        Logger(subsystem: "dev.exact", category: "wakes").notice("\(line, privacy: .public)")
     }
 }
 #endif

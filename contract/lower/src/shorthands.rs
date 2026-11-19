@@ -43,6 +43,10 @@ pub(crate) fn rows(name: &str) -> &'static [StyleId] {
         // @ref LLP 1057.003 D5 — Scroll-driven Animations 1 §2.2.4, §3.2.4.
         "scroll-timeline" => &[ScrollTimelineName, ScrollTimelineAxis],
         "view-timeline" => &[ViewTimelineName, ViewTimelineAxis, ViewTimelineInset],
+        // @ref LLP 1123 D4 — the regions and edges, then `align`'s alignment.
+        "-exact-safe-area-ignore" => &[SafeAreaIgnore, SafeAreaIgnoreAlign],
+        // @ref LLP 1123 D12 — one row, its grammar checked here.
+        "-exact-safe-area-bar" => &[SafeAreaBar],
         _ => unreachable!("known shorthand"),
     }
 }
@@ -61,6 +65,12 @@ pub(crate) fn component(value: &Expr, name: &str, index: usize) -> Result<Expr, 
             out = if index == 0 { Expr::Str("baseline".into(), *span) } else { Expr::Number(*n, *span) };
         }
         Expr::Str(text, span) if name == "font" => out = font(text, *span)?[index].clone(),
+        Expr::Str(text, span) if name == "-exact-safe-area-ignore" => {
+            out = Expr::Str(safe_area_ignore(text, *span)?[index].clone(), *span);
+        }
+        Expr::Str(text, span) if name == "-exact-safe-area-bar" => {
+            out = Expr::Str(safe_area_bar(text, *span)?, *span);
+        }
         Expr::Str(text, span) if name.ends_with("-timeline") => {
             out = Expr::Str(timeline(name, text, *span)?[index].clone(), *span);
         }
@@ -212,6 +222,20 @@ fn words(text: &str) -> Vec<&str> {
 }
 
 fn border(name: &str, text: &str, span: Span) -> Result<[String; 3], LowerError> {
+    let [width, style, color] = border_parts(name, text, span)?;
+    Ok([
+        width.unwrap_or("3px".into()),
+        style.unwrap_or("none".into()),
+        color.unwrap_or("currentcolor".into()),
+    ])
+}
+
+/// Authored components before the shorthand resets its omitted longhands.
+pub(crate) fn border_parts(
+    name: &str,
+    text: &str,
+    span: Span,
+) -> Result<[Option<String>; 3], LowerError> {
     let mut width = None;
     let mut style = None;
     let mut color = None;
@@ -283,13 +307,13 @@ fn border(name: &str, text: &str, span: Span) -> Result<[String; 3], LowerError>
                 // token is a length, which the refusal below names.
                 use exact_kernel::style::{scale, theme};
                 let length = scale::is_base(word)
-                    || crate::theme::measure_named(word) == Some(exact_tamber::Kind::Length);
+                    || crate::theme::measure_named(word) == Some(exact_forma::Kind::Length);
                 if crate::theme::scan::dotted_name(word)
                     && theme::bound()
                     && !theme::names(word)
                     && !length
                 {
-                    return err("tamber-unknown-token", format!("`{name}=\"{text}\"`: `{word}` is no token of this app's design and no role"), span);
+                    return err("forma-unknown-token", format!("`{name}=\"{text}\"`: `{word}` is no token of this app's design and no role"), span);
                 }
                 return err("lower-css-shorthand", format!("`{word}` is not an admitted `{name}` width, style or color; widths are nonnegative px/pt lengths, `-exact-hairline` or thin/medium/thick"), span);
             }
@@ -309,11 +333,7 @@ fn border(name: &str, text: &str, span: Span) -> Result<[String; 3], LowerError>
             span,
         );
     }
-    Ok([
-        width.unwrap_or("3px".into()),
-        style.unwrap_or("none".into()),
-        color.unwrap_or("currentcolor".into()),
-    ])
+    Ok([width, style, color])
 }
 
 // `columns`: `<column-width> || <column-count>`, each `auto` when not given.
@@ -456,6 +476,54 @@ const FONT_LONGHANDS: &[StyleId] = &[
 /// them, by CSS's grammar. A lone `cap` or `ex` is not an edge (CSS needs its
 /// under edge: `cap text`). A shorthand with no trim trims both ends; with no
 /// edge, its edge is `auto`.
+/// `-exact-safe-area-ignore: <regions>? <edges>? [align <alignment>]?` as its
+/// two rows (LLP 1123 D4): the regions and edges, and the alignment, `none`
+/// without `align`. With `align` alone it takes both regions on every edge,
+/// as naming neither does; each row's own parser checks its words.
+fn safe_area_ignore(text: &str, span: Span) -> Result<[String; 2], LowerError> {
+    let words: Vec<&str> = text.split_ascii_whitespace().collect();
+    let Some(at) = words.iter().position(|w| *w == "align") else {
+        return Ok([text.trim().to_string(), "none".to_string()]);
+    };
+    let [alignment] = words[at + 1..] else {
+        return err(
+            "lower-attr-value",
+            "`-exact-safe-area-ignore`'s `align` takes one alignment, last: `center`, `top`, `bottom`, `leading`, `trailing` or a corner such as `top-leading`",
+            span,
+        );
+    };
+    let regions = match words[..at].join(" ") {
+        taken if taken.is_empty() => "container keyboard".to_string(),
+        taken => taken,
+    };
+    Ok([regions, alignment.to_string()])
+}
+
+/// `-exact-safe-area-bar: none | <edge> [edge-effect] [region]` (LLP 1123
+/// D12), in that order: the row's keywords accept any set, and a bar names
+/// exactly one edge.
+fn safe_area_bar(text: &str, span: Span) -> Result<String, LowerError> {
+    let words: Vec<&str> = text.split_ascii_whitespace().collect();
+    let edge = ["top", "right", "bottom", "left", "start", "end"];
+    let flags = ["edge-effect", "region"];
+    let ordered = |rest: &[&str]| {
+        let at: Vec<usize> = rest
+            .iter()
+            .filter_map(|w| flags.iter().position(|f| f == w))
+            .collect();
+        at.len() == rest.len() && at.windows(2).all(|p| p[0] < p[1])
+    };
+    match words.as_slice() {
+        ["none"] => Ok("none".into()),
+        [e, rest @ ..] if edge.contains(e) && ordered(rest) => Ok(words.join(" ")),
+        _ => err(
+            "lower-attr-value",
+            "`-exact-safe-area-bar` is `none` or one edge (`top`, `right`, `bottom`, `left`, `start` or `end`), then `edge-effect` and `region` if wanted, in that order: e.g. `bottom edge-effect`",
+            span,
+        ),
+    }
+}
+
 fn text_box(name: &str, text: &str, span: Span) -> Result<[String; 2], LowerError> {
     let refuse = |why: String| {
         err(
@@ -612,12 +680,12 @@ impl Lowerer<'_> {
 
 /// Native interaction limits must also cover computed expressions, not only literals.
 pub(crate) fn portable_literal(value: &Expr, name: &str) -> Result<(), LowerError> {
-    match value {
-        Expr::Str(_, _) => Ok(()),
-        Expr::Ternary(_, yes, no, _) | Expr::Match { some: yes, none: no, .. } => { portable_literal(yes, name)?; portable_literal(no, name) },
-        Expr::Let { body, .. } => portable_literal(body, name),
-        _ => err("lower-css-interaction", format!("`{name}` takes a CSS keyword literal or a choice of literals so native support can be checked; computed strings cannot be checked"), value.span()),
+    for leaf in contract_checking::value_leaves(value) {
+        if !matches!(leaf, Expr::Str(..)) {
+            return err("lower-css-interaction", format!("`{name}` takes a CSS keyword literal or a choice of literals so native support can be checked; computed strings cannot be checked"), leaf.span());
+        }
     }
+    Ok(())
 }
 
 /// CSS `text-box-trim` on a block cuts its first and last formatted lines,
@@ -724,6 +792,7 @@ fn literals(e: &Expr) -> Option<Vec<(&str, Span)>> {
         Expr::Str(s, span) => Some(vec![(s.as_str(), *span)]),
         Expr::None(_) => Some(Vec::new()),
         Expr::Ternary(_, yes, no, _) => Some([literals(yes)?, literals(no)?].concat()),
+        Expr::Let { body, .. } => literals(body),
         _ => None,
     }
 }

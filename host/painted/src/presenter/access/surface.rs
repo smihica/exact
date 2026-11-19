@@ -14,6 +14,20 @@ impl<D: DataSource> Presenter<D> {
         let select = self.select_surface().is_some();
         let whole = [0.0, 0.0, shown.size.0, shown.size.1];
         let scroll = shown.scroll.or(select.then_some((0., 0.)));
+        // A detached submenu replaces the painted menu, but its expanded
+        // ancestors keep their identities so a service can collapse them.
+        let mut ancestor = 0;
+        for row in self.status_menu_ancestors() {
+            ancestor = self.access_bar_node(
+                b,
+                row.node,
+                ancestor,
+                role::BUTTON,
+                flag::CLICK | flag::EXPANDABLE | flag::EXPANDED,
+                row.title,
+                ((0., 0., 0., 0.), whole),
+            );
+        }
         let parent = if let Some((offset, max)) = scroll {
             let id = b.unique(identity(self.host.kernel(), shown.node));
             let flags = if offset > 0. { flag::BACKWARD } else { 0 }
@@ -26,7 +40,7 @@ impl<D: DataSource> Presenter<D> {
                 .unwrap_or_default();
             b.out.push(Node {
                 id,
-                parent: 0,
+                parent: ancestor,
                 view: shown.node,
                 role: if select {
                     role::LIST_BOX
@@ -37,13 +51,14 @@ impl<D: DataSource> Presenter<D> {
                 rect: whole,
                 range: [offset, max, 0.],
                 set: (0, 0),
+                grid: [0; 4],
                 name,
                 value: String::new(),
                 hint: String::new(),
             });
             id
         } else {
-            0
+            ancestor
         };
         if let Plan::Alert { title, message, .. } = shown.plan {
             let words = [
@@ -55,6 +70,17 @@ impl<D: DataSource> Presenter<D> {
                 let (Some(text), Some((_, rect))) = (text, texts.next()) else {
                     continue;
                 };
+                let mut rect = *rect;
+                if id == SUPPORTING {
+                    for (_, next) in texts.by_ref() {
+                        let right = (rect.0 + rect.2).max(next.0 + next.2);
+                        let bottom = (rect.1 + rect.3).max(next.1 + next.3);
+                        rect.0 = rect.0.min(next.0);
+                        rect.1 = rect.1.min(next.1);
+                        rect.2 = right - rect.0;
+                        rect.3 = bottom - rect.1;
+                    }
+                }
                 let id = b.unique(id);
                 b.out.push(Node {
                     id,
@@ -65,6 +91,7 @@ impl<D: DataSource> Presenter<D> {
                     rect: [rect.0, rect.1, rect.2, rect.3],
                     range: [0.0; 3],
                     set: (0, 0),
+                    grid: [0; 4],
                     name: text.clone(),
                     value: String::new(),
                     hint: String::new(),
@@ -79,7 +106,7 @@ impl<D: DataSource> Presenter<D> {
             for entry in entries {
                 match entry {
                     Entry::Item(_) => items += 1,
-                    Entry::Header(title, node) => headers.push((items, title, *node)),
+                    Entry::Header(title, node, _) => headers.push((items, title, *node)),
                     Entry::Separator => {}
                 }
             }
@@ -124,6 +151,22 @@ impl<D: DataSource> Presenter<D> {
                 (true, true) => flags |= flag::SELECTED,
                 (false, true) => flags |= flag::CHECKABLE | flag::CHECKED,
                 _ => {}
+            }
+            if !select {
+                if self.host.kernel().node(row.node).is_some_and(|n| {
+                    n.props.str(PropId::AccessibilityRole) == Some("menuitemcheckbox")
+                }) {
+                    flags |= flag::CHECKABLE;
+                }
+                if row
+                    .opens
+                    .and_then(|key| self.host.kernel().node_by_key(key))
+                    .is_some_and(|target| {
+                        matches!(self.surface_plan(target.id, false), Some(Plan::Menu(_)))
+                    })
+                {
+                    flags |= flag::EXPANDABLE;
+                }
             }
             let role = if select { role::OPTION } else { role::BUTTON };
             let place = (rect, whole);

@@ -10,6 +10,7 @@ import AVFAudio
 import ExactSoundRender
 import XCTest
 @testable import ExactKit
+@testable import ExactSound
 
 /// A stand-in for the arm: what it was asked, and what it answers.
 private enum Arm {

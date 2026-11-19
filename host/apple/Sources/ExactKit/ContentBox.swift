@@ -35,13 +35,6 @@ extension NodeView {
             bottom: number("border_width_bottom", uniform) + number("padding_bottom"))
     }
 
-    /// The padding a `fieldContent` payload sends, top, right, bottom, left:
-    /// `nil` on a native button's side its author left unsaid.
-    static func sentPadding(_ payload: [String: Any]) -> [CGFloat?]? {
-        guard let sides = payload["padding"] as? [Any], sides.count == 4 else { return nil }
-        return sides.map { ($0 as? NSNumber).map { CGFloat($0.doubleValue) } }
-    }
-
     /// A content-box update can move content without changing the node's frame.
     func applyKernelContentBox(_ box: CGRect?, padding: [CGFloat?]?) {
         kernelContentBox = box; kernelPadding = padding
@@ -72,7 +65,7 @@ extension NodeView {
     func layoutContent() {
         guard kind == "svg" || kind == "canvas2d", let presenter else { return }
         let box = contentBox()
-        if kind == "svg" { return presenter.svg.place(id, in: box) }
+        if kind == "svg" { presenter.svg?.place(id, in: box); return }
         let radii = BorderPaint.contentRadii(cornerSizes(in: bounds), outer: bounds, inner: box)
         presenter.canvas2d.place(id, in: box, radii: radii)
     }

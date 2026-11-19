@@ -1,8 +1,9 @@
 // @ref LLP 1149 D1.1, D2, D6.1. All branch selectors are flat per primitive.
 
-// A device may replace this line to compile the fragment stage for one primitive
-// class: with constant selectors the driver drops every other branch.
-const SPECIALIZED = false; const KIND_BRUSH = 0u; const FLAGS = 0u;
+// Fixed programs share this source; the defaults retain the general program.
+override SPECIALIZED: bool = false;
+override KIND_BRUSH: u32 = 0u;
+override FLAGS_MASK: u32 = 4294967295u;
 
 struct Viewport { size: vec2<f32>, pad: vec2<f32> }
 @group(0) @binding(0) var<uniform> viewport: Viewport;
@@ -201,9 +202,8 @@ fn stop_ramp(t: f32, row: i32) -> vec4<f32> {
     return vec4<f32>(c.rgb * c.a, c.a);
 }
 
-// Kind/brush and flags. The gradient ramp row is always read per instance.
 fn selectors(v: Vertex) -> vec2<u32> {
-    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, FLAGS); }
+    if SPECIALIZED { return vec2<u32>(KIND_BRUSH, v.data.y & FLAGS_MASK); }
     return v.data;
 }
 
@@ -244,10 +244,10 @@ fn brush(v: Vertex, data: vec2<u32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> 
             }
             if (flags & 8u) != 0u { t = fract(t); }
             if (flags & 268435456u) != 0u { t = 1.0 - abs(fract(t * 0.5) * 2.0 - 1.0); }
-            if (flags & 4u) != 0u { return stop_ramp(t, i32((v.data.y >> 16u) & 1023u)); }
+            if (flags & 4u) != 0u { return stop_ramp(t, i32((flags >> 16u) & 1023u)); }
             let size = vec2<f32>(textureDimensions(ramp));
             let uv = vec2<f32>((0.5 + clamp(t, 0.0, 1.0) * (size.x - 1.0)) / size.x,
-                               (f32((v.data.y >> 16u) & 1023u) + 0.5) / size.y);
+                               (f32((flags >> 16u) & 1023u) + 0.5) / size.y);
             return textureSample(ramp, filtering, uv);
         }
         case 2u, 3u: {
@@ -263,6 +263,16 @@ fn brush(v: Vertex, data: vec2<u32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> 
             var c = textureSample(picture, filtering, uv);
             if (data.x >> 16u) == 3u {
                 c = textureSampleGrad(picture, filtering, uv, dx / v.param.zw, dy / v.param.zw);
+            }
+            if (flags & 67108864u) != 0u {
+                let size = vec2<f32>(textureDimensions(picture));
+                let n = max(v.param.xy, vec2<f32>(1.0));
+                let at = uv * size * n - vec2<f32>(0.5);
+                let lo = floor(at);
+                let a = floor(lo / n);
+                let b = floor((lo + vec2<f32>(1.0)) / n);
+                let sample_uv = (a + vec2<f32>(0.5) + fract(at) * (b - a)) / size;
+                c = textureSampleLevel(picture, filtering, sample_uv, 0.0);
             }
             if (flags & 16u) != 0u {
                 let size = vec2<i32>(textureDimensions(picture));
@@ -397,17 +407,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
     var color = brush(v, data, dx, dy);
     var clip1 = 1.0;
     if (flags & 128u) != 0u {
-        let lo = v.clip1.xy;
-        let hi = lo + v.clip1.zw;
-        let q = abs(v.position.xy - (lo + hi) * 0.5) - v.clip1.zw * 0.5;
-        let reach = max(max(abs(lo.x), abs(lo.y)), max(abs(hi.x), abs(hi.y)));
-        // Cached outer shadows use CSS-reduced clips. Beyond this margin their
-        // coverage is already zero, including the derivative-based AA fringe.
-        if kind == 2u && (data.x >> 16u) == 2u && max(q.x, q.y) >= 4.0 && reach < 32768.0 {
-            clip1 = 0.0;
-        } else {
-            clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
-        }
+        clip1 = shape_coverage(v.position.xy, v.clip1, unpack_radii(v.clip_radii.zw), vec2<f32>(1.0));
     }
     switch kind {
         case 0u: { alpha = shape_coverage(v.local, v.rect, v.radii, pixel); }
@@ -415,17 +415,14 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             alpha = max(0.0, shape_coverage(v.local, v.rect, v.radii, pixel) - shape_coverage(v.local, v.uv, v.param, pixel));
         }
         case 2u: {
-            // A cached shadow already carries coverage in its image alpha.
-            if (data.x >> 16u) != 2u {
-                // An outer shadow is multiplied by 1 - clip1 below, which is 0
-                // where its border box covers the pixel, so the integral is skipped
-                // there. The integral is finite for sigma at most 0 or at least
-                // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
-                // which the 0 would not cancel.
-                let sigma = v.param.x;
-                if (flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30) {
-                    alpha = shadow(v.local, v.uv, v.radii, sigma, pixel);
-                }
+            // An outer shadow is multiplied by 1 - clip1 below, which is 0
+            // where its border box covers the pixel, so the integral is skipped
+            // there. The integral is finite for sigma at most 0 or at least
+            // 1e-30; below that 0.39894228 / sigma can overflow and make a NaN,
+            // which the 0 would not cancel.
+            let sigma = v.param.x;
+            if (flags & 128u) == 0u || clip1 < 1.0 || (sigma > 0.0 && sigma < 1.0e-30) {
+                alpha = shadow(v.local, v.uv, v.radii, sigma, pixel);
             }
         }
         case 3u: {

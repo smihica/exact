@@ -89,9 +89,64 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// The `transition` shorthand's grammar and its check, which a link
+/// registers.
+struct TransitionGrammar {
+    parse: fn(&str) -> Result<Transitions, ParseError>,
+    validate: fn(&Transitions) -> Result<(), TransitionError>,
+}
+
+const TRANSITIONS: TransitionGrammar = TransitionGrammar {
+    parse: Transitions::grammar,
+    validate: Transitions::validate,
+};
+
+/// The grammar, once linked ([`link_transitions`]). This crate's own tests
+/// parse directly.
+#[cfg(not(test))]
+static LINKED: std::sync::OnceLock<&'static TransitionGrammar> = std::sync::OnceLock::new();
+
+/// Link the `transition` shorthand's grammar and check (LLP 1047 D2, linked
+/// by use). An artifact links them when its plan binds a `transition` or
+/// `-exact-layout-transition` row, and a plan that does so unlinked is
+/// refused at boot (D6), so an unlinked artifact never parses one. The
+/// kernel's all-linking constructor, the compiler and the JS target's
+/// emitter link them always.
+pub fn link_transitions() {
+    #[cfg(not(test))]
+    let _ = LINKED.set(&TRANSITIONS);
+}
+
+fn linked() -> Option<&'static TransitionGrammar> {
+    #[cfg(not(test))]
+    return LINKED.get().copied();
+    #[cfg(test)]
+    Some(&TRANSITIONS)
+}
+
 impl Transitions {
-    /// Parse the CSS shorthand.
+    /// Parse the CSS shorthand, once linked ([`link_transitions`]).
     pub fn parse(text: &str) -> Result<Transitions, ParseError> {
+        linked().map_or_else(
+            || {
+                Err(ParseError::BadShape(
+                    "CSS transitions are not linked into this artifact (LLP 1047 D6)".into(),
+                ))
+            },
+            |g| (g.parse)(text),
+        )
+    }
+
+    /// [`Transitions::validate`], once linked: what a style row's value
+    /// takes. An empty row needs none.
+    pub fn validate_linked(&self) -> Result<(), TransitionError> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        linked().map_or(Err(TransitionError::Unlinked), |g| (g.validate)(self))
+    }
+
+    fn grammar(text: &str) -> Result<Transitions, ParseError> {
         let text = text.trim();
         if text.is_empty() || text.eq_ignore_ascii_case("none") {
             return Ok(Transitions::NONE);

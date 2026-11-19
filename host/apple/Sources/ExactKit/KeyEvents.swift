@@ -10,10 +10,10 @@
 // (#140).
 #if canImport(AppKit)
 import AppKit
-typealias KeyPlatformView = NSView
+package typealias KeyPlatformView = NSView
 #else
 import UIKit
-typealias KeyPlatformView = UIView
+package typealias KeyPlatformView = UIView
 #endif
 
 extension NodeView {
@@ -23,7 +23,7 @@ extension NodeView {
     /// 2026-10-04). A pressable with an `href` is the web's `<a>`, which
     /// `disabled` does not touch either. A press is still refused on any
     /// disabled node.
-    var formDisabled: Bool {
+    package var formDisabled: Bool {
         disabled && ["button", "input", "textarea", "control"].contains(kind)
             && !(kind == "button" && props["href"] != nil)
     }
@@ -47,7 +47,7 @@ extension KeyCodes {
 /// or `keyup` (43), or a capture keydown (44): its chord (`Shift+Meta+b`, `Event::key`), its
 /// `KeyboardEvent.code` ("" when the host cannot tell), `repeat` and
 /// `isComposing`. It prints as its chord, which the hosts' tests read.
-struct KeyPress: ExpressibleByStringLiteral, CustomStringConvertible {
+package struct KeyPress: ExpressibleByStringLiteral, CustomStringConvertible {
     var chord: String
     var code = ""
     var repeats = false
@@ -57,15 +57,15 @@ struct KeyPress: ExpressibleByStringLiteral, CustomStringConvertible {
     /// (`passesComposition`), which only a modifier's own press and release
     /// do with the text still marked.
     var composing = false
-    init(_ chord: String, code: String = "", repeats: Bool = false, up: Bool = false, composing: Bool = false) {
+    package init(_ chord: String, code: String = "", repeats: Bool = false, up: Bool = false, composing: Bool = false) {
         self.chord = chord
         self.code = code == "Unidentified" || !code.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) ? "" : code
         self.repeats = repeats && !up
         self.up = up
         self.composing = composing
     }
-    init(stringLiteral chord: String) { self.init(chord) }
-    var description: String { chord }
+    package init(stringLiteral chord: String) { self.init(chord) }
+    package var description: String { chord }
     /// The payload `KeyboardEvent::parse` reads.
     var payload: String {
         composing ? "\(chord)\n\(code)\n\(repeats)\ntrue" : code.isEmpty && !repeats ? chord : "\(chord)\n\(code)\n\(repeats)"
@@ -134,11 +134,11 @@ extension Presenter {
     /// (BlockHostMac.swift); on iOS a route to its tab panel or the routes'
     /// owner (LLP 1123 D2). Never the page under a popover or a dialog that
     /// is not its ancestor.
-    func eventParent(of view: KeyPlatformView) -> KeyPlatformView? {
+    package func eventParent(of view: KeyPlatformView) -> KeyPlatformView? {
         #if os(macOS)
         if let node = view as? NodeView { return menus.authoredParent(of: node) ?? dialogs.authoredParent(of: node) ?? blocks.parent(of: node) }
         #else
-        if let node = view as? NodeView, navigation.controllers[node.id]?.node === node,
+        if let node = view as? NodeView, navigation.routeSurfaces[node.id]?.node === node,
            let parent = navigation.logicalParent(of: node) ?? navigation.container {
             return parent
         }
@@ -152,7 +152,7 @@ extension Presenter {
         logicalAncestry(of: view).contains { $0 === ancestor }
     }
     /// `view` and its authored ancestors (`eventParent`).
-    func logicalAncestry(of view: KeyPlatformView) -> UnfoldFirstSequence<KeyPlatformView> {
+    package func logicalAncestry(of view: KeyPlatformView) -> UnfoldFirstSequence<KeyPlatformView> {
         sequence(first: view, next: { self.eventParent(of: $0) })
     }
     private func keyEvent(_ handler: String, at target: NodeView?, _ press: KeyPress, inline: UInt32? = nil) -> Bool {
@@ -173,7 +173,7 @@ extension Presenter {
             }
             #if os(iOS) || os(tvOS)
             // Keys leave the sheet; eventParent's inertness walks stay inside it.
-            if let node = view as? NodeView, let parent = menus.sheets.authoredParent(of: node) { next = parent }
+            if let node = view as? NodeView, let parent = dialogs.authoredParent(of: node) { next = parent }
             else { next = menus.logicalParent(of: view) ?? eventParent(of: view) }
             #else
             next = eventParent(of: view)
@@ -327,7 +327,7 @@ extension Presenter {
     /// (and the field editor editing it), textarea, native button or date/select control. Any other view a node
     /// holds (a web view, a native module's) keeps its keys, as an iframe's
     /// never reach the page.
-    func keyTarget(_ responder: NSResponder?) -> NodeView? {
+    package func keyTarget(_ responder: NSResponder?) -> NodeView? {
         if let run = responder as? InlineKeyView { return run.owner }
         guard let view = responder as? NSView else { return nil }
         var next: NSView? = view
@@ -403,7 +403,7 @@ extension NodeView {
     /// and `charactersIgnoringModifiers` loses it. Option and Control change
     /// `characters` too, so with either the layout is asked for Command's
     /// character alone.
-    static func commandKey(_ event: NSEvent) -> String? {
+    package static func commandKey(_ event: NSEvent) -> String? {
         let typed = event.modifierFlags.isDisjoint(with: [.control, .option])
             ? event.characters : event.characters(byApplyingModifiers: .command)
         return (typed ?? event.charactersIgnoringModifiers)?.lowercased()
@@ -411,7 +411,7 @@ extension NodeView {
     /// Whether Command is the only modifier held, as the Edit menu's ⌘A and
     /// ⌘C have it, ignoring Caps Lock, the numeric pad and Fn: a chord with
     /// another (⇧⌘C) is a different command.
-    static func isCommandAlone(_ event: NSEvent) -> Bool {
+    package static func isCommandAlone(_ event: NSEvent) -> Bool {
         event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function]) == .command
     }
 }

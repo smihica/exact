@@ -92,6 +92,10 @@ extension Agent {
             if let sv = v.scrollView {
                 n.merge(Agent.offset(of: sv, top: v.scrollTopInset(sv))) { _, new in new }
                 n.merge(Agent.range(of: sv)) { _, new in new }
+                // A zoomable scroller's zoom and range (LLP 1057.001.000 §6).
+                if v.extras?.zoom != nil, let range = v.zoomRange {
+                    n["scrollZoom"] = Double(sv.zoomScale); n["minZoom"] = Double(range.lowerBound); n["maxZoom"] = Double(range.upperBound)
+                }
                 let p = port(of: v, sv)
                 n["port"] = [p[0] + Double(shift.x), p[1] + Double(shift.y), p[2], p[3]].map { Agent.r2(CGFloat($0)) }
                 // How far past its own ends it sits: a stretched bounce is a
@@ -144,6 +148,7 @@ extension Agent {
         // D4's `screen` space) and the scene's interface orientation: what a
         // real touch's aim is checked against (LLP 1080.000 D4).
         if let w = vp.window, let container = vp.superview {
+            reply["safeArea"] = ["bottom": Agent.r2(w.safeAreaInsets.bottom)]
             let screen = w.screen
             let origin = container.convert(presenter.pageFrame.origin, to: screen.coordinateSpace) // the page's area (LLP 1130)
             reply["screen"] = ["w": Agent.r2(screen.bounds.width), "h": Agent.r2(screen.bounds.height), "scale": Agent.r2(screen.scale),
@@ -259,13 +264,14 @@ extension Presenter {
             if sub === controls.controls[id] { return ("control", id) }
             if segments.inspectionOwns(sub) { return ("segment", id) }
             if swipeActions.inspectionOwns(sub) { return ("swipe", id) }
+            if rowCells.inspectionOwns(sub) { return ("row-cells", id) }
             if groupedLists?.inspectionOwns(sub) == true { return ("grouped-list", id) }
             if Self.platformKinds.contains(o.kind) || o.props["hatch"] != nil { return ("platform", id) }
         }
         if menus.inspectionOwns(sub) { return ("menu", owner?.id) }
         // A live flight's layer on the presentation it flies in, and the
         // empty slot it holds open where its view lays out (FlightsIOS.swift).
-        if flights.values.contains(where: { $0.container === sub || $0.slot === sub }) { return ("flight", nil) }
+        if flightHost.owns(sub) { return ("flight", nil) }
         // A grouped list's background past the viewport's edge, beside it (LLP 1116.004 D2).
         if owner == nil, groupedLists?.inspectionOwns(sub) == true { return ("grouped-list", nil) }
         if sub === viewport { return ("viewport", nil) }
@@ -300,7 +306,7 @@ extension Presenter {
         if n.placementHidden { return "placement" }
         if segments.hides(n) { return "segments" }
         if menus.hides(n) { return "menus" }
-        if navigation.controllers.values.contains(where: { $0.lifted === n }) { return "navigation" }
+        if navigation.routeSurfaces.values.contains(where: { $0.lifted === n }) { return "navigation" }
         if swipeActions.hides(n) { return "swipe" }
         if groupedLists?.hides(n) == true { return "grouped-list" }
         return nil
@@ -394,7 +400,7 @@ extension Presenter {
                 if report.views > AgreementReport.walkCap { report.incomplete("walk-cap"); break walk }
                 if judged { report.judged += 1 } else {
                     report.opaque += 1
-                    if let what = elements.regions.owner(of: sub) { report.opaqueBy[what, default: 0] += 1 }
+                    if let what = elements.regionOwner(of: sub) { report.opaqueBy[what, default: 0] += 1 }
                 }
                 if let n = sub as? NodeView {
                     // In the presenter's map is not alive: the kernel must
@@ -495,7 +501,7 @@ extension Presenter {
             guard seen[id] === v, v.window != nil else { report.skip("offWindow"); continue }
             if v.placedAncestor != nil { report.skip("placed"); continue }
             if menus.projects(v) || swipeActions.projects(v) || groupedLists?.projects(v) == true { report.skip("projected"); continue }
-            if navigation.controllers[id]?.node === v { report.skip("route"); continue }
+            if navigation.routeSurfaces[id]?.node === v { report.skip("route"); continue }
             if f.transformed || !CATransform3DIsIdentity(v.layer.transform) { report.skip("transformed"); continue }
             if geometryAnimating(v.layer) { report.skip("animating"); continue }
             let sv = v.superview

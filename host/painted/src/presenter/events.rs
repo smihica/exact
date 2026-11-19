@@ -8,7 +8,7 @@ use super::*;
 impl<D: DataSource> Presenter<D> {
     /// A carrier's memory-pressure notification releases idle painter targets.
     pub fn memory_warning(&mut self) {
-        self.brush.trim();
+        self.brush.trim(self.host.runner().page().hidden);
     }
 
     /// A desktop window's activation preserves the focused allocation for
@@ -19,7 +19,7 @@ impl<D: DataSource> Presenter<D> {
         }
         self.window_active = active;
         if !active {
-            self.brush.trim();
+            self.brush.trim(self.host.runner().page().hidden);
             self.window_focus = self
                 .focus
                 .and_then(|id| self.host.kernel().node(id).map(|n| n.key));
@@ -263,17 +263,21 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// `blur()` drops the focus; `blur(id)` only when that node holds it.
+    /// A node a `focus()` waits to focus once it lands (`flights.focus`)
+    /// holds it, as on the web, where the `focus()` has already moved it
+    /// there: a blur that applies drops the wait too.
     pub(crate) fn blur_command(&mut self, args: &[exact_plan::Value]) {
-        let holds = |name: &str| {
-            self.focus
-                .and_then(|id| self.host.kernel().node(id))
-                .is_some_and(|n| n.props.str(PropId::Id) == Some(name))
+        let kernel = self.host.kernel();
+        let holder = match self.host.flights.focus {
+            Some(key) => kernel.node_by_key(key),
+            None => self.focus.and_then(|id| kernel.node(id)),
         };
-        if args
+        let applies = args
             .first()
             .and_then(exact_plan::Value::as_str)
-            .is_none_or(holds)
-        {
+            .is_none_or(|name| holder.is_some_and(|n| n.props.str(PropId::Id) == Some(name)));
+        if applies {
+            self.host.flights.focus = None;
             self.blur();
         }
     }
@@ -292,6 +296,10 @@ impl<D: DataSource> Presenter<D> {
         let (hidden, inert) = self.host.route_visibility_to(id, shown);
         if hidden || inert {
             return Some("not rendered");
+        }
+        // A flight's content takes no input until it lands, pointer or key.
+        if self.host.flying(id) {
+            return Some(crate::host::flights::IN_FLIGHT);
         }
         let region = self.host.content_region();
         let content = region.map(|r| r.binding().content);
@@ -367,6 +375,11 @@ impl<D: DataSource> Presenter<D> {
             Some(id) if !self.focusable(id) => "not focusable",
             Some(id) => {
                 if let Some(reason) = self.focus_refusal(id) {
+                    // A flying node is focused when it lands (`focus_landed`).
+                    if reason == crate::host::flights::IN_FLIGHT {
+                        self.host.flights.focus = self.host.kernel().node(id).map(|n| n.key);
+                        return None;
+                    }
                     self.host.log(format!("focus \"{name}\" refused: {reason}"));
                     return None;
                 }
@@ -431,6 +444,16 @@ impl<D: DataSource> Presenter<D> {
                 false,
                 Some("focus refused: page under the open surface is inert".into()),
             );
+        }
+        // Every way to the focus ends here: a flight's content takes none.
+        if next.is_some_and(|id| self.host.flying(id)) {
+            let refused = format!("focus refused: {}", crate::host::flights::IN_FLIGHT);
+            return (false, Some(refused));
+        }
+        // A focus put on a node supersedes a `focus()` waiting for its node
+        // to land, as the later of two `focus()` calls wins on the web.
+        if next.is_some() {
+            self.host.flights.focus = None;
         }
         let previous = self.focus;
         if previous == next {
@@ -590,6 +613,19 @@ impl<D: DataSource> Presenter<D> {
             .focus
             .or_else(|| self.alert_root().filter(|_| self.alert_inert()))
             .or_else(|| self.host.roots().first().copied());
+        self.key_event_at(target, kind, name, code, repeat, now_ms)
+    }
+
+    /// [`Self::key_event`] at `target` rather than the focus.
+    pub(crate) fn key_event_at(
+        &mut self,
+        target: Option<ViewId>,
+        kind: EventKind,
+        name: &str,
+        code: &str,
+        repeat: bool,
+        now_ms: f64,
+    ) -> (Option<String>, bool) {
         let mut path = Vec::new();
         let mut at = target.and_then(|id| self.handler_target(id, kind));
         while let Some(id) = at {
@@ -815,18 +851,26 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A secondary mouse click on a canvas, through the device input path.
-    /// Other native context menus remain unsupported, never a primary press:
-    /// one a node names with `contextPopover` (LLP 1021 §5.1, its submenus
-    /// §5.2) is refused as a popover, which Linux does not present.
+    /// The host's context-menu gesture: a recognized long press on Android,
+    /// a secondary mouse click on the desktop (LLP 1115.001 D10, LLP 1021 §5.1).
     pub(crate) fn contextmenu(
         &mut self,
         id: ViewId,
         at: Option<(f32, f32)>,
     ) -> Result<String, String> {
-        // The node names a menu, or is inside one that does (a card's title
-        // or grip): a finger held there opens that menu, as a secondary
-        // click on a child opens its parent's on the web and on Apple.
+        // Android's reader makes separate surface windows; desktop shells
+        // overlay the page. The gesture follows the shell, whether the node
+        // names a menu or only handles `contextmenu`.
+        if self.separate_surface_windows() {
+            let (x, y) = self.pointer_target(id, at)?;
+            let now = self.host.now();
+            return match self.long_press(x, y, now) {
+                true => Ok(format!("{{\"tapped\":{id},\"contextmenu\":true}}")),
+                false => Err(format!("view {id} opened no context menu")),
+            };
+        }
+        // A desktop shell without menu presentation keeps the popover
+        // refusal, including a click on a child of the invoker.
         let names_popover = {
             let kernel = self.host.kernel();
             let mut at = kernel.node(id);
@@ -837,18 +881,6 @@ impl<D: DataSource> Presenter<D> {
             }
             at.is_some()
         };
-        // Where the top layer is windows (LLP 1115.001 D10) the menu opens as
-        // a finger held on the node opens it: its `contextmenu` runs, then the
-        // menu shows at the point (the node's middle unsaid). The finger is
-        // held only where one can be: on a shown node that is not covered.
-        if names_popover && self.has_windows() {
-            let (x, y) = self.pointer_target(id, at)?;
-            let now = self.host.now();
-            return match self.long_press(x, y, now) {
-                true => Ok(format!("{{\"tapped\":{id},\"contextmenu\":true}}")),
-                false => Err(format!("view {id} opened no context menu")),
-            };
-        }
         self.mouse_click(id, at, true).map_err(|refusal| {
             if names_popover && refusal.contains("canvas") {
                 self.host.log(crate::navigation::POPOVER_UNSUPPORTED);
@@ -859,7 +891,7 @@ impl<D: DataSource> Presenter<D> {
         })
     }
 
-    /// An explicit primary mouse click; ordinary agent taps remain fingers.
+    /// An explicit mouse click; ordinary agent taps remain fingers.
     pub(crate) fn mouse_click(
         &mut self,
         id: ViewId,
@@ -872,7 +904,9 @@ impl<D: DataSource> Presenter<D> {
         }
         let (x, y) = self.pointer_target(id, at)?;
         let canvas = self.hover_canvas(x, y);
-        if canvas.is_none() || canvas != self.input_surface(id) {
+        if (canvas.is_none() || canvas != self.input_surface(id))
+            && !(secondary && self.desktop_overlays())
+        {
             return Err(format!("view {id} does not carry canvas {kind} input"));
         }
         let now = self.host.now();
@@ -881,9 +915,15 @@ impl<D: DataSource> Presenter<D> {
         if secondary {
             self.pointer_aux(2, true, x, y, now);
             self.pointer_aux(2, false, x, y, now);
+            if self.desktop_overlays() {
+                self.agent_contextmenu_at((x, y))?;
+            }
         } else {
-            self.pointer_down(x, y, now)?;
-            self.pointer_up(x, y, now)?;
+            // The click lifts whatever its down did, so no press is left held.
+            let down = self.pointer_down(x, y, now);
+            let up = self.pointer_up(x, y, now);
+            down?;
+            up?;
         }
         Ok(format!(
             "{{\"tapped\":{id},\"{kind}\":true,\"at\":[{},{}],\"delivery\":\"presenter\"}}",

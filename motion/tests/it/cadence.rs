@@ -22,6 +22,7 @@ fn engine() -> Engine {
 
 #[test]
 fn a_breathing_fade_is_motion_but_not_spatial() {
+    exact_motion::link_transitions();
     let mut e = engine();
     let breathe = "breathe 4.2s ease-in-out infinite @keyframes breathe{from{opacity:0.6}50%{opacity:1}to{opacity:0.6}}";
     e.set_animations(1, &keyframed(breathe).unwrap()).unwrap();
@@ -38,6 +39,7 @@ fn a_breathing_fade_is_motion_but_not_spatial() {
 
 #[test]
 fn a_transition_is_spatial_by_what_it_moves() {
+    exact_motion::link_transitions();
     let mut e = engine();
     for node in [1, 2] {
         e.set_transitions(node, Transitions::parse("all 300ms ease").unwrap())

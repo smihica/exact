@@ -1,6 +1,7 @@
 import XCTest
 import CoreGraphics
 @testable import ExactKit
+@testable import ExactGradients
 
 /// LLP 1100 D2: a colour row in its own space becomes a `CGColor` in that
 /// space, nothing clipped; the paths that still take channels get its sRGB

@@ -19,6 +19,8 @@ import UIKit
 import UserNotifications
 #endif
 
+AgentLink.install()
+
 setvbuf(stdout, nil, _IOLBF, 0)
 let exact = ExactComposition.app
 /// The host's own lines go to stderr: under the agent, stdout is the protocol.
@@ -197,8 +199,8 @@ func watchControl() {
             case "mount": root?.mount(arg)
             case "apply":
                 let bytes = FileManager.default.contents(atPath: arg) ?? Data()
-                let ok = exact.apply(bytes, label: String(arg.split(separator: "/").last ?? "plan"))
-                log("host: apply \(arg): \(ok ? "every session took it" : "refused")")
+                let result = exact.apply(bytes, label: String(arg.split(separator: "/").last ?? "plan"))
+                log("host: apply \(arg): \(result)")
             default: log("host: unknown control \(line)")
             }
         }
@@ -213,7 +215,7 @@ func agentReady() {
     guard ExactEnv.agentMode, !readySent else { return }
     readySent = true
     let error: Any = (a.bootError ?? b.bootError).map { $0 as Any } ?? NSNull()
-    Agent.startSocket(ready: ["ready": true, "boot": max(a.bootMs, b.bootMs), "views": a.viewCount + b.viewCount, "sessions": sessions.map(\.0), "error": error, "pid": Int(getpid())], sessions: sessions)
+    AgentLink.startSocket(ready: ["ready": true, "boot": max(a.bootMs, b.bootMs), "views": a.viewCount + b.viewCount, "sessions": sessions.map(\.0), "error": error, "pid": Int(getpid())], sessions: sessions)
 }
 
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -223,14 +225,15 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             guard let bytes = FileManager.default.contents(atPath: path) else {
                 fatalError("host: could not read the requested plan at \(path); compile the fixture and retry")
             }
-            guard exact.apply(bytes, label: "file plan") else {
+            guard exact.apply(bytes, label: "file plan") == .applied else {
                 fatalError("host: the requested plan at \(path) was refused; compile it for this host app and retry")
             }
         }
         a = exact.makeSession(delegate: delegate, label: "a")
         b = exact.makeSession(delegate: delegate, label: "b")
+        ExactComposition.installHostEvents(on: exact, applicationDelegate: nil, sceneDelegate: SceneDelegate.self)
         #if !os(tvOS)
-        exact.installNotificationClicks(boot: { $0.bootForWake() }, activate: nil)
+        ExactComposition.installNotificationClicks(on: exact, boot: { $0.bootForWake() }, activate: nil)
         #endif
         if ExactEnv.agentFreezes { a.clock = 0; b.clock = 0 }
         sessions = [("a", a), ("b", b)]
@@ -238,10 +241,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
     #if !os(tvOS)
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        exact.registeredForRemoteNotifications(deviceToken: deviceToken)
+        ExactComposition.registeredForRemoteNotifications(on: exact, deviceToken: deviceToken)
     }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        exact.failedToRegisterForRemoteNotifications(error: error)
+        ExactComposition.failedToRegisterForRemoteNotifications(on: exact, error: error)
     }
     #endif
     // A scene, not an app-wide window: an app that adopts no scene
@@ -258,7 +261,8 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         guard let ws = scene as? UIWindowScene else { return }
         #if !os(tvOS)
-        if let response = connectionOptions.notificationResponse { exact.openNotification(response) }
+        if let response = connectionOptions.notificationResponse { ExactComposition.openNotification(on: exact, response) }
+        ExactComposition.hostEvents(on: exact, connectionOptions: connectionOptions)
         #endif
         let w = ExactWindow(windowScene: ws)
         let rootController = RootController()

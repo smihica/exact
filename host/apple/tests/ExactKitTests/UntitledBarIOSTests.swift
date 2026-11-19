@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// Issue #364 over `host/apple/tests/fixtures/untitled-bar.contract`: a
 /// route's first `header` holding a button and no heading is UIKit's bar
@@ -49,8 +50,8 @@ final class UntitledBarIOSTests: XCTestCase {
         XCTAssertNil(session.boot(plan: try fixturePlan("UNTITLED_BAR"), size: window.bounds.size).error)
         view.frame = host.view.bounds
         view.layoutIfNeeded()
-        until("the route is up") { session.presenter.navigation.primaryNavigation?.topViewController is RouteController }
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        until("the route is up") { session.presenter.navigationHost.primaryNavigation?.topViewController is RouteController }
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let home = try XCTUnwrap(nav.topViewController as? RouteController)
         until("the header is the bar") { !nav.isNavigationBarHidden }
         let item = home.navigationItem

@@ -1,8 +1,58 @@
 //! Concrete app composition selected at bake, never a Cargo feature on a host.
 //! @ref LLP 1029.000 — disabling replacement removes its reachable loader code.
 
-/// Generate `AppData` and `app_data()` for a host's source type and constructor.
-/// `inputs` are the actual target bake's compatibility inputs.
+/// A Rust-only app's source type and constructor as `rust.placement` places them (LLP 1027.002): on `worker`, the
+/// source in `exact_data::Placed`, which moves it to an owner of its own at activation; on `main`, unchanged. A
+/// mixed app places its own children (`js/bake`'s embedded data) and never comes here. A Rust worker is native
+/// only (LLP 1027.002 §7): the web's source stays inline, and the bake says so. A Rust update module (`mode` other
+/// than `off`) runs in the swappable's executor, not under `Placed`, so `worker` there is refused, not dropped.
+fn placed_source(
+    data: &str,
+    constructor: &str,
+    mode: &str,
+    inputs: &serde_json::Value,
+) -> Result<(String, String), String> {
+    if inputs["rustPlacement"].as_str() != Some("worker") {
+        return Ok((data.to_owned(), constructor.to_owned()));
+    }
+    if inputs["platform"] == "web" {
+        println!("cargo:warning=rust.placement worker runs inline on web: a Rust worker is native only (LLP 1027.002 §7)");
+        return Ok((data.to_owned(), constructor.to_owned()));
+    }
+    if mode != "off" {
+        return Err(format!(
+            "rust.placement worker with Rust updates (rust mode {mode}): an update module runs inline, so its placement would be lost. Set rust.placement to main, or turn Rust updates off"
+        ));
+    }
+    Ok((
+        format!("exact_logic::exact_data::Placed<{data}>"),
+        format!("exact_logic::exact_data::Placed::new({constructor}, exact_logic::exact_runner::Placement::Worker)"),
+    ))
+}
+
+/// [`rust_entry`] over a source a mixed app's composer built (`js/bake`'s embedded data), which places its own
+/// children: never wrapped again.
+/// `app` names an unnamed source as in [`rust_entry_naming`]; `None` takes the manifest's.
+pub fn rust_entry_composed(
+    data: &str,
+    constructor: &str,
+    mode: &str,
+    inputs: &serde_json::Value,
+    app: Option<&str>,
+) -> Result<String, String> {
+    let manifest = inputs["app"].as_str().map(|app| format!("{app:?}"));
+    entry(
+        data,
+        constructor,
+        mode,
+        inputs,
+        app.or(manifest.as_deref()),
+        false,
+    )
+}
+
+/// Generate `AppData` and `app_data()` for a host's source type and constructor, placed as `rust.placement` says
+/// ([`placed_source`]). `inputs` are the actual target bake's compatibility inputs.
 /// A data source that names no app id takes the manifest's (`inputs["app"]`),
 /// so a native host gives it the app's storage roots (`Swappable::named`).
 pub fn rust_entry(
@@ -28,7 +78,25 @@ pub fn rust_entry_naming(
     inputs: &serde_json::Value,
     app: Option<&str>,
 ) -> Result<String, String> {
+    entry(data, constructor, mode, inputs, app, true)
+}
+
+fn entry(
+    data: &str,
+    constructor: &str,
+    mode: &str,
+    inputs: &serde_json::Value,
+    app: Option<&str>,
+    place: bool,
+) -> Result<String, String> {
+    declared_source(data, constructor, inputs)?;
     let constructor = native_storage_constructor(constructor, inputs)?;
+    let (data, constructor) = if place {
+        placed_source(data, &constructor, mode, inputs)?
+    } else {
+        (data.to_owned(), constructor)
+    };
+    let data = data.as_str();
     let constructor = constructor.as_str();
     // The digest of the source this binary compiles `constructor`'s crate
     // from (`scripts/rust.mjs` `nativeSource`): a Rust update built from the
@@ -44,7 +112,13 @@ pub fn rust_entry_naming(
         }
         _ => String::new(),
     };
-    let named = app.map(|app| format!(".named({app})")).unwrap_or_default();
+    // Under a variant a source naming the base app's id takes the variant's
+    // (LLP 1030.008 D2); `inputs` carries the base beside the id.
+    let named = match (app, inputs["variant"]["base"].as_str()) {
+        (Some(app), Some(base)) => format!(".named_variant({app}, {base:?})"),
+        (Some(app), None) => format!(".named({app})"),
+        (None, _) => String::new(),
+    };
     let mut supplemental = if let Some(directory) = std::env::var_os("EXACT_RUST_BUNDLE") {
         let receipt: serde_json::Value = serde_json::from_slice(
             &std::fs::read(std::path::Path::new(&directory).join("app.module.json"))
@@ -232,6 +306,47 @@ fn sqlite_refusal(manifest: &std::path::Path) -> String {
     )
 }
 
+/// Refuse an entry whose source is not the one app.json's `rust.data` names (LLP 1153.003 D2), as the compatibility
+/// inputs carry it (`rustData`): the web build runs the manifest's, so a build script that passed another would run
+/// one source natively and another on the web. A source the host storage wraps (`exact_data_host::Storage`) is read
+/// inside it. An entry over a source the crate composes itself (`ExactEmbeddedData`, `ExactEmptyData`) names no
+/// constructor of the data crate's; the mixed bake checks that one's type.
+fn declared_source(
+    data: &str,
+    constructor: &str,
+    inputs: &serde_json::Value,
+) -> Result<(), String> {
+    let declared = &inputs["rustData"];
+    let (Some(ty), Some(source)) = (declared["type"].as_str(), declared["source"].as_str()) else {
+        return Ok(());
+    };
+    if matches!(data, "ExactEmbeddedData" | "ExactEmptyData") {
+        return Ok(());
+    }
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let (data, constructor) = (compact(data), compact(constructor));
+    let inner = |text: &str, open: &str, close: char| {
+        text.strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+            .map(str::to_owned)
+    };
+    let data = inner(&data, "exact_data_host::Storage<", '>').unwrap_or(data);
+    let constructor =
+        inner(&constructor, "exact_data_host::Storage::new(", ')').unwrap_or(constructor);
+    if data == compact(ty) && constructor == compact(source) {
+        return Ok(());
+    }
+    // A native host crate the app wrote may run another source of the same crate (markdown-stress's Apple host runs
+    // its native document lane); the web's entry runs the module the manifest names, so it must name the same.
+    let library = |path: &str| path.split("::").next().map(str::to_owned);
+    if inputs["platform"] != "web" && library(&data) == library(ty) {
+        return Ok(());
+    }
+    Err(format!(
+        "app.json's rust.data names the source `{source}` (`{ty}`), and this build passes `{constructor}` (`{data}`): pass the source the manifest names, which the web build also runs"
+    ))
+}
+
 /// A Linux app's whole `entry.rs`: [`rust_entry`], its `launch_parts()`, its
 /// `hatches` and a `main` that runs the parts before `host` (`exact_linux` or
 /// `exact_linux_update`) starts with `run` (both from
@@ -252,17 +367,22 @@ pub fn linux_entry(
             inputs["rustMode"].as_str().ok_or("missing Rust policy")?,
             inputs
         )?,
-        launch_parts()?
+        {
+            let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR").ok_or("not run by cargo")?;
+            let app_dir = std::path::Path::new(&crate_dir).join("..");
+            let manifest = crate::Manifest::read(&app_dir)?;
+            painted_launch_parts(&app_dir, &manifest, "linux")?
+        }
     ))
 }
 
-/// Each `app.json` `launch` module with a `linux/launch.rs` (the app's
-/// `modules/` first, then exact2's) becomes a module of the executable,
-/// called with its `moduleConfig` before the host starts.
-fn launch_parts() -> Result<String, String> {
-    let crate_dir = std::env::var_os("CARGO_MANIFEST_DIR").ok_or("not run by cargo")?;
-    let app_dir = std::path::Path::new(&crate_dir).join("..");
-    let manifest = crate::Manifest::read(&app_dir)?;
+/// Each launch module's part for `platform`, called with its configuration
+/// before the painted host starts. An app-local module shadows the SDK's whole module.
+pub(crate) fn painted_launch_parts(
+    app_dir: &std::path::Path,
+    manifest: &crate::Manifest,
+    platform: &str,
+) -> Result<String, String> {
     let shared = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules");
     let app = serde_json::json!({
         "id": manifest.id,
@@ -271,7 +391,14 @@ fn launch_parts() -> Result<String, String> {
     })
     .to_string();
     let (mut mods, mut calls) = (String::new(), String::new());
-    for name in manifest.json["launch"].as_array().into_iter().flatten() {
+    let names = match manifest.json.get("launch") {
+        Some(value) => value
+            .as_array()
+            .ok_or("app.json launch: expected a list of module names")?
+            .as_slice(),
+        None => &[],
+    };
+    for name in names {
         let name = name
             .as_str()
             .ok_or("app.json launch: a module name is a string")?;
@@ -283,13 +410,20 @@ fn launch_parts() -> Result<String, String> {
         {
             return Err(format!("app.json launch: invalid module name {name:?}"));
         }
-        let Some(file) = [app_dir.join("modules"), shared.clone()]
-            .iter()
-            .map(|base| base.join(name).join("linux/launch.rs"))
-            .find(|f| f.exists())
-        else {
-            continue;
-        };
+        let own = app_dir.join("modules").join(name);
+        let base = if own.exists() { own } else { shared.join(name) };
+        if !base.exists() {
+            return Err(format!(
+                "app.json launch: no module {name} (neither the app nor Exact provides it)"
+            ));
+        }
+        let file = base.join(platform).join("launch.rs");
+        if !file.is_file() {
+            return Err(format!(
+                "app.json launch: {name} has no {platform} launch part ({}); provide it or remove {name} from launch",
+                file.display()
+            ));
+        }
         println!("cargo:rerun-if-changed={}", file.display());
         let config = manifest.json["moduleConfig"]
             .get(name)
@@ -412,9 +546,11 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
     // input is the media picker, `auth` below is the sign-in sheet, and its
     // numerals roll in the runtime's text (LLP 1077 D15), its date and
     // time controls are the browser's own (LLP 1115.001.000 D2), and it
-    // shows no tips (LLP 1035.006.000 D4).
+    // shows no tips (LLP 1035.006.000 D4). The native roster's entries are
+    // never the web's.
     let names: Vec<&str> = uses
         .iter()
+        .filter(|c| !Uses::NATIVE.has(*c))
         .filter(|c| {
             !matches!(
                 c,
@@ -423,6 +559,7 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
                     | Capability::Transitions
                     | Capability::MediaPicker
                     | Capability::AuthSession
+                    | Capability::Presence
                     | Capability::Numerals
                     | Capability::Dates
                     | Capability::Sqlite
@@ -467,6 +604,11 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
             | Capability::Animations
             | Capability::Gradients
             | Capability::Grid
+            | Capability::Shadows
+            | Capability::Corners
+            | Capability::Rotate
+            | Capability::TextStroke
+            | Capability::SymbolPalette
             | Capability::Geometry
             | Capability::Segments
             | Capability::Dataset
@@ -476,10 +618,31 @@ pub fn web_linked(plan: &exact_plan::Plan, inputs: &serde_json::Value) -> String
             | Capability::Transitions
             | Capability::MediaPicker
             | Capability::AuthSession
+            | Capability::Presence
             | Capability::Numerals
             | Capability::Dates
             | Capability::Sqlite
-            | Capability::Tips => {}
+            | Capability::Tips
+            | Capability::Modules
+            | Capability::Tools
+            | Capability::Svg
+            | Capability::Images
+            | Capability::NativeViews
+            | Capability::ContentRegions
+            | Capability::Traces
+            | Capability::Controls
+            | Capability::Flights
+            | Capability::Sticky
+            | Capability::Notifications
+            | Capability::HostEvents
+            | Capability::Activities
+            | Capability::Wakes
+            | Capability::WakeLock
+            | Capability::Video
+            | Capability::WebViews
+            | Capability::Sound
+            | Capability::Midi
+            | Capability::Navigation => {}
         }
     }
     entry
@@ -507,6 +670,9 @@ pub fn apple_linked(uses: exact_runner::Uses, host: &str) -> String {
     for (capability, group) in [
         (Capability::GroupedLists, "grouped_list_exports"),
         (Capability::Markdown, "markup_exports"),
+        (Capability::Presence, "presence_exports"),
+        (Capability::Svg, "svg_exports"),
+        (Capability::ContentRegions, "content_region_exports"),
     ] {
         if uses.has(capability) {
             entry.push_str(&format!("{apple}::{group}!();\n"));
@@ -538,6 +704,79 @@ mod tests {
         assert!(super::rust_entry("Data", "data()", "off", &inputs)
             .unwrap()
             .contains("ibex2_sqlite::link();"));
+    }
+
+    /// LLP 1027.002: a Rust-only app's entry places its source as `rust.placement` says, natively; `main`, a mixed
+    /// app's entry (`rust_entry`) and the web are today's entry.
+    #[test]
+    fn a_rust_only_entry_places_its_source_as_the_manifest_says() {
+        let inputs = |platform: &str, placement: &str| serde_json::json!({ "platform": platform, "rustMode": "off", "rustPlacement": placement, "app": "com.example.placed" });
+        let worker = super::rust_entry("Data", "data()", "off", &inputs("ios", "worker")).unwrap();
+        assert!(
+            worker.contains(
+                "exact_logic::configured!(AppData, exact_logic::exact_data::Placed<Data>,"
+            ),
+            "{worker}"
+        );
+        // The constructor the entry writes (here with its native storage link) is the one placed.
+        assert!(
+            worker.contains("exact_logic::exact_data::Placed::new({ #[cfg(not(target_arch = \"wasm32\"))] ibex2_sqlite::link(); data() }, exact_logic::exact_runner::Placement::Worker)"),
+            "{worker}"
+        );
+        for (platform, placement) in [("ios", "main"), ("macos", "main"), ("web", "worker")] {
+            let inputs = inputs(platform, placement);
+            assert_eq!(
+                super::rust_entry("Data", "data()", "off", &inputs).unwrap(),
+                super::rust_entry_composed("Data", "data()", "off", &inputs, None).unwrap(),
+                "{platform} {placement}"
+            );
+        }
+        // Rust updates run their module inline: worker is refused there, not dropped.
+        let tiered =
+            super::rust_entry("Data", "data()", "tiered", &inputs("ios", "worker")).unwrap_err();
+        assert!(
+            tiered.contains("rust.placement worker with Rust updates"),
+            "{tiered}"
+        );
+        // A mixed app's composer places its own children: its entry is never wrapped.
+        assert!(!super::rust_entry_composed(
+            "Data",
+            "data()",
+            "off",
+            &inputs("ios", "worker"),
+            None
+        )
+        .unwrap()
+        .contains("Placed"));
+    }
+
+    /// LLP 1153.003 D2: a build script passes the source app.json's `rust.data` names, which the web build runs.
+    #[test]
+    fn an_entry_over_another_source_than_the_manifests_is_refused() {
+        let inputs = serde_json::json!({
+            "platform": "web", "rustMode": "off",
+            "rustData": {"crate": "pins-data", "type": "pins_data::Pins", "source": "pins_data::Pins::new(3)"}
+        });
+        let entry = |data, constructor| super::rust_entry(data, constructor, "off", &inputs);
+        assert!(entry("pins_data::Pins", "pins_data::Pins::new(3)").is_ok());
+        assert!(entry(
+            "exact_data_host::Storage<pins_data::Pins>",
+            "exact_data_host::Storage::new(pins_data::Pins::new( 3 ))"
+        )
+        .is_ok());
+        let refused = entry("pins_data::Pins", "pins_data::Pins::default()").unwrap_err();
+        assert!(
+            refused.contains("rust.data names the source `pins_data::Pins::new(3)`"),
+            "{refused}"
+        );
+        assert!(entry("other_data::Other", "pins_data::Pins::new(3)").is_err());
+        // A source the crate composes itself is the mixed bake's to check.
+        assert!(entry("ExactEmbeddedData", "embedded_data()").is_ok());
+        // A native host may run another source of the manifest's crate, never another crate's.
+        let native = serde_json::json!({ "platform": "macos", "rustMode": "off", "rustData": inputs["rustData"] });
+        let entry = |data, constructor| super::rust_entry(data, constructor, "off", &native);
+        assert!(entry("pins_data::NativePins", "pins_data::NativePins::default()").is_ok());
+        assert!(entry("other_data::Other", "other_data::Other::default()").is_err());
     }
 
     #[test]
@@ -619,6 +858,13 @@ mod tests {
             let unnamed = super::rust_entry_naming("Data", "data()", mode, &inputs, None).unwrap();
             assert!(!unnamed.contains(".named("), "{unnamed}");
         }
+        // Under a variant (LLP 1030.008 D2) a source naming the base app takes the variant's id.
+        let variant = serde_json::json!({"app": "com.example.notes.dev", "linked": [], "variant": {"name": "dev", "base": "com.example.notes"}});
+        let entry = super::rust_entry("Data", "data()", "off", &variant).unwrap();
+        assert!(
+            entry.contains(".named_variant(\"com.example.notes.dev\", \"com.example.notes\")"),
+            "{entry}"
+        );
     }
 
     /// LLP 1047.001 D3: the entry names its set and invokes the export
@@ -642,11 +888,25 @@ mod tests {
             "{update}"
         );
         assert!(!super::apple_linked(Uses::NONE, "exact_apple").contains("exports!"));
+        let svg = super::apple_linked(Uses::NONE.with(Capability::Svg), "exact_apple");
+        assert!(svg.contains("::exact_apple::svg_exports!();"), "{svg}");
+        let regions =
+            super::apple_linked(Uses::NONE.with(Capability::ContentRegions), "exact_apple");
+        assert!(
+            regions.contains("::exact_apple::content_region_exports!();"),
+            "{regions}"
+        );
         let markdown = super::apple_linked(Uses::NONE.with(Capability::Markdown), "exact_apple");
         assert!(
             markdown.contains("::exact_apple::markup_exports!();"),
             "{markdown}"
         );
+        let presence = Uses::NONE.with_grants("secret.keep token user-presence optional");
+        for host in ["exact_apple", "exact_apple_update"] {
+            let entry = super::apple_linked(presence, host);
+            assert!(entry.contains("::presence_exports!();"), "{entry}");
+            assert!(entry.contains("::Capability::Presence"), "{entry}");
+        }
     }
 
     #[test]
@@ -657,5 +917,96 @@ mod tests {
         assert_eq!(web_rust_mode(&none), "off");
         let off = serde_json::json!({"rustMode": "off", "rustModule": "app-logic"});
         assert_eq!(web_rust_mode(&off), "off");
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use crate as contract;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    struct App(PathBuf);
+
+    impl App {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("launch-parts-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(dir.join("out")).unwrap();
+            Self(dir)
+        }
+
+        fn generate(&self, launch: serde_json::Value) -> Result<String, String> {
+            let manifest = contract::Manifest {
+                json: json!({"launch": launch, "moduleConfig": {"observe": {"projectId": "local"}}}),
+                id: "test.launch".into(),
+                name: "Launch".into(),
+                declared: true,
+            };
+            let plan = contract::compile("component App\n  view\n    text \"Launch\"\n").unwrap();
+            let out = self.0.join("out");
+            contract::native::android_entry(&self.0, &manifest, &plan, &out)?;
+            std::fs::read_to_string(out.join("launch.rs")).map_err(|e| e.to_string())
+        }
+    }
+
+    impl Drop for App {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn android_embeds_the_launch_list_and_refuses_missing_parts() {
+        let app = App::new();
+        let entry = app.generate(json!(["observe"])).unwrap();
+        assert!(entry.contains("/observe/android/launch.rs"), "{entry}");
+        assert!(entry.contains("launch_observe::launch("), "{entry}");
+        assert!(entry.contains("projectId\\\":\\\"local"), "{entry}");
+        assert!(entry.contains("test.launch"), "{entry}");
+        let second = app.0.join("modules/second/android");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("launch.rs"), "pub fn launch() {}").unwrap();
+        let entry = app.generate(json!(["second", "observe"])).unwrap();
+        assert!(
+            entry.find("launch_second::launch(").unwrap()
+                < entry.find("launch_observe::launch(").unwrap()
+        );
+        let own = app.0.join("modules/observe/linux");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("launch.rs"), "pub fn launch() {}").unwrap();
+        assert!(app
+            .generate(json!(["observe"]))
+            .unwrap_err()
+            .contains("observe has no android launch part"));
+        assert!(app
+            .generate(json!(["missing"]))
+            .unwrap_err()
+            .contains("no module missing"));
+        assert!(app
+            .generate(json!([]))
+            .unwrap()
+            .contains("fn launch_parts() {}"));
+        assert!(app
+            .generate(json!(["../observe"]))
+            .unwrap_err()
+            .contains("invalid module name"));
+        assert!(app
+            .generate(json!("observe"))
+            .unwrap_err()
+            .contains("expected a list"));
+        let manifest = contract::Manifest {
+            json: json!({"launch": ["observe"]}),
+            id: "test.launch".into(),
+            name: "Launch".into(),
+            declared: true,
+        };
+        let linux = super::painted_launch_parts(&app.0, &manifest, "linux").unwrap();
+        assert!(linux.contains("/modules/observe/linux/launch.rs"));
+        std::fs::remove_dir_all(own).unwrap();
+        assert!(super::painted_launch_parts(&app.0, &manifest, "linux")
+            .unwrap_err()
+            .contains("observe has no linux launch part"));
     }
 }

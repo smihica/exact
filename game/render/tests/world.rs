@@ -155,7 +155,7 @@ fn fixture_surface_agent_pixels_and_beacon() {
     );
     let state = surface.agent(r#"{"op":"state"}"#).unwrap();
     assert!(state.contains(r#""wallClock":true"#));
-    assert!(state.contains(r#""frameMs":{"p50":0"#));
+    assert!(state.contains(r#""frameMs":{"p50":null"#));
     assert!(surface.published().unwrap().contains(r#""beacons":1"#));
 }
 // Fixture follows the capsule exactly. Freeze ONLY its camera in this fixture so
@@ -285,6 +285,8 @@ fn bind_refusal_pause_messages_and_perf_do_not_need_a_device() {
     let hash = surface.sim().unwrap().world().hash();
     let state = surface.agent(r#"{"op":"state"}"#).unwrap();
     assert!(state.contains("perf"));
+    assert!(state.contains(r#""armed":false"#));
+    assert!(state.contains(r#""frameMs":{"p50":null"#));
     assert_eq!(hash, surface.sim().unwrap().world().hash());
     assert!(!surface
         .agent(r#"{"op":"state","entity":"player"}"#)
@@ -360,7 +362,7 @@ fn fixture_grid_fog_and_bloom() {
         .restore(&sim.save().unwrap(), exact_gpu::Restore::Open)
         .unwrap();
     let pixels = render(&gpu, &mut surface, 0.0, "beacons-defaults");
-    assert!(pixels.data.chunks_exact(4).any(|p| p[0] > 200));
+    assert!(pixels.data.as_chunks::<4>().0.iter().any(|p| p[0] > 200));
     assert_eq!(
         surface
             .sim()
@@ -381,8 +383,10 @@ fn fixture_grid_fog_and_bloom() {
     let plain = render(&gpu, &mut surface, 0.0, "beacons-without-grid");
     let changed = pixels
         .data
-        .chunks_exact(4)
-        .zip(plain.data.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(plain.data.as_chunks::<4>().0)
         .filter(|(a, b)| (i16::from(a[0]) - i16::from(b[0])).abs() > 3)
         .count();
     assert!(
@@ -400,8 +404,10 @@ fn fixture_grid_fog_and_bloom() {
     let distant = render(&gpu, &mut surface, 0.0, "beacons-distant-grid");
     let brighter = distant
         .data
-        .chunks_exact(4)
-        .zip(plain.data.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(plain.data.as_chunks::<4>().0)
         .filter(|(a, b)| i16::from(a[0]) > i16::from(b[0]) + 3)
         .count();
     assert!(
@@ -433,8 +439,10 @@ fn fixture_grid_fog_and_bloom() {
     assert!(
         plain
             .data
-            .chunks_exact(4)
-            .zip(clear.data.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(clear.data.as_chunks::<4>().0)
             .filter(|(a, b)| (i16::from(a[0]) - i16::from(b[0])).abs() > 3)
             .count()
             > 1000
@@ -451,8 +459,10 @@ fn fixture_grid_fog_and_bloom() {
     assert!(
         plain
             .data
-            .chunks_exact(4)
-            .zip(dark.data.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dark.data.as_chunks::<4>().0)
             .filter(|(a, b)| (i16::from(a[0]) - i16::from(b[0])).abs() > 1)
             .count()
             > 50

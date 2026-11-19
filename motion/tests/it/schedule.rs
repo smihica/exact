@@ -11,6 +11,7 @@ fn animation(timing: &str) -> exact_motion::Animation {
 
 #[test]
 fn step_deadlines_follow_the_sample_and_stop_after_the_last_iteration() {
+    exact_motion::link_transitions();
     for position in ["jump-start", "jump-end", "jump-none", "jump-both"] {
         let a = animation(&format!("1s steps(4, {position}) 2"));
         for t in [0., 0.1, 0.25, 0.5, 0.9, 1., 1.75] {
@@ -39,6 +40,7 @@ fn step_deadlines_follow_the_sample_and_stop_after_the_last_iteration() {
 
 #[test]
 fn keyframe_holds_sleep_to_their_edge_and_continuous_segments_keep_sampling() {
+    exact_motion::link_transitions();
     let a = crate::keyframed(
         "blink 1s linear infinite @keyframes blink{from{opacity:1}50%{opacity:1}to{opacity:0}}",
     )
@@ -69,6 +71,7 @@ fn keyframe_holds_sleep_to_their_edge_and_continuous_segments_keep_sampling() {
 
 #[test]
 fn alternate_repeats_keep_the_first_and_last_value_of_each_direction() {
+    exact_motion::link_transitions();
     for direction in ["alternate", "alternate-reverse"] {
         let a = animation(&format!("1s steps(2, jump-none) 3 forwards {direction}"));
         let mut t = 0.;
@@ -101,6 +104,7 @@ fn alternate_repeats_keep_the_first_and_last_value_of_each_direction() {
 
 #[test]
 fn retargeting_and_competing_plays_recompute_the_earliest_deadline() {
+    exact_motion::link_transitions();
     use exact_motion::{Change, Transitions};
     let mut e = Engine::new();
     let opacity = |value| Change {
@@ -142,6 +146,7 @@ fn retargeting_and_competing_plays_recompute_the_earliest_deadline() {
 
 #[test]
 fn lowered_and_paused_plays_request_no_sample_clock() {
+    exact_motion::link_transitions();
     let a = crate::keyframed("blink 1s steps(2) infinite @keyframes blink{to{opacity:0}}").unwrap();
     let mut e = Engine::new();
     e.set_animations(1, &a).unwrap();
@@ -152,6 +157,7 @@ fn lowered_and_paused_plays_request_no_sample_clock() {
 
 #[test]
 fn reverse_steps_cross_the_boundary_without_a_display_period_of_delay() {
+    exact_motion::link_transitions();
     let a = animation("1s steps(2, jump-none) infinite reverse");
     let mut t = 0.;
     let mut changes = Vec::new();

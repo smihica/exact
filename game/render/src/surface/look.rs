@@ -198,7 +198,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         // canvas's size is the look frame's own (`look.points`); the input's
         // viewport, which a save carries, is left as it is.
         if size.now.is_finite() {
-            sim.advance_with(
+            sim.advance_observed(
                 size.now,
                 Clock::Seekable,
                 observer(
@@ -208,8 +208,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
                     &mut self.trace,
                     &mut self.error,
                     &mut self.hook_poses,
-                    false,
-                    0,
+                    None,
+                    None,
                 ),
             );
         }
@@ -390,7 +390,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         if !self.storage_fits(device) {
             return Err(self.error.clone().map_or_else(String::new, |e| e.0).into());
         }
-        self.prepare_assets(device, queue, format);
+        // Untimed, as the look's encode is.
+        self.prepare_now(device, queue, format);
         let sim = self
             .sim
             .as_mut()
@@ -510,6 +511,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
             Some(sim.world()),
             hook_time,
             &self.hook_poses,
+            // A look is an observational read: it times nothing.
+            None,
         );
         if let Err(e) = encoded {
             renderer.disarm_probe();
@@ -524,8 +527,8 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         let labels = renderer.probe_labels(&feed.shape_names());
         let readback = renderer.probe_copies(&mut encoder, &texture, &facts);
         queue.submit([encoder.finish()]);
-        renderer.end_look();
         renderer.submitted();
+        renderer.end_look();
         readback.map();
         Ok((readback, facts, records, labels))
     }

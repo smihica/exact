@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 import ExactGroupedLists
 
 /// What a full-screen route stands on, over `scripts/fixtures/navigation-bars.contract`
@@ -35,8 +36,7 @@ final class ModalSurfaceIOSTests: XCTestCase {
         sessions.append(session)
         let view = ExactView(session: session)
         let host = UIViewController()
-        let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
-        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow(frame: CGRect(x: 0, y: 0, width: 402, height: 874))
+        let window = try UIWindow(windowScene: XCTUnwrap(hostedWindowScene(), "a presentation enters its presenter's window only through a scene"))
         window.frame = window.screen.bounds
         window.rootViewController = host
         window.makeKeyAndVisible()
@@ -46,16 +46,17 @@ final class ModalSurfaceIOSTests: XCTestCase {
         view.frame = host.view.bounds
         view.layoutIfNeeded()
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         return (session, try XCTUnwrap(nav.topViewController as? RouteController))
     }
 
     /// `name`'s full-screen route, opened from `start` and presented: the
     /// presentation's controller and the route's.
     private func open(_ session: ExactSession, _ name: String) throws -> (UIViewController, RouteController) {
-        let navigation = session.presenter.navigation
+        let navigation = session.presenter.navigationHost
         let button = try XCTUnwrap(session.presenter.views.values.first { $0.props["testId"] == "start-open-\(name)" })
-        _ = Agent(session: session).tap(["id": Int(button.id)])
+        let reply = Agent(session: session).tap(["id": Int(button.id)])
+        XCTAssertNil(reply["error"], "the opener for \(name) is tapped")
         until("the route is presented") {
             navigation.modalNavigation?.viewControllers.count == 1 && navigation.modalNavigation?.parent?.presentingViewController != nil
         }
@@ -63,12 +64,15 @@ final class ModalSurfaceIOSTests: XCTestCase {
         let route = try XCTUnwrap(navigation.modalNavigation?.topViewController as? RouteController)
         XCTAssertEqual(route.node.props["testId"], "route-\(name)")
         XCTAssertEqual(presented.modalPresentationStyle, .overFullScreen)
+        // The layer takes its fill when Core Animation displays it, in the window
+        until("the route is in the window and drawn") { route.node.window != nil && !route.node.layer.needsDisplay() }
         return (presented, route)
     }
 
     private func alpha(_ color: UIColor?, in view: UIView) -> CGFloat? { color?.resolvedColor(with: view.traitCollection).cgColor.alpha }
 
     func testATranslucentFullScreenRouteIsPaintedOnceOverThePage() throws {
+        guard hostedWindowScene() != nil else { throw missing("scene", "a full-screen presentation shows in a window only under a scene") }
         let (session, start) = try booted("surface-veil")
         let (presented, route) = try open(session, "veil")
         XCTAssertEqual(presented.view.backgroundColor, .clear, "the presentation paints no surface")
@@ -79,6 +83,7 @@ final class ModalSurfaceIOSTests: XCTestCase {
     }
 
     func testAnOpaqueFullScreenRouteLeavesTheSurfacesClearToo() throws {
+        guard hostedWindowScene() != nil else { throw missing("scene", "a full-screen presentation shows in a window only under a scene") }
         let (session, _) = try booted("surface-solid")
         let (presented, route) = try open(session, "solid")
         XCTAssertEqual(presented.view.backgroundColor, .clear)
@@ -87,6 +92,7 @@ final class ModalSurfaceIOSTests: XCTestCase {
     }
 
     func testAFullScreenRouteThatPaintsNothingKeepsTheSystemBackground() throws {
+        guard hostedWindowScene() != nil else { throw missing("scene", "a full-screen presentation shows in a window only under a scene") }
         let (session, _) = try booted("surface-full")
         let (presented, route) = try open(session, "full")
         XCTAssertEqual(presented.view.backgroundColor, .systemBackground, "the platform's surface (LLP 1115 D2)")

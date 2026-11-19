@@ -61,6 +61,10 @@ final class MetalCanvasView: UIView {
         awaitingFirstFrame = false
         metalLayer.isHidden = false
     }
+    func hidePicture() {
+        awaitingFirstFrame = false
+        metalLayer.isHidden = true
+    }
 }
 
 /// The process's spare canvas layers, their drawables kept (`MetalCanvasView`).
@@ -151,7 +155,7 @@ final class CanvasesHost {
     final class Entry {
         let view: NodeView
         let name: String
-        var values: Any
+        var values: Data
         var id: UInt32 = 0
         var presentable = true
         var wants = false
@@ -205,7 +209,7 @@ final class CanvasesHost {
         var picture: CGImage?
         /// The artifact whose surface this canvas is (LLP 1009 D6), once created.
         var module: GpuModule?
-        init(view: NodeView, name: String, values: Any) { self.view = view; self.name = name; self.values = values }
+        init(view: NodeView, name: String, values: Data) { self.view = view; self.name = name; self.values = values }
     }
     var entries: [UInt32: Entry] = [:]
     var publishers: [String: Entry] = [:]
@@ -271,7 +275,7 @@ final class CanvasesHost {
     }
 
     /// A surface op: new inputs for a canvas node.
-    func surface(view: NodeView, name: String, values: Any) {
+    func surface(view: NodeView, name: String, values: Data) {
         if let e = entries[view.id], e.view !== view || e.name != name { destroy(view: view.id) }
         if let e = entries[view.id] {
             e.values = values
@@ -293,6 +297,7 @@ final class CanvasesHost {
             haptics.remove(view)
             if e.id != 0 { e.module?.destroy(e.id) }
             releasePublisher(e)
+            lifecycle.removedCanvas()
         }
     }
 
@@ -309,6 +314,7 @@ final class CanvasesHost {
     }
 
     func loadIfNeeded() {
+        updatePerformanceTimer()
         guard !entries.isEmpty, session?.firstDrawMs != nil else { return }
         // Each artifact the first time one of its canvases exists (LLP 1009
         // D6). A declared module loads on the next turn, after the frame that
@@ -374,8 +380,10 @@ final class CanvasesHost {
         e.id = bytes.withUnsafeBufferPointer { m.create($0.baseAddress, bytes.count, ptr, w, h) }
         e.presentable = e.id != 0
         if e.id == 0 { FileHandle.standardError.write(Data("exact gpu: \(m.error())\n".utf8)); return }
-        e.performance = publishers[e.name] === e && session?.canvasPerformanceRequested(e.name) == true
-        if e.performance { _ = m.performanceReporting?(e.id, true) }
+        if let session, !m.giveStorage(e.id, session: session) {
+            failed = m.error(); m.destroy(e.id); e.id = 0; e.presentable = false; return
+        }
+        e.performance = false
         e.module = m
         updatePerformanceTimer()
         lifecycle.deliver(e.id, module: m)
@@ -464,8 +472,21 @@ final class CanvasesHost {
     /// the end of every batch, and once per run-loop turn for changes that
     /// arrive outside one (D4 b, c).
     func captureIfNeeded() {
-        for e in Array(entries.values) where live(e.view.id) === e && e.presentable && e.through && e.view.needsCapture {
-            if let m = e.module { capture(m, e) }
+        guard entries.values.contains(where: { $0.through && $0.view.needsCapture }) else { return }
+        if session?.isApplyingPresentation == true { scheduleCapture(); return }
+        // An ancestor reads its nested canvases while its bitmap is open.
+        // Upload their children first, outside that bitmap (LLP 1014 D3).
+        let ordered = entries.values.filter { $0.presentable && $0.through }.map { e in
+            var depth = 0, above = e.view.canvasAbove
+            while let canvas = above { depth += 1; above = canvas.canvasAbove }
+            return (e, depth)
+        }.sorted { $0.1 > $1.1 }
+        for (e, _) in ordered where live(e.view.id) === e && e.view.needsCapture {
+            if let m = e.module {
+                capture(m, e)
+                // Only an ancestor that samples its children recaptures; another would keep the flag forever.
+                if let outer = e.view.canvasAbove, entries[outer.id]?.through == true { outer.needsCapture = true }
+            }
         }
     }
 
@@ -473,7 +494,11 @@ final class CanvasesHost {
     func scheduleCapture() {
         guard !captureScheduled else { return }
         captureScheduled = true
-        DispatchQueue.main.async { self.captureScheduled = false; self.captureIfNeeded() }
+        DispatchQueue.main.async {
+            self.captureScheduled = false
+            self.captureIfNeeded()
+            if self.wantsFrames { self.session?.frames.requestCanvas() }
+        }
     }
 
     /// Whether the input being edited is under the overlay (D4 d): carets
@@ -485,6 +510,13 @@ final class CanvasesHost {
     private func capture(_ m: GpuModule, _ e: Entry) {
         // A nested readback can post a message and apply another batch here.
         guard live(e.view.id) === e, e.presentable, !e.capturing else { return }
+        // Creation and UIKit's inset reports belong to one presentation.
+        // Capture its final children once (LLP 1172.023 E3).
+        if session?.isApplyingPresentation == true {
+            e.view.needsCapture = true
+            scheduleCapture()
+            return
+        }
         e.capturing = true
         defer { e.capturing = false }
         guard let overlay = e.view.overlay, e.view.window != nil, let metal = e.view.canvasMetal else { return }
@@ -671,23 +703,26 @@ final class CanvasesHost {
         frameNow = now
         defer { frameNow = previous }
         drainSensors()
-        var more = false
-        for e in Array(entries.values) where live(e.view.id) === e && e.presentable {
+        let current = Array(entries.values)
+        for e in current where live(e.view.id) === e && e.presentable {
             guard let m = e.module else { continue }
             refreshChildren(m, e)
-            if e.through && e.view.needsCapture { capture(m, e) }
+            if let outer = e.view.canvasAbove, entries[outer.id]?.through == true,
+               m.dirty(e.id) != 0 || (e.wants && now != e.readAt) { outer.needsCapture = true }
+            if e.through, !e.view.paintedThisTurn, let overlay = e.view.overlay, editing(under: overlay) { e.view.needsCapture = true }
+        }
+        captureIfNeeded()
+        var more = false
+        for e in current where live(e.view.id) === e && e.presentable {
+            guard let m = e.module else { continue }
             // Nested under a canvas painted through its surface (LLP 1014):
             // its Metal layer is never composited, so presenting to it would
             // block on a drawable nobody takes. It is only ever read back into
             // the ancestor's capture — which a change asks for here — and it
             // never wants frames of its own.
             if let outer = e.view.canvasAbove, outer.overlay != nil, entries[outer.id]?.through == true {
-                if m.dirty(e.id) != 0 || (e.wants && now != e.readAt) { outer.needsCapture = true }
                 continue
             }
-            // D4 (d): every frame while editing under the overlay — but not
-            // twice on the turn a batch already captured.
-            if e.through, !e.view.paintedThisTurn, let overlay = e.view.overlay, editing(under: overlay) { capture(m, e) }
             m.syncDynamicRange(e.id, view: e.view, layer: e.view.canvasMetal?.metalLayer)
             guard live(e.view.id) === e, let metal = e.view.canvasMetal, e.wants || m.dirty(e.id) != 0 || e.resized(box(metal)) else { continue }
             // D4: a canvas renders when the host judges it on screen. A
@@ -737,7 +772,7 @@ final class CanvasesHost {
         // to submit for it, and its tick's frame is still to draw.
         let drew = m.drew.map { $0(e.id) != 0 } ?? (m.starved?(e.id) != 1)
         if drew { recorded(m); e.drawnTick = tick; drawn += 1 }
-        e.waiting = !drew
+        e.waiting = (m.presentationFlags?(e.id) ?? 0) & 4 == 0 && !drew
         // A module that cannot say when a first frame is shown (`gpu_seen`):
         // the frame just recorded is presented by this tick's flush.
         if drew, metal.awaitingFirstFrame, m.seen == nil, r < 2 { DispatchQueue.main.async { metal.reveal() } }

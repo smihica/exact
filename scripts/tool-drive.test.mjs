@@ -4,7 +4,7 @@
 // EXACT_TOOL_PORT=7740, as it is.
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { checkoutPort } from './port-lock.mjs';
 import { spawnOwned, stopAll } from './test-children.mjs';
@@ -36,7 +36,9 @@ test('a drive or verify naming the design tool runs on the checkout\'s own port,
   expect([verify.args, verify.port, verify.dir]).toEqual([['web', '--app', 'design-tool'], String(port), stage]);
   // A path names the tool over another app's EXACT_APP_DIR, as resolveApp reads them.
   expect(drive('agent', ['web', '--app', './apps/design-tool'], { EXACT_APP_DIR: resolve(ROOT, 'apps/caltrain') }).dir).toBe(stage);
-  // The stage names its stub's server at that port, not 7740 (verify.mjs appServer reads app.ts's origin).
+  // Discovery consumes the build's module list; the unit fixture supplies app.ts, which owns the stub origin.
+  mkdirSync(resolve(stage, '.exact'), { recursive: true });
+  writeFileSync(resolve(stage, '.exact/typescript-inputs.json'), JSON.stringify({ modules: [['app.ts', resolve(stage, 'app.ts')]], types: [] }));
   expect(appServer(stage).port).toBe(port);
   // A port named is that port's stage.
   expect(drive('agent', ['web', '--app', 'design-tool'], { EXACT_TOOL_PORT: '17997' }).dir).toBe(resolve(ROOT, 'target/design-tool-test-17997'));
@@ -57,7 +59,7 @@ test('another app, a drive already in a stage, and EXACT_TOOL_PORT=7740 are left
 test('agent.mjs and verify.mjs named the tool by its path or name stage it: what answers at its stub\'s port is that port\'s, never 7740', async () => {
   // Something already answering at the stage's port, in a process of its own
   // (a spawnSync here would leave a server in this one unanswered): each
-  // refuses before any build, naming the URL it would have started the stub at.
+  // refuses before starting a server, naming the URL it would have started the stub at.
   const held = spawnOwned(process.execPath, ['-e', "const s = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response('held') }); console.log(s.port); setTimeout(() => process.exit(0), 300_000);"], { stdio: ['ignore', 'pipe', 'ignore'] });
   const port = await new Promise(ok => held.stdout.once('data', d => ok(Number(String(d).trim()))));
   try {
@@ -65,6 +67,9 @@ test('agent.mjs and verify.mjs named the tool by its path or name stage it: what
     for (const k of ['EXACT_APP_DIR', 'EXACT_WEB_DIST']) delete env[k];
     const run = (args) => spawnSync(process.execPath, args, { cwd: ROOT, env, encoding: 'utf8', timeout: 120_000 });
     const verifies = [run(['scripts/verify.mjs', 'web', '--app', 'apps/design-tool']), run(['scripts/verify.mjs', 'web', '--app', 'design-tool'])];
+    const stage = resolve(ROOT, `target/design-tool-test-${port}`), dist = resolve(ROOT, `target/design-tool-test-web-${port}`);
+    const built = spawnSync(process.execPath, ['host/web/build.mjs', stage], { cwd: ROOT, env: { ...env, EXACT_WEB_DIST: dist }, encoding: 'utf8', timeout: 120_000 });
+    expect(built.status, built.stdout + built.stderr).toBe(0);
     const agent = run(['scripts/agent.mjs', 'web', '--app', './apps/design-tool', '--storage', 'tool-drive-test', '--reset-storage', 'tree']);
     for (const r of [...verifies, agent]) {
       expect(r.error).toBeUndefined();

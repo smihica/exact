@@ -50,8 +50,10 @@ return function (field, retain) {
     return result;
   }
   function result(handle) {
+    // `changed` (Exact patch 51) is the embedder's: Exact's prelude reads it
+    // and gives the app `changes` and `lastInsertRowid`.
     function execution(index) {
-      return { changes: field(handle, 6, index), lastInsertRowid: BigInt(field(handle, 7, index)) };
+      return { changes: field(handle, 6, index), lastInsertRowid: BigInt(field(handle, 7, index)), changed: field(handle, 9, index) };
     }
     try {
       var kind = field(handle, 0);

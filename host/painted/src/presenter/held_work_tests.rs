@@ -1,6 +1,10 @@
 use super::*;
 use exact_runner::{Answer, DataError, Dispatch, Outcome, Request, Store, Value};
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 #[derive(Default)]
 struct Held {
     ready: bool,
@@ -15,7 +19,7 @@ impl DataSource for Held {
     }
 
     fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
-        Ok(Answer::Later(Request::continuation(1)))
+        Ok(Answer::Later(Request::continuation::<TestWork>(1)))
     }
 
     fn dispatch(&mut self, token: u64, _: &Store) -> Dispatch {
@@ -116,7 +120,7 @@ impl DataSource for Holding {
     }
     fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
         self.asked += 1;
-        Ok(Answer::Later(Request::continuation(self.asked)))
+        Ok(Answer::Later(Request::continuation::<TestWork>(self.asked)))
     }
     fn dispatch(&mut self, _: u64, _: &Store) -> Dispatch {
         Dispatch::Held
@@ -212,7 +216,7 @@ impl DataSource for Oversized {
     ) -> Result<Answer, DataError> {
         assert!(matches!(outcome, Outcome::Failed {
             kind: exact_runner::FailureKind::Refused, ref message,
-        } if message == "native request exceeds 4 MiB"));
+        } if message.starts_with("native request exceeds 4 MiB (URL, headers and body together)")));
         Ok(Answer::Now(Value::Bool(true)))
     }
 }
@@ -245,6 +249,7 @@ fn an_empty_pump_delivers_a_refusal_from_waiting_admission() {
     .unwrap();
     assert!(error.is_none(), "{error:?}");
     let request = |ticket, request, class| RequestOut {
+        completion: None,
         ticket,
         request,
         class,
@@ -256,16 +261,17 @@ fn an_empty_pump_delivers_a_refusal_from_waiting_admission() {
         let sent = sent.clone();
         p.executor
             .run(
-                request(ticket, Request::continuation(ticket), RequestClass::Ordered),
+                request(
+                    ticket,
+                    Request::continuation::<TestWork>(ticket),
+                    RequestClass::Ordered,
+                ),
                 Some(Work::Later(Box::new(move |reply| {
                     sent.send(reply).unwrap();
                 }))),
             )
             .unwrap();
     }
-    let replies: Vec<_> = (0..16)
-        .map(|_| replies.recv_timeout(Duration::from_secs(10)).unwrap())
-        .collect();
     p.executor
         .run(
             request(
@@ -282,7 +288,11 @@ fn an_empty_pump_delivers_a_refusal_from_waiting_admission() {
     assert!(p.host.runner().has_pending());
     assert!(!p.host.has_ordered_request_refusals());
     p.executor.cancel(&[1016]);
-    for reply in replies {
+    // A handoff reserves its outcome's ceiling as it starts, so the lane runs
+    // only as many as its bytes hold. The rest fill the sixteen while queued
+    // and start as those answer.
+    for _ in 0..16 {
+        let reply = replies.recv_timeout(Duration::from_secs(10)).unwrap();
         reply.send(Outcome::Storage(Vec::new()));
     }
     while p.host.runner().has_pending() {

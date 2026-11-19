@@ -51,6 +51,7 @@ fn shown(e: &Engine) -> Option<String> {
 
 #[test]
 fn a_matched_path_moves_under_d_and_all_and_settles_on_the_row() {
+    exact_motion::link_transitions();
     for transition in ["d 400ms linear", "all 400ms linear"] {
         let mut e = engine(transition);
         assert_eq!(shown(&e), None, "first seen: no transition");
@@ -74,6 +75,7 @@ fn a_matched_path_moves_under_d_and_all_and_settles_on_the_row() {
 
 #[test]
 fn an_unchanged_path_keeps_its_curve_only_while_covered() {
+    exact_motion::link_transitions();
     for next in ["none", "opacity 1s", "all 0s", "d 0s"] {
         let mut e = engine("d 400ms linear");
         e.observe_path(NODE, Some(up()));
@@ -90,6 +92,7 @@ fn an_unchanged_path_keeps_its_curve_only_while_covered() {
 
 #[test]
 fn an_unmatched_path_or_no_declaration_changes_at_once() {
+    exact_motion::link_transitions();
     let curve = path(&[(b'M', &[6.0, 9.0]), (b'Q', &[12.0, 2.0, 18.0, 9.0])]);
     let mut e = engine("d 400ms linear");
     e.observe_path(NODE, Some(curve));
@@ -113,6 +116,7 @@ fn an_unmatched_path_or_no_declaration_changes_at_once() {
 
 #[test]
 fn a_change_back_reverses_from_the_current_shape_in_the_shortened_time() {
+    exact_motion::link_transitions();
     let mut e = engine("d 400ms linear");
     e.observe_path(NODE, Some(up()));
     e.advance(0.2).unwrap();
@@ -129,6 +133,7 @@ fn a_change_back_reverses_from_the_current_shape_in_the_shortened_time() {
 
 #[test]
 fn a_spring_on_d_plays_its_curve_and_a_removed_node_forgets_its_path() {
+    exact_motion::link_transitions();
     let mut e = engine("d -exact-spring(420, 30, 1)");
     e.observe_path(NODE, Some(up()));
     let end = e.settle_time().expect("a spring's curve");

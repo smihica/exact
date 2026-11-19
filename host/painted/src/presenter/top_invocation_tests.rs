@@ -80,7 +80,7 @@ impl SurfacePainter for Nothing {
 }
 
 fn windowed() -> Presenter<()> {
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(APP),
         (),
         (400., 800.),
@@ -115,6 +115,44 @@ fn invoke(p: &mut Presenter<()>, name: &str) {
     let view = id(p, name);
     p.invoke(view, 0.0, true);
     p.run_commands(|| ());
+}
+
+#[test]
+fn only_submenu_rows_expose_expansion_while_dialog_commands_remain_invocable() {
+    use crate::presenter::access::{act, flag};
+    for detached in [false, true] {
+        let source = APP.replace(
+            r#"testId="native-cmd""#,
+            r#"-exact-menu="status" popovertarget="menu" testId="native-cmd""#,
+        );
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(&source),
+            (),
+            (400., 800.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.serve_overlays();
+        p.frame();
+        if detached {
+            let invoker = id(&p, "native-cmd");
+            assert!(p.open_status_menu(invoker, (800., 600.), true, true, 0.));
+        } else {
+            invoke(&mut p, "native-cmd");
+        }
+        p.reader_access(1., true);
+        let row = |name| p.access_told().iter().find(|n| n.name == name).unwrap();
+        assert_ne!(row("More").flags & flag::EXPANDABLE, 0);
+        let dialog = row("Ask first");
+        assert_eq!(dialog.flags & flag::EXPANDABLE, 0);
+        assert_ne!(dialog.flags & flag::CLICK, 0);
+        let dialog = dialog.id;
+        assert!(p.access_act(dialog, act::CLICK, 0., 0.));
+        assert_eq!(open(&p).as_deref(), Some("dpm"));
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -453,7 +491,7 @@ fn windows_dialog_focus_outline_follows_input_without_losing_action() {
 #[test]
 fn desktop_dialog_wheel_is_confined_to_content_and_does_not_move_focus() {
     let source = APP.replace("Modally.", &"A long explanation. ".repeat(100));
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(&source),
         (),
         (400., 500.),
@@ -595,7 +633,7 @@ fn desktop_menu_home_and_end_skip_disabled_rows_and_keep_focus_inside() {
         button press=send disabled=true
           text "Unavailable last"
 "#;
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(source),
         (),
         (360., 500.),
@@ -879,7 +917,7 @@ fn a_shell_dismissal_fires_cancel_but_cannot_keep_the_window_open() {
     let source = APP.replace("  state said", "  state events = \"\"\n  action cancelled\n    preventDefault()\n    events = `${events}cancel,`\n  action closed\n    events = `${events}close,`\n  state said")
         .replace("dialog id=\"dpm\"", "dialog cancel=cancelled close=closed id=\"dpm\"")
         .replace("text said testId=\"said\"", "text events testId=\"events\"\n      text said testId=\"said\"");
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(&source),
         (),
         (400., 800.),
@@ -935,7 +973,7 @@ fn a_menu_rows_press_point_is_in_points_at_any_scale() {
           text "Row"
       text at testId="at"
 "#;
-    let (mut p, error) = Presenter::boot_with(
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
         &crate::test_plan(source),
         (),
         (400., 800.),
@@ -967,4 +1005,33 @@ fn a_menu_rows_press_point_is_in_points_at_any_scale() {
         (got[0] - want.0).abs() < 0.01 && (got[1] - want.1).abs() < 0.01,
         "{said} want {want:?}"
     );
+}
+
+/// #550 in a menu the desktop draws in its window: a letter focuses the row it starts, from the
+/// first row while none is focused, the same letter again the next, wrapping; Space with no search
+/// under way still chooses. (A menu in a popup window of its own hears only the keys `event` names.)
+#[test]
+fn a_letter_in_an_open_menu_focuses_the_row_it_starts() {
+    let mut p = windowed();
+    p.serve_overlays();
+    let focused = |p: &Presenter<()>| {
+        let open = p.top.open.as_ref().unwrap();
+        open.focused.map(|i| open.layout.targets[i].node)
+    };
+    let typed = |p: &mut Presenter<()>, key: &str, at: f64| {
+        assert!(p.surface_key(key, at));
+        p.run_commands(|| ());
+    };
+    invoke(&mut p, "native-cmd");
+    typed(&mut p, "e", 0.);
+    assert_eq!(focused(&p), Some(id(&p, "to-retargeted")));
+    typed(&mut p, "a", 600.);
+    assert_eq!(focused(&p), Some(id(&p, "to-confirm")));
+    typed(&mut p, "r", 1200.);
+    assert_eq!(focused(&p), Some(id(&p, "menu-rename")));
+    typed(&mut p, "z", 1800.);
+    assert_eq!(focused(&p), Some(id(&p, "menu-rename")));
+    typed(&mut p, " ", 2400.);
+    assert!(p.surface().is_none());
+    assert_eq!(p.host().runner().slot("said"), Some(&Value::str("renamed")));
 }

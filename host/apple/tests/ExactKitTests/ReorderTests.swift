@@ -1,6 +1,6 @@
 import XCTest
 @testable import ExactKit
-@testable import ExactDrag
+@testable import ExactCollections
 
 /// Answers Arrange's calls as the runtime would, and records them in order:
 /// the Swift half of the web/Linux sequence (`host/web/src/reorder_tests.rs`,
@@ -67,7 +67,7 @@ final class ReorderGroupRecorder: ReorderGroupCalls {
 }
 
 final class ReorderTests: XCTestCase {
-    override class func setUp() { super.setUp(); ExactDrag.install() } // LLP 1047.001 D4
+    override class func setUp() { super.setUp(); ExactCollections.install() } // LLP 1047.001 D10
     func testStateKeepsTheSerialExactAndRefusesAMalformedOp() {
         let state = ReorderState(["token": "18446744073709551615", "list": 3, "wrapper": 9, "phase": "settling", "dispatched": true])
         XCTAssertEqual(state?.token, UInt64.max)

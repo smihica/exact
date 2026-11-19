@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactSticky
 #if os(macOS)
 import AppKit
 #endif

@@ -111,6 +111,7 @@ fn step_json(step: &Step, s: &mut String) {
             to,
             from,
             mouse,
+            into,
             press,
             over,
             hold,
@@ -135,6 +136,10 @@ fn step_json(step: &Step, s: &mut String) {
             }
             if *mouse {
                 s.push_str(",\"mouse\":true");
+            }
+            if let Some(into) = into {
+                s.push_str(",\"into\":");
+                q(into, s);
             }
             for (name, ms) in [("press", press), ("over", over), ("hold", hold)] {
                 if let Some(ms) = ms {
@@ -213,8 +218,20 @@ fn step_json(step: &Step, s: &mut String) {
                 None => s.push_str(",\"times\":null"),
             }
         }
+        Step::AnswerFetch {
+            prefix, response, ..
+        } => {
+            s.push_str("{\"op\":\"answer-fetch\",\"prefix\":");
+            q(prefix, s);
+            s.push_str(",\"response\":");
+            s.push_str(response);
+        }
         Step::PassFetch { prefix, .. } => {
             s.push_str("{\"op\":\"pass-fetch\",\"prefix\":");
+            q(prefix, s);
+        }
+        Step::DropStream { prefix, .. } => {
+            s.push_str("{\"op\":\"drop-stream\",\"prefix\":");
             q(prefix, s);
         }
         // @ref LLP 1116.006 D8 — the body as JSON text, the persona as `as`.
@@ -281,6 +298,10 @@ fn step_json(step: &Step, s: &mut String) {
         Step::Authorize { cancel, .. } => {
             s.push_str(&format!("{{\"op\":\"authorize\",\"cancel\":{cancel}"));
         }
+        Step::Presence { answer, .. } => {
+            s.push_str("{\"op\":\"presence\",\"answer\":");
+            q(answer, s);
+        }
         Step::Clipboard {
             target, edit, text, ..
         } => {
@@ -316,6 +337,24 @@ fn step_json(step: &Step, s: &mut String) {
             s.push_str("{\"op\":\"expect-disabled\",\"target\":");
             q(target, s);
             s.push_str(&format!(",\"disabled\":{disabled}"));
+        }
+        Step::ExpectFocused { target, .. } => {
+            s.push_str("{\"op\":\"expect-focused\",\"target\":");
+            q(target, s);
+        }
+        Step::ExpectLayout {
+            target,
+            dimension,
+            comparison,
+            value,
+            ..
+        } => {
+            s.push_str("{\"op\":\"expect-layout\",\"target\":");
+            q(target, s);
+            s.push_str(&format!(
+                ",\"dimension\":\"{dimension}\",\"comparison\":\"{}\",\"value\":{value}",
+                comparison_name(*comparison)
+            ));
         }
         Step::ExpectText { target, value, .. } => {
             s.push_str("{\"op\":\"expect-text\",\"target\":");
@@ -382,18 +421,20 @@ fn step_json(step: &Step, s: &mut String) {
         } => {
             s.push_str("{\"op\":\"expect-state\",\"name\":");
             q(name, s);
-            s.push_str(",\"comparison\":");
-            q(
-                match comparison {
-                    contract_syntax::StateComparison::Equal => "equal",
-                    contract_syntax::StateComparison::AtLeast => "at-least",
-                    contract_syntax::StateComparison::AtMost => "at-most",
-                    contract_syntax::StateComparison::In => "in",
-                },
-                s,
-            );
-            s.push_str(",\"value\":");
-            state_literal(value, s);
+            s.push_str(&format!(
+                ",\"comparison\":\"{}\"",
+                comparison_name(*comparison)
+            ));
+            match value {
+                contract_syntax::StateOperand::Literal(value) => {
+                    s.push_str(",\"value\":");
+                    state_literal(value, s);
+                }
+                contract_syntax::StateOperand::State(path) => {
+                    s.push_str(",\"state\":");
+                    q(path, s);
+                }
+            }
         }
         Step::Perf { steps, .. } => {
             s.push_str("{\"op\":\"perf\",\"steps\":");
@@ -600,11 +641,23 @@ fn property_value(v: &contract_syntax::PropertyValue, s: &mut String) {
     }
 }
 
+/// A comparison as the driver's script names it.
+fn comparison_name(comparison: contract_syntax::StateComparison) -> &'static str {
+    match comparison {
+        contract_syntax::StateComparison::Equal => "equal",
+        contract_syntax::StateComparison::NotEqual => "not-equal",
+        contract_syntax::StateComparison::AtLeast => "at-least",
+        contract_syntax::StateComparison::AtMost => "at-most",
+        contract_syntax::StateComparison::In => "in",
+    }
+}
+
 fn state_literal(value: &Expr, s: &mut String) {
     match value {
         Expr::Number(n, _) => s.push_str(&format!("{n}")),
         Expr::Str(t, _) => q(t, s),
         Expr::Bool(b, _) => s.push_str(&format!("{b}")),
+        Expr::Some(inner, _) => state_literal(inner, s),
         Expr::List(items, _) => {
             s.push('[');
             for (i, item) in items.iter().enumerate() {
@@ -615,6 +668,22 @@ fn state_literal(value: &Expr, s: &mut String) {
             }
             s.push(']');
         }
-        _ => s.push_str("null"),
+        Expr::Call(_, fields, _) => {
+            s.push('{');
+            for (i, field) in fields.iter().enumerate() {
+                let Expr::NamedArg(name, value, _) = field else {
+                    unreachable!("state literal fields are named")
+                };
+                if i > 0 {
+                    s.push(',');
+                }
+                q(name, s);
+                s.push(':');
+                state_literal(value, s);
+            }
+            s.push('}');
+        }
+        Expr::None(_) => s.push_str("null"),
+        _ => unreachable!("state expectations contain only literals"),
     }
 }

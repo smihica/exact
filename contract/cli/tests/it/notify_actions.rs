@@ -9,6 +9,10 @@
 use exact_runner::{agent, Runner, Value, WakeHow};
 use std::path::PathBuf;
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 struct App(PathBuf);
 impl App {
     fn new(name: &str) -> Self {
@@ -356,6 +360,9 @@ fn data_codes_post_naming_undeclared_actions_is_refused() {
             panic!("a module call is work");
         };
         let outcome = match work {
+            exact_runner::Work::HttpResponse(_) => {
+                panic!("HTTP fixtures require the HTTP executor")
+            }
             exact_runner::Work::Now(work) => work(),
             exact_runner::Work::Later(work) => {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -624,7 +631,7 @@ impl exact_runner::DataSource for ActionWork {
             return None;
         }
         self.storage_sent = true;
-        Some(exact_runner::Request::continuation(
+        Some(exact_runner::Request::continuation::<TestWork>(
             exact_runner::BACKGROUND,
         ))
     }

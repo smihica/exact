@@ -1702,3 +1702,85 @@ pass timing plus per-view counts for hookless armed canvases. Hookless games
 compiled timing out before. Projecting the lighting's SH over the cube's texels,
 instead of a θ/φ grid, kept libm's `sinf`/`cosf`/`rem_pio2_large` out of the
 module and saved 5,803 bytes. The 550–650 KB target stays unmet.
+
+## Terrain fixture live run
+
+An armed live-clock window on `game/games/terrain-fixture` after its terrain presented
+(LLP 1182.000 D4a). The smoke configuration has lighting, edits and blending off.
+The web row is a sanity reading from the agent's headless Chrome. Each row is one 5 s window of `perf frames live 5000` at 1280 × 720, scale 1, one
+sample, `Quality::High`.
+
+| Renderer | Commit | Device | OS | Build profile | Refresh | Frame interval | Encode | Hook `prepare` | Draws, triangles a frame | Forward pass (GPU) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Chrome 158 on WebGPU, headless | `88076cf40` and the fixture | Mac Studio, Apple M5 Ultra | macOS 27.2.1 | `web` (optimized) | 60 Hz (16.6 ms period) | p50 17.2 ms, p95 21.8 ms | p50 0.8 ms, p95 0.9 ms | under 0.1 ms | 823, 213,232 | p50 0.11 ms, p95 0.12 ms |
+| Metal | not run | | | | | | | | | |
+
+The web row's adapter is not named in `state`; timestamp queries were available and the forward
+pass is the query's reading. All 2,312 section addresses were meshed before this window opened. Its frames
+uploaded no terrain bytes.
+
+## Terrain decision workload
+
+The fixture's [benchmark runner](../games/terrain-fixture/README.md#decision-workload)
+records the switches, host metadata, mount observations and three live windows
+for LLP 1182.000 D4b. Its rows carry the uncalibrated label.
+
+### Mac Studio, 2026-11-18
+
+Mac Studio (Apple M5 Ultra, 36 cores), macOS 27.2.1, a 1440 × 900 display at 75 Hz
+(13.33 ms), canvas 1280 × 720. Every row is `radius=40` under the live clock with
+`budget=deadline`: 20 s of warm-up, then three 60 s windows, and a figure with a
+range is the range across the three. The web rows are Google Chrome 158.0.8127.37
+on WebGPU, `web` profile; the Metal rows are the macOS app, `host-dev` profile.
+The machine's one-minute load was 4 to 22 during the rows, and 54 at the end of
+the Metal row with `move=fly light=8000`. Uncalibrated: the switch values stand
+for a game's costs and were not fitted to one. "Game guess" is `light=96000
+compare=on vertex=64 blend=window edits=4`.
+
+Flying crosses a chunk every 800 ms and walking every 4 s. A crossing retires 648
+sections, queues 648 and, with `compare=on`, queues a reuse compare for each of
+the 51,840 that stay. "Refill" is the time from a crossing to the last of its work.
+"`prepare` share" is the hook's `prepare` time over the window's 60 s.
+
+| Renderer | Switches | Window filled | Frame interval p95 | `prepare` p50, p95 | `prepare` share | Refill p50; p95 | Refills finished of those started |
+|---|---|---|---|---|---|---|---|
+| Chrome, WebGPU | `move=fly` | 11.3 s | 13.35 ms | 0.02, 2.9 ms | 4 % | 147 ms; 147 ms | all |
+| Chrome, WebGPU | `move=fly light=8000 compare=on` | 16.5 s | 13.35 ms | 11.5, 11.9 ms | 80–81 % | 787–800 ms; 947–960 ms | all |
+| Chrome, WebGPU | `move=fly`, game guess | not in 60 s | 13.35 ms | 11.9, 12.5–12.6 ms | 87–88 % | none | 0 of 75 a window |
+| Chrome, WebGPU | `move=walk light=8000 compare=on` | 11.7 s | 13.35 ms | 0.02, 11.1–11.5 ms | 16–17 % | 800–840 ms; 814–1,040 ms | all |
+| Chrome, WebGPU | `move=walk`, game guess | 50.3 s | 13.35 ms | 9.0–9.2, 11.5–11.6 ms | 72 % | 1.33–1.35 s; 1.37–1.72 s | all |
+| Metal | `move=fly` | 11.3 s | 13.33 ms | 0.01, 3.6–3.8 ms | 5 % | 147 ms; 147 ms | all |
+| Metal | `move=fly light=8000 compare=on` | 11.6 s | 13.33–13.44 ms | 0.01–6.2, 11.1–12.0 ms | 30–37 % | 347–440 ms; 427–520 ms | all |
+| Metal | `move=fly`, game guess | 30.7 s | 26.67 ms | 11.8–11.9, 12.3–12.4 ms | 70–71 % | 547–573 ms; 587–3,854 ms | 75, 75, 72 of 75 |
+| Metal | `move=walk light=8000 compare=on` | 11.4 s | 13.33 ms | 0.01, 10.7–10.8 ms | 6 % | 347–360 ms; 427–453 ms | all |
+| Metal | `move=walk`, game guess | 28.2 s | 13.33 ms | 5.4–5.6, 11.9–12.1 ms | 46–49 % | 573–587 ms; 627–934 ms | all |
+
+With meshing alone a refill takes a fifth of a chunk crossing. With lighting and
+the reuse compare on, the frame thread is the limit. In Chrome a flight at the
+smaller light region finishes each refill about when the next crossing starts, with
+four fifths of all time in `prepare`; at the game guess it finishes none. On Metal
+the same code runs about three times as fast, the refills fit, and at the game
+guess the frame no longer holds the display period: `prepare` runs to its deadline
+in most frames and a frame's blended upload is 9.5 MB. Walking fits everywhere.
+No web row has an overload frame (`catchUp.overloadFrames`), a Metal row has at
+most 4, and a tick costs 0.03 ms. The GPU's frame time has a p95 of 0.36 to 0.57 ms.
+
+A crossing that began while the window was first filling can stay counted as
+unfinished for the rest of a run (up to 7 here, 33 at the Metal game guess).
+
+Draw cost, from `--pair draw`: the same switches with `draw=on` and `draw=off`,
+which did equal work in every window. Each cell is the encode time's p50 with draws,
+without them, and the difference. These rows were taken at `3ea11d0d8`, when a
+retirement was a whole unit of the allowance.
+
+| Renderer | Switches | Draws a frame | Encode p50, `draw=on` | `draw=off` | Difference |
+|---|---|---|---|---|---|
+| Chrome, WebGPU | `move=stand` | 1,136 | 1.28–1.38 ms | 0.84–0.95 ms | 0.34–0.52 ms |
+| Chrome, WebGPU | `move=fly` | 1,205–1,243 | 1.17–1.48 ms | 0.91–1.33 ms | 0.15–0.30 ms |
+| Metal | `move=stand` | 1,136 | 1.24–1.65 ms | 1.13–1.23 ms | 0.10–0.41 ms |
+| Metal | `move=fly` | 1,201–1,242 | 1.40–1.63 ms | 0.98–1.10 ms | 0.42–0.62 ms |
+
+The p95 of the flying pairs is `prepare`'s and differs between the two runs by more
+than the draws cost, so it says nothing about them.
+
+Not taken: an iPad and a Pixel 5. The script's `ios` carrier has not run on a device.

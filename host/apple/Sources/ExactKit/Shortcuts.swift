@@ -19,7 +19,7 @@ extension Presenter {
     var shortcutModal: NodeView? {
         #if os(iOS) || os(tvOS)
         // A dialog in its sheet is modal with nothing written (LLP 1115.000 D11.5).
-        if let dialog = menus.sheets.topDialog { return dialog }
+        if let dialog = dialogs.topDialog { return dialog }
         #endif
         return chrome.ids("accessibilityModal").sorted().compactMap { views[$0] }
             .last { $0.props["accessibilityModal"] == "true" && $0.accessibilityVisible }

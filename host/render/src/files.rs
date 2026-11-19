@@ -1,7 +1,25 @@
 //! The dist's files as the server names them (LLP 1048.000 D10): which
 //! paths are files, their types, and the build a URL names.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// The build's files named by their content (`routes.json` `files`, LLP
+/// 1153.004 D4): from the name each had (`app.js`; a chunk's own) to the
+/// name it is written as. Empty for a build without the table.
+pub(crate) fn content_files(dist: &Path) -> HashMap<String, String> {
+    std::fs::read(dist.join("routes.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|table| table.get("files")?.as_object().cloned())
+        .map(|files| {
+            files
+                .into_iter()
+                .filter_map(|(from, to)| Some((from, to.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Whether a path names a file (its last segment has an extension the
 /// server knows as a type) rather than a page.
@@ -40,8 +58,8 @@ fn digest_prefix(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Only the split build's `stages/<name>.<digest>.wasm` is content-addressed.
-/// Compare with the unencoded bytes' hash, not just the shape of the name.
+/// A split build's `stages/<name>.<digest>.wasm`, named by its content:
+/// compared with the unencoded bytes' hash, not just the shape of the name.
 pub(crate) fn named_stage(path: &str, tag: &str) -> bool {
     path.strip_prefix("/stages/")
         .filter(|name| !name.contains('/'))
@@ -56,21 +74,25 @@ pub(crate) fn named_stage(path: &str, tag: &str) -> bool {
 /// and never stored, as its script is.
 pub(crate) const AUTH_CALLBACK: &str = "/.exact/auth/callback";
 
-/// A file `dist` serves as it is: anything under `/.exact/`, and any other
-/// file but a page (`.html`), which is rendered. Never outside `dist`.
+/// A public file inside `dist`. HTML is rendered, except under `/.exact/`,
+/// where pages are served as written.
 pub(crate) fn static_file(dist: &Path, path: &str) -> Option<(PathBuf, &'static str)> {
     let decoded = percent_decode(path, false)?;
     if decoded.split('/').any(|part| part == ".." || part == ".") || decoded.contains('\\') {
         return None;
     }
-    let mut file = dist.join(decoded.trim_start_matches('/'));
+    let relative = decoded.trim_start_matches('/');
+    if !public_path(Path::new(relative)) {
+        return None;
+    }
+    let mut file = dist.join(relative);
     let exact = decoded.starts_with("/.exact/");
     if exact && file.is_dir() {
         file = file.join("index.html");
     }
     let root = dist.canonicalize().ok()?;
     let file = file.canonicalize().ok()?;
-    if !file.starts_with(&root) || !file.is_file() {
+    if !public_path(file.strip_prefix(&root).ok()?) || !file.is_file() {
         return None;
     }
     let extension = file.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -82,6 +104,17 @@ pub(crate) fn static_file(dist: &Path, path: &str) -> Option<(PathBuf, &'static 
         return Some((file.clone(), content_type("html")));
     }
     Some((file.clone(), content_type(extension)))
+}
+
+/// Hidden build files are private; the two root namespaces are public routes.
+pub(crate) fn public_path(path: &Path) -> bool {
+    path.components().enumerate().all(|(i, part)| {
+        let std::path::Component::Normal(part) = part else {
+            return false;
+        };
+        let part = part.to_string_lossy();
+        !part.starts_with('.') || i == 0 && matches!(&*part, ".exact" | ".well-known")
+    })
 }
 
 pub(crate) fn percent_decode(path: &str, allow_slash: bool) -> Option<String> {
@@ -126,5 +159,81 @@ pub(crate) fn content_type(extension: &str) -> &'static str {
         "txt" | "wgsl" => "text/plain; charset=utf-8",
         "xml" => "application/xml",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_intermediates_are_neither_served_nor_compressed() {
+        let dist = std::env::temp_dir().join(format!("exact-render-hidden-{}", std::process::id()));
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&dist).unwrap();
+        let _remove = Remove(dist.clone());
+        for name in [
+            ".gen/plan.map.json",
+            ".git/config",
+            ".env",
+            "assets/.hidden/data.json",
+            ".exact/.env",
+            ".well-known/.env",
+            "assets/.exact/private.json",
+            ".exact/auth/callback/index.html",
+            ".exact/install/index.html",
+            ".well-known/assetlinks.json",
+            "assets/app.js",
+        ] {
+            let path = dist.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "private").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dist.join(".gen"), dist.join("intermediates")).unwrap();
+            std::os::unix::fs::symlink(&dist, dist.join("loop")).unwrap();
+            std::os::unix::fs::symlink(dist.join("assets/app.js"), dist.join("alias.js")).unwrap();
+            assert!(static_file(&dist, "/intermediates/plan.map.json").is_none());
+            assert!(static_file(&dist, "/alias.js").is_some());
+        }
+        for path in [
+            "/.gen/plan.map.json",
+            "/%2egen/plan.map.json",
+            "/.git/config",
+            "/.env",
+            "/assets/.hidden/data.json",
+            "/assets/%2Ehidden/data.json",
+            "/../.env",
+            "/.exact/.env",
+            "/.well-known/.env",
+            "/assets/.exact/private.json",
+            "/.exact/../.gen/plan.map.json",
+            "/.exact/%2e%2e/.gen/plan.map.json",
+        ] {
+            assert!(static_file(&dist, path).is_none(), "{path}");
+        }
+        for path in [
+            "/.exact/auth/callback",
+            "/.exact/install/",
+            "/.well-known/assetlinks.json",
+            "/assets/app.js",
+        ] {
+            assert!(static_file(&dist, path).is_some(), "{path}");
+        }
+        let compressed = crate::encode::files(&dist);
+        assert_eq!(compressed.len(), 2, "{compressed:?}");
+        assert!(compressed.contains(
+            &dist
+                .join(".well-known/assetlinks.json")
+                .canonicalize()
+                .unwrap()
+        ));
+        assert!(compressed.contains(&dist.join("assets/app.js").canonicalize().unwrap()));
     }
 }

@@ -8,36 +8,52 @@
 //! scrim of 32 % black that dims the page and its bars. It rests at its
 //! `navigationDetent` heights (`medium` half the tallest, `large` the
 //! window below the status bar, a point height or a percentage of the
-//! tallest, each with the bar under its foot added below), opening at
-//! `navigationInitialDetent`, else the first. It is laid out once, at its
-//! tallest, as Compose lays out a sheet's content: at a lower detent the
-//! rest is below the window's edge. It slides up as it opens and down as it
-//! leaves, and while the keyboard is up it rests at its tallest. A route
-//! pushed while a sheet is on top is shown in it (expo/exact#326), and the
-//! sheet keeps the detents of the route that opened it.
+//! tallest, `fit-content` its route's content measured alone, as the iOS
+//! host measures it, each with the bar under its foot added below and
+//! none above the tallest), opening at `navigationInitialDetent`, else
+//! the first. It is laid out at its tallest, as Compose lays out a sheet's
+//! content: at a lower detent the rest is below the window's edge. It
+//! slides up as it opens and down as it leaves. While the keyboard is up
+//! it rests at its tallest, but for a sheet resting at `fit-content`,
+//! which keeps its content's height on the keys, as Compose's
+//! `ModalBottomSheet` rises with the IME inset, and goes to the tallest
+//! only where that does not fit. A route pushed while a sheet is on top
+//! is shown in it (expo/exact#326), and the sheet keeps the detents of the
+//! route that opened it.
 //!
 //! **Pushes and pops** cross on Material's shared X axis: the route that
-//! leaves slides 30 toward where it goes and fades in the first 35 % of
+//! leaves slides 30 toward where it goes and fades out in the first 35 % of
 //! 300 ms, the one that arrives slides in 30 from the other side and fades
-//! in over the rest. Predictive Back previews a pop or a sheet's dismissal
-//! as Material's guidance has it (`stage/touch.rs`). Nothing moves while the
-//! person asks for less motion.
+//! in over the rest. A switch to another stack fades through: the leaving
+//! route fades out over the first 35 % of emphasized progress, and the
+//! arriving route fades in over the rest as it grows from 92 %.
+//! Predictive Back previews a pop or a sheet's dismissal
+//! as Material's guidance has it (`stage/touch.rs`). A route that declares
+//! its own entrance or exit plays that instead (`stage/authored.rs`).
+//! A route with a visible `navigationSource` grows from it by Material's
+//! container transform (`stage/zoom.rs`), and returns into it on Back.
+//! Nothing moves while the person asks for less motion.
 //!
 //! A shell with no bars (desktop Linux, a headless run) shows a modal
 //! route as written, with no motion, and a route pushed inside it in the
 //! box the sheet's own route was laid out in.
 use super::*;
 use crate::navigation::{sheet_of, Presented};
-use crate::paint::stage::{Item, Stage};
+use crate::paint::stage::{destination_path, Cross, Item, Stage};
 use crate::paint::tape::Tape;
 use crate::paint::{Rect4, Shape};
-use exact_kernel::{BlockAxis, HostBlock, NodeKey};
+use exact_kernel::{BlockAxis, HostBlock, Kernel, NodeKey};
 use std::rc::Rc;
 use tiny_skia::Transform;
 
+mod authored;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 mod touch;
+mod zoom;
+
+use authored::{Authored, Top};
+use exact_kernel::StyleId;
 
 /// The room a sheet's drag handle takes at its top, points: Material's
 /// handle, 4 tall with 22 above and below.
@@ -53,29 +69,28 @@ const EXIT_MS: f64 = 200.0;
 const SETTLE_MS: f64 = 300.0;
 const AXIS_MS: f64 = 300.0;
 const AXIS_SHIFT: f32 = 30.0;
-/// The share of the shared axis the leaving route fades in.
+/// The progress at which the leaving route has faded out.
 const AXIS_FADE: f32 = 0.35;
+const FADE_THROUGH_SCALE: f32 = 0.92;
 
-/// Material 3's easing curves (`MotionTokens`), as cubic Béziers.
+/// Material 3's easing curves (`MotionTokens`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Curve {
     Decelerate,
     Accelerate,
     Standard,
+    Emphasized,
 }
 
 impl Curve {
-    fn points(self) -> (f32, f32, f32, f32) {
-        match self {
+    /// The curve's progress at `t`, both 0 to 1.
+    fn ease(self, t: f32) -> f32 {
+        let (x1, y1, x2, y2) = match self {
             Curve::Decelerate => (0.05, 0.7, 0.1, 1.0),
             Curve::Accelerate => (0.3, 0.0, 0.8, 0.15),
             Curve::Standard => (0.2, 0.0, 0.0, 1.0),
-        }
-    }
-
-    /// The curve's progress at `t`, both 0 to 1.
-    fn ease(self, t: f32) -> f32 {
-        let (x1, y1, x2, y2) = self.points();
+            Curve::Emphasized => return zoom::emphasized(t),
+        };
         let at = |a: f32, b: f32, s: f32| {
             let u = 1.0 - s;
             3.0 * u * u * s * a + 3.0 * u * s * s * b + s * s * s
@@ -163,7 +178,10 @@ struct Sheet {
     /// Its top edge in the page, points.
     top: Glide,
     /// What its heights were computed from: a change places it again.
-    said: (Option<String>, (f32, f32), bool),
+    said: Said,
+    /// Its route's `fit-content` height, by the kernel's layout stamp it
+    /// was measured at ([`Presenter::fit_content`]).
+    measured: Option<((u64, u64, u64), f32)>,
     /// A full-screen route presented above it covers it: it is drawn
     /// beneath that route, as it was, and takes no touch.
     covered: bool,
@@ -182,11 +200,10 @@ struct Closing {
     scale: f32,
 }
 
-/// A push or a pop crossing.
+/// A route crossing.
 struct Shift {
     forward: bool,
-    /// The route that leaves: still in the tree after a push, only its
-    /// kept drawing after a pop.
+    /// The route that leaves, drawn live or from its kept drawing once removed.
     outgoing: NodeKey,
     incoming: NodeKey,
     /// The sheet it runs inside, by the route that opened it.
@@ -196,19 +213,59 @@ struct Shift {
     bar: Option<(Rc<Tape>, Rect4)>,
     /// Where a predictive Back had moved the leaving route.
     from: Option<Pose>,
+    /// The part the route it adds or removes declared, which it plays in
+    /// place of the shared axis, the other route at rest (LLP 1013.001 D2).
+    authored: Option<Authored>,
+    /// Only that route is drawn: the other is a sheet's, drawn as the sheet.
+    alone: bool,
+    container: Option<zoom::Container>,
+    /// A switch between stacks uses Material's fade through.
+    through: bool,
+    /// The leaving route's ancestors when the switch began: what of them
+    /// still stands is shared with the arriving route, not the arriving
+    /// side's to move.
+    left: Vec<NodeKey>,
 }
 
-/// How a route is drawn, about its own box.
+impl Shift {
+    /// What moves with `route` in a fade through: its destination path,
+    /// up to the first ancestor the other side holds too.
+    fn destination(&self, kernel: &Kernel, route: ViewId) -> Vec<ViewId> {
+        let live = |key: NodeKey| kernel.node_by_key(key).map(|n| keys_above(kernel, n.id));
+        let other = match kernel.node(route).is_some_and(|n| n.key == self.incoming) {
+            true => [self.left.clone(), live(self.outgoing).unwrap_or_default()].concat(),
+            false => live(self.incoming).unwrap_or_default(),
+        };
+        destination_path(kernel, route, &other)
+    }
+}
+
+/// The keys of `id`'s ancestors, nearest first.
+fn keys_above(kernel: &Kernel, id: ViewId) -> Vec<NodeKey> {
+    let mut keys = Vec::new();
+    let mut at = kernel.node(id).and_then(|n| n.parent);
+    while let Some(node) = at.and_then(|id| kernel.node(id)) {
+        keys.push(node.key);
+        at = node.parent;
+    }
+    keys
+}
+
+/// A route's motion in its box, or in the page for a fade through.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Pose {
     dx: f32,
     dy: f32,
     scale: f32,
-    /// The point it scales about, in its own box.
+    /// Degrees clockwise, about `origin`.
+    rotate: f32,
+    /// The point it scales and turns about, in that drawing space.
     origin: (f32, f32),
     opacity: f32,
-    /// Its corners' radius while a predictive Back shrinks it.
+    /// Its corners' radius while Back shrinks it or a container grows.
     radius: f32,
+    /// A width-fitted container clips the route to this local height.
+    height: Option<f32>,
 }
 
 impl Pose {
@@ -216,15 +273,18 @@ impl Pose {
         dx: 0.0,
         dy: 0.0,
         scale: 1.0,
+        rotate: 0.0,
         origin: (0.0, 0.0),
         opacity: 1.0,
         radius: 0.0,
+        height: None,
     };
 
-    /// Its box's own space to the page's, the box at `at`.
+    /// The pose about its origin, translated to `at`.
     fn transform(&self, at: (f32, f32)) -> Transform {
         Transform::from_translate(at.0 + self.dx, at.1 + self.dy)
             .pre_translate(self.origin.0, self.origin.1)
+            .pre_rotate(self.rotate)
             .pre_scale(self.scale, self.scale)
             .pre_translate(-self.origin.0, -self.origin.1)
     }
@@ -240,23 +300,37 @@ pub(super) struct State {
     gesture: Option<touch::Gesture>,
     /// The first root's stack as last seen, by key.
     seen: Vec<NodeKey>,
+    /// Its top route as last seen.
+    top: Option<Top>,
+    /// The route an authored entrance brings in, as last told the host.
+    arriving: Option<ViewId>,
     /// The top bar's picture as last drawn, and the route it is of.
     bar: Option<(NodeKey, Rc<Tape>, Rect4)>,
     /// The routes given a block of the stage's.
     blocks: Vec<ViewId>,
+    zooms: Vec<zoom::Source>,
+}
+
+/// What a sheet's heights are computed from: its `navigationDetent`, the
+/// page's height and the tallest, whether the keyboard is up, and its
+/// `fit-content` height.
+type Said = (Option<String>, (f32, f32), bool, Option<f32>);
+
+/// Whether `detent` names `fit-content`.
+fn fits(detent: Option<&str>) -> bool {
+    detent.is_some_and(|d| d.split_whitespace().any(|w| w == "fit-content"))
 }
 
 /// The sheet heights `detent` asks for on a page `tallest` high below the
-/// status bar, the bar under the foot `foot` high; unreadable words are
-/// left out, and none left is the tallest.
-fn heights(detent: Option<&str>, tallest: f32, foot: f32) -> Vec<f32> {
+/// status bar, the bar under the foot `foot` high, its route's content
+/// `fit` high with that bar; unreadable words are left out, and none left
+/// is the tallest.
+fn heights(detent: Option<&str>, tallest: f32, foot: f32, fit: f32) -> Vec<f32> {
     let mut out: Vec<f32> = (detent.unwrap_or("large").split_whitespace())
         .filter_map(|d| match d {
             "large" => Some(tallest),
             "medium" => Some(tallest / 2.0 + foot),
-            // Laid out at the tallest, a sheet has no height of its own
-            // content to rest at: `fit-content` rests at `medium`.
-            "fit-content" => Some(tallest / 2.0 + foot),
+            "fit-content" => Some(fit),
             d => match d.strip_suffix('%') {
                 Some(p) => p.parse::<f32>().ok().filter(|p| *p > 0.0).map(|p| {
                     if p >= 100.0 {
@@ -323,7 +397,7 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// Follow the first root's stack after a commit or a change of the
-    /// window: sheets open and close, a push or a pop starts its crossing,
+    /// window: sheets open and close, a route change starts its crossing,
     /// and the routes in a sheet are laid out in its block.
     pub(super) fn sync_stage(&mut self) {
         let now = self.host.now();
@@ -362,9 +436,10 @@ impl<D: DataSource> Presenter<D> {
             .collect();
         let before = std::mem::take(&mut self.stage.seen);
         self.stage.seen = keys.clone();
-        if presents {
-            self.sync_shift(&before, &keys, &kinds, still, now);
-        }
+        let top_was = self.stage.top.take();
+        self.sync_shift(&before, &stack, &keys, &kinds, top_was, now);
+        self.sync_sources();
+        self.stage.top = self.top_of(&stack, &kinds);
         // Sheets that went slide out from where they were.
         let (x, width) = self.sheet_span();
         let (h, status, foot) = self.sheet_room();
@@ -378,11 +453,7 @@ impl<D: DataSource> Presenter<D> {
         };
         for sheet in gone {
             let from = self.sheet_top_now(&sheet);
-            let scale = self
-                .stage
-                .preview
-                .as_ref()
-                .map_or(1.0, |p| p.sheet_scale(sheet.modal));
+            let scale = (self.stage.preview.as_ref()).map_or(1.0, |p| p.sheet_scale(sheet.modal));
             if !still && presents && self.brush.kept(sheet.shown) {
                 self.stage.closing.push(Closing {
                     shown: sheet.shown,
@@ -402,6 +473,12 @@ impl<D: DataSource> Presenter<D> {
             .preview
             .take_if(|p| !p.live(&keys) || p.returned(now));
         let tallest = (h - status).max(1.0);
+        // What of the page the keyboard covers, where it did not end the
+        // page above it (`interactive-widget: overlays-content`).
+        let lift = match self.window().filter(|_| keyboard) {
+            Some(w) => (h - (w.size.1 - w.keyboard[2] - self.chrome().frame[1])).max(0.0),
+            None => 0.0,
+        };
         for (i, last) in wanted {
             let kernel = self.host.kernel();
             let node = kernel.node(stack[i]).expect("a live route");
@@ -410,20 +487,39 @@ impl<D: DataSource> Presenter<D> {
                 .props
                 .str(PropId::NavigationInitialDetent)
                 .map(str::to_owned);
-            let said = (detent.clone(), (h, tallest), keyboard);
-            let mut found = heights(detent.as_deref(), tallest, foot);
+            let stamp = kernel.layout_stamp();
+            let kept = (self.stage.sheets.iter())
+                .find(|s| s.modal == keys[i])
+                .and_then(|s| s.measured);
+            let measured = match (presents && fits(detent.as_deref()), kept) {
+                (false, _) => None,
+                (true, Some(m)) if m.0 == stamp => Some(m),
+                (true, _) => self.fit_content(keys[i]),
+            };
+            // A `fit-content` sheet rests on the keyboard, as Compose's
+            // `ModalBottomSheet` rises with the IME inset.
+            let fit = measured.map(|(_, content)| (content + foot.max(lift)).clamp(1.0, tallest));
+            let said = (detent.clone(), (h, tallest), keyboard, fit);
+            let mut found = heights(detent.as_deref(), tallest, foot, fit.unwrap_or(tallest));
             if !presents {
                 found = vec![h];
             }
+            let fit_at = |found: &[f32]| {
+                fit.and_then(|fit| found.iter().position(|v| (v - fit).abs() < 0.5))
+            };
+            // While the keyboard is up a sheet rests at its tallest, but
+            // for one resting at `fit-content`, which keeps that height
+            // above the keys (the tallest, where it does not fit there).
             let rest = |found: &[f32]| -> usize {
-                if keyboard {
-                    return found.len() - 1;
-                }
-                let first = heights(initial.as_deref(), tallest, foot);
-                (initial.is_some())
+                let first = heights(initial.as_deref(), tallest, foot, fit.unwrap_or(tallest));
+                let at = (initial.is_some())
                     .then(|| found.iter().position(|v| (v - first[0]).abs() < 0.5))
                     .flatten()
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                match keyboard && fit_at(found) != Some(at) {
+                    true => found.len() - 1,
+                    false => at,
+                }
             };
             let covered = kinds[i..]
                 .iter()
@@ -432,11 +528,14 @@ impl<D: DataSource> Presenter<D> {
                 Some(sheet) => {
                     sheet.shown = keys[last];
                     sheet.covered = covered;
+                    sheet.measured = measured;
                     if sheet.said != said {
-                        sheet.at = if keyboard {
-                            found.len() - 1
-                        } else {
-                            sheet.at.min(found.len() - 1)
+                        let was = (sheet.said.3)
+                            .filter(|fit| (sheet.heights[sheet.at] - fit).abs() < 0.5);
+                        sheet.at = match (was.and(fit_at(&found)), keyboard) {
+                            (Some(at), _) => at,
+                            (None, true) => found.len() - 1,
+                            (None, false) => sheet.at.min(found.len() - 1),
                         };
                         sheet.top = Glide::still(h - found[sheet.at]);
                         sheet.heights = found;
@@ -457,17 +556,34 @@ impl<D: DataSource> Presenter<D> {
                         at,
                         top,
                         said,
+                        measured,
                         covered,
                     });
                 }
             }
         }
         self.stage.closing.retain(|c| c.top.moving(now));
+        if self.motion_off() {
+            self.stage.shift = None;
+            self.stage.preview = None;
+        }
         if (self.stage.shift.as_ref()).is_some_and(|s| !s.progress.moving(now)) {
             self.stage.shift = None;
         }
+        self.hold_arriving();
         self.place_sheets(&stack, &kinds);
         self.dirty |= self.stage_moving();
+    }
+
+    /// The height a `fit-content` detent asks of a sheet's route, `key`:
+    /// the route laid out alone at its block's width, its own height left
+    /// to its content, as the iOS host measures it (LLP 1075.003 §9.11,
+    /// `Kernel::fit_content_height`), with the kernel's layout stamp. Its
+    /// handle's room is in it, and the bar under its foot is not.
+    fn fit_content(&mut self, key: NodeKey) -> Option<((u64, u64, u64), f32)> {
+        let kernel = self.host.runner_mut().kernel_mut();
+        let height = kernel.fit_content_height(key)? - kernel.cover_bottom(key);
+        Some((kernel.layout_stamp(), height.max(0.0)))
     }
 
     /// The routes in each sheet laid out in its block: the sheet's width
@@ -491,6 +607,7 @@ impl<D: DataSource> Presenter<D> {
                 };
                 let tallest = sheet.heights[sheet.heights.len() - 1];
                 HostBlock {
+                    tactic: Default::default(),
                     width: BlockAxis::Is(width),
                     height: BlockAxis::Is(tallest.round()),
                 }
@@ -504,6 +621,7 @@ impl<D: DataSource> Presenter<D> {
                     continue;
                 };
                 HostBlock {
+                    tactic: Default::default(),
                     width: BlockAxis::Is(frame.width),
                     height: BlockAxis::Is(frame.height),
                 }
@@ -537,14 +655,17 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A push or a pop of one route, within the page or within one sheet,
-    /// starts a crossing; anything else is a cut.
+    /// A push or a pop of one route crosses on the shared axis; a switch
+    /// between page stacks fades through. A part the route it adds
+    /// or removes declares plays instead (`stage/authored.rs`), on a shell
+    /// with no bars too; else only a shell with bars moves.
     fn sync_shift(
         &mut self,
         before: &[NodeKey],
+        stack: &[ViewId],
         now_keys: &[NodeKey],
         kinds: &[Presented],
-        still: bool,
+        top_was: Option<Top>,
         now: f64,
     ) {
         let (Some(old), Some(new)) = (before.last(), now_keys.last()) else {
@@ -553,10 +674,53 @@ impl<D: DataSource> Presenter<D> {
         if old == new {
             return;
         }
+        // A second route change ends the first transition (LLP 1013.001 D6):
+        // whatever this one chooses, a cut included, starts from rest.
+        self.stage.shift = None;
+        let left = (top_was.as_ref().filter(|t| t.key == *old))
+            .map_or_else(Vec::new, |t| t.ancestors.clone());
         let pushed = now_keys.len() > before.len() && now_keys.starts_with(before);
         let popped = before.len() > now_keys.len() && before.starts_with(now_keys);
         let top = now_keys.len() - 1;
+        let returning_fullscreen = top_was.as_ref().is_some_and(|t| t.key == *old && !t.pushed);
+        if now_keys.len().abs_diff(before.len()) == 1 {
+            let part = match (pushed, popped) {
+                (true, _) => {
+                    (self.entrance(stack, top)).map(|part| (part, kinds[top] == Presented::Pushed))
+                }
+                (_, true) => {
+                    (top_was.filter(|t| t.key == *old)).and_then(|t| Some((t.exit?, t.pushed)))
+                }
+                _ => None,
+            };
+            if let Some((part, owner_pushed)) = part {
+                let change = (*old, *new);
+                return self.start_authored(part, pushed, owner_pushed, change, kinds, now);
+            }
+        }
+        if !self.stage_presents() {
+            return;
+        }
+        let still = self.motion_off();
+        let returning_source = self.stage.zooms.iter().any(|z| z.route == *old);
+        let container = self.navigation_container(before, stack, now_keys, kinds);
+        // A full-screen route returns into its source or cuts. Its drawing
+        // is kept only for a switch to another stack.
+        if popped && returning_fullscreen && container.is_none() {
+            return;
+        }
+        // A page goes to a page in another stack. A sheet's own change
+        // remains the sheet's, including when the old stack is removed.
+        let through = !pushed
+            && !popped
+            && before.first() != now_keys.first()
+            && kinds[top] != Presented::Sheet
+            && sheet_of(kinds, top).is_none()
+            && !kinds.contains(&Presented::Sheet)
+            && !self.stage.sheets.iter().any(|s| before.contains(&s.modal));
         let (forward, within) = match (pushed, popped) {
+            (true, _) if container.is_some() => (true, None),
+            _ if through => (true, None),
             // The route pushed is a page, or pushed inside a sheet.
             (true, _) if kinds[top] == Presented::Pushed && now_keys.len() == before.len() + 1 => {
                 (true, sheet_of(kinds, top))
@@ -574,7 +738,7 @@ impl<D: DataSource> Presenter<D> {
         };
         let sheet = within.map(|i| now_keys[i]);
         // A pop out of a sheet's first route closes the sheet instead.
-        if !forward && within.is_none() && kinds[top] != Presented::Pushed {
+        if !forward && within.is_none() && kinds[top] != Presented::Pushed && !returning_source {
             return;
         }
         let size = match sheet {
@@ -593,9 +757,27 @@ impl<D: DataSource> Presenter<D> {
             outgoing: *old,
             incoming: *new,
             sheet,
-            progress: Glide::new(0.0, 1.0, now, AXIS_MS, Curve::Standard),
+            progress: match container {
+                Some(_) => zoom::progress(forward, now),
+                None => Glide::new(
+                    0.0,
+                    1.0,
+                    now,
+                    AXIS_MS,
+                    if through {
+                        Curve::Emphasized
+                    } else {
+                        Curve::Standard
+                    },
+                ),
+            },
             bar,
             from,
+            authored: None,
+            alone: false,
+            container,
+            through,
+            left,
         });
     }
 
@@ -656,8 +838,15 @@ impl<D: DataSource> Presenter<D> {
         let kernel = self.host.kernel();
         let mut out = Vec::new();
         if let Some(shift) = &self.stage.shift {
-            out.extend(kernel.node_by_key(shift.incoming).map(|n| n.id));
-            out.extend(kernel.node_by_key(shift.outgoing).map(|n| n.id));
+            for key in [shift.incoming, shift.outgoing] {
+                let Some(route) = kernel.node_by_key(key).map(|n| n.id) else {
+                    continue;
+                };
+                match shift.through {
+                    true => out.extend(shift.destination(kernel, route)),
+                    false => out.push(route),
+                }
+            }
         }
         if let Some((outgoing, incoming)) = self.stage.preview.as_ref().and_then(|p| p.pair()) {
             out.extend(kernel.node_by_key(outgoing).map(|n| n.id));
@@ -670,6 +859,16 @@ impl<D: DataSource> Presenter<D> {
     pub(super) fn stage_paint(&mut self) -> Stage {
         let mut stage = Stage::default();
         let kernel = self.host.kernel();
+        for source in &mut self.stage.zooms {
+            if let Some(n) = kernel.node_by_key(source.route) {
+                source.bounds = (
+                    n.frame.x - self.page.0,
+                    n.frame.y - self.page.1,
+                    n.frame.width,
+                    n.frame.height,
+                );
+            }
+        }
         let stack: Vec<ViewId> = self
             .host
             .shown_stack()
@@ -678,7 +877,8 @@ impl<D: DataSource> Presenter<D> {
         let Some(top) = stack.last().copied() else {
             return stage;
         };
-        // After the last route of the stack, in the tree's order.
+        // After the last route of the stack, in the tree's order; in a fade
+        // through, after the destinations crossing.
         let parent = kernel.node(top).and_then(|n| n.parent);
         stage.after = (parent.and_then(|p| kernel.node(p)))
             .map(|p| p.children())
@@ -688,13 +888,32 @@ impl<D: DataSource> Presenter<D> {
                         .node(*c)
                         .is_some_and(|n| n.props.str(PropId::NavigationKey).is_some())
                 })
+            })
+            .into_iter()
+            .collect();
+        if let Some(shift) = self.stage.shift.as_ref().filter(|s| s.through) {
+            stage.after = [shift.incoming, shift.outgoing]
+                .iter()
+                .filter_map(|key| kernel.node_by_key(*key))
+                .filter_map(|n| shift.destination(kernel, n.id).last().copied())
+                .collect();
+        }
+        // A top route whose exit is declared is kept, so that its exit can
+        // play after the commit that removes it.
+        let exits = !self.motion_off()
+            && (self.stage.top.as_ref()).is_some_and(|t| {
+                t.exit.is_some() && kernel.node(top).is_some_and(|n| n.key == t.key)
             });
+        if exits {
+            stage.tape.push(top);
+        }
         if !self.stage_presents() {
-            self.desktop_stage(&mut stage, &stack);
+            self.desktop_stage(&mut stage, &stack, exits);
             return stage;
         }
         // A page Back would pop is kept, so that it can slide out after the
-        // commit that removes it.
+        // commit that removes it; any other page, so that a switch to another
+        // stack can fade it.
         let kinds: Vec<Presented> = (stack.iter())
             .map(|id| {
                 kernel
@@ -702,9 +921,16 @@ impl<D: DataSource> Presenter<D> {
                     .map_or(Presented::Pushed, |n| Presented::of(&n))
             })
             .collect();
-        let pops = stack.len() > 1 && kinds[stack.len() - 1] == Presented::Pushed;
-        if pops && !self.motion_off() && sheet_of(&kinds, stack.len() - 1).is_none() {
-            stage.tape.push(top);
+        let zoomed = kernel
+            .node(top)
+            .is_some_and(|n| self.stage.zooms.iter().any(|z| z.route == n.key));
+        let page = kinds[stack.len() - 1] != Presented::Sheet;
+        if page && !self.motion_off() && sheet_of(&kinds, stack.len() - 1).is_none() {
+            let pops = stack.len() > 1 && (kinds[stack.len() - 1] == Presented::Pushed || zoomed);
+            match pops {
+                true => stage.tape.push(top),
+                false => stage.rest.push(top),
+            }
         }
         let now = self.host.now();
         let (bar_top, bar_bottom) = self.bar_pictures();
@@ -736,8 +962,12 @@ impl<D: DataSource> Presenter<D> {
                 true => [(outgoing, out_pose, out_bar), (incoming, in_pose, in_bar)],
                 false => [(incoming, in_pose, in_bar), (outgoing, out_pose, out_bar)],
             };
+            // Under an owner alone, the other route is its sheet's to draw.
+            let skip = page_shift.filter(|s| s.alone).map(|_| order[0].0);
             for (key, pose, bar) in order {
-                self.stage_page_route(&mut stage, key, pose, bar);
+                if Some(key) != skip {
+                    self.stage_page_route(&mut stage, key, pose, bar, None);
+                }
             }
         } else if let Some((tape, frame)) = &bar_top {
             stage
@@ -760,31 +990,67 @@ impl<D: DataSource> Presenter<D> {
         Transform::from_translate(frame.0 - page[0], frame.1 - page[1])
     }
 
-    /// A page route crossing: its bar, then the route, as `pose` moves both.
+    /// A route crossing: where the walk paints it, or at `place`, a sheet's
+    /// box on a shell with no bars. A fade through moves the destination
+    /// that holds the route, about the window's centre, and leaves its top
+    /// bar in place.
     fn stage_page_route(
         &self,
         stage: &mut Stage,
         key: NodeKey,
         pose: Pose,
         bar: Option<(Rc<Tape>, Rect4)>,
+        place: Option<(f32, f32)>,
     ) {
         let kernel = self.host.kernel();
         let live = kernel.node_by_key(key);
-        let at = match &live {
-            Some(n) => (n.frame.x - self.page.0, n.frame.y - self.page.1),
-            None => (0.0, 0.0),
+        let Some(at) = place else {
+            let through = self.stage.shift.as_ref().filter(|s| s.through);
+            let key = match &live {
+                Some(n) => {
+                    if !self.motion_off() {
+                        stage.tape.push(n.id);
+                    }
+                    let path = match through {
+                        Some(shift) => shift.destination(kernel, n.id),
+                        None => vec![n.id],
+                    };
+                    (path.last().and_then(|id| kernel.node(*id))).map_or(key, |d| d.key)
+                }
+                None => key,
+            };
+            stage.crossing.push(Cross {
+                key,
+                motion: pose.transform((0.0, 0.0)),
+                page: through.is_some(),
+                opacity: pose.opacity,
+                radius: pose.radius,
+                height: pose.height,
+                bar: bar.map(|(tape, frame)| (tape, self.window_to_page(frame))),
+            });
+            return;
         };
+        let kept_size = self
+            .stage
+            .shift
+            .as_ref()
+            .filter(|s| s.outgoing == key)
+            .and_then(|s| s.container)
+            .map_or(self.viewport, |c| (c.route.2, c.route.3));
         let size = live
             .as_ref()
-            .map_or(self.viewport, |n| (n.frame.width, n.frame.height));
+            .map_or(kept_size, |n| (n.frame.width, n.frame.height));
         let ts = pose.transform(at);
         let fades = pose.opacity < 1.0;
         if fades {
             stage.items.push(Item::Opacity(pose.opacity));
         }
-        let rounded = pose.radius > 0.0;
+        let rounded = pose.radius > 0.0 || pose.height.is_some();
         if rounded {
-            let shape = Shape::new((0.0, 0.0, size.0, size.1), [pose.radius; 4]);
+            let shape = Shape::new(
+                (0.0, 0.0, size.0, pose.height.unwrap_or(size.1)),
+                [pose.radius; 4],
+            );
             stage.items.push(Item::Clip(shape, ts));
         }
         match live {
@@ -834,7 +1100,7 @@ impl<D: DataSource> Presenter<D> {
             };
             // A sheet a full-screen route covers is drawn beneath it where
             // that route lets it show, and takes no touch.
-            if sheet.covered && self.host.route_visibility(shown.id).0 {
+            if sheet.covered && self.host.route_hidden_but(shown.id, &self.stage_shows()) {
                 continue;
             }
             let mut items = Vec::new();
@@ -951,10 +1217,42 @@ impl<D: DataSource> Presenter<D> {
             None => self.viewport.0,
         };
         if let Some(shift) = self.stage.shift.as_ref().filter(|s| s.sheet == sheet) {
+            if let Some(part) = &shift.authored {
+                let pose = part.pose(now - shift.progress.start);
+                return match shift.forward {
+                    true => (Pose::REST, pose),
+                    false => (pose, Pose::REST),
+                };
+            }
             let (t, linear) = (
                 shift.progress.at(now).clamp(0.0, 1.0),
                 shift.progress.linear(now),
             );
+            if let Some(container) = shift.container {
+                let pose = container.pose(shift.forward, t, linear, shift.from);
+                return match shift.forward {
+                    true => (Pose::REST, pose),
+                    false => (pose, Pose::REST),
+                };
+            }
+            if shift.through {
+                let (w, h) = self.window().map_or(self.viewport, |window| window.size);
+                let page = self.chrome().frame;
+                let out_pose = Pose {
+                    opacity: (1.0 - t / AXIS_FADE).clamp(0.0, 1.0),
+                    ..Pose::REST
+                };
+                // MaterialFadeThrough applies its interpolator to both
+                // providers: FadeThrough's threshold is eased progress,
+                // and Scale runs for the whole transition.
+                let in_pose = Pose {
+                    scale: FADE_THROUGH_SCALE + (1.0 - FADE_THROUGH_SCALE) * t,
+                    origin: (w / 2.0 - page[0], h / 2.0 - page[1]),
+                    opacity: ((t - AXIS_FADE) / (1.0 - AXIS_FADE)).clamp(0.0, 1.0),
+                    ..Pose::REST
+                };
+                return (out_pose, in_pose);
+            }
             let way = if shift.forward { 1.0 } else { -1.0 };
             // The fades go by the clock, the moves by the curve.
             let out_fade = (1.0 - linear / AXIS_FADE).clamp(0.0, 1.0);
@@ -984,15 +1282,33 @@ impl<D: DataSource> Presenter<D> {
             return (out_pose, in_pose);
         }
         match &self.stage.preview {
-            Some(p) => (p.page_pose(now, width, self.viewport.1), Pose::REST),
+            Some(p) => match self.previewed_exit(p) {
+                Some(exit) => (exit.pose(f64::from(p.shown(now)) * exit.ms()), Pose::REST),
+                None => (p.page_pose(now, width, self.viewport.1), Pose::REST),
+            },
             None => (Pose::REST, Pose::REST),
         }
     }
 
     /// On a shell with no bars, a route pushed inside a sheet is drawn in
-    /// the box its sheet's route was laid out in.
-    fn desktop_stage(&self, stage: &mut Stage, stack: &[ViewId]) {
+    /// the box its sheet's route was laid out in, kept where its exit is
+    /// declared (`exits`), and an authored part plays as on a shell with
+    /// bars, with no bar.
+    fn desktop_stage(&self, stage: &mut Stage, stack: &[ViewId], exits: bool) {
         let kernel = self.host.kernel();
+        if let Some(shift) = &self.stage.shift {
+            let (out_pose, in_pose) = self.shift_poses(self.host.now(), shift.sheet);
+            let order = match shift.forward {
+                true => [(shift.outgoing, out_pose), (shift.incoming, in_pose)],
+                false => [(shift.incoming, in_pose), (shift.outgoing, out_pose)],
+            };
+            let place = (shift.sheet.and_then(|m| kernel.node_by_key(m)))
+                .map(|n| (n.frame.x - self.page.0, n.frame.y - self.page.1));
+            for (key, pose) in order {
+                self.stage_page_route(stage, key, pose, None, place);
+            }
+            return;
+        }
         let kinds: Vec<Presented> = (stack.iter())
             .map(|id| {
                 kernel
@@ -1015,7 +1331,7 @@ impl<D: DataSource> Presenter<D> {
         stage.items.push(Item::Route {
             id: shown.id,
             ts: Transform::from_translate(at.0, at.1),
-            tape: false,
+            tape: exits,
         });
     }
 }

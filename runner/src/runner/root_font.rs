@@ -18,8 +18,8 @@ use exact_plan::Value;
 pub(crate) struct RootFont {
     app: Option<AppSize>,
     host: f64,
-    /// The size the host last said, whatever the app's: what
-    /// `exactViewport().accessibilityTextSize` reads.
+    /// The size the host last said, whatever the app's: UIKit's
+    /// `exactViewport().accessibilityTextSize` reading.
     told: Option<f64>,
 }
 
@@ -186,17 +186,17 @@ impl<D: DataSource> Runner<D> {
 
     /// Whether the person's text size is one of the accessibility sizes, as
     /// UIKit's `isAccessibilityCategory` says (AX1 to AX5, a body of 28 or
-    /// more): only where the platform's own views change at them, in the
-    /// UIKit column (iOS, and tvOS, visionOS and watchOS, which share it); false
-    /// elsewhere, and on the web, which has no such fact. The host's size
-    /// as last told, or primed before boot.
+    /// more), or Android's reported large-text range (LLP 1039 D10).
+    /// UIKit uses the host's size as last told, or primed before boot;
+    /// Android reports its system preference independently of the root font.
     pub(super) fn accessibility_text_size(&self) -> bool {
         use exact_kernel::style::metrics::{column, Column};
         let host = self
             .root_font
             .told
             .unwrap_or_else(|| self.host_root_font_size());
-        column() == Column::Ios && host >= 28.0
+        self.viewport.preferences.accessibility_text_size
+            || (column() == Column::Ios && host >= 28.0)
     }
 
     /// Say whether Bold Text is on (LLP 1115.000 D12.3): the person's
@@ -312,7 +312,7 @@ impl<D: DataSource> Runner<D> {
                     if i > 0 {
                         said.push_str(", ");
                     }
-                    crate::agent::untyped_json(a, &mut said);
+                    crate::json::untyped_json(a, &mut said);
                 }
                 self.log(format!("setRootFontSize({said}) refused: the root font size is a number of px above 0, a percentage of the host's above 0 (\"125%\"), or \"medium\""));
                 return false;

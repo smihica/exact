@@ -14,15 +14,24 @@ extension NodeView {
     /// never a Tab stop on the web. An explicit `tabindex` makes any box
     /// focusable, and a Tab stop only when ≥ 0 (LLP 1088 D7.3).
     package override var acceptsFirstResponder: Bool {
-        if formDisabled || inert || isHiddenOrHasHiddenAncestor || cssVisibilityHidden { return false }
+        if held || formDisabled || inert || isHiddenOrHasHiddenAncestor || cssVisibilityHidden { return false }
         if field != nil || textArea != nil || isNativeButton || nativeValueControl != nil { return false }
-        return props["semanticTag"] == "dialog" || isParagraph || explicitTabIndex != nil || tabbable || isRadio || ariaRadioGroup != nil
+        return props["semanticTag"] == "dialog" || isParagraph || explicitTabIndex != nil || isRadio || focusableByKind
     }
-    var tabbable: Bool {
+    /// A member of a painted group is a stop only as its group's one stop
+    /// (`roleTabStop`, the kernel's: LLP 1166.000 D1), which a negative
+    /// `tabindex` rules out and no other `tabindex` makes.
+    package var tabbable: Bool {
+        if let stop = roleTabStop { return stop }
         if let index = explicitTabIndex { return index >= 0 }
-        if ariaRadioGroup != nil { return ariaRadioTabStop } // an authored radio group is one stop too
-        return kind == "button" || isNativeButton || isDateOrSelect || canvases?.wantsInput(id) == true || pressable || !handlers.isDisjoint(with: Self.focusEvents)
-            || reorderKeys || radioTabStop // a grouped grip takes the keys (LLP 1094 D9); a radio group one stop (x2apps survey #2)
+        return focusableByKind
+    }
+    /// What takes the focus and is a stop by its kind. Apart from `tabbable`
+    /// so that whether a group's member can take the focus
+    /// (`ControlHost.canFocusMember`) never asks which member is the stop.
+    private var focusableByKind: Bool {
+        kind == "button" || isNativeButton || isDateOrSelect || canvases?.wantsInput(id) == true || pressable || !handlers.isDisjoint(with: Self.focusEvents)
+            || presenter?.reorders.takesKeys(self) == true || radioTabStop // a grouped grip takes the keys (LLP 1094 D9); a radio group one stop (x2apps survey #2)
     }
     /// Sequential focus honours macOS "Keyboard navigation" (LLP 1115.000
     /// D7.2; `tabStop`, KeyViewLoopMac.swift): off, a button is no key view,
@@ -40,7 +49,7 @@ extension NodeView {
         return ok
     }
     // @ref LLP 1104 D6 — events are relayed from the node's single focus owner.
-    func focusEntered() {
+    package func focusEntered() {
         focusVisible = !isNativeButton && nativeValueControl == nil && presenter?.focusByPointer != true
         presenter?.collections.pinsChanged()
         presenter?.selection.focusEntered(self)
@@ -67,7 +76,7 @@ extension NodeView {
         }
         super.viewWillMove(toWindow: newWindow)
     }
-    func focusLeft() {
+    package func focusLeft() {
         releaseKeyboardPress()
         focusVisible = false
         presenter?.selection.focusLeft()
@@ -85,11 +94,11 @@ extension NodeView {
         guard isDateOrSelect, let control = presenter?.controls.controls[id], control.superview != nil else { return nil }
         return control
     }
-    func acceptsNativeValueFocus(_ control: NSControl) -> Bool {
+    package func acceptsNativeValueFocus(_ control: NSControl) -> Bool {
         control.isEnabled && !formDisabled && !inert && !control.isHiddenOrHasHiddenAncestor && !cssVisibilityHidden
     }
     /// Leave native editing keys to AppKit, but traverse Exact's explicit loop.
-    func nativeValueTab(_ event: NSEvent, control: NSControl) -> Bool {
+    package func nativeValueTab(_ event: NSEvent, control: NSControl) -> Bool {
         guard Self.keyName(event) == "Tab", event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
               let window = control.window else { return false }
         presenter?.tab(from: control, back: event.modifierFlags.contains(.shift), in: window)
@@ -199,7 +208,7 @@ extension Presenter {
     /// hand-built app commits its editors before a button acts
     /// (`NSEditor.commitEditing`). Text an input method is still composing
     /// is the input method's, and is left.
-    func commitPendingEdit() {
+    package func commitPendingEdit() {
         guard let id = edited, let node = views[id] else { return }
         let editor = node.field?.currentEditor() as? NSTextView ?? node.textArea
         if editor?.hasMarkedText() == true { return }

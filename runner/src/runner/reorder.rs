@@ -7,94 +7,11 @@ use crate::instance::collection::{
     Collection, ReorderBinding, ReorderFrame, ReorderGeometry, ReorderPhase, ReorderProgress,
     ReorderStart, ReorderToken,
 };
-use exact_kernel::{Display, NodeKey, NodeType, Op, PropId};
+use exact_kernel::{NodeKey, Op};
 use std::sync::atomic::{AtomicU64, Ordering};
 static SERIAL: AtomicU64 = AtomicU64::new(1);
 
 impl<D: DataSource> Runner<D> {
-    /// Resolve a strict authored ancestor IDREF, then join only mounted collection
-    /// rows. String key, current positive measurement and List handler are required.
-    pub fn reorder_binding(&self, handle: NodeKey) -> Option<ReorderBinding> {
-        if self.poisoned {
-            return None;
-        }
-        let node = self.kernel.node_by_key(handle)?;
-        let name = node.props.str(PropId::ReorderFor)?;
-        if name.is_empty()
-            || node.props.str(PropId::HeightDragFor).is_some()
-            || node.props.str(PropId::TransformDragFor).is_some()
-        {
-            return None;
-        }
-        let mut at = node;
-        let mut list = None;
-        loop {
-            if at.style.display == Display::None
-                || at.props.bool(PropId::Disabled) == Some(true)
-                || at.props.bool(PropId::Inert) == Some(true)
-            {
-                return None;
-            }
-            if at.key != handle && at.props.str(PropId::Id) == Some(name) {
-                if list.is_some() {
-                    return None;
-                }
-                list = Some(at.key);
-            }
-            if at.is_root {
-                break;
-            }
-            at = self.kernel.node(at.parent?)?;
-        }
-        let list = self.kernel.node_by_key(list?)?;
-        if list.node_type != NodeType::List
-            || !self.handlers_of(list.id).contains(&EventKind::Reorderdrop)
-        {
-            return None;
-        }
-        let binding = self
-            .tree
-            .as_ref()?
-            .reorder_collection(list.id)?
-            .reorder_binding(&self.kernel, handle)?;
-        let mut at = node;
-        loop {
-            if at.style.rotate != 0.0
-                || at.style.scale != 1.0
-                || (at.key != binding.wrapper
-                    && (at.style.translate.x != 0.0
-                        || at.style.translate.y != 0.0
-                        || at.style.translate_percent.x != 0.0
-                        || at.style.translate_percent.y != 0.0))
-            {
-                return None;
-            }
-            if at.is_root {
-                break;
-            }
-            at = self.kernel.node(at.parent?)?;
-        }
-        Some(binding)
-    }
-    /// Latest accepted scroll facts. Hosts also certify their own viewport mapping.
-    pub fn reorder_geometry(&self, list: NodeKey) -> Option<ReorderGeometry> {
-        let view = self.kernel.node_by_key(list)?.id;
-        self.tree
-            .as_ref()?
-            .reorder_collection(view)?
-            .reorder_geometry(list)
-    }
-    /// Admit one preview only after the host acquired the existing interaction pin.
-    /// Refused identity/facts do not consume a serial or change any styles/pins.
-    /// The session stays in its list, a grouped one too; a host that drags
-    /// between lists begins with `begin_group_reorder` (LLP 1094 D4).
-    pub fn begin_reorder(
-        &mut self,
-        binding: ReorderBinding,
-        geometry: ReorderGeometry,
-    ) -> Result<Option<ReorderStart>, RunnerError> {
-        self.begin_session(binding, geometry, None, false)
-    }
     pub(super) fn begin_session(
         &mut self,
         binding: ReorderBinding,
@@ -153,7 +70,7 @@ impl<D: DataSource> Runner<D> {
         Ok(Some(ReorderStart { token, receipt }))
     }
     /// True only while the original source binding, pin and action capability live.
-    pub fn has_reorder(&self, token: ReorderToken) -> bool {
+    pub(super) fn has_reorder_linked(&self, token: ReorderToken) -> bool {
         let Some(c) = self.reorder_collection(token.list) else {
             return false;
         };
@@ -163,7 +80,7 @@ impl<D: DataSource> Runner<D> {
     }
     /// Measured gap selection in unpreviewed content coordinates. No queries,
     /// all-key serialization or destination pin; stale precedes numeric validation.
-    pub fn preview_reorder(
+    pub(super) fn preview_reorder_linked(
         &mut self,
         token: ReorderToken,
         geometry: ReorderGeometry,
@@ -189,19 +106,8 @@ impl<D: DataSource> Runner<D> {
             receipt: self.apply_reorder_ops(ops)?,
         })
     }
-    /// Consume terminal eligibility once and dispatch exact private keys while the
-    /// source pin remains owned. Host rebase/end MUST precede `finish_reorder`.
-    /// A grouped session's `geometry` is its target's; it drops there and
-    /// may hold (`ReorderFrame::phase`, LLP 1094 D8).
-    pub fn drop_reorder(
-        &mut self,
-        token: ReorderToken,
-        geometry: ReorderGeometry,
-    ) -> Result<Option<CommitReceipt>, RunnerError> {
-        self.arrived(|r| r.drop_reorder_now(token, geometry))
-    }
 
-    fn drop_reorder_now(
+    pub(super) fn drop_reorder_now(
         &mut self,
         token: ReorderToken,
         geometry: ReorderGeometry,
@@ -241,7 +147,7 @@ impl<D: DataSource> Runner<D> {
     }
     /// Enter the no-action terminal phase; retain the pin until host hold cleanup.
     /// A hold is past cancelling: its send is out (LLP 1094 D8).
-    pub fn cancel_reorder(
+    pub(super) fn cancel_reorder_linked(
         &mut self,
         token: ReorderToken,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
@@ -268,11 +174,11 @@ impl<D: DataSource> Runner<D> {
     /// Current viewport presentation and mapping remain the host's responsibility.
     /// It says where the session stands, its target, and which mounted
     /// wrapper holds the dragged row now (LLP 1094 D4, D8).
-    pub fn reorder_frame(&self, token: ReorderToken) -> Option<ReorderFrame> {
+    pub(super) fn reorder_frame_linked(&self, token: ReorderToken) -> Option<ReorderFrame> {
         let mut frame = self
             .reorder_collection(token.list)?
             .preview_frame(&self.kernel, token)?;
-        let Some(s) = self.reorder_session.as_deref().filter(|s| s.token == token) else {
+        let Some(s) = self.session().filter(|s| s.token == token) else {
             return Some(frame);
         };
         frame.phase = s.phase;
@@ -290,16 +196,11 @@ impl<D: DataSource> Runner<D> {
     }
     /// Whether `token` is a live session on a grouped list.
     pub(super) fn is_grouped(&self, token: ReorderToken) -> bool {
-        self.reorder_session
-            .as_deref()
+        self.session()
             .is_some_and(|s| s.token == token && s.group.is_some())
     }
     fn set_phase(&mut self, token: ReorderToken, phase: ReorderPhase) {
-        if let Some(s) = self
-            .reorder_session
-            .as_deref_mut()
-            .filter(|s| s.token == token)
-        {
+        if let Some(s) = self.session_mut().filter(|s| s.token == token) {
             s.phase = phase;
         }
     }
@@ -307,7 +208,7 @@ impl<D: DataSource> Runner<D> {
     /// Hosts may defer this through the source return spring; finish only when
     /// presentation no longer needs the pin, or before explicitly replacing it.
     /// A stale token cannot clear a successor; deletion needs no source to survive.
-    pub fn finish_reorder(
+    pub(super) fn finish_reorder_linked(
         &mut self,
         token: ReorderToken,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
@@ -330,7 +231,11 @@ impl<D: DataSource> Runner<D> {
         self.reorder_owner = None;
         // Every row a grouped session hid shows again, and any gap left
         // open closes (LLP 1094 D6).
-        if let Some(s) = self.reorder_session.take() {
+        if let Some(s) = self
+            .reorder_session
+            .take()
+            .and_then(|s| s.downcast::<Session>().ok())
+        {
             for list in s.touched {
                 let (_, o) = self.edit_reorder(list, |c, u, _| {
                     c.close_incoming(u, false)?;
@@ -362,7 +267,7 @@ impl<D: DataSource> Runner<D> {
             let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
             u.fonts = Some(self.fonts.clone());
             u.reuse = self.reuse;
-            tree.edit_reorder(id, &mut u, edit)
+            tree.edit_collection(id, &mut u, edit)
                 .map(|r| (r, u.ops, u.notes, u.renewed, u.shown))
         };
         self.tree = Some(tree);
@@ -375,14 +280,6 @@ impl<D: DataSource> Runner<D> {
         });
         result.map_err(Into::into)
     }
-    /// The queued patches, taken to be applied, and the keep of their
-    /// colours, for the caller to hold until its commit marks them.
-    pub(super) fn take_reorder_ops(&mut self) -> (Vec<Op>, exact_kernel::style::wide::Keep) {
-        (
-            std::mem::take(&mut self.reorder_ops),
-            std::mem::take(&mut self.reorder_kept),
-        )
-    }
     pub(super) fn apply_reorder_ops(
         &mut self,
         ops: Vec<Op>,
@@ -393,7 +290,7 @@ impl<D: DataSource> Runner<D> {
             self.apply(ops).map(Some)
         }
     }
-    pub(super) fn reconcile_reorder(&mut self) -> Result<Vec<Op>, RunnerError> {
+    pub(super) fn reconcile_reorder_linked(&mut self) -> Result<Vec<Op>, RunnerError> {
         let Some(owner) = self.reorder_owner else {
             return Ok(Vec::new());
         };

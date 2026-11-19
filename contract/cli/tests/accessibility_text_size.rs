@@ -1,11 +1,15 @@
 //! `exactViewport().accessibilityTextSize`: true on iOS while the host's
 //! text size is an accessibility size (a Dynamic Type body of 28 or more,
 //! UIKit's `isAccessibilityCategory`), re-answered as the size crosses it,
-//! and false in any other column. One test, its own process: the column is
-//! the process's.
+//! and also true for Android's reported large-text range. One test, its own
+//! process: the column is the process's.
 use exact_kernel::style::metrics::{set_column, Column};
 use exact_kernel::{Kernel, PropId};
 use exact_runner::{DataError, DataSource, Runner, Value};
+#[path = "it/scratch.rs"]
+#[allow(dead_code)]
+mod scratch;
+use scratch::Scratch;
 
 struct NoData;
 
@@ -47,8 +51,7 @@ fn boot() -> Runner<NoData> {
 /// Booted on a kernel the host primed with `size` before the runner, as the
 /// Apple host does.
 fn boot_at(size: Option<f32>) -> Runner<NoData> {
-    let dir = std::env::temp_dir().join(format!("exact2-ax-text-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new(format!("exact2-ax-text-{}", std::process::id()));
     let path = dir.join("app.contract");
     std::fs::write(&path, SOURCE).unwrap();
     let plan = contract::bake(contract::compile_path(&path).unwrap(), NoData).unwrap();
@@ -123,8 +126,90 @@ fn the_accessibility_sizes_are_ios_bodies_of_28_and_more() {
     assert_eq!(shown(&r), "large", "primed before boot");
     r.set_root_font_size(33.0).unwrap();
     assert_eq!(shown(&r), "large", "told again");
+    screen_reader_and_rotation();
     set_column(Column::Web);
     let mut r = boot();
     r.set_root_font_size(40.0).unwrap();
     assert_eq!(shown(&r), "standard", "no such fact on the web");
+}
+
+fn screen_reader_and_rotation() {
+    use exact_runner::{Preferences, ScreenReader};
+    let recipe = include_str!("../../../docs/recipes/rolling-stat.md");
+    let source = recipe
+        .split("```contract\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let plan = contract::bake(contract::compile(source).unwrap(), NoData).unwrap();
+    let unknown = Runner::boot(
+        plan.clone(),
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_str(&exact_runner::agent::state(&unknown)).unwrap();
+    assert_eq!(state["resources"]["viewport"]["screenReader"], "unknown");
+    assert_eq!(unknown.timer_due_ms(), None);
+    let preferences = Preferences {
+        screen_reader: ScreenReader::On,
+        ..Default::default()
+    };
+    let mut r = exact_runner::time::launching_with(
+        exact_runner::time::Launch {
+            preferences: Some(preferences),
+            ..exact_runner::time::Launch::NONE
+        },
+        || {
+            Runner::boot(
+                plan,
+                NoData,
+                Kernel::with_monospace(),
+                Default::default(),
+                "/",
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(r.kernel().epoch(), 1);
+    assert_eq!(r.derive("rotates"), Some(&Value::Bool(false)));
+    let mut now = 0.0;
+    for (reader, large, reduced, rotates) in [
+        (ScreenReader::Unknown, false, false, false),
+        (ScreenReader::Off, false, false, true),
+        (ScreenReader::On, false, false, false),
+        (ScreenReader::Off, true, false, false),
+        (ScreenReader::Off, false, true, false),
+        (ScreenReader::Off, false, false, true),
+    ] {
+        let preferences = Preferences {
+            screen_reader: reader,
+            accessibility_text_size: large,
+            reduced_motion: reduced,
+            ..Default::default()
+        };
+        assert_eq!(Preferences::from_bits(preferences.bits()), preferences);
+        r.set_preferences(preferences).unwrap();
+        assert!(r.set_preferences(preferences).unwrap().is_none());
+        assert_eq!(r.derive("rotates"), Some(&Value::Bool(rotates)));
+        let before = r.slot("stat").cloned();
+        now += 15_000.0;
+        r.advance(now).unwrap();
+        assert_eq!(before != r.slot("stat").cloned(), rotates);
+        let state: serde_json::Value =
+            serde_json::from_str(&exact_runner::agent::state(&r)).unwrap();
+        assert_eq!(state["device"]["screenReader"], reader.keyword());
+    }
+    r.act("toggleMotion", vec![]).unwrap();
+    assert_eq!(r.derive("rotates"), Some(&Value::Bool(false)));
+    let before = r.slot("stat").cloned();
+    r.advance(now + 15_000.0).unwrap();
+    assert_eq!(before, r.slot("stat").cloned());
+    r.act("next", vec![]).unwrap();
+    assert_ne!(before, r.slot("stat").cloned());
 }

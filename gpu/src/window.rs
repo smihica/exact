@@ -3,6 +3,7 @@
 use crate::*;
 
 pub(crate) struct WindowFrame {
+    canvas: u32,
     hwnd: usize,
     target: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -172,6 +173,7 @@ impl WindowFrame {
                 cache: None,
             });
         Ok(Self {
+            canvas: 0,
             hwnd,
             target,
             config,
@@ -309,7 +311,13 @@ fn upload_rows(
                 right = texture.width() as usize;
                 break;
             }
-            for (x, (a, b)) in old.chunks_exact(4).zip(new.chunks_exact(4)).enumerate() {
+            for (x, (a, b)) in old
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(new.as_chunks::<4>().0)
+                .enumerate()
+            {
                 if a != b {
                     left = left.min(x);
                     right = right.max(x + 1);
@@ -362,6 +370,9 @@ impl Module {
             return Err(why);
         }
         self.flush();
+        if let Some(error) = self.refused_instance(id) {
+            return Err(error);
+        }
         let gpu = self.gpu.as_ref().ok_or("no device")?;
         let mut inst = if id == 0 {
             None
@@ -393,63 +404,50 @@ impl Module {
             self.window = Some(unsafe { WindowFrame::new(gpu, hwnd, hinstance, width, height) }?);
         }
         let window = self.window.as_mut().unwrap();
+        window.canvas = id;
         // Upload accepted UI into retained textures before acquiring a drawable.
         // Those uploads remain valid if acquisition later times out.
         window.pending_ui |= changed;
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        window.background.prepare(
-            &gpu.queue,
-            &mut encoder,
-            &window.below,
-            below,
-            window.pending_ui,
-        );
+        let mut recording = crate::frame::Recording::begin(&gpu.device);
+        let encoder = &mut recording.encoder;
+        window
+            .background
+            .prepare(&gpu.queue, encoder, &window.below, below, window.pending_ui);
         if window.pending_ui {
             window
                 .overlay
                 .prepare(&gpu.queue, &window.above, above, above_rows);
         }
         window.pending_ui = false;
-        if let Some(inst) = inst.as_mut() {
-            let format = wgpu::TextureFormat::Rgba8Unorm;
-            inst.surface.prepare_assets(&gpu.device, &gpu.queue, format);
-            let frame = Frame {
-                seekable: self.seekable,
-                period_ms: self.period_ms,
-                children_generation: inst.children_generation,
-                shader_generation: shaders::shader_generation(),
-                headroom: 1.,
-                ..*frame
-            };
-            inst.surface.render(
-                &frame,
-                &gpu.device,
-                &gpu.queue,
-                &mut encoder,
-                &window.scene.create_view(&Default::default()),
-                format,
-            );
-        } else {
-            // Keep presenting menus through the same swapchain. Switching this
-            // HWND back to GDI can leave the last GPU image covering the menu.
-            let view = window.scene.create_view(&Default::default());
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-        }
+        let frame = Frame {
+            seekable: self.seekable,
+            period_ms: self.period_ms,
+            children_generation: inst.as_ref().map_or(0, |i| i.children_generation),
+            shader_generation: shaders::shader_generation(),
+            headroom: 1.,
+            ..*frame
+        };
+        // Keep menus on the same swapchain: GDI can leave its last GPU image up.
+        crate::frame::render_scene(
+            inst.as_mut().map(|i| &mut *i.surface),
+            gpu,
+            &frame,
+            encoder,
+            &window.scene.create_view(&Default::default()),
+        );
         // Start offscreen rendering before waiting for the swapchain. Otherwise
         // the acquisition wait serializes the previous GPU frame with this
         // frame's simulation, scene uploads and command encoding.
-        let commands = encoder.finish();
+        let commands = match recording.finish() {
+            Ok(commands) => commands,
+            Err(e) => {
+                let own = inst.as_mut().and_then(|inst| {
+                    inst.drain();
+                    inst.surface.take_error()
+                });
+                return Err(own.map_or(e, |SurfaceError(own)| own));
+            }
+        };
         let timed = inst.as_ref().is_some_and(|i| i.performance.enabled());
         let (_, submit_ms) = crate::performance::time(timed, || gpu.queue.submit([commands]));
         if let (Some(ms), Some(inst)) = (submit_ms, inst.as_mut()) {
@@ -512,6 +510,12 @@ impl Module {
     /// Release the native window before its HWND is destroyed or CPU presentation resumes.
     pub fn detach_window(&mut self) {
         self.window = None;
+    }
+
+    pub(crate) fn discard_window_picture(&mut self, id: u32) {
+        if self.window.as_ref().is_some_and(|w| w.canvas == id) {
+            self.window = None;
+        }
     }
 }
 

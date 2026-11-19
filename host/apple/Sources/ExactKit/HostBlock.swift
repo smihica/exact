@@ -5,7 +5,7 @@ import Foundation
 import CExact
 
 /// The containing block a native container gives one subtree, in points.
-struct HostBlock: Equatable {
+package struct HostBlock: Equatable {
     /// One axis: a size, a maximum, a limit for automatic content fitting, or
     /// the region a `position-area` option places the box in (fit-content
     /// across, min-content winning; its content's height down).
@@ -20,15 +20,21 @@ struct HostBlock: Equatable {
             }
         }
     }
+    /// The ordered flips composed into physical side indices, low two bits first.
+    struct Tactic: Hashable {
+        var sides: UInt32 = 228 // top, right, bottom, left
+        static let none = Tactic()
+    }
     var width: Axis, height: Axis
+    var tactic: Tactic = .none
     /// A pane's: the block is its size.
-    static func size(_ size: CGSize) -> HostBlock { HostBlock(width: .size(size.width), height: .size(size.height)) }
+    package static func size(_ size: CGSize) -> HostBlock { HostBlock(width: .size(size.width), height: .size(size.height)) }
     /// A sheet's: as large as its content, at most this.
     static func atMost(_ size: CGSize) -> HostBlock { HostBlock(width: .atMost(size.width), height: .atMost(size.height)) }
     /// A modal route fits an automatic size; its authored size and minimum win.
     static func fit(_ size: CGSize) -> HostBlock { HostBlock(width: .fit(size.width), height: .fit(size.height)) }
     /// A popover's position-area option (`PositionArea.place`).
-    static func region(_ size: CGSize) -> HostBlock { HostBlock(width: .region(size.width), height: .region(size.height)) }
+    static func region(_ size: CGSize, tactic: Tactic = .none) -> HostBlock { HostBlock(width: .region(size.width), height: .region(size.height), tactic: tactic) }
 
     struct Measurement {
         var used: CGSize
@@ -39,11 +45,12 @@ struct HostBlock: Equatable {
 /// Where a host shows a block in place (LLP 1123 D2): its rectangle in the
 /// local coordinates of `within`, a node that holds it in the host's
 /// hierarchy as in the document.
-struct BlockPlacement: Equatable {
-    var rect: CGRect
-    var within: UInt32
+package struct BlockPlacement: Equatable {
+    package var rect: CGRect
+    package var within: UInt32
     /// A scrollport's offset in block points, including zero; nil for a fixed allocation.
-    var contentOffset: CGPoint?
+    package var contentOffset: CGPoint?
+    package init(rect: CGRect, within: UInt32, contentOffset: CGPoint? = nil) { (self.rect, self.within, self.contentOffset) = (rect, within, contentOffset) }
 }
 
 extension Runtime {
@@ -54,28 +61,33 @@ extension Runtime {
     /// reads (LLP 1123 D2). `shows` shows a split's own placeholder, or hides
     /// it again (kinds 14 and 15, LLP 1116.006 D2), in the same layout.
     func blocks(_ blocks: [(UInt32, HostBlock?)], placements: [(UInt32, BlockPlacement?)] = [], shows: [(UInt32, Bool)] = []) -> Batch {
-        return on {
-            var bytes = Data(capacity: (blocks.count + placements.count + shows.count) * 36)
-            let append = { (words: [UInt32]) in
-                for word in words { withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) } }
-            }
-            for (view, shown) in shows { append([view, shown ? 14 : 15, 0, 0, 0, 0]) }
-            for (view, block) in blocks {
-                let width = block?.width.wire, height = block?.height.wire
-                let lengths = [width?.length ?? 0, height?.length ?? 0, width?.policy ?? 0, height?.policy ?? 0].map { Float($0).bitPattern }
-                append([view, block == nil ? 5 : 4] + lengths)
-            }
-            for (view, placement) in placements {
-                guard let placement else {
-                    append([view, 7, 0, 0, 0, 0])
-                    continue
-                }
-                let r = placement.rect
-                let offset = placement.contentOffset ?? .zero
-                append([view, placement.contentOffset == nil ? 6 : 13] + [r.minX, r.minY, r.width, r.height].map { Float($0).bitPattern } + [placement.within] + [offset.x, offset.y].map { Float($0).bitPattern })
-            }
-            return read(exact_host_covers(rt, write(bytes)))
+        let bytes = Self.blockRecords(blocks, placements: placements, shows: shows)
+        return self.blocks(bytes)
+    }
+
+    func blocks(_ records: Data) -> Batch { on(layout: true) { read(exact_host_covers(rt, write(records))) } }
+
+    static func blockRecords(_ blocks: [(UInt32, HostBlock?)], placements: [(UInt32, BlockPlacement?)] = [], shows: [(UInt32, Bool)] = []) -> Data {
+        var bytes = Data(capacity: (blocks.count + placements.count + shows.count) * 36)
+        let append = { (words: [UInt32]) in
+            for word in words { withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) } }
         }
+        for (view, shown) in shows { append([view, shown ? 14 : 15, 0, 0, 0, 0]) }
+        for (view, block) in blocks {
+            let width = block?.width.wire, height = block?.height.wire
+            let lengths = [width?.length ?? 0, height?.length ?? 0, width?.policy ?? 0, height?.policy ?? 0].map { Float($0).bitPattern }
+            append([view, block == nil ? 5 : 4] + lengths + (block.map { [$0.tactic.sides] } ?? []))
+        }
+        for (view, placement) in placements {
+            guard let placement else {
+                append([view, 7, 0, 0, 0, 0])
+                continue
+            }
+            let r = placement.rect
+            let offset = placement.contentOffset ?? .zero
+            append([view, placement.contentOffset == nil ? 6 : 13] + [r.minX, r.minY, r.width, r.height].map { Float($0).bitPattern } + [placement.within] + [offset.x, offset.y].map { Float($0).bitPattern })
+        }
+        return bytes
     }
 }
 
@@ -87,7 +99,7 @@ extension Runtime {
     func measureBlock(_ view: UInt32, in block: HostBlock) -> HostBlock.Measurement? {
         return on(busy: nil) {
             let width = block.width.wire, height = block.height.wire
-            let len = exact_measure_block(rt, view, Float(width.length), Float(height.length), UInt32(width.policy), UInt32(height.policy))
+            let len = exact_measure_block(rt, view, Float(width.length), Float(height.length), UInt32(width.policy), UInt32(height.policy), block.tactic.sides)
             guard len == 32 else { return nil }
             guard let out = UnsafeRawPointer(exact_out(rt)) else { return nil }
             let f = { (i: Int) in CGFloat(Float(bitPattern: UInt32(littleEndian: out.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self)))) }

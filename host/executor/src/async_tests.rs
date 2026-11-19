@@ -10,6 +10,10 @@ use ibex2::stdlib::fetch_async::{Exchange, Head, HopMetrics, HopRequest, Sink};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 /// One exchange the core started, to answer by hand, with what it sent
 /// (an upload's buffer stays alive with it, as the platform's would).
 pub(super) struct Started {
@@ -179,6 +183,7 @@ pub(super) fn core_with_upload_copy(
 
 fn job(ticket: u64, request: Request) -> RequestOut {
     RequestOut {
+        completion: None,
         class: exact_runner::RequestClass::Ordered,
         ticket,
         target: "test".into(),
@@ -309,7 +314,7 @@ fn a_timeout_frees_the_ordered_lane_while_its_transport_has_not_ended() {
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = ran.clone();
     core.run(
-        job(2, Request::continuation(1)),
+        job(2, Request::continuation::<TestWork>(1)),
         Some(Box::new(move || {
             seen.store(true, Ordering::SeqCst);
             Outcome::Storage(vec![2])
@@ -584,6 +589,49 @@ fn an_upload_that_cannot_fit_beside_the_requests_behind_it_is_refused() {
     eventually(|| bytes(&core) == [0, 0]);
 }
 
+/// This executor reads a file body whole, so it keeps the 64 MiB bound the
+/// blocking executor's stream dropped, and refuses past it unsent, naming
+/// itself (LLP 1133.008.000 D4). A sparse file: nothing is read to refuse.
+#[test]
+fn a_file_body_over_64_mib_is_refused_unsent_naming_the_executor() {
+    let _turn = one_at_a_time();
+    let files = Files::new();
+    let big = std::fs::File::create(files.0.join("tmp/big.mov")).unwrap();
+    big.set_len((64 << 20) + 1).unwrap();
+    drop(big);
+    let script = Arc::new(Script::default());
+    let (core, woke) = core(
+        &script,
+        "net.fetch https://*.example.test\nfs.read app:/tmp",
+    );
+    core.set_app_roots(files.roots());
+    for fixture in [false, true] {
+        core.run_owned(
+            job(
+                1,
+                upload("https://a.example.test/", "app:/tmp/big.mov", 1 << 20),
+            ),
+            fixture.then(|| {
+                OwnedWork::HttpResponse(Arc::new(|| {
+                    Outcome::Response(Response {
+                        status: 200,
+                        headers: vec![],
+                        body: vec![],
+                    })
+                }))
+            }),
+        )
+        .unwrap();
+        let outcomes = collect(&core, &woke, 1);
+        assert!(
+            matches!(&outcomes[0], (1, Outcome::Failed { kind: FailureKind::Unsupported, message })
+            if message.contains("the asynchronous executor reads a file body whole, at most 67108864 bytes")),
+            "{outcomes:?}"
+        );
+    }
+    eventually(|| bytes(&core) == [0, 0]);
+}
+
 #[test]
 fn a_head_short_of_bytes_is_not_passed_over_at_its_origins_limit() {
     let script = Arc::new(Script::default());
@@ -706,7 +754,7 @@ fn a_refused_scope_never_runs_its_closure() {
     let (core, woke) = core(&script, ORIGINS);
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen = ran.clone();
-    let mut request = Request::continuation(1);
+    let mut request = Request::continuation::<TestWork>(1);
     request.grants = Some("net.fetch https://outside.test".into());
     core.run(
         job(1, request),

@@ -193,52 +193,106 @@ fn a_use_owns_its_state_and_a_row_owns_its_own_which_follows_its_key() {
 }
 
 #[test]
-fn a_child_may_not_own_a_resource() {
-    let src = "shape S\n  id: string\ncomponent A\n  view\n    Row()\ncomponent Row\n  resource s = s() as shape S\n  view\n    text s.id\n";
-    let e = contract::compile(src).unwrap_err();
+fn a_child_owns_its_resource_except_where_data_sizes_its_uses() {
+    // One use, outside every region: one instance and one request
+    // (LLP 1035.005.004 D1).
+    let one = "shape S\n  id: string\ncomponent A\n  view\n    Row()\ncomponent Row\n  resource s = s() as shape S\n  view\n    text s.id\n";
+    contract::compile(one).unwrap_or_else(|e| panic!("{e}"));
+    // Under a `for` over data, the rows would ask a count of requests no
+    // line states.
+    let rows = "shape S\n  id: string\ncomponent A\n  state ids = [\"a\"]\n  view\n    for id in ids key=id\n      Row()\ncomponent Row\n  resource s = s() as shape S\n  view\n    text s.id\n";
+    let e = contract::compile(rows).unwrap_err();
     assert_eq!(e.id, "type-child-resource");
-    // It states the rule and names the root (chess #3).
-    assert_eq!(e.message, "only the root, the root file's first component (`A`), may declare a `resource`, `mutation`, or `task`; `Row` is a child, which may own state, derives, and actions. Move this declaration into `A` and pass what `Row` needs as props; or, if `Row` is the app, move it above `A`");
+    assert_eq!(e.span.line, 7);
+    assert_eq!(e.message, "`Row` declares `resource s`, and this use is under a `for` over data (line 6): each row would ask `s` on its own, with nothing here saying how many. A component that owns requests is used where its instances are tabs, screens or `if` arms. For one request per row, declare it in `A` over the list, `resource rowS = s(x) for x in … key=…`, and pass each row its answer as a prop (docs/contract-for-agents.md, \"A feature's requests\")");
+    // Through a wrapper component, and as a slot fill that the slot's
+    // component repeats, the use is still a row's.
+    let wrapped = rows.replace(
+        "      Row()\n",
+        "      Wrap()\ncomponent Wrap\n  view\n    Row()\n",
+    );
+    let e = contract::compile(&wrapped).unwrap_err();
+    assert!(
+        e.message.starts_with(
+            "`Row` declares `resource s`, and this use is under a `for` over data (line 6)"
+        ),
+        "{e}"
+    );
+    let filled = "shape S\n  id: string\ncomponent A\n  view\n    Card()\n      Row()\ncomponent Card\n  slot\n  state ids = [\"a\"]\n  view\n    column\n      for id in ids key=id\n        children\ncomponent Row\n  resource s = s() as shape S\n  view\n    text s.id\n";
+    let e = contract::compile(filled).unwrap_err();
+    assert!(
+        e.message.starts_with(
+            "`Row` declares `resource s`, and this use is under a `for` over data (line 12)"
+        ),
+        "{e}"
+    );
+    // The repair it names compiles.
+    let fixed = "shape S\n  id: string\ncomponent A\n  state ids = [\"a\"]\n  resource rowS = s(x) for x in ids key=x as shape S\n  view\n    column\n      for r in rowS key=r.id\n        Row(s=r)\ncomponent Row\n  props\n    s: S\n  view\n    text s.id\n";
+    contract::compile(fixed).unwrap_or_else(|e| panic!("{e}"));
+    // A child's own resource over a list is refused at its declaration.
+    let listed = "shape S\n  id: string\ncomponent A\n  view\n    Row()\ncomponent Row\n  state ids = [\"a\"]\n  resource s = s(x) for x in ids key=x as shape S\n  view\n    text \"x\"\n";
+    let e = contract::compile(listed).unwrap_err();
+    assert_eq!(e.id, "type-child-resource");
+    assert_eq!(e.message, "only the root, the root file's first component (`A`), may declare a resource over a list (`resource s = s(…) for …`, one request per element). Declare it in `A` (`resource rowS = s(…) for …`) and pass its answers down to `Row` as a prop (docs/contract-for-agents.md, \"A feature's requests\")");
 }
 
 #[test]
-fn a_childs_task_is_moved_to_the_root_keyed_on_what_opens_it() {
-    // The euxy port: "scroll the selected icon into view when the sheet
-    // opens" is the root's gated task, keyed on the route.
-    let src = "component A\n  view\n    Sheet()\ncomponent Sheet\n  state n = 0\n  task reveal mount\n    after(1, bump)\n  action bump\n    n = n + 1\n  view\n    text \"x\"\n";
+fn a_childs_state_may_not_start_from_its_own_request() {
+    let src = "shape S\n  id: string\ncomponent A\n  view\n    Row()\ncomponent Row\n  resource s = s() as shape S\n  derive id = s.id\n  state first = id\n  view\n    text first\n";
     let e = contract::compile(src).unwrap_err();
-    assert_eq!(e.id, "type-child-resource");
+    assert_eq!(e.id, "type-state-reads-request");
     assert!(
-        e.message.starts_with(
-            "only the root, the root file's first component (`A`), may declare a `task`"
-        ) && e.message.contains(
-            "`task reveal when top(nav).name == \"icons\" key=top(nav).id` with `change(reveal)`"
-        ),
+        e.message
+            .starts_with("`state first` in `Row` reads `id`, which reads a resource"),
         "{}",
         e.message
     );
-    // The repair it names compiles, in the root.
-    let fixed = "routes nav\n  home \"/\"\n  icons \"/icons\"\ncomponent A\n  state n = 0\n  task reveal when top(nav).name == \"icons\" key=top(nav).id\n    change(reveal)\n  action reveal\n    n = n + 1\n  view\n    text \"x\"\n";
-    contract::compile(fixed).unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[test]
-fn a_childs_timer_is_moved_to_the_root_with_its_state_and_action_props() {
-    // The euxy port: a capsule charged by a press-and-hold `every(16)`.
-    let src = "component A\n  view\n    Capsule()\ncomponent Capsule\n  state charge = 0\n  state holding = false\n  task charging when holding\n    every(16, step)\n  action step\n    charge = charge + 2\n  action hold(on: bool)\n    holding = on\n  view\n    button pointerdown=hold(true) pointerup=hold(false)\n      text `${charge}`\n";
-    let e = contract::compile(src).unwrap_err();
+fn a_child_owns_its_mutation_except_where_data_sizes_its_uses() {
+    // In a screen: each instance sends on its own, and its `then` names its
+    // own action, which takes its captured props (LLP 1035.005.004 D6).
+    let screen = "routes nav\n  list \"/\"\n  book \"/book/:id\"\ncomponent A\n  state shown = \"\"\n  action show(s: string)\n    shown = s\n  view\n    column\n      for e in stack(nav) key=e.id\n        if e.name == \"book\"\n          Composer(id=e.params.id, done=show)\ncomponent Composer\n  props\n    id: string\n    done: action\n  mutation sent as shape string then ended\n  action send\n    send sent = save(id)\n  action ended\n    done(id)\n  view\n    button press=send\n      text (pending(sent) ? \"…\" : \"Send\")\n";
+    let plan = contract::compile(screen).unwrap_or_else(|e| panic!("{e}"));
+    let m = &plan.mutations[0];
+    let owner = m.owner.expect("the arm's");
+    assert_eq!(plan.slots[m.slot.0 as usize].owner, Some(owner));
+    assert_eq!(m.then_args.len, 1, "the captured `id`");
+    // Outside every region it is the root's, its slot late.
+    let one = "component A\n  view\n    Composer()\ncomponent Composer\n  mutation sent as shape string\n  action send\n    send sent = save()\n  view\n    button press=send\n      text \"Send\"\n";
+    let plan = contract::compile(one).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(plan.mutations[0].owner, None);
+    assert!(plan.slots[plan.mutations[0].slot.0 as usize].late);
+    // Under a `for` over data, each row would send on its own.
+    let rows = "component A\n  state ids = [\"a\"]\n  view\n    for id in ids key=id\n      Composer()\ncomponent Composer\n  mutation sent as shape string\n  view\n    text \"x\"\n";
+    let e = contract::compile(rows).unwrap_err();
     assert_eq!(e.id, "type-child-resource");
-    for part in [
-        "`task charging when holding` with `every(16, step)`",
-        "`Capsule(charge=charge, down=hold(true), up=hold(false))`",
-        "`pointerdown=down pointerup=up`",
-        "docs/recipes/timer-in-a-component.md",
-    ] {
-        assert!(e.message.contains(part), "{part}: {}", e.message);
-    }
-    // The repair it names compiles.
-    let fixed = "component A\n  state charge = 0\n  state holding = false\n  task charging when holding\n    every(16, step)\n  action step\n    charge = charge + 2\n  action hold(on: bool)\n    holding = on\n  view\n    Capsule(charge=charge, down=hold(true), up=hold(false))\ncomponent Capsule\n  props\n    charge: number\n    down: action\n    up: action\n  view\n    button pointerdown=down pointerup=up\n      text `${charge}`\n";
-    contract::compile(fixed).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(e.message, "`Composer` declares `mutation sent`, and this use is under a `for` over data (line 4): each row would send `sent` and run its `then` on its own. A component that owns requests is used where its instances are tabs, screens or `if` arms. Declare the mutation in `A` (`mutation composerSent as shape …`) and pass each row an action that sends it (docs/contract-for-agents.md, \"A feature's requests\")");
+    // Its `refreshes` names its own component's resources only.
+    let theirs = "shape S\n  id: string\ncomponent A\n  resource s = s() as shape S\n  view\n    Composer()\ncomponent Composer\n  mutation sent as shape string refreshes s\n  view\n    text \"x\"\n";
+    let e = contract::compile(theirs).unwrap_err();
+    assert_eq!(e.id, "type-refreshes-not-resource", "{e}");
+}
+
+#[test]
+fn a_child_owns_a_task_in_its_instance() {
+    let src = "component App\n  state shown = true\n  view\n    column\n      if shown\n        Counter(step=2)\ncomponent Counter\n  props\n    step: number\n  state n = 0\n  task tick mount\n    every(10, bump)\n  action bump\n    n = n + step\n  view\n    text `${n}`\n";
+    let plan = contract::compile(src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(plan.timers.len(), 1);
+    assert!(plan.timers[0].owner.is_some());
+    assert_eq!(plan.timers[0].args.len, 1);
+    let rows = src
+        .replace("  state shown = true", "  state shown = [1, 2]")
+        .replace("if shown", "for i in shown key=i");
+    let error = contract::compile(&rows).unwrap_err();
+    assert_eq!(error.id, "type-child-resource");
+    assert!(error.message.contains("task tick"), "{error}");
+    let virtualized = src.replace("    column", "    list virtualized=true height=100");
+    assert_eq!(
+        contract::compile(&virtualized).unwrap_err().id,
+        "type-child-resource"
+    );
 }
 
 #[test]

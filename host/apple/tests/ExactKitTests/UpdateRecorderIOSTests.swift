@@ -4,6 +4,7 @@ import QuartzCore
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactTraces
 
 /// A recording on iOS 18 and later (`UpdateRecorder`): each UI update UIKit
 /// makes, observed passively and timed by its phases, with the presentation

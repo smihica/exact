@@ -13,9 +13,10 @@ import { rt as Link } from './rt-link.js';
 export { liveTime } from './live-time.js';
 import { liveById, installFits } from './navigation.js';
 // synced animations (LLP 1055.002, emit.rs `clocks`)
-export { animationClocks, launchLocation } from './navigation.js';
+export { animationClocks, launchLocation, launchVisits } from './navigation.js';
 export { fontFamily } from './font-family.js';
-import { Head, markDocument, projectRoots, openTabs, unopened, tp } from './document.js';
+export { cssNames } from './regions.js';
+import { Head, markDocument, projectRoots, openTabs, prepareTabs, unopened, tp } from './document.js';
 export { Head, unopened, tp };
 export { canSetStatus, statusSubject } from './document.js';
 import { conforms, eq, equal, Refusal, Failed } from './shape.js';
@@ -53,10 +54,10 @@ export function useLinks(l) {
 // The runtime's other parts, each its own file, which import what they share from here.
 import { clock, time, armedAt, agentMode, every, advance, drive, unpark, fire, pauseTimers } from './clock.js';
 import { Resources, Mutations, lateReaders, lateIdle } from './resources.js';
-import { Views } from './tree.js';
+import { Views, viewId } from './tree.js';
 import { KeyEvent, Propagating } from './events.js';
 import { Pres, Present, Sh, Input, pressFeedback } from './pieces.js';
-import { Booting, start } from './mount.js';
+import { Booting, start, finishTaskScopes } from './mount.js';
 export * from './clock.js';
 export * from './resources.js';
 export * from './tree.js';
@@ -206,6 +207,10 @@ function flush() {
   }
   while (FocusQueue.length) FocusQueue.shift()();
 }
+/** Whether the flush will run an effect. An effect queued because a derive it reads might change runs only if that
+ * derive did, and settlement marks the readers of each derive that changed: an effect not marked is due only while a
+ * derive it reads has still to settle. */
+const due = () => Queue.some(n => !n.gone && (n.s === DIRTY || n.src.some(s => s.fn && s.s !== CLEAN)));
 function untracked(f) {
   const l = Listener;
   Listener = null;
@@ -359,6 +364,7 @@ export let Writes = null,
   Refused = null,
   Why = '',
   Sched = null;
+const HeldOutput = new Set(), SettledOutput = new WeakSet(), OutputInvocations = new WeakMap();
 // Cut by code point; a write's value or a source's error may be long, or private.
 const why = (step, m, c = [...m]) =>
     `while ${step}: ${c.length > WHY_MAX ? `${c.slice(0, WHY_MAX).join('')}… (${c.length - WHY_MAX} more characters in the journal)` : m}`,
@@ -418,6 +424,13 @@ export function R(r, reasking = false) {
 function settle() {
   for (const n of Settle) if (!n.gone) fresh(n);
 }
+// Keep a document handoff's checkpoint still. Defer the whole reply or
+// recommit, including what its caller does on refusal, under its own origin.
+export function deferForReplacement(f) {
+  if (Writes || !DEVELOPMENT_STORE) return false;
+  const origin = Origin.now(), invocation = Invocation.id;
+  return globalThis.__exactDevReplacement?.defer(() => Origin.run(origin, () => Invocation.run(invocation, f))) ?? false;
+}
 /** One commit: `f` runs; its writes, sends and refreshes land; settlement
  * runs; a refusal anywhere up to here puts everything back and leaves the
  * tree untouched; then the tree updates, completion callbacks run, requests go out, commands run. */
@@ -439,13 +452,15 @@ export function commit(f, what = 'commit', finished) {
   Why = '';
   time();
   const was = Now.v,
+    wasFrozen = Sounds.frozen === true,
     undo = [],
     saved = Resources.map(r => r.save()),
-    held = Mutations.map(m => [m.ticket, m.tickets, m.concluded]),
+    // by mutation: an instance's come and go with it (each.js `ownMut`)
+    held = Mutations.map(m => [m, m.ticket, m.tickets, m.concluded]),
     store = Store.save(),
     queued = Sched?.save(),
     writes = Ov.save();
-  let ok = true,
+  let sound, ok = true,
     // where a refusal stops it (`Why`)
     step = Booting ? 'building the view' : `running the ${what}`;
   try {
@@ -476,8 +491,9 @@ export function commit(f, what = 'commit', finished) {
     }
     // gated tasks and sequences over the settled state, inside the rollback (LLP 1092 D8, LLP 1125 D2)
     step = 'arming its tasks and sequences';
+    prepareTabs();
     Sched?.gates();
-    Sounds.gate?.();
+    sound = Sounds.gate?.();
   } catch (e) {
     ok = false;
     for (const [n, v] of undo.reverse()) write(n, v);
@@ -488,9 +504,7 @@ export function commit(f, what = 'commit', finished) {
     }
     // new list members end through their refusal callbacks (each.js)
     Resources.forEach((r, k) => k < saved.length && r.restore(saved[k]));
-    Mutations.forEach((m, k) => {
-      [m.ticket, m.tickets, m.concluded] = held[k];
-    });
+    for (const [m, ...h] of held) [m.ticket, m.tickets, m.concluded] = h;
     Sched?.restore(queued);
     Ov.restore(writes);
     Store.restore(store);
@@ -513,7 +527,8 @@ export function commit(f, what = 'commit', finished) {
     }
   }
   const [out, cmds, landed, finishes] = [Out, Commands, Landed, Finishes],
-    changed = Sched?.changed(queued), invocation = Invocation.id;
+    changed = Sched?.changed(queued), invocation = Invocation.id, origin = Origin.now();
+  if (hasOutput(cmds)) OutputInvocations.set(cmds, invocation);
   // A key handler's preventDefault/stopPropagation act on its event before the dispatch ends, a tree update a view
   // transition defers too (review C3).
   if (KeyEvent || Propagating)
@@ -523,15 +538,31 @@ export function commit(f, what = 'commit', finished) {
     }
   Writes = Finishes = null;
   unpark();
+  // Freeze releases streams and stops sequences even when the tree waits for a view transition.
+  if (ok) {
+    finishTaskScopes();
+    if (Sounds.frozen && Open.size) closeLetGo(inflight, say);
+    if (Sounds.frozen === true && !wasFrozen) {
+      Sounds.settling = true;
+      try {
+        for (const commands of new Set([...HeldOutput, cmds])) settleOutput(commands);
+        Sounds.committed?.(sound);
+      } finally {
+        Sounds.settling = false;
+      }
+    } else Sounds.committed?.(sound);
+  }
   // What the commit would have sent and did not is refused, whatever stopped its tree update (a hook that threw, a
   // poisoned tree, a tail a view transition never ran): an answer's batches that wait for it too (ts-stream.js).
   let sent = 0;
   const unrun = why => {
+    HeldOutput.delete(cmds);
     for (const go of out.splice(sent)) go.refused?.(why);
   };
   const link = Nav?.holdLink();
   const tail = Object.assign(
     () => {
+      HeldOutput.delete(cmds);
       try {
         return Invocation.run(invocation, () => link ? Nav.withLink(link, update) : update());
       } finally {
@@ -543,11 +574,13 @@ export function commit(f, what = 'commit', finished) {
   // the tree update; inside a view transition when it may hand on a shared element's name (LLP 1013.000 D7)
   const update = () => {
     for (const f of Before) f();
-    // presence measures what it tracks, and what may gain the row, before the tree changes (LLP 1063)
-    Pres?.before({ ops: Probes?.gains() ?? [] }, Views);
+    // presence measures what it tracks, and what may gain the row, before the tree changes (LLP 1063); when the flush
+    // will run no effect it writes nothing, and presence measures nothing (`still`)
+    Pres?.before({ ops: Probes?.gains() ?? [], still: !due() }, Views);
     try {
       flush();
       openTabs();
+      Sched?.gates();
     } catch (e) {
       Poisoned = true;
       Why = why('updating the tree', String(e));
@@ -567,9 +600,11 @@ export function commit(f, what = 'commit', finished) {
     while (sent < out.length) out[sent++]();
     if (Open.size) closeLetGo(inflight, say);
     for (const c of cmds) command(...c);
-    Sounds.apply?.(cmds);
-    Sounds.midiApply?.(cmds);
-    Sounds.stood?.();
+    if (!SettledOutput.delete(cmds)) {
+      Sounds.apply?.(cmds);
+      Sounds.midiApply?.(cmds);
+    }
+    Sounds.stood?.(sound);
     // after its focus commands, as the wasm host (focus.js); then the focus follows the route (input-glue.js;
     // LLP 1115.000 D4.2)
     if (!Booting) {
@@ -577,23 +612,27 @@ export function commit(f, what = 'commit', finished) {
       Input?.arrive();
     }
     // An answer's `then` is armed, due now, once however many land: the next advance runs it as its own commit
-    // (LLP 1016.001 D3).
+    // (LLP 1016.001 D3), under its answer's invocation and origin (LLP 1133.002 D12).
     for (const m of landed)
       if (m.then) {
         m.due = armedAt();
         m.thenInvocation = invocation;
+        m.thenOrigin = origin;
         if (!clock.agent) drive();
       }
-    Sched?.scan(true, changed); // a free queue's waiting send is due (LLP 1092 D3)
+    Sched?.scan(true, Sched?.changed(queued) ?? changed); // a free queue's waiting send is due (LLP 1092 D3)
     return true;
   };
   // a Back or Forward is mirrored to the history first, and one the browser animated cuts (router.js `traversal`)
-  return Sh && ok && !Traversal?.() ? Sh.commit(tail, Queue, inflight, After) : tail();
+  const deferred = Sh && ok && !Traversal?.();
+  if (deferred && hasOutput(cmds)) HeldOutput.add(cmds);
+  return deferred ? Sh.commit(tail, Queue, inflight, After) : tail();
 }
 /** A commit made again after a write ended or the source became ready (the runner's `commit_again`). Refused while
  * reads are owed (a reconciling ask), they fail, keeping what they show, before a commit publishes it; a refusal of
  * that leaves nothing owed. */
 export function recommit(f, what) {
+  if (deferForReplacement(() => recommit(f, what))) return;
   const done = commit(f, what),
     owed = done === false ? Resources.filter(r => r.reconciling) : [],
     why = Refused?.message;
@@ -633,6 +672,7 @@ function drain() {
   for (const [e, o] of Scrolls)
     for (const name in o) {
       const at = o[name];
+      if (e[name] !== at) globalThis.exact?.fragment?.cancel(false);
       if (e.$jump) e.$jump(name, at);
       else if (e[name] !== at) {
         if (
@@ -678,10 +718,14 @@ export function act(fn, types, skip = 0, names) {
     }
     fn(...a);
   };
-  const a = (...x) => commit(() => go(x), 'action');
+  const a = (...x) => {
+    if (deferForReplacement(() => a(...x))) return true;
+    return commit(() => go(x), 'action');
+  };
   a.t =
     f =>
-    (...v) => {
+    function action(...v) {
+      if (deferForReplacement(() => action(...v))) return true;
       if (Poisoned)
         try {
           f();
@@ -709,30 +753,12 @@ export const Hosts = {
     if (e) e.scrollBy(x, y);
     else say(`scrollBy "${id}" refused: no live node with that id`);
   },
-  // journal lines only; marks.js replaces these when the app has launch modules
-  observe: n => say(`observe ${n}`),
-  observeAttributes: () => {},
-  observeError: m => say(`observeError ${m}`),
 };
 // commands.js's, each by name as the compiled plan imported it for an action that names it (emit.rs, LLP 1047.002 D1):
 // a factory over the journal and whether the agent drives the page; one no action names is never linked
 export function useCommands(table) {
   for (const name in table) Hosts[name] = table[name](say, () => agentMode());
 }
-// A handler's `preventDefault()` and `stopPropagation()` act on its event (events.js `KeyEvent`, `Propagating`):
-// commands run before its commit returns; a stopped key reaches no ancestor's `key` handler, its default still does
-// (files diary F8); a prevented beforeunload is the browser's "Leave site?" (Safari reads `returnValue`)
-Hosts.preventDefault = () => {
-  KeyEvent?.preventDefault();
-  if (KeyEvent?.type === 'beforeunload') KeyEvent.returnValue = '';
-  // A pointerdown handler's: the browser keeps the focus, places no caret, starts no selection; the click still fires
-  // (LLP 1005 §3).
-  if (!KeyEvent && Propagating?.type === 'pointerdown') Propagating.preventDefault();
-};
-Hosts.stopPropagation = () => {
-  const e = KeyEvent ?? Propagating;
-  if (e) e.$stopped = true;
-};
 // The voice table's and the MIDI queue's commands (LLP 1096 D5, LLP 1125 D7): the runtime's own, never a host's;
 // sounds.js and midi.js apply a commit's once it stood, and transport.js reads the sequences in the gate step and plays
 // them once it stood (LLP 1125 D2).
@@ -740,12 +766,31 @@ export const Sounds = {
   apply: null,
   own: new Set(['playSound', 'playSounds', 'stopSounds', 'setSounds', 'sendMIDI', 'requestMIDIAccess']),
   gate: null,
+  committed: null,
   stood: null,
   seq: null,
   midi: null,
   midiApply: null,
+  settling: false,
   beatAt: null,
 };
+const physicalOutput = name => name === 'haptic' || Sounds.own.has(name);
+const hasOutput = commands => commands.some(([name]) => name === 'reload' || physicalOutput(name));
+function settleOutput(commands) {
+  if (!hasOutput(commands) || SettledOutput.has(commands)) return;
+  for (let i = 0; i < commands.length;) {
+    const [name, , origin] = commands[i];
+    if (!physicalOutput(name)) { i++; continue; }
+    say(`command ${name}`);
+    const refused = Invocation.run(OutputInvocations.get(commands) ?? 0, () => Origin.refused?.(name, origin));
+    if (refused) commands.splice(i, 1); else i++;
+  }
+  Sounds.apply?.(commands);
+  Sounds.midiApply?.(commands);
+  for (let i = commands.length - 1; i >= 0; i--) if (physicalOutput(commands[i][0])) commands.splice(i, 1);
+  SettledOutput.add(commands);
+  HeldOutput.delete(commands);
+}
 function command(name, args, origin) {
   const f = Hosts[name];
   say(`command ${name}`);
@@ -779,6 +824,7 @@ Object.assign(Link, {
   busy: () => !!Writes,
   poisoned: () => Poisoned,
   pauseTimers,
+  Invocation,
 });
 /** The app's data sources (LLP 1016). `answer(source, args, store)` gives `{v}` now, `{req}` (an HTTP request the host
  * runs, then `parse`s), a Promise (an executor-local continuation: TypeScript), or `null` while the source is not
@@ -812,7 +858,9 @@ export const Store = {
   // Outside a render, keeping what is already kept is no write, as the runner's `Store::set`.
   set(k, v) {
     if (globalThis.__exactRender) throw new Error("a render's store is empty and refuses writes"); // LLP 1048.000 D9
-    if (v != null && this.map.get(k) === v) return;
+    const same = v == null ? !this.map.has(k) : this.map.get(k) === v;
+    if (v != null && same) return;
+    if (!same) this.leased?.get(k)?.(); // a lease's write arms its recovery (storage-environment.js `exclusiveSecret`)
     if (v == null) this.map.delete(k);
     else this.map.set(k, v);
     this.writes.push([k, v]);
@@ -885,6 +933,22 @@ export const Store = {
         if (k.startsWith(p)) this.map.set(k.slice(p.length), localStorage.getItem(k));
       }
     } catch {}
+    // Another tab of the app wrote or removed a key, or cleared the store (LLP 1030.004 D2).
+    globalThis.addEventListener?.('storage', e => {
+      if (e.storageArea !== globalThis.localStorage) return;
+      if (e.key == null) for (const k of [...this.map.keys()]) this.peer(k, null);
+      else if (e.key.startsWith(p)) this.peer(e.key.slice(p.length), e.newValue);
+    });
+  },
+  /** Another tab's write of key `k` (`v`, or null removed): taken, unless this tab's own write of it is owed, and the
+   * store's readers asked again, as after a write outside a commit (the runner's `store_changed`). */
+  peer(k, v) {
+    if (this.pending.has(k) || this.writes.some(w => w[0] === k) || (this.map.get(k) ?? null) === v) return;
+    if (v == null) this.map.delete(k);
+    else this.map.set(k, v);
+    Rev++;
+    lateReaders();
+    recommit(lateIdle, "another tab's store write");
   },
 };
 // A release build's DEVELOPMENT_STORE is null: it inspects nothing, and its bundle drops the inspection's code.
@@ -896,9 +960,9 @@ export const inflight = { n: 0 };
 // A development build's only: the dev page's hold asks for it so, as a bundled page serves no rt.js; not on `exact`,
 // which says the runtime is up.
 if (DEVELOPMENT_STORE) globalThis.__exactPressFeedback = pressFeedback;
-// The elements the app marks `aria-busy="true"` (still loading), by test id else id.
+// The launch and agent ledger names busy elements by test ID or the view ID that `tree` uses.
 export const busy = () =>
-  [...document.querySelectorAll('[aria-busy="true"]')].map(el => el.getAttribute('data-testid') ?? el.id);
+  [...document.querySelectorAll('[aria-busy="true"]')].map(el => el.getAttribute('data-testid') ?? String(viewId(el)));
 export { gridValue } from './grid.js';
 export { Pc } from './lower.js';
 export { svgTransform, svgGeometry } from './svg-transform.js';
@@ -912,6 +976,6 @@ export * from './roster.js'; // the roster's pure entries
 // the router (LLP 1038), its own file
 export * from './router.js';
 import { routerValid } from './router.js';
-export { queues, gated } from './schedule.js'; // queued sends and gated tasks (LLP 1092), their own file
+export { queues, gated, ownedTasks } from './schedule.js'; // queued sends and gated tasks (LLP 1092), their own file
 export { timerWaits } from './timer-waits.js';
-export { resEach } from './each.js';
+export { resEach, owned, own, ownedMut, ownMut, keptOwned, rowPath } from './each.js';

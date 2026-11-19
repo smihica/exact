@@ -1,5 +1,5 @@
 //! @ref LLP 1043.000 §3 D5–D7 — CoreText advances into the shared walker.
-//! Handles are thread-confined, never reused; stale/null handles are harmless.
+//! Handles are process-wide, never reused; stale/null handles are harmless.
 //! Pointer buffers are borrowed only during a call. Non-null pointers must name
 //! valid, aligned buffers of the stated length, as with the measure callback.
 #![allow(unsafe_code)]
@@ -467,9 +467,83 @@ pub fn line_breaks(
     }
     ends.len()
 }
+/// The breaks Blink's scorer balances a paragraph at
+/// (`exact_textflow::balanced_breaks`, whose arguments these are): `count`
+/// opportunities as parallel `ends`, `nexts` and `hyphens`. Writes the
+/// `lines - 1` indices where lines break; returns their count, 0 where the
+/// scorer gives nothing or `cap` is too small.
+#[allow(clippy::too_many_arguments)]
+pub fn balanced_breaks(
+    width: f32,
+    indent: f32,
+    font_size: f32,
+    justified: bool,
+    ends: *const f32,
+    nexts: *const f32,
+    hyphens: *const u8,
+    count: usize,
+    lines: usize,
+    out: *mut u32,
+    cap: usize,
+) -> usize {
+    let (Some(ends), Some(nexts), Some(hyphens)) = (
+        slice(ends, count),
+        slice(nexts, count),
+        slice(hyphens, count),
+    ) else {
+        return 0;
+    };
+    let opportunities: Vec<_> = ends
+        .iter()
+        .zip(nexts)
+        .zip(hyphens)
+        .map(|((&end, &next), &hyphen)| (end, next, hyphen != 0))
+        .collect();
+    let Some(breaks) =
+        exact_textflow::balanced_breaks(width, indent, font_size, justified, &opportunities, lines)
+            .filter(|breaks| breaks.len() <= cap && !out.is_null())
+    else {
+        return 0;
+    };
+    for (i, &at) in breaks.iter().enumerate() {
+        unsafe { out.add(i).write(at as u32) };
+    }
+    breaks.len()
+}
 /// Release a prepared source. Zero, stale, and repeated frees are no-ops.
 pub fn free(handle: u64) {
     with_sources(|sources| sources.remove(&handle));
+}
+
+/// Natural text's paragraph bases (LLP 1060.000 D3,
+/// `exact_kernel::text::natural::paragraph_bases`): one byte per paragraph,
+/// 0 left to right, 1 right to left; `fallback` is the layout direction.
+/// Writes min(count, cap) to `out` (null is a query); returns the count, 0
+/// for invalid UTF-8.
+pub fn paragraph_bases(
+    text: *const u8,
+    len: usize,
+    fallback: u8,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let Some(text) = slice(text, len).and_then(|b| std::str::from_utf8(b).ok()) else {
+        return 0;
+    };
+    let fallback = match fallback {
+        1 => exact_kernel::Direction::Rtl,
+        _ => exact_kernel::Direction::Ltr,
+    };
+    let mut bases = Vec::new();
+    exact_kernel::text::natural::paragraph_bases(text, fallback, &mut bases);
+    for (i, base) in bases
+        .iter()
+        .enumerate()
+        .take(if out.is_null() { 0 } else { cap })
+    {
+        unsafe { out.add(i).write(*base as u8) };
+    }
+    bases.len()
 }
 
 /// Export the text-shape-owned walker seam from the application's static archive.
@@ -540,6 +614,46 @@ macro_rules! textflow_exports {
             cap: usize,
         ) -> usize {
             $crate::textflow::line_breaks(text, len, words, word_count, out, cap)
+        }
+        /// Where Blink's scorer breaks a balanced paragraph (LLP 1001 §6).
+        #[no_mangle]
+        pub extern "C" fn exact_text_balanced_breaks(
+            width: f32,
+            indent: f32,
+            font_size: f32,
+            justified: u32,
+            ends: *const f32,
+            nexts: *const f32,
+            hyphens: *const u8,
+            count: usize,
+            lines: usize,
+            out: *mut u32,
+            cap: usize,
+        ) -> usize {
+            $crate::textflow::balanced_breaks(
+                width,
+                indent,
+                font_size,
+                justified != 0,
+                ends,
+                nexts,
+                hyphens,
+                count,
+                lines,
+                out,
+                cap,
+            )
+        }
+        /// Natural text's base direction per paragraph (LLP 1060.000 D3).
+        #[no_mangle]
+        pub extern "C" fn exact_text_paragraph_bases(
+            text: *const u8,
+            len: usize,
+            fallback: u8,
+            out: *mut u8,
+            cap: usize,
+        ) -> usize {
+            $crate::textflow::paragraph_bases(text, len, fallback, out, cap)
         }
         /// Release one prepared source.
         #[no_mangle]

@@ -155,6 +155,7 @@ fn scroll_margins_refuse_percentages_without_changing_the_length() {
 
 #[test]
 fn borrowed_css_parses_like_owned_css_and_retains_no_source_borrow() {
+    exact_kernel::style::link_all();
     for (id, css, valid) in [
         (StyleId::TextColor, "#abcdef80", true),
         (StyleId::TextColor, "light-dark(#123, #abc)", true),
@@ -256,7 +257,8 @@ fn translate_text_is_a_narrow_css_pixel_subset_with_atomic_refusal() {
         "1px 2px 3",
         "10%% 0",
         "% 0",
-        "calc(1px + 2%) 0",
+        // A `calc()` the two rows cannot hold.
+        "calc(1rem + 2%) 0",
         "NaNpx 0",
         "infpx 0",
         "1e39px 0",
@@ -435,6 +437,7 @@ fn every_dynamic_codec_fills_its_row_and_marks_the_mask() {
 
 #[test]
 fn refusals_are_typed_and_change_nothing() {
+    exact_kernel::style::link_all();
     let mut s = StyleProps::default();
     let before = s.clone();
     let cases: Vec<(StyleId, StyleValue, StyleValueError)> = vec![
@@ -515,6 +518,7 @@ fn refusals_are_typed_and_change_nothing() {
 
 #[test]
 fn grid_css_values_reach_set_dynamic_in_every_style_value_shape() {
+    exact_kernel::style::link_all();
     let mut style = StyleProps::default();
     for (id, value, want) in [
         (StyleId::GridTemplateColumns, StyleValue::Auto, "auto"),
@@ -613,7 +617,11 @@ fn enum_rows_resolve_names_and_others_do_not() {
         // A keyword row (a bit set named by CSS keywords) lists its words too.
         let keywords = matches!(
             id,
-            StyleId::FontVariantNumeric | StyleId::FontVariantLigatures | StyleId::SafeArea
+            StyleId::FontVariantNumeric
+                | StyleId::FontVariantLigatures
+                | StyleId::SafeArea
+                | StyleId::SafeAreaIgnore
+                | StyleId::SafeAreaBar
         );
         assert_eq!(
             names.is_empty(),
@@ -926,6 +934,7 @@ fn dimension_pixel_strings_use_css_numbers_and_refuse_invalid_values_atomically(
 
 #[test]
 fn every_row_writes_its_own_field_and_no_other() {
+    exact_kernel::style::link_all();
     // Linked by use (LLP 1057.003), as every host that sets the rows links it.
     exact_kernel::timeline::link();
     exact_kernel::style::link_backdrop_filter();
@@ -953,6 +962,7 @@ fn every_row_writes_its_own_field_and_no_other() {
         StyleValue::Text("blur(12px) saturate(1.14)".into()),
         StyleValue::Text("flip-block, flip-inline".into()),
         StyleValue::Text("\"wght\" 650".into()),
+        StyleValue::Text("--gap: 8px".into()),
     ];
     let mut unwritten = Vec::new();
     let base = StyleProps::default();

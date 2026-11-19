@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// LLP 1095: the root's `accent-color` is the app's accent, its window's
 /// tint, and behind an alert only the accent dims.
@@ -327,7 +328,7 @@ final class AppAccentIOSTests: XCTestCase {
         var seen: [[[Double]]] = [], pushed = false
         let end = Date().addingTimeInterval(30)
         repeat {
-            if let nav = p.navigation.primaryNavigation, nav.viewControllers.count == 2, let item = nav.topViewController?.navigationItem {
+            if let nav = p.navigationHost.primaryNavigation, nav.viewControllers.count == 2, let item = nav.topViewController?.navigationItem {
                 pushed = true
                 let colours = [item.standardAppearance?.titleTextAttributes[.foregroundColor] as? UIColor, item.rightBarButtonItems?.first?.tintColor]
                 XCTAssertTrue(colours.allSatisfy { $0 == UIColor.tintColor }, "UIKit's tint")
@@ -335,7 +336,7 @@ final class AppAccentIOSTests: XCTestCase {
                 if seen.last != state { seen.append(state) }
             }
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.001))
-        } while !(pushed && !p.navigation.inTransition) && Date() < end
+        } while !(pushed && !p.navigationHost.inTransition) && Date() < end
         XCTAssertTrue(pushed, "the route is pushed")
         XCTAssertEqual(seen, [[rgb(.systemRed) + [1], rgb(.systemRed) + [1]]], "the title and the item in the window's tint from the push on")
     }
@@ -348,13 +349,13 @@ final class AppAccentIOSTests: XCTestCase {
         let session = try navigation("ACCENT_BARS", tint: .systemRed)
         let p = session.presenter
         func push(_ testId: String) throws -> UINavigationController {
-            let count = p.navigation.primaryNavigation?.viewControllers.count ?? 0
+            let count = p.navigationHost.primaryNavigation?.viewControllers.count ?? 0
             p.press(try XCTUnwrap(p.views.values.first { $0.props["testId"] == testId }, testId).id)
             let end = Date().addingTimeInterval(30)
-            while !(p.navigation.primaryNavigation?.viewControllers.count == count + 1 && !p.navigation.inTransition), Date() < end {
+            while !(p.navigationHost.primaryNavigation?.viewControllers.count == count + 1 && !p.navigationHost.inTransition), Date() < end {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
             }
-            return try XCTUnwrap(p.navigation.primaryNavigation, "pushed from \(testId)")
+            return try XCTUnwrap(p.navigationHost.primaryNavigation, "pushed from \(testId)")
         }
         let nav = try push("open-teal"), bar = nav.navigationBar
         let item = try XCTUnwrap(nav.topViewController?.navigationItem)
@@ -387,7 +388,7 @@ final class AppAccentIOSTests: XCTestCase {
         let session = try navigation("ACCENT_TABS", tint: .systemRed)
         let p = session.presenter
         func shown() throws -> (UINavigationBar, UIColor?) {
-            let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+            let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
             let title = nav.topViewController?.navigationItem.standardAppearance?.titleTextAttributes[.foregroundColor] as? UIColor
             return (nav.navigationBar, title)
         }
@@ -418,7 +419,7 @@ final class AppAccentIOSTests: XCTestCase {
         view.frame = host.view.bounds
         view.layoutIfNeeded()
         let end = Date().addingTimeInterval(30)
-        while !(session.presenter.navigation.primaryNavigation?.topViewController is RouteController), Date() < end {
+        while !(session.presenter.navigationHost.primaryNavigation?.topViewController is RouteController), Date() < end {
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
         }
         return session

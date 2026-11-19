@@ -1,0 +1,413 @@
+// CSS `background-image` gradients (LLP 1066), shared by UIKit and AppKit.
+// The host's Rust side sends the shape and stops (`style.rs` gradient_json),
+// stops already expanded to mix as CSS's premultiplied ones do. Length and
+// repeating stops cross as CSS and resolve through the kernel once the
+// presenter knows the box; percentage-only placement is computed here.
+import CExact
+import ExactCore
+import ExactKit
+import CoreGraphics
+import Foundation
+import QuartzCore
+
+struct Gradient: BoxGradient {
+    enum Shape: Equatable {
+        case angle(CGFloat)
+        case corner(right: Bool, bottom: Bool)
+        /// `at`: x%, xpx, y%, ypx. `extent`: closest-side, closest-corner,
+        /// farthest-side, farthest-corner.
+        case radial(circle: Bool, extent: Int, at: [CGFloat])
+        /// `conic-gradient()` (LLP 1077 D5): `from` CSS degrees (0 up,
+        /// clockwise), `at` x%, xpx, y%, ypx.
+        case conic(from: CGFloat, at: [CGFloat])
+    }
+    enum Placement: Equatable {
+        /// Stop 0 at the first point, stop 1 at the second.
+        case axial(CGPoint, CGPoint)
+        /// Stop 0 at the centre, stop 1 on the ellipse of these radii.
+        case radial(CGPoint, CGSize)
+        /// Stops around the centre, from this many CSS degrees.
+        case conic(CGPoint, CGFloat)
+    }
+
+    private let css: String?
+    /// The dark scheme's `css` where it interpolates otherwise.
+    private let darkCss: String?
+    /// The view's tint, light then dark: extended sRGB, unclipped, and alpha 0–1.
+    private let tint: [[Float]]?
+    private let resolvedPlacement: Placement?
+    let shape: Shape
+    private let light: [CGFloat]
+    private let dark: [CGFloat]?
+    /// Stops CSS interpolated outside sRGB (LLP 1100 D2): already dense, in
+    /// extended linear sRGB with alpha 0–1.
+    private let lightLinear: Bool
+    private let darkLinear: Bool
+    /// Whether the stops under an appearance are extended linear sRGB.
+    func linear(dark: Bool) -> Bool { dark && self.dark != nil ? darkLinear : lightLinear }
+
+    init?(_ value: BatchValue?, tint: PlatformColor? = nil) {
+        guard case .object(let o)? = value else { return nil }
+        self.tint = value?.namesTint == true ? SystemColor.tintPair(tint ?? SystemColor.appTint, extended: true)?.map { side in
+            side.map { Float($0 / 255) }
+        } : nil
+        css = o["tint"]?.string ?? o["css"]?.string
+        darkCss = o["tintDark"]?.string
+        if let css {
+            self.light = []; dark = nil; lightLinear = false; darkLinear = false
+            shape = .angle(180); resolvedPlacement = nil
+            guard !css.isEmpty else { return nil }
+            return
+        }
+        guard let light = o["stops"]?.numbers, light.count >= 10, light.count % 5 == 0 else { return nil }
+        if let p = o["line"]?.numbers, p.count == 4 {
+            resolvedPlacement = .axial(CGPoint(x: p[0], y: p[1]), CGPoint(x: p[2], y: p[3]))
+        } else if let p = o["ellipse"]?.numbers, p.count == 4 {
+            resolvedPlacement = .radial(CGPoint(x: p[0], y: p[1]), CGSize(width: p[2], height: p[3]))
+        } else if let p = o["arc"]?.numbers, p.count == 3 {
+            resolvedPlacement = .conic(CGPoint(x: p[0], y: p[1]), CGFloat(p[2]))
+        } else { resolvedPlacement = nil }
+        if let deg = o["linear"]?.number {
+            shape = .angle(CGFloat(deg))
+        } else if let c = o["corner"]?.numbers, c.count == 2 {
+            shape = .corner(right: c[0] != 0, bottom: c[1] != 0)
+        } else if let r = o["radial"]?.numbers, r.count == 6 {
+            shape = .radial(circle: r[0] != 0, extent: Int(r[1]), at: r[2...].map { CGFloat($0) })
+        } else if let c = o["conic"]?.numbers, c.count == 5 {
+            shape = .conic(from: CGFloat(c[0]), at: c[1...].map { CGFloat($0) })
+        } else {
+            return nil
+        }
+        self.light = light.map { CGFloat($0) }
+        dark = o["dark"]?.numbers.map { $0.map { CGFloat($0) } }
+        lightLinear = o["space"]?.string == "srgb-linear"
+        darkLinear = o["darkSpace"]?.string == "srgb-linear"
+    }
+
+    /// Resolve in the kernel after the presenter knows the gradient box;
+    /// `cycle`, one period of a repeating linear gradient (`exact_gradient_cycle`).
+    private func resolved(in box: CGRect, dark: Bool, cycle: Bool = false) -> Gradient? {
+        guard let css = dark ? darkCss ?? css : css else { return nil }
+        let resolve = cycle ? exact_gradient_cycle : exact_gradient
+        return Owner.shared.sync {
+            let input = Array(css.utf8), w = Float(box.width), h = Float(box.height)
+            let color = tint?[dark ? 1 : 0] ?? []
+            return color.withUnsafeBufferPointer { c in
+                let tint = color.isEmpty ? nil : c.baseAddress
+                let n = resolve(input, input.count, w, h, dark ? 1 : 0, tint, nil, 0)
+                guard n > 0 else { return nil }
+                var bytes = [UInt8](repeating: 0, count: n)
+                _ = resolve(input, input.count, w, h, dark ? 1 : 0, tint, &bytes, n)
+                return bytes.withUnsafeBufferPointer {
+                    var reader = BatchReader(bytes: $0)
+                    return (try? reader.value()).flatMap { Gradient($0) }
+                }
+            }
+        }
+    }
+
+    /// A `background-image`'s layers (LLP 1077 D5): one gradient's object,
+    /// or an array of them, the first on top.
+    static func layers(_ value: BatchValue?, tint: PlatformColor? = nil) -> [Gradient] {
+        if let list = value?.array { return list.compactMap { Gradient($0, tint: tint) } }
+        return Gradient(value, tint: tint).map { [$0] } ?? []
+    }
+
+    /// The gradient's alpha as pixels `size` points at `scale`, placed in
+    /// the whole picture: a conic or repeating mask (LLP 1077 D2, D5), which Core
+    /// Animation's gradient layer cannot say.
+    func image(size: CGSize, scale: CGFloat, dark: Bool) -> CGImage? {
+        let w = Int((size.width * scale).rounded(.up)), h = Int((size.height * scale).rounded(.up))
+        guard w > 0, h > 0, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                                 space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        // y down, as the layer the mask sits on.
+        ctx.translateBy(x: 0, y: CGFloat(h)); ctx.scaleBy(x: scale, y: -scale)
+        let rect = CGRect(origin: .zero, size: size)
+        paint(ctx, clip: CGPath(rect: rect, transform: nil), box: rect, dark: dark)
+        return ctx.makeImage()
+    }
+
+    /// One period of a repeating linear gradient placed in `box`: its stops
+    /// over the period, and the line in `box`'s space from the period's first
+    /// stop to its last (#661). Nil for any other gradient, or a box with no
+    /// extent along the line.
+    func cycle(in box: CGRect, dark: Bool) -> (gradient: Gradient, start: CGPoint, end: CGPoint)? {
+        guard isRepeatingLinear, let g = resolved(in: box, dark: dark, cycle: true),
+              case .axial(let a, let b) = g.placement(in: box) else { return nil }
+        return (g, a, b)
+    }
+
+    /// `repeating-linear-gradient()`, whose period a pattern can tile (#661).
+    var isRepeatingLinear: Bool { css?.hasPrefix("repeating-linear-gradient(") == true }
+
+    /// Conic geometry and repeated hard stops need the drawn painter;
+    /// Core Animation's single ramp quantizes a hatch's stop boundaries.
+    var needsDrawing: Bool {
+        if case .conic = shape { return true }
+        return isRepeatingLinear || css?.hasPrefix("conic-gradient(") == true
+    }
+
+    /// Locations 0–1 and their sRGB colours under an appearance. `dense`
+    /// samples each stretch between two hues sixteen times: Core Animation
+    /// mixes stops in a space of its own, not sRGB (measured against Chrome:
+    /// red into blue a mean 5.5/255 off, three hues 12), and short sRGB
+    /// steps leave it nothing to disagree about.
+    func stops(dark isDark: Bool, dense: Bool = false) -> ([CGFloat], [CGColor]) {
+        if css != nil { return resolved(in: CGRect(x: 0, y: 0, width: 100, height: 100), dark: isDark)?.stops(dark: isDark, dense: dense) ?? ([], []) }
+        var s = isDark ? dark ?? light : light
+        if linear(dark: isDark), let space = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) {
+            var locations: [CGFloat] = [], colors: [CGColor] = []
+            for i in stride(from: 0, to: s.count, by: 5) {
+                locations.append(s[i])
+                colors.append(ColorRange.tagged(CGColor(colorSpace: space, components: Array(s[i + 1..<i + 5])) ?? CGColor(gray: 0, alpha: 0)))
+            }
+            return (locations, colors)
+        }
+        if dense {
+            var out: [CGFloat] = []
+            for i in stride(from: 0, to: s.count, by: 5) {
+                out += s[i..<i + 5]
+                guard i + 9 < s.count, s[i] < s[i + 5], s[i + 1..<i + 4] != s[i + 6..<i + 9] else { continue }
+                for k in 1..<16 {
+                    let t = CGFloat(k) / 16
+                    out += (0..<5).map { s[i + $0] + (s[i + 5 + $0] - s[i + $0]) * t }
+                }
+            }
+            s = out
+        }
+        var locations: [CGFloat] = [], colors: [CGColor] = []
+        for i in stride(from: 0, to: s.count, by: 5) {
+            locations.append(s[i])
+            colors.append(CGColor(srgbRed: s[i + 1] / 255, green: s[i + 2] / 255, blue: s[i + 3] / 255, alpha: s[i + 4] / 255))
+        }
+        return (locations, colors)
+    }
+
+    /// Where the gradient falls for a padding box `box` (CSS's gradient box).
+    func placement(in box: CGRect) -> Placement {
+        if let resolvedPlacement {
+            switch resolvedPlacement {
+            case .axial(let a, let b): return .axial(CGPoint(x: a.x + box.minX, y: a.y + box.minY), CGPoint(x: b.x + box.minX, y: b.y + box.minY))
+            case .radial(let c, let r): return .radial(CGPoint(x: c.x + box.minX, y: c.y + box.minY), r)
+            case .conic(let c, let from): return .conic(CGPoint(x: c.x + box.minX, y: c.y + box.minY), from)
+            }
+        }
+        let (w, h) = (max(box.width, 0), max(box.height, 0))
+        switch shape {
+        case .angle, .corner:
+            var (sin, cos): (CGFloat, CGFloat)
+            if case .angle(let deg) = shape {
+                (sin, cos) = (Foundation.sin(deg * .pi / 180), Foundation.cos(deg * .pi / 180))
+            } else if case .corner(let right, let bottom) = shape {
+                // The 50% line joins the other two corners.
+                let (x, y) = (right ? h : -h, bottom ? w : -w), n = hypot(x, y)
+                (sin, cos) = n == 0 ? (0, 1) : (x / n, -y / n)
+            } else {
+                (sin, cos) = (0, 1)
+            }
+            let half = (w * abs(sin) + h * abs(cos)) / 2
+            let (cx, cy) = (box.midX, box.midY)
+            return .axial(CGPoint(x: cx - sin * half, y: cy + cos * half), CGPoint(x: cx + sin * half, y: cy - cos * half))
+        case .conic(let from, let at):
+            return .conic(CGPoint(x: box.minX + w * at[0] / 100 + at[1], y: box.minY + h * at[2] / 100 + at[3]), from)
+        case .radial(let circle, let extent, let at):
+            let c = CGPoint(x: box.minX + w * at[0] / 100 + at[1], y: box.minY + h * at[2] / 100 + at[3])
+            let dx = [abs(c.x - box.minX), abs(box.minX + w - c.x)], dy = [abs(c.y - box.minY), abs(box.minY + h - c.y)]
+            let near = CGSize(width: dx.min()!, height: dy.min()!), far = CGSize(width: dx.max()!, height: dy.max()!)
+            let corners = dx.flatMap { x in dy.map { hypot(x, $0) } }
+            let r: CGSize
+            switch (circle, extent) {
+            case (true, 0): let n = min(near.width, near.height); r = CGSize(width: n, height: n)
+            case (true, 1): let n = corners.min()!; r = CGSize(width: n, height: n)
+            case (true, 2): let n = max(far.width, far.height); r = CGSize(width: n, height: n)
+            case (true, _): let n = corners.max()!; r = CGSize(width: n, height: n)
+            case (false, 0): r = near
+            case (false, 1): r = CGSize(width: near.width * 2.squareRoot(), height: near.height * 2.squareRoot())
+            case (false, 2): r = far
+            default: r = CGSize(width: far.width * 2.squareRoot(), height: far.height * 2.squareRoot())
+            }
+            return .radial(c, r)
+        }
+    }
+
+    /// The colour a radial gradient with no area is everywhere (CSS).
+    private func degenerate(_ p: Placement, dark: Bool) -> CGColor? {
+        guard case .radial(_, let r) = p, r.width <= 0 || r.height <= 0 else { return nil }
+        return stops(dark: dark).1.last
+    }
+
+    /// Paint inside `clip` (the border box's rounded outline), placed in
+    /// `box`: over whatever was drawn before, under what is drawn after.
+    func paint(_ ctx: CGContext, clip: CGPath, box: CGRect, dark: Bool, limit: String? = nil) {
+        if let g = resolved(in: box, dark: dark) { g.paint(ctx, clip: clip, box: box, dark: dark, limit: limit); return }
+        let place = placement(in: box)
+        ctx.saveGState(); defer { ctx.restoreGState() }
+        ctx.addPath(clip); ctx.clip()
+        if let solid = degenerate(place, dark: dark) {
+            ctx.setFillColor(solid); ctx.fill(clip.boundingBox); return
+        }
+        if case .conic(let c, let from) = place {
+            paintConic(ctx, center: c, from: from, reach: clip.boundingBox, dark: dark)
+            return
+        }
+        if case .axial(let a, let b) = place {
+            paintAxial(ctx, start: a, end: b, dark: dark)
+            return
+        }
+        guard case .radial(let c, let r) = place else { return }
+        let (locations, colors) = stops(dark: dark)
+        guard let g = CGGradient(colorsSpace: CGColorSpace(name: linear(dark: dark) ? CGColorSpace.extendedLinearSRGB : CGColorSpace.sRGB), colors: colors as CFArray, locations: locations) else { return }
+        ctx.translateBy(x: c.x, y: c.y); ctx.scaleBy(x: r.width, y: r.height)
+        ctx.drawRadialGradient(g, startCenter: .zero, startRadius: 0, endCenter: .zero, endRadius: 1, options: [.drawsAfterEndLocation])
+    }
+
+    /// The stops from `a` to `b`, extended past both, over the clip.
+    func paintAxial(_ ctx: CGContext, start a: CGPoint, end b: CGPoint, dark: Bool) {
+        let (locations, colors) = stops(dark: dark)
+        let cuts = locations.indices.dropFirst().filter {
+            locations[$0] == locations[$0 - 1] && locations[$0] > locations[0] && locations[$0] < locations.last!
+        }
+        if !cuts.isEmpty {
+            paintAxialRuns(ctx, start: a, end: b, locations: locations, colors: colors, cuts: Array(cuts), dark: dark)
+            return
+        }
+        guard let g = CGGradient(colorsSpace: CGColorSpace(name: linear(dark: dark) ? CGColorSpace.extendedLinearSRGB : CGColorSpace.sRGB), colors: colors as CFArray, locations: locations) else { return }
+        ctx.drawLinearGradient(g, start: a, end: b, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+    }
+
+    /// Core Graphics quantizes hard stops inside a ramp: an expanded hatch
+    /// alternates narrow and wide stripes. Give each continuous run its own
+    /// endpoints, where Core Graphics clips at the actual stop positions.
+    ///
+    /// Core Graphics shades each run over the whole clip, whatever the run's
+    /// extent, so a repeating gradient costs the box's area once a stripe: a
+    /// diagonal hatch over a phone's sheet held the main thread for over a
+    /// second (#661). With more than eight runs the clip is cut into 32-pixel
+    /// tiles on the device's pixel grid, and each tile makes the same calls
+    /// for only the runs whose span along the gradient line crosses it. A run
+    /// all transparent paints nothing and is left out. After
+    /// appandflow/exact@b7c16ebe1.
+    private func paintAxialRuns(_ ctx: CGContext, start a: CGPoint, end b: CGPoint, locations: [CGFloat], colors: [CGColor], cuts: [Int], dark: Bool) {
+        let edges = [0] + cuts + [locations.count]
+        let space = CGColorSpace(name: linear(dark: dark) ? CGColorSpace.extendedLinearSRGB : CGColorSpace.sRGB)
+        func point(_ t: CGFloat) -> CGPoint { CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t) }
+        var runs: [(low: CGFloat, high: CGFloat, gradient: CGGradient, options: CGGradientDrawingOptions)] = []
+        for (first, end) in zip(edges, edges.dropFirst()) {
+            let low = locations[first], high = locations[end - 1]
+            guard high > low, colors[first..<end].contains(where: { $0.alpha > 0 }) else { continue }
+            let positions = locations[first..<end].map { ($0 - low) / (high - low) }
+            guard let gradient = CGGradient(colorsSpace: space, colors: Array(colors[first..<end]) as CFArray, locations: positions) else { continue }
+            var options: CGGradientDrawingOptions = []
+            if first == 0 { options.insert(.drawsBeforeStartLocation) }
+            if end == locations.count { options.insert(.drawsAfterEndLocation) }
+            runs.append((low, high, gradient, options))
+        }
+        func draw(_ run: (low: CGFloat, high: CGFloat, gradient: CGGradient, options: CGGradientDrawingOptions)) {
+            ctx.drawLinearGradient(run.gradient, start: point(run.low), end: point(run.high), options: run.options)
+        }
+        let along = CGPoint(x: b.x - a.x, y: b.y - a.y), squared = along.x * along.x + along.y * along.y
+        let reach = ctx.boundingBoxOfClipPath, device = ctx.userSpaceToDeviceSpaceTransform
+        // A few runs shade faster over the whole clip than tile by tile; under
+        // a rotated device grid the tiles would overlap and lay a translucent
+        // run twice.
+        guard runs.count > 8, squared > 0, !reach.isNull, !reach.isInfinite, device.b == 0, device.c == 0 else {
+            runs.forEach(draw)
+            return
+        }
+        let grid = ctx.convertToDeviceSpace(reach).integral, side: CGFloat = 32
+        for y in stride(from: grid.minY, to: grid.maxY, by: side) {
+            for x in stride(from: grid.minX, to: grid.maxX, by: side) {
+                let tile = ctx.convertToUserSpace(CGRect(x: x, y: y, width: min(side, grid.maxX - x), height: min(side, grid.maxY - y)))
+                let ts = [CGPoint(x: tile.minX, y: tile.minY), CGPoint(x: tile.maxX, y: tile.minY),
+                          CGPoint(x: tile.minX, y: tile.maxY), CGPoint(x: tile.maxX, y: tile.maxY)]
+                    .map { (($0.x - a.x) * along.x + ($0.y - a.y) * along.y) / squared }
+                let low = ts.min()!, high = ts.max()!
+                ctx.saveGState()
+                ctx.clip(to: tile)
+                for run in runs where (run.high >= low || run.options.contains(.drawsAfterEndLocation))
+                    && (run.low <= high || run.options.contains(.drawsBeforeStartLocation)) {
+                    draw(run)
+                }
+                ctx.restoreGState()
+            }
+        }
+    }
+
+    /// A conic gradient as wedges about its centre, each the colour at its
+    /// middle angle: Core Graphics has no conic gradient. A wedge a fifth of
+    /// a degree wide is under a device pixel at the edge of any box a phone
+    /// shows; they overlap by half a wedge and are not antialiased, so no
+    /// seam shows, and the clip's own edge stays smooth. Each replaces what
+    /// it overlaps (a translucent colour would otherwise be laid twice), in
+    /// a layer of their own over what was drawn before.
+    private func paintConic(_ ctx: CGContext, center c: CGPoint, from: CGFloat, reach: CGRect, dark: Bool) {
+        let corners = [CGPoint(x: reach.minX, y: reach.minY), CGPoint(x: reach.maxX, y: reach.minY),
+                       CGPoint(x: reach.minX, y: reach.maxY), CGPoint(x: reach.maxX, y: reach.maxY)]
+        let r = corners.map { hypot($0.x - c.x, $0.y - c.y) }.max()! + 2
+        let (locations, colors) = stops(dark: dark, dense: true)
+        let wedges = 1800
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setShouldAntialias(false)
+        ctx.setBlendMode(.copy)
+        defer { ctx.setBlendMode(.normal); ctx.setShouldAntialias(true); ctx.endTransparencyLayer() }
+        func point(_ t: CGFloat) -> CGPoint {
+            let a = (from + 360 * t) * .pi / 180
+            return CGPoint(x: c.x + r * Foundation.sin(a), y: c.y - r * Foundation.cos(a))
+        }
+        var k = 0
+        for i in 0..<wedges {
+            let t0 = CGFloat(i) / CGFloat(wedges), t1 = CGFloat(i + 1) / CGFloat(wedges), mid = (t0 + t1) / 2
+            while k + 1 < locations.count - 1 && locations[k + 1] < mid { k += 1 }
+            let a = locations[k], b = locations[min(k + 1, locations.count - 1)]
+            let f = b > a ? min(max((mid - a) / (b - a), 0), 1) : 0
+            ctx.setFillColor(Gradient.mix(colors[k], colors[min(k + 1, colors.count - 1)], f))
+            ctx.move(to: c)
+            ctx.addLine(to: point(max(t0 - 0.5 / CGFloat(wedges), 0)))
+            ctx.addLine(to: point(min(t1 + 0.5 / CGFloat(wedges), 1)))
+            ctx.closePath(); ctx.fillPath()
+        }
+    }
+
+    /// Straight mixing in the stops' own space, as the stops are already
+    /// laid out to look as CSS's premultiplied mix does.
+    private static func mix(_ a: CGColor, _ b: CGColor, _ t: CGFloat) -> CGColor {
+        let x = a.components ?? [0, 0, 0, 0], y = b.components ?? [0, 0, 0, 0]
+        guard x.count == 4, y.count == 4, let space = a.colorSpace else { return t < 0.5 ? a : b }
+        return CGColor(colorSpace: space, components: (0..<4).map { x[$0] + (y[$0] - x[$0]) * t }) ?? a
+    }
+
+    /// A gradient layer covering `bounds`, placed in `box` (same space).
+    func apply(_ layer: CAGradientLayer, bounds: CGRect, box: CGRect, dark: Bool, limit: String? = nil, stops made: ([CGFloat], [CGColor])? = nil) {
+        if let g = resolved(in: box, dark: dark) { g.apply(layer, bounds: bounds, box: box, dark: dark, limit: limit); return }
+        let place = placement(in: box)
+        var (locations, colors) = made ?? stops(dark: dark, dense: true)
+        let unit = { (p: CGPoint) in
+            CGPoint(x: bounds.width > 0 ? (p.x - bounds.minX) / bounds.width : 0, y: bounds.height > 0 ? (p.y - bounds.minY) / bounds.height : 0)
+        }
+        var type = CAGradientLayerType.axial, start = CGPoint(x: 0.5, y: 0), end = CGPoint(x: 0.5, y: 1)
+        if let solid = degenerate(place, dark: dark) {
+            (locations, colors) = ([0, 1], [solid, solid])
+        } else if case .axial(let a, let b) = place {
+            // Core Animation draws its bands perpendicular to the line in the
+            // unit square, which a box that is not square skews. Aim the unit
+            // line along S·d instead (S the box's scale, d the CSS direction)
+            // and size it so the end band still passes through `b`.
+            let (dx, dy) = (b.x - a.x, b.y - a.y), length = hypot(dx, dy)
+            let sd = CGPoint(x: bounds.width * dx / max(length, .ulpOfOne), y: bounds.height * dy / max(length, .ulpOfOne))
+            let k = length / max(sd.x * sd.x + sd.y * sd.y, .ulpOfOne)
+            start = unit(a)
+            end = CGPoint(x: start.x + k * sd.x, y: start.y + k * sd.y)
+        } else if case .radial(let c, let r) = place {
+            type = .radial
+            (start, end) = (unit(c), unit(CGPoint(x: c.x + r.width, y: c.y + r.height)))
+        }
+        if layer.type != type { layer.type = type }
+        if layer.startPoint != start { layer.startPoint = start }
+        if layer.endPoint != end { layer.endPoint = end }
+        let numbers = locations.map { NSNumber(value: Double($0)) }
+        if layer.locations != numbers { layer.locations = numbers }
+        if (layer.colors as? [CGColor]) != colors { layer.colors = colors }
+        layer.applyColorRange(limit: limit)
+    }
+}

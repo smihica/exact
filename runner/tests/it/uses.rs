@@ -30,8 +30,11 @@ fn motion_is_a_spring_or_a_gesture_that_holds_a_value() {
     // `transitions` (LLP 1047.001), never as motion.
     assert_eq!(css.to_string(), "transitions");
     assert!(!css.has(Capability::Motion));
+    // Every value of the row parses by the transitions grammar, `none` too
+    // (LLP 1047.001 §9.9), but `none` plays nothing as motion.
     let none = used("component A\n  view\n    text \"a\" opacity=0.5 transition=\"none\"\n");
-    assert_eq!(none, Uses::NONE, "a transition of none plays nothing");
+    assert_eq!(none.to_string(), "transitions");
+    assert!(!none.has(Capability::Motion));
     let spring = used(
         "component A\n  view\n    text \"a\" scale=1.5 transition=\"scale -exact-spring(180, 12, 1)\"\n",
     );
@@ -222,6 +225,156 @@ fn gradients_are_linked_by_use() {
 }
 
 #[test]
+fn visual_grammars_follow_literal_class_and_computed_rows() {
+    assert_eq!(used("component A\n  view\n    text \"a\"\n"), Uses::NONE);
+    for (row, value, capability) in [
+        ("box-shadow", "0 2px 4px #000", "shadows"),
+        ("text-shadow", "1px 2px #000", "shadows"),
+        ("corner-shape", "squircle", "corners"),
+        ("rotate", "y 30deg", "rotate"),
+        ("-webkit-text-stroke", "1px #f00", "text_stroke"),
+        ("-webkit-text-stroke-width", "1px", "text_stroke"),
+        ("-webkit-text-stroke-color", "#f00", "text_stroke"),
+        ("-exact-symbol-palette", "#f00 #00f", "symbol_palette"),
+        (
+            "background-image",
+            "conic-gradient(#f00, #00f)",
+            "gradients",
+        ),
+        ("mask-image", "linear-gradient(#000, #fff)", "gradients"),
+    ] {
+        for source in [
+            format!("component A\n  view\n    text \"a\" {row}=\"{value}\"\n"),
+            format!("style S\n  {row}=\"{value}\"\ncomponent A\n  view\n    text \"a\" class=S\n"),
+            format!(
+                "component A\n  state paint = \"{value}\"\n  view\n    text \"a\" {row}=paint\n"
+            ),
+        ] {
+            assert_eq!(used(&source).to_string(), capability, "{source}");
+        }
+    }
+}
+
+#[test]
+fn linked_grammars_follow_literal_class_and_computed_rows() {
+    // A native artifact parses these rows only through the grammar it links by
+    // use, so the row selects it however its value is written (LLP 1047 D2).
+    for (row, value, alternative, capability) in [
+        ("animation", "none", "none 1s", "animations"),
+        ("-exact-exit-animation", "none", "none 1s", "animations"),
+        ("filter", "blur(2px)", "none", "effects"),
+        ("clip-path", "inset(2px)", "none", "effects"),
+        ("grid-template-columns", "1fr 2fr", "auto", "grid"),
+        ("grid-template-rows", "auto 40px", "25%", "grid"),
+        ("grid-column", "1 / span 2", "auto", "grid"),
+        ("grid-row", "rail / 2", "span 2", "grid"),
+        ("grid-auto-flow", "column dense", "row", "grid"),
+        ("justify-items", "safe center", "stretch", "grid"),
+        ("transition", "opacity 1s", "none", "transitions"),
+        ("-exact-layout-transition", "1s", "none", "transitions"),
+        (
+            "background-image",
+            "linear-gradient(#000, #fff)",
+            "none",
+            "gradients",
+        ),
+        (
+            "mask-image",
+            "linear-gradient(#000, #fff)",
+            "none",
+            "gradients",
+        ),
+    ] {
+        for source in [
+            format!("component A\n  view\n    box {row}=\"{value}\"\n"),
+            format!("style S\n  {row}=\"{value}\"\ncomponent A\n  view\n    text \"a\" class=S\n"),
+            format!(
+                "component A\n  state paint = \"{value}\"\n  view\n    box {row}=paint\n"
+            ),
+            format!(
+                "component A\n  state on = true\n  view\n    box {row}=(on ? \"{value}\" : \"{alternative}\")\n"
+            ),
+        ] {
+            assert!(
+                used(&source).iter().any(|c| c.name() == capability),
+                "{source}: {}",
+                used(&source)
+            );
+        }
+    }
+}
+
+#[test]
+fn every_row_a_linked_grammar_parses_names_its_capability() {
+    // The kernel's table, row by row: a row whose value parses by a grammar
+    // linked by use names the capability that links it (kernel/build/codec.rs
+    // refuses to generate one that does not).
+    use exact_kernel::{StyleCodec, StyleId};
+    for style in StyleId::ALL {
+        let wanted = match style.codec() {
+            StyleCodec::Animations => Some("animations"),
+            StyleCodec::Filter | StyleCodec::ClipPath => Some("effects"),
+            StyleCodec::Tracks | StyleCodec::Placement => Some("grid"),
+            StyleCodec::Transitions => Some("transitions"),
+            StyleCodec::BackgroundImage | StyleCodec::MaskImage => Some("gradients"),
+            _ => None,
+        };
+        if let Some(wanted) = wanted {
+            assert_eq!(style.capability(), Some(wanted), "{style:?}");
+        }
+    }
+}
+
+#[test]
+fn decoration_styles_link_their_visual_grammars() {
+    let field = "component A\n  view\n    textarea decorations=TextDecorations(value=\"a\", spans=[TextDecorationSpan(name=\"glow\", start=0, end=1)])\n";
+    assert_eq!(used(field), Uses::NONE);
+    assert_eq!(
+        used(&format!("decoration glow color=\"#000\"\n{field}")),
+        Uses::NONE
+    );
+    let shadow = "decoration glow text-shadow=\"0 0 1px #000\"\n";
+    assert_eq!(used(&format!("{shadow}{field}")).to_string(), "shadows");
+    assert_eq!(
+        used(&format!("{shadow}component A\n  view\n    text \"a\"\n")),
+        Uses::NONE
+    );
+}
+
+#[test]
+fn a_decoration_table_that_is_not_a_literal_can_name_any_row() {
+    // The compiler writes the table as a literal; a decoded plan whose table
+    // is computed selects what any row can, on Apple a box's `filter` too.
+    let source = "decoration glow color=\"#000\"\ncomponent A\n  state rows = \"{}\"\n  view\n    column\n      text rows\n      textarea decorations=TextDecorations(value=\"a\", spans=[])\n";
+    let mut plan = contract::compile(source).unwrap();
+    let is_prop = |b: &exact_plan::BindingsRow, prop| {
+        b.kind == exact_plan::BindingKind::Prop
+            && exact_kernel::PropId::from_wire(b.id) == Some(prop)
+    };
+    let computed = plan
+        .bindings
+        .iter()
+        .find(|b| is_prop(b, exact_kernel::PropId::Text))
+        .unwrap()
+        .expr;
+    let table = plan
+        .bindings
+        .to_mut()
+        .iter_mut()
+        .find(|b| is_prop(b, exact_kernel::PropId::DecorationStyles))
+        .unwrap();
+    table.expr = computed;
+    for capability in [
+        Capability::Animations,
+        Capability::Effects,
+        Capability::Shadows,
+    ] {
+        assert!(uses(&plan).has(capability), "{capability:?}");
+    }
+    assert!(exact_runner::uses::apple_uses(&plan).has(Capability::Effects));
+}
+
+#[test]
 fn data_words_and_tabs_are_linked_by_use() {
     // @ref LLP 1075.003 §3.3, §3.7 — the web core carries neither the
     // `dataset` reading nor the tabs' walk unless a plan binds the row.
@@ -233,26 +386,6 @@ fn data_words_and_tabs_are_linked_by_use() {
         "component A\n  view\n    column\n      row role=\"tablist\"\n        button role=\"tab\" aria-controls=\"one\"\n          text \"One\"\n      column role=\"tabpanel\" id=\"one\"\n",
     );
     assert_eq!(tabs.to_string(), "tabs");
-}
-
-#[test]
-fn grid_grammars_are_linked_by_any_grid_row() {
-    assert!(!used("component A\n  view\n    box display=\"grid\"\n").has(Capability::Grid));
-    for (row, value, alternative) in [
-        ("grid-template-columns", "1fr 2fr", "auto"),
-        ("grid-template-rows", "auto 40px", "25%"),
-        ("grid-column", "1 / span 2", "auto"),
-        ("grid-row", "rail / 2", "span 2"),
-        ("grid-auto-flow", "column dense", "row"),
-        ("justify-items", "safe center", "stretch"),
-    ] {
-        let literal = used(&format!("component A\n  view\n    box {row}=\"{value}\"\n"));
-        assert!(literal.has(Capability::Grid), "literal {row}");
-        let dynamic = used(&format!(
-            "component A\n  state on = true\n  view\n    box {row}=(on ? \"{value}\" : \"{alternative}\")\n"
-        ));
-        assert!(dynamic.has(Capability::Grid), "dynamic {row}");
-    }
 }
 
 #[test]
@@ -351,7 +484,7 @@ fn a_grouped_list_is_a_list_whose_appearance_is_auto() {
         "component A\n  view\n    list appearance=\"auto\"\n      section\n        text \"a\"\n",
     );
     assert!(grouped.has(Capability::GroupedLists));
-    assert_eq!(grouped.to_string(), "grouped_lists");
+    assert_eq!(grouped.to_string(), "grouped_lists, corners");
 }
 
 /// LLP 1115.001.000 D2: a date or time control, which on Android links

@@ -33,7 +33,7 @@ test('a newly generated game builds, reports empty pins and captures without edi
     await run('bun', ['game/new.mjs', app]);
     // Generated adapters and the resolved lock stay under .shells; the authored
     // surface needs no manifest or app.json.
-    assert.deepEqual(readdirSync(app).sort(), ['.gitignore','.shells','.vscode','AGENTS.md','CLAUDE.md','README.md','app.contract','app.test.contract','exact.mjs','logic','pins.json','proof.mjs']);
+    assert.deepEqual(readdirSync(app).sort(), ['.exact','.gitignore','.shells','.vscode','AGENTS.md','CLAUDE.md','README.md','app.contract','app.test.contract','exact.mjs','logic','pins.json','proof.mjs']);
     assert.deepEqual(readdirSync(resolve(app, 'logic')).sort(), ['src','tests']);
     env.EXACT_APP_DIR = app;
     await run('bun', ['-e', 'import {resolveApp} from "./scripts/app.mjs"; resolveApp();']);
@@ -78,7 +78,7 @@ test('a newly generated game builds, reports empty pins and captures without edi
     assert.notEqual(JSON.parse(readFileSync(receipt, 'utf8')).inputs, before.inputs);
     assert.equal(readFileSync(hostReceipt, 'utf8'), hostBefore, 'a logic edit retains the completed host');
     assert.deepEqual(readdirSync(app).filter(file => !['.shells','artifacts','target','dist','dist.previous','app.contract.d.ts'].includes(file)).sort(),
-      ['.gitignore','.vscode','AGENTS.md','CLAUDE.md','README.md','app.contract','app.test.contract','exact.mjs','logic','pins.json','proof.mjs'], 'bakes and proofs write only ignored outputs');
+      ['.exact','.gitignore','.vscode','AGENTS.md','CLAUDE.md','README.md','app.contract','app.test.contract','exact.mjs','logic','pins.json','proof.mjs'], 'bakes and proofs write only ignored outputs');
   } finally {
     rmSync(directory, {recursive:true, force:true});
   }
@@ -92,6 +92,7 @@ test('generated commands run from an external author directory with quoted paths
   try {
     const created=spawnSync(process.execPath,[resolve(import.meta.dir,'new.mjs'),'.'],{cwd:app,encoding:'utf8'});
     assert.equal(created.status,0,created.stderr);
+    await import(resolve(app, 'proof.mjs'));
     // Its commands are its own runner's verbs, as an app's are (LLP 1086; the platformer's diary, R1).
     const verbs=created.stdout.split('\n').filter(line=>line.startsWith('  bun exact.mjs ')).map(line=>line.trim().split(/\s+/)[2]);
     assert.deepEqual(verbs,['test-rust','web','test','agent','mac','windows','prove'],created.stdout);
@@ -100,8 +101,8 @@ test('generated commands run from an external author directory with quoted paths
     for (const verb of [...verbs, 'lock', 'shells']) assert.ok(runnerVerbs.has(verb),verb);
     assert.match(readFileSync(resolve(app,'AGENTS.md'),'utf8'),/<!-- exact:begin[^]*an Exact game[^]*game[\\/]README\.md[^]*feedback status[^]*<!-- exact:end -->/);
     const inspect=resolve(directory,'inspect command.mjs');
-    writeFileSync(inspect,`import {readFileSync} from 'node:fs'; import {resolve} from 'node:path';
-      const [script,...args]=process.argv.slice(2); const path=resolve(script); readFileSync(path);
+    writeFileSync(inspect,`import {readFileSync,realpathSync} from 'node:fs'; import {resolve} from 'node:path';
+      const [script,...args]=process.argv.slice(2); const path=realpathSync(resolve(script)); readFileSync(path);
       console.log(JSON.stringify({path,args}));`);
     const run=async command=>{
       const raw=command.replace(/^bun /,`${quote(process.execPath)} ${quote(inspect)} `);
@@ -114,15 +115,21 @@ test('generated commands run from an external author directory with quoted paths
     const sdk=resolve(directory,'recording SDK');
     mkdirSync(resolve(sdk,'host/windows'),{recursive:true});
     mkdirSync(resolve(sdk,'scripts'),{recursive:true});
-    for (const file of ['app-cli.mjs', 'bun.mjs']) cpSync(resolve(import.meta.dir, '../scripts', file), resolve(sdk, 'scripts', file));
+    for (const file of ['app-cli.mjs', 'bun.mjs', 'paths.mjs']) cpSync(resolve(import.meta.dir, '../scripts', file), resolve(sdk, 'scripts', file));
+    symlinkSync(resolve(import.meta.dir, '../scripts/file-dependencies.mjs'), resolve(sdk, 'scripts/file-dependencies.mjs'));
     mkdirSync(resolve(sdk, 'js/bake/src'), { recursive: true });
     cpSync(resolve(import.meta.dir, '../js/bake/src/__exact_env.mjs'), resolve(sdk, 'js/bake/src/__exact_env.mjs'));
+    // An installed checkout's: a verb that builds is refused without node_modules (app-cli.mjs).
+    mkdirSync(resolve(sdk, 'node_modules/.bin'), { recursive: true });
+    writeFileSync(resolve(sdk, 'node_modules/.bin/rolldown'), '');
     writeFileSync(resolve(sdk,'host/windows/build.mjs'),`console.log(JSON.stringify({args:process.argv.slice(2),app:process.env.EXACT_APP_DIR}));`);
     const windows=spawnSync(process.execPath,['exact.mjs','windows','--release','--run'],{cwd:app,env:{...process.env,EXACT:sdk},encoding:'utf8'});
     assert.equal(windows.status,0,windows.stderr);
     const forwarded=JSON.parse(windows.stdout);
     assert.deepEqual(forwarded.args,['outside-game','--release','--run']);
     assert.equal(realpathSync.native(forwarded.app),realpathSync.native(app));
+    const restored = spawnSync(process.execPath, [resolve(app, 'exact.mjs'), '--help'], { cwd: app, env: { ...process.env, EXACT: resolve(import.meta.dir, '..') }, encoding: 'utf8' });
+    assert.equal(restored.status, 0, restored.stderr);
     const readme=readFileSync(resolve(app,'README.md'),'utf8');
     assert.ok(!readme.includes('/path/to/exact2'),readme);
     const documented=[...readme.matchAll(/`(bun [^`]+)`/g)].map(match=>match[1]);
@@ -481,6 +488,26 @@ test('game and generated shell workspaces inherit every root vendor patch', asyn
   } finally {rmSync(root, {recursive:true, force:true});}
 });
 
+test('a game optimizes its build-time meshopt decoder across build profiles', () => {
+  mkdirSync(resolve(import.meta.dir, '../target'), {recursive:true});
+  const root = realpathSync(mkdtempSync(resolve(import.meta.dir, '../target/meshopt-profile-')));
+  try {
+    const app = resolve(root, 'model-game');
+    createGame(app, undefined, {assets:true});
+    for (const profile of ['release', 'web', 'host-dev', 'gpu-dev']) {
+      const result = spawnSync('cargo', ['build', '-p', 'model-game-gpu', '--profile', profile,
+        '--unit-graph', '-Z', 'unstable-options', '--offline', '--locked'], {
+        cwd:resolve(app, '.shells'), env:{...process.env, RUSTC_BOOTSTRAP:'1'},
+        encoding:'utf8', maxBuffer:1 << 24,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const units = JSON.parse(result.stdout).units.filter(unit => unit.target.name === 'exact_meshopt');
+      assert.equal(units.length, 1, `${profile}: one decoder build`);
+      assert.equal(units[0].profile.opt_level, '3', `${profile}: the build-time decoder stays optimized`);
+    }
+  } finally {rmSync(root, {recursive:true, force:true});}
+});
+
 test('a Windows game shell links the shared presenter its baked entry uses', () => {
   const root = realpathSync(mkdtempSync(resolve(tmpdir(), 'game-windows-host-')));
   try {
@@ -493,7 +520,8 @@ test('a Windows game shell links the shared presenter its baked entry uses', () 
 });
 
 test('the SDK lock decides every version; a game that adds packages captures its own lock', async () => {
-  const {outsideSdkLock,sdkLock}=await import('./app/shells.mjs');
+  const {sdkLock}=await import('./app/shells.mjs');
+  const {outsideSdkLock}=await import('../scripts/app-shells.mjs');
   const lock=packages=>`version = 4\n\n${packages.map(([name,version,source,deps])=>`[[package]]\nname = "${name}"\nversion = "${version}"\n${source?`source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "${source}"\n`:''}${deps?`dependencies = [\n${deps.map(d=>` "${d}",\n`).join('')}]\n`:''}`).join('\n')}`;
   const sdk=lock([['glam','0.33.7','aa',['approx','libm']],['approx','0.5.1','bb'],['libm','0.2.16','cc'],['exact-game','0.1.0',null,['glam']]]);
   const members=new Set(['x-logic','x-gpu']);
@@ -510,7 +538,8 @@ test('the SDK lock decides every version; a game that adds packages captures its
 }, 120000);
 
 test('a root crate\'s new registry dependency or new path crate resolves before the SDK lock is refreshed', async () => {
-  const {outsideSdkLock,withRootPins}=await import('./app/shells.mjs');
+  const {withRootPins}=await import('./app/shells.mjs');
+  const {outsideSdkLock}=await import('../scripts/app-shells.mjs');
   const registry='registry+https://github.com/rust-lang/crates.io-index';
   const block=(name,version,checksum)=>`[[package]]\nname = "${name}"\nversion = "${version}"\n${checksum?`source = "${registry}"\nchecksum = "${checksum}"\n`:''}`;
   const lock=(...blocks)=>`version = 4\n\n${blocks.join('\n')}`;
@@ -527,6 +556,12 @@ test('a root crate\'s new registry dependency or new path crate resolves before 
   assert.deepEqual(outsideSdkLock(lock(block('cssparser','0.37.1','dd')),seeded,members),[`cssparser 0.37.1 ${registry}`],'the root lock decides the version');
   assert.deepEqual(outsideSdkLock(lock(block('itoa','1.0.9','cc')),seeded,members),[`itoa 1.0.9 ${registry}`],'the SDK lock still decides its own packages');
   assert.equal(withRootPins(sdk,''),sdk);
+  // The root's older major of a package the SDK holds (vt100's unicode-width 0.1) leaves the
+  // SDK's edges naming its own version: a bare one would let Cargo take either.
+  const width=lock(`${block('codespan-reporting','0.13.1','ff')}dependencies = [\n "unicode-width",\n]\n`,block('unicode-width','0.2.2','gg'));
+  const pinned=Bun.TOML.parse(withRootPins(width,lock(block('unicode-width','0.1.14','hh')))).package;
+  assert.deepEqual(pinned.map(p=>`${p.name} ${p.version}`),['codespan-reporting 0.13.1','unicode-width 0.2.2','unicode-width 0.1.14']);
+  assert.deepEqual(pinned[0].dependencies,['unicode-width 0.2.2']);
 });
 
 
@@ -550,7 +585,8 @@ test('an empty Cargo cache permits adapter generation and refuses offline resolu
 
 
 test('lockDrift names what exact2 added and moved under a captured lock, never what the game chose', async () => {
-  const {lockDrift,lockChanges}=await import('./app/shells.mjs');
+  const {lockDrift}=await import('./app/shells.mjs');
+  const {lockChanges}=await import('../scripts/app-shells.mjs');
   const lock=packages=>`version = 4\n\n${packages.map(([name,version,source,deps])=>`[[package]]\nname = "${name}"\nversion = "${version}"\n${source?`source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "${source}"\n`:''}${deps?`dependencies = [\n${deps.map(d=>` "${d}",\n`).join('')}]\n`:''}`).join('\n')}`;
   // exact2's text crate moved to parley, which brings fontique and a newer harfrust;
   // another shell's rand 0.8 is in the SDK lock, and this game chose rand 0.9.
@@ -582,25 +618,6 @@ test('lockDrift names what exact2 added and moved under a captured lock, never w
   assert.deepEqual(lockChanges(wired,unwired),['web 0.1.0 (path) no longer depends on helper']);
   assert.deepEqual(lockChanges(unwired,wired),['web 0.1.0 (path) now depends on helper']);
   assert.deepEqual(lockChanges(wired,wired),[]);
-});
-
-test('lock seeds the SDK lock\'s versions, a same-series bump included, and keeps the game\'s own packages', async () => {
-  const {lockSeed,staleLock}=await import('./app/shells.mjs');
-  const block=(name,version,source)=>`[[package]]\nname = "${name}"\nversion = "${version}"\n${source?`source = "${source}"\n`:''}`;
-  const lock=(...blocks)=>`version = 4\n\n${blocks.join('\n')}`;
-  const crates='registry+https://github.com/rust-lang/crates.io-index';
-  const sdk=lock(block('foo','0.12.1',crates),block('exact-game','0.1.0'));
-  const own=lock(block('foo','0.12.0',crates),block('rand','0.9.1',crates),block('tool','1.0.0','git+https://example.com/tool#aaa'),block('x-logic','0.1.0'));
-  // foo 0.12.0 → the SDK's 0.12.1 (one graph holds one version per series), not crates.io's newest.
-  assert.deepEqual(Bun.TOML.parse(lockSeed(sdk,own)).package.map(p=>`${p.name} ${p.version}`),['foo 0.12.1','exact-game 0.1.0','rand 0.9.1','tool 1.0.0','x-logic 0.1.0']);
-  assert.equal(lockSeed(sdk,sdk),sdk);
-  // A git fork of an SDK crate, same name and series, is another package: kept at its revision.
-  const fork=lock(block('foo','0.12.0','git+https://example.com/foo?branch=main#aaa'));
-  assert.deepEqual(Bun.TOML.parse(lockSeed(sdk,fork)).package.map(p=>`${p.name} ${p.version} ${p.source??''}`),['foo 0.12.1 '+crates,'exact-game 0.1.0 ','foo 0.12.0 git+https://example.com/foo?branch=main#aaa']);
-  // Only a lock that needs updating is stale; a crate missing from the cache is not.
-  assert.ok(staleLock('error: cannot update the lock file /g/.shells/Cargo.lock because --locked was passed to prevent this'));
-  assert.ok(staleLock('error: the lock file /g/.shells/Cargo.lock needs to be updated but --locked was passed to prevent this'));
-  assert.ok(!staleLock('error: failed to download `rustix v1.1.5`\n\nCaused by:\n  attempting to make an HTTP request, but --offline was specified'));
 });
 
 test('a captured lock exact2 moved past is named at a build, at generation and at update, and left alone', async () => {

@@ -12,6 +12,7 @@ fn css(rows: &[(StyleId, StyleValue)], fonts: &[&str]) -> String {
 
 #[test]
 fn explicit_transition_none_covers_no_property_in_the_browser() {
+    exact_kernel::style::link_all();
     assert_eq!(css(&[], &[]), "");
     assert_eq!(
         css(
@@ -22,14 +23,17 @@ fn explicit_transition_none_covers_no_property_in_the_browser() {
     );
 }
 
-/// LLP 1001 §6's balance; LLP 1104 D3's `::placeholder` colour.
+/// LLP 1001 §6's balance; LLP 1104 D3's `::placeholder` colour; LLP
+/// 1035.001 D11's `::backdrop` colour.
 #[test]
-fn balance_and_the_placeholder_colour_are_written_for_the_browser() {
+fn balance_and_the_part_colours_are_written_for_the_browser() {
     let text = |id, v: &str| css(&[(id, StyleValue::Text(v.into()))], &[]);
     let wrap = text(StyleId::TextWrapStyle, "balance");
     assert_eq!(wrap, "text-wrap-style:balance;");
     let ink = text(StyleId::PlaceholderColor, "#00800080");
     assert_eq!(ink, "--exact-placeholder-color:rgba(0,128,0,0.5019608);");
+    let dim = text(StyleId::BackdropColor, "#00000000");
+    assert_eq!(dim, "--exact-backdrop-color:rgba(0,0,0,0);");
 }
 
 /// CSS Fonts 4 §6.12: `font-feature-settings` is written as CSS serializes it.
@@ -77,6 +81,7 @@ fn cursor_emits_the_css_keyword_including_explicit_auto_override() {
 /// text had them, byte for byte.
 #[test]
 fn composed_declarations_keep_their_text() {
+    exact_kernel::style::link_all();
     let cases = [
         css(
             &[(StyleId::FontFamily, StyleValue::Number(0.0))],
@@ -229,6 +234,7 @@ fn layout_rows_keep_their_css() {
 
 #[test]
 fn every_grid_row_has_css_and_none_is_skipped() {
+    exact_kernel::style::link_all();
     fn t(s: &str) -> StyleValue<'_> {
         StyleValue::Text(s.into())
     }
@@ -264,9 +270,6 @@ fn every_grid_row_has_css_and_none_is_skipped() {
     }
 }
 
-/// LLP 1066: a gradient is one `background-image` declaration after the
-/// colour it paints over; a `light-dark()` stop is the browser's to
-/// resolve, and `none` clears.
 #[test]
 fn a_3d_rotate_and_translate_are_one_declaration_each() {
     fn t(s: &str) -> StyleValue<'_> {
@@ -285,7 +288,12 @@ fn a_3d_rotate_and_translate_are_one_declaration_each() {
     assert!(text.contains("rotate:y 30deg;"), "{text}");
     assert!(text.contains("translate:1px 2px 3px;"), "{text}");
     assert!(text.contains("perspective:800px;"), "{text}");
-    assert_eq!(text.matches("rotate").count(), 1, "{text}");
+    assert!(text.contains("--exact-rotate-axis:y;"), "{text}");
+    assert_eq!(
+        text.split(';').filter(|d| d.starts_with("rotate:")).count(),
+        1,
+        "{text}"
+    );
     // Chess diary #4: a percentage is the browser's to resolve.
     let text = css(
         &[
@@ -297,6 +305,20 @@ fn a_3d_rotate_and_translate_are_one_declaration_each() {
     );
     assert!(text.contains("translate:-50% 4px;"), "{text}");
     assert_eq!(text.matches("translate").count(), 1, "{text}");
+    // A `calc()` of px and a percentage is the two rows, written as one again.
+    let calc = "calc(50% - 12px) calc(-100% + 4px)";
+    let text = css(
+        &[
+            (StyleId::Translate, t(calc)),
+            (StyleId::TranslatePercent, t(calc)),
+            (StyleId::TranslateZ, t(calc)),
+        ],
+        &[],
+    );
+    assert!(
+        text.contains("translate:calc(-12px + 50%) calc(4px + -100%);"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -363,6 +385,7 @@ fn a_capsule_control_takes_no_curve() {
 
 #[test]
 fn background_image_is_one_declaration_over_the_colour() {
+    exact_kernel::style::link_all();
     fn t(s: &str) -> StyleValue<'_> {
         StyleValue::Text(s.into())
     }
@@ -400,6 +423,7 @@ fn background_image_is_one_declaration_over_the_colour() {
 /// authored transition list intact; 1 needs no effect.
 #[test]
 fn a_press_scale_keeps_the_authored_scale_and_transitions() {
+    exact_kernel::style::link_all();
     let n = StyleValue::Number;
     fn t(s: &str) -> StyleValue<'_> {
         StyleValue::Text(s.into())
@@ -437,6 +461,7 @@ fn a_press_scale_keeps_the_authored_scale_and_transitions() {
 /// its picture every frame).
 #[test]
 fn only_a_pressable_node_animates_the_scale_custom_property() {
+    exact_motion::link_animations();
     use exact_motion::animation::{Animations, Keyframes};
     let mut list = Animations::parse("grow 1s linear infinite, fade 2s").unwrap();
     list.0[0].keyframes = Keyframes::parse("from{scale:1;translate:0px 0px}to{scale:1.6}").unwrap();
@@ -493,4 +518,50 @@ fn scroll_snap_emits_both_axes_and_center() {
             format!("scroll-snap-type:{axis} mandatory;scroll-snap-align:center;")
         );
     }
+}
+
+#[test]
+fn press_translate_is_a_host_offset_beside_the_authored_translation() {
+    let mut s = StyleProps::default();
+    for row in [StyleId::PressTranslate, StyleId::PressTranslatePercent] {
+        s.set_dynamic(row, &exact_kernel::StyleValue::Text("10% 4px".into()))
+            .unwrap();
+    }
+    s.set_dynamic(
+        StyleId::Translate,
+        &exact_kernel::StyleValue::Text("10px 20px".into()),
+    )
+    .unwrap();
+    let (text, skipped) = super::css_text(&s, &[]);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert!(
+        text.contains("--exact-translate-x:10px;--exact-translate-y:20px;"),
+        "{text}"
+    );
+    assert!(
+        text.contains("--exact-press-x:10%;--exact-press-y:4px;"),
+        "{text}"
+    );
+    assert!(text.contains("--exact-press-translate:10% 4px;"), "{text}");
+}
+
+#[test]
+fn cleared_press_translation_does_not_create_a_containing_block() {
+    let mut style = StyleProps::default();
+    style.written.set(StyleId::PressTranslate);
+    let (text, skipped) = super::css_text(&style, &[]);
+    assert!(skipped.is_empty());
+    assert!(
+        !text.split(';').any(|d| d.starts_with("translate:")),
+        "{text}"
+    );
+    assert!(super::press_animations(&style));
+}
+
+#[test]
+fn press_keyframes_copy_all_translation_axes() {
+    assert_eq!(
+        press_keyframes_css("0%{translate:0px 0px 40px;}100%{translate:10% 20px;}"),
+        "0%{translate:0px 0px 40px;--exact-translate-x:0px;--exact-translate-y:0px;--exact-translate-z:40px;}100%{translate:10% 20px;--exact-translate-x:10%;--exact-translate-y:20px;--exact-translate-z:0px;}"
+    );
 }

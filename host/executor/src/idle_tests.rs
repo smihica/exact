@@ -6,6 +6,10 @@ use super::*;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+/// The host work these tests hand out (LLP 1047.001 D12).
+struct TestWork;
+impl exact_runner::HostWork for TestWork {}
+
 struct NoTransport;
 impl ibex2::stdlib::fetch::Transport for NoTransport {
     fn open(
@@ -101,7 +105,7 @@ fn cores_in_one_test_share_the_worker_limit_and_return_slots_to_their_owner() {
     assert!(!full.disabled);
     let (refused, _) = core();
     assert_eq!(
-        refused.run(tests::job(1, Request::continuation(1)), None),
+        refused.run(tests::job(1, Request::continuation::<TestWork>(1)), None),
         Err("native executor worker limit reached")
     );
     assert_eq!(budget.load(Ordering::Acquire), MAX_WORKERS);
@@ -111,7 +115,7 @@ fn cores_in_one_test_share_the_worker_limit_and_return_slots_to_their_owner() {
     let (replacement, woke) = core();
     replacement
         .run(
-            tests::job(2, Request::continuation(2)),
+            tests::job(2, Request::continuation::<TestWork>(2)),
             Some(Box::new(|| Outcome::Storage(vec![7]))),
         )
         .unwrap();
@@ -175,10 +179,11 @@ fn check_worker_start(core: &Core, woke: &std::sync::mpsc::Receiver<()>, bound: 
     assert!(core.idle.lock().unwrap().is_some());
     core.run(
         RequestOut {
+            completion: None,
             class: exact_runner::RequestClass::Ordered,
             ticket: 1,
             target: "test".into(),
-            request: Request::continuation(1),
+            request: Request::continuation::<TestWork>(1),
             forced: false,
         },
         Some(Box::new(|| Outcome::Storage(vec![7]))),
@@ -194,6 +199,7 @@ fn check_worker_start(core: &Core, woke: &std::sync::mpsc::Receiver<()>, bound: 
     ));
     core.run(
         RequestOut {
+            completion: None,
             class: exact_runner::RequestClass::Ordered,
             ticket: 2,
             target: "test".into(),
@@ -221,10 +227,11 @@ fn an_idle_pool_is_not_woken() {
     let (core, woke) = core();
     core.run(
         RequestOut {
+            completion: None,
             class: exact_runner::RequestClass::Ordered,
             ticket: 1,
             target: "test".into(),
-            request: Request::continuation(1),
+            request: Request::continuation::<TestWork>(1),
             forced: false,
         },
         Some(Box::new(|| Outcome::Storage(vec![]))),
@@ -246,4 +253,44 @@ fn an_idle_pool_is_not_woken() {
         before,
         "idle workers were notified"
     );
+}
+
+#[test]
+fn journal_drains_do_not_wake_workers_across_one_hundred_batches() {
+    let (core, woke) = core();
+    let preloads = preload::Preloads::start(Vec::new(), "", ibex2::host::Host::new);
+    let control = preloads.control();
+    assert!(core.adopt_preloads(preloads).is_ok());
+    check_worker_start(&core, &woke, Duration::from_secs(30));
+    let before = core.shared.worker_notifications.load(Ordering::Relaxed);
+    for _ in 0..100 {
+        assert!(control.take_journal().is_empty());
+        core.forget(|_| true);
+        core.begin_pump();
+        assert!(core.drain().is_empty());
+        core.notify();
+    }
+    assert_eq!(
+        core.shared.worker_notifications.load(Ordering::Relaxed),
+        before
+    );
+    for (ticket, request, work) in [
+        (
+            3,
+            Request::get("https://example.test/").independent_http(4096),
+            None,
+        ),
+        (
+            4,
+            Request::continuation::<TestWork>(4),
+            Some(Box::new(|| Outcome::Storage(vec![9])) as Work),
+        ),
+    ] {
+        core.run(tests::job(ticket, request), work).unwrap();
+        let (done, outcome) = next(&core, &woke);
+        assert_eq!(done, ticket);
+        if ticket == 4 {
+            assert!(matches!(outcome, Outcome::Storage(bytes) if bytes == [9]));
+        }
+    }
 }

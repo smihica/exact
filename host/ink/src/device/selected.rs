@@ -53,12 +53,11 @@ impl Selected {
         connector: u32,
         size: [u32; 2],
         refresh: u32,
-        turned: bool,
     ) -> Result<()> {
         // Linux has the one device layer.
         let Self::Wgpu(device) = self;
         // SAFETY: the caller's contract.
-        unsafe { device.attach_scanout(fd, connector, size, refresh, turned) }
+        unsafe { device.attach_scanout(fd, connector, size, refresh) }
     }
 
     #[cfg(all(feature = "scanout", target_os = "linux"))]

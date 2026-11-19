@@ -28,9 +28,10 @@
 // - input and accessibility: interaction enabled, the element, traits,
 //   label, value, hint, identifier, hidden-elements, all set again by props;
 // - motion: an `svg`'s scene layers and every Core Animation spec the view
-//   ran (`SvgHost.forget`, on release), so no animation of the old row
-//   plays on the new one (LLP 1055 D8; the new row's scene op starts its
-//   own). SVG elements are not views: an `svg` parks as one leaf.
+//   ran (the presenter's `svg` and `boxAnimations` forget them on release),
+//   so no animation of the old row plays on the new one (LLP 1055 D8; the
+//   new row's scene op starts its own). SVG elements are not views: an `svg`
+//   parks as one leaf.
 // - identity (LLP 1068 §4.9): the view's `incarnation`, zeroed when it
 //   parks, before the reset, and a never-used one issued at the take, in
 //   the batch that installs its props and handlers; an asynchronous
@@ -267,7 +268,7 @@ final class NodePool {
     /// false and leave the destroy to the caller. Nothing is destroyed or
     /// reset until the whole subtree has been found eligible.
     func retire(_ root: NodeView) -> Bool {
-        guard depth == 1, presenter.reorder == nil, !presenter.swipeActions.assistive,
+        guard depth == 1, !presenter.reorders.lifting, !presenter.swipeActions.assistive,
               !Self.leaves.contains(root.kind), list(holding: root) != nil,
               root.canvasAbove == nil, !presenter.modals.retainsRemovedView(root) else { return false }
         return park(root, under: nil)
@@ -528,6 +529,9 @@ extension NodeView {
     /// Parked (`NodePool`): what `forget` drops, except the view's presenter
     /// and its empty text hierarchy or symbol glyph view, which the next row reuses.
     func recycle() {
+        layoutHits = nil
+        trackClipboardHandlers(false)
+        trackIntersections(listening: false)
         holdGone() // a held state goes with its node, parked under its row (HeldState.swift)
         cancelPressContact()
         pressContact = nil
@@ -543,7 +547,7 @@ extension NodeView {
         parkTextRaster()
         liveText = nil
         loadGeneration += 1
-        presenter?.session?.rasters.cancel(id)
+        presenter?.session?.rasters?.cancel(id)
         // A symbol keeps its glyph and key: the same symbol again costs no
         // image, and `finishReuse` reports its size under the new id.
         buttonRasterView = nil
@@ -571,6 +575,7 @@ extension NodeView {
     /// list's scroll, with its delegate detached while it resets.
     func recycleScroll() {
         guard let sv = scroll else { return }
+        dropZoom()
         let delegate = sv.delegate
         sv.delegate = nil
         sv.setContentOffset(.zero, animated: false)
@@ -599,7 +604,7 @@ extension NodeView {
         // UIKit's setters are not free, even to the same value.
         if isHidden { isHidden = false }
         if alpha != 1 || boxFilter != nil { presentOpacity(1) }
-        translatePx = .zero; translatePercent = .zero; layoutOffset = .zero; layoutResize = .zero; endSurface(); scale = 1; rotate = 0; stopPressEase(); press = PressFeedback(); dropPressPaint()
+        translatePx = .zero; translatePercent = .zero; layoutOffset = .zero; zoomFactor = 1; zoomShift = .zero; layoutResize = .zero; endSurface(); scale = 1; rotate = 0; rotationAxis = [0, 0, 0]; stopPressEase(); press = PressFeedback(); dropPressPaint()
         if !transform.isIdentity { transform = .identity }
         if !isUserInteractionEnabled { isUserInteractionEnabled = true }
         // With assistive technology's runtime loaded every accessibility
@@ -612,6 +617,7 @@ extension NodeView {
         if accessibilityHint != nil { accessibilityHint = nil }
         if accessibilityViewIsModal { accessibilityViewIsModal = false }
         props = [:]
+        layoutHits = nil
         // The presenter's indexes for the new id (LLP 1068 §4.0): each is
         // filled by a property observer a rebind does not fire.
         if scroll != nil { presenter?.scrollers.insert(newID) }

@@ -25,13 +25,13 @@ extension Agent {
         let view = presenter.viewport
         let layer = presenter.documentHost.layer // in the viewport's place (`DocumentMountIOS.swift`)
         #else
-        let view = presenter.navigation.split.agentRoot
+        let view = presenter.navigation.stackSplit.agentRoot
         guard let layer = view.layer else { return ["error": "the session's view has no layer"] }
         #endif
         #if os(iOS) || os(tvOS)
         let size = view.pageSize // the page's area, a box's space (LLP 1130)
         #else
-        let area = presenter.navigation.split.agentCaptureArea
+        let area = presenter.navigation.stackSplit.agentCaptureArea
         let size = area.size
         #endif
         let (w, h) = (Int(size.width.rounded(.up)), Int(size.height.rounded(.up)))
@@ -59,7 +59,7 @@ extension Agent {
         }
         #else
         ctx.translateBy(x: -area.minX, y: -area.minY)
-        if presenter.navigation.split.active, !view.isFlipped {
+        if presenter.navigation.stackSplit.active, !view.isFlipped {
             ctx.translateBy(x: 0, y: view.bounds.height)
             ctx.scaleBy(x: 1, y: -1)
         }

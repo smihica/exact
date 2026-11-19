@@ -13,7 +13,7 @@
   // (op, a, b) -> string | undefined, js/src/door.rs's ops: 1 a request, 2-4 and 18-20 the store, 5 storage,
   // 6 native, 7 pure, 8 secure randomness drawn, 9/10 canvas, 11 the agent's random bytes, 12 auth, 13 a journal line,
   // 16 a request withdrawn unsent, 21 the runner's clock as the call began, 22 module work's state (module-work.js), 23
-  // a handed-out request the app aborted, 27 a native request/call id.
+  // a handed-out request the app aborted, 27 a native request/call id, 28 a setting's value from the launch (launch.js).
   var host = global.__exact_host;
   delete global.__exact_host;
   var browserSecrets = global.__exact_browser_secrets;
@@ -35,6 +35,18 @@
   delete global.__exact_time;
   var tracker = global.HermesInternal;
   time.refuseClock(tracker);
+  // What the runtime itself says through `console`: natively a line that is
+  // not the app's, so no host writes it to the platform's log
+  // (js/src/console.js, LLP 1027.009 D1); in a browser realm, its console.
+  var runtimeLine =
+    global.__exact_runtime_line ||
+    function (line) {
+      if (global.console) global.console.error(line);
+    };
+  // An uncancelled error event's line for the platform's log alone (console.js, LLP 1175 D5); a browser realm's
+  // console prints its own.
+  var uncaught = global.__exact_uncaught;
+  delete global.__exact_uncaught;
   // The runtime's own journal line (LLP 1097 D8): a failed storage
   // operation, an unhandled rejection. Natively it is the runner's journal
   // (`logs`) as it is; a realm without that door writes it to its console.
@@ -45,7 +57,7 @@
     } catch (e) {
       written = undefined;
     }
-    if (written !== "1" && global.console) global.console.error(String(line));
+    if (written !== "1") runtimeLine(String(line));
   }
   // The bake answers on an engine without some of Intl's constructors, where `new Intl.Collator()` says only
   // "undefined cannot be used as a constructor" (expo/exact#447). At bake such an error names the ones missing.
@@ -71,23 +83,38 @@
       return "(an error that cannot be read)";
     }
   }
-  // An answer's own timers, on the runner's clock (op 21), and the timer
-  // Hermes's rejection tracker asks for (time.js `timers`). Every
-  // unhandled rejection in the module reaches the journal, as a page's
-  // `unhandledrejection` reaches its console (LLP 1097 D8).
-  // The tracker's report is the timer it arms from inside its rejection
-  // hook (Hermes's `Promise._C`), told by that place, not by its name alone.
-  var reporting = 0,
-    hooked = false;
+  // The global's error events (errors.js, LLP 1175), natively from Ibex's events binding, and Hermes's rejection
+  // tracker: every unhandled rejection in the module reaches the journal, as a page's reaches its console (LLP 1097
+  // D8). A browser realm has its own events.
+  var errors = global.__exact_errors({
+    hooks: global.__exact_ibex2_events_hooks,
+    tracker: tracker,
+    journal: journal,
+    runtimeLine: runtimeLine,
+    uncaught: uncaught,
+    errorText: errorText,
+    leftOpen: function () {
+      leftOpen();
+    },
+    swap: function (call) {
+      var before = currentCall;
+      currentCall = call;
+      return before;
+    },
+  });
+  delete global.__exact_errors;
+  delete global.__exact_ibex2_events_hooks;
+  // The shim takes it at hardening (shim.cc): what the module's evaluation threw is reported before the load fails.
+  if (tracker) global.__exact_evaluation_threw = errors.evaluationThrew;
+  // An answer's own timers, on the runner's clock (op 21), and the timer the tracker's report asks for (time.js
+  // `timers`, `errors.report`).
   var timers = time.timers(
     timerOwner,
     function () {
       return host(21, "", "");
     },
-    journal,
-    function (callback) {
-      return (reporting > 0 || !hooked) && callback.name === "bound onUnhandled";
-    },
+    errors.report,
+    errors.raise,
     function (signal) {
       try {
         return abortHooks ? abortHooks.own(signal).sources : null;
@@ -96,27 +123,10 @@
       }
     }
   );
-  if (tracker && typeof tracker.enablePromiseRejectionTracker === "function") {
-    tracker.enablePromiseRejectionTracker({
-      allRejections: true,
-      onUnhandled: function (id, error) {
-        journal("data: unhandled rejection: " + errorText(error));
-        leftOpen();
-      },
-      onHandled: function () {},
-    });
-    var reject = global.Promise._C;
-    if (typeof reject === "function") {
-      hooked = true;
-      global.Promise._C = function (promise, error) {
-        reporting++;
-        try {
-          return reject.call(this, promise, error);
-        } finally {
-          reporting--;
-        }
-      };
-    }
+  // The checkpoint after a turn's microtasks: the tracker's reports, then the rejections handled since (D2).
+  function checkpoint() {
+    var ran = timers.checkpoint();
+    return errors.checkpoint() || ran;
   }
   // A browser realm (the wasm host's module realm) reports its own rejections (module-glue.js).
   if (!tracker && typeof global.addEventListener === "function")
@@ -139,6 +149,12 @@
           "; call it inside an answer"
       );
   }
+  global.exactHost = function exactHost() {
+    answerOnly("exactHost()");
+    var kind = host(12, "host", "");
+    if (kind === undefined) throw storageError("exactHost() is unavailable during bake", "bake");
+    return kind;
+  };
   // Host work an answer waits on that is neither a fetch nor storage (the
   // browser's digest settles in a later task): on the web it joins the
   // answer's storage turn, so the answer is pending on it, not on nothing.
@@ -194,6 +210,10 @@
   var pending = new Map(),
     // the answer a fetch belongs to
     currentCall = null,
+    // the id of the answer whose turn the engine runs (an id, so that no ended call's value is kept alive by it), and
+    // whether the turn is a module turn delivering a report's reply (LLP 1175 D3)
+    turnId = 0,
+    reportTurn = false,
     // a socket's mapper answering a frame (D7)
     mapping = null,
     // any mapper call
@@ -272,6 +292,7 @@
     } catch (e) {
       promise = Promise.reject(e);
     }
+    op.promise = promise;
     promise.then(
       function (value) {
         landed(op, true, value);
@@ -282,8 +303,7 @@
     );
   }
   function landed(op, ok, value) {
-    // A late completion of an operation already failed (a timed-out
-    // continuation the store then finishes) must not clear the new head.
+    // A revoked image's late completion must not clear the next head.
     if (op.settled) return;
     op.settled = true;
     if (head === op) {
@@ -298,6 +318,19 @@
   function headOwner() {
     return head ? owner(head.call) : null;
   }
+  // Storage this call already issued, excluding `hostWork`: an answer drains
+  // these FIFO operations before it asks the browser host for an unheld secret
+  // lease (LLP 1097 D7).
+  function hasQueuedStorage(call) {
+    if (head && owner(head.call) === call) return true;
+    for (var i = 0; i < queue.length; i++) if (owner(queue[i].call) === call) return true;
+    return false;
+  }
+  // Native image cancellation uses Ibex's identity on the original Promise.
+  // Other promises may resolve to raw capabilities (a database or statement).
+  global.__exact_storage_promise = function () {
+    return head && (head.method === "compressImage" || head.method === "transformImage") ? head.promise : undefined;
+  };
   // Neither Ibex's abort hooks nor a browser's dependent signal can be stopped by a listener on the caller's signal.
   var abortHooks = global.__exact_ibex2_abort_hooks;
   delete global.__exact_ibex2_abort_hooks;
@@ -375,6 +408,7 @@
     host: host,
     binary: binary,
     journal: journal,
+    runtimeLine: runtimeLine,
     pending: pending,
     work: work,
     background: background,
@@ -385,8 +419,23 @@
     Response: Response,
     FetchError: FetchError,
     conflict: SOCKET_AND_FETCH,
+    errors: errors,
     current: function () {
       return currentCall;
+    },
+    // Whether `call` is the answer whose turn the engine runs now (`__exact_call`, `__exact_turn`).
+    inTurn: function (call) {
+      return call !== null && call.id === turnId && turnId !== 0;
+    },
+    moving: function () {
+      return moving;
+    },
+    initializing: function () {
+      return initializing;
+    },
+    // A module turn that delivers a report's reply (LLP 1175 D3).
+    afterReport: function () {
+      return reportTurn;
     },
     mapping: function () {
       return mapping;
@@ -395,6 +444,10 @@
       return overlaying;
     },
     inOverlay: inOverlay,
+    // store.js's, once the store is made below
+    secretEffect: function (call) {
+      storeEnv.secretEffect(call);
+    },
   });
   delete global.__exact_fetch;
   var request = fetches.request,
@@ -406,7 +459,7 @@
   delete global.__exact_auth;
 
   // --- the store (store.js) and storage (storage.js) ------------------------
-  var store = global.__exact_store({
+  var storeEnv = {
     host: host,
     presence: binary.presence,
     browserSecrets: browserSecrets,
@@ -424,7 +477,8 @@
       return overlaying;
     },
     inOverlay: inOverlay,
-  });
+  };
+  var store = global.__exact_store(storeEnv);
   delete global.__exact_store;
   var storageCalls = global.__exact_storage_calls({
     host: host,
@@ -432,6 +486,7 @@
     errorText: errorText,
     background: background,
     owner: owner,
+    browserSecrets: browserSecrets,
     storing: storing,
     unstore: unstore,
     storageCounts: storageCounts,
@@ -541,9 +596,23 @@
     cleanUp();
     return text;
   }
-  function settle(call, final) {
+  function settleResult(call, final) {
     var secret = call.secrets && call.secrets[0];
-    if (secret && !secret.held) return JSON.stringify({ tag: 1, call: call.id, ticket: 0, secret: secret.name });
+    if (secret && !secret.held) {
+      if (browserSecrets && !call.lost && !call.letGo) {
+        if (hasQueuedStorage(call)) {
+          var storageOwner = headOwner();
+          return JSON.stringify({
+            tag: 1,
+            call: call.id,
+            ticket: 0,
+            waiting: !!storageOwner && storageOwner !== call,
+          });
+        }
+        secret.asked = true;
+      }
+      return JSON.stringify({ tag: 1, call: call.id, ticket: 0, secret: secret.name });
+    }
     // A fetch its continuation tried after it staged socket operations
     // (refused at the fetch) refuses the mutation too, before any frame.
     if (call.socketConflict && call.status === "done") {
@@ -632,8 +701,8 @@
         if (c !== background && !calls.has(c.id)) left = true;
       });
       if (left) return JSON.stringify({ tag: 1, call: call.id, ticket: 0 });
-      // Another answer's work may settle it before its timer: whichever comes first asks it again (not on a
-      // worker, which runs one turn to its end and so cannot wait on another's).
+      // Another answer's work may settle it before its timer: whichever comes
+      // first asks it again.
       if (
         !final &&
         (due === undefined || (moving && later)) &&
@@ -641,7 +710,8 @@
       )
         return JSON.stringify({ tag: 1, call: call.id, ticket: 0, waiting: true, timer: due });
     } else if (due === undefined && moving && !final && background.storage > 0) {
-      // The page's realm keeps its background-delivery rule (LLP 1097 D7).
+      // The page realm asks a waiter again after background storage lands
+      // (LLP 1097 D2, D7).
       return JSON.stringify({ tag: 1, call: call.id, ticket: 0, waiting: true });
     }
     // A later turn can clear even a timer that parked alone: keep its owner releasable (LLP 1162 D3).
@@ -661,12 +731,29 @@
     return fail(
       new Error(
         "the answer is pending on nothing: no host operation it started will resolve it. " +
-          "An answer that awaits a promise another answer started (a fetch shared between answers, or a queue chained through a " +
-          "fetch another answer is waiting on) waits on work it does not own in the web's module realm; make each answer's own " +
-          "fetch, or share the resolved value rather than the promise. Storage is different: an answer queued behind another's " +
-          "storage turn waits for it"
+          "An answer that awaits a promise another answer started waits on work it does not own; make each answer's own " +
+          "request, or share the resolved value rather than the promise"
       )
     );
+  }
+  function settle(call, final) {
+    var text = settleResult(call, final);
+    if (!call.secretCompleted) return text;
+    var result = JSON.parse(text);
+    // Results the realm consumes itself leave the completion sticky until one
+    // reaches the host. A next lease's request is one: the host ends the
+    // completed lease before it asks for the next (LLP 1146 D5).
+    if (
+      result.secret === undefined &&
+      result.tag === 1 &&
+      result.ticket === 0 &&
+      (result.yielded || result.waiting || result.timer === undefined)
+    )
+      return text;
+    call.secretCompleted = false;
+    result.secretComplete = true;
+    if (call.secretFailed) result.secretFailed = true;
+    return JSON.stringify(result);
   }
   var nativeCall = (global.__exact_module_sync = function (request) {
     // `native.call`, and a module binding's synchronous form (LLP 1133.002 D14)
@@ -727,6 +814,7 @@
     };
     var result;
     currentCall = call;
+    turnId = call.id;
     work.setTurn(call);
     calls.set(call.id, call);
     try {
@@ -882,7 +970,7 @@
   global.__exact_ready = global.__exact_waiting_answers(calls, pending, work, headOwner);
   delete global.__exact_waiting_answers;
   global.__exact_settle = function (id, final) {
-    timers.checkpoint();
+    checkpoint();
     currentCall = null;
     var call = calls.get(Number(id));
     if (call) call.ran = false;
@@ -949,13 +1037,13 @@
     // behind it issued; the call keeps its other storage (LLP 1069.002
     // A1.5). Said so, and the caller delivers on.
     if (failed && head && headOwner() && headOwner().letGo && failAbandonedImage(String(message))) return "settled";
+    // Any other wait that failed fails only the answer whose operation is in flight. That operation stays at the
+    // head, now the module's, and the other let-go answers' queued storage starts once it completes.
+    var timedOut = failed ? headOwner() : null;
+    if (timedOut && timedOut.letGo) failStorage(timedOut, String(message));
     var owed = false;
     calls.forEach(function (c) {
       if (!c.letGo) return;
-      if (failed) {
-        c.lost = true;
-        storing.delete(c);
-      }
       if (c.storage > 0 && !c.lost) owed = true;
       else {
         c.replied = true;
@@ -963,6 +1051,7 @@
       }
     });
     cleanUp();
+    if (failed) return timedOut && timedOut.letGo ? "settled" : "";
     if (!owed) return "";
     // Deliver only when the operation in flight is the let-go call's.
     // One queued behind a live answer stays there: delivering it here would
@@ -1008,7 +1097,7 @@
         lastEventId: "",
         coalesced: 0,
         kind: o.failed.kind,
-        message: o.failed.message,
+        message: launchRefusal(o.failed, call.streamUrl).message,
         status: 0,
       };
     else
@@ -1117,7 +1206,7 @@
   // background's, and what landed and failed.
   global.__exact_background = function () {
     // Reporting can read an app's error getters after the last drain (LLP 1162 D3).
-    if (timers.checkpoint()) readyAll();
+    if (checkpoint()) readyAll();
     currentCall = null;
     return JSON.stringify({
       head: headOwner() === background,
@@ -1197,7 +1286,7 @@
   // A compression whose wait gave up, and whose right to write the waiter
   // took away (LLP 1069.002 A1.5): it can write nothing now, so it is
   // failed and the queue moves on. Any other operation whose wait ran out
-  // may still write, so its queue waits for it, as before. Whether it was.
+  // may still write, so its queue waits for its actual completion.
   var IMAGE_ABANDONED = /^compressImage: timeout: the storage wait ran out/;
   function failAbandonedImage(message) {
     if (
@@ -1214,20 +1303,36 @@
     if (!head || owner(head.call) !== background) return "";
     return failAbandonedImage(JSON.parse(outcomeJson).failed.message) ? "1" : "";
   };
+  function failStorage(call, message) {
+    call.lost = true;
+    call.status = "failed";
+    call.error = storageError(message);
+    // Remove unsent work before any rejection can issue more work or a
+    // revoked image can release the queue's head.
+    var dropped = [];
+    queue = queue.filter(function (op) {
+      if (op.call !== call) return true;
+      dropped.push(op);
+      return false;
+    });
+    dropped.forEach(function (op) {
+      op.abandon();
+      landed(op, false, call.error);
+    });
+    if (head && head.call === call && !failAbandonedImage(message)) {
+      // Reject its promise now, but keep serialization until the host
+      // returns: an uncancellable sync or rename can still publish.
+      head.settle(false, call.error);
+      head.failed = true;
+      head.call = background;
+      background.storage++;
+      storing.add(background);
+    }
+    storing.delete(call);
+  }
   global.__exact_storage_failed = function (id, outcomeJson) {
     var call = calls.get(Number(id));
-    if (!call) return;
-    // The continuation will not land. Settle the head now, as a failed
-    // operation, so the queue advances. `lost` first: the answer's own
-    // rejection must not report success, and a later delivery of this same
-    // operation is ignored.
-    var message = JSON.parse(outcomeJson).failed.message;
-    call.lost = true;
-    // The code its message names (`compressImage: timeout: `), else `failed`.
-    if (head && head.call === call) landed(head, false, storageError(message));
-    call.status = "failed";
-    storing.delete(call);
-    call.error = storageError(message);
+    if (call) failStorage(call, JSON.parse(outcomeJson).failed.message);
   };
   // The answer a timer belongs to (time.js `timers`), or the refusal.
   function timerOwner(api) {
@@ -1268,6 +1373,8 @@
   global.__exact_turn = function (id) {
     var t = id === "module" ? work.MODULE : id ? calls.get(Number(id)) || null : null;
     currentCall = t === work.MODULE ? null : t;
+    turnId = currentCall ? currentCall.id : 0;
+    reportTurn = false;
     work.setTurn(t);
   };
   global.__exact_module_discarded = function () {
@@ -1294,6 +1401,14 @@
       copyBytes: copyBytes,
       toBase64: toBase64,
     });
+  // A refusal at the origin of a setting a launch gave names the setting (js/src/launch.js, LLP 1153.002 D3); a realm
+  // without it has no launch.
+  var launchRefusal =
+    global.__exact_launch_refusal ||
+    function (failed) {
+      return failed;
+    };
+  delete global.__exact_launch_refusal;
   global.__exact_fulfill = function (ticket, outcomeJson) {
     var p = settled(Number(ticket));
     if (!p) return;
@@ -1303,11 +1418,19 @@
     currentCall = p.module ? null : p.call;
     // an adopted fetch's: its let-go call's steps run as it (the async helper), a plain reaction as no answer
     if (p.module) work.landed();
+    // A report's: its listener's continuation reads the reply, and its failure is quiet (LLP 1175 D4).
+    if (p.report) {
+      fetches.reportLanded();
+      reportTurn = true;
+    }
     // Its `AbortSignal.timeout`'s deadline passed on the host: the signal aborts.
     if (o.failed && o.failed.kind === "Timeout" && p.timed) timers.expire(p.signal);
     // A reply delivered after the signal aborts still rejects with that signal's reason.
     if (p.signal && p.signal.aborted) p.reject(p.signal.reason);
-    else if (o.failed) p.reject(new FetchError(o.failed));
+    else if (o.failed) {
+      var failure = new FetchError(launchRefusal(o.failed, p.url));
+      p.reject(p.report ? errors.quietReason(failure) : failure);
+    }
     else p.resolve(hostReply(o.response, p.bodyTo, p.head));
   };
 })(globalThis);

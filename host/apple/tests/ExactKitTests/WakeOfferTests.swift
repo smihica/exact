@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactWakeCarriers
 
 /// One wake offered to several packages ends once, when the last package
 /// that took it is done, whether each finishes during its offer or later,

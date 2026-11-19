@@ -2,10 +2,10 @@
 import UIKit
 import XCTest
 @testable import ExactKit
-@testable import ExactDrag
+@testable import ExactCollections
 
 final class ReorderGroupIOSTests: XCTestCase {
-    override class func setUp() { super.setUp(); ExactDrag.install() }
+    override class func setUp() { super.setUp(); ExactCollections.install() } // LLP 1047.001 D10
     private var window: UIWindow?
     override func tearDown() { window?.isHidden = true; window = nil; super.tearDown() }
 
@@ -31,7 +31,7 @@ final class ReorderGroupIOSTests: XCTestCase {
     private func fixture(_ calls: ReorderGroupRecorder, nested: Bool = false) -> (Presenter, NodeView) {
         let p = Presenter()
         p.viewport.frame = CGRect(x: 0, y: 0, width: 400, height: 300)
-        p.reorderGroupCalls = calls
+        p.reorderHost!.groupCalls = calls
         let entry = { (list: Int, wrapper: Int, root: Int) -> [String: Any] in
             ["view": list, "revision": 1, "scrollSequence": 0, "count": 1, "totalExtent": 40,
              "rows": [["view": wrapper, "root": root, "epoch": 7]], "correction": NSNull()]
@@ -141,14 +141,14 @@ final class ReorderGroupIOSTests: XCTestCase {
         XCTAssertTrue(grip.becomeFirstResponder())
         key(" ", .keyboardSpacebar, at: grip)
         XCTAssertEqual(calls.log, ["begin 3"])
-        XCTAssertNil(p.reorderGroup?.ghost)
+        XCTAssertNil(p.reorderHost!.group?.ghost)
         key(UIKeyCommand.inputUpArrow, .keyboardUpArrow, at: grip)
         key(UIKeyCommand.inputDownArrow, .keyboardDownArrow, at: grip)
         key(UIKeyCommand.inputLeftArrow, .keyboardLeftArrow, at: grip)
         key(UIKeyCommand.inputRightArrow, .keyboardRightArrow, at: grip)
         key("\r", .keyboardReturnOrEnter, at: grip)
         XCTAssertEqual(calls.log, ["begin 3", "step 1", "step 2", "step 3", "step 4", "drop", "finish"])
-        XCTAssertNil(p.reorderGroup)
+        XCTAssertNil(p.reorderHost!.group)
         XCTAssertTrue(p.views[7]?.isFirstResponder == true, "the landed grip keeps the keyboard")
     }
 
@@ -159,7 +159,7 @@ final class ReorderGroupIOSTests: XCTestCase {
         key(" ", .keyboardSpacebar, at: grip)
         key(UIKeyCommand.inputEscape, .keyboardEscape, at: grip)
         XCTAssertEqual(calls.log, ["begin 3", "cancel", "finish"])
-        XCTAssertNil(p.reorderGroup)
+        XCTAssertNil(p.reorderHost!.group)
         calls.log = []
         grip.handlers = ["key"]
         var heard: [UInt32] = []

@@ -99,7 +99,7 @@ final class FocusFixupMacTests: XCTestCase {
         p.focusElement(["middle"])
         XCTAssertEqual(focused(p), "middle")
         try XCTUnwrap(p.views[5]).isHidden = true
-        p.navigation.refreshInputGates([try XCTUnwrap(p.views[4])])
+        p.inputGates.refresh([try XCTUnwrap(p.views[4])])
         XCTAssertNotEqual(focused(p), "middle", "a hidden view takes it")
     }
 

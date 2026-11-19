@@ -16,7 +16,7 @@ extension NodeView {
     /// anchor), else nil and the 2D path applies. `shift` is what a lifted
     /// Arrange row already moved by its frame (macOS).
     func spaceTransform(origin d: CGPoint, scale s: CGFloat, shift: CGPoint = .zero) -> CATransform3D? {
-        let axis = style["rotate_axis"]?.numbers ?? [0, 0, 1]
+        let axis = rotationAxis == [0, 0, 0] ? (style["rotate_axis"]?.numbers ?? [0, 0, 1]) : rotationAxis
         let z = number("translate_z")
         guard axis.count == 3, (axis[0] != 0 || axis[1] != 0 || z != 0) else { return nil }
         var t = CATransform3DMakeTranslation(translate.x - shift.x + d.x, translate.y - shift.y + d.y, z)
@@ -29,7 +29,7 @@ extension NodeView {
     /// moved along z. Only such a box is drawn off its frame in a way the
     /// platform's own hit test cannot see.
     var standsInSpace: Bool {
-        let axis = style["rotate_axis"]?.numbers ?? [0, 0, 1]
+        let axis = rotationAxis == [0, 0, 0] ? (style["rotate_axis"]?.numbers ?? [0, 0, 1]) : rotationAxis
         return (axis.count == 3 && (axis[0] != 0 || axis[1] != 0)) || number("translate_z") != 0
     }
 
@@ -222,7 +222,7 @@ extension NodeView {
             return v.ascend(p, to: top)
             #endif
         }
-        guard let placed = placedAncestor, let h = placed.placement, let canvas = placed.superview?.superview as? NodeView else {
+        guard let placed = placedAncestor, let h = placed.placement, let canvas = placed.superview?.canvasOverlayOwner else {
             return out(self, p, top)
         }
         return canvas.drawnPoint(NodeView.map(h, out(self, p, placed)), in: top)
@@ -236,16 +236,35 @@ extension NodeView {
         return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
     }
 
+    /// Whether `drawnPoint` must carry a point through this box itself: a
+    /// canvas places it, or (on macOS, whose conversion ignores layers) its
+    /// layer is transformed.
+    private var carriesDrawnPoints: Bool {
+        #if os(iOS) || os(tvOS)
+        placement != nil || placementHidden
+        #else
+        placement != nil || placementHidden || plane != nil
+        #endif
+    }
+
     /// Layout supplies the untransformed overflow; the presenter adds boxes
     /// carried outside it by transforms, stopping at each clipping boundary.
     func documentOverflow(in document: SpaceView) -> CGRect {
         var reach = drawnRect(CGRect(origin: .zero, size: content), in: document)
-        var below = [self]
-        while let child = below.popLast() {
+        // Each box goes with whether it or a box above it carries drawn
+        // points. Below none, the platform's conversion is `drawnRect`, and
+        // this pass, which runs at every batch, walks each box's ancestors
+        // once rather than twice per corner.
+        #if os(iOS) || os(tvOS)
+        var below = [(self, placedAncestor != nil)]
+        #else
+        var below = [(self, placedAncestor != nil || drawnOffFrame)]
+        #endif
+        while let (child, carried) = below.popLast() {
             guard child.style["display"]?.string != "none", child.props["semanticTag"] != "dialog",
                   child.props["popover"] == nil else { continue }
             if child.bounds.width > 0, child.bounds.height > 0 {
-                let box = child.drawnRect(child.bounds, in: document)
+                let box = carried ? child.drawnRect(child.bounds, in: document) : child.convertedRect(child.bounds, to: document)
                 if box.origin.x.isFinite, box.origin.y.isFinite, box.width.isFinite, box.height.isFinite {
                     reach = reach.union(box)
                 }
@@ -256,8 +275,19 @@ extension NodeView {
             #else
             let scrolls = child.scroll != nil
             #endif
-            if !scrolls, !child.overflowClips { below.append(contentsOf: child.container.subviews.compactMap { $0 as? NodeView }) }
+            if !scrolls, !child.overflowClips {
+                below.append(contentsOf: child.childNodes.map { ($0, carried || $0.carriesDrawnPoints) })
+            }
         }
         return reach
+    }
+
+    /// The bounds in `top`'s coordinates of `r`'s corners, each converted by
+    /// the platform: `drawnRect` where no box on the way carries drawn points.
+    private func convertedRect(_ r: CGRect, to top: SpaceView) -> CGRect {
+        let corners = [CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
+            .map { convert($0, to: top) }
+        let xs = corners.map { $0.x }, ys = corners.map { $0.y }
+        return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
     }
 }

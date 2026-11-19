@@ -24,6 +24,11 @@ pub(crate) fn state_name(name: &str) -> String {
 }
 
 impl<D: DataSource> Runner<D> {
+    /// Refuse writes to phone-owned watch values before deferred data runs.
+    pub fn read_only_store(&mut self, names: Vec<String>) {
+        self.store.read_only(names);
+    }
+
     /// Slot `i`'s boot value: the store's, when slot `i` is persisted and the
     /// stored text decodes to its type; else `v`, the initializer's.
     pub(super) fn restore_persisted(&mut self, i: usize, v: Value) -> Value {
@@ -114,7 +119,7 @@ pub fn encode(v: &Value, out: &mut String) {
         }),
         Value::Number(n) => exact_num::push_text!(out, "{}", exact_num::Shortest(*n)),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        v @ exact_plan::str_value!() => crate::agent::quote(v.text(), out),
+        v @ exact_plan::str_value!() => crate::json::quote(v.text(), out),
         Value::Option(None) | Value::Unit => out.push_str("null"),
         Value::Option(Some(v)) => encode(v, out),
         Value::List(items) | Value::Record(items) => {

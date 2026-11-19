@@ -57,7 +57,7 @@ extension MenuHost {
         init(_ owner: Confirmation, _ index: Int) { self.owner = owner; self.index = index }
     }
 
-    func isConfirmation(_ pop: NodeView) -> Bool {
+    package func isConfirmation(_ pop: NodeView) -> Bool {
         pop.props["popover"] != nil && pop.props["accessibilityRole"] == "alertdialog"
     }
     /// A chooser shows as a popover
@@ -72,7 +72,7 @@ extension MenuHost {
     /// The owner for `pop` opened from `source`, or nil — logged with why —
     /// for a shape the menu cannot present (iOS's refusals, word for word).
     func confirmation(of pop: NodeView, from source: NodeView, bubbled: Bool = false) -> Confirmation? {
-        let children = pop.container.subviews.compactMap { $0 as? NodeView }
+        let children = pop.childNodes
         let actions = children.filter { $0.isButton && $0.handlers.contains("press") }
         let cancels = children.filter { $0.isButton && !$0.handlers.contains("press") && closes($0, pop) }
         func refuse(_ why: String) -> Confirmation? {
@@ -194,7 +194,7 @@ extension MenuHost {
         return NSImage(cgImage: bitmap, size: NSSize(width: natural.width * scale, height: natural.height * scale))
     }
     private static func firstImage(in row: NodeView) -> NodeView? {
-        for case let node as NodeView in row.container.subviews {
+        for node in row.childNodes {
             if node.kind == "image" { return node }
             if let found = firstImage(in: node) { return found }
         }

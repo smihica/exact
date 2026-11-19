@@ -83,7 +83,8 @@ impl Readback {
                 .zip(mapped.chunks_exact(self.row as usize))
             {
                 if bgra {
-                    for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    for (d, s) in std::iter::zip(dst.as_chunks_mut::<4>().0, src.as_chunks::<4>().0)
+                    {
                         d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
                     }
                 } else {
@@ -99,8 +100,11 @@ impl Readback {
 
 impl Module {
     /// Render and capture directly into caller-owned RGBA bytes, reusing GPU
-    /// storage until the size, format, or device changes.
+    /// storage until the size, format, or device changes, or the surface clears.
     pub fn readback_into(&mut self, id: u32, frame: &Frame, out: &mut [u8]) -> Option<bool> {
+        if let Some(error) = self.refused_instance(id) {
+            return self.fail(error);
+        }
         self.check_device();
         if let Some(why) = shaders::missing(self.registry.shaders) {
             self.error = why;
@@ -145,6 +149,12 @@ impl Module {
             self.error = format!("readback: {} bytes for {} pixels", out.len(), len / 4);
             return None;
         }
+        if inst.surface.is_empty() {
+            out[..len].fill(0);
+            inst.dirty = false;
+            inst.drain();
+            return Some(false);
+        }
         // The host composes these untagged RGBA8 bytes as sRGB, even when
         // this surface normally draws into a Display P3 swapchain.
         let presentation_space = target::granted(inst.config.as_ref());
@@ -158,23 +168,35 @@ impl Module {
             inst.readback = Some(Readback::new(gpu, width, height, format));
         }
         let target = inst.readback.as_ref().unwrap();
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let mut recording = crate::frame::Recording::begin(&gpu.device);
         let wants = inst.surface.render(
             &frame,
             &gpu.device,
             &gpu.queue,
-            &mut encoder,
+            &mut recording.encoder,
             &target.view,
             format,
         );
-        target.copy(&mut encoder);
-        let commands = encoder.finish();
+        target.copy(&mut recording.encoder);
+        let commands = match recording.finish() {
+            Ok(commands) => commands,
+            Err(e) => {
+                if presentation_space != ColorSpace::Srgb {
+                    inst.surface.color_space_granted(presentation_space);
+                }
+                inst.drain();
+                self.error = inst.surface.take_error().map_or(e, |SurfaceError(own)| own);
+                return None;
+            }
+        };
         let (_, submit_ms) =
             crate::performance::time(inst.performance.enabled(), || gpu.queue.submit([commands]));
         if let Some(ms) = submit_ms {
             inst.performance.submitted(ms);
         }
         inst.surface.submitted();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        self.pipeline_cache.save_metal();
         let result = target.read(gpu, &mut out[..len]);
         if presentation_space != ColorSpace::Srgb {
             inst.surface.color_space_granted(presentation_space);
@@ -273,8 +295,10 @@ mod tests {
             let mut output = vec![77; len + 4];
             assert_eq!(module.readback_into(id, &frame, &mut output), Some(true));
             assert!(output[..len]
-                .chunks_exact(4)
-                .all(|pixel| pixel == [red as u8, 0, 255, 255]));
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [red as u8, 0, 255, 255]));
             assert_eq!(&output[len..], &[77; 4], "caller suffix remains untouched");
             let mut short = vec![77; len - 1];
             assert!(module.readback_into(id, &frame, &mut short).is_none());

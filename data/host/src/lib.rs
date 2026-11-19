@@ -36,6 +36,15 @@ enum Pending {
     Storage(Vec<u8>, String),
 }
 
+/// A storage operation the executor runs: the source's storage grants link
+/// I/O for it (LLP 1047.001 D12).
+struct StorageWork;
+impl exact_runner::HostWork for StorageWork {}
+
+/// Storage forwards its source's continuations, so it hands out what its
+/// source does.
+impl<D: exact_runner::HostWork> exact_runner::HostWork for Storage<D> {}
+
 /// A source with optional host-owned storage. Native storage uses the existing
 /// host worker. On the web the dedicated request is executed by browser storage.
 pub struct Storage<D> {
@@ -167,7 +176,7 @@ impl<D: DataSource> Storage<D> {
                         .clone()
                         .unwrap_or_else(|| self.grants().into());
                     let token = self.token(Pending::Storage(payload.clone(), scope))?;
-                    *request = exact_runner::Request::continuation(token);
+                    *request = exact_runner::Request::continuation::<StorageWork>(token);
                     return Ok(answer);
                 }
             }
@@ -206,6 +215,10 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Storage<D> {
     fn set_document_owner(&mut self, owner: u64) {
         self.document_owner = owner;
         self.source.set_document_owner(owner);
+    }
+
+    fn render_web(&mut self) {
+        self.source.render_web();
     }
 
     fn preload(&self) -> Result<bool, DataError> {
@@ -540,6 +553,10 @@ impl<D: DataSource> exact_runner::DataSourceWrapper for Storage<D> {
         outcome: Outcome,
     ) -> Result<(), DataError> {
         self.source.module_landed(store, token, outcome)
+    }
+
+    fn take_reports(&mut self) -> Vec<exact_runner::Report> {
+        self.source.take_reports()
     }
 
     fn take_logs(&mut self) -> Vec<String> {

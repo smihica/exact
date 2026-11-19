@@ -498,6 +498,22 @@ fn an_elements_attributes_continue_on_deeper_lines_that_begin_with_name_equals()
 }
 
 #[test]
+fn an_expression_broken_after_an_operator_is_told_to_wrap_it() {
+    let e = parse("fn pick(n: number): string = n > 1 ?\n  \"many\" : \"one\"\n").unwrap_err();
+    assert_eq!(e.id, "syntax-expected-expression");
+    assert!(
+        e.message
+            .contains("wrap the whole expression in parentheses"),
+        "{e}"
+    );
+    // A missing value is not told to wrap.
+    let e = parse("component A\n  view\n    text \"a\" width=\n").unwrap_err();
+    assert!(!e.message.contains("parentheses"), "{e}");
+    // The form it names parses.
+    parse("fn pick(n: number): string = (n > 1 ?\n  \"many\" : \"one\")\n").unwrap();
+}
+
+#[test]
 fn a_component_uses_arguments_may_span_lines_inside_its_parentheses() {
     let src = "component A\n  view\n    Row(\n      a=1,\n      b=\"x\",\n    )\n      text \"filled\"\ncomponent Row\n  props\n    a: number\n    b: string\n  slot\n  view\n    children\n";
     let file = parse(src).unwrap();
@@ -1012,5 +1028,20 @@ fn midi_bytes_keep_leading_zeroes() {
             parse(&format!("test \"MIDI\"\n  {step}\n")).unwrap_err().id,
             "syntax-bad-number",
         );
+    }
+}
+
+#[test]
+fn test_preference_error_names_supported_facts_and_drive_only_forms() {
+    let e = contract_syntax::parse("test \"size\"\n  prefer root-font-size 24\n").unwrap_err();
+    assert_eq!(e.id, "syntax-expected-step");
+    for form in [
+        "media feature",
+        "page fact",
+        "module permission",
+        "Quote numbers",
+        "Folds (`posture`, `segments`, `gap`), mode pins and extension substitutes are drive-only for now",
+    ] {
+        assert!(e.message.contains(form), "{} lacks {form}", e.message);
     }
 }

@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactWakeLock
 #if os(iOS)
 import UIKit
 #endif

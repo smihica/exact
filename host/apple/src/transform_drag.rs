@@ -57,6 +57,10 @@ pub(super) struct TransformDrags {
     // During independent terminal cleanup one original survivor may remain.
     pairs: BTreeMap<u64, Active>,
 }
+/// An entry point's refusal in an archive that links no drag: no handle is
+/// ever registered there, so no caller has one to send.
+pub(crate) const UNLINKED: &str = "this archive links no drag";
+
 impl TransformDrags {
     #[cfg(test)]
     pub(super) fn pair_count(&self) -> usize {
@@ -99,6 +103,18 @@ impl TransformDrags {
 }
 
 impl<D: DataSource> Host<D> {
+    /// A created view's transform-drag handlers (`transformgeometry`,
+    /// `transformrelease`).
+    pub(crate) fn register_transform_drag(
+        &mut self,
+        view: ViewId,
+        key: NodeKey,
+        geometry: bool,
+        release: bool,
+    ) {
+        self.transform_drags.insert(view, key, geometry, release);
+    }
+
     /// Before an event the host delivers itself, mid-gesture (a drag's
     /// release, its handle's new geometry): the runner's clock moves to the
     /// input's time `now_ms`, as [`Host::dispatch_at`] moves it, firing the
@@ -163,6 +179,14 @@ impl<D: DataSource> Host<D> {
     /// inputs never seek their incoming clock. A stale reply may include a batch
     /// retiring old surviving overlays at the existing Engine clock.
     pub fn transform_motion(&mut self, bytes: &[u8]) -> WrappedBatch {
+        match self.turn.drag {
+            Some(drag) => (drag.transform_motion)(self, bytes),
+            None => WrappedBatch::new("\"accepted\":false", self.hold_refusal(UNLINKED)),
+        }
+    }
+
+    /// [`Host::transform_motion`], where drags are linked.
+    pub(crate) fn transform_motion_linked(&mut self, bytes: &[u8]) -> WrappedBatch {
         self.transform_input(bytes).unwrap_or_else(|error| {
             WrappedBatch::new("\"accepted\":false", self.hold_refusal(error))
         })
@@ -481,7 +505,7 @@ impl<D: DataSource> Host<D> {
             }
     }
 
-    pub(super) fn reconcile_transform_drags(&mut self, batch: &mut Batch) {
+    pub(crate) fn reconcile_transform_drags(&mut self, batch: &mut Batch) {
         self.reconcile_transform_owner();
         let invalid: Vec<_> = self
             .transform_drags
@@ -511,7 +535,7 @@ impl<D: DataSource> Host<D> {
         }
     }
 
-    pub(super) fn transform_member_ended(&mut self, serial: u64) {
+    pub(crate) fn transform_member_ended(&mut self, serial: u64) {
         let pair = self.transform_drags.pairs.iter().find_map(|(&key, a)| {
             [a.held.translate(), a.held.scale()]
                 .iter()
@@ -541,7 +565,7 @@ impl<D: DataSource> Host<D> {
         WrappedBatch::new("\"accepted\":false", self.finish(batch, None))
     }
 
-    pub(super) fn emit_transform_drags(&mut self, batch: &mut Batch) {
+    pub(crate) fn emit_transform_drags(&mut self, batch: &mut Batch) {
         self.reconcile_transform_owner();
         let kernel = self.runner.kernel();
         let owner = self.transform_drags.owner;

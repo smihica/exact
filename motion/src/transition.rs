@@ -54,6 +54,8 @@ impl TransitionProperty {
             "border-color" => Some(TransitionProperty::BorderColor),
             // A path's `d` transitions (LLP 1055.000 D15); no keyframe names it.
             "d" => Some(TransitionProperty::Property(Property::D)),
+            // So does `filter` (LLP 1003.002).
+            "filter" => Some(TransitionProperty::Property(Property::Filter)),
             name => Property::from_author_name(name).map(TransitionProperty::Property),
         }
     }
@@ -108,6 +110,9 @@ pub enum TransitionError {
     Easing(EasingError),
     /// The spring parameters were invalid.
     Spring(SpringError),
+    /// A declaration reached an artifact that does not link CSS transitions
+    /// ([`crate::link_transitions`]); its plan is refused at boot (LLP 1047 D6).
+    Unlinked,
 }
 
 impl std::fmt::Display for TransitionError {
@@ -124,6 +129,9 @@ impl std::fmt::Display for TransitionError {
             TransitionError::SpringNegativeDelay => f.write_str("a spring's delay is 0 or more"),
             TransitionError::Easing(e) => e.fmt(f),
             TransitionError::Spring(e) => e.fmt(f),
+            TransitionError::Unlinked => {
+                f.write_str("CSS transitions are not linked into this artifact (LLP 1047 D6)")
+            }
         }
     }
 }
@@ -249,6 +257,7 @@ impl Transitions {
 /// A transition in flight for one property of one node.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Running {
+    property: Property,
     /// Value at the start of the transition.
     pub from: Value,
     /// Value at the end (the current target).
@@ -294,8 +303,8 @@ impl Running {
     /// Start a transition under `declaration` at `now`.
     pub fn start(
         declaration: &Transition,
-        from: Value,
-        to: Value,
+        property: Property,
+        (from, to): (Value, Value),
         velocity: Value,
         now: f64,
         reversing_adjusted_start: Value,
@@ -348,11 +357,16 @@ impl Running {
             } => Curve::Spring {
                 config,
                 velocity,
-                settle: settle_time(&config, from - to, velocity),
+                settle: if property == Property::Rotate {
+                    config.settle_time(-crate::rotation::distance(from, to), velocity.x)
+                } else {
+                    settle_time(&config, from - to, velocity)
+                },
             },
             easing => easing,
         };
         Running {
+            property,
             from,
             to,
             start: now + delay,
@@ -409,9 +423,13 @@ impl Running {
                 let before = easing.progress(((now - self.start) - step).max(0.0) / duration);
                 let after = easing.progress(((now - self.start) + step).min(*duration) / duration);
                 let slope = (after - before) / (2.0 * step);
-                let distance = self.to - self.from;
+                let distance = if self.property == Property::Rotate {
+                    Value::scalar(crate::rotation::distance(self.from, self.to))
+                } else {
+                    self.to - self.from
+                };
                 RunningSample {
-                    value: self.from.lerp(self.to, progress),
+                    value: self.interpolate(progress),
                     velocity: distance.map(|d| d * slope),
                     done: false,
                 }
@@ -429,8 +447,7 @@ impl Running {
                     };
                 }
                 let elapsed = now - self.start;
-                let displacement = self.from - self.to;
-                let (moved, speed) = spring(config, displacement, *velocity, elapsed);
+                let (value, speed) = self.spring_sample(config, *velocity, elapsed);
                 if elapsed >= *settle {
                     return RunningSample {
                         value: self.to,
@@ -439,11 +456,40 @@ impl Running {
                     };
                 }
                 RunningSample {
-                    value: self.to + moved,
+                    value,
                     velocity: speed,
                     done: false,
                 }
             }
+        }
+    }
+
+    fn interpolate(&self, progress: f64) -> Value {
+        if self.property == Property::Rotate {
+            crate::rotation::interpolate_axis(self.from, self.to, progress)
+        } else {
+            self.from.lerp(self.to, progress)
+        }
+    }
+
+    fn spring_sample(&self, config: &SpringConfig, velocity: Value, t: f64) -> (Value, Value) {
+        if self.property == Property::Rotate {
+            let distance = crate::rotation::distance(self.from, self.to);
+            let sample = config.sample(-distance, velocity.x, t);
+            if distance == 0.0 {
+                let v = Value {
+                    x: self.to.x + sample.displacement,
+                    ..self.to
+                };
+                return (v, Value::scalar(sample.velocity));
+            }
+            (
+                self.interpolate(1.0 + sample.displacement / distance),
+                Value::scalar(sample.velocity),
+            )
+        } else {
+            let (moved, speed) = spring(config, self.from - self.to, velocity, t);
+            (self.to + moved, speed)
         }
     }
 
@@ -465,12 +511,11 @@ impl Running {
         if duration <= 0.0 {
             return Some((0.0, vec![self.from, self.to]));
         }
-        let displacement = self.from - self.to;
         let count = (duration * crate::spring::SAMPLE_RATE).round() as usize;
         let mut values = Vec::with_capacity(count + 1);
         for n in 0..count {
             let t = n as f64 / crate::spring::SAMPLE_RATE;
-            values.push(self.to + spring(config, displacement, *velocity, t).0);
+            values.push(self.spring_sample(config, *velocity, t).0);
         }
         values.push(self.to);
         Some((duration, values))

@@ -33,6 +33,14 @@ fn portable_host() -> ibex2::host::Host {
 impl Executor {
     /// Start native transport owners from the app's grants.
     pub fn start(grants: &str) -> Self {
+        Self::start_notifying(grants, || ())
+    }
+
+    /// Observe wake delivery in tests without replacing the host's signal.
+    pub(crate) fn start_notifying(
+        grants: &str,
+        notified: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         #[cfg(unix)]
         exact_executor::listen::install(listen_module());
         let (wake, signal) = UnixStream::pair().expect("executor socketpair");
@@ -71,6 +79,7 @@ impl Executor {
                 // EAGAIN means a wake is already pending. Never block the worker
                 // (or retirement) because the presenter hasn't drained a pipe.
                 let _ = (&signal).write(&[1]);
+                notified();
             }),
             if portable {
                 std::sync::Arc::new(portable_host)
@@ -81,8 +90,8 @@ impl Executor {
         );
         core.enable_http_cache();
         // Linux starts programs for data code, and so does this host where it
-        // runs on a Mac; Android and Windows do not yet (LLP 1133.007 §8).
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        // runs on a Mac. Windows only installs storage roots (LLP 1173 D4).
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             core.allow_processes();
         }
         Self { core, wake, note }
@@ -173,6 +182,10 @@ impl Executor {
     /// Each long poll's backoff wait, by its stream ticket, live (D8).
     pub fn retry_reader(&self) -> exact_runner::RetryReader {
         self.core.retry_reader()
+    }
+    /// The session's live driver faults for individual long-poll attempts.
+    pub fn set_fetch_fault(&self, fault: exact_runner::runner::faults::FetchFault) {
+        self.core.set_fetch_fault(fault);
     }
     /// Each listener's address and connections, by its stream ticket, live.
     pub fn listen_reader(&self) -> exact_runner::listen::ListenReader {

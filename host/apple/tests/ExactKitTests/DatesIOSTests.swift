@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 /// HTML's empty date field on iOS (bench t7-wizard, 2026-10-08; LLP
 /// 1115.000 D13.1): a `UIDatePicker` always holds a date, so while the bound

@@ -5,7 +5,7 @@
 //! while a sequence follows a MIDI clock (LLP 1125 D9), what the clock has
 //! said (`follow`). Only for a plan that declares a sequence.
 
-use super::{num, quote};
+use crate::json::{num, quote};
 
 // `state.midi` (LLP 1125 D5–D8), written after the transport's.
 #[path = "midi.rs"]
@@ -21,6 +21,9 @@ const HAPTICS: usize = 64;
 /// `,"transport":{…}`, for a plan that declares a sequence.
 /// Then `,"midi":{…}`, for a plan that uses MIDI.
 pub(super) fn state<D: DataSource>(runner: &Runner<D>, request: &str, s: &mut String) {
+    if !runner.plays_audio() {
+        return;
+    }
     transport(runner, s);
     midi::state(runner, request, s);
 }

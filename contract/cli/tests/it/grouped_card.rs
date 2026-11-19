@@ -206,6 +206,7 @@ fn a_card_keeps_only_its_shadow_transition_and_the_section_keeps_opacity() {
 #[test]
 fn a_grouped_section_refuses_shadow_keyframes() {
     for animation in [
+        "animation=toString(\"fade 1s\")",
         "animation=\"glow 1s linear\"",
         "animation-name=\"glow\" animation-duration=\"1s\"",
         "animation-name=\"glow\" animation-duration=(on ? \"1s\" : \"2s\")",
@@ -221,7 +222,8 @@ fn a_grouped_section_refuses_shadow_keyframes() {
             "from box-shadow=\"0 8px 0 #f00\"",
         ] {
             let source = format!(
-                r#"keyframes glow
+                r#"fn toString(x: string): string = "glow 1s"
+keyframes glow
   {frames}
 keyframes fade
   to opacity=0.5

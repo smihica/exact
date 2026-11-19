@@ -4,8 +4,9 @@
 // module because linking it costs every launch, before `main`, the loading
 // of ~300 more images (~1 s in the simulator). An app's composition links
 // this module only when its plan can show the media picker (`media_picker`)
-// and installs it before any session is made; the core's `Picker` asks it
-// for the sheet and keeps everything else. On macOS and tvOS installing it
+// and installs it before any session is made; the pickers' `Picker`
+// (ExactPickers, which the bake links with it) asks it for the sheet and
+// keeps everything else. On macOS and tvOS installing it
 // does nothing: the Mac uses `NSOpenPanel`, and tvOS has no picker.
 import ExactKit
 

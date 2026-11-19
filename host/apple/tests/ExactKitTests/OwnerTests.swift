@@ -5,6 +5,7 @@ import XCTest
 import AppKit
 #endif
 @testable import ExactKit
+@testable import ExactCore
 
 // @ref LLP 1072 T1/T5 — the owner thread's contract.
 final class OwnerTests: XCTestCase {
@@ -22,6 +23,24 @@ final class OwnerTests: XCTestCase {
         }
         XCTAssertEqual(seen, Array(0..<100))
         XCTAssertFalse(Owner.shared.isOwner)
+    }
+
+    func testTravelMailboxCoalescesUntilTheNextOwnerJob() {
+        let runtime = Runtime()
+        defer { runtime.destroy() }
+        Owner.shared.sync {
+            Owner.shared.callMain {
+                let posts = Owner.shared.postedJobsForTests
+                for n in 0..<120 {
+                    Owner.shared.noteScroll(ScrollMailbox.Values(lease: runtime.completionLease,
+                        runtime: runtime.rt, view: 1, position: .offset(page: false, left: 0, top: Double(n))))
+                }
+                XCTAssertEqual(Owner.shared.pendingScrollsForTests, 1)
+                XCTAssertEqual(Owner.shared.postedJobsForTests, posts)
+            }
+            XCTAssertEqual(Owner.shared.pendingScrollsForTests, 1, "noting travel posts no owner job")
+        }
+        Owner.shared.sync { XCTAssertEqual(Owner.shared.pendingScrollsForTests, 0) }
     }
 
     func testNestedSyncOnTheOwnerRunsInline() {

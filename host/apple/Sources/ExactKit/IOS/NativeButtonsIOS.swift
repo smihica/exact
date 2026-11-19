@@ -13,13 +13,13 @@ import UIKit
 
 /// UIKit's button, as a native button's control: never a UIKit focus item
 /// (the node is the focus owner, D4).
-final class NativeButtonIOS: UIButton {
+package final class NativeButtonIOS: UIButton {
     /// Where the surface draws it, inside a placed canvas child (PlacedAccessibilityIOS.swift).
-    override var accessibilityFrame: CGRect {
+    package override var accessibilityFrame: CGRect {
         get { placedAccessibilityFrame ?? super.accessibilityFrame }
         set { super.accessibilityFrame = newValue }
     }
-    override var accessibilityActivationPoint: CGPoint {
+    package override var accessibilityActivationPoint: CGPoint {
         get { placedActivationPoint(from: super.accessibilityActivationPoint) ?? super.accessibilityActivationPoint }
         set { super.accessibilityActivationPoint = newValue }
     }
@@ -36,7 +36,7 @@ final class NativeButtonIOS: UIButton {
     private var applyingActiveConfiguration = false
     // The Swift configuration overlay cannot be overridden. This is UIKit's
     // public Objective-C property, imported with a prefix for the overlay.
-    override var __configuration: __UIButtonConfiguration? {
+    package override var __configuration: __UIButtonConfiguration? {
         get { super.__configuration }
         set {
             if !applyingActiveConfiguration {
@@ -59,7 +59,7 @@ final class NativeButtonIOS: UIButton {
         activeSubtitle?.installed = native?.value(forKey: "subtitleTextAttributesTransformer") as AnyObject?
         activeSymbol?.installed = native?.value(forKey: "imageColorTransformer") as AnyObject?
     }
-    override var configurationUpdateHandler: UIButton.ConfigurationUpdateHandler? {
+    package override var configurationUpdateHandler: UIButton.ConfigurationUpdateHandler? {
         get { super.configurationUpdateHandler }
         set {
             super.configurationUpdateHandler = { [weak self] button in
@@ -77,7 +77,7 @@ final class NativeButtonIOS: UIButton {
             }
         }
     }
-    override func updateConfiguration() {
+    package override func updateConfiguration() {
         super.updateConfiguration()
         if let written { ButtonConfigurationIOS.titleLayout(written.face.rows.title, on: self) }
         if let owner { written?.active.present(on: owner, down: isEnabled && isHighlighted) }
@@ -92,7 +92,7 @@ final class NativeButtonIOS: UIButton {
         let value: Value?
         var installed: AnyObject?
     }
-    override func layoutSubviews() {
+    package override func layoutSubviews() {
         super.layoutSubviews()
         if let written { ButtonConfigurationIOS.titleLayout(written.face.rows.title, on: self) }
         refreshActiveState()
@@ -133,25 +133,27 @@ final class NativeButtonIOS: UIButton {
     }
     /// UIKit's highlight, and a held press's beside it (HeldState.swift): a
     /// touch's own release leaves a held one highlighted.
-    override var isHighlighted: Bool {
+    package override var isHighlighted: Bool {
         get { super.isHighlighted }
         set {
             super.isHighlighted = newValue || owner?.holds("active") == true
             refreshActiveState()
         }
     }
-    override var isEnabled: Bool {
+    package override var isEnabled: Bool {
         didSet { refreshActiveState() }
     }
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if ExactEnv.agentMode { TouchLog.reach(touches) }
+    package override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        #if EXACT_AGENT
+        if ExactEnv.agentCarried { TouchLog.reach(touches) }
+        #endif
         super.touchesBegan(touches, with: event)
     }
     /// Where the touch lifted while UIKit sends the action it ends with (in
     /// `super.touchesEnded`): its press's point (LLP 1021 D2). VoiceOver's
     /// activation sends the action with no touch, and has none.
     private(set) var lifted: CGPoint?
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+    package override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         lifted = touches.first?.location(in: nil)
         defer { lifted = nil }
         super.touchesEnded(touches, with: event)
@@ -162,6 +164,7 @@ final class NativeButtonIOS: UIButton {
         var active: NativeButtonState
         var raster: UInt64
         var accent: UIColor?
+        var tint: UIColor?
         var destructive: Bool
         var enabled: Bool
         var label: String?
@@ -183,7 +186,7 @@ final class NativeButtonIOS: UIButton {
             face.rows.title["written"] = nil; theirs.rows.title["written"] = nil
             face.rows.subtitle["written"] = nil; theirs.rows.subtitle["written"] = nil
             face.rows.symbol["written"] = nil; theirs.rows.symbol["written"] = nil
-            return face == theirs && raster == other.raster && accent == other.accent && destructive == other.destructive
+            return face == theirs && raster == other.raster && accent == other.accent && tint == other.tint && destructive == other.destructive
                 && enabled == other.enabled && traits == other.traits && interactive == other.interactive && padding == other.padding
         }
     }
@@ -193,7 +196,7 @@ final class NativeButtonIOS: UIButton {
     /// Its natural size, kept for what it was measured with: UIKit lays the
     /// configuration out again for each ask, and every batch asks.
     private var measured: (written: Written?, traits: [AnyHashable], size: CGSize)?
-    var naturalSize: CGSize {
+    package var naturalSize: CGSize {
         let t = traitCollection
         let traits: [AnyHashable] = [t.preferredContentSizeCategory, t.legibilityWeight.rawValue, t.displayScale]
         if let measured, measured.written == written, measured.traits == traits { return measured.size }
@@ -226,7 +229,7 @@ final class NativeButtonIOS: UIButton {
     func noteTint() {
         if tintAdjustmentMode != .dimmed { tintAlpha = tintColor.cgColor.alpha }
     }
-    override func tintColorDidChange() {
+    package override func tintColorDidChange() {
         super.tintColorDidChange()
         noteTint()
         defer { if isHighlighted, written?.active.style["press_color"] != nil { setNeedsUpdateConfiguration() } }
@@ -236,7 +239,7 @@ final class NativeButtonIOS: UIButton {
     }
     /// The configuration drawn, its name in the table's iOS column.
     var drawn = ButtonFace.unsaid
-    override var canBecomeFocused: Bool {
+    package override var canBecomeFocused: Bool {
         #if os(tvOS)
         return isEnabled && isUserInteractionEnabled && owner?.inert != true && owner?.cssVisibilityHidden != true
             && (owner?.explicitTabIndex ?? 0) >= 0 && owner?.placedAncestor == nil
@@ -262,14 +265,14 @@ final class NativeButtonIOS: UIButton {
         toggled?(false)
         contextMenuInteraction?.dismissMenu()
     }
-    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+    package override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willDisplayMenuFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
         super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
         menuFocus?.setAside()
         menuConfiguration = configuration
         isMenuOpen = true
         toggled?(true)
     }
-    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willEndFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
+    package override func contextMenuInteraction(_ interaction: UIContextMenuInteraction, willEndFor configuration: UIContextMenuConfiguration, animator: UIContextMenuInteractionAnimating?) {
         super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
         guard menuConfiguration === configuration else { return }
         if isMenuOpen { isMenuOpen = false; toggled?(false) }
@@ -283,7 +286,7 @@ final class NativeButtonIOS: UIButton {
     }
     #endif
     #if os(tvOS)
-    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+    package override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         super.didUpdateFocus(in: context, with: coordinator)
         guard let owner, let presenter = owner.presenter else { return }
         if context.nextFocusedItem === self {
@@ -299,11 +302,11 @@ final class NativeButtonIOS: UIButton {
 
 extension NodeView {
     /// A `button appearance="auto"` (LLP 1069.011 D3).
-    var isNativeButton: Bool { kind == "control" && props["type"] == "button" }
+    package var isNativeButton: Bool { kind == "control" && props["type"] == "button" }
 
     /// Where a native control sits: the glass slot's content when the
     /// glass-group pass made one (D9), else the node.
-    var controlMount: UIView { glassSlot?.contentView ?? self }
+    package var controlMount: UIView { glassSlot?.contentView ?? self }
 
     /// Its face's title, as its control shows it.
     var nativeTitle: String? { (presenter?.controls.controls[id] as? NativeButtonIOS)?.written?.face.title }
@@ -405,7 +408,8 @@ extension ControlHost {
         let destructive = owner.props["destructive"] == "true" && !owner.wrote("accent_color")
         let accent = destructive ? UIColor.systemRed : Self.platformAccent(owner, accent)
         let written = NativeButtonIOS.Written(
-            face: face, active: NativeButtonState(owner), raster: owner.raster?.id ?? 0, accent: accent, destructive: destructive, enabled: !owner.disabled,
+            face: face, active: NativeButtonState(owner), raster: owner.raster?.id ?? 0, accent: accent, tint: owner.carriedTint,
+            destructive: destructive, enabled: !owner.disabled,
             label: owner.authoredLabel ?? face.title, testId: owner.props["testId"],
             // A checked radio is selected, as Safari's VoiceOver reads one (`setAccessibilityChecked`).
             // `aria-current` (not `false`) too: UIKit has no current (theme2 2026-10-22 06:40).
@@ -458,7 +462,7 @@ extension ControlHost {
                 "subtitle": face.subtitle as Any, "imagePlacement": face.placement ?? (face.leading ? "leading" : "trailing"),
                 "pointerEvents": button.isUserInteractionEnabled ? "auto" : "none",
                 "rows": ButtonConfigurationIOS.observation(face, button: button),
-                "size": [Agent.r2(button.bounds.width), Agent.r2(button.bounds.height)]]
+                "size": [InspectionValue.r2(button.bounds.width), InspectionValue.r2(button.bounds.height)]]
     }
 }
 

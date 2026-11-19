@@ -136,13 +136,13 @@ extension Presenter {
     /// The scale to place a box under `parent` at: the parent's own, so a
     /// flying subtree the display-scale pass left stays on one grid until it
     /// lands; else the display's.
-    func gridScale(under parent: GridOrigin) -> CGFloat { parent.scale > 0 ? CGFloat(parent.scale) : gridScale }
+    package func gridScale(under parent: GridOrigin) -> CGFloat { parent.scale > 0 ? CGFloat(parent.scale) : gridScale }
 
     /// The absolute origin `view` is placed from: that of the node whose
     /// children it is among (for a row a grouped list carried into its cell,
     /// the node it was carried from), else a container on the grid (a cell,
     /// the window).
-    func gridOrigin(above view: UIView) -> GridOrigin {
+    package func gridOrigin(above view: UIView) -> GridOrigin {
         func origin(_ holder: UIView) -> GridOrigin? {
             var ancestor: UIView? = holder
             while let a = ancestor, !(a is NodeView) { ancestor = a.superview }
@@ -221,38 +221,29 @@ extension Presenter {
             gridMoved = []
             for (v, _) in round where v.grid != nil { regridChildren(of: v) }
         }
-        regridSlots()
+        flightHost.regridSlots()
     }
 
-    /// Each flight's slot, where its view lands, from its parent's final
-    /// origin: the slot is no node, so no parent's pass reaches it.
-    func regridSlots() {
-        for f in flights.values {
-            guard let slot = f.slot, slot.superview != nil else { continue }
-            let rect = f.geometry.map { CGRect(x: $0.x, y: $0.y, width: $0.w, height: $0.h) } ?? f.view?.grid?.layout
-            let origin = gridOrigin(above: slot)
-            if let rect { slot.frame = PixelGrid.place(rect, in: origin, scale: gridScale(under: origin)).drawn }
-        }
-    }
 
     /// Every box drawn again on a new display's grid, parents first, each
     /// from its authored parent (carried rows go home for it, as before a
-    /// batch); a flying view is left to its flight, which lands it. Then
-    /// the flat leaves, and each scroller's end and offset.
+    /// batch, and are carried into their cells again before it returns); a
+    /// flying view is left to its flight, which lands it. Then the flat
+    /// leaves, and each scroller's end and offset.
     func regridAll() {
         groupedLists?.prepare()
         func depth(_ v: UIView) -> Int { var d = 0, s = v.superview; while let x = s { d += 1; s = x.superview }; return d }
         // A flying view's subtree is placed from it, which its landing places.
         func flying(_ v: UIView) -> Bool {
             var at: UIView? = v
-            while let a = at { if let n = a as? NodeView, isFlying(n) { return true }; at = a.superview }
+            while let a = at { if let n = a as? NodeView, flightHost.isFlying(n) { return true }; at = a.superview }
             return false
         }
         for (v, _) in views.values.map({ ($0, depth($0)) }).sorted(by: { $0.1 < $1.1 }) where !flying(v) {
             if let layout = v.grid?.layout { applyFrame(v, layout) }
         }
         flats.regridAll { !flying($0) }
-        regridSlots()
+        flightHost.regridSlots()
         let s = gridScale
         for id in scrollers {
             guard let v = views[id], let sv = v.scrollView, !flying(v) else { continue }
@@ -263,11 +254,16 @@ extension Presenter {
             if sv.contentOffset != offset { sv.contentOffset = offset }
         }
         flats.flush()
+        // Carry the rows into their cells again in the same work, as a
+        // batch does as it ends: a frame drawn before the projection's turn
+        // would show the cells without them. Inside a batch, its own sync
+        // carries them.
+        if !applying { groupedLists?.sync(changed: []) }
         requestProjectionSync()
     }
 
     /// `view`, newly among its parent's children (or the roots), drawn from there.
-    func regrid(_ view: NodeView) {
+    package func regrid(_ view: NodeView) {
         let origin = gridOrigin(above: view)
         guard let old = view.grid, PixelGrid.place(old.layout, in: origin, scale: gridScale(under: origin)) != old else { return }
         applyFrame(view, old.layout)

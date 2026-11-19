@@ -64,13 +64,13 @@ export async function webAx(carrier, opts = {}, readPlain = async () => null) {
       const joined = new Set(last.reply.ax.elements.map(e => e.part).filter(Boolean));
       last.reply.ax.coverage.parts = before.parts.map(p => ({ node: p.node, id: p.id, ax: joined.has(`${p.node}/${p.id}`) ? 'exposed' : 'not exposed' }));
     }
-    const same = ['epoch', 'incarnation', 'nonce'].every(k => before[k] === after[k]) && (!plain || (plain.epoch === before.epoch && plain.incarnation === before.incarnation));
+    const same = ['generation', 'epoch', 'incarnation', 'nonce'].every(k => before[k] === after[k]) && (!plain || (plain.generation === before.generation && plain.epoch === before.epoch && plain.incarnation === before.incarnation));
     if (same) break;
     last.spanned = true;
   }
   const { reply, before, spanned, plain } = last;
   reply.ax.platform = carrier.axEnabled;
-  return { reply: { epoch: before.epoch, incarnation: before.incarnation, clock: before.clock, ...(spanned ? { spanned: true } : {}), ...reply }, plain };
+  return { reply: { generation: before.generation, epoch: before.epoch, incarnation: before.incarnation, clock: before.clock, ...(spanned ? { spanned: true } : {}), ...reply }, plain };
 }
 
 function collectWeb(nodes, snapshot, limit) {
@@ -119,6 +119,9 @@ function collectWeb(nodes, snapshot, limit) {
       // An aria-pressed toggle's state (Chrome's `pressed`), as `checked` is kept.
       const pressed = prop(n, 'pressed'); if (pressed != null) states.pressed = pressed === 'mixed' ? 'mixed' : pressed === true || pressed === 'true';
       const level = prop(n, 'level'); if (level != null) states.level = Number(level);
+      // The option a focused field names as active (LLP 1166.001 D2), as the view Chrome resolved it to.
+      const active = n.properties?.find(p => p.name === 'activedescendant')?.value?.relatedNodes?.[0]?.backendDOMNodeId;
+      if (active != null && dom.has(active)) { const view = stamp(dom.get(active)); if (view != null) states.activedescendant = view; }
       const el = d !== undefined && isElement(d) ? attrs(d) : {};
       const tag = d !== undefined ? str(doc.nodes.nodeName[d]) : null;
       if (tag === 'INPUT' && el.type === 'password') states.protected = true;
@@ -460,7 +463,7 @@ export async function axTree(s, target, { limit, excluded, shallow } = {}) {
     const resolved = await resolve();
     const reply = await s.op({ op: 'tree', ax: true, ...(limit != null ? { limit } : {}), ...(excluded ? { excluded: true } : {}) });
     const after = await s.op({ op: 'tree', target: plain.roots?.[0] ?? 1, shallow: true }).catch(() => plain);
-    const same = [reply, after].every(r => r.epoch === plain.epoch && r.incarnation === plain.incarnation);
+    const same = [reply, after].every(r => r.generation === plain.generation && r.epoch === plain.epoch && r.incarnation === plain.incarnation);
     if (!same && attempt < 2) continue;
     if (!same) reply.spanned = true;
     return axFinish(reply, plain, resolved);

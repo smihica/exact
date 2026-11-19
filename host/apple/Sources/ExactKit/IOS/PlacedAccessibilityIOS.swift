@@ -29,7 +29,7 @@ extension UIView {
     /// This view's box on screen where the surface draws it, when it is
     /// inside a placed canvas child: `.zero` while the surface hides that
     /// child, nil when it is not inside one (UIKit's own frame is right).
-    var placedAccessibilityFrame: CGRect? {
+    package var placedAccessibilityFrame: CGRect? {
         guard let (owner, placed) = placedOwner else { return nil }
         if placed.placementHidden { return .zero }
         guard placed.placement != nil, let window else { return nil }
@@ -39,14 +39,14 @@ extension UIView {
     /// `point`, a point on screen as UIKit's view tree has it (an element's
     /// activation point UIKit computed), where the surface draws it; nil when
     /// this view is not inside a placed canvas child.
-    func placedScreenPoint(_ point: CGPoint) -> CGPoint? { placedScreenRect(CGRect(origin: point, size: .zero))?.origin }
+    package func placedScreenPoint(_ point: CGPoint) -> CGPoint? { placedScreenRect(CGRect(origin: point, size: .zero))?.origin }
 
     /// Where VoiceOver taps this view, inside a placed canvas child: UIKit's
     /// own point (`native`), mapped through the placement unless UIKit took
     /// it from the frame this view already maps (its default, the frame's
     /// midpoint). VoiceOver's synthesized tap there is mapped back to the view
     /// by the canvas's hit test.
-    func placedActivationPoint(from native: CGPoint) -> CGPoint? {
+    package func placedActivationPoint(from native: CGPoint) -> CGPoint? {
         guard let frame = placedAccessibilityFrame else { return nil }
         return frame.contains(native) ? native : placedScreenPoint(native)
     }
@@ -54,7 +54,7 @@ extension UIView {
     /// `rect`, a box on screen as UIKit's view tree has it (an element's
     /// frame UIKit computed), where the surface draws it; nil when this view
     /// is not inside a placed canvas child.
-    func placedScreenRect(_ rect: CGRect) -> CGRect? {
+    package func placedScreenRect(_ rect: CGRect) -> CGRect? {
         guard let (owner, placed) = placedOwner else { return nil }
         if placed.placementHidden { return .zero }
         guard placed.placement != nil, let window else { return nil }
@@ -67,7 +67,7 @@ extension UIView {
     /// The elements UIKit exposes for this view, found as VoiceOver finds
     /// them: what it declares (`declared`, UIKit's own answer before any
     /// stand-in's), else its subviews, down to each element.
-    func nativeAccessibilityElements(declared: [NSObject]) -> [NSObject] {
+    package func nativeAccessibilityElements(declared: [NSObject]) -> [NSObject] {
         var found: [NSObject] = [], seen = Set<ObjectIdentifier>()
         func visit(_ object: NSObject) {
             guard seen.insert(ObjectIdentifier(object)).inserted else { return }
@@ -93,7 +93,7 @@ extension UIView {
 /// adjusting it, is done by UIKit's; where UIKit's leaves activation to
 /// VoiceOver, VoiceOver taps the activation point here, which the canvas
 /// maps back through the placement to the control.
-final class PlacedElement: UIAccessibilityElement, AgentOwned {
+package final class PlacedElement: UIAccessibilityElement, InspectionOwned {
     private(set) weak var native: NSObject?
     private weak var control: UIView?
     init(standingFor native: NSObject, in control: UIView) {
@@ -101,41 +101,42 @@ final class PlacedElement: UIAccessibilityElement, AgentOwned {
         self.control = control
         super.init(accessibilityContainer: control)
     }
-    var agentViewId: UInt32? { control.map { UInt32($0.tag) } }
-    override var accessibilityLabel: String? { get { native?.accessibilityLabel } set {} }
-    override var accessibilityHint: String? { get { native?.accessibilityHint } set {} }
-    override var accessibilityValue: String? { get { native?.accessibilityValue } set {} }
-    override var accessibilityTraits: UIAccessibilityTraits { get { native?.accessibilityTraits ?? .none } set {} }
-    override var accessibilityFrame: CGRect {
+    package var inspectionViewId: UInt32? { control.map { UInt32($0.tag) } }
+    package override var accessibilityLabel: String? { get { native?.accessibilityLabel } set {} }
+    package override var accessibilityHint: String? { get { native?.accessibilityHint } set {} }
+    package override var accessibilityValue: String? { get { native?.accessibilityValue } set {} }
+    package override var accessibilityTraits: UIAccessibilityTraits { get { native?.accessibilityTraits ?? .none } set {} }
+    package override var accessibilityFrame: CGRect {
         get {
             guard let native else { return .zero }
             return control?.placedScreenRect(native.accessibilityFrame) ?? native.accessibilityFrame
         }
         set {}
     }
-    override var accessibilityActivationPoint: CGPoint {
+    package override var accessibilityActivationPoint: CGPoint {
         get {
             guard let native else { return .zero }
             return control?.placedScreenPoint(native.accessibilityActivationPoint) ?? native.accessibilityActivationPoint
         }
         set {}
     }
-    override var accessibilityIdentifier: String? { get { (native as? UIAccessibilityIdentification)?.accessibilityIdentifier } set {} }
-    override var accessibilityCustomActions: [UIAccessibilityCustomAction]? { get { native?.accessibilityCustomActions } set {} }
-    override func accessibilityActivate() -> Bool { native?.accessibilityActivate() ?? false }
-    override func accessibilityIncrement() { native?.accessibilityIncrement() }
-    override func accessibilityDecrement() { native?.accessibilityDecrement() }
+    package override var accessibilityIdentifier: String? { get { (native as? UIAccessibilityIdentification)?.accessibilityIdentifier } set {} }
+    package override var accessibilityCustomActions: [UIAccessibilityCustomAction]? { get { native?.accessibilityCustomActions } set {} }
+    package override func accessibilityActivate() -> Bool { native?.accessibilityActivate() ?? false }
+    package override func accessibilityIncrement() { native?.accessibilityIncrement() }
+    package override func accessibilityDecrement() { native?.accessibilityDecrement() }
 }
 
 /// A placed control's stand-ins, one for each of UIKit's elements, kept
 /// while that element lives so VoiceOver's cursor stays on one.
-final class PlacedStandIns {
+package final class PlacedStandIns {
+    package init() {}
     private var kept: [PlacedElement] = []
     /// UIKit's own answer is being read, which may ask the control again.
     private var reading = false
     /// The stand-ins `control` exposes while it is placed, nil when it is not
     /// (UIKit's own elements are right). `declared` reads UIKit's own answer.
-    func elements(of control: UIView, declared: () -> [NSObject]) -> [PlacedElement]? {
+    package func elements(of control: UIView, declared: () -> [NSObject]) -> [PlacedElement]? {
         guard !reading, control.isPlacedBySurface else { if !reading { kept = [] }; return nil }
         reading = true
         let natives = control.nativeAccessibilityElements(declared: declared())
@@ -147,23 +148,10 @@ final class PlacedStandIns {
 
 /// What a UIKit control declares as its elements before any stand-in: its
 /// `accessibilityElements`, else its counted elements (`super`'s answers).
-func declaredElements(_ elements: [Any]?, count: Int, at: (Int) -> Any?) -> [NSObject] {
+package func declaredElements(_ elements: [Any]?, count: Int, at: (Int) -> Any?) -> [NSObject] {
     if let elements, !elements.isEmpty { return elements.compactMap { $0 as? NSObject } }
     guard count != NSNotFound, count > 0 else { return [] }
     return (0..<count).compactMap { at($0) as? NSObject }
 }
 
-#if os(iOS)
-/// UIKit's switch, whose frame follows a placement.
-final class ExactSwitch: UISwitch {
-    override var accessibilityFrame: CGRect {
-        get { placedAccessibilityFrame ?? super.accessibilityFrame }
-        set { super.accessibilityFrame = newValue }
-    }
-    override var accessibilityActivationPoint: CGPoint {
-        get { placedActivationPoint(from: super.accessibilityActivationPoint) ?? super.accessibilityActivationPoint }
-        set { super.accessibilityActivationPoint = newValue }
-    }
-}
-#endif
 #endif

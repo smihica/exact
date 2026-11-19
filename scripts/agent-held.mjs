@@ -46,7 +46,7 @@ export async function heldClock(s, words) {
   return targets.length ? landed : { ...landed, diagnostic: 'clock held: no held request was in flight, so it waited for none' };
 }
 
-const UNTIL = 'clock until state <path> == <literal> within <ms> (the literal is JSON: a string, a number, true, false or null)';
+const UNTIL = 'clock until state <path> == <literal> within <ms> (the literal is JSON: a string, a number, true, false, null, or a list of them)';
 
 // `clock until state <path> == <literal> within <ms>`: real time passes, the clock frozen (no timer fires), until
 // `state <path>` reads the literal, for at most <ms>; a miss throws, naming the last value read. It is for state a
@@ -60,7 +60,8 @@ export async function untilClock(s, spec) {
   const path = m[1].replace(/\s+/g, ''), literal = m[2], bound = Number(m[3]);
   let want;
   try { want = JSON.parse(literal); } catch { /* refused below */ }
-  if (want === undefined || (want !== null && typeof want === 'object') || (typeof want === 'number' && !Number.isFinite(want))) throw new MalformedOperation(`${UNTIL}: ${literal} is not one`);
+  const scalar = (v) => v === null || typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v));
+  if (want === undefined || !(scalar(want) || (Array.isArray(want) && want.every(scalar)))) throw new MalformedOperation(`${UNTIL}: ${literal} is not one`);
   if (bound < 1 || bound > 3_600_000) throw new MalformedOperation(`${UNTIL}: a bound is 1 ms up to an hour, not ${bound}`);
   // A name, then fields and list indexes, read from `state` as an authored `expect state` reads it.
   const [name, ...fields] = path.split('.'), has = (o, k) => o !== null && typeof o === 'object' && Object.hasOwn(o, k);
@@ -82,7 +83,7 @@ export async function untilClock(s, spec) {
   };
   if (['ios', 'host-ios', 'macos', 'host'].includes(s.carrier.host)) s.now = (await s.op({ op: 'clock', take: true })).clock;
   // Every look races the bound: one that answers past it counts nothing, so a value is never met late.
-  const t0 = performance.now(), end = t0 + bound, met = (r) => r != null && 'value' in r && r.value === want;
+  const t0 = performance.now(), end = t0 + bound, met = (r) => r != null && 'value' in r && (Array.isArray(want) ? Array.isArray(r.value) && JSON.stringify(r.value) === JSON.stringify(want) : r.value === want);
   const look = () => {
     const r = read();
     r.catch(() => {}); // a look abandoned at the bound may fail later, unheard
@@ -101,7 +102,7 @@ export async function untilClock(s, spec) {
   }
   const real = Math.round(performance.now() - t0);
   // What is said comes from one more read, masked; a value that read cannot give is not said, never taken revealed.
-  const said = seen && (seen.missing || typeof seen.value === 'string') ? await read(false).catch(() => null) : seen;
+  const said = seen && (seen.missing || typeof seen.value === 'string' || (seen.value !== null && typeof seen.value === 'object')) ? await read(false).catch(() => null) : seen;
   const shown = said != null && 'value' in said;
   if (met(seen)) return { clock: s.now, real, until: 'met', ...(shown && { value: said.value }) };
   const last = seen == null ? 'no look answered within the bound'

@@ -1,65 +1,75 @@
 // Stationary viewport pixels (opaque surfaces or transparent reader ink).
 // Fractional content/scroll phase stays inside
 // worker drawing; output edges and the final copy are integral device pixels.
+#if os(macOS)
 import Foundation
 import CoreGraphics
 import CoreText
-#if os(macOS)
 import IOSurface
 import ObjectiveC
-#endif
 
-struct RegionPaintRow: Sendable, Equatable {
-    let artifact: UInt64
-    let box: CGRect
-    var selection = NSRange(location: 0, length: 0)
-    var selectionRanges: [NSRange] = []
+package struct RegionPaintRow: Sendable, Equatable {
+    package let artifact: UInt64
+    package let box: CGRect
+    package var selection = NSRange(location: 0, length: 0)
+    package var selectionRanges: [NSRange] = []
+    package init(artifact: UInt64, box: CGRect, selection: NSRange = NSRange(location: 0, length: 0),
+                 selectionRanges: [NSRange] = []) {
+        self.artifact = artifact; self.box = box; self.selection = selection; self.selectionRanges = selectionRanges
+    }
 }
-struct RegionSelectionSnapshot: Sendable {
-    let artifact: UInt64
-    let range: NSRange
-    let rects: [CGRect]
+package struct RegionSelectionSnapshot: Sendable {
+    package let artifact: UInt64
+    package let range: NSRange
+    package let rects: [CGRect]
 }
-struct RegionRasterRequest: Sendable {
-    let serial: UInt64
-    let publication: UInt64
-    let generation: Int
-    let rows: [RegionPaintRow]
-    let scroll: CGPoint
-    let size: CGSize
-    let scale: Int
-    let profile: NativeProfile
-    let format: UInt32
-    let background: [CGFloat]
+package struct RegionRasterRequest: Sendable {
+    package let serial: UInt64
+    package let publication: UInt64
+    package let generation: Int
+    package let rows: [RegionPaintRow]
+    package let scroll: CGPoint
+    package let size: CGSize
+    package let scale: Int
+    package let profile: NativeProfile
+    package let format: UInt32
+    package let background: [CGFloat]
     /// A selection's fill, as four components. With four more, the colour
     /// its glyphs are painted in over that fill (the Mac, LLP 1115.000 D7.9),
     /// and with a ninth that is 1, a glyph whose colour its author fixed
     /// keeps it (`Run.fixedInk`; the Mac's light appearance). With four, the
     /// fill is under the ink and the ink is the text's own.
-    let selectionColor: [CGFloat]
-    var interaction: RegionPointRequest? = nil
+    package let selectionColor: [CGFloat]
+    package var interaction: RegionPointRequest? = nil
     // The registered region surface keeps its 8 MiB contract. A reader can
     // admit a larger visible viewport, never a document-sized bitmap.
-    var pixelLimit: Int = 8 * 1024 * 1024
-    var headroom: Float = 0
-    static let maximumPixelLimit = 32 * 1024 * 1024
-    static let compositedFormat = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-    static let extendedFormat = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
-    var deep: Bool { format == Self.extendedFormat }
-    var composited: Bool { format == Self.compositedFormat || deep }
-    var bitsPerComponent: Int { deep ? 16 : 8 }
-    var bytesPerPixel: Int { deep ? 8 : 4 }
-    static func stride(width: Int, format: UInt32) -> Int {
+    package var pixelLimit: Int = 8 * 1024 * 1024
+    package var headroom: Float = 0
+    package init(serial: UInt64, publication: UInt64, generation: Int, rows: [RegionPaintRow], scroll: CGPoint,
+                 size: CGSize, scale: Int, profile: NativeProfile, format: UInt32, background: [CGFloat],
+                 selectionColor: [CGFloat], interaction: RegionPointRequest? = nil,
+                 pixelLimit: Int = 8 * 1024 * 1024, headroom: Float = 0) {
+        self.serial = serial; self.publication = publication; self.generation = generation; self.rows = rows
+        self.scroll = scroll; self.size = size; self.scale = scale; self.profile = profile; self.format = format
+        self.background = background; self.selectionColor = selectionColor; self.interaction = interaction
+        self.pixelLimit = pixelLimit; self.headroom = headroom
+    }
+    package static let maximumPixelLimit = 32 * 1024 * 1024
+    package static let compositedFormat = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+    package static let extendedFormat = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.floatComponents.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
+    package var deep: Bool { format == Self.extendedFormat }
+    package var composited: Bool { format == Self.compositedFormat || deep }
+    package var bitsPerComponent: Int { deep ? 16 : 8 }
+    package var bytesPerPixel: Int { deep ? 8 : 4 }
+    package static func stride(width: Int, format: UInt32) -> Int {
         let bytes = width * (format == extendedFormat ? 8 : 4)
-        #if os(macOS)
         if format == compositedFormat || format == extendedFormat { return IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, bytes) }
-        #endif
         return bytes
     }
-    var bytesPerRow: Int { Self.stride(width: width, format: format) }
+    package var bytesPerRow: Int { Self.stride(width: width, format: format) }
     // A continuing selection gesture may outlive replacement highlight pixels,
     // but never a source/geometry/palette change. New hits still require all pixels.
-    func sameInkAndGeometry(as other: RegionRasterRequest) -> Bool {
+    package func sameInkAndGeometry(as other: RegionRasterRequest) -> Bool {
         publication == other.publication && generation == other.generation &&
         rows.count == other.rows.count && zip(rows, other.rows).allSatisfy({
             $0.artifact == $1.artifact && $0.box == $1.box
@@ -67,22 +77,22 @@ struct RegionRasterRequest: Sendable {
         format == other.format && headroom == other.headroom && background == other.background && selectionColor == other.selectionColor
     }
     // Serial is delivery identity; the remaining fields describe exact pixels.
-    func samePixels(as other: RegionRasterRequest) -> Bool {
+    package func samePixels(as other: RegionRasterRequest) -> Bool {
         sameInkAndGeometry(as: other) && rows == other.rows
     }
-    func sameOutput(as other: RegionRasterRequest) -> Bool {
+    package func sameOutput(as other: RegionRasterRequest) -> Bool {
         samePixels(as: other) && interaction == other.interaction
     }
-    func selecting(_ range: NSRange?, artifact: UInt64) -> RegionRasterRequest {
+    package func selecting(_ range: NSRange?, artifact: UInt64) -> RegionRasterRequest {
         var rows = self.rows
         if let range, let i = rows.firstIndex(where: { $0.artifact == artifact }) { rows[i].selection = range }
         return RegionRasterRequest(serial: serial,publication: publication,generation: generation,rows: rows,
             scroll: scroll,size: size,scale: scale,profile: profile,format: format,
             background: background,selectionColor: selectionColor,interaction: interaction,pixelLimit: pixelLimit,headroom: headroom)
     }
-    var width: Int { Int(size.width * CGFloat(scale)) }
-    var height: Int { Int(size.height * CGFloat(scale)) }
-    var bytes: Int? {
+    package var width: Int { Int(size.width * CGFloat(scale)) }
+    package var height: Int { Int(size.height * CGFloat(scale)) }
+    package var bytes: Int? {
         let w = size.width * CGFloat(scale), h = size.height * CGFloat(scale)
         guard (scale == 1 || scale == 2), w.isFinite, h.isFinite,
               w > 0, h > 0, w <= 16384, h <= 16384,
@@ -96,19 +106,17 @@ struct RegionRasterRequest: Sendable {
               headroom.isFinite, headroom >= 0,
               format == CGImageAlphaInfo.premultipliedLast.rawValue || composited else { return nil }
         var bytes = bytesPerRow * Int(h)
-        #if os(macOS)
         if composited { bytes = IOSurfaceAlignProperty(kIOSurfaceAllocSize, bytes) }
-        #endif
         return bytes > pixelLimit ? nil : bytes
     }
 }
-enum RegionRasterRefusal: Error { case capacity, invalid, missingArtifact, profile, context }
-struct RegionPixelStats { var bytes = 0; var owners = 0; var peak = 0; var drops = 0 }
-final class RegionPixelAccount: @unchecked Sendable {
+package enum RegionRasterRefusal: Error { case capacity, invalid, missingArtifact, profile, context }
+package struct RegionPixelStats { package var bytes = 0; package var owners = 0; package var peak = 0; package var drops = 0 }
+package final class RegionPixelAccount: @unchecked Sendable {
     private let lock = NSLock()
     private var value = RegionPixelStats()
-    var stats: RegionPixelStats { lock.lock(); defer { lock.unlock() }; return value }
-    func reserve(_ bytes: Int, limit: Int = 8 * 1024 * 1024) -> RegionPixelCharge? {
+    package var stats: RegionPixelStats { lock.lock(); defer { lock.unlock() }; return value }
+    package func reserve(_ bytes: Int, limit: Int = 8 * 1024 * 1024) -> RegionPixelCharge? {
         lock.lock(); defer { lock.unlock() }
         guard bytes > 0, bytes <= limit, limit <= RegionRasterRequest.maximumPixelLimit, value.owners < 2,
               bytes <= 2 * RegionRasterRequest.maximumPixelLimit - value.bytes else { return nil }
@@ -119,27 +127,24 @@ final class RegionPixelAccount: @unchecked Sendable {
         lock.lock(); value.bytes -= bytes; value.owners -= 1; value.drops += 1; lock.unlock()
     }
 }
-final class RegionPixelCharge: Sendable {
+package final class RegionPixelCharge: Sendable {
     private let account: RegionPixelAccount
-    let bytes: Int
-    init(_ account: RegionPixelAccount, _ bytes: Int) { self.account = account; self.bytes = bytes }
+    package let bytes: Int
+    package init(_ account: RegionPixelAccount, _ bytes: Int) { self.account = account; self.bytes = bytes }
     deinit { account.release(bytes) }
 }
 /// Mutation is confined to construction on worker. The CGContext is destroyed
 /// before publication. Provider aliases retain both pixel and profile charges.
-final class RegionPixels: @unchecked Sendable {
+package final class RegionPixels: @unchecked Sendable {
     private let storage: UnsafeMutableRawPointer
-    let count: Int
+    package let count: Int
     private let charge: RegionPixelCharge
     private let profile: NativeProfile
-    #if os(macOS)
-    let surface: IOSurface?
+    package let surface: IOSurface?
     private static var chargeKey: UInt8 = 0
-    #endif
-    init(count: Int, charge: RegionPixelCharge, profile: NativeProfile, request: RegionRasterRequest? = nil,
+    package init(count: Int, charge: RegionPixelCharge, profile: NativeProfile, request: RegionRasterRequest? = nil,
          fill: (UnsafeMutableRawPointer) -> Bool) throws {
         precondition(!Thread.isMainThread)
-        #if os(macOS)
         if let request, request.composited {
             guard let surface = IOSurface(properties: [.width: request.width, .height: request.height,
                     .bytesPerElement: request.bytesPerPixel, .bytesPerRow: request.bytesPerRow, .allocSize: count,
@@ -164,19 +169,16 @@ final class RegionPixels: @unchecked Sendable {
             return
         }
         surface = nil
-        #endif
         let memory = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 64)
         memory.initializeMemory(as: UInt8.self, repeating: 0, count: count)
         guard fill(memory) else { memory.deallocate(); throw RegionRasterRefusal.context }
         storage = memory; self.count = count; self.charge = charge; self.profile = profile
     }
     deinit {
-        #if os(macOS)
         if surface != nil { return }
-        #endif
         storage.deallocate()
     }
-    @MainActor func provider() -> CGDataProvider? {
+    @MainActor package func provider() -> CGDataProvider? {
         let retained = Unmanaged.passRetained(self)
         guard let p = CGDataProvider(dataInfo: retained.toOpaque(), data: storage, size: count,
             releaseData: { info, _, _ in if let info { Unmanaged<RegionPixels>.fromOpaque(info).release() } }) else {
@@ -185,21 +187,21 @@ final class RegionPixels: @unchecked Sendable {
         return p
     }
 }
-final class RegionRaster: Sendable {
-    let request: RegionRasterRequest
-    let pixels: RegionPixels
-    let hits: RegionViewportHits
-    let intent: RegionRasterRequest
-    let interaction: RegionPointReply?
-    let selectionSnapshots: [RegionSelectionSnapshot]
-    init(_ request: RegionRasterRequest, _ pixels: RegionPixels, hits: RegionViewportHits,
+package final class RegionRaster: Sendable {
+    package let request: RegionRasterRequest
+    package let pixels: RegionPixels
+    package let hits: RegionViewportHits
+    package let intent: RegionRasterRequest
+    package let interaction: RegionPointReply?
+    package let selectionSnapshots: [RegionSelectionSnapshot]
+    package init(_ request: RegionRasterRequest, _ pixels: RegionPixels, hits: RegionViewportHits,
          intent: RegionRasterRequest, interaction: RegionPointReply?, selectionSnapshots: [RegionSelectionSnapshot] = []) {
         self.selectionSnapshots = selectionSnapshots
         self.request = request; self.pixels = pixels; self.hits = hits
         self.intent = intent; self.interaction = interaction
     }
     /// Certifies the supplied payload, never an unknown destination CGContext.
-    @MainActor func accepts(_ image: CGImage, size: CGSize, scale: Int, profile: NativeProfile) -> Bool {
+    @MainActor package func accepts(_ image: CGImage, size: CGSize, scale: Int, profile: NativeProfile) -> Bool {
         guard request.size == size, request.scale == scale, request.profile == profile,
               image.width == request.width, image.height == request.height,
               image.bitsPerComponent == request.bitsPerComponent, image.bitsPerPixel == request.bytesPerPixel * 8,
@@ -207,7 +209,7 @@ final class RegionRaster: Sendable {
               let space = image.colorSpace, let expected = profile.makeSpace() else { return false }
         return CFEqual(space, expected)
     }
-    @MainActor func image() -> CGImage? {
+    @MainActor package func image() -> CGImage? {
         guard let space = request.profile.makeSpace(), let provider = pixels.provider() else { return nil }
         return CGImage(width: request.width, height: request.height, bitsPerComponent: request.bitsPerComponent, bitsPerPixel: request.bytesPerPixel * 8,
             bytesPerRow: request.bytesPerRow, space: space, bitmapInfo: CGBitmapInfo(rawValue: request.format),
@@ -216,13 +218,13 @@ final class RegionRaster: Sendable {
 }
 /// One aggregate index per accepted publication, including all paragraph ink.
 /// At most 64 paragraph boundaries, no second per-line mapping allocation.
-final class RegionPaintIndex {
-    let publication: UInt64
+package final class RegionPaintIndex {
+    package let publication: UInt64
     private let rows: [RegionPaintRow]
     private let layouts: [RegionWorkerLayout]
     private let starts: [Int]
     private let index: WorkerInkIndex
-    init(request: RegionRasterRequest, lookup: (UInt64) -> RegionWorkerLayout?, account: InkAccount) throws {
+    package init(request: RegionRasterRequest, lookup: (UInt64) -> RegionWorkerLayout?, account: InkAccount) throws {
         precondition(!Thread.isMainThread)
         publication = request.publication
         let rows = request.rows; self.rows = rows
@@ -253,7 +255,7 @@ final class RegionPaintIndex {
         }
         return max(0, lo - 1)
     }
-    func render(_ intent: RegionRasterRequest, account: RegionPixelAccount,
+    package func render(_ intent: RegionRasterRequest, account: RegionPixelAccount,
                 hits accountHits: RegionHitAccount) throws -> RegionRaster {
         precondition(!Thread.isMainThread)
         guard intent.publication == publication, intent.rows.count == rows.count,
@@ -345,26 +347,29 @@ final class RegionPaintIndex {
     }
 }
 
-struct RegionVisibleWitness {
-    let publication: UInt64
-    let size: CGSize
-    let scroll: CGPoint
-    let profile: Data
-    let scale: Int
-    func matches(publication: UInt64, size: CGSize, scroll: CGPoint, profile: Data, scale: Int) -> Bool {
+package struct RegionVisibleWitness {
+    package let publication: UInt64
+    package let size: CGSize
+    package let scroll: CGPoint
+    package let profile: Data
+    package let scale: Int
+    package init(publication: UInt64, size: CGSize, scroll: CGPoint, profile: Data, scale: Int) {
+        self.publication = publication; self.size = size; self.scroll = scroll; self.profile = profile; self.scale = scale
+    }
+    package func matches(publication: UInt64, size: CGSize, scroll: CGPoint, profile: Data, scale: Int) -> Bool {
         self.publication == publication && self.size == size && self.scroll == scroll && self.profile == profile && self.scale == scale
     }
 }
 
 /// Display-only placement of one immutable accepted image. This is deliberately
 /// not a RegionVisibleWitness and cannot certify fresh hits or raster acceptance.
-struct RegionRetainedWitness: Equatable {
-    let publication: UInt64
-    let imageFrame: CGRect
-    let coverage: CGRect
-    let viewport: CGRect
-    var coversViewport: Bool { coverage == viewport }
-    init?(accepted a: RegionRasterRequest, current b: RegionRasterRequest,
+package struct RegionRetainedWitness: Equatable {
+    package let publication: UInt64
+    package let imageFrame: CGRect
+    package let coverage: CGRect
+    package let viewport: CGRect
+    package var coversViewport: Bool { coverage == viewport }
+    package init?(accepted a: RegionRasterRequest, current b: RegionRasterRequest,
           actualScroll: CGPoint, extent: CGSize, clip: CGRect) {
         guard a.bytes != nil, b.bytes != nil,
               a.publication == b.publication, a.generation == b.generation, a.rows == b.rows,
@@ -391,8 +396,10 @@ struct RegionRetainedWitness: Equatable {
 }
 /// Returning to an old context is not publication. Only accepted fresh pixels
 /// rearm a source/context invalidation; geometry-only pending keeps its owner.
-struct RegionRetentionValidity {
-    private(set) var valid = false
-    mutating func invalidate() { valid = false }
-    mutating func acceptedPixels() { valid = true }
+package struct RegionRetentionValidity {
+    package private(set) var valid = false
+    package init() {}
+    package mutating func invalidate() { valid = false }
+    package mutating func acceptedPixels() { valid = true }
 }
+#endif

@@ -5,6 +5,9 @@
 
 #[cfg(windows)]
 mod accessibility;
+#[cfg(all(test, not(windows)))]
+#[path = "accessibility/model.rs"]
+mod accessibility_model;
 #[cfg(windows)]
 mod appearance;
 #[cfg(windows)]
@@ -14,8 +17,12 @@ mod clicks;
 pub mod clipboard;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod desktop;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod displays;
 #[cfg(windows)]
 mod edit_menu;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod file_dialog;
 #[cfg(windows)]
 mod icon;
 #[cfg(windows)]
@@ -38,18 +45,35 @@ mod pads;
 mod placement;
 #[cfg(windows)]
 mod probe;
+pub mod screen_capture;
 #[cfg(windows)]
 mod timers;
 #[cfg(windows)]
 mod tooltip;
 #[cfg(any(windows, test))]
 mod touch;
+#[cfg(any(windows, test))]
+mod tray;
 #[cfg(windows)]
 mod url;
 #[cfg(any(windows, test))]
 mod wheel;
 #[cfg(windows)]
 mod window;
+
+#[cfg(windows)]
+fn shell_path(path: &std::path::Path) -> windows::core::Result<windows::core::HSTRING> {
+    use std::os::windows::ffi::OsStrExt;
+    let path =
+        exact_grants::WindowsPath::shell_path(&path.as_os_str().encode_wide().collect::<Vec<_>>())
+            .map_err(|error| {
+                windows::core::Error::new(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                    error.to_string(),
+                )
+            })?;
+    Ok(windows::core::HSTRING::from_wide(&path))
+}
 
 /// The window an app opens in, in logical pixels, and what closing it does:
 /// `host.windows.window` in its `app.json`, which the bake writes as
@@ -183,6 +207,60 @@ mod clipboard_package {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persistent_presence_write_and_forget_use_the_windows_backend() {
+        const STORE: &str = "presence-write-forget";
+        if std::env::var("EXACT_AGENT_STORAGE").as_deref() != Ok(STORE) {
+            let root = std::env::current_dir()
+                .unwrap()
+                .join("target/presence-windows");
+            std::fs::create_dir_all(&root).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::persistent_presence_write_and_forget_use_the_windows_backend",
+                ])
+                .env("EXACT_AGENT", "1")
+                .env("EXACT_AGENT_STORAGE", STORE)
+                .env_remove("EXACT_STORE")
+                .env("XDG_CACHE_HOME", &root)
+                .status()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(status.success());
+            return;
+        }
+        use exact_runner::presence::{Env, Faults, Occupancy, Op};
+        let mut installed = exact_painted::presence_secrets::backend(
+            "test.presence",
+            "secret.keep token user-presence optional",
+        )
+        .unwrap();
+        let env = Env {
+            can_lock: false,
+            moves: true,
+            now_ms: 0.0,
+            faults: Faults::NONE,
+        };
+        installed
+            .backend
+            .enqueue("token", Op::Write(Some(b"credential".to_vec())), None);
+        installed.backend.pump(&env);
+        assert!(installed.backend.take_log().is_empty());
+        assert_eq!(installed.backend.occupancy("token"), Some(Occupancy::Plain));
+        assert_eq!(
+            installed.backend.plain_value("token"),
+            Some(b"credential".to_vec())
+        );
+        installed.backend.enqueue("token", Op::Write(None), None);
+        installed.backend.pump(&env);
+        assert!(installed.backend.take_log().is_empty());
+        assert_eq!(
+            installed.backend.occupancy("token"),
+            Some(Occupancy::Absent)
+        );
+    }
+
     #[test]
     fn a_bare_close_reaches_the_window_but_a_dialog_close_does_not() {
         super::on_desktop_stack(|| {

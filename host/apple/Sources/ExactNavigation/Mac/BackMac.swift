@@ -1,0 +1,387 @@
+// The Mac's ways back from a pushed route (LLP 1115.000 D5.1; LLP 1115 D5,
+// "Back is always there"): Go ▸ Back ⌘[ in the menu bar (DevMenuMac.swift),
+// a navigational toolbar item, disabled at a stack's root (ToolbarMac.swift),
+// and the trackpad's swipe (`BackSwipe`, below). Each goes the way iOS's
+// Back button and edge swipe go (`NavigationBack.way`): an authored Back
+// control is what they press, and a route that declares none goes back by
+// the root's `navigate` with the location beneath, or with no `navigate`
+// handler by the runner's own `back`. A sheet or modal route is not pushed:
+// its close and Escape are its own.
+//
+// Forward (LLP 1115.000 D5.5) goes where Back left, as a browser's does: Go ▸
+// Forward ⌘], the swipe the other way, and a mouse's forward button. The
+// mouse's back and forward buttons go Back and Forward at their release
+// unless a `pointerup` prevented it, which is Chrome's rule.
+//
+// A navigation root with no routes that hears `navigate` (`routerRoot`:
+// one view that follows the router itself) has the same ways, from the
+// router alone: Back while its selected stack has a visit beneath the top,
+// Forward while something is ahead, each delivered to `navigate`, as a
+// browser steps session history.
+//
+// The navigation root says which of the two ways it offers now
+// (`navigationHistory`, LLP 1115.000 D5.5), for an app whose own Back and
+// Forward go less far than its router's visits: a way it withholds is
+// offered by none of these, so AppKit tracks no swipe that would end on
+// nothing.
+#if os(macOS)
+import AppKit
+import ExactKit
+
+extension NavigationHost {
+    /// The selected route when it was pushed, with its navigation root: not
+    /// the first of its stack, nor the modal route a later push would stay
+    /// inside (`NavigationRules.segments`), whose close is its own. Read
+    /// from what the last batch showed (`selection`), so a batch pays nothing.
+    var pushedRoute: (root: NodeView, route: NodeView)? {
+        guard let selection, let root = presenter.views[selection.root], selection.stack.indices.contains(selection.at) else { return nil }
+        let stack = selection.stack[...selection.at].compactMap { presenter.views[$0] }
+        guard stack.count == selection.at + 1, let route = stack.last else { return nil }
+        let owners = NavigationRules.segments(presentations: stack.map { $0.props["navigationPresentation"] })
+        // In a split (LLP 1115.002 D4) the detail's pane begins at a row's
+        // detail, which was not pushed: Back leads from what is above it.
+        let lower = owners.last?.lowerBound ?? 0
+        return selection.at > (lower == 0 ? split.base : lower) ? (root, route) : nil
+    }
+
+    /// The Back controls a route declares: the live elements in it whose
+    /// `id` is the root's `navigationBack`.
+    private func backControls(in route: NodeView, of root: NodeView) -> [NodeView] {
+        guard let name = root.props["navigationBack"] else { return [] }
+        // The views of that name alone (`ChromeIndex.named`), in id order as `carrying` gives them:
+        // asked by every batch's check of the window's bar, not a sort of every named view.
+        return (presenter.chrome.named[name] ?? []).sorted().compactMap { presenter.views[$0] }.filter { presenter.menus.contains(route, $0) }
+    }
+
+    /// What `canGoBack` decides from, without the runner: the pushed route,
+    /// its Back controls and theirs states, whether the root hears
+    /// `navigate`, and what is modal. Where none of these moved, only the
+    /// router's place beneath can, and a router op says so (the window's
+    /// bar presents for it); `locationBeneath` is a call to the owner.
+    var backFacts: [UInt32] {
+        guard let (root, route) = pushedRoute else { return [offers(back: true) ? 1 : 0] }
+        let controls: [UInt32] = backControls(in: route, of: root).flatMap { control -> [UInt32] in
+            [control.id, (control.disabled ? 1 : 0) | (control.handlers.contains("press") ? 2 : 0)]
+        }
+        let facts: [UInt32] = [route.id, root.handlers.contains("navigate") ? 1 : 0, presenter.alerts.modal == nil ? 0 : 1,
+                               presenter.dialogs.routeActive ? 1 : 0, offers(back: true) ? 1 : 0]
+        return facts + controls
+    }
+
+    /// Whether the platform's Back is offered (the toolbar's chevron shows):
+    /// a route is pushed, and it is a visit of the router (its key is a
+    /// visit's id, which has one beneath it) or declares a Back control. A
+    /// declared control that is disabled keeps the way offered and refuses it.
+    var backOffered: Bool {
+        guard let (root, route) = pushedRoute else { return false }
+        return route.props["navigationKey"].flatMap { UInt64($0) } != nil || !backControls(in: route, of: root).isEmpty
+    }
+
+    /// Whether the app has a navigation stack: its navigation root is
+    /// mounted (lowering gives the first root with a `navigationKey` a
+    /// `navigationBack`, named or empty).
+    var hasStack: Bool { !presenter.carrying("navigationBack").isEmpty }
+
+    /// Whether the stack has anywhere Back could go: its route table
+    /// declares more than one location, or the window's route is pushed.
+    /// A one-screen app has no chevron, as a hand-built one has none, until something
+    /// pushes onto its stack (its one location with another query, or a
+    /// location nothing matches); its toolbar is not held for Back until then.
+    var backPossible: Bool { !oneLocation || windowRoute?.pushed == true }
+
+    /// Whether the window's toolbar shows the chevron: the window's route,
+    /// pushed or the first of its stack, did not ask for a screen with no
+    /// bar (`navigationBar="none"`, LLP 1115.000 D5.2). At the root of a
+    /// stack it is there and disabled (`canGoBack`), as Finder's and
+    /// Safari's is, so the title bar is the same on every route. The author
+    /// hid the bar, not the way back: Go ▸ Back, ⌘[ and the swipe go from a
+    /// route with no bar as from any other.
+    ///
+    /// In a window that shows a list beside its detail (LLP 1115.002 D4, §5
+    /// Q10) the chevron comes with a push inside the detail and goes with
+    /// it, as SwiftUI's does: a list beside its detail has no Back to show,
+    /// and a chevron that is never enabled is not in a hand-built window.
+    /// Nor is one in an app with nowhere to go back to (`backPossible`).
+    /// Where the bar's Back is the back/forward group, a location ahead
+    /// (`forwardPossible`) keeps it too: after Back to a one-screen app's
+    /// root or to a detail's base, its Forward still goes.
+    var backInToolbar: Bool {
+        let forward = forwardPossible
+        guard hasStack, backPossible || forward else { return false }
+        guard let selection, selection.stack.indices.contains(selection.at) else { return true }
+        let route = windowRoute
+        let owner = route?.route ?? presenter.views[selection.stack[selection.at]]
+        guard owner?.props["navigationBar"] != "none" else { return false }
+        return !split.active || route?.pushed == true || forward
+    }
+
+    /// Whether the root offers Forward and the runner has a location ahead,
+    /// whatever is over the page now (`canGoForward` says whether it goes).
+    var forwardPossible: Bool { offers(back: false) && ahead != nil }
+
+    /// The first navigation root when it has no routes, as an app whose one
+    /// view follows the router, and hears `navigate`: Back and Forward then
+    /// step the router's visits from it (LLP 1115.000 D5.5).
+    var routerRoot: NodeView? {
+        guard routeless, let node = root?.node, node.handlers.contains("navigate") else { return nil }
+        return node
+    }
+
+    /// How Back goes from the selected route, resolved at use as iOS's is
+    /// (`NavigationBack.way`), or under `routerRoot` to the visit beneath
+    /// the router's top; nil when it does not.
+    var back: NavigationBack.Way? {
+        if let (root, route) = pushedRoute { return way(from: root, route) }
+        guard routerRoot != nil else { return nil }
+        return presenter.session?.runtime.locationBehind().map { .navigate($0) }
+    }
+
+    /// How Back goes from `route`, under `root`.
+    private func way(from root: NodeView, _ route: NodeView) -> NavigationBack.Way? {
+        let named = backControls(in: route, of: root)
+        let control = NavigationBack.control(named: root.props["navigationBack"], among: named, id: \.id, htmlID: { $0.props["id"] },
+                                                  pressable: { $0.handlers.contains("press") }, disabled: \.disabled, inActiveRoute: { _ in true })
+        return NavigationBack.way(control: control?.id, declared: !named.isEmpty, hearsNavigate: root.handlers.contains("navigate"),
+                                    beneath: { [presenter] in route.props["navigationKey"].flatMap { presenter.session?.runtime.locationBeneath($0) } })
+    }
+
+    /// Whether the navigation root offers Back (`back: true`) or Forward
+    /// now: what its `navigationHistory` says, both when it says nothing.
+    func offers(back: Bool) -> Bool {
+        guard let words = root?.node.props["navigationHistory"] else { return true }
+        return words.split(separator: " ").contains(back ? "back" : "forward")
+    }
+
+    /// Whether Back goes now: a way back the root offers, and nothing modal
+    /// over the page (a dialog in the top layer, a sheet on the window).
+    var canGoBack: Bool {
+        guard back != nil, offers(back: true), presenter.alerts.modal == nil else { return false }
+        if let dialog = presenter.dialogs.active {
+            return pushedRoute?.route === dialog && presenter.dialogs.routeActive && dialog.window?.attachedSheet == nil
+        }
+        return presenter.viewport.window?.attachedSheet == nil
+    }
+
+    /// The platform's Back, taken: the authored control pressed, else the
+    /// root's `navigate` with the location beneath, else the runner's `back`.
+    @discardableResult func goBack() -> Bool {
+        guard canGoBack, let how = back else { return false }
+        if let (root, route) = pushedRoute { take(how, from: root, route) }
+        else if case .navigate(let location) = how, let root = routerRoot { presenter.session?.navigate(location, at: root) }
+        return true
+    }
+
+    private func take(_ how: NavigationBack.Way, from root: NodeView, _ route: NodeView) {
+        switch how {
+        // A Back control its sheet's row stands for is pressed as that row presses it (RouteSheetMac.swift).
+        case .press(let id): presenter.press(id, fromNativeMenu: presenter.views[id].flatMap(presenter.dialogs.rowShows) != nil)
+        case .navigate(let location): presenter.session?.navigate(location, at: root)
+        case .pop:
+            if let key = route.props["navigationKey"] { presenter.session?.hostBack(key) }
+        }
+    }
+
+    /// Whether the selected route is a sheet or a full-screen cover over
+    /// the route beneath it, whose bar the window keeps.
+    var covered: Bool { sheetRoute != nil }
+
+    /// The selected route when it is a sheet (a modal route over the route
+    /// beneath it), with its navigation root.
+    private var sheetRoute: (root: NodeView, route: NodeView)? {
+        guard let selection, selection.at > 0, selection.stack.indices.contains(selection.at),
+              let root = presenter.views[selection.root], let route = presenter.views[selection.stack[selection.at]],
+              ["modal", "fullscreen"].contains(route.props["navigationPresentation"] ?? "") else { return nil }
+        return (root, route)
+    }
+
+    /// The root that hears Forward while the runner has a location ahead.
+    private var ahead: NodeView? {
+        guard let root = selection.flatMap({ presenter.views[$0.root] }) ?? routerRoot,
+              presenter.session?.runtime.locationAhead() != nil else { return nil }
+        return root
+    }
+
+    /// Whether Forward goes now: somewhere ahead the root offers, and nothing
+    /// modal over the page (an alert, a dialog in the top layer, a sheet on
+    /// the window).
+    var canGoForward: Bool {
+        forwardPossible && presenter.alerts.modal == nil && presenter.dialogs.active == nil
+            && presenter.viewport.window?.attachedSheet == nil
+    }
+
+    /// The platform's Forward, taken as the web host takes a browser's (LLP
+    /// 1038 D7): the root's `navigate` with the location ahead, else the
+    /// runner's own `go`.
+    @discardableResult func goForward() -> Bool {
+        guard canGoForward, let root = ahead else { return false }
+        presenter.session?.hostForward(at: root)
+        return true
+    }
+
+    /// The agent's `back` from a route (LLP 1116.006 D4): a pushed one's
+    /// as ⌘[ takes it (`goBack`); a sheet's as iOS's swipe down does, which
+    /// its `closedby="none"` refuses. nil with neither on top; the way, and
+    /// why the app refused it ("" when it did not).
+    func agentBack() -> (way: String, refused: String)? {
+        let withheld = offers(back: true) ? "a dialog or a sheet is open over the page" : "the navigation root's navigationHistory does not offer back"
+        if pushedRoute != nil {
+            if !canGoBack && back != nil { return ("route", withheld) }
+            return ("route", goBack() ? "" : "its navigationBack control is disabled or has no press handler")
+        }
+        if let (_, route) = sheetRoute { return ("sheet", dismiss(route) ?? "") }
+        if routerRoot != nil, back != nil { return ("route", goBack() ? "" : withheld) }
+        // A split's detail has no Back (LLP 1115.002 D4). A person leaves
+        // it by taking the selection off its row, and the pane's routes go
+        // as their stack goes back: that is the way back from it.
+        guard split.active, split.shown?.detail != nil else { return nil }
+        return ("route", split.closeDetail() ? "" : "the detail's stack did not go back: its navigationBack control is disabled or has no press handler")
+    }
+
+    /// The platform's dismissal of a modal route: Escape or Command-period
+    /// in its sheet and a click behind a `closedby="any"` one (LLP 1115.002
+    /// D7.4), and the agent's `back`. It goes as the stack goes back, which
+    /// the app decides; nil when it went, else why it was refused.
+    @discardableResult func dismiss(_ route: NodeView) -> String? {
+        let route = presenter.dialogs.dismissalOwner(of: route)
+        guard let selection, let root = presenter.views[selection.root] else { return "its stack has no navigation root" }
+        if NavigationRules.modalRefusesDismissal(closedby: route.props["closedby"]) { return "its closedby is \"none\"" }
+        guard let how = way(from: root, route) else { return "its navigationBack control is disabled or has no press handler" }
+        if case .press(let id) = how, presenter.dialogs.active !== route, presenter.dialogs.entries.contains(where: { $0.routeBase === route }) {
+            // A pushed child hides and gates the base's control. Dismissing its sheet still invokes that control's action.
+            guard let control = presenter.views[id], !sequence(first: control as NSView, next: { self.presenter.menus.parent(of: $0) })
+                .contains(where: { ($0 as? NodeView)?.props["inert"] == "true" }) else { return "its navigationBack control is inert" }
+            presenter.commitPendingEdit()
+            presenter.onPress?(id)
+        } else { take(how, from: root, route) }
+        return nil
+    }
+
+    /// `state.navigation.back` (the agent): how Back goes now, or that it does not.
+    var backObservation: Any {
+        guard canGoBack, let how = back else { return NSNull() }
+        switch how {
+        case .press(let id): return ["press": Int(id)]
+        case .navigate(let location): return ["navigate": location]
+        case .pop: return "pop"
+        }
+    }
+}
+
+/// The trackpad's swipe back and forward. With two fingers it is AppKit's
+/// swipe tracking from scroll events, as Safari's is (`trackSwipeEvent`: the
+/// person's "Swipe between pages" setting, the direction lock, natural
+/// scrolling and the distance that completes or cancels it are all
+/// AppKit's); with three, when that is the setting, `swipe(with:)`, which is
+/// also how some mouse drivers send their side buttons. The page does not
+/// follow the fingers: this host shows a route change at once, a push too,
+/// so Back or Forward lands as the fingers lift.
+///
+/// Only a scroll nothing took arrives: a scroller that can move that way
+/// takes it, one whose `overscroll-behavior-x` is `contain` or `none` keeps
+/// it at its edge, and a `wheel` handler's `preventDefault()` stops it, as
+/// Chrome's history swipe is (LLP 1115.000 D5.5).
+///
+/// The navigation root's `historyswipe` hears the two-finger swipe as AppKit
+/// tracks it, so an app can draw its own sign of it, as Chrome draws its
+/// arrow: `began` and `changed` while the fingers are down, then `ended`
+/// just before the step or `cancelled` when the lift goes nowhere. The
+/// settling AppKit animates after the lift is not told.
+final class BackSwipe {
+    unowned let presenter: Presenter
+    private(set) var tracking = false
+    init(_ presenter: Presenter) { self.presenter = presenter }
+
+    /// AppKit's tracking of the rest of the gesture, calling back with its
+    /// amount, phase and whether it is over. Its bounds are -1 with a way
+    /// forward and 1 with a way back, 0 on a side with neither, where
+    /// AppKit damps the travel. A test's stands in for it.
+    var track: (NSEvent, CGFloat, CGFloat, @escaping (CGFloat, NSEvent.Phase, Bool) -> Void) -> Void = { event, min, max, handler in
+        event.trackSwipeEvent(options: .lockDirection, dampenAmountThresholdMin: min, max: max) { amount, phase, complete, _ in
+            handler(amount, phase, complete)
+        }
+    }
+
+    /// The way a scroll event starts a swipe, 1 back and -1 forward, or nil:
+    /// a trackpad's gesture (phased, not its momentum), more sideways than
+    /// not, with swipe tracking on in System Settings and somewhere to go
+    /// that way. Back is toward the page before: content moving right, the
+    /// direction as the person scrolls.
+    static func way(gesture: Bool, dx: CGFloat, dy: CGFloat, enabled: Bool, back: Bool, forward: Bool) -> CGFloat? {
+        guard gesture, enabled, abs(dx) > abs(dy) else { return nil }
+        return dx > 0 && back ? 1 : dx < 0 && forward ? -1 : nil
+    }
+
+    /// A scroll event the page's scroll view passed up (it does for a
+    /// sideways gesture it is pinned for, `wantsScrollEventsForSwipeTracking`).
+    /// True when it began a swipe, which AppKit then tracks. A script's
+    /// wheel is not a trackpad's stream of events, and is never tracked.
+    func scroll(_ event: NSEvent, enabled: Bool) -> Bool {
+        let gesture = !event.phase.isEmpty && event.momentumPhase.isEmpty, (dx, dy) = (event.scrollingDeltaX, event.scrollingDeltaY)
+        // Whether the event could start a swipe at all, before asking where
+        // Back and Forward go, which is a call to the owner.
+        guard !tracking, Self.way(gesture: gesture, dx: dx, dy: dy, enabled: enabled, back: true, forward: true) != nil,
+              !Self.kept(event) else { return false }
+        let navigation = presenter.navigationHost
+        let (back, forward) = (navigation.canGoBack, navigation.canGoForward)
+        guard let way = Self.way(gesture: gesture, dx: dx, dy: dy, enabled: enabled, back: back, forward: forward) else { return false }
+        tracking = true
+        // The side the gesture set out for: one that ends on the other side
+        // (the fingers came back past where they started) goes nowhere.
+        var side: CGFloat = 0, told: CGFloat?
+        let client = presenter.client(event.locationInWindow)
+        track(event, forward ? -1 : 0, back ? 1 : 0) { [weak self] amount, phase, complete in
+            if side == 0, amount != 0 { side = amount < 0 ? -1 : 1 }
+            let steps = phase == .ended && amount * side > 0
+            if phase != .changed || amount != told { self?.tell(phase, steps: steps, way: way, amount: amount, client: client) }
+            told = amount
+            if steps {
+                if side > 0 { self?.presenter.navigationHost.goBack() } else { self?.presenter.navigationHost.goForward() }
+            }
+            // AppKit's tracking takes the gesture's remaining scroll events: it says when the fingers lift.
+            if phase == .ended || phase == .cancelled || complete { self?.presenter.session?.app.replacements.lifted(.scrollWheel) }
+            if complete { self?.tracking = false }
+        }
+        return true
+    }
+
+    /// One callback of the tracking, as the navigation root's `historyswipe`
+    /// hears it: the phase, the way the gesture set out (1 back, -1
+    /// forward), AppKit's `gestureAmount` along it and where the pointer was.
+    private func tell(_ phase: NSEvent.Phase, steps: Bool, way: CGFloat, amount: CGFloat, client: CGPoint) {
+        let name: String
+        switch phase {
+        case .began: name = "began"
+        case .changed: name = "changed"
+        case .ended: name = steps ? "ended" : "cancelled"
+        case .cancelled: name = "cancelled"
+        default: return
+        }
+        guard let root = presenter.navigationHost.root?.node, root.handlers.contains("historyswipe") else { return }
+        presenter.session?.historySwipe(name, back: way > 0, amount: max(0, Double(amount * way)), client: client, at: root)
+    }
+
+    /// Whether a scroller under the event keeps a sideways gesture
+    /// (`overscroll-behavior-x: contain` or `none`). `NSScrollView` hands
+    /// one it is pinned for to the view that tracks swipes even so.
+    static func kept(_ event: NSEvent) -> Bool {
+        guard let window = event.window, let frame = window.contentView?.superview ?? window.contentView,
+              let hit = frame.hitTest(frame.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow) else { return false }
+        return sequence(first: hit, next: \.superview).contains { ($0 as? ChainingScrollView).map { $0.containX && $0.scrollsX } ?? false }
+    }
+
+    /// The three-finger swipe (`NSResponder.swipe(with:)`): `deltaX` is
+    /// positive toward the page before, as AppKit reports it for the
+    /// person's scroll direction.
+    func swiped(deltaX: CGFloat) -> Bool {
+        deltaX > 0 ? presenter.navigationHost.goBack() : deltaX < 0 && presenter.navigationHost.goForward()
+    }
+}
+
+extension ExactSession {
+    /// The tracked history swipe, to the navigation root that hears it.
+    func historySwipe(_ phase: String, back: Bool, amount: Double, client: CGPoint, at root: NodeView) {
+        guard state != .destroyed, booted, presenter.views[root.id] === root, root.handlers.contains("historyswipe") else { return }
+        applyInput(runtime.historySwipe(root.id, phase: phase, direction: back ? "back" : "forward", amount: amount, client: client, now: now()))
+    }
+}
+#endif

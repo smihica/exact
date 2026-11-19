@@ -13,7 +13,7 @@
 
 use crate::page::{body_close_js, body_open_js, preload_image, runtime_style_of, Js, Sheet};
 use crate::{activation, direct_for, encoded, retire, settle_at, Ids, Projection, Rendered};
-use exact_plan::{ActivatePolicy, PaintPolicy, Plan};
+use exact_plan::{ActivatePolicy, PaintPolicy};
 use exact_runner::DataSource;
 use exact_web::document::{
     before_root, digest, project_tree, read_checkpoint, route_at, Document, Site, Writing,
@@ -38,7 +38,7 @@ pub(crate) struct Streamed {
 /// before it sent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
-    plan: &Plan,
+    plan: &exact_runner::Program,
     data: &F,
     viewport: exact_runner::Viewport,
     location: &str,
@@ -114,6 +114,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
             crate::render_time(),
             delivery,
             paints_boot.then_some(&mut on_boot as &mut dyn FnMut(&mut _)),
+            None,
         )?
     };
     let tree = match page.runner.document_tree() {
@@ -249,7 +250,7 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
     );
     let to = boot.as_ref().map(|boot| boot.to(&document.controls));
     hand(close_after_boot(close.clone(), to).as_bytes());
-    let settled = page.settled;
+    let (settled, drew) = (page.settled, page.runner.store().entropy_draws() > 0);
     retire(page, data);
     if over {
         return Err(format!("the page is {sent} bytes"));
@@ -266,6 +267,8 @@ pub(crate) fn render_js<D: DataSource + 'static, F: Fn() -> D>(
             activate,
             wake,
             runtime_form: true,
+            chooses_scheme: exact_runner::uses::chooses_scheme(plan),
+            drew,
         },
         body,
         boot,
@@ -364,6 +367,9 @@ mod tests {
     use exact_plan::Value;
     use exact_runner::{Answer, DataError, Outcome, Request, Response, Store};
     use std::sync::{mpsc, Arc, Mutex};
+    /// The host work these tests hand out (LLP 1047.001 D12).
+    struct TestWork;
+    impl exact_runner::HostWork for TestWork {}
 
     const SHELL: &str = r#"<!doctype html>
 <html lang="en">
@@ -373,7 +379,7 @@ mod tests {
 <link rel="modulepreload" href="./app.js">
 <style>p{margin:0}</style>
 <div id="exact-root"></div>
-<script type="module" src="./app.js"></script>
+<script type="module" data-entry src="./app.js"></script>
 "#;
     const SOURCE: &str = r#"
 routes nav
@@ -398,7 +404,7 @@ component Cards
         }
 
         fn answer(&mut self, _: &mut Store, _: &str, _: &[Value]) -> Result<Answer, DataError> {
-            Ok(Answer::Later(Request::continuation(1)))
+            Ok(Answer::Later(Request::continuation::<TestWork>(1)))
         }
 
         fn continuation(&mut self, _: u64) -> Option<Box<dyn FnOnce() -> Outcome + Send>> {
@@ -432,7 +438,7 @@ component Cards
 
     #[test]
     fn a_boot_document_is_replaced_when_the_settled_page_needs_a_kernel() {
-        let plan = contract::compile(SOURCE).unwrap();
+        let plan = exact_runner::Program::new(contract::compile(SOURCE).unwrap());
         let (release, hold) = mpsc::channel();
         let hold = Arc::new(Mutex::new(Some(hold)));
         let mut release = Some(release);
@@ -514,7 +520,7 @@ component Cards
         button "Delete" press=bump
       button "Keep" press=bump
 "#;
-        let plan = contract::compile(source).unwrap();
+        let plan = exact_runner::Program::new(contract::compile(source).unwrap());
         let (release, hold) = mpsc::channel();
         let hold = Arc::new(Mutex::new(Some(hold)));
         let mut release = Some(release);

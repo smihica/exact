@@ -7,6 +7,7 @@ import AppKit
 import CExact
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 final class FormRowsMacTests: XCTestCase {
     private var window: NSWindow!

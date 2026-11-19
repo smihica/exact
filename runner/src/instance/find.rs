@@ -19,7 +19,7 @@ fn has_root(children: &[Child], view: ViewId) -> bool {
 
 /// The root among `children` whose view is `target`, pushing the frames
 /// of the arms and rows crossed to reach it; `scanned` counts rows compared.
-fn locate<'a>(
+pub(super) fn locate<'a>(
     children: &'a [Child],
     target: ViewId,
     frames: &mut Vec<Frame>,
@@ -58,7 +58,7 @@ impl NodeInst {
     /// Whether `view` is this node's or a descendant's (a pin in a row).
     pub(super) fn contains(&self, view: ViewId) -> bool {
         self.view == view
-            || self.collection().is_some_and(|c| c.contains(view))
+            || self.list().is_some_and(|c| c.contains(view))
             || contains(&self.children, view)
     }
 }
@@ -88,7 +88,7 @@ impl Tree {
         while let Some(up) = parent(*chain.last().expect("nonempty")) {
             chain.push(up);
         }
-        let mut targets = chain.into_iter().rev();
+        let mut targets = chain.into_iter().rev().peekable();
         let mut frames = Vec::new();
         let mut here: &[Child] = &self.children;
         while let Some(target) = targets.next() {
@@ -96,13 +96,17 @@ impl Tree {
             if target == view {
                 return Some((n.node, frames));
             }
-            match n.collection() {
-                Some(collection) => {
-                    let row = collection.row_by_wrapper(targets.next()?)?;
-                    frames.push(row.frame.clone());
-                    here = &row.roots;
+            match n.list() {
+                Some(list)
+                    if targets
+                        .peek()
+                        .is_some_and(|next| list.row_by_wrapper(*next).is_some()) =>
+                {
+                    let (frame, roots) = list.row_by_wrapper(targets.next()?)?;
+                    frames.push(frame.clone());
+                    here = roots;
                 }
-                None => here = &n.children,
+                _ => here = &n.children,
             }
         }
         None

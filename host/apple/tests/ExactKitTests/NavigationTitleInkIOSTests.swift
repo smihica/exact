@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// A bar title's authored colour and typography, over the native fixture:
 /// each is the route's own item appearance, and a heading with none leaves
@@ -10,7 +11,7 @@ extension NavigationBarIOSTests {
     func testAuthoredClearTitleInkAndAbsenceUseDifferentAppearances() throws {
         let session = try fixture("title-ink", module: false)
         let heading = try node(session, "title-home")
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let item = try XCTUnwrap(nav.topViewController?.navigationItem)
         XCTAssertNil(item.standardAppearance)
         session.presenter.apply(wireBatch([["op": "style", "id": heading.id,
@@ -33,12 +34,14 @@ extension NavigationBarIOSTests {
     func testAHeadingsAuthoredTypographyIsTheBarsTitleFont() throws {
         let session = try fixture("title-font", module: false)
         let heading = try node(session, "title-home"), engine = try XCTUnwrap(heading.text)
-        let nav = try XCTUnwrap(session.presenter.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(session.presenter.navigationHost.primaryNavigation)
         let route = try XCTUnwrap(nav.topViewController), item = route.navigationItem
         func labels(_ view: UIView) -> [UILabel] { ((view as? UILabel).map { [$0] } ?? []) + view.subviews.flatMap(labels) }
         func drawnLarge() -> UIFont? {
-            nav.navigationBar.layoutIfNeeded()
-            return labels(nav.navigationBar).filter { $0.text == "Fixture" }.map(\.font).max { $0.pointSize < $1.pointSize }
+            // Over a route's scroller, iOS 26 draws the large title in the
+            // scroll content rather than in the bar.
+            nav.view.layoutIfNeeded()
+            return labels(nav.view).filter { $0.text == "Fixture" }.map(\.font).max { $0.pointSize < $1.pointSize }
         }
         let platform = NavigationTitleInk.platformFonts(route.traitCollection)
         XCTAssertNil(item.standardAppearance, "no authored typography: UIKit's title")
@@ -76,7 +79,7 @@ extension NavigationBarIOSTests {
         let p = session.presenter
         let heading = try node(session, "title-home")
         let route = try node(session, "route-home")
-        let item = try XCTUnwrap(p.navigation.primaryNavigation?.topViewController?.navigationItem)
+        let item = try XCTUnwrap(p.navigationHost.primaryNavigation?.topViewController?.navigationItem)
         p.apply(wireBatch([
             ["op": "props", "id": route.id, "set": ["navigationBar": "transparent"]],
             ["op": "style", "id": heading.id, "style": ["text_color": [0, 0, 0, 0], "written": ["text_color"]]]

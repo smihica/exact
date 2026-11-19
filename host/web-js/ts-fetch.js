@@ -10,11 +10,19 @@ import { tsGrantSet } from './admission-data.js';
 // captured when called and starts after its source returns, so a refused
 // one never starts; a module with none fetches at once, as before.
 export const SOCKET_AND_FETCH = 'a mutation cannot both send on a socket and fetch';
+// Set by the build where no module app.ts reaches spells `exactStream`: the page has no stream reader (LLP 1047.003 D5).
+export const STREAM_REFUSAL = null;
 // `exactHeld` (LLP 1016.000 D9), with Hermes's words (js/src/fetch.js): the server may hold the reply. Each
 // fetch is counted on its answer, held (`call.held`) or not (`call.plain`), or as tied to no answer
 // (`answering.loose`); an answer with only held fetches out counts for no clock (held.js `counted`, whose
 // hooks the page's entry sets on `answering`, build.mjs).
-export function fetch(input, options) { return owned(fetchInCall(input, options)).then(responseFor); }
+export function fetch(input, options) {
+  const call = currentContext();
+  return owned(fetchInCall(input, options)).then(responseFor, error => {
+    if (globalThis.__exactRender && error?.renderDeferred) return answering.refuseVisitor(error.message, call);
+    throw error;
+  });
+}
 // A response's body reads and clones in the module's promise domain, without changing the page's Response prototype:
 // the four Hermes's Response has (js/src/binary.js).
 export function responseFor(response) {
@@ -28,7 +36,15 @@ export function responseFor(response) {
   return response;
 }
 function fetchInCall(input, options) {
+  if (globalThis.__exactRender && !globalThis.__exactProduction) {
+    const call = currentContext();
+    if (call && call !== backgroundCall && !call.mutation) {
+      try { (call.urls ??= new Set()).add(new URL(input instanceof Request ? input.url : String(input)).href); }
+      catch { /* Invalid URLs still reach the executor's ordinary refusal. */ }
+    }
+  }
   // Checked before any path, a mutation's captured fetch included (LLP 1016.000 D8).
+  if (STREAM_REFUSAL && options?.exactStream !== undefined) return Promise.reject(new TypeError(STREAM_REFUSAL));
   if (options?.exactLongPoll !== undefined && options.exactStream === undefined)
     return Promise.reject(new TypeError('exactLongPoll asks again for an answer that keeps coming: give exactStream too'));
   const upload = options?.exactUploadProgress; // LLP 1016.000 D10
@@ -41,8 +57,8 @@ function fetchInCall(input, options) {
   if (idle !== undefined) {
     if (!Number.isInteger(idle) || idle < 1 || idle > 3600000) return Promise.reject(new TypeError('exactIdleTimeout must be an integer number of milliseconds from 1 to 3600000'));
     let url; try { url = input instanceof Request ? input.url : String(input); } catch (e) { return Promise.reject(e); }
-    if (options.exactStream === undefined || options.exactUploadProgress === true || options.exactLongPoll !== undefined || !/^wss?:/i.test(url))
-      return Promise.reject(new TypeError('exactIdleTimeout: only a WebSocket stream takes an idle timeout'));
+    if (options.exactStream === undefined || options.exactUploadProgress === true || options.exactLongPoll !== undefined || !(/^(wss?|https?):/i.test(url) || !/^[a-z][a-z0-9+.-]*:/i.test(url)))
+      return Promise.reject(new TypeError('exactIdleTimeout: only a WebSocket, event or byte stream takes an idle timeout'));
   }
   let protocols;
   try {
@@ -84,7 +100,7 @@ function fetchNow(input, options, protocols) {
   if (overlaying.on) return Promise.reject(inOverlay('fetch()'));
   // A mapper makes no fetch (D7), in any turn of its call.
   if (answering.mapper || answering.mapperCall) return Promise.reject(new Error(answering.mapper ? "fetch() is unavailable in a socket's mapper: it answers each frame now" : "fetch() is unavailable in a stream's mapper: fetch in the answer that opens the stream"));
-  const call = answering.call;
+  const call = answering.call, lease = (call ?? answering.promiseCall)?.lease;
   if (call?.mutation) {
     // An answer in flight may fetch in a later turn though its source sent, as natively (LLP 1016.000 D7, amended
     // 2026-11-12). The fetch waits for the commit that asked the answer: its refusal takes the frames back, and this too.
@@ -125,13 +141,26 @@ function fetchNow(input, options, protocols) {
       try { target = input instanceof Request ? input : String(input); init = captured(options); } catch (e) { return Promise.reject(e); }
       return Promise.resolve().then(() => {
         if (call.socketConflict) throw new Error(SOCKET_AND_FETCH);
+        arming(lease, target, init);
         // As the mutation's own, so a deadline its signal gives aborts in its turn
         return asCall(call, () => fetchWith(tsGrantSet, target, init, null, undefined, undefined, call.origin));
       });
     }
-    return fetchOf(input, options, call, protocols);
+    return armed(lease, input, options) ?? fetchOf(input, options, call, protocols);
   }
-  return fetchOf(input, options, call, protocols);
+  return armed(lease, input, options) ?? fetchOf(input, options, call, protocols);
+}
+// A request with effects arms its answer's lease's recovery as it goes, once its own options are checked, as the
+// native prelude's `fetch` arms it (LLP 1146 D5); `armed` answers the rejection of a request refused here or of a
+// marker that could not be kept.
+function arming(lease, input, options) {
+  if (!lease?.arm) return;
+  redirectOf(input, options);
+  const method = options?.method !== undefined ? options.method : input instanceof Request ? input.method : 'GET';
+  if (!['GET', 'HEAD'].includes(String(method).toUpperCase())) lease.arm();
+}
+function armed(lease, input, options) {
+  try { arming(lease, input, options); } catch (e) { return Promise.reject(e); }
 }
 // What `fetch` reads of its options, read now (inherited ones too), with
 // the headers and a body that can change copied.
@@ -297,11 +326,18 @@ function arm(api, run, ms, args) {
 }
 // Run `run` as `call`'s turn, as its timers run: in flight until the page's next task, so the agent's jump lands what it
 // started (its microtasks, the answer's continuation) before the next timer fires, as a browser runs them between tasks.
+// A callback's throw is journaled and reported to the page as a browser reports a timer's (LLP 1175 D2), with no answer
+// current, as natively.
 function runAs(call, run) {
   const { clock, journal } = answering.page;
   call.firing = (call.firing ?? 0) + 1; call.recount?.();
   globalThis.setTimeout(() => { call.firing--; call.recount?.(); });
-  asCall(call, () => { try { run(); } catch (e) { journal.push(`t=${clock.now} data: a timer's callback threw: ${e?.message ?? e}`); } });
+  let thrown = null;
+  asCall(call, () => { try { run(); } catch (e) { thrown = { e }; } });
+  if (thrown) {
+    journal.push(`t=${clock.now} data: a timer's callback threw: ${thrown.e?.message ?? thrown.e}`);
+    globalThis.reportError?.(thrown.e);
+  }
   // What the callback sent on a socket goes now, before the next timer of the same advance (ts-stream.js `later`).
   answering.later?.(call);
 }
@@ -484,6 +520,7 @@ Object.defineProperty(NoFunction, 'prototype', { value: globalThis.Function.prot
 // Fixed, so no `delete` or write uncovers the inherited one.
 for (const f of [NoFunction, noEval]) Object.defineProperty(f, 'constructor', { value: NoFunction, writable: false, configurable: false });
 const guarded = {
+  exactHost() { answerOnly('exactHost()'); return 'web'; },
   Date: GuardedDate, Math: GuardedMath, Function: NoFunction, eval: noEval,
   XMLHttpRequest: noIo('XMLHttpRequest'), WebSocket: noIo('WebSocket'), EventSource: noIo('EventSource'),
   Intl: Object.freeze(Object.create(NativeIntl, { DateTimeFormat: { value: DateTimeFormat } })),
@@ -551,7 +588,7 @@ function seeded(n) {
   return stream(n);
 }
 export const { Date, Math, Intl, setTimeout, setInterval, requestAnimationFrame, requestIdleCallback, clearTimeout, clearInterval,
-  cancelAnimationFrame, cancelIdleCallback, performance, scheduler, queueMicrotask, XMLHttpRequest, WebSocket, EventSource, crypto } = guarded;
+  cancelAnimationFrame, cancelIdleCallback, performance, scheduler, queueMicrotask, XMLHttpRequest, WebSocket, EventSource, crypto, exactHost } = guarded;
 // Not a binding of this module's own: its `fetch` keeps the page's `AbortSignal.timeout` for `exactTimeout`.
 export { GuardedAbortSignal as AbortSignal, ModuleResponse as Response };
 // By name, since no binding of this module may be named `Function` or `eval` here; a module imports `eval` under

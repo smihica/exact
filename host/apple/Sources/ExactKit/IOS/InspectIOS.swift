@@ -9,7 +9,7 @@
 #if EXACT_INSPECT && os(iOS)
 import UIKit
 
-enum InspectHost {
+package enum InspectHost {
     /// The overlay on each window inspect mode is on in.
     nonisolated(unsafe) private static var overlays: [ObjectIdentifier: InspectOverlay] = [:]
     nonisolated(unsafe) private(set) weak static var app: ExactApp?
@@ -119,35 +119,8 @@ enum InspectHost {
     typealias Place = () -> CGRect?
     static func place(of node: NodeView, in session: ExactSession) -> Place? {
         if shown(node) { return { [weak node] in node.flatMap { $0.window != nil && shown($0) ? $0.convert($0.bounds, to: nil) : nil } } }
-        let id = node.id, presenter = session.presenter
-        for c in presenter.navigation.controllers.values {
-            guard let nav = c.navigationController, nav.topViewController === c else { continue }
-            let bar = nav.navigationBar
-            let items = (c.navigationItem.leftBarButtonItems ?? []) + (c.navigationItem.rightBarButtonItems ?? [])
-            if let item = items.first(where: { c.itemNodes[ObjectIdentifier($0)] == id }) {
-                return { [weak bar, weak item] in
-                    guard let bar, let item, bar.window != nil, let frame = item.frame(in: bar) else { return nil }
-                    return bar.convert(frame, to: nil)
-                }
-            }
-            if let segments = c.titleSegments, let index = segments.press.tabs.firstIndex(of: id) {
-                return { [weak control = segments.control] in
-                    guard let control, control.window != nil else { return nil }
-                    let views = control.segmentViews
-                    return views.indices.contains(index) ? views[index].convert(views[index].bounds, to: nil) : nil
-                }
-            }
-            if let search = c.search, search.field === node {
-                return { [weak searchBar = search.controller.searchBar] in searchBar.flatMap { $0.window != nil ? $0.searchTextField.convert($0.searchTextField.bounds, to: nil) : nil } }
-            }
-            if let header = c.shownHeader, header === node || heading(in: header) === node || (c.navigationItem.titleView as? HeaderTitleView)?.groupId == id {
-                return { [weak bar, weak c] in
-                    guard let bar, let c, bar.window != nil else { return nil }
-                    if let title = c.navigationItem.titleView, title.window != nil { return title.convert(title.bounds, to: nil) }
-                    return bar.titleFrame(c.navigationItem.title).map { bar.convert($0, to: nil) }
-                }
-            }
-        }
+        let presenter = session.presenter
+        if let place = presenter.navigation.inspectPlace(of: node) { return place }
         if let root = presenter.navigation.container, let tabs = NavigationTabs.of(root, presenter), let index = tabs.tabs.firstIndex(where: { $0 === node }),
            let controller = presenter.navigation.tabController {
             let bar = controller.tabBar
@@ -168,7 +141,7 @@ enum InspectHost {
     /// trailing, so right to left in a right-to-left layout; in the bar's
     /// coordinates; copies drawn for its glass are one box): what a tab bar
     /// shows for its items, which UIKit gives no frame.
-    static func buttonBoxes(in bar: UIView) -> [CGRect] {
+    package static func buttonBoxes(in bar: UIView) -> [CGRect] {
         var boxes: [CGRect] = [], pending: [UIView] = bar.subviews
         while !pending.isEmpty {
             let v = pending.removeFirst()
@@ -268,7 +241,7 @@ enum InspectHost {
             // A system bar: a plan node it hosts (its title, an item) is
             // selectable; its own parts are not, and the walk goes no higher.
             if let bar = v as? UINavigationBar {
-                if let id = barNode(session, bar, window.convert(p, to: bar)) { return (session, id, session.presenter.views[id] ?? bar, nil) }
+                if let id = session.presenter.navigation.inspectNode(in: bar, at: window.convert(p, to: bar)) { return (session, id, session.presenter.views[id] ?? bar, nil) }
                 return (session, nil, nil, "That is part of UIKit's navigation bar, not a view of the app.")
             }
             if let bar = v as? UITabBar {
@@ -280,8 +253,8 @@ enum InspectHost {
             if v is UIToolbar { return (session, nil, nil, "That is part of a UIKit toolbar, not a view of the app.") }
             if let node = v as? NodeView, !node.isHidden { return (session, node.id, node, nil) }
             if let button = v as? NativeButtonIOS, let owner = button.owner { return (session, owner.id, owner, nil) }
-            if let owned = v as? AgentOwned, let id = owned.agentViewId { return (session, id, v, nil) }
-            if let title = v as? HeaderTitleView, let id = title.groupId { return (session, id, title, nil) }
+            if let owned = v as? InspectionOwned, let id = owned.inspectionViewId { return (session, id, v, nil) }
+            if let id = session.presenter.navigation.inspectTitle(v) { return (session, id, v, nil) }
             // A swipe action UIKit draws for a row: the action's node.
             if let button = v as? UIButton, !(v is NativeButtonIOS), let id = session.presenter.swipeActions.action(for: button) { return (session, id, button, nil) }
             // A grouped list's cell (its rows are no NodeViews): its switch's
@@ -319,43 +292,6 @@ enum InspectHost {
         return nil
     }
 
-    /// The plan node behind a navigation bar's item or title at `p` (in the
-    /// bar's coordinates), or nil for UIKit's own parts (Back, the bar).
-    private static func barNode(_ session: ExactSession, _ bar: UINavigationBar, _ p: CGPoint) -> UInt32? {
-        for c in session.presenter.navigation.controllers.values where c.navigationController?.navigationBar === bar && c.navigationController?.topViewController === c {
-            let items = (c.navigationItem.leftBarButtonItems ?? []) + (c.navigationItem.rightBarButtonItems ?? [])
-            for item in items {
-                guard let frame = item.frame(in: bar), frame.contains(p) else { continue }
-                if let id = c.itemNodes[ObjectIdentifier(item)] ?? (item.target as? BarPress)?.id { return id }
-            }
-            // The header's tablist as the title's segments: the tab under the point.
-            if let segments = c.titleSegments, segments.control.window != nil, segments.control.convert(segments.control.bounds, to: bar).contains(p) {
-                let views = segments.control.segmentViews, tabs = segments.press.tabs
-                if views.count == tabs.count, let index = views.firstIndex(where: { $0.convert($0.bounds, to: bar).contains(p) }) { return tabs[index] }
-            }
-            // The header's search input as the bar's search field.
-            if let search = c.search, let field = search.field {
-                let searchBar = search.controller.searchBar
-                if searchBar.window != nil, searchBar.convert(searchBar.bounds, to: bar).contains(p) { return field.id }
-            }
-            // The title UIKit draws (the label showing this route's title, not
-            // Back's): the route header's heading.
-            if let header = c.shownHeader, let title = bar.titleFrame(c.navigationItem.title), title.contains(p) { return heading(in: header)?.id ?? header.id }
-        }
-        return nil
-    }
-
-    /// The heading in a route's header, the title the bar shows for it.
-    private static func heading(in header: NodeView) -> NodeView? {
-        var pending: [NodeView] = [header]
-        while !pending.isEmpty {
-            let node = pending.removeFirst()
-            if node.props["accessibilityRole"] == "heading" { return node }
-            pending += node.container.subviews.compactMap { $0 as? NodeView }
-        }
-        return nil
-    }
-
     /// The tab whose item UIKit's tab bar shows at `p`, or nil: the bar's
     /// buttons, one per item, in order (`buttonBoxes`), else the agent's
     /// lookup by accessibility element, which only an accessibility client
@@ -382,7 +318,7 @@ extension UINavigationBar {
     /// labels saying it the title is the lowest (a large title is under
     /// Back's row), then the nearest the bar's middle (an inline one is
     /// centred; Back's is at the leading edge).
-    func titleFrame(_ title: String?) -> CGRect? {
+    package func titleFrame(_ title: String?) -> CGRect? {
         guard let title, !title.isEmpty else { return nil }
         var found: [CGRect] = [], pending: [UIView] = subviews.filter { !$0.isHidden && $0.alpha > 0.01 }
         while !pending.isEmpty {

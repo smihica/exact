@@ -349,7 +349,11 @@ fn walk(file: &mut File, scope: &Scope, seen: Option<&mut Seen>) -> Result<(), S
     }
     for test in tests {
         for step in &mut test.steps {
-            if let Step::ExpectState { value, .. } = step {
+            if let Step::ExpectState {
+                value: crate::StateOperand::Literal(value),
+                ..
+            } = step
+            {
                 r.expr(value)?;
             }
         }

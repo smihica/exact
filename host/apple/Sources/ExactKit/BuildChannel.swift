@@ -1,18 +1,19 @@
 // The build channel (LLP 1122 D4, LLP 1121 stage 4 commit 5): a development
 // build registers with its dev stream's nonce, reports its effective facts
-// and the digest of the plan it runs (tamber/1.9), and takes `pin` from the
+// and the digest of the plan it runs (forma/1.9), and takes `pin` from the
 // design server's clients, and `inspect` and `outline` where inspect mode is
 // compiled in (T2c, Inspect.swift); `hold` is reserved (stage 8), answered
 // unsupported. The server's half
-// is scripts/tamber-builds.mjs; the web page's, host/web/dev.js. A pin sets
+// is scripts/forma-builds.mjs; the web page's, host/web/dev.js. A pin sets
 // what the agent's `prefer` sets (Agent.swift), by the same means.
+import CExact
 #if os(macOS)
 import AppKit
 #else
 import UIKit
 #endif
 
-/// A pin as the server sends it (scripts/tamber-builds.mjs `pinRefused`).
+/// A pin as the server sends it (scripts/forma-builds.mjs `pinRefused`).
 struct BuildPin: Equatable {
     var scheme: String?, contrast: String?, mode: [String: String]?, rootFontSize: Double?
 
@@ -45,10 +46,10 @@ struct BuildPin: Equatable {
 
 /// The channel's state: the process's (one app, D11), as the agent's
 /// preferences are.
-enum BuildChannel {
+package enum BuildChannel {
     /// A production build (`ExactEnv.productionBake`) neither registers
     /// nor takes a pin, whatever its environment.
-    static let enabled = !ExactEnv.productionBake
+    package static let enabled = !ExactEnv.productionBake
     /// The frame kinds dispatched before any generation handling.
     static let commands: Set<String> = ["pin", "inspect", "outline", "hold"]
     /// What this build speaks: inspect where it is compiled in.
@@ -106,7 +107,11 @@ final class BuildHeld {
     let contrast = DisplayPreferences.agentContrast
     private(set) var sessions: [Session] = []
     #if os(macOS)
+    #if EXACT_AGENT
     let appearance = (system: Agent.systemAppearance, app: NSApp.appearance)
+    #else
+    let appearance = (system: Optional<NSAppearance>.none, app: NSApp.appearance)
+    #endif
     #else
     final class Scene { weak var scene: UIWindowScene?; let style: UIUserInterfaceStyle?, contrast: UIAccessibilityContrast?
         init(_ s: UIWindowScene) {
@@ -132,10 +137,14 @@ final class BuildHeld {
     /// The system appearance as it was: a pin's are set again over it.
     func restoreAppearance() {
         #if os(macOS)
+        #if EXACT_AGENT
         let following = Agent.followsSystem
         Agent.systemAppearance = appearance.system
         if following { NSApp.appearance = appearance.app }
         DisplayPreferences.changed()
+        #else
+        NSApp.appearance = appearance.app
+        #endif
         #else
         for held in scenes {
             guard let scene = held.scene else { continue }
@@ -153,7 +162,7 @@ extension ExactApp {
 
     /// A build-channel frame from the dev stream (`PlanURL`): a hello with a
     /// new nonce registers; a command applies, then reports.
-    func channel(_ frame: [String: Any]) {
+    package func channel(_ frame: [String: Any]) {
         guard BuildChannel.enabled, let connection else { return }
         if frame["hello"] as? Bool == true {
             connection.report(["kind": "register", "id": BuildChannel.id, "host": BuildChannel.host, "capabilities": BuildChannel.capabilities, "planDigest": BuildChannel.planDigest(self) ?? NSNull(), "design": BuildChannel.design ?? NSNull()])
@@ -213,7 +222,7 @@ extension ExactApp {
 
     /// The runner's own root font size (the agent's `state`, `device`).
     private func renderedRootFontSize(_ s: ExactSession) -> Double? {
-        guard let data = s.agent("{\"op\":\"state\"}").data(using: .utf8),
+        guard let data = s.runtime.ask(exact_state, "{}").data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return ((o["device"] as? [String: Any])?["rootFontSize"] as? NSNumber)?.doubleValue
     }
@@ -240,11 +249,13 @@ extension ExactApp {
     /// refuses the pin's modes runs its own again, and it is reported.
     private func apply(_ pin: BuildPin?, to sessions: [ExactSession], _ held: BuildHeld) {
         DisplayPreferences.agentContrast = pin?.contrast ?? held.contrast
+        #if EXACT_AGENT
         for session in sessions where pin?.scheme != nil || pin?.contrast != nil {
             let agent = session.agentInstance
             if let scheme = pin?.scheme { agent.systemScheme(dark: scheme == "dark") }
             agent.systemContrast(more: DisplayPreferences.contrast == "more")
         }
+        #endif
         PageFacts.pinnedRootFontSize = pin?.rootFontSize
         for session in sessions { session.apply(session.runtime.setRootFontSize(PageFacts.rootFontSize)) }
         var refused: String?
@@ -259,6 +270,16 @@ extension ExactApp {
             session.apply(session.runtime.setModes(mode))
         }
         if let refused { connection?.report(["kind": "unsupported", "what": "pin.mode", "detail": refused, "revision": BuildChannel.revision.map { $0 as Any } ?? NSNull()]) }
+    }
+
+    /// A session booted from the published plan, which carries that plan's
+    /// own design: that design is the one reported until the server's
+    /// snapshot says otherwise (`/__dev/design` answers 204 while the
+    /// server's is the plan's), fetched again here; a pin held is set on
+    /// it, and the generation reported (LLP 1122 D4).
+    func liveBooted(_ session: ExactSession) {
+        if BuildChannel.enabled, let design = session.runtime.designDigest() { BuildChannel.design = design }
+        connection?.syncDesign(); repinBooted()
     }
 
     /// A session (or scene) that boots under a pin takes the whole of it,

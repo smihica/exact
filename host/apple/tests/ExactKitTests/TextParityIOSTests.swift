@@ -63,24 +63,15 @@ final class TextParityIOSTests: XCTestCase {
             let firstSpan = span; span.text = "xg"
             let spec = Spec(runs: [base, firstSpan, base, span], align: 0, lineClamp: 0,
                             color: [0, 0, 0, 255], whiteSpace: 1, strut: base)
-            let source = RegionTextSource.capture(spec, engine: engine)
-            let workers = await Task.detached {
-                [false, true].map { RegionWorkerLayout.shape(source, width: 500, compact: $0).metadata }
-            }.value
             let ordinary = engine.paragraph(spec, width: 500)
             let flow = engine.paragraph(spec, width: 500, flow: [TextFlowShape(kind: 0, x: 0, y: 1000, a: 10)])
             XCTAssertFalse(flow.flowIncomplete)
-            print("mixed line boxes \(c): ordinary=\(ordinary.height), flow=\(flow.height), workers=\(workers.map(\.height))")
+            print("mixed line boxes \(c): ordinary=\(ordinary.height), flow=\(flow.height)")
             for p in [ordinary, flow] {
                 XCTAssertEqual(p.height, c.height * 2, "\(c)")
                 XCTAssertEqual(p.lineBottoms, [c.height, c.height * 2], "\(c)")
                 XCTAssertEqual(p.firstBaseline, c.baseline, accuracy: 1e-6, "\(c)")
                 XCTAssertEqual(p.baselines[1] - p.baselines[0], c.height, accuracy: 1e-6, "\(c)")
-            }
-            for p in workers {
-                XCTAssertEqual(p.height, c.height * 2, "\(c)")
-                XCTAssertEqual(p.lineBottoms, [c.height, c.height * 2], "\(c)")
-                XCTAssertEqual(p.baselines, ordinary.baselines, "worker placement matches the painter")
             }
         }
     }

@@ -1,10 +1,21 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
+import { cdpBrowser, chromium } from '../../../scripts/agent-launch.mjs';
+import { need } from '../../../scripts/coverage.mjs';
 import { fixture } from './surface.mjs';
 
-test('a connected registered publisher is duplicate even before the GPU gives it an id', async () => {
+test('a connected registered publisher keeps the name even before the GPU gives it an id', async () => {
   const f = await fixture({ duplicateDuringLoad: true });
-  assert.equal(f.diagnostics.filter(line => line.includes('duplicate live publisher')).length, 1);
+  assert.deepEqual(f.records, ['world\0{"value":1}']);
+  assert.deepEqual(f.diagnostics, []);
+});
+
+test('the clock uses the earliest tick across worlds', async () => {
+  const f = await fixture();
+  f.create(1); f.create(2, 'other');
+  f.gpu.gpu_agent = id => JSON.stringify({ quiescent: false, settleAt: id * 100, nextTickAt: id === 1 ? 25 : 12.5 });
+  assert.equal(f.exact.gpu.clock(false).nextTickAt, 12.5);
+  assert.equal(f.exact.gpu.clock(true).settleAt, 200);
 });
 
 test('player restore flushes its public record before reporting success', async () => {
@@ -103,13 +114,12 @@ for (const stale of ['detached', 'unregistered']) test(`a ${stale} publisher yie
   assert.equal(f.records.at(-1), 'glass\0{"value":2}');
 });
 
-test('first live canvas alone publishes and clears, with one named duplicate diagnostic', async () => {
+test('first live canvas alone publishes and clears; a second canvas of the surface is no fault', async () => {
   const f = await fixture();
   f.create(1); f.create(2);
   f.exact.gpu.surface(2, 'world', []);
   assert.deepEqual(f.records, ['world\0{"value":1}']);
-  assert.equal(f.diagnostics.length, 1);
-  assert.match(f.diagnostics[0], /world.*duplicate/);
+  assert.deepEqual(f.diagnostics, []);
   f.destroy(2);
   assert.equal(f.records.length, 1);
   f.create(3); f.destroy(1);
@@ -805,16 +815,24 @@ test('a named update sends the module only the arguments that changed since its 
   assert.deepEqual(last(), [['full', {saved: '<saved>', count: 6}], ['changed', {count: 7}]]);
 });
 
-test('R14 the canvas size reaches the module before each bind, whole or changed, which may tick a new world',async()=>{
+test('R14 the canvas size reaches the module before its first bind, which may tick a new world, and then as it changes',async()=>{
   const f=await fixture(), calls=[];
+  let reads=0;
   f.gpu.gpu_size=(id,w,h)=>{calls.push(['size',id,w,h]);return true;};
   f.gpu.gpu_bind_at=id=>{calls.push(['bind',id]);return true;};
   f.gpu.gpu_bind_changed_at=id=>{calls.push(['changed',id]);return true;};
-  f.create(1);
-  for(const seed of [2,3]) await f.applyBatch({ops:[{op:'surface',id:1,name:'world',values:{seed}}],timers:false,motion:false});
-  f.exact.gpu.retier('high'); f.exact.gpu.schedule();
+  const host=f.create(1), read=host.getBoundingClientRect;
+  host.getBoundingClientRect=function(){reads++;return read.call(this);};
   const size=['size',1,10,10];
-  assert.deepEqual(calls,[size,['bind',1],size,['bind',1],size,['changed',1],size,['changed',1]]);
+  assert.deepEqual(calls,[size,['bind',1]]);
+  // A bind in a batch reads no geometry, which would force the layout of what the batch wrote before it (#533).
+  for(const seed of [2,3]) await f.applyBatch({ops:[{op:'surface',id:1,name:'world',values:{seed}}],timers:false,motion:false});
+  assert.equal(reads,0);
+  // The ResizeObserver, after layout, tells a new size.
+  host.getBoundingClientRect=()=>({width:30,height:20});
+  f.resize();
+  f.exact.gpu.retier('high'); f.exact.gpu.schedule();
+  assert.deepEqual(calls,[size,['bind',1],['bind',1],['changed',1],['size',1,30,20],['changed',1]]);
 });
 
 test('E10 focused Contract buttons consume activation keys before the world', async () => {
@@ -906,3 +924,140 @@ test('canvas metrics opt in only the named first publisher and clear on disposal
   assert.equal(on.metricTimers.size, 0);
   const disposed = reads; on.pollMetrics(); assert.equal(reads, disposed);
 });
+
+test('canvas metrics start and stop after a commit without rebinding the canvas', async () => {
+  const options = { metricsName: null, snapshot: () => '{"frames":1}' };
+  const f = await fixture(options);
+  f.create(1);
+  assert.deepEqual(f.reporting, []);
+  assert.equal(f.metricTimers.size, 0);
+  for (let i = 0; i < 3; i++) {
+    options.metricsName = 'world';
+    f.applyBatch({ ops: [] });
+    assert.deepEqual(f.reporting.at(-1), [1, true]);
+    assert.equal(f.metricTimers.size, 1);
+    f.pollMetrics();
+    assert.equal(f.metrics.at(-1), 'world\0{"frames":1}');
+    options.metricsName = null;
+    f.applyBatch({ ops: [] });
+    assert.deepEqual(f.reporting.at(-1), [1, false]);
+    assert.equal(f.metricTimers.size, 0);
+    const before = f.metrics.length;
+    f.frame(); f.pollMetrics();
+    assert.equal(f.metrics.length, before);
+  }
+  assert.equal(f.reporting.length, 6);
+  f.destroy(1);
+  assert.equal(f.metrics.at(-1), 'world');
+});
+test('GPU modules receive reduced motion on load, changes and replacement', async () => {
+  const media = new EventTarget();
+  media.matches = true;
+  const f = await fixture({matchMedia(query) {
+    assert.equal(query, '(prefers-reduced-motion: reduce)');
+    return media;
+  }});
+  assert.deepEqual(f.motion, [true]);
+  f.create(1);
+  await f.exact.gpu.settled();
+  media.matches = false;
+  media.dispatchEvent(new Event('change'));
+  assert.deepEqual(f.motion, [true, false]);
+  await f.exact.gpu.swap(1);
+  assert.deepEqual(f.motion, [true, false, false]);
+  media.matches = true;
+  media.dispatchEvent(new Event('change'));
+  assert.deepEqual(f.motion, [true, false, false, true]);
+});
+
+for (const status of ['healthy', 'recovered']) test(`recovery ${status} delivers the latest motion preference before presentation`, async () => {
+  const media = new EventTarget();
+  media.matches = false;
+  const f = await fixture({matchMedia: () => media});
+  f.gpu.gpu_published = () => undefined;
+  f.create(1);
+  await f.exact.gpu.settled();
+  let present = true, reduce = false, dirty = false, resume, entered;
+  const pending = new Promise(resolve => { resume = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const deliveries = [], pictures = [];
+  f.gpu.gpu_reduced_motion = on => {
+    deliveries.push({present, on});
+    if (present) { reduce = on; dirty = true; }
+  };
+  f.gpu.gpu_recover = async () => {
+    // gpu/src/web.rs removes MODULE while awaiting a replacement device.
+    present = false;
+    entered();
+    await pending;
+    present = true;
+    return JSON.stringify({status});
+  };
+  f.exact.gpu.deviceLost();
+  await started;
+  for (const matches of [true, false, true]) {
+    media.matches = matches;
+    media.dispatchEvent(new Event('change'));
+  }
+  assert.deepEqual(deliveries, [], 'no preference is sent while the module is absent');
+  f.gpu.gpu_bind_at = () => { assert.equal(reduce, true); return true; };
+  f.gpu.gpu_dirty = () => dirty;
+  f.gpu.gpu_render = () => { pictures.push(reduce); dirty = false; return 0; };
+  resume();
+  await f.exact.gpu.settled();
+  assert.deepEqual(deliveries, [{present: true, on: true}]);
+  assert.ok(pictures.length > 0);
+  assert.ok(pictures.every(value => value === true), 'the first recovered picture uses the latest preference');
+  media.matches = false;
+  media.dispatchEvent(new Event('change'));
+  assert.deepEqual(deliveries.at(-1), {present: true, on: false});
+});
+
+need('chrome', chromium().unavailable)('the browser motion preference reaches a loaded GPU module', async () => {
+  const {hostFixtureFile} = await import('./glue-fixture.mjs');
+  const module = `
+    export default function() {}
+    export function gpu_load() {} export function gpu_seekable() {}
+    export function gpu_child_view() {} export function gpu_shaders_clear() {}
+    export function gpu_shader_names() { return '[]'; }
+    export function gpu_reduced_motion(on) { motion.push(on); globalThis.motionChanged?.(); }
+  `;
+  const html = `<script type="module">
+    globalThis.motion=[];
+    Object.defineProperty(Navigator.prototype, 'gpu', {get:()=>({requestAdapter:async()=>({info:{}})})});
+    globalThis.exact={views:new Map(),root:document.body,now:()=>0,agent:true,devAssets:[]};
+    await import('/gpu-glue.js'); globalThis.ready=true;
+  </script>`;
+  const server = Bun.serve({port:0,hostname:'127.0.0.1',fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === '/') return new Response(html, {headers:{'content-type':'text/html'}});
+    if (path === '/gpu.js') return new Response(module, {headers:{'content-type':'text/javascript'}});
+    if (path === '/favicon.ico') return new Response('', {status:404});
+    return new Response(hostFixtureFile(new URL('..' + path, import.meta.url)), {headers:{'content-type':'text/javascript'}});
+  }});
+  const browser = await cdpBrowser();
+  try {
+    const {sessionId} = await browser.page();
+    const call = (method, params = {}) => browser.cdp.send(method, params, sessionId);
+    const evaluate = async expression => {
+      const reply = await call('Runtime.evaluate', {expression,returnByValue:true,awaitPromise:true});
+      assert.equal(reply.exceptionDetails, undefined, JSON.stringify(reply.exceptionDetails));
+      return reply.result.value;
+    };
+    const prefer = value => call('Emulation.setEmulatedMedia', {features:[{name:'prefers-reduced-motion',value}]});
+    await prefer('reduce');
+    await call('Page.navigate', {url:`http://127.0.0.1:${server.port}/`});
+    const deadline = Date.now() + 15000;
+    while (!await evaluate('globalThis.ready === true')) {
+      assert.ok(Date.now() < deadline, 'GPU preference fixture did not load');
+      await Bun.sleep(50);
+    }
+    assert.deepEqual(await evaluate('motion'), [true]);
+    for (const [value, expected] of [['no-preference', [true, false]], ['reduce', [true, false, true]]]) {
+      await evaluate('globalThis.changed = new Promise(resolve => { globalThis.motionChanged = resolve; }); true');
+      await prefer(value);
+      await evaluate('changed');
+      assert.deepEqual(await evaluate('motion'), expected);
+    }
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);

@@ -60,8 +60,8 @@ bun scripts/exact.mjs new ../hello
 ```
 
 The new app has `app.contract` (its interface), `app.ts` (its data module),
-`app.json` (its manifest), `app.test.contract`, `web/` and `apple/` crates, and its
-own Cargo workspace; it consumes this checkout by path. Its generated `exact.mjs`
+`app.json` (its manifest) and `app.test.contract`; a native verb generates its host
+crates under `.exact/`. It consumes this checkout by path. Its generated `exact.mjs`
 runs the web and native commands (`bun exact.mjs test`, for example; `bun exact.mjs
 test web tests/*.test.contract` runs the files named, from the current directory,
 in turn); run it with no verb to list them, and see the [tooling reference](reference.md).
@@ -160,9 +160,11 @@ A `use` names one of three things:
   to it reaches the next build. A package's own relative uses stay inside the
   package.
 
-A library is Contract only: components, shapes, functions, styles, keyframes and
-timelines. It cannot own resources or carry TypeScript; its components take data
-through props, `inject` and slots. Fonts it names are the app's to supply.
+A library can supply components, shapes, functions, styles, keyframes and
+timelines. Its components may own resources and mutations using sources declared
+by its own package's module, with the app supplying the required grants. They may
+also own tasks at bounded uses, or take data through props, `inject` and slots.
+Fonts it names are the app's to supply.
 Contract never imports JavaScript or TypeScript. Import cycles and unknown names
 are refused. Keep external work behind the data interface.
 
@@ -273,9 +275,9 @@ action search(value: string)
   query = value
 ```
 
-Root components may own states, derives, actions, resources, mutations, and
-tasks. Child components may own states, derives, and actions; root-only work
-must be passed down as values or actions. State initializers read props,
+Components may own states, derives and actions. A root or a child at a bounded
+use may also own resources, mutations and tasks, each for its instance's lifetime.
+Data-sized list rows receive shared data and actions through props. State initializers read props,
 injects and earlier states only: they run before any resource answers or
 derive is computed. Derives can be declared in dependency order
 or another order, but their dependency graph must be acyclic.
@@ -453,13 +455,24 @@ empty state), and `appearance="none"` on the list keeps rows that are yours, a
 transcript or a feed of cards. A list laid out sideways is a carousel and gets
 none of it.
 
-A virtualized list has exactly one direct `for`, whose body has one flow root.
+A virtualized list has one direct keyed `for`, whose body has one flow root.
+A vertical list with `appearance="none"` can hold fixed content before and after
+it. Put a second `for` inside an element (all its rows mount); fixed content
+cannot hold a virtualized list. Fixed roots require nonnegative margin lengths, including percentages and
+font-relative units, and static or relative positioning without vertical offsets
+(`lower-collection-fixed-flow`).
+Fixed children keep their authored sibling layout and stay mounted, including
+when the `for` is empty. They have no data-row key or cell styling; give one an
+`id` to reach it with element `scrollIntoView(id)`. The list's end, including
+`scroll-start="end"`, `scrollFollowEnd` and `reachend`, includes the trail.
+An eager `for` inside a fixed element still receives the development long-list
+notice at 200 rows.
 A vertical list needs a real height bound (`height`, `max-height`, or growing
 `flex` in a bounded parent). A horizontal one needs a literal `display="flex"` and
 a positive `height` in points, literal or computed, takes `estimated-item-width`
 (literal or computed) and CSS's `gap` between its cards, and refuses
 `justify-content` other than `flex-start`. Padding along the list's
-axis is room before the first row and after the last, as in CSS: a length or an
+axis is room before the first child and after the last, as in CSS: a length or an
 `env()` inset, not a percentage. On iOS a list's pull-to-refresh spinner draws
 below its `padding-top`, so a header laid over that padding does not hide it. A
 virtualized list's `scroll-padding` insets where `scrollIntoView` aligns a row,
@@ -715,7 +728,8 @@ changed. During a live replacement request, the prior displayed value may remain
 visible even when call arguments changed, so private-data views must gate it by
 owner and authorization. Neither call arguments nor `with` make a resource wait
 for an upstream request to succeed. The default web JS target keeps no persisted
-resource answers (LLP 1027.005 D5).
+resource answers (LLP 1027.005 D5). Kept-answer diagnostics name a differing
+argument and the state or resource it reads, never an identifying value.
 The minute must already contain the current sample for the first ask; a timer
 can update it thereafter. Use `refresh` or `refreshes` for values whose only job
 is forcing another ask. Await true asynchronous prerequisites, such as a valid
@@ -1067,6 +1081,7 @@ measured layout as well as the compiler's structural checks.
 
 Use `aria-label`, roles, and other admitted ARIA attributes where content alone
 does not name a control. Keep accessible labels separate from driver `testId`s.
+A literal `role` must name a concrete ARIA role, or it is refused.
 They mean on every host what they mean in a browser: `aria-hidden` takes a
 subtree off the tree and out of its ancestors' names; `role="checkbox"`,
 `"radio"` or `"switch"` with `aria-checked` is that control, `role="img"` with a
@@ -1078,7 +1093,11 @@ this one) and `aria-description` are its description. `aria-invalid`,
 `"page"`, a wizard's `"step"`) take their ARIA words or a bool; UIKit has no
 property for those four, so iOS exposes the first three not at all and a
 pressable's (a button's, a link's) `aria-current` other than `false` as its
-selected trait, as `aria-selected` is. A data table is HTML's `table`: an
+selected trait, as `aria-selected` is.
+`aria-activedescendant` names the active option while a field keeps focus
+([combobox recipe](recipes/combobox.md)); the web exposes it, and other hosts carry it
+without using it.
+A data table is HTML's `table`: an
 optional `caption`, then `thead`, `tbody` and `tfoot` row groups of `tr`s (or
 `tr`s alone, which are a `tbody` of their own, as HTML's parser makes them),
 each `tr` holding `th` header cells (`scope="col"` or `"row"`) and `td`
@@ -1102,8 +1121,15 @@ and 100 where a bound is unsaid, and none for a `spinbutton`) and
 `aria-valuetext`: it is one element, its children unread, and its value is the
 platform's (UIKit's `accessibilityValue` as a percentage, "30%", a
 `spinbutton`'s as its number, "3", or the text; AppKit's value, minimum and
-maximum, the text its description). A `progress` or `input type="range"` says
-its own value.
+maximum, the text its description). A `slider` or `spinbutton` is adjusted
+by its own keys: give it `tabindex=0` and a `key` handler for the arrows.
+A screen reader's increment and decrement (VoiceOver's swipe up and down,
+TalkBack's and Windows' adjust) are then a keydown and a keyup at it, as
+Safari sends them to an ARIA slider: ArrowUp and ArrowDown for a spin
+button or an `aria-orientation="vertical"` slider, else ArrowRight and
+ArrowLeft, swapped where the slider's `direction` is `rtl` (the
+document's, unless the slider says its own). A `progress` or
+`input type="range"` says its own value.
 Leave font sizes, colours and control metrics unsaid and the platform supplies them;
 what you set on a node wins.
 
@@ -1469,9 +1495,9 @@ A route pushed while a sheet is on top is shown inside that sheet, which keeps t
 detents of the route that opened it, and Back returns to the route before it in
 the sheet. iOS and macOS show it in the sheet's own navigation stack, the web and
 Android lay it out in the sheet's box, and desktop Linux in the box the sheet's
-own route was laid out in. On Android a drag down or a tap on the scrim closes the
-sheet with what was pushed inside it. A route pushed over a `fullscreen` route is
-a page of its own.
+own route was laid out in. On iOS and Android a drag down, or a tap behind a sheet
+with `closedby="any"`, closes the sheet with what was pushed inside it. A route
+pushed over a `fullscreen` route is a page of its own.
 
 `path("item", value)` checks the route and encodes its parameters. Always build
 locations with it: a template literal as a location is refused and a string
@@ -1501,7 +1527,7 @@ values and serving behavior (LLP 1048.003). A compiled interface alone is not a 
 
 ## Time, motion, and geometry
 
-A root task schedules one action, with no arguments:
+A task schedules one action, with no arguments:
 
 ```contract
 component Clock
@@ -1514,11 +1540,14 @@ component Clock
     text `${ticks}` testId="ticks"
 ```
 
-`every(ms, action)` first fires one interval after boot, and `after(ms, action)`
-fires once, `ms` after boot. Intervals are whole-number literals of at least 1.
+`every(ms, action)` first fires one interval after its instance mounts, and
+`after(ms, action)` fires once, `ms` after that mount. Intervals are whole-number literals of at least 1.
 `every(frame, action)` runs once per presented frame without catching up missed
-frames. Each task body contains one schedule. Tasks are root-owned, not child
-lifecycle hooks.
+frames. Each task body contains one schedule. A child at a bounded use owns the
+same forms for its instance's lifetime; each firing runs in that instance's frame.
+A task is a schedule, not a lifecycle hook. A hidden instance stays alive, so use
+`when active` to stop its task while hidden. Each active `every(frame, …)` runs
+once per frame per instance.
 
 A task can wait for state instead of starting at mount:
 
@@ -1573,10 +1602,12 @@ component Motion
       text "Working" animation="breathe 1.6s ease-in-out infinite"
 ```
 
-Keyframe values are literals or calls to the app's own `fn`s with constant
-arguments (standard functions are refused), and keyframes animate paint and
-transform properties, not layout ones such as `width`. Styles remain
-literal-only. CSS easing and the admitted `-exact-spring(…)` timing function, which
+Keyframe values are evaluated at compilation using the runtime's pure operations:
+list literals, `.at()`, option `match`, templates and pure built-ins, including
+`toFixed` and `formatDecimal`. Only executed branches are evaluated. Reading
+state, resources, props, the clock, the locale or a host capability is refused
+by name. Keyframes animate paint and transform properties, not layout ones
+such as `width`. Styles remain literal-only. CSS easing and the admitted `-exact-spring(…)` timing function, which
 belongs only inside `transition`, are not interchangeable guesses: copy the
 appropriate [motion fixture](../contract/corpus/spring.contract).
 In a `list virtualized=true` row, an animation waits until its row first
@@ -1635,9 +1666,11 @@ game loops belong in those modules. See [Canvas Gallery](../apps/canvas-gallery/
 Use `object-fit` for replaced media; distinguish text content from markup.
 [Video Player](../apps/video-player/app.contract) shows playback bindings and
 [Markdown Stress](../apps/markdown-stress/app.contract) selection and editing;
-[Markdown](../apps/markdown/app.contract) is a reader. Markdown rendering and
-editing run on the web and Apple hosts; Linux shows `markup="markdown"` text as
-raw source and has no `iframe` or `video`.
+[Markdown](../apps/markdown/app.contract) is a reader. A Markdown reader
+(`text markup="markdown"`) renders on every host. The Markdown editor and
+`format()` run on the web, macOS and iOS; on Linux, Windows and Android a
+`textarea markup="markdown"` is a plain textarea of the source. Linux has no
+`iframe` or `video`.
 
 A hyphenated tag can address the app's native module: the bake checks the tag
 against `app.json`'s `modules` list, and its unknown attributes pass to the
@@ -1698,9 +1731,10 @@ viewport metadata uses the root element's `viewport-fit` and `interactive-widget
 attributes. `exactViewport` also carries `prefersReducedMotion`,
 `prefersReducedTransparency`, `prefersContrast` and `prefersColorScheme`: facts
 for the app to honor, not automatic engine policy. `displayMode: string` reads
-CSS's current `display-mode`: the browser's media query on the web,
-`fullscreen` or `standalone` for the window on macOS, and `standalone` on
-other native hosts. `navigationType` is how the browser loaded the page
+CSS's current `display-mode`: the browser's media query on the web (in Chrome,
+an agent's `prefer display-mode` replaces the reading and leaves the query
+alone), `fullscreen` or `standalone` for the window on macOS, and `standalone`
+on other native hosts. `navigationType` is how the browser loaded the page
 (`navigate`, `reload` or `back_forward`), and empty in a native app. Available fields are documented beside their source validation (LLP 1039); start with [the viewport corpus](../contract/corpus/viewport.contract).
 
 Localized strings live in the app's `strings/<locale>.json` files. Author calls
@@ -1774,12 +1808,15 @@ If a resource fails, check the source implementation, its generated types and
 grants, and its bake behavior. If an event fails, check the captured arguments,
 payload type, current action binding, and whether the node exists.
 
-`app.json` also controls delivery policy. `bun scripts/deploy.mjs <app>` is a
+`app.json` also controls delivery policy. From the app, `bun exact.mjs deploy` is a
 dry run, which expects a committed tree (or `--dirty`); publication uses `--yes`,
 an origin, a signing key, and the configured signed streams. Before
 changing trust or publishing, read [the reference](reference.md) on
 `EXACT_UPDATE_TRUST` (LLP 1030.000). Writing Contract does not require inventing a deployment
-service. To put an iOS app on someone's iPhone, run `bun exact.mjs share`: it
+service. `bun exact.mjs push` publishes a working-tree edit to installed release binaries
+immediately; `--watch` repeats it on save. It needs a production build receipt or
+existing stream and the signing key. It has no dry run and publishes no web root.
+To put an iOS app on someone's iPhone, run `bun exact.mjs share`: it
 builds the app and prints an AppDrop link that installs it with their own Apple ID.
 
 ## Where to go next

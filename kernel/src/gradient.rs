@@ -167,29 +167,29 @@ pub enum Geometry {
     },
 }
 
-/// The grammar, once linked ([`link`]). Only a wasm artifact reads it.
-#[cfg(target_arch = "wasm32")]
+/// The grammar, once linked ([`link`]). The kernel's own tests parse
+/// directly.
+#[cfg(not(test))]
 static LINKED: std::sync::OnceLock<fn(&str) -> Option<BackgroundImage>> =
     std::sync::OnceLock::new();
 
-/// Link `background-image`'s gradient grammar (LLP 1047 D2, linked by use):
-/// ~3 KiB of a web core that none of Caltrain, RealWorld or the video player
-/// paints with. A web artifact links it when its plan binds the row, and a
-/// plan that binds it unlinked is refused at boot (D6), so an unlinked
-/// artifact never parses one. Native artifacts and the compiler parse
-/// without it.
+/// Link the gradient grammar `background-image` and `mask-image` read (LLP
+/// 1047 D2, linked by use). An artifact links it when its plan binds either
+/// row (the `gradients` capability), and a plan that binds one unlinked is
+/// refused at boot (D6), so an unlinked artifact never parses one. The
+/// compiler, the JS target's emitter and [`crate::Kernel::new`] link it.
 pub fn link() {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(not(test))]
     let _ = LINKED.set(|css| BackgroundImage::check(css).ok());
 }
 
 impl BackgroundImage {
     /// The row's parse, as every codec's: `None` for anything not drawn.
-    /// On the web, once linked ([`link`]).
+    /// Once linked ([`link`]).
     pub fn parse(css: &str) -> Option<Self> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(not(test))]
         return LINKED.get().and_then(|parse| parse(css));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(test)]
         Self::check(css).ok()
     }
 

@@ -11,6 +11,7 @@ import Foundation
 import ImageIO
 import QuartzCore
 import ExactKit
+import ExactImages
 
 /// No implicit animations: new pixels appear with the batch that drew them.
 private final class Instant: NSObject, CALayerDelegate {
@@ -150,7 +151,9 @@ final class Canvas2DHost: Canvas2DEnv {
     /// draw of it asks for it again.
     var onRelease: ((String) -> Void)?
     private var images: [String: CGImage] = [:]
-    private var loading: Set<String> = []
+    private var loading: [String: UUID] = [:]
+    /// Handles whose last decode failed: a changed file decodes them again.
+    private var failed: Set<String> = []
     /// When each decoded handle was last drawn, or decoded if it has not been since.
     private var drawnAt: [String: CFTimeInterval] = [:]
     private var imageBytes = 0
@@ -172,8 +175,9 @@ final class Canvas2DHost: Canvas2DEnv {
     /// file and stopped past its byte limit, and an image over its pixel
     /// limit is refused before it is decoded.
     func load(_ srcs: [String]) {
-        for src in srcs where images[src] == nil && !loading.contains(src) {
-            loading.insert(src)
+        for src in srcs where images[src] == nil && loading[src] == nil {
+            let ticket = UUID()
+            loading[src] = ticket
             let remote = URL(string: src).flatMap { $0.scheme == "http" || $0.scheme == "https" ? $0 : nil }
             let local = remote == nil ? assetBytes?(src.hasPrefix("/") ? String(src.dropFirst()) : src) : nil
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -203,18 +207,43 @@ final class Canvas2DHost: Canvas2DEnv {
                         ] as CFDictionary)
                     }
                 DispatchQueue.main.async {
-                    guard let self else { return }
-                    self.loading.remove(src)
+                    guard let self, self.loading[src] == ticket else { return }
+                    self.loading.removeValue(forKey: src)
                     if let image {
                         if let old = self.images.updateValue(image, forKey: src) { self.imageBytes -= old.bytesPerRow * old.height }
                         self.imageBytes += image.bytesPerRow * image.height
                         self.drawnAt[src] = CACurrentMediaTime()
+                        self.failed.remove(src)
+                    } else {
+                        self.failed.insert(src)
                     }
                     self.onImage?(src, image)
                     self.releaseOverBudget()
                 }
             }
         }
+    }
+
+    /// Let go handles the runtime no longer asks for, decoded, failed or
+    /// loading: a changed file decodes none of them.
+    func drop(_ srcs: [String]) {
+        for src in srcs {
+            if let old = images.removeValue(forKey: src) { imageBytes -= old.bytesPerRow * old.height }
+            loading.removeValue(forKey: src)
+            failed.remove(src)
+            drawnAt.removeValue(forKey: src)
+        }
+    }
+
+    /// Replace a loaded handle and discard replies for its previous bytes.
+    func pictureChanged(_ src: String) {
+        let old = images.removeValue(forKey: src)
+        let pending = loading.removeValue(forKey: src) != nil
+        guard old != nil || pending || failed.remove(src) != nil else { return }
+        if let old { imageBytes -= old.bytesPerRow * old.height }
+        drawnAt.removeValue(forKey: src)
+        onRelease?(src)
+        load([src])
     }
 
     /// A replay drew `drawn`. `missed` were let go while a draw that used
@@ -457,12 +486,13 @@ final class Canvas2DHost: Canvas2DEnv {
         }
     }
 
-    /// A capture (LLP 1056 D9, as amended for #188): the bitmap of `id` the
-    /// presenter keeps, as a PNG, made on the replay queue after every replay
-    /// already dispatched. The replay queue waits while `snapshot` copies on
-    /// the runtime owner and marks the job; only then may it encode. `done`
-    /// hears the PNG on main, nil when copying or encoding was refused.
-    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, snapshot: @escaping (() -> Bool) -> Bool = { $0() }, done: @escaping (Data?) -> Void) {
+    /// A capture (LLP 1056 D9, as amended for #188 and #504): the bitmap of
+    /// `id` the presenter keeps, encoded as `type` (`canvas2DEncode`), made on
+    /// the replay queue after every replay already dispatched. The replay
+    /// queue waits while `snapshot` copies on the runtime owner and marks the
+    /// job; only then may it encode. `done` hears the file's bytes on main,
+    /// nil when copying or encoding was refused.
+    func capture(_ id: UInt32, lifetime: UInt64, generation: UInt32, sequence: UInt64, width: Int, height: Int, type: String = "image/png", quality: Double? = nil, snapshot: @escaping (() -> Bool) -> Bool = { $0() }, done: @escaping (Data?) -> Void) {
         // A later resize must not replace lists the capture is waiting to read.
         lock.lock(); waiting.removeValue(forKey: id); lock.unlock()
         replay.async { [weak self] in
@@ -477,8 +507,8 @@ final class Canvas2DHost: Canvas2DEnv {
             #if DEBUG
             if copied { self?.beforeCaptureEncode?() }
             #endif
-            let png = copied ? image.flatMap(canvas2DPNG) : nil
-            DispatchQueue.main.async { done(png) }
+            let encoded = copied ? image.flatMap { canvas2DEncode($0, type: type, quality: quality) } : nil
+            DispatchQueue.main.async { done(encoded) }
         }
     }
 

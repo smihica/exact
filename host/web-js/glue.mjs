@@ -13,7 +13,7 @@ export const HOST_WEB_GLUE = [
   'presence-glue.js', 'native-glue.js', 'geometry-glue.js', 'resize-glue.js', 'intersect-glue.js', 'media-glue.js',
   'sound-glue.js', 'midi-glue.js', 'prompt-glue.js', 'alert-message.js', 'wakelock-glue.js', 'orientationlock-glue.js', 'menu-rows.js',
   // Virtualized lists' browser half; animated images on the agent's clock (agent.js only); Canvas 2D's replayer.
-  'collection-glue.js', 'image-glue.js', 'canvas2d-glue.js',
+  'collection-glue.js', 'list-selection.js', 'image-glue.js', 'canvas2d-glue.js',
   // An iframe's navigation records and commands (commands.js, rt.js `onFrameNavigation`; LLP 1020.002).
   'frame-navigation.js', 'frame-messages.js',
   // Sign-in, storage, request bodies, injected faults and the local network's spaces (ts-data.js, auth.js, admission.js, agent.js, modules.js).
@@ -22,9 +22,24 @@ export const HOST_WEB_GLUE = [
   'fragment.js',
 ];
 
-/** Copy the host/web glue from the repository at `root` into `dir`. */
-export function stageHostGlue(root, dir) {
+/** `code`, the source of `file`, with each constant in `names` that it declares true written false, so the bundler
+ * drops what the constant gates; one it no longer declares fails the build by name. */
+function writeFalse(code, file, names) {
+  for (const name of names) {
+    const said = new RegExp(`(?<=\\bconst |, )${name} = true\\b`);
+    if (!said.test(code)) throw new Error(`${file}: glue.mjs replaces a line it no longer has: ${name} = true`);
+    code = code.replace(said, `${name} = false`);
+  }
+  return code;
+}
+
+/** Copy the host/web glue from the repository at `root` into `dir`, the input piece without the wasm host's paths
+ * (input-glue.js `WASM_HOST`, LLP 1047.002 D4.1): this runtime hears its own pointers and routes its own links. Nor
+ * has it the behaviours `unused` names (input.flag, LLP 1047.002 D4.2). */
+export function stageHostGlue(root, dir, unused = []) {
   for (const f of HOST_WEB_GLUE) cpSync(resolve(root, 'host/web', f), resolve(dir, f));
+  const piece = resolve(dir, 'input-glue.js');
+  writeFileSync(piece, writeFalse(readFileSync(piece, 'utf8'), 'host/web/input-glue.js', ['WASM_HOST', ...unused]));
 }
 
 /**
@@ -77,7 +92,7 @@ export function webHostFiles(...groups) {
 /** The data module realm's prelude (LLP 1027 D1a): these scripts, in this order, after module-binary.js, as
  * js/build.rs joins them natively. The realm evaluates them as one script, `module-prelude.js`, whose hash the
  * served page's CSP names; each file is a script of its own whose prelude.js takes the parts the others leave. */
-export const MODULE_PRELUDE = ['time.js', 'crypto.js', 'module-work.js', 'fetch.js', 'auth.js', 'store.js', 'storage.js', 'reply.js', 'prelude.js'].map(f => 'js/src/' + f);
+export const MODULE_PRELUDE = ['time.js', 'crypto.js', 'module-work.js', 'fetch.js', 'auth.js', 'store.js', 'storage.js', 'reply.js', 'errors.js', 'prelude.js'].map(f => 'js/src/' + f);
 /** `module-prelude.js`'s text, from the repository at `root`. */
 export const modulePrelude = root => MODULE_PRELUDE.map(f => readFileSync(resolve(root, f), 'utf8')).join('\n');
 
@@ -98,23 +113,25 @@ export function hostModuleSources(root, entries = ['host/web/glue.js', 'host/web
   return [...seen];
 }
 
-// Gate sources before bundling: Rolldown can simplify a true branch even with
-// constant inlining disabled. Lazy modules pass through the same gate (LLP 1069.007 D2).
-export function gateAgent(code, name) {
-  const declaration = /\b(?:const|let|var) AGENT_ADMITTED(?:\$\d+)? = (?:true|false);/g;
-  const imported = /\bimport\s*\{[^}]*\bAGENT_ADMITTED\b[^}]*\}\s*from/;
-  if (/searchParams\.has\(["']agent["']\)|params\.has\(["']agent["']\)|URLSearchParams\([^)]*\)\.has\(["']agent["']\)/.test(code)
-      && !new RegExp(declaration.source).test(code) && !imported.test(code)) {
-    throw new Error(`${name} reads ?agent without AGENT_ADMITTED; a production build must not admit agent mode (LLP 1069.007 D2)`);
-  }
-  return code.replace(declaration, text => text.replace('= true', '= false'));
+/** The data module realm's glue, `module-glue.js`, as one file at `file`. Its storage, filesystem and documents
+ * adapters stay shared modules: Rust requests import them too, and must share the same filesystem mutation queues,
+ * and the pickers' handles live in the page's one documents-glue.js. Only a release gates its sources: a development
+ * build admits agent mode, so a drive keeps its seed and its scratch store (LLP 1069.007 D2). */
+export async function bundleModuleGlue(root, file, { production, minify = true }) {
+  const { rolldown } = await import('rolldown'), { gateAgent } = production ? await import('./agent-gate.mjs') : {};
+  const bundle = await rolldown({ input: resolve(root, 'host/web/module-glue.js'), platform: 'browser',
+    external: ['./storage-fs.js', './storage-sqlite.js', './documents-glue.js'],
+    plugins: production ? [{ name: 'agent-gate', transform: (code, id) => ({ code: gateAgent(code, id) }) }] : [] });
+  try { await bundle.write({ file, format: 'es', minify }); }
+  finally { await bundle.close(); }
 }
 
-/** Bundle one host entry; the wasm glue keeps navigation as its other shipped module. */
-export async function bundleHostModule(root, name, { grants = false, production = false } = {}) {
+/** Bundle one host entry; the wasm glue keeps navigation as its other shipped module. `unused`: the navigation
+ * behaviours the page leaves out (navigation.flag; LLP 1047.002 D2.1). */
+export async function bundleHostModule(root, name, { grants = false, production = false, unused = [] } = {}) {
   const web = resolve(root, 'host/web');
   const external = name === 'glue.js' ? 'navigation.js' : grants ? 'grant-admission.js' : null;
-  const { rolldown } = await import('rolldown');
+  const { rolldown } = await import('rolldown'), { gateAgent } = production ? await import('./agent-gate.mjs') : {};
   const bundle = await rolldown({
     input: resolve(web, name),
     treeshake: false,
@@ -122,7 +139,8 @@ export async function bundleHostModule(root, name, { grants = false, production 
     plugins: [{
       name: 'host-module-boundary',
       transform(code, id) {
-        if (production) return gateAgent(code, id);
+        if (id.endsWith('/host/web/navigation/routes.js')) code = writeFalse(code, 'host/web/navigation/routes.js', unused);
+        return production ? gateAgent(code, id) : code;
       },
       resolveId(source, importer) {
         if (external && importer && resolve(dirname(importer), source) === resolve(web, external)) {

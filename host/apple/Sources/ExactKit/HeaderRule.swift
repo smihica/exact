@@ -20,15 +20,15 @@ import UIKit
 /// items before and after the heading (buttons and readouts, `role="status"`),
 /// its buttons with the stack's Back control, its search field, its tablist
 /// and the pressable around the heading. Each platform's bar is made from it.
-struct HeaderRule {
-    let header: NodeView, heading: NodeView?
-    let level: Int
-    let leading: [NodeView], trailing: [NodeView], items: [NodeView]
-    let search: NodeView?, segments: NodeView?, tap: NodeView?
+package struct HeaderRule {
+    package let header: NodeView, heading: NodeView?
+    package let level: Int
+    package let leading: [NodeView], trailing: [NodeView], items: [NodeView]
+    package let search: NodeView?, segments: NodeView?, tap: NodeView?
 
     /// The readouts among the leading and trailing items: nothing presses
     /// them (LLP 1075.003 §9.15).
-    var readouts: [NodeView] { (leading + trailing).filter { node in !items.contains { $0 === node } } }
+    package var readouts: [NodeView] { (leading + trailing).filter { node in !items.contains { $0 === node } } }
 
     /// The nodes handed to the shared rule, in all: what a projection walks,
     /// which the tests pin (a feed's rows are never among them).
@@ -38,8 +38,8 @@ struct HeaderRule {
     /// `appearance: none` (LLP 1075.003 §9.10): the rule makes no bar of it
     /// (`fact::AUTHORED`), and on iOS a pushed route with one gets no bar
     /// of the system Back alone either, since the author drew their own.
-    static func keepsAuthoredHeader(_ route: NodeView) -> Bool {
-        guard let header = route.container.subviews.lazy.compactMap({ $0 as? NodeView }).first,
+    package static func keepsAuthoredHeader(_ route: NodeView) -> Bool {
+        guard let header = route.childNodes.first,
               header.props["semanticTag"] == "header", header.style["display"]?.string != "none" else { return false }
         return header.wrote("appearance") && header.style["appearance"]?.string == "none"
     }
@@ -73,18 +73,18 @@ struct HeaderRule {
     /// button, the Mac toolbar's Back). `projected`: the header the route's
     /// bar is made from, so none for a route that says
     /// `navigationBar="none"` or a header hidden as authored.
-    init?(route: NodeView, back: String?, backIsPlatforms: Bool, projected: Bool) {
+    package init?(route: NodeView, back: String?, backIsPlatforms: Bool, projected: Bool) {
         // The rule makes a bar only of a first child that is a `header`
         // (`exact_kernel::bars::header_shape`); any other is answered here,
         // before walking it: a route whose first child is its feed would
         // hand every row's facts over at each projection, several a batch.
-        guard let first = route.container.subviews.lazy.compactMap({ $0 as? NodeView }).first,
+        guard let first = route.childNodes.first,
               first.props["semanticTag"] == "header" else { return nil }
         // The route, then its first child's subtree, in preorder: two words
         // a node, its facts and the count of its children.
         var nodes: [NodeView] = [route], words: [UInt32] = [route.props["navigationBar"] == "none" ? 256 : 0, 1]
         func add(_ node: NodeView) {
-            let children = node.container.subviews.compactMap { $0 as? NodeView }
+            let children = node.childNodes
             nodes.append(node)
             Self.walked += 1
             words.append(Self.facts(node, back: back))
@@ -119,7 +119,7 @@ extension NodeView {
     /// a family alone keeps the title's size and weight. Nil when the author
     /// wrote none of them: the title keeps the platform's own font. A written
     /// size is the kernel's number, with Dynamic Type already applied.
-    func authoredTitleFont(over base: PlatformFont, sized: Bool = true) -> PlatformFont? {
+    package func authoredTitleFont(over base: PlatformFont, sized: Bool = true) -> PlatformFont? {
         let size = sized && wrote("font_size"), weight = wrote("font_weight"), family = wrote("font_family"), slant = wrote("font_style")
         guard size || weight || family || slant, let engine = text else { return nil }
         return engine.font(size: size ? number("font_size", base.pointSize) : base.pointSize,

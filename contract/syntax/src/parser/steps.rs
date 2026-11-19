@@ -116,9 +116,13 @@ impl Parser {
             .iter()
             .take_while(|s| !launch_word(s).is_empty())
             .count();
-        // Fetch faults and media preferences may also change between steps.
+        // Fetch faults and preferences may also change between steps.
         let late = steps[leading..].iter().find(|s| {
-            !launch_word(s).is_empty() && !matches!(s, Step::FailFetch { .. } | Step::Prefer { .. })
+            !launch_word(s).is_empty()
+                && !matches!(
+                    s,
+                    Step::FailFetch { .. } | Step::AnswerFetch { .. } | Step::Prefer { .. }
+                )
         });
         if let Some(late) = late {
             return Err(SyntaxError {
@@ -418,34 +422,6 @@ impl Parser {
         })
     }
 
-    /// A state's name, then fields and list indexes at any depth, joined by
-    /// `.` (`gateway.state`, `rows.0`: feed F10, drums R7).
-    fn state_path(&mut self) -> R<String> {
-        let (mut name, _) = self.ident()?;
-        while self.eat_punct(".") {
-            name.push('.');
-            match self.peek_kind().clone() {
-                TokenKind::Number(n)
-                    if n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n) =>
-                {
-                    self.next();
-                    name.push_str(&format!("{}", n as u64));
-                }
-                TokenKind::Ident(_) => name.push_str(&self.ident()?.0),
-                other => {
-                    return self.err(
-                        "syntax-expected-name",
-                        format!(
-                            "expected a field or a list index after `.`, found {}",
-                            describe(&other)
-                        ),
-                    );
-                }
-            }
-        }
-        Ok(name)
-    }
-
     /// `clock until state <path> == <literal> within <ms>` (rules/DEFERRED.md,
     /// "Agent API", 2026-10-26), after `until`: the driver's own words, the
     /// literal as JSON text.
@@ -459,25 +435,17 @@ impl Parser {
         self.next();
         let path = self.state_path()?;
         self.expect_punct("==")?;
-        let token = self.next();
-        let value = match token.kind {
-            TokenKind::Str(s) => json_string(&s),
-            // A number too large for a double is no JSON the driver reads back.
-            TokenKind::Number(n) if n.is_finite() => format!("{n}"),
-            TokenKind::Punct("-") if matches!(self.peek_kind(), TokenKind::Number(n) if n.is_finite()) => {
-                format!("-{}", self.step_number("a number")?)
+        let value = if self.eat_punct("[") {
+            let mut items = Vec::new();
+            while !self.eat_punct("]") {
+                if !items.is_empty() {
+                    self.expect_punct(",")?;
+                }
+                items.push(self.until_scalar(&path)?);
             }
-            TokenKind::Ident(w) if w == "true" || w == "false" || w == "null" => w,
-            other => {
-                return Err(SyntaxError {
-                    id: "syntax-expected-step",
-                    message: format!(
-                        "`clock until state {path} ==` takes a string, a number, true, false or null, not {}",
-                        describe(&other)
-                    ),
-                    span: token.span,
-                })
-            }
+            format!("[{}]", items.join(","))
+        } else {
+            self.until_scalar(&path)?
         };
         if !self.at_ident("within") {
             let found = describe(&self.peek_kind().clone());
@@ -495,6 +463,30 @@ impl Parser {
             );
         }
         Ok(format!("until state {path} == {value} within {ms}"))
+    }
+
+    /// One scalar of `clock until state`'s literal, as JSON text.
+    fn until_scalar(&mut self, path: &str) -> R<String> {
+        let token = self.next();
+        Ok(match token.kind {
+            TokenKind::Str(s) => json_string(&s),
+            // A number too large for a double is no JSON the driver reads back.
+            TokenKind::Number(n) if n.is_finite() => format!("{n}"),
+            TokenKind::Punct("-") if matches!(self.peek_kind(), TokenKind::Number(n) if n.is_finite()) => {
+                format!("-{}", self.step_number("a number")?)
+            }
+            TokenKind::Ident(w) if w == "true" || w == "false" || w == "null" => w,
+            other => {
+                return Err(SyntaxError {
+                    id: "syntax-expected-step",
+                    message: format!(
+                        "`clock until state {path} ==` takes a string, a number, true, false, null or a list of them, not {}",
+                        describe(&other)
+                    ),
+                    span: token.span,
+                })
+            }
+        })
     }
 
     /// A JSON value from its tokens, as JSON text: a request's body. Its
@@ -546,7 +538,7 @@ impl Parser {
                 return self.err(
                     "syntax-expected-step",
                     format!(
-                    "expected `tap`, `type`, `pick`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `fail fetch`, `pass fetch`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`, `fail fetch`), found {}",
+                    "expected `tap`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `fail fetch`, `answer fetch`, `pass fetch`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`, `fail fetch`), found {}",
                     describe(&other)
                 ),
                 )
@@ -557,12 +549,17 @@ impl Parser {
             "tap" if self.at_ident("midi") => return self.tap_midi(span),
             "prefer" if self.at_ident("midi") => return self.prefer_midi(span),
             "prefer" => {
-                let (name, _) = self.ident()?;
+                // A module's permission is dotted (`permission.notifications`).
+                let (mut name, _) = self.ident()?;
+                while self.eat_punct(".") {
+                    name.push('.');
+                    name.push_str(&self.ident()?.0);
+                }
                 let value = match self.next() {
-                    Token { kind: TokenKind::Ident(value), .. } => value,
+                    Token { kind: TokenKind::Ident(value) | TokenKind::Str(value), .. } => value,
                     token => return Err(SyntaxError {
                         id: "syntax-expected-step",
-                        message: "`prefer` takes a CSS media feature and its value, as `prefer prefers-color-scheme dark`".into(),
+                        message: "`prefer` takes a media feature, a page fact (including `root-font-size`) or a module permission and its value. Quote numbers and values with punctuation, as `prefer root-font-size \"24\"` or `prefer permission.notifications granted`. Folds (`posture`, `segments`, `gap`), mode pins and extension substitutes are drive-only for now".into(),
                         span: token.span,
                     }),
                 };
@@ -592,12 +589,14 @@ impl Parser {
                     };
                     let (mut press, mut over, mut hold) = (None, None, None);
                     let (mut from, mut mouse) = (None, false);
+                    let mut into = None;
                     // Quoted reads or `clock`, last, while the finger is down (drums R8).
                     let mut during = Vec::new();
                     while let TokenKind::Ident(w) = self.peek_kind().clone() {
                         let twice = match w.as_str() {
                             "from" => from.is_some(),
                             "mouse" => mouse,
+                            "into" => into.is_some(),
                             _ => false,
                         };
                         if twice {
@@ -609,6 +608,12 @@ impl Parser {
                         if w == "mouse" {
                             self.next();
                             mouse = true;
+                            continue;
+                        }
+                        if w == "into" {
+                            self.next();
+                            self.expect_word("keyboard")?;
+                            into = Some("keyboard".to_string());
                             continue;
                         }
                         if w == "from" {
@@ -667,6 +672,7 @@ impl Parser {
                         to,
                         from,
                         mouse,
+                        into,
                         press,
                         over,
                         hold,
@@ -812,6 +818,22 @@ impl Parser {
                     paths,
                     span,
                 }
+            }
+            "presence" => {
+                let expected = "`presence` takes one answer: `allow`, `cancel`, `fail`, `lockout` or `invalidated`";
+                let answer = match self.peek_kind().clone() {
+                    TokenKind::Ident(answer) => {
+                        self.next();
+                        answer
+                    }
+                    _ => return self.err("syntax-expected-step", expected),
+                };
+                if !matches!(answer.as_str(), "allow" | "cancel" | "fail" | "lockout" | "invalidated")
+                    || !matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Eof)
+                {
+                    return self.err("syntax-expected-step", expected);
+                }
+                Step::Presence { answer, span }
             }
             // `authorize` or `authorize cancel` (LLP 1146 D4).
             "authorize" => {
@@ -1042,6 +1064,44 @@ impl Parser {
                     Step::FailFetch { prefix, times, span }
                 }
             }
+            "drop" => {
+                self.expect_word("stream")?;
+                let prefix = self.launch_str("drop stream", "a URL prefix")?;
+                Step::DropStream { prefix, span }
+            }
+            "answer" => {
+                self.expect_word("fetch")?;
+                let prefix = self.launch_str("answer fetch", "a URL prefix")?;
+                self.expect_word("with")?;
+                let status = self.step_number("an HTTP status from 200 through 599")?;
+                if status.fract() != 0.0 || !(200.0..=599.0).contains(&status)
+                    || [301.0, 302.0, 303.0, 307.0, 308.0].contains(&status) {
+                    return self.err("syntax-expected-step", "answer fetch takes a status from 200 through 599, excluding redirects (301, 302, 303, 307, 308)");
+                }
+                let mut headers = Vec::new();
+                while self.at_ident("header") {
+                    self.next();
+                    let name = self.str_lit("a header name")?.to_ascii_lowercase();
+                    let value = self.str_lit("a header value")?;
+                    if matches!(name.as_str(), "set-cookie" | "set-cookie2") {
+                        return self.err("syntax-expected-step", "answer fetch cannot expose set-cookie or set-cookie2 headers on every host");
+                    }
+                    headers.push(format!("{}:{}", json_string(&name), json_string(&value)));
+                }
+                let (body, content_type) = match self.peek_kind() {
+                    TokenKind::Newline | TokenKind::Eof => (String::new(), "text/plain; charset=utf-8"),
+                    TokenKind::Str(_) => (self.str_lit("a text body")?, "text/plain; charset=utf-8"),
+                    _ => (self.json_value()?, "application/json"),
+                };
+                if !headers.iter().any(|h| h.starts_with("\"content-type\":")) {
+                    headers.push(format!("\"content-type\":{}", json_string(content_type)));
+                }
+                let response = format!("{{\"status\":{status},\"headers\":{{{}}},\"body\":{}}}", headers.join(","), json_string(&body));
+                if body.len() > 65536 || prefix.len() + response.len() + 20 > 65536 {
+                    return self.err("syntax-expected-step", "answer fetch: encoded fixture exceeds 64 KiB");
+                }
+                Step::AnswerFetch { prefix, response, span }
+            }
             // @ref LLP 1116.006 D8 — `request POST "/items" {"title": "Bread"} as grace`.
             "request" => self.request_step(span)?,
             "reload" => Step::Reload { span },
@@ -1072,7 +1132,7 @@ impl Parser {
                         return self.err(
                             "syntax-expected-step",
                             format!(
-                                "`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, found {}",
+                                "`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, found {}",
                                 describe(&other)
                             ),
                         )
@@ -1128,6 +1188,11 @@ impl Parser {
                             span,
                         }
                     }
+                    "focused" => Step::ExpectFocused {
+                        target: self.str_lit("a testId")?,
+                        span,
+                    },
+                    "layout" => self.expect_layout(span)?,
                     "text" => {
                         let target = self.str_lit("a testId")?;
                         let other = match self.peek_kind() {
@@ -1171,46 +1236,19 @@ impl Parser {
                         self.expect_word("failures")?;
                         Step::ExpectNoFailures { span }
                     }
-                    "state" => {
-                        let name = self.state_path()?;
-                        let comparison = if self.eat_punct("==") {
-                            StateComparison::Equal
-                        } else if self.eat_punct(">=") {
-                            StateComparison::AtLeast
-                        } else if self.eat_punct("<=") {
-                            StateComparison::AtMost
-                        } else if self.at_ident("in") {
-                            self.next();
-                            StateComparison::In
-                        } else {
-                            return self.err("syntax-expected-step", "`expect state` takes `==`, `>=`, `<=`, or `in`");
-                        };
-                        let value = match comparison {
-                            StateComparison::AtLeast | StateComparison::AtMost => Expr::Number(self.step_number("a numeric bound")?, span),
-                            StateComparison::In => {
-                                let mut values = vec![self.state_literal()?];
-                                while !matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Dedent | TokenKind::Eof) {
-                                    values.push(self.state_literal()?);
-                                }
-                                Expr::List(values, span)
-                            }
-                            StateComparison::Equal => self.state_literal()?,
-                        };
-                        if !matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Dedent | TokenKind::Eof) {
-                            return self.err("syntax-expected-step", "`expect state` compares literals, not expressions");
-                        }
-                        Step::ExpectState { name, comparison, value, span }
-                    }
+                    "state" => self.expect_state(span)?,
                     other => {
                         // r32 t1 tried `expect value` for a field.
                         let hint = if other == "value" || other == "checked" {
                             "; `expect text` reads a control's value too (a checkbox with a `checked` binding reads `true` or `false`)"
+                        } else if other == "focus" {
+                            "; for the node that holds the focus, write `expect focused \"<testId>\"`"
                         } else {
                             ""
                         };
                         return self.err(
                             "syntax-expected-step",
-                            format!("`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, not `{other}`{hint}"),
+                            format!("`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, not `{other}`{hint}"),
                         );
                     }
                 }
@@ -1219,7 +1257,7 @@ impl Parser {
                 return Err(SyntaxError {
                     id: "syntax-expected-step",
                     message: format!(
-                    "expected `tap`, `type`, `pick`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`), found `{other}`"
+                    "expected `tap`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`), found `{other}`"
                 ),
                     span,
                 })
@@ -1260,7 +1298,7 @@ fn during_read(op: &str) -> bool {
 
 /// The words of a test's launch lines, which a test file may also write at
 /// its top level for every test in it (habits F7, calendar F13).
-pub(super) const LAUNCH: [&str; 10] = [
+pub(super) const LAUNCH: [&str; 11] = [
     "size",
     "at",
     "epoch",
@@ -1270,6 +1308,7 @@ pub(super) const LAUNCH: [&str; 10] = [
     "fresh",
     "before",
     "fail",
+    "answer",
     "prefer",
 ];
 
@@ -1286,6 +1325,7 @@ pub(super) fn launch_word(step: &Step) -> &'static str {
         Step::Fresh { .. } => "fresh",
         Step::BeforeData { .. } => "before data",
         Step::FailFetch { .. } => "fail fetch",
+        Step::AnswerFetch { .. } => "answer fetch",
         _ => "",
     }
 }
@@ -1296,16 +1336,73 @@ pub fn is_launch(step: &Step) -> bool {
 }
 
 /// Whether two launch lines set the same fact: `fail fetch` lines, the same
-/// prefix; media preferences, the same feature name.
+/// prefix; preferences, the same fact after resolving drive aliases.
 pub fn same_launch(a: &Step, b: &Step) -> bool {
-    if let (Step::FailFetch { prefix: x, .. }, Step::FailFetch { prefix: y, .. }) = (a, b) {
+    if let (
+        Step::FailFetch { prefix: x, .. } | Step::AnswerFetch { prefix: x, .. },
+        Step::FailFetch { prefix: y, .. } | Step::AnswerFetch { prefix: y, .. },
+    ) = (a, b)
+    {
         return x == y;
     }
     if let (Step::Prefer { name: x, .. }, Step::Prefer { name: y, .. }) = (a, b) {
-        return x == y;
+        return prefer_key(x) == prefer_key(y);
     }
     let word = launch_word(a);
     !word.is_empty() && word == launch_word(b)
+}
+
+// Match `scripts/agent-prefer.mjs`'s `preferGroups`. Unknown names, including
+// module permissions, keep their exact spelling for the driver's validation.
+fn prefer_key(name: &str) -> &str {
+    fn norm(name: &str) -> String {
+        let letters: String = name
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter(char::is_ascii_lowercase)
+            .collect();
+        letters
+            .strip_prefix("prefers")
+            .or_else(|| letters.strip_prefix("prefer"))
+            .unwrap_or(&letters)
+            .to_owned()
+    }
+    let normalized = norm(name);
+    [
+        "display-mode",
+        "prefers-reduced-motion",
+        "prefers-reduced-transparency",
+        "prefers-contrast",
+        "prefers-color-scheme",
+        "color-gamut",
+        "dynamic-range",
+        "pointer",
+        "hover",
+        "frozen",
+        "visibility-state",
+        "online",
+        "can-share",
+        "can-share-files",
+        "can-share-pictures",
+        "can-open-files",
+        "iframe-partition",
+        "has-focus",
+        "keyboard-navigation",
+        "bold-text",
+        "root-font-size",
+        "display-scale",
+        "gpu-tier",
+        "posture",
+        "segments",
+        "gap",
+        "mode",
+        "midi.state",
+        "midi.inputs",
+        "midi.outputs",
+    ]
+    .into_iter()
+    .find(|key| norm(key) == normalized)
+    .unwrap_or(name)
 }
 
 /// `YYYY-MM-DD`, alone or before a `T` time: what the driver's epoch reads.
@@ -1320,32 +1417,4 @@ fn iso_date(s: &str) -> bool {
             }
         })
         && (b.len() == 10 || b[10] == b'T')
-}
-
-impl Parser {
-    fn state_literal(&mut self) -> R<Expr> {
-        let span = self.peek().span;
-        if self.at_punct("-") || matches!(self.peek_kind(), TokenKind::Number(_)) {
-            return self
-                .step_number("a literal number")
-                .map(|n| Expr::Number(n, span));
-        }
-        let token = self.next();
-        match token.kind {
-            TokenKind::Str(value) => Ok(Expr::Str(value, span)),
-            TokenKind::Ident(word) if word == "true" || word == "false" => {
-                Ok(Expr::Bool(word == "true", span))
-            }
-            TokenKind::Ident(word) if word == "none" => Ok(Expr::None(span)),
-            TokenKind::Punct("[") => {
-                self.expect_punct("]")?;
-                Ok(Expr::List(Vec::new(), span))
-            }
-            _ => Err(SyntaxError {
-                id: "syntax-expected-step",
-                message: "`expect state` takes a number, a string, a bool, `none`, or `[]`".into(),
-                span,
-            }),
-        }
-    }
 }

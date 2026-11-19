@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactControls
 
 /// x2apps survey #2 on UIKit, which has no radio: the SF Symbols pair at
 /// the reader's body size with a 44-point target (LLP 1115.000 D13.2),

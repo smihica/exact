@@ -1,10 +1,54 @@
 // `state <name>` (agent-inspect.mjs `stateOp`, LLP 1116.007 D3.9): a state, derive or resource (or a field of the record)
 // reads by name, down a dotted path, as `expect state` does, even where a view carries the name; a plain view's is the record.
 import { test, expect } from 'bun:test';
-import { render, renderTrace, renderFrameHealthReport, renderFrameHealthMetrics, perfOp, readTrack, renderPerf, stateOp, tapRefusal, nextCommitTasks, settleBound, planLocators, perfDelta } from './agent-inspect.mjs';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { render, renderTrace, renderFrameHealthReport, renderFrameHealthMetrics, perfOp, readTrack, renderPerf, stateOp, tapRefusal, nextCommitTasks, settleBound, planLocators, perfDelta, pidTrace, scaledScreenshot } from './agent-inspect.mjs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { open } from './agent-session.mjs';
+import { launchFacts } from './agent-launch.mjs';
+import { compareOp } from './agent-compare.mjs';
+import { encodePng } from './png.mjs';
+
+test('rotated panel captures scale on image axes and compare against rotated layout boxes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-rotated-capture-'));
+  const logical = { x: 10, y: 40, w: 60, h: 30 };
+  const cases = [
+    [0, 120, 200, { x: 10, y: 40, w: 60, h: 30 }],
+    [90, 200, 120, { x: 130, y: 10, w: 30, h: 60 }],
+    [180, 120, 200, { x: 50, y: 130, w: 60, h: 30 }],
+    [270, 200, 120, { x: 40, y: 50, w: 30, h: 60 }],
+  ];
+  const session = {
+    host: 'linux',
+    layout: async () => ({ viewport: { w: 120, h: 200 }, nodes: [{ id: 1, ...logical }] }),
+    tree: async () => ({ nodes: [{ id: 1, type: 'View', props: { testId: 'card' } }] }),
+  };
+  const picture = (w, h, box, color) => {
+    const data = new Uint8Array(w * h * 16).fill(255);
+    for (let y = box.y * 2; y < (box.y + box.h) * 2; y++)
+      for (let x = box.x * 2; x < (box.x + box.w) * 2; x++) data.set([...color, 255], (y * w * 2 + x) * 4);
+    return encodePng({ width: w * 2, height: h * 2, data });
+  };
+  try {
+    for (const [rotation, w, h, box] of cases) {
+      const shot = { screenshot: join(dir, 'shot.png'), w, h, rotation };
+      const reference = join(dir, 'ref.png');
+      writeFileSync(shot.screenshot, picture(w, h, box, [0, 0, 0]));
+      writeFileSync(reference, picture(w, h, box, [160, 0, 0]));
+      const full = scaledScreenshot(shot, 2, 'linux');
+      expect(full.shrunk).toBe(false);
+      const scaled = scaledScreenshot(shot, 1, 'linux');
+      expect([scaled.image.width, scaled.image.height]).toEqual([w, h]);
+      expect(scaled.shrunk).toBe(true);
+      expect(render('screenshot', shot)).toContain(`${w}×${h}`);
+      const result = await compareOp(session, reference, async () => shot);
+      expect(result.compare.regions.length).toBeGreaterThan(0);
+      expect(result.text).toContain(`under card [${box.x},${box.y} ${box.w}×${box.h}]`);
+      expect(await session.layout()).toEqual({ viewport: { w: 120, h: 200 }, nodes: [{ id: 1, ...logical }] });
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('bounded frame report and capture controls bypass legacy perf collection', async () => {
   const asked = [];
@@ -76,16 +120,18 @@ test('Android live windows read their baseline once the lease lends the clock, a
   expect(s.now).toBe(1700);
 });
 
-test('Apple live windows use a host-side wait and release their lease on errors', async () => {
+test('Apple live windows read their baseline once the lease holds, use a host-side wait and release their lease on errors', async () => {
   const requests = [], cursor = { version: 1 };
+  let started = false;
   const s = { host: 'ios', op: async request => {
     requests.push(request);
-    if (request.capture) return { capture: request.capture === 'start' };
+    if (request.capture) { started = request.capture === 'start'; return { capture: started }; }
     if (request.cursor) throw new Error('disconnected');
-    return { available: true, cursor };
+    // An on-demand collector collects once the lease asks it to
+    return started ? { available: true, cursor } : { available: false, reason: 'collection-disabled' };
   }, perf: () => { throw new Error('legacy sampler'); } };
   await expect(perfOp(s, ['frames', 'live', '1'])).rejects.toThrow('disconnected');
-  expect(requests.map(request => request.capture ?? 'health')).toEqual(['health', 'start', 'health', 'stop']);
+  expect(requests.map(request => request.capture ?? (request.cursor ? 'delta' : 'health'))).toEqual(['health', 'start', 'health', 'delta', 'stop']);
   expect(requests.some(request => request.op === 'clock')).toBe(false);
   await expect(perfOp(s, ['frames', 'live', '30001'])).rejects.toThrow();
 });
@@ -257,16 +303,55 @@ test('ink traces retain phase and coverage information without inventing frame j
 
 test('--plan finds plans with a map beside them in a directory, and refuses one with none', () => {
   const dir = mkdtempSync(join(tmpdir(), 'plan-'));
-  mkdirSync(join(dir, 'bake', 'dev'), { recursive: true });
-  writeFileSync(join(dir, 'bake', 'dev', 'macos.plan.map.json'), '{}');
-  expect(planLocators(dir)).toEqual([join(dir, 'bake', 'dev', 'macos.plan')]);
-  expect(planLocators(join(dir, 'x.plan.map.json'))).toEqual([join(dir, 'x.plan')]);
-  expect(() => planLocators(join(dir, 'bake', 'dev', 'empty-dir-does-not-exist'))).toThrow();
+  try {
+    mkdirSync(join(dir, 'bake', 'dev'), { recursive: true });
+    writeFileSync(join(dir, 'bake', 'dev', 'macos.plan.map.json'), '{}');
+    expect(planLocators(dir)).toEqual([join(dir, 'bake', 'dev', 'macos.plan')]);
+    expect(planLocators(join(dir, 'x.plan.map.json'))).toEqual([join(dir, 'x.plan')]);
+    expect(() => planLocators(join(dir, 'bake', 'dev', 'empty-dir-does-not-exist'))).toThrow();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('perf during subtracts each handler\'s dispatches and drops the ones that did not run', () => {
   const read = (n) => ({ plan: 'p', incarnation: 1, seq: n, sites: [], handlers: [{ site: 3, event: 'hover in', dispatched: n, committed: n }, { site: 5, event: 'press', dispatched: 1, committed: 0 }] });
+  expect(() => perfDelta({...read(2), generation:1}, {...read(60), generation:3})).toThrow('generation 1 → 3');
   expect(perfDelta(read(2), read(60)).handlers).toEqual([{ site: 3, event: 'hover in', dispatched: 58, committed: 58 }]);
+});
+
+test('world perf during refuses replacement even when tick and restart counters match', async () => {
+  const before = { tick: 12, restarted: 0, spanTicks: 4, incarnation: 'module:7', generation: 1, spans: [] };
+  for (const [changed, reason] of [
+    [{ incarnation: 'module:8' }, 'world incarnation'],
+    [{ incarnation: 'replacement:7' }, 'world incarnation'],
+    [{ generation: 2 }, 'recording generation'],
+  ]) {
+    let current = before;
+    const s = { perf: async () => current };
+    await expect(perfOp(s, ['world:world', 'during'], 'perf world:world during "clock +0"', async () => {
+      current = { ...before, ...changed };
+    })).rejects.toThrow(reason);
+  }
+});
+
+test('world perf carries its recording cursor through the session and keeps valid spans', async () => {
+  const asked = [], spans = { incarnation: 'module:7', generation: 2, spanTicks: 4, spans: [{ name: 'tick.other', count: 1 }] };
+  const s = await open({ reuse: { host: 'web', browser: 'chrome', launchFacts: launchFacts({}), reset() {},
+    async ask(req) {
+      if (req.op === 'tree') return { nodes: [{ id: 1, props: { testId: 'world' }, depth: 0 }] };
+      asked.push(req);
+      return { world: { tick: 12, restarted: 0, perf: { tickSpans: spans } } };
+    },
+  } });
+  const got = await perfOp(s, ['world:world', 'during'], 'perf world:world during "clock +0"', async () => {});
+  expect(asked).toEqual([
+    { op: 'state', id: 1, world: true, perf: true },
+    { op: 'state', id: 1, world: true, perf: true, span_since: { incarnation: 'module:7', generation: 2, ticks: 4 } },
+  ]);
+  expect(got).toEqual({ target: 'world:world', tick: 12, restarted: 0, ...spans,
+    from: { tick: 12, incarnation: 'module:7', generation: 2, spanTicks: 4 } });
+  expect(renderPerf(got)).toContain('world incarnation module:7 · recording generation 2');
+  delete spans.generation;
+  await expect(s.perf('world:world')).rejects.toThrow('names no world incarnation or recording generation');
 });
 
 test('state world events uses the world seam and an optional type filter', async () => {
@@ -329,6 +414,21 @@ test('resource declarations refuse incomplete or malformed source spans', async 
     const reply = {planDigest:'same',resourceStatus:{inbox:{resource:1,source:'Inbox'}}};
     expect(identifyResources(reply, maps).resourceStatus.inbox.declaration.status).toBe('unavailable');
   }
+});
+
+test('the live world row shows reported hook work and leaves absent measurements blank', () => {
+  const report = world => render('perf', { period: { ms: 16.7 }, lifetime: {}, world });
+  const perf = { ticksPerFrame: { max: 2, count: 1 } };
+  const prepare = { p50: 0.2, p95: 0.3, p99: 0.4, mean: 0.25, count: 4 };
+  const hooks = { cpuMs: { prepare }, frame: {
+    draws: { max: 3, count: 1 }, triangles: { max: 36, count: 1 }, uploadBytes: { max: 0, count: 1 },
+  } };
+  expect(report([{ canvas: 7, perf, renderHooks: hooks }])).toContain(
+    ' · hooks prepare p50 0.2 ms p95 0.3 ms p99 0.4 ms mean 0.25 ms · draws max 3 · triangles max 36 · upload max 0 B · ticks/frame max 2');
+  expect(report([{ canvas: 7, perf: {}, renderHooks: { frame: null } }])).toContain(
+    ' · hooks prepare — · draws max — · triangles max — · upload max — · ticks/frame max —');
+  expect(report([{ canvas: 7, perf, renderHooks: { frame: { draws: { max: 0, count: 0 } } } }])).toContain(' · draws max —');
+  expect(report([{ canvas: 7, perf }])).not.toContain(' · hooks prepare');
 });
 
 // LLP 1144 D3: a scroll handler that changed the tree on every event of a fling is said once, with what to do; one that
@@ -481,4 +581,37 @@ test("a world's perf prints its counters; only `state <canvas> draws` is a draw 
   expect(render('state', perf, { name: 'world.0.perf' }).split('\n')).toEqual(['wallClock true', 'pixels [1280,720]', 'draws 15', 'instances 11', 'triangles 5425']);
   const draws = { tick: 4, hash: '0x1', draws: [{ pass: 'opaque', draw: 'mesh', winding: 'ccw', writes: 'color' }] };
   expect(render('state', draws, { name: 'world', look: true })).toBe('tick 4 · hash 0x1\nopaque        · mesh · ccw · writes color');
+});
+
+test('trace --pid looks for a sandboxed Mac app\'s marker in its container (LLP 1030.005 D4)', async () => {
+  const sandbox = '<plist><dict><key>com.apple.security.app-sandbox</key><true/></dict></plist>';
+  const run = (signed) => (cmd, args) => ({ stdout: cmd === 'ps' ? (args[1] === 'comm=' ? '/b/Probe.app/Contents/MacOS/Probe\n' : 'Sat Nov 14 19:00:00 2026\n')
+    : cmd === 'codesign' ? signed : cmd === 'plutil' ? 'com.example.probe\n' : cmd === 'getconf' ? '/var/folders/x/T/\n' : '' });
+  await expect(pidTrace(4242, () => '/nowhere', run(sandbox))).rejects.toThrow(`no ${join(homedir(), 'Library/Containers/com.example.probe/Data/tmp/exact-trace-4242.ready')}`);
+  await expect(pidTrace(4242, () => '/nowhere', run('<plist><dict/></plist>'))).rejects.toThrow('no /var/folders/x/T/exact-trace-4242.ready');
+});
+
+
+test('logs retain session tags and read a replacement journal from its start', async () => {
+  let generation = 1, lines = ['first', 'second'];
+  const calls = [];
+  const carrier = {
+    host: 'web', browser: 'chrome', hostLines: [], launchFacts: launchFacts({}), reset() {},
+    async ask(req) {
+      calls.push(req);
+      return {
+        generation, epoch: generation, incarnation: 1, clock: 0,
+        from: Math.min(req.since, lines.length), next: lines.length, lines: lines.slice(req.since),
+      };
+    },
+  };
+  const s = await open({ reuse: carrier });
+  expect((await s.logs()).generation).toBe(1);
+  generation = 2;
+  lines = ['replacement generation 2'];
+  const reply = await s.logs();
+  expect(reply.generation).toBe(2);
+  expect(reply.epoch).toBe(2);
+  expect(reply.lines).toEqual(lines);
+  expect(calls.map(c => c.since)).toEqual([0, 2, 0]);
 });

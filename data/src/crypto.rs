@@ -164,16 +164,17 @@ pub fn random_bytes(store: &Store, out: &mut [u8]) -> Result<(), DataError> {
             out.len()
         )));
     }
-    let agent = AGENT
-        .get_or_init(|| platform::agent_seed().map(|s| Mutex::new(AgentStream::new(s, "rust"))));
-    match agent {
+    match agent() {
         Some(stream) => stream.lock().unwrap_or_else(|e| e.into_inner()).fill(out),
         None => platform::fill(out).map_err(|error| {
             out.fill(0);
             DataError::Unavailable(format!("random_bytes: OS randomness unavailable: {error}"))
         })?,
     }
-    store.observe_entropy();
+    // An empty fill drew nothing
+    if !out.is_empty() {
+        store.observe_entropy();
+    }
     Ok(())
 }
 
@@ -185,9 +186,25 @@ pub fn random_uuid(store: &Store) -> Result<String, DataError> {
     Ok(format_uuid(bytes))
 }
 
+/// Whether [`random_bytes`] draws the agent's repeatable stream in this
+/// process, not the OS's entropy (LLP 1156.006.000 D23): the answer the first
+/// draw fixes for the process, so the two cannot disagree. For code that must
+/// not make a key from predictable bytes. The hosts keep a production bake out
+/// of agent mode; a development or release build under another trust, a
+/// terminal entry and an embedder honour `EXACT_AGENT=1`, and this is how such
+/// a build tells. A read of the device, as a draw is: bake compiles no value
+/// from it.
+pub fn seeded(store: &Store) -> bool {
+    store.observe_entropy();
+    agent().is_some()
+}
+
 /// The process's `rust` stream under the agent, from its start at the first
-/// draw; `None` outside the agent.
+/// draw or the first [`seeded`]; `None` outside the agent.
 static AGENT: OnceLock<Option<Mutex<AgentStream>>> = OnceLock::new();
+fn agent() -> &'static Option<Mutex<AgentStream>> {
+    AGENT.get_or_init(|| platform::agent_seed().map(|s| Mutex::new(AgentStream::new(s, "rust"))))
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod platform {
@@ -323,6 +340,8 @@ mod tests {
         ));
         assert!(too_many.iter().all(|&b| b == 7), "nothing written");
         assert_eq!(store.entropy_draws(), 3, "a refusal draws nothing");
+        random_bytes(&store, &mut []).unwrap();
+        assert_eq!(store.entropy_draws(), 3, "an empty fill draws nothing");
     }
 
     /// Two processes under the agent with seed 1 mint the `rust` stream's
@@ -333,7 +352,12 @@ mod tests {
         const NAME: &str =
             "crypto::tests::under_the_agent_two_runs_of_a_rust_source_mint_the_same_uuid";
         if std::env::var_os("EXACT_DATA_CRYPTO_CHILD").is_some() {
-            println!("uuid={}", random_uuid(&Store::new("", [])).unwrap());
+            // Asked before the first draw and after it: the one answer, and a counted read.
+            let store = Store::new("", []);
+            let before = seeded(&store);
+            let uuid = random_uuid(&store).unwrap();
+            assert_eq!((seeded(&store), store.entropy_draws()), (before, 3));
+            println!("seeded={before} uuid={uuid}");
             return;
         }
         let run = |agent: bool| {
@@ -347,6 +371,7 @@ mod tests {
                 command.env("EXACT_AGENT", "1");
             }
             let out = String::from_utf8(command.output().unwrap().stdout).unwrap();
+            assert!(out.contains(&format!("seeded={agent} ")), "{out}");
             // The harness prints the test's name on the same line.
             out.split("uuid=")
                 .nth(1)

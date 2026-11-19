@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 /// Plain UIKit scrollers keep the reader's content still when a box above
 /// the port changes size or is inserted, as CSS scroll anchoring does in
@@ -40,6 +41,28 @@ final class ScrollAnchoringIOSTests: XCTestCase {
         return ops
     }
 
+    func testScrollLayoutBoxCachesUntilItsAncestryOrDisplayChanges() throws {
+        let (p, _) = fixture(top: 200)
+        defer { p.reset(); window.isHidden = true }
+        let node = try XCTUnwrap(p.views[1])
+        XCTAssertTrue(node.hasScrollLayoutBox)
+        let walks = NodeView.scrollLayoutWalksForTests
+        for _ in 0..<120 { XCTAssertTrue(node.hasScrollLayoutBox) }
+        XCTAssertEqual(NodeView.scrollLayoutWalksForTests, walks)
+        let parent = NodeView(id: 100, kind: "view", presenter: p)
+        parent.style = ["display": .string("none")]
+        parent.addSubview(p.viewport)
+        XCTAssertFalse(node.hasScrollLayoutBox, "moving an ancestor invalidates descendants")
+        parent.style = [:]
+        XCTAssertTrue(node.hasScrollLayoutBox, "a direct ancestor style write invalidates descendants")
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["display": "none"]]]))
+        XCTAssertFalse(node.hasScrollLayoutBox)
+        p.apply(wireBatch([["op": "style", "id": 1, "style": ["display": "block"]]]))
+        XCTAssertTrue(node.hasScrollLayoutBox)
+        window.addSubview(p.viewport)
+        XCTAssertTrue(node.hasScrollLayoutBox)
+    }
+
     func testAFoldAboveThePortLeavesTheContentStill() {
         let (p, sv) = fixture(top: 200)
         p.apply(wireBatch([["op": "style", "id": 2, "style": ["height": 0.0]]] + rows(header: 0)))
@@ -52,8 +75,8 @@ final class ScrollAnchoringIOSTests: XCTestCase {
             p.apply(wireBatch([["op": "props", "id": 1, "set": ["scrollFollowEnd": String(followEnd)]]]))
             sv.contentOffset.y = 200
             // The retired navigation had covered the header before this batch.
-            p.navigation.covers = [2: .whole]
-            p.navigation.delivered = p.navigation.covers
+            p.navigationHost.covers = [2: .whole]
+            p.navigationHost.delivered = p.navigationHost.covers
             var deliveries = 0
             p.onCovers = { changes in
                 deliveries += 1
@@ -65,7 +88,7 @@ final class ScrollAnchoringIOSTests: XCTestCase {
                 p.apply(wireBatch(self.rows(header: 0, inserted: 60)))
             }
             // Retirement runs while the batch still holds its scroll captures.
-            p.onViewportFit = { p.navigation.reset() }
+            p.onViewportFit = { p.navigationHost.reset() }
             defer { p.onViewportFit = nil; p.onCovers = nil; p.reset() }
             p.apply(wireBatch([["op": "props", "id": 1, "set": ["viewportFit": "cover"]]] + rows(header: 0)))
             XCTAssertEqual(deliveries, 1)
@@ -76,16 +99,16 @@ final class ScrollAnchoringIOSTests: XCTestCase {
     func testAReplacementCoverWinsOverTheRetiredNavigationsCover() {
         let (p, _) = fixture(top: 200)
         let replacement = HostCover.inset(top: 20, bottom: 0)
-        p.navigation.covers = [2: .whole]
-        p.navigation.delivered = p.navigation.covers
+        p.navigationHost.covers = [2: .whole]
+        p.navigationHost.delivered = p.navigationHost.covers
         var deliveries: [[(UInt32, HostCover?)]] = []
         p.onCovers = { changes in
             XCTAssertFalse(p.applying)
             deliveries.append(changes)
         }
         p.onViewportFit = {
-            p.navigation.reset()
-            p.navigation.covers = [2: replacement]
+            p.navigationHost.reset()
+            p.navigationHost.covers = [2: replacement]
         }
         defer { p.onViewportFit = nil; p.onCovers = nil; p.reset() }
         p.apply(wireBatch([["op": "props", "id": 1, "set": ["viewportFit": "cover"]]]))
@@ -93,7 +116,7 @@ final class ScrollAnchoringIOSTests: XCTestCase {
         XCTAssertEqual(deliveries.first?.count, 1)
         XCTAssertEqual(deliveries.first?.first?.0, 2)
         XCTAssertEqual(deliveries.first?.first?.1, replacement)
-        p.navigation.reset()
+        p.navigationHost.reset()
         XCTAssertEqual(deliveries.count, 2, "outside a batch, retirement delivers immediately")
         XCTAssertNil(deliveries.last?.first?.1)
     }

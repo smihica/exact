@@ -8,6 +8,11 @@ impl<D: DataSource> Presenter<D> {
     /// every check; a boot note it left goes to the journal.
     pub fn set_updates(&mut self, updates: Option<Box<dyn crate::delivery::Store>>) {
         self.updates = updates;
+        if let Some(Waiting::Update { explicit, hold }) = self.waiting.as_mut() {
+            (*explicit, *hold) = (false, None);
+        }
+        self.update_checks =
+            (self.updates.as_ref()).map(|_| super::checks::Checks::from_compat(&self.compat));
         if let Some(note) = self.updates.as_mut().and_then(|u| u.take_note()) {
             self.host.log(note);
         }
@@ -27,8 +32,12 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// Connect the existing development URL loop; polling starts after first pixel.
+    /// Connect the existing development URL loop; polling starts after first
+    /// pixel. A generation the loop it replaces brought, held, goes with it.
     pub fn set_development(&mut self, url: Option<String>, identity: Option<String>) {
+        if matches!(self.waiting, Some(Waiting::Generation(..))) {
+            self.waiting = None;
+        }
         self.dev = url.map(|url| crate::fetch::Poller::new(url, self.compat.clone(), identity));
         // Its answers wake the executor's fd, so a host that turns only when
         // woken (the Android reader's canvas host) takes them at once.
@@ -44,7 +53,7 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// Milliseconds from `now` until a turn is owed: a timer, sampled motion
-    /// edge, or development poll (attached, and the first
+    /// edge, an update check, or development poll (attached, and the first
     /// pixel out: it polls after). A host that turns only when woken asks
     /// this (the Android reader's canvas host).
     pub fn turn_due_ms(&self, now: f64) -> Option<f64> {
@@ -53,6 +62,8 @@ impl<D: DataSource> Presenter<D> {
         let timer = timer
             .into_iter()
             .chain(self.image_turn_due_in_ms())
+            .chain(self.update_check_due())
+            .chain(self.reload_due_in_ms())
             .reduce(f64::min);
         let dev = self.dev.as_ref().filter(|_| self.painted);
         let poll = dev
@@ -89,15 +100,12 @@ impl<D: DataSource> Presenter<D> {
             Some(Ok(Some(generation)))
                 if self.dev.as_ref().unwrap().identity.as_ref() == Some(&generation.identity) => {}
             Some(Ok(Some(generation))) => {
-                // A newer generation waits its own second; the poll fetching
-                // the held one again does not restart it.
-                if self.pending_dev.as_ref().map(|g| &g.identity) != Some(&generation.identity) {
-                    self.dev.as_mut().unwrap().held_since = None;
-                }
                 // Held, or refused below: the poll downloads it again only
-                // once the dev server publishes another.
+                // once the dev server publishes another. A newer generation
+                // waits its own second; the poll fetching the held one again
+                // does not restart it.
                 self.dev.as_mut().unwrap().held = Some(generation.identity.clone());
-                self.pending_dev = Some(generation);
+                self.keep_generation(generation);
             }
             // A dev loop's status (its producers starting) once, not each tick.
             Some(Err(error)) => self.dev.as_mut().unwrap().say(&error),
@@ -105,15 +113,20 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// Install the generation a tick kept, when it may go.
+    /// Install the generation a tick kept, when it may go: the tick keeps it
+    /// as bytes until no interaction holds it (LLP 1029.000.002 D9).
     fn apply_development(&mut self, data: impl FnOnce() -> D) {
-        if let Some(generation) = self.pending_dev.take() {
+        let is_generation = |waiting: &mut Waiting<D>| matches!(waiting, Waiting::Generation(..));
+        if self.waiting.as_mut().is_some_and(is_generation) && self.activation_deferred() {
+            return;
+        }
+        if let Some(Waiting::Generation(generation, _)) = self.waiting.take_if(is_generation) {
             let let_go = self
                 .dev
                 .as_ref()
                 .and_then(|dev| dev.held_since)
                 .is_some_and(|t| t.elapsed() >= LET_GO_AFTER);
-            match self.reload_module(&generation.plan, data(), generation.module.clone(), let_go) {
+            match self.reload_now(&generation.plan, data(), generation.module.clone(), let_go) {
                 Ok(_) => {
                     let waker = self.executor.waker();
                     let dev = self.dev.as_mut().unwrap();
@@ -132,23 +145,25 @@ impl<D: DataSource> Presenter<D> {
                     self.rehold();
                     self.report_status();
                 }
-                Err(HostError::PreparingModule) => self.pending_dev = Some(generation),
+                Err(HostError::PreparingModule) => {
+                    self.waiting = Some(Waiting::Generation(generation, Some("module")));
+                }
                 Err(HostError::RequestsPending) => {
                     self.dev
                         .as_mut()
                         .unwrap()
                         .held_since
                         .get_or_insert_with(Instant::now);
-                    self.pending_dev = Some(generation);
+                    self.waiting = Some(Waiting::Generation(generation, Some("requests")));
                 }
                 Err(error) => eprintln!("exact url: candidate refused: {error}"),
             }
-            if self.pending_dev.is_none() {
+            if self.waiting.is_none() {
                 self.dev.as_mut().unwrap().held_since = None;
             }
         }
         // The live table: the snapshot and the commands poll's batches.
-        if self.pending_dev.is_none() {
+        if !self.waiting.as_mut().is_some_and(is_generation) {
             self.serve_live();
         }
     }
@@ -178,6 +193,10 @@ impl<D: DataSource> Presenter<D> {
                 .preload()
                 .map_err(|e| HostError::Asset(format!("candidate module: {e:?}")))?
             {
+                // Whoever keeps the candidate tries it at the shell's next
+                // turn: the loader wakes its loop for that one.
+                let wake = self.executor.waker();
+                data.when_preloaded(Box::new(move || wake()));
                 return Err(HostError::PreparingModule);
             }
             let mut validation = module
@@ -188,6 +207,7 @@ impl<D: DataSource> Presenter<D> {
                 .map_err(|e| HostError::Asset(format!("candidate module: {e:?}")))?;
             let (mut host, error) = exact_runner::time::launching_with(
                 exact_runner::time::Launch {
+                    preferences: Some(self.host.runner().viewport().preferences),
                     time: Some(self.host.runner().wall_time()),
                     place: Some(self.host.runner().place().clone()),
                     ..exact_runner::time::Launch::NONE
@@ -208,9 +228,7 @@ impl<D: DataSource> Presenter<D> {
                 return Err(HostError::Layout(error));
             }
             self.restore_time(&mut host)?;
-            let mut validated = host.carry();
-            validated.store = carried.store.clone();
-            *carried = validated;
+            *carried = carried.clone().with_validated_answers(host.carry());
         }
         Ok(data)
     }
@@ -253,6 +271,28 @@ impl<D: DataSource> Presenter<D> {
         self.connect_hatches();
     }
 
+    /// The data module of a session nothing shows (LLP 1133.017 D7: one
+    /// booted with no view, or one whose view records no frame): no pixel
+    /// waits for it, so it activates now, and the pump asks again while its
+    /// image loads. A frame displayed afterwards ends this, so a later
+    /// generation's module waits for its own first pixel.
+    pub fn activate_unshown(&mut self) {
+        self.unshown = true;
+        if self.data_activating() {
+            self.activate_first_pixel();
+        }
+    }
+
+    /// The data module is active (1), has yet to activate (0), or failed to
+    /// (-1, [`Presenter::activation_error`]).
+    pub fn data_state(&self) -> i32 {
+        match (&self.activation_failed, self.host.data_pending()) {
+            (Some(_), _) => -1,
+            (None, true) => 0,
+            (None, false) => 1,
+        }
+    }
+
     /// First pixel has been acknowledged ([`Presenter::first_pixel`]).
     pub fn first_pixel_told(&self) -> bool {
         self.painted
@@ -273,14 +313,25 @@ impl<D: DataSource> Presenter<D> {
     /// A development generation or an update is being prepared: the display
     /// loop polls for it. A loading data source wakes the loop itself.
     pub fn delivery_pending(&self) -> bool {
-        self.pending_dev.is_some() || self.pending_update
+        matches!(self.waiting, Some(Waiting::Generation(..))) || self.update_ready()
+    }
+
+    pub(super) fn update_ready(&self) -> bool {
+        let Some(Waiting::Update { explicit, hold }) = self.waiting else {
+            return false;
+        };
+        (explicit
+            || self
+                .update_checks
+                .as_ref()
+                .is_none_or(|c| c.activation_allowed()))
+            && !(hold == Some("requests") && self.host.runner().has_pending())
     }
 
     /// Wake an idle display while an executable image is loading off-thread.
     pub fn module_pending(&self) -> bool {
         (self.painted && self.activation_failed.is_none() && self.host.data_pending())
-            || self.pending_dev.is_some()
-            || self.pending_update
+            || self.delivery_pending()
     }
 
     /// Check the stream's head now, on the store's thread; the outcome
@@ -293,22 +344,124 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// A finished check, if one landed: its line to stderr and the journal
-    /// (`exact update: …`), the store's facts into the runner.
+    /// The boot is good only once a reader in another thread or language
+    /// drew it ([`Presenter::reader_drew`]), not at first pixel: the Android
+    /// reader, which may crash on a frame the presenter recorded (LLP
+    /// 1030.006 D5).
+    pub fn set_reader_blesses(&mut self) {
+        self.reader_blesses = true;
+    }
+
+    /// The reader drew a frame of the running generation: with a store, its
+    /// boot is good (LLP 1026 D11, LLP 1030.006 D5). Whether another drawing
+    /// is still wanted (first pixel not yet out). Once per generation: an
+    /// activation asks again.
+    pub fn reader_drew(&mut self) -> bool {
+        if !self.reader_blesses || self.blessed {
+            return false;
+        }
+        if !self.painted {
+            return true;
+        }
+        self.blessed = true;
+        if let Some(u) = self.updates.as_mut() {
+            u.boot_succeeded();
+            self.sync_delivery();
+        }
+        false
+    }
+
+    /// The update cadence's clock, milliseconds: the agent's under a drive
+    /// (and in tests), else the time since launch. Not the host's clock,
+    /// which an idle canvas screen does not advance.
+    fn update_clock(&self) -> f64 {
+        if self.agent || cfg!(test) {
+            return self.host.now();
+        }
+        static LAUNCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        LAUNCH.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Milliseconds until the next periodic update check is due.
+    pub fn update_check_due(&self) -> Option<f64> {
+        let due = self.update_checks.as_ref().and_then(|c| c.due())?;
+        Some((due - self.update_clock()).max(0.0))
+    }
+
+    /// A display host's frame after first pixel: the launch's update check,
+    /// unless the page is hidden, and from then on the cadence (LLP
+    /// 1030.006 D5). An embedder that never calls it checks only on
+    /// `deliveryCheck`.
+    pub fn update_launched(&mut self) {
+        if self.painted {
+            self.update_foreground(!self.host.runner().page().hidden);
+        }
+    }
+
+    /// The app came to the foreground or left it (an Android activity's
+    /// start and stop): the store checks, and activates under `immediate`,
+    /// as the cadence asks (LLP 1030.006 D5). Nothing before first pixel.
+    pub fn update_foreground(&mut self, foreground: bool) {
+        let was_ready = self.update_ready();
+        let now = self.update_clock();
+        let asks = match self.update_checks.as_mut() {
+            Some(checks) if self.painted => checks.foreground(foreground, now),
+            _ => return,
+        };
+        if asks.check {
+            self.check_update();
+        }
+        if asks.activate {
+            self.owe_update(false);
+        }
+        if !was_ready && self.update_ready() {
+            self.executor.notify();
+        }
+    }
+
+    /// A periodic check that is due, started; then a finished check, if one
+    /// landed: its line to stderr and the journal (`exact update: …`), the
+    /// store's facts into the runner, and under `immediate` the activation
+    /// it staged, which the next [`Presenter::run_commands`] applies.
     pub fn poll_update(&mut self) -> bool {
+        let now = self.update_clock();
+        if self.update_checks.as_mut().is_some_and(|c| c.tick(now)) {
+            self.check_update();
+        }
         let Some(line) = self.updates.as_mut().and_then(|u| u.take_line()) else {
             return false;
         };
         eprintln!("exact update: {line}");
         self.host.log(format!("exact update: {line}"));
         self.sync_delivery();
+        if self
+            .update_checks
+            .as_mut()
+            .is_some_and(|c| c.completed(&line))
+        {
+            self.owe_update(false);
+        }
         true
+    }
+
+    /// An interaction holds a replacement ([`Presenter::interaction_hold`]):
+    /// a composition; a button, a touch or a bar's finger down; or a gesture,
+    /// the predictive Back or a row the keys lifted. Activation waits for a
+    /// turn with none (LLP 1029.000.002 D9, LLP 1030.003 D5, LLP 1030.006 D6).
+    pub(super) fn activation_deferred(&self) -> bool {
+        self.interaction_hold().is_some()
     }
 
     /// Apply the staged bundle now with carry (`deliveryActivate`, LLP 1030
     /// D7): its assets stand in for the root's by name, its plan restarts
-    /// the app. `Ok(false)` when nothing is staged.
+    /// the app. `Ok(false)` when nothing is staged, or while an interaction
+    /// holds it, which the first [`Presenter::run_commands`] without one
+    /// applies.
     pub fn activate_update(&mut self, data: D) -> Result<bool, HostError> {
+        if self.activation_deferred() {
+            self.owe_update(false);
+            return Ok(false);
+        }
         if self.content_registration.is_some() {
             return Err(HostError::Layout(
                 "content-region trial requires session retirement before update".into(),
@@ -320,16 +473,32 @@ impl<D: DataSource> Presenter<D> {
         let Some(candidate) = updates.prepare_activation().map_err(HostError::Asset)? else {
             return Ok(false);
         };
-        let assets = Assets::selected(self.assets.root().to_path_buf(), candidate.assets.clone());
+        let pair =
+            crate::delivery::Module::prepare(&candidate.assets, &candidate.names, &self.compat)
+                .map_err(HostError::Asset)?;
         let decoded = Plan::decode(&candidate.plan).map_err(HostError::Plan)?;
+        crate::delivery::within_linked(
+            &candidate.plan,
+            pair.as_ref().map(|pair| pair.receipt.as_str()),
+            &self.compat,
+        )
+        .map_err(HostError::Unlinked)?;
+        if pair.is_some() && self.host.runner().has_pending() {
+            return Err(HostError::RequestsPending);
+        }
+        (candidate.verify_assets)().map_err(HostError::Asset)?;
+        let module = pair
+            .map(|pair| pair.read(&candidate.assets))
+            .transpose()
+            .map_err(HostError::Asset)?;
+        let assets = Assets::selected(self.assets.root().to_path_buf(), candidate.assets.clone());
+        let candidate_dir = candidate.dir.clone();
         let text = TextEngine::shared_for_assets(&decoded, &assets);
         let mut delivery = self.host.runner().delivery().with_compat(&self.compat);
         updates.status_into(&mut delivery);
         updates.staged_stream_into(&mut delivery);
         delivery.seq = candidate.seq;
         delivery.staged = false;
-        let module =
-            crate::delivery::Module::resolve(&candidate.assets).map_err(HostError::Asset)?;
         let kept = self.focus_place();
         let mut carried = self.host.carry();
         let data = self.prepare_logic(
@@ -343,6 +512,7 @@ impl<D: DataSource> Presenter<D> {
         )?;
         let (mut host, error) = exact_runner::time::launching_with(
             exact_runner::time::Launch {
+                preferences: Some(self.host.runner().viewport().preferences),
                 time: Some(self.host.runner().wall_time()),
                 place: Some(self.host.runner().place().clone()),
                 ..exact_runner::time::Launch::NONE
@@ -383,7 +553,11 @@ impl<D: DataSource> Presenter<D> {
             })
             .map_err(HostError::Asset)?;
         self.updates.as_mut().unwrap().boot_started();
+        // The reader's next drawing blesses the generation now counted.
+        self.blessed = false;
+        let faults = self.host.runner().faults().clone();
         self.host = host;
+        self.host.runner_mut().share_faults(&faults);
         // The old executor lets go of everything, then says which uploads had
         // begun to go out; the rest never left (LLP 1016.000 D10).
         self.executor.forget(|_| false);
@@ -404,7 +578,17 @@ impl<D: DataSource> Presenter<D> {
         self.images = images;
         self.restore_focus(kept);
         self.pointer = None;
+        // The reader opens sounds, videos and pages by path: it resolves
+        // them again under the generation now running (LLP 1030.006 D1).
+        crate::delivery::set_reader_root(candidate_dir.clone());
+        self.request(super::Request::Assets(
+            candidate_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
+        ));
         self.host.log("exact update: activated the staged bundle");
+        // The update is the newest candidate: one that waited does not apply.
+        self.supersede();
         self.sync_delivery();
         self.after_commit();
         Ok(true)
@@ -515,10 +699,10 @@ component App
     #[test]
     fn development_candidate_first_settle_reads_launch_facts() {
         let (mut p, facts) = dated_presenter();
-        assert!(p
-            .reload(&candidate_plan(), facts.clone())
-            .unwrap()
-            .is_none());
+        assert!(
+            p.reload(&candidate_plan(), facts.clone()).unwrap()
+                == crate::presenter::ReloadResult::Applied(None)
+        );
         assert_first_facts(&facts);
     }
 
@@ -581,6 +765,9 @@ component App
                 seq: 1,
                 plan: self.0.clone(),
                 assets: Arc::new(|_| Ok(None)),
+                names: Vec::new(),
+                dir: None,
+                verify_assets: Box::new(|| Ok(())),
             }))
         }
         fn commit_activation(&mut self, entry: Option<String>, seq: u64) -> Result<(), String> {
@@ -593,7 +780,7 @@ component App
     }
 
     #[test]
-    fn delivered_update_recomputes_paint_ranks_at_the_same_kernel_epoch() {
+    fn delivered_update_continues_the_epoch_and_recomputes_paint_ranks() {
         let source = r##"component Paint
   view
     box width=100 height=100
@@ -630,11 +817,11 @@ component App
         assert_eq!(p.brush.paint_epoch, Some(epoch));
         p.set_updates(Some(Box::new(StagedPlan(new.into()))));
         assert!(p.activate_update(()).unwrap());
-        assert_eq!(
-            p.host.kernel().epoch(),
-            epoch,
-            "replacement epochs must collide"
+        assert!(
+            p.host.kernel().epoch() > epoch,
+            "replacement epochs continue"
         );
+        assert_eq!(p.host.runner().generation(), 2);
         assert_eq!(
             pixel(&mut p),
             (255, 0, 0),
@@ -646,6 +833,18 @@ component App
         p.dirty = true;
         assert_eq!(pixel(&mut p), (255, 0, 0));
         assert_eq!(p.brush.rank_passes, passes + 1);
+        assert!(p.reload(b"invalid plan", ()).is_err());
+        assert_eq!(p.host.runner().generation(), 2);
+        for generation in 3..=4 {
+            let epoch = p.host.kernel().epoch();
+            assert_eq!(
+                p.reload(&old, ()).unwrap(),
+                crate::presenter::ReloadResult::Applied(None)
+            );
+            assert_eq!(p.host.runner().generation(), generation);
+            assert!(p.host.kernel().epoch() > epoch);
+            assert_eq!(pixel(&mut p), (0, 0, 255));
+        }
     }
 }
 

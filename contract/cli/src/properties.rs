@@ -26,6 +26,137 @@ pub fn check_properties_path(
     }
 }
 
+/// Check state path operands against the app's inferred declaration types.
+pub fn check_test_states_path(path: &Path, tests: &[TestDecl]) -> Result<(), Vec<CompileError>> {
+    use contract_syntax::{StateComparison as C, StateOperand};
+    use contract_types::{Ty, TypeError};
+    fn relations<'a>(steps: &'a [Step], out: &mut Vec<&'a Step>) {
+        for step in steps {
+            match step {
+                Step::ExpectState {
+                    value: StateOperand::State(_),
+                    ..
+                } => out.push(step),
+                Step::Perf { steps, .. } => relations(steps, out),
+                _ => {}
+            }
+        }
+    }
+    let mut steps = Vec::new();
+    for test in tests {
+        relations(&test.steps, &mut steps);
+    }
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let (file, _) = property_program(path)?;
+    let checked = contract_types::check_all(
+        &file,
+        false,
+        contract_lower::tags::style,
+        crate::strings_tables(path.parent().unwrap_or_else(|| Path::new("."))).map_err(
+            |message| {
+                vec![CompileError::from(TypeError {
+                    id: "type-test-state",
+                    message,
+                    span: contract_syntax::Span::point(1, 1),
+                })]
+            },
+        )?,
+    )
+    .map_err(|errors| {
+        errors
+            .into_iter()
+            .map(CompileError::from)
+            .collect::<Vec<_>>()
+    })?;
+    let root = &checked.expanded.root;
+    let scope = checked
+        .types
+        .component_scope(root, &checked.types.components[0]);
+    let path_type = |path: &str, span| -> Result<Ty, TypeError> {
+        let bad = || TypeError {
+            id: "type-test-state",
+            message: format!("`state {path}` is not a state path in the app"),
+            span,
+        };
+        let mut parts = path.split('.');
+        let name = parts.next().unwrap();
+        if !root.states.iter().any(|s| s.name == name)
+            && !root.derives.iter().any(|d| d.name == name)
+            && !root.resources.iter().any(|r| r.name == name)
+            && !root.mutations.iter().any(|m| m.name == name)
+        {
+            return Err(bad());
+        }
+        let mut ty = scope.lookup(name).ok_or_else(bad)?.1.clone();
+        for part in parts {
+            while let Ty::Option(inner) = ty {
+                ty = *inner;
+            }
+            ty = match &ty {
+                Ty::List(inner) if part.parse::<u32>().is_ok() => *inner.clone(),
+                Ty::List(_) if part == "length" => Ty::Number,
+                Ty::Record(name) => checked
+                    .types
+                    .shapes
+                    .field(name, part)
+                    .ok_or_else(bad)?
+                    .1
+                    .clone(),
+                _ => return Err(bad()),
+            };
+        }
+        Ok(ty)
+    };
+    let mut errors = Vec::new();
+    for step in steps {
+        let Step::ExpectState {
+            name,
+            comparison,
+            value: StateOperand::State(other),
+            span,
+        } = step
+        else {
+            unreachable!()
+        };
+        let check = || {
+            let left = path_type(name, *span)?;
+            let right = path_type(other, *span)?;
+            let valid = match comparison {
+                C::Equal | C::NotEqual => left.unify(&right).is_some(),
+                C::AtLeast | C::AtMost => left == Ty::Number && right == Ty::Number,
+                C::In => matches!(&right, Ty::List(inner) if left.unify(inner).is_some()),
+            };
+            if valid {
+                return Ok(());
+            }
+            let operator = match comparison {
+                C::Equal => "==",
+                C::NotEqual => "!=",
+                C::AtLeast => ">=",
+                C::AtMost => "<=",
+                C::In => "in",
+            };
+            Err(TypeError {
+                id: "type-test-state",
+                message: format!(
+                    "cannot compare `state {name}` ({left}) {operator} `state {other}` ({right})"
+                ),
+                span: *span,
+            })
+        };
+        if let Err(error) = check() {
+            errors.push(error.into());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Check observed suggestions against every write and caller before printing them.
 pub fn check_suggestions_path(
     path: &Path,

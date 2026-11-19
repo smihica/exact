@@ -5,8 +5,8 @@
 
 use super::role_named;
 use contract_syntax::{Attr, Component, Expr, File, Node, Span, Stmt, TemplatePart};
+use exact_forma::Design;
 use exact_kernel::{StyleCodec, StyleId};
-use exact_tamber::Design;
 use std::collections::BTreeSet;
 
 /// CSS's colour functions: an expression over a token is one of them.
@@ -83,7 +83,7 @@ pub(crate) struct Said {
     /// somewhere: any length or number token may be named (LLP 1121 D7).
     pub computed_measure: bool,
     /// Every word the literals write, a token's name or not: what D7's
-    /// retention reads (`tamber::Retention`), for this design or an edit of it.
+    /// retention reads (`forma::Retention`), for this design or an edit of it.
     pub words: BTreeSet<String>,
     /// Every word a colour keyframe writes: a token one names is folded into
     /// the keyframes, so its value is the plan's structure.
@@ -224,6 +224,7 @@ fn has_class_family(file: &File, attrs: &[Attr]) -> bool {
 /// under `parent` (as `nodes.rs` gives it: its class's rows, then its own,
 /// lengths coerced; `coerced`, its own so); an unknown class, or any
 /// animation, is no.
+#[expect(clippy::too_many_arguments)]
 fn prepared(
     file: &File,
     tag: &str,
@@ -232,6 +233,7 @@ fn prepared(
     attrs: &[Attr],
     coerced: &[Attr],
     span: Span,
+    constants: &crate::keyframes::Context<'_>,
 ) -> bool {
     let style = |name: &str| {
         file.styles
@@ -274,7 +276,7 @@ fn prepared(
         }),
         false => Ok(()),
     };
-    crate::svg::check_svg_with(tag, in_svg, parent, expanded, span, &refused).is_ok()
+    crate::svg::check_svg_with(tag, in_svg, parent, expanded, span, constants, &refused).is_ok()
 }
 
 impl Read {
@@ -290,6 +292,7 @@ impl Read {
         declared: &std::sync::Arc<super::rows::Declared>,
         typing: &super::rows::Typing,
     ) -> Read {
+        let constants = typing.constants(&file.fns);
         let mut literals: Vec<(String, Span, bool)> = Vec::new();
         let mut computed = false;
         let mut computed_measure = false;
@@ -427,7 +430,7 @@ impl Read {
                     let left = left
                         || boxed.is_err()
                         || audio.is_err()
-                        || !prepared(file, tag, in_svg, parent, a, own, *span);
+                        || !prepared(file, tag, in_svg, parent, a, own, *span, &constants);
                     // Its `font-family` and those around it: one lowering
                     // can't read (`fonts::font_use`) stops the element there,
                     // under the design a write leaves too (`rows::judge`).
@@ -750,7 +753,7 @@ impl Read {
         {
             leave(&mut uses_left, a);
             if colour_attr(&a.name) {
-                if let Some(text) = crate::keyframes::constant(&a.value, &file.fns) {
+                if let Ok(text) = constants.constant(&a.value) {
                     folded.extend(words(&text).map(str::to_string));
                     literals.push((text, a.span, true));
                 }
@@ -1024,14 +1027,14 @@ fn expressions<'t>(text: &'t str, is_token: &dyn Fn(&str) -> bool) -> Vec<&'t st
 }
 
 /// Whether `word` is a dotted identifier, a name a design's token may have
-/// (`eu.glow`, `_eu.glow`): Tamber's own name grammar (`is_name`), with a
+/// (`eu.glow`, `_eu.glow`): Forma's own name grammar (`is_name`), with a
 /// `.`. A number, a dimension (`-1.5px`) or a function (`rgb(0.5 0 0)`) is
 /// none (stage 12 B3, round 1, Astra 4; round 2, Astra 2).
 pub(crate) fn dotted_name(word: &str) -> bool {
-    word.contains('.') && exact_tamber::is_name(word)
+    word.contains('.') && exact_forma::is_name(word)
 }
 
-/// `tamber-unknown-token` or `tamber-kind` for a word inside a literal the
+/// `forma-unknown-token` or `forma-kind` for a word inside a literal the
 /// kernel refused in a row that holds a colour among other words (a shadow,
 /// a border, a gradient; LLP 1121 stage 12 B3, QUEUE's item): a dotted word
 /// naming no token of the design and no role, in a colour row's words; in a
@@ -1058,14 +1061,14 @@ pub(crate) fn literal_word(
         .filter(|w| w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
     for word in words {
         let length =
-            scale::is_base(word) || super::measure_named(word) == Some(exact_tamber::Kind::Length);
+            scale::is_base(word) || super::measure_named(word) == Some(exact_forma::Kind::Length);
         let (id, message) = match shadow {
             Some(kind) if length => (
-                "tamber-kind",
+                "forma-kind",
                 format!("`{attr}=\"{text}\"`: a shadow row's lengths are px: name a shadow token (`x: {kind} = 0 {word} 4px black`) to read `{word}`"),
             ),
             _ if dotted_name(word) && theme::bound() && !theme::names(word) && !length => (
-                "tamber-unknown-token",
+                "forma-unknown-token",
                 format!("`{attr}=\"{text}\"`: `{word}` is no token of this app's design and no role"),
             ),
             _ => continue,

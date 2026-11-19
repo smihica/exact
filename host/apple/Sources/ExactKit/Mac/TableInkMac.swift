@@ -31,10 +31,10 @@
 import AppKit
 
 /// A painted list's selected row's selection (`NodeView.drawSelection`).
-final class RowSelectionLayer: CALayer {
+package final class RowSelectionLayer: CALayer {
     weak var row: NodeView?
     var emphasized = false
-    override func action(forKey event: String) -> CAAction? { NSNull() }
+    package override func action(forKey event: String) -> CAAction? { NSNull() }
 }
 
 extension NodeView {
@@ -43,7 +43,7 @@ extension NodeView {
     /// read up the view chain, as the tint is (NodeColorMac.swift).
     var inEmphasizedRow: Bool {
         guard let presenter else { return false }
-        if let row = presenter.navigation.split.emphasizedRow, isDescendant(of: row) { return true }
+        if let row = presenter.navigation.stackSplit.emphasizedRow, isDescendant(of: row) { return true }
         guard !presenter.tables.feeds.isEmpty else { return false }
         var above = superview
         while let view = above, !(view is NSTableView) {
@@ -60,13 +60,13 @@ extension NodeView {
     /// glyph's view is made clear: whether it is hidden is CSS `visibility`'s
     /// (`applyCssVisibility`), written again with every style. Any other
     /// symbol's glyph is drawn, so one that stopped being a chevron shows.
-    func rowDisclosure(hidden: Bool) {
+    package func rowDisclosure(hidden: Bool) {
         func walk(_ view: NSView) {
             if let node = view as? NodeView, let leaf = node.symbolView {
                 let chevron = ["chevron.forward", "chevron.right"].contains(node.props["symbolName"] ?? "")
                 leaf.alphaValue = hidden && chevron ? 0 : 1
             }
-            for child in (view as? NodeView)?.container.subviews ?? view.subviews where child is NodeView { walk(child) }
+            for child in (view as? NodeView)?.structuralChildren ?? NodeView.structural(view.subviews) { walk(child) }
         }
         walk(self)
     }
@@ -85,18 +85,18 @@ extension NodeView {
     /// section's card, the list's document). It is a layer of that view,
     /// over its own box and under its rows, so a swipe row's scroll view
     /// does not clip it.
-    func drawSelection(_ mark: RowSelectionLayer, emphasized: Bool) {
+    package func drawSelection(_ mark: RowSelectionLayer, emphasized: Bool) {
         guard let holder = superview else { mark.removeFromSuperlayer(); return }
         holder.wantsLayer = true
         guard let layer = holder.layer else { return }
         if mark.superlayer !== layer {
             mark.removeFromSuperlayer()
-            let paint: [CALayer?] = (holder as? NodeView).map { [$0.shadowCaster, $0.boxFill, $0.boxGradient, $0.insetCaster, $0.imageLayer] } ?? []
+            let paint: [CALayer?] = (holder as? NodeView).map { [$0.shadowCaster, $0.boxFill, $0.boxGradient, $0.boxPattern, $0.insetCaster, $0.imageLayer] } ?? []
             let box = layer.sublayers?.last { sublayer in paint.contains { $0 === sublayer } }
             if let box { layer.insertSublayer(mark, above: box) } else { layer.insertSublayer(mark, at: 0) }
         }
         var leaf: NodeView = self
-        while let first = leaf.container.subviews.lazy.compactMap({ $0 as? NodeView }).first(where: { !$0.isHidden }) { leaf = first }
+        while let first = leaf.childNodes.first(where: { !$0.isHidden }) { leaf = first }
         let start = leaf === self ? frame.minX + number("padding_left") : holder.convert(leaf.bounds, from: leaf).minX
         let end = frame.maxX - number("padding_right"), edges = holder.bounds
         let left = min(max(start - 8, edges.minX), edges.minX + 10), right = max(min(end + 8, edges.maxX), edges.maxX - 10)
@@ -110,7 +110,7 @@ extension NodeView {
 
     /// The selection's colour, in this row's appearance and the system's
     /// accent as they are now.
-    func colorSelection(_ mark: RowSelectionLayer) {
+    package func colorSelection(_ mark: RowSelectionLayer) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let fill = (mark.emphasized ? NSColor.selectedContentBackgroundColor : .unemphasizedSelectedContentBackgroundColor).cgColor
             if mark.backgroundColor != fill { mark.backgroundColor = fill }
@@ -128,7 +128,7 @@ extension NodeView {
     /// The row this node is the root view of became, or stopped being, a
     /// selected row drawn emphasized: every paragraph in it resolves its ink
     /// again, and every symbol is drawn as a cell's image is.
-    func rowEmphasisChanged(_ emphasized: Bool) {
+    package func rowEmphasisChanged(_ emphasized: Bool) {
         func walk(_ view: NSView) {
             if let node = view as? NodeView {
                 if node.kind == "text" { node.reapplyColors() }

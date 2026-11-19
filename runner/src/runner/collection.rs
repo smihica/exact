@@ -1,196 +1,21 @@
-//! Portable viewport feedback and runner-owned geometric edge events.
+//! A list's geometric edges (`reachstart`, `reachend`): offered once a
+//! report reaches them, held under a covered route, deferred until the
+//! state they asked for settles. The list engine's half of the list seam.
 use super::*;
 use crate::compare::{equivalent, equivalent_all};
-use crate::instance::collection::{CollectionFeedback, CollectionFill, CollectionSnapshot};
+use crate::list_api::CollectionEdges;
+use std::fmt::Write as _;
 
 impl<D: DataSource> Runner<D> {
-    /// Mounted collection metadata for a host's post-commit layout/measurement.
-    pub fn collections(&self) -> Vec<CollectionSnapshot> {
-        self.tree
-            .as_ref()
-            .map(Tree::collections)
-            .unwrap_or_default()
-    }
-    /// Each mounted list's view, data generation and axis ([`Tree::collection_data`]).
-    pub fn collection_data(&self) -> Vec<(ViewId, u64, bool)> {
-        self.tree
-            .as_ref()
-            .map(Tree::collection_data)
-            .unwrap_or_default()
-    }
-    /// One list's entry of [`Runner::collections`].
-    pub fn collection(&self, view: ViewId) -> Option<CollectionSnapshot> {
-        self.tree.as_ref().and_then(|tree| tree.collection(view))
-    }
-    /// [`Tree::collection_mounted`].
-    pub fn collection_mounted(&self, view: ViewId, out: &mut Vec<(ViewId, u64)>) {
-        out.clear();
-        if let Some(tree) = &self.tree {
-            tree.collection_mounted(view, out);
-        }
-    }
-    /// [`Runner::collections`] with only each list's first mounted row
-    /// ([`Tree::collections_shallow`]).
-    pub fn collections_shallow(&self) -> Vec<CollectionSnapshot> {
-        self.tree
-            .as_ref()
-            .map(Tree::collections_shallow)
-            .unwrap_or_default()
-    }
-    /// Bound borrowed traversal and count all collections/rows before copying
-    /// numeric host snapshots. No keys, records or action frames are captured.
-    pub fn collections_bounded(
-        &self,
-        max_collections: usize,
-        max_rows: usize,
-        max_traversal: usize,
-        max_json_bytes: usize,
-    ) -> Result<Vec<CollectionSnapshot>, &'static str> {
-        match &self.tree {
-            Some(tree) => {
-                tree.collections_bounded(max_collections, max_rows, max_traversal, max_json_bytes)
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-    /// Compact numeric metadata for existing JSON batch envelopes, without
-    /// serde: `[]` where the artifact doesn't link lists (LLP 1047.000 §9).
-    pub fn collections_json(&self) -> String {
-        match (self.links.lists, &self.tree) {
-            (Some(lists), Some(tree)) => (lists.collections_json)(tree),
-            _ => "[]".to_string(),
-        }
-    }
-    /// Every outer list's kept inner positions (LLP 1070 §4.2), for `state`.
-    pub fn kept_positions_json(&self) -> String {
-        match (self.links.lists, &self.tree) {
-            (Some(lists), Some(tree)) => (lists.kept_json)(tree),
-            _ => "[]".to_string(),
-        }
-    }
-    /// Decode the common numeric LE protocol before touching state.
-    pub fn collection_feedback_bytes(&mut self, bytes: &[u8]) -> Result<Advanced, RunnerError> {
-        let (feedback, fill) = CollectionFeedback::decode_with_fill(bytes).map_err(|_| {
-            RunnerError::Instance(InstanceError::Collection(
-                "malformed collection feedback".into(),
-            ))
-        })?;
-        self.collection_feedback_filled(feedback, fill)
-    }
-    /// [`Runner::collection_feedback_filled`] with no limit and no motion.
-    pub fn collection_feedback(
+    /// The edges a report on list `view` reached, offered to its handlers
+    /// once each, start before end ([`Runner::collection_feedback_filled`]).
+    pub(super) fn collection_edges_linked(
         &mut self,
-        feedback: CollectionFeedback,
-    ) -> Result<Advanced, RunnerError> {
-        self.collection_feedback_filled(feedback, CollectionFill::default())
-    }
-    /// Update the addressed window and release transferred focus/interaction pins
-    /// in other collections in the same commit, then dispatch each edge at most
-    /// once. Start precedes end; any action state change defers end until settled.
-    /// Pre-commit errors return Err; an edge refusal accompanies the
-    /// committed receipts in Advanced.error. Hosts must consume both. No timers
-    /// advance. Without an edge handler, no resources or keys are evaluated.
-    pub fn collection_feedback_filled(
-        &mut self,
-        feedback: CollectionFeedback,
-        fill: CollectionFill,
-    ) -> Result<Advanced, RunnerError> {
-        if self.poisoned {
-            return Err(RunnerError::Poisoned);
-        }
-        if feedback.validate().is_err()
-            || !fill.velocity.is_finite()
-            || fill
-                .view_offset
-                .is_some_and(|n| !n.is_finite() || n.abs() > f32::MAX as f64)
-        {
-            return Err(RunnerError::Instance(InstanceError::Collection(
-                "invalid collection feedback".into(),
-            )));
-        }
-        let view = feedback.view;
-        let mut tree = self.tree.take().expect("booted");
-        let mut ids = std::mem::take(&mut self.ids);
-        let result = {
-            let cell_margins = |view| super::collection::cell_margins(&self.kernel, view);
-            let scroll_margin = |view| scroll_margin(&self.kernel, view);
-            let scroll_padding = |view| scroll_padding(&self.kernel, view);
-            let mut update = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-            update.fonts = Some(self.fonts.clone());
-            update.reuse = self.reuse;
-            update.scroll_padding = Some(&scroll_padding);
-            update.scroll_margin = Some(&scroll_margin);
-            if self.kernel.arena().env().cell_spaces {
-                update.cell_margins = Some(&cell_margins);
-            }
-            tree.update_collection(&mut update, feedback, fill)
-                .map(|changed| {
-                    (
-                        changed,
-                        update.ops,
-                        update.surfaces,
-                        update.notes,
-                        update.renewed,
-                        update.shown,
-                        update.refused,
-                    )
-                })
-        };
-        self.tree = Some(tree);
-        self.ids = ids;
-        let ((changed, edge), ops, surfaces) = match result {
-            Ok((changed, ops, surfaces, notes, renewed, shown, refused)) => {
-                self.notes = notes;
-                self.renewed = renewed;
-                self.shown.extend(shown);
-                for (list, why) in refused {
-                    self.record_refusal(&list, why);
-                }
-                (changed, ops, surfaces)
-            }
-            Err(error) => {
-                // This category is emitted only by pre-mutation geometry
-                // validation. A bad host report must leave the runner usable.
-                if !matches!(error, InstanceError::InvalidCollectionFeedback) {
-                    self.poison();
-                }
-                return Err(error.into());
-            }
-        };
-        let mut result = Advanced {
-            receipts: Vec::new(),
-            now_ms: self.now_ms,
-            error: None,
-            stopped_on_request: false,
-            needs_apply: false,
-        };
-        // A row that showed with animations waiting on it is a commit of its
-        // own when the report changed nothing else (LLP 1055 D13).
-        let revealed = self
-            .shown
-            .revealed
-            .iter()
-            .any(|v| self.kernel.is_awaiting(*v));
-        if changed || !ops.is_empty() || revealed {
-            match self.apply(ops) {
-                Ok(receipt) => {
-                    self.publish_surfaces(surfaces);
-                    result.receipts.push(Timed {
-                        at_ms: self.now_ms,
-                        receipt,
-                    });
-                }
-                Err(error) => {
-                    self.poison();
-                    return Err(error);
-                }
-            }
-        }
-        // @ref LLP 1010 — a list on a route its stack keeps covered (a deep
-        // link's root, a feed under a thread) is hidden and inert: its edge
-        // waits, armed, for the route to show, so nothing is asked for a
-        // screen the reader has not seen (`release_held_edges`).
-        let edge = match edge {
+        view: ViewId,
+        edges: CollectionEdges,
+        result: &mut Advanced,
+    ) {
+        let edge = match Some(edges) {
             Some(edges) if self.inactive(view) => {
                 let tree = self.tree.as_mut().expect("booted");
                 tree.rearm_collection_edge(view, edges.first);
@@ -267,57 +92,55 @@ impl<D: DataSource> Runner<D> {
                 }
             }
         }
-        result.now_ms = self.now_ms;
-        Ok(result)
     }
-    /// List `view`'s port is at `offset` (from its first row, as a report's):
-    /// the rows mounted out of the port that now show stop holding what
-    /// waits for them (LLP 1055 D13), in a commit of their own. No report:
-    /// the window and its rows stay the last report's, for a host that
-    /// waits for more travel before its next one.
-    pub fn collection_shown(&mut self, view: ViewId, offset: f64) -> Result<Advanced, RunnerError> {
-        if self.poisoned {
-            return Err(RunnerError::Poisoned);
-        }
-        let mut result = Advanced {
-            receipts: Vec::new(),
-            now_ms: self.now_ms,
-            error: None,
-            stopped_on_request: false,
-            needs_apply: false,
+
+    /// Runner-only collection events use the same action transaction and journal
+    /// as host events. They have no payload; their bound arguments are evaluated
+    /// in the list's scope when the edge dispatches (LLP 1054.000.006).
+    pub(super) fn dispatch_edge(
+        &mut self,
+        view: ViewId,
+        kind: EventKind,
+    ) -> Result<(CommitReceipt, bool), RunnerError> {
+        let name = match kind {
+            EventKind::Reachstart => "reachstart",
+            EventKind::Reachend => "reachend",
+            _ => unreachable!("collection edge"),
         };
-        if !offset.is_finite() {
-            return Ok(result);
-        }
-        let mut tree = self.tree.take().expect("booted");
-        let mut ids = std::mem::take(&mut self.ids);
-        let shown = {
-            let mut update = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-            update.fonts = Some(self.fonts.clone());
-            tree.show_collection(&mut update, view, offset);
-            update.shown
-        };
-        self.tree = Some(tree);
-        self.ids = ids;
-        self.shown.extend(shown);
-        if (self.shown.revealed.iter()).any(|v| self.kernel.is_awaiting(*v)) {
-            match self.apply(Vec::new()) {
-                Ok(receipt) => result.receipts.push(Timed {
-                    at_ms: self.now_ms,
-                    receipt,
-                }),
-                Err(error) => {
-                    self.poison();
-                    return Err(error);
-                }
+        let mut what = format!("{name} view {view}");
+        let was_poisoned = self.poisoned;
+        let mut changed = false;
+        let result = (|| {
+            let (node, frames) = self.find(view).ok_or(RunnerError::UnknownView(view))?;
+            let handler = self
+                .plan
+                .node(node)
+                .handlers
+                .iter()
+                .map(|h| self.plan.handler(h))
+                .find(|h| h.event == kind)
+                .cloned()
+                .ok_or(RunnerError::NoHandler { view, event: name })?;
+            let action = handler.action;
+            let _ = write!(what, " ({})", self.plan.str(self.plan.action(action).name));
+            let mut args = Vec::new();
+            for (k, a) in handler.args.iter().enumerate() {
+                let code = self.plan.arg(a).expr;
+                args.push(self.eval_argument(code, &frames, (view, node, name, k))?);
             }
-        }
-        Ok(result)
+            let before = EdgeState::capture(self, &frames);
+            let receipt = self.run_action(action, args, &frames)?;
+            changed = before.changed(self);
+            Ok(receipt)
+        })();
+        self.log_outcome(&what, &result, was_poisoned);
+        result.map(|receipt| (receipt, changed))
     }
+
     /// After an ordinary commit: a list whose edge waited under a covered
     /// route asks its host for a report once the route shows, which offers
     /// the edge it reaches then.
-    pub(super) fn release_held_edges(&mut self) -> Result<(), RunnerError> {
+    pub(super) fn release_held_edges_linked(&mut self) -> Result<(), RunnerError> {
         for view in std::mem::take(&mut self.held_edges) {
             if !self.tree.as_ref().expect("booted").has_collection(view) {
                 continue;
@@ -336,7 +159,7 @@ impl<D: DataSource> Runner<D> {
     /// Called once per ordinary commit, after settlement. Follow targets across
     /// continuation tickets, discard unmounted owners, and wake each ready edge
     /// once. Feedback-only commits never replenish this work.
-    pub(super) fn wake_deferred_edges(&mut self) -> Result<(), RunnerError> {
+    pub(super) fn wake_deferred_edges_linked(&mut self) -> Result<(), RunnerError> {
         let tree = self.tree.as_mut().expect("booted");
         for (view, targets) in std::mem::take(&mut self.deferred_edges) {
             if !tree.has_collection(view) {
@@ -372,7 +195,7 @@ impl EdgeState {
             rows: frames
                 .iter()
                 .filter_map(|f| f.row.as_ref())
-                .map(|row| (row.clone(), row.borrow().clone()))
+                .map(|row| (row.clone(), row.borrow().slots.clone()))
                 .collect(),
             pending: r.pending.iter().map(|p| (p.target, p.ticket)).collect(),
             ticket: r.next_ticket,
@@ -403,7 +226,7 @@ impl EdgeState {
                     _ => true,
                 })
             || self.rows.iter().any(|(row, old)| {
-                let now = row.borrow();
+                let now = &row.borrow().slots;
                 old.len() != now.len()
                     || old
                         .iter()
@@ -411,88 +234,4 @@ impl EdgeState {
                         .any(|((ak, av), (bk, bv))| ak != bk || !equivalent(av, bv))
             })
     }
-}
-
-impl<D: DataSource> Runner<D> {
-    /// After a batch applies (LLP 1055 D13): the views it renewed, taken.
-    pub(super) fn settle_shown(
-        &mut self,
-        shown: crate::instance::collection::shown::RowsShown,
-        receipt: &mut exact_kernel::CommitReceipt,
-    ) -> Vec<ViewId> {
-        // Rows that showed stop holding their animations, and rows mounted
-        // out of their port start to, before a host hears the commit.
-        let renewed = std::mem::take(&mut self.renewed);
-        for view in shown.revealed {
-            // A row bound again where it shows is heard as new (`renewed`),
-            // which starts it: only a row that stayed is named revealed.
-            if self.kernel.reveal(view) && !renewed.contains(&view) {
-                receipt.revealed.extend(self.kernel.arena().key_of(view));
-            }
-        }
-        for view in shown.awaiting {
-            self.kernel.await_view(view);
-        }
-        renewed
-    }
-}
-
-/// `view`'s `scroll-padding`, top, right, bottom, left, in points, as its
-/// committed style resolves it now ([`Update::scroll_padding`]): `env()` and a
-/// computed value resolved.
-pub(super) fn scroll_padding(kernel: &exact_kernel::Kernel, view: ViewId) -> [f64; 4] {
-    let Some(node) = kernel.node(view) else {
-        return [0.0; 4];
-    };
-    let env = &*kernel.arena().env_of(node.key.index);
-    let r = &node.style.rare;
-    let sides = [
-        r.scroll_padding_top.clone(),
-        r.scroll_padding_right.clone(),
-        r.scroll_padding_bottom.clone(),
-        r.scroll_padding_left.clone(),
-    ];
-    std::array::from_fn(|i| match sides[i].resolve(env) {
-        exact_kernel::Dimension::Points(n) => f64::from(on_grid(env, n, CELLS[i])),
-        _ => 0.0,
-    })
-}
-
-/// Each side's cell, top, right, bottom, left.
-const CELLS: [f32; 4] = {
-    use exact_kernel::style::cells::{COLUMN, ROW};
-    [ROW, COLUMN, ROW, COLUMN]
-};
-
-/// A scroll length as a terminal lays its spaces out: whole cells under its
-/// space rule (LLP 1121 stage 11 (c)), so a keyed jump stays on the rows.
-fn on_grid(env: &exact_kernel::Env, px: f32, cell: f32) -> f32 {
-    match env.cell_spaces {
-        true => exact_kernel::style::cells::space(px, cell),
-        false => px,
-    }
-}
-
-/// A row root's margins as the kernel laid them out (whole cells under a
-/// terminal's space rule), for a keyed list jump.
-pub(super) fn cell_margins(kernel: &exact_kernel::Kernel, view: ViewId) -> [f64; 4] {
-    kernel
-        .laid_margins(view)
-        .map_or([0.0; 4], |m| m.map(f64::from))
-}
-
-/// The expanded target box used by a keyed list jump.
-pub(super) fn scroll_margin(kernel: &exact_kernel::Kernel, view: ViewId) -> [f64; 4] {
-    let Some(node) = kernel.node(view) else {
-        return [0.0; 4];
-    };
-    let env = kernel.arena().env_of(node.key.index);
-    let (env, r) = (&*env, &node.style.rare);
-    let sides = [
-        r.scroll_margin_top.clone(),
-        r.scroll_margin_right.clone(),
-        r.scroll_margin_bottom.clone(),
-        r.scroll_margin_left.clone(),
-    ];
-    std::array::from_fn(|i| f64::from(on_grid(env, sides[i].at_basis(env, 0.0), CELLS[i])))
 }

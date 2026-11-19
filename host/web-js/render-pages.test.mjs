@@ -5,6 +5,7 @@ import { createServer } from 'node:net';
 import { webCompiler } from './module.mjs';
 import { buildTreeFile } from '../web/serve.mjs';
 import { generationOf } from '../web/generations.mjs';
+import { builtFile } from './content-names.mjs';
 
 const root = resolve(import.meta.dir, '../..');
 const contract = (call, extra = '') => `routes nav
@@ -132,8 +133,8 @@ export function answer(name: string, args: any[]): any {
       expect(buildTreeFile(dist, '/deck/100%25/', 'text/html')?.path).toBe(resolve(dist, 'deck/100%/index.html'));
       expect(buildTreeFile(dist, '/deck/100%25/')?.path).toBe(resolve(dist, 'deck/100%/index.html'));
       // A path below a file names no file and is routed as any other path naming nothing.
-      expect(existsSync(resolve(dist, 'app.js'))).toBe(true);
-      const below = await get('/app.js/x'), nothing = await get('/nothing/x');
+      expect(existsSync(resolve(dist, builtFile(dist, 'app.js')))).toBe(true);
+      const below = await get(`/${builtFile(dist, 'app.js')}/x`), nothing = await get('/nothing/x');
       expect(below.status).toBe(nothing.status);
       // The crawler files the build wrote are served as files.
       const robots = await get('/robots.txt');
@@ -219,6 +220,37 @@ component App
   });
 }, 120000);
 
+// The build makes no page whose render drew randomness, a listed page's or the not-found page's included, and names each
+// such route once every page has rendered (LLP 1048.000 D7). The runtime's own facts, which an inline time asks for, draw
+// nothing.
+test('the build makes no page whose render drew randomness, and names each such route', async () => {
+  await builtPages(`routes nav
+  home "/" render=build
+    product "/product/:id" render=build pages=productPages()
+  notfound render=build
+
+component App
+  resource note = note(top(nav).name) as shape string
+  view
+    main
+      text note
+      text "Updated "
+        time datetime=1792209600000 format="date-medium"
+`, `export const grants = '';
+export function answer(name: string, args: any[]): any {
+  if (name === 'productPages') return ['a'];
+  if (args[0] !== 'home') crypto.getRandomValues(new Uint8Array(1));
+  return 'a note';
+}
+`, ({ status, output, dist }) => {
+    const refusal = route => `route \`${route}\` is render=build, but its render drew randomness, and a page made at build would give every reader the same random values (LLP 1069.005 D2). Declare the route render=request, rendered for each request, or render=client, rendered in the browser`;
+    expect([status, output.split('\n').filter(line => line.includes('drew randomness'))], output)
+      .toEqual([1, [`/product/a: ${refusal('product')}`, `/404: ${refusal('notfound')}`]]);
+    expect([readFileSync(resolve(dist, 'index.html'), 'utf8').includes('a note'), existsSync(resolve(dist, 'product/a/index.html')), existsSync(resolve(dist, '404.html'))])
+      .toEqual([true, false, false]);
+  });
+}, 120000);
+
 const failures = [
   ["throw new Error('catalog unavailable')", 'catalog unavailable'],
   ["return Promise.reject(new Error('catalog rejected'))", 'catalog rejected'],
@@ -237,6 +269,40 @@ export function answer(name: string): any {
     expect(status, output).not.toBe(0);
     expect(output).toContain("route `product`'s pages (productPages)");
     expect(output).toContain(message);
+  });
+}, 120000);
+
+// A listed value is its route's page only where the router gives the location back to that route (LLP 1048.000 D2). The
+// build names each value a route declared earlier takes, and each the pattern can't hold, for every route, renders the
+// rest and then fails.
+test('a build names each listed value at a location a route declared earlier answers, and fails', async () => {
+  await builtPages(`routes nav
+  home "/" render=client
+    special "/product/special" render=request
+    product "/product/:id" render=build pages=productPages()
+    fresh "/story/new" render=request
+    story "/story/:id" render=build pages=storyPages()
+
+component App
+  view
+    main
+      text "a page"
+`, `export const grants = '';
+export function answer(name: string): any {
+  if (name === 'productPages') return ['7', 'special', ''];
+  if (name === 'storyPages') return ['new', '1'];
+  return '';
+}
+`, ({ status, output, dist }) => {
+    const refusal = (route, source, value, location, other) => `route \`${route}\`'s pages (${source}): the value "${value}" is at ${location}, which route \`${other}\`, declared before \`${route}\`, answers, so the page there is \`${other}\`'s, not \`${route}\`'s. Leave the value out of the list, or give one of the two routes another path`;
+    expect([status, output.split('\n').filter(line => line.includes('declared before'))], output).toEqual([1, [
+      refusal('product', 'productPages', 'special', '/product/special', 'special'),
+      refusal('story', 'storyPages', 'new', '/story/new', 'fresh'),
+    ]]);
+    // A value the pattern can't hold is reported in the same run
+    expect(output).toContain("route `product`'s pages (productPages): the value \"\" can't be a path segment: a path parameter cannot be empty, `.` or `..`. Leave the value out of the list");
+    expect([existsSync(resolve(dist, 'product/7/index.html')), existsSync(resolve(dist, 'story/1/index.html')), existsSync(resolve(dist, 'product/special'))])
+      .toEqual([true, true, false]);
   });
 }, 120000);
 

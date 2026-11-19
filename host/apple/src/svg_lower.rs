@@ -64,6 +64,13 @@ fn forward(frames: &[Keyframe], default: &Easing, property: Property, underlying
     if pts.last().is_none_or(|p| p.0 < 1.0) {
         pts.push((1.0, None, underlying));
     }
+    if property == Property::Rotate {
+        for (_, _, v) in &mut pts {
+            *v = exact_motion::rotation::presented(exact_motion::rotation::with_axis(
+                *v, underlying,
+            ));
+        }
+    }
     let mut t = Track {
         times: vec![pts[0].0],
         values: vec![pts[0].2],
@@ -86,7 +93,13 @@ fn forward(frames: &[Keyframe], default: &Easing, property: Property, underlying
                 begin(&mut t, a.0, a.2);
                 push(&mut t, b.0, b.2, c);
             }
-            None => stepped_keys(&mut t, a.0, b.0, easing, colour, |p| a.2.lerp(b.2, p)),
+            None => stepped_keys(&mut t, a.0, b.0, easing, colour, |p| {
+                if property == Property::Rotate {
+                    exact_motion::rotation::interpolate(a.2, b.2, p)
+                } else {
+                    a.2.lerp(b.2, p)
+                }
+            }),
         }
     }
     t
@@ -432,18 +445,20 @@ fn track_json(
 /// in the track, its underlying one included, has one alpha (then Core
 /// Animation's unpremultiplied interpolation is CSS's premultiplied one).
 ///
-/// A box's transform (`box_motion`, iOS) lowers when it turns about its
+/// A box's transform (`box_motion`) lowers when it turns about its
 /// centre, no layout transition moves it, and nothing in it takes input:
-/// Core Animation moves only the presentation, and UIKit hit-tests the
+/// Core Animation moves only the presentation, and the view hit-tests the
 /// model, where a browser hit-tests what it shows. Its background colour
 /// lowers when the layer paints it: no border and no `background-image`
 /// (else the view draws its box), every colour of one alpha. An SVG
-/// element's transform is its scene's, which samples it.
+/// element's transform lowers onto its outer layer when [`svg_turns`]
+/// permits it; otherwise its scene samples it.
 pub(crate) fn eligibility(
     kernel: &Kernel,
     engine: &mut Engine,
     sync: &MotionSync,
     box_motion: bool,
+    live_filters: bool,
     interactive: &dyn Fn(exact_kernel::ViewId) -> bool,
 ) {
     for (node, animations) in &sync.animations {
@@ -500,14 +515,28 @@ pub(crate) fn eligibility(
             .0
             .iter()
             .any(|a| a.duration <= 0.0 || a.iterations <= 0.0);
+        // A circle whose radius is nonpositive at every viewport size has
+        // no layer to animate. Eligibility runs before layout, so a positive
+        // percentage must not be resolved against an unlaid-out viewport.
+        let empty_circle = n.node_type == NodeType::SvgCircle
+            && props.contains(&Property::R)
+            && match n.style.r {
+                exact_kernel::Dimension::Points(r)
+                | exact_kernel::Dimension::Percent(r)
+                | exact_kernel::Dimension::Viewport(_, r) => r <= 0.0,
+                exact_kernel::Dimension::Calc(percent, points) => percent <= 0.0 && points <= 0.0,
+                _ => false,
+            };
         let sampled = if paired
+            || (props.contains(&Property::Rotate) && exact_kernel::motion::rotation_needs_sampling(n.style))
             || instant
+            || empty_circle
             // An inline run has no layer to play a spec on: its paragraph
             // paints the engine's sample.
             || n.is_inline_run()
             || (percent && !(boxed && !svg))
             || engine.timeline_bound(*node)
-            || under_box_filter(kernel, &n)
+            || under_box_filter(kernel, engine, &n)
             // A glass group ignores the opacity Core Animation plays between
             // it and its glass; the host isolates on what it is told.
             || (props.contains(&Property::Opacity) && in_glass_group(kernel, &n))
@@ -516,7 +545,7 @@ pub(crate) fn eligibility(
             || props.iter().any(|p| crate::looks::paints_over(&n, *p))
             // Drawn into an island's pixels, which Core Animation does not
             // animate (except a live filter picture on iOS).
-            || (svg && in_picture(kernel, &n, box_motion))
+            || (svg && in_picture(kernel, engine, &n, live_filters))
             || (boxed && svg && !svg_turns(&n, &props))
             || (moves && !circle_moves(&n, &props))
         {
@@ -602,8 +631,8 @@ pub(crate) fn hand_over_paths(kernel: &Kernel, engine: &mut Engine, live: bool) 
             && !served(&s.stroke)
             && s.vector_effect != exact_kernel::VectorEffect::NonScalingStroke
             && !marked(kernel, &n)
-            && !in_picture(kernel, &n, live)
-            && !under_box_filter(kernel, &n);
+            && !in_picture(kernel, engine, &n, live)
+            && !under_box_filter(kernel, engine, &n);
         let same = engine.path_ends(node).is_some_and(|(from, to)| {
             let (a, b) = (
                 exact_kernel::svg::parse_d(&from.to_d()),
@@ -651,7 +680,7 @@ const BOX_PLAYED: [Property; 5] = [
     Property::Rotate,
 ];
 
-/// LLP 1055.001 §3 — on iOS each running opacity transition of a box, and
+/// LLP 1055.001 §3 — each running opacity transition of a box, and
 /// each eligible transform or background-colour one, goes to Core Animation
 /// ([`Engine::play_transition`]) as LLP 1055.001 lowers a box's keyframes:
 /// the engine presents the target, the box's specs carry the transition
@@ -721,7 +750,7 @@ fn playable(
         || n.node_type == NodeType::Svg
         || skip(n.id)
         || crate::looks::paints_over(&n, p)
-        || under_box_filter(kernel, &n)
+        || under_box_filter(kernel, engine, &n)
         || engine
             .animation_plays(key)
             .iter()
@@ -733,6 +762,10 @@ fn playable(
         Property::Opacity => !in_glass_group(kernel, &n),
         Property::Translate | Property::Scale | Property::Rotate => {
             box_eligible(kernel, &n, &[p], interactive)
+                && (p != Property::Rotate
+                    || engine
+                        .transition_ends(key, p)
+                        .is_some_and(|t| exact_motion::rotation::planar(t.from, t.to)))
         }
         Property::BackgroundColor => {
             layer_paints_background(&n)
@@ -746,13 +779,22 @@ fn playable(
 }
 
 /// Whether the background colour a box's layer would paint is the box's
-/// fill as UIKit shows it (`BoxLayerIOS.applyBoxLayer`'s `bg`): a fixed or
+/// fill as the presenter shows it (`BoxLayerIOS` and `BoxLayerMac`): a fixed or
 /// light-dark colour (a platform or role colour may draw as vibrancy, a wide
 /// one in its own space), over the border box, with one circular radius, a
 /// round or continuous corner, no material, no layout transition that moves
-/// it to a surface, and shown. Anything UIKit rasterizes stays sampled.
+/// it to a surface, and shown. Anything the view rasterizes stays sampled.
 fn background_on_layer(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
     use exact_kernel::{ColorValue, Dimension};
+    // BoxLayerMac.layerBoxEligible excludes backgrounds painted into content.
+    if cfg!(target_os = "macos")
+        && matches!(
+            n.node_type,
+            NodeType::Text | NodeType::Canvas | NodeType::WebView
+        )
+    {
+        return false;
+    }
     let s = n.style;
     let radii: Vec<Option<f32>> = [
         s.border_radius_top_left.clone(),
@@ -773,6 +815,11 @@ fn background_on_layer(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
         .copied()
         .filter(|r| *r > 0.0)
         .collect();
+    // AppKit can put a rounded fill on boxFill or draw it with an image;
+    // backgroundColor on the backing layer does not reach those paints.
+    if cfg!(target_os = "macos") && !set.is_empty() {
+        return false;
+    }
     let one_radius = radii.iter().all(Option::is_some)
         && set.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01)
         && set
@@ -863,13 +910,23 @@ pub(crate) fn transition_specs(
                 (*duration, track)
             }
         };
+        if p == Property::Rotate {
+            for v in &mut track.values {
+                *v = exact_motion::rotation::presented(*v);
+            }
+        }
+        let from = if p == Property::Rotate {
+            exact_motion::rotation::presented(t.from)
+        } else {
+            t.from
+        };
         // Backwards fill holds the uneased value through a transition's delay.
         // Keep the eased start just inside the active interval, as at a jump.
-        if track.values[0] != t.from && track.times.len() > 1 {
+        if track.values[0] != from && track.times.len() > 1 {
             track.times[0] = HAIR * track.times[1];
             track.values[0] = track.values[0].lerp(track.values[1], HAIR);
             track.times.insert(0, 0.0);
-            track.values.insert(0, t.from);
+            track.values.insert(0, from);
             track.curves.insert(0, LINEAR);
         }
         let parts: &[(usize, &str)] = match p {
@@ -945,7 +1002,7 @@ fn marked(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
 }
 
 /// Whether an SVG element's `translate`, `rotate` and `scale` animations
-/// play on its transform pair's outer layer (iOS; LLP 1055.001 as a box's):
+/// play on its transform pair's outer layer (LLP 1055.001 as a box's):
 /// an element, not the `svg` (a box), with nothing drawn for one scale: no
 /// non-scaling stroke, filter or mask.
 fn svg_turns(n: &exact_kernel::NodeRef<'_>, props: &[Property]) -> bool {
@@ -976,6 +1033,7 @@ fn circle_moves(n: &exact_kernel::NodeRef<'_>, props: &[Property]) -> bool {
         && exact_kernel::svg::transform::is_identity(s.transform.matrix())
         && s.vector_effect != exact_kernel::VectorEffect::NonScalingStroke
         && s.rare.clip_path.url().is_none()
+        && !s.rare.clip_path.has_path()
         && s.rare.svg_mask.url().is_none()
         && s.filter.is_none()
         && !served(&s.fill)
@@ -996,19 +1054,16 @@ fn in_glass_group(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
     false
 }
 
-/// Every lowered animation that Core Animation can no longer play as CSS
-/// does because of an ancestor is switched to sampling, not only the ones a
-/// commit touched ([`eligibility`]): an opacity animation in a glass group
-/// (LLP 1053.000.000 D4), anything under a filtered box, and an SVG element
-/// drawn into a picture (`live` as for [`in_picture`]). An ancestor that
-/// gains a group or a filter touches none of its descendants. Returns the
-/// views whose Core Animation specs must be withdrawn. A node that leaves
-/// the group or the filter stays sampled: its pixels are right, at a little
-/// more work.
+/// Recheck running animations even when their own rows did not change:
+/// ancestors can gain filters or glass groups (LLP 1053.000.000 D4), and
+/// boxes can gain interactive descendants or a different paint destination.
+/// Return the views whose Core Animation specs must be withdrawn. They stay
+/// sampled until eligibility is checked again for a changed animation row.
 pub(crate) fn resample(
     kernel: &Kernel,
     engine: &mut Engine,
     live: bool,
+    interactive: &dyn Fn(exact_kernel::ViewId) -> bool,
 ) -> Vec<exact_kernel::ViewId> {
     let lowered: Vec<u64> = engine
         .animated_nodes()
@@ -1020,17 +1075,15 @@ pub(crate) fn resample(
             continue;
         };
         let svg = n.node_type.is_svg_element() || n.node_type == NodeType::Svg;
-        let opacity = || {
-            engine.animation_plays(node).iter().any(|play| {
-                play.animation
-                    .keyframes
-                    .properties()
-                    .contains(&Property::Opacity)
-            })
-        };
-        if under_box_filter(kernel, &n)
-            || (svg && in_picture(kernel, &n, live))
-            || (opacity() && in_glass_group(kernel, &n))
+        let props: Vec<Property> = engine
+            .animation_plays(node)
+            .iter()
+            .flat_map(|play| play.animation.keyframes.properties())
+            .collect();
+        if under_box_filter(kernel, engine, &n)
+            || (svg && in_picture(kernel, engine, &n, live))
+            || (props.contains(&Property::Opacity) && in_glass_group(kernel, &n))
+            || (!svg && !box_eligible(kernel, &n, &props, interactive))
         {
             engine.set_node_sampled(node, true);
             switched.push(n.id);
@@ -1040,11 +1093,14 @@ pub(crate) fn resample(
 }
 
 /// Whether a node is drawn into a filtered box's picture (CSS `filter` on
-/// a box, `BoxFilter` on Apple): it or a box above it has a filter, so its
-/// animations are sampled and each frame redraws the picture.
-fn under_box_filter(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
-    let filtered =
-        |a: &exact_kernel::NodeRef<'_>| !a.node_type.is_svg_element() && !a.style.filter.is_none();
+/// a box, `BoxFilter` on Apple): it or a box above it has a filter, or a
+/// filter transition running (LLP 1003.002 D8: `blur()` → `none` shows the
+/// picture until it ends), so its animations are sampled and each frame
+/// redraws the picture.
+fn under_box_filter(kernel: &Kernel, engine: &Engine, n: &exact_kernel::NodeRef<'_>) -> bool {
+    let filtered = |a: &exact_kernel::NodeRef<'_>| {
+        !a.node_type.is_svg_element() && (!a.style.filter.is_none() || filter_moves(engine, a))
+    };
     if filtered(n) {
         return true;
     }
@@ -1058,6 +1114,11 @@ fn under_box_filter(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
     false
 }
 
+/// Whether `a`'s `filter` transition is running (LLP 1003.002 D8).
+fn filter_moves(engine: &Engine, a: &exact_kernel::NodeRef<'_>) -> bool {
+    engine.is_active(exact_kernel::motion::motion_node(a.key), Property::Filter)
+}
+
 /// Whether an element is drawn only into pixels, where a layer's own
 /// animation would not show: under a filtered or masked element (an
 /// island), or inside a definition (a mask's, pattern's, marker's or clip
@@ -1067,8 +1128,11 @@ fn under_box_filter(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>) -> bool {
 /// is an exception on iOS (`live`): its picture follows its content on the
 /// GPU (`SvgFilterLive`), where Core Animation renders the content with its
 /// animations each frame, so what is inside it lowers as anywhere else.
-fn in_picture(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>, live: bool) -> bool {
+fn in_picture(kernel: &Kernel, engine: &Engine, n: &exact_kernel::NodeRef<'_>, live: bool) -> bool {
     use exact_kernel::svg::filter::FilterFn;
+    if crate::link::families::in_blended_scene(kernel, n) {
+        return true;
+    }
     let followed = |f: &exact_kernel::svg::filter::FilterList| {
         live && !f.0.iter().any(|x| matches!(x, FilterFn::Url(_)))
     };
@@ -1084,7 +1148,10 @@ fn in_picture(kernel: &Kernel, n: &exact_kernel::NodeRef<'_>, live: bool) -> boo
             | NodeType::SvgSymbol => return true,
             _ => {}
         }
+        // A moving filter is CSS functions (LLP 1003.002 D2), whatever its
+        // row says now.
         if (!a.style.filter.is_none() && !followed(&a.style.filter))
+            || (!live && filter_moves(engine, &a))
             || a.style.rare.svg_mask.url().is_some()
         {
             return true;
@@ -1106,8 +1173,13 @@ fn box_eligible(
     let turns = props
         .iter()
         .any(|p| matches!(p, Property::Translate | Property::Scale | Property::Rotate));
+    // AppKit's backdrop filter region follows the model transform (Backdrop.swift).
+    if turns && cfg!(target_os = "macos") && !s.backdrop_filter.is_none() {
+        return false;
+    }
     if turns
-        && (n.layout_position() == exact_kernel::PositionType::Sticky
+        && (exact_kernel::motion::rotation_needs_sampling(s)
+            || n.layout_position() == exact_kernel::PositionType::Sticky
             || !s.transform_origin.centred()
             || !s.rare.layout_transition.0.is_empty()
             || subtree_any(kernel, n.id, &|id| {

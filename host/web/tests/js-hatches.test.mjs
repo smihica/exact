@@ -3,13 +3,14 @@
 // its bounds, a call's time is its own, a throw stops one node's hatch and
 // leaves its end, and a production page keeps nothing. The DOM is a small
 // fake; the runtime and the page module are stand-ins.
-import { test, expect } from 'bun:test';
-import { copyFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { afterAll, test, expect } from 'bun:test';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const dir = mkdtempSync(resolve(tmpdir(), 'exact-js-hatches-'));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 copyFileSync(resolve(fileURLToPath(new URL('../../web-js/hatches.js', import.meta.url))), resolve(dir, 'hatches.js'));
 writeFileSync(resolve(dir, 'rt.js'), 'export const { onEnd, journal, clock, viewId, inflight, painted, time, paint, drive } = globalThis.rtStandIn;\n');
 writeFileSync(resolve(dir, 'native.js'), 'export const pageTable = () => { globalThis.pageTables = (globalThis.pageTables ?? 0) + 1; return globalThis.pageModule; };\n');
@@ -370,4 +371,22 @@ test('regions and parts are bounded, bound to their elements, and end as tombsto
   // The node's end takes what it registered.
   end();
   expect(globalThis.exact.hatchRegions.of(n)).toBe(null);
+});
+
+// The switch is read from the page's launch (§2.6): a page launched with `?hatches=off` connects no hatch at a route
+// whose URL names none, as after the app's first route change
+test('a page launched with ?hatches=off connects no hatch at a route without it', async () => {
+  const entries = performance.getEntriesByType;
+  globalThis.location = { search: '', href: 'http://127.0.0.1:9/next' };
+  performance.getEntriesByType = type => type === 'navigation' ? [{ name: 'http://127.0.0.1:9/?hatches=off' }] : entries.call(performance, type);
+  try {
+    // A module of its own, which reads the switch afresh
+    const hatches = await import(resolve(dir, 'hatches.js') + '?launched-off');
+    const before = handles.length;
+    await mount(hatches, node('meter', 8));
+    expect([handles.length - before, journal.some(l => l.includes('hatch hatches: off (?hatches=off)'))]).toEqual([0, true]);
+  } finally {
+    delete globalThis.location;
+    performance.getEntriesByType = entries;
+  }
 });

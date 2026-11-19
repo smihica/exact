@@ -22,15 +22,20 @@ public final class HeadlessSession {
         /// nil takes the node's `text_color`.
         public let color: BatchValue?
         public let background: BatchValue?
+        /// Inline opacity, including enclosing runs. The node's own opacity
+        /// is applied by its view, separately from these viewless runs.
+        public var opacity: Double { opacityGroups.reduce(1) { $0 * $1.alpha } }
+        public let opacityGroups: [InlineOpacity]
         public let decoration: String
         public let href: String
         public let hidden: Bool
         public let font: CTFont
         public init(text: String, size: CGFloat, weight: Int, family: Int, italic: Bool, letterSpacing: CGFloat = 0, numeric: Int = 0,
-                    color: BatchValue? = nil, background: BatchValue? = nil, decoration: String = "", href: String = "", hidden: Bool = false, font: CTFont) {
+                    color: BatchValue? = nil, background: BatchValue? = nil, opacityGroups: [InlineOpacity] = [], decoration: String = "", href: String = "", hidden: Bool = false, font: CTFont) {
             self.text = text; self.size = size; self.weight = weight; self.family = family; self.italic = italic
             self.letterSpacing = letterSpacing; self.numeric = numeric; self.color = color; self.background = background
             self.decoration = decoration; self.href = href; self.hidden = hidden; self.font = font
+            self.opacityGroups = opacityGroups
         }
     }
     /// A line's text in one run: `run` indexes the node's `runs`.
@@ -210,10 +215,11 @@ public final class HeadlessSession {
     }
 
     /// Typed source refresh; the render boot itself never opens the store.
-    public func timeline(at date: Date, moduleRoot: URL? = nil, deadline: DispatchTime = .now() + .milliseconds(900)) throws -> Data {
+    /// A configured widget's refresh receives `configuration`, its placement's chosen values, or its defaults.
+    public func timeline(at date: Date, configuration: Data? = nil, moduleRoot: URL? = nil, deadline: DispatchTime = .now() + .milliseconds(900)) throws -> Data {
         let receipt = try moduleRoot.map { try Data(contentsOf: $0.appendingPathComponent("typescript/app.module.json")) } ?? Data()
         let module = try moduleRoot.map { try Data(contentsOf: $0.appendingPathComponent("typescript/app.hbc"), options: .mappedIfSafe) } ?? Data()
-        let bytes = core.runtime.entryTimeline(at: date.timeIntervalSince1970 * 1000, deadline: deadline, receipt: receipt, module: module)
+        let bytes = core.runtime.entryTimeline(at: date.timeIntervalSince1970 * 1000, configuration: configuration, deadline: deadline, receipt: receipt, module: module)
         if let object = try JSONSerialization.jsonObject(with: bytes) as? [String: Any], let error = object["error"] as? String {
             throw Failure(description: error)
         }
@@ -266,6 +272,9 @@ public final class HeadlessSession {
         return try pump(at: now)
     }
 
+    /// Re-read an imported companion snapshot and invalidate its readers.
+    public func storeChanged() throws -> Snapshot { try turn { core.runtime.storeChanged() } }
+
     /// Drain ready replies and lay out their store changes: a live host's answer to its wake.
     @discardableResult
     public func pump(at now: Double) throws -> Snapshot {
@@ -279,8 +288,8 @@ public final class HeadlessSession {
     }
 
     /// Gallery refresh never opens the app's storage or executes requests.
-    package func previewTimeline(at date: Date) throws -> [String: Any] {
-        let bytes = core.runtime.previewTimeline(at: date.timeIntervalSince1970 * 1000)
+    package func previewTimeline(at date: Date, configuration: Data? = nil) throws -> [String: Any] {
+        let bytes = core.runtime.previewTimeline(at: date.timeIntervalSince1970 * 1000, configuration: configuration)
         let result = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] ?? [:]
         if let error = result["error"] as? String { throw Failure(description: error) }
         return result
@@ -405,7 +414,7 @@ public final class HeadlessSession {
     }
 
     package func agentFacts() -> [String: Any] {
-        let bytes = Data(core.runtime.agent("{\"op\":\"tags\"}").utf8)
+        let bytes = Data(core.runtime.ask(exact_tags, "").utf8)
         return (try? JSONSerialization.jsonObject(with: bytes) as? [String: Any]) ?? [:]
     }
 
@@ -441,10 +450,7 @@ public final class HeadlessSession {
             case .children: nodes[op.id]?.children = op.ids
             case .paragraph: nodes[op.id]?.inline = op.runs
             case .frame: nodes[op.id]?.frame = CGRect(x: op.x, y: op.y, width: op.w, height: op.h)
-            case .fieldContent:
-                if let r = op.payload["rect"] as? [Double], r.count == 4 {
-                    nodes[op.id]?.content = CGRect(x: r[0], y: r[1], width: r[2], height: r[3])
-                } else { nodes[op.id]?.content = nil }
+            case .fieldContent: nodes[op.id]?.content = op.contentRect
             case .flow:
                 nodes[op.id]?.flow = (op.payload["shapes"] as? [[String: Any]] ?? []).compactMap(TextFlowShape.init)
             // A motion property's presentation value: `opacity` is a static
@@ -552,7 +558,7 @@ fileprivate final class HeadlessLines {
         // Decoration 3 §2.1); the paragraph's own are added as it is drawn
         // (`SnapshotTextPaint.decoration`).
         let decorates = node.inline.contains { !$0.paints && !$0.lightRun.decoration.isEmpty }
-        let byId = decorates ? Dictionary(node.inline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }) : [:]
+        let byId = Dictionary(node.inline.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let lines = !decorates ? inline.map(\.lightRun.decoration) : inline.map { leaf in
             var all = [leaf.lightRun.decoration], up = byId[leaf.parent]
             while let run = up {
@@ -583,6 +589,7 @@ fileprivate final class HeadlessLines {
                     letterSpacing: run.letterSpacing, numeric: run.numeric,
                     color: Self.color(input?.colorRef, light: run.color, dark: input?.darkColor),
                     background: Self.color(input?.backgroundRef, light: run.background, dark: input?.darkBackground),
+                    opacityGroups: input?.opacityGroups(in: byId) ?? [],
                     decoration: input == nil ? run.decoration : lines[index], href: run.href, hidden: run.hidden, font: engine.font(run) as CTFont)
             }
             var ends: [Int] = [], offset = 0

@@ -331,9 +331,10 @@ fn a_guests_requests_are_held_for_the_agent_on_its_frame() {
         r#"{{"op":"type","ticket":{print},"text":"report.pdf"}}"#
     ))
     .contains("absolute path"));
-    assert!(answer(format!(
-        r#"{{"op":"type","ticket":{print},"text":"/tmp/report.pdf"}}"#
-    ))
+    assert!(answer(
+        serde_json::json!({"op":"type", "ticket":print, "text":std::env::temp_dir().join("report.pdf")})
+            .to_string()
+    )
     .contains("\"answered\":\"value\""));
     assert_eq!(r.device_holds().len(), 1);
 }

@@ -1,7 +1,7 @@
 // A module realm's environment, captured before a module Worker hardens its
 // globals: storage's synchronous namespace and host clock, and under the
 // agent its repeatable random stream. The I/O adapters load on first use.
-const AGENT_ADMITTED = true; // false in a production bake: host/web/build.mjs rewrites this line (LLP 1069.007 D2)
+const AGENT_ADMITTED = true; // false in a release, as the release gate writes it (agent-gate.mjs, LLP 1069.007 D2)
 export const directories = Object.freeze({ data: 'app:/data', cache: 'app:/cache', temporary: 'app:/tmp' });
 // Code from a string runs on no host a data module runs on: Hermes compiles none, and throws `SyntaxError: Parsing
 // source code unsupported` at the call. The realm's `Function` and `eval` throw that too, so a package's guarded probe
@@ -45,7 +45,7 @@ const DEVELOPMENT_STORE = null;
 // apart from the app's own, as on native. null: this drive has no storage.
 export function storageKey(appId, href = launchHref()) {
   const params = new URL(href).searchParams, name = params.get('storage'), own = DEVELOPMENT_STORE ? `${appId}@${DEVELOPMENT_STORE}` : appId;
-  if (!(AGENT_ADMITTED && params.has('agent'))) return own;
+  if (!(AGENT_ADMITTED && ['', '1'].includes(params.get('agent')))) return own;
   if (name == null) return null;
   if (!/^[A-Za-z0-9._-]+$/.test(name) || name === '.' || name === '..') throw new Error("storage: one name of letters, digits, '.', '-' or '_'");
   return `${own}/agent/${name}`;
@@ -66,7 +66,7 @@ export function emptyRead(op, path) {
 // its PKCE verifiers predictable.
 export function agentSeed(href = launchHref()) {
   const url = new URL(href);
-  if (!AGENT_ADMITTED || !url.searchParams.has('agent') || !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null;
+  if (!(AGENT_ADMITTED && ['', '1'].includes(url.searchParams.get('agent'))) || !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return null;
   const seed = Number(url.searchParams.get('seed') ?? 1);
   return Number.isSafeInteger(seed) && seed >= 0 && seed < 2 ** 32 ? seed : 1;
 }
@@ -151,17 +151,20 @@ export function exclusiveSecret(store, prefix, name, work) {
     }
     const fresh = localStorage.getItem(key);
     if (fresh == null) store.map.delete(name); else store.map.set(name, fresh);
-    localStorage.setItem(marker, '1');
-    (store.leased ??= new Set()).add(name);
+    // Recovery is armed before the lease's first write (the store's `set`) or request with effects (`work`'s
+    // argument), as on every host (LLP 1146 D5): an armed lease that fails or is cut off loses the secret.
+    let armed = false;
+    const arm = () => { if (!armed) { localStorage.setItem(marker, '1'); armed = true; } };
+    (store.leased ??= new Map()).set(name, arm);
     let completed = false;
-    try { const value = await work(); completed = true; return value; } finally {
+    try { const value = await work(arm); completed = true; return value; } finally {
       try { store.persist(); } finally { store.leased.delete(name); }
       if (store.pending.has(name)) {
         discard(); store.map.delete(name);
         localStorage.removeItem(key);
         throw new Error('The shared secret could not be persisted');
       }
-      if (!completed) { discard(); store.map.delete(name); localStorage.removeItem(key); }
+      if (!completed && armed) { discard(); store.map.delete(name); localStorage.removeItem(key); }
       localStorage.removeItem(marker);
     }
   });

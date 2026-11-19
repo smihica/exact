@@ -2,6 +2,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactCollections
 @testable import ExactDrag
 
 /// LLP 1057.001 §1 on AppKit's own mouse methods: candidates innermost first,
@@ -15,7 +16,7 @@ final class GesturePrecedenceMacTests: XCTestCase {
         _ = NSApplication.shared
         let p = Presenter()
         p.viewport.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
-        p.reorderCalls = calls
+        p.reorderHost!.calls = calls
         p.apply(wireBatch(ops))
         let window = NSWindow(contentRect: p.viewport.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false

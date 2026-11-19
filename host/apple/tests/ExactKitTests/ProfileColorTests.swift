@@ -9,6 +9,8 @@ import AppKit
 import UIKit
 #endif
 @testable import ExactKit
+@testable import ExactEffects
+@testable import ExactSvg
 
 /// LLP 1100 D3: a profile's colour is made by Core Graphics in the profile's
 /// space — a standard one by name, an app's from its ICC file — and a reader
@@ -157,7 +159,13 @@ final class ProfileColorTests: XCTestCase {
             // A fresh scene forces conversion again, rather than reusing CGColors.
             let svg = SvgScene()
             svg.apply(payload, dark: false, clock: nil)
-            let shape = try XCTUnwrap(svg.root.sublayers?.first as? CAShapeLayer)
+            #if os(macOS)
+            let content = svg.root
+            #else
+            let content = try XCTUnwrap(svg.root.sublayers?.first)
+            #endif
+            let shape = try XCTUnwrap(content.sublayers?.first as? CAShapeLayer)
+            _ = try XCTUnwrap(shape.path, phase + " path")
             XCTAssertNotNil(shape.fillColor, phase + " fill")
             XCTAssertNotNil(shape.strokeColor, phase + " stroke")
             let context = try XCTUnwrap(CGContext(data: nil, width: 32, height: 32,

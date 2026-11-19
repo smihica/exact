@@ -12,10 +12,16 @@
 //   baked; a JS build links no update store, so nothing is ever staged.
 // - `exactSurface` (LLP 1047 D3; runner/src/surface_record.rs): a GPU
 //   surface's published record, decoded against each reader's shape.
-import { data, Resources, commit, R, Refusal, Kept, say } from "./rt.js";
-import { environment, keyboardInset, onKeyboard, displayMode, preferences, UPDATES, updateCode, onPreferences, pageReporter, fold, foldEnv, onFold, preferFold } from "./navigation.js";
+import { data, Resources, commit, R, Refusal, Kept, say, Sounds } from "./rt.js";
+import * as rt from "./rt.js";
+import { environment, keyboardInset, onKeyboard, displayMode, preferences, UPDATES, updateCode, onPreferences, pageReporter, fold, foldEnv, onFold, preferFold, preferDisplayMode } from "./navigation.js";
 
-const again = (source, why) => () => commit(() => { for (const r of Resources) if (r.source === source) R(r); }, why);
+const again = (source, why) => {
+  const changed = () => {
+    if (!rt.deferForReplacement(changed)) return commit(() => { for (const r of Resources) if (r.source === source) R(r); }, why);
+  };
+  return changed;
+};
 // `readers`: resource name → [its fields, in its shape's order, …].
 const byName = (readers, name, v) => readers[name][0].map(n => v[n]);
 
@@ -35,6 +41,7 @@ export function viewportFacts(geometry = false) {
     devicePosture: f.posture, horizontalViewportSegments: f.cols, verticalViewportSegments: f.rows, // @ref LLP 1078 D2, D6
     colorGamut: GAMUT[(p >>> 26) & 3], dynamicRange: p & (1 << 28) ? "high" : "standard", // @ref LLP 1100 D9
     pointer: p & 64 ? "none" : p & 32 ? "coarse" : "fine", hover: p & 128 ? "none" : "hover",
+    screenReader: reporter()?.read()["screen-reader"] ?? "unknown",
     accessibilityTextSize: false, // a browser has no accessibility text sizes (runner/src/runner/root_font.rs)
     keyboardHeight: keyboardInset(), // @ref LLP 1039 D9: `env(keyboard-inset-height)`
     gpuTier: reporter()?.read()["gpu-tier"] ?? "high" }; // @ref LLP 1139.003 D2: the page facts' tier; this target has no GPU module, so the screen's class, or the agent's
@@ -55,7 +62,9 @@ export function viewport(readers) {
   viewportChanged = changed;
   shareReporter();
   // The agent's `prefer` fold group (LLP 1078 D7): an empty one re-reads the browser, a filled one is the substitute.
+  // Its `display-mode` is always the substitute (LLP 1039 D7).
   (globalThis.exact ??= {}).fold = { prefer: (f) => { const env = preferFold(f && Object.keys(f).length ? f : null); changed(); return env; }, env: foldEnv };
+  globalThis.exact.displayMode = { prefer: (mode) => { preferDisplayMode(mode); changed(); } };
 }
 
 // A release admits no agent mode (LLP 1069.007 D2): its build writes this false.
@@ -63,23 +72,59 @@ const AGENT_ADMITTED = true;
 // One reporter per session for both sources (`exactViewport().gpuTier` is a
 // page fact), and the agent's `prefer` page group (LLP 1069.000 D6) sets it,
 // whichever of them the plan reads.
-let pageFacts, viewportChanged = () => {}, pageChanged = () => {};
-const reporter = () => pageFacts !== undefined ? pageFacts : (pageFacts = typeof document === "object" && document.createElement
-  ? pageReporter(AGENT_ADMITTED && typeof location === "object" && new URLSearchParams(location.search).has("agent")) : null);
+let pageFacts, pageReaders = {}, pageFreezes = false, pageWatching = false, viewportChanged = () => {}, pageChanged = () => {};
+const reporter = () => pageFacts !== undefined ? pageFacts : typeof document === "object" && document.createElement
+  ? (pageFacts = pageReporter(AGENT_ADMITTED && typeof location === "object" && ["", "1"].includes(new URL(globalThis.performance?.getEntriesByType?.("navigation")[0]?.name ?? location.href).searchParams.get("agent")))) : null;
 function shareReporter() {
   const facts = reporter();
   if (!facts) return;
-  (globalThis.exact ??= {}).page = { prefer: p => { facts.prefer(p); pageChanged(); if (p?.["gpu-tier"]) viewportChanged(); return facts.read(); }, read: () => facts.read() };
+  (globalThis.exact ??= {}).page = { prefer: p => { facts.prefer(p); pageChanged(); if (p?.["gpu-tier"] || p?.["screen-reader"]) viewportChanged(); return facts.read(); }, read: () => facts.read() };
 }
+const pageFields = f => ({ visibilityState: f["visibility-state"], frozen: f.frozen, onLine: f.online, canShare: f["can-share"], canShareFiles: f["can-share-files"], canSharePictures: f["can-share-pictures"], canOpenFiles: f["can-open-files"], hasFocus: f["has-focus"], navigationType: f["navigation-type"], persisted: f.persisted, restores: f.restores, iframePartition: f["iframe-partition"] === true, name: windowName(), presented: f.presented === true });
+// `window.name`, an empty one set to `main` the first time it is read, so the tab the person opened is `main` and one a
+// link's `target` opened keeps its name (LLP 1030.004 D2). A render has no window: `main`.
+const windowName = () => typeof window === "object" && typeof window.name === "string" ? (window.name ||= "main") : "main";
 export function page(readers) {
+  pageReaders = readers;
   const facts = reporter();
   (data.reserved ??= {}).exactPage = (_, a, name) => {
     // A render has no page: the bake's answer (runner/src/page.rs `Page::default`).
-    const f = facts ? facts.read() : { "visibility-state": "visible", online: true, "can-share": false, "can-share-files": false, "can-share-pictures": false, "can-open-files": false, "has-focus": true, "navigation-type": "", persisted: false, restores: 0, "iframe-partition": false };
-    return byName(readers, name, { visibilityState: f["visibility-state"], onLine: f.online, canShare: f["can-share"], canShareFiles: f["can-share-files"], canSharePictures: f["can-share-pictures"], canOpenFiles: f["can-open-files"], hasFocus: f["has-focus"], navigationType: f["navigation-type"], persisted: f.persisted, restores: f.restores, iframePartition: f["iframe-partition"] === true });
+    const f = facts ? facts.read() : { "visibility-state": "visible", online: true, "can-share": false, "can-share-files": false, "can-share-pictures": false, "can-open-files": false, "has-focus": true, "navigation-type": "", frozen: false, persisted: false, restores: 0, "iframe-partition": false, presented: false };
+    return byName(readers, name, pageFields(f));
   };
   if (!facts) return;
-  pageChanged = again("exactPage", "page");
+  watchPage();
+  // `presented` (LLP 1069.000 D2 r7): true from the first animation frame after the first commit, at which the
+  // browser presents its picture; under the agent from the first commit (the reporter's).
+  let asked = false;
+  if (!facts.agent && typeof requestAnimationFrame === "function") rt.After?.push(() => {
+    if (asked) return;
+    asked = true;
+    requestAnimationFrame(() => { if (facts.presentedNow()) pageChanged(); });
+  });
+}
+
+// Physical output and a sequence need the freeze edge even if the plan reads no page fields.
+export function watchPage(freezes = false) {
+  pageFreezes ||= freezes;
+  const facts = reporter();
+  if (!facts || pageWatching) return;
+  pageWatching = true;
+  let previous = facts.read();
+  Sounds.frozen = previous.frozen;
+  pageChanged = () => {
+    if (rt.deferForReplacement(pageChanged)) return;
+    const next = facts.read();
+    const before = pageFields(previous), after = pageFields(next);
+    const readers = Resources.filter(r => r.source === "exactPage" && pageReaders[r.name]?.[0].some(k => before[k] !== after[k]));
+    if (!readers.length && !(pageFreezes && previous.frozen !== next.frozen)) { previous = next; return; }
+    // Transport consumes the edge in the readers' commit (LLP 1125 D4).
+    if (commit(() => {
+      Sounds.frozen = next.frozen;
+      for (const r of readers) R(r);
+    }, "page") !== false) previous = next;
+    else Sounds.frozen = previous.frozen;
+  };
   facts.onChange(pageChanged);
   shareReporter();
 }
@@ -94,15 +139,15 @@ export const timeFields = (name, facts) => byName(timeReaders, name, facts);
 /** Each reader's second entry: the value the build baked, if it baked one
  * (a plan built from source did not): the embedded answer. */
 export function activities(readers) {
-  (data.reserved ??= {}).exactActivities = (_, a, name) => byName(readers, name, { activities: [], frequentPushesEnabled: false, linked: false });
+  (data.reserved ??= {}).exactActivities = (_, a, name) => byName(readers, name, { activities: [], frequentPushesEnabled: false, linked: false, pushToStartToken: null, pushToStartActivities: [] });
 }
 
 // Replaced with string literals by build.mjs for both the page and its renderer.
-export const deliveryFacts = { stream: "embedded", seq: 0, embeddedSeq: 0, staged: false, sunset: "", interpreted: [], compatibilityId: "", version: globalThis.__exactVersion ?? "", buildNumber: globalThis.__exactBuildNumber ?? "", L: "0", E: [] };
+export const deliveryFacts = { stream: "embedded", seq: 0, embeddedSeq: 0, staged: false, sunset: "", interpreted: [], compatibilityId: "", version: globalThis.__exactVersion ?? "", buildNumber: globalThis.__exactBuildNumber ?? "", production: globalThis.__exactProduction ?? false, L: "0", E: [] };
 export function delivery(readers) {
   (data.reserved ??= {}).exactDelivery = (_, a, name) => {
     const [fields, baked] = readers[name];
-    const value = { ...deliveryFacts, ...Object.fromEntries(fields.map((field, i) => [field, baked?.[i] ?? deliveryFacts[field]])), version: deliveryFacts.version, buildNumber: deliveryFacts.buildNumber };
+    const value = { ...deliveryFacts, ...Object.fromEntries(fields.map((field, i) => [field, baked?.[i] ?? deliveryFacts[field]])), version: deliveryFacts.version, buildNumber: deliveryFacts.buildNumber, production: deliveryFacts.production };
     return byName(readers, name, value);
   };
 }
@@ -112,8 +157,9 @@ export function delivery(readers) {
  * calls the wasm host's `exact_surface_record`); the host's bytes are
  * `name` alone (disposed) or `name\0json`. */
 export function canvasPerformance(readers) {
-  const names = new Set(Object.values(readers).map(r => r[0]));
-  (globalThis.exact ??= {}).canvasPerformanceRequested = name => names.has(name);
+  (globalThis.exact ??= {}).canvasPerformanceRequested = name => Resources.some(r =>
+    r.source === "exactCanvasPerformance" && readers[r.name]?.[0] === name && !r.asleep && !r.gone);
+  rt.After?.push(() => globalThis.exact?.gpu?.syncPerformance?.());
   surfaces(readers, "exactCanvasPerformance", "canvasPerformanceRecord", 16 * 1024);
 }
 
@@ -138,7 +184,8 @@ export function surfaces(readers, source = "exactSurface", report = "surfaceReco
     } catch (e) { why = String(e?.message ?? e); throw e; }
   };
   const x = globalThis.exact ??= {};
-  x[report] = (surface, json) => {
+  x[report] = function publish(surface, json) {
+    if (rt.deferForReplacement(() => publish(surface, json))) return;
     if (!names.has(surface)) return;
     const was = records.get(surface) ?? null;
     if (was === (json ?? null)) return;

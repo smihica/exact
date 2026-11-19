@@ -4,6 +4,89 @@
 use super::*;
 
 impl<D: DataSource> Host<D> {
+    pub(super) fn finish_collection(&mut self) -> String {
+        // Rearming an edge changes its window even without a view receipt.
+        let mut batch = Batch::new();
+        let error = self.emit_collections(&mut batch).err();
+        let deadline = self.runner.collection_timer_due_ms();
+        if error.is_none()
+            && self.finished_deadline == Some(self.route_overflow_due(deadline))
+            && !self.presence.unauthored
+            && !self.layout_owed
+            && !self.layout_withheld
+            && self
+                .doc_watch
+                .as_ref()
+                .is_none_or(|watch| !watch.needs_retry())
+            && self.canvas_captures.is_empty()
+            && self.canvas_capture_waiting.is_empty()
+        {
+            // A preload may journal from another thread between reports.
+            if let Some(preloads) = &self.preloads {
+                for fact in preloads.journal() {
+                    self.runner.log(format!(
+                        "preload {} {} {:?}",
+                        fact.name, fact.origin, fact.outcome
+                    ));
+                }
+            }
+            self.request_route_overflow();
+            if batch.repeatable()
+                && self.finished_deadline == Some(self.route_overflow_due(deadline))
+            {
+                if let Some(key) = self.quiet_collection_key() {
+                    if let Some((previous, reply)) = &self.quiet_collection {
+                        if *previous == key {
+                            return reply.clone();
+                        }
+                    }
+                }
+            }
+            self.state_onto(&mut batch);
+            return self.write_batch(batch, None, true);
+        }
+        self.finish(batch, error)
+    }
+
+    pub(super) fn quiet_collection_key(&self) -> Option<[u64; 8]> {
+        if self.stored
+            || !self.preload_content.is_empty()
+            || !self.engine.quiescent()
+            || self.engine.spatial()
+        {
+            return None;
+        }
+        self.runner.collection_reply_key()
+    }
+
+    pub(super) fn finish(&mut self, mut batch: Batch, error: Option<String>) -> String {
+        #[cfg(test)]
+        {
+            self.finish_passes += 1;
+        }
+        // A host's fact laid out again (a native control's measured size, an
+        // inset, the text size): a box already moving was retargeted from where
+        // it shows, and its new frame and offset go in one batch. Without the
+        // offset the presenter showed the new frame with the old offset until
+        // the next tick, which then put the box back where it started (#134).
+        if self.presence.unauthored {
+            self.present(&mut batch, false);
+        }
+        // Clear the mark first: the resize handlers below commit the app's own moves
+        self.presence.unauthored = false;
+        let _roles = self.runner.bind_roles(); // Its own, crossing (LLP 1121 stage 5).
+        if let Some(documents) = self.turn.documents {
+            documents(self);
+        }
+        let (mut batch, error) = self.resize_rounds(batch, error);
+        self.route_overflow.settled =
+            error.is_none() && !batch.layout_provisional && !self.layout_owed;
+        self.drain_canvas_captures(&mut batch);
+        self.forget_canvas_captures();
+        self.state_onto(&mut batch);
+        self.write_batch(batch, error.as_deref(), true)
+    }
+
     /// Observe the viewport at the host's time, laying out due timer commits
     /// before resize notifications choose their depth threshold.
     pub fn resize_at(&mut self, width: f32, height: f32, now_ms: f64) -> String {
@@ -12,7 +95,7 @@ impl<D: DataSource> Host<D> {
         self.resize_inner(width, height, None, batch, error, None)
     }
 
-    fn settle_resize_clock(
+    pub(super) fn settle_resize_clock(
         &mut self,
         batch: Batch,
         error: Option<String>,
@@ -27,7 +110,9 @@ impl<D: DataSource> Host<D> {
         self.group_after_commit(&mut batch);
         self.persist();
         self.emit_language(&mut batch);
-        self.emit_transform_drags(&mut batch);
+        if let Some(drag) = self.turn.drag {
+            (drag.emit_transforms)(self, &mut batch);
+        }
         self.present(&mut batch, false);
         (batch, error.or(arrange))
     }
@@ -76,20 +161,49 @@ impl<D: DataSource> Host<D> {
             error = error.or(e).or(arrange);
             self.persist();
             self.emit_language(&mut batch);
-            self.emit_transform_drags(&mut batch);
+            if let Some(drag) = self.turn.drag {
+                (drag.emit_transforms)(self, &mut batch);
+            }
             self.present(&mut batch, false);
         }
-        self.runner.resize_settled();
+        self.resize_pending = self.runner.resize_settled();
         // Layout-only batches also owe SVG scenes, even without motion or a commit.
-        for note in self.svg.emit(
+        self.emit_svg(&mut batch);
+        (batch, error)
+    }
+
+    /// The SVG scenes, when the composition links SVG, and then the box
+    /// animations this batch owes, when anything can move.
+    pub(super) fn emit_svg(&mut self, batch: &mut Batch) {
+        if let Some(scenes) = self.turn.svg {
+            scenes(self, batch);
+        }
+        if let Some(motion) = self.turn.motion {
+            (motion.turn)(self, batch);
+        }
+    }
+
+    /// [`crate::link::TurnMotion`]'s turn: the boxes' lowered animations.
+    pub(crate) fn emit_box_motion(&mut self, batch: &mut Batch) {
+        self.svg
+            .emit_boxes(self.runner.kernel(), &self.engine, batch);
+    }
+
+    /// [`crate::link::TurnLinks`]'s SVG scenes.
+    pub(crate) fn emit_svg_scenes(&mut self, batch: &mut Batch) {
+        for note in self.svg.emit_scenes(
             self.runner.kernel(),
             &self.engine,
             &self.paint.motion,
-            &mut batch,
+            batch,
         ) {
             self.runner.log(note);
         }
-        (batch, error)
+    }
+
+    /// [`crate::link::TurnLinks`]'s documents.
+    pub(crate) fn sync_documents(&mut self) {
+        crate::doc_watch::sync(&mut self.doc_watch, &mut self.runner);
     }
 }
 
@@ -131,7 +245,9 @@ impl<D: DataSource> Host<D> {
         let arrange = self.arrange_after_commit(&mut batch);
         self.persist();
         self.emit_language(&mut batch);
-        self.emit_transform_drags(&mut batch);
+        if let Some(drag) = self.turn.drag {
+            (drag.emit_transforms)(self, &mut batch);
+        }
         self.present(&mut batch, false);
         self.resize_rounds(batch, error.or(arrange))
     }

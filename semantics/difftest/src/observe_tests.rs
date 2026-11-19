@@ -411,11 +411,17 @@ fn scripted_state_bounds_and_membership_check_the_runner_observation() {
   view
     text "Bounds"
 test "bounds"
+  expect state n != 0
   expect state n >= -2
   expect state n <= 2
   expect state n in 0 -2 2
   expect state word in "idle" "ready"
 "#;
+    assert!(!script::state_holds(
+        None,
+        contract_syntax::StateComparison::NotEqual,
+        &["none".into()]
+    ));
     let s = script::scripted("bounds", source, None).unwrap().remove(0);
     assert!(s.delivery.stopped.is_none());
     let plan = compile(&s.case).unwrap();

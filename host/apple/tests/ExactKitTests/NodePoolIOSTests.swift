@@ -2,6 +2,10 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactHeavyLeaves
+@testable import ExactImages
+@testable import ExactCollections
+@testable import ExactNativeViews
 @testable import ExactSurfaces
 
 /// A virtualized list's retired row lends its views to the next row of its
@@ -128,6 +132,35 @@ final class NodePoolIOSTests: XCTestCase {
         XCTAssertEqual(p.pool.count, 0)
     }
 
+    func testClipboardHandlersAreCountedAcrossPoolingWithTheSameHandlers() throws {
+        let p = fixture(), row = try XCTUnwrap(p.views[10])
+        let actions = [#selector(NodeView.copy(_:)), #selector(NodeView.cut(_:)), #selector(NodeView.paste(_:))]
+        row.handlers = ["copy", "cut", "paste"]
+        for base in stride(from: 10, to: 40, by: 10) {
+            XCTAssertEqual(p.clipboardHandlerCount, 1)
+            p.apply(wireBatch([collections([])] + destroy([base, base + 1, base + 2])
+                + [["op": "children", "id": 1, "ids": []]]))
+            XCTAssertTrue(p.pool.isParked(row))
+            XCTAssertEqual(p.clipboardHandlerCount, 0)
+            let walks = p.clipboardAncestryWalks
+            for action in actions { XCTAssertFalse(p.views[1]!.canPerformAction(action, withSender: nil)) }
+            XCTAssertEqual(p.clipboardAncestryWalks, walks)
+            let next = base + 10
+            var ops = rowOps(next, y: 0, label: "Reused")
+            ops[0]["handlers"] = ["copy", "cut", "paste"]
+            p.apply(wireBatch([collections([(next, next)])] + ops
+                + [["op": "children", "id": 1, "ids": [next]]]))
+            XCTAssertTrue(p.views[UInt32(next)] === row)
+            XCTAssertEqual(p.clipboardHandlerCount, 1)
+            for action in actions {
+                XCTAssertTrue(row.canPerformAction(action, withSender: nil))
+                XCTAssertTrue(row.clipboardHearer(action)?.node === row)
+            }
+        }
+        p.reset()
+        XCTAssertEqual(p.clipboardHandlerCount, 0)
+    }
+
     func testARetiredForwardingRowCancelsItsAncestorInsteadOfBeingReused() throws {
         final class Contact: UITouch {
             let target: UIView, point: CGPoint
@@ -241,9 +274,10 @@ final class NodePoolIOSTests: XCTestCase {
         XCTAssertEqual(text.paragraphPoint(lastLine), lastLine)
         var paints = 0
         _ = UIGraphicsImageRenderer(size: text.bounds.size).image { context in
-            text.eachFragment(context.cgContext) { box, offset in
+            text.eachFragment(context.cgContext) { box, offset, lines in
                 paints += 1
                 XCTAssertEqual(box, text.contentBox())
+                XCTAssertNil(lines)
                 XCTAssertEqual(offset, .zero)
                 XCTAssertTrue(context.cgContext.boundingBoxOfClipPath.contains(lastLine))
             }
@@ -459,7 +493,7 @@ final class NodePoolIOSTests: XCTestCase {
         let row = try XCTUnwrap(p.views[100]), list = try XCTUnwrap(p.views[102])
         let scroll = try XCTUnwrap(list.scroll)
         let card = try XCTUnwrap(p.views[110]), other = try XCTUnwrap(p.views[120])
-        XCTAssertFalse(p.collections.owns(102), "the inner list is not a collection")
+        XCTAssertFalse(p.listHost.owns(102), "the inner list is not a collection")
         scroll.contentOffset = CGPoint(x: 240, y: 0)
 
         p.apply(wireBatch([outer(200)] + destroy(carouselIDs(100)) + carouselOps(200, y: 140, kind: kind)

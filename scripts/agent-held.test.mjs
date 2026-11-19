@@ -131,7 +131,7 @@ function flipping(after, host = 'web', { slow = 0 } = {}) {
       if (req.op === 'tags') return { epoch: 3, incarnation: 1 };
       if (req.land) return { clock: s.now };
       const state = performance.now() - t0 >= after ? 'ready' : 'identifying';
-      return { resources: { gateway: { state, seq: 2 } }, slots: { rows: [{ n: -3 }] }, derives: {}, tasks: { record: 8, beat: 1000 } };
+      return { resources: { gateway: { state, seq: 2 } }, slots: { rows: [{ n: -3 }], saved: state === 'ready' ? ['1', 2] : [] }, derives: {}, tasks: { record: 8, beat: 1000 } };
     },
   };
   return { s, said };
@@ -155,6 +155,15 @@ test('clock until state waits on the wall clock, the clock frozen, until the val
   // The path as `expect state` takes it, a space before a dot: refused with the grammar alone before.
   expect(await untilClock(flipping(0).s, 'until state rows.0 .n == -3 within 10')).toMatchObject({ until: 'met', value: -3 });
   await expect(untilClock(flipping(60_000).s, 'until state gateway .state=="ready" within 10')).rejects.toThrow(/^clock until state gateway\.state == "ready" within 10: gateway\.state was "identifying"/);
+});
+
+test('clock until state compares a list of scalars whole (LLP 1156.006.000 D5)', async () => {
+  expect(await untilClock(flipping(0).s, 'until state saved == ["1",2] within 10')).toMatchObject({ until: 'met', value: ['1', 2] });
+  expect(await untilClock(flipping(60_000).s, 'until state saved == [] within 10')).toMatchObject({ until: 'met', value: [] });
+  // A list of the same length in another order, a prefix and a scalar are each a miss, said masked.
+  for (const literal of ['[2,"1"]', '["1"]', '"1"']) await expect(untilClock(flipping(0).s, `until state saved == ${literal} within 10`)).rejects.toThrow('saved was ["1",2]');
+  await expect(untilClock(flipping(0).s, 'until state saved == [[1]] within 10')).rejects.toThrow('a list of them): [[1]] is not one');
+  await expect(untilClock(flipping(0).s, 'until state saved == {"a":1} within 10')).rejects.toThrow('is not one');
 });
 
 test('a miss fails at its bound naming the last value; a missing field is named as one', async () => {
@@ -220,6 +229,6 @@ test('clock until state refuses what is not its form; on Apple it takes the cloc
     ['until state gateway.state == "ready"', 'not `clock until state'],
     ['until state gateway state == "ready" within 10', 'not `clock until state gateway state'], // a space not before a dot
     ['until state gateway.state == 1 within 0', 'a bound is 1 ms up to an hour'],
-    ['until state nothing == 1 within 10', 'no state named "nothing" (gateway, rows)'],
+    ['until state nothing == 1 within 10', 'no state named "nothing" (gateway, rows, saved)'],
   ]) await expect(untilClock(flipping(0).s, spec)).rejects.toThrow(says);
 });

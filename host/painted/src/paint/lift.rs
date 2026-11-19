@@ -53,7 +53,7 @@ impl Painter {
         // A native button's children are its face, painted above (LLP 1069.011 D5).
         let native =
             node.node_type == NodeType::Control && node.props.str(PropId::Type) == Some("button");
-        let children: Vec<_> = node
+        let mut children: Vec<_> = node
             .children()
             .into_iter()
             .filter(|id| Some(*id) != lift && !native)
@@ -62,24 +62,7 @@ impl Painter {
         // projective depth, as the web gives them negative indices by
         // depth; then every other child by its rank, then tree order.
         // All in flow and none placed (most parents): tree order as it is.
-        let ordered =
-            self.placements.is_empty() && !children.iter().any(|c| walk.ranks.contains_key(c));
-        let order: Vec<(ViewId, usize)> = children.iter().copied().zip(0..).collect();
-        let mut order = order;
-        if !ordered {
-            order.sort_by(|(a, i), (b, j)| {
-                match (self.placements.get(a), self.placements.get(b)) {
-                    (Some(a), Some(b)) => a.depth().total_cmp(&b.depth()).then(i.cmp(j)),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    _ => {
-                        let rank = |id: &ViewId| walk.ranks.get(id).copied().unwrap_or(0);
-                        rank(a).cmp(&rank(b)).then(i.cmp(j))
-                    }
-                }
-            });
-        }
-        let children: Vec<ViewId> = order.into_iter().map(|(id, _)| id).collect();
+        self.order_children(&mut children, &walk.ranks);
         // A surface that composites its children takes them in this order.
         if self.composites.canvases.contains(&node.id) {
             self.composite(walk, node, &children, ts, child_offset, child_rect);
@@ -88,13 +71,19 @@ impl Painter {
         // A scroller's rows are its children; a scroller holding one
         // container (a column of settings) keeps that container's children
         // apart instead, so one of them changing records only itself.
+        let ts = self.zoom_children(walk.scene.kernel, node, ts, child_offset);
+        let space = ts.pre_translate(node.frame.x - child_offset.0, node.frame.y - child_offset.1);
+        self.kept.push_space(node.id, space);
         let rows = self.has_rows(walk, node);
         let group = rows && !self.rows_wrapper(node.key);
         let wrap = group && self.wraps_rows(walk, &children);
         if group {
             self.group_begin(walk, node.id);
         }
-        for child in children {
+        let kept = self.kept_places(walk, Some(node), &children);
+        let (last, count) = (self.stage_after(&children), children.len());
+        for (at, child) in children.into_iter().enumerate() {
+            self.replay_kept(walk.scene, &kept, at, space);
             if wrap {
                 self.wrapped(walk, child, ts, child_offset, child_rect);
             } else if rows {
@@ -102,14 +91,16 @@ impl Painter {
             } else {
                 self.node(walk, child, ts, child_offset, child_rect);
             }
-            self.paint_stage(walk, child);
+            self.paint_stage(walk, child, Some(child) == last);
         }
+        self.replay_kept(walk.scene, &kept, count, space);
         if group {
             self.group_end(walk);
         }
         if let Some(child) = lift {
             self.node(walk, child, ts, child_offset, child_rect);
         }
+        self.kept.pop_space();
     }
 
     /// The row a list carries within itself, painted after its siblings.

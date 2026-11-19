@@ -1,11 +1,52 @@
 import XCTest
 import ExactCore
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 @testable import ExactKit
 
 /// LLP 1132 D10: `exactViewport().pointer` and `.hover` by device class, an
 /// iPad with a trackpad or mouse answering as the pointing device, and the
 /// agent's `prefer pointer` and `prefer hover` reaching the runtime.
 final class PrimaryInputTests: XCTestCase {
+    func testScreenReaderReadingAndResumeNotifications() {
+        let saved = DisplayPreferences.agentScreenReader
+        defer { DisplayPreferences.agentScreenReader = saved }
+        DisplayPreferences.agentScreenReader = nil
+        #if os(macOS)
+        let expected = NSWorkspace.shared.isVoiceOverEnabled
+        let resume = NSApplication.didBecomeActiveNotification
+        #else
+        let expected = UIAccessibility.isVoiceOverRunning
+        let resume = UIApplication.didBecomeActiveNotification
+        #endif
+        XCTAssertEqual(DisplayPreferences.screenReader, expected ? "on" : "off")
+        let bits = DisplayPreferences.bits(systemDark: false)
+        XCTAssertEqual((bits >> 17) & 3, expected ? 2 : 1)
+        var changes = 0
+        let tokens = DisplayPreferences.observe { changes += 1 }
+        NotificationCenter.default.post(name: resume, object: nil)
+        XCTAssertGreaterThan(changes, 0)
+        #if os(macOS)
+        let beforeWake = changes
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
+        XCTAssertGreaterThan(changes, beforeWake)
+        #else
+        let beforeVoiceOver = changes
+        NotificationCenter.default.post(name: UIAccessibility.voiceOverStatusDidChangeNotification, object: nil)
+        XCTAssertGreaterThan(changes, beforeVoiceOver)
+        #endif
+        for reading in ["on", "off", "unknown"] {
+            DisplayPreferences.agentScreenReader = reading
+            XCTAssertEqual(DisplayPreferences.screenReader, reading)
+        }
+        DisplayPreferences.forget(tokens)
+        let before = changes
+        NotificationCenter.default.post(name: resume, object: nil)
+        XCTAssertEqual(changes, before)
+    }
     func testATouchScreenWithAPointingDeviceIsFineAndHovers() {
         XCTAssertEqual(Preferences.primaryInput(touchScreen: true), [.coarsePointer, .noHover], "a finger")
         XCTAssertEqual(Preferences.primaryInput(touchScreen: true, pointingDevice: true), [], "an iPad with a trackpad: fine, hover")

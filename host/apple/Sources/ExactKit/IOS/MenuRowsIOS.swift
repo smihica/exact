@@ -65,7 +65,7 @@ extension MenuHost {
         }
     }
 
-    func title(of v: NodeView) -> String {
+    package func title(of v: NodeView) -> String {
         if v.kind == "text" { return v.paragraphSpec().runs.map(\.text).joined() }
         // A native button's children are its face, not views: its title, else its label.
         if v.isNativeButton { return v.face?.shown ?? "" }

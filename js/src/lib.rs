@@ -62,6 +62,7 @@ mod compression;
 mod crypto;
 mod door;
 mod engine;
+mod launch;
 mod module_work;
 mod native;
 mod native_storage;
@@ -108,6 +109,21 @@ use watch::{Watch, Watched};
 use wire::outcome_to_json;
 
 type NativeFactory = fn(&str) -> Box<dyn NativeModule>;
+
+/// Who wrote a line of the module's journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Writer {
+    /// The runtime itself, through the console among other ways.
+    Runtime,
+    /// The app's `console`, with the method that wrote it (LLP 1027.009 D1).
+    App(exact_runner::Console),
+    /// The runtime, for the platform's log alone: an error event no listener
+    /// cancelled, which a line of the runtime's own journals (LLP 1175 D5).
+    Uncaught,
+}
+
+/// The module's journal lines since the last take, each with who wrote it.
+pub(crate) type Logs = Vec<(Writer, String)>;
 
 /// The seam ABI this executor speaks. ABI 2 adds Canvas 2D's `draw` and
 /// `surfaces` (LLP 1056 D1); a module without them still reports 1, and
@@ -200,6 +216,12 @@ const YIELDED: u64 = u64::MAX - 2;
 /// timers on main use `WAITING` so another turn can change their wait (LLP 1162 D3).
 const TIMER: u64 = u64::MAX - 3;
 
+/// A module's wait, timer, yield or background round, which the host's
+/// executor resumes: the TypeScript bake reports that the module can hand one
+/// out (`typescriptHostWork`), which links I/O (LLP 1047.001 D12).
+pub(crate) struct ModuleTurn;
+impl exact_runner::HostWork for ModuleTurn {}
+
 /// The prefix of a handler's name as the runner asks for it (LLP 1133.016 D9).
 const TOOL: &str = "tool:";
 
@@ -241,6 +263,11 @@ struct HostState {
     secrets: secrets::Shared,
     store: Option<*mut Store>,
     requests: Vec<(u64, Request)>,
+    /// Reports (LLP 1175 D3, op 29): requests an error event's listener
+    /// made, moved out of `requests`, with whose turn it interrupted.
+    reports: Vec<(u64, Request, exact_runner::Reporter)>,
+    /// Whose turn the call into the engine now runs, for a report made in it.
+    turn: Option<exact_runner::Reporter>,
     /// The fetch tickets the app aborted after their requests were handed
     /// out (op 23), until `take_aborted` names their answers to the runner.
     aborted: Vec<u64>,
@@ -295,6 +322,8 @@ struct HostState {
     kept: Option<u64>,
     /// The bake's module ([`Module::inspect`]): storage refuses as `bake`.
     baking: bool,
+    /// The settings a launch may give this module: its grants' `env.launch` names (LLP 1153.002).
+    launch: Vec<String>,
     /// A replacement candidate must answer successfully before it can be installed.
     validating: bool,
     readonly_secrets: bool,
@@ -308,6 +337,13 @@ struct HostState {
     /// requests in flight and live answers' steps they left (op 21,
     /// `module_work.rs`, LLP 1146 D2).
     module_outstanding: usize,
+}
+
+impl HostState {
+    /// No device to answer storage: the bake's module, or a validation pass's.
+    fn deferring(&self) -> bool {
+        self.baking || self.validating
+    }
 }
 
 /// A TypeScript data source: bytecode, its bake-time identity, and the
@@ -365,7 +401,7 @@ pub struct Module {
     /// Where a test holds compressions (`Module::hold_compressions`).
     compression_hold: Option<std::sync::Arc<storage::Gate>>,
     document_owner: u64,
-    logs: Vec<String>,
+    logs: Logs,
     overruns: u32,
     /// The Canvas 2D roster the bake read (LLP 1056 D1), known before the
     /// engine loads.
@@ -377,6 +413,7 @@ pub struct Module {
     /// did not await moves to the background. An instance a worker owner
     /// builds runs one turn to its end, and keeps its answers waiting.
     main_thread: bool,
+    worker_retired: Option<Arc<std::sync::atomic::AtomicBool>>,
     background: background::Background,
 }
 
@@ -415,6 +452,7 @@ impl Module {
     ) -> Module {
         let grants = grants.into();
         let auth_callback = exact_runner::auth::carrier_callback(&grants, None);
+        let launch = (exact_runner::grants::launch_names(&grants).map(str::to_owned)).collect();
         let module = Module {
             revision: std::sync::OnceLock::new(),
             bytecode: bytecode.into(),
@@ -431,6 +469,7 @@ impl Module {
             directories: None,
             host: Box::new(HostState {
                 auth_callback,
+                launch,
                 ..HostState::default()
             }),
             native_factory: None,
@@ -457,6 +496,7 @@ impl Module {
             canvas_surfaces: Vec::new(),
             agent_seed: None,
             main_thread: true,
+            worker_retired: None,
             background: Default::default(),
         };
         module.with_agent_seed(exact_data::crypto::AgentStream::agent_seed())
@@ -525,7 +565,10 @@ impl Module {
     /// What an owner thread needs to build this module there (LLP 1027.002
     /// D2): its bytecode, identity, directories, plan and limits — all of it
     /// `Send`; the runtime is created, run and destroyed on the owner.
-    fn build(template: &Module) -> exact_data::placed::Obtain<Module> {
+    fn build(
+        template: &Module,
+        retired: Arc<std::sync::atomic::AtomicBool>,
+    ) -> exact_data::placed::Obtain<Module> {
         let bytecode = template.bytecode.clone();
         let app_id = template.app_id.clone();
         let grants = template.grants.clone();
@@ -542,13 +585,17 @@ impl Module {
         let watch = template.watch.clone();
         let native_slot = template.native_slot.clone();
         let secrets = template.host.secrets.clone();
+        let launch = template.host.launch.clone();
         Box::new(move || {
             let mut module = Module::new(bytecode, app_id, grants)
                 .with_agent_seed(agent_seed)
                 .with_preloads(preloads);
+            // A render's template reads no launch's value (`render_web`), nor does its instance.
+            module.host.launch = launch;
             // Before `activate`, which loads: a worker's answers wait for
             // their storage (LLP 1097 D6).
             module.main_thread = false;
+            module.worker_retired = Some(retired);
             // The template's interrupt reaches the instance on its owner, and
             // its native handle finds the instance's long-call handler.
             module.watch = watch;
@@ -615,9 +662,9 @@ impl Module {
         self.install(engine)?;
         let took_ms = started.elapsed().as_secs_f64() * 1e3;
         if took_ms > SLOW_LOAD_MS {
-            self.logs.push(format!(
+            self.logs.push((Writer::Runtime, format!(
                 "the module's top level took {took_ms:.0} ms to evaluate, and every answer waits for it after first pixel: compute what a source needs in that source, or once on its first call"
-            ));
+            )));
         }
         Ok(())
     }
@@ -698,6 +745,7 @@ impl Module {
             self.document_owner,
             self.compression_hold.clone(),
         )?);
+        self.storage.as_mut().unwrap().worker_retired = self.worker_retired.clone();
         let ctx = &mut *self.host as *mut HostState as *mut c_void;
         let host: HostFn = host_door;
         let bytes: engine::BytesFn = crypto::bytes_door;
@@ -756,16 +804,24 @@ impl Module {
         if self.host.native.is_none() && self.native_slot.hosted() {
             self.host.hosted = true;
             self.host.later = true;
+        }
+        // packages live in the host's app module: their synchronous calls reach
+        // it even when the app links a native module of its own (the door)
+        if self.native_slot.hosted() {
             self.host.hosted_call = self.native_slot.hosted_call();
         }
         engine
             .harden()
             .map_err(|e| format!("exact-js: hardening failed: {e}"))?;
-        match &self.bytecode {
+        let loaded = match &self.bytecode {
             Bytecode::Linked(bytes) => engine.load_static(bytes),
             Bytecode::Owned(bytes) => engine.load_shared(bytes.clone()),
+        };
+        if let Err(e) = loaded {
+            // What it said before it threw, its `error` listeners included (LLP 1175 D2), is kept for the journal.
+            self.logs.extend(engine.take_log());
+            return Err(format!("exact-js: the module did not load: {e}"));
         }
-        .map_err(|e| format!("exact-js: the module did not load: {e}"))?;
         let abi = engine.string("abi")?;
         if !abi_supported(&abi) {
             return Err(format!(
@@ -782,8 +838,13 @@ impl Module {
     pub fn unload(&mut self) {
         // A dev restart or a reload replaces the module: what it started
         // and did not await is finished first, within a second (LLP 1097
-        // D10). A worker's answers waited for theirs.
-        if !self.snapshot {
+        // D10). A retired worker drops its queued work without delivering it.
+        if !self.snapshot
+            && !self
+                .worker_retired
+                .as_ref()
+                .is_some_and(|r| r.load(std::sync::atomic::Ordering::Acquire))
+        {
             self.finish_background(std::time::Duration::from_secs(1));
         }
         self.drop_runtime();
@@ -819,6 +880,7 @@ impl Module {
         self.parked.clear();
         self.work = Default::default();
         self.host.requests.clear();
+        self.host.reports.clear();
         self.host.aborted.clear();
         self.background = Default::default();
         // Module work ends with the engine (LLP 1146 D2).
@@ -863,6 +925,16 @@ impl Module {
     /// The module's `console` lines since the last take — for the runner's
     /// `logs` (LLP 1012).
     pub fn take_logs(&mut self) -> Vec<String> {
+        self.take_lines()
+            .into_iter()
+            .filter(|(by, _)| *by != Writer::Uncaught)
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    /// [`Module::take_logs`], each `console` line with the method that wrote
+    /// it (LLP 1027.009 D1).
+    pub(crate) fn take_lines(&mut self) -> Logs {
         if let Some(engine) = self.engine.as_mut() {
             self.logs.extend(engine.take_log());
         }
@@ -892,6 +964,15 @@ impl Module {
         let count = engine.call("__exact_calls_open", ["", "", ""]);
         self.retire_oom();
         count.ok()?.parse().ok()
+    }
+
+    /// Whose turn a call for `target` runs, for a report made in it (LLP 1175 D3).
+    fn reporter(target: Option<Target>, source: &str) -> exact_runner::Reporter {
+        match target {
+            Some(target) => exact_runner::Reporter::Answer(target),
+            None if source.starts_with(TOOL) => exact_runner::Reporter::Tool,
+            None => exact_runner::Reporter::None,
+        }
     }
 
     fn take_request(&mut self, ticket: u64) -> Option<Request> {
@@ -960,6 +1041,7 @@ impl Module {
             None if session && source.starts_with(TOOL) => "tool",
             _ => "",
         };
+        self.host.turn = Some(Module::reporter(target, source));
         let started = Instant::now();
         let budget_ms = self.turn_budget_ms(started);
         // (its own time on this thread's CPU clock, a wall backstop beside it: turn.rs)
@@ -987,9 +1069,16 @@ impl Module {
                     .map_err(|e| DataError::Unavailable(format!("`{source}` threw: {e}")))?;
                 reply = Module::decode_reply(sig, engine, source, &text)?;
             }
-            Ok(Module::step(sig, engine, source, reply, self.host.baking))
+            Ok(Module::step(
+                sig,
+                engine,
+                source,
+                reply,
+                self.host.deferring(),
+            ))
         })();
         self.host.store = None;
+        self.host.turn = None;
         if let Some(error) = self.retire_oom() {
             return Err(error);
         }
@@ -1064,7 +1153,7 @@ impl Module {
             }),
             Ok(Step::Pending { call, ticket, due }) => {
                 let request = if matches!(ticket, 0 | WAITING | YIELDED | TIMER | secrets::TICKET) {
-                    timer_due(Request::continuation(call), ticket, due)
+                    timer_due(Request::continuation::<ModuleTurn>(call), ticket, due)
                 } else {
                     let Some(mut request) = self.take_request(ticket) else {
                         self.finish_let_go();

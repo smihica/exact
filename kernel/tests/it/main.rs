@@ -8,6 +8,7 @@ mod browser_columns;
 mod browser_controls;
 mod browser_flex;
 mod browser_host_block;
+mod browser_intrinsic;
 mod browser_paint_order;
 mod browser_position;
 mod browser_ratio;
@@ -23,8 +24,10 @@ mod cover;
 mod env;
 mod export;
 mod field_text;
+mod filter_motion;
 mod fit_content_native;
 mod fit_text;
+mod flex_auto_minimum;
 mod flow;
 mod flow_auto;
 mod flow_rows;
@@ -44,14 +47,18 @@ mod mark_sizes;
 mod motion;
 mod native_buttons;
 mod native_fields;
+mod natural_text;
 mod no_panic;
 mod paint;
 mod paragraph_stamp;
 mod presence;
 mod presented_height;
+mod property_cost;
 mod reader;
+mod reader_cost;
 mod regions;
 mod rem;
+mod role_keys;
 mod size_cache;
 mod symbol;
 mod symbol_color;
@@ -75,6 +82,7 @@ mod wire;
 /// A shorthand then the `@keyframes name{…}` rules it names, resolved as a
 /// runner resolves a row against its plan's table (LLP 1055 D5).
 pub fn keyframed(text: &str) -> exact_motion::Animations {
+    exact_kernel::style::link_all();
     let (head, rules) = text.split_at(text.find("@keyframes").unwrap_or(text.len()));
     let table: Vec<(String, exact_motion::Keyframes)> = rules
         .split("@keyframes")

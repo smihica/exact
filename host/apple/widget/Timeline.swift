@@ -75,7 +75,7 @@ private func widgetSnapshotView(_ entry: ExactWidgetEntry, displaySize: CGSize, 
     // SnapshotView retains the session until WidgetKit has evaluated its layout and leaves.
     return SnapshotDriver.view(session: session, displaySize: displaySize, environment: environment)
 }
-// Families share an in-flight answer only within one generation and store revision.
+// Families share an in-flight answer only within one generation, configuration and store revision.
 private enum WidgetRefresh {
     static let queue = DispatchQueue(label: "exact.widget-refresh", qos: .userInitiated)
     /// The group's environment is set once, before any refresh reads it.
@@ -115,6 +115,11 @@ struct ExactTimelineProvider: TimelineProvider {
     func placeholder(in context: Context) -> ExactWidgetEntry { preview(context, placeholder: true) }
     func getSnapshot(in context: Context, completion: @escaping (ExactWidgetEntry) -> Void) { completion(preview(context, placeholder: false)) }
     func getTimeline(in context: Context, completion: @escaping (Timeline<ExactWidgetEntry>) -> Void) {
+        getTimeline(in: context, configuration: nil, completion: completion)
+    }
+    /// `configuration` is a configured placement's chosen values (`ExactIntentTimelineProvider`): its refresh
+    /// receives them, and its timeline is kept and shared apart from other configurations'.
+    func getTimeline(in context: Context, configuration: Data?, completion: @escaping (Timeline<ExactWidgetEntry>) -> Void) {
         #if EXACT_INSPECT
         let start = DispatchTime.now()
         #endif
@@ -139,7 +144,7 @@ struct ExactTimelineProvider: TimelineProvider {
             ? "embedded-" + (Bundle.main.object(forInfoDictionaryKey: "ExactWidgetGeneration") as? String ?? "")
             : root.lastPathComponent
         guard let group = WidgetContainer.root,
-              let cache = try? WidgetTimelineCache(root: group, kind: kind, generation: generation) else {
+              let cache = try? WidgetTimelineCache(root: group, kind: kind, generation: generation, configuration: configuration) else {
             widgetLog.error("getTimeline refused: app group unavailable")
             completion(fallback)
             return
@@ -158,7 +163,7 @@ struct ExactTimelineProvider: TimelineProvider {
                         let refresh = try HeadlessSession(plan: plan, entry: kind, size: size, facts: inputs, assetRoot: root)
                         defer { refresh.close() }
                         let module = Bundle.main.object(forInfoDictionaryKey: "ExactWidgetTypeScript") as? Bool == true ? root : nil
-                        let bytes = try refresh.timeline(at: date, moduleRoot: module, deadline: deadline)
+                        let bytes = try refresh.timeline(at: date, configuration: configuration, moduleRoot: module, deadline: deadline)
                         _ = try WidgetRefresh.entries(bytes, kind: kind, plan: plan, root: root, size: size)
                         return bytes
                     }
@@ -203,6 +208,20 @@ func footprint() -> UInt64 {
     return status == KERN_SUCCESS ? max(info.phys_footprint, UInt64(max(0, info.ledger_phys_footprint_peak))) : 0
 }
 #endif
+// An entity parameter's choices are the entries the app published to the App Group
+// (LLP 1126 D2): Edit Widget runs these in the extension, where no session boots.
+extension ExactConfigurationEntity {
+    private init(_ entry: ContentIndexEntries.Entry) {
+        self.init(id: entry.id, title: entry.title, subtitle: entry.description)
+    }
+    static func exactPublished(matching text: String? = nil) -> [Self] {
+        ContentIndexEntries.published(kind: exactKind, matching: text).map(Self.init)
+    }
+    static func exactChosen(_ ids: [String]) -> [Self] {
+        ContentIndexEntries.chosen(kind: exactKind, ids: ids, title: exactTitle).map(Self.init)
+    }
+}
+
 // SwiftUI has no public gamut environment key. The configuration seeds this
 // from UIKit traits or the Mac screen; the archived view carries it.
 private struct WidgetDisplayGamut: EnvironmentKey { static let defaultValue = "srgb" }

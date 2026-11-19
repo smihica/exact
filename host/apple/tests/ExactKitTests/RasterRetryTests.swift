@@ -4,6 +4,7 @@ import ImageIO
 import XCTest
 import Darwin
 @testable import ExactKit
+@testable import ExactImages
 
 /// A remote picture whose download failed in a way asking again may mend is
 /// asked again while it is on screen (LLP 1011 §4, the Linux host's rules):
@@ -136,6 +137,7 @@ final class RasterRetryTests: XCTestCase {
         pump(1)
         XCTAssertEqual(server.times.count, asked, "nothing is asked while it is off screen")
         XCTAssertEqual(images(loader).first?["held"] as? Bool, true, "and no error yet")
+        XCTAssertFalse(loader.loading(inside: node), "a retry waiting for the screen cannot hold a fragment's alignment")
         node.frame = shown; loader.resized(node)
         // (Between retries it is neither held nor failed: a download is under way.)
         settle { images(loader).first?["held"] as? Bool == false && images(loader).first?["failure"] as? String == "HTTP 503" }
@@ -262,7 +264,7 @@ final class RasterRetryTests: XCTestCase {
         XCTAssertEqual(RasterRetry.withoutQueries("at https:cdn.example/a.png?hm=1"), "at https:cdn.example/a.png")
         XCTAssertEqual(RasterRetry.withoutQueries("`//h/a.svg?hm=1`: fill=\"url(https:h/x?hm=s)\""), "`//h/a.svg`: fill=\"url(https:h/x)\"")
         XCTAssertEqual(RasterRetry.withoutQueries("HTTP 503: why?"), "HTTP 503: why?")
-        XCTAssertEqual(RasterRetry.withoutQuery("photos:https://cdn.example/a.png?x=a &hm=secret"), "photos:https://cdn.example/a.png")
+        XCTAssertEqual(sourceWithoutQuery("photos:https://cdn.example/a.png?x=a &hm=secret"), "photos:https://cdn.example/a.png")
         XCTAssertEqual(RasterRetry.withoutQueries("https://cdn.example/a.png?ex=1\u{000B}&hm=secret"), "https://cdn.example/a.png")
         XCTAssertEqual(RasterRetry.withoutQueries("https://cdn.example/a.png?\u{000B}hm=secret"), "https://cdn.example/a.png")
         XCTAssertEqual(RasterRetry.redacted("url(\"https://h/a?x=a &hm=s\") gone", source: "https://h/a?x=a &hm=s"), "url(\"https://h/a\") gone")

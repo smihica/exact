@@ -214,7 +214,7 @@ pub fn card() -> String {
     for (_, call) in part_calls() {
         out += &format!("  {call}\n");
     }
-    out += "\ntest steps (app.test.contract; every other form: docs/contract-grammar.md)\n";
+    out += "\ntest steps (app.test.contract, docs/contract-grammar.md)\n";
     for s in steps() {
         out += &format!("  {s}\n");
     }
@@ -235,18 +235,19 @@ pub fn card() -> String {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    // A filled state is named once, by its outline's role, which keeps the card under its size.
+    // A filled state is a mark on its outline's role, which keeps the card under its size.
     let roles = exact_kernel::generated::SYMBOL_ROLES;
-    let (filled, outlines): (Vec<&str>, Vec<&str>) =
-        roles.iter().partition(|role| role.ends_with("-fill"));
+    let outlines: Vec<String> = roles
+        .iter()
+        .filter(|role| !role.ends_with("-fill"))
+        .map(|role| {
+            let filled = roles.contains(&format!("{role}-fill").as_str());
+            format!("{role}{}", if filled { "*" } else { "" })
+        })
+        .collect();
     out += &format!(
-        "symbol roles: {}; with a <role>-fill: {}\n",
-        outlines.join(" "),
-        filled
-            .iter()
-            .map(|role| role.trim_end_matches("-fill"))
-            .collect::<Vec<_>>()
-            .join(" ")
+        "symbol roles (\"symbol:<role>\"; * has a <role>-fill; symbol:sf/<name> is Apple-only): {}\n",
+        outlines.join(" ")
     );
     out
 }
@@ -327,7 +328,9 @@ mod tests {
             "clock data",
             "reload",
             "back",
+            "presence allow",
             "fail fetch",
+            "drop stream",
             "request",
         ] {
             assert!(
@@ -419,8 +422,7 @@ mod tests {
         };
         let blocks = rules.contract();
         assert!(!blocks.is_empty(), "the rules hold an example");
-        let dir = std::env::temp_dir().join(format!("exact-card-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::Scratch::new(format!("exact-card-{}", std::process::id()));
         let path = dir.join("app.contract");
         let mut failures = Vec::new();
         for body in &blocks {
@@ -435,7 +437,6 @@ mod tests {
                     .map(|w| format!("warning [{}] {}", w.id, w.message)),
             );
         }
-        std::fs::remove_dir_all(&dir).unwrap();
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
@@ -479,12 +480,10 @@ mod tests {
 
     /// Whether `app` compiles with no error and no warning.
     fn problems(app: &str) -> Vec<String> {
-        let dir = std::env::temp_dir().join(format!("exact-how-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::Scratch::new(format!("exact-how-{}", std::process::id()));
         let path = dir.join("app.contract");
         std::fs::write(&path, app).unwrap();
         let (compiled, warnings) = contract::compile_path_all_warned(&path, false);
-        std::fs::remove_dir_all(&dir).unwrap();
         let mut out: Vec<String> = Vec::new();
         if let Err(all) = compiled {
             out.extend(

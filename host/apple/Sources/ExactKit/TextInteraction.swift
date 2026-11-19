@@ -101,7 +101,7 @@ extension NodeView {
     /// A heading by its role, which is what the iOS bar takes for a route's
     /// title: an `aria-level` with no `role="heading"` is not one there (LLP
     /// 1115.000 D12.5), as it has no heading style on any host.
-    var isHeading: Bool { isParagraph && props["accessibilityRole"] == "heading" }
+    package var isHeading: Bool { isParagraph && props["accessibilityRole"] == "heading" }
     /// @ref LLP 1116.019 — what a labelled text shows, as its value: an
     /// `aria-label` names the text, and the words it shows are still spoken
     /// after the name, as a hand-built readout's `accessibilityLabel` and
@@ -241,10 +241,10 @@ struct TextAccessibilityWrite: Equatable {
 
 /// Words a group-role paragraph holds: a static text of its runs `runs`
 /// between two links, or its whole text when it has no runs.
-private final class ParagraphWords: NSAccessibilityElement, AgentOwned {
+private final class ParagraphWords: NSAccessibilityElement, InspectionOwned {
     weak var owner: NodeView?
     let runs: [UInt32]
-    var agentViewId: UInt32? { owner?.id }
+    var inspectionViewId: UInt32? { owner?.id }
     init(owner: NodeView, text: String, runs: [InlineText]) {
         self.owner = owner; self.runs = runs.map(\.id)
         super.init()
@@ -260,10 +260,10 @@ private final class ParagraphWords: NSAccessibilityElement, AgentOwned {
         return rect.isNull ? .zero : window.convertToScreen(owner.convert(rect, to: nil))
     }
 }
-private final class InlineAccessibility: NSAccessibilityElement, AgentOwned {
+private final class InlineAccessibility: NSAccessibilityElement, InspectionOwned {
     weak var owner: NodeView?
     package let id: UInt32
-    var agentViewId: UInt32? { id } // the run's own view (LLP 1080.002 D5)
+    var inspectionViewId: UInt32? { id } // the run's own view (LLP 1080.002 D5)
     init(owner: NodeView, run: InlineText, text: NSString) {
         self.owner = owner; id = run.id
         super.init()
@@ -306,10 +306,10 @@ private final class InlineAccessibility: NSAccessibilityElement, AgentOwned {
     }
 }
 #else
-private final class InlineAccessibility: UIAccessibilityElement, AgentOwned {
+private final class InlineAccessibility: UIAccessibilityElement, InspectionOwned {
     weak var owner: NodeView?
     package let id: UInt32
-    var agentViewId: UInt32? { id } // the run's own view (LLP 1080.002 D5)
+    var inspectionViewId: UInt32? { id } // the run's own view (LLP 1080.002 D5)
     init(owner: NodeView, run: InlineText, text: NSString) {
         self.owner = owner; id = run.id
         super.init(accessibilityContainer: owner)

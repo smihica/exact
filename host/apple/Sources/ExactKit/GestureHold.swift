@@ -143,7 +143,7 @@ final class SwipeHold {
         session.apply(batch)
         guard live else { return nil }
         // Only the first explicitly authored direct child is the companion.
-        if let indicator = view.subviews.compactMap({ $0 as? NodeView }).first(where: { $0.props["swipeIndicator"] == "true" }) {
+        if let indicator = NodeView.committed(view.subviews).first(where: { $0.props["swipeIndicator"] == "true" }) {
             for property: UInt32 in [3, 1] {
                 let (token, batch) = session.runtime.holdBegin(indicator.id, property: property, now: session.now())
                 if let token { indicators.append((token, token.x)) }
@@ -214,7 +214,7 @@ final class SwipeHold {
         if updated && !cancel && fingerVelocity?.isFinite != false && armed(displacement),
            live, inputEligible, let view {
             let id = view.id, now = session.now()
-            session.applyInput(mapping.value(displacement) > 0 ? session.runtime.swiperight(id, now: now) : session.runtime.swipeleft(id, now: now))
+            session.applyInput(mapping.value(displacement) > 0 ? session.runtime.swiperight(id, now: now) : session.runtime.swipeleft(id, now: now), at: id)
         }
         ended = true
         session.retireInputHold(self)

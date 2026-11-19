@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 
 extension NavigationBarIOSTests {
     func testCachedNativeBarMenuRejectsNewActivePropertiesWithoutReprojection() throws {
@@ -10,7 +11,7 @@ extension NavigationBarIOSTests {
         let original = try node(session, "menu-item"), row = try node(session, "bar-menu-bump")
         let header = try node(session, "header-home")
         let pop = try XCTUnwrap(p.carrying("popover").first { $0.props["id"] == "bar-menu" })
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let controller = try XCTUnwrap(nav.topViewController as? RouteController)
         let nativeID: UInt32 = 900001
         var props = original.props
@@ -30,7 +31,7 @@ extension NavigationBarIOSTests {
         ]))
         let source = try XCTUnwrap(p.views[nativeID])
         XCTAssertTrue(source.isNativeButton)
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertNil(pop.props["accessibilityRole"])
         XCTAssertTrue(pop.menuShaped)
         let item = try XCTUnwrap(controller.barItemsMade[source.id]?.bar)
@@ -39,7 +40,7 @@ extension NavigationBarIOSTests {
         let signature = controller.projectedSource
         XCTAssertNil(row.nativeActiveRefusals["UIAction"])
         p.apply(wireBatch([["op": "style", "id": row.id, "style": ["press_opacity_to": 0.4]]]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertEqual(controller.projectedSource, signature)
         XCTAssertTrue(controller.barItemsMade[source.id]?.bar === item)
         XCTAssertNil(item.customView)
@@ -52,11 +53,11 @@ extension NavigationBarIOSTests {
         let session = try fixture("active-bar-refusal", module: false)
         let source = try node(session, "compose-home")
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let controller = try XCTUnwrap(nav.topViewController as? RouteController)
         let original = try XCTUnwrap(controller.barItemsMade[source.id]?.bar)
         p.apply(wireBatch([["op": "style", "id": source.id, "style": ["press_opacity_to": 0.4]]]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertTrue(controller.barItemsMade[source.id]?.bar === original)
         XCTAssertNil(original.customView)
         let logs = session.agent(#"{"op":"logs","since":0}"#)
@@ -67,14 +68,14 @@ extension NavigationBarIOSTests {
         let session = try fixture("active-title-bar", module: false)
         let source = try node(session, "compose-home")
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let controller = try XCTUnwrap(nav.topViewController as? RouteController)
         p.apply(wireBatch([
             ["op": "create", "id": 900001, "kind": "text", "props": ["text": "Go"], "style": [:]],
             ["op": "children", "id": source.id, "ids": [900001]],
             ["op": "style", "id": source.id, "style": ["press_color": [0, 0, 255, 255]]],
         ]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         let item = try XCTUnwrap(controller.barItemsMade[source.id]?.bar)
         XCTAssertNil(item.image)
         XCTAssertNil(item.customView)
@@ -84,11 +85,11 @@ extension NavigationBarIOSTests {
         XCTAssertTrue(color.getRed(nil, green: nil, blue: &blue, alpha: nil))
         XCTAssertEqual(blue, 1)
         p.apply(wireBatch([["op": "style", "id": source.id, "style": ["press_color": [255, 0, 0, 255], "press_opacity_to": 0.4]]]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertTrue(controller.barItemsMade[source.id]?.bar === item)
         XCTAssertNil(item.titleTextAttributes(for: .highlighted)?[.foregroundColor], "an unsupported combination refuses the whole active override")
         p.apply(wireBatch([["op": "style", "id": source.id, "style": [:]]]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertNil(item.titleTextAttributes(for: .highlighted)?[.foregroundColor])
     }
 
@@ -96,11 +97,11 @@ extension NavigationBarIOSTests {
         let session = try fixture("active-segment-refusal", module: false)
         let source = try node(session, "segment-all")
         let p = session.presenter
-        let nav = try XCTUnwrap(p.navigation.primaryNavigation)
+        let nav = try XCTUnwrap(p.navigationHost.primaryNavigation)
         let controller = try XCTUnwrap(nav.topViewController as? RouteController)
         let original = try XCTUnwrap(controller.navigationItem.titleView as? UISegmentedControl)
         p.apply(wireBatch([["op": "style", "id": source.id, "style": ["press_background_color": [255, 0, 0, 255]]]]))
-        p.navigation.prepareRoutes([controller], in: nav)
+        p.navigationHost.prepareRoutes([controller], in: nav)
         XCTAssertTrue(controller.navigationItem.titleView === original)
         let logs = session.agent(#"{"op":"logs","since":0}"#)
         XCTAssertTrue(logs.contains(":active") && logs.contains("background-color") && logs.contains("UISegmentedControl"), logs)

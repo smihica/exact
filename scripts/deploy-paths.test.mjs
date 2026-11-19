@@ -8,10 +8,143 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, sep, toNamespacedPath } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { assertCapturedContractSources, canonicalBytes, classify, classifyArtifacts, cohortReceipt, contractCompiler, disposeSnapshot, installedContractPackage, materializeSnapshot, namesNative, nativePlatforms, publishRoot, snapshotOf, sourcePathspec, streamHead, unrelocatableContractDependency } from './deploy.mjs';
+import { assertCapturedContractSources, assertCapturedPackageDependencies, bake, buildFor, canonicalBytes, classify, classifyArtifacts, cohortReceipt, contractCompiler, copyBake, disposeSnapshot, installedContractPackage, materializeSnapshot, namesNative, nativePlatforms, publishRoot, snapshotOf, sourcePaths, unrelocatableContractDependency } from './deploy.mjs';
+import { streamHead } from './publisher.mjs';
+import { bakeOutput, bakeTarget, buildBake } from './app.mjs';
 import * as asyncLane from './async.mjs';
+import { gameAppleLeg } from './affected.mjs';
 import { pinned } from './test-workspace.mjs';
+import { packageSpecifier } from './exact.mjs';
+import { pathFrom } from './paths.mjs';
 const {changedPaths, failures, owners, retainSkippedFailures} = asyncLane;
+
+test('identical deploy bakes reuse compilation and retain each run receipt', () => {
+  const dir = pinned(realpathSync(mkdtempSync(join(tmpdir(), 'exact-deploy-receipts-'))));
+  const target = bakeTarget('linux'), id = 'com.exact.receipts';
+  const write = (name, bytes) => { mkdirSync(dirname(join(dir, name)), {recursive:true}); writeFileSync(join(dir, name), bytes); };
+  let plan = Buffer.from('captured plan');
+  const inputs = {app:id, platform:'linux', store:{L:'A'}, trust:'production'};
+  const compat = () => ({target, inputs, id:sha256(`exact2 compatibility id v1\n${canonicalBytes(inputs)}`).slice(0,32),
+    embedded:{plan:{sha256:sha256(plan),bytes:plan.length},assets:[]}});
+  try {
+    write('Cargo.toml', '[workspace]\nmembers=["linux"]\nresolver="2"\n');
+    write('linux/Cargo.toml', '[package]\nname="receipts-linux"\nversion="0.1.0"\nedition="2021"\n');
+    write('linux/src/main.rs', 'fn main() { println!("first"); }\n');
+    write('app.contract', plan);
+    const baker = () => write('linux/build.rs', `fn main() {
+      println!("cargo:rerun-if-env-changed=EXACT_BAKE_OUTPUT");
+      println!("cargo:rerun-if-env-changed=EXACT_BAKE_INPUTS");
+      println!("cargo:rerun-if-env-changed=EXACT_UPDATE_TRUST");
+      println!("cargo:rerun-if-changed=../app.contract");
+      let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+      std::fs::write(out.join("compat.json"), r#"${JSON.stringify(compat())}"#).unwrap();
+      std::fs::write(out.join("artifacts.json"), r#"${JSON.stringify({version:1,artifacts:[{name:'app.plan',sha256:sha256(plan),bytes:plan.length,requires:{}}],sources:{}})}"#).unwrap();
+      std::fs::write(out.join("app.plan"), std::fs::read("../app.contract").unwrap()).unwrap();
+      let count = std::path::Path::new("../bakes");
+      let mut bytes = std::fs::read(count).unwrap_or_default(); bytes.push(b'x');
+      std::fs::write(count, bytes).unwrap();
+    }`);
+    baker();
+    const lock = spawnSync('cargo', ['generate-lockfile', '--offline'], {cwd:dir,encoding:'utf8'});
+    expect(lock.status).toBe(0);
+    const app = {name:'receipts', dir, workspace:dir, target:join(dir,'target'), id, manifest:{rust:false}, crate:kind=>`receipts-${kind}`};
+    const build = run => buildFor(app, 'linux', dir, join(dir, run));
+    const first = build('run-one');
+    expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('x');
+    const second = build('run-two');
+    expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('x');
+    expect(second.binary.sha256).toBe(first.binary.sha256);
+    const stem = `linux-${target}`;
+    for (const run of ['run-one','run-two']) {
+      expect(JSON.parse(readFileSync(join(dir,run,'bake',`${stem}.build.json`)))).toEqual(first);
+      expect(readFileSync(join(dir,run,'bake',`${stem}.plan`))).toEqual(plan);
+    }
+    const cache = bakeOutput(app,{EXACT_UPDATE_TRUST:'production'});
+    expect(existsSync(join(cache,`${stem}.build.json`))).toBe(true);
+    write('linux/src/main.rs','fn main() { println!("edited source"); }\n');
+    plan = Buffer.from('next captured plan');
+    write('app.contract',plan); baker();
+    const edited = build('run-source');
+    expect(edited.binary.sha256).not.toBe(first.binary.sha256);
+    expect(readFileSync(join(dir,'run-source','bake',`${stem}.plan`))).toEqual(plan);
+    expect(readFileSync(join(dir,'run-one','bake',`${stem}.plan`),'utf8')).toBe('captured plan');
+    expect(readFileSync(join(dir,'run-one','bake',`${stem}.build.json`),'utf8')).toBe(JSON.stringify(first)+'\n');
+    buildBake(app,'linux',target,{env:{EXACT_UPDATE_TRUST:'development',CARGO_NET_OFFLINE:'true'}});
+    const trusted = build('run-trust');
+    expect(trusted.trust).toBe('production');
+    expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('xxxx');
+    inputs.cohort = 'changed'; baker();
+    const cohort = build('run-cohort');
+    expect(cohort.compat.id).not.toBe(trusted.compat.id);
+    expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('xxxxx');
+    write('.cargo/config.toml','[build]\nrustflags=["--cfg", "changed_toolchain_flags"]\n');
+    let configured = build('run-toolchain');
+    expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('xxxxxx');
+    const installed = spawnSync('rustup',['toolchain','list'],{encoding:'utf8'});
+    if (!process.env.RUSTUP_TOOLCHAIN && /^stable-\S+/m.test(installed.stdout ?? '')) {
+      const stable = spawnSync('rustc',['+stable','-vV'],{encoding:'utf8'});
+      if (stable.status === 0 && stable.stdout !== configured.binary.configuration.rustc) {
+        write('rust-toolchain.toml','[toolchain]\nchannel="stable"\n');
+        const previous = configured;
+        configured = build('run-compiler');
+        expect(configured.binary.sha256).not.toBe(previous.binary.sha256);
+        expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('xxxxxxx');
+        build('run-compiler-again');
+        expect(readFileSync(join(dir,'bakes'),'utf8')).toBe('xxxxxxx');
+      }
+    }
+    const cachedPlan = join(cache,`${stem}.plan`);
+    writeFileSync(cachedPlan,'incomplete bake');
+    expect(()=>copyBake(app,join(dir,'run-incomplete'),configured,cache)).toThrow('plan or graph');
+    expect(existsSync(join(dir,'run-incomplete','bake',`${stem}.build.json`))).toBe(false);
+    writeFileSync(cachedPlan,plan);
+    writeFileSync(configured.products[0].path,'incomplete product');
+    expect(()=>copyBake(app,join(dir,'run-corrupt'),configured,cache)).toThrow('product changed');
+    expect(existsSync(join(dir,'run-corrupt','bake',`${stem}.build.json`))).toBe(false);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+}, 60_000);
+
+test('web deploys copy completed receipts and generated entries from a stable cache', () => {
+  const dir=realpathSync(mkdtempSync(join(tmpdir(),'exact-web-receipts-')));
+  const write=(name,bytes)=>{mkdirSync(dirname(join(dir,name)),{recursive:true});writeFileSync(join(dir,name),bytes);};
+  const plan=Buffer.from('web plan'), entry=Buffer.from('widget plan'), target='wasm32-unknown-unknown';
+  const app={name:'receipts',id:'com.exact.web-receipts',dir,workspace:dir,target:join(dir,'target'),crate:kind=>`receipts-${kind}`,manifest:{}};
+  const inputs={app:app.id,platform:'web',store:{L:'0'},trust:'production'};
+  const compat={inputs,target,id:sha256(`exact2 compatibility id v1\n${canonicalBytes(inputs)}`).slice(0,32),
+    embedded:{plan:{sha256:sha256(plan),bytes:plan.length},assets:[{name:'plans/widget.plan',sha256:sha256(entry),bytes:entry.length}]}};
+  const build={version:1,trust:'production',compat,binary:{sha256:sha256('binary')},products:[],graph:{version:1,sources:{},artifacts:[
+    {name:'app.plan',sha256:sha256(plan),bytes:plan.length},...compat.embedded.assets]}};
+  const cache=bakeOutput(app,{EXACT_UPDATE_TRUST:'production'});
+  try {
+    mkdirSync(cache,{recursive:true});
+    const interrupted=join(cache,`linux-${bakeTarget('linux')}.build.json`);
+    writeFileSync(interrupted,'{"version":');
+    write('fixture.json',JSON.stringify(build));
+    // The web producer stands in for host/web/build.mjs; Cargo reuse is exercised above.
+    write('host/web/build.mjs', `import {appendFileSync,readFileSync,mkdirSync,writeFileSync} from 'node:fs';
+      import {resolve} from 'node:path';
+      const build=JSON.parse(readFileSync('fixture.json')), out=process.env.EXACT_BAKE_OUTPUT;
+      const stem='web-${target}';
+      appendFileSync('outputs',out+'\\n');
+      mkdirSync(resolve(out,stem+'.entries/plans'),{recursive:true});
+      for(const [suffix,bytes] of [['.json',JSON.stringify(build.compat)],['.artifacts.json',JSON.stringify(build.graph)],['.plan','web plan'],['.build.json',JSON.stringify(build)],['.entries/plans/widget.plan','widget plan']]) writeFileSync(resolve(out,stem+suffix),bytes);
+      mkdirSync(process.env.EXACT_WEB_DIST,{recursive:true});
+      writeFileSync(resolve(process.env.EXACT_WEB_DIST,'exact.json'),'{}');
+    `);
+    for (const run of ['first','second']) {
+      bake(app,join(dir,run),dir,dir);
+      const output=join(dir,run,'bake',`web-${target}`);
+      expect(JSON.parse(readFileSync(output+'.build.json'))).toEqual(build);
+      expect(readFileSync(output+'.entries/plans/widget.plan')).toEqual(entry);
+      expect(readdirSync(join(dir,run,'bake')).every(name=>name.startsWith(`web-${target}`))).toBe(true);
+    }
+    expect(readFileSync(interrupted,'utf8')).toBe('{"version":');
+    expect(readFileSync(join(dir,'outputs'),'utf8').trim().split('\n')).toEqual([cache,cache]);
+    writeFileSync(join(cache,`web-${target}.entries/plans/widget.plan`),'incomplete entry');
+    expect(()=>copyBake(app,join(dir,'corrupt'),build,cache)).toThrow('not the file');
+    expect(existsSync(join(dir,'corrupt/bake',`web-${target}.build.json`))).toBe(false);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
 
 // LLP 1153 D1.1, D1.5: the native platforms a deploy ships are the ones the manifest names, under deploy, else under
 // host, and only a manifest that names none in either is web-only.
@@ -82,8 +215,8 @@ test('the Swappable executor rename moves the cohort and refuses the old executo
     const old = classifyArtifacts(candidate, installed);
     expect(old.binary).toBe(true);
     expect(old.bundle).toBe(false);
-    expect(old.missing).toEqual(['app.plan: executors.wasmi']);
-    expect(classifyArtifacts(candidate, cohortReceipt(candidate))).toEqual({ binary: false, bundle: true, missing: [], warnings: [] });
+    expect([old.missing, old.needsBinary]).toEqual([['app.plan: executors.wasmi'], ['app.plan: executors.wasmi']]);
+    expect(classifyArtifacts(candidate, cohortReceipt(candidate))).toEqual({ binary: false, bundle: true, missing: [], needsBinary: [], warnings: [] });
     const independent = structuredClone(candidate);
     delete independent.graph.artifacts[0].requires.executors;
     expect(classifyArtifacts(independent, installed).bundle).toBe(true);
@@ -140,7 +273,7 @@ test('a deploy snapshot leaves out dist and everything a build keeps beside it, 
     reapGenerations(dist, { newest: 1, ageMs: 0, bytes: 2 ** 30 });
     const release = leaseGeneration(dist, readdirSync(`${dist}.gen`)[0]);
     write('dist.lock', '1'); write('dist.stage-a1b2c3/app.js', 'half a build'); write('dist.previous/app.js', 'aside');
-    const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...sourcePathspec(repo, { dir: repo, workspace: repo, manifest: {} }, resolve(repo, 'exact2')));
+    const ignored = git('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...sourcePaths(repo, { dir: repo, workspace: repo, manifest: {} }, resolve(repo, 'exact2')).pathspec);
     expect(ignored.status, ignored.stderr).toBe(0);
     expect(existsSync(`${dist}.gen.reaped`)).toBe(true);
     expect(ignored.stdout.split('\0').filter(Boolean)).toEqual(['local.json']);
@@ -222,9 +355,9 @@ test('async names the suites of each failure its log attributes', () => {
   });
 });
 
-test('async runs a check only for the suites selected, its Rust tests built as a full run builds them', () => {
+test('hourly runs the full checks and selects the remaining suites, sharing workspace test builds', () => {
   const none = asyncLane.nothing();
-  expect(asyncLane.checks('new', 'old', none).map(([name]) => name)).toEqual(['build', 'clippy', 'fmt', 'caps', 'boot', 'web-bytes', 'lean', 'vm-extract', 'difftest', 'difftest-js', 'metrics']);
+  expect(asyncLane.checks('new', 'old', none).map(([name]) => name)).toEqual(['build', 'workspace-build', 'workspace', 'prepare', 'default-test', 'clippy', 'workspace-clippy', 'fmt', 'caps', 'boot', 'wasm', 'web-bytes', 'tvos-install', 'linux', 'windows', 'windows-arm64', 'android', 'difftest-quick', 'lean', 'vm-extract', 'difftest', 'difftest-js', 'metrics']);
   const selection = {...none, cargo:['exact-painted'], conform:['caltrain'], ios:true, glue:['./host/web/a.test.mjs'], lane:['a_lane_test']};
   const some = asyncLane.checks('new', 'old', selection);
   const step = name => some.find(([n]) => n === name);
@@ -238,7 +371,7 @@ test('async runs a check only for the suites selected, its Rust tests built as a
   expect(step('conform-webkit')).toBeUndefined();
   expect(step('glue')[2].at(-1)).toContain('./host/web/a.test.mjs');
   for (const name of ['prepare', 'ios']) expect(step(name)).toBeDefined();
-  for (const name of ['ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test', 'parity-svg', 'parity-motion', 'module-seams', 'notifications-web']) expect(step(name)).toBeUndefined();
+  for (const name of ['ios-touch', 'tvos', 'watchos', 'game', 'game-apple', 'web-ax-test', 'parity-svg', 'parity-motion', 'module-seams', 'notifications-web']) expect(step(name)).toBeUndefined();
   expect(asyncLane.covers('test', selection)).toEqual(['cargo:exact-painted']);
   expect(asyncLane.covers('conform-browsers', selection)).toEqual(['conform:caltrain']);
   expect(asyncLane.covers('ios', selection)).toBe(null);
@@ -252,11 +385,11 @@ test('async runs a check only for the suites selected, its Rust tests built as a
   expect(ranTwo.failures).toEqual(['ios: ExactKitTests.CTests testC failed', 'ios: exit 65 (see log)']);
   const full = asyncLane.checks('new', 'old', {lane:[], glue:['./x.test.mjs']});
   expect(full.find(([n]) => n === 'test')[2]).toEqual(expect.arrayContaining(['cargo', 'test', '--workspace']));
-  for (const name of ['ios', 'ios-touch', 'tvos', 'watchos', 'game', 'web-ax-test', 'conform', 'parity-svg', 'parity-motion', 'module-seams', 'notifications-web']) expect(full.some(([n]) => n === name)).toBe(true);
+  for (const name of ['ios', 'ios-touch', 'tvos', 'watchos', 'game', 'game-apple', 'web-ax-test', 'conform', 'parity-svg', 'parity-motion', 'module-seams', 'notifications-web']) expect(full.some(([n]) => n === name)).toBe(true);
   // A parity leg builds its gallery's Linux host, then drives the smoke on a fresh web build
   expect(full.find(([n]) => n === 'parity-svg').slice(1)).toEqual(['sh', ['-c', 'cargo build --profile host-dev -p svg-gallery-linux && EXACT_PARITY_REBUILD=1 bun scripts/smoke.mjs svg --hosts linux']]);
   // What a selection can leave out is what a full run has and an empty selection has not.
-  expect([...asyncLane.gated()].sort()).toEqual(['conform', 'conform-browsers', 'game', 'game-assets-scaffold', 'game-lock', 'game-pins', 'game-recipes', 'game-scaffold', 'game-vocab', 'glue', 'ios', 'ios-touch', 'lane', 'module-seams', 'notifications-web', 'parity-motion', 'parity-svg', 'prepare', 'test', 'tvos', 'watchos', 'web-ax-test', 'web-build-test']);
+  expect([...asyncLane.gated()].sort()).toEqual(['conform', 'conform-browsers', 'game', 'game-apple', 'game-assets-scaffold', 'game-lock', 'game-pins', 'game-recipes', 'game-scaffold', 'game-vocab', 'glue', 'ios', 'ios-touch', 'lane', 'module-seams', 'notifications-web', 'parity-motion', 'parity-svg', 'test', 'tvos', 'watchos', 'web-ax-test', 'web-build-test']);
 });
 
 test('async runs each module drive whole and keeps its failure until it runs again', () => {
@@ -295,6 +428,12 @@ test('async compiles tvOS per commit with no simulator, and tier 2 installs it',
   const ran = {checks: {tvos: {status: 0}}, failures: []};
   retainSkippedFailures(['tvos: IOS/RemoteTVOS.swift: cannot find type'], ran);
   expect(ran.failures).toEqual([]);
+});
+
+test('async compiles the shared game Apple shell when the lane selects it (#559)', () => {
+  const step = selection => asyncLane.checks('new', 'old', selection).filter(([name]) => name === 'game-apple');
+  expect(step({...asyncLane.nothing(), gameApple: true})).toEqual([['game-apple', 'sh', ['-c', gameAppleLeg]]]);
+  expect(step(asyncLane.nothing())).toEqual([]);
 });
 
 test('async compiles watchOS per commit with no simulator, and tier 2 does not again', () => {
@@ -360,7 +499,7 @@ test('async glue runs the capture fixtures and the web JS target\'s tests, less 
   expect(glue).toContain('./host/web-js/conformance/net.test.mjs');
   expect(glue).toContain('./host/web-js/live-clock.test.js');
   expect(glue).not.toContain('./host/web-js/bundle-size.test.mjs');
-  expect(glue).not.toContain('./host/web-js/document-agent.test.mjs');
+  expect(glue).toContain('./host/web-js/document-agent.test.mjs');
 });
 
 test('async glue runs a script test no list names', () => {
@@ -443,6 +582,293 @@ test('a deploy snapshot omits the Exact corpus link and still validates applicat
   const app = { name: 'test', dir: external, workspace: external, manifest: {} };
   expect(() => snapshotOf(app, { compiler, dirty: true }, exact)).toThrow(/symlink llp.*escapes the captured source repositories/);
 }, 30000);
+
+test('a deploy omits each Cargo crate target and still refuses dirty source', () => {
+  const root = mkdtempSync(join(fixture, 'cargo-outputs-'));
+  const exact = join(root, 'exact'), external = join(root, 'app');
+  const compiler = contractCompiler(compilerRoot('fn main() { print!(r#"{{"packages":[],"sources":[],"consulted":[],"errors":[]}}"#); }\n'));
+  const git = (repo, ...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  };
+  const write = (repo, name, text) => {
+    const path = join(repo, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  const crate = 'vendor/ibex/crates/hermes-lean-sys-installer';
+  for (const repo of [exact, external]) {
+    write(repo, '.gitignore', 'target/\n/local.rs\n');
+    write(repo, 'app.contract', 'app Test\n');
+    write(repo, `${crate}/Cargo.toml`, '[workspace]\n[package]\nname="installer"\nversion="0.1.0"\n');
+    write(repo, `${crate}/src/main.rs`, 'fn main() {}\n');
+    write(repo, 'fixtures/target/input.rs', 'source named target\n');
+    git(repo, 'init', '-q');
+    git(repo, 'add', '-A');
+    git(repo, 'add', '--force', 'fixtures/target/input.rs');
+    git(repo, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm', 'fixture');
+    write(repo, `${crate}/target/debug/incremental/output.o`, 'build output');
+  }
+  const app = { name: 'test', dir: external, workspace: external, manifest: {} };
+  const snapshot = snapshotOf(app, { compiler }, exact);
+  try {
+    expect(snapshot.dirty).toBe(false);
+    const captured = materializeSnapshot(snapshot, join(root, 'run'), app);
+    for (const repo of [captured.exactRoot, captured.app.dir]) {
+      expect(existsSync(join(repo, crate, 'target'))).toBe(false);
+      expect(readFileSync(join(repo, 'fixtures/target/input.rs'), 'utf8')).toBe('source named target\n');
+    }
+  } finally { disposeSnapshot(snapshot); }
+  for (const repo of [exact, external]) {
+    for (const path of ['local.rs', 'fixtures/target/local.rs', 'untracked.rs']) {
+      write(repo, path, 'uncommitted source\n');
+      expect(() => snapshotOf(app, { compiler }, exact)).toThrow(`A  ${path}`);
+      rmSync(join(repo, path));
+    }
+    write(repo, `${crate}/src/main.rs`, 'fn main() { panic!() }\n');
+    expect(() => snapshotOf(app, { compiler }, exact)).toThrow(/uncommitted or ignored source files:[\s\S]*src\/main.rs/);
+    write(repo, `${crate}/src/main.rs`, 'fn main() {}\n');
+  }
+  git(exact, 'add', '--force', `${crate}/target/debug/incremental/output.o`);
+  expect(() => snapshotOf(app, { compiler, dirty: true }, exact)).toThrow(/tracked source .*target.*inferred output root/);
+}, 30_000);
+
+test('Android build products leave Git and deploy clean while host source edits refuse', () => {
+  const root = mkdtempSync(join(fixture, 'android-outputs-'));
+  const exact = join(root, 'exact'), dir = join(root, 'app');
+  const compiler = contractCompiler(compilerRoot('fn main() { print!(r#"{{"packages":[],"sources":[],"consulted":[],"errors":[]}}"#); }\n'));
+  const write = (name, bytes) => {
+    const path = join(exact, 'host/android', name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, bytes);
+  };
+  const git = (repo, ...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  };
+  write('.gitignore', readFileSync(new URL('../host/android/.gitignore', import.meta.url)));
+  write('build.gradle.kts', '// root project\n');
+  for (const module of ['canvas', 'widgets']) write(`${module}/build.gradle.kts`, '// module\n');
+  write('canvas/src/Canvas.kt', 'class Canvas\n');
+  for (const repo of [exact, dir]) {
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, 'app.contract'), 'app Test\n');
+    git(repo, 'init', '-q');
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm',
+      'fixture\n\nCo-Authored-By: GPT-6.1 Sol <noreply@openai.com>');
+  }
+  const products = ['build/reports/dependencies.html', '.gradle/caches/state.bin', '.kotlin/sessions/session',
+    'canvas/build/intermediates/classes.jar', 'widgets/build/outputs/widget.aar', 'settings-gradle.lockfile',
+    'hs_err_pid123.log', 'replay_pid123.log', 'hs_err_pid123.mdmp'];
+  for (const product of products) write(product, 'generated');
+  const app = { name: 'test', dir, workspace: dir, manifest: {} };
+  const snapshot = snapshotOf(app, { compiler }, exact);
+  try {
+    expect(snapshot.dirty).toBe(false);
+    expect(git(exact, 'status', '--porcelain')).toBe('');
+    const captured = materializeSnapshot(snapshot, join(root, 'run'), app);
+    for (const product of products) expect(existsSync(join(captured.exactRoot, 'host/android', product))).toBe(false);
+    expect(readFileSync(join(captured.exactRoot, 'host/android/canvas/src/Canvas.kt'), 'utf8')).toBe('class Canvas\n');
+  } finally { disposeSnapshot(snapshot); }
+  write('canvas/src/Canvas.kt', 'class Changed\n');
+  expect(() => snapshotOf(app, { compiler }, exact)).toThrow('host/android/canvas/src/Canvas.kt');
+  write('canvas/src/Canvas.kt', 'class Canvas\n');
+  for (const source of ['canvas/hs_err.kt', 'fixtures/build/input.kt']) {
+    write(source, 'source');
+    expect(() => snapshotOf(app, { compiler }, exact)).toThrow(`host/android/${source}`);
+    rmSync(join(exact, 'host/android', source));
+  }
+}, 30_000);
+
+test('Cargo manifests and JVM crash reports do not grow deployment Git arguments', () => {
+  const repo = mkdtempSync(join(fixture, 'many-manifests-'));
+  const app = { dir: repo, workspace: repo, manifest: {} };
+  const git = (...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  git('init', '-q');
+  const argv = paths => ['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...paths].join(' ').length;
+  const before = argv(sourcePaths(repo, app, repo).pathspec);
+  for (let index = 0; index < 400; index++) {
+    const crate = join(repo, 'vendor/crates', `standalone-installer-${index}`);
+    mkdirSync(crate, { recursive: true });
+    writeFileSync(join(crate, 'Cargo.toml'), '[workspace]\n');
+  }
+  git('add', '-A');
+  const after = argv(sourcePaths(repo, app, repo).pathspec);
+  expect(after).toBeLessThan(32767);
+  expect(after).toBe(before);
+  const android = join(repo, 'host/android');
+  mkdirSync(android, { recursive: true });
+  for (let index = 10000; index < 10400; index++) {
+    for (const name of [`hs_err_pid${index}.log`, `replay_pid${index}.log`, `hs_err_pid${index}.mdmp`]) {
+      writeFileSync(join(android, name), 'crash report');
+    }
+  }
+  const crashes = argv(sourcePaths(repo, app, repo).pathspec);
+  expect(crashes).toBeLessThan(32767);
+  expect(crashes).toBe(before);
+});
+
+test('an external app installs its captured lockfile and keeps SDK mounts frozen', () => {
+  const root = mkdtempSync(join(fixture, 'app-lock-'));
+  const exact = join(root, 'exact'), dir = join(root, 'app');
+  const compiler = contractCompiler(resolve(import.meta.dir, '..'));
+  const write = (name, text) => {
+    const path = join(root, name);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  const git = (repo, ...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  const commit = repo => {
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm', 'fixture\n\nCo-Authored-By: GPT-6.1 Sol <noreply@openai.com>');
+  };
+  mkdirSync(join(dir, '.exact'), { recursive: true });
+  mkdirSync(exact);
+  symlinkSync(realpathSync(exact), join(dir, '.exact/checkout'), process.platform === 'win32' ? 'junction' : 'dir');
+  const pkg = { name: 'app', private: true, dependencies: { '@fixture/ui': packageSpecifier(dir, 'ui', exact) } };
+  const mount = pathFrom(dir, join(exact, 'snapback4/ts'));
+  write('app/.gitignore', 'node_modules/\n.exact/\n');
+  write('app/package.json', JSON.stringify(pkg));
+  write('app/exact.mjs', 'const seed = "../exact";\n');
+  write('app/app.json', JSON.stringify({ name: 'Test', app: { id: 'com.exact.test', name: 'Test' }, typescript: { sources: { snapback4: mount } } }));
+  write('app/app.contract', 'use Label from "@fixture/ui"\n\ncomponent App\n  view\n    Label()\n');
+  write('exact/packages/ui/package.json', JSON.stringify({ name: '@fixture/ui', version: '1.0.0', exports: './index.contract' }));
+  write('exact/scripts/app-cli.mjs', '');
+  write('exact/packages/ui/index.contract', 'component Label\n  view\n    text "Captured package"\n');
+  write('exact/packages/extra/package.json', JSON.stringify({ name: '@fixture/extra', version: '1.0.0' }));
+  write('exact/snapback4/ts/driver.ts', 'export const driver = "captured";');
+  const installed = spawnSync(process.execPath, ['install'], { cwd: dir, encoding: 'utf8' });
+  expect(installed.status, installed.stderr).toBe(0);
+  for (const repo of [exact, dir]) { git(repo, 'init', '-q'); commit(repo); }
+  const app = { name: 'test', dir, workspace: join(dir, '.exact/shells'), manifest: {} };
+  const lock = readFileSync(join(dir, 'bun.lock'));
+  // Games can omit app.json; each app's bootstrap link is still machine-local.
+  for (const [name, file, content] of [
+    ['two', 'app.json', '{"app":{"id":"com.exact.two","name":"Two"}}'],
+    ['game', 'app.contract', 'component App\n  view\n    text "Game"\n'],
+    ['launcher', 'exact.mjs', 'const seed = "../../exact";\n'],
+  ]) {
+    write(`app/${name}/${file}`, content);
+    write(`app/${name}/.gitignore`, '/.exact/\n');
+    mkdirSync(join(dir, name, '.exact'));
+    symlinkSync(realpathSync(exact), join(dir, name, '.exact/checkout'), process.platform === 'win32' ? 'junction' : 'dir');
+  }
+  commit(dir);
+  const game = { name: 'game', dir: join(dir, 'game'), workspace: join(dir, 'game'), manifest: {} };
+  const gameSnapshot = snapshotOf(game, { compiler }, exact);
+  try {
+    expect(existsSync(join(game.dir, 'app.json'))).toBe(false);
+    expect(gameSnapshot.dirty).toBe(false);
+  } finally { disposeSnapshot(gameSnapshot); }
+  let snapshot = snapshotOf(app, { compiler });
+  try {
+    expect(snapshot.dirty).toBe(false);
+    write('exact/snapback4/ts/driver.ts', 'export const driver = "edited after capture";');
+    const captured = materializeSnapshot(snapshot, join(root, 'run'), app);
+    for (const name of ['two', 'game', 'launcher'])
+      expect(realpathSync(join(captured.app.dir, name, '.exact/checkout'))).toBe(captured.exactRoot);
+    const library = join(captured.app.dir, 'node_modules/@fixture/ui/index.contract');
+    expect(readFileSync(library, 'utf8')).toContain('Captured package');
+    expect(realpathSync(library).startsWith(captured.sourceRoot + sep)).toBe(true);
+    expect(readFileSync(join(captured.app.dir, 'bun.lock'))).toEqual(lock);
+    const mounted = realpathSync(resolve(captured.app.dir, JSON.parse(readFileSync(join(captured.app.dir, 'app.json'), 'utf8')).typescript.sources.snapback4));
+    expect(mounted).toBe(join(captured.exactRoot, 'snapback4/ts'));
+    expect(readFileSync(join(mounted, 'driver.ts'), 'utf8')).toBe('export const driver = "captured";');
+    expect(pkg.dependencies['@fixture/ui']).toBe('file:.exact/checkout/packages/ui');
+    expect(mount).toBe('.exact/checkout/snapback4/ts');
+  } finally { disposeSnapshot(snapshot); }
+
+  write('exact/snapback4/ts/driver.ts', 'export const driver = "captured";');
+  write('app/two/.exact/source.txt', 'an ignored input remains source');
+  expect(() => snapshotOf(app, { compiler }, exact)).toThrow('two/.exact/source.txt');
+  rmSync(join(dir, 'two/.exact/source.txt'));
+  rmSync(join(dir, 'two/.exact/checkout'));
+  symlinkSync(realpathSync(fixture), join(dir, 'two/.exact/checkout'), process.platform === 'win32' ? 'junction' : 'dir');
+  expect(() => snapshotOf(app, { compiler }, exact)).toThrow('escapes the captured source repositories');
+  rmSync(join(dir, 'two/.exact/checkout'));
+  symlinkSync(realpathSync(exact), join(dir, 'two/.exact/checkout'), process.platform === 'win32' ? 'junction' : 'dir');
+  pkg.dependencies['@fixture/extra'] = 'file:.exact/checkout/packages/extra';
+  write('app/package.json', JSON.stringify(pkg));
+  commit(dir);
+  snapshot = snapshotOf(app, { compiler }, exact);
+  try {
+    expect(snapshot.dirty).toBe(false);
+    expect(() => materializeSnapshot(snapshot, join(root, 'stale-lock'), app)).toThrow('bun install --frozen-lockfile failed');
+    expect(readFileSync(join(dir, 'bun.lock'))).toEqual(lock);
+  } finally { disposeSnapshot(snapshot); }
+}, 30000);
+
+test('every install manifest refuses absolute file and link dependencies before discovery', () => {
+  const root = mkdtempSync(join(fixture, 'live-dependency-'));
+  const exact = join(root, 'exact'), dir = join(root, 'app'), workspace = join(dir, '.exact/shells');
+  const marker = join(root, 'discovered');
+  const compiler = contractCompiler(compilerRoot(`fn main() {
+    std::fs::write(r#"${marker}"#, "read").unwrap();
+    print!(r#"{{"packages":[],"sources":[],"consulted":[],"errors":[]}}"#);
+  }`));
+  const git = (repo, ...args) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  mkdirSync(exact);
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(dir, 'app.contract'), 'component App\n  view\n    text "Test"\n');
+  for (const repo of [exact, dir]) {
+    git(repo, 'init', '-q');
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=Exact Test', '-c', 'user.email=exact@example.invalid', 'commit', '-qm',
+      'fixture\n\nCo-Authored-By: GPT-6.1 Sol <noreply@openai.com>');
+  }
+  const app = { name: 'test', dir, workspace, manifest: {} };
+  // Neither target exists: refusal must precede resolution or installation.
+  for (const manifestRoot of [dir, workspace, exact]) {
+    for (const spec of [`file:${join(root, 'live-package')}`, 'link:live-package']) {
+      writeFileSync(join(manifestRoot, 'package.json'), JSON.stringify({ dependencies: { helper: spec } }));
+      writeFileSync(join(manifestRoot, 'bun.lock'), '{}');
+      expect(() => {
+        const snapshot = snapshotOf(app, { compiler, dirty: true }, exact);
+        disposeSnapshot(snapshot);
+      }).toThrow('would be read live after the snapshot');
+      expect(existsSync(marker)).toBe(false);
+    }
+    rmSync(join(manifestRoot, 'package.json'));
+    rmSync(join(manifestRoot, 'bun.lock'));
+  }
+}, 30000);
+
+test('installed local packages cannot reach outside the captured source', () => {
+  const root = mkdtempSync(join(fixture, 'installed-local-'));
+  const source = join(root, 'source'), app = join(source, 'app'), installed = join(app, 'node_modules/helper');
+  const local = join(source, 'helper'), live = join(root, 'live');
+  for (const dir of [installed, local, live]) mkdirSync(dir, { recursive: true });
+  const manifest = spec => writeFileSync(join(app, 'package.json'), JSON.stringify({ dependencies: { helper: spec } }));
+  manifest('file:../helper');
+  writeFileSync(join(local, 'index.ts'), 'captured');
+  writeFileSync(join(live, 'index.ts'), 'live');
+  symlinkSync(join(local, 'index.ts'), join(installed, 'index.ts'));
+  expect(() => assertCapturedPackageDependencies(app, source)).not.toThrow();
+  rmSync(join(installed, 'index.ts'));
+  symlinkSync(join(live, 'index.ts'), join(installed, 'index.ts'));
+  expect(() => assertCapturedPackageDependencies(app, source)).toThrow('outside the captured snapshot');
+  rmSync(installed, { recursive: true });
+  symlinkSync(live, installed, process.platform === 'win32' ? 'junction' : 'dir');
+  manifest('link:helper');
+  expect(() => assertCapturedPackageDependencies(app, source)).toThrow('outside the captured snapshot');
+  rmSync(installed);
+  mkdirSync(installed);
+  manifest('file:../../live');
+  expect(() => assertCapturedPackageDependencies(app, source)).toThrow('outside the captured snapshot');
+});
 
 test('Contract discovery builds in the selected private Cargo target', () => {
   const root = compilerRoot(), target = mkdtempSync(join(fixture, 'cargo-target-'));

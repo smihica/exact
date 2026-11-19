@@ -54,8 +54,8 @@ pub(crate) fn apply_zoom(arena: &NodeArena, slot: u32, s: &mut taffy::Style) {
     dim(&mut s.size.width);
     dim(&mut s.size.height);
     for size in [&mut s.min_size, &mut s.max_size] {
-        lpa(&mut size.width);
-        lpa(&mut size.height);
+        dim(&mut size.width);
+        dim(&mut size.height);
     }
     for rect in [&mut s.padding, &mut s.border] {
         for side in [
@@ -225,7 +225,7 @@ pub struct Icon<'a> {
     /// The SVG's viewBox, `min-x min-y width height`.
     pub view_box: &'a str,
     /// Its paths' `d`, drawn as a template (filled), its rule's marker
-    /// stripped; empty for an SVG the web and Linux draw as the file.
+    /// stripped; empty for an SVG drawn from a file or an Apple raster asset.
     pub path: &'a str,
     /// The SVG's path under `assets/`.
     pub svg: &'a str,
@@ -265,6 +265,12 @@ impl<'a> Icon<'a> {
             svg,
             even_odd,
         })
+    }
+
+    /// The file the Apple build rasterizes, when neither an SF Symbol nor
+    /// a template path supplies the icon.
+    pub fn apple_asset(&self) -> Option<&'a str> {
+        (self.sf.is_empty() && self.path.is_empty() && !self.svg.is_empty()).then_some(self.svg)
     }
 
     /// The source form a host reads, after `symbol:` (as the build writes a
@@ -375,8 +381,8 @@ mod tests {
             (back.1, back.2, "0 0 24 24")
         );
         assert_eq!(symbol_path(&format!("sf/{}", back.0)), Some(role));
-        assert_eq!(symbol_path("sf/flag.checkered"), None);
-        assert_eq!(apple_symbol_name("sf/flag.checkered"), "flag.checkered");
+        assert_eq!(symbol_path("sf/flag.2.crossed"), None);
+        assert_eq!(apple_symbol_name("sf/flag.2.crossed"), "flag.2.crossed");
     }
 
     /// Stage 14 C2: an even-odd icon's path starts `evenodd:`, which

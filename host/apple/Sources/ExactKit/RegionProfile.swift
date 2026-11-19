@@ -1,20 +1,22 @@
 // Immutable ICC bytes and extended-sRGB identity; never a UI context or CT layout object.
+#if os(macOS)
 import Foundation
 import CoreGraphics
 
-enum ProfileRefusal: String, Error, Sendable {
+package enum ProfileRefusal: String, Error, Sendable {
     case missing, tooLarge, reconstruction, model, notEquivalent, roundtrip, capacity
 }
-struct NativeProfileStats: Sendable, Equatable {
-    var bytes = 0
-    var owners = 0
-    var peakBytes = 0
-    var drops = 0
+package struct NativeProfileStats: Sendable, Equatable {
+    package var bytes = 0
+    package var owners = 0
+    package var peakBytes = 0
+    package var drops = 0
 }
-final class NativeProfileAccount: @unchecked Sendable {
+package final class NativeProfileAccount: @unchecked Sendable {
     private let lock = NSLock()
     private var value = NativeProfileStats()
-    var stats: NativeProfileStats { lock.lock(); defer { lock.unlock() }; return value }
+    package init() {}
+    package var stats: NativeProfileStats { lock.lock(); defer { lock.unlock() }; return value }
     fileprivate func reserve(_ count: Int) -> NativeProfileCharge? {
         lock.lock(); defer { lock.unlock() }
         guard count > 0, count <= NativeProfile.maximumBytes, value.owners < 2,
@@ -32,22 +34,22 @@ fileprivate final class NativeProfileCharge: Sendable {
     init(account: NativeProfileAccount, count: Int) { self.account = account; self.count = count }
     deinit { account.release(count) }
 }
-struct NativeProfileCapture {
-    let owner: NativeProfile?
-    let refusal: ProfileRefusal?
+package struct NativeProfileCapture {
+    package let owner: NativeProfile?
+    package let refusal: ProfileRefusal?
 }
-final class NativeProfile: Sendable, Equatable {
-    static let maximumBytes = 256 * 1024
-    let bytes: Data
+package final class NativeProfile: Sendable, Equatable {
+    package static let maximumBytes = 256 * 1024
+    package let bytes: Data
     private let charge: NativeProfileCharge
     // ICC exports extended sRGB as sRGB. Keep its extended components through reconstruction.
     private let extended: Bool
     private init(bytes: Data, charge: NativeProfileCharge, extended: Bool) {
         self.bytes = bytes; self.charge = charge; self.extended = extended
     }
-    static func == (lhs: NativeProfile, rhs: NativeProfile) -> Bool { lhs.bytes == rhs.bytes && lhs.extended == rhs.extended }
+    package static func == (lhs: NativeProfile, rhs: NativeProfile) -> Bool { lhs.bytes == rhs.bytes && lhs.extended == rhs.extended }
 
-    static func capture(original: CGColorSpace, data: CFData?, account: NativeProfileAccount) -> NativeProfileCapture {
+    package static func capture(original: CGColorSpace, data: CFData?, account: NativeProfileAccount) -> NativeProfileCapture {
         func refused(_ reason: ProfileRefusal) -> NativeProfileCapture { NativeProfileCapture(owner: nil, refusal: reason) }
         guard let data else { return refused(.missing) }
         let count = CFDataGetLength(data)
@@ -65,24 +67,25 @@ final class NativeProfile: Sendable, Equatable {
         return NativeProfileCapture(owner: NativeProfile(bytes: bytes, charge: charge, extended: extended), refusal: nil)
     }
 
-    func makeSpace() -> CGColorSpace? {
+    package func makeSpace() -> CGColorSpace? {
         guard let space = CGColorSpace(iccData: bytes as CFData), space.model == .rgb, space.numberOfComponents == 3,
               let roundtrip = space.copyICCData(), (roundtrip as Data) == bytes else { return nil }
         return extended ? CGColorSpace(name: CGColorSpace.extendedSRGB) : space
     }
 }
 
-struct NativeFormat: Sendable, Equatable {
-    var width = 0
-    var height = 0
-    var bytesPerRow = 0
-    var bitsPerComponent = 0
-    var bitsPerPixel = 0
-    var bitmapInfo: UInt32 = 0
-    var antialias = false
-    var valid: Bool {
+package struct NativeFormat: Sendable, Equatable {
+    package var width = 0
+    package var height = 0
+    package var bytesPerRow = 0
+    package var bitsPerComponent = 0
+    package var bitsPerPixel = 0
+    package var bitmapInfo: UInt32 = 0
+    package var antialias = false
+    package var valid: Bool {
         width > 0 && width <= 16384 && height > 0 && height <= 16384
             && bytesPerRow >= width * 4 && bitsPerComponent == 8 && bitsPerPixel == 32
             && bitmapInfo == CGImageAlphaInfo.premultipliedLast.rawValue && antialias
     }
 }
+#endif

@@ -5,7 +5,7 @@ use super::super::{Batch, Host};
 use exact_runner::{design::Edit, DataSource, LiveRefusal, Timed};
 
 impl<D: DataSource> Host<D> {
-    /// Apply a `tamber-batch` or `tamber-snapshot` frame: a batch whose
+    /// Apply a `forma-batch` or `forma-snapshot` frame: a batch whose
     /// `live` says `applied` (with `unsupported` when the wide colour table
     /// refused a colour), `stale` (ask for a snapshot), `structure` (a plan
     /// is coming) or `refused`.
@@ -13,7 +13,7 @@ impl<D: DataSource> Host<D> {
         let Some(edit) = Edit::parse(frame) else {
             return self.finish(
                 crate::batch::Batch::new(),
-                Some("live: not a tamber batch or snapshot"),
+                Some("live: not a forma batch or snapshot"),
             );
         };
         let mut batch = crate::batch::Batch::new();
@@ -40,9 +40,9 @@ impl<D: DataSource> Host<D> {
         };
         let batch = self.batch_from(batch, &receipts, None);
         let mut out = String::from("{\"live\":");
-        exact_runner::agent::quote(&live, &mut out);
+        exact_runner::json::quote(&live, &mut out);
         out.push_str(&format!(",\"unsupported\":{unsupported},\"design\":"));
-        exact_runner::agent::quote(&self.runner.design(), &mut out);
+        exact_runner::json::quote(&self.runner.design(), &mut out);
         out.push(',');
         out.push_str(&batch[1..]);
         out

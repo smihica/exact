@@ -3,6 +3,7 @@ import UIKit
 import ObjectiveC.runtime
 import XCTest
 @testable import ExactKit
+@testable import ExactNavigation
 @testable import ExactMarkdown
 
 /// LLP 1086.000.000 D2: the agent's `reveal` counts what a person sees as in
@@ -327,7 +328,7 @@ final class RevealKeyboardIOSTests: XCTestCase {
         }
         let (session, _, _, field) = try liveFixture("keyboard-policy-change", policy: "resizes-visual", plan: "EXACT_HEADLESS_PLAN")
         let p = session.presenter
-        XCTAssertFalse(p.navigation.wantsWholeView, "this page has no native navigation")
+        XCTAssertFalse(p.navigationHost.wantsWholeView, "this page has no native navigation")
         let shown = expectation(forNotification: UIResponder.keyboardDidShowNotification, object: nil)
         XCTAssertTrue(field.becomeFirstResponder())
         wait(for: [shown], timeout: 10)
@@ -405,8 +406,8 @@ final class RevealKeyboardIOSTests: XCTestCase {
         if session.firstDrawMs == nil { session.firstDrawMs = ExactEnv.wall() }
         let opener = try XCTUnwrap(p.views.values.first { $0.props["testId"] == "sheet" })
         p.press(opener.id)
-        until("the sheet is presented") { p.modals.coordinateView?.window != nil && !p.modals.inTransition }
-        let sheet = try XCTUnwrap(p.modals.coordinateView)
+        until("the sheet is presented") { p.modalHost.coordinateView?.window != nil && !p.modalHost.inTransition }
+        let sheet = try XCTUnwrap(p.modalHost.coordinateView)
         let route = try XCTUnwrap(p.views.values.first { $0.props["testId"] == "route-sheet" })
         func height() -> CGFloat? {
             guard let reply = try? JSONSerialization.jsonObject(with: Data(session.runtime.agent("{\"op\":\"frames\"}").utf8)) as? [String: Any],
@@ -516,7 +517,7 @@ final class RevealKeyboardIOSTests: XCTestCase {
         XCTAssertEqual(p.keyboardPolicy, "resizes-visual")
         setKeyboard(p, top: 574)
         spin(0.3)
-        let scrollport = try XCTUnwrap(p.navigation.controllers[route.id]?.contentViewport)
+        let scrollport = try XCTUnwrap(p.navigationHost.controllers[route.id]?.contentViewport)
         XCTAssertEqual(scrollport.contentInset.bottom, 300, accuracy: 0.5, "the route's scrollport takes the overlap")
         XCTAssertEqual(p.viewport.contentInset.bottom, 0, "the outer page gains no keyboard range")
         XCTAssertEqual(bottom(), 874, accuracy: 0.5, "laid out as without a keyboard")
@@ -526,7 +527,7 @@ final class RevealKeyboardIOSTests: XCTestCase {
             setKeyboard(p, top: 574)
             p.hostDocument(fixed: false)
             XCTAssertEqual(p.viewport.contentInset.bottom, 0, "\(policy) adds no scroll range when native ownership ends")
-            p.navigation.fitOwner()
+            p.navigationHost.fitOwner()
             XCTAssertEqual(p.viewport.contentInset.bottom, 0, "\(policy) adds no scroll range when ownership returns")
             setKeyboard(p, top: nil)
         }
@@ -654,7 +655,7 @@ extension XCTestCase {
             presenter.setKeyboardInset(overlap)
         }
         if top == nil { presenter.pinnedRoom.release() }
-        presenter.navigation.primaryRoutes.forEach { $0.fitContentViewport() }
+        presenter.navigationHost.primaryRoutes.forEach { $0.fitContentViewport() }
         presenter.menus.rehostPopovers()
         presenter.revealEditorAsTheKeysMove()
     }
@@ -676,7 +677,7 @@ private final class KeyboardGuideFixture {
 
     init(_ presenter: Presenter) {
         self.presenter = presenter
-        (presenter.navigation.activeRoute?.contentMount ?? presenter.viewport).addSubview(input)
+        (presenter.navigationHost.activeRoute?.contentMount ?? presenter.viewport).addSubview(input)
         frameMethod = class_getInstanceMethod(UILayoutGuide.self, #selector(getter: UILayoutGuide.layoutFrame))!
         actionMethod = class_getInstanceMethod(UIApplication.self, #selector(UIApplication.sendAction(_:to:from:for:)))!
         frameOriginal = method_getImplementation(frameMethod)
@@ -685,7 +686,7 @@ private final class KeyboardGuideFixture {
         let action = unsafeBitCast(actionOriginal, to: (@convention(c) (UIApplication, Selector, Selector, AnyObject?, AnyObject?, UIEvent?) -> Bool).self)
         let frameBlock: @convention(block) (UILayoutGuide) -> CGRect = { [weak self] guide in
             if guide is UIKeyboardLayoutGuide, let self, let container = guide.owningView, let presenter = self.presenter,
-               container === presenter.session?.view || container === presenter.modals.coordinateView {
+               container === presenter.session?.view || container === presenter.modalHost.coordinateView {
                 let edge = self.top.map { container.convert(CGPoint(x: 0, y: $0), from: container.window).y } ?? container.bounds.maxY
                 return CGRect(x: 0, y: edge, width: container.bounds.width, height: max(0, container.bounds.maxY - edge))
             }

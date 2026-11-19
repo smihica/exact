@@ -1,6 +1,7 @@
 import XCTest
 import WebKit
 @testable import ExactKit
+@testable import ExactWebViews
 #if os(macOS)
 import AppKit
 #endif
@@ -29,7 +30,7 @@ final class IframePostMessageTests: XCTestCase {
             try Data(html.replacingOccurrences(of: "FRAME", with: name).utf8).write(to: directory.appendingPathComponent("\(name).html"))
         }
         let session = ExactApp.shared.makeSession(label: "iframe-replies")
-        session.webviews.moduleLocation = { module }
+        session.webHost.moduleLocation = { module }
         defer { session.destroy() }
         XCTAssertNil(session.boot(plan: try fixturePlan("IFRAME_POST_MESSAGES"), size: CGSize(width: 640, height: 500)).error)
         AppFiles.learn(["roots": ["data": directory.path]])

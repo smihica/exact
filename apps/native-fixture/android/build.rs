@@ -22,7 +22,7 @@ fn main() {
     // The compatibility id (LLP 1030 D3a) as `../linux/build.rs` computes it
     // for this target: the Canvas host is the Linux host's presenter under
     // Android's own Canvas. That host has no update store and replaces no
-    // Rust module, whatever the record says of either (host/android/README.md).
+    // Rust module, and the bake records no store (host/android/README.md).
     println!("cargo:rerun-if-changed=../app.json");
     println!("cargo:rerun-if-changed=../data");
     println!("cargo:rerun-if-changed=../../../Cargo.lock");
@@ -30,8 +30,15 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     let manifest = contract::Manifest::read(&app_dir).unwrap_or_else(|e| panic!("app.json: {e}"));
     let grants = native_fixture_data::Fixture.grants();
-    let compat = exact_bake::compatibility_id(&app_dir, "linux", &target, &manifest, Some(grants))
-        .unwrap_or_else(|e| panic!("compatibility id: {e}"));
+    let compat = exact_bake::compatibility_id(
+        &app_dir,
+        "linux",
+        &target,
+        &manifest,
+        Some(grants),
+        exact_bake::hands_out_work!(native_fixture_data::Fixture),
+    )
+    .unwrap_or_else(|e| panic!("compatibility id: {e}"));
     std::fs::write(out_dir.join("compat.json"), compat.to_json()).unwrap();
     // The app's hatches and what its plan links (LLP 1115.001.000 D2, D4).
     contract::native::android_entry(&app_dir, &manifest, &baked, &out_dir)

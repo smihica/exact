@@ -57,6 +57,7 @@ impl<D: DataSource> Presenter<D> {
             rect: [mx + ox, my + oy, mw, mh],
             range: [menu.offset, max, 0.0],
             set: (0, 0),
+            grid: [0; 4],
             name: String::new(),
             value: String::new(),
             hint: String::new(),
@@ -86,6 +87,7 @@ impl<D: DataSource> Presenter<D> {
                 rect: [shows.0 + ox, shows.1 + oy, shows.2, shows.3],
                 range: [0.0; 3],
                 set: (at as i32 + 1, count),
+                grid: [0; 4],
                 name: choice.label,
                 value: String::new(),
                 hint: String::new(),
@@ -96,7 +98,6 @@ impl<D: DataSource> Presenter<D> {
     /// The node of the open menu's row the keys are at, which is where the
     /// focus is while the menu is open (the combobox pattern's active
     /// descendant). Windows reads it (`desktop_access.rs`).
-    #[cfg(any(windows, test))]
     pub(in crate::presenter) fn access_menu_focus(&self) -> Option<i32> {
         let select = self.menu?;
         let at = self.menu_paint()?.chosen?;

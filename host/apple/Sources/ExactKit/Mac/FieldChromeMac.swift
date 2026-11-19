@@ -157,7 +157,7 @@ extension TextEngine {
         }
         return cacheFont(font, for: key)
     }
-    static func controlWeight(_ font: NSFont) -> Int {
+    package static func controlWeight(_ font: NSFont) -> Int {
         if let weight = TextEngine.cssWeight(of: font) { return weight }
         let traits = font.fontDescriptor.object(forKey: .traits) as? [NSFontDescriptor.TraitKey: Any]
         let weight = traits?[.weight] as? CGFloat ?? 0

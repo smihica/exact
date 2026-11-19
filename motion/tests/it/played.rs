@@ -49,6 +49,7 @@ fn fading() -> Engine {
 
 #[test]
 fn a_played_transition_settles_at_its_end() {
+    exact_motion::link_transitions();
     let e = fading();
     assert!(e.quiescent(), "nothing for the display to drive");
     assert_eq!(e.settle_time(), Some(1.0), "an agent's settle waits for it");
@@ -56,6 +57,7 @@ fn a_played_transition_settles_at_its_end() {
 
 #[test]
 fn an_unchanged_target_keeps_it_played_until_it_ends() {
+    exact_motion::link_transitions();
     let mut e = fading();
     e.advance(0.5).unwrap();
     // A commit that changes the node restates its rows
@@ -69,6 +71,7 @@ fn an_unchanged_target_keeps_it_played_until_it_ends() {
 
 #[test]
 fn a_removal_forgets_it() {
+    exact_motion::link_transitions();
     let mut e = fading();
     e.remove(NODE);
     assert!(e.at_rest(NODE));
@@ -84,6 +87,7 @@ fn a_removal_forgets_it() {
 
 #[test]
 fn a_hold_takes_it_from_where_it_stands() {
+    exact_motion::link_transitions();
     let mut e = fading();
     let held = e.begin_hold(NODE, P, 0.25, None).unwrap().unwrap();
     assert_eq!(
@@ -107,6 +111,7 @@ fn a_hold_takes_it_from_where_it_stands() {
 
 #[test]
 fn an_unchanged_colour_target_keeps_a_transition_between_colour_spaces() {
+    exact_motion::link_transitions();
     let red = exact_motion::color::parse("#ff0000").unwrap();
     let mut e = Engine::new();
     linear(&mut e);
@@ -127,6 +132,8 @@ fn an_unchanged_colour_target_keeps_a_transition_between_colour_spaces() {
 
 #[test]
 fn its_end_shows_the_animation_it_covered() {
+    exact_motion::link_transitions();
+    exact_motion::link_animations();
     let fade = Keyframes::parse("from{opacity:0}to{opacity:1}").unwrap();
     let mut row = Animations::parse("fade 2s linear -1s paused").unwrap();
     row.resolve(|name| (name == "fade").then_some(&fade));
@@ -144,6 +151,7 @@ fn its_end_shows_the_animation_it_covered() {
 
 #[test]
 fn a_new_path_takes_its_curve_back() {
+    exact_motion::link_transitions();
     let path = |y: f64| {
         PathValue(vec![
             PathCommand {
@@ -179,6 +187,7 @@ fn a_new_path_takes_its_curve_back() {
 /// engine samples it again from where its curve is, and drives the clock.
 #[test]
 fn a_reclaimed_transition_is_sampled_from_where_its_curve_is() {
+    exact_motion::link_transitions();
     let mut e = fading();
     e.advance(0.25).unwrap();
     assert!(e.played_transitions().any(|k| k == (NODE, P)));

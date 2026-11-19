@@ -32,7 +32,7 @@ extension NodeView {
     /// The editor's text is now `value`, marked text and all. The app is
     /// told when that is not the text it knows: what it was last told
     /// (`toldText`), or the value it last set, compared as UTF-16 units.
-    func typedText(_ value: String) {
+    package func typedText(_ value: String) {
         if value.utf16.elementsEqual((toldText ?? props["value"] ?? "").utf16) { return }
         toldText = value
         presenter?.typed(id, value, input: handlers.contains("input"))

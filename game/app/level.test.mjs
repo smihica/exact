@@ -1,8 +1,8 @@
-import {test, expect} from 'bun:test';
+import {test, expect, spyOn} from 'bun:test';
 import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {resolve} from 'node:path';
-import {gameDefaults, gameShells} from './shells.mjs';
+import {gameDefaults, gameShells, renderGraph, sharesAppleEntry} from './shells.mjs';
 
 test('external shells use the SDK toolchain and refresh stale generated pins', () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-shell-toolchain-'));
@@ -117,6 +117,23 @@ test('a declared app data crate is linked into generated game hosts', () => {
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
 
+test('a game with an update store is refused before its shells are generated', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-store-shell-'));
+  const shells = () => gameShells(dir, gameDefaults(dir).game, resolve(import.meta.dir, '..'));
+  try {
+    mkdirSync(resolve(dir, 'logic/src'), {recursive:true});
+    writeFileSync(resolve(dir, 'logic/src/lib.rs'), 'impl Game for Island { const ID: &\'static str = "island"; }');
+    for (const platform of ['android', 'ios', 'macos', 'linux', 'windows', 'web']) {
+      writeFileSync(resolve(dir, 'app.json'), JSON.stringify({deploy:{store:{[platform]:'A'}}}));
+      expect(shells).toThrow(`deploy.store.${platform} is "A", but games take no over-the-air updates today`);
+      expect(existsSync(resolve(dir, '.shells'))).toBe(false);
+    }
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({deploy:{store:{android:'0', ios:'0'}}}));
+    shells();
+    expect(existsSync(resolve(dir, '.shells/android/Cargo.toml'))).toBe(true);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
 test('render declarations fail before creating or changing generated files', () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-render-declaration-'));
   const valid = {crate:'island-render', hooks:'view::Hooks', shaders:'shaders::REGISTRY'};
@@ -218,7 +235,9 @@ test('the bake writes the render crate its assembled shader inventory, engine pr
     gameShells(dir, gameDefaults(dir).game, resolve(import.meta.dir, '..'));
     const frame = readFileSync(resolve(import.meta.dir, '../render/src/shaders/frame.wgsl'), 'utf8');
     expect(readFileSync(resolve(dir, '.shells/shaders/sky.wgsl'), 'utf8')).toBe(`${frame}\n// sky body\n`);
-    expect(readFileSync(resolve(dir, '.shells/.cargo/config.toml'), 'utf8')).toContain(`EXACT_GAME_SHADERS = ${JSON.stringify(resolve(realpathSync(dir), '.shells/shaders'))}`);
+    const config = readFileSync(resolve(dir, '.shells/.cargo/config.toml'), 'utf8');
+    expect(config).toContain(`EXACT_GAME_SHADERS = ${JSON.stringify(resolve(realpathSync(dir), '.shells/shaders'))}`);
+    expect(config).toContain(`build-dir = ${JSON.stringify(resolve(realpathSync(dir), 'target'))}`);
   } finally { rmSync(dir, {recursive:true, force:true}); }
 });
 
@@ -230,3 +249,81 @@ test('starter and Beacons retarget glow through the row handle', () => {
     expect(source).not.toMatch(/require_mut::<Glow>|\.0\.to\(|tick_end\(/);
   }
 });
+
+test('a game shares the Apple host only when the build will bake the shared entry (#559)', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-shared-entry-'));
+  try {
+    mkdirSync(resolve(dir, 'logic/src'), {recursive:true});
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({game:{}}));
+    writeFileSync(resolve(dir, 'logic/src/lib.rs'), 'impl Game for Island { const ID: &\'static str = "island"; }');
+    const game = gameDefaults(dir).game, sdk = resolve(import.meta.dir, '..');
+    const shell = () => readFileSync(resolve(dir, '.shells/apple/Cargo.toml'), 'utf8') + readFileSync(resolve(dir, '.shells/apple/build.rs'), 'utf8');
+    const shares = env => {
+      gameShells(dir, game, sdk, {env});
+      const text = shell();
+      // The dependency and the build script's call are one decision.
+      expect(text.includes('exact-game-apple.workspace = true')).toBe(text.includes('bake_shared_declaration('));
+      return text.includes('bake_shared_declaration(');
+    };
+    expect(shares({})).toBe(true);
+    expect(shares({EXACT_APPLE_LINK:'all', EXACT_UPDATE_TRUST:'production'})).toBe(true);
+    expect(shares({EXACT_UPDATE_TRUST:'production'})).toBe(false);
+    expect(shares({EXACT_APPLE_LINK:'plan'})).toBe(false);
+    expect(shares({EXACT_NATIVE_SOURCE:'0'.repeat(64)})).toBe(false);
+    expect(shares({EXACT_RUST_BUNDLE:dir})).toBe(false);
+    expect(sharesAppleEntry({link:['sqlite']}, {EXACT_APPLE_LINK:'plan'})).toBe(true);
+    expect(sharesAppleEntry({preload:{feed:{url:'https://example.com/feed'}}}, {})).toBe(false);
+    expect(sharesAppleEntry({preload:{}}, {})).toBe(true);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('a lock captured before the shared Apple host keeps the game on its own host until the lock is refreshed (#559)', () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-shared-apple-'));
+  try {
+    mkdirSync(resolve(dir, 'logic/src'), {recursive:true});
+    writeFileSync(resolve(dir, 'app.json'), JSON.stringify({game:{}}));
+    writeFileSync(resolve(dir, 'logic/src/lib.rs'), 'impl Game for Island { const ID: &\'static str = "island"; }');
+    writeFileSync(resolve(dir, 'Cargo.lock'), 'version = 4\n\n[[package]]\nname = "exact-runner"\nversion = "0.1.0"\n');
+    const game = gameDefaults(dir).game, sdk = resolve(import.meta.dir, '..');
+    const sharesHost = () => /^exact-game-apple\.workspace = true$/m.test(readFileSync(resolve(dir, '.shells/apple/Cargo.toml'), 'utf8'));
+    gameShells(dir, game, sdk, {env:{}});
+    expect(sharesHost()).toBe(false);
+    gameShells(dir, game, sdk, {env:{}, updateLock:true});
+    expect(sharesHost()).toBe(true);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('the bake warns when logic can enable a renderer dependency', () => {
+  const logic = { id: 'logic', name: 'sample-logic', dependencies: [] };
+  const metadata = { packages: [logic], workspace_members: ['logic'], resolve: { nodes: [] } };
+  const game = { crate: logic.name };
+  const warn = spyOn(console, 'warn').mockImplementation(() => {});
+  try {
+    renderGraph(metadata, game);
+    expect(warn).not.toHaveBeenCalled();
+    logic.dependencies.push({ name: 'exact-game-render', rename: 'renderer', optional: true, kind: null });
+    renderGraph(metadata, game);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith('warning: hook code in the logic crate: its optional features are outside the determinism lint run, and the logic crate can name renderer types; move it to render/');
+    warn.mockClear();
+    logic.dependencies = [{ name: 'exact-game-render', optional: false, kind: null, target: 'cfg(unix)' }];
+    renderGraph(metadata, game);
+    expect(warn).toHaveBeenCalledTimes(1);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+for (const kind of ['dev', 'build']) {
+  test(`the bake does not warn about a ${kind} dependency on the renderer`, () => {
+    const logic = { id: 'logic', name: 'sample-logic', dependencies: [{ name: 'exact-game-render', kind }] };
+    const metadata = { packages: [logic], workspace_members: ['logic'], resolve: { nodes: [] } };
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      renderGraph(metadata, { crate: logic.name });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+}

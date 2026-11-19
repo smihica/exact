@@ -2,6 +2,7 @@
 import AppKit
 import XCTest
 @testable import ExactKit
+@testable import ExactCollections
 
 /// Press feedback on AppKit (LLP 1061 D2): the mouse button held down inside
 /// a pressable node shows its `press_scale`; dragging out releases the
@@ -231,11 +232,15 @@ final class PressFeedbackMacTests: XCTestCase {
         XCTAssertFalse(v.platformPressTints)
         // An item of a list that scrolls sideways is a carousel's card, not a row (as on the web host).
         list.container.addSubview(v)
-        let sideways = try XCTUnwrap(CollectionSnapshot(["view": 2, "revision": 1, "scrollSequence": 1, "totalExtent": 600.0, "axis": "x", "rows": [[String: Any]]()]))
-        p.collections.entries[2] = CollectionHost.Entry(sideways)
+        let snapshots = wireBatch([
+            ["op": "collections", "items": [["view": 2, "revision": 1, "scrollSequence": 1,
+                                             "totalExtent": 600.0, "axis": "x", "rows": [[String: Any]]()]]],
+        ]).ops.first?.collections
+        let sideways = try XCTUnwrap(snapshots?.first)
+        p.listHost.entries[2] = CollectionHost.Entry(sideways)
         XCTAssertFalse(v.isListRow)
         XCTAssertTrue(v.platformPressTints, "a carousel's card shows the press")
-        p.collections.entries[2] = nil
+        p.listHost.entries[2] = nil
         XCTAssertTrue(v.isListRow)
         // A native control keeps its own feedback: no wash is laid over it.
         let native = NodeView(id: 4, kind: "control", presenter: p)

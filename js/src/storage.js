@@ -12,7 +12,8 @@
       journal = env.journal,
       errorText = env.errorText,
       background = env.background,
-      owner = env.owner;
+      owner = env.owner,
+      browserSecrets = env.browserSecrets;
     var storing = env.storing,
       unstore = env.unstore,
       storageCounts = env.storageCounts,
@@ -32,7 +33,7 @@
     // the same on every host (kanban F28; host/web-js/ts-data.js `coded`):
     // storage itself is unavailable ("bake", "agent", "unsupported"), the
     // grants do not cover the operation ("denied"), the filesystem's POSIX
-    // name ("ENOENT", "EEXIST", "ENOTDIR", "EISDIR", "ENOTEMPTY", "EBUSY"),
+    // name ("ENOENT", "EEXIST", "ENOTDIR", "EISDIR", "ENOTEMPTY", "EBUSY", "EACCES"),
     // else "failed". The message says more and differs by host.
     var REFUSED = {
       bake: "storage is unavailable during bake",
@@ -41,14 +42,15 @@
     };
     var toldAgent = false,
       READS = { readFile: true, readdir: true, stat: true, realpath: true };
-    // Rust's error numbers are platform-specific. Never treat Windows access
-    // denial (5) as EISDIR, or its 17/39 as Unix EEXIST/ENOTEMPTY.
+    // Rust's error numbers are platform-specific: Windows access denial
+    // is 5 (EACCES), and its 17/39 are not Unix EEXIST/ENOTEMPTY.
     var windowsStorage = global.__exact_windows_storage === true;
     delete global.__exact_windows_storage;
     var ERRNO = windowsStorage
       ? {
           2: "ENOENT",
           3: "ENOENT",
+          5: "EACCES",
           32: "EBUSY",
           33: "EBUSY",
           80: "EEXIST",
@@ -57,7 +59,7 @@
           183: "EEXIST",
           267: "ENOTDIR",
         }
-      : { 2: "ENOENT", 16: "EBUSY", 17: "EEXIST", 20: "ENOTDIR", 21: "EISDIR", 39: "ENOTEMPTY", 66: "ENOTEMPTY" };
+      : { 13: "EACCES", 2: "ENOENT", 16: "EBUSY", 17: "EEXIST", 20: "ENOTDIR", 21: "EISDIR", 39: "ENOTEMPTY", 66: "ENOTEMPTY" };
     // The image calls' own failures (LLP 1069.002 A1.4, LLP 1133.019 D17),
     // named in the message natively; the web sets the code itself.
     var IMAGE_CODE =
@@ -102,15 +104,22 @@
       var error = new Error(message);
       error.kind = "Unavailable";
       error.code = code || storageCode(String(message));
-      if (/^unsupported: no (home|bundle): directory here$/.test(String(message)))
+      if (/^NotSupportedError: |^unsupported: no (home|bundle): directory here$/.test(String(message)))
         // no such directory on iOS, tvOS, Android (LLP 1133.007 D6); its code stays "failed", as "unsupported" is a
         // host with no app storage
         Object.defineProperty(error, "name", { value: "NotSupportedError", writable: true, configurable: true });
       return error;
     }
-    function storageCall(receiver, method, args, convert) {
+    // `accepted`, for a release (a lock's `unlock()`), runs once the operation is queued.
+    function storageCall(receiver, method, args, convert, accepted) {
       if (env.overlaying()) return Promise.reject(inOverlay("storage." + method + "()"));
       var call = env.current();
+      // An answer whose storage wait failed issues no more storage. A release in its `finally` still runs, as the
+      // module's work, queued behind the write the answer left in flight.
+      if (call && call.lost) {
+        if (!accepted) return Promise.reject(call.error || storageError("the answer's storage wait failed"));
+        call = background;
+      }
       // Storage issued after its answer replied (a `.then` chained on a save,
       // a write begun when a background one lands) is background work (D2).
       // Before any answer, during module evaluation, it is refused, as it is
@@ -126,6 +135,14 @@
         );
         journal("storage refused: " + refused.message);
         return Promise.reject(refused);
+      }
+      var waitingSecret = call.secrets && call.secrets[0];
+      if (browserSecrets && !call.letGo && waitingSecret && waitingSecret.asked && !waitingSecret.held) {
+        var waitingRefusal = storageError(
+          "storage." + method + "() called while its answer waits for store.exclusive(): it was never run"
+        );
+        journal("storage refused: " + waitingRefusal.message);
+        return Promise.reject(waitingRefusal);
       }
       var refused;
       // A file operation names its path: a document the person chose
@@ -165,6 +182,7 @@
       }
       call.storage++;
       storing.add(call);
+      if (accepted) accepted();
       // The web realm attributes the cell now, while this answer is current.
       // The adapter runs at issue, and a background round may be current then
       // (LLP 1097 D7). Hermes has no hook and runs the adapter at the call.
@@ -175,6 +193,10 @@
         var op = {
           call: call,
           method: method,
+          abandon: function () {
+            if (held != null && typeof global.__exact_abandon_storage === "function")
+              global.__exact_abandon_storage(held);
+          },
           run: function () {
             try {
               return receiver[method].apply(receiver, argv);
@@ -190,7 +212,7 @@
           env.setCurrent(at);
           unstore(at);
           if (ok) {
-            storageCounts.done++;
+            if (!op.failed) storageCounts.done++;
             var destination =
               method === "transformImage" ? (typeof value === "string" ? value.split("\t")[3] : value.path) : argv[1];
             if (
@@ -217,6 +239,7 @@
               })
             )
               storageCounts.writes++;
+            if (op.failed) return;
             try {
               resolve(convert ? convert(value) : value);
             } catch (e) {
@@ -224,6 +247,7 @@
             }
             return;
           }
+          if (op.failed) return;
           var error = value;
           // The host's grant refusal names no path: name it, and the lines that would admit it.
           if (
@@ -256,12 +280,73 @@
         env.enqueue(op);
       });
     }
-    function statement(raw) {
+    // LLP 1030.004 D2: a write that landed announces its topics to the app's other sessions, and a read in an answer
+    // watches them, so one session's write re-asks another's reads. A database's topic is `sqlite:<path>`; an app
+    // file's is its URL, and its directory's, which lists it.
+    function fileTopics(path) {
+      if (typeof path !== "string" || !/^app:\//.test(path)) return [];
+      var href;
+      try {
+        href = new URL(path).href.replace(/\/$/, "");
+      } catch (e) {
+        return [];
+      }
+      var parent = href.slice(0, href.lastIndexOf("/"));
+      return /^app:\/./.test(parent) ? [href, parent] : [href];
+    }
+    function watchTopics(topics) {
+      var call = env.current();
+      if (call && call.status === "pending" && !call.replied)
+        topics.forEach(function (topic) {
+          host(6, "watch", topic);
+        });
+    }
+    // Announced with the next call that has a store, when the write landed between answers.
+    var unannounced = [];
+    function announce(topics) {
+      topics.forEach(function (topic) {
+        if (unannounced.indexOf(topic) < 0) unannounced.push(topic);
+      });
+      unannounced = unannounced.filter(function (topic) {
+        try {
+          return host(6, "announce", topic) !== "announced";
+        } catch (e) {
+          return true;
+        }
+      });
+    }
+    function announcing(promise, topics) {
+      return promise.then(function (value) {
+        announce(topics);
+        return value;
+      });
+    }
+    // A SQLite write announces when it changed the database: a row, or the schema (a DROP or an ALTER). The
+    // provider says which in `changed`, which is not the app's: the app gets `changes` and `lastInsertRowid`. A
+    // `CREATE TABLE IF NOT EXISTS` run on every read changes neither, so two windows do not re-ask each other.
+    function execution(result) {
+      return { changes: result.changes, lastInsertRowid: result.lastInsertRowid };
+    }
+    function written(promise, topics) {
+      return promise.then(function (value) {
+        var results = Array.isArray(value) ? value : [value];
+        if (
+          results.some(function (result) {
+            return result.changed;
+          })
+        )
+          announce(topics);
+        return Array.isArray(value) ? value.map(execution) : execution(value);
+      });
+    }
+    function statement(raw, path) {
+      var topic = ["sqlite:" + path];
       return Object.freeze({
         execute: function (params) {
-          return storageCall(raw, "execute", [params]);
+          return written(storageCall(raw, "execute", [params]), topic);
         },
         query: function (params) {
+          watchTopics(topic);
           return storageCall(raw, "query", [params]);
         },
         close: function () {
@@ -323,15 +408,19 @@
     function database(raw, path, by) {
       var handle = { path: path, by: by, told: false };
       openDatabases.add(handle);
+      var topic = ["sqlite:" + path];
       return Object.freeze({
         execute: function (sql, params) {
-          return storageCall(raw, "execute", [sql, params]);
+          return written(storageCall(raw, "execute", [sql, params]), topic);
         },
         query: function (sql, params) {
+          watchTopics(topic);
           return storageCall(raw, "query", [sql, params]);
         },
         prepare: function (sql) {
-          return storageCall(raw, "prepare", [sql], statement);
+          return storageCall(raw, "prepare", [sql], function (s) {
+            return statement(s, path);
+          });
         },
         // Read now, not when a queued call is issued: what the caller changes after the call never changes what runs.
         transaction: function (commands, options) {
@@ -341,7 +430,7 @@
           } catch (e) {
             return Promise.reject(storageError(String((e && e.message) || e), "failed"));
           }
-          return storageCall(raw, "transaction", args);
+          return written(storageCall(raw, "transaction", args), topic);
         },
         // A close counts once issued; one refused or failed leaves the database open, and tracked.
         close: function () {
@@ -375,7 +464,15 @@
       "digest",
     ].forEach(function (method) {
       files[method] = function () {
-        return storageCall(nativeStorage && nativeStorage.fs, method, arguments);
+        var result = storageCall(nativeStorage && nativeStorage.fs, method, arguments);
+        var topics = fileTopics(arguments[0]);
+        if (method === "rename" || method === "copyFile")
+          topics = (method === "rename" ? topics : []).concat(fileTopics(arguments[1]));
+        if (!/^(writeFile|atomicWriteFile|appendFile|mkdir|rm|rename|copyFile|chmod|symlink)$/.test(method)) {
+          watchTopics(topics);
+          return result;
+        }
+        return announcing(result, topics);
       };
     });
     // LLP 1069.010.000 D4: a kept file the app replaces with its own atomic write stays kept: the host reads what the
@@ -455,8 +552,13 @@
         heldLocks.add(lock);
         if (by && by.replied) freeLocks();
         return Object.freeze({
+          // Tracked until the queue takes the release: one refused is still freed with its answer (`freeLocks`).
           unlock: function () {
-            return heldLocks.delete(lock) ? storageCall(fs, "unlock", [h]) : Promise.resolve();
+            return heldLocks.has(lock)
+              ? storageCall(fs, "unlock", [h], undefined, function () {
+                  heldLocks.delete(lock);
+                })
+              : Promise.resolve();
           },
         });
       });
@@ -501,9 +603,10 @@
     }
     // The image calls' options (`imageCall`, below), checked before
     // anything is queued, as the host's arguments after `from` and `to`:
-    // `compressImage`'s two numbers and type (LLP 1069.002 A1, A1.11), then its
-    // edit, and `transformImage`'s all, each as the one JSON value the codec
-    // reads (LLP 1133.019 D17).
+    // `compressImage`'s two numbers (`maxBytes` undefined when unsaid) and
+    // type (LLP 1069.002 A1, A1.11, A1.12), then its edit and `quality`, and
+    // `transformImage`'s all, each as the one JSON value the codec reads
+    // (LLP 1133.019 D17).
     var IMAGE_WORDS = {
       flip: ["horizontal", "vertical"],
       resizeQuality: ["pixelated", "low", "medium", "high"],
@@ -545,7 +648,7 @@
           ? options !== undefined && (!options || typeof options !== "object")
           : !options || typeof options !== "object"
       )
-        fail(transform ? "options must be an object" : "options must be {maxDimension, maxBytes}");
+        fail("options must be an object");
       options = options || {};
       crop = options.crop;
       take("rotate", finite, "a finite number of degrees");
@@ -563,12 +666,17 @@
       if (!transform) {
         var dimension = options.maxDimension,
           bytes = options.maxBytes,
+          quality = options.quality,
           type = options.type === undefined ? "image/jpeg" : options.type;
         if (!Number.isInteger(dimension) || dimension < 1 || dimension > 8192)
           fail("maxDimension must be an integer from 1 to 8192");
-        if (!Number.isInteger(bytes) || bytes < 1 || bytes > 67108864)
+        if (bytes !== undefined && (!Number.isInteger(bytes) || bytes < 1 || bytes > 67108864))
           fail("maxBytes must be an integer from 1 to 67108864");
+        if (quality !== undefined && !(typeof quality === "number" && quality >= 0 && quality <= 1))
+          fail("quality must be a number from 0 to 1");
+        if (bytes === undefined && quality === undefined) fail("needs maxBytes, quality or both");
         if (type !== "image/jpeg" && type !== "image/png") fail('type must be "image/jpeg" or "image/png"');
+        if (quality !== undefined) out.quality = quality;
         return [dimension, bytes, type].concat(Object.keys(out).length ? [JSON.stringify(out)] : []);
       }
       take("resizeWidth", side, "an integer from 1 to 16384");
@@ -591,8 +699,8 @@
       word("metadata");
       return [JSON.stringify(out)];
     }
-    // `fs.compressImage(from, to, {maxDimension, maxBytes, type, rotate, flip, crop})` (LLP 1069.002 A1,
-    // A1.11; LLP 1133.019 D15) and `fs.transformImage(from, to, options)` (D14): their options are checked
+    // `fs.compressImage(from, to, {maxDimension, maxBytes, quality, type, rotate, flip, crop})` (LLP 1069.002
+    // A1, A1.11, A1.12; LLP 1133.019 D15) and `fs.transformImage(from, to, options)` (D14): their options are checked
     // before anything is queued and travel as `imageOptions` words them; natively the reply is
     // `width\theight\tsize`, a transform's then its path and the codec's report, and on the web the record.
     function imageCall(method, from, to, options, record) {
@@ -606,6 +714,9 @@
       }
       return storageCall(nativeStorage && nativeStorage.fs, method, [from, to].concat(tail), function (value) {
         return typeof value === "string" ? record(value.split("\t"), tail) : value;
+      }).then(function (written) {
+        announce(fileTopics(written && written.path));
+        return written;
       });
     }
     files.compressImage = function (from, to, options) {

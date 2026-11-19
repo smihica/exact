@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactSticky
 
 final class StickyTransitionIOSTests: XCTestCase {
     func testAPinnedBoxKeepsItsPlacementWhileTranslatingAndScrolling() throws {

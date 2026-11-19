@@ -1,6 +1,6 @@
 // The router on the JS target (LLP 1038; route/src), re-exported by rt.js: the verbs and reads, the route table, and the
 // router slot's changes to the browser's history.
-import { Refusal, effect, After, journal, clock, commit, W, pressFeedback, fact, Hosts, Resources, Assigned, refused, useTraversal } from "./rt.js";
+import { Refusal, effect, After, journal, clock, commit, W, pressFeedback, fact, Hosts, Resources, Assigned, refused, useTraversal, launchVisits } from "./rt.js";
 import { Counting } from "./held.js";
 import { projectRoots } from "./document.js";
 import { canonical, locationOf, fragmentOf, enc, dec, matchPattern } from "./route-pattern.js";
@@ -56,10 +56,12 @@ const copy = r => [r[0], r[1].map(t => [t[0], t[1].slice()]), r[2]];
 /** A launch: the location's chain, else, when no route matches it and no `notfound` route absorbs it (an app with no
  * navigation root, which the compiler writes none for: LLP 1116.009 D2), the first screen's (`/`), the refusal journaled;
  * the runner's `RouterContext::launch` (runner/src/runner/router.rs). The app boots, and its first commit puts `/` in the
- * address bar. */
-export function launch(location) {
-  if (!chain(location).length) { say(`router launch refused: no route matches ${canonical(location)}`); location = "/"; }
-  return open_(["", [], 0], location);
+ * address bar. After a reload the page's earlier visits (`before`), which Back returns to, are beneath it, as the
+ * runner's own `go` to each in turn leaves them; the browser's Back then pops to the visit beneath. */
+export function launch(location, before = launchVisits()) {
+  if (!chain(location).length) { say(`router launch refused: no route matches ${canonical(location)}`); location = "/"; before = []; }
+  const visits = [...before.filter(v => chain(v).length), location];
+  return visits.slice(1).reduce(go_, open_(["", [], 0], visits[0]));
 }
 /** A reload's router carry: keep only a stack the new table still describes; otherwise launch its old top. */
 export function carryRouter(old, location) { const tabs = roots().map(i => Routes[i].name), stacks = old?.[1], valid = Array.isArray(stacks) && stacks.length === tabs.length && stacks.every((t, i) => t?.[0] === tabs[i] && Array.isArray(t[1]) && t[1].every(e => { const m = e?.length === 6 && matchRoute(e[2] ?? ""); return m && Routes[m[0]].name === e[1]; })); if (!valid) return launch(stacks?.find(t => t?.[0] === old?.[0])?.[1]?.at(-1)?.[2] ?? location); const out = copy(old); for (const t of out[1]) for (const e of t[1]) e[4] = matchRoute(e[2])[1]; return out; }
@@ -94,7 +96,6 @@ function replace_(r, location) {
   const d = dest(r, location), i = sel(r);
   if (!d) return refuse(r, `no route matches ${canonical(location)}`);
   if (i < 0) return refuse(r, "router has no selected stack");
-  if (r[1][i][1].length === 1 && d.name !== r[1][i][0]) return refuse(r, "replace cannot change the tab's root route");
   const out = copy(r), s = out[1][i][1]; s[s.length - 1] = entry(s.at(-1)[0], d, fragmentOf(location)); return out;
 }
 function back_(r) { const i = sel(r); if (i < 0 || r[1][i][1].length < 2) return r; const out = copy(r); out[1][i][1].pop(); return out; }
@@ -159,8 +160,8 @@ function hostGo(location) {
   const next = navigating(go_)(r, location); if (next !== r) commit(() => W(RouterSlot, next), "host go");
 }
 // @ref LLP 1153 D5 — the scroll to a fragment, the browser's own step made once the route's data has arrived (the
-// runner's `fragment_command`): no resource waiting for its source and no request in flight, a mutation's included and
-// a held one not (held.js `Counting`, the runner's `has_pending`). `fragment.js` finds and scrolls, then holds the
+// runner's `fragment_command`): no resource waiting for its source and no owned request in flight, a mutation's
+// included and a held or forgotten one not (held.js `Counting`, the runner's `has_pending`). `fragment.js` finds and holds the
 // target while the route's pictures load; it loads at first use. `Navigations`: what each `open`, `push`, `replace`
 // or `go` to a location with a fragment returned, with the visit and fragment it left on top: an explicit navigation,
 // which scrolls even to the fragment the visit already shows, where a return by `back` or `select` keeps its place.
@@ -187,7 +188,7 @@ function assigned() {
 const shows = ({ visit, fragment }) => { const r = RouterSlot?.n?.v, t = r && validRouter(r) && top_(r); return !!t && t[0] === visit && t[5] === fragment; };
 function fragmentDue() {
   if (Due && !shows(Due)) Due = null;
-  if (!Due || Counting.size || Resources.some(r => r.waiting)) return;
+  if (!Due || [...Counting].some(t => t.held() && !t.r?.gone) || Resources.some(r => !r.gone && r.waiting)) return;
   const due = Scheduled = Due; Due = null;
   fragments().then(f => { if (Scheduled !== due || !shows(due)) return; Scheduled = null; f.scroll(pageRoot(), due.visit, due.fragment, say, due.activation); }, e => say(`fragment: ${e.message}`));
 }
@@ -211,10 +212,11 @@ function mirror(r) {
   const top = top_(r), ids = new Set(r[1].flatMap(t => t[1].map(e => e[0]))), before = Shown?.[1].flatMap(t => t[1]) ?? [];
   const removed = before.map(e => e[0]).filter(id => !ids.has(id)), was = before.find(e => e[0] === top[0]);
   Shown = r;
-  // A navigation to a fragment, a new visit with one, or a fragment that changed scrolls (LLP 1153 D5); a visit
-  // returned to keeps its place. The history mirrors the visit's url with its fragment.
-  const n = assigned(), activated = !!n && n[1] === top[0] && n[2] === top[5];
-  const op = changeOf(r, top, activated || (was ? was[5] !== top[5] : !!top[5]), removed);
+  // A navigation to a fragment, a new visit with one, a fragment that changed, or the visit at another path (a new
+  // page) scrolls (LLP 1153 D5, D5.1); a visit returned to, or given only a new query, keeps its place. The history
+  // mirrors the visit's url with its fragment.
+  const n = assigned(), activated = !!n && n[1] === top[0] && n[2] === top[5], path = url => url.split("?")[0];
+  const op = changeOf(r, top, activated || (was ? was[5] !== top[5] || path(was[2]) !== path(top[2]) : !!top[5]), removed);
   History.apply(op);
   return op;
 }
@@ -231,7 +233,7 @@ export function router(slot, history) {
   // An author's own `scrollIntoView` wins over a fragment's scroll not yet made, or held while pictures load; its
   // `scrollBy` over one held.
   const own = Hosts.scrollIntoView; Hosts.scrollIntoView = (...a) => { const d = Due ?? Scheduled; if (d) { say(`fragment #${d.fragment}: the app's own scrollIntoView took its place`); Due = Scheduled = null; } globalThis.exact?.fragment?.cancel(); return own(...a); };
-  const by = Hosts.scrollBy; Hosts.scrollBy = (...a) => { globalThis.exact?.fragment?.cancel(); return by(...a); };
+  const by = Hosts.scrollBy; Hosts.scrollBy = (...a) => { globalThis.exact?.fragment?.cancel(false); return by(...a); };
   // @ref LLP 1038 §7 — a plain click on a same-origin link to a declared
   // route stays in this document, as input-glue.js's rule for the wasm host:
   // a link with its own `press` navigates by it; any other goes to the
@@ -261,6 +263,7 @@ export function router(slot, history) {
     const r = slot(); if (!r || !r[1].length) return;
     const op = r === Shown ? Early : mirror(r); Early = null;
     if (op?.scroll) wantScroll(op);
+    else if (op) { Due = Scheduled = null; Fragments?.then(f => f.cancel()); }
   });
   // `effect` runs once synchronously. Its first apply follows
   // `projectRoots`' projection, so publish those initial visits now.
@@ -282,13 +285,13 @@ export const routeMatches = location => { const m = matchRoute(canonical(locatio
 // ---------------------------------------------------------------- validity
 const int = n => typeof n === "number" && Number.isInteger(n) && n >= 0 && n <= 9007199254740991, str = s => typeof s === "string";
 /** Whether `r` is a valid router (runner/src/runner/router.rs `router`): its shape; tabs of distinct names, each stack
- * starting at its tab's own route; entries of distinct ids below `next`, each URL canonical and matching the entry's
+ * non-empty; entries of distinct ids below `next`, each URL canonical and matching the entry's
  * route name and params; and a top on the selected tab. A source can answer a forged one. */
 export function validRouter(r) {
   if (!Array.isArray(r) || r.length !== 3 || !str(r[0]) || !Array.isArray(r[1]) || !int(r[2])) return false;
   const tabs = new Set(), ids = new Set();
   for (const t of r[1]) {
-    if (!Array.isArray(t) || t.length !== 2 || !str(t[0]) || !Array.isArray(t[1]) || tabs.has(t[0]) || t[1][0]?.[1] !== t[0]) return false;
+    if (!Array.isArray(t) || t.length !== 2 || !str(t[0]) || !Array.isArray(t[1]) || tabs.has(t[0]) || !t[1].length) return false;
     tabs.add(t[0]);
     for (const e of t[1]) {
       if (!Array.isArray(e) || e.length !== 6 || !int(e[0]) || !str(e[1]) || !str(e[2]) || !str(e[3]) || !Array.isArray(e[4]) || e[4].length !== Names.length || !e[4].every(str) || !str(e[5])) return false;

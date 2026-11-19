@@ -29,7 +29,7 @@
 use super::super::super::{DataSource, Runner};
 use super::super::{Json, ModulesRow};
 use super::Listed;
-use crate::runner::modules::WakeHow;
+use crate::runner::wakes::WakeHow;
 use serde_json::{json, Map};
 
 /// The first backoff, and the longest (D1).
@@ -262,14 +262,14 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// Entry `reference`'s invocation was delivered.
-    pub(in crate::runner) fn wake_entry_running(&mut self, reference: u64) {
+    pub(in crate::runner::modules) fn wake_entry_running_linked(&mut self, reference: u64) {
         if let Some(m) = self.extensions.declared.wake_meta.get_mut(&reference) {
             m.again = false;
         }
     }
 
     /// Entry `reference`'s invocation ended `state` (module doc).
-    pub(in crate::runner) fn wake_entry_ended(
+    pub(in crate::runner::modules) fn wake_entry_ended_linked(
         &mut self,
         reference: u64,
         state: &str,
@@ -338,9 +338,13 @@ impl<D: DataSource> Runner<D> {
     }
 
     /// A source declared `"listed"`: the entries of its kind, its fields each.
+    /// So is a source whose value the runner keeps: the content index, the app's icon.
     pub(in crate::runner) fn listed_value(&self, row: &ModulesRow, sub: &Json) -> Option<Json> {
         if let Some(entries) = self.reach_value(sub) {
             return Some(entries);
+        }
+        if sub["appIcon"] == "status" {
+            return Some(self.app_icon_status(row));
         }
         let listed = sub["listed"].as_object()?;
         let state = listed.get("state")?.as_str()?;

@@ -17,9 +17,12 @@
 
 #import <Foundation/Foundation.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -41,12 +44,40 @@ char *dup_utf8(NSString *value) {
 
 } // namespace
 
-// Four serial delegate queues provide bounded native concurrency. Each session
-// is leased until native completion; its connection pool survives.
+// A request body read from a file as it is sent (Exact patch 46): the Rust
+// side's `BodyFile`, from which each attempt opens a reader at the first byte.
+extern "C" {
+void *ibex2_darwin_body_open(void *file);
+long ibex2_darwin_body_read(void *reader, unsigned char *buffer, size_t length);
+const char *ibex2_darwin_body_failure(void *reader);
+void ibex2_darwin_body_close(void *reader);
+void ibex2_darwin_body_free(void *file);
+}
+
+// One attempt's body: the input half of a bound stream pair, which URLSession
+// reads, and a thread that copies the Rust reader's bytes into the output half.
+// URLSession's own input stream, unlike an NSInputStream subclass, lets it read
+// a reply that comes before the body has gone (a 413): it closes the stream and
+// the copy stops. A reader that fails (the file shrank, the disk stalled, the
+// request ended) fails the exchange with its words, unless a reply came first.
+@class Ibex2Exchange;
+@interface Ibex2FilePump : NSObject
+- (NSInputStream *)startWithReader:(void *)reader exchange:(Ibex2Exchange *)exchange
+                              task:(NSURLSessionTask *)task;
+- (void)stop;
+@end
+
+// A transport's sessions. A collected exchange runs on `shared`, one session
+// whose delegate waits only while a reply is far ahead of its reader, so every
+// such exchange of the transport shares one connection pool, and HTTP/2
+// multiplexes them on one connection an origin (Exact patch 49). Any other
+// exchange leases one of up to four sessions of its own, whose delegate waits
+// while its reader is behind; its connection pool survives the lease.
 @interface Ibex2SessionPool : NSObject
 @property(nonatomic, strong) NSCondition *condition;
 @property(nonatomic, strong) NSMutableArray<NSURLSession *> *idle;
 @property(nonatomic, assign) NSUInteger count;
+@property(nonatomic, strong) NSURLSession *shared;
 @end
 @implementation Ibex2SessionPool
 - (instancetype)init {
@@ -59,7 +90,10 @@ char *dup_utf8(NSString *value) {
   [self.condition broadcast];
   [self.condition unlock];
 }
-- (void)dealloc { for (NSURLSession *session in _idle) [session finishTasksAndInvalidate]; }
+- (void)dealloc {
+  for (NSURLSession *session in _idle) [session finishTasksAndInvalidate];
+  [_shared finishTasksAndInvalidate];
+}
 @end
 
 // A task owns its exchange until completion; Rust independently retains the
@@ -68,6 +102,11 @@ char *dup_utf8(NSString *value) {
 @interface Ibex2Exchange : NSObject
 @property(nonatomic, strong) NSCondition *condition;
 @property(nonatomic, strong) NSMutableData *bytes;
+// Where the reader's next bytes start in `bytes` (Exact patch 49).
+@property(nonatomic, assign) NSUInteger offset;
+// On the pool's `shared` session, whose delegate serves every collected
+// exchange (Exact patch 49).
+@property(nonatomic, assign) BOOL shared;
 @property(nonatomic, strong) NSHTTPURLResponse *response;
 @property(nonatomic, strong) NSString *failure;
 @property(nonatomic, strong) NSURLSessionDataTask *task;
@@ -83,6 +122,13 @@ char *dup_utf8(NSString *value) {
 // task was leased and started, so a headers wait called again resumes it.
 @property(nonatomic, assign) int64_t sent;
 @property(nonatomic, assign) BOOL started;
+// A file body's Rust side, freed with the exchange, and the pump of the
+// attempt going out, stopped before the next one's starts (Exact patch 46).
+@property(nonatomic, assign) void *bodyFile;
+@property(nonatomic, strong) Ibex2FilePump *bodyPump;
+// Read for as long as its caller holds it, on a session with no whole-exchange
+// limit (Exact patch 48).
+@property(nonatomic, assign) BOOL openEnded;
 @end
 
 @implementation Ibex2Exchange
@@ -95,10 +141,14 @@ char *dup_utf8(NSString *value) {
   }
   return self;
 }
+- (void)dealloc {
+  [_bodyPump stop];
+  if (_bodyFile != nullptr) ibex2_darwin_body_free(_bodyFile);
+}
 // Caller holds condition. Recycle only after all old callbacks have finished.
 // The exchange owns any buffered bytes independently of the pooled session.
 - (void)recycle {
-  if (self.nativeComplete && self.session != nil) {
+  if (self.nativeComplete && self.session != nil && !self.shared) {
     [self.pool returnSession:self.session];
     self.session = nil;
   }
@@ -111,6 +161,84 @@ char *dup_utf8(NSString *value) {
     [self.condition broadcast];
   }
 }
+@end
+
+// The bound pair's buffer and the copy's: what an attempt holds beside the
+// Rust reader's two chunks.
+static const NSUInteger Ibex2PumpBytes = 64 << 10;
+
+// A limit no exchange reaches, about 32 years, for one that is to have none
+// (Exact patch 48). It stays finite: Foundation keeps these intervals as
+// doubles and converts them to timers.
+static const NSTimeInterval Ibex2Unbounded = 1e9;
+
+// The largest reply a collected exchange may have and run on the shared
+// session: a plain request's ceiling (Exact patch 49). A larger one leases a
+// session of its own.
+static const size_t Ibex2SharedLimit = 64 << 20;
+
+// How far a reply on the shared session may run ahead of its reader before
+// the delegate waits for it (Exact patch 49). A collecting reader is never
+// that far behind for long, so the session's other exchanges are not held,
+// and what the transport holds of each reply stays bounded.
+static const NSUInteger Ibex2SharedAhead = 1 << 20;
+
+@implementation Ibex2FilePump {
+  std::atomic<bool> _stopped;
+}
+- (NSInputStream *)startWithReader:(void *)reader exchange:(Ibex2Exchange *)exchange
+                              task:(NSURLSessionTask *)task {
+  NSInputStream *input = nil;
+  NSOutputStream *output = nil;
+  [NSStream getBoundStreamsWithBufferSize:Ibex2PumpBytes inputStream:&input outputStream:&output];
+  __weak Ibex2Exchange *weakExchange = exchange;
+  __weak NSURLSessionTask *weakTask = task;
+  NSThread *thread = [[NSThread alloc] initWithBlock:^{
+    [output open];
+    std::vector<unsigned char> chunk(Ibex2PumpBytes);
+    long pending = 0, offset = 0;
+    NSString *failure = nil;
+    while (!self->_stopped.load()) {
+      if (pending == 0) {
+        long count = ibex2_darwin_body_read(reader, chunk.data(), chunk.size());
+        if (count < 0) {
+          const char *why = ibex2_darwin_body_failure(reader);
+          failure = why == nullptr ? @"the file body could not be read" : @(why);
+          break;
+        }
+        if (count == 0) break;
+        pending = count;
+        offset = 0;
+      }
+      // Never a write that would wait: a stop, or a stream no one reads, is
+      // seen within a few milliseconds.
+      if (!output.hasSpaceAvailable) {
+        NSStreamStatus status = output.streamStatus;
+        if (status == NSStreamStatusError || status == NSStreamStatusClosed) break;
+        usleep(2000);
+        continue;
+      }
+      NSInteger wrote = [output write:chunk.data() + offset maxLength:(NSUInteger)pending];
+      if (wrote <= 0) break; // URLSession closed its half: a reply came, or the task ended.
+      offset += wrote;
+      pending -= wrote;
+    }
+    [output close];
+    ibex2_darwin_body_close(reader);
+    Ibex2Exchange *exchange = weakExchange;
+    if (failure != nil && exchange != nil && !self->_stopped.load()) {
+      [exchange.condition lock];
+      BOOL answered = exchange.response != nil;
+      if (!answered) [exchange finishWith:[NSString stringWithFormat:@"TypeError: Failed to fetch — %@", failure]];
+      [exchange.condition unlock];
+      if (!answered) [weakTask cancel];
+    }
+  }];
+  thread.name = @"exact-body-pump";
+  [thread start];
+  return input;
+}
+- (void)stop { _stopped.store(true); }
 @end
 
 @interface Ibex2NoRedirect : NSObject <NSURLSessionDataDelegate>
@@ -188,6 +316,16 @@ char *dup_utf8(NSString *value) {
     [dataTask cancel];
   } else {
     exchange.received += data.length;
+    // On the shared session the delegate serves every exchange, so it waits
+    // only when a collecting reader has fallen a mebibyte behind.
+    if (exchange.shared) {
+      while (exchange.bytes.length - exchange.offset >= Ibex2SharedAhead && !exchange.finished)
+        [exchange.condition wait];
+      if (!exchange.finished) [exchange.bytes appendData:data];
+      [exchange.condition broadcast];
+      [exchange.condition unlock];
+      return;
+    }
     NSUInteger offset = 0;
     while (offset < data.length && !exchange.finished) {
       while (exchange.bytes.length == capacity && !exchange.finished)
@@ -219,6 +357,25 @@ char *dup_utf8(NSString *value) {
   // the completed connection without racing the final delegate bookkeeping.
   [exchange finishWith:failure];
   [exchange.condition unlock];
+}
+// A file body's stream for each attempt, the first and any resend: URLSession
+// ignores a streamed upload task's HTTPBodyStream and asks here. The attempt
+// before is told to stop first (Exact patch 46).
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+    needNewBodyStream:(void (^)(NSInputStream *))completionHandler {
+  Ibex2Exchange *exchange = [self exchangeFor:task.taskIdentifier];
+  [exchange.condition lock];
+  [exchange.bodyPump stop];
+  exchange.bodyPump = nil;
+  void *file = exchange.finished ? nullptr : exchange.bodyFile;
+  [exchange.condition unlock];
+  void *reader = file == nullptr ? nullptr : ibex2_darwin_body_open(file);
+  Ibex2FilePump *pump = reader == nullptr ? nil : [[Ibex2FilePump alloc] init];
+  NSInputStream *stream = [pump startWithReader:reader exchange:exchange task:task];
+  [exchange.condition lock];
+  exchange.bodyPump = pump;
+  [exchange.condition unlock];
+  completionHandler(stream);
 }
 // An upload's progress: the bytes written so far, which a headers wait that
 // asked for them returns (Exact patch 23).
@@ -254,7 +411,7 @@ extern "C" {
 /// Serial delegate queues preserve per-task callback order while the four
 /// leases bound native callback concurrency and application handoff buffers.
 /// @ref LLP 0057#3-the-boundary — pooling is the platform's job
-static NSURLSession *new_session(void) {
+static NSURLSession *new_session(BOOL open_ended, BOOL shared) {
   @autoreleasepool {
     NSURLSessionConfiguration *config =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
@@ -284,7 +441,23 @@ static NSURLSession *new_session(void) {
     config.URLCache = nil;
     config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
 
-    // One serial delegate per session; leases never overlap on a session.
+    // An open-ended stream lasts as long as its caller holds it, so its
+    // session has no whole-exchange limit (Exact patch 48). The limit is a
+    // session's, not a task's: every other request goes on a session that
+    // keeps URLSession's seven days.
+    if (open_ended) config.timeoutIntervalForResource = Ibex2Unbounded;
+
+    // URLSession runs a few HTTP/1.1 connections a host (six on macOS, four
+    // on iOS) and queues the rest. On the shared session a reply the server
+    // holds keeps its connection, so a read to that origin would wait behind
+    // held ones that sessions of their own never queued it behind. Thirty-two
+    // is more than exact2 runs at once on one transport (six workers, eight
+    // launch preloads, eight prefetches); HTTP/2 still carries an origin's
+    // exchanges on one connection (Exact patch 49).
+    if (shared) config.HTTPMaximumConnectionsPerHost = 32;
+
+    // One serial delegate per session. A leased session serves one exchange
+    // at a time; the shared one serves many, each found by its task.
     Ibex2NoRedirect *delegate = [[Ibex2NoRedirect alloc] init];
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config
                                                          delegate:delegate
@@ -311,7 +484,7 @@ void ibex2_darwin_session_has_state(void *handle, int *out_cookies,
     return;
   }
   @autoreleasepool {
-    NSURLSession *session = new_session();
+    NSURLSession *session = new_session(NO, NO);
     NSURLSessionConfiguration *config = session.configuration;
     [session finishTasksAndInvalidate];
     *out_cookies = (config.HTTPCookieStorage != nil ||
@@ -340,14 +513,16 @@ void ibex2_darwin_session_destroy(void *handle) {
 // headers. Inputs are copied by Foundation before this function returns.
 void *ibex2_darwin_http_start(void *session_handle, const char *method,
     const char *url, const char *header_block, const unsigned char *body,
-    size_t body_len, size_t max_body, double timeout_seconds, int speculative,
-    char **out_error) {
+    size_t body_len, void *body_file, unsigned long long body_file_len,
+    size_t max_body, double timeout_seconds, int open_ended, int collected,
+    int speculative, char **out_error) {
   @autoreleasepool {
     *out_error = nullptr;
     NSURL *nsurl = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
     Ibex2SessionPool *pool = (__bridge Ibex2SessionPool *)session_handle;
     if (nsurl == nil || pool == nil) {
       *out_error = dup_utf8(@"TypeError: Failed to fetch — invalid URL or session");
+      if (body_file != nullptr) ibex2_darwin_body_free(body_file);
       return nullptr;
     }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:nsurl];
@@ -362,12 +537,26 @@ void *ibex2_darwin_http_start(void *session_handle, const char *method,
       }
     }
     if (body_len > 0) request.HTTPBody = [NSData dataWithBytes:body length:body_len];
+    // A file body streams from its reader with its length (Exact patch 46).
+    if (body_file != nullptr)
+      [request setValue:[NSString stringWithFormat:@"%llu", body_file_len]
+          forHTTPHeaderField:@"Content-Length"];
+    // An open-ended request (an event stream, a byte stream) is read for as
+    // long as its caller holds it, and `timeoutInterval` ends a task after
+    // that long without data, so it is lifted (Exact patch 48). Its wait for
+    // the head goes with it: URLSession holds a response back until its first
+    // body bytes or its end (content sniffing), so a stream whose server
+    // answers and then waits shows no head until it sends.
     if (timeout_seconds > 0) request.timeoutInterval = timeout_seconds;
+    else if (open_ended) request.timeoutInterval = Ibex2Unbounded;
     // Low Data Mode refuses a request nobody has asked for yet (Exact patch 37).
     if (speculative) request.allowsConstrainedNetworkAccess = NO;
     Ibex2Exchange *exchange = [[Ibex2Exchange alloc] initWithLimit:max_body];
     exchange.pool = pool;
     exchange.request = request;
+    exchange.bodyFile = body_file;
+    exchange.openEnded = open_ended != 0;
+    exchange.shared = collected && !exchange.openEnded && max_body <= Ibex2SharedLimit;
     // Rust installs cancellation before resume, including an already aborted signal.
     return (__bridge_retained void *)exchange;
   }
@@ -386,6 +575,13 @@ int ibex2_darwin_http_headers(void *handle, int *out_status,
     exchange.started = YES;
     [exchange.condition unlock];
     NSURLSession *session = nil;
+    if (!started && exchange.shared) {
+      Ibex2SessionPool *pool = exchange.pool;
+      [pool.condition lock];
+      if (pool.shared == nil) pool.shared = new_session(NO, YES);
+      session = pool.shared;
+      [pool.condition unlock];
+    }
     while (!started && session == nil) {
       [exchange.condition lock];
       BOOL aborted = exchange.finished;
@@ -393,13 +589,23 @@ int ibex2_darwin_http_headers(void *handle, int *out_status,
       if (aborted) break;
       Ibex2SessionPool *pool = exchange.pool;
       [pool.condition lock];
-      if (pool.idle.count != 0) {
-        session = pool.idle.lastObject;
-        [pool.idle removeLastObject];
-      } else if (pool.count < 4) {
-        pool.count++;
+      // An idle session of the exchange's kind (Exact patch 48); at the four,
+      // one of the other kind gives up its place.
+      BOOL open = exchange.openEnded;
+      NSUInteger kind = [pool.idle indexOfObjectPassingTest:^BOOL(NSURLSession *idle, NSUInteger, BOOL *) {
+        return (idle.configuration.timeoutIntervalForResource >= Ibex2Unbounded) == open;
+      }];
+      if (kind != NSNotFound) {
+        session = pool.idle[kind];
+        [pool.idle removeObjectAtIndex:kind];
+      } else if (pool.count < 4 || pool.idle.count != 0) {
+        if (pool.count < 4) pool.count++;
+        else {
+          [pool.idle.lastObject finishTasksAndInvalidate];
+          [pool.idle removeLastObject];
+        }
         [pool.condition unlock];
-        session = new_session();
+        session = new_session(open, NO);
         continue;
       } else {
         // Timed wait also closes the check/wait race with cancellation.
@@ -410,11 +616,13 @@ int ibex2_darwin_http_headers(void *handle, int *out_status,
     [exchange.condition lock];
     if (!started && !exchange.finished) {
       exchange.session = session;
-      exchange.task = [session dataTaskWithRequest:exchange.request];
+      exchange.task = exchange.bodyFile != nullptr
+          ? [session uploadTaskWithStreamedRequest:exchange.request]
+          : [session dataTaskWithRequest:exchange.request];
       [(Ibex2NoRedirect *)session.delegate track:exchange for:exchange.task.taskIdentifier];
       [exchange.task resume];
     } else if (!started) {
-      if (session != nil) [exchange.pool returnSession:session];
+      if (session != nil && !exchange.shared) [exchange.pool returnSession:session];
       exchange.nativeComplete = YES;
     }
 
@@ -426,6 +634,9 @@ int ibex2_darwin_http_headers(void *handle, int *out_status,
       [exchange.condition unlock];
       return 2;
     }
+    // The bytes sent when the head came, which are fewer than the body's if
+    // the server answered before reading it all (Exact patch 46).
+    if (inout_sent != nullptr) *inout_sent = exchange.sent;
     // A head that arrived is handed back with a failure too (Exact patch 31).
     if (exchange.response != nil) {
       *out_status = (int)exchange.response.statusCode;
@@ -450,17 +661,26 @@ int ibex2_darwin_http_read(void *handle, unsigned char *output, size_t capacity,
     *out_length = 0;
     *out_error = nullptr;
     [exchange.condition lock];
-    while (exchange.bytes.length == 0 && !exchange.finished) [exchange.condition wait];
+    while (exchange.bytes.length == exchange.offset && !exchange.finished)
+      [exchange.condition wait];
     *out_reused = exchange.reused;
     if (exchange.failure != nil) {
       *out_error = dup_utf8(exchange.failure);
       [exchange.condition unlock];
       return 1;
     }
-    size_t count = MIN(capacity, exchange.bytes.length);
+    size_t count = MIN(capacity, exchange.bytes.length - exchange.offset);
     if (count != 0) {
-      std::memcpy(output, exchange.bytes.bytes, count);
-      [exchange.bytes replaceBytesInRange:NSMakeRange(0, count) withBytes:nullptr length:0];
+      std::memcpy(output, (const unsigned char *)exchange.bytes.bytes + exchange.offset, count);
+      exchange.offset += count;
+      // Taken bytes are dropped once they are at least half the buffer, so a
+      // reply on the shared session is moved a bounded number of times, not
+      // once a read; a leased exchange's 64 KiB are dropped at once, which
+      // its waiting delegate counts on.
+      if (!exchange.shared || exchange.offset * 2 >= exchange.bytes.length) {
+        [exchange.bytes replaceBytesInRange:NSMakeRange(0, exchange.offset) withBytes:nullptr length:0];
+        exchange.offset = 0;
+      }
     }
     *out_length = count;
     [exchange.condition broadcast];
@@ -475,6 +695,7 @@ void ibex2_darwin_http_cancel(void *handle) {
     if (!exchange.finished) {
       [exchange finishWith:@"AbortError: The operation was aborted"];
       [exchange.bytes setLength:0];
+      exchange.offset = 0;
       [exchange.task cancel];
     }
     [exchange.condition unlock];

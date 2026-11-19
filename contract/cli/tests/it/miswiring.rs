@@ -3,6 +3,8 @@
 //! host would refuse or ignore at run time; each names its repair, fails no
 //! build, and what the compiler cannot see through is given the benefit.
 
+use crate::scratch::Scratch;
+
 /// The ids and lines of the warnings `src` earns, after checking that it
 /// still compiles.
 fn warned(src: &str) -> Vec<(String, u32)> {
@@ -233,7 +235,7 @@ const KEY: &str = "lower-navigation-key";
 /// (lines 8 and 11).
 fn stack(root: &str, home: &str, pushed: &str) -> String {
     format!(
-        "routes nav\n  rooms \"/\"\n    room \"/room/:id\"\ncomponent App\n  view\n    main navigationKey={root} navigationBack=\"back\" width=\"100%\" height=\"100%\"\n      for e in stack(nav) key=e.id\n        if e.name == \"rooms\"\n          column navigationKey={home} position=\"absolute\" inset=0\n            text \"Rooms\"\n        if e.name == \"room\"\n          column navigationKey={pushed} position=\"absolute\" inset=0\n            text \"Room\"\n"
+        "routes nav\n  rooms \"/\"\n    room \"/room/:id\"\ncomponent App\n  view\n    main navigationKey={root} navigationBack=\"\" width=\"100%\" height=\"100%\"\n      for e in stack(nav) key=e.id\n        if e.name == \"rooms\"\n          column navigationKey={home} position=\"absolute\" inset=0\n            text \"Rooms\"\n        if e.name == \"room\"\n          column navigationKey={pushed} position=\"absolute\" inset=0\n            text \"Room\"\n"
     )
 }
 
@@ -297,8 +299,8 @@ fn a_navigation_split_where_no_host_reads_it_is_named_with_its_repair() {
     // recipe-finder, round 12 (and seven apps of rounds 10 and 11): `navigationSplit`
     // on `main`, which the split reads on the root route only.
     let on_root = stack("`${top(nav).id}`", "`${e.id}`", "`${e.id}`").replace(
-        "navigationBack=\"back\"",
-        "navigationBack=\"back\" navigationSplit=360",
+        "navigationBack=\"\"",
+        "navigationBack=\"\" navigationSplit=360",
     );
     assert_eq!(warned(&on_root), [(SPLIT.to_string(), 6)]);
     let m = &messages(&on_root)[0];
@@ -324,9 +326,7 @@ const IMAGE: &str = "lower-image-source";
 
 /// The warnings of a file that uses a package part (`exact:content`), as a build prints them.
 fn warned_file(name: &str, src: &str) -> Vec<(String, u32, String)> {
-    let dir = std::env::temp_dir().join(format!("exact-miswiring-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Scratch::new(format!("exact-miswiring-{name}-{}", std::process::id()));
     let path = dir.join("app.contract");
     std::fs::write(&path, src).unwrap();
     let (result, warnings) = contract::compile_path_all_warned(&path, false);
@@ -364,144 +364,6 @@ fn an_image_source_that_is_neither_a_symbol_nor_a_file_is_named_with_its_repair(
     // A role, an Apple name, a file, a URL, a computed source: all drawn.
     let fine = "component App\n  state s = \"x\"\n  view\n    column\n      image \"symbol:heart\"\n      image \"symbol:sf/heart.text.square\"\n      image \"logo.png\"\n      image \"/img/logo\"\n      image \"https://example.com/a\"\n      image s\n";
     assert_eq!(warned(fine), []);
-}
-
-const ROOT: &str = "lower-replace-root";
-
-/// A welcome at `/` beside a main list at `/habits`, as Codex Sol wrote it: the
-/// action `begin` is `body` (line 10 on), pressed on the route that `cond` chooses;
-/// `follow` is the navigation root's `navigate`, as in every pattern.
-fn first_screen(body: &str, cond: &str) -> String {
-    format!(
-        "routes nav\n  welcome \"/\"\n  habits \"/habits\"\n    habit \"/habit/:id\"\ncomponent App\n  state welcomed = false\n  action follow(url: string)\n    nav = go(nav, url)\n  action begin\n{body}  view\n    main navigationKey=`${{top(nav).id}}` navigationBack=\"back\" navigate=follow width=\"100%\" height=\"100%\"\n      for e in stack(nav) key=e.id\n        if {cond}\n          column navigationKey=`${{e.id}}` position=\"absolute\" inset=0\n            button press=begin testId=\"continue\"\n              text \"Continue\"\n"
-    )
-}
-
-const WELCOME: &str = "e.name == \"welcome\"";
-const LEAVE: &str = "    nav = replace(nav, path(\"habits\"))\n";
-/// An action that pushes a second visit of the welcome, before `begin`.
-const AHEAD: &str = "  action ahead\n    nav = push(nav, \"/?again=1\")\n  action begin\n";
-/// The shapes a sequence's `play` takes.
-const TRACKS: &str = "shape Step\n  beat: number\n  src: string\n  gain: number\n  group: string\n  note: number\n  velocity: number\n  channel: number\n  duration: number\n  haptic: string\nshape Track\n  beats: number\n  loops: number\n  offset: number\n  output: string\n  steps: Step[]\n";
-const BUTTON: &str =
-    "            button press=begin testId=\"continue\"\n              text \"Continue\"\n";
-
-/// The fixture with `extra` in the welcome route after Continue.
-fn beside(extra: &str) -> String {
-    first_screen(LEAVE, WELCOME).replace(BUTTON, &format!("{BUTTON}{extra}"))
-}
-
-#[test]
-fn a_replace_the_router_refuses_at_launch_is_named_with_its_repair() {
-    // The welcome app (guard-rail evaluation, 2026-10-16): Continue replaced the
-    // root with the main list, which the router refuses while the root is alone.
-    let src = first_screen(&format!("    welcomed = true\n{LEAVE}"), WELCOME);
-    assert_eq!(warned(&src), [(ROOT.to_string(), 11)]);
-    let m = &messages(&src)[0];
-    assert!(
-        m.contains("if the app boots and draws its launch screen, this `replace`, pressed there before anything else changes the router, is refused and `habits` does not open")
-            && m.contains("a launch at `/` opens `welcome` as the only screen of its stack")
-            && m.contains("the log says \"replace cannot change the tab's root route\"")
-            && m.contains("show what `welcome` shows inside it (docs/recipes/first-launch.md)")
-            && m.contains("write `push`"),
-        "{m}"
-    );
-    // A literal location with a query, a `path()` of literals beside a command, the
-    // top named in the view, an action that calls the one that replaces, and what a
-    // person may do before Continue, which the claim leaves out: another button, a
-    // link, the navigate handler pressed with a location.
-    let again = |extra: &str| {
-        beside(extra).replace(
-            "  action begin\n",
-            "  action again\n    nav = push(nav, \"/?again=1\")\n  action begin\n",
-        )
-    };
-    for (case, src) in [
-        ("a literal", first_screen("    nav = replace(nav, \"/habits?from=welcome\")\n", WELCOME)),
-        ("a path", first_screen("    haptic(\"success\")\n    nav = replace(nav, path(\"habit\", \"7\"))\n", WELCOME)),
-        ("the top", first_screen(LEAVE, "top(nav).name == \"welcome\"")),
-        ("a call", first_screen("    leave()\n  action leave\n    nav = replace(nav, path(\"habits\"))\n", WELCOME)),
-        ("another button", again("            button press=again\n              text \"Again\"\n")),
-        ("a link", beside("            link href=\"/?again=1\"\n              text \"Again\"\n")),
-        ("the navigate handler pressed", beside("            button press=follow(\"/?again=1\")\n              text \"Again\"\n")),
-        // A list, which a wide window shows beside a pushed screen: none is
-        // pushed before the press.
-        ("a split", beside("            list\n              text \"Rows\"\n")),
-        ("a task that is refused", first_screen(LEAVE, WELCOME).replace("  action begin\n", "  task t mount\n    after(1, resume)\n  action resume\n    if welcomed\n      nav = replace(nav, path(\"habits\"))\n  action begin\n")),
-    ] {
-        let named = warned(&src).into_iter().filter(|(id, _)| id == ROOT).count();
-        assert_eq!(named, 1, "{case}\n{src}");
-    }
-}
-
-#[test]
-fn a_replace_that_may_not_be_refused_or_reached_at_launch_is_not_named() {
-    for (case, src) in [
-        // Pressed on a pushed screen, where it replaces that screen.
-        ("a pushed screen", first_screen(LEAVE, "e.name == \"habit\"")),
-        ("no choice", first_screen(LEAVE, "e.id >= 0")),
-        ("an and", first_screen(LEAVE, "e.name == \"welcome\" and e.id >= 0")),
-        // Something that moves the router by itself first: a task, or another
-        // handler in the same gesture.
-        ("a task", first_screen(LEAVE, WELCOME).replace("  action begin\n", "  task t mount\n    after(1, ahead)\n  action ahead\n    nav = open(nav, path(\"habits\"))\n  action begin\n")),
-        // An automatic handler whose action binds the router's name to another router.
-        ("an automatic router parameter", beside("").replace("      for e in stack(nav)", "      column intersect=ahead(push(push(nav, \"/?one=1\"), \"/?two=1\")) width=1 height=1\n      for e in stack(nav)").replace("  action begin\n", "  action ahead(nav: Router)\n    nav = back(nav)\n  action begin\n")),
-        ("an automatic match binding", beside("").replace("      for e in stack(nav)", "      column intersect=ahead(some(push(push(nav, \"/?one=1\"), \"/?two=1\"))) width=1 height=1\n      for e in stack(nav)").replace("  action begin\n", "  action ahead(r: option<Router>)\n    match r\n      case some(nav)\n        nav = back(nav)\n      case none\n  action begin\n")),
-        // A link around the button, which the click follows first.
-        ("a link root", first_screen(LEAVE, WELCOME).replace("    main navigationKey", "    link href=\"/?again=1\" navigationKey")),
-        ("a link inside", first_screen(LEAVE, WELCOME).replace("              text \"Continue\"\n", "              link href=\"/?again=1\"\n                text \"Continue\"\n")),
-        ("a pressed root", first_screen(LEAVE, WELCOME).replace("    main navigationKey", "    main press=ahead navigationKey").replace("  action begin\n", "  action ahead\n    nav = open(nav, path(\"habits\"))\n  action begin\n")),
-        ("a link around", first_screen(LEAVE, WELCOME).replace(BUTTON, "            link href=\"/?again=1\"\n              button press=begin\n                text \"Continue\"\n")),
-        ("a native view's press", beside("").replace("      for e in stack(nav)", "      startup-view press=ahead width=1 height=1\n      for e in stack(nav)").replace("  action begin\n", "  action ahead\n    nav = push(nav, \"/?again=1\")\n  action begin\n")),
-        ("a mutation's then", first_screen(LEAVE, WELCOME).replace("component App\n", "shape Reply\n  ok: bool\ncomponent App\n  mutation saved as shape Reply then ahead\n").replace("  action begin\n", AHEAD)),
-        ("a sequence's ended", first_screen(LEAVE, WELCOME).replace("component App\n", &format!("{TRACKS}component App\n")).replace("  action begin\n", &format!("  sequence s when welcomed\n    play([Track(beats=1, loops=1, offset=0, output=\"synth\", steps=[])], bpm=120, ended=ahead)\n{AHEAD}"))),
-        ("a pointerdown", first_screen(LEAVE, WELCOME).replace("button press=begin", "button pointerdown=ahead press=begin").replace("  action begin\n", "  action ahead\n    nav = open(nav, path(\"habits\"))\n  action begin\n")),
-        // A view guard, a disabled, hidden or styled control or root, a press that
-        // is not a button's, and a root keyed otherwise.
-        ("a guard", first_screen(LEAVE, WELCOME).replace(BUTTON, "            if depth(nav) > 1\n              button press=begin\n                text \"Continue\"\n")),
-        ("a disabled control", first_screen(LEAVE, WELCOME).replace("press=begin", "press=begin disabled=(welcomed)")),
-        ("a class", format!("style Off\n  display=\"none\"\n{}", first_screen(LEAVE, WELCOME)).replace("button press=begin", "button class=Off press=begin")),
-        ("a class on the root", format!("style Off\n  display=\"none\"\n{}", first_screen(LEAVE, WELCOME)).replace("main navigationKey", "main class=Off navigationKey")),
-        ("an opacity", first_screen(LEAVE, WELCOME).replace("button press=begin", "button opacity=0 press=begin")),
-        ("a hidden input", first_screen(LEAVE, WELCOME).replace(BUTTON, "            input type=\"hidden\" press=begin\n")),
-        ("a pinned root", first_screen(LEAVE, WELCOME).replace("main navigationKey=`${top(nav).id}`", "main navigationKey=(welcomed ? \"0\" : `${top(nav).id}`)")),
-        ("a route keyed by a word", first_screen(LEAVE, WELCOME).replace("column navigationKey=`${e.id}`", "column navigationKey=\"welcome\"")),
-        ("an ancestor's press", first_screen(LEAVE, WELCOME).replace(BUTTON, "            column press=ahead\n              button press=begin\n                text \"Continue\"\n").replace("  action begin\n", "  action ahead\n    nav = open(nav, path(\"habits\"))\n  action begin\n")),
-        // An argument evaluated before the action, which may refuse.
-        ("a bound argument", first_screen(LEAVE, WELCOME).replace("action begin\n", "action begin(ignored: string)\n").replace("press=begin", "press=begin(path(\"habit\", `${welcomed}`))")),
-        // A function of the app's that takes a name the router or `path()` calls:
-        // here the replace goes to `/` and succeeds.
-        ("a shadowed path", format!("fn path(route: string): string = \"/\"\n{}", first_screen(LEAVE, WELCOME))),
-        ("a shadowed segment", format!("fn encodeRouteSegment(value: string): string = \"..?done=1\"\n{}", first_screen("    nav = replace(nav, path(\"habit\", \"7\"))\n", WELCOME))),
-        // The navigation stack recipe's swap of a detail, guarded by the top.
-        ("a guard on the top", first_screen("    nav = top(nav).name == \"habit\" ? replace(nav, path(\"habit\", \"8\")) : push(nav, path(\"habit\", \"8\"))\n", WELCOME)),
-        ("a guard in the action", first_screen(&format!("    if depth(nav) > 1\n  {LEAVE}"), WELCOME)),
-        // The root itself, by its route or with a query: the replace succeeds.
-        ("the root", first_screen("    nav = replace(nav, path(\"welcome\"))\n", WELCOME)),
-        ("the root's query", first_screen("    nav = replace(nav, \"/?filter=done\")\n", WELCOME)),
-        // A router a `let` pushed first, a later write, a computed location, a
-        // `path()` whose computed parameter may be refused before the replace.
-        ("a let", first_screen("    let n = push(nav, path(\"habits\"))\n    nav = replace(n, path(\"habit\", \"7\"))\n", WELCOME)),
-        ("a later write", first_screen(&format!("{LEAVE}    nav = push(nav, path(\"habits\"))\n"), WELCOME)),
-        ("a computed location", first_screen("    nav = replace(nav, \"/\" + \"habits\")\n", WELCOME)),
-        ("a computed parameter", first_screen("    nav = replace(nav, path(\"habit\", \"7\" + \"\"))\n", WELCOME)),
-        // A parameter that is a router, not the router's state.
-        (
-            "a router parameter",
-            first_screen(LEAVE, WELCOME)
-                .replace("action begin\n", "action begin(nav: Router)\n")
-                .replace("press=begin", "press=begin(push(nav, path(\"habits\")))"),
-        ),
-    ] {
-        let named = warned(&src).into_iter().filter(|(id, _)| id == ROOT).count();
-        assert_eq!(named, 0, "{case}\n{src}");
-    }
-    // A launch at `/` that opens no root alone (here `notfound` over the first
-    // tab's root), and tabs, whose panels are made as the tablist selects them.
-    let src = "routes nav\n  tab welcome \"/a b/one\"\n  section \"/a%20b/:id\"\n  notfound\ncomponent App\n  action begin\n    nav = replace(nav, path(\"section\", \"one\"))\n  view\n    main navigationKey=`${top(nav).id}` navigationBack=\"back\" width=\"100%\" height=\"100%\"\n      for e in stack(nav) key=e.id\n        if e.name == \"welcome\"\n          column navigationKey=`${e.id}` position=\"absolute\" inset=0\n            button press=begin\n              text \"Continue\"\n";
-    assert_eq!(warned(src), [], "{src}");
-    let src = "routes nav\n  tab today \"/\"\n  tab history \"/history\"\ncomponent App\n  action see\n    nav = replace(nav, path(\"history\"))\n  view\n    main navigationKey=`${top(nav).id}` navigationBack=\"back\"\n      column\n        for t in nav.tabs key=t.name\n          column role=\"tabpanel\" id=`panel-${t.name}`\n            for e in t.stack key=e.id\n              column navigationKey=`${e.id}`\n                if e.name == \"today\"\n                  button press=see\n                    text \"History\"\n      row role=\"tablist\"\n        button role=\"tab\" aria-controls=\"panel-today\" aria-selected=(nav.tab == \"today\")\n          text \"Today\"\n        button role=\"tab\" aria-controls=\"panel-history\" aria-selected=(nav.tab == \"history\")\n          text \"History\"\n";
-    assert_eq!(warned(src), [], "{src}");
 }
 
 /// The euxy port: a deep link into another tab, `go` then `select`, left the
@@ -718,4 +580,115 @@ fn a_geometry_read_in_a_child_is_checked_against_the_whole_view() {
     let src = app("frame(\"pane\")");
     assert_eq!(warned(&src), [(GEOMETRY.to_string(), 13)]);
     assert!(messages(&src)[0].contains("did you mean `frame(\"panel\")`?"));
+}
+
+const NAVIGATION_BACK: &str = "lower-navigation-back-id";
+
+fn back_id(name: &str, view: &str) -> String {
+    let view: String = view.lines().map(|l| format!("      {l}\n")).collect();
+    format!("component App\n  state closed = 0\n  action back\n    closed = closed + 1\n  action close(v: number)\n    closed = v\n  view\n    main navigationKey=\"root\" {name}\n{view}")
+}
+
+fn back_warnings(src: &str) -> Vec<(String, u32)> {
+    warned(src)
+        .into_iter()
+        .filter(|(id, _)| id == NAVIGATION_BACK)
+        .collect()
+}
+
+#[test]
+fn navigation_back_names_a_press_controls_id_not_an_action() {
+    for press in ["back", "close(1)"] {
+        let name = if press == "back" { "back" } else { "close" };
+        let src = back_id(
+            &format!("navigationBack=\"{name}\""),
+            &format!("button press={press}\n  text \"Close\""),
+        );
+        assert_eq!(back_warnings(&src), [(NAVIGATION_BACK.to_string(), 8)]);
+        let m = messages(&src)
+            .into_iter()
+            .find(|m| m.contains("names a control's `id`, not an action"))
+            .unwrap();
+        assert!(
+            m.contains("no element in the view has that id")
+                && m.contains("root's `navigate` handler")
+                && m.contains("router's Back"),
+            "{m}"
+        );
+        assert!(m.contains(&format!("id=\"{name}\"")), "{m}");
+        let repaired = src.replace("button press=", &format!("button id=\"{name}\" press="));
+        assert_eq!(back_warnings(&repaired), []);
+    }
+    // The warning does not depend on a namesake action or any press handler.
+    for view in ["text \"Body\"", "button press=back\n  text \"Close\""] {
+        let src = back_id("navigationBack=\"close\"", view);
+        assert_eq!(
+            back_warnings(&src),
+            [(NAVIGATION_BACK.to_string(), 8)],
+            "{src}"
+        );
+    }
+    let src = back_id(
+        "navigationBack=\"close\"",
+        "button testId=\"close\" press=back\n  text \"Close\"",
+    );
+    assert!(messages(&src)
+        .iter()
+        .any(|m| m.contains("`testId=\"close\"`")));
+    let src = back_id(
+        "navigationBack=\"clsoe\"",
+        "button id=\"close\" press=back\n  text \"Close\"",
+    );
+    assert!(messages(&src)
+        .iter()
+        .any(|m| m.contains("did you mean `navigationBack=\"close\"`?")));
+}
+
+#[test]
+fn navigation_back_checks_only_provably_missing_controls() {
+    for (name, view) in [
+        ("", "text \"Body\""),
+        ("navigationBack=\"\"", "text \"Body\""),
+        ("navigationBack=`${closed}`", "text \"Body\""),
+        (
+            "navigationBack=\"close\"",
+            "column id=\"close\"\n  text \"Body\"",
+        ),
+        (
+            "navigationBack=\"close\"",
+            "button id=\"close\" commandfor=\"ask\" command=\"show-modal\"\n  text \"Close\"\ndialog id=\"ask\"\n  text \"Confirm\"",
+        ),
+        (
+            "navigationBack=\"close\"",
+            "button id=\"close\" press=back\n  text \"Close\"",
+        ),
+        (
+            "navigationBack=\"close\"",
+            "button id=`${closed}` press=back\n  text \"Close\"",
+        ),
+        (
+            "navigationBack=\"close\"",
+            "button id=\"close\" disabled=true press=back\n  text \"Close\"",
+        ),
+        (
+            "navigationBack=\"close\"",
+            "if closed == 0\n  button id=\"close\" press=back\n    text \"Close\"",
+        ),
+    ] {
+        let src = back_id(name, view);
+        assert_eq!(back_warnings(&src), [], "{src}");
+    }
+    // A matching id only on another route is not proof of reachability.
+    let src = back_id("navigationBack=\"close\"", "column navigationKey=\"home\"\n  button id=\"close\" press=back\n    text \"Close home\"\ncolumn navigationKey=\"detail\"\n  text \"Detail\"");
+    assert_eq!(back_warnings(&src), []);
+    // A computed id on any element could match the Back name.
+    let src = back_id(
+        "navigationBack=\"close\"",
+        "column id=`${closed}`\n  text \"Body\"",
+    );
+    assert_eq!(back_warnings(&src), []);
+    let src = "component App\n  view\n    main navigationKey=\"root\" navigationBack=\"close\"\n      Close()\ncomponent Close\n  state closed = false\n  action back\n    closed = true\n  view\n    button id=\"close\" press=back\n      text \"Close\"\n";
+    assert_eq!(back_warnings(src), []);
+    let src = src.replace(" id=\"close\"", "");
+    assert_eq!(back_warnings(&src), [(NAVIGATION_BACK.to_string(), 3)]);
 }

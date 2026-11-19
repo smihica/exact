@@ -4,15 +4,15 @@
 import Foundation
 import MachO
 
-enum ControlKinds {
+package enum ControlKinds {
     /// The chrome index's keys for the controls the presenter projects.
     static let indexed = ["type:checkbox", "type:radio", "type:select", "type:range", "type:date", "type:time", "type:datetime-local", "type:button"]
-    static let dates: Set<String> = ["date", "time", "datetime-local"]
+    package static let dates: Set<String> = ["date", "time", "datetime-local"]
     /// The chrome index's key for a `progress`, the platform's activity
     /// indicator (LLP 1069.001, amended 2026-10-07) or, with a `value`, its
     /// progress bar (LLP 1116 D8): a view, not a control, so its own pass,
     /// outside `indexed`.
-    static let progress = "type:progress"
+    package static let progress = "type:progress"
     /// `switch`, `checkbox`, or the `type` prop's value (`radio`, a select, …).
     static func kind(_ props: [String: String]) -> String {
         switch props["type"] {
@@ -28,18 +28,18 @@ enum ControlKinds {
 
 /// A range's `min`, `max` and `step` by HTML's rules, and its value
 /// clamped and snapped as HTML sanitizes it (`exact_kernel::Range`).
-struct RangeSpec {
-    var min = 0.0, max = 100.0
-    var step: Double? = 1
+package struct RangeSpec {
+    package var min = 0.0, max = 100.0
+    package var step: Double? = 1
 
-    init(_ props: [String: String]) {
+    package init(_ props: [String: String]) {
         let number = { (s: String?) in s.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }.flatMap { $0.isFinite ? $0 : nil } }
         min = number(props["min"]) ?? 0
         max = Swift.max(number(props["max"]) ?? 100, min)
         step = props["step"]?.trimmingCharacters(in: .whitespaces).lowercased() == "any" ? nil : (number(props["step"]).flatMap { $0 > 0 ? $0 : nil } ?? 1)
     }
 
-    func sanitize(_ value: Double) -> Double {
+    package func sanitize(_ value: Double) -> Double {
         let clamped = Swift.min(Swift.max(value, min), max)
         guard let step else { return clamped }
         var snapped = min + ((clamped - min) / step + 0.5).rounded(.down) * step
@@ -48,12 +48,12 @@ struct RangeSpec {
     }
 
     /// The value it shows: its `value`, or the midpoint as HTML's default.
-    func shown(_ props: [String: String]) -> Double {
+    package func shown(_ props: [String: String]) -> Double {
         sanitize(props["value"].flatMap { Double($0) } ?? (min + (max - min) / 2))
     }
 
     /// A number as HTML writes one: no trailing `.0`.
-    static func format(_ v: Double) -> String {
+    package static func format(_ v: Double) -> String {
         v == v.rounded() && abs(v) < 1e15 ? String(Int64(v)) : String(v)
     }
 }
@@ -61,31 +61,31 @@ struct RangeSpec {
 /// A determinate progress's `value` and `max` by HTML's rules
 /// (`exact_kernel::Progress`, LLP 1116 D8): `max` is 1 unless it reads as a
 /// number above 0; `value` is 0 unless it reads as one, held to 0 and `max`.
-struct ProgressSpec {
-    var value = 0.0, max = 1.0
+package struct ProgressSpec {
+    package var value = 0.0, max = 1.0
 
-    init(_ props: [String: String]) {
+    package init(_ props: [String: String]) {
         let number = { (s: String?) in s.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) }.flatMap { $0.isFinite ? $0 : nil } }
         max = number(props["max"]).flatMap { $0 > 0 ? $0 : nil } ?? 1
         value = Swift.min(Swift.max(number(props["value"]) ?? 0, 0), max)
     }
 
     /// How much of the bar is filled, 0 to 1.
-    var fraction: Double { value / max }
+    package var fraction: Double { value / max }
 }
 
 /// A date control's value in HTML's format, read and written as the
 /// platform's `Date` at UTC: HTML's values carry no zone, so the picker
 /// shows the wall time the string names and never converts it.
-enum DateValue {
+package enum DateValue {
     /// What an empty date control says (LLP 1115.000 D13.1): its author's
     /// `placeholder`, or no words. A date format (`mm/dd/yyyy`) is a
     /// browser's empty field, which the platform's control does not have.
-    static func placeholder(_ props: [String: String]) -> String {
+    package static func placeholder(_ props: [String: String]) -> String {
         props["placeholder"] ?? ""
     }
 
-    static let utc = TimeZone(identifier: "UTC")!
+    package static let utc = TimeZone(identifier: "UTC")!
     private static func formatter(_ pattern: String) -> DateFormatter {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -107,7 +107,7 @@ enum DateValue {
     /// three fraction digits, a local date and time the two joined by `T` or
     /// a space, and nothing after. A value HTML's sanitization would empty is
     /// nil.
-    static func parse(_ kind: String, _ s: String) -> Date? {
+    package static func parse(_ kind: String, _ s: String) -> Date? {
         let digits = { (part: Substring, count: ClosedRange<Int>) -> Int? in
             count.contains(part.count) && part.allSatisfy({ ("0"..."9").contains($0) }) ? Int(part) : nil
         }
@@ -151,7 +151,7 @@ enum DateValue {
     /// `d` as HTML's normalized value for `kind`, as `el.value` reads a local
     /// date and time: seconds only when they or the fraction are not zero,
     /// and the fraction, in whole milliseconds, in as few digits as it needs.
-    static func format(_ kind: String, _ d: Date) -> String {
+    package static func format(_ kind: String, _ d: Date) -> String {
         // Whole milliseconds, rounded: a Date's binary fraction reads .5 as .4999….
         let (q, r) = Int64((d.timeIntervalSince1970 * 1000).rounded()).quotientAndRemainder(dividingBy: 1000)
         let second = Date(timeIntervalSince1970: Double(r < 0 ? q - 1 : q)), fraction = r < 0 ? r + 1000 : r
@@ -170,7 +170,7 @@ enum DateValue {
     /// shows that value, else what an action wrote over it. A picker shows
     /// no finer than a minute and UIKit's may drop the seconds it is given,
     /// so the minute is what is compared.
-    static func shown(_ kind: String, typed: String, _ d: Date) -> String {
+    package static func shown(_ kind: String, typed: String, _ d: Date) -> String {
         let minute = { (d: Date) in (d.timeIntervalSince1970 / 60).rounded(.down) }
         guard let value = parse(kind, typed), minute(value) == minute(d) else { return format(kind, d) }
         return typed
@@ -178,7 +178,7 @@ enum DateValue {
 
     /// The wall clock's fields in the picker's zone-free representation,
     /// using the same reference day as parsed bounds for a time-only input.
-    static func initial(_ kind: String, now: Date = Date(), timeZone: TimeZone = .current,
+    package static func initial(_ kind: String, now: Date = Date(), timeZone: TimeZone = .current,
                         minimum: Date? = nil, maximum: Date? = nil) -> Date {
         let f = formatter(kind == "date" ? "yyyy-MM-dd" : kind == "time" ? "HH:mm" : "yyyy-MM-dd'T'HH:mm")
         f.timeZone = timeZone
@@ -190,14 +190,14 @@ enum DateValue {
 }
 
 /// A select's options and the one it shows (`exact_select_options`).
-struct SelectMenu: Equatable {
-    struct Option: Equatable { let value: String; let label: String; let disabled: Bool }
-    var options: [Option] = []
-    var chosen: Int?
-    var chosenValue: String? { chosen.map { options[$0].value } }
+package struct SelectMenu: Equatable {
+    package struct Option: Equatable { package let value: String; package let label: String; package let disabled: Bool }
+    package var options: [Option] = []
+    package var chosen: Int?
+    package var chosenValue: String? { chosen.map { options[$0].value } }
 
-    init(options: [Option] = [], chosen: Int? = nil) { self.options = options; self.chosen = chosen }
-    init(json: Data) {
+    package init(options: [Option] = [], chosen: Int? = nil) { self.options = options; self.chosen = chosen }
+    package init(json: Data) {
         guard let obj = try? JSONSerialization.jsonObject(with: json) as? [String: Any] else { return }
         options = (obj["options"] as? [[String: Any]] ?? []).map {
             Option(value: $0["value"] as? String ?? "", label: $0["label"] as? String ?? "", disabled: $0["disabled"] as? Bool ?? false)
@@ -209,7 +209,7 @@ struct SelectMenu: Equatable {
     /// option with that value, else the one option with that label, as the
     /// web host chooses (Playwright's `selectOption`; kanban F17, shop F10);
     /// else the refusal, naming the options.
-    func choose(_ text: String, id: UInt32) -> (value: String?, refusal: String?) {
+    package func choose(_ text: String, id: UInt32) -> (value: String?, refusal: String?) {
         let enabled = options.filter { !$0.disabled }
         if enabled.contains(where: { $0.value == text }) { return (text, nil) }
         let trimmed = text.trimmingCharacters(in: .whitespaces)
@@ -230,14 +230,14 @@ struct SelectMenu: Equatable {
 /// then carries no row, and the platform columns keep their defaults here,
 /// which are what a button with no style draws (`unsaid`; the Mac's push
 /// button).
-struct ButtonFace: Equatable {
+package struct ButtonFace: Equatable {
     /// Whether the node is a button at all; the rest is empty when not.
     var button = true
-    var title: String?
+    package var title: String?
     var subtitle: String?
     var placement: String?
-    var rows = ButtonFaceRows()
-    var symbol: String?
+    package var rows = ButtonFaceRows()
+    package var symbol: String?
     /// An svg-only icon's token name (`icon.reply`), the agent's name for its path.
     var symbolIcon: String?
     struct Image: Equatable {
@@ -246,14 +246,14 @@ struct ButtonFace: Equatable {
         var size: CGSize?
     }
     var image: Image?
-    var raster = false
+    package var raster = false
     var leading = true
-    var label: String?
-    var fits = true
+    package var label: String?
+    package var fits = true
     /// A tab's badge (LLP 1075.003 §9.9): the text of the filled box beside
     /// its face, which the kernel reads from the tab's children.
     var badge: String?
-    var style: String?
+    package var style: String?
     var ios = ButtonFace.unsaid
     var iosBefore26 = ButtonFace.unsaid
     var macos = "push"
@@ -315,8 +315,8 @@ struct ButtonFace: Equatable {
 /// (`designRequiresCompatibility`, `host/apple/build.mjs`) draws as before 26
 /// on iOS 27 and macOS 27, where a glass button configuration or bezel draws
 /// no glass. Read once; callers also check the OS (`#available(… 26.0, *)`).
-enum LinkedDesign {
-    static let liquidGlass: Bool = {
+package enum LinkedDesign {
+    package static let liquidGlass: Bool = {
         guard let header = _dyld_get_image_header(0) else { return false }
         var at = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
         for _ in 0..<header.pointee.ncmds {
@@ -332,8 +332,8 @@ enum LinkedDesign {
 
 
 /// Only authored rows cross this dictionary; absence is UIKit's answer (D1–D2).
-struct ButtonFaceRows: Equatable {
-    var title: NodeStyle = [:], subtitle: NodeStyle = [:], symbol: NodeStyle = [:], button: NodeStyle = [:]
+package struct ButtonFaceRows: Equatable {
+    package var title: NodeStyle = [:], subtitle: NodeStyle = [:], symbol: NodeStyle = [:], button: NodeStyle = [:]
     var imageGap: CGFloat?
     init() {}
     init(_ object: [String: Any]) {

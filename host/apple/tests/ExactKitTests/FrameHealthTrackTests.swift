@@ -113,6 +113,32 @@ final class FrameHealthTrackTests: XCTestCase {
         XCTAssertNil(health.track)
     }
 
+    /// A track's lease asks an on-demand collector to collect, as a capture's does: the demand keeps the track that
+    /// asked for it, and ends when the track stops or its lease ends at the next frame, without a read.
+    func testATrackStartsAnOnDemandCollectorForItsLease() throws {
+        let health = FrameHealth(policy: .onDemand), scroll = scroller()
+        defer { health.destroy() }
+        let now = CACurrentMediaTime()
+        func start() -> [String: Any] {
+            health.trackRequest("start", node: 1, scroller: scroll, durationMs: 1000, cursor: nil, maximumFramesPerSecond: 60, now: now)
+        }
+        XCTAssertEqual(start()["track"] as? Bool, true)
+        XCTAssertTrue(health.enabled)
+        XCTAssertTrue(try XCTUnwrap(health.track).tracks(scroll))
+        XCTAssertNotNil(health.trackRequest("stop", node: nil, scroller: nil, durationMs: nil, cursor: nil, maximumFramesPerSecond: 60, now: now)["raw"])
+        XCTAssertFalse(health.enabled)
+        XCTAssertEqual(start()["track"] as? Bool, true)
+        XCTAssertTrue(health.enabled)
+        health.expireCapture(at: now + 2)
+        XCTAssertNil(health.track)
+        XCTAssertFalse(health.enabled)
+        // Collection that is off refuses it by what it is
+        let off = FrameHealth(enabled: false)
+        defer { off.destroy() }
+        XCTAssertEqual(off.trackRequest("start", node: 1, scroller: scroll, durationMs: 1000, cursor: nil, maximumFramesPerSecond: 60)["reason"] as? String,
+                       "collection-disabled")
+    }
+
     /// Any finite offset encodes: centipoints are clamped to JSON's safe integers, both signs.
     func testHugeFiniteOffsetsEncodeClampedBothSigns() throws {
         let track = FrameHealthTrack(node: 1, scroller: scroller(), now: 0, durationMs: 30_000, maximumFramesPerSecond: 60)
@@ -231,7 +257,23 @@ final class FrameHealthTrackTests: XCTestCase {
         defer { Agent.out = saved }
         let wire = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: request)) as? [String: Any] ?? [:]
         agent.handle(op: "perf", wire, line: "")
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: pipe.fileHandleForReading.availableData) as? [String: Any])
+        let data = pipe.fileHandleForReading.availableData
+        XCTAssertLessThanOrEqual(data.count, FrameHealthTrack.maximumBytes, "the final emitted line includes its tags and newline")
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testTheEmittedTrackPageIncludesTagsWithinItsBudget() throws {
+        let session = ExactApp.shared.makeSession(label: "track-tags")
+        defer { session.destroy() }
+        XCTAssertNil(session.boot(size: CGSize(width: 400, height: 800)).error)
+        let now = CACurrentMediaTime(), scroll = scroller()
+        let track = FrameHealthTrack(node: 7, scroller: scroll, now: now, durationMs: 120_000, maximumFramesPerSecond: 120)
+        for i in 0..<5000 { track.record(Double(i), phase: "d", at: now + Double(i) / 120) }
+        session.frameHealth.track = track
+        let reply = try ask(Agent(session: session), ["op": "perf", "frames": true, "track": "read"])
+        for key in ["generation", "epoch", "incarnation", "clock"] { XCTAssertNotNil(reply[key], key) }
+        XCTAssertEqual((reply["rows"] as? [[Any]])?.first?[3] as? Int, 90400)
+        XCTAssertEqual(reply["more"] as? Bool, true)
     }
 
     /// Where the last read stopped, as the driver keeps it, so consecutive reads don't repeat rows.

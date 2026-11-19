@@ -102,10 +102,8 @@ final class NativeFieldsMacTests: XCTestCase {
             XCTAssertEqual(cell.accessibilityAttributeValue(.role) as? String, "AXComboBox")
             XCTAssertEqual(cell.accessibilityAttributeValue(.roleDescription) as? String, NSAccessibility.Role.comboBox.description(with: nil))
             XCTAssertTrue(cell.accessibilityAttributeNames().contains(.expanded))
-            XCTAssertFalse(field.isAccessibilityExpanded())
             XCTAssertEqual(cell.accessibilityAttributeValue(.expanded) as? Bool, false)
             p.apply(wireBatch([["op": "props", "id": id, "set": ["accessibilityExpanded": "true"]]]))
-            XCTAssertTrue(field.isAccessibilityExpanded())
             XCTAssertEqual(cell.accessibilityAttributeValue(.expanded) as? Bool, true)
             p.apply(wireBatch([["op": "props", "id": id, "clear": ["accessibilityRole", "accessibilityExpanded"]]]))
             XCTAssertEqual(cell.accessibilityAttributeValue(.role) as? String, "AXTextField")
@@ -125,7 +123,7 @@ final class NativeFieldsMacTests: XCTestCase {
         let standard = NSTextField()
         XCTAssertEqual(field.isBezeled, standard.isBezeled)
         node.appearance = NSAppearance(named: .aqua)
-        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [[12, 200, 40, 255], [200, 12, 40, 255]]]]]), root: p.root)
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [[12, 200, 40, 255], [200, 12, 40, 255]]]]]).ops[0], root: p.root)
         p.applyThemeTint()
         XCTAssertFalse(field.isBezeled)
         XCTAssertFalse(field.drawsBackground)
@@ -138,7 +136,7 @@ final class NativeFieldsMacTests: XCTestCase {
         node.viewDidChangeEffectiveAppearance()
         XCTAssertEqual(node.layer?.backgroundColor, node.fieldGround, "Field chrome follows appearance without an authored scheme color")
         XCTAssertEqual(field.stringValue, "Keep this text")
-        ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]), root: p.root)
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]).ops[0], root: p.root)
         p.applyThemeTint()
         XCTAssertNil(node.fieldGround)
         XCTAssertEqual(field.isBezeled, standard.isBezeled)
@@ -510,8 +508,8 @@ final class NativeFieldsMacTests: XCTestCase {
     /// author-drawn and Markdown editors keep their transparent native views.
     func testTextareaThemeBackgroundAndRemoval() throws {
         _ = NSApplication.shared
-        defer { ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]])) }
-        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [[204, 255, 204, 255], [0, 51, 0, 255]]]]]))
+        defer { ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]).ops[0]) }
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [[204, 255, 204, 255], [0, 51, 0, 255]]]]]).ops[0])
         let session = ExactApp.shared.makeSession(label: "textarea-theme")
         defer { session.destroy() }
         let node = NodeView(id: 1, kind: "textarea", presenter: session.presenter)
@@ -536,14 +534,14 @@ final class NativeFieldsMacTests: XCTestCase {
         XCTAssertTrue(editor.drawsBackground)
         XCTAssertTrue(scroll.drawsBackground)
         XCTAssertEqual(scroll.borderType, .bezelBorder)
-        ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]))
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": [String: Any]()]]).ops[0])
         node.applyStyle([:])
         XCTAssertEqual(editor.backgroundColor, NSTextView().backgroundColor)
         XCTAssertEqual(scroll.backgroundColor, NSScrollView().backgroundColor)
         XCTAssertEqual(editor.string, "Keep this text")
         XCTAssertEqual(editor.selectedRange(), NSRange(location: 5, length: 4))
         XCTAssertEqual(editor.textContainerInset, inset)
-        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [255, 0, 0, 255]]]]))
+        ThemeRoles.apply(wireBatch([["op": "roles", "roles": ["Field": [255, 0, 0, 255]]]]).ops[0])
         node.applyStyle(["appearance": .string("none"), "background_color": .array([.number(0), .number(0), .number(255), .number(255)])])
         XCTAssertFalse(editor.drawsBackground)
         XCTAssertFalse(scroll.drawsBackground)
@@ -921,6 +919,54 @@ final class NativeFieldsMacTests: XCTestCase {
         try isGreen(text.placeholderColor, "a textarea")
         area.applyStyle([:])
         XCTAssertNil(text.placeholderColor, "no row: AppKit's again")
+    }
+}
+/// A field offers a combobox's expanded state and a stepper's bounds and
+/// steps only when it is one, as AppKit's `NSTextField`, `NSSearchField`,
+/// `NSComboBox` and `NSStepper` do. Another process (VoiceOver) is served the
+/// names the field's cell lists and, besides, an attribute or action for each
+/// typed method the field's class implements. This pins both halves; their
+/// merge is AppKit's accessibility server's, which only another process sees.
+final class FieldAccessibilityOfferMacTests: XCTestCase {
+    func testEachFieldOffersOnlyItsRolesAttributesAndActions() throws {
+        _ = NSApplication.shared
+        let p = Presenter()
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = p.viewport
+        defer { window.close() }
+        let fields: [(id: Int, props: [String: String])] = [
+            (11, ["accessibilityLabel": "Plain"]),
+            (12, ["type": "search", "accessibilityLabel": "Search"]),
+            (13, ["accessibilityRole": "combobox", "accessibilityExpanded": "false", "accessibilityLabel": "Combo"]),
+            (14, ["type": "number", "min": "0", "max": "10", "value": "3", "accessibilityLabel": "Number"]),
+        ]
+        var ops: [[String: Any]] = [["op": "create", "id": 1, "kind": "view"], ["op": "roots", "ids": [1]],
+                                    ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0]]
+        for (i, f) in fields.enumerated() {
+            ops.append(["op": "create", "id": f.id, "kind": "input", "handlers": ["input"], "props": f.props])
+            ops.append(["op": "frame", "id": f.id, "x": 10.0, "y": 10.0 + Double(i) * 40, "w": 280.0, "h": 24.0])
+        }
+        ops.append(["op": "children", "id": 1, "ids": fields.map(\.id)])
+        p.apply(wireBatch(ops))
+        p.syncAccessibility()
+        let contested: Set<String> = ["AXExpanded", "AXMinValue", "AXMaxValue", "AXIncrement", "AXDecrement"]
+        var offered: [String: [String]] = [:]
+        for f in fields {
+            let field = try XCTUnwrap(p.views[UInt32(f.id)]?.field)
+            let element = try XCTUnwrap(NSAccessibility.unignoredDescendant(of: field) as? NSObject)
+            let names = element.accessibilityAttributeNames().map(\.rawValue) + element.accessibilityActionNames().map(\.rawValue)
+                + field.accessibilityAttributeNames().map(\.rawValue) + field.accessibilityActionNames().map(\.rawValue)
+            offered[f.props["accessibilityLabel"]!] = Set(names).intersection(contested).sorted()
+        }
+        XCTAssertEqual(offered, ["Plain": [], "Search": [], "Combo": ["AXExpanded"],
+                                 "Number": ["AXDecrement", "AXIncrement", "AXMaxValue", "AXMinValue"]])
+        let typed = [#selector(NSView.isAccessibilityExpanded), #selector(NSView.accessibilityMinValue), #selector(NSView.accessibilityMaxValue),
+                     #selector(NSView.accessibilityPerformIncrement), #selector(NSView.accessibilityPerformDecrement)]
+        for (field, appKit) in [(Field.self, NSTextField.self), (SearchField.self, NSSearchField.self)] as [(AnyClass, AnyClass)] {
+            let overridden = typed.filter { class_getMethodImplementation(field, $0) != class_getMethodImplementation(appKit, $0) }
+            XCTAssertEqual(overridden.map(NSStringFromSelector), [], "\(field) implements them for every field")
+        }
     }
 }
 #endif

@@ -9,9 +9,10 @@
 //! @ref LLP 1001 §2
 
 mod parse;
-mod simplify;
+pub(crate) mod simplify;
 mod substitute;
 mod text;
+pub(crate) use text::ident;
 mod wire;
 
 pub use parse::nonnegative_row;
@@ -96,23 +97,111 @@ impl EnvTerm {
     }
 }
 
-/// `node` with every local inset (`EnvTerm::Local`) replaced by its points
-/// under `env`.
-fn localize(node: &Node, env: &Env) -> Node {
-    let all = |c: &[Node]| c.iter().map(|n| localize(n, env)).collect();
-    match node {
-        Node::Env(EnvTerm::Local(edge)) => Node::Value(f64::from(env.local_inset(*edge)), Unit::Px),
-        Node::Value(..) | Node::Env(..) => node.clone(),
-        Node::Sum(c) => Node::Sum(all(c)),
-        Node::Product(c) => Node::Product(all(c)),
-        Node::Min(c) => Node::Min(all(c)),
-        Node::Max(c) => Node::Max(all(c)),
-        Node::Negate(c) => Node::Negate(Box::new(localize(c, env))),
-        Node::Invert(c) => Node::Invert(Box::new(localize(c, env))),
-        Node::Clamp(c) => Node::Clamp(Box::new(
-            c.each_ref().map(|n| n.as_ref().map(|n| localize(n, env))),
-        )),
+/// `var(--name)` of an author's custom property (LLP 1123 D5), read in a
+/// length: the property's value where the reading node has one, else the
+/// fallback; with neither, the length is invalid at computed-value time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Var {
+    /// The property's name, with its leading `--`.
+    pub name: Arc<str>,
+    /// What stands in where the property has no value.
+    pub fallback: Option<Box<Node>>,
+}
+
+/// What an observation reads (LLP 1123 D10's families): the safe area, or
+/// the keyboard's guide, docked only or following an undocked keyboard too
+/// (D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Family {
+    /// `--exact-safe-area-inset-*`.
+    SafeArea = 0,
+    /// `--exact-keyboard-inset-*`: UIKit's guide with `usesBottomSafeArea`
+    /// and `followsUndockedKeyboard` off.
+    Keyboard = 1,
+    /// `--exact-keyboard-undocked-inset-*`: the guide that also follows an
+    /// undocked keyboard.
+    KeyboardUndocked = 2,
+}
+
+impl Family {
+    /// Every family, in wire order.
+    pub const ALL: [Family; 3] = [Family::SafeArea, Family::Keyboard, Family::KeyboardUndocked];
+
+    /// The name's part before the edge: `safe-area-inset-` and the like.
+    pub fn infix(self) -> &'static str {
+        match self {
+            Family::SafeArea => "safe-area-inset-",
+            Family::Keyboard => "keyboard-inset-",
+            Family::KeyboardUndocked => "keyboard-undocked-inset-",
+        }
     }
+
+    /// The family by wire index.
+    pub fn from_index(i: u8) -> Option<Family> {
+        Family::ALL.get(i as usize).copied()
+    }
+
+    /// The family and edge a host's observation name reads
+    /// (`--exact-safe-area-inset-top`, `--exact-keyboard-inset-bottom`); `None`
+    /// for any other name.
+    pub fn named(name: &str) -> Option<(Family, Edge)> {
+        let observed = name.strip_prefix("--exact-")?;
+        Family::ALL.into_iter().find_map(|family| {
+            let edge = observed.strip_prefix(family.infix())?;
+            Some((family, Edge::from_name(edge)?))
+        })
+    }
+
+    /// Its components' bits among a reader's inputs ([`Observe::component`]).
+    pub(crate) const fn bits(self) -> u16 {
+        0b1111 << (self as u16 * 4)
+    }
+}
+
+/// How many values a reader's input holds: four edges a family, each at
+/// [`Observe::component`].
+pub const COMPONENTS: usize = Family::ALL.len() * 4;
+
+/// An observation (LLP 1123 D9, D10's leaf) of a family on `edge`: the
+/// reading box's own, as the solve gives it, or a native target's raw
+/// safe-area insets ([`Env::observation`]); else `fallback`,
+/// guaranteed-invalid without one. The keyboard's readings are lowered from
+/// their names (`var(--exact-keyboard-inset-*)`); the safe area's are built
+/// by the kernel until D10's lowering reads `var(--exact-safe-area-inset-*)`
+/// and the target names as observations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observe {
+    /// Whose: the box's own, or a native target's.
+    pub target: super::targets::Target,
+    /// What it reads.
+    pub family: Family,
+    /// The edge observed.
+    pub edge: Edge,
+    /// What stands in where the observation is unavailable.
+    pub fallback: Option<Box<Node>>,
+}
+
+impl Observe {
+    /// Its index among a reader's inputs: four edges a family.
+    pub(crate) fn component(&self) -> usize {
+        self.family as usize * 4 + self.edge as usize
+    }
+}
+
+/// `node` with every local inset (`EnvTerm::Local`) and container unit (LLP
+/// 1123 D16) replaced by its points under `env`, and every custom property
+/// by its value there (D5);
+/// `None` where a property has neither a value nor a fallback.
+fn localize(node: &Node, env: &Env) -> Option<Node> {
+    let leaves = Leaves {
+        local: &|edge| env.local_inset(edge),
+        observed: &|leaf| env.observation(leaf),
+        // Replace every container leaf, so `localized` leaves none it fires on: the basis
+        // is the small viewport's where `env` has no container
+        container: &|unit| Some(unit.basis(env)),
+    };
+    substitute(node, &leaves, &mut |name| env.property(name).cloned())
 }
 
 /// A calculation tree as §10.10 builds one and §10.10.1 leaves it: numeric
@@ -126,6 +215,10 @@ pub enum Node {
     /// `env()` without a fallback: a substitution of a length, which a tree
     /// may hold as a leaf (one with a fallback is held as text, [`Entry`]).
     Env(EnvTerm),
+    /// `var()` of an author's custom property, resolved per node.
+    Var(Var),
+    /// An observation of the box that reads it (LLP 1123 D9, D10's leaf).
+    Observe(Observe),
     /// Its children added.
     Sum(Vec<Node>),
     /// Its children multiplied.
@@ -149,6 +242,8 @@ impl PartialEq for Node {
         match (self, other) {
             (Value(a, u), Value(b, v)) => a.to_bits() == b.to_bits() && u == v,
             (Env(a), Env(b)) => a == b,
+            (Var(a), Var(b)) => a == b,
+            (Observe(a), Observe(b)) => a == b,
             (Sum(a), Sum(b)) | (Product(a), Product(b)) | (Min(a), Min(b)) | (Max(a), Max(b)) => {
                 a == b
             }
@@ -161,9 +256,17 @@ impl PartialEq for Node {
 
 impl Node {
     /// The children a calculation reads, in order.
-    fn children(&self) -> impl Iterator<Item = &Node> {
+    pub(crate) fn children(&self) -> impl Iterator<Item = &Node> {
         let (nodes, optional): (&[Node], &[Option<Node>]) = match self {
             Node::Value(..) | Node::Env(..) => (&[], &[]),
+            Node::Var(v) => (
+                v.fallback.as_deref().map_or(&[][..], std::slice::from_ref),
+                &[],
+            ),
+            Node::Observe(o) => (
+                o.fallback.as_deref().map_or(&[][..], std::slice::from_ref),
+                &[],
+            ),
             Node::Sum(c) | Node::Product(c) | Node::Min(c) | Node::Max(c) => (c, &[]),
             Node::Negate(c) | Node::Invert(c) => (std::slice::from_ref(c), &[]),
             Node::Clamp(c) => (&[], c.as_slice()),
@@ -172,8 +275,18 @@ impl Node {
     }
 
     /// Whether a node anywhere in it satisfies `f`.
-    fn any(&self, f: &dyn Fn(&Node) -> bool) -> bool {
+    pub(crate) fn any(&self, f: &dyn Fn(&Node) -> bool) -> bool {
         f(self) || self.children().any(|c| c.any(f))
+    }
+
+    /// Each custom property it reads, fallbacks included.
+    pub(crate) fn names(&self, out: &mut Vec<Arc<str>>) {
+        if let Node::Var(v) = self {
+            if !out.contains(&v.name) {
+                out.push(v.name.clone());
+            }
+        }
+        self.children().for_each(|c| c.names(out));
     }
 
     /// The value under `env`, a percentage of `basis`, in IEEE-754 `f64`
@@ -188,6 +301,14 @@ impl Node {
                 Unit::Rem => f64::from(env.root_font_size) * v,
             },
             Node::Env(term) => term.value(env)?,
+            Node::Var(v) => match env.property(&v.name) {
+                Some(value) => value.value(env, basis)?,
+                None => v.fallback.as_ref()?.value(env, basis)?,
+            },
+            Node::Observe(o) => match env.observation(o) {
+                Some(points) => f64::from(points),
+                None => o.fallback.as_ref()?.value(env, basis)?,
+            },
             Node::Sum(c) => {
                 let mut total = 0.0;
                 for n in c {
@@ -311,6 +432,189 @@ pub(crate) fn lone_env(term: EnvTerm) -> Dimension {
     dimension(Node::Env(term))
 }
 
+/// The tree a length is (LLP 1123 D5): a compact form's, or a
+/// calculation's own; `None` for `auto`, a size keyword or a text a row
+/// substitutes.
+pub(crate) fn tree_of(d: &Dimension) -> Option<Node> {
+    let plus = |term: EnvTerm, x: f32| match x {
+        0.0 => Node::Env(term),
+        _ => Node::Sum(vec![Node::Env(term), Node::Value(f64::from(x), Unit::Px)]),
+    };
+    Some(match d {
+        // A size keyword is no length a tree holds
+        Dimension::Auto | Dimension::Keyword(_) => return None,
+        Dimension::Points(v) => Node::Value(f64::from(*v), Unit::Px),
+        Dimension::Percent(p) => Node::Value(f64::from(*p), Unit::Percent),
+        Dimension::Calc(p, x) => Node::Sum(vec![
+            Node::Value(f64::from(*p), Unit::Percent),
+            Node::Value(f64::from(*x), Unit::Px),
+        ]),
+        Dimension::Env(edge, x) => plus(EnvTerm::Inset(*edge), *x),
+        Dimension::Region(region, edge, x) => plus(EnvTerm::Region(*region, *edge), *x),
+        Dimension::Segment(var, a, b, x) => plus(EnvTerm::Segment(*var, *a, *b), *x),
+        Dimension::Viewport(unit, n) => Node::Value(f64::from(*n), Unit::Viewport(*unit)),
+        Dimension::Compare(c) => return c.tree(|t| t.clone()),
+    })
+}
+
+/// Whether `node` reads an environment value `env` leaves undefined, which
+/// makes what holds it invalid at computed-value time (CSS Environment
+/// Variables 1 §3); a custom property is read as its value, else its
+/// fallback (CSS Variables 1 §3).
+pub(crate) fn undefined_in(node: &Node, env: &Env) -> bool {
+    match node {
+        // A local inset is always defined, and only a node's environment has it
+        Node::Env(EnvTerm::Local(_)) => false,
+        Node::Env(term) => term.value(env).is_none(),
+        Node::Var(v) => match (env.property(&v.name), &v.fallback) {
+            (Some(value), _) => undefined_in(value, env),
+            (None, Some(fallback)) => undefined_in(fallback, env),
+            (None, None) => true,
+        },
+        Node::Observe(o) => match (env.observation(o), &o.fallback) {
+            (Some(_), _) => false,
+            (None, Some(fallback)) => undefined_in(fallback, env),
+            (None, None) => true,
+        },
+        n => n.children().any(|c| undefined_in(c, env)),
+    }
+}
+
+/// Whether `node` is small enough to hold once its custom properties are
+/// substituted: CSS Variables 1 §3.3 has a long expansion invalid, and the
+/// bound is the one every consumer of a tree holds an author's to (CSS
+/// Values 4 §10.8's values and levels, which the wire and the Apple host
+/// check).
+pub(crate) fn within_expansion(node: &Node) -> bool {
+    wire::within_author_limits(node)
+}
+
+/// A length's CSS: a lone value as itself, any other tree as a math
+/// function, a text as written.
+pub(crate) fn length_css(d: &Dimension, out: &mut String) {
+    let tree = match d {
+        Dimension::Compare(c) => match c.tree(|t| text::length(t, out)) {
+            Some(()) => return,
+            None => return c.css(out),
+        },
+        d => tree_of(d),
+    };
+    match tree {
+        Some(t) => text::length(&t, out),
+        None => out.push_str("auto"),
+    }
+}
+
+/// What a substitution reads at a node: its local insets, and its
+/// observations, `None` where one is unavailable (LLP 1123 D9).
+pub(crate) struct Leaves<'a> {
+    pub(crate) local: &'a dyn Fn(Edge) -> f32,
+    pub(crate) observed: &'a dyn Fn(&Observe) -> Option<f32>,
+    /// A container unit's basis in points (LLP 1123 D16); `None` keeps the
+    /// leaf, where no node's containers are known.
+    pub(crate) container: &'a dyn Fn(ViewportUnit) -> Option<f32>,
+}
+
+/// `node` with each local inset and observation as `leaves` gives it and
+/// each custom property as `property` resolves it (LLP 1123 D5); `None`
+/// where a property or an observation has neither a value nor a fallback.
+pub(crate) fn substitute(
+    node: &Node,
+    leaves: &Leaves<'_>,
+    property: &mut dyn FnMut(&Arc<str>) -> Option<Node>,
+) -> Option<Node> {
+    let all = |c: &[Node], property: &mut dyn FnMut(&Arc<str>) -> Option<Node>| {
+        c.iter()
+            .map(|n| substitute(n, leaves, property))
+            .collect::<Option<Vec<_>>>()
+    };
+    Some(match node {
+        Node::Env(EnvTerm::Local(edge)) => Node::Value(f64::from((leaves.local)(*edge)), Unit::Px),
+        Node::Var(v) => match property(&v.name) {
+            Some(value) => value,
+            None => substitute(v.fallback.as_ref()?, leaves, property)?,
+        },
+        Node::Observe(o) => match (leaves.observed)(o) {
+            Some(points) => Node::Value(f64::from(points), Unit::Px),
+            None => substitute(o.fallback.as_ref()?, leaves, property)?,
+        },
+        Node::Value(v, Unit::Viewport(unit)) if unit.is_container() => {
+            match (leaves.container)(*unit) {
+                Some(basis) => Node::Value(v * f64::from(basis) / 100.0, Unit::Px),
+                None => node.clone(),
+            }
+        }
+        Node::Value(..) | Node::Env(..) => node.clone(),
+        Node::Sum(c) => Node::Sum(all(c, property)?),
+        Node::Product(c) => Node::Product(all(c, property)?),
+        Node::Min(c) => Node::Min(all(c, property)?),
+        Node::Max(c) => Node::Max(all(c, property)?),
+        Node::Negate(c) => Node::Negate(Box::new(substitute(c, leaves, property)?)),
+        Node::Invert(c) => Node::Invert(Box::new(substitute(c, leaves, property)?)),
+        Node::Clamp(c) => {
+            let [lo, v, hi] = c.as_ref();
+            // `none` stays `none`; an argument that substitutes to nothing is invalid
+            let mut one = |n: &Option<Node>| match n {
+                Some(n) => substitute(n, leaves, property).map(Some),
+                None => Some(None),
+            };
+            Node::Clamp(Box::new([one(lo)?, one(v)?, one(hi)?]))
+        }
+    })
+}
+
+/// Each author's custom property a text's `var()`s name, fallbacks
+/// included, by CSS's tokens: a function's name in any case, a property's
+/// as written.
+fn text_properties(text: &str, out: &mut Vec<Arc<str>>) {
+    text_vars(text, &mut |name| {
+        if crate::style::safe_area_properties::is_author_name(name)
+            && !out.iter().any(|n| &**n == name)
+        {
+            out.push(name.into());
+        }
+    });
+}
+
+/// The components of its box's own observations a text's `var()`s read, as
+/// [`Comparison::observed_components`] gives a tree's. The safe area's name
+/// is the local inset until activation (`parse.rs`), so only the keyboard's
+/// readings count.
+fn text_observations(text: &str) -> u16 {
+    let mut components = 0;
+    text_vars(text, &mut |name| {
+        if let Some((family, edge)) = Family::named(name).filter(|(f, _)| *f != Family::SafeArea) {
+            components |= 1 << (family as usize * 4 + edge as usize);
+        }
+    });
+    components
+}
+
+/// Each name a text's `var()`s read, fallbacks included, by CSS's tokens: a
+/// function's name in any case, a property's as written.
+fn text_vars(text: &str, each: &mut dyn FnMut(&str)) {
+    use cssparser::{Parser, ParserInput, Token};
+    fn walk(p: &mut Parser<'_, '_>, each: &mut dyn FnMut(&str)) {
+        while let Ok(token) = p.next() {
+            let var = matches!(token, Token::Function(name) if name.eq_ignore_ascii_case("var"));
+            if !matches!(token, Token::Function(_) | Token::ParenthesisBlock) {
+                continue;
+            }
+            let _ = p.parse_nested_block(|p| {
+                if var {
+                    if let Ok(Token::Ident(name)) = p.next() {
+                        each(name);
+                    }
+                }
+                walk(p, each);
+                Ok::<_, cssparser::ParseError<'_, ()>>(())
+            });
+        }
+    }
+    let mut input = ParserInput::new(text);
+    walk(&mut Parser::new(&mut input), each);
+}
+
 /// A calculation a row holds: a handle to its interned entry.
 #[derive(Clone)]
 pub struct Comparison(Arc<Value<Arc<[u8]>, Entry>>);
@@ -402,8 +706,13 @@ impl Comparison {
         }
     }
 
+    /// Whether it is held as a tree, not as a text a row substitutes.
+    pub(crate) fn is_tree(&self) -> bool {
+        self.tree(|_| ()).is_some()
+    }
+
     /// `f` of the tree, or `None` for a text, without copying either.
-    fn tree<T>(&self, f: impl FnOnce(&Node) -> T) -> Option<T> {
+    pub(crate) fn tree<T>(&self, f: impl FnOnce(&Node) -> T) -> Option<T> {
         self.with(|e| match e {
             Entry::Tree(t) => Some(f(t)),
             Entry::Text { .. } => None,
@@ -447,13 +756,7 @@ impl Comparison {
     /// whichever argument it is in, or a text substituted is no value of its
     /// row (CSS Environment Variables 1 §3).
     pub(crate) fn undefined(&self, env: &Env) -> bool {
-        // A local inset is always defined, and only a node's environment has it
-        let undefined = |n: &Node| match n {
-            Node::Env(EnvTerm::Local(_)) => false,
-            Node::Env(term) => term.value(env).is_none(),
-            _ => false,
-        };
-        self.tree(|t| t.any(&undefined)).unwrap_or_else(|| {
+        self.tree(|t| undefined_in(t, env)).unwrap_or_else(|| {
             self.substituted(env)
                 .is_none_or(|d| d.undefined_segment(env))
         })
@@ -512,6 +815,97 @@ impl Comparison {
         })
     }
 
+    /// Whether it reads an observation, its box's own or a native target's
+    /// (LLP 1123 D7, D9), a text's as it will be parsed included.
+    pub(crate) fn reads_observed(&self) -> bool {
+        self.with(|e| match e {
+            Entry::Tree(t) => t.any(&|n| matches!(n, Node::Observe(_))),
+            Entry::Text { text, .. } => text_observations(text) != 0,
+        })
+    }
+
+    /// The components of its box's own observations it reads, fallbacks
+    /// included: a bit per [`Observe::component`].
+    pub(crate) fn observed_components(&self) -> u16 {
+        if let Some(components) = self.with(|e| match e {
+            Entry::Text { text, .. } => Some(text_observations(text)),
+            Entry::Tree(_) => None,
+        }) {
+            return components;
+        }
+        let components = std::cell::Cell::new(0u16);
+        self.tree(|t| {
+            t.any(&|n| {
+                if let Node::Observe(o) = n {
+                    if o.target == super::targets::Target::Box {
+                        components.set(components.get() | 1 << o.component());
+                    }
+                }
+                false
+            })
+        });
+        components.get()
+    }
+
+    /// The native targets it reads raw insets from, fallbacks included, each
+    /// with the edge it reads as a bit, as [`Edge`] numbers them, once per
+    /// leaf (LLP 1123 D9, "The native chain").
+    pub(crate) fn targets_read(&self) -> Vec<(super::targets::Target, u8)> {
+        let targets = std::cell::RefCell::new(Vec::new());
+        self.tree(|t| {
+            t.any(&|n| {
+                if let Node::Observe(o) = n {
+                    if o.target != super::targets::Target::Box {
+                        let edge = 1 << o.edge as u8;
+                        targets.borrow_mut().push((o.target.clone(), edge));
+                    }
+                }
+                false
+            })
+        });
+        targets.into_inner()
+    }
+
+    /// Whether it reads a container unit (LLP 1123 D16), which resolves per
+    /// node: in a tree, at a leaf; a text whose `env()` has a fallback,
+    /// wherever it may name one.
+    pub(crate) fn reads_container(&self) -> bool {
+        match &self.0.value {
+            Entry::Tree(t) => {
+                t.any(&|n| matches!(n, Node::Value(_, Unit::Viewport(u)) if u.is_container()))
+            }
+            // An escape may spell the unit (`c\71 w`), so a text with one may read it
+            Entry::Text { text, .. } => {
+                let text = text.to_ascii_lowercase();
+                text.contains("cq") || text.contains('\\')
+            }
+        }
+    }
+
+    /// Whether it reads an author's custom property (LLP 1123 D5), which
+    /// resolves per node: in a tree, at a leaf; a text whose `env()` has a
+    /// fallback, wherever it names one.
+    pub(crate) fn reads_custom(&self) -> bool {
+        match &self.0.value {
+            Entry::Tree(t) => t.any(&|n| matches!(n, Node::Var(_))),
+            Entry::Text { text, .. } => {
+                let mut names = Vec::new();
+                text_properties(text, &mut names);
+                !names.is_empty()
+            }
+        }
+    }
+
+    /// The custom properties it reads, each name with its `--`, fallbacks
+    /// included (LLP 1123 D5): a tree's at its leaves, a text's wherever a
+    /// `var()` of an author's name stands in it.
+    pub(crate) fn properties(&self, out: &mut Vec<Arc<str>>) {
+        match &self.0.value {
+            Entry::Tree(t) => t.names(out),
+            Entry::Text { text, .. } => text_properties(text, out),
+        }
+    }
+
     /// Whether it reads the local inset at `edge`.
     pub(crate) fn reads_local_edge(&self, edge: Edge) -> bool {
         self.with(|e| match e {
@@ -522,14 +916,24 @@ impl Comparison {
         })
     }
 
-    /// The tree with its local insets as `env` has them, in points, as the
-    /// dimension that holds it; `None` when it reads none. A tree handed to
-    /// layout, where only the window's environment is known, is localized
-    /// first (LLP 1123 D5).
+    /// The tree with its local insets, custom properties, observations and
+    /// container units as `env` has them, as the dimension that holds it,
+    /// `Auto` (the row's initial value) where a property is invalid; `None`
+    /// when it reads none of them. A tree handed to layout, where only the
+    /// window's environment is known, is localized first (LLP 1123 D5, D16).
     pub(crate) fn localized(&self, env: &Env) -> Option<Dimension> {
         self.tree(|t| {
-            t.any(&|n| matches!(n, Node::Env(EnvTerm::Local(_))))
-                .then(|| dimension(simplify::simplify(localize(t, env))))
+            t.any(&|n| {
+                matches!(
+                    n,
+                    Node::Env(EnvTerm::Local(_)) | Node::Var(_) | Node::Observe(_)
+                ) || matches!(n, Node::Value(_, Unit::Viewport(u)) if u.is_container())
+            })
+            .then(|| {
+                let t = localize(t, env).map(simplify::simplify);
+                t.filter(within_expansion)
+                    .map_or(Dimension::Auto, dimension)
+            })
         })
         .flatten()
     }

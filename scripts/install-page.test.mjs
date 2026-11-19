@@ -7,13 +7,13 @@ if (!Bun.which('cargo', { PATH: process.env.PATH })) throw new Error(`these test
 // The fixtures name their apps; a caller's EXACT_APP_DIR would redirect every one.
 delete process.env.EXACT_APP_DIR;
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync, mkdirSync, renameSync, symlinkSync, existsSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync, mkdirSync, renameSync, symlinkSync, existsSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { closeFilesystemReader, filesystemRead } from './filesystem.mjs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createServer } from 'node:http';
-import { allowHostArgs, allowHostName, developmentGate, developmentInstallPage, installData, installPage, installProblems, writeInstallPages, installBrowserOrigins, installNetworkPage, localInstallURL } from './install-page.mjs';
+import { sourceProvenance, allowHostArgs, allowHostName, developmentGate, developmentInstallPage, installData, installPage, installProblems, writeInstallPages, installBrowserOrigins, installNetworkPage, localInstallURL } from './install-page.mjs';
 import { readManifest, rustPolicy, rebuildPolicy } from './app.mjs';
 import { compressionCache, developmentOpenPage, listPublicFiles, readStaticFile, serveStatic, staticWatchChanges, applyStaticTreeChange, warmCompression } from '../host/web/serve.mjs';
 import { request as httpRequest } from 'node:http';
@@ -23,43 +23,106 @@ import { DirectoryOrigin, webReleasePath } from './origin.mjs';
 import { developmentLinks } from '../host/apple/build.mjs';
 const manifest = {name:'Interview',app:{id:'com.interview.app',name:'Interview'}};
 
-test('wasm install provenance keeps source facts and records a build time only in development', () => {
-  mkdirSync(join(import.meta.dir, '../target'), { recursive: true });
-  const dir = mkdtempSync(join(import.meta.dir, '../target/install-provenance-'));
+test('wasm install provenance keeps source facts and records a build time only in development', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'install-provenance-'));
   try {
     const source = readFileSync(join(import.meta.dir, '../host/web/build.mjs'), 'utf8');
-    const start = source.indexOf('const sourceRevision ='), end = source.indexOf('const escapeHtml =', start);
+    const start = source.indexOf('const [sourceRevision, sourceChanges] ='), end = source.indexOf('const escapeHtml =', start);
     assert.ok(start >= 0 && end > start);
-    const generate = new Function('spawnSync', 'stage', 'app', 'buildReceipt', 'buildEnv', 'bakedReceipt', 'writeInstallPages', source.slice(start, end));
-    for (const trust of ['production', 'development']) for (const known of [true, false]) {
-      generate((command, args, options) => {
-        assert.equal(command, 'git');
-        assert.deepEqual(options, { cwd: dir, encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' });
-        return { status: known ? 0 : 128, stdout: args[0] === 'rev-parse' ? 'abc1234567\n' : ' M app.contract\n' };
-      },
+    const generate = new (async function () {}).constructor('sourceProvenance', 'stage', 'app', 'buildReceipt', 'buildEnv', 'bakedReceipt', 'writeInstallPages', source.slice(start, end));
+    for (const trust of ['production', 'development']) for (const [revision, changes] of [['abc1234567', ' M app.contract'], [null, null], [null, ''], ['abc1234567', null]]) {
+      await generate(async cwd => { assert.equal(cwd, dir); return [revision, changes]; },
         dir, { dir, manifest }, { binary: { sha256: 'a'.repeat(64) } }, { EXACT_UPDATE_TRUST: trust }, { reach: { rows: [] } }, writeInstallPages);
       const { build, reach } = JSON.parse(readFileSync(join(dir, '.exact/install.json')));
-      assert.equal(build.source, known ? 'abc1234567' : null);
-      assert.equal(build.dirty, known ? true : null);
+      assert.equal(build.source, revision);
+      assert.equal(build.dirty, changes === null ? null : !!changes);
       assert.equal(build.mode, trust === 'production' ? 'Release build' : 'Development build');
       assert.equal(build.id, 'a'.repeat(64));
       assert.deepEqual(reach, []);
       if (trust === 'production') assert.equal(build.builtAt, null);
       else assert.equal(new Date(build.builtAt).toISOString(), build.builtAt);
     }
-    // A timed-out process can leave partial stdout without establishing metadata.
-    for (const stalled of ['rev-parse', 'status']) {
-      generate((_command, args, options) => ({ status: args[0] === stalled ? null : 0,
-        ...(args[0] === stalled ? { signal: options.killSignal, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) } : {}),
-        stdout: args[0] === 'rev-parse' ? 'abc1234567\n' : ' M app.contract\n' }),
-        dir, { dir, manifest }, { binary: { sha256: 'a'.repeat(64) } }, { EXACT_UPDATE_TRUST: 'production' }, { reach: { rows: [] } }, writeInstallPages);
-      const { build } = JSON.parse(readFileSync(join(dir, '.exact/install.json')));
-      assert.equal(build.source, stalled === 'rev-parse' ? null : 'abc1234567');
-      assert.equal(build.dirty, stalled === 'status' ? null : true);
-      assert.equal(build.builtAt, null);
-    }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('source provenance leaves the index unchanged when tracked file metadata needs refreshing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'install-git-'));
+  const git = (...args) => { const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); };
+  try {
+    git('init', '-q');
+    const file = join(dir, 'tracked');
+    writeFileSync(file, 'unchanged'); git('add', 'tracked');
+    const later = new Date(Date.now() + 5000); utimesSync(file, later, later);
+    const before = readFileSync(join(dir, '.git/index'));
+    assert.deepEqual(await sourceProvenance(dir), [null, 'A  tracked']);
+    assert.deepEqual(readFileSync(join(dir, '.git/index')), before);
+    assert.equal(existsSync(join(dir, '.git/index.lock')), false);
+    assert.deepEqual(await sourceProvenance(join(dir, 'missing')), [null, null]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform === 'win32')('source provenance bounds a slow git read even when a descendant holds stdout open', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'install-slow-git-'));
+  try {
+    const executable = join(dir, 'git');
+    writeFileSync(executable, `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+const verb = process.argv[3], base = process.env.PROVENANCE_FIXTURE + '/' + verb;
+writeFileSync(base + '.pid', String(process.pid));
+console.log('partial output');
+if (verb === 'status') {
+  const holder = spawn(process.execPath, ['--eval', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 1, 'ignore'] });
+  writeFileSync(base + '.holder.pid', String(holder.pid));
+  holder.unref();
+}
+process.on('SIGTERM', () => {
+  writeFileSync(base + '.term', 'received');
+  if (verb === 'rev-parse') process.exit(0);
+});
+setInterval(() => {}, 1000);
+`);
+    chmodSync(executable, 0o755);
+    const script = `import { sourceProvenance } from ${JSON.stringify(join(import.meta.dir, 'install-page.mjs'))};
+      console.log(JSON.stringify(await sourceProvenance(${JSON.stringify(dir)})));`;
+    const run = spawnSync(process.execPath, ['--eval', script], { encoding: 'utf8', timeout: 20000,
+      env: { ...process.env, PATH: dir, PROVENANCE_FIXTURE: dir } });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(run.stdout), [null, null]);
+    assert.doesNotThrow(() => process.kill(Number(readFileSync(join(dir, 'status.holder.pid'), 'utf8')), 0), 'the descendant still holds stdout when the read returns');
+    for (const verb of ['rev-parse', 'status']) {
+      assert.equal(readFileSync(join(dir, verb + '.term'), 'utf8'), 'received');
+      const pid = Number(readFileSync(join(dir, verb + '.pid'), 'utf8'));
+      await shown('git to exit after termination', () => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) { assert.equal(error.code, 'ESRCH'); return true; }
+      });
+    }
+  } finally {
+    for (const name of ['rev-parse.pid', 'status.pid', 'status.holder.pid']) {
+      const file = join(dir, name);
+      if (existsSync(file)) { try { process.kill(Number(readFileSync(file, 'utf8')), 'SIGKILL'); } catch {} }
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 25000);
+
+test.skipIf(process.platform === 'win32')('source provenance rejects output larger than one MiB', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'install-large-git-'));
+  try {
+    const executable = join(dir, 'git');
+    writeFileSync(executable, `#!${process.execPath}
+process.stdout.write(process.argv[3] === 'rev-parse' ? 'abc1234567\\n' : 'x'.repeat(1024 * 1024 + 1));
+`);
+    chmodSync(executable, 0o755);
+    const script = `import { sourceProvenance } from ${JSON.stringify(join(import.meta.dir, 'install-page.mjs'))};
+      console.log(JSON.stringify(await sourceProvenance(${JSON.stringify(dir)})));`;
+    const run = spawnSync(process.execPath, ['--eval', script], { encoding: 'utf8', timeout: 20000,
+      env: { ...process.env, PATH: dir } });
+    assert.equal(run.status, 0, run.stderr);
+    assert.deepEqual(JSON.parse(run.stdout), ['abc1234567', null]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 25000);
 
 test('static ancestor notifications reconcile nested trees and retain refused replacements', () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-static-ancestor-'));
@@ -364,7 +427,7 @@ printf '%s\\n' '{"value":"aGk="}'
       // Check at once: a read asked again is the failed read's own, so its helper has run by now
       assert.equal(readFileSync('spawns','utf8'),'x','a closed reader is not asked again');
     `;
-    const child=spawnSync(process.execPath,['--input-type=module','-e',program],{cwd:dir,encoding:'utf8',env:{...process.env,PATH:join(dir,'bin')+':'+process.env.PATH}});
+    const child=spawnSync(process.execPath,['--input-type=module','-e',program],{cwd:dir,encoding:'utf8',env:{...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:undefined}});
     assert.equal(child.status,0,child.stderr);
   } finally {rmSync(dir,{recursive:true,force:true});}
 }, 200_000);
@@ -401,7 +464,7 @@ chmod 755 target/exact-filesystem-tool/debug/exact-filesystem
       assert.equal(failed.status,0,failed.stderr);assert.match(failed.stdout,/status 42, signal none/);
       assert.equal(readFileSync('attempts','utf8'),'x','failed operations must not be retried');
     `;
-    const child=spawnSync(process.execPath,['--eval',program],{cwd:dir,encoding:'utf8',env:{...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,RUSTC_WORKSPACE_WRAPPER:'/toolchain/clippy-driver',CLIPPY_ARGS:'-D warnings'}});
+    const child=spawnSync(process.execPath,['--eval',program],{cwd:dir,encoding:'utf8',env:{...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:undefined,RUSTC_WORKSPACE_WRAPPER:'/toolchain/clippy-driver',CLIPPY_ARGS:'-D warnings'}});
     assert.equal(child.status,0,child.stderr);
   } finally {rmSync(dir,{recursive:true,force:true});}
 }, 200_000);
@@ -420,7 +483,7 @@ cp helper-source target/exact-filesystem-tool/debug/exact-filesystem
 chmod 755 target/exact-filesystem-tool/debug/exact-filesystem
 `,{mode:0o755});
     writeFileSync(join(dir,'helper-source'),`#!/bin/sh\nprintf '%s\\n' '{"value":"helper"}'\n`);
-    const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_HOME:join(dir,'cargo-home')};
+    const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:undefined,CARGO_HOME:join(dir,'cargo-home')};
     delete env.EXACT_FILESYSTEM_HELPER;
     const get=()=>{
       const run=spawnSync(process.execPath,['--eval',"import {filesystem} from './scripts/filesystem.mjs';console.log(filesystem({op:'get'}));"],{cwd:dir,encoding:'utf8',env});
@@ -434,6 +497,69 @@ chmod 755 target/exact-filesystem-tool/debug/exact-filesystem
     assert.equal(get(),2);
   } finally {rmSync(dir,{recursive:true,force:true});}
 }, 200_000);
+
+test('a deploy capture keeps its checked helper in its owning Cargo cache', () => {
+  const dir=realpathSync(mkdtempSync(join(tmpdir(),'exact-helper-deploy-')));
+  const capture=join(dir,'capture'), cache=join(dir,'cargo');
+  try {
+    for (const sub of ['scripts','bin','filesystem/src']) mkdirSync(join(capture,sub),{recursive:true});
+    const bridge=readFileSync(new URL('./filesystem.mjs',import.meta.url));
+    const restore=()=>writeFileSync(join(capture,'scripts/filesystem.mjs'),bridge);
+    restore();
+    writeFileSync(join(capture,'filesystem/src/main.rs'),'fn main() {}\n');
+    writeFileSync(join(capture,'helper-source'),`#!/bin/sh\nprintf '%s\\n' '{"value":"helper"}'\n`);
+    writeFileSync(join(capture,'bin/cargo'),`#!/bin/sh
+set -e
+printf x >> '${join(dir,'builds')}'
+while [ "$1" != --target-dir ]; do shift; done
+out="$2/debug"
+mkdir -p "$out"
+cp helper-source "$out/exact-filesystem"
+chmod 755 "$out/exact-filesystem"
+`,{mode:0o755});
+    // The `rustc` on PATH says what `version` says, as a toolchain alias does that an update moves.
+    const version=join(dir,'version');
+    writeFileSync(version,'rustc 1.0.0 (aaaa)\n');
+    writeFileSync(join(capture,'bin/rustc'),`#!/bin/sh\ncat '${version}'\n`,{mode:0o755});
+    writeFileSync(join(dir,'other-rustc'),`#!/bin/sh\necho 'rustc 2.0.0 (bbbb)'\n`,{mode:0o755});
+    const env={...process.env,PATH:join(capture,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:cache};
+    delete env.EXACT_FILESYSTEM_HELPER;
+    const get=()=>{
+      const run=spawnSync(process.execPath,['--eval',"import {filesystem} from './scripts/filesystem.mjs';console.log(filesystem({op:'get'}));"],{cwd:capture,encoding:'utf8',env});
+      assert.equal(run.status,0,run.stderr); assert.equal(run.stdout.trim(),'helper');
+      return readFileSync(join(dir,'builds'),'utf8');
+    };
+    assert.equal(get(),'x');
+    rmSync(join(capture,'target'),{recursive:true,force:true});
+    restore();
+    assert.equal(get(),'x','recreating captured outputs must not compile the helper again');
+    assert.ok(existsSync(join(cache,'exact-filesystem-tool')));
+    let count='x';
+    for (const name of ['filesystem/src/main.rs','rust-toolchain.toml','.cargo/config.toml']) {
+      mkdirSync(dirname(join(capture,name)),{recursive:true});
+      writeFileSync(join(capture,name),'changed input\n');
+      count+='x';
+      assert.equal(get(),count,`${name}: changed inputs need a new checked helper`);
+      assert.equal(get(),count);
+    }
+    for (const toolchain of ['first-compiler','second-compiler']) {
+      env.RUSTUP_TOOLCHAIN=toolchain;
+      count+='x';
+      assert.equal(get(),count,'a toolchain override needs a new checked helper');
+      assert.equal(get(),count);
+    }
+    env.RUSTC=join(dir,'other-rustc');
+    count+='x';
+    assert.equal(get(),count,'the compiler RUSTC names needs a new checked helper');
+    assert.equal(get(),count);
+    delete env.RUSTC;
+    assert.equal(get(),count,'the compiler checked before still has its helper');
+    writeFileSync(version,'rustc 1.0.1 (cccc)\n');
+    count+='x';
+    assert.equal(get(),count,'a compiler updated behind the same name needs a new checked helper');
+    assert.equal(get(),count);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
 
 test('concurrent helper callers share a checked build and validate it against inputs after waiting', async () => {
   const {dir,call,claim,has}=helperBuilds(), callers=[];
@@ -505,7 +631,7 @@ chmod 755 target/exact-filesystem-tool/debug/exact-filesystem
 `,{mode:0o755});
     const helper=value=>`#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({value})}'\n`;
     writeFileSync(join(dir,'helper-source'),helper('checked'));
-    const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH};
+    const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:undefined};
     delete env.EXACT_FILESYSTEM_HELPER;
     const named=spawnSync(process.execPath,['scripts/filesystem.mjs','--helper'],{cwd:dir,encoding:'utf8',env});
     assert.equal(named.status,0,named.stderr);
@@ -564,7 +690,7 @@ let clock=0;
 helperBuildWait.now=()=>{if(clock<120_000&&(clock+=10_000)===120_000)writeFileSync('waited-'+process.argv[2],'');return clock;};
 try{console.log(filesystem({op:'get'}));}catch(error){console.log(error.message);process.exit(3);}
 `);
-  const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH};
+  const env={...process.env,PATH:join(dir,'bin')+':'+process.env.PATH,CARGO_TARGET_DIR:undefined};
   const call=name=>{
     const child=spawn(process.execPath,['caller.mjs',name],{cwd:dir,env,stdio:['ignore','pipe','inherit']});
     let out='';child.stdout.on('data',data=>{out+=data;});

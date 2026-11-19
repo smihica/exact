@@ -1,5 +1,6 @@
 import XCTest
 @testable import ExactKit
+@testable import ExactActivities
 
 final class ActivityLoadingTests: XCTestCase {
     func testMissingArmReportsLoaderReasonOnEachAttempt() {

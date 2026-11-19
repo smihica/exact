@@ -1,10 +1,49 @@
-import { host, loadAfterPaint, localAssetURL, agentMode, now, collections, followOffset, readOut, root, log, pageNative, loadPageNative, pieces, mutate, REPLACE_SETTLE_MS, SETTLE_DEADLINE_MS, waiting, encoder, writeIn, loadStage, focus, ask, presence, arrange, motion, views, retiredViews, followedScrolls, followScroll, pendingScrolls, lists, messageFrames, messageViews, controllers, forgettable, inflight, heldAsks, pageFacts, loadGpuIfNeeded, moduleCall, rustImports, dataImports, t0, agentKeepsStore, decoder, assetNamespace, documentsGlue, AGENT_ADMITTED, httpHelpers } from "../glue.js";
+import { host, loadAfterPaint, localAssetURL, agentMode, now, collections, followOffset, readOut, root, log, pageNative, loadPageNative, pieces, mutate, REPLACE_SETTLE_MS, waiting, encoder, writeIn, loadStage, focus, ask, presence, arrange, motion, views, retiredViews, followedScrolls, followScroll, pendingScrolls, lists, messageFrames, messageViews, controllers, forgettable, inflight, heldAsks, pageFacts, loadGpuIfNeeded, moduleCall, rustImports, dataImports, t0, agentKeepsStore, decoder, assetNamespace, documentsGlue, AGENT_ADMITTED, httpHelpers } from "../glue.js";
 import { send, applyBatch } from "./commit.js";
-import { navigation, launchLocation, reportTime, reportPlace, preferences, updateCode, foldBits, appRootFontSize, releaseAssets, afterPaint, grantOrigins, modalLayers, inertAncestor, editMenu } from "../navigation.js";
+import { navigation, launchLocation, launchVisits, reportTime, reportPlace, preferences, updateCode, foldBits, appRootFontSize, releaseAssets, afterPaint, grantOrigins, modalLayers, inertAncestor, editMenu } from "../navigation.js";
 import { setInputReady } from "./input.js";
 import { startClock } from "./flow.js";
-import { waitForInflight } from "./agent.js";
 import { forgetList } from "./views.js";
+import { engagement } from "../engagement.js";
+// A trap leaves the module as it stopped (a Rust borrow held, a batch half
+// applied), so every later call traps again. The first one stops the page's
+// calls: the clock ends, a later call throws `ModuleStopped` without entering
+// the module and is not reported, and the page says so once.
+class ModuleStopped extends Error {}
+function guardedExports(exports) {
+  const guarded = {};
+  for (const [name, value] of Object.entries(exports)) {
+    guarded[name] = typeof value !== "function" ? value : (...args) => {
+      if (host.trapped) {
+        throw new ModuleStopped(`app.wasm stopped after a trap: ${host.trapped}`);
+      }
+      try {
+        return value(...args);
+      } catch (error) {
+        if (error instanceof WebAssembly.RuntimeError) {
+          stopModule(error);
+        }
+        throw error;
+      }
+    };
+  }
+  return guarded;
+}
+function stopModule(error) {
+  if (host.trapped) {
+    return;
+  }
+  host.trapped = error;
+  host.ticker?.dispose();
+  host.ticker = null;
+  host.textflow?.dispose();
+  host.textflow = null;
+  root.dataset.error = String(error);
+  console.error("exact: app.wasm trapped, and the page no longer calls it:", error);
+  globalThis.exact.onTrap?.(error);
+}
+addEventListener("error", (e) => e.error instanceof ModuleStopped && e.preventDefault());
+addEventListener("unhandledrejection", (e) => e.reason instanceof ModuleStopped && e.preventDefault());
 export async function loadRust() {
   if (host.rustLoader) {
     return;
@@ -20,6 +59,14 @@ export async function loadRust() {
 // LLP 1019 D5: FontFace loading is part of host boot. The DOM remains empty until every local face loaded, or 100 ms elapsed. At the barrier, install
 // every face already ready unless its family has a failed sibling; faces that
 // finish later remain unused for this generation (no post-paint swap).
+function devCard(source, assets) {
+  try {
+    const url = new URL(source, document.baseURI);
+    return url.origin === location.origin ? assets?.get(decodeURIComponent(url.pathname.replace(/^\//, ""))) : null;
+  } catch {
+    return null;
+  }
+}
 async function prepareFonts(faces, assets) {
   if (!faces?.length) {
     return [];
@@ -29,11 +76,17 @@ async function prepareFonts(faces, assets) {
     state: "pending",
     loaded: null
   }));
-  const pending = rows.map(async (row) => {
+  // A dev generation's font file, which the page reads when asked (dev.js `later`), is read before the 100 ms
+  // barrier starts: the barrier times the face's load, not the dev server.
+  const read = await Promise.all(faces.map((face) => {
+    const card = devCard(face.source, assets);
+    return card?.read ? card.read().catch(() => null) : null;
+  }));
+  const pending = rows.map(async (row, i) => {
     const { face } = row;
     try {
       const url = new URL(localAssetURL(face.source, assets), document.baseURI).href;
-      row.loaded = await new FontFace(face.family, `url(${JSON.stringify(url)})`, {
+      row.loaded = await new FontFace(face.family, read[i] ?? `url(${JSON.stringify(url)})`, {
         weight: face.weight,
         stretch: face.stretch,
         style: face.style
@@ -90,8 +143,59 @@ function activateData() {
   // pieces this tree first uses: input waits for their handlers (LLP 1047 D5)
   return pending ? pending.then(ready) : ready();
 }
-export function boot(...args) {
-  return mutate(() => bootNow(...args));
+// A replacement commits between interactions (LLP 1029.000.002 D7, D9): it waits for whatever `engagement` says the
+// person holds and for what its candidate names itself (`also`: a module's requests). `wait` answers true in the
+// first task with neither, and the caller applies in that same task; or false once a newer replacement begins or the
+// page goes. `changed` asks again, for a hold no input ends. `pending` names what it
+// waits for. One ticket follows a candidate through preparation.
+export const replacements = (() => {
+  let waiter = null, queued = false, ticket = 0, active = false, preparing = null;
+  const channel = new MessageChannel();
+  const holds = () => held() ?? waiter?.also?.() ?? null;
+  const settle = () => {
+    if (waiter && !queued && !holds()) {
+      queued = true;
+      channel.port2.postMessage(null);
+    }
+  };
+  addEventListener("pagehide", () => { ticket++; active = false; preparing = null; waiter?.resolve(false); waiter = null; }, true);
+  const held = engagement(settle);
+  channel.port1.onmessage = () => {
+    queued = false;
+    if (waiter && !holds()) {
+      const { resolve } = waiter;
+      waiter = null;
+      resolve(true);
+    }
+  };
+  return {
+    get pending() { return active || waiter ? holds() ?? preparing : null; },
+    changed: settle,
+    begin() {
+      waiter?.resolve(false);
+      waiter = null;
+      active = true;
+      preparing = null;
+      return ++ticket;
+    },
+    preparing(mine, why) { if (mine === ticket) preparing = why; },
+    end(mine) { if (mine === ticket) { active = false; preparing = null; } },
+    current(mine) { return mine === ticket; },
+    wait(mine = ticket, also = null) {
+      if (mine !== ticket) return Promise.resolve(false);
+      waiter?.resolve(false);
+      return new Promise((resolve) => { waiter = { resolve, also }; settle(); });
+    },
+  };
+})();
+export async function boot(bytes, assets = host.devAssets, current = () => true, module = null, fresh = false, ticket = replacements.begin()) {
+  try {
+    if (!current() || !replacements.current(ticket)) return null;
+    const request = ++host.bootAttempt;
+    const live = () => current() && replacements.current(ticket) && request === host.bootAttempt;
+    if (host.incarnation && !await replacements.wait(ticket) || !live()) return null;
+    return await mutate(() => live() ? bootNow(bytes, assets, live, module, fresh, ticket) : null);
+  } finally { replacements.end(ticket); }
 }
 // Report both schemes as the page draws them, beneath an app's theme (LLP 1095 D4), so the kernel's canvas ink
 // follows the browser's palette at boot and when its contrast changes (src/colors.rs).
@@ -111,8 +215,8 @@ export function reportColors() {
   probe.remove();
   host.wasm.exact_report_colors(writeIn(JSON.stringify(colors)));
 }
-async function bootNow(bytes, assets = host.devAssets, current = () => true, module = null, fresh = false) {
-  const t = performance.now(), request = ++host.bootAttempt;
+async function bootNow(bytes, assets = host.devAssets, current = () => true, module = null, fresh = false, ticket) {
+  const t = performance.now(), request = host.bootAttempt;
   // Decode and load private font faces while the live page keeps running.
   // Carry state only at the synchronous host acceptance point below.
   const bakedLength = bytes ? 0 : host.wasm.exact_plan();
@@ -123,8 +227,6 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
   if (faces.error) {
     throw new Error(faces.error);
   }
-  globalThis.exact.fontAliases = Object.fromEntries(faces.map((f) => [f.declared, f.family]));
-  // canvas text names the declared family (LLP 1056 D8)
   const preparedFonts = await prepareFonts(faces, assets);
   const shaderCommit = assets !== null && globalThis.exact.gpu ? await globalThis.exact.gpu.prepareShaders(assets) : null;
   if (!bytes && !module && host.page?.answers) await host.page.answers;
@@ -132,28 +234,22 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
   if (!current() || request !== host.bootAttempt) {
     return null;
   }
-  // A replacement lets the current executor finish its answers first. The dev loop's waits a moment, then swaps
-  // anyway, as an app may always have a request out: what is still out is let go as a plan restart lets it go,
-  // and the new runner asks again for what it has not settled (LLP 1007 §6). An update refuses instead.
-  let left = [];
-  if (module) {
-    if (!await waitForInflight(performance.now() + (module.letGo ? REPLACE_SETTLE_MS : SETTLE_DEADLINE_MS))) {
-      if (!module.letGo) {
-        throw new Error("module replacement waits for in-flight requests to settle; retry the update");
-      }
-      left = waiting();
+  // A module's replacement lets the running executor finish its answers first: the page's requests and the
+  // runner's own, which refuses the swap while one is out (src/abi.rs `boot_module`). An update waits for them with
+  // no deadline. The dev loop's waits a second from the first turn they alone hold it, then swaps anyway, as an app
+  // may always have a request out: what is still out is let go as a plan restart lets it go, and the new runner
+  // asks again for what it has not settled (LLP 1029.000.002 D9, LLP 1007 §6).
+  let left = [], timed = false, letGo = false;
+  const requests = module && (() => {
+    if (letGo || !waiting().length && !host.wasm.exact_requests_pending()) return null;
+    if (module.letGo && !timed) {
+      timed = true;
+      setTimeout(() => { letGo = true; replacements.changed(); }, REPLACE_SETTLE_MS);
     }
-    if (!current() || request !== host.bootAttempt) {
-      return null;
-    }
-  }
-  const launch = encoder.encode(launchLocation());
-  if (host.wasm.exact_set_launch) {
-    const [epoch, offset] = reportTime(now());
-    host.wasm.exact_set_launch(epoch, offset, writeIn(reportPlace()));
-  }
-  // @ref LLP 1038 D5; then the date and place the boot's first settle reads (LLP 1027.000.000)
-  const kept = !fresh && (bytes || module) ? (await loadStage("inspection"), focus.keep(ask({ op: "tree" }), Number(document.activeElement?.closest?.("[data-view]")?.dataset.view))) : undefined;
+    return "requests";
+  });
+  const keeps = !fresh && (bytes || module);
+  if (keeps) await loadStage("inspection");
   // A cold WebView or hidden iframe can have no viewport. Wait without a deadline; module swaps reuse the runner's.
   if (!current() || request !== host.bootAttempt) {
     return null;
@@ -164,6 +260,23 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
       return null;
     }
   }
+  // What carries is read after the last hold's end, with no task between: the interaction's and the requests' are
+  // asked together, so one that began while the other was waited out holds the candidate too. The page's location,
+  // history, date and place are read here with the rest, as the person may have navigated during the hold.
+  if (!current() || request !== host.bootAttempt) return null;
+  if (host.incarnation && !await replacements.wait(ticket, requests) || !current() || request !== host.bootAttempt) return null;
+  // Canvas text names the declared family (LLP 1056 D8); the running plan's aliases hold until the swap.
+  globalThis.exact.fontAliases = Object.fromEntries(faces.map((f) => [f.declared, f.family]));
+  // @ref LLP 1038 D5. After a reload, the visits Back returns to come first, one a line, so the runner launches with
+  // them beneath (#527). A rendered document's checkpoint is matched against the location alone (`page_launch`), so
+  // it launches without them.
+  const launch = encoder.encode([...(host.page?.checkpoint ? [] : launchVisits()), launchLocation()].join("\n"));
+  // The date and place the boot's first settle reads (LLP 1027.000.000).
+  if (host.wasm.exact_set_launch) {
+    const [epoch, offset] = reportTime(now());
+    host.wasm.exact_set_launch(epoch, offset, writeIn(reportPlace()));
+  }
+  const kept = keeps ? focus.keep(ask({ op: "tree" }), Number(document.activeElement?.closest?.("[data-view]")?.dataset.view)) : undefined;
   reportColors();
   let len;
   host.wasm.exact_live_clock?.(agentMode ? 0 : 1);
@@ -187,15 +300,20 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
     payload.set(bytes);
     payload.set(launch, bytes.length);
     host.wasm.exact_set_update?.(updateCode());
+    host.wasm.exact_set_screen_reader(pageFacts.screenReaderCode());
     len = host.wasm.exact_boot_plan(bytes.length, innerWidth, innerHeight, launch.length, preferences() | foldBits());
   } else {
     if (host.page?.checkpoint) {
-      host.wasm.exact_checkpoint(writeIn(agentMode ? host.page.checkpoint.replace("\n", " driven\n") : host.page.checkpoint));
+      const checkpoint = agentMode
+        ? (await loadAfterPaint("./faults.js", "drivenCheckpoint"))(host.page.checkpoint)
+        : host.page.checkpoint;
+      host.wasm.exact_checkpoint(writeIn(checkpoint));
     }
     ptr = host.wasm.exact_in(launch.length);
     // a drive's clock starts at zero (page.rs)
     new Uint8Array(host.memory.buffer, ptr, launch.length).set(launch);
     host.wasm.exact_set_update?.(updateCode());
+    host.wasm.exact_set_screen_reader(pageFacts.screenReaderCode());
     len = host.wasm.exact_boot(innerWidth, innerHeight, launch.length, preferences() | foldBits());
   }
   const batch = JSON.parse(readOut(len));
@@ -305,7 +423,10 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
   document.getElementById("exact-looks")?.remove();
   // a held state goes unsaid (dev.js holds it again); the last plan's theme (LLP 1095 D4) and state looks (LLP 1121 D8): this boot's batch sets its own
   commitFonts(preparedFonts);
-  focus.restart(kept, () => applyBatch(batch), () => ask({ op: "tree" }), (id) => views.get(id));
+  focus.restart(kept, () => {
+    host.restoringScheme = fresh;
+    try { applyBatch(batch); } finally { host.restoringScheme = false; }
+  }, () => ask({ op: "tree" }), (id) => views.get(id));
   host.toldOffset = null;
   followOffset(now());
   // @ref LLP 1027.000.000 — the date, as the clock the runner already reads
@@ -314,6 +435,16 @@ async function bootNow(bytes, assets = host.devAssets, current = () => true, mod
   }
   if (host.wasm.exact_set_page) {
     applyBatch(JSON.parse(readOut(host.wasm.exact_set_page(pageFacts.bits()))));
+  }
+  // @ref LLP 1069.000 D2 r7 — the present of this runner's first picture: the first animation frame after its first
+  // commit (under the agent, each frame is presented at its commit, and the runner says so at its boot)
+  if (host.wasm.exact_page_presented && !agentMode) {
+    const incarnation = host.incarnation;
+    requestAnimationFrame(() => {
+      if (host.incarnation === incarnation) {
+        applyBatch(JSON.parse(readOut(host.wasm.exact_page_presented())));
+      }
+    });
   }
   appRootFontSize("medium");
   if (host.wasm.exact_set_root_font_size) {
@@ -442,7 +573,8 @@ export async function main() {
       response = download();
     }
   }
-  host.wasm = instance.exports;
+  host.exports = instance.exports;
+  host.wasm = guardedExports(instance.exports);
   const [staged] = WebAssembly.Module.customSections(compiled, "exact.stages");
   if (staged) {
     host.stages = JSON.parse(new TextDecoder().decode(staged)).stages;

@@ -44,6 +44,8 @@ import { devices } from "./devices.js";
 import { setSpaceState } from "../web/address-space.js";
 import { members } from "./members.js";
 import { sheets } from "./sheets.js";
+import { errorCode, object, complete, handlesAt, overlay, partial, equalJson, serdeJson, fill, value } from "./declared-values.js";
+import { hatchClock } from "./hatches.js";
 
 // `rows`: source → [extension.name, send, substitute, type, request, options' type, live];
 // `bound`: extension → a loader of its web implementation, where the app binds one
@@ -51,6 +53,8 @@ import { sheets } from "./sheets.js";
 // `views`: a package view's tag → [extension, displayed, binding props, agent vocabulary] (views.js);
 // `events`: extension.event → [its action, taken when heard; activation | emit | wake; hold; its parameters' types; its
 // name; a wake's budget].
+// Who a call comes from, least privileged first (the runner's `CallOrigin`)
+const RANK = ["device", "wake", "tool", "action", "app"];
 export function modules(rows, bound = {}, views = {}, events = {}) {
   const byKey = new Map(), preferred = new Map(), permission = new Map(), held = [];
   const covers = row => (!Array.isArray(row.sub.implementationTargets) || row.sub.implementationTargets.includes("web")) && !row.sub.implementationOverrides?.includes("web");
@@ -73,13 +77,19 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   const sampled = samples(t => now() - clock.now + t);
   // Another package's members of a ceremony's name (LLP 1133.014 D10 item 1, `members.js`).
   const mb = members(() => [...byKey.values()], row => valueOf(row), () => data.grants);
-  // The origin of the commit running now (LLP 1133.002 D12): the device's while an emitted event's handler runs, and,
-  // since data code and an answer's commit cannot say which request they follow, while any request such a handler
-  // made is still in flight (`deviceBase`, the in-flight count before it): the least privileged origin.
+  // The origin of the commit running now (LLP 1133.002 D12), which its Contract sends, commands and requests carry: one
+  // restored (a reply's, a `then`'s, a queued send's), else the device's or a wake's while its handler runs, else a
+  // tool's during its call (calls.js, LLP 1133.023 D7). An app's commit, which cannot say which request it follows,
+  // takes the least privileged still running (`inFlight`): a device handler's requests (`deviceBase`, the in-flight
+  // count before them) or an active wake.
   let origin = "app", deviceBase = null, wk = null;
-  // A tool call's (calls.js, LLP 1133.023 D7) stands below the app's.
-  const originNow = () => Origin.ask ?? (deviceBase !== null ? "device" : wk?.active() ? "wake" : origin === "app" ? Origin.call?.() ?? origin : origin);
+  const inFlight = () => (deviceBase !== null ? "device" : wk?.active() ? "wake" : null);
+  const originNow = () => Origin.ask ?? (origin !== "app" ? origin : Origin.call?.() ?? inFlight() ?? origin);
   Origin.now = originNow;
+  // Data code calls a module as the least privileged of its own call's origin, the commit's and what still runs that it
+  // cannot tell itself apart from (`inFlight`), as the runner's `data_origin` does (LLP 1133.002 D12); a Contract send
+  // carries its commit's origin exactly.
+  const dataOrigin = from => [from ?? "app", originNow(), inFlight() ?? "app"].reduce((a, b) => (RANK.indexOf(b) < RANK.indexOf(a) ? b : a));
   // What a commit of a wake's origin may not run (LLP 1133.017 D6): journaled, never run; a call's, calls.js says.
   Origin.refused = (name, from) => from === "tool" ? !!Origin.callRefuses?.(name) : from === "wake" && REFUSED.has(name) && (say(`${name}: refused: during a wake`), true);
   After.push(() => { if (deviceBase !== null && inflight.n <= deviceBase) deviceBase = null; });
@@ -138,6 +148,14 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   };
   // A denied permission may gate only an option (`continues`: Face ID denied still leaves the passcode, D12).
   const denialFails = (permission, args) => typeof permission?.continues !== "string" || args?.[permission.continues] === true;
+  // A read of the app's own item under the agent: no dialog, the implementation opens it as the app's own or fails. On a
+  // target its `owned` names, where the app declares that line and the permission is not granted (LLP 1133.019 D11
+  // item 4, the runner's `owned_call`).
+  const ownedCall = row => {
+    const line = row.sub.owned?.web;
+    return typeof line === "string" && (data.grants ?? "").split("\n").some(l => l.trim().split(/\s+/)[0] === line)
+      && stateOf(row.sub.permission?.name ?? "") !== "granted";
+  };
   const statusOf = (row, permission = row.sub.permission) => {
     const status = sibling(row, permission?.status);
     return status ? valueOf(status) ?? {} : {};
@@ -148,15 +166,24 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   };
   // A name admitted with no permission is never held or refused, and a request answers the status in every state but
   // `prompt` (`admission`, LLP 1133.004 §7).
-  const decidePermission = (row, send, p = row.sub.permission, args = {}) => {
+  // `p` is the permission `permissionOf` selected: none when a permission it requires is not this row's, as in the runner
+  const decidePermission = (row, send, p, args = {}) => {
     if (!p || row.sub.admission === "none") return null;
     const state = stateOf(p.name);
     // A target that makes the module absent keeps its own answer (`unknown`), as the runner's.
     if (!send && isStatus(row)) return { now: row.sub.targets?.web?.available === false ? valueOf(row) : statusValue(row, valueOf(row)) };
     // A source that reads a value of its own until the permission is granted (`ungranted`), as the runner's.
     if (!send && "ungranted" in row.sub && state !== "granted") return { now: structuredClone(row.sub.ungranted) };
-    if (state === "denied" && row.sub.admission !== "request" && denialFails(p, args)) return { now: { error: p.denied } };
-    return state === "prompt" && asks(row, send) && statusAsks(row, p) ? { hold: "permission" } : null;
+    // A request that answers the status answers it denied too (`deniedAnswers`: WebKit's `requestPermission` resolves
+    // `denied`, LLP 1133.013 D11)
+    const answersDenied = send && row.sub.deniedAnswers === true;
+    if (state === "denied" && row.sub.admission !== "request" && denialFails(p, args) && !answersDenied) return { now: { error: p.denied } };
+    if (state !== "prompt") return null;
+    if (asks(row, send)) return statusAsks(row, p) ? { hold: "permission" } : null;
+    // A name that is no request answers the permission's `whilePrompt` while the state is `prompt`, where it has one: an
+    // error naming the request that asks (LLP 1133.013 D11), as in the runner
+    const { whilePrompt } = p;
+    return whilePrompt && typeof whilePrompt === "object" && !Array.isArray(whilePrompt) ? { now: structuredClone(whilePrompt) } : null;
   };
   const decide = (row, send, args = {}) => {
     // A target's own restriction holds under the agent too (§6): the web has no precision request.
@@ -199,7 +226,8 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   };
   const answer = (row, json) => {
     const code = errorCode(json);
-    if (code) throw new Failed(`${row.key}: ${code}`, "error", code);
+    // The answer's message follows its code, as the runner's `answer_json` writes it: `whilePrompt`'s names the request
+    if (code) throw new Failed(typeof json.message === "string" ? `${row.key}: ${code}: ${json.message}` : `${row.key}: ${code}`, "error", code);
     return value(json, row.type, row.key);
   };
   const capability = h => h.waits === "permission" ? "permission" : h.waits === "raise" ? h.row.sub.raise.ticket : h.waits === "ceremony" ? h.row.sub.ceremony.ticket
@@ -371,9 +399,10 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   // The bound implementation, loaded on first use (LLP 1133.002 D15), with its context (LLP 1133.009 D10 items 2-6):
   // `changed`, `agent`, the session's clock (`now`, the agent's under the agent), whether the page is in the
   // foreground (`foreground()`; `foreground(shown)` on the implementation is told each change), the journal (`log`),
-  // the track table (`tracks`), admitted paths' files (`files`) and the audio session (`audioSession`). The web has
-  // no session end an implementation could finish in.
-  const loaded = new Map(), chunks = new Map(), live = new Set(), ready = new Map();
+  // the track table (`tracks`), admitted paths' files (`files`), the audio session (`audioSession`), and
+  // `clocked(fn)`, which runs `fn` after each move of the session's clock. The web has no session end an
+  // implementation could finish in.
+  const loaded = new Map(), chunks = new Map(), live = new Set(), ready = new Map(), constructed = new Map();
   // Under the agent the drive's page fact (`prefer visibility-state`, agent.js) is the foreground; the machine's never is.
   let agentShown = true;
   const shown = () => clock.agent ? agentShown : typeof document !== "object" || document.visibilityState !== "hidden";
@@ -424,6 +453,13 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
     // A directory a handle fills (LLP 1133.012 D12 item 7): emptied, made, and listed.
     remove: path => fileStore().then(s => s.rm(path)),
     mkdir: path => fileStore().then(s => s.mkdir(path)),
+    // A Blob made the file's entry by reference, as a picked file is (LLP 1133.008.000 D2): the page reads none of it.
+    // `refusal` is asked inside the store's transaction, and what it returns stops the write.
+    put: (path, blob, refusal) => fileStore().then(async s => { await s.mkdir(path.slice(0, path.lastIndexOf("/"))); return s.putBlob(path, blob, refusal); }),
+    putAll: (entries, refusal) => fileStore().then(async s => {
+      await Promise.all([...new Set(entries.map(e => e.path.slice(0, e.path.lastIndexOf("/"))))].map(path => s.mkdir(path)));
+      return s.putBlobs(entries, refusal);
+    }),
     list: path => fileStore().then(s => s.readdir(path)).catch(() => []),
   };
   // The page's Audio Session (W3C Audio Session; LLP 1133.009 D7, LLP 1133.012 D4): `play-and-record` while a
@@ -460,8 +496,9 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   const chunk = extension => { if (!chunks.has(extension)) chunks.set(extension, bound[extension]()); return chunks.get(extension); };
   const instance = extension => {
     if (!bound[extension]) return null;
-    if (!loaded.has(extension)) loaded.set(extension, chunk(extension).then(m => {
-      const context = { changed: key => reask([...byKey.values()].filter(r => r.key.split("#")[0] === key && route(r) !== "substitute").map(r => r.key)), agent: clock.agent, config: m.config ?? {}, now: () => { time(); return clock.now; }, foreground: shown, log: say, tracks, files, audioSession,
+    if (!loaded.has(extension)) loaded.set(extension, chunk(extension).then(async m => {
+      const context = { changed: key => reask([...byKey.values()].filter(r => r.key.split("#")[0] === key && route(r) !== "substitute").map(r => r.key)), agent: clock.agent, config: m.config ?? {}, now: () => { time(); return clock.now; }, clocked: fn => { Clocked.push(fn); }, foreground: shown, log: say, tracks, files, audioSession,
+        after: (ms, body) => hatchClock.after(ms, body),
         // The app's grant lines, and the host's auth session for an implementation (LLP 1133.014 D10 item 3).
         grants: data.grants ?? "", get authSession() { return globalThis.exact?.authSession; },
         revokePicture: source => pictures?.revokePicture(source), pictureChanged: source => pictures?.pictureChanged(source), invoke: invoker(extension),
@@ -511,7 +548,8 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
           return true;
         } };
       const impl = m.implementation?.(context) ?? null;
-      if (clock.agent) impl?.preferred?.(preferredOf(extension));
+      constructed.set(extension, impl);
+      if (clock.agent) await impl?.preferred?.(preferredOf(extension));
       ready.set(extension, impl);
       return impl;
     }));
@@ -560,6 +598,14 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
   const tell = () => { sampled.visibility(!shown()); for (const impl of loaded.values()) impl.then(i => i?.foreground?.(shown())); };
   if (typeof addEventListener === "function") addEventListener("visibilitychange", tell);
   (globalThis.exact ??= {}).foreground = visible => { if (agentShown !== visible) { agentShown = visible; tell(); ar.visibility(!visible); } };
+  // Preferences can cancel pending initialization; construction picks up any earlier changes.
+  const tellPreferred = async extension => {
+    if (!constructed.has(extension)) return;
+    inflight.n++;
+    try { await constructed.get(extension)?.preferred?.(preferredOf(extension)); }
+    catch (e) { say(`${extension}: ${e.message}`); }
+    finally { inflight.n--; }
+  };
   // The agent's preferred values for an extension's names, by name.
   const preferredOf = extension => Object.fromEntries([...preferred].filter(([k]) => k.startsWith(`${extension}.`) && (!k.includes("#") || route(byKey.get(k)) === "agent")).map(([k, v]) => [k.slice(extension.length + 1).split("#")[0], v]));
   // Under the agent, the preferred value laid over the implementation's answer field by field (LLP 1133.009 D10 item 11).
@@ -601,7 +647,8 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
     // A pending call's handlers (LLP 1133.034 D5): the ones its handler options name, by `request:<n>` while it runs.
     const callbacks = (row.sub.handlerOptions ?? []).map(o => args?.[o]).filter(h => typeof h === "string");
     if (callbacks.length) handlers.set(`request:${request}`, new Set(callbacks));
-    const told = { origin: how.origin ?? "app", request, ...(route(row) === "agent" ? { preferred: how.sheet ?? preferred.get(row.key) } : {}) };
+    const fixture = byKey.get(row.sub.from);
+    const told = { origin: how.origin ?? "app", request, ...(route(row) === "agent" ? { preferred: how.sheet ?? preferred.get(row.key) ?? (fixture && valueOf(fixture)) } : {}) };
     const answered = (async () => impl[name](args ?? {}, told))().finally(() => {
       if (forwarded.get(asker)?.request === request) forwarded.delete(asker);
       dataCalls.delete(call); handlers.delete(`request:${request}`);
@@ -861,11 +908,14 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
       }
     }
     // A path option is the app's own file, within its `fs.read` or `fs.write` lines (LLP 1133.009 D10 item 4); each
-    // of a list's (LLP 1133.024 D16); a keyed shape's path keys (`keys`), each item's (LLP 1133.006 D8 item 3).
+    // of a list's (LLP 1133.024 D16); a keyed shape's path keys (`keys`), each item's (LLP 1133.006 D8 item 3). One
+    // declared a `directory` names a directory, an app root itself included, with or without one trailing `/`.
     for (const [option, path] of Object.entries(sub.paths ?? {})) {
       const capability = `fs.${path.access}`, value = args?.[option];
       for (const given of path.keys ? [value].flat().flatMap(item => path.keys.map(k => item?.[k])) : [value].flat()) {
-        if (typeof given === "string" && !(appPath(given) && coversPath(appGrantSet(), capability, given))) return `grant-missing (${option}=${given} needs ${capability})`;
+        if (typeof given !== "string") continue;
+        const at = path.directory ? given.replace(/\/$/, "") : given;
+        if (!(appPath(path.directory ? at + "/f" : at) && coversPath(appGrantSet(), capability, at))) return `grant-missing (${option}=${given} needs ${capability})`;
       }
     }
     const applies = !sub.when || Object.entries(sub.when).every(([k, v]) => args?.[k] === v);
@@ -896,6 +946,7 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
     // Under the agent: the web's own restriction, then the permission's ticket, a sheet's or the raise's (LLP 1133.018
     // D13 item 4); else the implementation.
     const agentDecision = () => unsupported(row, send) ? { now: { error: "NotSupportedError" } }
+      : ownedCall(row) ? { forward: true }
       : decidePermission(row, send, p, args) ?? (send && row.sub.choose ? { hold: "choose" } : null) ?? (send && row.sub.raise ? decide(row, send, args) : null) ?? { forward: true };
     const deviceDecision = () => unsupported(row, send) ? { now: { error: "NotSupportedError" } } : decidePermission(row, send, p, args) ?? dv.decide(row, args);
     let d = r === "agent" ? agentDecision() : dv.role(row) ? deviceDecision() : decideTimed(row, send, timeout, args);
@@ -1139,7 +1190,7 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
       const args = sampled.clamp(row, { ...(body.args ?? {}) }, say);
       sp.resolveOf(row, args);
       const timeout = row.send ? timeoutOf(row, args) : null, reader = !row.send && sampled.sampled(row) ? `data ${groupOf(args)}` : null;
-      const origin = body.origin === "tool" ? "tool" : originNow();
+      const origin = dataOrigin(body.origin);
       if (row.sub.effect) return effect(row, args, origin);
       let d = admitted(row, args, origin, row.send, timeout);
       const spanned = sp.admitted(row, args, origin, d);
@@ -1222,7 +1273,7 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
           if (c.word) {
             preferred.set(`${ext}.${c.word}`, ids);
             say(`${ext}.${c.word}: chosen by the agent`);
-            loaded.get(ext)?.then(impl => impl?.preferred?.(preferredOf(ext)));
+            tellPreferred(ext);
           }
           sheet = { typed: ids };
         }
@@ -1331,7 +1382,7 @@ export function modules(rows, bound = {}, views = {}, events = {}) {
         return clock.agent && agentWord(key) && viewWords.has(extension) ? [extension] : [];
       });
       for (const extension of new Set(told)) {
-        loaded.get(extension)?.then(impl => impl?.preferred?.(preferredOf(extension)));
+        tellPreferred(extension);
       }
       // A field word's change is an arrival, once every word is set.
       for (const [key, before] of moved) ar.moved(key, before, preferred.get(key));
@@ -1354,112 +1405,3 @@ const appPath = p => p.startsWith("app:/") && p.slice(5).split("/").length >= 2 
 
 /** HTML's activation-triggering input events, and `click`: what a person's activation is. */
 const ACTIVATING = new Set(["click", "keydown", "mousedown", "pointerdown", "pointerup", "touchend"]);
-
-/** The code of an error answer, `{"error": "POSITION_UNAVAILABLE"}`, which may say more in a `message`, and each
- * platform's own code beside it (`apple`, `android`; LLP 1133.011 D1), as the runner's `error_code`. */
-function errorCode(json) {
-  if (json === null || typeof json !== "object" || Array.isArray(json)) return null;
-  const keys = Object.keys(json);
-  return typeof json.error === "string" && keys.every(k => ["error", "message", "apple", "android"].includes(k)) ? json.error : null;
-}
-
-/** A Contract call's options record (its fields in order) as the object an
- * implementation reads: a `none` left out, so an omitted option stays the platform's (D2). */
-function object(value, type) {
-  if (value === null || value === undefined) return undefined;
-  if (Array.isArray(type)) return type[0] === "?" ? object(value, type[1]) : type[0] === "[" ? value.map(v => object(v, type[1])) : value;
-  if (!type || typeof type !== "object" || !Array.isArray(value)) return value;
-  const out = {};
-  Object.keys(type).forEach((f, i) => { const v = object(value[i], type[f]); if (v !== undefined) out[f] = v; });
-  return out;
-}
-
-/** `json` with every option field it leaves out `null`, as data code reads a value of `type`. */
-function complete(json, type) {
-  if (errorCode(json) || json === null || typeof json !== "object") return json;
-  if (Array.isArray(type)) return type[0] === "[" && Array.isArray(json) ? json.map(x => complete(x, type[1])) : type[0] === "?" ? complete(json, type[1]) : json;
-  if (typeof type !== "object") return json;
-  const out = { ...json };
-  for (const [f, t] of Object.entries(type)) out[f] = out[f] === undefined ? (Array.isArray(t) && t[0] === "?" ? null : out[f]) : complete(out[f], t);
-  return out;
-}
-
-/** The strings at `path` in `v`: `a.b`, and `a[].b` for each element of the list `a`. */
-function handlesAt(v, path) {
-  const [head, ...rest] = path.split("."), each = head.endsWith("[]"), at = v?.[each ? head.slice(0, -2) : head];
-  const items = each ? (Array.isArray(at) ? at : []) : [at];
-  return items.flatMap(x => rest.length ? handlesAt(x, rest.join(".")) : typeof x === "string" ? [x] : []);
-}
-
-/** `over`'s fields laid over `v`'s, record by record. */
-function overlay(v, over) {
-  if (v === null || typeof v !== "object" || Array.isArray(v) || over === null || typeof over !== "object" || Array.isArray(over)) return over;
-  for (const [k, x] of Object.entries(over)) v[k] = overlay(v[k], x);
-  return v;
-}
-
-/** `v`, a partial overlay of a value of `type`: each field it writes checked, record by record. */
-function partial(v, type, at) {
-  if (v !== null && typeof v === "object" && !Array.isArray(v) && type && typeof type === "object" && !Array.isArray(type)) {
-    for (const [k, x] of Object.entries(v)) {
-      if (!Object.hasOwn(type, k)) throw new Failed(`${at}: field \`${k}\` is not in the shape`, "shape");
-      partial(x, type[k], `${at}.${k}`);
-    }
-    return;
-  }
-  if (Array.isArray(type) && type[0] === "?") { if (v != null) partial(v, type[1], at); return; }
-  value(v, type, at);
-}
-
-function equalJson(a, b) {
-  if (a === b) return true;
-  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length && keys.every(k => Object.hasOwn(b, k) && equalJson(a[k], b[k]));
-}
-
-/** `v` as the runner's serde_json writes it, its objects' keys sorted; "" for no value. */
-function serdeJson(v) {
-  if (Array.isArray(v)) return `[${v.map(serdeJson).join(",")}]`;
-  if (v && typeof v === "object") return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${serdeJson(v[k])}`).join(",")}}`;
-  return JSON.stringify(v) ?? "";
-}
-
-/** Set `path` (`coords.accuracy`) in `v` to `filler` where it is absent. */
-function fill(v, path, filler) {
-  const parts = path.split(".");
-  let at = v;
-  for (let i = 0; i < parts.length; i++) {
-    if (at === null || typeof at !== "object") return;
-    if (i === parts.length - 1) { if (at[parts[i]] === undefined) at[parts[i]] = filler; return; }
-    at = at[parts[i]] ??= {};
-  }
-}
-
-/** `json` as the runtime holds a value of `type` (a record is its fields in
- * order): an option field it leaves out is none, as an omitted word is. */
-function value(json, type, at) {
-  if (typeof type === "string") {
-    const ok = type === "n" ? typeof json === "number" && isFinite(json) : type === "b" ? typeof json === "boolean"
-      : type === "s" ? typeof json === "string" : json === null;
-    if (!ok) throw new Failed(`${at}: expected ${{ n: "a number", b: "a bool", s: "a string" }[type] ?? "null"}`, "shape");
-    return json;
-  }
-  if (Array.isArray(type)) {
-    if (type[0] === "?") return json == null ? null : value(json, type[1], at);
-    if (type[0] === "e") {
-      if (!type[1].includes(json)) throw new Failed(`${at}: ${JSON.stringify(json)} is not one of ${type[1].join(", ")}`, "shape");
-      return json;
-    }
-    if (!Array.isArray(json)) throw new Failed(`${at}: expected an array`, "shape");
-    return json.map((x, i) => value(x, type[1], `${at}[${i}]`));
-  }
-  if (json === null || typeof json !== "object" || Array.isArray(json)) throw new Failed(`${at}: expected an object`, "shape");
-  for (const k of Object.keys(json)) if (!Object.hasOwn(type, k)) throw new Failed(`${at}: field \`${k}\` is not in the shape`, "shape");
-  return Object.entries(type).map(([f, t]) => {
-    if (json[f] === undefined && Array.isArray(t) && t[0] === "?") return null;
-    if (json[f] === undefined) throw new Failed(`${at}: field \`${f}\` is missing`, "shape");
-    return value(json[f], t, `${at}.${f}`);
-  });
-}

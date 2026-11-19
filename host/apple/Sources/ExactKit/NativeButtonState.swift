@@ -5,18 +5,18 @@ import UIKit
 #endif
 
 /// Authored active properties, independent of the native control's state.
-struct NativeButtonState: Equatable {
-    var style: NodeStyle = [:]
+package struct NativeButtonState: Equatable {
+    package var style: NodeStyle = [:]
 
-    init() {}
-    init(_ owner: NodeView) {
-        for key in ["press_background_color", "press_color", "press_opacity", "press_opacity_to", "press_scale"] {
+    package init() {}
+    package init(_ owner: NodeView) {
+        for key in ["press_background_color", "press_color", "press_opacity", "press_opacity_to", "press_scale", "press_translate", "press_translate_percent"] {
             style[key] = owner.style[key]
         }
     }
 
     /// Face rows retain the ownership of viewless text and symbols.
-    static func colorOwnership(_ base: ButtonFaceRows) -> (title: Bool, secondary: Bool, image: Bool) {
+    package static func colorOwnership(_ base: ButtonFaceRows) -> (title: Bool, secondary: Bool, image: Bool) {
         func ownsColor(_ rows: NodeStyle) -> Bool { rows["written"]?.array?.contains(.string("text_color")) == true }
         return (ownsColor(base.title), ownsColor(base.subtitle), ownsColor(base.symbol) || base.symbol["tint_color"] != nil)
     }
@@ -48,13 +48,14 @@ struct NativeButtonState: Equatable {
 extension NodeView {
     /// Reject only at the host projection that knows which native API will draw.
     @discardableResult
-    func rejectNativeActiveProperties(on component: String, supporting supported: Set<String> = []) -> Bool {
+    package func rejectNativeActiveProperties(on component: String, supporting supported: Set<String> = []) -> Bool {
         let unsupported = NativeButtonState(self).style.keys.filter { !supported.contains($0) }
         let names = Set(unsupported.map { key in
             switch key {
             case "press_color": return "color"
             case "press_background_color": return "background-color"
             case "press_scale": return "-exact-press-scale"
+            case "press_translate", "press_translate_percent": return "translate"
             default: return "opacity"
             }
         }).sorted()
@@ -82,14 +83,17 @@ extension NodeView {
     }
 }
 
-/// An authored opacity or scale adds no timing of its own to native state updates.
+/// Authored presentation adds no timing of its own to native state updates.
 package enum ActivePresentation {
     package static func restore(_ layer: CALayer) {
+        PressTranslation.restore(layer)
         layer.removeAnimation(forKey: "nativeActiveOpacity")
         layer.removeAnimation(forKey: "nativeActiveScale")
     }
     package static func apply(_ style: NodeStyle, to layer: CALayer, down: Bool, origin: CGPoint? = nil,
                               opacityFactor: Float = 1, baseOpacity: Float? = nil) {
+        let progress: CGFloat = down ? 1 : 0
+        PressTranslation.apply(style, to: layer, ease: PressFeedback(from: progress, to: progress, start: 0), still: true)
         // A style batch can refresh active state before the filter writes its model opacity.
         let base = baseOpacity ?? layer.opacity
         let opacity = down ? style["press_opacity_to"]?.number.map { Float(min(1, max(0, $0))) * opacityFactor }

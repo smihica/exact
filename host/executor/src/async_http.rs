@@ -15,6 +15,7 @@ impl Machine {
         abort: AbortController,
         retiring: AbortRegistration,
         scoped: Option<ibex2::grant::GrantSet>,
+        fixture: Option<super::super::ResponseWork>,
     ) {
         let refuse = |outcome| self.answer(lane, run, outcome);
         if abort.signal().aborted() {
@@ -44,7 +45,7 @@ impl Machine {
         };
         let fetch = super::super::reach::gate_fetch(fetch, request.reach);
         let limit = super::super::body_to::limit(&request);
-        if request.body_from.is_some() {
+        if request.body_from.is_some() || request.body_to.is_some() {
             let file = FileJob {
                 request,
                 forced,
@@ -52,20 +53,18 @@ impl Machine {
                 abort,
                 retiring,
                 fetch,
+                fixture,
             };
-            return self.file(lane, run, file, sized);
+            return if file.request.body_from.is_some() {
+                self.file(lane, run, file, sized)
+            } else {
+                self.file_reply(lane, run, file)
+            };
         }
-        // File preparation and publication share the exchange's deadline (LLP 1162 D1).
-        let deadline = if request.body_to.is_some() {
-            if let Some(ms) = request.timeout_ms {
-                self.timer.arm(ms, lane, run, abort.clone());
-            }
-            None
-        } else {
-            request.timeout_ms.map(|ms| (ms, abort.clone()))
-        };
+        let deadline = request.timeout_ms.map(|ms| (ms, abort.clone()));
         self.fetch(
-            lane, run, request, None, forced, abort, retiring, limit, fetch, deadline,
+            lane, run, request, None, forced, abort, retiring, limit, fetch, deadline, None,
+            fixture,
         );
     }
 
@@ -82,13 +81,13 @@ impl Machine {
         limit: usize,
         fetch: ibex2::host::Fetch,
         deadline: Option<(u32, AbortController)>,
+        destination: Option<ibex2::stdlib::fetch_async::ResponseBody>,
+        fixture: Option<super::super::ResponseWork>,
     ) {
-        let destination = match self.body_destination(lane, run, &request, &abort) {
-            Ok(destination) => destination,
-            Err(outcome) => return self.answer(lane, run, outcome),
-        };
         let timeout = request.timeout_ms;
         let mut req = fetch_request(request, forced);
+        // Collected as it arrives, unless a file takes it.
+        req.collected = destination.is_none();
         req.response_body = destination;
         super::super::cache::observe(&self.shared, &mut req);
         req.max_body = Some(limit);
@@ -100,6 +99,7 @@ impl Machine {
             lane,
             run,
             deadline: Mutex::new(deadline),
+            fixture: Mutex::new(fixture),
         });
         let retry = super::super::cache::retry_request(&self.shared, run.0, &req).map(|request| {
             let (fetch, tracked, upload, signal) = (
@@ -154,6 +154,7 @@ struct Tracked {
     lane: usize,
     run: Run,
     deadline: Mutex<Option<(u32, AbortController)>>,
+    fixture: Mutex<Option<super::super::ResponseWork>>,
 }
 
 #[path = "metrics.rs"]

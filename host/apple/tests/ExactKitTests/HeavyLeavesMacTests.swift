@@ -65,7 +65,7 @@ final class HeavyLeavesMacTests: XCTestCase {
         // Outside any list: made with its batch.
         let lead = try XCTUnwrap(videos.first { $0.props["testId"] == "lead" })
         XCTAssertNotNil(lead.video, "a video in no collection's row is made with its batch")
-        XCTAssertFalse(presenter.leaves.isPending(lead))
+        XCTAssertFalse(try XCTUnwrap(presenter.leaves).isPending(lead))
         // In rows: those near the port are made, those built ahead wait.
         let content = try XCTUnwrap(window.contentView)
         let shown = content.convert(content.bounds, to: nil).insetBy(dx: -80, dy: -60)
@@ -77,12 +77,12 @@ final class HeavyLeavesMacTests: XCTestCase {
         for v in near { XCTAssertNotNil(v.video, "a row within a quarter viewport has its video") }
         for v in far {
             XCTAssertNil(v.video, "a row built ahead waits for its video")
-            XCTAssertTrue(presenter.leaves.isPending(v))
+            XCTAssertTrue(try XCTUnwrap(presenter.leaves).isPending(v))
         }
         // The agent's settle: every one is made.
-        presenter.leaves.settle()
-        for v in rows { XCTAssertNotNil(v.video); XCTAssertFalse(presenter.leaves.isPending(v)) }
-        XCTAssertEqual((presenter.leaves.observation["pendingLeaves"] as? [Int])?.count ?? -1, 0)
+        try XCTUnwrap(presenter.leaves).settle()
+        for v in rows { XCTAssertNotNil(v.video); XCTAssertFalse(try XCTUnwrap(presenter.leaves).isPending(v)) }
+        XCTAssertEqual((presenter.leaves?.observation["pendingLeaves"] as? [Int])?.count ?? -1, 0)
     }
 }
 #endif

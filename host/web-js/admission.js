@@ -1,6 +1,6 @@
 import { rt } from './rt-link.js';
 import { admitsNetwork, admitsSecret, coversPath, createGrantSet, grantError, grantWords, hasGrant, rawGrantText, scopedGrantSet, unionGrantSets } from '../web/grant-admission.js';
-import { faultMessage, takeFault } from '../web/faults.js';
+import { answeredFetch, countFault, faultMessage, matchFault } from '../web/faults.js';
 import { redirectFor, reachRefusal, UNATTRIBUTED } from '../web/address-space.js';
 export { socketProtocols, admitsNetwork, admitsSecret, coversPath, createGrantSet, grantError, grantWords, hasGrant, rawGrantText, trimGrant, sameGrantDeclaration, scopedGrantSet, unionGrantSets } from '../web/grant-admission.js';
 
@@ -99,12 +99,14 @@ export async function fetchWith(set, input, init = {}, expires = null, redirect 
   if (invalid) throw new FetchError('Refused', invalid);
   if (!asset && !admitsNetwork(set, value, 'fetch')) throw new FetchError('Refused', refusal('net.fetch'));
   // @ref LLP 1103 D1, D2 — a driver fault: the refused connection's failure, never sent.
-  if (!asset && takeFault(value)) throw new FetchError('Network', faultMessage(value));
+  const fixture = !asset && matchFault(value, true);
+  if (fixture && !fixture.response) { countFault(value, fixture); throw new FetchError('Network', faultMessage(value)); }
+  if (fixture && init.exactBodyTo !== undefined) throw new FetchError('Refused', 'answer fetch does not support exactBodyTo');
   const unreached = asset ? null : reachRefusal(value, origin);
   if (unreached) throw new FetchError('Refused', `NotAllowedError: ${unreached}`);
   redirect = redirectFor(origin, redirect);
   try {
-    const rest = ownWithout(init, ['exactTimeout', 'exactIndependentHttp', 'exactPreload', 'exactPrefetch', 'redirect', 'signal']);
+    const rest = ownWithout(init, ['exactBodyTo', 'exactTimeout', 'exactIndependentHttp', 'exactPreload', 'exactPrefetch', 'redirect', 'signal']);
     // A forced ask reloads unless the request stores nothing; Fetch allows only-if-cached same-origin (LLP 1162 D4).
     const cache = init.cache ?? input?.cache, sent = forced && cache !== 'no-store' ? 'reload' : cache;
     const mode = init.mode ?? (sent === 'only-if-cached' && 'same-origin');
@@ -130,7 +132,12 @@ export async function fetchWith(set, input, init = {}, expires = null, redirect 
     // By the clock, just before it goes out: grant work and a body read that
     // held the event loop past the deadline fire no timer first.
     if (until && performance.now() >= until.at) throw new FetchError('Timeout', `the request timed out after ${until.ms} ms`);
-    const response = await browserFetch(typeof Request === 'function' && input instanceof Request ? input : value, { ...rest, ...(signal ? { signal } : {}), redirect });
+    if (own?.aborted) throw own.reason;
+    const requestInput = typeof Request === 'function' && input instanceof Request ? input : value;
+    const options = { ...rest, ...(signal ? { signal } : {}), redirect };
+    // The browser validates the request even when the driver supplies its response.
+    const checked = new Request(requestInput, options);
+    const response = fixture ? answeredFetch(fixture.response, checked) : await browserFetch(checked);
     // A no-cors response hides its destination; a manual redirect is the browser's opaque-redirect result.
     if (!response.url && response.type !== 'opaqueredirect') {
       response.body?.cancel().catch(() => {});
@@ -150,10 +157,16 @@ export async function fetchWith(set, input, init = {}, expires = null, redirect 
     // Refused, and the response is let go. The response keeps its URL,
     // type and null body, and its own read is served from what the clone took.
     await read(response, ceiling);
+    if (fixture) {
+      if (until && performance.now() >= until.at) throw new FetchError('Timeout', `the request timed out after ${until.ms} ms`);
+      if (own?.aborted) throw own.reason;
+      countFault(value, fixture);
+    }
     if (deadline) deadline.signal.removeEventListener('abort', relay);
     return response;
   }
   catch (error) {
+    if (globalThis.__exactRender && error?.renderDeferred) throw error;
     if (error instanceof FetchError) throw error;
     if (deadline && signal?.aborted && signal.reason === deadline.signal.reason) throw new FetchError('Timeout', `the request timed out after ${until.ms} ms`);
     // The caller's own abort rejects with its signal's reason, as Fetch and the native prelude do: an
@@ -179,13 +192,13 @@ export function createRequestExecutor(appId, sourceSet, readBody = response => r
     if (why) return { failed: 2, message: why };
     if (req.canvas) {
       if (globalThis.__exactRender) return { refused: 'canvas capture' };
-      const active = controller?.active ?? (() => true), ready = rt.canvasCommitted(req.canvas.surface, active);
+      const active = controller?.active ?? (() => true), ready = rt.canvasCommitted(req.canvas.surface, active, { type: req.canvas.type, quality: req.canvas.quality });
       ready.catch(() => {});
       const { captureCanvas, writeCanvas } = await import('./canvas-capture.js');
       let status = 200, value;
       try {
         value = await captureCanvas(req.canvas.surface, req.canvas.path,
-          (path, png) => writeCanvas(appId, admitted, path, png, active), ready, active);
+          (path, bytes) => writeCanvas(appId, admitted, path, bytes, active), ready, active);
       } catch (e) { status = 400; value = { name: e?.name ?? 'EncodingError', message: String(e?.message ?? e) }; }
       return { status, headers: [['content-type', 'application/json']], body: new TextEncoder().encode(JSON.stringify(value)) };
     }
@@ -202,6 +215,7 @@ export function createRequestExecutor(appId, sourceSet, readBody = response => r
       const response = await fetchWith(admitted, req.url, init, null, redirectOf(req.url, init), within, req.origin ?? UNATTRIBUTED);
       return { status: response.status, headers: [...response.headers], body: new Uint8Array(await readBody(response, req.maxResponseBytes)) };
     } catch (error) {
+      if (globalThis.__exactRender && error?.renderDeferred) return { refused: error.message };
       return { failed: error?.kind === 'Refused' ? 2 : 1, message: String(error?.message ?? error) };
     }
   };
@@ -256,14 +270,26 @@ export function createSecretFacade(store, admitted, keys) {
       seen.read = true;
       return !globalThis.__exactRender && admitsSecret(admitted, name) && !mustLock(admitted, name) ? store.get(name) ?? null : null;
     },
-    async exclusive(name, work) {
-      effect('store.exclusive()'); name = String(name); allowed(name);
-      if (mustLock(admitted, name)) return Promise.reject(unsupported(name));
-      const context = globalThis.__exact_async_context, owner = context?.current();
-      return store.exclusive(name, () => {
-        const before = context?.swap(owner);
-        try { return work(); } finally { context?.swap(before); }
-      });
+    exclusive(name, work) {
+      const context = globalThis.__exact_async_context, owner = context?.current(), call = owner?.[0] ?? owner?.[4];
+      // The answer's promise (ts-fetch.js `AnswerPromise`), so what follows the lease is still the answer's
+      const P = context?.Promise ?? Promise;
+      try { effect('store.exclusive()'); name = String(name); allowed(name); } catch (e) { return P.reject(e); }
+      if (mustLock(admitted, name)) return P.reject(unsupported(name));
+      // An answer holds one lease at a time, waiting or held, as on every host (LLP 1146 D5): none holds one name
+      // while it waits for another. The answer is the one running, or a promise reaction's (ts-fetch.js
+      // `AnswerPromise`); `arm` is ts-fetch.js's for a request with effects.
+      if (call?.lease) return P.reject(new Error('nested secret leases are unsupported'));
+      const lease = call ? (call.lease = { arm: null }) : null;
+      let leased;
+      try {
+        leased = P.resolve(store.exclusive(name, arm => {
+          if (lease) lease.arm = arm;
+          const before = context?.swap(owner);
+          try { return work(); } finally { context?.swap(before); }
+        }));
+      } catch (e) { leased = P.reject(e); }
+      return leased.finally(() => { if (call?.lease === lease) delete call.lease; });
     },
     has(name) { return seen.get(name) !== null; },
     locked(name) { effect('store.locked()'); seen.read = true; return false; },

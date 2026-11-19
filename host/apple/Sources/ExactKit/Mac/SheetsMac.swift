@@ -48,23 +48,26 @@
 import AppKit
 
 /// A sheet's window. Titled, which is what takes the keyboard.
-final class SheetWindow: NSWindow {}
+package final class SheetWindow: ExactDrivenWindow {}
 
 /// A dialog's sheet: its window, the view that holds the dialog's subtree,
 /// and the window it is a sheet on. A modal route's sheet is the same, with
 /// its own title row and buttons round that view (`RouteChrome`, D7.4).
-final class DialogSheet {
-    let window: SheetWindow
+package final class DialogSheet {
+    package let window: SheetWindow
     let rootEdits = RootEdits()
-    let content = BlockView(frame: .zero)
+    package let content = BlockView(frame: .zero)
     /// A modal route's sheet: its rows round the content. Nil for a dialog's.
-    let chrome: RouteChrome?
+    package let chrome: (any SheetChrome)?
     /// The page's window, or the sheet this one stands on.
     private(set) weak var over: NSWindow?
     var begun = false
+    /// The author's `::backdrop` colour laid over the window it is a sheet
+    /// on (LLP 1035.001 D11); nil where none is written, as AppKit lays none.
+    private var dim: NSView?
     /// The content's size as layout last returned it.
     private var used = CGSize.zero
-    init(over: NSWindow, size: CGSize, chrome: RouteChrome? = nil) {
+    init(over: NSWindow, size: CGSize, chrome: (any SheetChrome)? = nil) {
         self.over = over
         self.chrome = chrome
         window = SheetWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled], backing: .buffered, defer: false)
@@ -76,7 +79,7 @@ final class DialogSheet {
     }
     /// The content's size, as layout returned it: the window's, with a
     /// route's rows round it.
-    func fit(_ size: CGSize) {
+    package func fit(_ size: CGSize) {
         guard size.width > 0, size.height > 0 else { return }
         used = size
         // A window's content is whole points: a fraction's is the next one up.
@@ -87,7 +90,37 @@ final class DialogSheet {
         window.setContentSize(whole)
     }
     /// The rows round the content changed: the window is the same content and the new rows.
-    func refit() { fit(used) }
+    package func refit() { fit(used) }
+
+    /// The dialog's `::backdrop` colour over the window beneath, again after
+    /// a batch. It comes in and goes with the sheet, over the quarter of a
+    /// second AppKit's own animation takes, and at once under the agent's clock.
+    func paintDim(_ color: NSColor?, shown: Bool) {
+        if let color, shown, dim == nil, let under = over?.contentView {
+            let view = SheetDim(frame: under.bounds)
+            view.autoresizingMask = [.width, .height]
+            view.wantsLayer = true
+            view.alphaValue = 0
+            under.addSubview(view)
+            dim = view
+        }
+        guard let view = dim else { return }
+        if let color { view.layer?.backgroundColor = color.cgColor }
+        let alpha: CGFloat = color != nil && shown ? 1 : 0
+        if alpha == 0 { dim = nil }
+        let done = { if alpha == 0 { view.removeFromSuperview() } }
+        if ExactEnv.agentFreezes { view.alphaValue = alpha; return done() }
+        guard view.alphaValue != alpha else { return }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.25
+            view.animator().alphaValue = alpha
+        }, completionHandler: done)
+    }
+}
+
+/// A sheet's authored dim: drawn, never hit.
+final class SheetDim: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 extension NodeView {
@@ -113,9 +146,9 @@ extension NodeView {
 
     /// The subtree moved into a sheet's window, or out of it: its boxes on
     /// the window's ground are painted again, on the ground they now have.
-    func sheetGroundChanged() {
+    package func sheetGroundChanged() {
         if groundIsTheWindows || hasGroupedCardFill { updateMaterial(); applyBoxLayer(); materialContent?.needsDisplay = true; needsDisplay = true }
-        for case let child as NodeView in container.subviews { child.sheetGroundChanged() }
+        for child in structuralChildren { child.sheetGroundChanged() }
     }
 }
 
@@ -123,7 +156,7 @@ extension NSView {
     /// Native containers move independently of the runner's transform rows.
     /// Read their presentation layers only while a native ancestor animates;
     /// an idle presentation copy may still hold the previous transaction.
-    func convertNativePresentation(_ rect: NSRect, from view: NSView) -> NSRect {
+    package func convertNativePresentation(_ rect: NSRect, from view: NSView) -> NSRect {
         func moving(_ view: NSView) -> CALayer? {
             guard !(view is NodeView), let layer = view.layer, layer.animationKeys()?.isEmpty == false else { return nil }
             return layer.presentation()
@@ -155,7 +188,7 @@ extension NSView {
 extension Presenter {
     /// Whether `window` holds this session's nodes: its view's window, the
     /// sheet of one of its dialogs or alerts, or one of its popovers'.
-    func hosts(_ window: NSWindow?) -> Bool {
+    package func hosts(_ window: NSWindow?) -> Bool {
         guard let window else { return false }
         return window === viewport.window || window === alerts.sheet || dialogs.entries.contains { $0.sheet?.window === window } || menus.hosts(window)
     }
@@ -184,8 +217,8 @@ extension Presenter {
     /// index of the front modal dialog's, alert's or route's, a
     /// presentation the runner keeps live with what is above it, and the
     /// rest inert (LLP 1123 D2).
-    package var openTopLayer: (frames: [TopLayerFrame], modal: Int?) {
-        navigation.split.samplePlacement()
+    package var openTopLayer: TopLayerGeometry {
+        navigation.stackSplit.samplePlacement()
         let sheets = dialogs.presented, popovers = menus.presented
         func depth(_ view: NodeView) -> Int {
             if view.window !== viewport.window {
@@ -215,9 +248,9 @@ extension Presenter {
         }
         let modal = ordered.lastIndex { $0 === dialogs.active || dialogs.presentsRoute($0) }
         if let alert = alerts.presented, let node = alert.node {
-            return (painted + [(node.id, CGRect.zero, nil)], alert.popover ? modal : painted.count)
+            return (painted + [(node.id, CGRect.zero, nil)], alert.popover ? modal : painted.count, alert.popover ? dialogs.backdrop : nil)
         }
-        return (painted, modal)
+        return (painted, modal, dialogs.backdrop)
     }
     package var openTopLayerFrames: [(UInt32, CGRect)] { openTopLayer.frames.map { ($0.0, $0.1) } }
 }
@@ -236,12 +269,12 @@ extension DialogHost {
         // sheet on one window back until the first has gone.
         var over = front
         while let top = over.attachedSheet { over = top }
-        let sheet = DialogSheet(over: over, size: entry.frame.size, chrome: entry.route ? RouteChrome() : nil)
+        let sheet = DialogSheet(over: over, size: entry.frame.size, chrome: entry.route ? presenter.navigation.makeRouteChrome() : nil)
         sheet.rootEdits.presenter = presenter
         sheet.rootEdits.join(sheet.window)
         sheet.content.pointerTracking = { [weak presenter] in presenter?.trackPointer($0) }
         entry.sheet = sheet
-        if entry.route { adopt(entry, sheet) }
+        if entry.route { presenter.navigation.adoptRouteSheet(entry, sheet) }
         guard let block = block(of: entry) else { return }
         presenter.blocks.show(entry.dialog, in: sheet.content, block: block) { [weak sheet] size in sheet?.fit(size) }
         entry.dialog.sheetGroundChanged()
@@ -259,6 +292,7 @@ extension DialogHost {
         // its own first key view as the sheet comes in.
         let focus = focusOwner(sheet.window)
         sheet.window.initialFirstResponder = focus
+        sheet.paintDim(entry.dialog.backdropColor, shown: true)
         over.beginSheet(sheet.window) { _ in }
         guard entries.contains(where: { $0 === entry }) else { return false }
         if let focus, focus.window === sheet.window, focusOwner(sheet.window) !== focus { sheet.window.makeFirstResponder(focus) }
@@ -271,9 +305,10 @@ extension DialogHost {
         let dialog = entry.dialog, over = sheet.over
         let key = sheet.window.isKeyWindow
         sheet.rootEdits.leave(sheet.window)
+        sheet.paintDim(nil, shown: false)
         if let over, over.sheets.contains(sheet.window) { over.endSheet(sheet.window) }
         sheet.window.orderOut(nil)
-        if entry.route { release(entry) }
+        if entry.route { presenter?.navigation.releaseRouteSheet(entry) }
         if live(dialog) { dialog.frame = entry.frame }
         presenter?.blocks.release(dialog)
         if live(dialog) { dialog.sheetGroundChanged() }

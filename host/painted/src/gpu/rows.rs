@@ -8,6 +8,13 @@ pub(super) enum Op {
     Pop,
     Mask(Shape, Result<GradientPaint, [u8; 4]>, Transform),
     Backdrop(Shape, exact_kernel::style::BackdropFilter, Transform),
+    Pixelated {
+        image: Arc<Bitmap>,
+        dst: Rect4,
+        clips: Vec<Shape>,
+        ts: Transform,
+        tint: Option<[u8; 4]>,
+    },
     Slot(u32),
     Layer(Rc<Drawing>, Affine, f32),
 }
@@ -231,6 +238,17 @@ impl Gpu {
         self.replay(&row.drawing, &row.slots, offset);
     }
 
+    pub(super) fn draw_row_through(&mut self, id: u32, ts: Transform) {
+        let Some(row) = self.rows.kept.get(&id).cloned() else {
+            self.image_refused = true;
+            return;
+        };
+        let s = self.scale as f64;
+        let [a, b, c, d, e, f] = [ts.sx, ts.ky, ts.kx, ts.sy, ts.tx, ts.ty].map(f64::from);
+        let device = Affine::new([a, b, c, d, e * s, f * s]);
+        self.replay(&row.drawing, &row.slots, device);
+    }
+
     fn replay(&mut self, drawing: &Drawing, slots: &HashMap<u32, Slot>, offset: Affine) {
         let point_ts =
             Affine::scale(1. / self.scale as f64) * offset * Affine::scale(self.scale as f64);
@@ -261,6 +279,20 @@ impl Gpu {
                 Op::Backdrop(shape, filter, own) => {
                     self.filter_backdrop(shape, filter, ts.pre_concat(*own))
                 }
+                Op::Pixelated {
+                    image,
+                    dst,
+                    clips,
+                    ts: own,
+                    tint,
+                } => self.image(
+                    image,
+                    *dst,
+                    clips,
+                    ts.pre_concat(*own),
+                    *tint,
+                    exact_kernel::ImageRendering::Pixelated,
+                ),
                 Op::Slot(id) => {
                     if let Some(slot) = slots.get(id) {
                         self.replay(&slot.drawing, slots, offset);
@@ -360,8 +392,43 @@ fn refused_images_do_not_publish_rows_slots_or_layers() {
             .finish()
             .unwrap()
             .data()
-            .chunks_exact(4)
-            .all(|p| p == [255, 0, 0, 255]));
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [255, 0, 0, 255]));
         gpu.row_free(2);
     }
+}
+
+/// A kept row drawn through a scale replays into the scene as it was
+/// recorded, in no layer of its own, so a blend in it still reads what is
+/// under it: a red row multiplied over green is black.
+#[cfg(test)]
+#[test]
+fn a_row_drawn_through_a_scale_blends_with_what_is_under_it() {
+    let mut gpu = Gpu::new().unwrap();
+    let mut red = Pixmap::new(100, 100).unwrap();
+    red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+    gpu.begin(100., 100., 1.);
+    gpu.row_begin(1, (0., 0.), None);
+    gpu.island_image(
+        std::sync::Arc::new(red),
+        (0., 0., 100., 100.),
+        Transform::identity(),
+        1,
+    );
+    gpu.row_end((0., 0., 100., 100.));
+    gpu.finish().unwrap();
+    gpu.begin(100., 100., 1.);
+    let page = Shape::rect((0., 0., 100., 100.));
+    gpu.fill(&page, [0, 255, 0, 255], Transform::identity());
+    let ts = Transform::from_row(0.8, 0., 0., 0.8, 10., 10.);
+    gpu.row_draw_through(1, ts, (0., 0., 100., 100.));
+    let frame = gpu.finish().unwrap();
+    let px = |x, y| {
+        let p = frame.pixel(x, y).unwrap();
+        [p.red(), p.green(), p.blue()]
+    };
+    assert_eq!(px(50, 50), [0, 0, 0], "the row, multiplied");
+    assert_eq!(px(95, 95), [0, 255, 0], "the page past it");
 }
