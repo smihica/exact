@@ -67,9 +67,9 @@ impl Selected {
     }
 
     #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn scan_out(&mut self, texture: TextureId) -> Result<()> {
+    pub fn scan_out(&mut self, texture: TextureId, rotation: crate::Rotation) -> Result<()> {
         let Self::Wgpu(device) = self;
-        device.scan_out(texture)
+        device.scan_out(texture, rotation)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

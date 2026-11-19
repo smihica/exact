@@ -83,15 +83,20 @@ impl Selected {
     pub fn has_scanout(&self) -> bool {
         match self {
             Self::Wgpu(d) | Self::Other(d) => d.has_scanout(),
-            Self::Fake(_) | Self::Counted(_) => false,
+            Self::Fake(d) => d.display.is_some(),
+            Self::Counted(_) => false,
         }
     }
 
     #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn scan_out(&mut self, texture: TextureId) -> Result<()> {
+    pub fn scan_out(&mut self, texture: TextureId, rotation: exact_ink::Rotation) -> Result<()> {
         match self {
-            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture),
-            Self::Fake(_) | Self::Counted(_) => unreachable!(),
+            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture, rotation),
+            Self::Fake(d) => {
+                d.display.as_mut().unwrap().push((texture, rotation));
+                Ok(())
+            }
+            Self::Counted(_) => unreachable!(),
         }
     }
 }
@@ -144,6 +149,9 @@ pub struct Fake {
     submitted: Submission,
     copies: Vec<([u32; 2], [u32; 2])>,
     retired: Vec<TextureId>,
+    /// The frames its display was given, when it has one.
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    display: Option<Vec<(TextureId, exact_ink::Rotation)>>,
 }
 impl Device for Fake {
     type Buffer = Buffer;
@@ -373,6 +381,23 @@ fn destination_copies_follow_transforms_clips_and_filter_support() {
         d.copies[1]
     );
     assert_eq!(d.copies[2], ([100, 100], [600, 400]));
+}
+
+#[cfg(all(feature = "scanout", target_os = "linux"))]
+#[test]
+fn a_display_turns_the_frame_itself_so_no_pass_rotates_it() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake {
+        display: Some(Vec::new()),
+        ..Default::default()
+    }));
+    let rotation = exact_ink::Rotation::R90;
+    ink.begin(64., 32., 1.);
+    ink.finish_pixels(rotation).unwrap();
+    let Selected::Fake(d) = &ink.device else {
+        unreachable!()
+    };
+    assert_eq!(d.events, [Event::Draw(vec![])]);
+    assert_eq!(d.display, Some(vec![(ink.target.unwrap(), rotation)]));
 }
 
 #[test]

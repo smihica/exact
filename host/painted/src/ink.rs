@@ -124,6 +124,13 @@ impl Ink {
                 self.close_group()?;
             }
             let mut target = self.end_frame()?;
+            // The display's own copy turns the frame; only a readback needs a turned target.
+            #[cfg(all(feature = "scanout", target_os = "linux"))]
+            if self.device.has_scanout() {
+                readback = Instant::now();
+                self.device.scan_out(target, rotation)?;
+                return Ok(vec![0; self.size[0] as usize * self.size[1] as usize * 4]);
+            }
             if rotation != exact_ink::Rotation::R0 {
                 let [w, h] = rotation.size(self.size);
                 let rotated = match self.rotated_target {
@@ -135,11 +142,6 @@ impl Ink {
                 target = rotated;
             }
             readback = Instant::now();
-            #[cfg(all(feature = "scanout", target_os = "linux"))]
-            if self.device.has_scanout() {
-                self.device.scan_out(target)?;
-                return Ok(vec![0; self.size[0] as usize * self.size[1] as usize * 4]);
-            }
             self.device.readback(target)
         })();
         let bytes = self
