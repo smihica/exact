@@ -31,7 +31,10 @@ presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
 Use `EXACT_ROTATE=0|90|180|270` to orient the picture and absolute input.
 Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
-Ink uses upstream’s eight fixed shader programs compiled at device creation.
+Ink compiles thirteen fixed material and clip combinations at device creation.
+Large unclipped solid fills use a flat-color pipeline for their interior. The
+direct display queues up to two frames and turns each image in the scanout pass.
+See [the frame-pacing measurements](memo/frame-pacing.md).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
@@ -81,8 +84,8 @@ setup. The Linux and Ink suites cover the affected renderer and host paths:
 ```sh
 cargo test --locked -p exact-linux --lib kiosk
 cargo test --locked -p exact-painted --lib kiosk
-cargo test --locked -p exact-painted --lib ink::
-cargo test --locked -p exact-ink --lib
+cargo test --locked -p exact-painted --lib --features scanout ink::
+cargo test --locked -p exact-ink --lib --features scanout
 cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings
 ```
 

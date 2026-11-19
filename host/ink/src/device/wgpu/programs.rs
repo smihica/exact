@@ -95,7 +95,7 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
     let mut d = Wgpu::new().expect("wgpu device for program parity");
     assert_eq!(d.programs.len(), CLASSES.len());
     eprintln!(
-        "Ink: {} fixed + 2 general pipelines, device {:.3} ms, shaders {:.3} ms, cached {}",
+        "Ink: {} fixed material programs, device {:.3} ms, shaders {:.3} ms, cached {}",
         d.programs.len(),
         d.info.device_ms,
         d.info.shaders_ms,
