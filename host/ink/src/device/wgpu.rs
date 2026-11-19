@@ -3,7 +3,6 @@
 use super::{check_region, texture_ids};
 use super::{Device, Error, Format, Info, Result, Submission, TextureDesc};
 use crate::instance::{flags, Batch, Bindings, Brush, Frame, Instance, Kind, Scissor, TextureId};
-use ::wgpu::util::DeviceExt;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -16,6 +15,7 @@ use web_time::Instant;
 
 mod atlas;
 mod cache;
+mod mips;
 #[cfg(target_os = "macos")]
 mod present;
 mod programs;
@@ -99,6 +99,7 @@ pub struct Wgpu {
     replace_pipeline: ::wgpu::RenderPipeline,
     solid_pipeline: ::wgpu::RenderPipeline,
     programs: Vec<::wgpu::RenderPipeline>,
+    mip_pipeline: ::wgpu::RenderPipeline,
     #[cfg(test)]
     pub(super) general_only: bool,
     layout: ::wgpu::BindGroupLayout,
@@ -317,6 +318,7 @@ impl Wgpu {
                 )
             })
             .collect();
+        let mip_pipeline = mips::pipeline(&device, &shader, cache.as_ref());
         if let Some(e) = errors.pop().await {
             return Err(Error::Device(e.to_string()));
         }
@@ -387,6 +389,7 @@ impl Wgpu {
             replace_pipeline,
             solid_pipeline,
             programs,
+            mip_pipeline,
             #[cfg(test)]
             general_only: false,
             layout,
@@ -437,21 +440,13 @@ impl Wgpu {
         Ok(&texture.view)
     }
 
-    fn bindings(
-        &self,
-        b: Bindings,
-        uniform: &::wgpu::Buffer,
-        image: Option<&::wgpu::TextureView>,
-    ) -> Result<::wgpu::BindGroup> {
+    fn bindings(&self, b: Bindings, uniform: &::wgpu::Buffer) -> Result<::wgpu::BindGroup> {
         let views = [
             self.slot(b.glyph, Format::Alpha)?,
             self.slot(b.color, Format::Rgba)?,
             self.slot(b.path, Format::Alpha)?,
             self.slot(b.ramp, Format::Rgba)?,
-            match image {
-                Some(v) => v,
-                None => self.slot(b.image, Format::Rgba)?,
-            },
+            self.slot(b.image, Format::Rgba)?,
         ];
         let mut entries = vec![::wgpu::BindGroupEntry {
             binding: 0,
@@ -814,62 +809,7 @@ impl Device for Wgpu {
             return Err(Error::Unsupported("alpha mip chain"));
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for level in 1..texture.desc.levels() {
-            let width = (texture.desc.width >> level).max(1);
-            let height = (texture.desc.height >> level).max(1);
-            let source = texture.raw.create_view(&::wgpu::TextureViewDescriptor {
-                base_mip_level: level - 1,
-                mip_level_count: Some(1),
-                ..Default::default()
-            });
-            let target = texture.raw.create_view(&::wgpu::TextureViewDescriptor {
-                base_mip_level: level,
-                mip_level_count: Some(1),
-                ..Default::default()
-            });
-            let viewport = checked(&self.device, &self.errors, || {
-                self.device
-                    .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                        label: Some("ink mip viewport"),
-                        contents: bytemuck::cast_slice(&[width as f32, height as f32, 0., 0.]),
-                        usage: ::wgpu::BufferUsages::UNIFORM,
-                    })
-            })?;
-            let instance = Instance::new(
-                Kind::Downsample,
-                Brush::Solid,
-                [0., 0., width as f32, height as f32],
-            );
-            let buffer = checked(&self.device, &self.errors, || {
-                self.device
-                    .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                        label: Some("ink mip quad"),
-                        contents: bytemuck::bytes_of(&instance),
-                        usage: ::wgpu::BufferUsages::VERTEX,
-                    })
-            })?;
-            let group = self.bindings(Bindings::default(), &viewport, Some(&source))?;
-            let batch = Batch {
-                replace: false,
-                instances: 0..1,
-                scissor: Scissor {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                bindings: Bindings::default(),
-            };
-            self.encode_pass(
-                &mut encoder,
-                &target,
-                &buffer,
-                &[instance],
-                &[batch],
-                &[group],
-                Some([0.; 4]),
-            );
-        }
+        mips::encode(&self.device, &self.mip_pipeline, &mut encoder, texture);
         let submission = self.submit(encoder.finish())?;
         self.textures.get_mut(&id).unwrap().last = submission;
         Ok(submission)
@@ -990,7 +930,7 @@ impl Device for Wgpu {
         let groups = frame
             .batches
             .iter()
-            .map(|b| self.bindings(b.bindings, &self.buffers[slot].viewport, None))
+            .map(|b| self.bindings(b.bindings, &self.buffers[slot].viewport))
             .collect::<Result<Vec<_>>>()?;
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.encode_pass(

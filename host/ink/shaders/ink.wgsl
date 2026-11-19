@@ -342,10 +342,10 @@ fn blur_pixel(v: Vertex) -> vec4<f32> {
 }
 
 // Each mip dimension falls by at most three, including odd source dimensions.
-fn area_pixel(v: Vertex) -> vec4<f32> {
+fn area_pixel(position: vec2<f32>, rect: vec4<f32>, uv: vec4<f32>) -> vec4<f32> {
     let source_size = vec2<f32>(textureDimensions(picture));
-    let ratio = source_size * v.uv.zw / v.rect.zw;
-    let lo = (floor(v.position.xy) - v.rect.xy) * ratio + v.uv.xy * source_size;
+    let ratio = source_size * uv.zw / rect.zw;
+    let lo = (floor(position) - rect.xy) * ratio + uv.xy * source_size;
     let hi = lo + ratio;
     var sum = vec4<f32>(0.0);
     for (var y = i32(floor(lo.y)); y < i32(ceil(hi.y)); y++) {
@@ -356,6 +356,25 @@ fn area_pixel(v: Vertex) -> vec4<f32> {
         }
     }
     return sum / (ratio.x * ratio.y);
+}
+
+@vertex
+fn vs_mip(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let corner = vec2<f32>(f32(i & 1u), f32(i >> 1u));
+    return vec4<f32>(corner * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+}
+
+@fragment
+fn fs_mip(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let source = textureDimensions(picture);
+    // Even levels cover four whole texels, in the area filter's accumulation order.
+    if all((source & vec2<u32>(1u)) == vec2<u32>(0u)) {
+        let a = vec2<i32>(p.xy) * 2;
+        return (textureLoad(picture, a, 0) + textureLoad(picture, a + vec2<i32>(1, 0), 0)
+            + textureLoad(picture, a + vec2<i32>(0, 1), 0) + textureLoad(picture, a + vec2<i32>(1, 1), 0)) * 0.25;
+    }
+    let size = max(source / vec2<u32>(2u), vec2<u32>(1u));
+    return area_pixel(p.xy, vec4<f32>(0.0, 0.0, vec2<f32>(size)), vec4<f32>(0.0, 0.0, 1.0, 1.0));
 }
 
 fn luminosity(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.3, 0.59, 0.11)); }
@@ -464,7 +483,7 @@ fn fs_main(v: Vertex) -> @location(0) vec4<f32> {
             let gray = dot(c.rgb, vec3<f32>(0.213, 0.715, 0.072));
             color = vec4<f32>(clamp(vec3<f32>(gray) + v.param.x * (c.rgb - vec3<f32>(gray)), vec3<f32>(0.0), vec3<f32>(c.a)), c.a);
         }
-        case 8u: { color = area_pixel(v); }
+        case 8u: { color = area_pixel(v.position.xy, v.rect, v.uv); }
         default: { alpha = 0.0; }
     }
     if (flags & 536870912u) != 0u {
