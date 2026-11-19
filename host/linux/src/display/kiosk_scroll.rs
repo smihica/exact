@@ -94,6 +94,7 @@ impl TouchScroll {
     ) -> bool {
         match event {
             InputEvent::TouchButton(true) => {
+                p.set_touching(true);
                 let under = p.scrollers_at(pointer.0, pointer.1);
                 let target = (!under.claims.1 && under.field.is_none())
                     .then(|| under.chain.into_iter().find(|s| s.id != 0 && s.axes.1))
@@ -180,6 +181,7 @@ impl TouchScroll {
                 true
             }
             InputEvent::TouchButton(false) => {
+                p.set_touching(false);
                 let Some(g) = &mut self.gesture else {
                     return false;
                 };
@@ -187,6 +189,8 @@ impl TouchScroll {
                     self.clear(p);
                     return false;
                 }
+                // The shell consumes the lift after taking the drag from the presenter.
+                p.pointer_released();
                 let Some(_) = p.kiosk_scroll_state(g.id) else {
                     self.clear(p);
                     return true;
@@ -199,6 +203,9 @@ impl TouchScroll {
                 true
             }
             InputEvent::Cancel | InputEvent::Wheel(..) | InputEvent::Button(true) => {
+                if matches!(event, InputEvent::Cancel) {
+                    p.set_touching(false);
+                }
                 self.clear(p);
                 false
             }
@@ -273,6 +280,37 @@ mod tests {
         now: f64,
     ) -> bool {
         s.input(p, point, (400., 500.), event, now)
+    }
+    #[test]
+    fn dragged_and_caught_touches_hold_reloads_until_the_finger_lifts_or_is_lost() {
+        use exact_painted::presenter::ReloadResult;
+        let next = contract::compile("component App\n  view\n    text \"next\"\n")
+            .unwrap()
+            .encode();
+        for (catch, end) in [
+            (false, InputEvent::TouchButton(false)),
+            (true, InputEvent::TouchButton(false)),
+            (true, InputEvent::Cancel),
+        ] {
+            let (mut p, mut scroll, mut at, _) = fixture();
+            let mut send = |p: &mut Presenter<()>, event, now| {
+                if !input(&mut scroll, p, &mut at, event, now) {
+                    super::super::pointer::dispatch(p, &mut at, (400., 500.), 1., event, now)
+                        .unwrap();
+                }
+            };
+            send(&mut p, InputEvent::TouchButton(true), 0.);
+            send(&mut p, InputEvent::Touch(None, Some(0.4)), 20.);
+            if catch {
+                send(&mut p, InputEvent::TouchButton(false), 21.);
+                send(&mut p, InputEvent::TouchButton(true), 22.);
+            }
+            let before = p.hosts();
+            assert_eq!(p.reload(&next, ()).unwrap(), ReloadResult::Held("pointer"));
+            send(&mut p, end, 30.);
+            p.run_commands(|| ());
+            assert_eq!(p.hosts(), before + 1);
+        }
     }
     #[test]
     fn kiosk_scroll_tap_drag_fling_and_catch() {
