@@ -574,8 +574,11 @@ fn a_kept_rows_bitmap_keeps_its_decode_across_a_trim_in_both_modes() {
             let (row_texture, other_texture) = (*a, *b);
             ink.end_frame().unwrap();
             drop(kept);
-            ink.begin(4., 4., 1.);
-            ink.end_frame().unwrap();
+            // Pressure immediately after a draw and hiding after one idle frame.
+            if hidden {
+                ink.begin(4., 4., 1.);
+                ink.end_frame().unwrap();
+            }
             ink.trim(hidden);
             assert_eq!(session.stats().resident_bytes, 2 * other.bytes());
             let Selected::Fake(device) = &ink.device else {

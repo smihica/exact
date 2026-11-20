@@ -106,7 +106,8 @@ The release app used 32 different 256 × 192 photos drawn at 144 × 108 in
 virtual rows with a shadow, icon and text. Each setting ran in two processes,
 six flicks per process, in off/on/on/off order. We counted missed refreshes
 from DRM page-flip sequence numbers in the 500 ms after each release. The
-last four flicks per process revisited photos drawn earlier.
+last four flicks per process revisited photos drawn earlier. All 32 photos
+fit in the idle budget including their mip levels.
 
 | Final release, 32 photos | Cache off | Cache on |
 | --- | ---: | ---: |
@@ -122,9 +123,9 @@ difference across both runs was the absence of repeated texture work on
 warm flicks. Occasional missed refreshes remained.
 
 With 160 distinct image sources, 24 forward flicks per setting missed 33
-refreshes with the cache off and 21 with it on.
-Median V3D resident memory at the last scrolling sample of the two runs
-per setting was 66.85 MiB off and 66.93 MiB on. The driver accounts for
+refreshes with the cache off and 21 with it on. The benefit for first-time
+uploads cannot be inferred from that difference. Median V3D resident memory
+at the last scrolling sample of the two runs per setting was 66.85 MiB off and 66.93 MiB on. The driver accounts for
 other GPU allocations in these figures. In a separate ten-minute run with
 reuse enabled, 531 flicks alternated directions every 12 gestures. Over the
 last five minutes, V3D resident memory ranged from 67.63 to 67.76 MiB.

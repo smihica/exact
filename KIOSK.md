@@ -68,6 +68,9 @@ Subscriptions do not start capture or change preview ownership.
   are not wired.
   It is single-finger and vertical. It is not a general gesture
   recognizer for every Linux input device or nested scroll hierarchy.
+- The Linux DRM host does not signal memory pressure, window hiding or focus
+  loss. Idle textures stay within the budget. The next frame retires entries
+  whose decoded picture has been released.
 - Shadow textures share a 16 MiB non-evicting budget. Animated dimensions,
   scale or blur create new geometries; after the budget is reached, new shapes
   use analytic drawing. Texture allocation failure still uses the renderer's
