@@ -538,29 +538,52 @@ fn fractional_row_scroll_matches_a_fresh_walk_with_clips_and_hinted_text() {
   view
     scroll testId="port" width=120 height=80
       column
+        view testId="header" position="sticky" top=0 z-index=2 width=120 height=24 background-color="#aa2244"
         view width=120 height=70 clip-path="path('M 5 5 Q 115 0 115 65 L 5 65 Z')" background-color="#2488bb"
-          text "Hinted text" font-size=17 color="#ffffff"
+          text "Hinted text" testId="label" font-size=17 color="#ffffff"
         view width=120 height=200 background-color="#44aa33"
 "##;
-    let (mut p, _) = Presenter::boot_with_fixture_fonts(
-        &crate::test_plan(source),
-        (),
-        (140., 100.),
-        1.,
-        PathBuf::new(),
-        PainterChoice::Ink,
-    )
-    .unwrap();
-    p.frame();
-    let k = p.host.kernel();
-    let port = k.node_by_key(k.find_by_test_id("port")[0]).unwrap().id;
-    for offset in [0.25, 0.5, 1., 1.25] {
-        p.scroll_to(port, (0., offset)).unwrap();
-        let kept = p.frame();
-        p.brush.forget_rows();
-        p.repaint();
-        let fresh = p.frame();
-        assert!(kept.data() == fresh.data(), "scroll {offset}");
+    let plan = crate::test_plan(source);
+    let boot = || {
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &plan,
+            (),
+            (140., 100.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Ink,
+        )
+        .unwrap();
+        assert_eq!(error, None);
+        p.frame();
+        p
+    };
+    let (mut kept, mut fresh) = (boot(), boot());
+    let port = stage::tests::id(&kept, "port");
+    let sticky = stage::tests::id(&kept, "header");
+    let label = stage::tests::id(&kept, "label");
+    for offset in [0.25, 0.5, 1., 1.25, 140.25, 160.5, 170.25, 0.25] {
+        for p in [&mut kept, &mut fresh] {
+            assert_eq!(p.scroll_to(port, (0., offset)), Some((0., offset)));
+        }
+        fresh.brush.forget_rows();
+        fresh.repaint();
+        let (actual, expected) = (kept.frame(), fresh.frame());
+        let expected_y = fresh.box_of(sticky).unwrap().rect.1;
+        assert_eq!(expected_y, 0., "fresh sticky y at scroll {offset}");
+        assert_eq!(
+            kept.box_of(sticky).unwrap().rect.1,
+            expected_y,
+            "kept sticky y at scroll {offset}"
+        );
+        let a = kept.box_of(label).unwrap();
+        let b = fresh.box_of(label).unwrap();
+        assert_eq!(
+            (a.rect, a.clip),
+            (b.rect, b.clip),
+            "text at scroll {offset}"
+        );
+        assert!(actual.data() == expected.data(), "scroll {offset}");
     }
 }
 

@@ -104,6 +104,7 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
             Kind::Shadow as u32 | (Brush::Image as u32) << 16
         );
         assert_ne!(frame.batches[0].bindings.image, TextureId(0));
+        assert_ne!(i.flags & flags::RASTERED_SHADOW, 0);
         // The quad's device origin, unrounded, and the same live exclusion.
         assert_eq!(i.xform, [120., 0., 0., 100., 2. * (10.25 + dx - 10.), 21.]);
         assert_eq!(
@@ -130,6 +131,8 @@ fn the_cache_keys_geometry_not_position_and_keeps_its_budget() {
 
 #[test]
 fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
+    let mut analytic = Ink::new().unwrap();
+    analytic.shadows = Shadows::new(false);
     let mut full = Ink::new().unwrap();
     full.shadows = Shadows::new(true);
     full.shadows.bands = false;
@@ -138,7 +141,7 @@ fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
     bands.shadows.bands = true;
     for scale in [1., 1.5, 2.] {
         for phase in [0., 0.25, 0.5, 0.75] {
-            for ink in [&mut full, &mut bands] {
+            for ink in [&mut analytic, &mut full, &mut bands] {
                 ink.begin(260., 380., scale);
                 ink.push_opacity(0.7);
                 ink.push_clip(
@@ -167,10 +170,18 @@ fn bands_preserve_the_full_cached_shadow_at_fractional_positions() {
                 ink.pop_clip();
                 ink.pop_opacity();
             }
-            let (max, percent) = difference(&full.finish().unwrap(), &bands.finish().unwrap());
+            let analytic = analytic.finish().unwrap();
+            let full = full.finish().unwrap();
+            let bands = bands.finish().unwrap();
+            let (max, percent) = difference(&full, &bands);
             assert!(
                 max <= 1 && percent < 0.1,
                 "scale {scale}, phase {phase}: {max}, {percent}%"
+            );
+            let (max, percent) = difference(&analytic, &bands);
+            assert!(
+                max <= 2,
+                "analytic at scale {scale}, phase {phase}: {max}, {percent}%"
             );
         }
     }

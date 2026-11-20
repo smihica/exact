@@ -31,12 +31,22 @@ presentation. Set `EXACT_PAINTER=ink`, `WGPU_BACKEND=vulkan` and
 Use `EXACT_ROTATE=0|90|180|270` to orient the picture and absolute input.
 Older launchers can still select 90 degrees with `KIOSK_PORTRAIT=1`. GLES comparisons use `WGPU_BACKEND=gl` in a build
 that enables wgpu's GLES backend; the direct display path is Vulkan-only.
-Ink uses upstream’s eight fixed shader programs compiled at device creation.
+Ink compiles thirteen fixed material and clip combinations at device creation.
+Large unclipped solid fills use a flat-color pipeline for their interior. The
+direct display queues up to two frames and turns each image in the scanout pass.
+See [the frame-pacing measurements](memo/frame-pacing.md).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
 `KIOSK_SHADOW_BANDS=1`. `KIOSK_FPS=1` adds an on-screen counter;
 `KIOSK_TIMING=1` logs frame submission timings.
+
+Set `KIOSK_BITMAP_CACHE=1` to reuse a GPU texture at the decoded picture's
+own dimensions while another owner holds the decoded pixels. Each Ink painter
+can keep up to 64 idle textures and 8 MiB including mip levels. A single
+texture larger than the budget is released when it becomes idle. When the
+host signals memory pressure, window hiding or focus loss, the painter drops
+its idle entries. The default releases unused, unpinned images at frame end.
 
 Camera capture runs while an image using `kiosk-camera:preview` is mounted.
 The probe reads tightly packed 640×480 YUV420 at 30fps, converts it to RGBA,
@@ -58,6 +68,9 @@ Subscriptions do not start capture or change preview ownership.
   are not wired.
   It is single-finger and vertical. It is not a general gesture
   recognizer for every Linux input device or nested scroll hierarchy.
+- The Linux DRM host does not signal memory pressure, window hiding or focus
+  loss. Idle textures stay within the budget. The next frame retires entries
+  whose decoded picture has been released.
 - Shadow textures share a 16 MiB non-evicting budget. Animated dimensions,
   scale or blur create new geometries; after the budget is reached, new shapes
   use analytic drawing. Texture allocation failure still uses the renderer's
@@ -81,8 +94,8 @@ setup. The Linux and Ink suites cover the affected renderer and host paths:
 ```sh
 cargo test --locked -p exact-linux --lib kiosk
 cargo test --locked -p exact-painted --lib kiosk
-cargo test --locked -p exact-painted --lib ink::
-cargo test --locked -p exact-ink --lib
+cargo test --locked -p exact-painted --lib --features scanout ink::
+cargo test --locked -p exact-ink --lib --features scanout
 cargo clippy --locked -p exact-linux -p exact-painted -p exact-ink --lib --tests --features exact-linux/scanout -- -D warnings
 ```
 

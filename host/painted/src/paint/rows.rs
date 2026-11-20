@@ -510,20 +510,17 @@ impl Painter {
     }
 
     /// Note a node walked while a row records.
-    pub(super) fn row_node(
-        &mut self,
-        kernel: &Kernel,
-        key: NodeKey,
-        f: exact_kernel::Frame,
-        shown: &Presented,
-    ) {
+    pub(super) fn row_node(&mut self, kernel: &Kernel, node: &NodeRef<'_>, shown: &Presented) {
         if let Some(c) = &mut self.rows.recording {
             c.frames.push(RowFrame {
-                node: key,
-                frame: f,
-                padding: kernel.resolved_padding(key).unwrap_or_default(),
+                node: node.key,
+                frame: node.frame,
+                padding: kernel.resolved_padding(node.key).unwrap_or_default(),
             });
-            c.refused |= shown.press != 1.0 || shown.press_translate != [0.; 4];
+            // A sticky node can remain in view after its row's natural bounds scroll away.
+            c.refused |= node.layout_position() == exact_kernel::PositionType::Sticky
+                || shown.press != 1.0
+                || shown.press_translate != [0.; 4];
         }
     }
 
@@ -703,10 +700,28 @@ impl Painter {
         let scale = (ts.sx, ts.sy);
         let frame = self.rows.frame;
         let kept = self.rows.kept.get(&node.key);
-        let valid = kept.is_some_and(|row| self.backend.row_reusable(row.id, origin))
-            && (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, true))
-                || (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, false))
-                    && self.pictures_again(walk, node.key)));
+        let visible_bounds = kept
+            .map(|row| {
+                (
+                    row.bounds.0 + origin.0,
+                    row.bounds.1 + origin.1,
+                    row.bounds.2,
+                    row.bounds.3,
+                )
+            })
+            .filter(|&bounds| !self.backend.row_culled(bounds));
+        // A clipped row still supplies hit boxes and text. Its raster can wait until it draws.
+        let valid = kept.is_some_and(|row| {
+            let paint_origin = if visible_bounds.is_some() {
+                origin
+            } else {
+                row.origin
+            };
+            self.backend.row_reusable(row.id, paint_origin)
+        }) && (kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, true))
+            || (visible_bounds.is_some()
+                && kept.is_some_and(|row| self.row_valid(row, &node, walk, scale, false))
+                && self.pictures_again(walk, node.key)));
         if let Some(row) = self.rows.kept.get(&node.key).filter(|_| valid) {
             counters::add(Counter::RowsReplayed, 1);
             let d = (origin.0 - row.origin.0, origin.1 - row.origin.1);
@@ -726,15 +741,9 @@ impl Painter {
                 walk.inline.insert(*id, inline.translated(d.0, d.1));
             }
             self.damage.unsupported |= row.unsupported;
-            let bounds = (
-                row.bounds.0 + origin.0,
-                row.bounds.1 + origin.1,
-                row.bounds.2,
-                row.bounds.3,
-            );
             let rid = row.id;
             self.rows.kept.get_mut(&node.key).expect("kept").seen = frame;
-            if !self.backend.row_culled(bounds) {
+            if let Some(bounds) = visible_bounds {
                 self.backend.row_draw(rid, origin, bounds);
             }
             return;

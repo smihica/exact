@@ -928,7 +928,7 @@ impl Painter {
         let f = node.frame;
         let (x, y, w, h) = paint_rect(f, offset);
         let p = (walk.scene.presented)(id);
-        self.row_node(walk.scene.kernel, node.key, f, &p);
+        self.row_node(walk.scene.kernel, &node, &p);
         // @ref LLP 1077 D8 — turned or moved in space: painted apart, warped.
         if self.spatial(walk, &node, &p, (x, y, w, h), ts, offset, clip_rect) {
             self.row_refuse();

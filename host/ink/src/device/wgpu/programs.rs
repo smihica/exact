@@ -5,6 +5,7 @@ use super::*;
 pub(super) struct Class {
     kind_brush: u32,
     flags: u32,
+    required: u32,
 }
 
 const CLIPS: u32 = flags::CLIP0 | flags::CLIP1 | flags::MASK;
@@ -15,20 +16,33 @@ impl Class {
         Self {
             kind_brush: kind as u32 | ((brush as u32) << 16),
             flags,
+            required: 0,
         }
     }
 
-    pub(super) fn constants(&self) -> [(&'static str, f64); 3] {
+    const fn exact(kind: Kind, brush: Brush, flags: u32) -> Self {
+        Self {
+            required: flags,
+            ..Self::new(kind, brush, flags)
+        }
+    }
+
+    pub(super) fn constants(&self) -> [(&'static str, f64); 4] {
         [
             ("SPECIALIZED", 1.),
             ("KIND_BRUSH", self.kind_brush as f64),
             ("FLAGS_MASK", self.flags as f64),
+            ("FLAGS_SET", self.required as f64),
         ]
     }
 }
 
 // Unlisted kinds, brushes and flags use the general program.
-pub(super) const CLASSES: [Class; 8] = [
+pub(super) const CLASSES: [Class; 13] = [
+    Class::new(Kind::RoundedRect, Brush::Solid, 0),
+    Class::new(Kind::RoundedRect, Brush::Image, flags::CLIP0),
+    Class::new(Kind::Glyph, Brush::Solid, 0),
+    Class::new(Kind::Layer, Brush::Image, 0),
     Class::new(Kind::RoundedRect, Brush::Solid, CLIPS),
     Class::new(Kind::Ring, Brush::Solid, CLIPS),
     Class::new(Kind::Shadow, Brush::Solid, CLIPS),
@@ -37,12 +51,19 @@ pub(super) const CLASSES: [Class; 8] = [
     Class::new(Kind::Layer, Brush::Image, CLIPS),
     Class::new(Kind::RoundedRect, Brush::Image, IMAGE),
     Class::new(Kind::Coverage, Brush::Image, IMAGE),
+    Class::exact(
+        Kind::Shadow,
+        Brush::Image,
+        flags::CLIP1 | flags::TINT | flags::RASTERED_SHADOW,
+    ),
 ];
 
 pub(super) fn class(instance: &Instance) -> Option<usize> {
-    CLASSES
-        .iter()
-        .position(|c| instance.kind_brush == c.kind_brush && instance.flags & !c.flags == 0)
+    CLASSES.iter().position(|c| {
+        instance.kind_brush == c.kind_brush
+            && instance.flags & !c.flags == 0
+            && instance.flags & c.required == c.required
+    })
 }
 
 #[cfg(test)]
@@ -52,10 +73,13 @@ mod tests {
     #[test]
     fn uncommon_flags_and_brushes_use_the_general_program() {
         let mut i = Instance::rounded([0.; 4], [0.; 4], [1.; 4]);
-        assert_eq!(class(&i), Some(0));
+        assert_eq!(CLASSES[class(&i).unwrap()].flags, 0);
         for bit in 0..32 {
             i.flags = 1 << bit;
-            assert_eq!(class(&i), (i.flags & !CLIPS == 0).then_some(0));
+            assert_eq!(
+                class(&i).map(|p| CLASSES[p].flags),
+                (i.flags & !CLIPS == 0).then_some(CLIPS)
+            );
         }
         for brush in [Brush::Gradient, Brush::Pattern] {
             i = Instance::new(Kind::RoundedRect, brush, [0.; 4]);
@@ -71,7 +95,7 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
     let mut d = Wgpu::new().expect("wgpu device for program parity");
     assert_eq!(d.programs.len(), CLASSES.len());
     eprintln!(
-        "Ink: {} fixed + 2 general pipelines, device {:.3} ms, shaders {:.3} ms, cached {}",
+        "Ink: {} fixed material programs, device {:.3} ms, shaders {:.3} ms, cached {}",
         d.programs.len(),
         d.info.device_ms,
         d.info.shaders_ms,
@@ -98,17 +122,23 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
         mask: alpha,
         ..Default::default()
     };
+    let mut visited = [false; CLASSES.len()];
     for (index, class) in CLASSES.iter().enumerate() {
-        let bits: Vec<_> = (0..32).filter(|b| class.flags & (1 << b) != 0).collect();
+        let bits: Vec<_> = (0..32)
+            .filter(|b| (class.flags & !class.required) & (1 << b) != 0)
+            .collect();
         for combination in 0..(1 << bits.len()) {
-            let clips = bits.iter().enumerate().fold(0, |value, (n, bit)| {
-                value
-                    | if combination & (1 << n) != 0 {
-                        1 << bit
-                    } else {
-                        0
-                    }
-            });
+            let clips = bits
+                .iter()
+                .enumerate()
+                .fold(class.required, |value, (n, bit)| {
+                    value
+                        | if combination & (1 << n) != 0 {
+                            1 << bit
+                        } else {
+                            0
+                        }
+                });
             let mut e = Encoder::new(64, 48);
             let mut i = Instance::rounded(
                 [5.25, 4.5, 51., 37.],
@@ -119,13 +149,23 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
             i.flags = clips;
             i.uv = [0., 0., 1., 1.];
             i.param = [0.7, 0., 0., 0.];
-            if index == 1 {
+            let kind = i.kind_brush & 65535;
+            let brush = i.kind_brush >> 16;
+            if kind == Kind::Ring as u32 {
                 i.uv = [8., 8., 43., 27.];
                 i.param = [4.; 4];
             }
-            if index == 2 {
+            if kind == Kind::Shadow as u32 && brush == Brush::Solid as u32 {
                 i.uv = [13., 12., 32., 23.];
                 i.param = [3., 0., 0., 0.];
+            }
+            if kind == Kind::Shadow as u32 && brush == Brush::Image as u32 {
+                i.xform = [51., 0., 0., 37., 5.25, 4.5];
+                i.rect = [0., 0., 1., 1.];
+                i.radii = [0.; 4];
+                i.param = [0.; 4];
+            }
+            if i.kind_brush & 65535 == Kind::Shadow as u32 {
                 i.flags |= flags::CLIP1;
             }
             for slot in 0..2 {
@@ -147,7 +187,13 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
                     uv: [0., 0., 1., 1.],
                 });
             }
-            assert_eq!(super::programs::class(&i), Some(index));
+            // A narrower fixed program owns the overlapping flag combinations.
+            let selected = super::programs::class(&i).expect("a fixed program");
+            if selected != index {
+                assert!(selected < index);
+                continue;
+            }
+            visited[index] = true;
             e.push(i, bindings).unwrap();
             let frame = e.finish();
             d.general_only = true;
@@ -163,4 +209,5 @@ fn every_fixed_program_matches_the_general_program_pixel_for_pixel() {
             );
         }
     }
+    assert!(visited.into_iter().all(|v| v));
 }

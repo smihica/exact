@@ -83,15 +83,20 @@ impl Selected {
     pub fn has_scanout(&self) -> bool {
         match self {
             Self::Wgpu(d) | Self::Other(d) => d.has_scanout(),
-            Self::Fake(_) | Self::Counted(_) => false,
+            Self::Fake(d) => d.display.is_some(),
+            Self::Counted(_) => false,
         }
     }
 
     #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn scan_out(&mut self, texture: TextureId) -> Result<()> {
+    pub fn scan_out(&mut self, texture: TextureId, rotation: exact_ink::Rotation) -> Result<()> {
         match self {
-            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture),
-            Self::Fake(_) | Self::Counted(_) => unreachable!(),
+            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture, rotation),
+            Self::Fake(d) => {
+                d.display.as_mut().unwrap().push((texture, rotation));
+                Ok(())
+            }
+            Self::Counted(_) => unreachable!(),
         }
     }
 }
@@ -144,6 +149,9 @@ pub struct Fake {
     submitted: Submission,
     copies: Vec<([u32; 2], [u32; 2])>,
     retired: Vec<TextureId>,
+    /// The frames its display was given, when it has one.
+    #[cfg(all(feature = "scanout", target_os = "linux"))]
+    display: Option<Vec<(TextureId, exact_ink::Rotation)>>,
 }
 impl Device for Fake {
     type Buffer = Buffer;
@@ -375,6 +383,23 @@ fn destination_copies_follow_transforms_clips_and_filter_support() {
     assert_eq!(d.copies[2], ([100, 100], [600, 400]));
 }
 
+#[cfg(all(feature = "scanout", target_os = "linux"))]
+#[test]
+fn a_display_turns_the_frame_itself_so_no_pass_rotates_it() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake {
+        display: Some(Vec::new()),
+        ..Default::default()
+    }));
+    let rotation = exact_ink::Rotation::R90;
+    ink.begin(64., 32., 1.);
+    ink.finish_pixels(rotation).unwrap();
+    let Selected::Fake(d) = &ink.device else {
+        unreachable!()
+    };
+    assert_eq!(d.events, [Event::Draw(vec![])]);
+    assert_eq!(d.display, Some(vec![(ink.target.unwrap(), rotation)]));
+}
+
 #[test]
 fn a_canvas_redrawn_at_its_size_keeps_one_texture() {
     fn frame(images: &mut images::Images, device: &mut Fake, pixels: &Arc<Pixmap>) -> TextureId {
@@ -407,4 +432,175 @@ fn a_canvas_redrawn_at_its_size_keeps_one_texture() {
             .count()
     };
     assert_eq!((uploads(first), uploads(resized)), (4, 1));
+}
+
+fn bitmap(session: &exact_raster::RasterSession, [w, h]: [u32; 2]) -> Arc<Bitmap> {
+    let bytes = u64::from(w) * u64::from(h) * 4;
+    let reservation = session.reserve_allocation(bytes).unwrap();
+    let image = Arc::new(Bitmap::new(
+        Pixmap::new(w, h).unwrap(),
+        (w, h),
+        reservation.charge(),
+    ));
+    reservation.commit(bytes).unwrap();
+    image
+}
+
+#[test]
+fn only_an_opted_in_full_size_bitmap_reuses_its_upload_after_leaving_the_frame() {
+    let session = exact_raster::Gate::new().session();
+    for enabled in [false, true] {
+        let size = [17, 9];
+        let image = bitmap(&session, size);
+        let (mut device, mut images) = (Fake::default(), images::Images::new(enabled));
+        images.begin(&mut device).unwrap();
+        let full = images.bitmap(&mut device, &image, size).unwrap();
+        let reduced = images.bitmap(&mut device, &image, [17, 2]).unwrap();
+        images.end(&mut device).unwrap();
+        assert_eq!(
+            Arc::strong_count(&image),
+            3,
+            "each active variant owns the decode"
+        );
+        images.begin(&mut device).unwrap();
+        images.end(&mut device).unwrap();
+        assert_eq!(
+            Arc::strong_count(&image),
+            1,
+            "neither idle variant owns the decode"
+        );
+        assert!(device.retired.contains(&reduced));
+        assert_eq!(device.retired.contains(&full), !enabled);
+        images.begin(&mut device).unwrap();
+        let again = images.bitmap(&mut device, &image, size).unwrap();
+        assert_eq!(again == full, enabled);
+        assert_eq!(device.events.len(), if enabled { 2 } else { 3 });
+        images.end(&mut device).unwrap();
+        images.begin(&mut device).unwrap();
+        images.end(&mut device).unwrap();
+        images.begin(&mut device).unwrap();
+        drop(image);
+        assert_eq!(session.stats().resident_bytes, 0);
+        let replacement = bitmap(&session, size);
+        assert_ne!(
+            images.bitmap(&mut device, &replacement, size).unwrap(),
+            again
+        );
+        images.end(&mut device).unwrap();
+        assert!(device.retired.contains(&again));
+    }
+}
+
+#[test]
+fn recently_idle_bitmaps_fit_both_the_mip_byte_and_texture_count_limits() {
+    let session = exact_raster::Gate::new().session();
+    // 32 complete 256 x 192 mip chains fit in 8 MiB. Tiny images reach the count limit.
+    for (size, limit) in [([256, 192], 32), ([1, 1], 64)] {
+        let (mut device, mut images) = (Fake::default(), images::Images::new(true));
+        let frame = |images: &mut images::Images, device: &mut Fake, picture: &Arc<Bitmap>| {
+            images.begin(device).unwrap();
+            let texture = images
+                .bitmap(device, picture, [picture.width(), picture.height()])
+                .unwrap();
+            images.end(device).unwrap();
+            texture
+        };
+        let mut pictures: Vec<_> = (0..=limit).map(|_| bitmap(&session, size)).collect();
+        let textures: Vec<_> = pictures
+            .iter()
+            .map(|p| frame(&mut images, &mut device, p))
+            .collect();
+        assert_eq!(frame(&mut images, &mut device, &pictures[0]), textures[0]);
+        assert!(
+            device.retired.is_empty(),
+            "the active bitmap has its own place"
+        );
+        images.begin(&mut device).unwrap();
+        images.end(&mut device).unwrap();
+        assert_eq!(device.retired, [textures[1]]);
+        assert_ne!(frame(&mut images, &mut device, &pictures[1]), textures[1]);
+        images.begin(&mut device).unwrap();
+        images.end(&mut device).unwrap();
+        assert_eq!(device.retired, [textures[1], textures[2]]);
+
+        let next = bitmap(&session, size);
+        frame(&mut images, &mut device, &next);
+        images.begin(&mut device).unwrap();
+        drop(pictures.pop());
+        images.end(&mut device).unwrap();
+        assert_eq!(device.retired, [textures[1], textures[2], textures[limit]]);
+        let oversized = bitmap(&session, [2048, 1024]);
+        let large = frame(&mut images, &mut device, &oversized);
+        images.begin(&mut device).unwrap();
+        images.end(&mut device).unwrap();
+        assert_eq!(
+            device.retired,
+            [textures[1], textures[2], textures[limit], large]
+        );
+    }
+}
+
+#[test]
+fn a_kept_rows_bitmap_keeps_its_decode_across_a_trim_in_both_modes() {
+    let session = exact_raster::Gate::new().session();
+    for enabled in [false, true] {
+        for hidden in [false, true] {
+            let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+            ink.images = images::Images::new(enabled);
+            let rect = (0., 0., 4., 4.);
+            let kept = bitmap(&session, [4, 4]);
+            let other = bitmap(&session, [4, 4]);
+            let draw = |ink: &mut Ink, image: &Arc<Bitmap>| {
+                ink.image(
+                    image,
+                    rect,
+                    &[],
+                    Transform::identity(),
+                    None,
+                    exact_kernel::ImageRendering::Auto,
+                );
+            };
+            ink.begin(4., 4., 1.);
+            ink.row_begin(1, (0., 0.), None);
+            draw(&mut ink, &kept);
+            ink.row_end(rect);
+            draw(&mut ink, &other);
+            let Selected::Fake(device) = &ink.device else {
+                unreachable!()
+            };
+            let [Event::Upload(a), Event::Upload(b)] = device.events.as_slice() else {
+                panic!("expected both bitmap uploads");
+            };
+            let (row_texture, other_texture) = (*a, *b);
+            ink.end_frame().unwrap();
+            drop(kept);
+            // Pressure immediately after a draw and hiding after one idle frame.
+            if hidden {
+                ink.begin(4., 4., 1.);
+                ink.end_frame().unwrap();
+            }
+            ink.trim(hidden);
+            assert_eq!(session.stats().resident_bytes, 2 * other.bytes());
+            let Selected::Fake(device) = &ink.device else {
+                unreachable!()
+            };
+            assert!(device.retired.contains(&other_texture));
+            assert!(!device.retired.contains(&row_texture));
+            ink.begin(4., 4., 1.);
+            ink.row_draw(1, (0., 0.), rect);
+            assert!(ink
+                .encoder
+                .take_frame()
+                .batches
+                .iter()
+                .any(|b| b.bindings.image == row_texture));
+            ink.row_free(1);
+            ink.begin(4., 4., 1.);
+            assert_eq!(session.stats().resident_bytes, other.bytes());
+            let Selected::Fake(device) = &ink.device else {
+                unreachable!()
+            };
+            assert!(device.retired.contains(&row_texture));
+        }
+    }
 }

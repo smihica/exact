@@ -105,7 +105,7 @@ impl Ink {
             i.xform[4] + scale * i.rect[0],
             i.xform[5] + scale * i.rect[1],
         ];
-        d.flags = i.flags | flags::TINT;
+        d.flags = i.flags | flags::TINT | flags::RASTERED_SHADOW;
         d.clip1 = i.clip1;
         d.clip_radii = i.clip_radii;
         d.param[0] = 0.;
