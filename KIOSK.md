@@ -41,6 +41,13 @@ The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_SHADOW_BANDS=1`. `KIOSK_FPS=1` adds an on-screen counter;
 `KIOSK_TIMING=1` logs frame submission timings.
 
+Set `KIOSK_BITMAP_CACHE=1` to reuse a GPU texture at the decoded picture's
+own dimensions while another owner holds the decoded pixels. Each Ink painter
+can keep up to 64 idle textures and 8 MiB including mip levels. A single
+texture larger than the budget is released when it becomes idle. When the
+host signals memory pressure, window hiding or focus loss, the painter drops
+its idle entries. The default releases unused, unpinned images at frame end.
+
 Camera capture runs while an image using `kiosk-camera:preview` is mounted.
 The probe reads tightly packed 640×480 YUV420 at 30fps, converts it to RGBA,
 then rotates it clockwise into a 480×640 preview. It is a fixed Pi capture

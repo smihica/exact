@@ -86,7 +86,7 @@ impl Ink {
             glyphs: Default::default(),
             text_sigma: 0.,
             ramps: Atlas::ramps(),
-            images: images::Images::default(),
+            images: images::Images::new(std::env::var("KIOSK_BITMAP_CACHE").as_deref() == Ok("1")),
             pool: exact_ink::layer::Pool::default(),
             groups: Vec::new(),
             clips: Vec::new(),
