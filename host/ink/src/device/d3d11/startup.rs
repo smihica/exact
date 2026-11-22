@@ -1,5 +1,5 @@
-//! Hardware prepares before configuration; WARP starts only after failure or
-//! the measured startup bound. @ref LLP 1149 D6.3, S2.9.
+//! Hardware prepares first. WARP starts after failure or at the startup
+//! deadline. @ref LLP 1149 D6.3, S2.9.
 use super::*;
 use std::sync::{mpsc, Arc};
 
@@ -24,6 +24,15 @@ impl Startup {
         Self::start_with(
             force_warp,
             now + STARTUP_DEVICE_BUDGET.saturating_sub(age),
+            Prepared::open,
+        )
+    }
+
+    /// A hidden window gets a fresh device budget when it is asked to show.
+    pub fn start_for_first_present(force_warp: bool) -> Result<Self> {
+        Self::start_with(
+            force_warp,
+            Instant::now() + STARTUP_DEVICE_BUDGET,
             Prepared::open,
         )
     }

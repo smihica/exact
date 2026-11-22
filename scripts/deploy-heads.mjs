@@ -5,8 +5,8 @@ import { verify } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import { refuse, canonicalBytes, fileCard, publicKeyFromRaw, indexCard, readAssetIndex, validateRawIntegers } from './deploy-signing.mjs';
-import { OriginUnavailable, sha256, streamPath } from './origin.mjs';
+import { refuse, canonicalBytes, ENVELOPE_BYTES, fileCard, publicKeyFromRaw, indexCard, readAssetIndex, validateRawIntegers } from './deploy-signing.mjs';
+import { channelOrigin, MAX_FILE_BYTES, OriginUnavailable, safeRelative, sha256, streamPath } from './origin.mjs';
 
 /** Binary source evidence travels as a blob: a full compiler input roster
  * can exceed the envelope's size limit. Its digest is signed in the cohort. */
@@ -17,12 +17,119 @@ export function binaryInputFile(build) {
 }
 
 /** Frozen capabilities and binary evidence. Absolute source paths stay in
- * the private build receipt, outside the signed stream envelope. */
+ * the private build receipt. */
 export function cohortReceipt(build) {
   if (build?.version !== 1 || build.graph?.version !== 1 || !build.binary?.sha256) throw new Error('missing completed bake graph and binary receipt');
   const evidence = binaryInputFile(build);
   return {version:1,compat:{id:build.compat.id,inputs:build.compat.inputs,target:build.compat.target},sources:build.graph.sources,surfaceCalls:build.graph.surfaceCalls??{},binary:build.binary.sha256,
     ...(evidence ? {binaryInputs:{sha256:evidence.sha256,bytes:evidence.bytes.length}} : {})};
+}
+
+function cohortBlob(name, bytes, prefix) {
+  const digest = sha256(bytes);
+  const card = { url: `${prefix}${digest}`, sha256: digest, bytes: bytes.length };
+  return { name, bytes, sha256: digest, card };
+}
+
+export function cohortFiles(receipt) {
+  const bytes = canonicalBytes(receipt);
+  if (bytes.length <= MAX_FILE_BYTES) return [cohortBlob('cohort receipt', bytes, '../../blobs/')];
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += MAX_FILE_BYTES) {
+    chunks.push(cohortBlob('cohort receipt chunk', bytes.subarray(offset, offset + MAX_FILE_BYTES), './'));
+  }
+  const index = canonicalBytes({ chunks: chunks.map(chunk => chunk.card) });
+  const manifest = cohortBlob('cohort receipt manifest', index, '../../blobs/');
+  manifest.card.chunked = true;
+  return [manifest, ...chunks];
+}
+
+export function sameCohortPayload(a, b) {
+  return a.sha256 === b.sha256 && a.bytes === b.bytes && a.chunked === b.chunked;
+}
+
+function cohortForStream(receipt, stream) {
+  return receipt?.version === 1 && receipt.compat?.id === stream.compatibilityId
+    && receipt.compat.inputs && receipt.sources && receipt.binary ? receipt : null;
+}
+
+function headFiles(origin, app, stream) {
+  const configured = origin.url ?? channelOrigin(app.manifest, stream.channel);
+  const root = new URL(/^https?:\/\//.test(configured) ? `${configured.replace(/\/+$/, '')}/` : 'https://origin.invalid/');
+  const headUrl = new URL(`${streamPath(stream)}/exact.json`, root);
+  return { headUrl, async read(card, base = headUrl) {
+    const url = resolveCardURL(base, card.url);
+    if (origin.getURL) return { url, raw: await origin.getURL(url.href) };
+    if (!url.pathname.startsWith(root.pathname)) refuse('the file card is outside the directory origin');
+    const path = decodeURIComponent(url.pathname.slice(root.pathname.length));
+    return { url, raw: await origin.get(safeRelative(path)) };
+  } };
+}
+
+// Same-origin HTTP file cards use the same URL rules as exact-update.
+function resolveCardURL(base, reference) {
+  const absolute = reference.includes('://') || reference.startsWith('//');
+  const authority = /^(?:https?:)?\/\/([^/?#]+)/.exec(reference);
+  if (reference.includes('\\') || (absolute ? !authority || authority[1].includes('@') : reference.includes(':') && !reference.startsWith('/'))) {
+    refuse('the file card must name an HTTP file on the stream origin');
+  }
+  const rawPath = (absolute ? reference.slice(authority[0].length) : reference).split(/[?#]/, 1)[0];
+  let depth = absolute || rawPath.startsWith('/') ? 0 : base.pathname.split('/').length - 2;
+  for (const segment of rawPath.replace(/^\//, '').split('/')) {
+    if (segment === '.') continue;
+    if (segment === '..') {
+      if (depth === 0) refuse('the file card climbs above the stream origin');
+      depth--;
+    } else depth++;
+  }
+  const url = new URL(reference, base);
+  if (url.origin !== base.origin || url.username || url.password) refuse('the file card must name an HTTP file on the stream origin');
+  url.hash = '';
+  return url;
+}
+
+function cohortCard(card, name) {
+  fileCard(card, name);
+  if (card.bytes > MAX_FILE_BYTES) refuse(`${name} is ${card.bytes} bytes; the most is ${MAX_FILE_BYTES}`);
+}
+
+function checkedCohortBytes(card, raw, label) {
+  if (!raw || raw.length !== card.bytes || sha256(raw) !== card.sha256) refuse(`${label} is not the bytes its envelope names`);
+  return raw;
+}
+
+function cohortJson(raw, label, { exactIntegers = false } = {}) {
+  let text;
+  // Preserve a leading BOM so JSON.parse rejects it as the native parser does.
+  try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw); }
+  catch (error) { refuse(`${label} is not UTF-8: ${error.message}`); }
+  if (exactIntegers) validateRawIntegers(text, label);
+  try { return JSON.parse(text); }
+  catch (error) { refuse(`${label} is not JSON: ${error.message}`); }
+}
+
+/** Read the cohort from a head whose signature has already been checked. */
+async function readHeadCohort(files, head, stream) {
+  const card = head.cohortReceipt;
+  // The additive envelope format (LLP 1030 D9) also reads signed inline receipts.
+  if (!card) return cohortForStream(head.cohort, stream);
+  const { url, raw } = await files.read(card);
+  let bytes = checkedCohortBytes(card, raw, 'the cohort receipt');
+  if (card.chunked) {
+    const chunks = cohortJson(bytes, 'the cohort receipt manifest', { exactIntegers: true })?.chunks;
+    if (!Array.isArray(chunks) || !chunks.length) refuse('the cohort receipt manifest has no chunks');
+    for (const chunk of chunks) cohortCard(chunk, 'a cohort receipt chunk');
+    const bodies = [];
+    for (const chunk of chunks) {
+      const { raw } = await files.read(chunk, url);
+      bodies.push(checkedCohortBytes(chunk, raw, 'a cohort receipt chunk'));
+    }
+    bytes = Buffer.concat(bodies);
+  }
+  const receipt = cohortJson(bytes, 'the cohort receipt');
+  const cohort = cohortForStream(receipt, stream);
+  if (!cohort) refuse(`the cohort receipt does not describe cohort ${stream.compatibilityId} in version 1`);
+  return cohort;
 }
 
 function strictBase64(text, length, label) {
@@ -32,31 +139,27 @@ function strictBase64(text, length, label) {
   return decoded;
 }
 
-/** `inspectHead`, then the asset index a usable head names, read from the
- * origin into `head.assets` as its cards; a head whose index is missing or
- * not its bytes is unusable. */
+/** Authenticate the head, then verify its asset index and cohort receipt. */
 export async function admitHead(origin, found, app, stream) {
   const admission = inspectHead(found, app, stream);
   if (!admission.usable) return admission;
   try {
+    const files = headFiles(origin, app, stream);
+    admission.cohort = await readHeadCohort(files, admission.head, stream);
     const card = admission.head.assets;
-    const path = card && new URL(card.url, `https://origin.invalid/${streamPath(stream)}/exact.json`).pathname.slice(1);
-    const assets = card ? readAssetIndex(card, await origin.get(path)) : [];
+    const assets = card ? readAssetIndex(card, (await files.read(card)).raw) : [];
     return { ...admission, head: { ...admission.head, assets } };
   } catch (error) {
     if (error instanceof OriginUnavailable) throw error;
-    return { usable: false, authenticated: false, head: found?.json ?? null, seq: null, problem: error.message || String(error) };
+    return { ...admission, usable: false, seq: admission.authenticated ? admission.seq : null, problem: error.message || String(error) };
   }
 }
 
-/** Parse and authenticate one origin head by the same pre-download rules as
- * exact-update. An unusable head contributes no sequence: even a syntactically
- * valid number is attacker-controlled until its signature has verified. Its
- * asset index is `admitHead`'s to read. */
+/** Parse and authenticate a head before `admitHead` reads its payloads. */
 export function inspectHead(found, app, stream) {
   try {
     if (!Buffer.isBuffer(found?.bytes)) throw new Error('the origin returned no head bytes');
-    if (found.bytes.length > 64 * 1024) throw new Error(`the envelope is ${found.bytes.length} bytes; the most is ${64 * 1024}`);
+    if (found.bytes.length > ENVELOPE_BYTES) throw new Error(`the envelope is ${found.bytes.length} bytes; the most is ${ENVELOPE_BYTES}`);
     const text = new TextDecoder('utf-8', { fatal: true }).decode(found.bytes);
     validateRawIntegers(text);
     const head = JSON.parse(text);
@@ -71,6 +174,10 @@ export function inspectHead(found, app, stream) {
     if (typeof head.stream.compatibilityId !== 'string') throw new Error('the stream names no compatibility id');
     if (!Number.isSafeInteger(head.stream.seq) || head.stream.seq < 0) throw new Error('the stream names no exact nonnegative seq');
     if (head.assets !== undefined) indexCard(head.assets);
+    if (head.cohortReceipt !== undefined) {
+      cohortCard(head.cohortReceipt, 'the cohort receipt');
+      if (head.cohortReceipt.chunked !== undefined && head.cohortReceipt.chunked !== true) refuse('the cohort receipt has an invalid chunked flag');
+    }
     if (head.sunset !== undefined) {
       if (!head.sunset || typeof head.sunset !== 'object' || Array.isArray(head.sunset)) throw new Error('the sunset card is not an object');
       if (typeof head.sunset.message !== 'string') throw new Error('the sunset card has no message');
@@ -105,7 +212,7 @@ export function inspectHead(found, app, stream) {
  * The record wrapper is audit metadata; only its embedded signed envelope is
  * authority for a client's rollback floor. Malformed, foreign, and unsigned
  * records do not contribute a number. */
-async function authenticatedReleaseFloor(origin, app, stream) {
+export async function authenticatedReleaseFloor(origin, app, stream) {
   // Hidden names were accepted by older publishers. Include them while
   // recovering the rollback floor even though new release ids cannot begin
   // with a dot.
@@ -116,7 +223,7 @@ async function authenticatedReleaseFloor(origin, app, stream) {
   if (names === null && origin.kind !== 'directory') return { known: false, empty: false, floor: null };
   if (names === null || names.length === 0) return { known: true, empty: true, floor: null };
   let floor = null;
-  const kept = keptRecords(origin, stream), added = {};
+  const kept = keptRecords(origin, app, stream), added = {};
   for (const name of names.filter((entry) => entry.endsWith('.json'))) {
     if (Object.hasOwn(kept.seqs, name)) { floor = Math.max(floor ?? 0, kept.seqs[name]); continue; }
     const bytes = await origin.get(`${streamPath(stream)}/releases/${name}`);
@@ -141,16 +248,14 @@ function authenticatedRecord(bytes, app, stream) {
   } catch { return null; }
 }
 
-/** The seq of each release record of an AppDrop stream that this machine has authenticated, by name, so the next
- *  publication reads only the records it has not: a record is written once and never replaced, and reading the
- *  whole history over the network made each push cost a request per release ever published. Only an authenticated
- *  seq is kept, and it only raises the floor, so a record changed since cannot lower it; one that did not
- *  authenticate is read again. Only names the origin still lists count, as when every record is read. A directory
- *  origin's records are local reads, so none is kept for one. */
-function keptRecords(origin, stream) {
+/** Keep authenticated AppDrop sequences for the app and keys that verified
+ * them. Release records are immutable. Only names still listed count toward
+ * the floor, and records that could not be authenticated are read again. */
+function keptRecords(origin, app, stream) {
   if (origin.kind !== 'appdrop') return { seqs: {}, keep() {} };
   const cache = process.env.XDG_CACHE_HOME?.startsWith('/') ? process.env.XDG_CACHE_HOME : resolve(homedir(), '.cache');
-  const file = resolve(cache, 'exact/release-seqs', `${sha256(`${origin.describe()}\n${streamPath(stream)}`)}.json`);
+  const scope = { origin: origin.describe(), stream: streamPath(stream), app: app.id, keys: app.manifest.deploy?.signing?.keys ?? {} };
+  const file = resolve(cache, 'exact/release-seqs', `${sha256(canonicalBytes(scope))}.json`);
   const seqs = {};
   try {
     for (const [name, seq] of Object.entries(JSON.parse(readFileSync(file, 'utf8')))) if (Number.isSafeInteger(seq) && seq >= 0) seqs[name] = seq;
@@ -167,22 +272,19 @@ function keptRecords(origin, stream) {
 }
 
 /** Keep the record a publication wrote as authenticated (`keptRecords`): it holds the seq its own signed envelope names. */
-export const keepRecord = (origin, stream, name, seq) => keptRecords(origin, stream).keep({ [name]: seq });
+export const keepRecord = (origin, app, stream, name, seq) => keptRecords(origin, app, stream).keep({ [name]: seq });
 
-/** Allocate above everything the stream has authenticated: an admitted head
- * and the maximum signed immutable history. A head rolled back on the origin
- * (a restored backup, a stale replica) would otherwise hand out a seq that
- * clients already hold for another bundle. Repairing an unusable head uses
- * the history alone; if none exists, overwriting would guess at the clients'
- * rollback floor and is refused. */
-export async function nextSeq(origin, app, stream, admission, at, above = 0) {
-  return Math.max(above + 1, await nextOriginSeq(origin, app, stream, admission, at));
+/** Allocate above the verified head and signed history. A missing payload
+ * can make a signed head unusable while its sequence still binds clients. */
+export async function nextSeq(origin, app, stream, admission, at, above = 0, { startingCohort = false } = {}) {
+  return Math.max(above + 1, await nextOriginSeq(origin, app, stream, admission, at, startingCohort));
 }
 
-async function nextOriginSeq(origin, app, stream, admission, at) {
+async function nextOriginSeq(origin, app, stream, admission, at, startingCohort) {
   const history = await authenticatedReleaseFloor(origin, app, stream);
+  if (startingCohort && history.floor !== null) refuse(`${at} has authenticated release history but no authenticated capability receipt for this publication; run deploy to recover it`);
   let floor;
-  if (admission?.usable) floor = Math.max(admission.seq, history.floor ?? 0);
+  if (admission?.seq != null) floor = Math.max(admission.seq, history.floor ?? 0);
   else {
     if (!history.known) throw new OriginUnavailable(`${at} ${admission ? `is unusable (${admission.problem})` : 'is missing'}, but ${origin.describe()} cannot enumerate its authenticated release history; a rollback-safe sequence cannot be allocated`);
     floor = history.floor;
@@ -193,12 +295,13 @@ async function nextOriginSeq(origin, app, stream, admission, at) {
   return floor + 1;
 }
 
-/** The latest release record under a stream, when the origin has any: it names the platform and carries the cohort's inputs, so two ids that differ are explained field by field. */
-export async function latestRecord(origin, app, stream) {
+/** The latest signed release record and a verified cohort from its history.
+ * A signed head's receipt card fixes which payload can be recovered. */
+export async function latestRecord(origin, app, stream, admission = null) {
   const names = await origin.list(`${streamPath(stream)}/releases`, { includeHidden: true });
   if (!names?.length) return null;
   // Each record not kept is read; then the one with the largest seq, unless it was among them (`keptRecords`).
-  const kept = keptRecords(origin, stream), added = {}, read = new Map(), seqs = {};
+  const kept = keptRecords(origin, app, stream), added = {}, read = new Map(), seqs = {};
   const recordAt = async (name) => {
     const bytes = await origin.get(`${streamPath(stream)}/releases/${name}`);
     return bytes ? authenticatedRecord(bytes, app, stream) : null;
@@ -209,9 +312,50 @@ export async function latestRecord(origin, app, stream) {
     if (record) { read.set(name, record); seqs[name] = added[name] = record.envelope.stream.seq; }
   }
   kept.keep(added);
+  const files = headFiles(origin, app, stream);
+  let latest = null;
+  let required = admission?.authenticated ? admission.head.cohortReceipt : null;
+  let cohortProblem = required ? admission.problem : null;
+  const failed = new Set();
   for (const name of Object.keys(seqs).sort((a, b) => seqs[b] - seqs[a])) {
     const record = read.get(name) ?? await recordAt(name);
-    if (record) return record;
+    if (!record) continue;
+    latest ??= record;
+    const card = record.envelope.cohortReceipt;
+    if (card && required && !sameCohortPayload(card, required)) continue;
+    const key = card ? JSON.stringify([card.url, card.sha256, card.bytes, card.chunked]) : null;
+    if (failed.has(key)) continue;
+    try {
+      const cohort = await readHeadCohort(files, record.envelope, stream);
+      if (!required || (cohort && sameCohortPayload(required, card ?? cohortFiles(cohort)[0].card))) {
+        return { ...latest, cohort, cohortCard: card };
+      }
+    }
+    catch (error) {
+      if (error instanceof OriginUnavailable) throw error;
+      failed.add(key);
+      required ??= card;
+      cohortProblem ??= error.message || String(error);
+    }
   }
-  return null;
+  return latest ? { ...latest, cohort: null, cohortCard: required, cohortProblem } : null;
+}
+
+function matchingBuildCohort(card, build, stream) {
+  if (!card || build?.trust !== 'production' || build.compat.id !== stream.compatibilityId) return null;
+  const cohort = cohortReceipt(build);
+  return sameCohortPayload(card, cohortFiles(cohort)[0].card) ? cohort : null;
+}
+
+/** Recover a frozen cohort from the signed head, a matching production
+ * receipt, or signed history. Keep any verified card and its original URL. */
+export async function recoverCohort(origin, app, stream, admission, build) {
+  const card = admission?.authenticated ? admission.head.cohortReceipt : null;
+  if (admission?.authenticated && admission.cohort) return { cohort: admission.cohort, cohortCard: card };
+  const fromHead = matchingBuildCohort(card, build, stream);
+  if (fromHead) return { cohort: fromHead };
+  const record = await latestRecord(origin, app, stream, admission);
+  if (record?.cohort) return record;
+  const fromHistory = matchingBuildCohort(record?.cohortCard, build, stream);
+  return fromHistory ? { ...record, cohort: fromHistory, cohortCard: null } : record;
 }

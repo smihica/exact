@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactSharing
 @testable import ExactNavigation
 @testable import ExactCollections
 @testable import ExactNativeViews
@@ -239,6 +240,21 @@ final class NavigationTabsIOSTests: XCTestCase {
         XCTAssertTrue(owner.delegate === owner, "the app's own delegate")
         navigation.retireTabs()
         XCTAssertTrue(owner.delegate === owner, "still the app's")
+    }
+
+    /// Retiring the tabs leaves none of their stacks the primary owner, so a layout before the next projection
+    /// leaves the selected tab's stack in its retired container, where UIKit requires its view to stay.
+    func testALayoutAfterTheTabsRetireLeavesTheirStacksInTheirContainer() throws {
+        let session = try fixture("basics-roottabbar")
+        let navigation = session.presenter.navigationHost
+        let tabs = try XCTUnwrap(navigation.tabController)
+        let stack = try XCTUnwrap(navigation.primaryNavigation)
+        navigation.retireTabs()
+        XCTAssertNil(navigation.primaryOwner, "no stack of the retired tabs")
+        let view = try XCTUnwrap(session.view)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertTrue(stack.parent === tabs && stack.view.isDescendant(of: tabs.view), "the stack and its view stay in the container")
     }
 
     func testAnAppOwnedContainerSelectsThroughARebuiltTablist() throws {

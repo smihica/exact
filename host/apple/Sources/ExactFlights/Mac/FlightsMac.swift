@@ -14,8 +14,8 @@ import ExactKit
 struct FlightSource {
     var rect: NSRect // the window's content view coordinates
     var radius: CGFloat
-    /// An image's fitted rectangle as a fraction of its box.
-    var fit: CGRect?
+    /// The picture and its content clip, as fractions of the leaver's box.
+    var placement: FlightImagePlacement?
     var natural: CGSize?
     /// The leaver's decoded image (`FlightLook.stand`), held for the flight.
     package var raster: (any ImageLease)?
@@ -95,9 +95,8 @@ extension Presenter {
         let shown = leaver.layer.flatMap { l in content.layer.map { l.convert(l.bounds, to: $0) } } ?? leaver.convert(leaver.bounds, to: content)
         var source = FlightSource(rect: shown, radius: leaver.cornerRadii(in: leaver.bounds).max() ?? 0)
         if let flying = flights.values.first(where: { $0.view === leaver }), let look = leaver.flightLook {
-            let b = leaver.bounds
-            source.fit = CGRect(x: look.image.minX / max(b.width, 1), y: look.image.minY / max(b.height, 1),
-                                width: look.image.width / max(b.width, 1), height: look.image.height / max(b.height, 1))
+            source.placement = FlightImagePlacement(image: look.image, clip: look.contentClip ?? leaver.bounds)
+                .fraction(in: leaver.bounds)
             source.natural = flying.source.natural ?? leaver.raster?.image.naturalSize
             source.radius = leaver.layer?.cornerRadius ?? 0
             if let clip = flying.clip {
@@ -112,7 +111,7 @@ extension Presenter {
             // flying view's own raster landed, that is the replacement's.
             source.natural = source.raster?.image.naturalSize ?? source.natural
         } else if leaver.kind == "image", let natural = leaver.raster?.image.naturalSize {
-            source.fit = Self.fitFraction(natural: natural, box: leaver.bounds.size, fit: leaver.style["object_fit"]?.string ?? "fill")
+            source.placement = leaver.flightImagePlacement(natural: natural, in: leaver.bounds)
             source.natural = natural
             source.raster = leaver.raster
         }
@@ -294,9 +293,10 @@ extension Presenter {
         view.layer?.cornerRadius = mix(f.source.radius, view.cornerRadii(in: NSRect(origin: .zero, size: to.size)).max() ?? 0)
         if view.kind == "image" {
             let natural = view.raster?.image.naturalSize ?? f.source.raster?.image.naturalSize ?? f.source.natural ?? .zero
-            let end = Self.fitFraction(natural: natural, box: to.size, fit: view.style["object_fit"]?.string ?? "fill")
-            let start = f.source.fit ?? end
-            view.flightLook = FlightLook(image: Self.flightImage(from: from.size, fit: start, to: to.size, fit: end, progress: p),
+            let end = view.flightImagePlacement(natural: natural, in: slot.bounds)
+            let start = f.source.placement ?? end
+            view.flightLook = FlightLook(image: Self.flightImage(from: from.size, fit: start.image, to: to.size, fit: end.image, progress: p),
+                                         contentClip: Self.flightImage(from: from.size, fit: start.clip, to: to.size, fit: end.clip, progress: p),
                                          stand: view.raster == nil ? f.source.raster : nil)
             view.applyImageLayer()
         } else {
@@ -326,12 +326,6 @@ extension Presenter {
         func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * p }
         return CGRect(x: mix(start.minX * from.width, end.minX * to.width), y: mix(start.minY * from.height, end.minY * to.height),
                       width: mix(start.width * from.width, end.width * to.width), height: mix(start.height * from.height, end.height * to.height))
-    }
-
-    static func fitFraction(natural: CGSize, box: CGSize, fit: String) -> CGRect {
-        guard box.width > 0, box.height > 0, natural.width > 0, natural.height > 0 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
-        let r = RasterGeometry.rect(natural: natural, content: CGRect(origin: .zero, size: box), fit: fit)
-        return CGRect(x: r.minX / box.width, y: r.minY / box.height, width: r.width / box.width, height: r.height / box.height)
     }
 }
 #endif

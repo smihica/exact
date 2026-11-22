@@ -106,7 +106,9 @@ extension Presenter {
     private func pageBands(of v: NodeView, _ sv: UIScrollView, margins m: UIEdgeInsets, area: CGSize, _ judge: ControlBars?) -> Bands {
         var at: UIView? = v, page: NodeView?
         while let c = at, c !== root {
-            if c.isHidden || !c.transform.isIdentity || c.clipsToBounds || (c !== v && c is UIScrollView) { return Bands() }
+            // The scroller's own clip gives way to its band where its scroll view holds what it draws (`clipsItself`)
+            let clips = c === v ? c.clipsToBounds && !v.scrollHoldsContent : c.clipsToBounds || c is UIScrollView
+            if c.isHidden || !c.transform.isIdentity || clips { return Bands() }
             if let n = c as? NodeView, c.superview === root { page = n }
             at = c.superview
         }
@@ -179,11 +181,14 @@ extension Presenter {
         bars.allSatisfy { $0.paintRank >= v.paintRank || !$0.wrote("z_index") && !v.wrote("z_index") }
     }
 
-    /// A virtualized list draws rows a port past its own (D5): a longer band is not taken.
+    /// A virtualized list draws rows a port past its own (D5): a longer band is not taken. Its port is its box, past it
+    /// by its scroll view's outset once it has reach, less the part of its insets it does not draw through
+    /// (`ListHosting.drawnThrough`).
     private static func drawn(_ band: UIEdgeInsets, _ v: NodeView, _ sv: UIScrollView) -> Bool {
-        guard v.presenter?.collections.owns(v.id) == true else { return true }
-        let i = sv.adjustedContentInset, own = v.pageBand
-        let port = v.bounds.height - (i.top - own.top) - (i.bottom - own.bottom)
+        guard let lists = v.presenter?.collections, lists.owns(v.id) else { return true }
+        let i = sv.adjustedContentInset, o = v.reach == .zero ? .zero : v.scrollOutset
+        let through = lists.drawnThrough(v.id) ?? v.scrollDrawnThrough(sv)
+        let port = v.bounds.height + o.top + o.bottom - (i.top - through.top) - (i.bottom - through.bottom)
         return band.top <= port + 0.5 && band.bottom <= port + 0.5
     }
 }
@@ -197,6 +202,33 @@ extension NodeView {
         // The scroller's frame, insets and offset move as one: inside an animation UIKit has open, only if the last frame showed it
         moveOrPlace { bandScroll(band, inset: own) }
     }
+    /// Reach (LLP 1123 D13): the scroll view's frame grows past the box by `reach` on each edge,
+    /// as the kernel's terms give it, keeping CSS `scrollTop` and `scrollLeft` unclamped. D14's
+    /// writer, called next, measures every term from the reached frame, writes the insets that put
+    /// the content back where layout put it, and clamps the offset to the range they make; so
+    /// activation applies reach first and the writer after it, as reach grows and as it shrinks.
+    package func setReach(_ reach: UIEdgeInsets) {
+        let changed = !reachGiven || reach != self.reach
+        if !reachGiven { more.reachGiven = true }
+        // The scroller's frame and offset move as one: inside an animation UIKit has open, only if the last frame showed it
+        moveOrPlace { reachScroll(reach) }
+        // A grouped list's geometry, its cards' margins and side safe area among it, follows a new answer now, not at its next batch
+        if changed, groupedOwner { presenter?.groupedLists?.geometryChanged(id) }
+    }
+    private func reachScroll(_ reach: UIEdgeInsets) {
+        guard let sv = scrollView, reach != self.reach else { return }
+        let top = sv.contentOffset.y + scrollTopInset(sv), left = sv.contentOffset.x + scrollLeftInset(sv), height = sv.bounds.height
+        let mark = presenter?.collections.portMark(id)
+        defer { if let mark { presenter?.collections.portMoved(id, since: mark) } }
+        more.reach = reach
+        // A layout transition's surface that took the clip over keeps it until it ends (`endSurface`)
+        if surface?.clippedSelf != true, clipsToBounds != clipsItself { clipsToBounds = clipsItself }
+        sv.frame = scrollFrame
+        // A list that keeps its end judges it, for the writer next, as it did before reach moved the frame
+        (sv as? ScrollView)?.boundsGrew(by: sv.bounds.height - height)
+        fitScroll()
+        sv.contentOffset = PixelGrid.offset(CGPoint(x: left - scrollLeftInset(sv), y: top - scrollTopInset(sv)), in: sv, clamped: false)
+    }
     private func bandScroll(_ band: UIEdgeInsets, inset own: UIEdgeInsets?) {
         guard let sv = scrollView else { return }
         let own = own ?? band
@@ -209,8 +241,10 @@ extension NodeView {
         // the end.
         let follows = props["scrollFollowEnd"] == "true" || presenter?.collections.owns(id) == true
         let atEnd = follows && sv.contentOffset.y >= end() - 1 && !authorOwnsScroll(sv)
-        let oldOwn = bandInset, top = sv.contentOffset.y + scrollTopInset(sv)
+        let oldOwn = bandInset, top = sv.contentOffset.y + scrollTopInset(sv), mark = presenter?.collections.portMark(id)
         more.pageBand = band; more.bandInset = own
+        // A layout transition's surface that took the clip over keeps it until it ends (`endSurface`)
+        if surface?.clippedSelf != true, clipsToBounds != clipsItself { clipsToBounds = clipsItself }
         sv.frame = scrollFrame
         var inset = sv.contentInset, bars = sv.verticalScrollIndicatorInsets
         inset.top += own.top - oldOwn.top; inset.bottom += own.bottom - oldOwn.bottom
@@ -223,8 +257,8 @@ extension NodeView {
         // Offsets a layout in flight saved to restore are native: they move with the inset.
         let moved = own.top - oldOwn.top
         if var saved = beforeLayoutScroll { saved.offset.y -= moved; saved.topInset += moved; beforeLayoutScroll = saved }
-        if var followed = followedScroll { followed.top -= moved; followedScroll = followed }
-        presenter?.collections.offsetsMoved(id, by: -moved)
+        if var followed = followedScroll { followed.top -= moved; followed.port += moved; followedScroll = followed }
+        if let mark { presenter?.collections.portMoved(id, since: mark) }
     }
 }
 #endif

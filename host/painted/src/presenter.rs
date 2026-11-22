@@ -51,6 +51,9 @@ mod delivery;
 pub mod desktop_access;
 mod device;
 mod display_frame;
+pub mod drag_out;
+#[cfg(test)]
+mod drag_out_tests;
 pub mod edit_menu;
 mod events;
 mod feedback;
@@ -59,8 +62,9 @@ mod field_pointer;
 mod field_scroll;
 #[cfg(test)]
 mod field_tests;
+mod file_drop;
 #[cfg(test)]
-mod frame_target_tests;
+pub(crate) mod frame_target_tests;
 mod group;
 mod hatch;
 mod history;
@@ -75,6 +79,7 @@ mod pan_release;
 mod picker;
 mod pointer;
 mod present;
+mod reader_selection;
 mod replacement;
 pub use present::Carried;
 use replacement::Waiting;
@@ -91,6 +96,8 @@ mod svg_hit;
 mod tabs;
 #[cfg(windows)]
 mod windows_field;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use display_frame::PanelImage;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use display_frame::SubmittedFrame;
 #[path = "content_region/presenter.rs"]
@@ -178,7 +185,9 @@ pub use device::{touch_only, Device, Pointing};
 pub use exact_runner::ScreenReader;
 pub use hosted::action as field_action;
 use painter::cpu_info;
-pub(crate) use painter::PainterBoot;
+#[cfg(windows)]
+pub(crate) use painter::d3d11_backend;
+pub use painter::PainterBoot;
 #[cfg(target_os = "macos")]
 pub use painter::SubmittedAppleFrame;
 pub use painter::{set_custom_painter, PainterChoice, PainterFactory, PainterInfo};
@@ -189,6 +198,13 @@ pub use requests::{AgentTurn, Handed, Haptic, Pick, Request};
 pub use scrollers::{Scroller, Under, PAGE};
 pub use stage::SHEET_HANDLE;
 pub use window::{Chrome, Window};
+
+#[derive(PartialEq, Eq)]
+enum PaintHit {
+    Published,
+    Current,
+    ScrollbarCover,
+}
 
 /// The presenter: one host, its painter, and the host state.
 pub struct Presenter<D: DataSource> {
@@ -265,6 +281,8 @@ pub struct Presenter<D: DataSource> {
     /// when another replaces the one it measured (LLP 1079 D3).
     pub(crate) hosts: u64,
     pub(crate) focus: Option<ViewId>,
+    /// A focus command selected a node before its first presented layout.
+    pub(crate) focus_reveal: Option<exact_kernel::NodeKey>,
     /// What was typed into a menu in its last half second (`tabs.rs`).
     type_ahead: exact_kernel::TypeAhead,
     /// Last connected path from the focused node, for a removal commit.
@@ -282,6 +300,10 @@ pub struct Presenter<D: DataSource> {
     pub(crate) fields: BTreeMap<ViewId, field::FieldMark>,
     field_history: history::Histories,
     field_drag: Option<field_pointer::Drag>,
+    file_drag: file_drop::FileDrag,
+    mouse_selection: reader_selection::MouseSelection,
+    #[cfg(any(target_os = "android", test))]
+    reader_selection: Option<reader_selection::Selection>,
     /// A contact that went down on a range (`range.rs`).
     range_drag: Option<range::Drag>,
     ime: Option<ime::Composition>,
@@ -347,6 +369,9 @@ pub struct Presenter<D: DataSource> {
     /// The fields `rangeFrame` reads, as painted beside `boxes`.
     ranges: std::rc::Rc<range_frame::Painted>,
     pub(crate) dirty: bool,
+    /// Unpresented picture damage left behind by a geometry-only or non-window
+    /// paint; keeps `dirty()` true without forcing repeated `boxes()` walks.
+    pub(crate) picture_dirty: bool,
     pub(crate) image_paint_pending: bool,
     /// The app's `setScheme` (`None`: follow the system) and the appearance
     /// its shell or an agent says (LLP 1061 D5); light until either does.
@@ -383,12 +408,15 @@ pub struct Presenter<D: DataSource> {
     pub(crate) display: display_frame::State,
     /// Requested painter (`Auto` may change its mind after a failed frame).
     choice: PainterChoice,
+    #[cfg(any(windows, test))]
+    pub(crate) deferred_painter: Option<PainterBoot>,
     /// Boot font-scan milliseconds: the machine's cost, not the app's.
     pub fonts_ms: f64,
     /// The painter, for the report.
     pub painter: PainterInfo,
     /// The executor for a request that leaves the process (LLP 1016 D2).
     executor: crate::executor::Executor,
+    start_executor: crate::executor::Start,
     /// Requests held at dispatch until a commit or source wake releases them (LLP 1027.002 D3).
     parked: BTreeMap<u64, exact_runner::RequestOut>,
     refusal_turn: bool,
@@ -439,6 +467,13 @@ pub struct Presenter<D: DataSource> {
 fn r2(x: f32) -> f64 {
     (x as f64 * 100.0).round() / 100.0
 }
+fn log_alert(line: &str) {
+    #[cfg(target_os = "android")]
+    crate::android::console(exact_runner::Console::Warn, line);
+    #[cfg(not(target_os = "android"))]
+    eprintln!("exact: {line}");
+}
+
 /// The app's `console` lines (LLP 1027.009 D1), the sink of each runner the
 /// presenter shows: on standard error in every build, and on Android, where
 /// standard error is logcat's `exact` tag, under the app's own tag instead
@@ -467,6 +502,7 @@ impl<D: DataSource> Presenter<D> {
         launch: &str,
         region: Option<crate::content_region::ContentRegionRegistration>,
         painter: PainterBoot,
+        services: crate::app::Services,
     ) -> Result<(Presenter<D>, Option<String>), HostError> {
         let assets = match selected {
             Some(set) => Assets::selected(root, set),
@@ -483,6 +519,7 @@ impl<D: DataSource> Presenter<D> {
             Some(delivery),
             launch,
             region,
+            services,
         )?;
         presenter.compat = compat.to_string();
         presenter.host.web_mount = crate::app::web_mount(compat);
@@ -502,6 +539,7 @@ impl<D: DataSource> Presenter<D> {
         delivery: Option<exact_runner::Delivery>,
         launch: &str,
         region: Option<crate::content_region::ContentRegionRegistration>,
+        services: crate::app::Services,
     ) -> Result<(Presenter<D>, Option<String>), HostError> {
         let choice = painter.choice;
         if region.is_some() && choice != PainterChoice::Cpu {
@@ -539,7 +577,7 @@ impl<D: DataSource> Presenter<D> {
             .map_err(HostError::Painter)?;
         #[cfg(not(windows))]
         let (backend, painter) = painter.open().map_err(HostError::Painter)?;
-        let mut images = Images::with_assets(assets.clone());
+        let mut images = (services.open_images)(assets.clone());
         images.fit(viewport, scale);
         let (mut host, error) = Host::boot_decoded(
             decoded,
@@ -582,16 +620,20 @@ impl<D: DataSource> Presenter<D> {
         // Initial selected layout and asset metadata/integrity accepted.
         // Decoded pixels and their natural dimensions arrive together later.
         // Only now may the app's queued requests reach its executor.
-        let executor = host.executor();
+        let start_executor = services.start_executor;
+        let executor = host.executor_with(start_executor);
         if let Some(note) = executor.note() {
             host.log(note.to_string());
         }
+        let mut brush = Painter::new(text.clone(), scale, backend);
+        brush.canvases.drawings = host.canvas_snapshots().clone();
         let mut p = Presenter {
             last_wheel: None,
             wheel_free: BTreeMap::new(),
             snap_rested: BTreeMap::new(),
             host,
             executor,
+            start_executor,
             parked: BTreeMap::new(),
             refusal_turn: false,
             collection: collection::State::default(),
@@ -600,7 +642,7 @@ impl<D: DataSource> Presenter<D> {
             transform_geometry: Default::default(),
             arrange: None,
             group: None,
-            brush: Painter::new(text.clone(), scale, backend),
+            brush,
             text,
             make_text,
             ahead: None,
@@ -614,6 +656,7 @@ impl<D: DataSource> Presenter<D> {
             compat: String::new(),
             hosts: 0,
             focus: None,
+            focus_reveal: None,
             type_ahead: Default::default(),
             focus_out: Vec::new(),
             autofocus_from: None,
@@ -622,6 +665,10 @@ impl<D: DataSource> Presenter<D> {
             fields: BTreeMap::new(),
             field_history: Default::default(),
             field_drag: None,
+            file_drag: Default::default(),
+            mouse_selection: Default::default(),
+            #[cfg(any(target_os = "android", test))]
+            reader_selection: None,
             range_drag: None,
             ime: None,
             ime_epoch: 0,
@@ -660,6 +707,7 @@ impl<D: DataSource> Presenter<D> {
             boxes_serial: 0,
             ranges: Default::default(),
             dirty: true,
+            picture_dirty: false,
             image_paint_pending: false,
             deferred_collections: None,
             media: Default::default(),
@@ -703,6 +751,8 @@ impl<D: DataSource> Presenter<D> {
             last_frame_succeeded: false,
             display: display_frame::State::default(),
             choice,
+            #[cfg(any(windows, test))]
+            deferred_painter: None,
             fonts_ms,
             painter,
             updates: None,
@@ -811,7 +861,11 @@ impl<D: DataSource> Presenter<D> {
     pub fn dirty(&self) -> bool {
         // A hold no picture has carried owes one, to carry it to a present
         // (LLP 1003.001 D9).
-        self.dirty || !self.surfaces.captures.is_empty() || self.host.holds_uncarried()
+        self.dirty
+            || self.picture_dirty
+            || !self.surfaces.captures.is_empty()
+            || self.host.holds_uncarried()
+            || self.host.runner().canvas_owed(&|_| true)
     }
 
     /// Where the pointer is drawn (`None` draws none).
@@ -888,7 +942,7 @@ impl<D: DataSource> Presenter<D> {
         // stderr as well as in the journal. The runner queues none unless it
         // measures, so a production binary prints none.
         for line in self.host.runner().take_alerts() {
-            eprintln!("exact: {line}");
+            log_alert(&line);
         }
         self.restore_scroll_anchors();
         self.alert_sync();
@@ -1206,42 +1260,44 @@ impl<D: DataSource> Presenter<D> {
 
     /// The deepest painted box under a point (viewport points), through every clip.
     pub fn hit(&mut self, x: f32, y: f32) -> Option<ViewId> {
-        self.hit_with_visibility(x, y, false)
+        self.hit_with_visibility(x, y, PaintHit::Published)
     }
 
     /// Ordinary mouse releases use current CSS eligibility even before the
     /// next display flip. Retained regions keep their picture's hit policy.
     pub(super) fn hit_after_pointerdown(&mut self, x: f32, y: f32) -> Option<ViewId> {
-        self.hit_with_visibility(x, y, true)
+        self.hit_with_visibility(x, y, PaintHit::Current)
     }
 
-    fn hit_with_visibility(&mut self, x: f32, y: f32, current: bool) -> Option<ViewId> {
+    fn hit_with_visibility(&mut self, x: f32, y: f32, mode: PaintHit) -> Option<ViewId> {
         // Under an open surface of the top layer the page is inert.
         if !self.display.contains(x, y) || (self.top_open() && self.alert.is_none()) {
             return None;
         }
         self.boxes();
-        self.painted_hit(x, y, current)
+        self.painted_hit(&self.boxes, x, y, mode)
             .map(|id| self.inline_hit(id, x, y).unwrap_or(id))
     }
 
-    /// Hit-test the latest paint; [`Self::hit`] refreshes its boxes first.
-    pub(super) fn painted_hit(&self, x: f32, y: f32, current: bool) -> Option<ViewId> {
-        self.boxes
+    /// Hit-test a slice of the latest paint, in front-to-back order.
+    fn painted_hit(&self, boxes: &[PaintedBox], x: f32, y: f32, mode: PaintHit) -> Option<ViewId> {
+        boxes
             .iter()
             .map(PaintedBox::for_hit)
             .rev()
             .filter(|b| {
                 self.alert_allows(b.id)
                     && !self.host.flying(b.id)
-                    && (b.contains(x, y) && crate::paint::hits(self.host.kernel(), b, x, y)
+                    && (b.contains(x, y)
+                        && crate::paint::hits(self.host.kernel(), b, x, y)
+                        && (mode != PaintHit::ScrollbarCover || b.inside_rounded_border(x, y))
                         || crate::paint::slop_hits(self.host.kernel(), b, x, y))
                     && !self.host.route_visibility(b.id).1
                     && self.display.allows(self.host.kernel(), b.id)
             })
             .find_map(|b| {
                 let mut hit = b.clone();
-                if current && !self.brush.region_blocks_action(b.id) {
+                if mode == PaintHit::Current && !self.brush.region_blocks_action(b.id) {
                     let node = self.host.kernel().node(b.id)?;
                     hit.pointer_hit = node
                         .computed_row(exact_kernel::StyleId::PointerEvents, |s| s.pointer_events)
@@ -1250,6 +1306,28 @@ impl<D: DataSource> Presenter<D> {
                 }
                 self.svg_hit(&hit, x, y)
             })
+    }
+
+    /// The agent's wheel: over the node's center.
+    pub fn wheel(&mut self, id: ViewId, dx: f32, dy: f32) -> Result<String, String> {
+        if !dx.is_finite() || !dy.is_finite() {
+            return Err("wheel needs finite deltas".into());
+        }
+        if !self.alert_allows(id) || self.host.route_visibility(id).1 {
+            return Err(format!("view {id} is hidden or inert"));
+        }
+        let b = self
+            .box_of(id)
+            .ok_or_else(|| format!("no view {id} on screen"))?;
+        let (x, y) = (b.rect.0 + b.rect.2 / 2.0, b.rect.1 + b.rect.3 / 2.0);
+        self.wheel_at(x, y, dx, dy);
+        Ok(format!(
+            "{{\"tapped\":{id},\"wheel\":[{},{}],\"at\":[{},{}]}}",
+            num(dx as f64),
+            num(dy as f64),
+            num(r2(x)),
+            num(r2(y))
+        ))
     }
 
     /// The agent's `tap <list> into <key>` (LLP 1070.000 §5): the runner's
@@ -1330,6 +1408,7 @@ impl<D: DataSource> Presenter<D> {
             }
         }
         self.tick_arrange(self.host.now());
+        self.tick_field_drag(self.host.now());
         self.step_glides(now_ms);
         self.step_zooms(now_ms);
         if let Some(error) = self.deliver_scroll_ends() {

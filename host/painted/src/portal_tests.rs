@@ -414,6 +414,8 @@ enum Portal {
     Old,
     /// It quits with the chooser up.
     Quits,
+    #[cfg(target_os = "linux")]
+    Settings { legacy: bool },
     /// The bus never says `Hello`.
     Silent,
 }
@@ -526,6 +528,52 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
                     );
                 }
                 "AddMatch" => send(&mut s, wire::METHOD_RETURN, reply, "", "", "", &[]),
+                #[cfg(target_os = "linux")]
+                "ReadOne" if matches!(portal, Portal::Settings { legacy: true }) => {
+                    s.write_all(&error(
+                        m.serial,
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        "ReadOne",
+                    ))
+                    .unwrap();
+                }
+                #[cfg(target_os = "linux")]
+                "Read" | "ReadOne" => {
+                    let namespace = "org.freedesktop.appearance";
+                    let key = "color-scheme";
+                    let variant = |v| Value::Variant(Box::new(v));
+                    let path = "/org/freedesktop/portal/desktop";
+                    let iface = "org.freedesktop.portal.Settings";
+                    let setting = |ns, n| [Value::str(ns), Value::str(key), variant(Value::U32(n))];
+                    assert_eq!(m.body, [Value::str(namespace), Value::str(key)]);
+                    send(
+                        &mut s,
+                        wire::SIGNAL,
+                        None,
+                        path,
+                        iface,
+                        "SettingChanged",
+                        &setting(namespace, 2),
+                    );
+                    let value = variant(Value::U32(1));
+                    let result = if m.member == "Read" {
+                        variant(value)
+                    } else {
+                        value
+                    };
+                    send(&mut s, wire::METHOD_RETURN, reply, "", "", "", &[result]);
+                    for (ns, n) in [("other", 0), (namespace, 2), (namespace, 2), (namespace, 0)] {
+                        send(
+                            &mut s,
+                            wire::SIGNAL,
+                            None,
+                            path,
+                            iface,
+                            "SettingChanged",
+                            &setting(ns, n),
+                        );
+                    }
+                }
                 "OpenFile" | "SaveFile" => {
                     let token = match m.body[2].get("handle_token") {
                         Some(Value::Str(t)) => t.clone(),
@@ -595,6 +643,40 @@ fn bus(name: &str, portal: Portal) -> (String, std::thread::JoinHandle<Vec<Messa
         asked
     });
     (address, served)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_appearance_follows_the_settings_portal() {
+    for legacy in [false, true] {
+        let (address, served) = bus(
+            if legacy {
+                "appearance-old"
+            } else {
+                "appearance"
+            },
+            Portal::Settings { legacy },
+        );
+        let (send, updates) = std::sync::mpsc::channel();
+        let appearance = watch_appearance(&address, move |dark| {
+            let _ = send.send(dark);
+        })
+        .unwrap();
+        for expected in [Some(true), Some(false), None] {
+            assert_eq!(
+                updates.recv_timeout(Duration::from_secs(3)).unwrap(),
+                expected
+            );
+        }
+        drop(appearance);
+        let asked = served.join().unwrap();
+        assert_eq!(asked[1].member, "AddMatch");
+        assert_eq!(asked[2].member, "ReadOne");
+        if legacy {
+            assert_eq!(asked[3].member, "Read");
+        }
+        assert!(updates.into_iter().next().is_none());
+    }
 }
 
 #[test]

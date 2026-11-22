@@ -3,6 +3,7 @@
 //! as they were when a read again finds a colour the first read took is
 //! none, and never for one the first read refused; and gone from the index
 //! when they read no token, are cleared, or their node is unmounted.
+//! Textarea decorations also keep paint in the index while their field lives.
 
 use crate::{DataError, DataSource, Event, Runner};
 use exact_kernel::{Kernel, PropId, ViewId};
@@ -22,12 +23,16 @@ const MODES: &str = "forma t\n\naxes\n  dark-style = black | dim  under scheme=d
 
 /// `contract`'s plan beside the design.
 fn plan(name: &str, contract: &str) -> exact_plan::Plan {
+    plan_with_design(name, contract, MODES)
+}
+
+fn plan_with_design(name: &str, contract: &str, forma: &str) -> exact_plan::Plan {
     let dir = crate::TempDir(
         std::env::temp_dir().join(format!("exact2-faces-{name}-{}", std::process::id())),
     );
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("app.forma"), MODES).unwrap();
+    std::fs::write(dir.join("app.forma"), forma).unwrap();
     std::fs::write(dir.join("app.contract"), contract).unwrap();
     let plan = contract::compile_path(&dir.join("app.contract")).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -54,6 +59,117 @@ fn view(r: &Runner<NoData>, test: &str) -> Option<ViewId> {
 fn press(r: &mut Runner<NoData>, test: &str) {
     let id = view(r, test).unwrap();
     r.dispatch(id, Event::Press).unwrap();
+}
+
+const DECORATED_FIELD: &str = r#"decoration painted color="ink"
+component App
+  state shown = false
+  derive marks = TextDecorations(value="abcd", spans=[TextDecorationSpan(name="painted", start=0, end=4)])
+  action toggle
+    shown = not shown
+  view
+    column
+      button "Toggle" press=toggle testId="toggle"
+      if shown
+        column
+          textarea value="abcd" decorations=marks testId="editor"
+"#;
+
+fn decoration_styles(r: &Runner<NoData>, field: ViewId) -> &str {
+    r.kernel
+        .node(field)
+        .unwrap()
+        .props
+        .str(PropId::DecorationStyles)
+        .unwrap()
+}
+
+#[test]
+fn decoration_colours_use_the_runners_roles() {
+    use exact_kernel::style::roles;
+    use exact_kernel::{Color, ColorValue};
+
+    let mut first = boot(plan_with_design(
+        "decoration-roles",
+        DECORATED_FIELD,
+        "forma t\n\naxes\n  palette = paper | night\n\ntheme\n  ink = CanvasText\n    when palette=night: #eeeeee\n",
+    ));
+    let second = boot(plan("decoration-other", DECORATED_FIELD));
+    let canvas = roles::role("CanvasText").unwrap();
+    first
+        .roles()
+        .set(&[(canvas, ColorValue::Fixed(Color::parse("#ff0060").unwrap()))]);
+    second
+        .roles()
+        .set(&[(canvas, ColorValue::Fixed(Color::parse("#0060ff").unwrap()))]);
+
+    press(&mut first, "toggle");
+    let field = view(&first, "editor").unwrap();
+    assert!(decoration_styles(&first, field).contains("#ff0060ff"));
+
+    let _other = second.bind_roles();
+    first.set_mode("palette", "night").unwrap();
+    assert!(decoration_styles(&first, field).contains("#eeeeeeff"));
+    first.set_mode("palette", "paper").unwrap();
+    assert!(decoration_styles(&first, field).contains("#ff0060ff"));
+    first.set_token("ink", "#3300ff", &[]).unwrap();
+    assert!(decoration_styles(&first, field).contains("#3300ffff"));
+    first.set_token("ink", "CanvasText", &[]).unwrap();
+    assert!(decoration_styles(&first, field).contains("#ff0060ff"));
+    assert!(std::rc::Rc::ptr_eq(&roles::bound(), second.roles()));
+}
+
+#[test]
+fn decoration_colours_refresh_when_role_overrides_change() {
+    let mut r = boot(plan_with_design(
+        "decoration-role-edits",
+        DECORATED_FIELD,
+        "forma t\n\ntheme\n  ink = #ff0060\n  CanvasText = #010203\n  GrayText = #123456\n",
+    ));
+    press(&mut r, "toggle");
+    let field = view(&r, "editor").unwrap();
+    r.set_token("ink", "CanvasText", &[]).unwrap();
+    assert!(decoration_styles(&r, field).contains("#010203ff"));
+    r.set_token("CanvasText", "#0060ff", &[]).unwrap();
+    assert!(decoration_styles(&r, field).contains("#0060ffff"));
+    r.set_token("CanvasText", "GrayText", &[]).unwrap();
+    assert!(decoration_styles(&r, field).contains("#123456ff"));
+    r.set_token("GrayText", "#abcdef", &[]).unwrap();
+    assert!(decoration_styles(&r, field).contains("#abcdefff"));
+}
+
+#[test]
+fn decoration_colours_are_released_when_their_subtree_retires() {
+    let mut r = boot(plan_with_design(
+        "decoration-retire",
+        DECORATED_FIELD,
+        "forma t\n\ntheme\n  ink = oklch(60% 0.2 30)\n",
+    ));
+    press(&mut r, "toggle");
+    let field = view(&r, "editor").unwrap();
+    assert!(decoration_styles(&r, field).contains("oklch("));
+    assert!(r.ids.theme.decorations.contains_key(&field));
+    press(&mut r, "toggle");
+    assert!(view(&r, "editor").is_none());
+    assert!(!r.ids.theme.decorations.contains_key(&field));
+}
+
+#[test]
+fn decoration_colours_kept_after_a_refusal_are_in_the_document() {
+    let mut r = boot(plan_with_design(
+        "decoration-document",
+        DECORATED_FIELD,
+        "forma t\n\ntheme\n  ink = #ff0060\n",
+    ));
+    press(&mut r, "toggle");
+    let field = view(&r, "editor").unwrap();
+    assert!(decoration_styles(&r, field).contains("#ff0060ff"));
+    r.set_token("ink", "12px", &[]).unwrap();
+    let doc = r.document_tree().unwrap();
+    assert_eq!(
+        doc.node(field).unwrap().props.str(PropId::DecorationStyles),
+        Some(decoration_styles(&r, field)),
+    );
 }
 
 /// The editor's faces, or `None` when its prop is unset.

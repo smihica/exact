@@ -23,7 +23,6 @@ final class SurfacesHost: SurfacesCapability {
     func canvases() -> Canvases { CanvasesHost() }
     func canvas2D() -> Canvas2DCanvases { Canvas2DHost() }
     func makeMetalView() -> MetalView { MetalCanvasView(frame: .zero) }
-    var canvasTextMeasure: ExactCanvasTextFn { CanvasText.measureRun }
     var pointerLockPreferred: Bool {
         #if os(iOS) || os(tvOS)
         CanvasInputHost.lockOwner != nil

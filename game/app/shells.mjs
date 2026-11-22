@@ -7,9 +7,9 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path
 import { fileURLToPath } from 'node:url';
 import { pathWithin } from '../../scripts/paths.mjs';
 import { parseManifest, shaderFiles } from '../../scripts/app.mjs';
-import { lockBlocks, lockChanges, memberRefusal, outsideSdkLock, series, seriesId, staleLock } from '../../scripts/app-shells.mjs';
+import { lockBlocks, lockChanges, memberRefusal, mergeLockBlocks, outsideSdkLock, series, seriesId, staleLock } from '../../scripts/app-shells.mjs';
 
-// Resolve authored keys in memory; only the bake writes the resolved manifest.
+// Resolve authored keys in memory before writing the resolved manifest.
 const merge = (base, overrides) => {
   const result = {...base};
   for (const [key, value] of Object.entries(overrides)) {
@@ -60,6 +60,33 @@ export function gameDefaults(dir) {
   return app;
 }
 
+const gameManifestSource = dir => existsSync(resolve(dir, 'app.json')) ? createHash('sha256').update(readFileSync(resolve(dir, 'app.json'))).digest('hex') : 'none';
+const writeGameManifest = (dir, app, authored) => {
+  const root = resolve(dir, '.shells');
+  mkdirSync(root, {recursive:true});
+  writeChanged(resolve(root, 'app.json'), JSON.stringify({game: app.game, ...app}, null, 2) + '\n', false);
+  writeChanged(resolve(root, 'app-source.sha256'), authored + '\n', false);
+};
+
+/** Prepare the same game manifest for a Contract build as for a bake, including unsaved editor input. */
+export function prepareContractGame(args) {
+  if (args[0] !== 'build' || args.includes('--help') || args.includes('-h')) return true;
+  const input = args.slice(1).find((arg, i, rest) => !arg.startsWith('-') && !['-o', '--stdin-as', '--entry', '--surface'].includes(rest[i - 1]));
+  if (!input) return true;
+  const parent = dirname(resolve(input));
+  if (!existsSync(parent)) return true;
+  try {
+    const dir = realpathSync(parent);
+    const authored = gameManifestSource(dir), game = gameDefaults(dir);
+    if (game) writeGameManifest(dir, game, authored);
+    return true;
+  } catch (error) {
+    if (args.includes('--json')) process.stdout.write(JSON.stringify([{ id: 'app-manifest', severity: 'error', message: error.message, file: input, line: 0, col: 0, end_col: 0, related: [] }]) + '\n');
+    else console.error(error.message);
+    return false;
+  }
+}
+
 // A game without logic/Cargo.toml gets this generated member: its sources stay
 // where the author wrote them. @ref llp/1046.003-game-engine-as-built.explainer.md#one-sdk-lock-2026-09-23
 function logicManifest(dir, crate) {
@@ -84,10 +111,11 @@ function renderDeclaration(dir, render) {
   if (render === undefined) return;
   const rustPath = value => typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$/.test(value);
   if (!render || typeof render !== 'object' || Array.isArray(render)
-      || Object.keys(render).some(key => !['crate', 'hooks', 'shaders'].includes(key))
+      || Object.keys(render).some(key => !['crate', 'hooks', 'shaders', 'workers'].includes(key))
       || typeof render.crate !== 'string' || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-render$/.test(render.crate)
-      || !rustPath(render.hooks) || ('shaders' in render && !rustPath(render.shaders))) {
-    throw new Error('game.render must contain only a <name>-render crate, its Hooks type path and an optional shaders registry path');
+      || !rustPath(render.hooks) || ('shaders' in render && !rustPath(render.shaders))
+      || ('workers' in render && typeof render.workers !== 'boolean')) {
+    throw new Error('game.render requires a <name>-render crate and its Hooks type path, with optional shaders registry path and boolean workers');
   }
   const folder = resolve(dir, 'render'), manifest = resolve(folder, 'Cargo.toml');
   if (!existsSync(manifest)) throw new Error(`game.render.crate ${render.crate} requires ${manifest}`);
@@ -148,7 +176,7 @@ export function gameShells(dir, game, workspace, {env = process.env, updateLock 
   dir = realpathSync(dir);
   // Only this app is materialized. Each bake owns a generated Cargo workspace.
   // Read before the defaults are, so a file edited meanwhile is recorded as the older.
-  const authored = existsSync(resolve(dir, 'app.json')) ? createHash('sha256').update(readFileSync(resolve(dir, 'app.json'))).digest('hex') : 'none';
+  const authored = gameManifestSource(dir);
   const app = {game, ...gameDefaults(dir)};
   const {crate, type, data, render} = app.game, name = crate.slice(0, -'-logic'.length);
   // Reject authored declaration errors before touching even an old generated workspace.
@@ -214,9 +242,8 @@ export function gameShells(dir, game, workspace, {env = process.env, updateLock 
   }
   // An external game cannot inherit the SDK's compiler through its ancestors.
   writeChanged(resolve(root,'rust-toolchain.toml'), readFileSync(resolve(gameRoot,'../rust-toolchain.toml'),'utf8'), false);
-  writeChanged(resolve(root, 'app.json'), JSON.stringify(app, null, 2) + '\n', false);
-  // What it was resolved from, by content: the compiler names a stale copy (contract/cli manifest.rs `generated_stale`).
-  writeChanged(resolve(root, 'app-source.sha256'), `${authored}\n`, false);
+  // Keep the manifest and its source digest together (contract/cli manifest.rs `generated_stale`).
+  writeGameManifest(dir, app, authored);
   writeChanged(resolve(root,'Cargo.toml'), '# Generated by the game bake.\n' + Object.entries(cargo)
     .map(([key,value])=>`[${key}]\n${Object.entries(value).map(([key,value])=>`${JSON.stringify(key)} = ${toml(value)}\n`).join('')}`).join('\n'), false);
   // A game's own lock is captured only when it adds dependencies; otherwise
@@ -265,6 +292,7 @@ fn main() {
     let app = std::env::args_os().nth(1).expect("game directory");
     bake_files::bake_game_level::<Logic>(&app).expect("bake level");
     bake_files::bake_game_tables::<Logic>(&app).expect("bake tuning tables");
+    bake_files::bake_game_sounds::<Logic>(&app).expect("bake streamed sound metadata");
 }
 `, false);
   let dataDir;
@@ -324,7 +352,7 @@ fn main() {
       ...(kind === 'web' && data ? { [`src/bin/${name}-dev.rs`]: `//! The resident dev driver for the game's web shell: \`${name}-dev <source> <out>\`, baking with its data.\n\nfn main() -> std::process::ExitCode {\n    exact_web::dev::main::<app_data::${data.type}>()\n}\n` } : {}),
       'Cargo.toml': header + dependencies + (tests.length ? `\n[dev-dependencies]\nserde_json.workspace = true\nexact-update = { path = ${JSON.stringify(pathWithin(shell, resolve(gameRoot, '../update')))} }\n` : ''),
       ...Object.fromEntries(tests.map(file => [`tests/${file}`, readFileSync(resolve(appDir, 'linux/tests', file), 'utf8')])),
-      [['linux', 'windows'].includes(kind) ? 'src/main.rs' : 'src/lib.rs']: kind === 'gpu' ? `exact_game_render::module!(game_logic::${type}${app.game.audio === true ? ", audio" : ""}${app.game.assets === true ? ", assets" : ""}${render ? `, hooks = game_render::${render.hooks}${render.shaders ? `, shaders = game_render::${render.shaders}` : ''}` : ''});\n` : (kind === 'windows' ? '#![cfg_attr(\n    all(target_os = "windows", not(debug_assertions)),\n    windows_subsystem = "windows"\n)]\n' : '') + 'include!(concat!(env!("OUT_DIR"), "/entry.rs"));\n',
+      [['linux', 'windows'].includes(kind) ? 'src/main.rs' : 'src/lib.rs']: kind === 'gpu' ? `exact_game_render::module!(game_logic::${type}${app.game.audio === true ? ", audio" : ""}${app.game.assets === true ? ", assets" : ""}${render ? `, hooks = game_render::${render.hooks}${render.shaders ? `, shaders = game_render::${render.shaders}` : ''}${render.workers === true ? ', workers' : ''}` : ''});\n` : (kind === 'windows' ? '#![cfg_attr(\n    all(target_os = "windows", not(debug_assertions)),\n    windows_subsystem = "windows"\n)]\n' : '') + 'include!(concat!(env!("OUT_DIR"), "/entry.rs"));\n',
       'build.rs': kind === 'gpu'
         ? `use exact_game::{Args, Game, Value};
 use std::{env, fs, path::PathBuf};
@@ -370,6 +398,7 @@ fn main() {
     publish("../keys.json", serde_json::json!({name: keys}));
 ${bakeArt ? `    exact_game_bake::bake_art(${JSON.stringify(relative(shell, appDir))}).expect("bake art");\n` : ''}    bake_files::bake_game_level::<Logic>(${JSON.stringify(relative(shell, appDir))}).expect("bake level");
     bake_files::bake_game_tables::<Logic>(${JSON.stringify(relative(shell, appDir))}).expect("bake tuning tables");
+    bake_files::bake_game_sounds::<Logic>(${JSON.stringify(relative(shell, appDir))}).expect("bake streamed sound metadata");
     println!("cargo:rerun-if-changed={}", level_bake_path());
     println!("cargo:rerun-if-changed=build.rs");
 }
@@ -402,6 +431,10 @@ ${bakeArt ? `    exact_game_bake::bake_art(${JSON.stringify(relative(shell, appD
 // game/app/shells.lock, the lock of the union of every shell's dependencies.
 // A game that adds packages captures its own Cargo.lock with --update-lock.
 const sdkLockFile = source => [resolve(source, 'app/shells.lock'), resolve(gameRoot, 'app/shells.lock')].find(path => existsSync(path));
+const rootLock = source => {
+  const path = resolve(source, '../Cargo.lock');
+  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+};
 // Root crates reach every shell by path, so a root commit that adds a registry
 // dependency to one (15856ff7: cssparser in kernel) moves every shell's graph
 // while updating only the root Cargo.lock. Those packages are as decided as the
@@ -410,7 +443,7 @@ const sdkLockFile = source => [resolve(source, 'app/shells.lock'), resolve(gameR
 // game resolves offline before anyone refreshes the SDK lock. A new root crate
 // (00d37ef9f: exact-svg-filter under the kernel) is one too: the root lock's
 // path packages, which carry no source or checksum, seed it the same way.
-export function withRootPins(sdk, root = existsSync(resolve(gameRoot, '../Cargo.lock')) ? readFileSync(resolve(gameRoot, '../Cargo.lock'), 'utf8') : '') {
+export function withRootPins(sdk, root = rootLock(gameRoot)) {
   // A root's new major of a package the SDK lock holds is a pin too; a compatible one is not.
   const packages = Bun.TOML.parse(sdk).package ?? [];
   const held = new Set(packages.map(pkg => `${pkg.name} ${series(pkg.version)}`));
@@ -671,10 +704,18 @@ function sdkStage(source, lock, use) {
  * dependencies, or (`update`) rewrite it from that union. */
 export function sdkLock(source = gameRoot, {update = false, env = process.env} = {}) {
   const path = resolve(source, 'app/shells.lock');
-  // A refresh takes the root lock's versions for packages new to the SDK.
-  const lock = existsSync(path) ? (update ? withRootPins(readFileSync(path, 'utf8')) : readFileSync(path, 'utf8')) : null;
+  const sdk = existsSync(path) ? readFileSync(path, 'utf8') : null;
+  const root = update ? rootLock(source) : '';
+  const lock = update && sdk ? withRootPins(sdk, root) : sdk;
   sdkStage(source, lock, stage => {
-    const result = cargoMetadata(stage, update ? [] : ['--locked', '--offline'], env);
+    let result = cargoMetadata(stage, update ? [] : ['--locked', '--offline'], env);
+    if (result.status !== 0 && update && lock && root) {
+      // A new root dependency can require a newer patch of a crate the SDK already pins.
+      // Retry with the newer checked-in registry versions, preserving SDK-only packages.
+      const registry = lockBlocks(root).filter(block => /^source = "registry\+/m.test(block));
+      writeFileSync(resolve(stage, 'Cargo.lock'), mergeLockBlocks(lock, registry));
+      result = cargoMetadata(stage, [], env);
+    }
     if (result.status !== 0) throw new Error(`${update ? 'SDK lock update' : `${path} is stale for the SDK's shell dependencies; refresh it: bun game/app/shells.mjs --update-lock`}\n${result.stderr || result.error?.message}`);
     if (update) writeChanged(path, readFileSync(resolve(stage, 'Cargo.lock'), 'utf8'), false);
   });

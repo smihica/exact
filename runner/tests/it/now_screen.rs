@@ -22,7 +22,7 @@ use exact_runner::{
 #[derive(Default)]
 struct Schedule {
     queries: Vec<(String, Vec<Value>)>,
-    wrong_shape: bool,
+    refuse: bool,
 }
 
 fn station(id: &str, name: &str) -> Value {
@@ -46,8 +46,8 @@ impl DataSource for Schedule {
                 station("pa", "Palo Alto"),
             ])),
             "departures" => {
-                if self.wrong_shape {
-                    return Ok(Value::list(vec![Value::str("not a departure")]));
+                if self.refuse {
+                    return Err(DataError::BadArguments("refused".into()));
                 }
                 let id = args
                     .first()
@@ -872,13 +872,13 @@ fn commands_exit_the_side_and_refusals_leave_the_kernel_untouched() {
         }
     ));
 
-    r.data().wrong_shape = true;
+    r.data().refuse = true;
     let err = r.act("selectStation", vec![Value::str("pa")]).unwrap_err();
-    assert!(matches!(err, RunnerError::Shape { ref resource, .. } if resource == "board"));
+    assert!(matches!(err, RunnerError::Data { ref resource, .. } if resource == "board"));
     assert_eq!(
         r.kernel().export(None).unwrap(),
         before,
-        "a shape refusal applies nothing"
+        "a source's refusal applies nothing"
     );
     assert_eq!(
         r.slot("stationId"),

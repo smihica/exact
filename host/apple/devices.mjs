@@ -6,8 +6,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { constants, homedir, networkInterfaces, tmpdir } from 'node:os';
 import { createServer as createTCPServer } from 'node:net';
 import { basename, dirname, resolve } from 'node:path';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { decodePng, encodePng } from '../../scripts/png.mjs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { decodePng, encodePng, pngDimensions } from '../../scripts/png.mjs';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -229,6 +229,9 @@ export function forwardedEnv(env = process.env) {
   return Object.fromEntries(['EXACT_STORE', 'EXACT_AGENT_PADS'].filter((k) => env[k]).map((k) => [k, env[k]]));
 }
 
+/** The development launch sent to devicectl. Only an explicit live drive selects the wall clock. */
+export const phoneLaunch = (extra, env = process.env) => ({ ...forwardedEnv(env), EXACT_AGENT: '1', ...extra });
+
 /** What `simctl launch` gives the app of `env`: each `SIMCTL_CHILD_` variable, without the prefix. */
 export const simulatorChildEnv = (env = process.env) =>
   Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith('SIMCTL_CHILD_')).map(([k, v]) => [k.slice('SIMCTL_CHILD_'.length), v]));
@@ -278,14 +281,51 @@ export async function withMaterials(r, path, window) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-/** The simulator's display as it is, into `path` over the app's own picture: whatever is over the app (a system
- *  permission alert, a sheet of the system's) is in it, and nothing checks it against the app's drawing. */
-export function displayAsIs(r, path, udid) {
+function displayScale(screen, { width, height }) {
+  if (!(screen?.w > 0 && screen?.h > 0 && width > 0 && height > 0)) return undefined;
+  // The two axes are rounded to whole pixels independently.
+  const low = Math.max((width - 0.5) / screen.w, (height - 0.5) / screen.h);
+  const high = Math.min((width + 0.5) / screen.w, (height + 0.5) / screen.h);
+  if (low <= high) return (low + high) / 2;
+}
+
+export async function displayPictureReply(ask, r, path, { keepPixels = false } = {}) {
+  const header = Buffer.alloc(24), fd = openSync(path, 'r');
+  try { readSync(fd, header); } finally { closeSync(fd); }
+  const dimensions = pngDimensions(header);
+  const probe = await ask({ op: 'screenshot', window: 'display', probe: true }).catch(() => null);
+  const after = probe?.error ? null : probe;
+  const front = r.front == null || after?.front == null ? "the app's focus could not be confirmed"
+    : r.front !== after.front ? 'focus changed during capture' : r.front;
+  let scale = displayScale(r.screen, dimensions);
+  // The capture can land after a rotation, or before a rotation reported by the probe.
+  if (scale === undefined && after?.screen) {
+    scale = displayScale(after.screen, dimensions);
+    r = { ...after, ...(r.moving ? { moving: r.moving } : {}), ...(r.imagesPending ? { imagesPending: r.imagesPending } : {}) };
+  }
+  const { screen, ...metadata } = r;
+  if (scale === undefined) {
+    if (keepPixels) {
+      const reason = front === true ? "the app's screen geometry could not be confirmed" : front;
+      return { front: reason, screenshot: path, w: dimensions.width, h: dimensions.height, scale: null,
+        captureSpace: 'screen', pixels: 'display',
+        note: `the capture may show another app or system overlay (${reason}); saved at native pixel size because the size in points is unavailable` };
+    }
+    const observed = screen ? `the app reports ${screen.w}×${screen.h} points` : 'the app did not report its screen size';
+    throw new Error(`display screenshot: Xcode captured ${dimensions.width}×${dimensions.height} pixels, ${observed}. Try again once the orientation settles.`);
+  }
+  if (front !== true) metadata.note = [metadata.note, `the capture may show another app or system overlay (${front})`].filter(Boolean).join('\n');
+  return { ...metadata, front, screenshot: path, w: screen.w, h: screen.h, scale, captureSpace: 'screen', pixels: 'display' };
+}
+
+/** The simulator's full display, including any system UI over the app. */
+export async function displayAsIs(ask, path, udid, { skipMotion } = {}) {
+  const r = await ask({ op: 'screenshot', window: 'display', ...(skipMotion ? { skipMotion } : {}) });
+  if (r.error) throw new Error(r.error);
   const taken = read('xcrun', ['simctl', 'io', udid, 'screenshot', '--type=png', path], { timeout: 20000 });
   if (taken.status !== 0) throw new Error(`simctl io screenshot: ${(taken.stderr || '').trim().split('\n').pop() || 'failed'}`);
-  r.pixels = 'display'; r.pixelsWhy = 'the display as it is, asked for'; r.statusBar = true;
-  if (r.front !== true) r.note = `the app is not in front (${r.front}): the display shows what is over it`;
-  return r;
+  const reply = await displayPictureReply(ask, r, path);
+  return { ...reply, pixelsWhy: 'the display as it is, asked for' };
 }
 
 /** Why the display is not the app's at the points the app drew itself (`points`, window points), or null: around a
@@ -320,10 +360,12 @@ function covered(points, app, display, scale) {
 
 /** Every available simulator: { udid, name, runtime, state, type } — `type`
  *  the device type's last component (`iPhone-18-Pro`, `Apple-TV-4K-…`), which a
- *  renamed simulator keeps. */
-export function simulators() {
-  const r = read('xcrun', ['simctl', 'list', 'devices', 'available', '-j']);
-  if (r.status !== 0) throw new Error('xcrun simctl list: ' + r.stderr);
+ *  renamed simulator keeps. In the device set at `set` when given, else in the
+ *  default set (`~/Library/Developer/CoreSimulator/Devices`). */
+export function simulators(set) {
+  // A set of thousands of devices lists more than spawnSync's default 1 MiB of output
+  const r = read('xcrun', ['simctl', ...(set ? ['--set', set] : []), 'list', 'devices', 'available', '-j'], { maxBuffer: 32 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error('xcrun simctl list: ' + (r.stderr || r.error?.message || '').trim());
   return Object.entries(JSON.parse(r.stdout).devices).flatMap(([runtime, list]) => list.map((d) => ({ udid: d.udid, name: d.name, runtime, state: d.state, type: d.deviceTypeIdentifier?.split('.').pop() ?? '' })));
 }
 

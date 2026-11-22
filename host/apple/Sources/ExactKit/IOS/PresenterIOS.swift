@@ -111,12 +111,12 @@ package final class Presenter {
     let glassGroups = GlassGroups()
     var contextNodes: Set<UInt32> = []
     var inlineOwners: [UInt32: (owner: UInt32, index: Int)] = [:]
-    package var heightBindings: [UInt32: HeightDragBinding] = [:]
-    package var transformBindings: [UInt32: TransformDragBinding] = [:]
+    /// Transform and height drag handles, which the Drag module keeps.
+    lazy package var drags: DragHandles = DragLink.installed?.handles(self) ?? NoDragHandles()
     /// Reordering a list's rows: the lists family's (`ReorderLink`).
     lazy package var reorders: any ReorderHosting = ReorderLink.make?(self) ?? NoReorders()
     lazy package var transformGeometry = TransformGeometryHost(self)
-    lazy var nativeGeometry = NativeGeometry(self)
+    package lazy var nativeGeometry = NativeGeometry(self)
     /// Nodes showing a `background-attachment: fixed` gradient (LLP 1066
     /// D7): re-aimed at the viewport when anything scrolls or a batch lands.
     let fixedGradients = NSHashTable<NodeView>.weakObjects()
@@ -142,6 +142,16 @@ package final class Presenter {
     lazy var accent = AppAccent(self)
     /// The native menu arm (LLP 1021 D3).
     package lazy var menus = MenuHost(presenter: self)
+    /// The menus' interactions again, outside a batch: a view that came to hold authored content out of its parent
+    /// (the tab bar's accessory) takes the menu an ancestor of it gives (`ContextMenuHost.syncMounts`).
+    package func mountsChanged() {
+        guard !resetting else { return }
+        menus.sync()
+    }
+    #if os(iOS)
+    /// The drag sources (LLP 1094.000 D4), when the module is linked.
+    package lazy var dragOut: DragOutSources? = DragOutLink.installed?.sources(self)
+    #endif
     /// A `dialog` that is not a confirmation, as UIKit's sheet (`DialogLink`).
     lazy package var dialogs: any DialogHosting = DialogLink.make?(self) ?? NoDialogs(self)
     /// The `input`s the batch being applied makes in a closed box (`MenuHost.waitingFields`).
@@ -373,6 +383,9 @@ package final class Presenter {
         fieldSelections.reset()
         edited = nil
         menus.reset()
+        #if os(iOS)
+        dragOut?.reset()
+        #endif
         swipeActions.reset(); rowCells.reset()
         pool.reset()
         leaves?.reset()
@@ -399,9 +412,7 @@ package final class Presenter {
         owedText.removeAll()
         movingText.removeAll()
         listViews.removeAll()
-        heightBindings.removeAll()
-        transformBindings.removeAll()
-        transformGeometry.reset(); nativeGeometry.reset()
+        drags.reset(); nativeGeometry.reset()
         videoVisibility?.reset()
         pageGeometryOwed = false
     }
@@ -492,7 +503,7 @@ package final class Presenter {
             if view.isHidden || (view as? NodeView)?.props["inert"] == "true" { return }
             if let node = view as? NodeView, views[node.id] === node, Self.tabbable(node),
                !fields || node.field != nil || node.textArea != nil { listed.append(node) } else if view.isFirstResponder, (view as? NodeView)?.paintedGroup != nil { start = listed.count }
-            view.subviews.forEach(walk)
+            (navigation.lifted?.focusChildren(of: view) ?? view.subviews).forEach(walk)
         }
         walk(scope)
         let order = listed.enumerated().sorted { a, b in
@@ -547,7 +558,7 @@ package final class Presenter {
     }
 
     /// A hatch's `focus()` on the node it resolved (LLP 1075.003 §3.4).
-    func focusNode(_ target: NodeView) { focus(target, selectText: false) }
+    package func focusNode(_ target: NodeView) { focus(target, selectText: false) }
 
     /// Whether `target` has a box to focus. A header's search field is the
     /// bar's, which UIKit collapses to no height until it is pulled down or
@@ -635,7 +646,7 @@ package final class Presenter {
     var onClipboard: ((UInt32, UInt32, String) -> Void)?
     var onContextmenu: ((UInt32) -> Void)?
     var onDblclick: ((UInt32) -> Void)?
-    var onSelectionChange: ((UInt32, String, Int, Int, [CGRect]) -> Void)? // a `text`'s part of the selection (`TextSelectionIOS`)
+    var onSelectionChange: ((UInt32, String, Int, Int, [CGRect]) -> Void)? // a `text`'s part of the selection (`ExactTextSelection`)
     /// A touch went down on a node (`true`) or came up (LLP 1005 §3).
     var onPointer: ((UInt32, PointerKind, PointerSample) -> Void)?
     var onSwiperight: ((UInt32) -> Void)?
@@ -770,7 +781,7 @@ package final class Presenter {
     /// A `contextmenu` with its point (studio diary R22): kind 10 and its line.
     func contextmenu(_ id: UInt32, line: String) { send(id) { [self] in onClipboard?(id, 10, line) } }
     func dblclick(_ id: UInt32) { send(id) { [self] in onDblclick?(id) } }
-    func selectionChange(_ id: UInt32, _ text: String, _ start: Int, _ end: Int, rects: [CGRect] = []) { send(id) { [self] in onSelectionChange?(id, text, start, end, rects) } }
+    package func selectionChange(_ id: UInt32, _ text: String, _ start: Int, _ end: Int, rects: [CGRect] = []) { send(id) { [self] in onSelectionChange?(id, text, start, end, rects) } }
     func pointer(_ id: UInt32, _ kind: PointerKind, _ sample: PointerSample) { send(id) { [self] in onPointer?(id, kind, sample) } }
     func refresh(_ id: UInt32) { send(id) { [self] in onRefresh?(id) } }
     func pan(_ id: UInt32, _ dx: Double, _ dy: Double) { send(id) { [self] in onPan?(id, dx, dy) } }
@@ -951,32 +962,16 @@ package final class Presenter {
         // An op inside an animation UIKit has open only if its view showed in the last frame (`moveOrPlace`).
         func applyOp(_ op: BatchOp, _ kind: BatchOp.Kind, _ id: UInt32) {
             switch kind {
-            case .transformDrag:
-                if let binding = TransformDragBinding(op.payload) {
-                    for n in [binding.id, binding.target, binding.clip].compactMap({ $0 }) where flats.isFlat(n) { flats.promote(n) }
-                    if binding.target == nil {
-                        if transformBindings[binding.id]?.handleKey == binding.handleKey
-                            && transformBindings[binding.id]?.runtime == binding.runtime {
-                            transformBindings.removeValue(forKey: binding.id)
-                            transformGeometry.retire(binding.id)
-                        }
-                    } else { transformBindings[binding.id] = binding }
-                    if let v = views[binding.id] { DragLink.installed?.updateTransformGesture(v) }
+            case .transformDrag, .heightDrag:
+                let nodes = drags.bind(kind, op.payload)
+                for n in nodes where flats.isFlat(n) { flats.promote(n) }
+                if let id = nodes.first, let v = views[id] {
+                    if kind == .transformDrag { DragLink.installed?.updateTransformGesture(v) } else { DragLink.installed?.updateHeightGesture(v) }
                 }
             case .retireMotion:
                 if let rawRuntime = op.payload["runtime"] as? String, let runtime = UInt64(rawRuntime),
                    let rawToken = op.payload["token"] as? String, let token = UInt64(rawToken) {
                     session?.transformInputHold?.retire(runtime: runtime, token: token)
-                }
-            case .heightDrag:
-                if let binding = HeightDragBinding(op.payload) {
-                    for n in [binding.id, binding.target].compactMap({ $0 }) where flats.isFlat(n) { flats.promote(n) }
-                    if binding.target == nil {
-                        if heightBindings[binding.id]?.handleKey == binding.handleKey {
-                            heightBindings.removeValue(forKey: binding.id)
-                        }
-                    } else { heightBindings[binding.id] = binding }
-                    if let v = views[binding.id] { DragLink.installed?.updateHeightGesture(v) }
                 }
             case .create:
                 // An inert leaf box is a layer in its parent's (LLP 1068 §6.1).
@@ -1173,6 +1168,7 @@ package final class Presenter {
         flats.flush()
         // A view the flush promoted and mounted may have moved its children.
         while !gridMoved.isEmpty { regridMoved(); flats.flush() }
+        navigation.lifted?.place()
         if rowFill, pageGeometryOwed || listRowDependencies?.scrollers != scrollers { rowFill = false }
         if !rowFill {
             pageGeometryOwed = false
@@ -1216,6 +1212,9 @@ package final class Presenter {
         #endif
         attachRegionPopovers()
         ApplyProfile.time("pass.menus") { menus.sync() }
+        #if os(iOS)
+        ApplyProfile.time("pass.dragOut") { dragOut?.sync() }
+        #endif
         glassGroups.reconcile()
         positionContexts()
         // A view a `children` op moved within its parent keeps its ancestors.
@@ -1268,9 +1267,7 @@ package final class Presenter {
         owedText.remove(id)
         movingText.remove(id)
         scrollPump.forget(id)
-        heightBindings.removeValue(forKey: id)
-        transformBindings.removeValue(forKey: id)
-        transformGeometry.retire(id)
+        drags.retire(id)
         chrome.forget(id)
         scrollers.remove(id); pendingScrolls.remove(id); materialNodes.remove(id); contextNodes.remove(id)
         return views.removeValue(forKey: id)
@@ -1288,8 +1285,9 @@ package final class Presenter {
         let container = parent.container
         // A row a grouped list carries stays in its cell (`GroupedLists.placing`).
         let want = groupedLists.map { $0.placing(container, ids.compactMap { views[$0] }) } ?? ids.compactMap { views[$0] }
-        // An open popover under the agent stays in the top layer.
+        // An open popover under the agent stays in the top layer, and a node nested beside the tab panels over their container.
         menus.children(container, want)
+        navigation.lifted?.children(parent, ids, want)
         let wanted = Set(want.map(ObjectIdentifier.init))
         var current = container.subviews
         for case let child as NodeView in current where !wanted.contains(ObjectIdentifier(child)) && !pool.isParked(child) && !isLeaving(child) {
@@ -1298,14 +1296,14 @@ package final class Presenter {
         // In order, below anything else in the container (a scroll
         // view's indicators): inserting a subview at an index moves
         // it when it is already there. One already there stays.
-        for child in want where child.superview !== container { placedAnew.append(child.id) }
+        for child in want where child.superview !== container && navigation.lifted?.holds(child, under: parent) != true { placedAnew.append(child.id) }
         let heldByArrangement: (NodeView) -> Bool = { node in
             #if os(iOS)
             if #available(iOS 27.1, *) { return self.arrangements.owns(node, under: parent) }
             #endif
             return false
         }
-        let contained = NodeView.keepingGhosts(want.filter { !heldByArrangement($0) && !navigation.ownsContainment(of: $0, under: parent) && !menus.lifted($0) && !flightHost.isFlying($0) }, in: container)
+        let contained = NodeView.keepingGhosts(want.filter { !heldByArrangement($0) && !navigation.ownsContainment(of: $0, under: parent) && !menus.lifted($0) && !flightHost.isFlying($0) && navigation.lifted?.holds($0, under: parent) != true }, in: container)
         // Keep paragraph coverage below authored children when UIKit owns its view
         let text = parent.specs?.rasterView
         let offset = text?.superview === container ? 1 : 0
@@ -1339,7 +1337,7 @@ package final class Presenter {
             var view: UIView? = views[id]
             while let current = view {
                 if let node = current as? NodeView, !seen.insert(node.id).inserted { break }
-                view = current.superview
+                view = layoutParent(of: current)
             }
         }
         return seen
@@ -1383,7 +1381,7 @@ package final class Presenter {
     private(set) var title: String?
     var onTitle: ((String?) -> Void)?
     #if os(iOS)
-    lazy var textSelection = TextSelectionHost(self) // `user-select: text` (LLP 1115.000 D11.6)
+    lazy var textSelection: any TextSelecting = TextSelectionLink.make?(self) ?? NoTextSelection() // `user-select: text` (LLP 1115.000 D11.6)
     /// The status bar's resolved style (LLP 1105), the controllers' `preferredStatusBarUpdateAnimation`, and who is told of a change.
     package var statusBar = StatusBarChoice(), statusBarUpdateAnimation = UIStatusBarAnimation.none
     var onStatusBar: ((StatusBarChoice) -> Void)?
@@ -1440,7 +1438,15 @@ extension Presenter {
             if let p = dialogs.authoredParent(of: node) { return p }
             if navigation.routeSurfaces[node.id]?.node === node, let p = navigation.logicalParent(of: node) ?? navigation.container { return p }
         }
-        return menus.logicalParent(of: view) ?? groupedLists?.logicalParent(of: view) ?? view.superview
+        return menus.logicalParent(of: view) ?? groupedLists?.logicalParent(of: view) ?? navigation.lifted?.parent(of: view) ?? view.superview
+    }
+}
+
+extension NodeView {
+    /// The node and its authored ancestors, including those UIKit holds in another container.
+    package var authoredLine: some Sequence<NodeView> {
+        sequence(first: self as UIView, next: { [weak presenter] in presenter?.authoredParent(of: $0) ?? $0.superview })
+            .lazy.compactMap { $0 as? NodeView }
     }
 }
 #endif

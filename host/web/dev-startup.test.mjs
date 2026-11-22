@@ -5,7 +5,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { declaredSources } from '../../scripts/file-dependencies.mjs';
 import { request } from 'node:http';
 import { createServer } from 'node:net';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, resolve, sep } from 'node:path';
 import { spawnOwned, stopAll } from '../../scripts/test-children.mjs';
 import { claimDevLoop, stopBuildTree } from './dev-startup.mjs';
 import { applyStaticChange, applyStaticTreeChange } from './serve.mjs';
@@ -402,7 +402,7 @@ test('Cargo watchers ignore reads and observe edits through installed source lin
   const entries = new Set([crate, file, `${crate}/src`, sdk, `${sdk}/src/lib.rs`]), handlers = new Map(), edits = new Set();
   let targetTime = 1;
   const old = { mtimeMs: 1, ctimeMs: 1, birthtimeMs: 1, isSymbolicLink: () => false };
-  const env = { resolve, dirname, basename, declaredSources: () => () => null, app: { dir: '/app', manifest: {} },
+  const env = { resolve, dirname, basename, sep, declaredSources: () => () => null, app: { dir: '/app', manifest: {} },
     built: { packages: { roots: [crate, sdk, { file }], sources: [file] } }, edited: edits,
     skipped: /(^|\/)(node_modules|target)(\/|$)/, settingsFile: () => false,
     existsSync: path => entries.has(path),
@@ -457,7 +457,7 @@ test('a Cargo watcher sees an edit made at a linked file: package\'s declared di
       if (at === resolve(pkg, 'rust') && String(name).endsWith('probe')) ready = true;
       listener(event, name);
     });
-    const env = { resolve, dirname, basename, existsSync, lstatSync, statSync, watch: watching, declaredSources, watchers, edited: edits,
+    const env = { resolve, dirname, basename, sep, existsSync, lstatSync, statSync, watch: watching, declaredSources, watchers, edited: edits,
       app: { dir: app, manifest: {} }, built: { packages: { roots: [crate, { file }], sources: [file] } },
       skipped: /(^|\/)(node_modules|target)(\/|$)/, settingsFile: () => false, temporaryOfDesign: () => false, OUTPUT: /^$/, INPUT_TREE: /^$/,
       stopYoungBuild() {}, rebuild() {}, setTimeout: () => 1, clearTimeout() {} };

@@ -55,7 +55,7 @@ impl<D: DataSource + Default> CanvasHost<D> {
         if let Some(names) = crate::canvas::jni::jni_extensions::take_bound() {
             self.bind_extensions(&names);
         }
-        if !self.scrolled {
+        if !self.scroll_hold.take_request_skip() {
             // The reader takes its requests once it has the turn's frame:
             // after first pixel (a displayed frame activates it), the
             // hatches connect, once (LLP 1075.003.000.001 §2.1).
@@ -90,6 +90,11 @@ impl<D: DataSource + Default> CanvasHost<D> {
             .reader_module_event(id, key, session, kind, payload, now);
     }
 
+    /// The reader's iframe finished a document (LLP 1020 §10).
+    pub fn frame_loaded(&mut self, id: u32, key: exact_kernel::NodeKey, session: u64) {
+        self.force |= self.p.reader_frame_loaded(id, key, session);
+    }
+
     /// A media element's event or state (LLP 1042.001 D7), only for the
     /// session and allocation whose element the reader still holds.
     #[allow(clippy::too_many_arguments)]
@@ -106,6 +111,19 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.force |= self
             .p
             .reader_media(id, key, session, event, payload, state, now);
+    }
+
+    /// Authored updates for an audio player whose reader is stopped.
+    #[cfg(target_os = "android")]
+    pub fn background_audio(
+        &self,
+        id: u32,
+        key: exact_kernel::NodeKey,
+        session: u64,
+    ) -> Option<String> {
+        self.p
+            .background_audio(id, key, session)
+            .map(|props| props.to_string())
     }
 
     /// The reader's answer to request `id`, or its cancellation (`None`).
@@ -136,7 +154,9 @@ impl<D: DataSource + Default> CanvasHost<D> {
     /// Android's visibility and execution eligibility, composed by `Exact.executionEligible`
     /// from Activity and promoted service ownership. Release gated streams before returning.
     pub fn page_hidden(&mut self, hidden: bool, eligible: bool) {
-        self.force |= self.p.page_execution(hidden, eligible);
+        self.force |= self
+            .p
+            .page_execution(hidden, eligible, super::agent::seekable());
     }
 
     /// Whether the data module is active (`Native.dataActive`): 1, 0 while

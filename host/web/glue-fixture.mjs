@@ -50,6 +50,7 @@ export function fixture(agentMode = true) {
     requestsPending: 0,
     wasm: { exact_in: () => 0, exact_plan: () => 1, exact_out: () => 0,
       exact_requests_pending: () => context.requestsPending,
+      exact_set_screen_reader: () => {},
       exact_plan_fonts: () => '[]', exact_boot: () => '{"ops":[],"timers":true}',
       exact_boot_plan: () => '{"ops":[],"timers":true}', exact_advance: () => '{"ops":[],"clock":16}' },
     devAssets: null, bootAttempt: 0, encoder: new TextEncoder(), location: { pathname: '/', search: '', href: 'https://fixture.invalid/' }, URL,
@@ -69,15 +70,16 @@ export function fixture(agentMode = true) {
     replacements: { pending: null, begin() {}, current: () => true, preparing() {}, end() {}, changed() {}, wait: () => Promise.resolve(true) }, // boot.js's, with nothing holding a replacement
     page: null, // a built document's boot (LLP 1048.000 D6); these pages have none
     loadStage: () => Promise.resolve(), stageLoaded: () => true, // every stage linked (LLP 1047.000 §9)
-    preferences: () => '{}', localAssetURL: source => source, pageFacts: {} /* `globalThis.exact` exposes it (LLP 1139.003 D2) */, sizes: new Set(), mediaAttached: (deadline, set = context.mediaAttaching) => Promise.all(set).then(() => true) /* glue.js's, unbounded */,
+    preferences: () => '{}', localAssetURL: source => source, pageFacts: { read: () => ({ 'screen-reader': 'unknown' }), screenReaderCode: () => 0 } /* `globalThis.exact` exposes it (LLP 1139.003 D2) */, sizes: new Set(), mediaAttached: (deadline, set = context.mediaAttaching) => Promise.all(set).then(() => true) /* glue.js's, unbounded */,
     launchLocation: () => launchLocation(context), // the launch path less the drive's facts (feed F16)
+    launchVisits: () => [],
   });
   context.host = context;
   context.mutation = Promise.resolve();
   context.gpuInPlay = () => Boolean(context.gpuLoading || context.exact?.gpu || context.exact?.pendingSurfaces?.length);
   context.gpuLoading = null;
   context.frameSampler = null;
-  vm.runInContext(`let toldOffset = null; const folded = () => false; /* no folded text here (LLP 1007.001) */ const backButton = ${backButton}; const viewBox = ${viewBox}; const layoutBoxes = ${layoutBoxes}; const scrollRange = ${scrollRange}; Object.assign(host, { backButton, viewBox, layoutBoxes, scrollRange });\n` + glueDeclarations(source, ['POST_BOUND', 'followOffset', 'shownValue', 'heldNamed']) + '\n' + ['nodeDetail', 'agentInputReady', 'agent', 'agentNow', 'agentReply', 'settleGpu', 'gpuPendingReply', 'agentSettled', 'tagged', 'clock', 'startClock', 'mutate', 'boot', 'bootNow', 'reportColors'].map(declaration).join('\n') + '\n' + publicObject, context);
+  vm.runInContext(`let toldOffset = null; const folded = () => false; /* no folded text here (LLP 1007.001) */ const backButton = ${backButton}; const viewBox = ${viewBox}; const layoutBoxes = ${layoutBoxes}; const scrollRange = ${scrollRange}; Object.assign(host, { backButton, viewBox, layoutBoxes, scrollRange });\n` + glueDeclarations(source, ['POST_BOUND', 'followOffset', 'shownValue', 'heldNamed', 'ModuleStopped', 'StageNotLoaded', 'guardedExports', 'stopModule']) + '\n' + ['nodeDetail', 'agentInputReady', 'agent', 'agentNow', 'agentReply', 'settleGpu', 'gpuPendingReply', 'agentSettled', 'tagged', 'clock', 'startClock', 'mutate', 'boot', 'bootNow', 'reportColors'].map(declaration).join('\n') + '\n' + publicObject, context);
   context.reportPlace = placeReporter(new URLSearchParams(agentMode ? 'agent=1' : ''), context);
   context.reportTime = timeReporter(new URLSearchParams(agentMode ? 'agent=1' : ''), context);
   return context;

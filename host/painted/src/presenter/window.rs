@@ -51,8 +51,10 @@ pub struct Chrome {
     /// browser carries the root's background over the whole canvas; else the
     /// platform's surface for the scheme (`Canvas`, LLP 1115 D2).
     pub background: [u8; 4],
-    /// Whether the page's scheme is dark: the navigation bar's icons are light then.
+    /// Whether the page's scheme is dark.
     pub dark: bool,
+    /// Light Android navigation icons, resolved independently of the status bar.
+    pub navigation_light_icons: bool,
     /// Light status bar icons, resolved independently of the scheme (LLP 1105 D7).
     pub status_light_icons: bool,
     /// Whether the system bars give way to the page (`system-bars-hidden`,
@@ -178,9 +180,24 @@ impl<D: DataSource> Presenter<D> {
             // The keyboard's edge has no inset of its own (the web's reading).
             env[2] = 0.0;
         }
+        // The bands an edge box's background reaches into (D3.7): none under
+        // `cover`, and none at a keyboard's edge.
+        let bands = match cover {
+            true => [0.0; 4],
+            false => [
+                safe[0],
+                safe[1],
+                match keyboard > 0.0 && policy == Keyboard::Resizes {
+                    true => 0.0,
+                    false => safe[2],
+                },
+                safe[3],
+            ],
+        };
         let rose = keyboard > self.window.keyboard;
         let moved = self.window.keyboard != keyboard;
-        self.dirty |= self.window.frame != Some(frame) || moved;
+        self.dirty |= self.window.frame != Some(frame) || moved || self.brush.bands != bands;
+        self.brush.bands = bands;
         self.window.frame = Some(frame);
         self.window.keyboard = keyboard;
         // The size, the insets and the keyboard's overlap in one commit (LLP
@@ -268,6 +285,7 @@ impl<D: DataSource> Presenter<D> {
                     .map(|c| crate::paint::rgba(c.resolve(dark)))
             })
             .filter(|c| c[3] == 255);
+        let bars = self.status_bar();
         Chrome {
             frame: self
                 .window
@@ -275,8 +293,9 @@ impl<D: DataSource> Presenter<D> {
                 .unwrap_or([0.0, 0.0, self.viewport.0, self.viewport.1]),
             background: authored.unwrap_or_else(|| crate::paint::page_color(dark)),
             dark,
-            status_light_icons: self.status_bar().light_icons,
-            bars_hidden: self.status_bar().hidden,
+            status_light_icons: bars.light_icons,
+            navigation_light_icons: bars.navigation_light_icons,
+            bars_hidden: bars.hidden,
         }
     }
 

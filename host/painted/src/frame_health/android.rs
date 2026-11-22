@@ -55,14 +55,14 @@ static WINDOW: Kind = Kind {
     coverage: window_coverage,
 };
 
-fn app_coverage() -> Value {
+fn app_coverage(live_agent: &str) -> Value {
     json!({"presentation": "unobserved", "renderThread": "unobserved", "inputLatency": "unobserved",
-        "GPU": "unobserved", "window": "android-frame-metrics", "liveAgent": "lent-wall-clock"})
+        "GPU": "unobserved", "window": "android-frame-metrics", "liveAgent": live_agent})
 }
 
-fn window_coverage() -> Value {
+fn window_coverage(live_agent: &str) -> Value {
     json!({"presentation": "unobserved", "frameTimes": "unobserved", "surfaceViews": "unobserved",
-        "inputLatency": "unobserved", "liveAgent": "lent-wall-clock"})
+        "inputLatency": "unobserved", "liveAgent": live_agent})
 }
 
 /// Words per window frame the reader hands over: intended vsync, vsync,
@@ -80,10 +80,28 @@ pub(crate) enum Lend {
     Driver,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FrameClock {
+    Platform,
+    Held,
+    Lent,
+}
+
+impl FrameClock {
+    fn coverage(self) -> &'static str {
+        match self {
+            Self::Platform => "platform-clock",
+            Self::Held => "virtual-clock",
+            Self::Lent => "lent-wall-clock",
+        }
+    }
+}
+
 /// The reader's sources and the period they share with GPU canvases.
 pub(crate) struct Reader {
     pub app: Health,
     pub window: Health,
+    clock: FrameClock,
     /// The display's refresh period as the reader reads it, nanoseconds.
     display: u64,
     /// The latest turn's period, nanoseconds; 0 where Choreographer gave none.
@@ -101,6 +119,7 @@ impl Reader {
         Reader {
             app: Health::new(&APP, collect),
             window: Health::new(&WINDOW, collect),
+            clock: FrameClock::Platform,
             display: 0,
             turn: 0,
             given: 0,
@@ -109,8 +128,10 @@ impl Reader {
         }
     }
 
-    /// The clock is the agent's (`true`) or the display's, at `now`.
-    pub fn clock(&mut self, virtual_clock: bool, now: u64) {
+    /// Whose clock the sources run under at `now`.
+    pub fn clock(&mut self, clock: FrameClock, now: u64) {
+        self.clock = clock;
+        let virtual_clock = matches!(clock, FrameClock::Held);
         self.app.set_virtual(virtual_clock, now);
         self.window.set_virtual(virtual_clock, now);
     }
@@ -274,10 +295,11 @@ impl Reader {
                 "reason": "Use perf frames report for hitches, or the driver's perf frames live <ms> for a live window."}),
             );
         }
+        let live_agent = self.clock.coverage();
         match self.source(q) {
             Ok(h) => {
                 let cursor = q.get("cursor").filter(|c| !c.is_null());
-                keep(h.metrics(cursor, now))
+                keep(h.metrics(cursor, now, live_agent))
             }
             Err(e) => keep(e),
         }

@@ -1,4 +1,4 @@
-# wgpu-hal 30.0.1 — eighteen local patches: seven in Metal, ten in Vulkan, one in D3D12
+# wgpu-hal 30.0.1 — seventeen local patches: seven in Metal, nine in Vulkan, one in D3D12
 
 Complete crates.io archive, including the upstream MIT/Apache licenses and
 `.cargo_vcs_info.json`. No dependency upgrade. Patch 11 offers an explicit native arithmetic-only f16 opt-in. Every changed
@@ -355,13 +355,25 @@ registration behind. Metadata revision 17. Upstreamable.
 `cargo test --manifest-path vendor/wgpu-hal/Cargo.toml --lib shared_registration`
 runs on any host.
 
-## 18. A split render/display device can own a DRM connector (Vulkan)
+## 18. Find the Vulkan display by its DRM connector
 
-`src/vulkan/drm.rs`. On Raspberry Pi 4, V3D renders and vc4 scans out.
-The Vulkan device's reported DRM nodes do not identify the display card, so
-the node match rejects a usable connector. When that match fails, ask each
-physical device for the connector through `VK_EXT_acquire_drm_display` and
-use the first non-null display. The normal node match takes precedence.
+On a Raspberry Pi 4, V3D renders and vc4 owns the display connector.
+`src/vulkan/drm.rs` asks each Vulkan physical device for the display on that
+connector. A driver can recognize it even when its advertised DRM node has a
+different device number. Display acquisition, mode lookup and surface creation
+return errors to the caller. After a successful acquisition, the surface keeps
+the DRM descriptor open and releases the display when surface creation fails or
+the surface is dropped. [Vulkan DRM display queries](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetDrmDisplayEXT.html)
+and [display acquisition](https://docs.vulkan.org/refpages/latest/refpages/source/vkAcquireDrmDisplayEXT.html).
+
+## 19. Identify a queued Vulkan presentation on Linux
+
+A caller that enabled the Vulkan `presentId` feature can label the next
+presentation on its swapchain. The native queue passes that ID to Vulkan once.
+This lets a DRM carrier wait for the corresponding page flip, including when
+the app goes idle after presenting a single frame. Surface creation keeps the
+selected plane’s stack position and checks that it supports opaque output.
+[Vulkan presentation IDs](https://docs.vulkan.org/refpages/latest/refpages/source/VkPresentIdKHR.html).
 
 ## Updating
 

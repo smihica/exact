@@ -81,6 +81,7 @@ fn usage() -> String {
   contract fmt --uses <file.contract>
   contract types <file.contract> [-o <app.d.ts>] [--check]
   contract rust <file.contract> [-o <shapes.rs>]
+  contract module-rust <file.contract> [-o <modules.rs>]
   contract test <file.test.contract>
   contract lean <file.contract> [--components] [--name <ident>] [-o <file.lean>]
   {verify}
@@ -145,6 +146,12 @@ fn run() -> ExitCode {
                 .map_err(|mut all| all.swap_remove(0).to_string())?;
             contract::rust(&plan, &call_records).map_err(|e| format!("{}: {e}", path.display()))
         }),
+        Some("module-rust") => types(
+            &args[1..],
+            "module-rust",
+            "modules.rs",
+            contract::module_rust_path,
+        ),
         _ => {
             eprintln!("{}", usage());
             ExitCode::from(2)
@@ -211,54 +218,45 @@ fn gallery(args: &[String]) -> ExitCode {
 fn symbols(args: &[String]) -> ExitCode {
     const USAGE: &str =
         "usage: contract symbols <file.contract> [--stdin] [--editor] [--name <exact-name>]
-  --stdin: the file's text is stdin's, read as if saved at <file.contract>
-  --editor: also each definition's `type`, `shapes`, and each view element (`elements`)";
-    // `--stdin` and `--editor`, anywhere once but as `--name`'s value (a
-    // literal ID may be spelled so): the rest is matched without them.
-    let (mut stdin, mut editor, mut rest) = (0, 0, Vec::new());
-    for (i, arg) in args.iter().enumerate() {
-        let flag = i == 0 || args[i - 1] != "--name";
-        if flag && arg == "--stdin" {
-            stdin += 1;
-        } else if flag && arg == "--editor" {
-            editor += 1;
-        } else {
-            rest.push(arg.clone());
-        }
-    }
-    let args = rest;
-    let (input, name) = match args.as_slice() {
-        [flag] if matches!(flag.as_str(), "--help" | "-h") => {
-            println!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        [input] if !input.starts_with('-') => (input, None),
-        [input, flag, name] if !input.starts_with('-') && flag == "--name" => {
-            (input, Some(name.as_str()))
-        }
-        _ => {
-            eprintln!("{USAGE}");
-            return ExitCode::from(2);
-        }
-    };
-    if stdin > 1 || editor > 1 {
+       contract symbols <file.contract> --editor [--stdin] [--component <name>] [--tag <tag>]
+              [--has <attr> …] [--where 'attr=expression' …] [--match <text> …] [--or <filters> …]
+  --stdin reads the named file's text from stdin.
+  --editor adds types, shapes and view elements. Element filters return only matching elements.
+  --component and --tag match exactly. All --has and --where filters must match.
+  Each --match is a case-sensitive substring of authored text or attributes. Any can match.
+  --or starts another filter group. Elements that satisfy any group appear once.
+  Example
+    contract symbols app.contract --editor --component Editor --tag button --match 'Save draft' --or --component Preview --tag button --match Cancel";
+    let Some(command) = symbol_args(args) else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
-    }
-    let path = std::path::Path::new(input);
-    let query = match editor {
-        0 => contract::symbols_json,
-        _ => contract::editor_symbols_json,
     };
-    let symbols = if stdin == 1 {
+    let SymbolCommand::Query(SymbolArgs {
+        input,
+        stdin,
+        editor,
+        name,
+        filters,
+    }) = command
+    else {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    };
+    let path = std::path::Path::new(input);
+    let query = || match (filters.is_empty(), editor) {
+        (false, _) => contract::editor_elements_json(path, &filters),
+        (true, true) => contract::editor_symbols_json(path, name),
+        (true, false) => contract::symbols_json(path, name),
+    };
+    let symbols = if stdin {
         let mut text = String::new();
         if let Err(cause) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
             eprintln!("contract symbols: stdin: {cause}");
             return ExitCode::from(1);
         }
-        contract::with_contract_texts(vec![(path.into(), text)], || query(path, name))
+        contract::with_contract_texts(vec![(path.into(), text)], query)
     } else {
-        query(path, name)
+        query()
     };
     match symbols {
         Ok(json) => {
@@ -275,6 +273,71 @@ fn symbols(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+struct SymbolArgs<'a> {
+    input: &'a str,
+    stdin: bool,
+    editor: bool,
+    name: Option<&'a str>,
+    filters: Vec<contract::ElementFilters<'a>>,
+}
+
+enum SymbolCommand<'a> {
+    Help,
+    Query(SymbolArgs<'a>),
+}
+
+fn symbol_args(args: &[String]) -> Option<SymbolCommand<'_>> {
+    let mut args = args.iter().map(String::as_str);
+    let (mut input, mut name, mut group) = (None, None, None);
+    let mut filters = Vec::new();
+    let (mut stdin, mut editor) = (false, false);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--help" | "-h" => return Some(SymbolCommand::Help),
+            "--stdin" if !stdin => stdin = true,
+            "--editor" if !editor => editor = true,
+            "--name" if input.is_some() && name.is_none() => name = Some(args.next()?),
+            "--or" => filters.push(group.take()?),
+            "--component" | "--tag" | "--match" | "--has" | "--where" => {
+                let value = args.next().filter(|value| !value.is_empty())?;
+                let filters = group.get_or_insert_with(contract::ElementFilters::default);
+                match arg {
+                    "--component" if filters.component.is_none() => filters.component = Some(value),
+                    "--tag" if filters.tag.is_none() => filters.tag = Some(value),
+                    "--match" => filters.text.push(value),
+                    "--has" => filters.has.push(value),
+                    "--where" => {
+                        let (name, value) = value.split_once('=')?;
+                        let (name, value) = (name.trim(), value.trim());
+                        if name.is_empty() || value.is_empty() {
+                            return None;
+                        }
+                        filters.values.push((name, value));
+                    }
+                    _ => return None,
+                }
+            }
+            _ if !arg.starts_with('-') && input.is_none() => input = Some(arg),
+            _ => return None,
+        }
+    }
+    if let Some(group) = group {
+        filters.push(group);
+    } else if !filters.is_empty() {
+        return None;
+    }
+    if !filters.is_empty() && (!editor || name.is_some()) {
+        return None;
+    }
+    Some(SymbolCommand::Query(SymbolArgs {
+        input: input?,
+        stdin,
+        editor,
+        name,
+        filters,
+    }))
 }
 
 /// `contract sources`: every file compiling the root reads, as JSON, even
@@ -353,8 +416,7 @@ fn sources(args: &[String]) -> ExitCode {
     }
 }
 
-/// `contract types` (TypeScript) or `contract rust` (Rust structs): the
-/// data seam's shapes, derived from the plan.
+/// TypeScript declarations or Rust bindings derived from the plan.
 fn types(
     args: &[String],
     command: &str,
@@ -490,7 +552,7 @@ fn tests(args: &[String]) -> ExitCode {
         }
     };
     match contract::tests(&src).and_then(|t| contract::properties(&src).map(|p| (t, p))) {
-        Ok((t, p)) => {
+        Ok((mut t, mut p)) => {
             let test = std::path::Path::new(input);
             let paired = test.with_file_name(
                 test.file_name()
@@ -503,9 +565,9 @@ fn tests(args: &[String]) -> ExitCode {
             let properties = if p.is_empty() {
                 Ok(())
             } else {
-                contract::check_properties_path(&app, &p)
+                contract::resolve_properties_path(&app, &mut p)
             };
-            let states = contract::check_test_states_path(&app, &t);
+            let states = contract::resolve_test_states_path(&app, &mut t);
             let errors: Vec<_> = properties
                 .err()
                 .into_iter()

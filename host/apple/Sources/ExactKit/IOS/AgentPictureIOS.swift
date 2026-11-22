@@ -15,21 +15,53 @@ extension Agent {
         presenter.menus.endCheck()
     }
 
-    func preparePicture(_ req: [String: Any]) -> AgentPicturePreparation {
+    private func settlePicture(_ req: [String: Any], in window: UIWindow? = nil) -> (loading: Int, moving: Bool) {
         let loading = settleForPicture()
-        // UIKit's own motion lands first, unless the picture is a film's frame (LLP 1116.003 D8).
-        let moving = req["film"] as? Bool != true && !settleMotion()
+        let moving = req["film"] as? Bool != true && req["skipMotion"] as? Bool != true && !settleMotion(in: window)
         // A canvas painting its children through its surface (LLP 1014)
         // shows its last capture: what is pending is captured and rendered
         // at the agent's clock first, as `clock` leaves it.
         if let now = session.clock, session.canvases.waitUntilReady() { session.canvases.settle(now: now) }
         presenter.canvas2d.waitForReplays()
         SvgLink.waitForDrawing?(1)
+        return (loading, moving)
+    }
+
+    func preparePicture(_ req: [String: Any]) -> AgentPicturePreparation {
+        let (loading, moving) = settlePicture(req)
         let guests = session.webviews.snapshots().merging(session.natives.snapshots()) { web, _ in web }
         return AgentPicturePreparation(loading: loading, moving: moving, guests: guests)
     }
 
+    private func displayPicture(_ req: [String: Any]) -> [String: Any] {
+        // A full-screen presentation can detach the viewport. A system overlay can leave that scene inactive.
+        let appWindow = presenter.viewport.window ?? session.view?.window
+        let scene = appWindow?.windowScene ?? MainActor.assumeIsolated {
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            return scenes.first { $0.activationState == .foregroundActive }
+                ?? scenes.first { $0.activationState == .foregroundInactive }
+        }
+        let (loading, moving) = req["probe"] as? Bool == true ? (0, false)
+            : checkPicture.map { ($0.loading, $0.moving) } ?? settlePicture(req, in: scene?.keyWindow ?? appWindow)
+        let window = scene?.keyWindow ?? appWindow
+        var r: [String: Any] = ["front": Agent.frontRefusal(window) ?? true]
+        if let screen = scene?.screen {
+            let space = screen.coordinateSpace
+            r["screen"] = ["w": Agent.r2(space.bounds.width), "h": Agent.r2(space.bounds.height)]
+            if let window, window.convert(window.bounds, to: space) == space.bounds {
+                r["safeArea"] = ["top": Agent.r2(window.safeAreaInsets.top), "bottom": Agent.r2(window.safeAreaInsets.bottom)]
+            }
+        }
+        #if os(iOS)
+        if let bar = scene?.statusBarManager, !bar.isStatusBarHidden { r["statusBar"] = true }
+        #endif
+        noteUnshown(unshownHeaderNodes(), in: &r, struckThrough: false)
+        pictureDetails(&r, presented: presentedOverApp(), loading: loading, moving: moving, display: true)
+        return r
+    }
+
     func screenshot(_ req: [String: Any]) -> [String: Any] {
+        if req["window"] as? String == "display" { return displayPicture(req) }
         // The simulator driver's check, after it read the display, that the display was still this app's.
         if req["probe"] as? Bool == true { return ["front": displayFront()] }
         guard let path = req["path"] as? String else { return ["malformed": true, "error": "screenshot needs a path"] }
@@ -77,9 +109,7 @@ extension Agent {
         session.natives.redrawForCapture()
         // Header nodes the app's navigation bar leaves out, as the agent's
         // chrome paints them: struck through in red (LLP 1116 D2).
-        let unshown = presenter.navigation.unshownByBar().keys.sorted().compactMap { presenter.views[$0] }.filter {
-            $0.window != nil && !$0.isHidden && $0.bounds.width > 0 && $0.bounds.height > 0
-        }
+        let unshown = unshownHeaderNodes()
         let png = UIGraphicsImageRenderer(size: size, format: format).pngData { _ in
             captureView.drawHierarchy(in: CGRect(origin: CGPoint(x: -margins.left, y: -margins.top), size: captureView.bounds.size), afterScreenUpdates: true)
             UIColor.systemRed.setStroke()
@@ -117,19 +147,33 @@ extension Agent {
                 r["materials"] = [Agent.r2(area.minX), Agent.r2(area.minY), Agent.r2(area.width), Agent.r2(area.height)]
             }
         }
-        if moving { r["moving"] = true }
         #if os(iOS)
         // The status bar is SpringBoard's, never in the window's picture: its height, for the simulator driver to put it in (devices.mjs `withDisplay`).
         if wholeWindow, let bar = vp.window?.windowScene?.statusBarManager?.statusBarFrame.height, bar > 0, !(vp.window?.windowScene?.statusBarManager?.isStatusBarHidden ?? true) { r["statusBar"] = Agent.r2(bar) }
         // The window's own safe area, whatever the page's `viewport-fit`: the rows `compare` leaves out (the home indicator's too).
         if wholeWindow, let window = vp.window { r["safeArea"] = ["top": Agent.r2(window.safeAreaInsets.top), "bottom": Agent.r2(window.safeAreaInsets.bottom)] }
         #endif
+        noteUnshown(unshown, in: &r, struckThrough: true)
+        pictureDetails(&r, presented: presented, loading: loading, moving: moving)
+        return r
+    }
+
+    private func unshownHeaderNodes() -> [NodeView] {
+        presenter.navigation.unshownByBar().keys.sorted().compactMap { presenter.views[$0] }.filter {
+            $0.window != nil && !$0.isHidden && $0.bounds.width > 0 && $0.bounds.height > 0
+        }
+    }
+
+    private func noteUnshown(_ nodes: [NodeView], in r: inout [String: Any], struckThrough: Bool) {
+        guard !nodes.isEmpty else { return }
+        r["unshown"] = nodes.map { n -> [String: Any] in ["id": Int(n.id), "testId": n.props["testId"] ?? NSNull()] }
+        r["unshownNote"] = struckThrough ? "struck through in red: \(RouteGeometry.unshownReason)" : RouteGeometry.unshownReason
+    }
+
+    private func pictureDetails(_ r: inout [String: Any], presented: String?, loading: Int, moving: Bool, display: Bool = false) {
+        if moving { r["moving"] = true }
         if let presented { r["presented"] = presented }
         if loading > 0 { r["imagesPending"] = loading }
-        if !unshown.isEmpty {
-            r["unshown"] = unshown.map { n -> [String: Any] in ["id": Int(n.id), "testId": n.props["testId"] ?? NSNull()] }
-            r["unshownNote"] = "struck through in red: \(RouteGeometry.unshownReason)"
-        }
         // What the picture shows in the page that the app presents as UIKit's
         // own, said where the image cannot (euxy port, FRICTION §2).
         // Under native presentation what is still painted is what a person sees painted too (a content popover).
@@ -143,17 +187,19 @@ extension Agent {
             r["chrome"] = bars.map { n -> [String: Any] in ["id": Int(n.id), "testId": n.props["testId"] ?? NSNull()] }
             r["chromeNote"] = "--chrome agent paints the authored header and tablist: the app shows UIKit's navigation bar and tab bar for them, which --chrome platform (exact.mjs's default) shows and `screenshot <png> window` draws"
         }
-        // The software keyboard is not in the capture, which UIKit draws in a process of its own, and the app may
-        // stand above it (LLP 1102 §3.17): say so, where the image alone reads as a shortened screen. The simulator
-        // driver puts the keyboard's pixels in a window capture (`windowTop`, LLP 1116.008 D8; devices.mjs).
+        // A window render omits the software keyboard (LLP 1102 §3.17). The simulator driver can add its pixels
+        // from `windowTop` (LLP 1116.008 D8; devices.mjs).
         let container = session.presenter.keyboardContainer
         if let top = container.flatMap({ session.presenter.keyboardGuideTop(in: $0) }) {
             var keyboard: [String: Any] = ["visible": true, "top": Agent.r2(top)]
             if let window = keyboardTopForCheck() { keyboard["windowTop"] = Agent.r2(window) }
+            if display {
+                keyboard["captured"] = true
+            } else {
+                r["note"] = "the software keyboard is up: it is not in the capture, and the app above it may be shortened (state shows keyboard.top)"
+            }
             r["keyboard"] = keyboard
-            r["note"] = "the software keyboard is up: it is not in the capture, and the app above it may be shortened (state shows keyboard.top)"
         }
-        return r
     }
 
 }

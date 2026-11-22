@@ -216,7 +216,7 @@ impl Manifest {
 
     /// Whether a game's generated `.shells/app.json`, which [`Manifest::read`]
     /// prefers, was resolved from another `app.json` than `app_dir` holds now.
-    /// The bake records the authored file's content digest beside it
+    /// Contract preparation and the bake record the authored file's digest beside it
     /// (`game/app/shells.mjs`); a missing record counts as another.
     pub fn generated_stale(app_dir: &Path) -> bool {
         use sha2::{Digest, Sha256};

@@ -120,7 +120,7 @@ final class Canvas2DRecordTests: XCTestCase {
     /// sheet): stretched into the old box until the view lays out.
     func testARecordingShowsInItsPlacedBox() throws {
         let host = Canvas2DHost(), parent = CALayer()
-        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: [])
+        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: []) { _ in CGRect(x: 0, y: 0, width: 150, height: 100) }
         var wider = op([list(cover)], fresh: true)
         wider["w"] = 340
         host.apply(7, wider, layer: parent)
@@ -132,7 +132,7 @@ final class Canvas2DRecordTests: XCTestCase {
         let recorder = try XCTUnwrap(layer.sublayers?.compactMap { $0 as? Canvas2DRecordLayer }.first)
         XCTAssertFalse(recorder.isHidden)
         XCTAssertEqual(recorder.bounds.size, CGSize(width: 150, height: 100), "the placed box, not the drawn size")
-        host.place(7, in: CGRect(x: 0, y: 0, width: 170, height: 100), radii: [])
+        host.place(7, in: CGRect(x: 0, y: 0, width: 170, height: 100), radii: []) { _ in CGRect(x: 0, y: 0, width: 170, height: 100) }
         XCTAssertEqual(layer.frame.width, 170)
         XCTAssertEqual(recorder.bounds.size, CGSize(width: 170, height: 100))
     }

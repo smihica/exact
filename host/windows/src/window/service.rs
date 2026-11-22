@@ -47,6 +47,7 @@ impl<D: DataSource + Default + 'static> App<D> {
             }
             crate::orientation::apply(p);
             p.hatch_turn();
+            p.poll_images();
             if let Some(e) = p.admit_idle_timer(self.started.elapsed().as_secs_f64() * 1000.0) {
                 eprintln!("exact-windows: {e}");
             }
@@ -86,6 +87,14 @@ impl<D: DataSource + Default + 'static> App<D> {
                     p.hardware_pad(index, connected, buttons, axes, at)
                 },
             );
+        }
+        if let Some(window) = &self.window {
+            if apply_title(&mut self.title, p, window, &self.name) {
+                if let Some(access) = &mut self.accessibility {
+                    // A full accessibility refresh can render a canvas before the display frame.
+                    access.set_title(self.title.caption(&self.name));
+                }
+            }
         }
         if let Err(e) = self.timers.update(
             p.native_timer_generation(),

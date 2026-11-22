@@ -3,6 +3,7 @@
 //! against the small viewport where none does.
 use super::*;
 use crate::kernel::{Keyboard, KeyboardPolicy};
+use crate::Dimension;
 
 /// `id`'s width and height.
 fn size(k: &Kernel, id: ViewId) -> (f32, f32) {
@@ -67,6 +68,29 @@ fn a_percentage_beside_a_container_unit_reads_the_container() {
     let mut k = owner(300.0, 600.0, ops);
     lay_out(&mut k);
     assert_eq!((size(&k, 3).0, size(&k, 4).0), (270.0, 270.0));
+}
+
+#[test]
+fn an_object_position_reads_its_owners_content_root() {
+    let mut ops = create(3..=4);
+    for (id, value) in [(3, "10cqw top"), (4, "calc(10cqw + 5px) top")] {
+        ops.push(style(id, vec![], &[(StyleId::ObjectPosition, value)]));
+    }
+    ops.extend([children(1, &[2]), children(2, &[3, 4])]);
+    let mut k = owner(300.0, 600.0, ops);
+    let offset = |k: &Kernel, id| {
+        let env = k.env_of(id);
+        k.node(id).unwrap().style.object_position.resolve(&env).x
+    };
+    lay_out(&mut k);
+    assert_eq!(offset(&k, 3), Dimension::Points(30.0));
+    assert_eq!(offset(&k, 4), Dimension::Points(35.0));
+
+    k.set_host_block(2, Some(block(BlockAxis::Is(200.0), BlockAxis::Is(600.0))))
+        .unwrap();
+    lay_out(&mut k);
+    assert_eq!(offset(&k, 3), Dimension::Points(20.0));
+    assert_eq!(offset(&k, 4), Dimension::Points(25.0));
 }
 
 #[test]

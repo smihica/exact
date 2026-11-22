@@ -269,6 +269,24 @@ check('a shrinking clip reveals children up to the shown box, then restores over
   expect(await evaluate('surface()')).toBeNull();
 });
 
+check('a resized box drops its surface when the paused move leaves the element', async () => {
+  await fixture(`<div id="card" style="${card};overflow:hidden"><div id="body" style="height:100px;width:100px"></div></div>`);
+  await style(card.replace('40px', '140px') + ';overflow:hidden');
+  expect(await evaluate(`(async () => {
+    seek(500);
+    const card = document.getElementById('card');
+    const move = card.getAnimations().find(a => 'translate' in a.effect.getKeyframes()[0]);
+    const during = getComputedStyle(card).clipPath;
+    move.currentTime = move.effect.getComputedTiming().endTime;
+    const goneWhilePaused = move.playState === 'paused' && !card.getAnimations().includes(move);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    const { clipPath, overflow, backgroundColor } = getComputedStyle(card);
+    return { during, goneWhilePaused, clipPath, overflow, backgroundColor,
+      hit: document.elementFromPoint(40, 110).id, hasSurface: !!surface() };
+  })()`)).toEqual({ during: expect.stringContaining('exact-presence-clip'), goneWhilePaused: true,
+    clipPath: 'none', overflow: 'hidden', backgroundColor: 'rgb(255, 0, 0)', hit: 'body', hasSurface: false });
+});
+
 check('a same-name exit is a fresh finite play beside the unchanged infinite animation', async () => {
   for (const paused of [true, false]) {
     await fixture(`<div id="card" style="${card};animation:pulse 1s infinite linear"></div>`);

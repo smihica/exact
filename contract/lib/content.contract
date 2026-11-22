@@ -207,10 +207,11 @@ shape BadgePreferences
 // A status in a word, as "Full", "Cancelled" or "Locked": the label in a
 // capsule, in the caption style (semibold), so a state reads as text, never
 // as a colour alone. `tint` is its fill: `none` the neutral grey, the accent
-// (`some("AccentColor")`) as a tint (the accent at 16% under the label's own
-// ink, which reads on every accent in either scheme: a solid accent under
-// white ink is 1.4:1 on yellow and 3.5:1 on the system blue, short of the
-// 4.5:1 a caption needs), or a state's hue (`some("-exact-system-orange")`
+// (`some("AccentColor")`) or the system blue (the default accent) as a tint
+// (the hue at 16% under the label's own ink, which reads on every accent in
+// either scheme: a solid accent under white ink is 1.4:1 on yellow and 3.5:1
+// on the system blue, 3.2:1 in the dark scheme, short of the 4.5:1 a caption
+// needs), or a state's hue (`some("-exact-system-orange")`
 // for Full, the system red for Cancelled, green for Open). On a hue the ink
 // is white (the label's in the dark scheme, the fill in the page's), as UIKit
 // draws a filled button's title and a badge's count on any colour (black on
@@ -235,9 +236,9 @@ component Badge
       else if fill == "-exact-tertiary-fill"
         row padding="2px 8px" border-radius=999 background-color=fill
           text label font="-exact-caption1" font-weight=600 white-space="nowrap" color="-exact-label"
-      else if fill == "AccentColor"
+      else if fill == "AccentColor" or fill == "-exact-system-blue"
         row position="relative" padding="2px 8px" border-radius=999 overflow="hidden"
-          view position="absolute" inset=0 background-color="AccentColor" opacity=0.16 aria-hidden=true
+          view position="absolute" inset=0 background-color=fill opacity=0.16 aria-hidden=true
           text label font="-exact-caption1" font-weight=600 white-space="nowrap" color="-exact-label"
             position="relative"
       else if ["-exact-system-green", "-exact-system-mint", "-exact-system-teal", "-exact-system-cyan", "-exact-system-yellow", "-exact-system-orange"].includes(fill)

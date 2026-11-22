@@ -64,7 +64,9 @@ fn a_metered_body_declares_one_counter_and_join_steps_at_its_call() {
     );
     assert!(labels.contains("x_join("), "{labels}");
     assert!(
-        js.contains("tg(e2,2,\"text\",()=>{let $s=0;"),
+        js.split("tg(").skip(1).any(|call| call
+            .split_once(',')
+            .is_some_and(|(_, args)| args.starts_with("2,\"text\",()=>{let $s=0;"))),
         "a metered binding is evaluated by its guard: {js}"
     );
 }
@@ -94,19 +96,29 @@ fn each_reset_point_is_its_own_evaluation() {
     assert_eq!(owned.matches("let $s=0").count(), 2, "{owned}");
 }
 
-/// An action knows its string parameters' names, and whether it takes the
-/// row first, so an argument past MAX_STRING is refused naming it.
+/// The string budget names authored arguments, skipping the row and captured props.
 #[test]
 fn act_names_its_string_parameters() {
-    let (_, js) = js("component App\n  state t = \"\"\n  action put(v: string, n: number)\n    t = v\n  resource ids = ids() as shape string[]\n  view\n    column\n      button press=put(\"a\", 1) testId=\"go\"\n        text \"go\"\n      for i in ids key=i\n        Row()\ncomponent Row\n  state got = \"\"\n  action take(w: string)\n    got = w\n  view\n    input value=got input=take testId=\"in\"\n");
+    let (_, js) = js("component App\n  state t = \"\"\n  action put(v: string, n: number)\n    t = v\n  resource ids = ids() as shape string[]\n  view\n    column\n      button press=put(\"a\", 1) testId=\"go\"\n        text \"go\"\n      for i in ids key=i\n        Row(label=i)\ncomponent Row\n  props\n    label: string\n  state got = \"\"\n  action take(w: string)\n    if label != \"\"\n      got = w\n  view\n    input value=got input=take testId=\"in\"\n");
     assert!(
         decl(&js, "a_0").ends_with(",[\"s\",\"n\"],0,[\"v\",0]);"),
         "{js}"
     );
-    assert!(decl(&js, "a_1").ends_with(",[\"s\"],1,[\"w\"]);"), "{js}");
+    assert!(
+        decl(&js, "a_1").ends_with(",[\"s\",\"s\"],1,[0,\"w\"]);"),
+        "{js}"
+    );
     assert!(
         js.contains("sig(\"\",\"s\",\"t\")"),
         "a string slot is named: {js}"
+    );
+    assert!(
+        js.contains(r#""got""#),
+        "the row state names its declaration: {js}"
+    );
+    assert!(
+        !js.contains(r#""got#"#),
+        "the row state shipped its namespace: {js}"
     );
 }
 
@@ -218,17 +230,16 @@ fn labels_are_only_built_on_the_trap_path() {
 
 #[test]
 fn at_read_rows_share_the_readers_list_and_call_budgets() {
-    let mut plan = contract::compile("component App\n  state xs = [1, 2]\n  derive picked = xs.map(x => x + 1)\n  view\n    text `${picked.length}`\n").unwrap();
-    plan.derives[0].unsettled = true;
+    let mut plan = contract::compile(
+        "component App\n  state xs = [1, 2]\n  state ys = [3, 4]\n  derive picked = xs.map(x => x + 1)\n  derive other = ys.map(x => x + 2)\n  view\n    column\n      text `${picked.length}`\n      text `${picked.length}/${other.length}`\n",
+    ).unwrap();
+    for row in &mut plan.derives {
+        row.unsettled = true;
+    }
     let js = crate::emit::emit(&plan, false, false).unwrap().js;
-    assert!(
-        js.contains("const d_0=($budget={s:0,n:0,d:0},$pc)=>"),
-        "{js}"
-    );
-    assert!(js.contains("++$budget.s>65536"), "{js}");
+    assert!(js.contains("const d_0=$atRead("), "{js}");
+    assert_eq!(js.matches("++$budget.s>65536").count(), 1, "{js}");
     assert!(js.contains("d_0(undefined,"), "{js}");
-    assert!(!js.contains("const d_0=memo"), "{js}");
-    assert!(js.contains("finally{$budget.d--}"), "{js}");
     assert!(!js.contains("const d_0=memo"), "{js}");
 }
 

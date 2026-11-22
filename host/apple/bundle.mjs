@@ -6,6 +6,7 @@ import { packageWidgets, packageAlarmExtension, widgetId, entryProfiles, activit
 import { packageNotificationService, packageShareExtension, notificationServiceEntitlements, notificationServiceProfile, shareInfo, shareId, macShareEntitlements } from './extensions.mjs';
 import { createHash } from 'node:crypto';
 import { spawnSync } from './toolchain.mjs';
+import { repackBase } from './native-extras.mjs';
 import { resolve, basename, dirname } from 'node:path';
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { verifyBakeFiles } from '../../scripts/app.mjs';
@@ -13,9 +14,9 @@ import { unclaimedNote } from '../../scripts/links.mjs';
 import { webRefusal, browserEntitlements } from './documents.mjs';
 import { memoryEntitlements, alarmKeys } from './plist.mjs';
 import { listAssets } from '../web/serve.mjs';
-import { appIcon, buildInfo, iosAssets, appleAssets, copyNativeResources, IOS_RESOURCE_ROOT, iosBundleGrants, iosExecutableRefusal, shareIosResources, iconFiles, signingOrder, helperEntitlements, wrapFramework, assertArchiveFrameworks, plistFile } from './assets.mjs';
+import { appIcon, buildInfo, iosAssets, appleAssets, appleAssetsKey, bakedAssetInputs, copyNativeResources, IOS_RESOURCE_ROOT, iosBundleGrants, iosExecutableRefusal, shareIosResources, iconFiles, signingOrder, helperEntitlements, wrapFramework, assertArchiveFrameworks, plistFile } from './assets.mjs';
 import { allows, profile, identity, embeddedProfile, installedProfiles } from './devices.mjs';
-import { grantEntitlements, grantEntitlementValues, macHostIdentity } from './presence.mjs';
+import { grantEntitlements, grantEntitlementValues, macHostIdentity, namedClip } from './presence.mjs';
 import { stripForDistribution, stripProductionExecutable } from './link.mjs';
 import { assertLibraryNames, placeLibrary } from '../../scripts/package-libraries.mjs';
 import { embedWatch, watchProfiles, watchSyncKeys, watchSyncSelected } from './watch.mjs';
@@ -258,7 +259,10 @@ export function assembleIOS({intents, shared, library, moduleLibraries = [], pac
   // `host.ios.resources`, before anything is signed: `bundle:/` (LLP 1133.007 D6).
   copyNativeResources(app, resolve(bundle, IOS_RESOURCE_ROOT), buildReceipt.binary.metadata.nativeResources ?? [], 'ios');
   verifyBakeFiles(bakedCompat, bakedPlan, listAssets(bundle, true, ['typescript']));
-  const assetKeys = iosAssets(app, bundle, device, { tv, catalog: production, requireIcon: distribution, kept: { dir: resolve(linkRoot, 'assets'), stamp: swiftc }, icons: buildReceipt.graph.appleIcons ?? [], expected: buildReceipt.binary.metadata.appleAssetCatalogs ?? [], ...(tv ? {} : { expectedLaunchImage: buildReceipt.binary.metadata.launchImage ?? null }), launch: buildReceipt.graph.launchBackground });
+  const assetKeys = iosAssets(app, bundle, device, { tv, catalog: production, requireIcon: distribution, kept: { dir: resolve(linkRoot, 'assets'), stamp: swiftc }, ...bakedAssetInputs(buildReceipt.graph), expected: buildReceipt.binary.metadata.appleAssetCatalogs ?? [], ...(tv ? {} : { expectedLaunchImage: buildReceipt.binary.metadata.launchImage ?? null }) });
+  // Experimental: a development archive records what its icons were made from and the keys they gave Info.plist, so a
+  // repack (repack.mjs) whose icon inputs are the same takes the base's icons instead of drawing them again.
+  if (repackBase({ ios: true, tv, device, ipa, developmentArchive: args.includes('--development'), distribution: distribution || production })) buildReceipt.assets = { key: appleAssetsKey(app, { platform: 'ios', device, catalog: production, stamp: swiftc, ...bakedAssetInputs(buildReceipt.graph) }), keys: assetKeys, stamp: swiftc };
   const stamp = { ...rosterKeys, ...(production ? distributionKeys(sdkName) : {}), ...buildInfo(app, { root, archive: !!ipa && distribution, production: production || distribution, ...stampSdk }) };
   writeFileSync(resolve(bundle, 'Info.plist'), infoPlist(app, device, { development, distributed: distribution, reach: appleReach, icon: { ...assetKeys, ...(!tv ? watchSyncKeys(app, bakedCompat.inputs?.grantCeiling) : {}) }, distribution: stamp, tv }));
   if (!tv && watchSyncSelected(app)) writeFileSync(resolve(bundle, 'watch-sync.plan'), bakedPlan);
@@ -313,10 +317,11 @@ export function assembleIOS({intents, shared, library, moduleLibraries = [], pac
   const required = appleReach?.entitlements ?? [], appRequired = [...required, ...browserEntitlements({ ...app, widgetTV: tv }, distribution), ...memoryEntitlements({ ...app, widgetTV: tv })];
   const values = grantEntitlementValues(app, appleReach);
   // With entries, the app's and the extension's profiles together, each granting the shared groups (LLP 1126.001 WP13).
-  const provisioned = shared && device && !unsigned ? entryProfiles({ app, udid: ph?.udid, required: appRequired, values }) : null;
+  const provisioned = device && !unsigned && (shared || (!tv && app.manifest.share_target)) ? entryProfiles({ app, udid: ph?.udid, required: appRequired, values }) : null;
   const appProfile = device && !unsigned ? provisioned?.app ?? (allows(prof, appRequired, values) ? prof : profile(ph?.udid, app.id, appRequired, { values })) : null;
+  if (distribution && clip && appProfile && !namedClip(app, appProfile)) console.error(`host/apple: the app's profile "${appProfile.name}" does not let the app name its App Clip ${clip.id}, as App Store Connect asks (ITMS-90876). A profile made before the clip's App ID was registered cannot: make it again.`);
   // The clip's profile is for its own App ID, of the app's profile's team, prefix and method, as the extension's is.
-  const profiles = { host: () => profile(ph?.udid, `${app.id}.host`, required, { values: grantEntitlementValues({ id: `${app.id}.host` }, appleReach) }), clip: () => embeddedProfile(ph?.udid, clip.id, appProfile, [...grantEntitlements({ ...app, clipParent: app.id }, required), 'com.apple.developer.parent-application-identifiers']) };
+  const profiles = { host: () => profile(ph?.udid, `${app.id}.host`, required, { values: grantEntitlementValues({ id: `${app.id}.host` }, appleReach) }), clip: () => embeddedProfile(ph?.udid, clip.id, appProfile, [...grantEntitlements({ ...app, clipParent: app.id }, required), 'com.apple.developer.parent-application-identifiers', 'com.apple.developer.on-demand-install-capable']) };
   const packageManifests = (buildReceipt.binary.privacyManifests ?? []).slice(1);
   // `watch`: a device build embeds the watch app, signed with profiles of the app's team, prefix and method.
   const companion = watch && appProfile ? watchProfiles({ app, udid: ph?.udid, like: appProfile }) : [];
@@ -325,11 +330,11 @@ export function assembleIOS({intents, shared, library, moduleLibraries = [], pac
     const keptSymbols = ipa || kind !== 'host' ? symbols : resolve(binDir, `${executable}.dSYMs`);
     const signingProfile = appProfile ? (kind === 'app' ? appProfile : profiles[kind]()) : null;
     const alarmProfile = signingProfile && !shared && alarm && !tv && kind === 'app' ? embeddedProfile(ph?.udid, widgetId(app), signingProfile) : null;
-    const signingIdentity = signingProfile ? identity(signingProfile.team, { profiles: [signingProfile, ...(kind === 'app' ? [provisioned?.extension, alarmProfile, ...companion] : [])].filter(Boolean) }) : sha1;
+    const signingIdentity = signingProfile ? identity(signingProfile.team, { profiles: [signingProfile, ...(kind === 'app' ? [provisioned?.extension, provisioned?.share, alarmProfile, ...companion] : [])].filter(Boolean) }) : sha1;
     const ent = resolve(binDir, kind === 'app' ? 'entitlements.plist' : `${kind}-entitlements.plist`);
     if (signingProfile) copyFileSync(signingProfile.path, resolve(assembled, 'embedded.mobileprovision'));
     // Unsigned, the re-signer's profile decides; ask for no debugger, as a distribution profile grants none.
-    writeFileSync(ent, entitlements({ ...app, id, widgetTV: tv, widgetHost: kind === 'host', ...(kind === 'clip' ? { clipParent: app.id } : {}) }, signingProfile?.team, signingProfile?.dev ?? !unsigned, appleReach, { simulator: !device, prefix: signingProfile?.prefix, allows: signingProfile?.entitlements ?? [], distributed: distribution }));
+    writeFileSync(ent, entitlements({ ...app, id, widgetTV: tv, widgetHost: kind === 'host', ...(kind === 'clip' ? { clipParent: app.id } : {}) }, signingProfile?.team, signingProfile?.dev ?? !unsigned, appleReach, { simulator: !device, prefix: signingProfile?.prefix, allows: signingProfile?.entitlements ?? [], profile: signingProfile, distributed: distribution }));
     if (shared && kind === 'app') {
       const group = JSON.parse(runApple('plutil', ['-convert', 'json', '-o', '-', ent], { read: true }).stdout)['keychain-access-groups'][0];
       const keys = widgetAppKeys(app, 'ios', { group: widgetGroup(app), keychain: group });
@@ -364,16 +369,15 @@ export function assembleIOS({intents, shared, library, moduleLibraries = [], pac
       // The extension's identifier and shared Keychain group under its own profile's prefix (entryProfiles refused a pair whose prefixes differ).
       entitlements: entitlements({ ...app, id: widgetId(app), widgetAppId: app.id }, signingProfile?.team, signingProfile?.dev ?? !unsigned, null, { simulator: !device, prefix: provisioned?.extension.prefix ?? signingProfile?.prefix }),
       sign: (extension, ent) => run('codesign', ['--force', '--sign', signingIdentity, '--timestamp=none', ...(device ? ['--entitlements', ent] : []), extension], { stdio: 'ignore' }) });
-    // The share extension (LLP 1133.024 D4): a simulator's group needs no account; a phone's waits for the App Group
-    // and the `.share` App ID on the team, so a device build has no inbox yet and says so.
     if (kind === 'app' && tv && app.manifest.share_target) console.log('Share extension: not built for tvOS, which has no share sheet (LLP 1133.024 D4).');
     if (kind === 'app' && !tv && app.manifest.share_target) {
-      const group = device ? null : widgetGroup(app);
+      const group = widgetGroup(app), share = provisioned?.share;
       for (const [key, value] of Object.entries(shareInfo(app, group))) runApple('plutil', ['-replace', key, '-string', value, resolve(assembled, 'Info.plist')]);
-      if (device) console.log(`Share extension: not built for a device until the team registers the App Group ${widgetGroup(app)} and the App ID ${shareId(app)} (LLP 1133.024 §19).`);
-      else packageShareExtension({ app, bundle: assembled, directory: linkRoot, sdk, triple, group, runApple, production, symbols: keptSymbols ?? linkRoot,
-        entitlements: entitlements({ ...app, id: shareId(app), widgetAppId: app.id }, signingProfile?.team, signingProfile?.dev ?? !unsigned, null, { simulator: true, prefix: signingProfile?.prefix }),
-        sign: (extension) => run('codesign', ['--force', '--sign', signingIdentity, '--timestamp=none', extension], { stdio: 'ignore' }) });
+      // The extension writes the inbox. Only the app and its widgets use the app's Keychain group.
+      const owner = { id: shareId(app), manifest: {} };
+      packageShareExtension({ app, bundle: assembled, directory: linkRoot, sdk, triple, device, group, runApple, production: production || distribution, symbols: keptSymbols ?? linkRoot, profile: share,
+        entitlements: entitlements(owner, share?.team, share?.dev ?? !unsigned, null, { simulator: !device, prefix: share?.prefix, inboxGroup: group }),
+        sign: (extension, ent) => run('codesign', ['--force', '--sign', signingIdentity, '--timestamp=none', ...(device ? ['--entitlements', ent] : []), extension], { stdio: 'ignore' }) });
     }
     if (!shared && alarm && !tv && kind === 'app') packageAlarmExtension({ app, bundle: assembled, directory: linkRoot, sdk, triple, device, runApple, alarm, production, symbols: keptSymbols ?? linkRoot,
       profile: alarmProfile,

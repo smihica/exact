@@ -19,13 +19,25 @@ impl<P> Frame<P> {
 }
 
 impl Painter {
-    /// Place a new shared destination without publishing a stream before its reveal.
-    pub(crate) fn flight_probe(
+    pub(crate) fn replaced(&mut self) {
+        self.native_session = native::new_session();
+        // The new kernel can reuse the old tree's epochs, view IDs and node keys.
+        self.paint_epoch = None;
+        self.discard_rows();
+        self.shared = SharedState::default();
+        self.svg_warned.clear();
+        self.ripples.clear();
+        self.zoom.clear();
+        self.reader_highlights.clear();
+    }
+
+    /// Locate a target for scrolling before publishing its first frame.
+    pub(crate) fn reveal_probe(
         &mut self,
         scene: &Scene<'_>,
         viewport: (f32, f32),
     ) -> Result<Frame<Option<Arc<Pixmap>>>, String> {
-        let backend = std::mem::replace(&mut self.backend, Box::new(layer::Unpainted));
+        let backend = std::mem::replace(&mut self.backend, Box::new(layer::Unpainted::<false>));
         let rows = std::mem::take(&mut self.rows);
         let frame = self.paint_selected_for(scene, viewport, None, None, FrameTarget::Geometry);
         self.rows = rows;
@@ -51,7 +63,12 @@ impl Painter {
         target: FrameTarget,
     ) -> Result<Frame<Option<Arc<Pixmap>>>, String> {
         if target == FrameTarget::Geometry && !self.backend.needs_geometry_paint() {
-            let backend = std::mem::replace(&mut self.backend, Box::new(layer::Unpainted));
+            let unpainted: Box<dyn Backend> = if self.backend.independent_section_rows() {
+                Box::new(layer::Unpainted::<true>)
+            } else {
+                Box::new(layer::Unpainted::<false>)
+            };
+            let backend = std::mem::replace(&mut self.backend, unpainted);
             let frame = self.paint_selected_for(scene, viewport, None, None, target);
             self.backend = backend;
             return frame;

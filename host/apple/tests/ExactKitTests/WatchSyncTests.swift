@@ -4,6 +4,7 @@ import AppKit
 #endif
 import CryptoKit
 import ExactCore
+import ExactSnapshot
 @testable import ExactWatchSync
 @testable import ExactKit
 

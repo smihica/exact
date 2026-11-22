@@ -196,15 +196,27 @@ internal class SoundOutput(
     }
 
     private fun publish(counts: DoubleArray? = null) {
-        val report = report ?: return
-        val state = JSONObject().put("kind", "aaudio").put("state", status).put("skipped", skipped)
+        report?.invoke(snapshot(counts).toString())
+    }
+
+    fun state(): JSONObject = snapshot(if (handle != 0L) backend.counts(handle) else null)
+
+    private fun snapshot(counts: DoubleArray?): JSONObject {
+        val state = snapshot(status, skipped)
         error?.let { state.put("error", it) }
         counts?.let {
             state.put("live", it[0].toLong()).put("dropped", it[1].toLong()).put("late", it[2].toLong())
                 .put("outputLatency", it[3]).put("sampleRate", it[4].toInt()).put("timestamp", it[5] == 1.0)
                 .put("underruns", it[8].toInt()).put("decoded", "$decodedCount/${files.size}")
         }
-        report(state.toString())
+        return state
+    }
+
+    companion object {
+        fun closedState(): JSONObject = snapshot("closed", 0)
+
+        private fun snapshot(status: String, skipped: Long): JSONObject =
+            JSONObject().put("kind", "aaudio").put("state", status).put("skipped", skipped)
     }
 
     private fun close(release: Boolean = true) {

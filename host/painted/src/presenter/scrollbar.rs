@@ -1,5 +1,5 @@
 use super::*;
-use crate::paint::scrollbar::contains;
+use crate::paint::scrollbar::{contains, Bar};
 
 impl<D: DataSource> Presenter<D> {
     /// Refresh Windows' automatic scrollbar visibility after returning to the app.
@@ -20,6 +20,61 @@ impl<D: DataSource> Presenter<D> {
         self.brush.scrollbars.enabled = true;
         self.brush.scrollbars.auto_hide = auto_hide;
         self.dirty = true;
+    }
+
+    fn scrollbar_exposed(&self, bar: &Bar, x: f32, y: f32) -> bool {
+        let Some(owner) = self.boxes.get(bar.owner) else {
+            return false;
+        };
+        owner.id == bar.id
+            && owner.contains(x, y)
+            && self
+                .painted_hit(std::slice::from_ref(owner), x, y, PaintHit::Published)
+                .is_some()
+            && self.boxes.get(bar.above..).is_some_and(|above| {
+                self.painted_hit(above, x, y, PaintHit::ScrollbarCover)
+                    .is_none()
+            })
+    }
+
+    /// Refresh the look from the same published boxes used for presses.
+    pub(crate) fn refresh_scrollbar_hover(&mut self) -> bool {
+        if !self.brush.scrollbars.enabled {
+            return false;
+        }
+        let mut hovered = Vec::new();
+        if let Some((x, y)) = self
+            .hover_point
+            .filter(|&(x, y)| !self.shape_surface_open() && self.display.contains(x, y))
+        {
+            let mut over_track = false;
+            for bar in self.brush.scrollbars.bars.iter().rev() {
+                if contains(bar, bar.port, x, y) && self.scrollbar_exposed(bar, x, y) {
+                    let track = !over_track && contains(bar, bar.track, x, y);
+                    over_track |= track;
+                    hovered.push((bar.key, bar.vertical, track));
+                }
+            }
+        }
+        if self.brush.scrollbars.hovered == hovered {
+            return false;
+        }
+        self.brush.scrollbars.hovered = hovered;
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn scrollbars_shown(&mut self) -> bool {
+        let state = &mut self.brush.scrollbars;
+        if state.drag.is_some_and(|(key, vertical, _)| {
+            !state
+                .bars
+                .iter()
+                .any(|b| (b.key, b.vertical) == (key, vertical))
+        }) {
+            state.drag = None;
+        }
+        self.refresh_scrollbar_hover()
     }
 
     pub(super) fn scrollbar_pointer(&mut self, phase: i32, x: f32, y: f32) -> bool {
@@ -63,31 +118,23 @@ impl<D: DataSource> Presenter<D> {
         if phase == 1 {
             return std::mem::take(&mut self.brush.scrollbars.pressed);
         }
-        if phase != 0 {
+        if phase != 0 || !self.display.contains(x, y) {
             return false;
         }
-        // A press that lands on an open popover is the popover's: no page
-        // scrollbar under it takes it.
-        let on_popover = self.alert.is_some()
-            && !self.alert_inert()
-            && self.hit(x, y).is_some_and(|h| self.alert_holds(h));
+        self.boxes();
         let bar = self
             .brush
             .scrollbars
             .bars
             .iter()
             .rev()
-            .find(|b| {
-                self.alert_allows(b.id)
-                    && (!on_popover || self.alert_holds(b.id))
-                    && contains(b.track, x, y)
-            })
+            .find(|b| contains(b, b.track, x, y) && self.scrollbar_exposed(b, x, y))
             .copied();
         let Some(bar) = bar else {
             return false;
         };
         self.brush.scrollbars.pressed = true;
-        if contains(bar.thumb, x, y) {
+        if contains(&bar, bar.thumb, x, y) {
             self.brush.scrollbars.drag = Some((
                 bar.key,
                 bar.vertical,
@@ -116,6 +163,337 @@ impl<D: DataSource> Presenter<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PANEL: &str = r##"      column position="absolute" left=150 top=25 width=132 height=145 z-index=10 background-color="#e1eddf"
+        button "Panel action" press=click appearance="none" width="100%" height="100%" background-color="#e1eddf" border-width=0"##;
+
+    fn covered(panel: &str) -> Presenter<()> {
+        let source = format!(
+            r##"component App
+  state count = 0
+  action click
+    count = count + 1
+  view
+    column width=400 height=260 position="relative" background-color="#ffffff"
+      textarea testId="editor" value="one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty" position="absolute" left=20 top=15 width=200 height=180 box-sizing="border-box" font-size=16 line-height=1.4 resize="none" scrollbar-width=(count == 7 ? "none" : "auto")
+{panel}
+      text `Presses: ${{count}}` position="absolute" left=20 top=210
+"##
+        );
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(&source),
+            (),
+            (400., 260.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.set_scrollbars(false);
+        p
+    }
+
+    #[test]
+    fn a_higher_panel_covers_the_textarea_scrollbar() {
+        let mut p = covered(PANEL);
+        p.pointer_move(215., 53., 0.).unwrap();
+        let pixels = p.frame();
+        let pixel = pixels.pixel(215, 53).unwrap();
+        let rgb = [pixel.red(), pixel.green(), pixel.blue()];
+        for (index, x) in [180., 208., 211., 215., 219., 220.].into_iter().enumerate() {
+            p.pointer_down(x, 53., 10. * index as f64 + 1.).unwrap();
+            p.pointer_up(x, 53., 10. * index as f64 + 2.).unwrap();
+            p.frame();
+        }
+        assert_eq!(
+            (rgb, p.host.runner().slot("count")),
+            ([225, 237, 223], Some(&exact_runner::Value::Number(6.)))
+        );
+        let kernel = p.host.kernel();
+        let editor = kernel
+            .node_by_key(kernel.find_by_test_id("editor")[0])
+            .unwrap()
+            .id;
+        p.pointer_down(215., 21., 61.).unwrap();
+        p.pointer_move(215., 61., 62.).unwrap();
+        p.pointer_up(215., 61., 63.).unwrap();
+        let dragged = p.scroll_of(editor).1;
+        assert!(dragged > 0., "the exposed thumb can be grabbed");
+        assert_eq!(
+            p.host.runner().slot("count"),
+            Some(&exact_runner::Value::Number(6.))
+        );
+
+        p.pointer_down(220., 53., 64.).unwrap();
+        p.pointer_up(220., 53., 65.).unwrap();
+        p.frame();
+        assert!(
+            p.brush.scrollbars.bars.is_empty(),
+            "scrollbar-width is none"
+        );
+        p.wheel_at(145., 53., 0., 48.);
+        assert_eq!(p.scroll_of(editor).1, dragged + 48.);
+
+        p.pointer_down(220., 53., 66.).unwrap();
+        p.pointer_up(220., 53., 67.).unwrap();
+        p.frame();
+        assert_eq!(p.brush.scrollbars.bars.len(), 1);
+        assert_eq!(p.scroll_of(editor).1, dragged + 48.);
+    }
+
+    #[test]
+    fn a_covered_scrollbar_stays_hidden_until_the_pointer_leaves_the_panel() {
+        let mut p = covered(PANEL);
+        p.set_scrollbars(true);
+        let points = [(221., 53.), (215., 53.), (215., 21.)];
+        let reds = points.map(|(x, y)| {
+            p.pointer_move(x, y, 0.).unwrap();
+            p.frame().pixel(214, 21).unwrap().red()
+        });
+        assert_eq!(
+            reds[0], reds[1],
+            "hover over the panel leaves the thumb hidden"
+        );
+        assert!(
+            reds[2] < reds[0],
+            "the exposed track still reveals the thumb"
+        );
+    }
+
+    #[test]
+    fn a_rounded_button_takes_presses_in_its_hit_slop_over_a_scrollbar() {
+        let mut p = covered(
+            r##"      column position="absolute" left=150 top=25 width=132 height=145 z-index=10 background-color="#e1eddf" pointer-events="none"
+        button "Panel action" testId="panel" press=click appearance="none" position="absolute" left=70 top=0 width=62 height=145 background-color="#e1eddf" border-width=0 border-radius=4 pointer-events="auto" -exact-hit-slop="12px""##,
+        );
+        p.frame();
+        let kernel = p.host.kernel();
+        let button = kernel
+            .node_by_key(kernel.find_by_test_id("panel")[0])
+            .unwrap()
+            .id;
+        assert_eq!(p.hit(215., 53.), Some(button));
+        p.pointer_down(215., 53., 0.).unwrap();
+        p.pointer_up(215., 53., 1.).unwrap();
+        assert_eq!(
+            p.host.runner().slot("count"),
+            Some(&exact_runner::Value::Number(1.))
+        );
+    }
+
+    #[test]
+    fn a_native_button_face_covers_the_textarea_scrollbar() {
+        let mut p = covered(
+            r##"      button "Panel action" testId="panel" press=click appearance="auto" buttonStyle="filled" position="absolute" left=190 top=50 width=120 height=40 z-index=10 border-radius="50%""##,
+        );
+        let pixels = p.frame();
+        let face = pixels.pixel(215, 53).unwrap();
+        assert_eq!(Some(face), pixels.pixel(250, 53));
+        assert!(face.blue() > face.red());
+        let kernel = p.host.kernel();
+        let editor = kernel
+            .node_by_key(kernel.find_by_test_id("editor")[0])
+            .unwrap()
+            .id;
+        let button = kernel
+            .node_by_key(kernel.find_by_test_id("panel")[0])
+            .unwrap()
+            .id;
+        assert_eq!(p.hit(215., 53.), Some(button));
+
+        p.pointer_down(215., 53., 0.).unwrap();
+        p.pointer_up(215., 53., 1.).unwrap();
+        let presses = p.host.runner().slot("count").cloned();
+        p.pointer_down(215., 53., 2.).unwrap();
+        p.pointer_move(215., 70., 3.).unwrap();
+        p.pointer_up(215., 70., 4.).unwrap();
+        assert_eq!(
+            (presses, p.scroll_of(editor).1),
+            (Some(exact_runner::Value::Number(1.)), 0.)
+        );
+    }
+
+    #[test]
+    fn a_closed_select_face_covers_the_textarea_scrollbar() {
+        const NEUTRAL: &str = "EXACT_SELECT_SCROLLBAR_NEUTRAL_TEST";
+        let neutral = std::env::var_os(NEUTRAL).is_some();
+        if neutral {
+            crate::app::show_neutral_look();
+        }
+        let mut p = covered(
+            r##"      select pointerdown=click position="absolute" left=210 top=50 width=120 height=40 z-index=10 border-radius="50%"
+        option "One" value="one""##,
+        );
+        let pixels = p.frame();
+        let face = pixels.pixel(215, 53).unwrap();
+        assert_eq!(Some(face), pixels.pixel(250, 53));
+        assert_ne!(Some(face), pixels.pixel(215, 21));
+        let kernel = p.host.kernel();
+        let editor = kernel
+            .node_by_key(kernel.find_by_test_id("editor")[0])
+            .unwrap()
+            .id;
+
+        p.pointer_down(215., 53., 0.).unwrap();
+        p.pointer_move(215., 73., 1.).unwrap();
+        p.pointer_up(215., 73., 2.).unwrap();
+        assert_eq!(
+            (p.host.runner().slot("count"), p.scroll_of(editor).1),
+            (Some(&exact_runner::Value::Number(1.)), 0.)
+        );
+        if !neutral {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", std::thread::current().name().unwrap()])
+                .env(NEUTRAL, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn drag_through_panel_corner(panel: &str) {
+        let mut p = covered(panel);
+        let pixels = p.frame();
+        assert_eq!(pixels.pixel(215, 53), pixels.pixel(215, 21));
+        let kernel = p.host.kernel();
+        let editor = kernel
+            .node_by_key(kernel.find_by_test_id("editor")[0])
+            .unwrap()
+            .id;
+
+        p.pointer_down(216., 76., 0.).unwrap();
+        p.pointer_up(216., 76., 1.).unwrap();
+        assert_eq!(
+            p.host.runner().slot("count"),
+            Some(&exact_runner::Value::Number(1.)),
+            "the part of the button that covers the track takes the click"
+        );
+
+        p.pointer_down(215., 53., 2.).unwrap();
+        p.pointer_move(215., 84., 3.).unwrap();
+        p.pointer_up(215., 84., 4.).unwrap();
+        assert!(
+            p.scroll_of(editor).1 > 0.,
+            "the exposed thumb can be grabbed"
+        );
+    }
+
+    #[test]
+    fn a_scrollbar_can_be_grabbed_outside_a_rounded_border() {
+        drag_through_panel_corner(
+            r##"      button "Panel action" press=click appearance="none" position="absolute" left=210 top=50 width=80 height=80 z-index=10 border-radius=40 background-color="#e1eddf" border-width=0"##,
+        );
+    }
+
+    #[test]
+    fn a_scrollbar_can_be_grabbed_outside_a_projected_rounded_border() {
+        drag_through_panel_corner(
+            r##"      button "Panel action" press=click appearance="none" position="absolute" left=210 top=50 width=80 height=80 z-index=10 rotate="y 5deg" border-radius=40 background-color="#e1eddf" border-width=0"##,
+        );
+    }
+
+    #[test]
+    fn a_scrollbar_can_be_grabbed_outside_a_rotated_overflow_clip() {
+        drag_through_panel_corner(
+            r##"      column position="absolute" left=210 top=50 width=80 height=80 z-index=10 rotate="45deg" overflow="hidden"
+        button "Panel action" press=click appearance="none" position="absolute" left=-60 top=-60 width=200 height=200 background-color="#e1eddf" border-width=0"##,
+        );
+    }
+
+    #[test]
+    fn a_scrollbar_drag_lasts_until_the_display_acknowledges_its_removal() {
+        let source = r#"component App
+  state shown = true
+  action hide
+    shown = false
+  view
+    column
+      column testId="port" width=200 height=180 overflow-y="auto" scrollbar-width=(shown ? "auto" : "none")
+        box height=620 flex-shrink=0
+      button "Hide" testId="hide" press=hide
+"#;
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &crate::test_plan(source),
+            (),
+            (260., 260.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.set_scrollbars(false);
+        let shown = p.display_frame().unwrap();
+        assert!(p.display_complete(&shown));
+        let bar = p.brush.scrollbars.bars[0];
+        p.pointer_down(194., 10., 0.).unwrap();
+        assert!(p.brush.scrollbars.drag.is_some());
+        let kernel = p.host.kernel();
+        let hide = kernel
+            .node_by_key(kernel.find_by_test_id("hide")[0])
+            .unwrap()
+            .id;
+        assert_eq!(p.host.dispatch_at(hide, Event::Press, 1.), None);
+        assert_eq!(p.after_commit(), None);
+        let hidden = p.display_frame().unwrap();
+        p.pointer_move(194., 50., 2.).unwrap();
+        assert!(
+            p.scroll_of(bar.id).1 > 0.,
+            "the displayed thumb can still drag"
+        );
+        assert!(p.brush.scrollbars.drag.is_some());
+        assert!(p.display_complete(&hidden));
+        assert!(p.brush.scrollbars.drag.is_none());
+        let offset = p.scroll_of(bar.id);
+        p.pointer_move(194., 90., 3.).unwrap();
+        p.pointer_up(194., 90., 4.).unwrap();
+        assert_eq!(p.scroll_of(bar.id), offset);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn a_scrollbar_in_a_retained_row_uses_its_scroller_clip() {
+        let source = r##"component App
+  view
+    column width=320 height=360 overflow-y="auto"
+      column testId="inner" width=200 height=240 overflow-y="auto" flex-shrink=0 background-color="#ffffff"
+        box height=1020 flex-shrink=0
+      box height=200 flex-shrink=0
+"##;
+        let plan = crate::test_plan(source);
+        let offsets = [PainterChoice::Cpu, PainterChoice::Ink].map(|choice| {
+            let (mut p, error) = Presenter::boot_with_fixture_fonts(
+                &plan,
+                (),
+                (320., 180.),
+                1.,
+                PathBuf::new(),
+                choice,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            p.set_scrollbars(false);
+            let pixels = p.frame();
+            let drawn = pixels.pixel(194, 10).unwrap().red() < 255;
+            let kernel = p.host.kernel();
+            let inner = kernel
+                .node_by_key(kernel.find_by_test_id("inner")[0])
+                .unwrap()
+                .id;
+            p.pointer_down(194., 10., 0.).unwrap();
+            p.pointer_move(194., 50., 1.).unwrap();
+            p.pointer_up(194., 50., 2.).unwrap();
+            (drawn, p.scroll_of(inner).1)
+        });
+        assert!(offsets[0].0 && offsets[0].1 > 0., "{offsets:?}");
+        assert_eq!(offsets[1], offsets[0]);
+    }
 
     fn input(direction: &str) -> (Presenter<()>, ViewId) {
         let value = if direction == "rtl" {

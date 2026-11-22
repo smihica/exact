@@ -290,6 +290,7 @@ fn split_scrollbar_policy_and_hover_changes_repaint_both_panes() {
                 p.set_scrollbars(auto_hide);
             }
             p.hover_point = hover;
+            p.refresh_scrollbar_hover();
             if step == 1 {
                 act(&mut p, "change", vec![Value::str("A changed detail")]);
             }
@@ -351,7 +352,7 @@ fn text_in_a_sheet_stack_repaints_the_whole_frame_with_a_split_active() {
         }
         p.pointer = None;
         p.blur();
-        p.brush.scrollbars.pointer = Some((1100., 200.));
+        p.hover_point = Some((1100., 200.));
         let route = id(
             &p,
             if pushed {

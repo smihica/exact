@@ -385,3 +385,130 @@ fn mouse_file_press_precedes_production_picker_refusal() {
     }
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn caret_reveal_reports_scroll_after_selection_and_keyboard_moves() {
+    caret_reveal_reports_scroll(PainterChoice::Cpu);
+}
+
+#[cfg(windows)]
+#[test]
+fn caret_reveal_reports_scroll_after_selection_and_keyboard_moves_with_ink() {
+    caret_reveal_reports_scroll(PainterChoice::Ink);
+}
+
+fn caret_reveal_reports_scroll(choice: PainterChoice) {
+    super::pin_font();
+    let source = r#"component App
+  state top = -1
+  state reports = 0
+  state callbackY = -1
+  state measuredY = -1
+  action moved(x: number, y: number)
+    top = y
+    reports = reports + 1
+    let r = rangeFrame("editor", 16, 17)
+    callbackY = r.y
+  action measure
+    let r = rangeFrame("editor", 16, 17)
+    measuredY = r.y
+  action findLast
+    focus("editor")
+    setSelectionRange("editor", 16, 17)
+  action scrollUp
+    scrollBy("editor", 0, -20)
+  view
+    column gap=8 padding=8
+      button testId="find" press=findLast retainFocus=true
+        text "Find last line"
+      button testId="scroll-up" press=scrollUp retainFocus=true
+        text "Scroll up 20"
+      button testId="measure" press=measure retainFocus=true
+        text "Measure"
+      textarea id="editor" testId="editor" value="a\nb\nc\nd\ne\nf\ng\nh\ni" scroll=moved appearance="none" width=320 height=55 overflow-y="auto" font-size=15 line-height="20px"
+      text `reports=${reports} top=${top}` testId="log"
+"#;
+    let (mut p, error) = Presenter::boot_with(
+        &contract::compile(source).unwrap().encode(),
+        (),
+        (500., 300.),
+        1.,
+        std::path::PathBuf::new(),
+        choice,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let expected = if choice == PainterChoice::Ink {
+        "ink"
+    } else {
+        "cpu"
+    };
+    let paint = |p: &mut Presenter<()>| {
+        p.frame();
+        assert!(
+            p.last_frame_succeeded(),
+            "the selected painter must draw the frame"
+        );
+        assert_eq!(
+            p.painter.name, expected,
+            "a fallback does not qualify this painter"
+        );
+    };
+    let named = |p: &Presenter<()>, name: &str| {
+        let k = p.host().kernel();
+        k.node_by_key(k.find_by_test_id(name)[0]).unwrap().id
+    };
+    let number =
+        |p: &Presenter<()>, name: &str| p.host().runner().slot(name).unwrap().as_number().unwrap();
+    let measure = |p: &mut Presenter<()>| {
+        p.tap(named(p, "measure")).unwrap();
+        p.run_commands(<()>::default);
+        number(p, "measuredY")
+    };
+    let editor = named(&p, "editor");
+    paint(&mut p);
+    assert_eq!(p.scroll_of(editor), (0., 0.));
+    assert_eq!(number(&p, "reports"), 0.);
+
+    p.tap(named(&p, "find")).unwrap();
+    p.run_commands(<()>::default);
+    paint(&mut p);
+    let end = p.scroll_of(editor).1;
+    assert!(end > 20., "the selection must reveal the last line");
+    assert_eq!(number(&p, "top"), end as f64);
+    assert_eq!(number(&p, "reports"), 1.);
+    assert_eq!(
+        number(&p, "callbackY"),
+        measure(&mut p),
+        "rangeFrame() in scroll= must see the post-reveal position"
+    );
+
+    p.tap(named(&p, "scroll-up")).unwrap();
+    p.run_commands(<()>::default);
+    paint(&mut p);
+    assert_eq!(p.scroll_of(editor).1, end - 20.);
+    assert_eq!(number(&p, "top"), (end - 20.) as f64);
+    assert_eq!(number(&p, "reports"), 2.);
+
+    p.hold_modifier("ControlLeft", true);
+    for (key, top, reports) in [("Home", 0., 3.), ("Home", 0., 3.), ("End", end, 4.)] {
+        p.type_key(editor, key, key, true, false).unwrap();
+        p.type_key(editor, key, key, false, false).unwrap();
+        paint(&mut p);
+        assert_eq!(p.scroll_of(editor).1, top);
+        assert_eq!(number(&p, "top"), top as f64);
+        assert_eq!(number(&p, "reports"), reports);
+        assert_eq!(
+            number(&p, "callbackY"),
+            measure(&mut p),
+            "rangeFrame() in scroll= after {key} must see the post-reveal position"
+        );
+        paint(&mut p);
+        assert_eq!(
+            number(&p, "reports"),
+            reports,
+            "a repaint must not report a scroll"
+        );
+    }
+    p.hold_modifier("ControlLeft", false);
+}

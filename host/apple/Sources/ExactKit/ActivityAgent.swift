@@ -88,22 +88,22 @@ enum ActivityAgent {
                 let entries = WidgetGallery.activities(in: agent.session.app.resolver)
                 guard let address = request["activity"] as? [String: String], let kind = address["entry"],
                       let entry = entries.first(where: { $0.kind == kind }) else {
-                    throw HeadlessSession.Failure(description: "unknown activity; available: \(entries.map(\.kind).joined(separator: ", "))")
+                    throw ExactFailure(description: "unknown activity; available: \(entries.map(\.kind).joined(separator: ", "))")
                 }
                 let placement = address["placement"] ?? "lockScreen", scheme = address["scheme"] ?? "light"
                 // The stand-in's pixels per point: 1 unless asked, a device's 2 or 3.
                 let scale = CGFloat(Int(address["scale"] ?? "1") ?? 0)
-                guard [1, 2, 3].contains(scale) else { throw HeadlessSession.Failure(description: "activity --scale: 1, 2 or 3") }
+                guard [1, 2, 3].contains(scale) else { throw ExactFailure(description: "activity --scale: 1, 2 or 3") }
                 guard ["lockScreen", "compactLeading", "compactTrailing", "minimal", "expanded"].contains(placement), ["light", "dark"].contains(scheme) else {
-                    throw HeadlessSession.Failure(description: "invalid activity placement or scheme")
+                    throw ExactFailure(description: "invalid activity placement or scheme")
                 }
                 guard ["tree", "state", "screenshot"].contains(op) else {
-                    throw HeadlessSession.Failure(description: "activity gallery supports tree, screenshot, state and app clock")
+                    throw ExactFailure(description: "activity gallery supports tree, screenshot, state and app clock")
                 }
                 if request["availability"] as? Bool == true { return ["available": true] }
                 let given = try address["state"].map { bytes -> [String: Any] in
                     guard let value = try JSONSerialization.jsonObject(with: Data(bytes.utf8)) as? [String: Any] else {
-                        throw HeadlessSession.Failure(description: "activity --state: expected a JSON object")
+                        throw ExactFailure(description: "activity --state: expected a JSON object")
                     }
                     return value
                 }
@@ -146,13 +146,13 @@ enum ActivityAgent {
                     }
                     result["roots"] = roots; result["nodes"] = nodes
                 case "screenshot":
-                    guard let path = request["path"] as? String else { throw HeadlessSession.Failure(description: "screenshot needs a path") }
+                    guard let path = request["path"] as? String else { throw ExactFailure(description: "screenshot needs a path") }
                     guard let image = GalleryCapture.image(ActivityAddressView(preview: preview, placement: placement, width: width), width: width, height: nil, scale: scale),
                           let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-                        throw HeadlessSession.Failure(description: "could not render activity screenshot")
+                        throw ExactFailure(description: "could not render activity screenshot")
                     }
                     CGImageDestinationAddImage(destination, image, nil)
-                    guard CGImageDestinationFinalize(destination) else { throw HeadlessSession.Failure(description: "could not write activity screenshot") }
+                    guard CGImageDestinationFinalize(destination) else { throw ExactFailure(description: "could not write activity screenshot") }
                     result["screenshot"] = path; result["w"] = image.width; result["h"] = image.height; result["scale"] = scale
                     result["rendering"] = "in-process ActivityKit region stand-in"
                 default: break

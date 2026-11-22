@@ -1,7 +1,7 @@
 //! The instanced painter's adapter. @ref LLP 1149 D1.2, D2, D3.1.
 use crate::image::Bitmap;
 use crate::paint::border::BorderFill;
-use crate::paint::{Backend, FrameTarget, GradientPaint, Rect4, Shape, POINTER};
+use crate::paint::{Backend, CanvasUpdate, FrameTarget, GradientPaint, Rect4, Shape, POINTER};
 use crate::raster::tiny_path as path;
 use crate::text::{Paragraph, RunPaint, TextEngine};
 use exact_ink::atlas::Atlas;
@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tiny_skia::{FillRule, Path, PathBuilder, Pixmap, Transform};
 
+#[cfg(target_os = "linux")]
+pub use exact_ink::device::wgpu::scanout;
 mod clips;
 mod effects;
 mod stats;
@@ -110,53 +112,63 @@ impl Ink {
         }
     }
 
-    fn finish_pixels(
+    fn finished_target(&mut self, rotation: exact_ink::Rotation) -> Result<TextureId> {
+        while !self.groups.is_empty() {
+            self.close_group()?;
+        }
+        let mut target = self.end_frame()?;
+        if rotation != exact_ink::Rotation::R0 {
+            let [w, h] = rotation.size(self.size);
+            let rotated = match self.rotated_target {
+                Some(t) => self.device.resize_target(t, w, h)?,
+                None => self.device.create_target(w, h)?,
+            };
+            self.rotated_target = Some(rotated);
+            rotation.blit(&mut self.device, target, self.size, rotated)?;
+            target = rotated;
+        }
+        Ok(target)
+    }
+
+    fn finish_output(
         &mut self,
         rotation: exact_ink::Rotation,
-    ) -> std::result::Result<Pixmap, String> {
+        readback: bool,
+    ) -> std::result::Result<(TextureId, Option<Pixmap>), String> {
         exact_ink::counters::add(exact_ink::counters::Counter::PaintAttempts, 1);
         if let Some(e) = &self.error {
             return Err(e.clone());
         }
-        let mut readback = Instant::now();
+        let mut readback_ms = 0.;
         let result = (|| {
-            while !self.groups.is_empty() {
-                self.close_group()?;
-            }
-            let mut target = self.end_frame()?;
-            // The display's own copy turns the frame; only a readback needs a turned target.
-            #[cfg(all(feature = "scanout", target_os = "linux"))]
-            if self.device.has_scanout() {
-                readback = Instant::now();
-                self.device.scan_out(target, rotation)?;
-                return Ok(vec![0; self.size[0] as usize * self.size[1] as usize * 4]);
-            }
-            if rotation != exact_ink::Rotation::R0 {
+            let target = self.finished_target(rotation)?;
+            let pixels = if readback {
+                let started = Instant::now();
+                let bytes = self.device.readback(target)?;
                 let [w, h] = rotation.size(self.size);
-                let rotated = match self.rotated_target {
-                    Some(t) => self.device.resize_target(t, w, h)?,
-                    None => self.device.create_target(w, h)?,
-                };
-                self.rotated_target = Some(rotated);
-                rotation.blit(&mut self.device, target, self.size, rotated)?;
-                target = rotated;
-            }
-            readback = Instant::now();
-            self.device.readback(target)
+                let pixels = Pixmap::from_vec(bytes, tiny_skia::IntSize::from_wh(w, h).unwrap())
+                    .ok_or_else(|| Error::Invalid("invalid Ink readback".into()))?;
+                readback_ms = started.elapsed().as_secs_f64() * 1000.;
+                Some(pixels)
+            } else {
+                None
+            };
+            Ok((target, pixels))
         })();
-        let bytes = self
+        let frame = self
             .accept(result)
             .ok_or_else(|| self.error.clone().unwrap())?;
-        let render_ms = self.layer_ms;
-        let pixels = Pixmap::from_vec(
-            bytes,
-            tiny_skia::IntSize::from_wh(rotation.size(self.size)[0], rotation.size(self.size)[1])
-                .unwrap(),
-        )
-        .ok_or("invalid ink readback")?;
-        self.last_ms = (render_ms, readback.elapsed().as_secs_f64() * 1000.);
+        self.last_ms = (self.layer_ms, readback_ms);
         self.update_statistics();
-        Ok(pixels)
+        Ok(frame)
+    }
+
+    fn finish_pixels(
+        &mut self,
+        rotation: exact_ink::Rotation,
+    ) -> std::result::Result<Pixmap, String> {
+        self.finish_output(rotation, true)
+            .map(|(_, pixels)| pixels.expect("Ink read back the completed target"))
     }
 
     /// Device and shader timings reported by the presenter.
@@ -427,25 +439,6 @@ impl Backend for Ink {
         Ok(false)
     }
 
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    #[allow(unsafe_code)]
-    unsafe fn attach_scanout(
-        &mut self,
-        fd: i32,
-        connector: u32,
-        size: [u32; 2],
-        refresh: u32,
-    ) -> std::result::Result<(), String> {
-        // SAFETY: the caller's contract.
-        unsafe { self.device.attach_scanout(fd, connector, size, refresh) }
-            .map_err(|e| e.to_string())
-    }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    fn presents(&self) -> bool {
-        self.device.has_scanout()
-    }
-
     fn lost_device_needs_cpu(&self) -> bool {
         self.device_lost && matches!(self.device, Selected::Wgpu(_))
     }
@@ -486,7 +479,14 @@ impl Backend for Ink {
         }
     }
     fn needs_geometry_paint(&self) -> bool {
-        true
+        #[cfg(windows)]
+        {
+            exact_ink::device::d3d11::fields::enabled()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
     fn trim(&mut self, hidden: bool) {
         self.encoder = Encoder::new(self.size[0], self.size[1]);
@@ -688,11 +688,26 @@ impl Backend for Ink {
         self.accept(result);
     }
     fn canvas(&mut self, pixels: &Arc<Pixmap>, dst: Rect4, clips: &[Shape], ts: Transform) {
+        self.canvas_frame(pixels, None, dst, clips, ts);
+    }
+    fn canvas_frame(
+        &mut self,
+        pixels: &Arc<Pixmap>,
+        update: Option<CanvasUpdate>,
+        dst: Rect4,
+        clips: &[Shape],
+        ts: Transform,
+    ) {
         self.observe_transform(ts);
         let size = [pixels.width(), pixels.height()];
         // A canvas is drawn at its own device-pixel size: no mip chain unless shrunk.
         let mipmapped = images::minified(size, dst, self.device_transform(ts));
-        let result = self.images.pixmap(&mut self.device, pixels, mipmapped);
+        let result = match update {
+            Some(update) => self
+                .images
+                .canvas(&mut self.device, pixels, update, mipmapped),
+            None => self.images.pixmap(&mut self.device, pixels, mipmapped),
+        };
         if let Some(texture) = self.accept(result) {
             self.picture(
                 texture,
@@ -852,6 +867,23 @@ impl Backend for Ink {
     ) -> Option<std::result::Result<Pixmap, String>> {
         Some(self.finish_pixels(rotation))
     }
+    #[cfg(all(target_os = "linux", not(test)))]
+    fn finish_scanout(
+        &mut self,
+        rotation: exact_ink::Rotation,
+        readback: bool,
+    ) -> Option<std::result::Result<(wgpu::TextureView, Option<Pixmap>), String>> {
+        Some(
+            self.finish_output(rotation, readback)
+                .and_then(|(target, pixels)| {
+                    let Selected::Wgpu(device) = &self.device;
+                    let view = device.scanout_view(target);
+                    self.accept(view)
+                        .map(|view| (view, pixels))
+                        .ok_or_else(|| self.error.clone().unwrap())
+                }),
+        )
+    }
     fn finish_for(&mut self, target: FrameTarget) -> std::result::Result<Option<Pixmap>, String> {
         #[cfg(windows)]
         if let Selected::D3d11(device) = &mut self.device {
@@ -914,6 +946,10 @@ impl Backend for Ink {
     }
 
     fn rows(&self) -> bool {
+        // Row recordings cannot nest inside a layer capture.
+        self.rows.capture.is_empty()
+    }
+    fn independent_section_rows(&self) -> bool {
         true
     }
     fn row_local(&self) -> bool {
@@ -921,6 +957,9 @@ impl Backend for Ink {
     }
     fn row_reusable(&self, id: u32, origin: (f32, f32)) -> bool {
         self.reusable(id, origin)
+    }
+    fn can_keep_clipped_row(&self, id: u32, bounds: Rect4) -> bool {
+        self.keeps_row_outside_clip(id, bounds)
     }
     fn group_begin(&mut self, _id: u32, scroll: (f32, f32)) {
         if exact_ink::counters::enabled() {
@@ -932,7 +971,10 @@ impl Backend for Ink {
             self.rows.scrolls.pop();
         }
     }
-    fn row_begin(&mut self, id: u32, origin: (f32, f32), _: Option<u32>) {
+    fn row_begin(&mut self, id: u32, origin: (f32, f32), previous: Option<u32>) {
+        if let Some(previous) = previous {
+            self.observe_row_replacement(previous, origin);
+        }
         self.record_row(id, origin);
     }
     fn row_end(&mut self, _: Rect4) -> u32 {
@@ -959,7 +1001,14 @@ impl Backend for Ink {
         exact_ink::device::apple::trace_mark(c"image slot again", || id as f64);
         self.replace_slot(row, id)
     }
-    fn layer_begin(&mut self, key: u64, ts: Transform, pivot: (f32, f32), base: [f32; 7]) -> bool {
+    fn layer_begin(
+        &mut self,
+        key: u64,
+        ts: Transform,
+        pivot: (f32, f32),
+        _reference: (f32, f32),
+        base: [f32; 7],
+    ) -> bool {
         self.observe_transform(ts);
         // Transforming a rasterized group would move the stationary outer clips.
         // @ref LLP 1149 D4: let the walk apply motion before clipping.

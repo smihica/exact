@@ -167,6 +167,19 @@ pub(crate) fn load_partial(
     app_root: &Path,
     refused: &mut Refused,
 ) -> Result<(File, Sources), Vec<CompileError>> {
+    load_partial_visiting_views(path, src, app_root, refused, None)
+}
+
+pub(crate) type ViewVisitor<'a> = &'a mut dyn FnMut(&Sources, &File);
+
+/// Visit parsed files with their authored view ranges before scoping and rewriting.
+pub(crate) fn load_partial_visiting_views(
+    path: &Path,
+    src: &str,
+    app_root: &Path,
+    refused: &mut Refused,
+    visit: Option<ViewVisitor<'_>>,
+) -> Result<(File, Sources), Vec<CompileError>> {
     #[cfg(test)]
     LOADS.with(|loads| loads.set(loads.get() + 1));
     let root_key = path.canonicalize().unwrap_or_else(|_| {
@@ -175,7 +188,8 @@ pub(crate) fn load_partial(
             .unwrap_or_else(|| app_root.to_path_buf())
     });
     let mut loader = Loader::new(app_root, path, path.to_path_buf(), src, &root_key);
-    let loaded = loader.load_all(path, src, root_key);
+    loader.view_ranges = visit.is_some();
+    let loaded = loader.load_all(path, src, root_key, visit);
     *refused = std::mem::take(&mut loader.refused);
     loaded.map(|file| (file, loader.sources))
 }
@@ -198,6 +212,7 @@ impl Loader<'_> {
         path: &Path,
         src: &str,
         root_key: PathBuf,
+        visit: Option<ViewVisitor<'_>>,
     ) -> Result<File, Vec<CompileError>> {
         let resolve = |sources: &Sources, all: Vec<CompileError>| {
             all.into_iter()
@@ -210,6 +225,11 @@ impl Loader<'_> {
             .and_then(|()| self.load_view_packages())
         {
             return Err(resolve(&self.sources, all));
+        }
+        if let Some(visit) = visit {
+            for unit in &self.units {
+                visit(&self.sources, &unit.file);
+            }
         }
         // Each component's `param.` names, as their tokens (LLP 1121 D15),
         // before anything reads a row.
@@ -668,6 +688,7 @@ struct Loader<'a> {
     /// Whether a file's `use` or `members` line that refuses is passed over,
     /// to read every file the others name ([`read_all`]).
     keep_going: bool,
+    view_ranges: bool,
 }
 impl<'a> Loader<'a> {
     /// A loader of the root `src`, the file `first` names, canonically `root_key`.
@@ -698,6 +719,7 @@ impl<'a> Loader<'a> {
             vars: None,
             refused: Refused::default(),
             keep_going: false,
+            view_ranges: false,
         }
     }
 
@@ -736,7 +758,12 @@ impl Loader<'_> {
         // Every syntax refusal in this file, not only its first; what parsed
         // is still loaded and checked, unless the file's declarations
         // cannot be told apart.
-        let mut file = match contract_syntax::parse_source_partial(src, source_id) {
+        let parse = if self.view_ranges {
+            contract_syntax::parse_source_with_view_ranges
+        } else {
+            contract_syntax::parse_source_partial
+        };
+        let mut file = match parse(src, source_id) {
             Ok(file) => file,
             Err(partial) => {
                 let sources = &self.sources;

@@ -3,29 +3,64 @@
 // bytes as an unfiltered RGBA image, as an animated PNG of equal frames, or as
 // a contact sheet of them; shrink one. Node's zlib does the compression; this does the
 // chunks, the filters, and the CRC. No dependency (rules/RULES.md: none).
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { deflateSync, inflateSync } from 'node:zlib';
 
-/** {width, height, data: Uint8Array of RGBA} from a PNG buffer: every colour type and bit depth, a palette and its
- * transparency, interlaced or not. */
-export function decodePng(buf) {
-  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
-  for (let i = 0; i < 8; i++) if (buf[i] !== sig[i]) throw new Error('not a PNG');
-  let pos = 8, width = 0, height = 0, depth = 0, color = 0, interlace = 0, palette = null, trns = null;
-  const idat = [];
-  while (pos + 8 <= buf.length) {
+const COLOR_CHUNKS = new Set(['iCCP', 'cICP', 'sRGB', 'gAMA', 'cHRM']);
+
+/** Read samples in sRGB for comparison. ColorSync handles tagged captures on Apple hosts. */
+export function readSrgbPng(path) {
+  const bytes = readFileSync(path);
+  if (process.platform !== 'darwin') return decodePng(bytes);
+  const tags = new Set();
+  for (const [type] of pngChunks(bytes)) {
+    if (type === 'IDAT') break;
+    if (COLOR_CHUNKS.has(type)) tags.add(type);
+  }
+  if (!tags.size || (tags.has('sRGB') && !tags.has('cICP'))) return decodePng(bytes);
+  const dir = mkdtempSync(join(tmpdir(), 'exact-srgb-'));
+  try {
+    const out = join(dir, 'srgb.png');
+    const r = spawnSync('sips', ['--matchTo', '/System/Library/ColorSync/Profiles/sRGB Profile.icc', path, '--out', out], { encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`sips ${path}: ${r.stderr?.trim() || r.error?.message || 'conversion failed'}`);
+    return decodePng(readFileSync(out));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+function* pngChunks(buf) {
+  if (!buf.subarray(0, 8).equals(SIGNATURE)) throw new Error('not a PNG');
+  for (let pos = 8; pos + 8 <= buf.length;) {
     const len = buf.readUInt32BE(pos);
     const type = buf.toString('latin1', pos + 4, pos + 8);
-    const data = buf.subarray(pos + 8, pos + 8 + len);
+    yield [type, buf.subarray(pos + 8, pos + 8 + len)];
+    if (type === 'IEND') break;
+    pos += 12 + len;
+  }
+}
+
+/** RGBA bytes from a PNG buffer, with colour-space chunks retained for re-encoding when requested. */
+export function decodePng(buf, { preserveColor = false } = {}) {
+  let width = 0, height = 0, depth = 0, color = 0, interlace = 0, palette = null, trns = null;
+  const idat = [], colorChunks = [];
+  for (const [type, data] of pngChunks(buf)) {
     if (type === 'IHDR') { width = data.readUInt32BE(0); height = data.readUInt32BE(4); depth = data[8]; color = data[9]; interlace = data[12]; }
     else if (type === 'PLTE') palette = data;
     else if (type === 'tRNS') trns = data;
     else if (type === 'IDAT') idat.push(data);
-    else if (type === 'IEND') break;
-    pos += 12 + len;
+    // PNG requires an RGB ICC profile for RGBA output. Gray profiles cannot describe the converted pixels.
+    else if (preserveColor && COLOR_CHUNKS.has(type) && (type !== 'iCCP' || (color & 2))) {
+      colorChunks.push([type, Buffer.from(data)]);
+    }
   }
+  const metadata = colorChunks.length ? { colorChunks } : {};
   const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[color];
   if (!channels || (color === 3 && !palette)) throw new Error(`unsupported PNG: color type ${color}${color === 3 ? ' without a palette' : ''}`);
-  if (depth === 8 && !interlace && (color === 6 || (color === 2 && !trns))) return direct(width, height, color === 6 ? 4 : 3, inflateSync(Buffer.concat(idat)));
+  if (depth === 8 && !interlace && (color === 6 || (color === 2 && !trns))) {
+    return { ...direct(width, height, color === 6 ? 4 : 3, inflateSync(Buffer.concat(idat))), ...metadata };
+  }
   const bits = channels * depth, bpp = Math.max(1, bits >> 3), raw = inflateSync(Buffer.concat(idat)), out = new Uint8Array(width * height * 4);
   const sample = (row, x, c) => {
     const bit = (x * channels + c) * depth;
@@ -61,7 +96,7 @@ export function decodePng(buf) {
       [prev, cur] = [cur, prev];
     }
   }
-  return { width, height, data: out };
+  return { width, height, data: out, ...metadata };
 }
 /** One scanline's bytes into `cur`, undoing its filter `f` against the line before (`prev`); `bpp` is the bytes a
  * pixel takes, at least one. */
@@ -101,15 +136,23 @@ function scanlines({ width, height, data }) {
   return deflateSync(raw);
 }
 const SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+/** Pixel dimensions from the first 24 bytes of a PNG. */
+export function pngDimensions(buf) {
+  if (buf.length < 24 || !buf.subarray(0, 8).equals(SIGNATURE) || buf.toString('latin1', 12, 16) !== 'IHDR')
+    throw new Error('not a PNG');
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
 function header(width, height) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
   return chunk('IHDR', ihdr);
 }
 
-/** A PNG buffer from {width, height, data: RGBA bytes}. */
+/** A PNG buffer from RGBA bytes and optional colour-space chunks. */
 export function encodePng(image) {
-  return Buffer.concat([SIGNATURE, header(image.width, image.height), chunk('IDAT', scanlines(image)), chunk('IEND', Buffer.alloc(0))]);
+  const colors = image.colorChunks?.map(([type, data]) => chunk(type, data)) ?? [];
+  return Buffer.concat([SIGNATURE, header(image.width, image.height), ...colors, chunk('IDAT', scanlines(image)), chunk('IEND', Buffer.alloc(0))]);
 }
 
 /** An animated PNG of equal-size RGBA frames, each shown `delayMs` (one for all, or one each), looping. A viewer without APNG shows the first. */
@@ -157,7 +200,7 @@ export function contactSheet(frames, { columns = 6, maxWidth = 2048 } = {}) {
 
 /** An image shrunk to w×h, each at most its own, by area: every pixel the mean of the pixels it covers, each
  * weighted by how much of it is covered — a box average when the factor is whole (a screenshot's `--scale`). */
-export function shrink({ width, height, data }, w, h) {
+export function shrink({ width, height, data, colorChunks }, w, h) {
   if (!(Number.isInteger(w) && Number.isInteger(h) && w >= 1 && h >= 1 && w <= width && h <= height)) throw new Error(`shrink: ${width}×${height} to ${w}×${h}: whole sizes, at most the image's`);
   // One axis at a time: for each pixel out, the [source, weight] pairs it covers.
   const spans = (from, to) => Array.from({ length: to }, (_, i) => {
@@ -172,7 +215,7 @@ export function shrink({ width, height, data }, w, h) {
     for (const [s, k] of ys[y]) sum += mid[(s * w + x) * 4 + c] * k;
     out[(y * w + x) * 4 + c] = Math.min(255, Math.round(sum));
   }
-  return { width: w, height: h, data: out };
+  return { width: w, height: h, data: out, ...(colorChunks ? { colorChunks } : {}) };
 }
 
 /** The RGBA bytes of a rectangle of an image, as an image. */

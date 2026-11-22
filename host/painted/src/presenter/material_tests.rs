@@ -27,7 +27,7 @@ const APP: &str = r##"component App
 
 /// Whether this is the child process that shows the Material look; the
 /// parent runs the test there and returns false.
-pub(super) fn material_process() -> bool {
+pub(in crate::presenter) fn material_process() -> bool {
     const CHILD: &str = "EXACT_MATERIAL_LOOK_TEST";
     if std::env::var_os(CHILD).is_some() {
         crate::app::show_material_look();
@@ -481,7 +481,7 @@ fn materials_segmented_buttons_share_the_row_and_fill_the_checked_one() {
     let [km, mi, nmi] = ["u-km", "u-mi", "u-nmi"].map(|n| rect(&mut p, n));
     for s in [km, mi, nmi] {
         assert_eq!(s.3, 40.0, "the segmented-button-height row: {s:?}");
-        assert!((s.2 - km.2).abs() <= 1.0, "equal shares: {s:?} {km:?}");
+        assert_eq!(s.2, km.2, "equal shares: {s:?} {km:?}");
     }
     assert_eq!(mi.0, km.0 + km.2 - 1.0, "one outline between them");
     assert_eq!(units.2, km.2 + mi.2 + nmi.2 - 2.0);
@@ -491,7 +491,7 @@ fn materials_segmented_buttons_share_the_row_and_fill_the_checked_one() {
     }
     // An authored width is shared out.
     let (w1, w2) = (rect(&mut p, "w-1"), rect(&mut p, "w-2"));
-    assert_eq!((w1.2, w2.2), (150.0, 151.0));
+    assert_eq!((w1.2, w2.2), (150.5, 150.5));
     assert_eq!(w2.0 + w2.2, w1.0 + 300.0, "the row's width");
     // Five, each at least `ButtonDefaults.MinWidth`.
     let five = ["f-1", "f-2", "f-3", "f-4", "f-5"].map(|n| rect(&mut p, n));
@@ -512,8 +512,9 @@ fn materials_segmented_buttons_share_the_row_and_fill_the_checked_one() {
         "its round start"
     );
     assert_ne!(pixel(&mut p, r1.0 + 0.5, r1.1 + 0.5), page, "a square side");
-    // `appearance: none` keeps the authored buttons.
-    assert_ne!(rect(&mut p, "o-1").3, 40.0);
+    // `appearance: none` keeps the authored buttons, which share no outline.
+    let (o1, o2) = (rect(&mut p, "o-1"), rect(&mut p, "o-2"));
+    assert_eq!(o2.0, o1.0 + o1.2);
     // The row's ends are round, between them square.
     assert_eq!(pixel(&mut p, km.0 + 1.0, km.1 + 1.0), page, "a round start");
     assert_eq!(
@@ -1011,7 +1012,7 @@ fn materials_segmented_group_fits_what_holds_it() {
     // A label that no longer fits its share wraps, as an ordinary
     // button's title does, and the segment grows to hold it.
     let long = rect(&mut p, "l-1");
-    assert_eq!(long.2, 100.0);
+    assert_eq!(long.2, 100.5);
     assert!(long.3 > 40.0, "{long:?}");
 }
 
@@ -1290,5 +1291,177 @@ fn material_content_and_header_tabs_are_segments() {
             page,
             "{prefix}: moved fill"
         );
+    }
+}
+
+const LABELS: &str = r##"component App
+  view
+    column padding=16 align-items="flex-start" gap=8
+      button testId="outlined"
+        text "Bookmark all"
+      button buttonStyle="tinted" testId="tonal"
+        text "Bookmark all"
+      button buttonStyle="plain" testId="text"
+        text "Bookmark all"
+      button buttonStyle="tinted" disabled=true testId="tonal-off"
+        text "Bookmark all"
+      button buttonStyle="filled" testId="filled-icon"
+        image "symbol:add"
+        text "Bookmark all"
+      button buttonStyle="plain" testId="text-icon"
+        image "symbol:add"
+        text "Bookmark all"
+      button buttonStyle="filled" testId="trailing"
+        text "Bookmark all"
+        image "symbol:add"
+      column direction="rtl" align-items="flex-start"
+        button buttonStyle="filled" testId="rtl"
+          image "symbol:add"
+          text "Bookmark all"
+"##;
+
+/// A labelled button is Material's for its emphasis (LLP 1115.001 D9): a
+/// 40 dp pill; unsaid, an outlined button; `tinted`, a tonal one; `plain`, a
+/// text button in the accent, padded 12 dp where the others are 24.
+#[test]
+fn materials_labelled_buttons_take_their_emphasis() {
+    if !material_process() {
+        return;
+    }
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &crate::test_plan(LABELS),
+        (),
+        (400., 600.),
+        2.4375,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let page = pixel(&mut p, 2.0, 2.0);
+    let rect = |p: &mut Presenter<()>, name| {
+        let view = id(p, name);
+        p.rect_of(view).unwrap()
+    };
+    for name in ["outlined", "tonal", "text"] {
+        let r = rect(&mut p, name);
+        assert_eq!(r.3, 40.0, "{name}: ButtonDefaults.MinHeight");
+        assert_eq!(pixel(&mut p, r.0 + 1.0, r.1 + 1.0), page, "{name}: a pill");
+    }
+    let inside = |p: &mut Presenter<()>, name| {
+        let r = rect(p, name);
+        pixel(p, r.0 + 8.0, r.1 + 20.0)
+    };
+    let outlined = rect(&mut p, "outlined");
+    assert_eq!(inside(&mut p, "outlined"), page, "an outline, not a fill");
+    assert_ne!(
+        pixel(&mut p, outlined.0 + 0.5, outlined.1 + 20.0),
+        page,
+        "its outline"
+    );
+    let tonal = inside(&mut p, "tonal");
+    assert_ne!(tonal, page, "a container");
+    assert_ne!(inside(&mut p, "tonal-off"), tonal, "disabled");
+    assert_eq!(inside(&mut p, "text"), page, "no container");
+    let text = rect(&mut p, "text");
+    assert_eq!(text.2, outlined.2 - 24.0, "TextButtonContentPadding");
+    // An 18 dp icon 8 dp from the title; 16 dp beside it, or 12 and 16 for
+    // a text button (`…WithIconContentPadding`).
+    assert_eq!(rect(&mut p, "filled-icon").2, outlined.2 + 18.0);
+    assert_eq!(rect(&mut p, "text-icon").2, text.2 + 30.0);
+    let accent = crate::paint::control::accents(None, false).0;
+    let frame = (*p.frame()).clone();
+    let at = |v: f32| (v * 2.4375) as u32;
+    let accented = (at(text.1)..at(text.1 + text.3))
+        .flat_map(|y| (at(text.0)..at(text.0 + text.2)).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let c = frame.pixel(x, y).unwrap().demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()] == accent
+        })
+        .count();
+    assert!(accented > 0, "a text button's label is the accent");
+    // The symbol's side is the narrower one, whichever end the symbol is at:
+    // only there does ink start within the title's 24 dp.
+    let mut ink = |name| {
+        let r = rect(&mut p, name);
+        let y = at(r.1 + r.3 / 2.0);
+        let container = frame.pixel(at(r.0 + 8.0), y).unwrap();
+        let mut across = at(r.0 + 8.0)..at(r.0 + r.2 - 8.0);
+        let inked = |x: &u32| frame.pixel(*x, y).unwrap() != container;
+        let left = across.clone().find(inked).unwrap() as f32 / 2.4375 - r.0;
+        let right = r.0 + r.2 - across.rfind(inked).unwrap() as f32 / 2.4375;
+        (left < 24.0, right < 24.0)
+    };
+    assert_eq!(ink("filled-icon"), (true, false), "a leading symbol");
+    assert_eq!(ink("trailing"), (false, true), "a trailing symbol");
+    assert_eq!(ink("rtl"), (false, true), "a leading symbol, right to left");
+}
+
+/// A key's focus under the Material look is Compose's: a bare field shows
+/// its caret alone, and what presses its state layer (its content's colour
+/// at 10 % over its shape, a checkbox's round its mark), never a ring.
+/// `outline: none` takes it off.
+#[test]
+fn materials_key_focus_is_a_state_layer_not_a_ring() {
+    if !material_process() {
+        return;
+    }
+    let source = r##"component App
+  state n = 0
+  action go
+    n = n + 1
+  view
+    column padding=16 gap=16 align-items="flex-start" accent-color="#ff0000"
+      input testId="field" appearance="none" width=200 height=30
+      button testId="button"
+        text "Save"
+      button outline="none" testId="unmarked"
+        text "Save"
+      input type="checkbox" testId="checkbox"
+      column press=go width=200 height=40 color="#000000" testId="card"
+        text "Card"
+"##;
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &crate::test_plan(source),
+        (),
+        (400., 600.),
+        2.4375,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.key_down("Tab", 1.);
+    assert_eq!(p.focus, Some(id(&p, "field")));
+    // The ring's edge, and a point the state layer covers.
+    let points = |r: Rect4, name| match name {
+        "checkbox" => ((r.0 + r.2 / 2., r.1 + 0.5), (r.0 + r.2 / 2., r.1 - 4.)),
+        _ => (
+            (r.0 + r.2 / 2., r.1 + 0.5),
+            (r.0 + r.2 - 8., r.1 + r.3 / 2.),
+        ),
+    };
+    let page = pixel(&mut p, 2.0, 2.0);
+    let names = ["field", "button", "unmarked", "checkbox", "card"];
+    for (n, name) in names.into_iter().enumerate() {
+        let target = id(&p, name);
+        let (edge, inside) = points(p.rect_of(target).unwrap(), name);
+        assert!(p.set_focus(None, 2. + n as f64).is_none());
+        let before = (
+            pixel(&mut p, edge.0, edge.1),
+            pixel(&mut p, inside.0, inside.1),
+        );
+        assert!(p.set_focus(Some(target), 2.5 + n as f64).is_none());
+        let after = (
+            pixel(&mut p, edge.0, edge.1),
+            pixel(&mut p, inside.0, inside.1),
+        );
+        assert_ne!(after.0, [255, 0, 0, 255], "{name}: no ring");
+        assert_eq!(before.1, page, "{name}");
+        match name {
+            // `outline: none` takes the state layer off, as it did the ring.
+            "field" | "unmarked" => assert_eq!(after.1, page, "{name}: no state layer"),
+            _ => assert_ne!(after.1, page, "{name}: the state layer"),
+        }
     }
 }

@@ -87,7 +87,7 @@ fn text(f: Stdlib, args: &[Value]) -> Result<Option<Value>, CallError> {
             .ok_or(CallError::TypeMismatch)
     };
     Ok(Some(match f {
-        Stdlib::Slice => Value::str(&strings::slice(s(0)?, n(1)?, n(2)?)),
+        Stdlib::Slice => Value::str(&strings::slice_text(s(0)?, n(1)?, n(2)?)),
         Stdlib::ReplaceAll => Value::str(
             &strings::replace_all(s(0)?, s(1)?, s(2)?, MAX_STRING)
                 .map_err(|_| CallError::StringTooLong)?,
@@ -128,6 +128,7 @@ fn call_value(
         // a plan that reads geometry it doesn't link (LLP 1047 D6).
         Stdlib::Frame
         | Stdlib::RangeFrame
+        | Stdlib::ScrollMetrics
         | Stdlib::Measure
         | Stdlib::ElementFromPoint
         | Stdlib::ElementsFromPoint

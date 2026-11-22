@@ -2,8 +2,9 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { spawn, spawnSync } from '../host/apple/toolchain.mjs';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { withHostDeployment } from './filesystem.mjs';
-import { delimiter, dirname, relative, resolve, sep } from 'node:path';
+import { OFFLINE_MISSING, withHostDeployment } from './filesystem.mjs';
+import { BUILD_SCRIPT_FAILED_LINE, buildScriptFailed, throwContractErrors } from './contract-diagnosis.mjs';
+import { basename, delimiter, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
@@ -129,6 +130,27 @@ export function cargoDiagnosticsCommand(command, args, options) {
     ? [process.execPath, ['--no-env-file', fileURLToPath(import.meta.url), ...args], options] : [command, args, options];
 }
 
+/** Run a build in the app's workspace. A recovery gets the failed Cargo output before diagnostics are reported. */
+export function buildCommand(command, args, app, env, stderr = 'pipe', recover) {
+  if (command === 'cargo') env = cargoEnvironment(env);
+  const options = { cwd: app.workspace, env, stdio: ['ignore', 'pipe', stderr], encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 };
+  const run = () => spawnSync(...cargoDiagnosticsCommand(...androidCargo(...appleCargo(command, args, options))));
+  let result = run();
+  // Cargo fetches locked sources once when an offline build needs them (LLP 1054 O2).
+  if (command === 'cargo' && result.status !== 0 && OFFLINE_MISSING.test(result.stderr ?? '')) {
+    console.error(`${app.name}: Cargo's sources are not all fetched; fetching the locked ones (cargo fetch --locked) and trying again`);
+    const fetched = spawnSync('cargo', ['fetch', '--locked'], { cwd: app.workspace, env, stdio: ['ignore', 'inherit', 'inherit'] });
+    if (fetched.status === 0) result = run();
+  }
+  if (result.error || (result.status !== 0 && !recover?.(result))) {
+    if (command === 'cargo') throwContractErrors(app, args, result, ROOT);
+    const said = args.filter((arg, i) => arg !== '--config' && args[i - 1] !== '--config').join(' ');
+    const out = (result.stdout ?? '').split('\n').filter(line => !line.includes('"reason":')).join('\n').slice(-4000);
+    throw new Error(`${command} ${said} failed: ${result.error?.message ?? result.stderr ?? `exit ${result.signal ?? result.status} (see diagnostics above)`}${out.trim() ? `\n${out}` : ''}`);
+  }
+  return result;
+}
+
 async function streamCargo(args) {
   const child = spawn('cargo', args, { stdio: ['ignore', 'inherit', 'pipe'] });
   const ended = new Promise((ok, fail) => { child.once('error', fail); child.once('close', (code, signal) => ok({ code, signal })); });
@@ -137,11 +159,21 @@ async function streamCargo(args) {
     process.on(signal, handler); return [signal, handler];
   });
   const filter = cargoDiagnosticFilter(text => process.stderr.write(text));
+  // Whether a build script failed, which the caller cannot read from the stderr this streams (contract-diagnosis.mjs),
+  // read from whole lines however the stream splits them
+  let partial = '', failed = false;
   try {
     child.stderr.setEncoding('utf8');
-    for await (const text of child.stderr) filter.write(text);
+    for await (const text of child.stderr) {
+      filter.write(text);
+      const lines = (partial + text).split('\n');
+      partial = lines.pop();
+      failed ||= lines.some(buildScriptFailed);
+    }
     filter.end();
+    failed ||= buildScriptFailed(partial);
     const { code, signal } = await ended;
+    if (failed && (signal || code !== 0)) process.stdout.write(`${BUILD_SCRIPT_FAILED_LINE}\n`);
     for (const [signal, handler] of handlers) process.off(signal, handler);
     if (signal) process.kill(process.pid, signal); else process.exitCode = code;
   } finally { for (const [signal, handler] of handlers) process.off(signal, handler); }
@@ -249,6 +281,38 @@ export function appCrates(dir) {
       return { dir: crate, manifest: resolve(crate, 'Cargo.toml'), name: pkg?.name ?? null, joins };
     });
 }
+/** The directory of the package `name` that the app's host crates at `dir` build with, linked by path, which may be
+ * another app's, as Unsaid links Hello's data crate (LLP 1153.003 D2), or null when none does: through a normal or
+ * build dependency of that name or one renamed to it, given its own `path` or inheriting one from the crate's
+ * workspace, found as Cargo finds it and read without a build's lock check; a test's dev-dependency is not what a
+ * host builds. Two host crates linking different directories under that name are refused. */
+export function linkedCrate(dir, name) {
+  const found = new Set();
+  for (const crate of appCrates(dir).filter(crate => HOST_CRATES.includes(basename(crate.dir)))) {
+    const manifest = readToml(crate.manifest) ?? {};
+    const tables = [manifest, ...Object.values(manifest.target ?? {})]
+      .flatMap(table => [table.dependencies, table['build-dependencies']]);
+    let workspace;
+    for (const [key, dep] of tables.flatMap(table => Object.entries(table ?? {}))) {
+      if (dep?.workspace === true) workspace ??= cargoWorkspace(crate.dir, manifest);
+      const from = dep?.workspace === true ? workspace?.dependencies[key] : dep, base = dep?.workspace === true ? workspace?.root : crate.dir;
+      if ((from?.package ?? key) === name && typeof from?.path === 'string') found.add(resolve(base, from.path));
+    }
+  }
+  if (found.size > 1) throw new Error(`${dir}: its host crates link ${name} from ${[...found].join(' and ')}; link one directory`);
+  return found.size ? [...found][0] : null;
+}
+
+/** The workspace of the crate at `crate` (its parsed `manifest`), `{ root, dependencies }`, as Cargo finds it: the
+ * one `package.workspace` names, else the nearest directory with a `[workspace]`, the crate's own first; or null. */
+function cargoWorkspace(crate, manifest) {
+  const named = typeof manifest.package?.workspace === 'string' ? resolve(crate, manifest.package.workspace) : null;
+  for (let at = named ?? crate; ; at = dirname(at)) {
+    const workspace = readToml(resolve(at, 'Cargo.toml'))?.workspace;
+    if (workspace) return { root: at, dependencies: workspace.dependencies ?? {} };
+    if (named || dirname(at) === at) return null;
+  }
+}
 /** The refusal of a crate beside app.json that joins neither generated workspace, with the line to add. */
 export const notAMember = (crate) => `${crate.manifest}: a crate beside app.json joins the app's generated workspace. Add, under [package], workspace = "${MEMBER_OF.host}" (a GPU crate: workspace = "${MEMBER_OF.gpu}"). An app that writes its own host crates writes their workspace too, a Cargo.toml beside app.json (docs/reference.md, "An authored workspace").`;
 /** The workspace the crates beside app.json name in `package.workspace` (LLP 1153.003 D1): an authored one; the
@@ -331,19 +395,72 @@ export function authoredWorkspace(dir) {
  * from the root down to `cwd`, `config` before `config.toml` in each
  * (https://doc.rust-lang.org/cargo/reference/config.html#hierarchical-structure). Each `{ path, configuration }`;
  * an invalid one is refused, saying it could not `purpose`. */
-function cargoConfigurations(cwd, env, purpose) {
+function cargoConfigurations(cwd, env, purpose, includes = false) {
   const directories = [];
   for (let at = resolve(cwd); ; at = dirname(at)) {
     directories.push(at);
     if (at === dirname(at)) break;
   }
   const home = env.CARGO_HOME ?? resolve(homedir(), '.cargo');
+  function read(path, stack) {
+    const real = realpathSync(path);
+    if (stack.includes(real)) throw new Error(`Cargo configuration includes itself: ${path}`);
+    let configuration;
+    try { configuration = Bun.TOML.parse(readFileSync(path, 'utf8')); }
+    catch { throw new Error(`Cannot ${purpose} because Cargo configuration ${path} is unreadable or invalid. Fix its TOML before building.`); }
+    const included = includes ? (configuration.include ?? []).flatMap(item => {
+      const file = resolve(dirname(path), typeof item === 'string' ? item : item.path);
+      return item.optional && !existsSync(file) ? [] : read(file, [...stack, real]);
+    }) : [];
+    return [...included, { path, configuration }];
+  }
   return [...new Set([home, ...directories.reverse().map(at => resolve(at, '.cargo'))])].flatMap(directory => {
     const path = ['config', 'config.toml'].map(name => resolve(directory, name)).find(existsSync);
-    if (!path) return [];
-    try { return [{ path, configuration: Bun.TOML.parse(readFileSync(path, 'utf8')) }]; }
-    catch { throw new Error(`Cannot ${purpose} because Cargo configuration ${path} is unreadable or invalid. Fix its TOML before building.`); }
+    return path ? read(path, []) : [];
   });
+}
+
+/** The environment Cargo gives build scripts, including its config's [env] table. */
+export function cargoBuildEnv(cwd, env) {
+  const entries = new Map();
+  for (const {path, configuration} of cargoConfigurations(cwd, env, 'read the build environment', true)) {
+    for (const [name, entry] of Object.entries(configuration.env ?? {})) {
+      const previous = entries.get(name);
+      entries.set(name, typeof entry === 'string' ? {value:entry, path}
+        : {...previous, ...entry, path:entry.value === undefined ? previous?.path : path});
+    }
+  }
+  const result = {...env};
+  for (const [name, {value, force, relative, path}] of entries) {
+    if (force || result[name] === undefined) {
+      result[name] = relative ? resolve(dirname(path), '..', value) : value;
+    }
+  }
+  return result;
+}
+
+/** `path` made absolute as written, a `..` kept: a relative one joins the working directory, a Windows drive's own
+ * for `D:staging`, and a root (a drive, a UNC share) stays whole. */
+export function writtenPath(path) {
+  if (isAbsolute(path)) return path;
+  const { root } = parse(path);
+  return resolve(root || '.') + sep + path.slice(root.length);
+}
+
+/** `path` as the system reaches it, or null when a part of it cannot be read. Windows collapses a `..` before it
+ * opens a path, as `path.resolve` does; POSIX follows each link before a later `..`, which `path.resolve`, and Bun's
+ * `realpathSync.native`, collapse first, so there a path with `..` is followed part by part, split at `/` alone. Bun
+ * 1.4.2's `realpathSync` cannot read a POSIX name that holds a backslash, which the system and Node read, so such a
+ * path gives null here and its root is remapped only as written. */
+export function physicalPath(path) {
+  const written = writtenPath(path), { root } = parse(written);
+  const parts = written.slice(root.length).split(/\/+/).filter(part => part && part !== '.');
+  try {
+    if (process.platform === 'win32' || !parts.includes('..')) return realpathSync.native(resolve(written));
+    let at = realpathSync.native(root);
+    for (const part of parts) at = part === '..' ? dirname(at) : realpathSync.native(resolve(at, part));
+    return at;
+  } catch { return null; }
 }
 
 /** The `--config` that gives `target` the rustflags `flags` beside those its Cargo configuration gives it. A TOML array

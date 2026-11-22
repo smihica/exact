@@ -1,13 +1,15 @@
-// @ref LLP 1047.001 D10 — sharing: `share(…)`, the system share sheet (LLP
-// 1069.003, roster `share`), and a received share's claim from the share
-// extension's inbox (LLP 1133.024). The core reaches both only through what
-// this file declares. The two are selected by different inputs: sending by
-// the plan's `share` command, receiving by the manifest's `share_target`,
-// which no roster row names yet; the family's move adds that composition
-// input, or leaves receiving in the core. Without the family a `share` is
-// refused into the journal, which is all its outcome ever is (D2), and no
-// share is received. The context menu's Share item presents `ShareSheet`
-// directly; it belongs to the menus' move. The slot's default is today's.
+// @ref LLP 1047.001 D10 — sharing, the `ExactSharing` product (roster
+// `share`): `share(…)`, the system share sheet (LLP 1069.003), a link's
+// context-menu Share item, and a received share's claim from the share
+// extension's inbox (LLP 1133.024). The core reaches all three only through
+// what this file declares. The product is linked by a plan's `share`
+// command, by a link that gets the host's own context menu, or by the
+// manifest's `share_target`. Without it a `share` is refused into the
+// journal, which is all its outcome ever is (D2), a link's menu offers no
+// Share item, and no share is received.
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// What a session asks of sharing; one object serves every session.
 package protocol ShareHosting: AnyObject {
@@ -18,6 +20,11 @@ package protocol ShareHosting: AnyObject {
     /// Once storage is configured: the cold share's files land, and the
     /// inbox is claimed from now on.
     func land(_ session: ExactSession)
+    #if os(iOS)
+    /// A link's context-menu Share item: the sheet with `url`, off `view`'s
+    /// `rect`; `log` gets the journal line.
+    func shareLink(_ url: URL, from view: UIView, at rect: CGRect, log: @escaping (String) -> Void)
+    #endif
     #if EXACT_AGENT
     // What the agent asks: development only, so production strips them.
     /// The agent answered a share's hold: its real sheet closes.
@@ -41,6 +48,9 @@ package final class NoShare: ShareHosting {
     }
     package func claimCold(_ session: ExactSession) {}
     package func land(_ session: ExactSession) {}
+    #if os(iOS)
+    package func shareLink(_ url: URL, from view: UIView, at rect: CGRect, log: @escaping (String) -> Void) {}
+    #endif
     #if EXACT_AGENT
     package func answered(_ session: ExactSession, _ reply: [String: Any]) {}
     package func receive(_ session: ExactSession, _ request: [String: Any]) -> [String: Any] {
@@ -53,9 +63,10 @@ package final class NoShare: ShareHosting {
     #endif
 }
 
-/// The slot is set before any session is made, and read on the main thread.
+/// The slot `ExactSharing.install()` sets before any session is made, read
+/// on the main thread.
 package enum ShareLink {
-    package static var installed: (any ShareHosting)? = BuiltInShare()
+    package static var installed: (any ShareHosting)?
 }
 
 extension ExactSession {

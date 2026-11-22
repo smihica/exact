@@ -18,6 +18,7 @@
 //! each command keeps what it did there. On Android the shell is the Canvas
 //! host's reader (`host/android/README.md` has the words as it reads them).
 use super::*;
+use crate::window_title::WindowTitle;
 use exact_runner::orientation::Session;
 use exact_runner::share::Share;
 use exact_runner::ControlValue;
@@ -106,6 +107,11 @@ pub enum Request {
     Assets(String),
     /// A desktop file dialog, taken as a typed request by the window host.
     FileDialog(super::file_dialog::FileDialog),
+    /// The active `head` title. With no title, the activity uses its label.
+    WindowTitle(Option<String>),
+    /// A node's drag out of the app (LLP 1094.000 D7): the reader starts the
+    /// platform's drag with what it carries.
+    Drag(super::drag_out::DragOut),
 }
 
 /// What a picker is opened with, each value as HTML writes it and empty
@@ -153,6 +159,8 @@ impl Request {
             Request::Files(_) => 18,
             Request::Assets(_) => 20,
             Request::FileDialog(_) => 21,
+            Request::WindowTitle(_) => 22,
+            Request::Drag(_) => 23,
         }
     }
 }
@@ -259,6 +267,7 @@ pub(super) struct State {
     back_epoch: Option<u64>,
     keyboard: Option<(u32, ViewId)>,
     pad_input: Option<bool>,
+    window_title: WindowTitle,
     /// What the shell was last told of the wake lock and the kernel epoch
     /// that was read at; whether a host with no shell journaled it.
     wakelock: Option<bool>,
@@ -324,12 +333,16 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
         Request::Haptic(haptic) => out.push(*haptic as i32),
         Request::Share(share) => {
             // Which of the three the app gave (bit 0 the title, 1 the text,
-            // 2 the URL), then each, empty where it gave none.
+            // 2 the URL), then each, empty where it gave none, then each
+            // file's `app:/` path.
             let parts = [&share.title, &share.text, &share.url];
             let given = |i: usize| i32::from(parts[i].is_some()) << i;
             out.push(given(0) | given(1) | given(2));
             for part in parts {
                 string(out, part.as_deref().unwrap_or_default());
+            }
+            for file in &share.files {
+                string(out, file);
             }
         }
         Request::Back(goes) | Request::KeepScreenOn(goes) | Request::PadInput(goes) => {
@@ -362,7 +375,13 @@ fn encode(id: u32, request: &Request, out: &mut Vec<i32>) {
             }
         }
         Request::FileDialog(dialog) => string(out, &dialog.picker.summary()),
+        Request::WindowTitle(title) => {
+            if let Some(title) = title {
+                string(out, title);
+            }
+        }
         Request::Surface(surface) => surface.encode(out),
+        Request::Drag(drag) => drag.encode(out),
         Request::Hatch(words) => out.extend(words),
         Request::SurfaceHaptic(surface, json) => {
             out.push(*surface as i32);
@@ -481,6 +500,20 @@ impl<D: DataSource> Presenter<D> {
         // The shell's extensions answer the module calls the runner hands
         // the native slot, once their names are bound (`bind_extensions`).
         self.handle_modules();
+    }
+
+    /// The Android reader's share sheet: `exactPage()` says it shares text,
+    /// a link and `app:/` files (LLP 1094.000 D7), and no element's picture.
+    pub fn serve_share_sheet(&mut self) {
+        let page = self.host.runner().page();
+        let page = exact_runner::Page {
+            can_share: true,
+            can_share_files: true,
+            ..page
+        };
+        if let Some(e) = self.set_page(page) {
+            self.host.log(format!("page: {e}"));
+        }
     }
 
     /// The packages this binary composes (`crate::package`, LLP 1133.022
@@ -721,12 +754,8 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// What the shell is told of the app's state, when it is not what it
-    /// was last told: whether Back has somewhere to go (read again only
-    /// after a commit, since it walks the tree) and whether a text field
-    /// holds the focus, which shows and hides the software keyboard; and
-    /// whether a canvas takes pad input. Queued with no wake: the shell
-    /// calls this as it takes its requests.
+    /// Tell the shell what changed in the app's state. The shell calls this
+    /// as it takes its requests, so these statements need no wake.
     pub fn tell_shell(&mut self) {
         if !self.requests.shell {
             return;
@@ -761,6 +790,10 @@ impl<D: DataSource> Presenter<D> {
         }
         if let Some(session) = self.orientation_moved() {
             self.queue(Request::Orientation(session));
+        }
+        if self.requests.window_title.update(self.host.runner()) {
+            let title = self.requests.window_title.authored().map(str::to_owned);
+            self.queue(Request::WindowTitle(title));
         }
         // A package view's displayed state, by the same rule, now the bars'
         // covers are set (LLP 1133.008 D8 item 2).
@@ -888,6 +921,11 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
+    /// Whether a shell takes this presenter's requests ([`Self::serve_requests`]).
+    pub(crate) fn serves_requests(&self) -> bool {
+        self.requests.shell
+    }
+
     pub(crate) fn reader_requests_pending(&self) -> bool {
         !self.requests.queued.is_empty()
     }
@@ -1007,6 +1045,7 @@ impl<D: DataSource> Presenter<D> {
         (self.requests.wakelock, self.requests.wakelock_epoch) = (None, None);
         (self.requests.orientation, self.requests.orientation_epoch) = (None, None);
         self.requests.pad_input = None;
+        self.requests.window_title = WindowTitle::default();
         let waiting: Vec<u32> = (self.requests.waiting.iter())
             .filter(|(_, w)| {
                 !matches!(
@@ -1322,17 +1361,20 @@ impl<D: DataSource> Presenter<D> {
     }
 
     /// `share(…)`: the runner's rule, then the shell's sheet where there
-    /// is one. Its outcome arrives by the request's id. The request carries
-    /// no files: Android's sheet would take them as content URIs from a
-    /// `FileProvider`, which the shell does not have (LLP 1125 D12).
+    /// is one. Its outcome arrives by the request's id. The Android reader
+    /// gives the sheet `app:/` files as content URIs of its own provider
+    /// (LLP 1094.000 D7); it draws no element's picture (LLP 1125 D12).
     pub(super) fn share(&mut self, args: &[exact_plan::Value], source: Option<ViewId>) {
-        const ANDROID: &str = "files are not carried to Android's share sheet yet";
         let share = Share::from_args(args);
         let (agent, shell) = (self.agent, self.requests.shell);
+        // What the sheet takes is what `exactPage()` says it does ([`Self::serve_share_sheet`]).
+        let page = self.host.runner().page();
         let reach = exact_runner::share::Reach {
             sheet: shell,
-            files: shell.then_some(ANDROID),
-            pictures: shell.then_some(ANDROID),
+            files: (shell && !page.can_share_files)
+                .then_some("files are not carried to this host's share sheet"),
+            pictures: (shell && !page.can_share_pictures)
+                .then_some("a picture of an element is not carried to Android's share sheet yet"),
         };
         let runner = self.host.runner_mut();
         if let exact_runner::share::Arm::Present(share, _) =

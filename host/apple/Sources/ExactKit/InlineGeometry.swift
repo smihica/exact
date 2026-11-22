@@ -12,13 +12,23 @@ private typealias PlatformFont = UIFont
 #endif
 
 extension Runtime {
-    func setInlineGeometry(_ read: @escaping (UInt32) -> CGRect?, range: @escaping (UInt32, UInt32, UInt32) -> CGRect?) {
+    func setInlineGeometry(_ read: @escaping (UInt32) -> CGRect?, range: @escaping (UInt32, UInt32, UInt32) -> CGRect?,
+                          metrics: @escaping (UInt32) -> [Double]?) {
         inlineFrame = read
         rangeFrame = range
+        scrollMetrics = metrics
         let ctx = UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())
         on {
-            exact_set_inline_geometry(rt, Self.readInlineFrame, Self.readRangeFrame, UnsafeMutableRawPointer(bitPattern: ctx))
+            exact_set_text_geometry(rt, Self.readInlineFrame, Self.readRangeFrame, Self.readScrollMetrics, UnsafeMutableRawPointer(bitPattern: ctx))
         }
+    }
+
+    private static let readScrollMetrics: ExactScrollMetricsFn = { ctx, id, out in
+        guard let ctx, let out else { return 0 }
+        let runtime = Unmanaged<Runtime>.fromOpaque(ctx).takeUnretainedValue()
+        guard let values = Owner.shared.callMain({ runtime.scrollMetrics?(id) }), values.count == 6 else { return 0 }
+        for (i, value) in values.enumerated() { out[i] = value }
+        return 1
     }
 
     private static let readRangeFrame: ExactRangeFrameFn = { ctx, id, start, end in
@@ -41,6 +51,28 @@ extension Runtime {
 }
 
 extension Presenter {
+    func textareaScrollMetrics(_ id: UInt32) -> [Double]? {
+        guard let node = views[id], let field = node.textArea, field.window != nil, !node.cssVisibilityHidden else { return nil }
+        var ancestor: PlatformView? = field
+        while let view = ancestor {
+            if view.isHidden { return nil }
+            ancestor = view.superview
+        }
+        #if os(macOS)
+        guard let scroll = node.textAreaScroll, let document = scroll.documentView else { return nil }
+        scroll.layoutSubtreeIfNeeded()
+        let point = scroll.contentView.bounds.origin, port = scroll.contentView.bounds.size, size = document.frame.size
+        #else
+        field.layoutIfNeeded()
+        let inset = field.adjustedContentInset
+        let point = CGPoint(x: field.contentOffset.x + inset.left, y: field.contentOffset.y + inset.top)
+        let port = CGSize(width: max(0, field.bounds.width - inset.left - inset.right),
+                          height: max(0, field.bounds.height - inset.top - inset.bottom))
+        let size = field.contentSize
+        #endif
+        return [point.x, point.y, max(port.width, size.width), max(port.height, size.height), port.width, port.height].map(Double.init)
+    }
+
     /// `rangeFrame` (LLP 1114.007): a textarea's UTF-16 range as TextKit
     /// last laid it out, a plain one's or a Markdown one's source alike, in
     /// viewport points; collapsed, the caret's rectangle. Nil past the
@@ -236,6 +268,39 @@ extension NodeView {
             } else { merged.append(lo...hi) }
         }
         return merged
+    }
+
+    /// The start of the first rendered text baseline in the paragraph view's coordinates.
+    func firstPaintedBaseline(_ run: InlineText?) -> CGPoint? {
+        guard isParagraph, let text else { return nil }
+        let box = paragraphBox()
+        #if os(macOS)
+        if let reader = readerParagraph {
+            guard run == nil, reader.hasPixels, let geometry = reader.accepted?.metadata,
+                  let first = geometry.baselines.first else { return nil }
+            return CGPoint(x: box.minX, y: box.minY + geometry.source.painted(first))
+        }
+        let scale = pixelScale ?? 1
+        #else
+        let scale = traitCollection.displayScale
+        #endif
+        guard let paragraph = paragraphLayout() else { return nil }
+        if let run {
+            guard run.range.length > 0, let rect = inlineRects(run).first(where: { $0.width > 0 }) else { return nil }
+            let fit = props["fitScale"].flatMap(Float.init) ?? 1
+            let font = text.font(run.run(dark: drawsDark).scaled(fit)) as CTFont
+            let (above, _) = CSSLineBox.content(font, scale: paragraph.lineScale)
+            return CGPoint(x: rect.minX, y: rect.minY + above + run.lightRun.backgroundAbove)
+        }
+        guard let line = paragraph.lines.firstIndex(where: { CTLineGetGlyphCount($0) > 0 }) else { return nil }
+        var point = CGPoint(x: box.minX + paragraph.origin(line, align: paragraphSpec().align, width: box.width),
+                            y: TextEngine.paintedLine(paragraph.baselines[line], top: box.minY, scale: scale, lineScale: paragraph.lineScale))
+        if let fragments = columnRecord?.fragments, !fragments.isEmpty {
+            guard let fragment = fragments.first(where: { $0.lines.contains(line) }) else { return nil }
+            point.x += fragment.dx
+            point.y += fragment.dy
+        }
+        return point
     }
 
     func inlineBounds(_ run: InlineText) -> CGRect? {

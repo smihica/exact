@@ -1104,10 +1104,17 @@ each `tr` holding `th` header cells (`scope="col"` or `"row"`) and `td`
 cells, any cell with `colspan` and `rowspan` (`rowspan=0` reaches the end of
 its row group). Rows and cells may come from a `for`. A sortable
 column's `th` takes `aria-sort` (`"ascending"`, `"descending"`, `"none"` or
-`"other"`; no bool), which only the web exposes. Terms and their descriptions
-are a `dl` of `dt` terms each followed by its `dd` descriptions. On the web
-these are the elements, laid out by the browser; on the native hosts the
-kernel lays a table out as a grid of `auto` columns as wide as its content.
+`"other"`). The web and macOS expose the sort direction to assistive technology.
+On the Mac, unstyled rows with one row of text headers and unspanned cells
+give the table AppKit column headers. Put `press` on a `th` to sort the rows in your
+app and set `aria-sort` to show their order. People can drag a divider to
+resize a column. Its contents wrap at that width, which a named window
+restores when reopened. Use `appearance="none"` on the table to keep the
+authored presentation.
+
+Terms and their descriptions are a `dl` of `dt` terms each followed by its `dd`
+descriptions. The browser lays out the HTML elements. On native hosts the kernel
+lays a table out as a grid. Its columns size to their content until resized.
 Where columns share width (a span wider than the columns it covers, a table
 narrower than its content), the grid shares it equally and the browser in
 proportion to the columns' widths, so unequal columns can differ by a few
@@ -1348,6 +1355,11 @@ opacity and transforms remain admitted. `accent-color` tints the styles that sup
 A settings screen is a grouped list: a `list` whose `appearance` is the literal
 `auto`. Its children are `section`s. A section's first child may be a `header`
 and its last a `footer`, each holding a `text`; everything between is its rows.
+A `header` may instead hold boxes of your own, such as a `row` of an `image`
+and a `text` (an avatar beside a name). That header is custom: it keeps its
+views in the platform's header, which still pins in a plain list, and its texts
+name it for a screen reader. Several bare texts are refused; lay them out in a
+`row` or a `column`. A `footer` holds one `text` only.
 A row is read by its shape: an optional leading `image "symbol:…"`, a `text`
 title, an optional second `text` (a value) or a `column` of two texts (a
 subtitle), and an optional trailing accessory — a `forward-chevron` or
@@ -1514,12 +1526,19 @@ shows a full retained navigation stack and tab UI.
 
 A `head` element declares document metadata: `title`, `description`, `canonical`,
 `image`, `robots`, and `status` (a literal 404, 410 or 503). The innermost active
-declaration wins field by field. Use `scroll document` for document scrolling and
-ordinary `scroll` for an inner scrollport; both need a bound. Route rows can
-declare `render`, `activate`, `paint` and `pages` policies; these interact with
-the site's build/render pipeline, not just its client-side view. Leave `activate`
-unsaid unless a page needs otherwise: a rendered page then loads no script until
-the reader acts, when nothing on it needs the runtime sooner
+declaration wins field by field. The title updates the browser tab, the macOS
+window and the iOS scene. On Windows, it sets the window caption and the
+window's UI Automation name. An empty title clears both, and removing the title
+restores the app name. On Android, it sets the activity title. An empty title
+clears it, and removing the title restores the activity label. AOSP's desktop
+caption displays the application label.
+[AOSP window decoration source](https://android.googlesource.com/platform/frameworks/base.git/+/f4e211cf82c8c3bffa3afd671e66c95eafdd28ad/libs/WindowManager/Shell/src/com/android/wm/shell/windowdecor/DesktopModeWindowDecoration.java#780)
+
+Use `scroll document` for document scrolling and ordinary `scroll` for an inner
+scrollport. Both need a bound. Route rows can declare `render`, `activate`,
+`paint` and `pages` policies for the site's build, rendering and client-side view.
+Leave `activate` unsaid unless a page needs otherwise: a rendered page then
+loads no script until the reader acts, when nothing on it needs the runtime sooner
 (LLP 1048.007). Follow
 [the document corpus](../contract/corpus/document.contract) and
 [the document tests](../contract/cli/tests/it/document.rs) for accepted policy
@@ -1706,6 +1725,14 @@ component Responsive
         text "Compact layout"
 ```
 
+`exactPage().platform` identifies the host from the first frame. Declare
+`platform: string` or an enum over the following values in the page resource's shape.
+The native hosts report
+`ios`, `macos`, `tvos`, `watchos`, `android`, `linux` or `windows`.
+A browser or server-rendered web page reports `web`, a terminal app reports
+`terminal`, and a runner booted without a host reports `headless`. A browser
+on an Android phone therefore reports `web`.
+
 `exactPage` answers the page's facts by the web's names: `visibilityState`
 (`"visible"` or `"hidden"`), `onLine`, `canShare`, `canOpenFiles`, and
 `hasFocus`, which is `document.hasFocus()`: true while the app's window has the
@@ -1734,7 +1761,7 @@ for the app to honor, not automatic engine policy. `displayMode: string` reads
 CSS's current `display-mode`: the browser's media query on the web (in Chrome,
 an agent's `prefer display-mode` replaces the reading and leaves the query
 alone), `fullscreen` or `standalone` for the window on macOS, and `standalone`
-on other native hosts. `navigationType` is how the browser loaded the page
+on other native hosts. On `exactPage`, `navigationType` is how the browser loaded the page
 (`navigate`, `reload` or `back_forward`), and empty in a native app. Available fields are documented beside their source validation (LLP 1039); start with [the viewport corpus](../contract/corpus/viewport.contract).
 
 Localized strings live in the app's `strings/<locale>.json` files. Author calls

@@ -289,17 +289,20 @@ impl<D: DataSource> Host<D> {
         );
         data.configure_secrets(secret_session.shared.clone())
             .map_err(|error| HostError::Layout(format!("shared secrets: {error:?}")))?;
-        let mut runner = Runner::boot_with_delivery(
-            plan,
-            data,
-            kernel,
-            carried,
-            store_snapshot,
-            delivery.unwrap_or_default(),
-            exact_runner::Viewport::sized(width as f64, height as f64),
-            launch,
-        )
-        .map_err(HostError::Runner)?;
+        let mut runner = crate::PLATFORM
+            .boot(|| {
+                Runner::boot_with_delivery(
+                    plan,
+                    data,
+                    kernel,
+                    carried,
+                    store_snapshot,
+                    delivery.unwrap_or_default(),
+                    exact_runner::Viewport::sized(width as f64, height as f64),
+                    launch,
+                )
+            })
+            .map_err(HostError::Runner)?;
         #[cfg(target_os = "macos")]
         drop(boot_trace);
         #[cfg(any(windows, target_os = "macos"))]
@@ -699,7 +702,7 @@ impl<D: DataSource> Host<D> {
     }
 
     /// Whether any node shows press feedback now.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn pressing(&self) -> bool {
         !self.presses.is_empty()
     }
@@ -717,7 +720,14 @@ impl<D: DataSource> Host<D> {
     /// The agent API's read operations (LLP 1012): `tree`, `state`, `logs`
     /// from the runner; `settle` from the engine, and a resource's re-ask.
     pub fn agent(&self, request: &str) -> String {
-        if exact_runner::json::field_str(request, "op").as_deref() == Some("settle") {
+        let op = exact_runner::json::field_str(request, "op");
+        if op.as_deref() == Some("saveWindow") {
+            let tree = crate::picker::store_root(self.runner.data_ref().app_id())
+                .ok()
+                .flatten();
+            return exact_data::storage::save_test_window(&self.runner, tree, request);
+        }
+        if op.as_deref() == Some("settle") {
             return match self
                 .engine
                 .settle_time()
@@ -758,7 +768,14 @@ impl<D: DataSource> Host<D> {
 
     /// An executor for the app's grants, which the source's announced topics also wake (LLP 1016.002).
     pub fn executor(&mut self) -> crate::executor::Executor {
-        let executor = crate::executor::Executor::start(&self.grants());
+        self.executor_with(crate::executor::Executor::start)
+    }
+
+    pub(crate) fn executor_with(
+        &mut self,
+        start: crate::executor::Start,
+    ) -> crate::executor::Executor {
+        let executor = start(&self.grants());
         if let Some(roots) = self.app_roots() {
             executor.set_app_roots(roots);
         }
@@ -984,7 +1001,7 @@ impl<D: DataSource> Host<D> {
             .map_err(|e| format!("safe area: {e:?}"))?;
         match self
             .runner
-            .refresh_viewport_geometry()
+            .refresh_geometry()
             .map_err(|e| format!("safe area: {e:?}"))?
         {
             Some(receipt) => {
@@ -1056,7 +1073,10 @@ impl<D: DataSource> Host<D> {
                     continue;
                 }
                 let size = crate::paint::look::symbol_size(&node);
-                sizes.push((node.id, (size > 0.).then_some((size, size))));
+                sizes.push((
+                    node.id,
+                    (size > 0.).then(|| crate::paint::look::symbol_natural(&node)),
+                ));
             }
         }
         for (view, size) in sizes {
@@ -1278,6 +1298,12 @@ impl<D: DataSource> Host<D> {
             }
             self.media_mounts.commit(self.runner.kernel(), r);
         }
+        if !self.runner.plan().surfaces.is_empty()
+            && receipts.iter().any(|t| !t.receipt.destroyed.is_empty())
+        {
+            self.runner.retire_canvas_generations();
+            self.prune_canvas_pixels();
+        }
         self.track_presence(receipts);
         self.size_new_symbols(receipts);
         if receipts.iter().any(|t| !t.receipt.created.is_empty()) {
@@ -1288,7 +1314,8 @@ impl<D: DataSource> Host<D> {
         // named `--storage` drive writes them into that scratch tree, so a
         // reload reads them back (platformer R10). The log is taken either way.
         // Written by the store's own thread (`store_writer.rs`), so no frame waits on a file's sync.
-        let writes = self.runner.take_store_writes();
+        let mut writes = self.runner.take_store_writes();
+        writes.retain(|w| !w.name.starts_with(exact_runner::Store::WINDOW_STATE));
         for line in self.secret_session.remember(&writes) {
             self.runner.log(line);
         }

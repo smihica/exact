@@ -39,29 +39,51 @@ impl<D: DataSource> Presenter<D> {
     pub fn set_kiosk_fps(&mut self, fps: u32) {
         self.brush.fps = Some(fps);
     }
+}
 
-    /// Hand a DRM connector to the Ink painter for direct presentation.
-    ///
-    /// # Safety
-    /// `fd` is the DRM master of the card that scans out `connector` and stays
-    /// open while this presenter lives. The caller stops submitting frames and
-    /// reading display events on it, including when this call returns an error.
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    #[allow(unsafe_code)]
-    pub unsafe fn kiosk_attach_scanout(
-        &mut self,
-        fd: i32,
-        connector: u32,
-        size: [u32; 2],
-        refresh: u32,
-    ) -> Result<(), String> {
-        // SAFETY: the shell upholds the display ownership contract above.
-        unsafe { self.brush.attach_scanout(fd, connector, size, refresh) }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Whether the painter still owns direct presentation after a frame.
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn kiosk_presents(&self) -> bool {
-        self.brush.presents()
+    #[test]
+    fn kiosk_overscroll_moves_pixels_without_changing_logical_scroll() {
+        let plan = crate::test_plan(
+            r##"component App
+  view
+    scroll testId="port" width=80 height=60 background-color="#ffffff"
+      column
+        box testId="row" width=80 height=40 background-color="#ff0000"
+        box width=80 height=200 background-color="#0000ff"
+"##,
+        );
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &plan,
+            (),
+            (80., 60.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let port = stage::tests::id(&p, "port");
+        let row = stage::tests::id(&p, "row");
+        assert!(p.kiosk_scroll_to(port, -12., -12.));
+        let displaced = p.frame();
+        assert_eq!(p.kiosk_scroll_state(port).unwrap().offset, (0., 0.));
+        assert_eq!(p.box_of(row).unwrap().rect.1, 12.);
+        assert_eq!(displaced.pixel(20, 6).unwrap().green(), 255);
+        assert_eq!(displaced.pixel(20, 16).unwrap().green(), 0);
+
+        p.kiosk_clear_overscroll();
+        let restored = p.frame();
+        assert_eq!(p.kiosk_overscroll(), None);
+        assert_eq!(p.box_of(row).unwrap().rect.1, 0.);
+        assert_eq!(restored.pixel(20, 6).unwrap().green(), 0);
+
+        assert!(p.kiosk_scroll_to(port, -12., -12.));
+        p.reload(&plan, ()).unwrap();
+        assert_eq!(p.kiosk_overscroll(), None);
     }
 }

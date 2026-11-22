@@ -4,7 +4,8 @@
 //!
 //! @ref LLP 1026 D11 (crash recovery; assets by digest)
 
-use crate::envelope::{sha256_hex, FileCard};
+use super::EmbeddedAsset;
+use crate::envelope::{resolve_url, sha256_hex, CohortReceipt, FileCard};
 use std::collections::BTreeSet;
 #[cfg(not(test))]
 use std::fs::hard_link;
@@ -256,6 +257,76 @@ impl Blobs {
     /// the card, so a damaged blob is fetched again, never linked forward.
     pub(super) fn holds(&self, card: &FileCard) -> bool {
         read_card(&self.0.join(&card.sha256), card).is_ok()
+    }
+
+    /// Reuse a verified file from the blob store or the binary before fetching it.
+    pub(super) fn obtain(
+        &self,
+        card: &FileCard,
+        base: &str,
+        fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+        embedded_asset: &mut dyn FnMut(&str) -> Option<EmbeddedAsset>,
+    ) -> Result<(), String> {
+        let url = resolve_url(base, &card.url)?;
+        if self.holds(card) {
+            return Ok(());
+        }
+        // The binary's digest only rules a file out. Its bytes may have changed.
+        if let Some(embedded) = embedded_asset(&card.name).filter(|e| e.sha256 == card.sha256) {
+            if let Ok(bytes) = read_card(&embedded.path, card) {
+                return self.put(&card.sha256, &bytes);
+            }
+        }
+        let bytes = fetch(&url)?;
+        if bytes.len() as u64 != card.bytes {
+            return Err(format!(
+                "{} is {} bytes; the head declared {}",
+                card.name,
+                bytes.len(),
+                card.bytes
+            ));
+        }
+        let digest = sha256_hex(&bytes);
+        if digest != card.sha256 {
+            return Err(format!(
+                "{} hashes to {digest}; the head declared {}",
+                card.name, card.sha256
+            ));
+        }
+        self.put(&card.sha256, &bytes)
+    }
+
+    pub(super) fn obtain_cohort(
+        &self,
+        receipt: &CohortReceipt,
+        head_url: &str,
+        fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> Result<(), String> {
+        self.obtain(&receipt.card, head_url, fetch, &mut |_| None)?;
+        if receipt.chunked {
+            let base = resolve_url(head_url, &receipt.card.url)?;
+            for card in self.cohort_chunks(receipt)? {
+                self.obtain(&card, &base, fetch, &mut |_| None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cohort_chunks(&self, receipt: &CohortReceipt) -> Result<Vec<FileCard>, String> {
+        CohortReceipt::chunks(&read_card(
+            &self.0.join(&receipt.card.sha256),
+            &receipt.card,
+        )?)
+    }
+
+    pub(super) fn keep_cohort(&self, receipt: &CohortReceipt, keep: &mut BTreeSet<String>) {
+        keep.insert(receipt.card.sha256.clone());
+        if !receipt.chunked {
+            return;
+        }
+        if let Ok(chunks) = self.cohort_chunks(receipt) {
+            keep.extend(chunks.into_iter().map(|card| card.sha256));
+        }
     }
 
     /// Keep `bytes`, already checked against `digest`, whole and durable.

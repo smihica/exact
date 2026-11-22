@@ -33,10 +33,9 @@ and opens a fresh socket. Resources default to kept answers; add `transient`
 for sensitive feed data.
 
 On macOS, Linux and Windows desktops `frozen` stays false even with a hidden window.
-Android sets it when the Activity stops without a promoted foreground-service
-claim, or when the last such claim ends while hidden; a started Activity clears
-it. iOS and tvOS set it in the background unless active audio with the background
-audio mode keeps execution eligible. A configured playback category alone grants
+Android sets it when the activity is stopped and no promoted foreground service
+carries a live claim or plays media. iOS and tvOS set it in the background unless
+active audio with the background audio mode keeps execution eligible. A configured playback category alone grants
 nothing; ending playback while hidden freezes the page. A signed-phone run remains owed.
 On the web it follows Page Lifecycle `freeze`/`resume` where fired, else false.
 A browser promises nothing after hidden: save as changes happen and handle

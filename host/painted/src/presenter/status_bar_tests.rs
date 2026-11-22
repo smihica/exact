@@ -65,6 +65,29 @@ fn no_declaration_is_the_default() {
 }
 
 #[test]
+fn navigation_icons_follow_their_own_topmost_declaration_and_scheme() {
+    let mut p = screen(
+        r#"navigation-bar-style="light-content""#,
+        "",
+        r#"status-bar-style="dark-content""#,
+        "",
+    );
+    assert!(p.chrome().navigation_light_icons);
+    assert!(!p.chrome().dark);
+    assert!(!p.chrome().status_light_icons);
+    p.set_system_scheme(true);
+    assert!(p.chrome().navigation_light_icons);
+    assert!(!p.chrome().status_light_icons);
+    let p = screen(
+        r#"navigation-bar-style="light-content""#,
+        r#"navigation-bar-style="auto""#,
+        "",
+        r#"color-scheme="light""#,
+    );
+    assert!(!p.chrome().navigation_light_icons);
+}
+
+#[test]
 fn the_declaration_painted_on_top_wins() {
     let light = r#"status-bar-style="light-content""#;
     let dark = r#"status-bar-style="dark-content""#;

@@ -21,7 +21,8 @@ use exact_plan::{BindingKind, BindingsRow, EventKind, Plan};
 /// layout that can reach the algorithm ([`lays_out_grid`]) selects,
 /// [`Capability::Effects`] a box's `filter` or what SVG uses,
 /// [`Capability::Drag`] a height or transform drag (a reorder is the
-/// lists'), and the native roster's entries. The browser lays out a grid itself, and the
+/// lists'), and the native roster's entries. [`Capability::TextSelection`] is
+/// iOS's reading; the bake adds it to every Mac set. The browser lays out a grid itself, and the
 /// other native hosts link the algorithm whole, so for them the capability
 /// is the rows' grammars.
 pub fn apple_uses(plan: &Plan) -> Uses {
@@ -32,6 +33,8 @@ pub fn apple_uses(plan: &Plan) -> Uses {
         }
     };
     add(Capability::Grid, lays_out_grid(plan));
+    // A link's own context menu offers Share (`ExactSharing`).
+    add(Capability::Share, has_link_menu(plan));
     // A height or transform drag is the drag family's; a reorder is the
     // lists' (`Capability::Collections`, below), and its motion is `Motion`.
     add(
@@ -120,6 +123,22 @@ pub fn apple_uses(plan: &Plan) -> Uses {
                 && can_be(plan, &b, |v| v.trim().eq_ignore_ascii_case("sticky"))
         }),
     );
+    // iOS selects only text its author made selectable (LLP 1115.000 D11.6):
+    // a `user-select` that can be `text` or `all`, on a box or an inline
+    // run (`contain`, which the compiler refuses, reads as `text`). A
+    // decoration table paints a `textarea`, whose text is the field's.
+    add(
+        Capability::TextSelection,
+        plan.bindings.iter().any(|b| {
+            b.kind == BindingKind::Style
+                && StyleId::from_bit(u32::from(b.id)) == Some(StyleId::UserSelect)
+                && can_be(plan, &b, |v| {
+                    ["text", "all", "contain"]
+                        .iter()
+                        .any(|k| v.trim().eq_ignore_ascii_case(k))
+                })
+        }),
+    );
     // A background transfer (`@exact/background-transfer`) asks no device
     // grant, and listing or removing a geofence (`@exact/geofencing`) needs
     // only the foreground location one: their names select the carriers. A
@@ -145,14 +164,18 @@ pub fn apple_uses(plan: &Plan) -> Uses {
         }),
     );
     // A Live Activity's sends, or the resource that reads them.
+    let activities = plan.sources.iter().any(|row| {
+        matches!(
+            plan.str(row.name),
+            "startActivity" | "updateActivity" | "endActivity" | "exactActivities"
+        )
+    });
+    add(Capability::Activities, activities);
+    // An entry's plan boots only in a binary that publishes entries; a Live
+    // Activity's sends name the generation that publication makes.
     add(
-        Capability::Activities,
-        plan.sources.iter().any(|row| {
-            matches!(
-                plan.str(row.name),
-                "startActivity" | "updateActivity" | "endActivity" | "exactActivities"
-            )
-        }),
+        Capability::Widgets,
+        !plan.snapshot_entry.is_empty() || activities,
     );
     // The media family's four products, each beside its loaded arm. An
     // `audio` element is a `Video` node.
@@ -194,6 +217,35 @@ pub fn apple_uses(plan: &Plan) -> Uses {
         ]
         .into_iter()
         .any(|id| binds(plan, BindingKind::Prop, id as u16)),
+    );
+    // `@exact/search-index`'s names: only that package writes the content
+    // index. Without it the store refuses a change (`NotSupportedError`), a
+    // generated entity query answers none, and a search result an earlier
+    // build indexed opens the app where it starts. A package whose
+    // implementation reaches `context.contentIndex` belongs here, as the
+    // wakes' names do.
+    add(
+        Capability::ContentIndex,
+        plan.sources.iter().any(|row| {
+            matches!(
+                plan.str(row.name),
+                "setContentIndex"
+                    | "addContentIndexEntry"
+                    | "deleteContentIndexEntry"
+                    | "contentIndexEntries"
+            )
+        }),
+    );
+    // HTML's `dialog`: the host makes it a sheet unless its rows make it a
+    // confirmation when it opens (`MenuHost.isSheet`), and the author's box
+    // whatever its rows once its author paints it, so any `dialog` can be one.
+    add(
+        Capability::Dialogs,
+        plan.bindings.iter().any(|b| {
+            b.kind == BindingKind::Prop
+                && b.id == PropId::SemanticTag as u16
+                && can_be(plan, &b, |v| v == "dialog")
+        }),
     );
     // A swipe row, a reorder group, a reorder grip and a list whose rows
     // are cells (iOS draws them, LLP 1115.000 D16) reach the family without
@@ -349,6 +401,27 @@ fn uses_controls(plan: &Plan) -> bool {
 /// accepts, or a computed one, which can be anything.
 fn can_be(plan: &Plan, binding: &BindingsRow, used: impl Fn(&str) -> bool) -> bool {
     constant_str(plan, plan.code(binding.expr)).is_none_or(used)
+}
+
+/// Whether a link can get the host's own context menu, as
+/// `NodeView.hasLinkMenu` decides on iOS: an `href` that is not empty and
+/// is `http:`, `https:` or has no scheme (resolved against the app's origin).
+fn has_link_menu(plan: &Plan) -> bool {
+    plan.bindings.iter().any(|b| {
+        b.kind == BindingKind::Prop
+            && b.id == PropId::Href as u16
+            && can_be(plan, &b, |href| {
+                let scheme = href.split_once(':').map(|(s, _)| s).filter(|s| {
+                    s.starts_with(|c: char| c.is_ascii_alphabetic())
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                });
+                !href.is_empty()
+                    && scheme.is_none_or(|s| {
+                        s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https")
+                    })
+            })
+    })
 }
 
 fn has_node(plan: &Plan, of: impl Fn(NodeType) -> bool) -> bool {

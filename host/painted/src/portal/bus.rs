@@ -14,6 +14,82 @@ const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
 const DBUS: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 
+#[cfg(target_os = "linux")]
+pub(crate) fn watch_appearance(
+    address: &str,
+    changed: impl Fn(Option<bool>) + Send + 'static,
+) -> Option<crate::desktop::Appearance> {
+    const STARTUP: Duration = Duration::from_millis(30);
+    const SETTINGS: &str = "org.freedesktop.portal.Settings";
+    const APPEARANCE: &str = "org.freedesktop.appearance";
+    const KEY: &str = "color-scheme";
+
+    let mut bus = Bus::connect(address, STARTUP).ok()?;
+    let socket = bus.stream.try_clone().ok()?;
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("exact-desktop-appearance".into())
+        .spawn(move || {
+            // The portal may need starting. Closing the window interrupts the
+            // socket even while the service is starting or waiting for signals.
+            bus.wait_forever();
+            let subscribed = bus.subscribe(&format!(
+                "type='signal',sender='{PORTAL}',path='{PORTAL_PATH}',interface='{SETTINGS}',member='SettingChanged',arg0='{APPEARANCE}',arg1='{KEY}'"
+            )).is_ok();
+            let args = [Value::str(APPEARANCE), Value::str(KEY)];
+            let reply = match bus.call(PORTAL, PORTAL_PATH, SETTINGS, "ReadOne", &args) {
+                Err(error) if error.starts_with("org.freedesktop.DBus.Error.UnknownMethod") => {
+                    bus.call(PORTAL, PORTAL_PATH, SETTINGS, "Read", &args)
+                }
+                result => result,
+            };
+            // The snapshot includes all changes sent before its reply.
+            if reply.is_ok() {
+                bus.queued.clear();
+            }
+            let mut current = reply.ok().and_then(|body| match body.as_slice() {
+                [value] => appearance_value(value),
+                _ => None,
+            });
+            let _ = send.send(current);
+            changed(current);
+            if !subscribed { return; }
+            while let Ok(message) = bus.signal() {
+                if message.path != PORTAL_PATH || message.interface != SETTINGS || message.member != "SettingChanged" {
+                    continue;
+                }
+                if let [Value::Str(namespace), Value::Str(key), value] = message.body.as_slice() {
+                    if namespace == APPEARANCE && key == KEY {
+                        let next = appearance_value(value);
+                        if next != current {
+                            current = next;
+                            changed(next);
+                        }
+                    }
+                }
+            }
+        }).ok()?;
+    let initial = receive.recv_timeout(STARTUP).ok().flatten();
+    Some(crate::desktop::Appearance { initial, socket })
+}
+
+#[cfg(target_os = "linux")]
+fn appearance_value(value: &Value) -> Option<bool> {
+    let Value::Variant(value) = value else {
+        return None;
+    };
+    // Settings.Read returns one more variant than ReadOne and SettingChanged.
+    let value = match value.as_ref() {
+        Value::Variant(inner) => inner.as_ref(),
+        value => value,
+    };
+    match value {
+        Value::U32(1) => Some(true),
+        Value::U32(2) => Some(false),
+        _ => None,
+    }
+}
+
 /// A connection to a message bus, authenticated and named.
 pub(crate) struct Bus {
     stream: UnixStream,

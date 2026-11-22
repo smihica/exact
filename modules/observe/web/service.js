@@ -51,6 +51,25 @@ function anyValue(v) {
 /** Observe's custom-event validation, copied from expo-app-metrics (`LogEvents`). */
 function rulesName(raw) { const n = String(raw ?? '').trim(); return n && !n.startsWith('expo.') && n.length <= 256 ? n : null; }
 const truncate = (s, max) => (s.length <= max ? s : s.slice(0, max - 1) + '…');
+/** Observe's feedback checks, from expo-observe's `reportFeedback.ts`. */
+function rulesFeedback(e) {
+  const id = typeof e.id === 'string' ? e.id : '';
+  const message = typeof e.message === 'string' && e.message.trim() ? e.message : undefined;
+  let rating;
+  if (typeof e.rating === 'number') {
+    const value = e.rating, min = e.min ?? 0, max = e.max ?? 10;
+    if (![value, min, max].every(Number.isSafeInteger) || min < 0 || min >= max || max > 10 || value < min || value > max) {
+      console.warn('observe: dropped feedback with a rating outside its scale');
+      return null;
+    }
+    rating = { value, min, max };
+  }
+  if (!id.trim() || (message === undefined && !rating)) {
+    console.warn('observe: dropped feedback with no id, or with neither message nor rating');
+    return null;
+  }
+  return { id, message, rating };
+}
 function rulesAttributes(raw) {
   const kept = {}; let dropped = 0;
   for (const key of Object.keys(raw ?? {}).sort()) {
@@ -162,17 +181,18 @@ export function start(config, { boot = 0 } = {}) {
   }
 
   const inSample = () => uniform(clientId) < Math.min(Math.max(config.sampleRate ?? 1, 0), 1);
-  const shouldDispatch = () => (config.dispatchingEnabled ?? true) && inSample() && (!config['fact.development'] || config.dispatchInDebug === true);
+  const mayDispatch = () => (config.dispatchingEnabled ?? true) && (!config['fact.development'] || config.dispatchInDebug === true);
   const backoff = n => Math.min(60 * 2 ** (n - 1), 900) * Math.random();
   const retryAfter = h => { if (!h) return null; const s = Number(h); const clamp = x => Math.min(Math.max(x, 60), 900); if (Number.isFinite(s)) return clamp(s); const d = Date.parse(h); return Number.isNaN(d) ? null : clamp((d - Date.now()) / 1000); };
 
   /** Sends one signal's rows chunk by chunk, as expo-observe's `DispatchLoop.swift` does.
    * With `keepalive`, it also stops at the per-signal JSON-length budget. */
-  async function send(signal, url, keepalive) {
+  async function send(signal, url, keepalive, only) {
     if (Date.now() < gate.after) return;
     let limit = CHUNK, budget = KEEPALIVE_BUDGET;
     for (;;) {
-      const q = load(), rows = q[signal].slice(0, limit);
+      // With `only`, just the rows of that name: another tab may add others during a fetch.
+      const q = load(), rows = (only ? q[signal].filter(r => r.name === only) : q[signal]).slice(0, limit);
       if (!rows.length) return;
       const body = JSON.stringify(signal === 'metrics' ? metricsBody(rows, q.sessions) : logsBody(rows, q.sessions));
       if (keepalive && body.length > budget) {
@@ -200,10 +220,13 @@ export function start(config, { boot = 0 } = {}) {
     }
   }
   async function drain(keepalive) {
-    if (!shouldDispatch() || !config.projectId) { await update(q => { q.metrics = []; q.logs = []; }); return; }
+    if (!mayDispatch() || !config.projectId) { await update(q => { q.metrics = []; q.logs = []; }); return; }
+    // Out of the sample only feedback is sent, as expo-observe sends it.
+    const only = inSample() ? undefined : 'expo.feedback';
+    if (only) await update(q => { q.metrics = []; q.logs = q.logs.filter(r => r.name === only); });
     const base = String(config.endpoint ?? 'https://o.expo.dev').replace(/\/+$/, '');
-    await send('metrics', `${base}/${config.projectId}/v1/metrics`, keepalive);
-    await send('logs', `${base}/${config.projectId}/v1/logs`, keepalive);
+    await send('metrics', `${base}/${config.projectId}/v1/metrics`, keepalive, only);
+    await send('logs', `${base}/${config.projectId}/v1/logs`, keepalive, only);
   }
   // Without Web Locks (a page that is not a secure context) each tab sends alone, and a
   // row two tabs read before either removes it is sent twice.
@@ -235,6 +258,14 @@ export function start(config, { boot = 0 } = {}) {
           const attrs = { ...globals, ...a.kept };
           if (e.displayName?.trim()) attrs['expo.log.display_name'] = truncate(e.displayName.trim(), 128);
           log(SEVERITY[e.severity] ? e.severity : 'info', name, e.body == null ? undefined : truncate(String(e.body), 4096), attrs, a.dropped, e.wall);
+          break;
+        }
+        case 'app.feedback': {
+          const f = rulesFeedback(e); if (!f) break;
+          const a = rulesAttributes(e.attributes);
+          const attrs = { ...globals, ...a.kept, 'expo.feedback.id': f.id };
+          if (f.rating) Object.assign(attrs, { 'expo.feedback.rating': f.rating.value, 'expo.feedback.scale.min': f.rating.min, 'expo.feedback.scale.max': f.rating.max });
+          log('info', 'expo.feedback', f.message === undefined ? undefined : truncate(f.message, 4096), attrs, a.dropped, e.wall);
           break;
         }
         case 'app.error': log('error', 'js.exception', undefined, { 'expo.error.source': e.source ?? 'reportedByUser', 'expo.error.is_fatal': false, 'exception.type': e.type ?? 'Error', 'exception.message': e.message ?? '', ...(e.stack ? { 'exception.stacktrace': e.stack } : {}) }, 0, e.wall); break;

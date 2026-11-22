@@ -59,7 +59,7 @@ final class Canvas2DFontTests: XCTestCase {
     func testPulsingTextKeepsOnlyTheRecordingFontsAndABoundedCache() throws {
         let host = Canvas2DHost(), parent = CALayer(), engine = TextEngine(resolve: { _ in nil })
         host.textEngine = { engine }
-        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: [])
+        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: []) { _ in CGRect(x: 0, y: 0, width: 150, height: 100) }
         apply(host, parent, cover + [font(40), (.save, [])] + text, fresh: true)
         let saved = try pixels(parent)
         for frame in 0..<512 {
@@ -105,7 +105,7 @@ final class Canvas2DFontTests: XCTestCase {
     func testKeptListsRetainTheirFontsUntilCoveredAndResetDropsSavedFonts() throws {
         let host = Canvas2DHost(), parent = CALayer(), engine = TextEngine(resolve: { _ in nil })
         host.textEngine = { engine }
-        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: [])
+        host.place(7, in: CGRect(x: 0, y: 0, width: 150, height: 100), radii: []) { _ in CGRect(x: 0, y: 0, width: 150, height: 100) }
         apply(host, parent, cover + [font(30), (.save, [])] + text, fresh: true)
         let smaller = [font(12), (.fillText, [10, 80, 1, 0, 83, 99, 111, 114, 101])]
         apply(host, parent, smaller)

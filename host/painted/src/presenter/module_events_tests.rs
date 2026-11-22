@@ -9,6 +9,70 @@ fn id(p: &Presenter<()>, name: &str) -> ViewId {
 }
 
 #[test]
+fn iframe_load_commits_for_the_current_frame_allocation() {
+    let source = r#"component App
+  state loaded = false
+  state shown = true
+  action finish
+    loaded = true
+  action remove
+    shown = false
+  task retire mount
+    after(1, remove)
+  view
+    column
+      if shown
+        iframe src="https://example.com/" width=300 height=200 load=finish testId="frame"
+      iframe src="https://example.com/" width=300 height=200 testId="unhandled"
+      image "" width=10 height=10 load=finish testId="image"
+      text (loaded ? "loaded" : "waiting") testId="status"
+"#;
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(source),
+        (),
+        (400., 400.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let frame = id(&p, "frame");
+    let key = p.host.kernel().node(frame).unwrap().key;
+    let session = p.brush.native_session;
+    let status = id(&p, "status");
+    let unhandled = id(&p, "unhandled");
+    let unhandled_key = p.host.kernel().node(unhandled).unwrap().key;
+    let image = id(&p, "image");
+    let image_key = p.host.kernel().node(image).unwrap().key;
+    let status_text = |p: &Presenter<()>| {
+        p.host
+            .kernel()
+            .node(status)
+            .unwrap()
+            .props
+            .str(PropId::Text)
+            .unwrap()
+            .to_owned()
+    };
+    assert!(!p.reader_frame_loaded(unhandled, unhandled_key, session));
+    assert!(!p.reader_frame_loaded(image, image_key, session));
+    assert!(!p.reader_frame_loaded(frame, unhandled_key, session));
+    let stale = exact_kernel::NodeKey {
+        generation: key.generation.wrapping_add(1),
+        ..key
+    };
+    assert!(!p.reader_frame_loaded(frame, stale, session));
+    assert!(!p.reader_frame_loaded(frame, key, session.wrapping_add(1)));
+    assert!(!p.reader_module_event(frame, key, session, "load", String::new(), 0.));
+    assert_eq!(status_text(&p), "waiting");
+    assert!(p.reader_frame_loaded(frame, key, session));
+    assert_eq!(status_text(&p), "loaded");
+    assert!(p.host.advance(2.).is_none());
+    assert!(p.host.kernel().node(frame).is_none());
+}
+
+#[test]
 fn native_module_events_commit_only_for_the_view_allocation_that_emitted_them() {
     let source = r#"component App
   state selection = "initial"

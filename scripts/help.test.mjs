@@ -57,7 +57,10 @@ test('each verb of a new app\'s exact.mjs, and no verb, answers help from exact2
     const own = { seed: ['bun', 'seed.mjs'] }, index = indexText({ verbs: APP_VERBS, own }), forms = new Set();
     for (const text of [index, ...APP_VERBS.map((v) => helpText(v))]) for (const [, form] of text.matchAll(/bun exact\.mjs ((?:[\w<>-]+ )?(?:--help|-h)(?: all)?|help(?: all)?)(?=[:\s]|$)/g)) forms.add(form);
     assert.ok(forms.has('<verb> --help') && forms.has('<verb> --help all'), `the forms named: ${[...forms]}`);
-    const expected = (args) => { const verb = args.find((a) => HELP[a]); return verb ? helpText(verb, { all: args.includes('all') }) : index; };
+    const expected = (args) => {
+      const verb = args.find((a) => HELP[a]);
+      return verb ? helpText(verb, { all: args.includes('all') }) : `${index}\n\nExact checkout: ${realpathSync(sdk)}`;
+    };
     for (const form of forms) for (const verb of form.includes('<verb>') ? APP_VERBS : ['']) {
       const args = form.replace('<verb>', verb).split(' ').filter(Boolean), r = exact(...args);
       assert.equal(r.status, 0, `${args.join(' ')}: ${r.stderr}`);
@@ -156,6 +159,45 @@ test('contract help names the build and verify flags with their arguments and re
   }
 });
 
+test('the Exact wrapper gives a filtered symbols example without building the compiler', () => {
+  const result = timed([resolve(ROOT, 'scripts/exact.mjs'), 'contract', 'symbols', '--editor', '--help']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /symbols <file\.contract>.*--editor.*--component.*--tag/);
+  assert.match(result.stdout, /bun exact\.mjs contract symbols app\.contract .*--match 'Save draft'/);
+});
+
+test('the app wrapper preserves symbols filter values when finding the input file', () => {
+  const parent = mkdtempSync(resolve(tmpdir(), 'exact-symbols-help-'));
+  try {
+    const dir = resolve(parent, 'app'), sdk = resolve(parent, 'sdk');
+    createApp(dir);
+    mkdirSync(resolve(sdk, 'scripts'), { recursive: true });
+    mkdirSync(resolve(sdk, 'js/bake/src'), { recursive: true });
+    for (const file of ['scripts/app-cli.mjs', 'scripts/help.mjs', 'scripts/paths.mjs', 'scripts/bun.mjs', 'js/bake/src/__exact_env.mjs']) {
+      copyFileSync(resolve(ROOT, file), resolve(sdk, file));
+    }
+    symlinkSync(resolve(ROOT, 'scripts/file-dependencies.mjs'), resolve(sdk, 'scripts/file-dependencies.mjs'));
+    writeFileSync(resolve(sdk, 'scripts/exact.mjs'), 'console.log(JSON.stringify(process.argv.slice(2))); console.error(process.env.EXACT_VARIANT ?? "");');
+    const exact = (...args) => timed([resolve(dir, 'exact.mjs'), 'contract', 'symbols', ...args], { cwd: parent, env: { ...process.env, EXACT: sdk } });
+    const help = exact('--editor', '--help');
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /bun exact\.mjs contract symbols app\.contract .*--match 'Save draft'/);
+    const flags = ['--editor', '--match', '--help', '--match', 'app.contract'];
+    const result = exact('app.contract', ...flags);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), ['contract', 'symbols', resolve(realpathSync(dir), 'app.contract'), ...flags]);
+    const match = ['--editor', '--match', '--variant'];
+    const literal = exact('app.contract', ...match);
+    assert.equal(literal.status, 0, literal.stderr);
+    const forwarded = ['contract', 'symbols', resolve(realpathSync(dir), 'app.contract'), ...match];
+    assert.deepEqual(JSON.parse(literal.stdout), forwarded);
+    const variant = exact('app.contract', ...match, '--variant', 'preview');
+    assert.equal(variant.status, 0, variant.stderr);
+    assert.deepEqual(JSON.parse(variant.stdout), forwarded);
+    assert.match(variant.stderr, /^preview$/m);
+  } finally { rmSync(parent, { recursive: true, force: true }); }
+});
+
 // LLP 1116.003 D5: the helps a small web app reads first (web, test, agent) say what a first build
 // needs; `--help all` names every flag the short text leaves out, and the ports.
 test('a first build\'s helps are short, and --help all has every flag', () => {
@@ -169,6 +211,9 @@ test('a first build\'s helps are short, and --help all has every flag', () => {
     assert.match(all, /^Ports {4}/m, `${verb} --help all says its ports`);
     assert.doesNotMatch(all, /^More /m);
   }
+  const checkout = timed([resolve(ROOT, 'scripts/exact.mjs'), 'web', '--help', 'all'], { cwd: ROOT });
+  assert.equal(checkout.status, 0, checkout.stderr);
+  assert.equal(checkout.stdout.trim(), helpText('web', { all: true }));
   // LLP 1116.008 D2: web's help does not teach a background dev server (builders followed it into five steps).
   assert.match(helpText('web', { all: true }), /The dev loop is for a person watching\n\s+the app change: verify, test and agent build and serve their own copy, so checking\n\s+the app needs no dev server\./);
   assert.doesNotMatch(helpText('web', { all: true }), /web\.log| &\s|background|\$!/);

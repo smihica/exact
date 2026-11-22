@@ -67,6 +67,8 @@ mod nodes;
 mod overflow;
 pub mod params;
 mod popover_surface;
+mod prose;
+mod provenance;
 mod resource_args;
 mod roles;
 mod root_names;
@@ -95,6 +97,7 @@ mod theme;
 mod timers;
 mod tips;
 mod tools;
+mod transfer;
 mod type_tokens;
 mod values;
 pub mod var_tokens;
@@ -173,7 +176,7 @@ pub use theme::retained::{
     with_design_scan, DesignScan,
 };
 pub use theme::{retention, rows, synthetic_candidates};
-pub use warnings::{warnings, MAX_WARNINGS};
+pub use warnings::{warnings, WarningSelection, MAX_WARNINGS};
 
 use contract_analyze::Analysis;
 use contract_syntax::{Attr, Expr, File, FnDecl, Node, Owner, Span};
@@ -231,6 +234,7 @@ pub(crate) fn prop_row(id: exact_kernel::PropId, expr: Code, written: bool) -> B
 
 pub(crate) struct Lowerer<'a> {
     pub b: PlanBuilder,
+    each_steps: &'a BTreeMap<u32, u32>,
     /// The app's theme, resolved (LLP 1095 D4).
     pub theme: Vec<theme::ThemeEntry>,
     sites: Option<Sites>,
@@ -355,12 +359,6 @@ struct FontUse {
 /// At most this many refusals from one lowering.
 pub const MAX_REFUSALS: usize = 20;
 
-impl From<LowerError> for Vec<LowerError> {
-    fn from(e: LowerError) -> Self {
-        vec![e]
-    }
-}
-
 /// Lower a checked file to a plan.
 pub fn lower(
     checked: &Checked<'_>,
@@ -372,17 +370,16 @@ pub fn lower(
         .map_err(|mut all| all.swap_remove(0))
 }
 
-/// Lower, reporting every independent refusal: each element and each of its attributes is
-/// lowered whatever its siblings' fate (at most [`MAX_REFUSALS`]). `mapped` also returns the
-/// development source sites; `profile` is the surface the plan is for. `warned` collects diagnostics
-/// using the plan's control appearance decisions. It links every row's grammar (LLP 1053.000 §2).
+/// Lower every element and attribute, reporting up to [`MAX_REFUSALS`] independent refusals.
+/// `mapped` requests development source sites. Collected warnings use the plan's control
+/// appearance decisions. Every row's grammar is linked (LLP 1053.000 §2).
 pub fn lower_all(
     checked: &Checked<'_>,
     analysis: &Analysis,
     asset_root: Option<&Path>,
     mapped: bool,
     profile: Profile,
-    warned: Option<&mut Vec<LowerError>>,
+    warned: Option<(&WarningSelection, &mut Vec<LowerError>)>,
 ) -> Result<(Plan, Option<Sites>), Vec<LowerError>> {
     exact_kernel::style::link_all();
     if mapped && checked.expanded.instances.is_empty() {
@@ -399,6 +396,7 @@ pub fn lower_all(
             bundled::check(&checking.expanded(), root)
         })
         .unwrap_or_default();
+    asset_errors.extend(routes::tab_accessory::check(checked));
     let mut text_styles = warnings::TextStyles::new();
     let result = lower_with_sites(
         checked,
@@ -408,11 +406,12 @@ pub fn lower_all(
         profile,
         warned.as_ref().map(|_| &mut text_styles),
     );
-    if let Some(out) = warned {
+    if let Some((selection, out)) = warned {
         out.extend(warnings::with_text_styles(
             checked,
             &text_styles,
             asset_warnings,
+            selection,
         ));
     }
     let result = match result {
@@ -455,7 +454,8 @@ fn lower_with_sites(
         .map(|f| contract_syntax::share_calls(&f.body, &is_fn))
         .collect();
     let mut l = Lowerer {
-        b: PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, compiler_identity()),
+        b: nodes::builder(ex),
+        each_steps: &ex.each_steps,
         theme: Vec::new(),
         sites: capture_sites.then(|| Sites::declared(ex)),
         text_styles,
@@ -611,6 +611,9 @@ fn lower_body(
                     ),
                     span: a.span,
                 }),
+                None if a.name.starts_with("--exact-") => {
+                    l.errors.extend(lint::host_name_declared(a));
+                }
                 None => {
                     let hint = (name.is_empty() && !a.name.is_empty())
                         .then(|| "; the press's opacity is `opacity` in an `:active` part (LLP 1121 D8)".to_string())
@@ -641,6 +644,7 @@ fn lower_body(
     }
     // Each component's parts and the rows its classes bring them (LLP 1139 D2).
     l.check_anatomy(file);
+    l.errors.extend(provenance::check(checked));
     let refused = l.declare_keyframes(file);
     l.errors.extend(refused);
     l.declare_shapes(file)?;
@@ -650,7 +654,14 @@ fn lower_body(
     for (i, s) in root.states.iter().enumerate() {
         let ty = l.ty_id(&root_types.slots[i])?;
         let id = l.b.slot(&s.name, ty, placeholder);
-        l.b.set_slot_persist(id, root.persists(&s.name));
+        if let Some(persist) = root.persistence(&s.name) {
+            let scope = if persist.window {
+                exact_plan::PersistScope::Window
+            } else {
+                exact_plan::PersistScope::App
+            };
+            l.b.set_slot_persist(id, scope);
+        }
         l.slots.push(id);
     }
     l.declare_routes(file);
@@ -939,21 +950,6 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// A tag's fixed row value as a constant body, built once per compile.
-    fn fixed(&mut self, style: bool, value: &'static str) -> Code {
-        if let Some(code) = self.fixed.get(&(style, value)) {
-            return *code;
-        }
-        // A fixed style is an enum's name or a number in points.
-        let v = match value.parse::<f64>() {
-            Ok(n) if style => Value::Number(n),
-            _ => Value::str(value),
-        };
-        let code = self.b.constant(&v);
-        self.fixed.insert((style, value), code);
-        code
-    }
-
     pub(crate) fn expr_code(
         &mut self,
         e: &Expr,
@@ -1083,9 +1079,13 @@ impl<'a> Lowerer<'a> {
                 let mut inner = scope.clone();
                 inner.push_each_of(var, index.as_deref(), list_ty);
                 let key = self.expr_code(key, &inner, locals)?;
-                let (_r, arms) =
+                let (region, arms) =
                     self.b
                         .region(RegionKind::Each, parent, arm, order, subject, key, 1);
+                if let Some(&step) = self.each_steps.get(tag) {
+                    self.b
+                        .set_region_place(region, exact_plan::PlaceStepsId(step));
+                }
                 if let Some(sites) = &mut self.sites {
                     sites.region(*tag);
                 }
@@ -1336,8 +1336,7 @@ impl<'a> Lowerer<'a> {
                 }
                 // CSS's one-to-four-value box shorthands: a binding a side.
                 if values::four_sided(rows) {
-                    let fns = &self.fns;
-                    shorthands::computed_list(&a.name, &a.value, &|f| fns.get(f).map(|(_, b)| *b))?;
+                    shorthands::computed_list(self, scope, &a.name, &a.value)?;
                     if let Some(sides) = shorthands::sides(&a.name, &a.value)? {
                         for (&row, value) in rows.iter().zip(sides) {
                             let (code, ty) = self.typed_code(&value, scope, locals)?;
@@ -1477,6 +1476,7 @@ impl<'a> Lowerer<'a> {
                 self.handler(tag, event, control, a, scope, locals, handlers)?;
             }
             tags::AttrTarget::MediaMetadata => self.media_metadata(a, scope, locals, bindings)?,
+            tags::AttrTarget::DataTransfer => self.data_transfer(a, scope, locals, bindings)?,
         }
         Ok(())
     }

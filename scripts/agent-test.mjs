@@ -2,21 +2,24 @@
 // turns a file's `test` blocks into steps, and this drives them through the
 // session the operations use (`agent.mjs`'s `open`). `agent.mjs` re-exports it.
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ROOT, contractTool } from './tools.mjs';
 import { faultRequest as rawFaultRequest, preferGroups } from './agent-prefer.mjs';
 import { open } from './agent.mjs';
 import { duringOp } from './agent-drag.mjs';
+import { dragExpectation } from './agent-drag-out.mjs';
 import { equalJson } from '../host/web-js/declared-values.js';
+import { compareBox, samplePoints } from './agent-compare.mjs';
 import { perfDelta } from './agent-inspect.mjs';
 import { driveStore, faultSpecOf, launchFacts } from './agent-launch.mjs';
 import { macSandboxed } from './agent-build.mjs';
 import { resolveApp, webDist as defaultWebDist } from './app.mjs';
 import { onThisMachine, serverUrl } from './app-server.mjs';
-import { backendOrigin, backendOriginSelection, literalBackendOrigin, staticFacts } from '../js/bake/src/typescript.mjs';
+import { backendOrigin, backendOriginSelection, injectBackendOrigin, literalBackendOrigin, staticFacts } from '../js/bake/src/typescript.mjs';
 import { declaredSettings, settingValues } from '../js/bake/src/__exact_env.mjs';
 import { appSettings } from './app-imports.mjs';
 import { createRequire } from 'node:module';
@@ -94,19 +97,58 @@ export function focusedExpectation(nodes, target) {
   return { message: `expected "${target}" focused, ${was}` };
 }
 
-/** `expect layout <target> width|height ==|<=|>= <points>`: null when the size holds, else `{ message }`. The
- * size is the box `layout <target>` reports, `node.space.viewport` (LLP 1012: viewport points, presentation transforms
- * folded in), at the reply's two decimals. A node the shipped app does not show fails as `expect text` has it; a host
- * with no box for the node says why (`space.unavailable`: an iOS swipe action not revealed). */
+/** Read presented boxes in viewport points. Both sides of a comparison use the same tree snapshot. */
 export async function layoutExpectation(s, nodes, st) {
-  const n = targetNode(nodes, st.target), said = `${st.dimension} of "${st.target}"`;
-  if (!n) return { message: `${said} is absent (no view carries that testId${unopenedHint(nodes)})` };
-  if (n.unshown) return { message: `testId "${st.target}" is in the tree, but ${n.unshown}`, unshown: true };
-  const space = (await s.layout(n.id)).node?.space, box = space?.viewport;
-  if (!box) return { message: `${said} is unknown: ${space?.unavailable ?? 'the host reports no box for it'}` };
-  const r2 = (v) => Math.round(v * 100) / 100, w = r2(box.w), h = r2(box.h), got = st.dimension === 'width' ? w : h;
-  if (stateHolds(got, st)) return null;
-  return { message: `${said} is ${got}, expected ${{ equal: '', 'at-least': '>= ', 'at-most': '<= ' }[st.comparison]}${st.value} (its box is ${w}×${h})` };
+  const round = v => Math.round(v * 100) / 100;
+  async function measure({ target, dimension }) {
+    const n = targetNode(nodes, target), said = `${dimension} of "${target}"`;
+    if (!n) return { message: `${said} is absent (no view carries that testId${unopenedHint(nodes)})` };
+    if (n.unshown) return { message: `testId "${target}" is in the tree, but ${n.unshown}`, unshown: true };
+    const space = (await s.layout(n.id)).node?.space;
+    if (!space?.viewport) return { message: `${said} is unknown: ${space?.unavailable ?? 'the host reports no box for it'}` };
+    const { x, y, w, h } = space.viewport;
+    if (dimension === 'baseline' && !Number.isFinite(space.baseline))
+      return { message: `${said} is unknown: the host reports no text baseline for it` };
+    const values = { baseline: space.baseline, width: w, height: h, x, left: x, y, top: y, right: x + w, bottom: y + h, centerX: x + w / 2, centerY: y + h / 2 };
+    return { value: round(values[dimension]), said, size: `${round(w)}×${round(h)}` };
+  }
+  const lhs = await measure(st);
+  if (lhs.message) return lhs;
+  const rhs = typeof st.value === 'number' ? { value: st.value } : await measure(st.value);
+  if (rhs.message) return rhs;
+  const delta = lhs.value - rhs.value;
+  const tolerance = st.tolerance ? st.tolerance + Number.EPSILON * Math.max(1, Math.abs(lhs.value), Math.abs(rhs.value)) : 0;
+  const holds = { equal: Math.abs(delta) <= tolerance, 'at-least': delta >= -tolerance, 'at-most': delta <= tolerance };
+  if (holds[st.comparison]) return null;
+  const sign = { equal: '', 'at-least': '>= ', 'at-most': '<= ' }[st.comparison];
+  const expected = rhs.said ? `${rhs.said} (${rhs.value})` : rhs.value;
+  const within = st.tolerance === undefined ? '' : ` within ${st.tolerance} pt`;
+  return { message: `${lhs.said} is ${lhs.value}, expected ${sign}${expected}${within} (its box is ${lhs.size})` };
+}
+
+async function paintExpectation(s, st, file) {
+  const nodes = (await s.tree()).nodes, node = targetNode(nodes, st.target);
+  if (!node) return `no view carries testId "${st.target}"${unopenedHint(nodes)}`;
+  if (node.unshown) return `testId "${st.target}" is in the tree, but ${node.unshown}`;
+  const space = (await s.layout(node.id)).node?.space, box = space?.viewport;
+  if (!box) return space?.unavailable ?? `the host reports no viewport box for "${st.target}"`;
+  if (st.op === 'expect-screenshot') return compareBox(s, box, resolve(dirname(file), st.reference));
+  if (!(st.x >= 0 && st.x < box.w && st.y >= 0 && st.y < box.h))
+    return `sample (${st.x}, ${st.y}) is outside "${st.target}" (${box.w}×${box.h})`;
+  const sampled = await samplePoints(s, [[box.x + st.x, box.y + st.y]], true);
+  if (sampled.error) return sampled.error;
+  const rgba = sampled.values?.[0];
+  if (!['extended-linear-srgb', 'srgb'].includes(sampled.space) || rgba?.length !== 4 || !rgba.every(Number.isFinite))
+    return `the host returned no sRGB pixel for "${st.target}"`;
+  const bytes = rgba.map((v, i) => {
+    if (i < 3 && sampled.space === 'extended-linear-srgb') v = v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055;
+    return Math.round(Math.max(0, Math.min(1, v)) * 255);
+  });
+  const expected = st.color.slice(1).match(/../g).map(c => parseInt(c, 16));
+  if (expected.length === 3) expected.push(255);
+  if (bytes.every((v, i) => Math.abs(v - expected[i]) <= st.tolerance)) return null;
+  const actual = '#' + bytes.map(b => b.toString(16).padStart(2, '0')).join('');
+  return `"${st.target}" at (${st.x}, ${st.y}) is ${actual}, expected ${st.color} within ${st.tolerance} per channel`;
 }
 
 /** A press on a disabled control does nothing, and each host said so its own way (the web's silently, a native one in the words of the view
@@ -200,7 +242,7 @@ export function storeBase(appId, host, env = process.env, home = homedir(), sand
 export function fetchOrigins(dist) {
   const read = f => { try { return readFileSync(resolve(dist, '.gen', f), 'utf8'); } catch { return ''; } };
   const text = read('admission-data.js') + read('app.js');
-  return [...new Set([...text.matchAll(/"net\.fetch (https?:\/\/[^/"\s]+)[/"]/g)].map((m) => m[1]))];
+  return [...new Set([...text.matchAll(/"(?:development )?net\.fetch (https?:(?:\/\/[^/"\s]+)?)[/"]/g)].map((m) => m[1]))];
 }
 /** The loopback ones: a backend on this machine the tests talk to. */
 export const loopbackOrigins = (dist) => fetchOrigins(dist).filter((o) => /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(o));
@@ -240,7 +282,7 @@ const listening = (origin, ms = 1000) => new Promise((done) => {
 export async function backendPreflight(app, dist, say = console.error) {
   const down = [];
   for (const origin of loopbackOrigins(dist)) if (!(await listening(origin))) down.push(origin);
-  if (!down.length) return snapbackDevice?.devicePreflight(app, fetchOrigins(dist));
+  if (!down.length) return snapbackDevice?.devicePreflight(app, fetchOrigins(dist).filter((o) => /^https?:\/\//.test(o)));
   const what = `no backend at ${down.map(origin=>`${origin} (source: ${backendOriginSource(app,origin)})`).join(', ')}: nothing listens there, and app.ts fetches it (a net.fetch grant)`;
   if (!snapbackDevice?.mountsSnapback(app)) return say(`note: ${what}; a test that loads from it fails`);
   throw new Error(`${what}. The app's Snapback client cannot open data that has never synced, so every test would fail. Start the server first, from the backend's directory (\`npx snapback4 dev --port ${new URL(down[0]).port || 80}\`, seeded if the tests read seeded rows), then run the tests again.`);
@@ -344,20 +386,22 @@ export function backendFetchPrefixes(tests, origins) {
  * go (`request N (name) failed and is no longer pending: <it ends unsent | it is not retried>: <why>`). A mutation has no
  * `state.failed`: its slot keeps what it had and its `then` never runs, so this is the only place the reason is said
  * (sb4 farm wave 6, E3: an answer's undeclared field voided a reply, 25 minutes with nothing naming the field). */
-export function refusedReplies(lines) {
+export function refusedReplies(lines, { resources = false } = {}) {
   const refused = new Map();
+  const outcome = resources ? 'it ends unsent|it is not retried|it keeps its last value' : 'it ends unsent|it is not retried';
+  const requestRe = new RegExp(`request \\d+ \\(([^)]+)\\) failed and is no longer pending: (?:${outcome}): (.*)$`);
   for (const l of Array.isArray(lines) ? lines : []) {
-    const m = (typeof l === 'string' ? l : JSON.stringify(l)).match(/request \d+ \(([^)]+)\) failed and is no longer pending: (?:it ends unsent|it is not retried): (.*)$/)
-      ?? (typeof l === 'string' ? l : JSON.stringify(l)).match(/send ([^ ]+) failed: (.*); it ends unsent$/);
+    const text = typeof l === 'string' ? l : JSON.stringify(l);
+    const m = text.match(requestRe) ?? text.match(/send ([^ ]+) failed: (.*); it ends unsent$/);
     if (m) refused.set(m[1], m[2]);
   }
   return refused;
 }
-/** Assert a mutation's observed refusal, preserving only its matching journal lines for verify. */
+/** Assert a mutation's or resource's observed refusal, preserving only its matching journal lines for verify. */
 export function refusalExpectation(logs, target) {
   const lines=Array.isArray(logs?.lines) ? logs.lines : [];
   for (let i=lines.length-1;i>=0;i--) {
-    const why=refusedReplies([lines[i]]).get(target);
+    const why=refusedReplies([lines[i]], { resources: true }).get(target);
     if (why==null) continue;
     const expected=[String(lines[i])];
     // A failed reply's transaction line precedes the request's terminal failure.
@@ -368,7 +412,7 @@ export function refusalExpectation(logs, target) {
     }
     return { expected };
   }
-  return { message: `expected mutation ${JSON.stringify(target)} to refuse, but no refused reply was observed; clock data or clock settle lands a send` };
+  return { message: `expected ${JSON.stringify(target)} to refuse, but no refused reply was observed; clock data or clock settle lands a request` };
 }
 
 /** What had failed when a test launched: nothing (LLP 1146 D4). */
@@ -383,7 +427,7 @@ export async function failureMark(s) {
   return {
     failures: Object.fromEntries(Object.entries(state.failures ?? {}).map(([name, f]) => [name, f.count])),
     failed: state.failed ?? {}, mutations: state.mutationFailures ?? {},
-    faults: Object.fromEntries((state.faults ?? []).map((f) => [f.prefix, f.failureHits ?? (f.response ? 0 : f.hits)])), journal,
+    faults: Object.fromEntries((state.faults ?? []).map((f) => [f.method === undefined ? f.prefix : JSON.stringify([f.prefix, f.method]), f.failureHits ?? (!f.response || f.response.status >= 400 ? f.hits : 0)])), journal,
   };
 }
 
@@ -395,11 +439,12 @@ export function unarranged(was, now, { refusals = [], churn = [] } = {}) {
   const faulted = Object.entries(now.faults).some(([prefix, hits]) => hits > (was.faults[prefix] ?? 0));
   if (!faulted) {
     for (const [name, count] of Object.entries(now.failures)) {
+      if (refusals.includes(name)) continue;
       const more = count - (was.failures[name] ?? 0);
       if (more > 0) out.push(`resource ${name} was refused ${more === 1 ? 'once' : `${more} times`}${now.failed[name] ? ` (${now.failed[name]})` : ''}`);
     }
     // A host that counts no refusals still names what failed.
-    for (const [name, why] of Object.entries(now.failed)) if (!(name in now.failures) && !(name in was.failed)) out.push(`resource ${name} failed (${why})`);
+    for (const [name, why] of Object.entries(now.failed)) if (!refusals.includes(name) && !(name in now.failures) && !(name in was.failed)) out.push(`resource ${name} failed (${why})`);
   }
   for (const [name, f] of Object.entries(now.mutations)) {
     if (refusals.includes(name) || JSON.stringify(f) === JSON.stringify(was.mutations[name])) continue;
@@ -696,7 +741,7 @@ async function propertyFailure(p, line, state, previous, s, file, test, step, in
  * lands: a run's caller says where a long test is and what each test did as it goes, not only at the run's end.
  */
 export async function runTests({ host, browser, file, plan, app, size, env, webDist, device = false, phone, reader, url, seed, locale, formatLocale, timeZone, epoch, failFetch, storage = 'test', touch = 'agent', chrome: bars = 'agent', scale, atEnd, atStep, atLine, atResult, port, running, only, testIndex, replayLaunch, replayShots, ax } = {}) {
-  const root = resolve(fileURLToPath(new URL('..', import.meta.url))), selected = resolveApp(app);
+  const selected = resolveApp(app);
   // The APK carrier runs at the phone's size (agent-stdio.mjs reads `reader` the same way).
   const apk = host === 'android' && (reader ?? !!process.env.EXACT_ANDROID_READER);
   if (apk && size) throw new Error('test android: --size does not reach the APK, which runs at the phone\'s size; --headless takes it');
@@ -713,8 +758,9 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
   try { schema = readFileSync(resolve(selected.dir, '../snapback/schema.q'), 'utf8'); } catch { /* No schema beside this app. */ }
   // What `fresh` resets: every loopback origin the app's web build fetches (its net.fetch grants).
   const backends = url ? [] : loopbackOrigins(resolve(webDist));
-  // Cargo owns target selection and freshness, including CARGO_TARGET_DIR.
-  const c = spawnSync('cargo', ['run', '-q', '-p', 'contract', '--', 'test', resolve(file)], { cwd: root, encoding: 'utf8' });
+  const compiler = contractTool();
+  if (!compiler) throw new Error('cannot compile the authored tests without the Contract compiler');
+  const c = spawnSync(compiler.cmd, [...compiler.pre, 'test', resolve(file)], { cwd: ROOT, env: compiler.env, encoding: 'utf8' });
   if (c.status !== 0) throw new Error(c.stderr?.trim() || c.error?.message || 'contract test compiler failed');
   // Native runs use the origin their build selected (LLP 1142 D13), else the scaffold's declared one, else the grants
   // app.ts names as the build evaluates them, when no web admission file exists.
@@ -747,6 +793,8 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
     const n = t.index;
     if (done) break;
     if (t.hosts && !t.hosts.includes(scope)) { landed({ name: t.name, index: n, failures: [], notes: [], skipped: `on ${t.hosts.join(', ')}` }); continue; }
+    // A device asks the app's own data module; only `contract verify`'s runner takes a test's answers.
+    if (t.steps.some((st) => st.op === 'answer-source')) { landed({ name: t.name, index: n, failures: [], notes: [], skipped: 'answer source: contract verify answers it' }); continue; }
     const failures = [], expectedRefusals = [], index = n;
     const refusalCursors = new Map();
     let end = null;
@@ -756,7 +804,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
     // A test's launch lines lead its steps and override the drive's flags (habits F7).
     // The drive's `--fail-fetch` is every test's, with its own leading `fail fetch` lines added (LLP 1103 D3).
     const facts = { size, seed, locale, formatLocale, timeZone, epoch, failFetch };
-    const lines = [], preferences = [];
+    const lines = [], preferences = [], stored = [], sessions = [];
     const media = {}, permissions = {}; // the latest of each, which a `reload` applies again
     let beforeData = false, leading = 0, reset = null, opensAt = null; // `at`'s location, where the app opens (LLP 1153 D5)
     // `fail fetch` lines that lead the steps are armed before the app's first data load (LLP 1103 D3).
@@ -769,8 +817,10 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
     for (const st of t.steps) {
       if (st.op === 'before-data') beforeData = true;
       else if (st.op === 'fresh') reset = st;
+      else if (st.op === 'signed-in') sessions.push(st);
+      else if (st.op === 'stored') stored.push([st.window ? '#window.' + st.name : st.name, st.json]);
       else if (st.op === 'fail-fetch') { early(st); facts.failFetch = [facts.failFetch, st.times == null ? st.prefix : `${st.prefix}\t${st.times}`].filter(Boolean).join('\n'); if (st.times != null) armed.set(st.prefix, st.line); }
-      else if (st.op === 'answer-fetch') facts.failFetch = [facts.failFetch, faultSpecOf([{prefix: st.prefix, hits: 0, armed: true, response: st.response}])].filter(Boolean).join('\n');
+      else if (st.op === 'answer-fetch') facts.failFetch = [facts.failFetch, faultSpecOf([{prefix: st.prefix, method: st.method, hits: 0, armed: true, response: st.response}])].filter(Boolean).join('\n');
       else if (st.op === 'size') facts.size = [st.width, st.height];
       else if (st.op === 'at') opensAt = st.value;
       else if (st.op === 'prefer') preferences.push(st);
@@ -806,11 +856,36 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
       landed({ name: t.name, index: n, failures: [`${t.name}: line ${reset.line}: ${e.message}`], notes });
       continue;
     }
+    if (sessions.length) {
+      try {
+        if (!server) throw new Error('signed-in needs the local OAuth fixture as the app server');
+        const parse = createRequire(import.meta.url)('rolldown/utils').parseSync;
+        const settings = appSettings(selected.dir, launched);
+        const source = settings.modules.get('app.ts');
+        const options = { source, load: settings.load };
+        const code = injectBackendOrigin(settings.code, chosen, parse, launched, options);
+        const grants = staticFacts(code, parse, options).grants ?? '';
+        const plain = new Set(grants.split('\n').map(line => line.trim().split(/\s+/))
+          .map(words => words[0] === 'development' ? words.slice(1) : words)
+          .filter(words => words.length === 2 && words[0] === 'secret.keep').map(words => words[1]));
+        const { signedInSession } = await import('../packages/oauth/test/fixture.ts');
+        for (const st of sessions) {
+          if (!plain.has(st.key)) throw new Error(`line ${st.line}: signed-in requires a plain secret.keep grant for ${st.key}`);
+          stored.push(['#oauth.' + st.key, await signedInSession(server, st.key, st.account)]);
+        }
+      } catch (e) {
+        landed({ name: t.name, index: n, failures: [`${t.name}: ${e.message}`], notes });
+        continue;
+      }
+    }
+    if (stored.length) {
+      // A fixture and its reload share the named scratch store, even under a live driver's EXACT_STORE=real.
+      fixture.EXACT_STORE = 'memory';
+      Object.assign(fresh, fixture, { EXACT_AGENT_STORED: JSON.stringify(stored) });
+    }
     const heads = await Promise.all(shared.map((o) => backendHead(o)));
-    // A drag on an iOS simulator is the touch runner's real gesture (LLP 1080.000 §11; chat2 diary: an authored
-    // test could not drag there); every other step stays the agent's. A phone has no runner yet: its drag says so.
-    // `--touch platform` makes every tap a real touch too (splitter rough 12: a test of what a finger reaches).
-    const drags = !device && ['ios', 'host-ios'].includes(host) && t.steps.some((st) => st.op === 'drag');
+    // An authored drag uses XCTest on iOS. Other taps opt in with `--touch platform` (LLP 1080.000 §11).
+    const drags = ['ios', 'host-ios'].includes(host) && t.steps.some((st) => st.op === 'drag');
     const fingers = touch !== 'agent' ? touch : drags ? 'drag' : 'agent';
     // The date a relaunch starts at: this launch's date at the clock's zero plus the virtual time the test has reached
     // (every `clock +N`, settle and timer), as the runner reports it; whole milliseconds, which every host takes.
@@ -863,7 +938,17 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
       const failFetch = now.faults ? faultSpecOf(now.faults) : undefined;
       facts.epoch = await reached();
       if (s.host === 'web') { await s.carrier.reset({ keep: true, failFetch, epoch: facts.epoch }); s.now = 0; s.contact = null; resetLogs(s); }
-      else { await s.close(); s = await open({ host, browser, plan, ...facts, failFetch: failFetch ?? facts.failFetch, env: { ...(env ?? {}), ...fixture }, app, webDist, device, phone, reader, url, storage: store, touch: fingers, chrome: bars, scale, port, ax }); }
+      else {
+        const environment = { ...(env ?? {}), ...fixture };
+        if (now.store?.some(name => name.startsWith('exact.state.#window.'))) {
+          const id = randomUUID().replaceAll('-', '');
+          const reply = await s.op({ op: 'saveWindow', id });
+          if (!reply.saved) throw new Error(reply.error ?? 'reload: could not save the window');
+          environment.EXACT_AGENT_RESTORE_WINDOW = id;
+        }
+        await s.close();
+        s = await open({ host, browser, plan, ...facts, failFetch: failFetch ?? facts.failFetch, env: environment, app, webDist, device, phone, reader, url, storage: store, touch: fingers, chrome: bars, scale, port, ax });
+      }
       s.notes = notes;
       // A module's permission is the runner's, which starts again, as a phone keeps a granted one across a restart.
       for (const [name, value] of Object.entries({ ...media, ...permissions })) {
@@ -930,7 +1015,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
         armed.delete(prefix);
         let state;
         try { state = await s.state(); } catch (e) { failures.push(`${t.name}: line ${line}: fail fetch ${JSON.stringify(prefix)}: could not read whether it fired: ${e.message}`); return; }
-        const f = (state.faults ?? []).find((e) => e.prefix === prefix);
+        const f = (state.faults ?? []).find((e) => e.prefix === prefix && e.method === undefined);
         if (!f || f.hits === 0) failures.push(`${t.name}: line ${line}: fail fetch ${JSON.stringify(prefix)} times ${f?.times ?? '?'} matched no fetch`);
       };
       // Before an input while counted faults are outstanding: those that fired leave the check, so a press the app
@@ -939,7 +1024,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
       const settleFired = async () => {
         if (!armed.size) return;
         const faults = (await s.state()).faults ?? [];
-        for (const f of faults) if (f.hits > 0) armed.delete(f.prefix);
+        for (const f of faults) if (f.method === undefined && f.hits > 0) armed.delete(f.prefix);
       };
       // The last `perf` block's counts, and what had failed at launch or at the last `expect no failures` (LLP 1146 D3, D4).
       // The launch's mark is empty: a failure while the app booted is one the test did not arrange.
@@ -953,7 +1038,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
         if (INPUTS.has(st.op)) await settleFired();
         if (st.op === 'type') { typed.add(st.target); touched.add(st.target); } else if (INPUTS.has(st.op) || st.op === 'reload') typed.clear();
         switch (st.op) {
-          case 'size': case 'at': case 'epoch': case 'time-zone': case 'locale': case 'seed': case 'before-data': case 'fresh': break; // the session opened with it
+          case 'size': case 'at': case 'epoch': case 'time-zone': case 'locale': case 'seed': case 'before-data': case 'fresh': case 'stored': case 'signed-in': break; // the session opened with it
           case 'prefer': if (n >= leading) await prefer(st); break;
           // A driver fault (LLP 1103): a leading one was a launch line; a later one arms (or re-arms) now, a `pass` stops it.
           case 'fail-fetch': {
@@ -968,8 +1053,8 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
           }
           case 'answer-fetch': {
             if (n < leading) break;
-            await unfired(st.prefix);
-            const r = await s.op({ op: 'prefer', faults: { answer: st.prefix, response: st.response } });
+            if (st.method === undefined) await unfired(st.prefix);
+            const r = await s.op({ op: 'prefer', faults: { answer: st.prefix, method: st.method, response: st.response } });
             if (r?.error) throw new Error(r.error);
             break;
           }
@@ -981,6 +1066,11 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
             });
             if (r?.error) throw new Error(r.error);
             if (r?.dropped !== true) throw new Error(`drop stream is unavailable on ${host}`);
+            break;
+          }
+          case 'scroll': {
+            const node = await s.find(st.target);
+            await s.reveal(node.id);
             break;
           }
           // The driver's `tap` forms (feed F10): `into` brings a virtualized list's row into view by its key.
@@ -1051,6 +1141,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
             delivered(await s.type(`@${ticket}`, location)); input = st.line; break;
           }
           case 'clipboard': delivered(await s.type(st.target, { clipboard: st.edit, text: st.text })); input = st.line; break;
+          case 'background': await s.background(st.ms); input = null; break;
           case 'clock': await s.clock(st.arg); input = null; loaded = true; if (/^\+?\d/.test(st.arg)) unpolled = null; break;
           // The driver writes through the app's server as another person (LLP 1116.006 D8), not the app: nothing it
           // shows changes until it reads again.
@@ -1072,7 +1163,7 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
             const tree = await s.tree();
             const f = treeExpectation(tree.nodes, st.target, st.present);
             // The first step of a test that waited for data cannot see the boot's loading view (authoring bench).
-            const first = !beforeData && t.steps.slice(0, t.steps.indexOf(st)).every((p) => p.op in LAUNCH || p.op === 'size' || p.op === 'at' || p.op === 'prefer');
+            const first = !beforeData && n === leading;
             if (f?.unshown) failures.push(`${at}: ${f.message}`);
             else if (f) await fail(`${at}: ${f.message}${first && st.present ? ' (the test waited for the app\'s data before its first step; `before data`, a launch line, starts without that wait)' : ''}`);
             break;
@@ -1094,6 +1185,12 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
             if (f) await fail(`${at}: ${f.message}`);
             break;
           }
+          case 'expect-sample':
+          case 'expect-screenshot': {
+            const message = await paintExpectation(s, st, file);
+            if (message) await fail(`${at}: ${message}`);
+            break;
+          }
           case 'expect-layout': {
             const f = await layoutExpectation(s, (await s.tree()).nodes, st);
             if (f?.unshown) failures.push(`${at}: ${f.message}`);
@@ -1109,6 +1206,11 @@ export async function runTests({ host, browser, file, plan, app, size, env, webD
           case 'expect-state': {
             const state = await s.state(undefined, undefined, false, false, { reveal: true });
             const f = stateExpectation(state, st);
+            if (f) await fail(`${at}: ${f.message}`);
+            break;
+          }
+          case 'expect-drag': {
+            const f = dragExpectation(targetNode((await s.tree()).nodes, st.target), st);
             if (f) await fail(`${at}: ${f.message}`);
             break;
           }
@@ -1273,20 +1375,25 @@ export function nativeFetchOrigins(dir, env = process.env) {
     grants = staticFacts(settings.code, parse, { load: settings.load }).grants ?? '';
   }
   catch { return []; } // the bake refuses it, and says why when it builds
-  return [...new Set([...declared, ...grants.split('\n').map(line => /^\s*(?:development\s+)?net\.fetch\s+(https?:\/\/[^/\s]+)/.exec(line)?.[1]).filter(Boolean)])];
+  return [...new Set([...declared, ...grants.split('\n').map(line => /^\s*(?:development\s+)?net\.fetch\s+(https?:(?:\/\/[^/\s]+)?)(?:\/|\s|$)/.exec(line)?.[1]).filter(Boolean)])];
 }
 /** Resolve the built grant alias and diagnose a fault that cannot meet a granted URL. */
 export function resolveFaultPrefix(prefix, origins, say=console.warn) {
   const unique=[...new Set(origins.map(o=>o.replace(/\/+$/,'')))];
   // A path (`/api/v9/channels`) is under the backend, as a `request` line's is: the test names what it
-  // fails without the port a checkout's fixture was given.
+  // fails without the port a checkout's fixture was given. Scheme grants (`https:`) have no single host.
   if (prefix==='backend' || prefix.startsWith('/')) {
-    const loopback=unique.filter(origin=>/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(origin));
-    const candidates=loopback.length ? loopback : unique;
+    const concrete=unique.filter(origin=>/^https?:\/\//.test(origin));
+    const loopback=concrete.filter(origin=>/^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(origin));
+    const candidates=loopback.length ? loopback : concrete;
     if (candidates.length!==1) throw new Error(`fetch ${JSON.stringify(prefix)} needs exactly one net.fetch origin; found ${candidates.length}. Use a literal URL for a multi-backend app.`);
     return prefix==='backend' ? candidates[0] : candidates[0]+prefix;
   }
-  if (!unique.some(origin => origin.startsWith(prefix) || prefix.startsWith(origin+'/') || prefix===origin))
+  // A scheme grant (`net.fetch https:`) admits any URL on that scheme (LLP 1156.007 §5.2).
+  const matches = origin => /^https?:$/.test(origin)
+    ? prefix === origin || prefix.startsWith(`${origin}//`)
+    : origin.startsWith(prefix) || prefix.startsWith(origin+'/') || prefix===origin;
+  if (!unique.some(matches))
     say(`warning: fetch fault prefix ${JSON.stringify(prefix)} matches no granted origin (${unique.join(', ') || 'none'}); it will not intercept the backend`);
   return prefix;
 }

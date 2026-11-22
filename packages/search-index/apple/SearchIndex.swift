@@ -1,9 +1,10 @@
 // @exact/search-index on Apple (LLP 1133.023 D4, D14): a thin layer over the
 // host's mirror, `context.contentIndex`, which keeps the entries in the
 // app's container and tells Core Spotlight's named index the difference
-// (ExactKit's ContentIndex.swift). The host, not this module, answers the
-// reindex delegate, a search result's continuation and the generated entity
-// queries, since each can come with no package loaded.
+// (ExactIndexMirror's ContentIndex.swift, which a plan naming this package
+// links). The host, not this module, answers the reindex delegate, a search
+// result's continuation and the generated entity queries, since each can
+// come with no package loaded.
 import ExactPackage
 import Foundation
 

@@ -79,6 +79,14 @@ pub struct ThemedFaces {
     pub refused: Vec<String>,
 }
 
+/// A field's declaration table and its last resolved paint.
+#[derive(Debug, Clone)]
+pub(crate) struct ThemedDecorations {
+    pub(crate) text: exact_kernel::PropValue,
+    pub(crate) tuple: u32,
+    pub(crate) resolved: crate::decorations::ResolvedStyles,
+}
+
 /// The end of a refused colour's journal line. A first read sets the faces
 /// with the colour empty, so its kind's paint stands; a read again that
 /// refuses a colour the faces as set took keeps those faces.
@@ -102,6 +110,8 @@ pub struct ThemeIndex {
     pub(super) looks: std::collections::HashMap<ViewId, super::looks::Looks>,
     /// Each Markdown node's faces that read a token, likewise.
     faces: std::collections::HashMap<ViewId, ThemedFaces>,
+    /// Each field's decoration declarations that read a token, likewise.
+    pub(crate) decorations: std::collections::HashMap<ViewId, ThemedDecorations>,
     /// The window's app tuple (`setMode`), which a visit starts in.
     pub window: u32,
     /// The window's tuple moved since a visit last started: the next one
@@ -161,6 +171,17 @@ impl ThemeIndex {
         self.faces.iter().map(|(view, f)| (*view, f))
     }
 
+    pub(super) fn decoration_styles(
+        &self,
+        view: ViewId,
+        text: &exact_kernel::PropValue,
+    ) -> Option<&crate::decorations::ResolvedStyles> {
+        self.decorations
+            .get(&view)
+            .filter(|table| table.text == *text)
+            .map(|table| &table.resolved)
+    }
+
     /// `view`'s `style` reads no token now.
     pub(super) fn drop_row(&mut self, view: ViewId, style: StyleId) {
         if !self.rows.is_empty() {
@@ -173,6 +194,7 @@ impl ThemeIndex {
         self.rows.retain(|(view, _), _| live(*view));
         self.looks.retain(|view, _| live(*view));
         self.faces.retain(|view, _| live(*view));
+        self.decorations.retain(|view, _| live(*view));
     }
 
     /// Each node's state looks that read a token, by view.
@@ -291,6 +313,33 @@ impl Drop for Bound {
 }
 
 impl super::NodeInst {
+    pub(super) fn decoration_styles(
+        &mut self,
+        u: &mut super::Update<'_>,
+        i: usize,
+        text: exact_kernel::PropValue,
+    ) -> exact_kernel::PropValue {
+        let _roles = u.roles.map(exact_kernel::style::roles::bind);
+        let tuple = self.tuple;
+        let previous = u.ids.theme.decoration_styles(self.view, &text);
+        let resolved = crate::decorations::resolve_styles(u.env.plan, tuple, &text, previous);
+        let value = resolved.value.clone();
+        self.themed.set(i, resolved.tokens != 0, false);
+        if resolved.tokens != 0 {
+            u.ids.theme.decorations.insert(
+                self.view,
+                ThemedDecorations {
+                    text,
+                    tuple,
+                    resolved,
+                },
+            );
+        } else {
+            u.ids.theme.decorations.remove(&self.view);
+        }
+        value
+    }
+
     /// Enter this node's children: their tuple is its own, their inherited
     /// colours what it sets or passes on, and a tuple that moved since
     /// `before` sets every themed row below again. The modes it was in.

@@ -9,11 +9,12 @@ impl<D: DataSource> Runner<D> {
     /// one a kernel would have refused, is the error: render it with a
     /// kernel instead.
     pub fn document_tree(&mut self) -> Result<DocTree, DocTreeError> {
+        let _roles = self.bind_roles();
         let mut doc = self
             .tree
             .as_ref()
             .ok_or(DocTreeError::Unsupported("a runner with no tree"))?
-            .document(&self.plan, &self.sites, self.fonts.clone())?;
+            .document(&self.plan, &self.sites, &self.ids.theme, self.fonts.clone())?;
         self.fold_live_times(&mut doc);
         Ok(doc)
     }

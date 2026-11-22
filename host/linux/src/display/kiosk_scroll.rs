@@ -93,7 +93,7 @@ impl TouchScroll {
         now: f64,
     ) -> bool {
         match event {
-            InputEvent::TouchButton(true) => {
+            InputEvent::TouchDown => {
                 p.set_touching(true);
                 let under = p.scrollers_at(pointer.0, pointer.1);
                 let target = (!under.claims.1 && under.field.is_none())
@@ -156,6 +156,12 @@ impl TouchScroll {
                     let _ = p.pointer_cancel(now);
                     g.phase = Phase::Dragging;
                 }
+                // evdev repeats the contact position before its release even when it stayed still.
+                // Coasting starts with the velocity of the last movement.
+                if next == g.last {
+                    *pointer = next;
+                    return true;
+                }
                 let before = g.position;
                 g.position = drag(g.position, g.last.1 - next.1, s.max.1, g.height);
                 let after = g.position;
@@ -180,7 +186,7 @@ impl TouchScroll {
                 );
                 true
             }
-            InputEvent::TouchButton(false) => {
+            InputEvent::TouchUp => {
                 p.set_touching(false);
                 let Some(g) = &mut self.gesture else {
                     return false;
@@ -202,7 +208,7 @@ impl TouchScroll {
                 g.tick_at = now;
                 true
             }
-            InputEvent::Cancel | InputEvent::Wheel(..) | InputEvent::Button(true) => {
+            InputEvent::Cancel | InputEvent::Wheel(..) | InputEvent::MouseDown(_) => {
                 if matches!(event, InputEvent::Cancel) {
                     p.set_touching(false);
                 }
@@ -288,22 +294,22 @@ mod tests {
             .unwrap()
             .encode();
         for (catch, end) in [
-            (false, InputEvent::TouchButton(false)),
-            (true, InputEvent::TouchButton(false)),
+            (false, InputEvent::TouchUp),
+            (true, InputEvent::TouchUp),
             (true, InputEvent::Cancel),
         ] {
-            let (mut p, mut scroll, mut at, _) = fixture();
+            let (mut p, scroll, at, _) = fixture();
+            let mut pointer = super::super::pointer::Pointer::new(at);
+            pointer.scroll = Some(scroll);
             let mut send = |p: &mut Presenter<()>, event, now| {
-                if !input(&mut scroll, p, &mut at, event, now) {
-                    super::super::pointer::dispatch(p, &mut at, (400., 500.), 1., event, now)
-                        .unwrap();
-                }
+                super::super::pointer::dispatch(p, &mut pointer, (400., 500.), 1., event, now)
+                    .unwrap();
             };
-            send(&mut p, InputEvent::TouchButton(true), 0.);
+            send(&mut p, InputEvent::TouchDown, 0.);
             send(&mut p, InputEvent::Touch(None, Some(0.4)), 20.);
             if catch {
-                send(&mut p, InputEvent::TouchButton(false), 21.);
-                send(&mut p, InputEvent::TouchButton(true), 22.);
+                send(&mut p, InputEvent::TouchUp, 21.);
+                send(&mut p, InputEvent::TouchDown, 22.);
             }
             let before = p.hosts();
             assert_eq!(p.reload(&next, ()).unwrap(), ReloadResult::Held("pointer"));
@@ -319,24 +325,12 @@ mod tests {
             &mut s,
             &mut p,
             &mut point,
-            InputEvent::TouchButton(true),
+            InputEvent::TouchDown,
             0.
         ));
-        assert!(!input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(false),
-            10.
-        ));
+        assert!(!input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 10.));
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 0.);
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(true),
-            20.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchDown, 20.);
         assert!(input(
             &mut s,
             &mut p,
@@ -345,13 +339,7 @@ mod tests {
             40.
         ));
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 100.);
-        assert!(input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(false),
-            41.
-        ));
+        assert!(input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 41.));
         s.tick(&mut p, 57.);
         let moving = p.kiosk_scroll_state(id).unwrap().offset.1;
         assert!(moving > 100.);
@@ -359,7 +347,7 @@ mod tests {
             &mut s,
             &mut p,
             &mut point,
-            InputEvent::TouchButton(true),
+            InputEvent::TouchDown,
             58.
         ));
         assert!(!s.animating());
@@ -369,13 +357,7 @@ mod tests {
     #[test]
     fn kiosk_scroll_overscroll_keeps_logical_offset_and_returns() {
         let (mut p, mut s, mut point, id) = fixture();
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(true),
-            0.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchDown, 0.);
         input(
             &mut s,
             &mut p,
@@ -386,28 +368,10 @@ mod tests {
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 0.);
         let over = p.kiosk_overscroll().unwrap().1;
         assert!(over < 0. && over > -100.);
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(false),
-            150.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 150.);
         // Catch and release a bounce without changing its visual position.
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(true),
-            151.,
-        );
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(false),
-            152.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchDown, 151.);
+        input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 152.);
         assert!((s.gesture.as_ref().unwrap().position - over).abs() < 0.001);
         for n in 1..180 {
             s.tick(&mut p, 152. + n as f64 * 16.);
@@ -420,32 +384,26 @@ mod tests {
     fn kiosk_scroll_queued_motion_keeps_press_and_release_boundaries() {
         let events = coalesce(vec![
             InputEvent::Touch(Some(0.5), Some(0.8)),
-            InputEvent::TouchButton(true),
+            InputEvent::TouchDown,
             InputEvent::Touch(None, Some(0.7)),
             InputEvent::Touch(Some(0.6), None),
             InputEvent::Touch(None, Some(0.5)),
-            InputEvent::TouchButton(false),
+            InputEvent::TouchUp,
         ]);
         assert_eq!(
             events,
             vec![
                 InputEvent::Touch(Some(0.5), Some(0.8)),
-                InputEvent::TouchButton(true),
+                InputEvent::TouchDown,
                 InputEvent::Touch(Some(0.6), Some(0.5)),
-                InputEvent::TouchButton(false)
+                InputEvent::TouchUp
             ]
         );
     }
     #[test]
     fn kiosk_scroll_same_batch_does_not_invent_velocity() {
         let (mut p, mut s, mut point, id) = fixture();
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(true),
-            100.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchDown, 100.);
         input(
             &mut s,
             &mut p,
@@ -453,13 +411,7 @@ mod tests {
             InputEvent::Touch(None, Some(0.4)),
             100.,
         );
-        input(
-            &mut s,
-            &mut p,
-            &mut point,
-            InputEvent::TouchButton(false),
-            100.,
-        );
+        input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 100.);
         s.tick(&mut p, 116.);
         assert_eq!(p.kiosk_scroll_state(id).unwrap().offset.1, 100.);
         assert!(!s.animating());
@@ -469,13 +421,7 @@ mod tests {
         let mut velocities = Vec::new();
         for step in [10, 50] {
             let (mut p, mut s, mut point, _) = fixture();
-            input(
-                &mut s,
-                &mut p,
-                &mut point,
-                InputEvent::TouchButton(true),
-                0.,
-            );
+            input(&mut s, &mut p, &mut point, InputEvent::TouchDown, 0.);
             for t in (step..=200).step_by(step) {
                 input(
                     &mut s,
@@ -485,7 +431,17 @@ mod tests {
                     t as f64,
                 );
             }
-            velocities.push(s.gesture.as_ref().unwrap().velocity);
+            let velocity = s.gesture.as_ref().unwrap().velocity;
+            input(
+                &mut s,
+                &mut p,
+                &mut point,
+                InputEvent::Touch(Some(0.5), Some(0.2)),
+                220.,
+            );
+            input(&mut s, &mut p, &mut point, InputEvent::TouchUp, 220.);
+            assert_eq!(s.gesture.as_ref().unwrap().velocity, velocity);
+            velocities.push(velocity);
         }
         assert!((velocities[0] - velocities[1]).abs() < 1.);
     }

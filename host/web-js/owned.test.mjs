@@ -232,7 +232,7 @@ test('a tab screen asks while shown and keeps its answer while hidden', () => fi
   // The agent lists it by instance path, apart from the root's resources.
   const state = await browser.state();
   expect(state.owned).toEqual(['works']);
-  expect(Object.keys(state.resources)).not.toContain('works#1');
+  expect(Object.keys(state.resources).filter(name => name.split('#')[0] === 'works')).toEqual([]);
   expect(Object.values(state.instances)).toEqual([{ works: { ok: true, works: ['sf'] } }]);
 
   await browser.tap('tab-home');
@@ -324,6 +324,35 @@ test('a use outside every region asks with the root', () => fixture(FEED, async 
   await browser.clock('settle');
   expect(await asks()).toEqual(['now(t1)', 'now(t2)']);
   expect(await text('got')).toBe('now t2');
+}), 180_000);
+
+// A child's state used outside every region starts as the root first renders, in the boot's commit (the runner's
+// `init_late_slots`, LLP 1017 P4c): what its initializer asks, here a parent's resource read through a prop, lands.
+const SEEDED = `shape Subject
+  ok: bool
+  works: string[]
+
+component App
+  resource base = subjectWorks("root") as shape Subject else empty()
+  view
+    main
+      text base.works.join(",") testId="base"
+      Seeded(seed=base)
+
+component Seeded
+  props
+    seed: Subject
+  state copy = seed
+  view
+    column
+      text copy.works.join(",") testId="copy"
+`;
+
+test('a state used outside every region starts in the boot, and what it reads lands', () => fixture(SEEDED, async ({ text, asks, land }) => {
+  expect(await asks()).toEqual(['subjectWorks(root)']);
+  expect(await land()).toBe(1);
+  // The state read the resource's placeholder as it started, once (LLP 1017.000 P4c)
+  expect([await text('base'), await text('copy')]).toEqual(['root', '']);
 }), 180_000);
 
 test("an owned request's source placeholder shows in the making render", () => fixture(DISCOVER.replace('else empty(ok=true)', 'else emptyWorks()'), async ({ text, land }) => {

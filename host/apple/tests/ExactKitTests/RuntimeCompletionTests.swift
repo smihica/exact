@@ -6,6 +6,7 @@ import UIKit
 @testable import ExactKit
 @testable import ExactCollections
 @testable import ExactCore
+@testable import ExactSurfaces
 
 final class RuntimeCompletionTests: XCTestCase {
     private typealias Receive = (RuntimeCompletion) -> Void

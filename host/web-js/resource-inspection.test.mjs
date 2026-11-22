@@ -355,7 +355,7 @@ test.each([
       globalThis.__exactRender = true;
       const cp = document.createElement('script');
       cp.type = 'application/vnd.exact.checkpoint';
-      cp.textContent = JSON.stringify({ answers: [
+      cp.textContent = JSON.stringify({ location: '/', answers: [
         ['items', source, withArgs ? [1] : [], { r: ['rendered 1'] }],
         ['items', source, withArgs ? [2] : [], { r: ['rendered 2'] }],
         ['title', 'title', [], 'Hello'],
@@ -389,6 +389,30 @@ test.each([
       requests: requests.map(request => JSON.stringify(request)).sort(), items: shown.map(text => [text]), title: 'Hello',
       answers: [...written.map(element), ['title', 'title', [], 'Hello']],
     });
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);
+
+// LLP 1048.000 D6 — a page rendered at another location seeds no answer: its resource asks, showing its placeholder
+test('a page rendered at another location seeds no answer and journals that it renders fresh', async () => {
+  const server = runtimeServer(), browser = await suiteBrowser(), page = await browser.newPage();
+  try {
+    await page.goto(server.url.href);
+    const boot = await page.evaluate(async () => {
+      const cp = document.createElement('script');
+      cp.type = 'application/vnd.exact.checkpoint';
+      cp.textContent = JSON.stringify({ location: '/elsewhere', answers: [['title', 'title', [], 'Hello']], pending: [], readers: [] });
+      document.head.append(cp);
+      const rt = await import('/host/web-js/rt.js');
+      const requests = [];
+      rt.data.answer = (source, args) => {
+        requests.push([source, args]);
+        return { promise: new Promise(() => {}) };
+      };
+      const title = rt.res('title', 'title', () => [], undefined, undefined, 's', '');
+      rt.mount(root => rt.hd(root, { headTitle: () => title() }));
+      return { requests, title: title(), journal: rt.journal.filter(l => / document: | adopted the document$/.test(l)).map(l => l.slice(l.indexOf(' ') + 1)) };
+    });
+    expect(boot).toEqual({ requests: [['title', []]], title: '', journal: ['document: rendered at /elsewhere, not /; rendering fresh'] });
   } finally { await browser.close(); server.stop(true); }
 }, 30000);
 
@@ -442,6 +466,30 @@ test('a dev reload\'s carried answer that read the store is not asked again at b
       return { requests, title: title(), store: title.r.store };
     });
     expect(boot).toEqual({ requests: [], title: 'Hello', store: true });
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);
+
+// A child's state used outside every region has no value until the boot's commit starts it (rt.js `late`, LLP 1017.000
+// P4c); on a development page a value the last reload carried wins, and the initializer does not run (checkpoint.js
+// `devLate`, as the runner's `init_slot`).
+test('a late slot starts as the boot\'s commit starts, and a reload\'s carried value wins over its initializer', async () => {
+  const server = runtimeServer(), browser = await suiteBrowser(), page = await browser.newPage();
+  try {
+    await page.goto(server.url.href);
+    const boot = await page.evaluate(async () => {
+      const cp = document.createElement('script');
+      cp.type = 'application/vnd.exact.dev-checkpoint';
+      cp.textContent = JSON.stringify({ time: 0, answers: [], slots: [['kept', 'string', 'carried']] });
+      document.head.append(cp);
+      const rt = await import('/host/web-js/rt.js'), { devLate } = await import('/host/web-js/checkpoint.js');
+      const ran = [];
+      const kept = devLate('kept', () => { ran.push('kept'); return 'initial'; }, 's', 'string');
+      const fresh = rt.late(() => { ran.push('fresh'); return 'started'; }, 's', 'fresh');
+      const before = [kept(), fresh() ?? 'unstarted'];
+      rt.mount(root => rt.hd(root, { headTitle: () => kept() + ' ' + fresh() }));
+      return { before, after: [kept(), fresh()], ran };
+    });
+    expect(boot).toEqual({ before: ['carried', 'unstarted'], after: ['carried', 'started'], ran: ['fresh'] });
   } finally { await browser.close(); server.stop(true); }
 }, 30000);
 
@@ -1019,3 +1067,201 @@ test('web builds expose their version inputs in the view and delivery state', as
     }
   } finally { await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true }); }
 }, 60000);
+
+// A resource idle at its first settlement adopts nothing compiled, so it shows its placeholder, not its build-time
+// answer, as the runner's does (LLP 1161.002 D4): at boot, and an instance made later that has a build-time answer. At
+// a boot from a rendered page it keeps the page's answer (§7). None asks, and a write shows over the placeholder. The
+// boot's last word stands: one settled awake keeps its build-time answer when its gate closes later in the boot (D2),
+// and one settled idle starts from it when its gate opens later in the boot. Woken after the boot while its source is
+// not ready, a root resource shows its build-time answer, not pending, each time, as the runner adopts a compiled
+// value then, and the journal names that answer only when the source's replaces it; an instance, which the runner
+// adopts nothing for after the boot, is pending, on its placeholder or on a build-time answer it showed. Before its
+// source is ready a root resource's build-time answer is pending only while the arguments are not its own.
+test('a resource idle at its first settlement shows its placeholder over a build-time answer, and keeps a page\'s', async () => {
+  const server = runtimeServer(), browser = await suiteBrowser(), page = await browser.newPage();
+  try {
+    await page.goto(server.url.href);
+    const observed = await page.evaluate(async () => {
+      const cp = document.createElement('script');
+      cp.type = 'application/vnd.exact.checkpoint';
+      cp.textContent = JSON.stringify({ location: '/', answers: [['kept', 'echo', [], 'page answer']] });
+      document.head.append(cp);
+      const rt = await import('/host/web-js/rt.js');
+      // the source is not ready until `ready`; a write's never answers
+      const asked = [];
+      let ready = false;
+      rt.data.answer = (source, args, store, name) => {
+        asked.push(name);
+        if (source === 'save') return { promise: new Promise(() => {}) };
+        return ready ? { v: 'fresh' } : undefined;
+      };
+      rt.data.overlay = (source, args, answer, writes) => ({ value: `${answer} and ${writes.length} write at ${args.length} arguments`, keep: [] });
+      // `open`: the gate a persisted state closes at boot, opened later; `shut` stays closed; `closes` and `opens`
+      // change during the boot; `nap` closes after it
+      const open = rt.sig(false), shut = rt.sig(false), closes = rt.sig(true), opens = rt.sig(false), nap = rt.sig(true);
+      const at = rt.sig(1), saved = rt.sig(null);
+      const res = (name, gate, args = () => []) => rt.res(name, 'echo', Object.assign(args, { gate: () => gate() }), 'build-time', args(), 's', 'waiting');
+      // an instance is named by its path before it first settles, as each.js `own` names it
+      const instance = (name, gate, args) => {
+        const made = res(name, gate, args);
+        made.r.path = name;
+        return made;
+      };
+      const built = res('built', open), kept = res('kept', open), written = res('written', shut);
+      const closed = res('closed', closes), opened = res('opened', opens), moved = res('moved', () => true, () => [at()]);
+      const launched = instance('launched', open), awake = instance('awake', nap, () => [at()]);
+      let write;
+      rt.mount(root => {
+        write = rt.mut('saved', saved, [written], 'b');
+        rt.hd(root, { headTitle: () => built() + kept() + launched() + written() + closed() + opened() + awake() + moved() });
+        rt.W(closes, false);
+        rt.W(opens, true);
+      });
+      const atBoot = {
+        shown: [built(), kept(), launched(), closed(), opened(), opened.p(), awake()],
+        asked: asked.filter(name => ['built', 'kept', 'launched', 'written'].includes(name)),
+      };
+      let later;
+      rt.commit(() => { later = instance('later', open); });
+      const afterBoot = later();
+      rt.commit(() => rt.M(write, 'save', []));
+      const under = written();
+      // its arguments leave the build-time answer's and come back, unforced and then refreshed
+      const pending = [moved.p()];
+      for (const [to, refresh] of [[2], [1], [2], [1, true]]) {
+        rt.commit(() => { rt.W(at, to); if (refresh) rt.R(moved); });
+        pending.push(moved.p());
+      }
+      const wake = () => {
+        rt.commit(() => rt.W(nap, false));
+        rt.commit(() => { rt.W(open, true); rt.W(nap, true); });
+        return [built(), built.p(), launched(), launched.p(), later(), later.p(), awake(), awake.p()];
+      };
+      const woken = wake();
+      // an instance still owes its answer when its arguments leave and come back
+      rt.commit(() => rt.W(at, 2));
+      rt.commit(() => rt.W(at, 1));
+      const back = [awake.p(), moved.p()];
+      rt.commit(() => rt.W(open, false));
+      const again = wake();
+      ready = true;
+      for (const f of rt.data.q.splice(0)) f();
+      const lines = rt.journal.filter(l => /build-time/.test(l)).map(l => l.replace(/^t=\S+ /, '')).sort();
+      return { atBoot, afterBoot, under, pending, woken, back, again, answered: [built(), launched(), later(), awake(), opened(), closed()], lines };
+    });
+    expect(observed).toEqual({
+      atBoot: { shown: ['waiting', 'page answer', 'waiting', 'build-time', 'build-time', false, 'build-time'], asked: [] },
+      afterBoot: 'waiting',
+      under: 'waiting and 1 write at 0 arguments',
+      pending: [false, true, false, true, false],
+      woken: ['build-time', false, 'waiting', true, 'waiting', true, 'build-time', true],
+      back: [true, false],
+      again: ['build-time', false, 'waiting', true, 'waiting', true, 'build-time', true],
+      answered: ['fresh', 'fresh', 'fresh', 'fresh', 'fresh', 'build-time'],
+      lines: [
+        'awake answered: replaces its build-time answer',
+        'awake shows its build-time answer until its source answers',
+        'built answered: replaces its build-time answer',
+        'closed shows its build-time answer until its source answers',
+        'moved answered: replaces its build-time answer',
+        'moved shows its build-time answer until its source answers',
+        'opened answered: replaces its build-time answer',
+        'opened shows its build-time answer until its source answers',
+      ],
+    });
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);
+
+// A build-time answer stands in until an answer lands, one asked at newer arguments included, and is journaled so at
+// the ask and when the answer lands (LLP 1102 §3.17, the runner's `revalidated`), a store reader's too, which names no
+// arguments; a placeholder is no build-time answer, so a store reader that shows one says neither line: one with
+// neither a page answer nor a build-time answer on a device whose store holds the app's own entries, and one whose
+// build-time answer the store's secrets pass over (store-reader.js), unless its placeholder shows nothing. The
+// build-time line is said once, whether the source answers at once, later, or once it is ready.
+test('a build-time answer is journaled as one until an answer lands, and a placeholder never', async () => {
+  const server = runtimeServer(), browser = await suiteBrowser(), page = await browser.newPage();
+  try {
+    await page.goto(server.url.href);
+    const lines = await page.evaluate(async () => {
+      // a rendered page that kept none of these answers
+      const cp = document.createElement('script');
+      cp.type = 'application/vnd.exact.checkpoint';
+      cp.textContent = JSON.stringify({ location: '/', answers: [] });
+      document.head.append(cp);
+      const rt = await import('/host/web-js/rt.js'), { install, reader } = await import('/host/web-js/store-reader.js');
+      localStorage.setItem(rt.Kept('secret') + 'token', 'private');
+      install(['token']);
+      const answers = new Map();
+      // `late`'s source is not ready until `data.ready`'s callbacks run
+      let ready = false;
+      rt.data.answer = (source, [x]) => {
+        if (x === 'late' && !ready) return undefined;
+        if (x === 'now') return { v: 'fresh' };
+        const answer = Promise.withResolvers();
+        answers.set(x, answer);
+        return { promise: answer.promise };
+      };
+      const at = rt.sig(1);
+      const moved = rt.res('moved', 'echo', () => [at()], 'built', [1], 's');
+      const now = rt.res('now', 'echo', () => ['now'], 'built', ['now'], 's');
+      // store readers as the compiler writes them, with no arguments for the bake's answer
+      const built = reader(rt.res, false)('built', 'echo', () => ['built'], 'built', undefined, 's');
+      const stored = reader(rt.res, false)('stored', 'echo', () => ['stored'], undefined, undefined, 's', 'waiting');
+      const secret = reader(rt.res, true)('secret', 'echo', () => ['secret'], 'built', undefined, 's', 'waiting');
+      const bare = reader(rt.res, true)('bare', 'echo', () => ['bare'], 'built', undefined, 's', () => undefined);
+      const late = reader(rt.res, false)('late', 'echo', () => ['late'], 'built', undefined, 's');
+      rt.mount(() => {
+        for (const r of [moved, now, built, stored, secret, bare, late]) {
+          rt.effect(() => r());
+        }
+      });
+      // asked again at newer arguments before the build-time answer's ask lands
+      rt.commit(() => rt.W(at, 2));
+      ready = true;
+      for (const f of rt.data.q.splice(0)) f();
+      for (const x of [1, 2, 'built', 'stored', 'secret', 'bare', 'late']) answers.get(x).resolve('fresh');
+      while (rt.inflight.n) await new Promise(resolve => setTimeout(resolve, 0));
+      return rt.journal.filter(l => / (moved|now|built|stored|secret|bare|late) /.test(l) && /build-time|placeholder/.test(l)).map(l => l.replace(/^t=\S+ /, ''));
+    });
+    expect(lines.sort()).toEqual([
+      'bare answered: replaces its build-time answer',
+      'bare shows its build-time answer until its source answers',
+      'built answered: replaces its build-time answer',
+      'built shows its build-time answer until its source answers',
+      'late answered: replaces its build-time answer',
+      'late shows its build-time answer until its source answers',
+      'moved answered: replaces its build-time answer',
+      'moved shows its build-time answer until its source answers',
+      'now answered: replaces its build-time answer',
+      'now shows its build-time answer until its source answers',
+      'secret shows its placeholder until its source answers: the store holds secrets its build-time answer did not see',
+    ]);
+  } finally { await browser.close(); server.stop(true); }
+}, 30000);
+
+// A page's answer asked again is journaled as the page's, never as a build-time answer (LLP 1102 §3.17, the runner's
+// `revalidated`): nothing when the fresh answer agrees, the page's line when it contradicts, an immediate answer or one
+// that lands later alike, and no line at the ask.
+test('a page answer asked again is journaled as the page\'s, and nothing when it agrees', async () => {
+  const server = runtimeServer(), browser = await suiteBrowser(), page = await browser.newPage();
+  try {
+    await page.goto(server.url.href);
+    const lines = await page.evaluate(async () => {
+      const rt = await import('/host/web-js/rt.js');
+      const later = Promise.withResolvers();
+      rt.data.answer = (source, [x]) => x === 'same' ? { v: 'page' } : x === 'now' ? { v: 'fresh' } : { promise: later.promise };
+      rt.mount(() => {
+        // Each starts from the page's answer at its arguments, which the page lists in `open`
+        for (const x of ['same', 'now', 'later']) {
+          const r = rt.res(x, 'echo', () => [x], undefined, undefined, 's', undefined, false, [[x], 'page', true, false]);
+          rt.effect(() => r());
+        }
+      });
+      later.resolve('fresh');
+      while (rt.inflight.n) await new Promise(resolve => setTimeout(resolve, 0));
+      return rt.journal.filter(l => / (same|now|later)\b/.test(l) && /answer/.test(l)).map(l => l.replace(/^t=\S+ /, ''));
+    });
+    const contradicted = name => `${name} answered differently from the page's answer: the first frame showed the rendered page's value until its source answered`;
+    expect(lines).toEqual([contradicted('now'), contradicted('later')]);
+  } finally { await page.close(); server.stop(true); }
+}, 30000);

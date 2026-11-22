@@ -739,3 +739,218 @@ fn a_poster_paints_until_the_first_frame_and_sizes_nothing() {
         "gone at the first frame"
     );
 }
+
+#[test]
+fn svg_posters_use_the_video_fit_when_decoded_and_painted() {
+    let poster = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20400%20100'%3E%3Cpath%20d='M0%200H400V100H0Z'/%3E%3C/svg%3E";
+    let source = format!(
+        r#"component App
+  view
+    row background-color="white"
+      video src="a.mp4" poster="{poster}" width=160 height=80 testId="default"
+      video src="a.mp4" poster="{poster}" width=160 height=80 object-fit="contain" testId="contain"
+      video src="a.mp4" poster="{poster}" width=160 height=80 object-fit="unset" testId="clear"
+"#
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &crate::test_plan(&source),
+        (),
+        (480., 80.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.frame();
+    assert!(p.wait_images(Duration::from_secs(30)));
+    let decoded = ["default", "contain", "clear"].map(|name| {
+        let k = p.host().kernel();
+        let id = k.node_by_key(k.find_by_test_id(name)[0]).unwrap().id;
+        let bitmap = &p.images.bitmaps[&id];
+        (bitmap.width(), bitmap.height())
+    });
+    let frame = p.frame();
+    let ink = [80, 240, 400].map(|x| {
+        (0..80)
+            .filter(|y| frame.pixel(x, *y).unwrap().red() < 128)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        (decoded, ink),
+        (
+            [(160, 40), (160, 40), (160, 80)],
+            std::array::from_fn(|_| (20..60).collect())
+        )
+    );
+}
+
+/// The browser suite supplies measured SVG ink from its own table.
+#[test]
+#[ignore = "host/web/tests/symbol-size.test.mjs supplies Chromium's SVG measurements"]
+fn template_placement_matches_browser() {
+    crate::app::show_neutral_look();
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(&std::env::var("EXACT_SYMBOL_ORACLE").expect("Chromium oracle table"))
+            .unwrap();
+    assert!(!cases.is_empty());
+    // Bound the CPU clip masks while preserving Chromium's 840 px width for vw.
+    let failures: Vec<_> = cases.chunks(64).flat_map(compare_placement).collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn compare_placement(cases: &[serde_json::Value]) -> Vec<String> {
+    let mut source = String::from("component App\n");
+    for (i, case) in cases.iter().enumerate() {
+        source.push_str(&format!("  state position{i} = {}\n", case["position"]));
+    }
+    source.push_str(
+        "  view\n    column width=640 gap=0 background-color=\"white\" color=\"black\"\n",
+    );
+    for (i, case) in cases.iter().enumerate() {
+        if i % 4 == 0 {
+            source.push_str("      row width=640 height=80\n");
+        }
+        let (w, h) = (case["w"].as_f64().unwrap(), case["h"].as_f64().unwrap());
+        let bottom = h * if case["overflow"] == true { 2. } else { 1. };
+        let sf = case["sf"].as_str().unwrap();
+        let fit = case["fit"].as_str().unwrap();
+        if let Some(kind) = case["kind"].as_str() {
+            let tag = if kind == "video" { "video" } else { "image" };
+            let fit = if fit.is_empty() {
+                String::new()
+            } else {
+                format!("object-fit=\"{fit}\"")
+            };
+            source.push_str(&format!("        {tag} \"oracle.png\" width=160 height=80 font-size={} {fit} object-position=position{i} testId=\"i{i}\"\n", case["font"].as_u64().unwrap_or(20)));
+        } else {
+            source.push_str(&format!("        image \"symbol:icon|{sf}|0 0 {w} {h}|M0 0H{w}V{bottom}H0Z|\" width=160 height=80 font-size={} object-fit=\"{fit}\" object-position=position{i} testId=\"i{i}\"\n", case["font"].as_u64().unwrap_or(20)));
+        }
+    }
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(&source),
+        (),
+        (840., cases.len().div_ceil(4) as f32 * 80.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    for (i, _) in cases
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c["kind"] == "bitmap")
+    {
+        let k = p.host().kernel();
+        let id = k
+            .node_by_key(k.find_by_test_id(&format!("i{i}"))[0])
+            .unwrap()
+            .id;
+        let mut pixels = tiny_skia::Pixmap::new(40, 20).unwrap();
+        pixels.fill(tiny_skia::Color::BLACK);
+        let gate = exact_raster::Gate::new();
+        let charge = gate
+            .session()
+            .reserve_allocation(40 * 20 * 4)
+            .unwrap()
+            .charge();
+        p.images.bitmaps.insert(
+            id,
+            Arc::new(crate::image::Bitmap::new(pixels, (40, 20), charge)),
+        );
+    }
+    let frame = p.frame().clone();
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let k = p.host().kernel();
+        let node = k
+            .node_by_key(k.find_by_test_id(&format!("i{i}"))[0])
+            .unwrap();
+        let env = k.env_of(node.id);
+        let viewport = if case["kind"].is_string() {
+            crate::paint::object_fit(
+                (
+                    case["w"].as_u64().unwrap() as u32,
+                    case["h"].as_u64().unwrap() as u32,
+                ),
+                crate::paint::object_fit_of(&node),
+                &node.style.object_position,
+                (0., 0., 160., 80.),
+                &env,
+            )
+        } else {
+            exact_kernel::object::placed(
+                crate::paint::look::symbol_natural(&node),
+                node.style.object_fit,
+                &node.style.object_position,
+                (0., 0., 160., 80.),
+                &env,
+            )
+        }
+        .unwrap();
+        let (x, y, w, h) = if case["kind"].is_string() {
+            viewport
+        } else {
+            let path = exact_kernel::symbol_path_in(
+                node.props
+                    .str(exact_kernel::PropId::ImageSource)
+                    .unwrap()
+                    .strip_prefix("symbol:")
+                    .unwrap(),
+                exact_kernel::SymbolSet::Web,
+            )
+            .unwrap();
+            let ts = crate::paint::fitted(path.view_box, viewport);
+            (
+                ts.tx,
+                ts.ty,
+                case["w"].as_f64().unwrap() as f32 * ts.sx,
+                case["h"].as_f64().unwrap() as f32
+                    * ts.sy
+                    * if case["overflow"] == true { 2. } else { 1. },
+            )
+        };
+        let projected = [
+            x.max(viewport.0).max(0.),
+            y.max(viewport.1).max(0.),
+            (x + w).min(viewport.0 + viewport.2).min(160.) - 1.,
+            (y + h).min(viewport.1 + viewport.3).min(80.) - 1.,
+        ];
+        let expected = case["expected"].as_array().unwrap()[2..]
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect::<Vec<_>>();
+        let mut ink: [f32; 4] = [160., 80., -1., -1.];
+        for y in 0..80 {
+            for x in 0..160 {
+                if frame
+                    .pixel(x + i as u32 % 4 * 160, y + i as u32 / 4 * 80)
+                    .unwrap()
+                    .demultiply()
+                    .red()
+                    < 128
+                {
+                    ink = [
+                        ink[0].min(x as f32),
+                        ink[1].min(y as f32),
+                        ink[2].max(x as f32),
+                        ink[3].max(y as f32),
+                    ];
+                }
+            }
+        }
+        if case["kind"] == "video" {
+            ink = projected;
+        }
+        if projected
+            .iter()
+            .zip(&expected)
+            .any(|(a, b)| (a - b).abs() > 1.)
+            || ink.iter().zip(&expected).any(|(a, b)| (a - b).abs() > 1.)
+        {
+            failures.push(format!("{case}: geometry {projected:?}, pixels {ink:?}"));
+        }
+    }
+    failures
+}

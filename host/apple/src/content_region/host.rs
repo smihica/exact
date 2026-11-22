@@ -384,6 +384,7 @@ impl<D: DataSource> Host<D> {
                 false,
                 Some(registration),
                 Some(limits),
+                None,
                 crate::link::Links::ALL,
                 None,
                 |_| Ok(()),
@@ -929,7 +930,7 @@ impl<D: DataSource> Host<D> {
         // It is staged with node changes, never emitted before promotion.
         let collections_json = self.native_collections_with(&candidate.collections)?;
         if collections_json != self.collections_json {
-            staged.collections(&collections_json);
+            staged.collections("items", &collections_json);
         }
         let owner = self
             .runner

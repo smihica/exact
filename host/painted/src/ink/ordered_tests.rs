@@ -1,7 +1,7 @@
 //! Exercise the adapter's real pass boundaries with an ordered fake queue.
 use super::*;
 use exact_ink::device::{Submission, TextureDesc, TextureUpload};
-use exact_ink::instance::Frame;
+use exact_ink::instance::{Frame, Scissor};
 use std::collections::HashMap;
 type Native = exact_ink::device::Selected;
 type Buffer = <Native as Device>::Buffer;
@@ -60,45 +60,6 @@ impl Selected {
             Self::Fake(_) | Self::Counted(_) => unreachable!(),
         }
     }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    #[allow(unsafe_code)]
-    pub unsafe fn attach_scanout(
-        &mut self,
-        fd: i32,
-        connector: u32,
-        size: [u32; 2],
-        refresh: u32,
-    ) -> Result<()> {
-        match self {
-            Self::Wgpu(d) | Self::Other(d) => unsafe {
-                // SAFETY: the caller passes through the native device's contract.
-                d.attach_scanout(fd, connector, size, refresh)
-            },
-            Self::Fake(_) | Self::Counted(_) => unreachable!(),
-        }
-    }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn has_scanout(&self) -> bool {
-        match self {
-            Self::Wgpu(d) | Self::Other(d) => d.has_scanout(),
-            Self::Fake(d) => d.display.is_some(),
-            Self::Counted(_) => false,
-        }
-    }
-
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    pub fn scan_out(&mut self, texture: TextureId, rotation: exact_ink::Rotation) -> Result<()> {
-        match self {
-            Self::Wgpu(d) | Self::Other(d) => d.scan_out(texture, rotation),
-            Self::Fake(d) => {
-                d.display.as_mut().unwrap().push((texture, rotation));
-                Ok(())
-            }
-            Self::Counted(_) => unreachable!(),
-        }
-    }
 }
 macro_rules! forward {
     ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)+) => {
@@ -149,9 +110,6 @@ pub struct Fake {
     submitted: Submission,
     copies: Vec<([u32; 2], [u32; 2])>,
     retired: Vec<TextureId>,
-    /// The frames its display was given, when it has one.
-    #[cfg(all(feature = "scanout", target_os = "linux"))]
-    display: Option<Vec<(TextureId, exact_ink::Rotation)>>,
 }
 impl Device for Fake {
     type Buffer = Buffer;
@@ -383,23 +341,6 @@ fn destination_copies_follow_transforms_clips_and_filter_support() {
     assert_eq!(d.copies[2], ([100, 100], [600, 400]));
 }
 
-#[cfg(all(feature = "scanout", target_os = "linux"))]
-#[test]
-fn a_display_turns_the_frame_itself_so_no_pass_rotates_it() {
-    let mut ink = Ink::from_device(Selected::Fake(Fake {
-        display: Some(Vec::new()),
-        ..Default::default()
-    }));
-    let rotation = exact_ink::Rotation::R90;
-    ink.begin(64., 32., 1.);
-    ink.finish_pixels(rotation).unwrap();
-    let Selected::Fake(d) = &ink.device else {
-        unreachable!()
-    };
-    assert_eq!(d.events, [Event::Draw(vec![])]);
-    assert_eq!(d.display, Some(vec![(ink.target.unwrap(), rotation)]));
-}
-
 #[test]
 fn a_canvas_redrawn_at_its_size_keeps_one_texture() {
     fn frame(images: &mut images::Images, device: &mut Fake, pixels: &Arc<Pixmap>) -> TextureId {
@@ -603,4 +544,128 @@ fn a_kept_rows_bitmap_keeps_its_decode_across_a_trim_in_both_modes() {
             assert!(device.retired.contains(&row_texture));
         }
     }
+}
+
+#[test]
+fn opacity_composite_covers_draws_from_both_passes() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    ink.begin(1920., 1080., 1.);
+    let identity = Transform::identity();
+    let clip = Shape::rect((120., 40., 40., 40.));
+    ink.push_clip(&clip, identity);
+    ink.push_opacity(0.5);
+    ink.fill(&Shape::rect((100., 48., 30., 8.)), [255; 4], identity);
+    ink.flush().unwrap();
+    ink.fill(&Shape::rect((144., 64., 30., 8.)), [255; 4], identity);
+    ink.pop_opacity();
+    ink.pop_clip();
+    assert_eq!(
+        only_composite(&mut ink),
+        Scissor::from_rect([119., 46., 42., 28.])
+    );
+}
+
+fn only_composite(ink: &mut Ink) -> Scissor {
+    let frame = ink.encoder.take_frame();
+    let [composite] = frame.batches.as_slice() else {
+        panic!("expected one composite: {:?}", frame.batches);
+    };
+    composite.scissor
+}
+
+#[test]
+fn an_empty_opacity_group_adds_no_composite() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    ink.begin(1920., 1080., 1.);
+    let identity = Transform::identity();
+    ink.fill(&Shape::rect((10., 10., 20., 20.)), [255; 4], identity);
+    ink.push_opacity(0.5);
+    ink.pop_opacity();
+    // The parent's own draw is all that remains.
+    assert_eq!(ink.encoder.take_frame().instances.len(), 1);
+    assert!(ink.error.is_none());
+}
+
+#[test]
+fn a_mask_group_composites_within_its_content() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    let identity = Transform::identity();
+    let viewport = Shape::rect((0., 0., 640., 360.));
+    let child = Shape::rect((100., 40., 30., 8.));
+    ink.begin(640., 360., 1.);
+    ink.push_opacity(0.5);
+    ink.fill(&child, [255; 4], identity);
+    ink.pop_opacity();
+    let group = only_composite(&mut ink);
+    ink.begin(640., 360., 1.);
+    ink.push_mask(&viewport, identity);
+    ink.fill(&child, [255; 4], identity);
+    ink.pop_mask(&viewport, &Err([255; 4]), identity);
+    assert_eq!(only_composite(&mut ink), group);
+    assert_ne!(group, Scissor::full([640, 360]));
+}
+
+#[test]
+fn a_transformed_group_composites_the_whole_viewport() {
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    ink.begin(640., 360., 1.);
+    ink.push_opacity(0.5);
+    ink.groups.last_mut().unwrap().transform = Some(Transform::from_translate(5., 0.));
+    ink.fill(
+        &Shape::rect((10., 20., 30., 8.)),
+        [255; 4],
+        Transform::identity(),
+    );
+    ink.pop_opacity();
+    assert_eq!(only_composite(&mut ink), Scissor::full([640, 360]));
+}
+
+#[test]
+fn an_opacity_layer_composites_within_its_content() {
+    // A transform that does not round-trip through the device scale exactly.
+    let ts = Transform::from_row(1.1, 0., 0., 1.1, 0.1, 0.3);
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    let mut draw = |layer: bool| {
+        ink.begin(640., 360., 3.);
+        if layer {
+            let base = [0., 0., 1., 0., 0.5, 0., 0.];
+            assert!(ink.layer_begin(1, ts, (20., 20.), (0., 0.), base));
+        } else {
+            ink.push_opacity(0.5);
+        }
+        ink.fill(&Shape::rect((10., 20., 30., 8.)), [255; 4], ts);
+        if layer {
+            ink.layer_end();
+        } else {
+            ink.pop_opacity();
+        }
+        only_composite(&mut ink)
+    };
+    let group = draw(false);
+    assert_eq!(draw(true), group);
+    assert_ne!(group, Scissor::full([1920, 1080]));
+}
+
+#[test]
+fn a_replayed_opacity_group_composites_where_the_row_is_drawn() {
+    let viewport = (0., 0., 640., 360.);
+    let identity = Transform::identity();
+    let group = |ink: &mut Ink, x: f32, y: f32| {
+        ink.push_opacity(0.5);
+        ink.fill(&Shape::rect((x, y, 30., 8.)), [255; 4], identity);
+        ink.pop_opacity();
+    };
+    let mut ink = Ink::from_device(Selected::Fake(Fake::default()));
+    ink.begin(640., 360., 1.);
+    group(&mut ink, 310., 220.);
+    let fresh = only_composite(&mut ink);
+
+    ink.begin(640., 360., 1.);
+    ink.row_begin(1, (0., 0.), None);
+    group(&mut ink, 10., 20.);
+    ink.row_end(viewport);
+    ink.begin(640., 360., 1.);
+    ink.row_draw(1, (300., 200.), viewport);
+    assert_eq!(only_composite(&mut ink), fresh);
+    assert!(fresh.width < 40 && fresh.height < 20, "{fresh:?}");
 }

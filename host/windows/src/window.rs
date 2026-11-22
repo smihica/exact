@@ -2,7 +2,8 @@ use crate::keyboard::key_names;
 use exact_ink::counters;
 use exact_painted::{
     app::{self, Config},
-    presenter::PointerKind,
+    presenter::{PainterBoot, PointerKind},
+    window_title::WindowTitle,
     Presenter,
 };
 use exact_runner::DataSource;
@@ -24,21 +25,23 @@ use winit::{
 
 mod edit_menu;
 mod file_dialog;
+mod file_drop;
 mod frames;
 mod lifecycle;
 mod presents;
 mod service;
 mod tray;
 use frames::{next_frame_deadline, presentation_resumes, FrameSchedule};
-use presents::direct_device;
 
 struct App<D: DataSource> {
     service_causes: u8,
     proxy: EventLoopProxy<crate::accessibility::Event>,
     accessibility: Option<crate::accessibility::Access>,
     name: String,
+    title: WindowTitle,
     min_size: (f32, f32),
     config: Config,
+    painter: PainterBoot,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     preparing: Option<exact_ink::device::d3d11::Startup>,
@@ -90,8 +93,11 @@ struct App<D: DataSource> {
     keep_running: bool,
     /// The window is not shown: hidden by a close, or since a hidden launch.
     hidden: bool,
+    /// DWM is composing this window for its first frame after a show request.
+    pending_show: Option<lifecycle::PendingShow>,
     /// The app's one instance, which later launches reach.
     instance: Option<crate::instance::Instance>,
+    cold_documents: Vec<String>,
     tray: Option<tray::Tray>,
     presents: presents::Presents,
 }
@@ -110,6 +116,19 @@ impl<D: DataSource> Drop for App<D> {
         self.caret.clear();
         self.tooltip = Default::default();
     }
+}
+
+fn apply_title<D: DataSource>(
+    title: &mut WindowTitle,
+    p: &Presenter<D>,
+    window: &Window,
+    name: &str,
+) -> bool {
+    if !title.update(p.host().runner()) {
+        return false;
+    }
+    window.set_title(title.caption(name));
+    true
 }
 
 fn system_theme<D: DataSource>(p: &mut Presenter<D>, theme: Theme, agent: bool) {
@@ -149,12 +168,13 @@ pub(crate) fn boot_phase(name: &str) {
     }
 }
 
-pub(super) fn run<D: DataSource + Default + 'static>(
+pub(super) fn run<D: DataSource + Default + 'static, const DEVELOPMENT: bool>(
     name: &str,
     opening: crate::Window,
     plan: &[u8],
     compat: &str,
     composed: exact_painted::Composed,
+    services: crate::Services,
 ) -> i32 {
     if let Some(result) = exact_ink::device::d3d11::startup_watchdog::helper() {
         return result;
@@ -175,28 +195,35 @@ pub(super) fn run<D: DataSource + Default + 'static>(
         eprintln!("exact-windows: update-store delivery is not implemented; bake store level 0");
         return 1;
     }
-    let device = std::env::var("EXACT_INK_DEVICE").ok();
-    let direct = direct_device(
-        exact_painted::presenter::PainterChoice::from_env(
-            exact_painted::presenter::PainterChoice::from_baked(compat),
-        ),
-        device.as_deref(),
-    );
-    let preparing = if Config::windowed_from_env()
-        && direct
-        && !exact_ink::device::d3d11::startup_watchdog::after_layout()
-    {
-        match exact_ink::device::d3d11::Startup::start(
-            exact_ink::device::direct_d3d11(device.as_deref()).unwrap(),
-        ) {
-            Ok(p) => Some(p),
-            Err(error) => {
-                eprintln!("exact-windows: {error}");
+    let frame_limit = match std::env::var("EXACT_AGENT_WINDOW_FRAMES") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(count @ 1..=10_000) => Some(count),
+            _ => {
+                eprintln!("exact-windows: EXACT_AGENT_WINDOW_FRAMES requires 1..=10000");
                 return 1;
             }
+        },
+        Err(_) => None,
+    };
+    let login = crate::desktop::login_launch(&std::env::args().collect::<Vec<_>>());
+    let painter = PainterBoot::windows::<DEVELOPMENT>(compat);
+    let launch = app::prepare_window_painter(login, frame_limit.is_some(), || {
+        let Some(warp) = painter.direct_d3d11() else {
+            return Ok(None);
+        };
+        if !Config::windowed_from_env()
+            || exact_ink::device::d3d11::startup_watchdog::after_layout()
+        {
+            return Ok(None);
         }
-    } else {
-        None
+        exact_ink::device::d3d11::Startup::start(warp).map(Some)
+    });
+    let (hidden, preparing) = match launch {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("exact-windows: {error}");
+            return 1;
+        }
     };
     // A distributed app locates data beside its executable, never in its caller's cwd.
     if std::env::var_os("EXACT_ASSETS").is_none() {
@@ -217,7 +244,7 @@ pub(super) fn run<D: DataSource + Default + 'static>(
     {
         std::thread::sleep(Duration::from_millis(200));
     }
-    let mut config = Config::from_env(plan, compat);
+    let mut config = Config::from_bake_with_services::<DEVELOPMENT>(plan, compat, services);
     config.preferences = Some(exact_runner::Preferences {
         screen_reader: if config.agent {
             exact_runner::ScreenReader::Unknown
@@ -229,17 +256,6 @@ pub(super) fn run<D: DataSource + Default + 'static>(
     // The presenter makes the hatches' value after its first frame is shown.
     config.hatches = composed.hatches;
     config.packages = composed.packages;
-    // Config has already stripped EXACT_AGENT_* for a production bake.
-    let frame_limit = match std::env::var("EXACT_AGENT_WINDOW_FRAMES") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(count @ 1..=10_000) => Some(count),
-            _ => {
-                eprintln!("exact-windows: EXACT_AGENT_WINDOW_FRAMES requires 1..=10000");
-                return 1;
-            }
-        },
-        Err(_) => None,
-    };
     let first_tap = std::env::var("EXACT_AGENT_WINDOW_TAP").ok();
     if first_tap.is_some()
         && frame_limit.is_none()
@@ -248,14 +264,16 @@ pub(super) fn run<D: DataSource + Default + 'static>(
         eprintln!("exact-windows: EXACT_AGENT_WINDOW_TAP requires a measured window run");
         return 1;
     }
-    if !config.windowed() {
+    if DEVELOPMENT && !config.windowed() {
         crate::displays::install_headless();
         return crate::clipboard::run_headless::<D>(&mut config, started);
     }
-    let instance = match lifecycle::claim(frame_limit.is_some(), compat, name) {
+    let args = crate::instance::arguments();
+    let instance = match lifecycle::claim(frame_limit.is_some(), compat, name, &args) {
         Ok(instance) => instance,
         Err(code) => return code,
     };
+    let cold_documents = lifecycle::cold_documents(&mut config, compat, &args);
     boot_phase("config-ready");
     if std::env::var_os("EXACT_SIZE").is_none() {
         config.size = (opening.width, opening.height);
@@ -302,18 +320,20 @@ pub(super) fn run<D: DataSource + Default + 'static>(
     let timers = crate::timers::Timers::new(move |fired| {
         let _ = timer_proxy.send_event(crate::accessibility::Event::Timer(fired));
     });
-    let mut state = App::<D> {
+    let state = App::<D> {
         service_causes: 0,
         proxy,
         accessibility: None,
         name: name.to_owned(),
+        title: WindowTitle::default(),
         min_size: (opening.min_width, opening.min_height),
         config,
+        painter,
         window: None,
         surface: None,
         preparing,
         jump_list_started: false,
-        direct,
+        direct: painter.direct_d3d11().is_some(),
         presenter: None,
         timers,
         started,
@@ -354,12 +374,17 @@ pub(super) fn run<D: DataSource + Default + 'static>(
         refit_after_scale: false,
         closing: false,
         keep_running: opening.keep_running,
-        hidden: false,
+        hidden,
+        pending_show: None,
         instance,
+        cold_documents,
         tray: None,
         presents: Default::default(),
     };
-    if let Err(e) = event_loop.run_app(&mut state) {
+    let state = Rc::new(std::cell::RefCell::new(state));
+    let result = event_loop.run_app(&mut file_drop::Window::new(state.clone()));
+    let mut state = state.borrow_mut();
+    if let Err(e) = result {
         eprintln!("exact-windows: {e}");
         state.failed = true;
     }
@@ -572,7 +597,7 @@ impl<D: DataSource + Default + 'static> App<D> {
         if self.frame_limit.is_some() {
             p.repaint();
         }
-        let painting = p.dirty();
+        let painting = p.dirty() || self.frames == 0;
         let paint = Instant::now();
         if let Some(previous) = self.caret.take_previous_frame() {
             p.recycle_frame(previous);
@@ -619,9 +644,20 @@ impl<D: DataSource + Default + 'static> App<D> {
         let (handed, direct) = (frame.is_some() || direct_present_ms > 0., frame.is_none());
         let present = Instant::now();
         if let Some(frame) = frame {
-            let surface = surface
-                .as_mut()
-                .ok_or("direct painter returned an unpresented frame")?;
+            let surface = match &mut *surface {
+                Some(existing) => existing,
+                None if self.direct => {
+                    return Err("direct painter returned an unpresented frame".into())
+                }
+                slot => {
+                    let context =
+                        softbuffer::Context::new(window.clone()).map_err(|e| e.to_string())?;
+                    slot.insert(
+                        softbuffer::Surface::new(&context, window.clone())
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+            };
             surface.resize(width, height).map_err(|e| e.to_string())?;
             let mut buffer = surface.buffer_mut().map_err(|e| e.to_string())?;
             if buffer.len() != frame.data().len() / 4 {
@@ -643,8 +679,18 @@ impl<D: DataSource + Default + 'static> App<D> {
         if !p.last_frame_succeeded() {
             return Ok(());
         }
+        if let Some(pending) = self.pending_show.take() {
+            pending.reveal()?;
+        }
         if painting && handed {
             self.presents.drew(p, direct, self.started);
+            // Service work can make the next picture dirty before the idle lookup.
+            self.tooltip.update(
+                p,
+                window,
+                (self.pointer_inside && self.focused && self.buttons == 0).then_some(self.pointer),
+                false,
+            );
         }
         // A keyboard command can change the cursor while the mouse is still.
         // Re-resolve the painted hit after the frame, including unmounts and HUDs.
@@ -768,8 +814,9 @@ impl<D: DataSource + Default + 'static> App<D> {
             self.jump_list_started = true;
             crate::jump_list::start(self.config.compat.clone());
         }
+        apply_title(&mut self.title, p, window, &self.name);
         if let Some(access) = &mut self.accessibility {
-            access.sync(p, window, &self.name);
+            access.sync(p, window, self.title.caption(&self.name));
         }
         let accessible_at = frame_started.elapsed().as_secs_f64() * 1000.;
         self.ime.sync(window, p);
@@ -883,6 +930,7 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
             Window::default_attributes()
                 .with_no_redirection_bitmap(self.direct)
                 .with_visible(false)
+                .with_drag_and_drop(false)
                 .with_title(&self.name)
                 .with_window_icon(crate::icon::small())
                 .with_taskbar_icon(crate::icon::large())
@@ -932,39 +980,33 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
             }
         }
         boot_phase("native-hooks-ready");
-        let mut direct = false;
         exact_runner::page::set_awaits_present(true);
-        let booted = if let Some(preparing) = self.preparing.take() {
-            app::boot_presenter_with_device::<D>(&mut self.config, viewport, preparing)
-        } else if self.direct && exact_ink::device::d3d11::startup_watchdog::after_layout() {
-            app::boot_presenter_after_layout_device::<D>(&mut self.config, viewport)
-        } else {
-            app::boot_presenter::<D>(&mut self.config, viewport)
-        };
+        let booted = app::boot_window_presenter::<D>(
+            &mut self.config,
+            viewport,
+            self.hidden,
+            self.painter,
+            self.preparing.take(),
+            self.direct && exact_ink::device::d3d11::startup_watchdog::after_layout(),
+        );
         boot_phase("presenter-ready");
         match booted {
             Ok((mut p, warning)) => {
-                if let Ok(handle) = window.window_handle() {
-                    if let RawWindowHandle::Win32(_) = handle.as_raw() {
-                        let owned =
-                            match exact_ink::device::d3d11::Window::from_owner(window.clone()) {
-                                Ok(owned) => owned,
-                                Err(e) => {
-                                    self.fail(events, e.to_string());
-                                    return;
-                                }
-                            };
-                        let attached = p.attach_painter_window(owned, [size.width, size.height]);
-                        match attached {
-                            Ok(attached) => direct = attached,
-                            Err(e) => {
-                                self.fail(events, e);
-                                return;
-                            }
+                if !self.hidden {
+                    let attached = exact_ink::device::d3d11::Window::from_owner(window.clone())
+                        .map_err(|e| e.to_string())
+                        .and_then(|owned| {
+                            p.attach_painter_window(owned, [size.width, size.height])
+                        });
+                    match attached {
+                        Ok(attached) => self.direct = attached,
+                        Err(e) => {
+                            self.fail(events, e);
+                            return;
                         }
                     }
+                    boot_phase("composition-ready");
                 }
-                boot_phase("composition-ready");
                 p.host_mut().runner_mut().set_row_reuse(true);
                 if let Some(scale) = self.appearance.text_scale() {
                     if let Some(error) = p.set_text_scale(scale) {
@@ -999,9 +1041,9 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
                 if let Some(warning) = warning {
                     eprintln!("exact-windows: {warning}");
                 }
+                apply_title(&mut self.title, &p, &window, &self.name);
                 self.presenter = Some(p);
                 self.tray_start();
-                self.hidden = self.launches_hidden();
                 let hidden = self.hidden;
                 let can_open_files = self.dialogs.available();
                 self.tell_page(|page| {
@@ -1012,22 +1054,6 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
             Err(e) => {
                 self.fail(events, e);
                 return;
-            }
-        }
-        if !direct {
-            let context = match softbuffer::Context::new(window.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.fail(events, e);
-                    return;
-                }
-            };
-            match softbuffer::Surface::new(&context, window.clone()) {
-                Ok(surface) => self.surface = Some(surface),
-                Err(e) => {
-                    self.fail(events, e);
-                    return;
-                }
             }
         }
         boot_phase("before-show");
@@ -1080,15 +1106,11 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
             self.about_to_wait(events);
             return;
         }
-        // Executor, image and hatch wakes need a display turn; polling the
-        // executor alone does not service all three. Timers take the branch above.
-        if matches!(event, crate::accessibility::Event::Wake) {
-            if counters::enabled() {
-                self.service_causes |= counters::WORKER;
-            }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        // Executor, image, tray, appearance and hatch wakes are serviced in
+        // `about_to_wait`, which requests a redraw only when the presenter
+        // becomes dirty or needs continuous frames.
+        if matches!(event, crate::accessibility::Event::Wake) && counters::enabled() {
+            self.service_causes |= counters::WORKER;
         }
         if let crate::accessibility::Event::Access(event) = event {
             if let (Some(access), Some(p), Some(window)) =
@@ -1098,7 +1120,12 @@ impl<D: DataSource + Default + 'static> ApplicationHandler<crate::accessibility:
                     return;
                 }
                 p.advance(self.started.elapsed().as_secs_f64() * 1000.);
-                access.event(p, window, &self.name, event.window_event);
+                access.event(
+                    p,
+                    window,
+                    self.title.caption(&self.name),
+                    event.window_event,
+                );
             }
         }
         self.about_to_wait(events);

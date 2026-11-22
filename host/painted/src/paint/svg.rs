@@ -3,13 +3,17 @@
 //! clipping to that box when overflow is not visible. Each shape paints
 //! through [`Backend::svg_path`]; group opacity is a group, as in CSS.
 
-use super::{effective_overflow, rgba, Painter, Rect4, Shape, Walk};
+use super::{bbox, effective_overflow, intersect, rgba, Painter, Rect4, Shape, Walk};
 use exact_kernel::svg::scene::{self, Item, Kind, ShapePaint};
 use exact_kernel::svg::server::Server;
-use exact_kernel::svg::Path;
+use exact_kernel::svg::{Path, Seg};
 use exact_kernel::{NodeKey, NodeRef, Overflow};
 use exact_motion::{Property, Value};
+use i_overlay::{
+    core::fill_rule::FillRule, core::overlay_rule::OverlayRule, float::single::SingleFloatOverlay,
+};
 use tiny_skia::Transform;
+use vello::kurbo::{self, Affine, BezPath, PathEl, Stroke, StrokeOpts};
 
 #[cfg(test)]
 #[path = "filter_tests.rs"]
@@ -74,27 +78,33 @@ pub struct SvgPaint<'a> {
 }
 
 thread_local! {
-    /// Each symbol's path, parsed once: a role's schema `d` or an icon
+    /// Each symbol's paths, parsed once: a role's schema `d` or an icon
     /// token's (LLP 1121 D10), by its text (a row of icons painted again
     /// parsed every one, 4% of the easy list's thread).
-    static SYMBOL_PATHS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<Path>>> =
+    static SYMBOL_PATHS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<SymbolGeometry>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// The parsed path of a symbol's `d`.
-fn parsed_symbol(d: &str) -> std::rc::Rc<Path> {
-    SYMBOL_PATHS.with(|paths| {
-        if let Some(p) = paths.borrow().get(d) {
-            return p.clone();
+struct SymbolGeometry {
+    paths: Vec<Path>,
+    bounds: Option<Rect4>,
+}
+
+fn parsed_symbol(d: &str) -> std::rc::Rc<SymbolGeometry> {
+    SYMBOL_PATHS.with(|cache| {
+        if let Some(glyph) = cache.borrow().get(d) {
+            return glyph.clone();
         }
-        let p = std::rc::Rc::new(exact_kernel::svg::parse_d(d));
-        let mut paths = paths.borrow_mut();
+        let paths: Vec<_> = d.split(';').map(exact_kernel::svg::parse_d).collect();
+        let bounds = paths.iter().filter_map(Path::bounds).reduce(island::union);
+        let glyph = std::rc::Rc::new(SymbolGeometry { paths, bounds });
+        let mut cache = cache.borrow_mut();
         // Bounded: a computed source's paths come and go.
-        if paths.len() >= 1024 {
-            paths.clear();
+        if cache.len() >= 1024 {
+            cache.clear();
         }
-        paths.insert(d.to_string(), p.clone());
-        p
+        cache.insert(d.to_string(), glyph.clone());
+        glyph
     })
 }
 
@@ -111,14 +121,88 @@ pub(crate) fn fitted(view_box: &str, (x, y, w, h): Rect4) -> Transform {
 /// A viewBox's `min-x min-y width height`; a role's 24-unit box when it
 /// does not read.
 pub(crate) fn view_box(text: &str) -> [f32; 4] {
-    let n: Vec<f32> = text
-        .split([' ', ','])
-        .filter_map(|v| v.parse().ok())
-        .collect();
-    match n[..] {
-        [x, y, w, h] if w > 0.0 && h > 0.0 => [x, y, w, h],
-        _ => [0.0, 0.0, 24.0, 24.0],
+    exact_kernel::object::view_box(text)
+}
+
+type Contour = Vec<[f64; 2]>;
+
+fn contours(path: &BezPath, tolerance: f64) -> Vec<Contour> {
+    let mut contours = Vec::<Contour>::new();
+    kurbo::flatten(path, tolerance, |op| match op {
+        PathEl::MoveTo(p) => contours.push(vec![[p.x, p.y]]),
+        PathEl::LineTo(p) => {
+            if let Some(contour) = contours.last_mut() {
+                contour.push([p.x, p.y]);
+            }
+        }
+        _ => {}
+    });
+    contours.retain(|c| c.len() >= 3);
+    contours
+}
+
+fn glyph_clip(edge: Shape, visible: Rect4, tolerance: f64) -> Vec<Contour> {
+    let (x, y, w, h) = visible;
+    let (x, y, r, b) = (
+        f64::from(x),
+        f64::from(y),
+        f64::from(x + w),
+        f64::from(y + h),
+    );
+    let rect = [[x, y], [r, y], [r, b], [x, b]];
+    if !edge.rounded() {
+        return vec![rect.to_vec()];
     }
+    let rounded = contours(&super::bezier_outline(&edge), tolerance);
+    if visible == edge.rect {
+        return rounded;
+    }
+    rounded
+        .overlay(&rect.as_slice(), OverlayRule::Intersect, FillRule::NonZero)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Intersect the geometry before painting so a fractional edge gets one coverage value.
+fn clipped_glyph(
+    path: &Path,
+    fit: Transform,
+    stroke: Option<f32>,
+    rule: FillRule,
+    clip: &[Contour],
+    tolerance: f64,
+) -> Path {
+    let affine = Affine::new([fit.sx, fit.ky, fit.kx, fit.sy, fit.tx, fit.ty].map(f64::from));
+    let mut path = affine * super::svg_bezier_path(path);
+    if !path.is_finite() {
+        return Path::default();
+    }
+    let size = path.control_box().size();
+    // Subdivision below the precision of the glyph's coordinates adds no detail.
+    let tolerance = tolerance.max(size.width.max(size.height) * f64::from(f32::EPSILON));
+    if let Some(width) = stroke {
+        path = kurbo::stroke(
+            &path,
+            &Stroke::new(f64::from(width * fit.sx)),
+            &StrokeOpts::default(),
+            tolerance,
+        );
+    }
+    let mut result = Vec::new();
+    for ring in contours(&path, tolerance)
+        .overlay(&clip, OverlayRule::Intersect, rule)
+        .into_iter()
+        .flatten()
+    {
+        let Some(([x, y], points)) = ring.split_first() else {
+            continue;
+        };
+        result.push(Seg::Move(*x as f32, *y as f32));
+        result.extend(points.iter().map(|&[x, y]| Seg::Line(x as f32, y as f32)));
+        result.push(Seg::Close);
+    }
+    Path(result)
 }
 
 impl Painter {
@@ -134,9 +218,10 @@ impl Painter {
     pub(super) fn symbol(
         &mut self,
         node: &NodeRef<'_>,
-        content: Rect4,
+        edge: Shape,
         ink: Option<[u8; 4]>,
         ts: Transform,
+        env: &exact_kernel::Env,
     ) {
         let Some(role) = node
             .props
@@ -146,21 +231,23 @@ impl Painter {
             return;
         };
         let style = node.style;
-        let size = super::look::symbol_size(node).max(1.0);
-        let natural = (size.round().max(1.0) as u32, size.round().max(1.0) as u32);
-        // `fill` keeps a symbol's aspect, as the web's `contain` and Apple do.
-        let fit = match style.object_fit {
-            exact_kernel::ObjectFit::Fill => exact_kernel::ObjectFit::Contain,
-            fit => fit,
+        let Some(path) = exact_kernel::symbol_path_in(role, self.symbols) else {
+            return;
         };
-        let Some(rect) = super::object_fit(natural, fit, content) else {
+        let Some(rect) = exact_kernel::object::placed(
+            super::look::symbol_natural(node),
+            style.object_fit,
+            &style.object_position,
+            edge.rect,
+            env,
+        ) else {
             return;
         };
         let colour = ink.unwrap_or_else(|| rgba(node.text_color().resolve(self.dark)));
         let face = node.computed_style(exact_kernel::StyleMask::of(
             exact_kernel::StyleId::FontWeight,
         ));
-        self.symbol_face(role, &face, rect, colour, ts);
+        self.draw_glyph(path, &face, rect, colour, ts, Some(edge));
     }
 
     /// A semantic button's symbol shares the portable image painter.
@@ -190,36 +277,81 @@ impl Painter {
         colour: [u8; 4],
         ts: Transform,
     ) {
-        let (x, y, w, h) = rect;
+        self.draw_glyph(symbol, style, rect, colour, ts, None);
+    }
+
+    fn draw_glyph(
+        &mut self,
+        symbol: exact_kernel::SymbolPath<'_>,
+        style: &exact_kernel::StyleProps,
+        rect: Rect4,
+        colour: [u8; 4],
+        ts: Transform,
+        edge: Option<Shape>,
+    ) {
+        let glyph = parsed_symbol(symbol.d);
         let weight = f32::from(style.font_weight).clamp(100.0, 900.0);
-        let ts = ts.pre_concat(fitted(symbol.view_box, (x, y, w, h)));
+        let fit = fitted(symbol.view_box, rect);
         let bw = self::view_box(symbol.view_box)[2];
+        // The stroke is in the role's 24 units whatever the box.
+        let stroke = (1.1 + (weight - 100.0) / 400.0) * bw / 24.0;
+        let clip = if let Some((edge, (x, y, w, h))) = edge.zip(glyph.bounds) {
+            let outset = if symbol.filled { 0. } else { stroke / 2. };
+            let ink = bbox(
+                fit,
+                (x - outset, y - outset, w + 2. * outset, h + 2. * outset),
+            );
+            let visible = intersect(rect, edge.rect);
+            let (_, _, width, height) = intersect(ink, visible);
+            if width <= 0. || height <= 0. {
+                return;
+            }
+            (edge.rounded() || intersect(ink, visible) != ink).then(|| {
+                let device_scale = ts.sx.hypot(ts.ky).max(ts.kx.hypot(ts.sy)) * self.scale;
+                let tolerance = 1. / (32. * f64::from(device_scale.max(1.)));
+                (glyph_clip(edge, visible, tolerance), tolerance)
+            })
+        } else {
+            None
+        };
         // Each of an icon's paths filled on its own, as its SVG draws them,
         // a translucent tint once over all of them, as the web's mask is.
-        let group = symbol.d.contains(';') && colour[3] < 255;
+        let group = glyph.paths.len() > 1 && colour[3] < 255;
         let colour = if group {
             self.backend.push_opacity(f32::from(colour[3]) / 255.0);
             [colour[0], colour[1], colour[2], 255]
         } else {
             colour
         };
-        for d in symbol.d.split(';') {
-            let path = parsed_symbol(d);
+        let rule = if symbol.even_odd {
+            FillRule::EvenOdd
+        } else {
+            FillRule::NonZero
+        };
+        let stroke_ink = (!symbol.filled).then_some(stroke);
+        let placed = ts.pre_concat(fit);
+        for path in &glyph.paths {
+            let clipped;
+            let (path, transform, filled, even_odd) = if let Some((clip, tolerance)) = &clip {
+                clipped = clipped_glyph(path, fit, stroke_ink, rule, clip, *tolerance);
+                (&clipped, ts, true, false)
+            } else {
+                (path, placed, symbol.filled, symbol.even_odd)
+            };
             let paint = SvgPaint {
-                path: &path,
-                fill: symbol.filled.then_some(Ink::Solid(colour)),
-                even_odd: symbol.even_odd,
-                stroke: (!symbol.filled).then_some(Ink::Solid(colour)),
+                path,
+                fill: filled.then_some(Ink::Solid(colour)),
+                even_odd,
+                stroke: (!filled).then_some(Ink::Solid(colour)),
                 order: [0, 1, 2],
-                // The stroke is in the role's 24 units whatever the box.
-                width: (1.1 + (weight - 100.0) / 400.0) * bw / 24.0,
+                width: stroke,
                 cap: 1,
                 join: 1,
                 miter: 4.0,
                 dash: Vec::new(),
                 phase: 0.0,
             };
-            self.backend.svg_path(&paint, ts);
+            self.backend.svg_path(&paint, transform);
         }
         if group {
             self.backend.pop_opacity();

@@ -709,7 +709,7 @@ package final class MenuHost {
     package func isLaidOut(_ box: NodeView) -> Bool { laidOut.contains(box.id) }
     /// `box` laid out now, before it shows in Exact's views: a sheet, the
     /// top layer, a context menu's preview.
-    func layOut(_ box: NodeView) {
+    package func layOut(_ box: NodeView) {
         guard let session = presenter?.session, laidOut.insert(box.id).inserted else { return }
         session.apply(session.runtime.covers([(box.id, nil)]))
         var stack: [UIView] = [box]
@@ -760,7 +760,7 @@ package final class MenuHost {
     /// After one closes: what shows in Exact's views no more is covered
     /// again, after this turn, unless it has stopped being a box of the top
     /// layer (the host gave it back for good).
-    func coverClosed() {
+    package func coverClosed() {
         guard !laidOut.isEmpty, !coverPending else { return }
         coverPending = true
         DispatchQueue.main.async { [weak self] in self?.coverClosedNow() }
@@ -786,7 +786,7 @@ package final class MenuHost {
         #endif
     }
     /// Whether `node` is an open popover in the top layer (the agent's).
-    func lifted(_ node: NodeView) -> Bool {
+    package func lifted(_ node: NodeView) -> Bool {
         #if os(iOS)
         if context.lifts(node) { return true }
         #endif
@@ -812,11 +812,11 @@ package final class MenuHost {
         }
     }
     /// Revisit only the hosts captured at opening, including after UIKit detaches one.
-    func rehostPopovers() {
+    package func rehostPopovers() {
         guard !agentOpen.isEmpty else { return }
         for entry in agentOpen.values.sorted(by: { $0.order < $1.order }) { lift(entry) }
     }
-    func replacePopoverHost(_ old: UIViewController, with controller: UIViewController) {
+    package func replacePopoverHost(_ old: UIViewController, with controller: UIViewController) {
         for entry in agentOpen.values { entry.layer.replaceHost(old, with: controller) }
     }
 
@@ -1229,7 +1229,7 @@ package final class MenuHost {
 
     /// The controller a presentation from `view` goes over: its own, or the
     /// dialog sheet or route presentation that is already up over it.
-    func controller(for view: UIView) -> UIViewController? {
+    package func controller(for view: UIView) -> UIViewController? {
         guard let found = ViewPresentation.controller(for: view) else { return nil }
         if let top = sheets.top ?? presenter?.modals.owner, top !== found,
            found.presentedViewController != nil, top.view.window === found.view.window { return top }

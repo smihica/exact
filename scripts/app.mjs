@@ -1,13 +1,13 @@
 import { bindGpuProduct, bakeSelection } from './app-shells.mjs';
 export { bindGpuProduct, bakeSelection } from './app-shells.mjs';
 import { takeLock } from '../host/web/build-lock.mjs';
-import { refreshCargoRustShapes } from './cargo-dep-info.mjs';
+import { refreshCargoRustBindings } from './cargo-dep-info.mjs';
 import { capturePrivacyManifest } from '../host/apple/privacy.mjs';
 import { appleMetadataProblem } from '../host/apple/plist.mjs';
 import { appleImplementations } from '../js/bake/src/typescript.mjs';
 import { webHostFiles, hostModuleSources, MODULE_PRELUDE } from '../host/web-js/glue.mjs';
 export { webHostFiles } from '../host/web-js/glue.mjs';
-import { compilerPaths, unitDepInfo, cargoBakeInputs, bakeSourceInputs, pendingSourceInputs, inputProducts, inputHashes, sourcePath, packageDirectories, directoryInputNames, buildInputCollector, binarySourceInputs, swiftTargetInputs, watchOutput } from './cargo-dep-info.mjs';
+import { compilerPaths, unitDepInfo, cargoBakeInputs, cargoLibraryTarget, bakeSourceInputs, pendingSourceInputs, inputProducts, inputHashes, sourcePath, packageDirectories, directoryInputNames, buildInputCollector, binarySourceInputs, swiftTargetInputs, watchOutput } from './cargo-dep-info.mjs';
 import { notificationServiceBuildInventory, notificationServiceInputChanges, notificationServiceSourceRoot } from './notification-service.mjs';
 export { compilerPaths, unitDepInfo } from './cargo-dep-info.mjs';
 import { LIBRARY_CACHE, directDependencies, prepareLibrary } from './package-libraries.mjs';
@@ -35,6 +35,7 @@ import { checkDesignName } from './forma-design-path.mjs';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep, toNamespacedPath } from 'node:path';
 import { pathFrom, preservePaths, samePath, within } from './paths.mjs';
+import { parseColour, schemeColours } from './scheme-colours.mjs';
 export { pathFrom } from './paths.mjs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -43,13 +44,12 @@ import { SHELL_SOURCES } from '../host/web/look.mjs';
 import { createHash } from 'node:crypto';
 import { refuse } from './deploy-signing.mjs';
 import { nativeSource, prepareRustBundle } from './rust.mjs';
-import { bakeOutside, compiledBakeDir, linkable, linkedInputs, recordRustBake } from './linked-plan.mjs';
-import { throwContractErrors } from './contract-diagnosis.mjs';
+import { bakeOutside, buildAndroidBake, compiledBakeDir, linkable, linkedInputs, recordRustBake } from './linked-plan.mjs';
 import { filesystem, installedModules, OFFLINE_MISSING, removePrivateTree, withHostDeployment } from './filesystem.mjs';
 import { installedFileDependencies } from './file-dependencies.mjs';
-import { startSweep } from './sweep.mjs';
+import { holdAppOutput, startSweep } from './sweep.mjs';
 import { WEB_TOOLCHAIN, WEB_STD, WEB_SIZE, WEB_RUSTFLAGS, webToolchainEnv, cargoEnvironment,
-  androidCargo, appCrates, appleCargo, authoredWorkspace, cargoDiagnosticsCommand, cargoOnPath, claimTargetCrates,
+  appCrates, authoredWorkspace, buildCommand, cargoOnPath, claimTargetCrates, physicalPath, writtenPath,
   wholeProgram, declaredWorkspace, knownWorkspace, refuseLoose, rememberWorkspace, shellsDir, targetRustflags } from './cargo-check.mjs';
 export { WEB_TOOLCHAIN, WEB_STD, WEB_SIZE, webToolchainEnv, cargoEnvironment, cargoOnPath, wholeProgram } from './cargo-check.mjs';
 import { appCrateName, gpuModules, packageGpuInputs, packageGpuManifest, gpuView, joinMetadata, joinsGpu, settleShells } from './app-shells.mjs';
@@ -250,7 +250,9 @@ export function rustRemapFlags(app, toolchain = null, env = process.env) {
   const { commit, sysroot } = rustcFacts.get(key);
   const pairs = [[resolve(env.CARGO_HOME ?? resolve(homedir(), '.cargo')), 'cargo']];
   if (sysroot && commit) pairs.push([resolve(sysroot, 'lib/rustlib/src/rust'), `/rustc/${commit}`]);
-  if (env.EXACT_SOURCE_ROOT) pairs.push([resolve(env.EXACT_SOURCE_ROOT), 'source']);
+  // The source root by the physical path Cargo names its sources by (/var is /private/var), and as written, `..` and
+  // all, last, so rustc's last matching prefix is the written spelling where both match one path
+  if (env.EXACT_SOURCE_ROOT) for (const root of new Set([physicalPath(env.EXACT_SOURCE_ROOT), writtenPath(env.EXACT_SOURCE_ROOT)].filter(Boolean))) pairs.push([root, 'source']);
   pairs.push([ROOT, '']);
   if (app && resolve(app.workspace) !== ROOT) pairs.push([resolve(app.workspace), '']);
   if (app) pairs.push([resolve(app.target), 'target']);
@@ -401,7 +403,7 @@ export function platformCrateKind(dir, kind) {
 
 /** The app `nameOrCrate` selects (`caltrain`, `caltrain-web`, …; or `EXACT_APP_DIR`): its directory, Cargo workspace,
  * target directory, crate identity (`appCrateName`), and manifest. */
-export function resolveApp(nameOrCrate) {
+export function resolveApp(nameOrCrate, { useOutput = true } = {}) {
   const path = nameOrCrate && /[\\/]|^\.\.?$/.test(String(nameOrCrate)) ? resolve(String(nameOrCrate)) : null;
   const outside = path ?? (process.env.EXACT_APP_DIR ? resolve(process.env.EXACT_APP_DIR) : null);
   if (path) nameOrCrate = undefined;
@@ -415,8 +417,10 @@ export function resolveApp(nameOrCrate) {
   dir = realpathSync(dir);
   // The bake runs this checkout's TypeScript compiler and bundler (partial
   // fixture copies carry no package.json, as PINNED_BUN says).
-  if (PINNED_BUN) installedModules();
-  installedFileDependencies(dir); // every package reader reads node_modules, where a `file:` package is as of the last install
+  if (useOutput) {
+    if (PINNED_BUN) installedModules();
+    installedFileDependencies(dir); // builds read a file: package as of its last install
+  }
   // Materialize defaults before Cargo inspects workspace members on a clean checkout.
   const manifest = claimVariant(dir, () => readManifest(dir, name));
   if (manifest.game === undefined) name = appCrateName(dir, name);
@@ -456,6 +460,14 @@ export function resolveApp(nameOrCrate) {
   const generated = workspace === shellsDir(dir), own = manifest.game || generated ? dir : workspace;
   const target = process.env.CARGO_TARGET_DIR ? resolve(process.env.CARGO_TARGET_DIR) : resolve(own, 'target');
   assertOwnTarget(target, own);
+  let outputUsed = false;
+  const output = () => {
+    if (useOutput && !outputUsed) {
+      holdAppOutput(target);
+      outputUsed = true;
+    }
+    return target;
+  };
   // What a build asks for before it runs Cargo in the workspace, once: a generated workspace written current with the
   // manifest (LLP 1153 D1.3) and its copied lock resolved (the first build fetches what the cache lacks), or an
   // authored workspace's lock checked. Every build helper reads `workspace`, so every build passes here; a web
@@ -464,13 +476,14 @@ export function resolveApp(nameOrCrate) {
   let rusted = false, gpuWorkspace = generated ? null : workspace;
   const rust = () => {
     if (rusted) return workspace;
+    output();
     rusted = true;
     // A deploy builds its capture of the app where the app builds (scripts/deploy.mjs `materializeSnapshot`).
     if (process.env.CARGO_TARGET_DIR && own !== ROOT && !process.env.EXACT_DEPLOY_CAPSULE) claimTargetCrates(target, name, dir);
     if (generated) gpuWorkspace = settleShells(dir, manifest, name); else checkLock?.();
     return workspace;
   };
-  startSweep(target);
+  if (useOutput) startSweep(target);
   let packages;
   const prepare = (refresh = false, options) => {
     if (manifest.game && (refresh || !packages)) {
@@ -492,7 +505,7 @@ export function resolveApp(nameOrCrate) {
     return packages.find(pkg => pkg.name === crate(kind));
   };
   return {
-    name, dir, target, crate, generated, rust, outside: !!outside,
+    name, dir, get target() { return output(); }, crate, generated, rust, outside: !!outside,
     selector,
     get workspace() { return rust(); },
     get gpuWorkspace() { rust(); return gpuWorkspace; },
@@ -567,8 +580,8 @@ export function readManifest(dir, name) {
       ? 'game.presentation is now game.render: rename the key, move presentation/ to render/, name the crate <name>-render and rename its "type" to "hooks" (LLP 1046.008, amendment of 2026-10-04)'
       // LLP 1163 D2: the dark launch colour moved into the W3C member.
       : /^background_color_dark: /.test(p) ? 'background_color_dark is now color_scheme_dark.background_color: "color_scheme_dark": { "background_color": "#000000" } (LLP 1163 D2)'
-      // Expo's splash keys and a host's own launch colour: the launch is the manifest's one colour on every host.
-      : /^((host\.\w+\.)?(splash\w*|windowBackground|backgroundColor|launchColor)): not a known key$/i.test(p) ? `${p.split(':')[0]}: not a known key; what shows before the first frame is background_color, and color_scheme_dark.background_color in a dark scheme, on every host (host.ios.launchImage and host.android.launchImage add a picture)`
+      // Expo's splash keys and a host's own launch colour: the launch colours are the manifest's on every host.
+      : /^((host\.\w+\.)?(splash\w*|windowBackground|backgroundColor|launchColor)): not a known key$/i.test(p) ? `${p.split(':')[0]}: not a known key; what shows before the first frame is background_color in every colour scheme, or color_scheme_light.background_color and color_scheme_dark.background_color in one, on every host (host.ios.launchImage and host.android.launchImage add a picture)`
       : /^host\.ios\.associatedDomains: expected array, got boolean$/.test(p) ? REMOVED_DOMAINS[parsed.host.ios.associatedDomains]
       : appleMetadataProblem(p)).filter((p) => !/^host\.web\.(head(\[|: )|csp|cspReportOnly)/.test(p)).concat(webHeadProblems(parsed), webCspProblems(parsed));
   if (!problems.length) problems.push(...installProblems(parsed), ...gpuModuleProblems(parsed), ...documentTypeProblems(parsed), ...shareTargetProblems(parsed), ...protocolHandlerProblems(parsed), ...linkProblems(parsed), ...appIconProblems(parsed, dir), ...launchImageProblems(parsed, dir), ...variantProblems(parsed, dir));
@@ -616,8 +629,11 @@ function protocolHandlerProblems({ protocol_handlers = [], host }) {
  * (LLP 1030 D2/D10; 1030.000 D7). A browser opens files only, so
  * `inode/directory` (the Apple bake's word for a folder) goes, and it
  * registers neither `http` nor `https`, so those handlers go too.
- * `color_scheme_dark` keeps only the W3C draft's members, and with the app's
- * `dir` each icon gets the `sizes` and `type` of its file (LLP 1163 D2). */
+ * The themeable members take the W3C form (`schemeColours`, LLP 1163 D2): the
+ * light colour as the base where it holds in a dark scheme too or a dark one is
+ * named, the dark one under `color_scheme_dark`; a light colour named alone has
+ * none, so it is left out. `background_color` is clipped to sRGB. With the
+ * app's `dir` each icon gets the `sizes` and `type` of its file. */
 export function webAppManifest(manifest, name, notes = [], dir = null) {
   const keys = ['name', 'short_name', 'description', 'id', 'start_url', 'display', 'display_override', 'theme_color', 'background_color', 'icons', 'lang', 'orientation', 'file_handlers', 'protocol_handlers', 'launch_handler', 'shortcuts', 'categories', 'handle_links', 'scope', 'scope_extensions'];
   let web = Object.fromEntries(keys.filter((k) => manifest[k] !== undefined).map((k) => [k, manifest[k]]));
@@ -626,8 +642,12 @@ export function webAppManifest(manifest, name, notes = [], dir = null) {
   // A shortcut's `apple` and `android` words are the native bakes' (LLP 1133.023 D11).
   if (web.shortcuts) web.shortcuts = web.shortcuts.map(({ apple, android, ...item }) => item);
   if (manifest.share_target) web.share_target = webShareTarget(manifest.share_target, notes);
-  const { icons: _, ...dark } = manifest.color_scheme_dark ?? {};
-  if (Object.keys(dark).length) web.color_scheme_dark = dark;
+  for (const member of ['background_color', 'theme_color']) {
+    delete web[member];
+    const { light, dark } = schemeColours(manifest, member), value = (text) => text && (member === 'background_color' ? parseColour(text, member).hex : text);
+    if (light && dark) web[member] = value(light);
+    if (dark && value(dark) !== value(light)) (web.color_scheme_dark ??= {})[member] = value(dark);
+  }
   if (dir && web.icons) web.icons = publishedIcons(web.icons, dir);
   for (const key of ['file_handlers', 'protocol_handlers', 'shortcuts']) if (!web[key]?.length) delete web[key];
   web.name ??= name;
@@ -818,24 +838,6 @@ const under = (root, path) => {
   return child === '' || (!isAbsolute(child) && child !== '..' && !child.startsWith('..' + sep));
 };
 const orderedBuild = (rows) => rows.sort((a, b) => Buffer.compare(Buffer.from(canonicalBuild(a)), Buffer.from(canonicalBuild(b))));
-function buildCommand(command, args, app, env, stderr = 'pipe') {
-  if (command === 'cargo') env = cargoEnvironment(env);
-  let result = spawnSync(...cargoDiagnosticsCommand(...androidCargo(...appleCargo(command, args, { cwd: app.workspace, env, stdio: ['ignore','pipe',stderr], encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 }))));
-  // An offline Cargo that lacks a source it needs (a new workspace, a new lock entry) fetches the lock's
-  // sources once and tries again, instead of failing on the first missing crate (LLP 1054 O2).
-  if (command === 'cargo' && result.status !== 0 && OFFLINE_MISSING.test(result.stderr ?? '')) {
-    console.error(`${app.name}: Cargo's sources are not all fetched; fetching the locked ones (cargo fetch --locked) and trying again`);
-    const fetched = spawnSync('cargo', ['fetch', '--locked'], { cwd: app.workspace, env, stdio: ['ignore', 'inherit', 'inherit'] });
-    if (fetched.status === 0) result = spawnSync(...cargoDiagnosticsCommand(...androidCargo(...appleCargo(command, args, { cwd: app.workspace, env, stdio: ['ignore','pipe',stderr], encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 }))));
-  }
-  if (result.error || result.status !== 0) {
-    if (command === 'cargo') throwContractErrors(app, args, result, ROOT);
-    // Said short: the profiles' `--config` pairs and a JSON build's artifact lines bury the diagnostics above.
-    const said = args.filter((arg, i) => arg !== '--config' && args[i - 1] !== '--config').join(' '), out = (result.stdout ?? '').split('\n').filter(line => !line.includes('"reason":')).join('\n').slice(-4000);
-    throw new Error(`${command} ${said} failed: ${result.error?.message ?? result.stderr ?? `exit ${result.signal ?? result.status} (see diagnostics above)`}${out.trim() ? `\n${out}` : ''}`);
-  }
-  return result;
-}
 /** A build script's call into the bake: a Contract that does not compile
  * ends the process with its diagnostics as the last thing printed, with no
  * stack after them (LLP 1054 L9); any other failure is thrown on. */
@@ -984,6 +986,13 @@ function buildGraph(app, target, kind, env, gpu, platform) {
 const buildOutputs = (app, graph, env) => [app.target, graph.metadata.target_directory, graph.metadata.build_directory,
   env.CARGO_BUILD_BUILD_DIR, env.EXACT_BAKE_OUTPUT, env.EXACT_WINDOWS_OUTPUT, env.EXACT_WEB_DIST ?? webDist(app),
   ...['dist', 'web-dist', 'dist-windows', 'artifacts'].map(name => resolve(app.dir, name))].filter(Boolean).map(path => resolve(path));
+
+/** The backend origin the bake in `baked` selected (its app.module.json), or null for a bake with no TypeScript module. */
+export function bakedBackendOrigin(baked) {
+  const moduleReceipt = resolve(baked, 'app.module.json');
+  return existsSync(moduleReceipt) ? JSON.parse(readFileSync(moduleReceipt, 'utf8')).backendOrigin : null;
+}
+
 function completeBuild(app, platform, target, graph, messages, roots, env, prepared = new Map(), generatedInputs = {products:[], watchedDirectories:[]}, privacyManifests = []) {
   const scripts = messages.filter((m) => m.reason === 'build-script-executed' && graph.roles.has(m.package_id));
   const targetDirs = [app.target, graph.metadata.build_directory].map(dir => resolve(dir, target));
@@ -994,8 +1003,7 @@ function completeBuild(app, platform, target, graph, messages, roots, env, prepa
   const baked = existsSync(resolve(rootOutput, 'compat.json')) ? rootOutput : env.EXACT_BAKED /* a bake before Cargo keeps the plan and its receipts apart (linked-plan.mjs) */, compat = JSON.parse(readFileSync(resolve(baked, 'compat.json'), 'utf8'));
   if (compat.target !== target || compat.inputs.platform !== platform || compat.inputs.app !== app.id) throw new Error('actual bake receipt names another target, platform or app');
   const bundleGraph = JSON.parse(readFileSync(resolve(baked, 'artifacts.json'), 'utf8'));
-  const moduleReceipt = resolve(baked, 'app.module.json');
-  const backendOrigin = existsSync(moduleReceipt) ? JSON.parse(readFileSync(moduleReceipt, 'utf8')).backendOrigin : null;
+  const backendOrigin = bakedBackendOrigin(baked);
   // Recreate packaging outputs from Cargo's actual bake, even on a cache hit.
   // A build script must never watch its own receipt: writing it dirties every next build.
   const stem = `${platform}-${target}`;
@@ -1126,7 +1134,7 @@ function completeBuild(app, platform, target, graph, messages, roots, env, prepa
     const entries=platform==='ios'&&(app.manifest.widgets?.length||app.manifest.live_activities?.length); if(entries)add(resolve(packageRoot,'widget'),true); if(entries||env.EXACT_WIDGET_GALLERY==='1')add(resolve(packageRoot,'Sources/ExactSnapshot'),true);
   }
   if(platform==='web') {
-    for(const path of [...Object.values(webHostFiles('base','rust','gpu',...(gpuModules(app.manifest,'web').length?['gpuModules']:[]))).filter(path => !path.startsWith('target/web-host/')),...hostModuleSources(ROOT),'host/web-js/glue.mjs','host/web-js/agent-gate.mjs','scripts/app.mjs','scripts/rust.mjs',...SHELL_SOURCES,'host/web/build.mjs','package.json','bun.lock']) add(resolve(ROOT,path));
+    for(const path of [...Object.values(webHostFiles('base','rust','gpu',...(gpuModules(app.manifest,'web').length?['gpuModules']:[]),...(app.manifest.game?.render?.workers===true?['gpuJobs']:[]))).filter(path => !path.startsWith('target/web-host/')),...hostModuleSources(ROOT),'host/web-js/glue.mjs','host/web-js/agent-gate.mjs','scripts/app.mjs','scripts/rust.mjs',...SHELL_SOURCES,'host/web/build.mjs','package.json','bun.lock']) add(resolve(ROOT,path));
     if (existsSync(resolve(app.dir, 'app.ts'))) {
       // The TS producer is a build dependency, outside the runtime Cargo graph.
       // Its canonical API declaration still determines the accepted app module.
@@ -1172,7 +1180,7 @@ function completeBuild(app, platform, target, graph, messages, roots, env, prepa
     .concat(generatedInputs.products);
   hashes.save();
   const sourceRecord = platform === 'windows' ? {sourceInputs:bakeSourceInputs(app, sourceInputs, watchOutputs)} : {};
-  return {version:1,backendOrigin,...sourceRecord,watchedDirectories:[...packageDirectories([...sourceInputs],watchOutputs), ...generatedInputs.watchedDirectories],...(env.EXACT_RUST_BUNDLE?{rust:resolve(baked,'rust')}:{}),...(optionalInputs.size?{optionalInputs:[...optionalInputs].sort()}:{}),...(baked!==rootOutput?{linkedPlan:baked,linkedInputs:linkedInputs(baked)}:{}),...bakedSettings(baked,app.dir),trust:env.EXACT_UPDATE_TRUST??'development',compat,graph:bundleGraph,binary:{sourceInputs:sourceInputsRecord,...(privacyManifests.length ? {privacyManifests} : {}),...(assetCatalogApp ? {assetCatalogApp} : {}),...(nativeResources.length ? {nativeResourceApp:{dir:app.dir,manifest:app.manifest,platform}} : {}),sha256:buildHash(canonicalBuild(fingerprint)),...fingerprint,inventories,inputs:files,watchOutputs,links:[...links.values()],directories:[...directories.values()],missing:[...absent.values()]},products};
+  return {version:1,backendOrigin,...sourceRecord,watchedDirectories:[...packageDirectories([...sourceInputs],watchOutputs), ...generatedInputs.watchedDirectories],...(platform==='android'?{androidOut:baked}:{}),...(env.EXACT_RUST_BUNDLE?{rust:resolve(baked,'rust')}:{}),...(optionalInputs.size?{optionalInputs:[...optionalInputs].sort()}:{}),...(baked!==rootOutput?{linkedPlan:baked,linkedInputs:linkedInputs(baked)}:{}),...bakedSettings(baked,app.dir),trust:env.EXACT_UPDATE_TRUST??'development',compat,graph:bundleGraph,binary:{sourceInputs:sourceInputsRecord,...(privacyManifests.length ? {privacyManifests} : {}),...(assetCatalogApp ? {assetCatalogApp} : {}),...(nativeResources.length ? {nativeResourceApp:{dir:app.dir,manifest:app.manifest,platform}} : {}),sha256:buildHash(canonicalBuild(fingerprint)),...fingerprint,inventories,inputs:files,watchOutputs,links:[...links.values()],directories:[...directories.values()],missing:[...absent.values()]},products};
 }
 // The permanent companion inode owns exclusion; the JSON claim is only its diagnostic record.
 export function claimBuildOutput(app, path) {
@@ -1222,11 +1230,9 @@ export function claimLive(text) {
   if (ps.status !== 0 || !Number.isFinite(started)) return true; // running, and `ps` cannot say since when: never guess
   return !(started > Date.parse(claim.started) + 1000); // `lstart` has whole seconds: a holder started after its claim is a reused pid
 }
-/** Cargo library filenames use the selected target name, with hyphens
- * normalized to underscores, even when the package has another name. */
-export const cargoLibraryTarget = (pkg) => pkg.targets.find(t => t.kind.some(k => ['cdylib','staticlib','rlib','lib'].includes(k)));
-export const appleCargoClaims = (app, target, units) => [...new Set(units.map(unit =>
-  resolve(app.target, '.apple-cargo-locks', target, `lib${unit.name.replace(/-/g, '_')}.lock`)))].sort();
+export { cargoLibraryTarget } from './cargo-dep-info.mjs';
+export const cargoProductClaims = (app, target, units) => [...new Set(units.map(unit =>
+  resolve(app.target, target.endsWith('-linux-android') ? '.android-cargo-locks' : '.apple-cargo-locks', target, `lib${unit.name.replace(/-/g, '_')}.lock`)))].sort();
 
 /** What an app's bake watches besides its sources (its asset roots that exist, whether a backend origin is chosen, which of the settings files `.env.local` and `.env` exist); unset, a missing one stays an input where the app holds its build output, and every build reruns the script and relinks (bake/src/receipt/watch.rs). Every baking build passes it. `app`: its `dir`, `manifest`. */
 export const bakeWatchEnv = app => ({ EXACT_ASSET_ROOTS: ['assets', 'deck', ...(app.manifest.game ? [] : ['gpu/shaders'])].filter(root => (root === 'assets' && app.manifest.game && (app.manifest.game.assets === true || existsSync(resolve(app.dir, 'art')))) || existsSync(resolve(app.dir, root))).join(','), EXACT_BACKEND_SELECTION: existsSync(resolve(app.dir, '.exact/backend-origin')) ? 'present' : 'absent', EXACT_ENV_FILES: ['.env.local', '.env'].filter(file => existsSync(resolve(app.dir, file))).join(',') });
@@ -1238,7 +1244,7 @@ export function buildBake(app, platform, target, options = {}) {
   // `kind` names another crate for the platform's cohort: Android's Canvas host bakes as Linux from `<app>-android`.
   const kind=options.kind??platformCrateKind(app.dir,platform), apple=['apple','ios','macos','tvos'].includes(kind);
   let env=withHostDeployment({...process.env,...options.env});env.CARGO_TARGET_DIR=app.target;env.EXACT_BAKE_OUTPUT=options.output??bakeOutput(app,env);
-  env.EXACT_RUST_SHAPES = '1';
+  env.EXACT_RUST_BINDINGS = '1';
   const privacyManifests = apple ? [capturePrivacyManifest(resolve(app.dir, 'PrivacyInfo.xcprivacy'))] : [], watch = target.includes('apple-watchos');
   if(platform==='web'||watch)env=webToolchainEnv(env,{linksWasm:target==='wasm32-unknown-unknown'&&!options.check});
   if(options.analysis && env.EXACT_UPDATE_TRUST==='production')env.EXACT_BAKE_ANALYSIS='1';else delete env.EXACT_BAKE_ANALYSIS;
@@ -1268,13 +1274,13 @@ export function buildBake(app, platform, target, options = {}) {
   });
   const releases = [];
   try {
-    if (apple || ['web', 'windows'].includes(platform)) for (const path of appleCargoClaims(app, target, selected.map(({unit}) => unit))) {
+    if (apple || kind === 'android' || ['web', 'windows'].includes(platform)) for (const path of cargoProductClaims(app, target, selected.map(({unit}) => unit))) {
       releases.push(awaitBuildOutput(app, path, owner => console.error(`waiting for the ${platform} build of ${owner}`)));
     }
   for(const {pkg,unit} of selected) {
     if (pkg.id === graph.root.id && pkg.targets.some(t => t.kind.includes('custom-build'))) env.EXACT_BAKE_PACKAGE_DIR = realpathSync(dirname(pkg.manifest_path));
     const profile = (gpuPackage(pkg) ? options.gpuProfile : null) ?? options.profile ?? (platform === 'web' ? 'web' : 'release');
-    refreshCargoRustShapes(env.CARGO_TARGET_DIR,target,profile,[...graph.packages.values()],env,graph.metadata.build_directory);
+    refreshCargoRustBindings(env.CARGO_TARGET_DIR,target,profile,[...graph.packages.values()],env,graph.metadata.build_directory);
     // The GPU bake can create the first asset directory (for a typed level).
     Object.assign(env, bakeWatchEnv(app));
     // The app's own web artifact builds std for size; a GPU crate keeps the toolchain's std.
@@ -1285,21 +1291,24 @@ export function buildBake(app, platform, target, options = {}) {
     const archive=apple&&pkg.id===graph.root.id, at=graph.workspaces.get(pkg.id)??(gpuPackage(pkg)?gpuView(app):app);
     const whole=wholeProgram(kind,options.profile??'release');
     const args=[archive?'rustc':options.check?'check':'build',...(archive?['--crate-type','staticlib']:[]),...cargoReproducibilityFlags(at),...injectedProfiles(at),...whole,...(sized||watch?WEB_STD:[]),...(target==='wasm32-unknown-unknown'?wasmRemapFlags(at,sized?WEB_TOOLCHAIN:null):[]),'-p',pkg.name,'--target',target,'--profile',profile,...(['linux','windows'].includes(kind)&&pkg.id===graph.root.id?['--bin',unit.name]:['--lib']),...(gpuPackage(pkg)?['--config',`profile.${profile}.strip=false`]:[]),'--message-format=json-render-diagnostics'];
-    // Refresh Rust bakers through an rlib before they read a coordinated
-    // Rust/manifest edit. Generated inputs also predate the first archive.
+    const outputs = buildOutputs(app,graph,env);
+    delete env.EXACT_BAKED;
     if (archive && options.link && !env.EXACT_RUST_BUNDLE && linkable(app,pkg)) {
-      env.EXACT_BAKED = bakeOutside(app,platform,target,env,dir => {
-        buildCommand('cargo',['build',...args.slice(3)],app,{...env,EXACT_BAKED:dir},'inherit');
-      },{cargoArgs:[...whole,'--profile',profile],outputs:buildOutputs(app,graph,env)});
-    } else delete env.EXACT_BAKED;
+      env.EXACT_BAKED = bakeOutside(app,platform,target,env,dir =>
+        buildCommand('cargo',['build',...args.slice(3)],at,{...env,EXACT_BAKED:dir},'inherit'),
+      {cargoArgs:[...whole,'--profile',profile],outputs});
+    }
+    const android = kind === 'android' && pkg.id === graph.root.id && options.androidPayload;
+    if (android && app.manifest.game) generatedInputs = inputProducts(['app.json', 'keys.json', 'surfaces.json'].map(file => resolve(app.dir, '.shells', file)), app.dir, outputs);
     const recordInputs = pkg.id === graph.root.id ? cargoBakeInputs(pkg,target,profile,env,platform === 'windows' ? app : null) : () => {};
-    // Cargo compiles a TypeScript app's linked bake from a content-addressed copy (linked-plan.mjs compiledBakeDir), so an identity, grants or Canvas roster change leaves its archive fresh; a Rust data crate's bake registers its build script in its own directory and keeps it.
     const shared = archive && env.EXACT_BAKED && !existsSync(resolve(app.dir,'data/Cargo.toml')) && env.CARGO_TARGET_DIR ? compiledBakeDir(env.EXACT_BAKED, resolve(env.CARGO_TARGET_DIR,'bake-compiled')) : null;
-    const result=buildCommand('cargo',args,at,shared?{...env,EXACT_BAKED:shared}:env,'inherit');
+    const {result, dir} = android ? buildAndroidBake(app,pkg,target,env,at.workspace,outputs,options.androidPayload(),(cargoEnv,recover) => buildCommand('cargo',args,at,cargoEnv,'inherit',recover)) :
+      {result:buildCommand('cargo',args,at,shared?{...env,EXACT_BAKED:shared}:env,'inherit')};
     const cargo = { workspace: at.workspace, metadata: graph.cargoGraphs.get(at.workspace) };
     const output=result.stdout.split('\n').filter(Boolean).map(line => ({...JSON.parse(line), cargo}));messages.push(...output);roots.push({package:pkg.id,name:unit.name});
     recordInputs(output);
-    if (archive && env.EXACT_BAKED) recordRustBake(env, buildOutputs(app,graph,env));
+    if (dir) env.EXACT_BAKED = dir;
+    else if (env.EXACT_BAKED) recordRustBake(env, outputs);
     // Generated host inputs can postdate the build's start; bind their bytes before host compilation.
     if (apple && app.manifest.game && pkg.id === graph.surface?.id) generatedInputs = inputProducts([
       graph.root.manifest_path, ...graph.root.targets.map(t => t.src_path),

@@ -35,7 +35,9 @@ export function glueDeclarations(source, names) {
       if (declaration.id.type === 'Identifier') declarations.set(declaration.id.name, `${statement.kind} ${source.slice(declaration.start, declaration.end)};`);
     }
   }
-  return names.map(name => {
+  const geometry = names.includes('refresh') || names.includes('refreshSymbols')
+    ? readFileSync(resolve(root, 'host/web/symbol-geometry.js'), 'utf8').replaceAll('export function ', 'function ') : '';
+  return geometry + names.map(name => {
     if (!declarations.has(name)) throw new Error(`glue.js fixture: missing declaration ${name}`);
     return declarations.get(name);
   }).join('\n');

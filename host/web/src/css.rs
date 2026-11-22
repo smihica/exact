@@ -117,6 +117,23 @@ fn css_text_in(
             continue;
         }
         let value = style.get(id);
+        // The raster tint mask shares the replaced object's authored placement.
+        // Its picture can move out of view independently through --exact-tint-offset.
+        if id == StyleId::ObjectPosition {
+            out.push_str("--exact-object-position:");
+            declared(&mut out, id, &value);
+            out.push(';');
+        } else if id == StyleId::ObjectFit {
+            out.push_str("--exact-tint-size:");
+            out.push_str(match style.object_fit {
+                exact_kernel::ObjectFit::Fill => "100% 100%",
+                exact_kernel::ObjectFit::Contain => "contain",
+                exact_kernel::ObjectFit::Cover => "cover",
+                exact_kernel::ObjectFit::None => "auto",
+                exact_kernel::ObjectFit::ScaleDown => "var(--exact-tint-fit,contain)",
+            });
+            out.push(';');
+        }
         match (id, &value) {
             (StyleId::TranslateVelocity, RowValue::Vec2(v)) => {
                 push_text!(
@@ -571,10 +588,44 @@ fn css_text_in(
             // @ref LLP 1123 D4 — no host chrome covers a page the browser
             // lays out: nothing is cleared, so there is nothing to turn off.
             (StyleId::SafeArea | StyleId::SafeAreaIgnore | StyleId::SafeAreaIgnoreAlign, _) => {}
-            // @ref LLP 1123 D11, D12 — not CSS, and not written yet: a page's
-            // reservations and bars wait for the web's owners (D17)
+            // @ref LLP 1123 D8, D11 to D14 — not CSS, and not written yet: a page's
+            // margins, reservations, bars, reach and scroll insets wait for the
+            // web's owners (D17)
             (
-                StyleId::SafeAreaBar
+                StyleId::ScrollContentInsetTop
+                | StyleId::ScrollContentInsetRight
+                | StyleId::ScrollContentInsetBottom
+                | StyleId::ScrollContentInsetLeft
+                | StyleId::ScrollVerticalIndicatorInsetsTop
+                | StyleId::ScrollVerticalIndicatorInsetsRight
+                | StyleId::ScrollVerticalIndicatorInsetsBottom
+                | StyleId::ScrollVerticalIndicatorInsetsLeft
+                | StyleId::ScrollHorizontalIndicatorInsetsTop
+                | StyleId::ScrollHorizontalIndicatorInsetsRight
+                | StyleId::ScrollHorizontalIndicatorInsetsBottom
+                | StyleId::ScrollHorizontalIndicatorInsetsLeft
+                | StyleId::SafeAreaExtendBoundsTop
+                | StyleId::SafeAreaExtendBoundsRight
+                | StyleId::SafeAreaExtendBoundsBottom
+                | StyleId::SafeAreaExtendBoundsLeft
+                | StyleId::ScrollInsetAdjustment
+                | StyleId::ScrollIndicatorAdjustment
+                | StyleId::ScrollEdgeEffectSoft
+                | StyleId::ScrollEdgeEffectHard
+                | StyleId::ScrollEdgeEffectHidden
+                | StyleId::SafeAreaReach
+                | StyleId::SafeAreaReachEdges
+                | StyleId::SafeAreaExtend
+                | StyleId::SafeAreaBar
+                | StyleId::LayoutMarginTop
+                | StyleId::LayoutMarginRight
+                | StyleId::LayoutMarginBottom
+                | StyleId::LayoutMarginLeft
+                | StyleId::LayoutMarginLeading
+                | StyleId::LayoutMarginTrailing
+                | StyleId::LayoutMarginsPreserved
+                | StyleId::LayoutMarginsFromSafeArea
+                | StyleId::LayoutMarginsMinimum
                 | StyleId::AdditionalSafeAreaTop
                 | StyleId::AdditionalSafeAreaRight
                 | StyleId::AdditionalSafeAreaBottom
@@ -1023,6 +1074,7 @@ fn declared(out: &mut String, id: StyleId, value: &RowValue<'_>) {
         RowValue::DashArray(d) => out.push_str(&d.css()),
         RowValue::Transform(t) => out.push_str(&t.css()),
         RowValue::TransformOrigin(t) => out.push_str(&t.css()),
+        RowValue::ObjectPosition(t) => exact_kernel::style::env::browser_text(&t.css(), out),
         RowValue::PaintOrder(p) => out.push_str(&p.css()),
         RowValue::Marker(m) => out.push_str(&m.css()),
         RowValue::Filter(f) => out.push_str(&f.css()),

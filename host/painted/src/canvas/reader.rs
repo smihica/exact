@@ -44,13 +44,12 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.p.reader_replaced(Box::new(Recorder::new()));
         stream::reader_replaced();
         layer::ALIVE.with(|a| a.borrow_mut().clear());
-        self.tracks.clear();
-        self.tracks_epoch = 0;
-        self.clock_sent = false;
+        self.tracks = Default::default();
         // The last paint is the last reader's: nothing moves it, and the
         // next frame is a paint.
         self.painted = None;
         self.moved = 0;
+        self.end_scroll();
         self.quiet = None;
         self.paint_by = None;
         self.travel = crate::travel::Travel::default();

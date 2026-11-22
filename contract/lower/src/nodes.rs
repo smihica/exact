@@ -23,7 +23,44 @@ pub(super) struct ElementStep<'n> {
     pub(super) rows: u8,
 }
 
+pub(super) fn builder(ex: &contract_syntax::Expanded) -> PlanBuilder {
+    let mut b = PlanBuilder::new(exact_kernel::SCHEMA_DIGEST, compiler_identity());
+    for step in &ex.steps {
+        use contract_syntax::inline::SourceKind;
+        use exact_plan::PlaceKind;
+        let (kind, name) = match &step.kind {
+            SourceKind::Element(tag) => (PlaceKind::Element, tag.as_str()),
+            SourceKind::Component(name) => (PlaceKind::Component, name.as_str()),
+            SourceKind::Each(key) => (PlaceKind::Each, key.as_str()),
+            SourceKind::Children => (PlaceKind::Children, ""),
+        };
+        b.place_step(
+            step.outer.map(exact_plan::PlaceStepsId),
+            kind,
+            name,
+            step.ordinal,
+            step.shared_id,
+        );
+    }
+    b
+}
+
 impl Lowerer<'_> {
+    /// A tag's fixed row value as a constant body, built once per compile.
+    pub(super) fn fixed(&mut self, style: bool, value: &'static str) -> Code {
+        if let Some(code) = self.fixed.get(&(style, value)) {
+            return *code;
+        }
+        // A fixed style is an enum's name or a number in points.
+        let v = match value.parse::<f64>() {
+            Ok(n) if style => Value::Number(n),
+            _ => Value::str(value),
+        };
+        let code = self.b.constant(&v);
+        self.fixed.insert((style, value), code);
+        code
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     pub(super) fn prepare_element<'n>(
@@ -43,6 +80,7 @@ impl Lowerer<'_> {
             children,
             span,
             instance,
+            place,
         } = n
         else {
             unreachable!("prepare_element only receives elements")
@@ -202,7 +240,7 @@ impl Lowerer<'_> {
         self.check_svg(tag, parent_tag, expanded, scope)?;
         shorthands::check_text_box(tag, parent_tag, expanded)?;
         // @ref LLP 1011.002 D3 — the one box `vertical-align` moves.
-        let inline_image = tag == "image" && matches!(parent_tag, Some("text"));
+        let inline_image = tag == "image" && matches!(parent_tag, Some("text" | "p"));
         if inline_image {
             // Its box takes lengths alone, not the sizes it would resolve
             // against a containing block (LLP 1011.002 §"Not built").
@@ -243,7 +281,7 @@ impl Lowerer<'_> {
         }
         // @ref LLP 1034 §8 — an inline run paints in its paragraph's
         // scheme: no host gives a run an appearance of its own.
-        if matches!(tag.as_str(), "text" | "time") && matches!(parent_tag, Some("text" | "time")) {
+        if crate::prose::phrasing(tag) && parent_tag.is_some_and(crate::prose::text_container) {
             if let Some(a) = expanded.iter().find(|a| a.name == "color-scheme") {
                 return Err(LowerError {
                             id: "lower-attr-tag",
@@ -278,6 +316,7 @@ impl Lowerer<'_> {
         let authored_children = children;
         let children: &[Node] = face.as_deref().unwrap_or(authored_children.as_slice());
         controls::check_nesting(tag, parent_tag, *span)?;
+        crate::prose::check(tag, parent_tag, *span)?;
         crate::tables::check(tag, parent_tag, self.in_dl_group, expanded, children, *span)?;
         controls::check_progress(tag, expanded, children)?;
         crate::live_time::check(tag, expanded, *span)?;
@@ -334,6 +373,7 @@ impl Lowerer<'_> {
         });
         let expanded = row_list.as_deref().unwrap_or(expanded);
         media::check_session(tag, expanded)?;
+        crate::transfer::check_node(tag, parent_tag, expanded)?;
         crate::frames::check(tag, positional, expanded)?;
         let audio = media::audio_rows(tag, expanded, *span)?;
         let expanded = audio.as_deref().unwrap_or(expanded);
@@ -914,15 +954,15 @@ impl Lowerer<'_> {
             fn run(c: &Node, images: bool) -> bool {
                 match c {
                     Node::Element { tag, .. } => {
-                        matches!(tag.as_str(), "text" | "time") || images && tag == "image"
+                        crate::prose::phrasing(tag) || images && tag == "image"
                     }
                     Node::Use { .. } | Node::Children { .. } => false,
                     region => region.children().all(|c| run(c, images)),
                 }
             }
             // A `text` that holds runs, not a string or a `time` value.
-            let paragraph = !matches!(parent_tag, Some("text" | "time"))
-                && tag == "text"
+            let paragraph = !parent_tag.is_some_and(crate::prose::text_container)
+                && matches!(tag.as_str(), "text" | "p")
                 && positional.is_empty()
                 && !expanded.iter().any(|a| a.name == "text");
             // Columns lay a paragraph's lines out apart, which an image's
@@ -1067,6 +1107,9 @@ impl Lowerer<'_> {
             &handler_refs,
             surface,
         );
+        if let Some(step) = place {
+            self.b.set_node_place(id, exact_plan::PlaceStepsId(*step));
+        }
         if !look_rows.is_empty() {
             self.b.set_looks(id, &look_rows);
         }

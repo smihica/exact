@@ -25,13 +25,13 @@ extension NodeView {
             let pinch = UIPinchGestureRecognizer(target: self, action: #selector(transformDragging(_:)))
             pinch.delegate = self
             addGestureRecognizer(pan); addGestureRecognizer(pinch)
-            transformRecognizer = pan; transformContact = TransformContact(pinch)
+            transformRecognizer = pan; contact = TransformContact(pinch)
         } else if presenter?.transformBindings[id]?.target == nil, let pan = transformRecognizer {
             let previous = transformHold; transformHold = nil
             DispatchQueue.main.async { previous?.cancel() }
             removeGestureRecognizer(pan); transformRecognizer = nil
-            if let pinch = transformContact?.pinch { removeGestureRecognizer(pinch) }
-            transformContact = nil
+            if let pinch = contact?.pinch { removeGestureRecognizer(pinch) }
+            contact = nil
         }
         #endif
     }
@@ -44,12 +44,12 @@ extension NodeView {
     /// and `manipulation` keep every drag the binding's, and a pan joining
     /// the binding's pinch is always admitted (rule 6).
     func transformShouldBegin(_ gesture: UIGestureRecognizer) -> Bool? {
-        guard gesture === transformRecognizer || gesture === transformContact?.pinch else { return nil }
+        guard gesture === transformRecognizer || gesture === contact?.pinch else { return nil }
         guard SwipeInput.allows(self), presenter?.transformBindings[id]?.target != nil else { return false }
         guard gesture === transformRecognizer else { return !allowsPinchZoom }
         let action = style["touch_action"]?.string ?? "auto"
         guard action != "auto", action != "manipulation", let pan = gesture as? UIPanGestureRecognizer else { return true }
-        if let pinch = transformContact?.pinch, pinch.state == .began || pinch.state == .changed { return true }
+        if let pinch = contact?.pinch, pinch.state == .began || pinch.state == .changed { return true }
         let velocity = pan.velocity(in: self), translation = pan.translation(in: self)
         let direction = velocity == .zero ? translation : velocity
         guard direction != .zero else { return true }
@@ -94,7 +94,7 @@ extension NodeView {
         return true
     }
     package func gestureRecognizer(_ gesture: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
-        let pair: [UIGestureRecognizer?] = [transformRecognizer, transformContact?.pinch]
+        let pair: [UIGestureRecognizer?] = [transformRecognizer, contact?.pinch]
         return pair.contains { $0 === gesture } && pair.contains { $0 === other }
     }
     /// The clip's centre in window points: the origin of the focal arithmetic.
@@ -104,7 +104,7 @@ extension NodeView {
     }
     #if !os(tvOS)
     @objc func transformDragging(_ gesture: UIGestureRecognizer) {
-        guard let contact = transformContact, let pan = transformRecognizer else { return }
+        guard let contact = contact, let pan = transformRecognizer else { return }
         let time = CACurrentMediaTime(), isPan = gesture === pan
         func focal() -> CGPoint { (contact.panning ? pan : contact.pinch).location(in: window) }
         func anchor(_ from: CGPoint? = nil) {

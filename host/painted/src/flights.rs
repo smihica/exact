@@ -486,17 +486,17 @@ component App
         p.host_mut().dispatch_at(toggle, Event::Press, 100.0);
         p.tick(250.0);
         assert_eq!(p.host().flight_frames()[0].progress, 0.0);
-        p.reader_clock(250.0, true);
+        p.reader_clock(250.0, true, true);
         p.frame();
         let carried = p.picture_carried();
-        p.reader_clock(260.0, true);
+        p.reader_clock(260.0, true, true);
         assert_eq!(
             p.host().flight_frames()[0].progress,
             0.0,
             "held until its present"
         );
         p.picture_presented(carried, 250.0);
-        p.reader_clock(266.0, true);
+        p.reader_clock(266.0, true, true);
         assert!((p.host().flight_frames()[0].progress - 0.016).abs() < 1e-5);
         p.host_mut().dispatch_at(toggle, Event::Press, 300.0);
         assert_eq!(p.host().flight_frames().len(), 1);
@@ -639,7 +639,7 @@ component App
                 p.host_mut().dispatch_at(toggle, Event::Press, 100.0);
                 p.after_commit();
                 p.run_commands(|| ());
-                p.reader_clock(116.0, end != "driven");
+                p.reader_clock(116.0, end != "driven", true);
                 p.frame();
                 let carried = p.picture_carried();
                 p.picture_presented(carried, 116.0);
@@ -649,17 +649,17 @@ component App
                 match end {
                     "driven" => {
                         p.tick(1301.0);
-                        p.reader_clock(1301.0, false);
+                        p.reader_clock(1301.0, false, true);
                     }
                     "live" => {
-                        p.reader_clock(700.0, true);
+                        p.reader_clock(700.0, true, true);
                         assert!(p.host().flying(field));
                         assert_ne!(p.focus(), Some(field));
-                        p.reader_clock(1300.0, true);
+                        p.reader_clock(1300.0, true, true);
                     }
                     _ => {
                         p.reader_replaced(Box::new(crate::canvas::Recorder::new()));
-                        p.reader_clock(132.0, true);
+                        p.reader_clock(132.0, true, true);
                     }
                 }
                 assert!(!p.host().flying(field), "{how} {end}");
@@ -727,7 +727,7 @@ component App
             };
             assert!(p.host().flying(field));
             p.tick(1301.0);
-            p.reader_clock(1301.0, false);
+            p.reader_clock(1301.0, false, true);
             assert!(!p.host().flying(field));
             assert_eq!(p.focus(), Some(kept), "{how}");
         }
@@ -770,7 +770,7 @@ component App
             let args: Vec<_> = blurred.into_iter().map(exact_plan::Value::str).collect();
             p.blur_command(&args);
             p.tick(1301.0);
-            p.reader_clock(1301.0, false);
+            p.reader_clock(1301.0, false, true);
             assert!(!p.host().flying(field));
             let expected = if landed { Some(field) } else { None };
             assert_eq!(p.focus(), expected, "blur({blurred:?})");

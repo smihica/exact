@@ -513,10 +513,13 @@ pub(crate) struct Surfaces {
     pub(crate) direct_window: Option<window::DirectWindow>,
     #[cfg(windows)]
     pub(crate) startup_device: Option<window::Startup>,
+    #[cfg(windows)]
+    pub(crate) preparing_device: Option<Result<exact_ink::device::d3d11::Startup, String>>,
     /// Each opened artifact by name, "" the primary; each is tried once.
     abis: BTreeMap<String, Abi>,
     attempted: BTreeSet<String>,
     canvases: BTreeMap<u32, Canvas>,
+    defer_readback: bool,
     performance_due: Option<std::time::Instant>,
     edits_admitted: bool,
     restore: Option<Result<Vec<u8>, String>>,

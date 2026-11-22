@@ -2,9 +2,9 @@
 // (`__exact_env.mjs` `inlineSettings`, `__exact_launch_setting.mjs`), what a launch's environment is to the check of a
 // build's freshness, and how js/src/launch.js names the setting in a grant refusal.
 import { expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
@@ -568,6 +568,43 @@ test('discovery and freshness use the bake across mounted imports and checker-on
     await expect(check(stage,resolve(libraries,'tsc'),libraries)).rejects.toThrow("Type 'string' is not assignable to type 'number'");
   } finally { rmSync(root,{recursive:true,force:true}); }
 }, 30000);
+
+test('checker paths track the sources of a published web build', async () => {
+  const { checkerOutput, packageOrigin, recordSourceInputs } = await import('../src/__exact_env.mjs');
+  const { shown, webChanges, webInputDigests } = await import('../../../scripts/agent-launch.mjs');
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-checker-paths-'));
+  const app = { dir, manifest: {} };
+  const pending = resolve(dir, 'dist.stage-abcdef'), dist = resolve(dir, 'dist');
+  const stage = resolve(pending, '.gen/typescript');
+  const checkerPath = path => sep === '\\' ? path.replaceAll(sep, '/') : '/' + path;
+  try {
+    mkdirSync(stage, { recursive: true });
+    writeFileSync(resolve(dir, 'app.ts'), 'export const value = 1;\n');
+    writeFileSync(resolve(stage, '__exact_paths.json'), JSON.stringify({ app: dir }));
+    const loaded = ['__exact_entry.ts', '__exact_env.d.ts', 'app.contract.d.ts', 'app.ts'];
+    for (const file of loaded) writeFileSync(resolve(stage, file), file === 'app.ts' ? readFileSync(resolve(dir, file)) : '');
+    const { files, resolution } = checkerOutput([
+      ...loaded.map(file => checkerPath(resolve(stage, file))),
+      `File '${checkerPath(resolve(stage, 'app.contract.ts'))}' does not exist.`,
+    ].join('\r\n'));
+    recordSourceInputs(stage, 'modules', [resolve(stage, 'app.ts')]);
+    recordSourceInputs(stage, 'types', files.map(path => [path, packageOrigin(stage, path)]));
+    recordSourceInputs(stage, 'resolution', resolution.map(path => [path, packageOrigin(stage, path)]));
+    const sourceInputs = JSON.parse(readFileSync(resolve(stage, '__exact_inputs.json'), 'utf8'));
+    writeFileSync(resolve(pending, '.exact-build.json'), JSON.stringify({
+      target: 'js', inputs: webInputDigests(app, true, [], sourceInputs), inputRoots: [], sourceInputs,
+    }));
+    renameSync(pending, dist);
+    expect(webChanges(dist, app).all).toEqual([]);
+    expect(sourceInputs.reads).toContainEqual({ kind: 'absent', path: resolve(dir, 'app.contract.ts') });
+    const old = new Date('2020-01-01');
+    for (const file of ['app.contract.ts', 'app.ts']) {
+      writeFileSync(resolve(dir, file), 'export const value = 2;\n');
+      utimesSync(resolve(dir, file), old, old);
+      expect(webChanges(dist, app).all).toContain(shown(resolve(dir, file)));
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('resolution metadata and new candidates invalidate recorded inputs, including mounted sources', async () => {
   const { configure } = await import('../src/typescript.mjs');

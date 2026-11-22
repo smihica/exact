@@ -32,13 +32,13 @@ struct WidgetEntry {
     func configuration(_ supplied: [String: String]) throws -> [String: String] {
         for (name, value) in supplied {
             guard let parameter = parameters.first(where: { $0.name == name }) else {
-                throw HeadlessSession.Failure(description: parameters.isEmpty ? "widget \(kind) has no configuration" : "widget --configuration: \(kind) has no parameter \(name); parameters: \(parameters.map(\.name).joined(separator: ", "))")
+                throw ExactFailure(description: parameters.isEmpty ? "widget \(kind) has no configuration" : "widget --configuration: \(kind) has no parameter \(name); parameters: \(parameters.map(\.name).joined(separator: ", "))")
             }
             switch parameter.choices {
             case .fixed(let values, _) where !values.contains(value):
-                throw HeadlessSession.Failure(description: "widget --configuration: \(name) is one of \(values.joined(separator: ", "))")
+                throw ExactFailure(description: "widget --configuration: \(name) is one of \(values.joined(separator: ", "))")
             case .entity where value.isEmpty:
-                throw HeadlessSession.Failure(description: "widget --configuration: \(name) is an entry's id, which is not empty")
+                throw ExactFailure(description: "widget --configuration: \(name) is an entry's id, which is not empty")
             default: break
             }
         }
@@ -74,6 +74,7 @@ struct WidgetVariant: Hashable, Identifiable {
         case "systemMedium": return CGSize(width: 338, height: 158)
         case "systemLarge": return CGSize(width: 338, height: 354)
         case "systemExtraLarge": return CGSize(width: 720, height: 354)
+        case "systemExtraLargePortrait": return CGSize(width: 354, height: 720)
         case "accessoryCircular", "accessoryCorner": return CGSize(width: 58, height: 58)
         case "accessoryInline": return CGSize(width: 225, height: 26)
         default: return CGSize(width: 160, height: 72)
@@ -103,10 +104,10 @@ final class WidgetPreview: ObservableObject {
         generation = entry.assets.publicationID
         clock = appSession.now(); epochAtZero = appSession.dateNow().epoch
         guard let family = SnapshotEnvironment.Family(rawValue: variant.family) else {
-            throw HeadlessSession.Failure(description: "invalid widget family: \(variant.family)")
+            throw ExactFailure(description: "invalid widget family: \(variant.family)")
         }
         guard let plan = entry.assets.bytes("plans/\(entry.kind).plan") else {
-            throw HeadlessSession.Failure(description: "missing widget plan: \(entry.kind); rebuild the app")
+            throw ExactFailure(description: "missing widget plan: \(entry.kind); rebuild the app")
         }
         let place = appSession.launchPlace
         let date = Date(timeIntervalSince1970: (epochAtZero + clock) / 1000)
@@ -126,7 +127,7 @@ final class WidgetPreview: ObservableObject {
         var given: [String: Any]?
         if let suppliedProps {
             guard let object = try JSONSerialization.jsonObject(with: Data(suppliedProps.utf8)) as? [String: Any] else {
-                throw HeadlessSession.Failure(description: "widget --props: expected a JSON object")
+                throw ExactFailure(description: "widget --props: expected a JSON object")
             }
             given = object
         }
@@ -228,7 +229,7 @@ final class ActivityPreview {
         self.entry = entry; self.scheme = scheme
         clock = appSession.now(); epochAtZero = appSession.dateNow().epoch; suppliedState = supplied
         guard let plan = entry.assets.bytes("plans/\(entry.kind).plan") else {
-            throw HeadlessSession.Failure(description: "missing activity plan: \(entry.kind); rebuild the app")
+            throw ExactFailure(description: "missing activity plan: \(entry.kind); rebuild the app")
         }
         let place = appSession.launchPlace
         let date = Date(timeIntervalSince1970: (epochAtZero + clock) / 1000)
@@ -563,12 +564,12 @@ enum WidgetGallery {
                 let entries = entries(in: agent.session.app.resolver)
                 guard let address = request["widget"] as? [String: String], let kind = address["entry"],
                       let entry = entries.first(where: { $0.kind == kind }) else {
-                    throw HeadlessSession.Failure(description: "unknown widget; available: \(entries.map(\.kind).joined(separator: ", "))")
+                    throw ExactFailure(description: "unknown widget; available: \(entries.map(\.kind).joined(separator: ", "))")
                 }
                 var configuration: [String: String] = [:]
                 if let supplied = address["configuration"] {
                     guard let object = try JSONSerialization.jsonObject(with: Data(supplied.utf8)) as? [String: String] else {
-                        throw HeadlessSession.Failure(description: "widget --configuration: expected a JSON object of parameter names to values")
+                        throw ExactFailure(description: "widget --configuration: expected a JSON object of parameter names to values")
                     }
                     configuration = object
                 }
@@ -578,10 +579,10 @@ enum WidgetGallery {
                 guard entry.families.contains(variant.family), SnapshotEnvironment.Family(rawValue: variant.family) != nil,
                       ["fullColor", "accented", "vibrant"].contains(variant.mode), ["light", "dark"].contains(variant.scheme),
                       ["large", "xxxl"].contains(variant.size), [1, 2, 3].contains(variant.scale) else {
-                    throw HeadlessSession.Failure(description: "invalid widget variant; families: \(entry.families.joined(separator: ", ")); modes: fullColor, accented, vibrant; schemes: light, dark; sizes: large, xxxl; scales: 1, 2, 3")
+                    throw ExactFailure(description: "invalid widget variant; families: \(entry.families.joined(separator: ", ")); modes: fullColor, accented, vibrant; schemes: light, dark; sizes: large, xxxl; scales: 1, 2, 3")
                 }
                 guard ["tree", "screenshot", "state"].contains(op) else {
-                    throw HeadlessSession.Failure(description: "widget gallery supports tree, screenshot, state and app clock")
+                    throw ExactFailure(description: "widget gallery supports tree, screenshot, state and app clock")
                 }
                 if request["availability"] as? Bool == true { return ["available": true] }
                 let old = agent.widgetPreview
@@ -612,13 +613,13 @@ enum WidgetGallery {
                     result["slots"] = entry.parameters.isEmpty ? ["snapshot_props": preview.props] : ["snapshot_props": preview.props, "snapshot_configuration": preview.configuration]
                     result["refresh"] = preview.refresh; result["refreshReason"] = preview.refreshReason
                 case "screenshot":
-                    guard let path = request["path"] as? String else { throw HeadlessSession.Failure(description: "screenshot needs a path") }
+                    guard let path = request["path"] as? String else { throw ExactFailure(description: "screenshot needs a path") }
                     guard let image = GalleryCapture.image(WidgetPreviewView(preview: preview), width: variant.displaySize.width, height: variant.displaySize.height, scale: variant.scale),
                           let destination = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-                        throw HeadlessSession.Failure(description: "could not render widget screenshot")
+                        throw ExactFailure(description: "could not render widget screenshot")
                     }
                     CGImageDestinationAddImage(destination, image, nil)
-                    guard CGImageDestinationFinalize(destination) else { throw HeadlessSession.Failure(description: "could not write widget screenshot") }
+                    guard CGImageDestinationFinalize(destination) else { throw ExactFailure(description: "could not write widget screenshot") }
                     result["screenshot"] = path; result["w"] = variant.displaySize.width; result["h"] = variant.displaySize.height; result["scale"] = variant.scale
                     result["rendering"] = "in-process WidgetKit container stand-in"
                 default: break

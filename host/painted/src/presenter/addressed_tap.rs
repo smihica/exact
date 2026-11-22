@@ -242,7 +242,8 @@ impl<D: DataSource> Presenter<D> {
                 // taking the pointer, uncovered, in this route.
                 let (cx, cy) = (b.rect.0 + b.rect.2 / 2.0, b.rect.1 + b.rect.3 / 2.0);
                 self.display.contains(cx, cy)
-                    && (self.painted_hit(cx, cy, false))
+                    && self
+                        .painted_hit(&self.boxes, cx, cy, PaintHit::Published)
                         .is_some_and(|h| h == b.id || self.is_inside(h, b.id))
             })
             .map(|b| {

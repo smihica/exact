@@ -91,6 +91,24 @@ export const fetchWith = (grants, input) => globalThis.heldGates(String(input));
     expect(tsf.unfinishedIO()).toBe(false);
     expect(() => tsf.ordinary(() => { throw failure; })).toThrow(failure);
     expect(tsf.unfinishedIO()).toBe(false);
+    // A parallel mutation's ticket lives in `owner.tickets`, not `owner.ticket`.
+    const parallel = { parallel: true, ticket: null, tickets: [] };
+    const pCall = {}, pt = { id: 9, name: 'upload', owner: parallel, call: pCall, waiting: true, promise: new Promise(() => {}) };
+    parallel.tickets.push(pt);
+    held.counted(pt, inflight);
+    held.trackAnswer(pt);
+    tsf.answering.call = pCall;
+    const pPoll = tsf.fetch('https://x.test/parallel', { exactHeld: true });
+    tsf.answering.call = null;
+    expect(held.heldAsks()).toEqual([{ name: 'upload', ticket: 9 }]);
+    expect(held.heldTickets()).toEqual([pt]);
+    expect(held.answersAtWork()).toBe(true);
+    gates.get('https://x.test/parallel')();
+    await pPoll;
+    expect(held.heldReplies()).toEqual({ item: 1, upload: 1 });
+    expect(held.heldAsks()).toEqual([]);
+    expect(held.answersAtWork()).toBe(false);
+    parallel.tickets = [];
   } finally {
     if (hadRender) globalThis.__exactRender = render; else delete globalThis.__exactRender;
     delete globalThis.heldGates;

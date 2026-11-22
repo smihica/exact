@@ -1,6 +1,45 @@
 //! Inline geometry follows the acknowledged paragraph and its identities.
 use super::*;
 
+fn baseline_of(p: &mut Presenter<Empty>, id: ViewId) -> Option<f64> {
+    let reply: serde_json::Value = serde_json::from_str(&p.layout_json(Some(id), false)).unwrap();
+    reply["node"]["space"]["baseline"].as_f64()
+}
+
+#[test]
+fn text_baselines_follow_the_row_and_the_acknowledged_padding() {
+    let source = r#"component App
+  state inset = 2
+  action grow
+    inset = 30
+  view
+    column
+      box press=grow testId="grow" height=20
+      row align-items="baseline"
+        text "Large" testId="large" font-size=32
+        text "Small" testId="small" font-size=13
+      text "Moving" testId="moving" padding-top=inset
+"#;
+    let (mut p, _, _) = boot_app(source);
+    let first = submit(&mut p).unwrap();
+    assert!(complete(&mut p, &first));
+    let large = id(&p, "large");
+    let small = id(&p, "small");
+    let moving = id(&p, "moving");
+    let grow = id(&p, "grow");
+    let a = baseline_of(&mut p, large).unwrap();
+    let b = baseline_of(&mut p, small).unwrap();
+    assert!((a - b).abs() <= 0.5, "{a} vs {b}");
+    assert!(p.rect_of(large).unwrap().1 < p.rect_of(small).unwrap().1);
+    assert_eq!(baseline_of(&mut p, grow), None);
+    let y = baseline_of(&mut p, moving).unwrap();
+    viewport_action(&mut p, "grow");
+    let next = submit(&mut p).unwrap();
+    assert_eq!(baseline_of(&mut p, moving), Some(y));
+    assert!(complete(&mut p, &next));
+    assert!((baseline_of(&mut p, moving).unwrap() - y - 28.).abs() <= 0.01);
+}
+
 #[test]
 fn inline_geometry_keeps_sibling_ownership_and_placement_until_successful_ack() {
     let source = format!(
@@ -24,6 +63,8 @@ fn inline_geometry_keeps_sibling_ownership_and_placement_until_successful_ack() 
     assert!(complete(&mut p, &first));
     let tail = id(&p, "tail");
     let before = p.rect_of(tail).unwrap();
+    let baseline = baseline_of(&mut p, tail).unwrap();
+    assert!(baseline > f64::from(before.1) && baseline < f64::from(before.1 + before.3));
     assert!(before.1 > 200., "{before:?}");
     let key = p.host.kernel().node(tail).unwrap().key;
     let parent = p.host.kernel().node(tail).unwrap().parent;
@@ -44,6 +85,7 @@ fn inline_geometry_keeps_sibling_ownership_and_placement_until_successful_ack() 
     assert_eq!(p.rect_of(tail), Some(before));
     assert!(complete(&mut p, &failed));
     assert_eq!(p.rect_of(tail), Some(before), "failed replacement");
+    assert_eq!(baseline_of(&mut p, tail), Some(baseline));
     p.scroll_element_into_view(&["tail".into(), "nearest".into()]);
     assert!(p.scroll_of(id(&p, "port")).1 > 100.);
     fail.set(false);

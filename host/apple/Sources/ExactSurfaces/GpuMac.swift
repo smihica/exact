@@ -490,8 +490,9 @@ final class CanvasesHost {
             // The agent owns presentation time even behind another window. An
             // offscreen target cannot starve and refreshes the same placements.
             if ExactEnv.agentMode {
-                for e in Array(entries.values) where !visible || e.starvedUntil > CACurrentMediaTime() {
-                    _ = readback(view: e.view)
+                for e in Array(entries.values) where !visible || e.waiting || e.starvedUntil > CACurrentMediaTime() {
+                    if let outer = e.view.canvasAbove, outer.overlay != nil, entries[outer.id]?.through == true { continue }
+                    if readback(view: e.view) != nil { e.waiting = false }
                 }
             }
             for e in Array(entries.values) { messages(e) }

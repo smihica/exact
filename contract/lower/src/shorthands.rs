@@ -47,6 +47,12 @@ pub(crate) fn rows(name: &str) -> &'static [StyleId] {
         "-exact-safe-area-ignore" => &[SafeAreaIgnore, SafeAreaIgnoreAlign],
         // @ref LLP 1123 D12 — one row, its grammar checked here.
         "-exact-safe-area-bar" => &[SafeAreaBar],
+        // @ref LLP 1123 D13 — whether reach is automatic, then its edges; and the
+        // extension, one row, its grammar checked here.
+        "-exact-safe-area-reach" => &[SafeAreaReach, SafeAreaReachEdges],
+        "-exact-safe-area-extend" => &[SafeAreaExtend],
+        // @ref LLP 1123 D14 — the edges that are soft, then those that are hard.
+        "-exact-scroll-edge-effect-style" => &[ScrollEdgeEffectSoft, ScrollEdgeEffectHard],
         _ => unreachable!("known shorthand"),
     }
 }
@@ -70,6 +76,15 @@ pub(crate) fn component(value: &Expr, name: &str, index: usize) -> Result<Expr, 
         }
         Expr::Str(text, span) if name == "-exact-safe-area-bar" => {
             out = Expr::Str(safe_area_bar(text, *span)?, *span);
+        }
+        Expr::Str(text, span) if name == "-exact-scroll-edge-effect-style" => {
+            out = Expr::Str(scroll_edge_effect_style(text, *span)?[index].clone(), *span);
+        }
+        Expr::Str(text, span) if name == "-exact-safe-area-reach" => {
+            out = Expr::Str(safe_area_reach(text, *span)?[index].clone(), *span);
+        }
+        Expr::Str(text, span) if name == "-exact-safe-area-extend" => {
+            out = Expr::Str(safe_area_extend(text, *span)?, *span);
         }
         Expr::Str(text, span) if name.ends_with("-timeline") => {
             out = Expr::Str(timeline(name, text, *span)?[index].clone(), *span);
@@ -524,6 +539,122 @@ fn safe_area_bar(text: &str, span: Span) -> Result<String, LowerError> {
     }
 }
 
+/// Whether `words` are an `<edges>` set (LLP 1123 D13, D14): at least one of
+/// `top`, `right`, `bottom`, `left`, `start` and `end`, each once.
+fn edge_set(words: &[&str]) -> bool {
+    let edge = ["top", "right", "bottom", "left", "start", "end"];
+    !words.is_empty()
+        && words.iter().all(|w| edge.contains(w))
+        && words
+            .iter()
+            .enumerate()
+            .all(|(i, w)| !words[..i].contains(w))
+}
+
+/// `unset` for each of a shorthand's `rows`, where the value is that alone.
+fn unset<const N: usize>(text: &str) -> Option<[String; N]> {
+    (text.trim() == "unset").then(|| std::array::from_fn(|_| "unset".to_string()))
+}
+
+/// `-exact-scroll-edge-effect-style: [<edges> [automatic | soft | hard]]#` as its
+/// two rows (LLP 1123 D14), the soft edges and the hard ones, as UIKit holds a
+/// style for each edge: each item's edges in its style's row, an edge in
+/// neither automatic, each edge named once across the list.
+fn scroll_edge_effect_style(text: &str, span: Span) -> Result<[String; 2], LowerError> {
+    if let Some(rows) = unset(text) {
+        return Ok(rows);
+    }
+    let refuse = || {
+        err(
+            "lower-attr-value",
+            "`-exact-scroll-edge-effect-style` is a list of edges, each named once across it, each item ending in a style, `automatic`, `soft` or `hard`: e.g. `top bottom soft` or `top soft, bottom hard`",
+            span,
+        )
+    };
+    let (mut soft, mut hard, mut automatic, mut named) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for item in text.split(',') {
+        let words: Vec<&str> = item.split_ascii_whitespace().collect();
+        let Some((style, edges)) = words.split_last() else {
+            return refuse();
+        };
+        if !edge_set(edges) || edges.iter().any(|e| named.contains(e)) {
+            return refuse();
+        }
+        named.extend_from_slice(edges);
+        match *style {
+            "soft" => soft.extend_from_slice(edges),
+            "hard" => hard.extend_from_slice(edges),
+            "automatic" => automatic.extend_from_slice(edges),
+            _ => return refuse(),
+        }
+    }
+    // Refuse `automatic` on `start` or `end` beside a style on `left` or `right`: the rows hold an
+    // automatic edge as one in neither set, so it could not take the edge from the physical name
+    let has = |edges: &[&str], names: [&str; 2]| edges.iter().any(|e| names.contains(e));
+    if has(&automatic, ["start", "end"])
+        && (has(&soft, ["left", "right"]) || has(&hard, ["left", "right"]))
+    {
+        return err(
+            "lower-attr-value",
+            "`-exact-scroll-edge-effect-style` cannot hold `automatic` on `start` or `end` beside `soft` or `hard` on `left` or `right`: name the automatic edge `left` or `right`, or the styled one `start` or `end`",
+            span,
+        );
+    }
+    let set = |edges: &[&str]| {
+        if edges.is_empty() {
+            "none".to_string()
+        } else {
+            edges.join(" ")
+        }
+    };
+    Ok([set(&soft), set(&hard)])
+}
+
+/// `-exact-safe-area-reach: auto | none | <edges>` as its two rows (LLP 1123
+/// D13): `auto`, or `edges` with the edges named, none for `none`.
+fn safe_area_reach(text: &str, span: Span) -> Result<[String; 2], LowerError> {
+    if let Some(rows) = unset(text) {
+        return Ok(rows);
+    }
+    let words: Vec<&str> = text.split_ascii_whitespace().collect();
+    match words.as_slice() {
+        ["auto"] => Ok(["auto".into(), "none".into()]),
+        ["none"] => Ok(["edges".into(), "none".into()]),
+        edges if edge_set(edges) => Ok(["edges".into(), edges.join(" ")]),
+        _ => err(
+            "lower-attr-value",
+            "`-exact-safe-area-reach` is `auto`, `none`, or the edges it reaches on, each once: e.g. `top bottom`",
+            span,
+        ),
+    }
+}
+
+/// `-exact-safe-area-extend: none | <edges>` (LLP 1123 D13): the edges, each
+/// once. The host places the extension by hand at the box, so no placement
+/// word is taken.
+fn safe_area_extend(text: &str, span: Span) -> Result<String, LowerError> {
+    if text.trim() == "unset" {
+        return Ok("unset".into());
+    }
+    let words: Vec<&str> = text.split_ascii_whitespace().collect();
+    if words == ["none"] || edge_set(&words) {
+        return Ok(words.join(" "));
+    }
+    if words.contains(&"manual") {
+        return err(
+            "lower-attr-value",
+            "`-exact-safe-area-extend` takes no `manual`: the host always places the extension at the box's final frame (LLP 1123 D13). Name the edges alone: e.g. `top bottom`",
+            span,
+        );
+    }
+    err(
+        "lower-attr-value",
+        "`-exact-safe-area-extend` is `none`, or the edges it extends on, each once: e.g. `bottom` or `top bottom`",
+        span,
+    )
+}
+
 fn text_box(name: &str, text: &str, span: Span) -> Result<[String; 2], LowerError> {
     let refuse = |why: String| {
         err(
@@ -693,7 +824,7 @@ pub(crate) fn portable_literal(value: &Expr, name: &str) -> Result<(), LowerErro
 /// `text-box` shorthand) is a `text`'s, and its edge, inherited, may sit
 /// anywhere.
 pub(crate) fn text_box_trim_refusal(name: &str, tag: &str, module: bool) -> Option<String> {
-    (matches!(name, "text-box-trim" | "text-box") && tag != "text" && !module).then(|| {
+    (matches!(name, "text-box-trim" | "text-box") && !crate::prose::text_container(tag) && !module).then(|| {
         format!("`{name}` trims a `text`, not `{tag}`; write it on the `text` inside (`text-box-edge` may stay here: it is inherited)")
     })
 }
@@ -750,10 +881,10 @@ pub(crate) fn check_text_box(
             _ => {}
         }
     }
-    let Some(trim) = trim.filter(|_| tag == "text") else {
+    let Some(trim) = trim.filter(|_| crate::prose::text_container(tag)) else {
         return Ok(());
     };
-    if parent_tag == Some("text") {
+    if parent_tag.is_some_and(crate::prose::text_container) {
         return err(
             "lower-attr-tag",
             format!("`{}` on an inline `text` run: Exact trims a paragraph, not a run's own box; set it on the paragraph", trim.name),
@@ -863,11 +994,19 @@ pub fn style_values(name: &str, value: &Expr) -> Result<Vec<(StyleId, Expr)>, Lo
 /// (`` `${pad}px 0` ``) are split in [`sides`]; a computed single value
 /// (`padding=pad`) is every side's, and a computed list that reaches a row
 /// is refused there.
-pub(crate) fn computed_list<'e>(
+pub(crate) fn computed_list(
+    l: &Lowerer<'_>,
+    scope: &Scope,
     name: &str,
-    value: &'e Expr,
-    body: &dyn Fn(&str) -> Option<&'e Expr>,
+    value: &Expr,
 ) -> Result<(), LowerError> {
+    #[derive(Clone, Copy)]
+    struct Sources<'s, 'e> {
+        fns: &'s BTreeMap<&'e str, (&'e FnDecl, &'e Expr)>,
+        derives: &'e [contract_syntax::Binding],
+        component: &'s Scope,
+        scope: Option<&'s Scope>,
+    }
     /// The `let`s in scope: each name and its value.
     type Env<'e> = Vec<(&'e str, &'e Expr)>;
     /// The texts a computed value can spell, one per way its `?:`, `match`
@@ -875,7 +1014,7 @@ pub(crate) fn computed_list<'e>(
     /// when they are too many or the calls too deep to tell.
     fn texts<'e>(
         e: &'e Expr,
-        body: &dyn Fn(&str) -> Option<&'e Expr>,
+        body: Sources<'_, 'e>,
         env: &mut Env<'e>,
         depth: u8,
     ) -> Option<Vec<String>> {
@@ -926,13 +1065,45 @@ pub(crate) fn computed_list<'e>(
                 env.pop();
                 out?
             }
-            Expr::Ident(name, _) => match env.iter().rev().find(|(n, _)| n == name) {
-                Some(&(_, value)) => texts(value, body, env, depth)?,
-                None => vec!["x".into()],
-            },
-            Expr::Call(f, _, _) => match body(f) {
-                // A `fn`'s parameters are computed parts; its `let`s its own.
-                Some(b) if depth < 8 => texts(b, body, &mut Vec::new(), depth + 1)?,
+            Expr::Ident(name, _) => {
+                if let Some(i) = env.iter().rposition(|(n, _)| n == name) {
+                    texts(env[i].1, body, &mut env[..i].to_vec(), depth)?
+                } else {
+                    let mut name = name;
+                    let mut scope = body.scope;
+                    loop {
+                        let Some((contract_types::Ref::Derive(i), ty)) =
+                            scope.and_then(|s| s.lookup(name))
+                        else {
+                            break vec!["x".into()];
+                        };
+                        if *ty == Ty::Number {
+                            break vec!["x".into()];
+                        }
+                        let value = &body.derives[i as usize].expr;
+                        scope = Some(body.component);
+                        if let Expr::Ident(alias, _) = value {
+                            name = alias;
+                            continue;
+                        }
+                        if depth >= 8 {
+                            return None;
+                        }
+                        break texts(value, Sources { scope, ..body }, &mut Vec::new(), depth + 1)?;
+                    }
+                }
+            }
+            Expr::Call(f, _, _) => match body.fns.get(f.as_str()) {
+                // A function's parameters and local bindings have their own scope.
+                Some((_, b)) if depth < 8 => texts(
+                    b,
+                    Sources {
+                        scope: None,
+                        ..body
+                    },
+                    &mut Vec::new(),
+                    depth + 1,
+                )?,
                 Some(_) => return None,
                 None => vec!["x".into()],
             },
@@ -941,23 +1112,14 @@ pub(crate) fn computed_list<'e>(
     }
     // Whether a computed value may hold more than `most` values, or cannot
     // be told not to.
-    fn more<'e>(
-        e: &'e Expr,
-        body: &dyn Fn(&str) -> Option<&'e Expr>,
-        env: &mut Env<'e>,
-        most: usize,
-    ) -> bool {
+    fn more<'e>(e: &'e Expr, body: Sources<'_, 'e>, env: &mut Env<'e>, most: usize) -> bool {
         texts(e, body, env, 0)
             .is_none_or(|all| all.iter().any(|t| box_sides::values(t).len() > most))
     }
     // Where the value builds a list that is not split at compile time: a
     // literal arm and a template's own white space are ([`sides`]); a
     // `fn`'s result, a `let`'s value and a concatenation are not.
-    fn lists<'e>(
-        e: &'e Expr,
-        body: &dyn Fn(&str) -> Option<&'e Expr>,
-        env: &mut Env<'e>,
-    ) -> Option<Span> {
+    fn lists<'e>(e: &'e Expr, body: Sources<'_, 'e>, env: &mut Env<'e>) -> Option<Span> {
         match e {
             Expr::Str(..) => None,
             // Refused only where an interpolation adds a value: its white
@@ -984,18 +1146,27 @@ pub(crate) fn computed_list<'e>(
             e => more(e, body, env, 1).then(|| e.span()),
         }
     }
+    let body = Sources {
+        fns: &l.fns,
+        derives: &l.root.derives,
+        component: &l.sharing.root_scope,
+        scope: Some(scope),
+    };
     let Some(span) = lists(value, body, &mut Vec::new()) else {
         return Ok(());
     };
-    let longhands: Vec<String> = longhands(name).iter().map(|l| format!("`{l}`")).collect();
-    err(
-        "lower-css-shorthand",
-        format!(
-            "`{name}` is computed here as a list of values, which no host splits at run time; write {} (each may be computed), or a literal `{name}`",
-            longhands.join("/")
-        ),
-        span,
-    )
+    // Exact's box shorthands have no longhand attributes: only a literal value splits
+    let message = match name.starts_with("-exact-") {
+        true => format!("`{name}` is computed here as a list of values, which no host splits at run time; write a literal `{name}`, or one computed value for every side"),
+        false => {
+            let longhands: Vec<String> = longhands(name).iter().map(|l| format!("`{l}`")).collect();
+            format!(
+                "`{name}` is computed here as a list of values, which no host splits at run time; write {} (each may be computed), or a literal `{name}`",
+                longhands.join("/")
+            )
+        }
+    };
+    err("lower-css-shorthand", message, span)
 }
 
 /// A box shorthand (`padding: <length>{1,4}`, `border-color: <color>{1,4}`,
@@ -1022,6 +1193,7 @@ pub(crate) fn sides(name: &str, value: &Expr) -> Result<Option<Vec<Expr>>, Lower
                     let (count, order) = match name {
                         "border-radius" => ("one to four", "top-left, top-right, bottom-right, bottom-left; no `/` elliptical radii"),
                         "gap" => ("one or two", "row, column"),
+                        "-exact-directional-layout-margins" => ("one to four", "top, leading, bottom, trailing"),
                         _ if rows == 2 => ("one or two", "x, y"),
                         _ => ("one to four", "top, right, bottom, left"),
                     };

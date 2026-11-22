@@ -6,7 +6,10 @@ import { createDocument } from './dom.js';
 import { webCompiler } from './module.mjs';
 import { renderer } from './render.mjs';
 import { suiteBrowser } from '../../scripts/agent-launch.mjs';
+import { engineTests } from '../../scripts/coverage.mjs';
 import { standIns } from '../web/tests/stand-ins.mjs';
+
+const engineTest = await engineTests(['chromium']);
 
 test('a tab preparation can clone its render DOM shell without sharing attributes or children', () => {
   const doc = createDocument(), panel = doc.createElement('section');
@@ -62,6 +65,19 @@ test('the render DOM reflects link relations and image alternatives in both dire
     el[prop] = '';
     expect(el.getAttribute(prop)).toBe('');
   }
+});
+
+test('the render DOM gives path templates their viewBox aspect at the inherited size', () => {
+  const doc = createDocument();
+  const parent = doc.createElement('div');
+  parent.style.fontSize = '20px';
+  const img = doc.createElement('img');
+  img.setAttribute('data-symbol-source', 'symbol:icon||0 0 400 100|M0 0H400V100H0Z|');
+  img.setAttribute('data-symbol-viewbox', '0 0 400 100');
+  parent.append(img);
+  doc.root.append(parent);
+  doc.rootHTML();
+  expect(decodeURIComponent(img.getAttribute('src'))).toMatch(/width=['"]20['"] height=['"]5['"]/);
 });
 
 test('the render DOM marks its hero first among its attributes and preloads it by the same request, past a hidden image', () => {
@@ -305,12 +321,13 @@ component App
   }
 }, 180000);
 
-test('Bun-rendered bound links and symbols keep their attributes through adoption', async () => {
+engineTest.chromium('Bun-rendered links and icons preserve their attributes and layout through adoption', async () => {
   if (webCompiler().cmd === 'cargo') throw new Error('build the compiler first: cargo build -p exact-web-js');
   const root = resolve(import.meta.dir, '../..'), dir = mkdtempSync(resolve(root, 'target/dom-render-test-'));
   let server, browser;
   try {
     const dist = resolve(dir, 'dist');
+    const wideSymbol = 'symbol:icon||0 0 400 100|M0 0H400V100H0Z|';
     writeFileSync(resolve(dir, 'app.json'), JSON.stringify({ name: 'DOM Render Test', app: { id: 'test.dom-render', name: 'DOM Render Test' }, host: { web: {} } }));
     writeFileSync(resolve(dir, 'app.contract'), `component App
   state url = "https://example.com/a"
@@ -329,6 +346,9 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
         text "kept"
       image \`symbol:\${role}\` testId="sym"
       image \`symbol:\${role}\` alt="A person" testId="named"
+      column align-items="start"
+        image "${wideSymbol}" font-size=20 testId="wide"
+        text "After the icon" testId="after-wide"
       button press=local testId="local"
         text "make it local"
       button press=external testId="external"
@@ -357,6 +377,7 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
           authored: ['target', 'rel'].map(k => el('authored').getAttribute(k)),
           kept: el('kept').getAttribute('rel'),
           symbols: ['sym', 'named'].map(id => el(id).getAttribute('alt')),
+          wide: [el('wide').naturalWidth, el('wide').naturalHeight, el('after-wide').offsetTop - el('wide').offsetTop],
         };
       }),
       images: await page.getByRole('img').count(),
@@ -373,9 +394,15 @@ test('Bun-rendered bound links and symbols keep their attributes through adoptio
     await page.waitForFunction(() => document.querySelector('[data-testid="lnk"]').getAttribute('href') === 'https://example.com/a');
     const external = await read();
     // An authored `rel` keeps its tokens, and the ones a new browsing context needs join it (LLP 1141.002 D1).
-    const expected = (link, kept) => ({ attrs: { link, authored: ['_self', null], kept, symbols: ['', 'A person'] }, images: 1 });
+    const expected = (link, kept) => ({
+      attrs: { link, authored: ['_self', null], kept, symbols: ['', 'A person'], wide: [20, 5, 5] },
+      images: 1,
+    });
     const out = expected(['https://example.com/a', '_blank', 'external noopener'], 'noreferrer external noopener');
-    expect({ before, adopted, local, external }).toEqual({ before: out, adopted: out, local: expected(['/about', null, null], 'noreferrer'), external: out });
+    expect({ before, adopted, local, external }).toEqual({
+      before: out, adopted: out, local: expected(['/about', null, null], 'noreferrer'),
+      external: out,
+    });
   } finally {
     await browser?.close(); server?.stop(true); rmSync(dir, { recursive: true, force: true });
   }

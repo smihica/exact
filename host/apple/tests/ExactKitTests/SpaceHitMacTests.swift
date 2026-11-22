@@ -256,5 +256,50 @@ final class SpaceHitMacTests: XCTestCase {
         XCTAssertEqual(p.root.frame.width, 610, accuracy: 1e-6, "the plain box's right edge: 10 + 590 + 10")
         XCTAssertEqual(p.root.frame.height, 700, accuracy: 1e-6, "the moved box's child: 100 + 200 + 400")
     }
+
+    /// A one-axis overflow clip (`clip` beside `visible`) bounds descendants
+    /// on its clipped axis while still letting them extend `documentOverflow`
+    /// past its visible axis.
+    func testOneAxisClipExtendsDocumentOverflowOnItsVisibleAxisOnly() {
+        _ = NSApplication.shared
+        let p = Presenter()
+        p.viewport.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+        let window = NSWindow(contentRect: p.viewport.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = p.viewport
+        self.window = window
+        p.apply(wireBatch([
+            ["op": "create", "id": 1, "kind": "view", "style": [String: Any]()],
+            ["op": "create", "id": 2, "kind": "view", "style": ["overflow_x": "clip", "overflow_y": "visible"]],
+            ["op": "create", "id": 3, "kind": "view", "style": [String: Any]()],
+            ["op": "create", "id": 4, "kind": "view", "style": [String: Any]()],
+            ["op": "children", "id": 1, "ids": [2]],
+            ["op": "children", "id": 2, "ids": [3, 4]],
+            ["op": "roots", "ids": [1]],
+            ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 300.0],
+            ["op": "content", "id": 1, "w": 400.0, "h": 300.0],
+            ["op": "frame", "id": 2, "x": 10.0, "y": 10.0, "w": 100.0, "h": 50.0],
+            // Past the visible Y axis (bottom = 10 + 500 = 510), within clipped X.
+            ["op": "frame", "id": 3, "x": 10.0, "y": 400.0, "w": 40.0, "h": 100.0],
+            // Past the clipped X axis (right = 10 + 700 = 710): clipped to 110, must not widen root.
+            ["op": "frame", "id": 4, "x": 600.0, "y": 0.0, "w": 100.0, "h": 40.0],
+        ]))
+        p.viewport.layoutSubtreeIfNeeded()
+        p.fitDocument()
+        XCTAssertEqual(p.root.frame.width, 400, accuracy: 1e-6, "clipped X descendant must not widen document")
+        XCTAssertEqual(p.root.frame.height, 510, accuracy: 1e-6, "visible Y descendant extends document: 10 + 400 + 100")
+
+        let moveChild = wireBatch([["op": "present", "id": 3, "property": "translate", "x": 0, "y": 100]])
+        p.apply(moveChild)
+        XCTAssertEqual(p.root.frame.height, 610, accuracy: 1e-6)
+        p.apply(wireBatch([["op": "style", "id": 2, "style": ["overflow_x": "clip", "overflow_y": "clip"]]]))
+        XCTAssertEqual(p.root.frame.height, 300, accuracy: 1e-6)
+        XCTAssertTrue(p.preservesDocumentFit(moveChild))
+        p.apply(moveChild)
+        XCTAssertEqual(p.root.frame.height, 300, accuracy: 1e-6)
+
+        p.apply(wireBatch([["op": "present", "id": 2, "property": "translate", "x": 0, "y": 400]]))
+        XCTAssertEqual(p.root.frame.height, 460, accuracy: 1e-6, "the clipping box itself moved")
+    }
 }
 #endif

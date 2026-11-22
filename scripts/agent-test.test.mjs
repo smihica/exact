@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { encodePng } from './png.mjs';
 import { join } from 'node:path';
 import { failureMark, backendFetchPrefixes, churnLines, disabledExpectation, focusedExpectation, layoutExpectation, nativeFetchOrigins, NO_FAILURES, perfExpectation, pickHint, propertyHolds, testMutationClock, refusalExpectation, refuseDisabled, reloadWeb, runTests, serverRequest, testScope, textExpectation, treeExpectation, unarranged } from './agent-test.mjs';
 import { axFindings } from './agent-ax.mjs';
@@ -68,6 +69,10 @@ test('device properties see boot, typing and clock changes, and reset stays betw
         text "Toggle"
       input testId="field" value=textValue input=edit
       button "Enable" testId="enable" press=enable
+      row align-items="baseline"
+        text "Small" testId="small" font-size=12
+        text "Large" testId="large" font-size=32
+      box testId="inset" width=40 height="env(safe-area-inset-bottom)" background-color="#1280e0"
 `);
   writeFileSync(file, `always "ready stays"
   expect state ready stays true
@@ -95,14 +100,16 @@ test "reload is observed"
   const compiler = join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', 'contract');
   const compile = spawnSync(compiler, ['build', contract, '-o', plan], { cwd: root, encoding: 'utf8' });
   expect(compile.status, compile.stderr).toBe(0);
-  const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'caltrain', '--plan', plan, '--out', dist, '--render', 'none'], { cwd: root, encoding: 'utf8' });
+  writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Properties', app: { id: 'test.properties', name: 'Properties' }, host: { web: {} }, rust: false }));
+  const build = spawnSync(process.execPath, ['host/web-js/build.mjs', 'properties', '--plan', plan, '--out', dist, '--render', 'none'],
+    { cwd: root, env: { ...process.env, EXACT_APP_DIR: dir }, encoding: 'utf8' });
   expect(build.status, build.stderr).toBe(0);
   const server = createServer((req, res) => serveBuildTree(dist, req, res));
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     // Each step is said before it runs and each result as it lands, in order (agent.mjs prints them as they come).
     const heard = [];
-    const r = await runTests({ host: 'web', file, app: 'caltrain', url: `http://127.0.0.1:${server.address().port}/`,
+    const r = await runTests({ host: 'web', file, app: dir, webDist: dist, url: `http://127.0.0.1:${server.address().port}/`,
       atLine: ({ index, line, last, op }) => heard.push(`${index} ${line}/${last} ${op}`), atResult: (t) => heard.push(`= ${t.name}`) });
     expect(heard).toEqual(['0 14/16 tap', '0 15/16 type', '0 16/16 clock', '= the three observations', '1 18/18 type', '= a fresh history', '2 20/21 tap', '2 21/21 reload', '= reload is observed']);
     expect(heard.filter(h => h.startsWith('= ')).length).toBe(r.results.length);
@@ -123,19 +130,46 @@ test "reload is observed"
 test "boot only"
   expect state n == 0
 `);
-    const boot = await runTests({ host: 'web', file, app: 'caltrain', url: `http://127.0.0.1:${server.address().port}/` });
+    const boot = await runTests({ host: 'web', file, app: dir, webDist: dist, url: `http://127.0.0.1:${server.address().port}/` });
     expect(boot.failed).toBe(1);
+    const image = (r, g, b) => encodePng({ width: 40, height: 34, data: Buffer.from(Array.from({length: 40 * 34}, () => [r, g, b, 255]).flat()) });
+    writeFileSync(join(dir, 'inset.png'), image(18, 128, 224));
+    writeFileSync(join(dir, 'other.png'), image(250, 250, 0));
     writeFileSync(file, `test "bounded clock"
+  prefer safe-area "47 0 34 0"
+  expect layout "inset" height == 34
+  expect layout "inset" left == layout "field" left within 0.5
+  expect layout "inset" top >= layout "field" bottom
+  expect layout "small" baseline == layout "large" baseline
+  expect layout "small" baseline >= layout "small" top
+  expect layout "small" baseline <= layout "small" bottom
+  expect sample "inset" at 5 10 == "#1381dfff" within 1
+  expect screenshot "inset" matches "inset.png"
+  reload
+  expect layout "inset" height == 34
+  prefer safe-area "0 0 12 0"
+  expect layout "inset" height == 12
   clock +100
   expect state n >= 1
   expect state n <= 1
   expect state n in 0 1
   expect state textValue in "" "ok"
 test "wrong lower bound"
+  expect layout "inset" height == 0
   expect state n >= 1
+test "wrong paint"
+  expect layout "inset" baseline >= 0
+  prefer safe-area "0 0 34 0"
+  expect sample "inset" at 5 10 == "#1381df"
+  expect screenshot "inset" matches "other.png"
 `);
-    const bounds = await runTests({ host: 'web', file, app: 'caltrain', url: `http://127.0.0.1:${server.address().port}/` });
-    expect([bounds.passed, bounds.failed]).toEqual([1, 1]);
+    const bounds = await runTests({ host: 'web', file, app: dir, webDist: dist, url: `http://127.0.0.1:${server.address().port}/` });
+    expect(bounds.results[0].failures).toEqual([]);
+    expect([bounds.passed, bounds.failed]).toEqual([1, 2]);
+    const paintErrors = bounds.results[2].failures.join('\n');
+    expect(paintErrors).toContain('the host reports no text baseline');
+    expect(paintErrors).toContain('#1280e0ff');
+    expect(paintErrors).toContain('1360 of 1360 points differ');
     expect(bounds.results[1].failures.join('\n')).toContain('n is 0, expected >= 1');
 
     expect(boot.results[0].failures.join('\n')).toContain('at step 0: boot');
@@ -551,6 +585,10 @@ test('expect layout bounds the width or height `layout <target>` prints, and say
   expect(asked).toEqual([6, 6, 6, 2, 2, 2, 6]);
   expect((await step('gone', 'height', 'at-most', 24)).message).toBe('height of "gone" is absent (no view carries that testId)');
   expect(await step('tagline', 'height', 'at-most', 24)).toEqual({ message: `testId "tagline" is in the tree, but ${why}`, unshown: true });
+  const relative = { target: 'status-mark', dimension: 'centerY', comparison: 'equal',
+    value: { target: 'fixed-mark', dimension: 'bottom' }, tolerance: 136 };
+  expect(await layoutExpectation(s, tree, relative)).toBeNull();
+  expect((await layoutExpectation(s, tree, { ...relative, tolerance: 135 })).message).toContain('bottom of "fixed-mark" (19) within 135 pt');
   const boxless = (id) => layoutExpectation(s, [{ id, type: 'View', props: { testId: 'boxless' } }], { target: 'boxless', dimension: 'width', comparison: 'at-most', value: 1 });
   expect((await boxless(8)).message).toBe('width of "boxless" is unknown: native swipe action is not revealed');
   expect((await boxless(9)).message).toBe('width of "boxless" is unknown: the host reports no box for it');
@@ -792,7 +830,8 @@ test('expect refusal asserts an observed mutation failure and preserves unrelate
     'refused reply other; wall 1 ms: Not permitted',
     'showModal absent refused: no dialog has that id',
   ]);
-  expect(refusalExpectation({lines},'resource').message).toContain('no refused reply was observed');
+  expect(refusalExpectation({lines},'resource')).toEqual({expected:[lines[7]]});
+  expect(refusalExpectation({lines},'absent').message).toContain('no refused reply was observed');
   expect(refusalExpectation({lines:[]},'saved').message).toContain('clock data');
   // The same assertion cannot consume a refusal before the preceding assertion of the same slot's log cursor.
   expect(refusalExpectation({lines:lines.slice(2)},'saved').expected).toEqual([lines[3],lines[2]]);
@@ -807,7 +846,6 @@ test('expect refusal asserts an observed mutation failure and preserves unrelate
   expect(refusalsOf({lines:lines.slice(0,2),host:[mirror,mirror]},first.expected)).toEqual(['refused reply saved; wall 3 ms: Not permitted']);
   expect(refusalsOf({lines:repeated,host:[mirror,mirror,mirror]},[...first.expected,...first.expected])).toEqual(['refused reply saved; wall 3 ms: Not permitted']);
 });
-
 
 test('an authored expected refusal keeps a prior send value, skips then, and is accepted by verify', async () => {
   const {refusalsOf} = await import('./verify.mjs');
@@ -1247,7 +1285,7 @@ test('a module setting leaves native literal fetch grants available to faults', 
     mkdirSync(join(dir,'.exact'),{recursive:true});
     writeFileSync(join(dir,'.exact/typescript-inputs.json'),JSON.stringify({modules:['app.ts','src/api.ts'].map(file=>[file,join(dir,file)]),types:[]}));
     const origins = nativeFetchOrigins(dir, {});
-    expect(origins).toEqual(['http://127.0.0.1:9123']);
+    expect(origins).toEqual(['https:', 'http://127.0.0.1:9123']);
     expect(backendFetchPrefixes([{ steps: [{ op: 'fail-fetch', prefix: '/items' }] }], origins)[0].steps[0].prefix).toBe('http://127.0.0.1:9123/items');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1441,3 +1479,22 @@ test('single-value page facts replay by canonical name and drive-only forms are 
     expect(r.status, r.stdout + r.stderr).toBe(0);
   } finally {rmSync(dir, {recursive:true, force:true});}
 }, 30000);
+
+test('scheme net.fetch grants match fault prefixes on that scheme without warning (LLP 1156.007 §5.2)', async () => {
+  const { faultRequest, fetchOrigins, nativeFetchOrigins } = await import('./agent-test.mjs');
+  const warnings = [], dir = mkdtempSync(join(tmpdir(), 'exact-scheme-origins-'));
+  try {
+    mkdirSync(join(dir, '.gen'), { recursive: true }); mkdirSync(join(dir, '.exact'), { recursive: true });
+    writeFileSync(join(dir, 'app.json'), '{}'); writeFileSync(join(dir, '.exact/typescript-inputs.json'), JSON.stringify({ modules: [['app.ts', join(dir, 'app.ts')]], types: [] }));
+    writeFileSync(join(dir, '.gen/admission-data.js'), 'export const tsGrantSet = { entries: [[1, "net.fetch https:", ["fetch-scheme", "https"]]] };');
+    writeFileSync(join(dir, 'app.ts'), "export const grants = 'net.fetch https:';\n");
+    expect(fetchOrigins(dir)).toEqual(['https:']);
+    expect(nativeFetchOrigins(dir, {})).toEqual(['https:']);
+    expect(faultRequest('fail', ['fetch', 'https://'], ['https:'], s => warnings.push(s))).toEqual({ op: 'prefer', faults: { fail: 'https://' } });
+    expect(faultRequest('fail', ['fetch', 'https://social.example/api'], ['https:'], s => warnings.push(s))).toEqual({ op: 'prefer', faults: { fail: 'https://social.example/api' } });
+    expect(warnings).toEqual([]);
+    faultRequest('fail', ['fetch', 'http://wrong'], ['https:'], s => warnings.push(s));
+    expect(warnings).toHaveLength(1);
+    expect(() => faultRequest('pass', ['fetch', 'backend'], ['https:'])).toThrow(/exactly one/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

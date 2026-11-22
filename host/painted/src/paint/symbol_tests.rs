@@ -62,3 +62,126 @@ fn windows_and_android_draw_their_own_back_and_more() {
     }
     assert!(!inked(&mut material, "share", (14., 12.)));
 }
+
+#[test]
+fn template_clip_preserves_fractional_edge_coverage() {
+    let source = r#"component App
+  view
+    column width=24 height=121 align-items="start" padding-left=0.5 padding-top=0.5 background-color="white" color="black"
+      image "symbol:icon||0 0 20 20|M0 0H20V20H0Z|" width=20 height=20 object-fit="contain"
+      image "symbol:icon||0 0 20 20|M-2 0H22V20H-2Z|" width=20 height=20 object-fit="contain"
+      image "symbol:icon||0 0 40 20|M0 0H40V20H0Z|" width=20 height=20 object-fit="cover"
+      image "symbol:icon||0 0 20 20|M0 0H20V20H0Z|" width=20 height=20 object-fit="contain" border-radius=2
+      image "symbol:icon||0 0 20 20|M-2 0H20V20H0V10H-2Z|" width=20 height=20 object-fit="contain"
+      svg width=20 height=20 viewBox="0 0 20 20" overflow="visible"
+        path d="M0 0H20V20H0Z"
+"#;
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(source),
+        (),
+        (24., 121.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let frame = p.frame();
+    let row = |y| {
+        (0..24)
+            .map(|x| frame.pixel(x, y).unwrap().red())
+            .collect::<Vec<_>>()
+    };
+    let reference = row(110);
+    assert!(reference[0] > 0 && reference[0] < 255, "{reference:?}");
+    for y in [10, 30, 50, 70, 85, 95] {
+        assert_eq!(row(y), reference, "row {y}");
+    }
+    assert!(frame.pixel(0, 61).unwrap().red() > reference[0]);
+    assert_eq!(frame.pixel(10, 40), frame.pixel(10, 60));
+}
+
+#[test]
+fn template_view_boxes_fit_and_position_before_the_paths_are_painted() {
+    let mut source = String::from("component App\n  view\n    column width=160 gap=0 background-color=\"white\" color=\"black\"\n");
+    let mut expected = Vec::new();
+    for (w, h, contain, none) in [
+        (799.1, 184., (0, 22, 159, 57), (70, 38, 89, 41)),
+        (184., 799.1, (71, 0, 88, 79), (78, 30, 81, 49)),
+    ] {
+        for (fit, ink) in [
+            ("contain", contain),
+            ("fill", contain),
+            ("cover", (0, 0, 159, 79)),
+            ("none", none),
+            ("scale-down", none),
+        ] {
+            let id = expected.len();
+            source.push_str(&format!("      image \"symbol:icon||0 0 {w} {h}|M0 0H{w}V{h}H0Z|\" width=160 height=80 font-size=20 object-fit=\"{fit}\" testId=\"i{id}\"\n"));
+            expected.push(ink);
+        }
+    }
+    source.push_str("      image \"symbol:icon||0 0 400 100|M0 0H400V100H0Z|\" width=160 height=80 font-size=20 object-fit=\"contain\" object-position=\"left bottom\" testId=\"position\"\n");
+    expected.push((0, 40, 159, 79));
+    let (mut p, error) = Presenter::boot_with(
+        &crate::test_plan(&source),
+        (),
+        (160., 880.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let frame = p.frame();
+    for (i, want) in expected.into_iter().enumerate() {
+        let mut ink = (160, 80, 0, 0);
+        for y in 0..80 {
+            for x in 0..160 {
+                if frame
+                    .pixel(x, y + i as u32 * 80)
+                    .unwrap()
+                    .demultiply()
+                    .red()
+                    < 128
+                {
+                    ink = (ink.0.min(x), ink.1.min(y), ink.2.max(x), ink.3.max(y));
+                }
+            }
+        }
+        // The two rasterizers can choose adjacent antialiased edge pixels.
+        for (actual, expected) in [ink.0, ink.1, ink.2, ink.3]
+            .into_iter()
+            .zip([want.0, want.1, want.2, want.3])
+        {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "icon {i}: {ink:?} != {want:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sf_backed_icons_keep_a_square_intrinsic_box() {
+    for (w, h) in [(799.1, 184.0), (184.0, 799.1)] {
+        let source = format!("component App\n  view\n    row width=100 height=100 align-items=\"start\"\n      image \"symbol:icon|star|0 0 {w} {h}|M0 0H{w}V{h}H0Z|\" font-size=20 testId=\"icon\"\n");
+        let (p, error) = Presenter::boot_with(
+            &crate::test_plan(&source),
+            (),
+            (100., 100.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        let kernel = p.host().kernel();
+        let node = kernel
+            .node_by_key(kernel.find_by_test_id("icon")[0])
+            .unwrap();
+        let em = crate::paint::look::symbol_size(&node);
+        assert_eq!(crate::paint::look::symbol_natural(&node), (em, em));
+        assert_eq!((node.frame.width, node.frame.height), (em, em));
+    }
+}

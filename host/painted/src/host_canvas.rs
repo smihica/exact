@@ -41,6 +41,11 @@ impl<D: DataSource> Host<D> {
         for e in self.canvas2d.apply(lists) {
             self.runner.log(e);
         }
+        self.prune_canvas_pixels();
+        changed
+    }
+
+    pub(super) fn prune_canvas_pixels(&mut self) {
         let live = self.runner.canvas_views();
         self.canvas2d.retain(&live);
         // An image no mounted canvas's latest draw asked for is let go.
@@ -52,7 +57,6 @@ impl<D: DataSource> Host<D> {
             }
             named
         });
-        changed
     }
 
     /// A canvas capture (`exact_runner::canvas_capture`), carried out on
@@ -67,9 +71,8 @@ impl<D: DataSource> Host<D> {
         crate::canvas2d::capture(&self.canvas2d, found, roots, &grants, scope)
     }
 
-    /// Each 2D canvas's latest bitmap, for the painters.
-    pub(crate) fn canvas_snapshots(&self) -> BTreeMap<ViewId, crate::canvas2d::CanvasPaint> {
-        self.canvas2d.snapshots()
+    pub(crate) fn canvas_snapshots(&self) -> &crate::canvas2d::CanvasSnapshots {
+        &self.canvas2d.snapshots
     }
 
     /// Whether a 2D canvas asked for another frame (LLP 1056 D5).
@@ -77,10 +80,13 @@ impl<D: DataSource> Host<D> {
         self.runner.canvas_wants_frame()
     }
 
-    /// Whether the decoded `src` is held for the canvases.
+    /// The decoded pixels the canvases share.
     #[cfg(test)]
-    pub(crate) fn canvas_image_cached(&self, src: &str) -> bool {
-        self.canvas2d.images.contains_key(src)
+    pub(crate) fn cached_canvas_image(
+        &self,
+        src: &str,
+    ) -> Option<&std::sync::Arc<tiny_skia::Pixmap>> {
+        self.canvas2d.images.get(src).map(|image| &image.pixels)
     }
 
     /// `source` changed: forgotten, decoded or not, and decoded again
@@ -105,7 +111,7 @@ impl<D: DataSource> Host<D> {
                 let size = (pixels.width(), pixels.height());
                 self.canvas2d
                     .images
-                    .insert(source.to_owned(), std::sync::Arc::new(pixels));
+                    .insert(source.to_owned(), crate::canvas2d::CachedImage::new(pixels));
                 size
             });
         self.runner.canvas_image(source, result, &[]);

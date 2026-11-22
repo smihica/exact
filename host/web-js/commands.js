@@ -7,12 +7,13 @@
 // imports the ones its actions name and hands them to rt.js's `useCommands`
 // (emit.rs, LLP 1047.002 D1), so a command no action names is never linked.
 // The compiler reads this file's `export const` names as it is built.
-import { popoverCommand, appRootFontSize, liveById, declaredScheme, setFieldSelection, setFieldRangeText } from "./navigation.js";
+import { modalCommand, popoverCommand, appRootFontSize, liveById, declaredScheme, setFieldSelection, setFieldRangeText } from "./navigation.js";
 import { Kept, DEVELOPMENT_STORE, Hosts, KeyEvent, Propagating } from './rt.js';
 // A launch service can install its handlers before app() links the commands (LLP 1172.011 E1).
 export const observe = say => Hosts.observe ?? (name => say(`observe ${name}`));
 export const observeAttributes = () => Hosts.observeAttributes ?? (() => {});
 export const observeError = say => Hosts.observeError ?? (message => say(`observeError ${message}`));
+export const observeFeedback = say => Hosts.observeFeedback ?? (id => say(`observeFeedback ${id}`));
 // Commands run before the handler returns; beforeunload also needs Safari's returnValue.
 export const preventDefault = () => () => {
   KeyEvent?.preventDefault();
@@ -105,6 +106,8 @@ export const exitFullscreen = say => () => { if (document.fullscreenElement) doc
 export const setWindowOpacity = say => () => say("setWindowOpacity refused: a page cannot change its window's opacity");
 // A page cannot put its window away and keep running (LLP 1133.025 D4).
 export const hideWindow = say => () => say("hideWindow refused: a page cannot hide its window");
+// The commit that names it already ran its tree update inside the browser's view transition (rt.js, shared.js).
+export const startViewTransition = () => () => {};
 // A page cannot set the browser's zoom, which is the person's (LLP 1021 §5.3.1).
 export const setPageZoom = say => () => say("setPageZoom refused: the browser's zoom is the person's; a page cannot set it");
 // A recording of frames is the Apple hosts'; the browser's performance panel records the page.
@@ -129,10 +132,10 @@ export const relaunch = () => () => location.reload();
 // `window.close()` (studio diary R17): a browser closes only a window a
 // script opened, and says so in its console otherwise.
 // `close(id)` is a dialog's (LLP 1101.001 P5): HTMLDialogElement's.
-export const close = say => id => id == null ? window.close() : modal(id, say, "close");
+export const close = say => id => id == null ? window.close() : modalCommand(liveById(id), id, "close", say);
 // `showModal(id)` from an action (LLP 1115 D6): the dialog's own, or an
 // alertdialog popover's showPopover, as the native hosts present either.
-export const showModal = say => id => modal(id, say, "showModal");
+export const showModal = say => id => modalCommand(liveById(id), id, "showModal", say);
 export const showPopover = say => (id, source) => popoverCommand("showPopover", id, source, say);
 export const hidePopover = say => id => popoverCommand("hidePopover", id, null, say);
 export const togglePopover = say => (id, source) => popoverCommand("togglePopover", id, source, say);
@@ -156,11 +159,4 @@ function media(say, id, name, seconds) {
   const e = liveById(id);
   if (!e?.$media) return say(`${name} "${id}" refused: ${e ? "not a video or audio" : "no live node with that id"}`);
   e.$media.command(name, seconds);
-}
-
-function modal(id, say, method) {
-  const e = liveById(id);
-  if (e instanceof HTMLDialogElement) { if (method === "close") e.close(); else if (!e.open) e.showModal(); else say(`showModal "${id}" ignored: dialog is already open`); return; }
-  if (e?.popover != null && e.getAttribute("role") === "alertdialog") { if (method === "close") e.hidePopover(); else if (!e.matches(":popover-open")) e.showPopover(); return; }
-  if (method === "showModal") say(`showModal "${id}" refused: no dialog or alertdialog popover has that id`);
 }

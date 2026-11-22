@@ -28,6 +28,32 @@ pub enum Target {
 }
 
 impl Target {
+    /// The target that the part of a name between `--exact-` and its
+    /// family names: `native-<n>` for a chain entry from 1 to 255, a kind,
+    /// a relation, or `target-<name>` for a registered one; `None` for any
+    /// other part.
+    pub fn named(part: &str) -> Option<Target> {
+        if let Some(digits) = part.strip_prefix("native-") {
+            // As written: `native-02` and `native-+2` are no names
+            let n = digits.parse::<u8>().ok();
+            return n
+                .filter(|&n| n >= 1 && n.to_string() == digits)
+                .map(Target::Chain);
+        }
+        if let Some(name) = part.strip_prefix("target-") {
+            return valid_name(name).then(|| Target::Registered(name.into()));
+        }
+        (Kind::ALL
+            .into_iter()
+            .find(|k| k.name() == part)
+            .map(Target::Kind))
+        .or_else(|| {
+            (Relation::ALL.into_iter())
+                .find(|r| r.name() == part)
+                .map(Target::Relation)
+        })
+    }
+
     /// The custom property's name up to its edge, as an author writes it:
     /// `--exact-native-2-safe-area-inset-` for the second chain entry's
     /// safe area.
@@ -78,6 +104,12 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Its bit among a chain entry's kinds, by its discriminant, which is its
+    /// index in [`Kind::ALL`].
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
     /// Every kind, in wire order.
     pub const ALL: [Kind; 6] = [
         Kind::Owner,
@@ -164,9 +196,10 @@ pub struct NativeTarget {
 pub struct ChainEntry {
     /// The controller's view.
     pub target: NativeTarget,
-    /// The controller it is, where [`Kind`] names one: `Navigation`, `Tab`,
-    /// `Split` or `Column`; `None` for any other.
-    pub kind: Option<Kind>,
+    /// The kinds it is, as [`Kind::bit`]s: `Navigation`, `Tab`, `Split` or
+    /// `Column`, a navigation controller that is a split's column both, and
+    /// none for any other controller.
+    pub kinds: u8,
 }
 
 /// An owner's native targets, or the session view's (D2's owner update).
@@ -188,7 +221,7 @@ impl NativeTargets {
             Target::Kind(Kind::Owner) => chain(0),
             Target::Kind(Kind::Parent) => chain(1),
             Target::Kind(kind) => (self.chain.iter())
-                .find(|e| e.kind == Some(*kind))
+                .find(|e| e.kinds & kind.bit() != 0)
                 .map(|e| &e.target),
             Target::Relation(r) => (self.relations.iter())
                 .find(|(x, _)| x == r)
@@ -210,9 +243,15 @@ impl NativeTargets {
         if self.chain.len() > usize::from(u8::MAX) {
             return Some("a native chain longer than 255 entries; numbered names reach 255");
         }
-        if (self.chain.iter()).any(|e| matches!(e.kind, Some(Kind::Owner | Kind::Parent))) {
+        let positional = Kind::Owner.bit() | Kind::Parent.bit();
+        if (self.chain.iter()).any(|e| e.kinds & positional != 0) {
             return Some(
                 "a chain entry of kind owner or parent; those are entries 1 and 2 by position",
+            );
+        }
+        if (self.chain.iter()).any(|e| e.kinds >> Kind::ALL.len() != 0) {
+            return Some(
+                "a chain entry of an unknown kind; report navigation, tab, split or column",
             );
         }
         let relations = &self.relations;
@@ -255,11 +294,13 @@ impl Scope {
 const STALE: &str =
     "a stale generation: a report older than one already taken for this target; send its current one";
 
-/// Why `target`'s insets are refused, if they are.
+/// Why `target`'s insets are refused, if they are: a nonfinite one. A negative raw inset is
+/// taken, as UIKit gives a window's root one under a negative addition past its insets (LLP
+/// 1123 D11); a length that reads it is clamped to its property's range, as a `calc()` is.
 fn insets_refusal(target: &NativeTarget) -> Option<&'static str> {
     (target.insets)
-        .is_some_and(|i| !i.iter().all(|v| v.is_finite() && *v >= 0.0))
-        .then_some("nonfinite or negative insets; report a target without insets as unavailable")
+        .is_some_and(|i| !i.iter().all(|v| v.is_finite()))
+        .then_some("nonfinite insets; report a target without insets as unavailable")
 }
 
 /// Why `target` cannot be registered over `last`, the name's last

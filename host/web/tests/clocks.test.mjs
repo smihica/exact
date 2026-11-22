@@ -169,6 +169,21 @@ check('pulses that mount apart share a phase, and a resumed one rejoins it', asy
       return { held, times: [anim('waiting').currentTime, anim('authored').currentTime], end: clock.settle() };
     })()`);
     expect(revealed).toEqual({ held: [0, 0, 500], times: [250, 0], end: 1500 });
+
+    expect(await evaluate(`(async () => {
+      const { animationClock } = await import('./navigation.js');
+      const root = document.getElementById('exact-root');
+      root.replaceChildren();
+      const start = 4000, duration = 173 / 240 * 1000;
+      const animation = root.animate([{ opacity: 0 }, { opacity: 1 }], duration);
+      const clock = animationClock(() => start, () => null, () => {});
+      clock.register(start);
+      const deadline = clock.settle();
+      clock.seek(deadline - 1);
+      const before = animation.playState;
+      clock.seek(deadline);
+      return [deadline, before, animation.playState];
+    })()`)).toEqual([4000 + 173 / 240 * 1000, 'paused', 'finished']);
   } finally {
     await suite.close();
     server.close();

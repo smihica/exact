@@ -98,6 +98,146 @@ fn apart(a: &str, b: &str) -> bool {
     p.next_including_whitespace_and_comments().is_ok() && p.position().byte_index() == a.len()
 }
 
+/// Substitute a position as one token stream before reading its coordinates.
+/// With no environment, validate substitutions and retain the specified value.
+pub(crate) fn position_tokens(text: &str, env: Option<&Env>) -> Option<(String, bool)> {
+    fn walk(
+        p: &mut Parser<'_, '_>,
+        env: Option<&Env>,
+        tokens: &mut Vec<String>,
+        deferred: &mut bool,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > super::MAX_DEPTH {
+            return None;
+        }
+        loop {
+            let start = p.position();
+            let Ok(token) = p.next_including_whitespace_and_comments().cloned() else {
+                return Some(());
+            };
+            let close = match token {
+                Token::Comment(_) => continue,
+                Token::BadString(_)
+                | Token::BadUrl(_)
+                | Token::CloseParenthesis
+                | Token::CloseSquareBracket
+                | Token::CloseCurlyBracket
+                | Token::Semicolon
+                | Token::Delim('!') => return None,
+                Token::Function(name) if name.eq_ignore_ascii_case("env") => {
+                    let (term, fallback) = p
+                        .parse_nested_block(|p| {
+                            env_parts(p, depth).map_err(|_| p.new_custom_error::<(), ()>(()))
+                        })
+                        .ok()?;
+                    *deferred |= fallback.is_some();
+                    match env {
+                        Some(env) => {
+                            if let Some(value) = term.value(env) {
+                                tokens.push(format!("{value}px"));
+                            } else {
+                                let mut input = ParserInput::new(fallback.as_deref()?);
+                                walk(
+                                    &mut Parser::new(&mut input),
+                                    Some(env),
+                                    tokens,
+                                    deferred,
+                                    depth + 1,
+                                )?;
+                            }
+                        }
+                        None => tokens.push(p.slice_from(start).to_string()),
+                    }
+                    continue;
+                }
+                Token::Function(name) if name.eq_ignore_ascii_case("var") => {
+                    *deferred = true;
+                    p.parse_nested_block(|p| {
+                        let name = p.expect_ident()?.to_string();
+                        if !name.starts_with("--") || name.len() <= 2 {
+                            return Err(p.new_custom_error(()));
+                        }
+                        let fallback = if p.is_exhausted() {
+                            None
+                        } else {
+                            p.expect_comma()?;
+                            let start = p.position();
+                            let mut fallback = Vec::new();
+                            // A fallback is validated even when the variable is defined.
+                            walk(p, None, &mut fallback, deferred, depth + 1)
+                                .ok_or(p.new_custom_error(()))?;
+                            Some(p.slice_from(start).to_string())
+                        };
+                        if let Some(env) = env {
+                            let mut value = String::new();
+                            if let Some(edge) = name
+                                .strip_prefix(super::super::env::LOCAL_PREFIX)
+                                .and_then(super::super::env::Edge::from_name)
+                            {
+                                value = format!("{}px", env.local_inset(edge));
+                            } else if let Some(node) = env.property(&name) {
+                                super::text::length(node, &mut value);
+                            } else if let Some(fallback) = fallback {
+                                value = fallback;
+                            } else {
+                                return Err(p.new_custom_error(()));
+                            }
+                            let mut input = ParserInput::new(&value);
+                            walk(
+                                &mut Parser::new(&mut input),
+                                Some(env),
+                                tokens,
+                                deferred,
+                                depth + 1,
+                            )
+                            .ok_or(p.new_custom_error(()))?;
+                        }
+                        Ok::<_, ParseError<'_, ()>>(())
+                    })
+                    .ok()?;
+                    continue;
+                }
+                Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("em") => {
+                    tokens.push(format!("{}px", value * env.map_or(1.0, |e| e.font_size)));
+                    continue;
+                }
+                Token::Function(_) | Token::ParenthesisBlock => ")",
+                Token::SquareBracketBlock => "]",
+                Token::CurlyBracketBlock => "}",
+                _ => {
+                    tokens.push(p.slice_from(start).to_string());
+                    continue;
+                }
+            };
+            tokens.push(p.slice_from(start).to_string());
+            p.parse_nested_block(|p| {
+                walk(p, env, tokens, deferred, depth + 1).ok_or(p.new_custom_error::<(), ()>(()))
+            })
+            .ok()?;
+            tokens.push(close.into());
+        }
+    }
+    let mut input = ParserInput::new(text);
+    let mut tokens = Vec::new();
+    let mut deferred = false;
+    walk(
+        &mut Parser::new(&mut input),
+        env,
+        &mut tokens,
+        &mut deferred,
+        0,
+    )?;
+    let mut out = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 && !apart(&tokens[i - 1], token) {
+            out.push_str("/**/");
+        }
+        out.push_str(token);
+    }
+    Some((out, deferred))
+}
+
 /// The `f64` points a substituted length is under `env`, against `basis`.
 pub(super) fn value(d: Dimension, env: &Env, basis: Option<f64>) -> Option<f64> {
     Some(match d.resolve(env) {

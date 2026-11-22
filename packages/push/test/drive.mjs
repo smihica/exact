@@ -7,14 +7,17 @@
 //   is the answer and the live value; a value preferred later is a rotation.
 // - Bound (`--bound`): the system's prompt, allowed through SpringBoard,
 //   then the system's answer to the registration: the call answers a
-//   subscription and the live value shows its token, or the call fails with
-//   the system's own failure (never the package's 60 s bound); then a
-//   relaunch that only reads `pushSubscription()` answers the same token.
+//   subscription and the live value shows its token, each with the bundle
+//   id the token was issued to and one installation ID, or the call fails
+//   with the system's own failure (never the package's 60 s bound); then a
+//   relaunch that only reads `pushSubscription()` answers the same token
+//   and installation ID.
 //
 // - On this Mac (`word.swift`, `service-reference.swift`): the branch `subscribePush()` takes for each
 //   notification authorization, from the function it switches on, and the
 //   state `pushPermissionState()` reads: only `notDetermined` asks;
-//   provisional and ephemeral register without asking, as authorized does.
+//   provisional and ephemeral register without asking, as authorized does;
+//   and the installation ID, kept once on this device only.
 //
 // usage: bun packages/push/test/drive.mjs [--bound] [--sim <udid>] [--keep]
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -78,6 +81,7 @@ run('bun', ['install'], app);
 const flags = [...(sim ? ['--sim', sim] : []), '--storage', 'push', '--reset-storage'];
 const agent = (...ops) => JSON.parse(`[${run('bun', ['exact.mjs', 'agent', 'ios', '--json', ...flags, ...ops], app).trim().split('\n').filter((l) => l.startsWith('{')).join(',')}]`);
 const text = (tree, testId) => tree?.nodes?.find((n) => n.props?.testId === testId)?.props?.text;
+const apple = (deviceToken) => JSON.stringify({ apple: { deviceToken, appId: id, installationId: '6f1d3a52-8c0e-4b7a-9e21-5d4c3b2a1f00' } });
 
 {
   // The web has no implementation: its declared absence, not an error, whatever the permission.
@@ -95,13 +99,13 @@ const text = (tree, testId) => tree?.nodes?.find((n) => n.props?.testId === test
   const allowed = agent('tap subscribe', `tap @${permission} allow`, 'state').at(-1);
   const value = (allowed.pending ?? []).find((p) => p.device?.capability === 'subscription')?.ticket;
   check('allowed, it waits on the subscription\'s value', value != null && allowed.extensions?.push?.permissions?.notifications === 'granted', JSON.stringify(allowed.pending));
-  const answered = agent('tap subscribe', `tap @${permission} allow`, `type @${value} {"apple":{"deviceToken":"ab12"}}`, 'clock settle', 'tree',
-    'prefer extension push.pushSubscription={"apple":{"deviceToken":"cd34"}}', 'clock settle', 'tree');
+  const answered = agent('tap subscribe', `tap @${permission} allow`, `type @${value} ${apple('ab12')}`, 'clock settle', 'tree',
+    `prefer extension push.pushSubscription=${apple('cd34')}`, 'clock settle', 'tree');
   const [first, rotated] = answered.filter((r) => Array.isArray(r.nodes));
   check('the value answers the call and is the live value', text(first, 'subscribed') === 'answered' && text(first, 'token') === 'ab12', JSON.stringify([text(first, 'subscribed'), text(first, 'token')]));
   check('a value preferred later is a rotation the source reads', text(rotated, 'token') === 'cd34', text(rotated, 'token'));
   // While permission is not granted the subscription reads none, a token given before included; granted, the token.
-  const turned = agent('--permission', 'notifications=denied', 'prefer extension push.pushSubscription={"apple":{"deviceToken":"ef56"}}', 'clock settle', 'state', 'tree',
+  const turned = agent('--permission', 'notifications=denied', `prefer extension push.pushSubscription=${apple('ef56')}`, 'clock settle', 'state', 'tree',
     'prefer permission.notifications granted', 'clock settle', 'tree');
   const [deniedState] = turned.filter((r) => r.slots);
   const [denied, granted] = turned.filter((r) => Array.isArray(r.nodes));
@@ -117,6 +121,7 @@ if (argv.includes('--bound')) {
   const flat = (n) => [n, ...(n.children ?? []).flatMap(flat)];
   const read = async (s) => { await s.clock('settle'); return text(await s.tree(), 'token'); };
   let token = null;
+  let installation = null;
   let s = await open({ host: 'ios', touch: 'drag', bind: 'push' });
   try {
     await s.tap('subscribe');
@@ -133,6 +138,11 @@ if (argv.includes('--bound')) {
     const failed = state.failed?.subscribed ?? '';
     if (/^[0-9a-f]+$/.test(token ?? '')) {
       check(`bound, the call answers the system's token (${token.length / 2} bytes) and the live value shows it`, answered === 'answered' && state.slots?.subscribed?.apple?.deviceToken === token, JSON.stringify([answered, state.slots?.subscribed]));
+      const named = [state.slots?.subscribed?.apple?.appId, state.resources?.subscription?.apple?.appId];
+      check('bound, the call\'s answer and the live value name the installed bundle id', named.every((appId) => appId === id), JSON.stringify(named));
+      const installations = [state.slots?.subscribed?.apple?.installationId, state.resources?.subscription?.apple?.installationId];
+      installation = installations[0];
+      check('bound, the call\'s answer and the live value carry one installation UUID', /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(installation ?? '') && installations[1] === installation, JSON.stringify(installations));
     } else {
       // A failure the system forwarded carries its own message; the package's bound is no answer at all.
       const bounded = /no answer to the registration/.test(journal + failed);
@@ -147,6 +157,8 @@ if (argv.includes('--bound')) {
       let again = 'none';
       for (let i = 0; i < 20 && (again = await read(s)) === 'none'; i++) await Bun.sleep(1000);
       check('a relaunch that only reads pushSubscription() answers the current token', again === token, again);
+      const kept = (await s.state()).resources?.subscription?.apple?.installationId;
+      check('a relaunch answers the same installation ID', kept === installation, JSON.stringify([kept, installation]));
     } finally { await s.close?.(); }
   }
 }

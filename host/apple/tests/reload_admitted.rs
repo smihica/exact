@@ -1,12 +1,16 @@
 //! LLP 1047.001 D6: a development binary links every family, so a reload
 //! from hello's plan into a plan that uses one is committed as the next
-//! generation. `reload_refused.rs` is hello's composition.
+//! generation, and an entry boots. `reload_refused.rs` is hello's
+//! composition.
 
 use exact_apple::abi::{Bridge, Hooks};
 
 #[path = "reload/common.rs"]
 mod common;
-use common::{boot, digest, media, plan, source, NoData, ACTIVITIES, ANIMATED, TRACING};
+use common::{
+    boot, boot_entry, digest, entry, media, plan, source, NoData, ACTIVITIES, ANIMATED, SEARCH,
+    TOOLS, TRACING,
+};
 
 #[test]
 fn an_all_linked_binary_reloads_from_hello_into_each_family() {
@@ -51,6 +55,7 @@ fn an_all_linked_binary_reloads_from_hello_into_each_family() {
         ("file input", plan("input type=\"file\" id=\"f\"")),
         ("trace", source(TRACING)),
         ("wake lock", plan("text \"a\" wakelock=\"screen\"")),
+        ("markdown", plan("text \"**a**\" markup=\"markdown\"")),
         (
             "route",
             plan("column navigationKey=\"a\"\n      text \"a\""),
@@ -67,6 +72,11 @@ fn an_all_linked_binary_reloads_from_hello_into_each_family() {
             "history",
             plan("column navigationKey=\"a\" navigationHistory=\"back\"\n      text \"a\""),
         ),
+        ("selectable text", plan("text \"a\" user-select=\"text\"")),
+        ("canvas", plan("canvas surface=dot() width=40 height=40")),
+        ("tools", source(TOOLS)),
+        ("content_index", source(SEARCH)),
+        ("dialog", plan("dialog id=\"d\"\n      text \"a\"")),
     ]
     .into_iter()
     .chain(media().map(|(next, name)| (name, next)))
@@ -81,4 +91,11 @@ fn an_all_linked_binary_reloads_from_hello_into_each_family() {
         assert!(!reply.contains("Unlinked"), "{view}: {reply}");
         assert_ne!(digest(&mut bridge), before, "{view}");
     }
+}
+
+/// All linked, an entry boots.
+#[test]
+fn an_all_linked_binary_boots_an_entry() {
+    let reply = boot_entry(&entry());
+    assert!(!reply.contains("\"error\":\""), "{reply}");
 }

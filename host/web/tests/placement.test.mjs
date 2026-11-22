@@ -10,7 +10,7 @@ import {decodePng} from '../../../scripts/png.mjs';
 
 const engineTest = await engineTests(['chromium', 'firefox', 'webkit']);
 const placementSource = glueDeclarations(hostFixtureFile(process.env.E2B_GPU_SOURCE || new URL('../gpu-glue.js', import.meta.url), 'utf8'),
-  ['childFrames', 'PLACEMENT_OPACITY', 'placementStyle', 'placementOpacity', 'restoreChild', 'supplyChildren', 'clipPath', 'placeChildren']);
+  ['childFrames', 'PLACEMENT_OPACITY', 'placementStyle', 'placementOpacity', 'restoreChild', 'supplyChildren', 'clipPath', 'placeChildren', 'beforeStyle', 'afterStyle']);
 const childrenCase = glueCase(wasmSource, 'children');
 
 // The production placement code over a canvas host in a page: `child()` adds a 40px red label, `layout()` supplies
@@ -48,7 +48,8 @@ async function browserPlacement(engine, run) {
         gpu_placement:(_,i,out)=>{out.set([1,0,10+i*50,0,1,10,0,0,1,-1]);return window.outcome;},
         gpu_placement_opacity:()=>window.factor,
       };
-      const placement = new Function('gpu', source + ';return {supplyChildren,placeChildren,placementStyle};')(gpu);
+      const placement = new Function('gpu', 'surfaces', source + ';return {supplyChildren,placeChildren,placementStyle,beforeStyle,afterStyle};')(gpu, new Map([[entry.id, entry]]));
+      (globalThis.exact ??= {}).gpu = placement;
       document.head.append(Object.assign(document.createElement('style'), {textContent:placement.placementStyle}));
       window.layout = () => {placement.supplyChildren(entry);placement.placeChildren(entry);};
       window.child = (tag = 'div', cls = '') => {
@@ -108,6 +109,65 @@ for (const engine of ['chromium', 'firefox', 'webkit']) {
     await page.evaluate(() => {outcome=0;layout();});
     await paintedOpacity(page,[.8]);
     assert.equal(await page.evaluate(() => label.style.opacity),'0.8');
+  }));
+
+  engineTest[engine](`${engine}: placing class-positioned labels keeps their authored frames`, () => browserPlacement(engine, async page => {
+    const result = await page.evaluate(() => {
+      const labels = [child(), child()];
+      for (const el of labels) el.style.removeProperty('position');
+      const frames = [];
+      gpu.gpu_child_view = (_, i, name, ...frame) => { frames[i] = frame; };
+      layout(); layout();
+      return {frames, positions: labels.map(el => [el.style.position, getComputedStyle(el).position])};
+    });
+    assert.deepEqual(result, {frames:[[10,10,40,40],[60,10,40,40]],positions:[['','absolute'],['','absolute']]});
+  }));
+
+  engineTest[engine](`${engine}: a placed label follows a conditional position class at a breakpoint`, () => browserPlacement(engine, async page => {
+    await page.evaluate(async () => {
+      const {commit, scope, sig, write} = await import('/rt.js');
+      const {Pc} = await import('/lower.js');
+      const el = child(), wide = matchMedia('(min-width: 450px)');
+      el.style.removeProperty('position');
+      const arm = sig(Number(wide.matches));
+      wide.addEventListener('change', () => commit(() => write(arm.n, Number(wide.matches))));
+      scope(() => Pc(el, arm, 'label ', 'xa-placement', [['static'], ['absolute']], ['position'],
+        (set, [position]) => set(el, 'position', '', () => position)));
+      layout();
+    });
+    const label = page.locator('.label');
+    assert.equal(await label.evaluate(el => getComputedStyle(el).position), 'relative');
+    await page.setViewportSize({width:500, height:100});
+    await page.waitForFunction(() => document.querySelector('.xa-placement-1'));
+    assert.equal(await label.evaluate(el => getComputedStyle(el).position), 'absolute');
+    await page.setViewportSize({width:400, height:100});
+    await page.waitForFunction(() => document.querySelector('.xa-placement-0'));
+    assert.equal(await label.evaluate(el => getComputedStyle(el).position), 'relative');
+    await page.evaluate(() => {outcome=0;layout();});
+    assert.equal(await label.evaluate(el => getComputedStyle(el).position), 'static');
+  }));
+
+  engineTest[engine](`${engine}: updating a placed label keeps its placement and restores the latest binding values`, () => browserPlacement(engine, async page => {
+    const result = await page.evaluate(async () => {
+      const {css} = await import('/rt.js');
+      const label = child();
+      const styles = () => ['position','transform','transform-origin','z-index','visibility'].map(prop => label.style.getPropertyValue(prop));
+      layout();
+      for (const [prop, value] of Object.entries({position:'relative', transform:'rotate(7deg)', 'transform-origin':'center', 'z-index':7, visibility:'hidden'})) {
+        css(label, prop, '', value);
+      }
+      const immediate = styles();
+      layout();
+      const placed = styles();
+      window.outcome=0; layout();
+      return {immediate, placed, unplaced: styles()};
+    });
+    assert.deepEqual(result.immediate, result.placed);
+    assert.match(result.placed[1], /^matrix3d\(/);
+    assert.match(result.placed[2], /^0px 0px(?: 0px)?$/);
+    assert.deepEqual(result.placed.slice(3), ['-1','hidden']);
+    assert.match(result.unplaced[2], /^center center(?: 0px)?$/);
+    assert.deepEqual(result.unplaced.filter((_, i) => i !== 2), ['relative','rotate(7deg)','7','hidden']);
   }));
 
   engineTest[engine](`${engine}: placement opacity defaults, clamps and leaves a transparent label activatable`, () => browserPlacement(engine, async page => {

@@ -2,11 +2,23 @@
 //! The kernel owns range reconciliation; this module only reads and writes
 //! the named JSON fields the hosts receive, and the declaration table.
 
+use exact_kernel::gradient::{color_text, ColorText};
+use exact_kernel::style::wide::Keep;
 use exact_kernel::text::decorations::{Decorations, Range, Span};
-use exact_kernel::{StyleId, StyleProps, StyleValue};
-use exact_plan::Value;
+use exact_kernel::{ColorValue, PropValue, RowValue, StyleId, StyleProps, StyleValue};
+use exact_plan::{Plan, Value};
 use serde_json::{json, Value as Json};
 use std::collections::BTreeMap;
+
+type Rows = BTreeMap<String, Vec<(u16, Json)>>;
+
+fn style_value(value: &Json) -> Option<StyleValue<'_>> {
+    match value {
+        Json::String(text) => Some(StyleValue::Text(text.as_str().into())),
+        Json::Number(number) => number.as_f64().map(StyleValue::Number),
+        _ => None,
+    }
+}
 
 /// The `decoration` declarations visible to one field, decoded with the
 /// same style codecs as node rows.
@@ -14,34 +26,18 @@ use std::collections::BTreeMap;
 pub struct StyleTable(BTreeMap<String, StyleProps>);
 
 impl StyleTable {
-    /// Read the compiler's ordered `[kernelStyleId, literal]` rows.
+    /// Read ordered `[kernelStyleId, literal]` rows. An invalid value leaves
+    /// the other properties and declarations available to their spans.
     pub fn decode(text: &str) -> Result<Self, String> {
-        let table: BTreeMap<String, Json> =
-            serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let table: Rows = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let mut styles = BTreeMap::new();
         for (name, rows) in table {
-            let Some(rows) = rows.as_array() else {
-                return Err("decoration styles: expected rows".into());
-            };
             let mut patch = StyleProps::default();
-            for row in rows {
-                let Some(row) = row.as_array().filter(|row| row.len() == 2) else {
-                    return Err("decoration styles: invalid row".into());
-                };
-                let id = row[0]
-                    .as_u64()
-                    .and_then(|id| StyleId::from_bit(u32::try_from(id).ok()?))
-                    .ok_or("decoration styles: unknown row")?;
-                let value = match &row[1] {
-                    Json::String(text) => StyleValue::Text(text.as_str().into()),
-                    Json::Number(number) => StyleValue::Number(
-                        number.as_f64().ok_or("decoration styles: invalid number")?,
-                    ),
-                    _ => return Err("decoration styles: expected literal".into()),
-                };
-                patch
-                    .set_dynamic(id, &value)
-                    .map_err(|error| format!("decoration styles: {error:?}"))?;
+            for (id, value) in rows {
+                let id =
+                    StyleId::from_bit(u32::from(id)).ok_or("decoration styles: unknown row")?;
+                let value = style_value(&value).ok_or("decoration styles: expected literal")?;
+                let _ = patch.set_dynamic(id, &value);
             }
             styles.insert(name, patch);
         }
@@ -57,6 +53,124 @@ impl StyleTable {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.0.keys().map(String::as_str)
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedStyles {
+    pub(crate) value: PropValue,
+    pub(crate) tokens: u64,
+    // Positions in the unchanged authored table, including rows omitted from the wire.
+    rows: BTreeMap<usize, ResolvedRow>,
+    _wide: Keep,
+}
+
+impl ResolvedStyles {
+    // Wire serialization can consult the session's role overrides through aliases.
+    pub(crate) fn reads_roles(&self) -> bool {
+        self.rows
+            .values()
+            .any(|row| matches!(row.color, Some(ColorValue::Role(_))))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRow {
+    text: String,
+    color: Option<ColorValue>,
+}
+
+impl ResolvedRow {
+    fn from_style(patch: &StyleProps, id: StyleId) -> Self {
+        let (text, color) = match patch.get(id) {
+            RowValue::ColorValue(color) => {
+                let mut text = String::new();
+                color_text(&mut text, color, ColorText::Wire);
+                (text, Some(color))
+            }
+            RowValue::Enum(keyword) => (keyword.into(), None),
+            RowValue::TextShadow(shadow) => (shadow.wire(), shadow.shadow().and_then(|s| s.color)),
+            _ => unreachable!(),
+        };
+        Self { text, color }
+    }
+}
+
+/// Select Forma values in the field's app tuple (LLP 1121 D7). A refused
+/// row keeps its last accepted value, if any (D13).
+pub(crate) fn resolve_styles(
+    plan: &Plan,
+    tuple: u32,
+    text: &PropValue,
+    previous: Option<&ResolvedStyles>,
+) -> ResolvedStyles {
+    use exact_kernel::style::theme;
+    let mut resolved = ResolvedStyles {
+        value: text.clone(),
+        tokens: 0,
+        rows: BTreeMap::new(),
+        _wide: Keep::default(),
+    };
+    if plan.theme.is_empty() {
+        return resolved;
+    }
+    let Some(mut table) = text
+        .as_str()
+        .and_then(|raw| serde_json::from_str::<Rows>(raw).ok())
+    else {
+        return resolved;
+    };
+    let _theme = theme::bind(&crate::bridge::theme_table_at(plan, tuple));
+    theme::take_named();
+    let mut position = 0;
+    for rows in table.values_mut() {
+        rows.retain_mut(|(id, row)| {
+            let index = position;
+            position += 1;
+            let Some(id @ (StyleId::TextColor | StyleId::BackgroundColor | StyleId::TextShadow)) =
+                StyleId::from_bit(u32::from(*id))
+            else {
+                return true;
+            };
+            let Some(value) = style_value(row) else {
+                return true;
+            };
+            let mut patch = StyleProps::default();
+            let set = patch.set_dynamic(id, &value);
+            let read = theme::take_named();
+            if read == 0 {
+                return true;
+            }
+            resolved.tokens |= read;
+            let paint = if set.is_ok() && patch.mask.has(id) {
+                Some(ResolvedRow::from_style(&patch, id))
+            } else {
+                previous.and_then(|styles| styles.rows.get(&index)).cloned()
+            };
+            let Some(paint) = paint else {
+                return false;
+            };
+            *row = Json::String(paint.text.clone());
+            resolved.rows.insert(index, paint);
+            true
+        });
+    }
+    if resolved.tokens != 0 {
+        resolved.value = PropValue::Str(
+            serde_json::to_string(&table)
+                .expect("style rows serialize")
+                .into(),
+        );
+        // Hosts parse the wire text again when painting, even after a sweep.
+        resolved._wide = Keep::of(|mark| {
+            for paint in resolved.rows.values() {
+                if let Some(color) = paint.color {
+                    mark.color(color);
+                }
+            }
+        });
+    }
+    resolved.tokens |= previous.map_or(0, |styles| styles.tokens);
+    resolved
 }
 
 /// Read a field's `decorations` prop. An invalid record is refused as a
@@ -229,6 +343,22 @@ mod tests {
         assert!(table.get("unknown").is_none());
         assert_eq!(table.names().collect::<Vec<_>>(), ["mention"]);
         assert!(StyleTable::decode(r#"{"bad":[[65535,1]]}"#).is_err());
+    }
+
+    #[test]
+    fn a_refused_colour_leaves_the_other_paint_rows_available() {
+        let table = json!({
+            "mention": [
+                [StyleId::TextColor as u16, "unavailable"],
+                [StyleId::TextDecorationLine as u16, "underline"],
+            ],
+            "link": [[StyleId::TextColor as u16, "#1083fe"]],
+        });
+        let table = StyleTable::decode(&table.to_string()).unwrap();
+        let mention = table.get("mention").unwrap();
+        assert!(!mention.mask.has(StyleId::TextColor));
+        assert!(mention.mask.has(StyleId::TextDecorationLine));
+        assert!(table.get("link").unwrap().mask.has(StyleId::TextColor));
     }
 
     #[test]

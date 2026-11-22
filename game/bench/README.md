@@ -1783,4 +1783,295 @@ retirement was a whole unit of the allowance.
 The p95 of the flying pairs is `prepare`'s and differs between the two runs by more
 than the draws cost, so it says nothing about them.
 
-Not taken: an iPad and a Pixel 5. The script's `ios` carrier has not run on a device.
+Not taken: an iPad. The script's `ios` carrier has not run on a device.
+
+### Pixel 5, 2026-11-19
+
+Pixel 5 (Snapdragon 765G, Adreno 620, 8 cores), Android 14, on USB power, its
+display in Android's default adaptive mode and not pinned: 90 Hz (11.11 ms) when
+read before and after the rows, and through the Chrome rows, whose animation
+callback ran every 11.1 ms; not read during the native rows. The native rows are the release APK on the Canvas reader
+(Vulkan) at 1080 × 2138; the web rows are Chrome 155.0.8059.87 on WebGPU, `web`
+profile, at 1080 × 1984. Taken on `d4cd2c7d5` with the script's phone hosts as they
+were first written, with the same windows, switches and "game guess" as the Mac's
+rows. Read beside the rows with adb, not by the script: the display mode, the
+battery's temperature (20.9 to 27.9 °C over the two hours) and Android's
+thermal status (0 throughout); the engine reports no thermal state on Android.
+Uncalibrated.
+
+| Renderer | Switches | Window filled | Frame interval p50, p95 | `prepare` p50, p95 | `prepare` share | Refill p50; p95 | Refills finished; started, a window |
+|---|---|---|---|---|---|---|---|
+| Vulkan | `move=fly` | 14.8 s | 18.3–18.4, 24.1–24.3 ms | 0.02–0.03, 8.3–8.4 ms | 15–16 % | 373–375 ms; 398–414 ms | 75; 75–76 |
+| Vulkan | `move=fly light=8000 compare=on` | not in 60 s | 16.6, 23.1–23.3 ms | 6.9, 7.5 ms | 38 % | 6.3–6.4 s; 7.2–8.8 s | 30, 20, 28; 75 |
+| Vulkan | `move=fly`, game guess | not in 60 s | 15.8–15.9, 24.2–24.4 ms | 11.0–11.1, 12.1–12.2 ms | 64–65 % | none | 0; 75 |
+| Vulkan | `move=walk light=8000 compare=on` | 37.8 s | 18.2–18.3, 23.8–24.4 ms | 4.1–4.3, 7.2 ms | 18 % | 2.00–2.06 s; 2.07–2.11 s | 15; 15 |
+| Vulkan | `move=walk`, game guess | not in 60 s | 16.7–17.2, 24.5–25.1 ms | 8.6–9.5, 10.2–11.5 ms | 47–54 % | none | 0; 15 |
+| Chrome, WebGPU | `move=fly` | not in 60 s | 11.1, 22.2–22.3 ms | 0.2, 8.0–8.4 ms | 9 % | none | 0; 75 |
+| Chrome, WebGPU | `move=fly light=8000 compare=on` | not in 60 s | 11.1, 22.2–22.3 ms | 0.5–1.1, 8.8–8.9 ms | 18–19 % | none | 0; 75 |
+| Chrome, WebGPU | `move=fly`, game guess | not in 60 s | 11.1, 22.2–22.3 ms | 9.7–9.9, 13.1–13.3 ms | 59–63 % | none | 0; 75 |
+| Chrome, WebGPU | `move=walk light=8000 compare=on` | not in 60 s | 11.1, 22.2 ms | 0.2–0.6, 2.8–4.7 ms | 5–7 % | none | 0; 15 |
+| Chrome, WebGPU | `move=walk`, game guess | not in 60 s | 11.1, 22.2 ms | 0.2–5.3, 8.5–10.7 ms | 15–31 % | none | 0; 15 |
+
+"Window filled" is within the 60 s the script waits. A refill that finishes in a
+window may have started in the one before.
+
+On Vulkan the GPU's frame time is 17.6 to 18.6 ms at the median (17.9 to 20.4 ms
+at p95) in every row, against a display period of 11.1 ms at 90 Hz and 16.7 ms
+at 60; the frame interval's
+median is 15.8 to 18.4 ms and the encode's 4.6 to 12.1 ms. At the fixture's fixed
+`High` quality the passes' p95 are: bloom 10.0 to
+11.9 ms, the forward pass with the sky 4.4 to 6.7 ms, the tone map 3.6 to 5.3 ms.
+The frame thread still limits the terrain: meshing alone does all a flight asks
+(97,200 operations a window) and refills in half a crossing; with lighting and the
+reuse compare it does 572,000 to 599,000 of the 3.98 million a flight asks, and the
+window never fills. `prepare` ends past its deadline in every frame of the three
+rows that never fill, and in about half the frames of the two that do.
+
+In Chrome the encode is 10.1 to 14.5 ms at the median and 15.3 to 18.8 ms at p95
+against a display period of 11.1 ms, 59 to 81 % of all time, and little of it is
+`prepare`: 0.2 ms at the median when the terrain is meshed alone, about one
+section. `prepare` ends past its deadline in every frame, or all but a few. A flight with meshing
+alone completes 29,800 to 31,100 operations a window of the 97,200 it asks, and no
+row fills its window. The GPU's frame time there is 13.0 to 14.7 ms at the median.
+
+Draw cost, from `--pair draw` with `move=fly`:
+
+| Renderer | Draws a frame | Encode p50, `draw=on` | `draw=off` | Difference |
+|---|---|---|---|---|
+| Vulkan | 374–384 | 4.5–4.7 ms | 3.1–3.2 ms | 1.39–1.50 ms |
+| Chrome, WebGPU | 302–313 | 10.8–11.5 ms | 9.4–9.5 ms | not comparable |
+
+The Chrome pair did unequal work, so the script calls it inconclusive and gives no
+difference: without the draws the run completes 96,600 to 97,400 operations a
+window, fills its window in 20.6 s and refills each crossing (523 to 534 ms at the
+median) with `prepare` at 4.0 to 5.2 ms of the encode; with them it completes
+30,200 to 31,200 and never fills. What 300 draws cost that page's thread is not
+isolated by these two runs; that the terrain keeps up without them and not with
+them is.
+
+Not taken: a row at `Low` quality (the fixture's quality is fixed), and energy
+readings.
+
+### Pixel 5 with the jobs lane, 2026-11-20
+
+The same phone and windows at `e8db3870e`, `jobs=off` beside `jobs=on` (LLP
+1182.000 D9), in the native app; the display read 90 Hz before, in the middle of
+and after every row, the battery went from 20.7 to 27.8 °C and Android's thermal
+status stayed 0. "Operations" is `operationsCompleted` over a window. A flight
+asks 97,200 a window with meshing alone and 3.98 million with the reuse compare.
+
+| Switches | `jobs` | Operations a window | `prepare` p50, p95 | `prepare` share | Frames past the deadline | Frame interval p50 | Upload a frame, mean | Refill p50 | Refills finished; started, a window |
+|---|---|---|---|---|---|---|---|---|---|
+| `move=fly light=8000 compare=on` | off | 529,000–544,000 | 6.7, 7.3 ms | 37 % | all | 16.6–16.7 ms | 0.07 MB | 6.3–7.1 s | 40, 17, 23; 75 |
+| `move=fly light=8000 compare=on` | on | 1.90–1.91 million | 1.2, 4.2–4.3 ms | 10 % | 11–56 of 3,445 | 16.7–17.1 ms | 0.07 MB | 1.94 s | 21, 24, 22; 75 |
+| `move=fly`, game guess | off | 29,400–29,800 | 10.8–10.9, 12.2 ms | 62–63 % | all | 15.9–16.1 ms | 0.08 MB | none | 0; 75 |
+| `move=fly`, game guess | on | 53,200–53,900 | 8.1–8.2, 10.0–11.1 ms | 44–46 % | 1,147–1,432 of 3,180 | 18.3 ms | 3.5–3.6 MB | none | 0; 75 |
+| `move=fly` | on | 97,200 | 0.04, 4.1–4.5 ms | 5 % | 67–131 of 3,205 | 18.7 ms | 0.07 MB | 220–221 ms | 75; 75 |
+| `move=walk`, game guess | on | 29,200; 749,000; 783,000 | 17.8–21.1, 20.4–26.3 ms | 70–71 % | all | 25.0–30.0 ms | 7.8–9.5 MB | 3.98–4.00 s | 0, 18, 15; 15 |
+| Chrome, `move=fly` | on, inline | 29,600–30,800 | 0.2, 8.2–8.4 ms | 9 % | all | 11.1 ms | 0.02 MB | none | 0; 75 |
+
+With the smaller light setting the lane does 3.5 times the work, takes `prepare`
+from 37 % of all time to 10 % and from every frame past its deadline to under 2 %,
+and a refill that finishes takes 1.9 s instead of 6 to 7 s. It is still half of
+what a flight asks, and with `prepare` at a tenth of the time the frame thread
+is no longer what limits it. With meshing alone a refill falls from 373 ms to
+220 ms.
+
+At the game guess the lane does 1.8 times the work in flight and the frame thread
+stays loaded. With the sections off it, the blended window is re-sorted and
+uploaded in most frames, 3.5 MB a frame flying and 9.5 MB walking where `jobs=off`
+uploaded under 0.1 MB, and that upload is then `prepare`: walking, 18 to 21 ms a frame
+against the 8.6 to 9.5 ms of the `jobs=off` row above, and the frame interval goes
+from 17 ms to 25 to 30 ms. The walking refills that `jobs=off` never finished now
+finish in a crossing's 4 s. The first of the walking windows was still the first
+fill.
+
+In Chrome the lane is inline and the row is the `jobs=off` row: an inline lane
+adds no throughput.
+
+### Mac Studio with the jobs lane, 2026-11-21
+
+Mac Studio (Apple M5 Ultra, 36 cores), macOS 27.2.1, on Metal, `host-dev`, a
+1280 × 720 window on a 1920 × 1080 display at 60 Hz (the rows of 2026-11-18 were
+read at 75 Hz and are not comparable), radius 40, `move=fly`, uncalibrated. Three
+windows of 60 s after 20 s of warm-up; a range is the windows' range. `jobs=off`
+beside `jobs=on` with the fixture's job queue at 32 KiB (`bf61e9d6f`) and at
+256 KiB (branch commit `7c5363e71`, the tree of the change that set it).
+
+| Switches | `jobs` | Operations a window | `prepare` p50, p95 | `prepare` share | Frames past the deadline | Frames a window | Refill p50 | First fill |
+|---|---|---|---|---|---|---|---|---|
+| `light=8000 compare=on` | off | 3,985,200 | 0.02–0.2, 13.1–13.2 ms | 29 % | 75–93 | 3,598–3,599 | 400 ms | 14.5 s |
+| `light=8000 compare=on` | on, 32 KiB | 2,540,504–2,540,832 | 0.4–0.5, 1.5–2.0 ms | 4 % | 0 | 3,598–3,600 | 1,300 ms | 14.8 s |
+| `light=8000 compare=on` | on, 256 KiB | 3,985,200 | 0.8–0.9, 3.8 ms | 7 % | 0–9 | 3,597–3,600 | 417 ms | 14.5 s |
+| game guess | off | 3,987,103–3,987,126 | 12.9, 15.6 ms | 67–68 % | 1,428–1,440 | 3,524–3,525 | 550 ms | 28.3 s |
+| game guess | on, 32 KiB | 2,369,304–2,375,439 | 6.0–6.1, 6.8–7.4 ms | 31–32 % | 1–3 | 3,599–3,600 | 1,400 ms | not in 60 s |
+| game guess | on, 256 KiB | 3,987,806–3,987,826 | 5.1–5.2, 6.6–8.3 ms | 23–24 % | 0–2 | 3,599 | 417 ms | 14.6 s |
+| meshing alone | off | 97,200 | 0.01, 5.9–6.0 ms | 7 % | 0–10 | 3,598–3,600 | 183 ms | 14.3 s |
+| meshing alone | on, 256 KiB | 97,200 | 0.02, 1.9–2.0 ms | 3 % | 0 | 3,598 | 200 ms | 14.3 s |
+
+The game guess is `light=96000 compare=on vertex=64 blend=window edits=4`. A flight
+asks 3.99 million operations a window with the reuse compare and 97,200 without.
+
+With a 32 KiB queue the lane relieved the frame thread and fell behind: the pool
+finished each frame's fill before the next and stood idle (`renderHooks.jobs` read
+`queued: 0, running: 0` at every window's end), completing two thirds of what
+`jobs=off` did, with a refill longer than the 800 ms crossing at the game guess.
+On the Pixel 5 the same queue was never empty: its workers were the limit.
+
+With 256 KiB the lane completes the flight. `prepare` at p95 falls from 13.1 ms
+to 3.8 ms, from 15.6 ms to 6.6–8.3 ms at the game guess, and from 5.9 ms to 1.9 ms
+with meshing alone. At the game guess the 75 frames a window that `jobs=off` drops
+are drawn, the refill falls from 550 ms to 417 ms and the first fill halves. At
+the two lighter workloads the refill is one frame longer: a result is installed in
+the frame after it is made, and both lanes install at most 64 units a frame.
+
+### Pixel 5 and Chrome on the Mac, 2026-11-21: the rung, a cap, and what a draw costs
+
+The Pixel 5 of the rows above (Android 14; display adaptive, 90 Hz at every reading
+before, during and after each row; battery 23.6 to 27.9 °C, thermal status 0), its
+native app on Vulkan (release) and its Chrome 155 on WebGPU, at `73440a874` and
+`47be848cc` (the native rows with the setup form of `2cf518362`). The Mac Studio
+in Chrome 159 at `73440a874`, a 1280 × 720 page on a display at 60 Hz. Uncalibrated.
+Three windows of 60 s; a range is the windows' range.
+
+**The rung** (native, `radius=40 move=fly`, meshing alone). This scene has one
+sample and no sun at every rung, so `low` differs from `high` by the render scale.
+
+| `quality` | Pixels | GPU frame p50, p95 | Forward and sky | Bloom | Tone map | Frame interval p50, p95 | Frames a window | Refill p50 | First fill |
+|---|---|---|---|---|---|---|---|---|---|
+| `high` | 1080 × 2138 | 18.2, 20.1–20.2 ms | 4.6, 6.5–6.6 ms | 9.9, 11.9 ms | 3.4, 5.2–5.3 ms | 18.3–18.5, 24.3–24.5 ms | 3,267–3,273 | 372–381 ms | 14.6 s |
+| `low` | 540 × 1069 | 9.9, 10.2 ms | 2.0, 3.7 ms | 5.4, 7.0–7.1 ms | 0.9, 1.2 ms | 11.1, 11.8 ms | 5,396–5,399 | 192 ms | 9.8 s |
+
+At `low` the phone holds its 90 Hz: the GPU's frame fits the 11.1 ms period where
+at `high` it is 18 ms. Bloom is more than half of the frame at both rungs, and at a
+quarter of the pixels it is still 5.4 ms: its first pass goes from 4.6 ms to
+3.9 ms.
+
+**A cap** (Chrome on the phone, `radius=40 move=fly`, meshing alone).
+
+| `fps` | Frame interval p50 | Encode p50 | `prepare` mean | First fill | Refills finished of 75 | Refill p50 |
+|---|---|---|---|---|---|---|
+| `0` | 11.1 ms | 9.6–10.8 ms | 0.3 ms | not in 60 s; 42,702 sections pending at the end | 0 | — |
+| `45` | 22.2 ms | 5.9–6.1 ms | 4.7 ms | 19.5 s | 75 | 289 ms |
+
+Uncapped, the encode fills the period, every frame enters late and `prepare` gets
+one unit. Capped at 45, D6 takes the cap's period as its target and the window
+fills and keeps up.
+
+**What a draw costs** (Chrome). On a filled, standing window `prepare` is idle and
+the encode is the engine's own work and the hook's draws.
+
+| Host, switches | `draw` | Draws a frame | Binds a frame | Encode p50 |
+|---|---|---|---|---|
+| Phone, `radius=8 move=stand` | `on` | 141 | 283 | 3.12–3.15 ms |
+| | `arena` | 141 | 7 | 2.80–2.88 ms |
+| | `indirect` | 141 | 148 | 3.17–3.19 ms |
+| | `off` | 0 | 0 | 2.79–2.87 ms |
+| Mac, `radius=40 move=stand` | `on` | 1,136 | 2,273 | 1.57–1.74 ms |
+| | `arena` | 1,136 | 31 | 1.28–1.39 ms |
+| | `indirect` | 1,136 | 1,167 | 1.43–1.51 ms |
+| | `off` | 0 | 0 | 1.28–1.30 ms |
+
+Standing, 141 draws from a buffer each cost the phone 0.3 ms and 1,136 cost the Mac
+0.3 to 0.45 ms. From shared arenas they cost less than the windows' spread. A bind
+at a dynamic offset with an indirect draw costs about what three direct calls do.
+
+In flight the same switches say what the calls do not (phone, `radius=40 move=fly`):
+
+| `draw` | Encode p50 | `prepare` p50 | Encode less `prepare` | Sections pending at the end | First fill |
+|---|---|---|---|---|---|
+| `on` | 10.7–11.2 ms | 0.2 ms | about 10.7 ms | 42,196 | not in 60 s |
+| `arena` | 10.9–12.1 ms | 7.2–7.6 ms | about 4 ms | 12,216 | not in 60 s |
+| `off` | 9.2 ms | 4.5–5.0 ms | about 4.4 ms | 473 | 21.1 s |
+
+(The two medians are of separate rings, so the third column is an estimate.)
+A flight installs and retires sections every frame. With a buffer for each
+section that costs about 6 ms of encode a frame in the phone's Chrome, and
+`prepare` is starved; from arenas, about 400 draws a frame cost what no draws do,
+and `prepare` gets 7 ms. The window still does not fill in 60 s with `arena`, and
+does with `off`, though `prepare` runs longer with `arena`: a unit costs more
+there. Why was not read; the allocator and `write_buffer` into a retained buffer
+are what differ.
+
+### The web worker lane, 2026-11-21
+
+Chrome with `jobs=on` on the web worker lane (LLP 1182.000 D9) beside `jobs=off`,
+flying at radius 40, on a page served without cross-origin isolation headers
+(`BENCH_NO_ISOLATION=1`) except where a row says otherwise. The Mac Studio in
+Chrome 159 (a 1280 × 720 page on a display at 60 Hz; another session was building,
+and the one-minute load was 14 to 34 on 36 cores), at `e91832165`, and the lighting
+row with the lane at `15a842770`, which differs in the lane's readings only. The
+Pixel 5 of the rows above in Chrome 155 at `e91832165` (display at 90 Hz at every
+reading; battery 19.6 to 27.7 °C, thermal status 0). Uncalibrated. Three windows of
+60 s; a range is the windows' range.
+
+"Lighting" is `light=96000 vertex=64 blend=window edits=4`: the game guess without
+its reuse compares. Mesh jobs take the wire; compare batches decline it and run on
+the page.
+
+**Mac Studio.**
+
+| Workload | `jobs` | First fill | Refill p50, p95 | `prepare` p50, p95 | Frames past the deadline, a window | Operations a window |
+|---|---|---|---|---|---|---|
+| Meshing alone | `off` | 14.1 s | 183, 183 ms | 0.0, 2.7 ms | 0 | 97,200 |
+| | worker | 14.1 s | 200, 200 ms | 0.1, 0.9 ms | 0 | 97,200 |
+| Lighting | `off` | not in 60 s; 8,878 sections pending | 683, 700 ms | 15.5, 16.2 ms | 2,946–3,108 of 3,504–3,521 | 98,552–100,940 |
+| | worker | 29.2 s | 383, 383 ms | 9.2–9.3, 10.3 ms | 0 | 101,519–101,520 |
+| | worker, isolated page | 29.2 s | 383, 383–517 ms | 9.3–9.7, 10.3–11.5 ms | 0–33 | 101,490–101,521 |
+| Game guess | `off` | not in 60 s; 52,232 pending | none finishes | 14.9, 15.5 ms | every frame | 180,339–662,772 |
+| | worker | not in 60 s; 51,066 pending | none finishes | 14.8, 16.6–17.1 ms | 1,990–2,008 of 3,461–3,477 | 1,447,473–1,528,123 |
+
+(Lighting with `jobs=off` finished its refills in the second and third windows; the
+first was still filling. The isolated page's row was read at a load of 32.)
+
+With lighting the lane fills the window, where the page alone does not in 60 s; the
+refill falls from 683 to 383 ms and `prepare` from 15.5 to 9.2 ms, with no frame
+past its deadline. Meshing alone
+has little to move: the refill is one frame longer (a result is installed the frame
+after it is made, as on the native pool) and `prepare`'s p95 falls from 2.7 to
+0.9 ms. At the game guess neither lane finishes a refill. The lane does 2.2 to 8.5
+times the operations, and the page is then full of what stays on it: the compare
+batches, which decline the wire, and the blended layer's upload (32 GB a window
+against 1 GB).
+
+| Workload, worker lane | First worker ready | Wire p95 a frame | Handlers a frame | Largest worker memory | Peak answers held | Bytes out, in a window |
+|---|---|---|---|---|---|---|
+| Meshing alone | 13 ms | 0.5 ms | 0.025 ms | 1.5 MiB | 0.56 MB | 1.0 MB, 238 MB |
+| Lighting | 387 ms | 0.5 ms | 0.046–0.055 ms | 2.1 MiB | 1.7 MB | 1.0 MB, 924–937 MB |
+| Game guess | 392 ms | 0.7 ms | 0.044–0.051 ms | 2.1 MiB | 2.4 MB | 1.0 MB, 1,256–1,273 MB |
+
+Four workers were ready in every row. "First worker ready" counts from the first
+`take` that wanted one, the script's import included. The wire is the page's time
+in `take` copying, decoding, encoding and posting; a tenth of the display period
+is 1.67 ms. With lighting, 21 to 22 % of `prepare`s began with a worker idle and a
+wire job queued (`idleWithWork`, read at `15a842770`).
+
+With `gpu-jobs-worker.js` removed from the build (at `fd5b3ec16`) the lighting row
+reports `inline`, shows its first picture in 0.4 s and finishes its refills.
+
+**Pixel 5.**
+
+| Workload | `jobs` | First fill | Refill p50, p95 | `prepare` p50, p95 | Frames past the deadline, a window | Operations a window |
+|---|---|---|---|---|---|---|
+| Meshing alone, `fps=45` | `off` | 19.5 s | 267–311, 356 ms | 0.2, 16.2–16.4 ms | 483–567 | 97,200 |
+| | worker | 26.7 s | 333, 378 ms | 0.4, 7.7 ms | 30–37 | 97,200 |
+| Meshing alone, `fps=0` | worker | not in 60 s; 38,060 pending | none finishes | 1.1, 5.6–5.9 ms | 2,950–3,089 | 44,369–47,830 |
+| Lighting, `fps=45` | `off` | not in 60 s; 46,941 pending | none finishes | 21.6–21.7, 26.1–26.2 ms | 2,267–2,296 | 18,764–18,803 |
+| | worker | not in 60 s; 41,936 pending | none finishes | 14.9–15.8, 41.7–43.7 ms | 831–912 | 38,627–39,757 |
+
+| Workload, worker lane | First worker ready | Wire p95 a frame | Handlers a frame | Largest worker memory | Peak answers held |
+|---|---|---|---|---|---|
+| Meshing alone, `fps=45` | 213 ms | 3.4–3.5 ms | 0.64–0.65 ms | 1.5 MiB | 0.47 MB |
+| Meshing alone, `fps=0` | 294 ms | 2.1–2.2 ms | 0.18–0.22 ms | 1.5 MiB | 0.41 MB |
+| Lighting, `fps=45` | 1,919 ms | 1.6–1.8 ms | 0.29–0.34 ms | 2.1 MiB | 0.84–0.95 MB |
+
+On the phone the lane takes work off the page and gives some back as wire time: a
+tenth of its 11.1 ms display period is 1.1 ms, and the wire's p95 is 1.6 to 3.5 ms.
+Capped at 45, meshing alone keeps up either way; with the lane `prepare`'s p95
+halves and frames past the deadline fall from about 500 to about 35 a window, while
+the first fill and the refill are longer (26.7 s against 19.5 s; a p50 of 333 ms
+against 267 to 311 ms). With lighting the lane does twice the operations
+and neither lane finishes a refill; `prepare`'s p50 falls from 21.7 to about 15 ms
+and its p95 rises from 26 to 42 ms. Uncapped, the
+window does not fill with the lane, as it does not without it (the cap's rows
+above): the encode fills the period.

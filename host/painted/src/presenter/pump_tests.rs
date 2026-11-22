@@ -190,7 +190,7 @@ fn a_session_nothing_shows_is_hidden_before_its_data_activates() {
     assert!(error.is_none(), "{error:?}");
     p.agent = false;
 
-    p.page_execution(true, false);
+    p.page_execution(true, false, false);
     assert!(p.pump(0.).is_none());
     p.activate_unshown();
     assert!(p.pump(1.).is_none());
@@ -198,7 +198,7 @@ fn a_session_nothing_shows_is_hidden_before_its_data_activates() {
     assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
 
     // An activity shows the session: the resource asks now.
-    p.page_execution(false, true);
+    p.page_execution(false, true, false);
     assert!(p.pump(2.).is_none());
     assert_eq!(*asked.borrow(), ["feed"]);
 }
@@ -370,7 +370,7 @@ component App
     )));
     runner.bind_extensions(&["tide"], &[]);
     // No activity: the page is hidden and may not execute.
-    p.page_execution(true, false);
+    p.page_execution(true, false, false);
 
     p.activate_unshown();
     assert_eq!(p.data_state(), 0, "the module's image is still loading");

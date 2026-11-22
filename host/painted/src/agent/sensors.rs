@@ -30,7 +30,7 @@ fn framed<D: DataSource>(
     to: f64,
     mut seek: impl FnMut(&mut Presenter<D>, f64) -> (f64, Option<String>),
 ) -> (f64, Option<String>) {
-    loop {
+    p.defer_gpu_readback(|p| loop {
         // Deliver world records before later timers (LLP 1012, LLP 1046.003).
         p.sync_surfaces();
         let worlds = p.worlds(serde_json::json!({"op":"clock","settle":false}));
@@ -64,7 +64,7 @@ fn framed<D: DataSource>(
         }
         p.sync_surfaces();
         p.worlds(serde_json::json!({"op":"clock","settle":false}));
-    }
+    })
 }
 
 /// Every sample the substitute's canvas inputs owe their surfaces up to `at`.

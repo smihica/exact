@@ -40,13 +40,13 @@ build with a `lower-symbol-alias` warning naming the role.
   A `color` written on the symbol is its colour, as `currentcolor` paints an icon on the
   web; a row's `forward-chevron` is already grey.
   Emoji and characters (▦ ☏) aren't icons: they ignore the tint and differ by browser.
-- A role or icon's `font` sets its natural size (`font="-exact-title1"`
-  follows the reader's text size); a raster icon keeps its SVG aspect. On a page or in `button appearance="none"`,
-  `width` and `height` size its box; the glyph keeps its aspect under both
-  `object-fit="fill"` (default) and `"contain"`. For a 24-point box, write
-  `image "symbol:calendar" width=24 height=24`.
-  `object-fit="cover"` fills and clips; `"none"` keeps the natural size;
-  `"scale-down"` shrinks it only when it does not fit. An explicit box is independent of the font.
+- `font` sets natural size; `font="-exact-title1"` follows text size.
+  A template without `sf` uses its viewBox's aspect, its longer side at one em.
+  An `sf` source keeps platform metrics; its SVG fallback meets the viewBox in an em square.
+  On pages, `width` and `height` size its box.
+  `object-fit="fill"` (default) fills the viewport, meeting the viewBox inside it;
+  `"contain"` fits the natural box; `"cover"` fills and clips; `"none"` keeps natural
+  size; `"scale-down"` only shrinks. `object-position` places it as for an SVG `<img>`.
 - On iOS, a titled native button's symbol follows its title's font; a symbol-only
   button uses the platform's size. Its image's `font-size` overrides either.
   Native button images take no `width`,

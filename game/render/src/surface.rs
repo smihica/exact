@@ -28,6 +28,10 @@ pub trait Executor: Default {
     fn suspend(&mut self, _suspended: bool) {}
     /// Called once after the simulation advances, including zero-size frames.
     fn sync(&mut self, _world: &World, _generation: u64, _playing: bool, _seekable: bool) {}
+    /// Sync presentation with access to payloads that game callbacks cannot observe.
+    fn sync_sim<G: Game>(&mut self, sim: &Sim<G>, playing: bool, seekable: bool) {
+        self.sync(sim.world(), sim.generation(), playing, seekable);
+    }
     /// Snapshot newly constructed definitions before a carry replaces dynamic state.
     fn before_restore(&mut self, _world: &World, _mode: Restore) {}
     /// Overlay fresh definitions only for a development carry.
@@ -234,11 +238,12 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> WorldSurface<G, 
         let Some(sim) = &self.sim else {
             return vec!["not bound".into()];
         };
-        let mut reasons: Vec<String> = if ASSETS || G::LEVEL.is_some() {
-            sim.asset_failures().map(str::to_owned).collect()
-        } else {
-            Vec::new()
-        };
+        let mut reasons: Vec<String> =
+            if ASSETS || exact_game::asset::delivers_without_models::<G>() {
+                sim.asset_failures().map(str::to_owned).collect()
+            } else {
+                Vec::new()
+            };
         if let Some(error) = &self.error {
             reasons.push(format!("render error: {}", error.0));
         }
@@ -832,8 +837,10 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                     }
                 }
             }
-            let (span_since, trace_export) =
-                perf_request.map_or((None, false), |r| (r.span_since, r.trace_export));
+            let (span_since, trace_export, reset) = perf_request
+                .map_or((None, false, false), |r| {
+                    (r.span_since, r.trace_export, r.perf_reset)
+                });
             reply.truncate(reply.len() - 2);
             reply.push_str(if self.device {
                 ",\"device\":true"
@@ -889,6 +896,7 @@ impl<G: Game, P: Executor, const ASSETS: bool, H: crate::Hooks> Surface
                     &mut reply,
                     &self.hooks,
                     self.hook_clock.budget.as_deref(),
+                    reset,
                 );
             }
             // Only the agent's armed timing is the agent's to report.

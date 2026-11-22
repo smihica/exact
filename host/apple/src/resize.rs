@@ -3,6 +3,10 @@
 //! resized handlers' commits in the batch whose layout raised them.
 use super::*;
 
+#[cfg(test)]
+#[path = "geometry_facts_tests.rs"]
+mod geometry_facts_tests;
+
 impl<D: DataSource> Host<D> {
     pub(super) fn finish_collection(&mut self) -> String {
         // Rearming an edge changes its window even without a view receipt.
@@ -50,6 +54,7 @@ impl<D: DataSource> Host<D> {
 
     pub(super) fn quiet_collection_key(&self) -> Option<[u64; 8]> {
         if self.stored
+            || self.window_state_changed
             || !self.preload_content.is_empty()
             || !self.engine.quiescent()
             || self.engine.spatial()
@@ -79,10 +84,12 @@ impl<D: DataSource> Host<D> {
             documents(self);
         }
         let (mut batch, error) = self.resize_rounds(batch, error);
+        self.emit_prose_markers(&mut batch);
         self.route_overflow.settled =
             error.is_none() && !batch.layout_provisional && !self.layout_owed;
-        self.drain_canvas_captures(&mut batch);
-        self.forget_canvas_captures();
+        if let Some(canvas) = self.turn.canvas {
+            (canvas.captures)(self, &mut batch);
+        }
         self.state_onto(&mut batch);
         self.write_batch(batch, error.as_deref(), true)
     }
@@ -141,7 +148,9 @@ impl<D: DataSource> Host<D> {
             depth = shallowest + 1;
             let mut receipts = Vec::new();
             for (view, rect, _) in due {
-                self.runner.resize_delivered(view, rect);
+                if !self.runner.resize_delivered(view, rect) {
+                    continue;
+                }
                 match self.runner.dispatch(view, Event::Resize(rect)) {
                     Ok(receipt) => receipts.push(Timed {
                         at_ms: self.now_ms,
@@ -165,6 +174,30 @@ impl<D: DataSource> Host<D> {
                 (drag.emit_transforms)(self, &mut batch);
             }
             self.present(&mut batch, false);
+        }
+        // Answer the geometry facts this layout changed, in a commit of their own laid out in
+        // turn (LLP 1123 D6); the runner stops a chain of them at its bound
+        match self.runner.refresh_geometry() {
+            Ok(Some(receipt)) => {
+                let timed = Timed {
+                    at_ms: self.now_ms,
+                    receipt,
+                };
+                let (next, e) = self.commit_tree(&[timed], None, batch);
+                batch = next;
+                let arrange = self.arrange_after_commit(&mut batch);
+                self.persist();
+                self.emit_language(&mut batch);
+                if let Some(drag) = self.turn.drag {
+                    (drag.emit_transforms)(self, &mut batch);
+                }
+                self.present(&mut batch, false);
+                return self.resize_rounds(batch, error.or(e).or(arrange));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error.get_or_insert(format!("{e:?}"));
+            }
         }
         self.resize_pending = self.runner.resize_settled();
         // Layout-only batches also owe SVG scenes, even without motion or a commit.

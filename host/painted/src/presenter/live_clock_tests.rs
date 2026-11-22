@@ -59,9 +59,9 @@ component App
             assert!(!p.needs_animation_frame());
             let before = p.host().now();
             if reader {
-                assert!(p.reader_clock(edge - 1., true).is_none());
+                assert!(p.reader_clock(edge - 1., true, true).is_none());
                 assert_eq!(p.host().now(), before);
-                assert!(p.reader_clock(edge, true).is_none());
+                assert!(p.reader_clock(edge, true, true).is_none());
             } else {
                 assert_eq!(
                     p.android_clock(edge - 1., false, &mut last_tick, 16.),
@@ -136,7 +136,7 @@ fn reader_turns_leave_frozen_timers_for_an_explicit_clock_operation() {
             let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
             assert!(reply.get("error").is_none(), "{reply}");
             p.repaint();
-            assert!(p.reader_clock(1000., live).is_none());
+            assert!(p.reader_clock(1000., live, true).is_none());
             assert_eq!(ticks(&p), if live { 1. } else { 0. }, "{op}");
             assert_eq!(p.host().now(), 1000.);
             assert_eq!(p.timer_due_ms(), Some(if live { 2000. } else { 1000. }));
@@ -180,6 +180,311 @@ fn the_display_clock_reaches_every_host_until_a_driver_takes_time() {
     p.set_live_clock(None);
     p.clock(10_500.0);
     assert_eq!(ticks(&p), 5.0);
+}
+
+#[test]
+fn a_live_preference_starts_its_transition_at_the_request_time() {
+    let plan = crate::test_plan(
+        r#"shape Page
+  onLine: bool
+component App
+  resource page = exactPage() as shape Page
+  view
+    box testId="pad" opacity=(page.onLine ? 1 : 0) transition="opacity 1s linear"
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        NoData,
+        (80., 40.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.frame();
+    let k = p.host().kernel();
+    let id = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+    assert_eq!(p.host().presented(id).opacity, 1.);
+    p.set_live_clock(Some(Rc::new(|| 5000.)));
+    let reply =
+        crate::agent::handle_for_window(&mut p, r#"{"op":"prefer","page":{"online":"false"}}"#);
+    assert!(!reply.contains("error"), "{reply}");
+    p.tick(5100.);
+    let opacity = p.host().presented(id).opacity;
+    assert!((opacity - 0.9).abs() < 0.001, "opacity: {opacity}");
+}
+
+#[test]
+fn a_live_share_starts_its_transition_at_the_request_time() {
+    let plan = crate::test_plan(
+        r#"routes nav
+  tab home "/"
+    share "/share"
+component App
+  state received = false
+  action follow(url: string)
+    nav = go(nav, url)
+    received = true
+  view
+    column navigationKey="share-root" navigationBack="back" navigate=follow
+      box testId="pad" opacity=(received ? 0 : 1) transition="opacity 1s linear"
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        (),
+        (80., 40.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.frame();
+    let k = p.host().kernel();
+    let root = k.roots()[0];
+    let pad = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+    p.set_live_clock(Some(Rc::new(|| 5000.)));
+    let request = serde_json::json!({
+        "op": "share", "id": root,
+        "target": {"action": "/share", "params": {"text": "text"}},
+        "share": {"text": "test"}
+    });
+    let reply = crate::agent::handle_for_window(&mut p, &request.to_string());
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["value"], "/share?text=test", "{reply}");
+    p.tick(5100.);
+    let opacity = p.host().presented(pad).opacity;
+    assert!((opacity - 0.9).abs() < 0.001, "opacity: {opacity}");
+}
+
+#[test]
+fn live_midi_starts_its_transition_at_the_message_time() {
+    #[derive(Default)]
+    struct MidiInput;
+
+    impl DataSource for MidiInput {
+        fn query(&mut self, source: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::UnknownSource(source.into()))
+        }
+
+        fn grants(&self) -> &str {
+            "device.midi purpose.midi"
+        }
+    }
+
+    let plan = crate::test_plan(
+        r#"component App
+  state heard = false
+  action hear(event: MIDIMessageEvent)
+    heard = true
+  view
+    box testId="pad" midimessage=hear midiinputs=["keys"] opacity=(heard ? 0 : 1) transition="opacity 1s linear"
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        MidiInput,
+        (80., 40.),
+        1.,
+        PathBuf::new(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    p.frame();
+    let send = |p: &mut Presenter<_>, request| {
+        let reply = crate::agent::handle_for_window(p, request);
+        assert!(!reply.contains("\"error\""), "{reply}");
+    };
+    send(
+        &mut p,
+        r#"{"op":"prefer","midi":{"state":"granted","inputs":["keys"]}}"#,
+    );
+    p.set_live_clock(Some(Rc::new(|| 5000.)));
+    send(
+        &mut p,
+        r#"{"op":"midi","input":"keys","data":[144,60,100]}"#,
+    );
+    p.tick(5100.);
+    let k = p.host().kernel();
+    let id = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+    let opacity = p.host().presented(id).opacity;
+    assert!((opacity - 0.9).abs() < 0.001, "opacity: {opacity}");
+}
+
+#[test]
+fn a_live_window_uses_wall_time_for_input_and_leaves_contact_holds_to_the_carrier() {
+    let plan = crate::test_plan(
+        r#"component App
+  state ticks = 0
+  state pressed = false
+  action down
+    pressed = true
+  action tick
+    ticks = ticks + 1
+  task timer mount
+    every(5500, tick)
+  view
+    box testId="pad" width=80 height=40 pointerdown=down opacity=(pressed ? 0.5 : 1)
+"#,
+    );
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &plan,
+        (),
+        (80., 40.),
+        1.,
+        Default::default(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none());
+    p.frame();
+    p.set_live_clock(Some(std::rc::Rc::new(|| 5000.)));
+    let k = p.host().kernel();
+    let id = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+    let send = |p: &mut Presenter<()>, request: serde_json::Value| {
+        let reply = crate::agent::handle_for_window(p, &request.to_string());
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert!(reply["error"].is_null(), "{reply}");
+        reply
+    };
+    let down = send(
+        &mut p,
+        serde_json::json!({"op":"tap","phase":"down","id":id}),
+    );
+    assert!(p.dirty(), "the window still owes the input's paint");
+    let event_time = p.contact_event_ms(None);
+    assert_eq!(p.host().runner().slot("pressed"), Some(&Value::Bool(true)));
+    p.tick(5000.);
+    let held = send(
+        &mut p,
+        serde_json::json!({"op":"tap","phase":"hold","ms":1000}),
+    );
+    assert_eq!(held["waitMs"].as_f64(), Some(1000.));
+    assert_eq!(p.contact_event_ms(None), event_time);
+    for reply in [&down, &held] {
+        assert_eq!(reply["mode"], "platform");
+        assert_eq!(reply["carrier"], std::env::consts::OS);
+        assert_eq!(reply["delivery"], "presenter");
+    }
+    assert_eq!(
+        (
+            event_time,
+            held["clock"].as_f64(),
+            p.host().runner().slot("ticks")
+        ),
+        (Some(5000.), Some(5000.), Some(&Value::Number(0.))),
+    );
+}
+
+#[test]
+fn a_live_pan_releases_at_the_time_of_lift() {
+    let plan = crate::test_plan(
+        r#"component App
+  state speed = -1
+  action moved(dx: number, dy: number)
+    speed = dx
+  action released(vx: number, vy: number)
+    speed = vx
+  view
+    box testId="pad" width=400 height=300 pan=moved panrelease=released touch-action="none"
+"#,
+    );
+    for (move_at, release, flings) in [
+        (5000., 5000., true),
+        (5000., 5150., false),
+        (5000., 6080., false),
+        (5500., 5500., true),
+    ] {
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &plan,
+            (),
+            (400., 300.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let wall = Rc::new(Cell::new(5000.));
+        let read = wall.clone();
+        p.set_live_clock(Some(Rc::new(move || read.get())));
+        let send = |p: &mut Presenter<()>, request: &str| {
+            let reply = crate::agent::handle_for_window(p, request);
+            assert!(!reply.contains("\"error\""), "{reply}");
+        };
+        let k = p.host().kernel();
+        let pad = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+        send(
+            &mut p,
+            &format!(r#"{{"op":"tap","phase":"down","id":{pad}}}"#),
+        );
+        wall.set(move_at);
+        send(
+            &mut p,
+            r#"{"op":"tap","phase":"move","dx":80,"dy":0,"ms":80}"#,
+        );
+        wall.set(release);
+        send(&mut p, r#"{"op":"tap","phase":"up"}"#);
+        let speed = p
+            .host()
+            .runner()
+            .slot("speed")
+            .and_then(Value::as_number)
+            .unwrap();
+        if flings {
+            assert!(speed > 850., "immediate release velocity: {speed}");
+        } else {
+            assert_eq!(speed, 0., "stationary release velocity");
+        }
+    }
+}
+
+#[test]
+fn a_live_contact_animates_press_feedback_like_a_pointer() {
+    let plan = crate::test_plan(
+        r#"component App
+  state active = false
+  action pressed
+    active = true
+  view
+    box testId="pad" press=pressed width=80 height=40 -exact-press-scale=0.6
+"#,
+    );
+    let sample = |agent| {
+        let (mut p, error) = Presenter::boot_with_fixture_fonts(
+            &plan,
+            NoData,
+            (80., 40.),
+            1.,
+            PathBuf::new(),
+            PainterChoice::Cpu,
+        )
+        .unwrap();
+        assert!(error.is_none(), "{error:?}");
+        p.frame();
+        let k = p.host().kernel();
+        let id = k.node_by_key(k.find_by_test_id("pad")[0]).unwrap().id;
+        p.set_live_clock(Some(Rc::new(|| 5000.)));
+        if agent {
+            let reply = crate::agent::handle_for_window(
+                &mut p,
+                &format!(r#"{{"op":"tap","phase":"down","id":{id}}}"#),
+            );
+            assert!(!reply.contains("error"), "{reply}");
+        } else {
+            assert!(p.pointer_down(40., 20., 5000.).unwrap());
+        }
+        p.tick(5010.);
+        p.host().presented(id).press
+    };
+    let pointer = sample(false);
+    assert!(pointer > 0.6 && pointer < 1., "scale: {pointer}");
+    assert_eq!(sample(true), pointer);
 }
 
 #[test]
@@ -771,7 +1076,7 @@ fn a_background_reader_runs_change_and_elapsed_tasks_without_frame_tasks() {
         p.host_mut().runner_mut().act("receive", vec![]).unwrap();
         assert!(p.after_commit().is_none());
         for _ in 0..8 {
-            assert!(p.reader_clock(at, true).is_none());
+            assert!(p.reader_clock(at, true, false).is_none());
         }
         assert_eq!(p.background_due_ms(), Some(at + 30000.));
         assert_eq!(
@@ -783,7 +1088,13 @@ fn a_background_reader_runs_change_and_elapsed_tasks_without_frame_tasks() {
         assert!(p.dirty(), "the foreground still owes a paint");
     }
     p.timer_visibility(false);
-    assert!(p.reader_clock(90000., true).is_none());
+    for _ in 0..2 {
+        let reply = crate::agent::handle_for_window(&mut p, r#"{"op":"state"}"#);
+        assert!(serde_json::from_str::<serde_json::Value>(&reply).unwrap()["error"].is_null());
+        assert!(p.reader_clock(90000., true, false).is_none());
+        assert_eq!(p.host().runner().slot("frames"), Some(&Value::Number(0.)));
+    }
+    assert!(p.reader_clock(90000., true, true).is_none());
     assert_eq!(p.host().runner().slot("frames"), Some(&Value::Number(1.)));
 }
 
@@ -810,9 +1121,9 @@ fn a_background_readers_waits_ignore_paint_but_respect_main_work_and_clock_takeo
         p.timer_visibility(true);
         p.timer_observation(true, true, true);
         now.set(1000.);
-        assert!(p.reader_clock(1000., false).is_none());
+        assert!(p.reader_clock(1000., false, true).is_none());
         assert_eq!(ticks(&p), 0., "a frozen clock stays frozen");
-        assert!(p.reader_clock(1000., true).is_none());
+        assert!(p.reader_clock(1000., true, true).is_none());
         if kind == "idle" {
             assert!(p.admit_idle_timer(1000.).is_none());
             assert_eq!(ticks(&p), 0., "main-thread work has not completed");
@@ -870,7 +1181,7 @@ component App
         p.set_live_clock(Some(Rc::new(|| 1000.)));
         p.timer_visibility(true);
         let before = unix_ms();
-        assert!(p.reader_clock(1000., live).is_none());
+        assert!(p.reader_clock(1000., live, true).is_none());
         let after = unix_ms();
         let observed = p
             .host()
@@ -921,7 +1232,7 @@ fn background_admission_releases_already_held_waits_before_their_caps() {
         assert!(p.pump(1001.).is_none());
         p.timer_visibility(true);
         p.timer_observation(false, false, true);
-        assert!(p.reader_clock(1001., true).is_none());
+        assert!(p.reader_clock(1001., true, true).is_none());
         p.run_commands(NoData::default);
         assert!(p.admit_idle_timer(1001.).is_none());
         p.run_commands(NoData::default);

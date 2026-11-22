@@ -65,7 +65,7 @@ fn unshown(loaded: &Rc<Cell<bool>>) -> Presenter<NoData> {
     )
     .unwrap();
     assert_eq!(error, None);
-    p.page_execution(true, false);
+    p.page_execution(true, false, false);
     p.activate_unshown();
     assert_eq!(p.data_state(), i32::from(loaded.get()));
     assert_eq!(text(&p, "where"), "inbox inbox");
@@ -91,7 +91,7 @@ fn share(name: &str) -> (serde_json::Value, PathBuf) {
 
 /// The first frame a window is given shows the launch location.
 fn shown(p: &mut Presenter<NoData>) {
-    p.page_execution(false, true);
+    p.page_execution(false, true, false);
     let frame = p.display_frame().unwrap();
     assert!(p.display_complete(&frame));
 }

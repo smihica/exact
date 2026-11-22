@@ -27,6 +27,7 @@ impl<D: DataSource> Runner<D> {
         &mut self,
         edits: &[(&str, &str, &[&str])],
     ) -> Result<(CommitReceipt, usize), RunnerError> {
+        let _roles = self.bind_roles();
         let mut bits = 0;
         let mut roles = Vec::new();
         for &(name, value, _) in edits {
@@ -161,6 +162,37 @@ impl<D: DataSource> Runner<D> {
                 id: view,
                 prop,
                 value,
+            });
+            set += 1;
+        }
+        let mut decorations: Vec<_> = self
+            .ids
+            .theme
+            .decorations
+            .iter_mut()
+            .filter(|(view, table)| {
+                (table.resolved.tokens & bits != 0
+                    || !roles.is_empty() && table.resolved.reads_roles())
+                    && kernel.node(**view).is_some()
+            })
+            .collect();
+        decorations.sort_by_key(|(view, _)| **view);
+        for (&view, table) in decorations {
+            let resolved = crate::decorations::resolve_styles(
+                &self.plan,
+                table.tuple,
+                &table.text,
+                Some(&table.resolved),
+            );
+            let changed = resolved.value != table.resolved.value;
+            table.resolved = resolved;
+            if !changed {
+                continue;
+            }
+            ops.push(Op::SetProp {
+                id: view,
+                prop: exact_kernel::PropId::DecorationStyles,
+                value: table.resolved.value.clone(),
             });
             set += 1;
         }

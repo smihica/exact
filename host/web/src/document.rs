@@ -196,6 +196,7 @@ impl Source for KernelSource<'_> {
         match self.kernel.node(id) {
             Some(node) if self.bare => super::element::with_style_rows(
                 super::element::animation_style(self.kernel, &node, style),
+                self.kernel,
                 &node,
             ),
             _ => style,
@@ -824,9 +825,19 @@ impl<S: Source> Walk<'_, '_, S> {
                     let drawn = props.get("data-symbol-path").is_some_and(|d| !d.is_empty())
                         && !value.starts_with("symbol:icon||");
                     let size = f64::from(font) * if drawn { symbol_scale() } else { 1.0 };
+                    let (width, height) = value
+                        .strip_prefix("symbol:")
+                        .and_then(exact_kernel::Icon::parse)
+                        .and_then(|icon| icon.template_size(size as f32))
+                        .unwrap_or((size as f32, size as f32));
+                    let ratio = if width == height {
+                        String::new()
+                    } else {
+                        format!(" viewBox='0 0 {width} {height}'")
+                    };
                     attrs.push((
                         name.clone(),
-                        Some(format!("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}'/%3E")),
+                        Some(format!("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'{ratio}/%3E")),
                     ));
                 }
                 // `el.textContent = value` while it has no element children:

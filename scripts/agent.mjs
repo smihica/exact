@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
-//   tree | layout | state | logs [--all] | check [light|dark|both] | screenshot <png> [window
-//     [status|app|pictureinpicture [<image>]]] (an iOS simulator's window: the display's pixels when they are this
-//     app's, still; `app` the app's own drawing; `pictureinpicture` Exact's floating window on macOS, the image's where
-//     several float) | screenshot <png> compare <reference.png> | screenshot <png|apng> over <ms> every <ms> [window] |
+//   tree | layout | state | logs [--all] | check [light|dark|both] | screenshot <png> [display|window
+//     [status|app|pictureinpicture [<image>]]] (iPhone stills take the display. A simulator window takes the display
+//     while it shows the settled app. `window app` takes the app's drawing. On macOS `pictureinpicture` takes Exact's
+//     floating window, the image's where several float.) | screenshot <png> compare <reference.png> |
+//     screenshot <png|apng> over <ms> every <ms> [window] |
 //     screenshot <path> <canvas> save | screenshot <png> <canvas> from <yaw> <pitch> <distance> | from top <height> |
 //     from camera [over <ms> every <ms>] (a world's look frame, LLP 1127.000) | state <canvas> draws | look · state
 //     <canvas>:<entity> visible
@@ -27,7 +28,7 @@
 //   clock <ms|+ms|+ms real [until <path>]|settle|data|held [<target>…] [<n>s]|until state <path> == <literal> within
 //     <ms>> (+ms real until: a test harness's signal file, ending the real wait early; until state: the wall clock, the
 //     clock frozen, until state reads the JSON literal) | resize <w>x<h> | resize <w> <h> | post [<surface>] <text>
-//     (type <surface> message <text>: a world's Input::messages) | close | sample <x> <y> […] (extended linear sRGB
+//     (type <surface> message <text>: a world's Input::messages) | close | sample <x> <y> […] (extended linear sRGB on Apple, screenshot sRGB elsewhere
 //     under view points, LLP 1100 D12) | prefer <media feature or page fact> <value> […] | perf [<target>] [during
 //     "<op>" …] | perf frames [late <n>] | perf hatches [during "<op>" …] | perf streams [start]
 //   bun scripts/agent.mjs trace <file> | trace --phone <name|udid> | trace --device | trace --pid <pid> [--plan
@@ -81,7 +82,7 @@ import { guardFlags } from './help.mjs';
 import { relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkOp } from './agent-check.mjs';
-import { compareScreenshot, referenceNote } from './agent-compare.mjs';
+import { compareScreenshot, referenceNote, samplePoints } from './agent-compare.mjs';
 import { parseDrag, heldRead } from './agent-drag.mjs';
 import { driveNotes, runTests, reloadWeb, fetchOrigins, loopbackOrigins, faultRequest } from './agent-test.mjs';
 import { phone } from '../host/apple/devices.mjs';
@@ -152,10 +153,12 @@ export async function main(argv, injected = {}) {
     return 2;
   }
   if (flags.live) {
-    if (!['macos', 'mac', 'ios'].includes(host) || flags.test)
-      throw new Error('--live requires a macOS or iOS simulator drive without --test');
-    // A phone's carrier forces agent mode, and a real drag there needs an XCTest runner on the phone.
-    if (flags.device) throw new Error('--live drives the iOS simulator, not a phone');
+    if (!['macos', 'mac', 'ios', 'android'].includes(host) || flags.test)
+      throw new Error('--live requires a macOS, iOS or Android reader drive without --test');
+    if (host === 'android') {
+      if (flags.reader === false) throw new Error('android --live requires the reader APK. Remove --headless.');
+      flags.reader = true;
+    }
     if (flags.timing && flags.timing !== 'platform')
       throw new Error('--live keeps the platform clock; --timing agent is incompatible');
     flags.timing = 'platform';
@@ -163,11 +166,11 @@ export async function main(argv, injected = {}) {
   const browser = flags.browser ?? (host === 'web' ? process.env.EXACT_WEB_BROWSER : undefined),
     help = argv.includes('--help') || argv.includes('-h'); // help before any work
   if (host && flags.test && !help) {
-    // A test's `drag` on an iOS simulator is a real gesture by itself; `--touch platform` makes every tap one too
+    // A test's `drag` on iOS is a real gesture by itself; `--touch platform` makes every tap one too
     // (LLP 1080.000).
     if (flags.touch && !['agent', 'platform'].includes(flags.touch))
       throw new Error(
-        `--touch ${flags.touch} is not taken with --test: a test's \`drag\` is a real gesture by itself on an iOS simulator; --touch platform makes every tap one too (LLP 1080.000)`,
+        `--touch ${flags.touch} is not taken with --test: a test's \`drag\` is a real gesture by itself on iOS; --touch platform makes every tap one too (LLP 1080.000)`,
       );
     // Each test's line as it ends, and, while one runs past HEARTBEAT_MS, where it is every HEARTBEAT_MS: a run of
     // long tests (a few hundred drags) said nothing after the server's line until the last test ended.
@@ -241,11 +244,9 @@ export async function main(argv, injected = {}) {
   // A trace a person's session saved (LLP 1079 D5), read back with no app running.
   if (host === 'trace' && (ops.length === 1 || (!ops.length && (flags.phone || flags.device || flags.pid)))) {
     const traces = name => {
-      try {
-        return resolve(resolveApp(flags.app ?? name).target, 'traces');
-      } catch {
-        return resolve(process.cwd(), 'target', 'traces');
-      }
+      let dir = process.cwd();
+      try { dir = resolveApp(flags.app ?? name).dir; } catch { /* An unrecognized app saves in the current project. */ }
+      return resolve(dir, '.exact', 'traces');
     };
     const file =
       ops[0] ??
@@ -269,9 +270,9 @@ export async function main(argv, injected = {}) {
             'state',
             'logs [--all]',
             'check [light|dark|both] (what is wrong with the screen, in text: run it before a screenshot)',
-            "screenshot <png> [window [status|app|pictureinpicture [<image>]]] (an iOS simulator's window: the display's pixels when they are this app's, still; `app` the app's own drawing; `pictureinpicture` Exact's floating window on macOS)",
-            "screenshot <png> compare <reference.png> (where and on which nodes the screen differs from it, drawn in <png>.diff.png and the regions up close in <png>.regions.png; an iOS simulator's window with its bars, elsewhere the viewport)",
-            'screenshot <png|apng> over <ms> every <ms> [window]',
+            "screenshot <png> [display|window [status|app|pictureinpicture [<image>]]] (iPhone stills and iOS `display` take the display. A simulator window takes the display while it shows the settled app. `window app` takes the app's drawing. On macOS `pictureinpicture` takes Exact's floating window.)",
+            'screenshot <png> compare <reference.png> (differences by node, drawn in <png>.diff.png and <png>.regions.png. On iOS the capture includes the system bars.)',
+            'screenshot <png|apng> over <ms> every <ms> [window] (Android reader refuses film. Record --live with adb shell screenrecord.)',
             'screenshot <path> <canvas> save',
             'screenshot <png> <canvas> from <yaw> <pitch> <distance>',
             'from top <height>',
@@ -317,6 +318,7 @@ export async function main(argv, injected = {}) {
             "post [<surface>] <text> (one word or one quoted string: a message the world reads from Input::messages next tick, as the page's postMessage(text, surface) sends it; no surface, the page's one world)",
             'tap @N|@<id> <choice>',
             'type @N|@<id> <value>',
+            'background <milliseconds> (iOS: leave the app for real time, then resume the same session)',
             "clock <ms|+ms|+ms real [until <path>]|settle|data|held [<target>…] [<n>s]|until state <path> == <literal> within <ms> (real time, the clock frozen, until state <path> reads the JSON literal; a miss fails naming the last value: a stream's state after its first message)>",
             'sample <x> <y> […]',
             'resize <w>x<h>',
@@ -505,13 +507,15 @@ export async function main(argv, injected = {}) {
           if (args[1] !== 'window' || args.length > 4)
             throw new MalformedOperation('screenshot <png> window pictureinpicture [<image>]');
           r = await s.screenshot(args[0], true, 'pictureinpicture', false, args[3]);
+        } else if (args[1] === 'display' && args[2] !== 'save') {
+          if (args.length !== 2) throw new MalformedOperation('screenshot <png> display');
+          r = await s.screenshot(args[0], true, 'display');
         } else
           r = await s.screenshot(
             args[0] ?? 'screenshot.png',
-            args[2] === 'save' ? args[1] : args[1] === 'display' ? 'display' : args[1] === 'window',
+            args[2] === 'save' ? args[1] : args[1] === 'window',
             args[2],
-            !!s.held,
-          ); // inside a held touch, as it stands
+          );
         break;
       case 'tap':
         // The contact's phases (LLP 1035.003 D1) read as `tap move …`,
@@ -531,6 +535,10 @@ export async function main(argv, injected = {}) {
           r = target === null && !opts.midi ? await s.pointer(phase, opts) : await s.tap(target, opts);
         }
         break;
+      case 'background':
+        if (args.length !== 1 || !/^\d+$/.test(args[0])) throw new MalformedOperation('background <milliseconds>');
+        r = await s.background(Number(args[0]));
+        break;
       case 'clock':
         r = await s.clock(trimmed.slice(5).trim() || 'settle');
         break;
@@ -538,7 +546,7 @@ export async function main(argv, injected = {}) {
         const n = args.map(Number);
         if (!n.length || n.length % 2 || n.some(v => !Number.isFinite(v)))
           throw new MalformedOperation("sample <x> <y> [<x> <y> …]: view points; layout <target> gives a node's frame");
-        r = await s.op({ op: 'sample', points: n.flatMap((v, i) => (i % 2 ? [] : [[v, n[i + 1]]])) });
+        r = await samplePoints(s, n.flatMap((v, i) => (i % 2 ? [] : [[v, n[i + 1]]])));
         break;
       }
       case 'resize':
@@ -597,7 +605,7 @@ export async function main(argv, injected = {}) {
         );
       default:
         throw new MalformedOperation(
-          `unknown op: ${op} (tree, layout, state, logs, check, screenshot, sample, tap, type, post, pick, reload, clock, resize, close, back, prefer, call, perf, fail fetch, pass fetch)`,
+          `unknown op: ${op} (tree, layout, state, logs, check, screenshot, sample, tap, type, post, pick, reload, clock, background, resize, close, back, prefer, call, perf, fail fetch, pass fetch)`,
         );
     }
     return [op, r, how];

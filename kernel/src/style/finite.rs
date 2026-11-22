@@ -18,6 +18,7 @@ impl RowValue<'_> {
             RowValue::DashArray(v) => v.0.iter().all(|n| n.is_finite()),
             RowValue::Transform(v) => v.is_finite(),
             RowValue::TransformOrigin(v) => v.is_finite(),
+            RowValue::ObjectPosition(v) => v.is_finite(),
             RowValue::AnimationRange(v) => v.is_finite(),
             RowValue::ViewTimelineInset(v) => v.is_finite(),
             RowValue::Paint(_)

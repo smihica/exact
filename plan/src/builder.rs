@@ -482,7 +482,7 @@ impl PlanBuilder {
             init,
             owner: None,
             late: false,
-            persist: false,
+            persist: PersistScope::None,
         });
         SlotsId(self.plan.slots.len() as u32 - 1)
     }
@@ -992,6 +992,37 @@ impl PlanBuilder {
         SequencesId(self.plan.sequences.len() as u32 - 1)
     }
 
+    /// Append one interned step from the source expansion (LLP 1029.000.002 D1).
+    pub fn place_step(
+        &mut self,
+        outer: Option<PlaceStepsId>,
+        kind: PlaceKind,
+        name: &str,
+        ordinal: u32,
+        shared_id: bool,
+    ) -> PlaceStepsId {
+        let id = PlaceStepsId(self.plan.place_steps.len() as u32);
+        let name = self.str(name);
+        self.plan.place_steps.push(PlaceStepsRow {
+            outer,
+            kind,
+            name,
+            ordinal,
+            shared_id,
+        });
+        id
+    }
+
+    /// Associate an authored element with its source step.
+    pub fn set_node_place(&mut self, node: NodesId, place: PlaceStepsId) {
+        self.plan.nodes.to_mut()[node.0 as usize].place = Some(place);
+    }
+
+    /// Associate a keyed region with the source loop that owns its rows.
+    pub fn set_region_place(&mut self, region: RegionsId, place: PlaceStepsId) {
+        self.plan.regions[region.0 as usize].place = Some(place);
+    }
+
     /// A region under `parent` (or an arm root when `parent` is `None`),
     /// with `arm_count` arms allocated. Returns the region and its arms.
     #[allow(clippy::too_many_arguments)] // mirrors the row: kind, site (parent, arm, order), two codes, arms
@@ -1013,6 +1044,7 @@ impl PlanBuilder {
             arms.push(ArmsId(self.plan.arms.len() as u32 - 1));
         }
         self.plan.regions.push(RegionsRow {
+            place: None,
             kind,
             parent,
             arm,
@@ -1080,6 +1112,7 @@ impl PlanBuilder {
             });
         }
         self.plan.nodes.to_mut().push(NodesRow {
+            place: None,
             node_type,
             parent,
             arm,
@@ -1135,8 +1168,8 @@ impl PlanBuilder {
         self.plan.slots[id.0 as usize].late = true;
     }
 
-    /// Mark a root slot persisted (LLP 1116 D5), or not.
-    pub fn set_slot_persist(&mut self, id: SlotsId, persist: bool) {
+    /// Choose where a root slot is kept across reloads.
+    pub fn set_slot_persist(&mut self, id: SlotsId, persist: PersistScope) {
         self.plan.slots[id.0 as usize].persist = persist;
     }
 

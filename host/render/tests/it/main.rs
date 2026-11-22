@@ -809,8 +809,8 @@ fn a_route_lists_its_pages_with_its_source() {
     assert_eq!(later.unwrap().locations, ["/post/3"]);
     // The build's own list leaves the listed route to its source.
     assert_eq!(
-        exact_web::document::build_locations(&plan).unwrap(),
-        vec![("/".to_string(), false)]
+        exact_web::document::build_locations(&plan),
+        (vec![("/".to_string(), false)], None)
     );
 }
 
@@ -1074,7 +1074,7 @@ component Clock
 }
 
 #[test]
-fn rendered_delivery_uses_web_version_inputs() {
+fn rendered_pages_report_the_web_platform_and_its_build_version() {
     warm_transport();
     let plan = contract::compile(
         r#"
@@ -1083,10 +1083,13 @@ routes nav
 shape Build
   version: string
   buildNumber: string
+shape Page
+  platform: string
 component App
+  resource page = exactPage() as shape Page
   resource build = exactDelivery() as shape Build
   view
-    text `${build.version} (${build.buildNumber})`
+    text `${page.platform} ${build.version} (${build.buildNumber})`
 "#,
     )
     .unwrap();
@@ -1096,7 +1099,7 @@ component App
             build_number: build_number.into(),
             ..Default::default()
         };
-        let expected = format!(">{version} ({build_number})<");
+        let expected = format!(">web {version} ({build_number})<");
         for (ids, projection) in [
             (exact_render::Ids::Any, exact_render::Projection::Direct),
             (exact_render::Ids::Any, exact_render::Projection::Kernel),

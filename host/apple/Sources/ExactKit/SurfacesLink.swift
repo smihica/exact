@@ -21,8 +21,18 @@ package protocol SurfacesCapability: AnyObject {
     func canvas2D() -> Canvas2DCanvases
     /// A `canvas` node's GPU view.
     func makeMetalView() -> MetalView
-    /// Canvas 2D's text measure, which the runner calls back.
-    var canvasTextMeasure: ExactCanvasTextFn { get }
+    /// Canvas 2D for a new session: its text measurer, the image handles it
+    /// decodes and lets go, its held replays, and the display scale it backs
+    /// at, now and when the window moves (LLP 1056 D4, D5, D8, D9).
+    func wire(_ session: ExactSession, scale: CGFloat)
+    /// The display's scale changed: the canvases redraw at it (D4).
+    func display(_ runtime: Runtime, scale: CGFloat) -> Batch
+    /// Canvas draws in a turn of their own (LLP 1072 §8.5).
+    func deferDraws(_ runtime: Runtime)
+    /// The owed canvas draws on the owner, not waited for (LLP 1072 §8.5).
+    func draw(_ runtime: Runtime, done: @escaping (RuntimeCompletion) -> Void)
+    /// One canvas capture op (`mode: "canvas"` surface work, LLP 1056 D9).
+    func capture(_ session: ExactSession, _ op: [String: Any])
     /// Whether a surface wants the pointer locked.
     var pointerLockPreferred: Bool { get }
     /// Whether a GPU module is loaded, so a new generation's shaders matter.
@@ -141,7 +151,7 @@ package protocol Canvas2DCanvases: AnyObject {
     func apply(_ id: UInt32, _ payload: [String: Any], layer parent: CALayer?)
     /// Places the bitmap of `id` at `box`, its view's content box, clipped
     /// to the content edge's `radii`; every later bitmap shows there too.
-    func place(_ id: UInt32, in box: CGRect, radii: [CGSize])
+    func place(_ id: UInt32, in box: CGRect, radii: [CGSize], placement: @escaping (CGSize) -> CGRect)
     func forget(_ id: UInt32)
     func load(_ srcs: [String])
     /// Lets go handles no mounted canvas asks for any more.
@@ -270,7 +280,7 @@ final class NoCanvas2D: Canvas2DCanvases {
     var onReplayEnded: (() -> Void)?
     var loadingCount: Int { 0 }
     func apply(_ id: UInt32, _ payload: [String: Any], layer parent: CALayer?) {}
-    func place(_ id: UInt32, in box: CGRect, radii: [CGSize]) {}
+    func place(_ id: UInt32, in box: CGRect, radii: [CGSize], placement: @escaping (CGSize) -> CGRect) {}
     func forget(_ id: UInt32) {}
     func load(_ srcs: [String]) {}
     func drop(_ srcs: [String]) {}

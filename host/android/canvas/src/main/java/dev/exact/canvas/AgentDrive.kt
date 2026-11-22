@@ -6,6 +6,11 @@ import android.os.Process
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 
+internal fun agentCarried(): Boolean {
+    val mode = android.system.Os.getenv("EXACT_AGENT")
+    return mode == "1" || mode == "live"
+}
+
 /**
  * The agent API's carrier in the reader (LLP 1012; LLP 1107 D1's `--reader`): `scripts/agent.mjs android --reader`
  * drives the app this activity shows by the Linux host's own protocol, one JSON line a request and one its answer.

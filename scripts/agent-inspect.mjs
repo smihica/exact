@@ -19,12 +19,18 @@ export function worldFile(path) {
 
 /** A capture's pixels, decoded once, at the drive's `--scale`: shrunk by area from the capture's own pixels a point, never enlarged. */
 export function scaledScreenshot(r, scale, host) {
-  const png = decodePng(readFileSync(r.screenshot)), drawn = r.scale ?? png.width / r.w, said = Math.round(drawn * 100) / 100;
+  const png = decodePng(readFileSync(r.screenshot), { preserveColor: scale !== undefined });
   if (scale === undefined) return { image: png, shrunk: false };
+  const drawn = r.scale ?? png.width / r.w, said = Math.round(drawn * 100) / 100;
   if (!Number.isFinite(drawn)) throw new Error(`--scale: the ${host} capture did not say its size in points`);
-  if (scale > drawn + 1e-3) throw new Error(`--scale ${scale}: this ${host} capture is ${said} pixel${said === 1 ? '' : 's'} a point; a screenshot is never enlarged`);
-  if (drawn - scale <= 1e-3) return { image: png, shrunk: false };
-  return { image: shrink(png, Math.max(1, Math.round(png.width * scale / drawn)), Math.max(1, Math.round(png.height * scale / drawn))), shrunk: true };
+  const screen = r.captureSpace === 'screen';
+  const width = Math.max(1, Math.round(screen ? r.w * scale : png.width * scale / drawn));
+  const height = Math.max(1, Math.round(screen ? r.h * scale : png.height * scale / drawn));
+  const enlarges = screen ? width > png.width || height > png.height : scale > drawn + 1e-3;
+  if (enlarges) throw new Error(`--scale ${scale}: this ${host} capture is ${said} pixel${said === 1 ? '' : 's'} a point; a screenshot is never enlarged`);
+  const sameSize = screen ? width === png.width && height === png.height : drawn - scale <= 1e-3;
+  if (sameSize) return { image: png, shrunk: false };
+  return { image: shrink(png, width, height), shrunk: true };
 }
 
 const sourceLocation = value => value && typeof value.file === 'string' && value.file.length > 0
@@ -900,12 +906,12 @@ export async function pidTrace(pid, dest, run = spawnSync, timeout = 10000) {
 
 /** The trace a phone's dev menu saved last (`ExactSession.latestTrace`,
  * `tmp/trace-latest.json` in the app's container), copied into the app's
- * `target/traces/` (LLP 1079 D5): from a simulator's container, which
+ * `.exact/traces/` (LLP 1079 D5) from a simulator's container, which
  * devicectl cannot copy, else off the phone as its screenshots are. */
 export function phoneTrace(ph, a, run = spawnSync) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = resolve(a.target, 'traces', `trace-${String(ph.name ?? ph.udid).replace(/[^\w.-]/g, '_')}-${stamp}.json`);
-  mkdirSync(resolve(a.target, 'traces'), { recursive: true });
+  const file = resolve(a.dir, '.exact', 'traces', `trace-${String(ph.name ?? ph.udid).replace(/[^\w.-]/g, '_')}-${stamp}.json`);
+  mkdirSync(dirname(file), { recursive: true });
   const unsaved = `no trace saved in ${a.id} on ${ph.name ?? ph.udid}: Save Trace in its dev menu first (four fingers tapped once)`;
   const container = run('xcrun', ['simctl', 'get_app_container', ph.udid, a.id, 'data'], { encoding: 'utf8' });
   // simctl's 148: no simulator by that id, so a phone. A simulator it knows

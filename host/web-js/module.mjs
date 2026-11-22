@@ -9,24 +9,72 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 // Also for its PATH: the pinned binaryen (and Cargo) as every web build has
 // them, so a prebuild optimizes and keeps what an app's build would.
 import { awaitBuildOutput, WEB_STD, WEB_SIZE, WEB_TOOLCHAIN, injectedProfiles, resolveApp, wasmRemapFlags, webToolchainEnv } from '../../scripts/app.mjs';
 import { rustDataOf, undeclaredDataCrate } from '../../scripts/app-shells.mjs';
-import { appCrates } from '../../scripts/cargo-check.mjs';
+import { appCrates, linkedCrate } from '../../scripts/cargo-check.mjs';
 import { SETUP_FETCHES, withHostDeployment } from '../../scripts/filesystem.mjs';
 import { replaceBuild } from '../web/serve.mjs';
 import { proofInputs } from '../../game/inputs.mjs';
 import { keptProducts } from '../../scripts/kept.mjs';
-import { RustMissing, fromSet, fromSets, fetchedAllowed, launch, rustMissing, freshCompiler } from '../../scripts/tools.mjs';
+import { RustMissing, fromSet, fromSets, fetchedTool, launch, rustMissing, freshCompiler } from '../../scripts/tools.mjs';
 import { EXE } from '../../scripts/paths.mjs';
 export { EXE };
-import { buildScriptDir, crateDir, depInfoOf, fresh as cargoFresh, refreshCargoRustShapes } from '../../scripts/cargo-dep-info.mjs';
+import { buildScriptDir, crateDir, depInfoOf, fresh as cargoFresh, refreshCargoRustBindings } from '../../scripts/cargo-dep-info.mjs';
 export { buildScriptDir, crateDir, depInfoOf, freshCompiler };
 export const fresh = (product, dep, also = []) => cargoFresh(product, dep, also);
 import { BINARYEN_DOWNLOAD } from '../web/stages.mjs';
+
+// ECMA-426 §6 and §9.2. Only the generated column and source index are needed to charge a span to its module.
+function vlq(segment, at) {
+  const digits = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let value = 0, place = 1, digit;
+  do {
+    digit = digits.indexOf(segment[at++]);
+    if (digit < 0) throw new Error('invalid source-map VLQ');
+    value += (digit & 31) * place;
+    place *= 32;
+  } while (digit & 32);
+  return [value % 2 ? -Math.floor(value / 2) : value / 2, at];
+}
+
+/** Module shares of the minified launch script. A line ending, a one-field segment or text before a line's first
+ * mapping has no source. Columns count UTF-16 units. A character split by a mapping belongs to its starting span. */
+export function entrySizeReport(chunk, out) {
+  const map = chunk.map, mappings = map.mappings.split(';'), counts = new Map();
+  const lines = chunk.code.split(/(\r\n|[\r\n\u2028\u2029])/);
+  const add = (source, bytes) => { if (bytes) counts.set(source, (counts.get(source) ?? 0) + bytes); };
+  let source = 0;
+  for (let i = 0; i < lines.length; i += 2) {
+    const line = lines[i];
+    let column = 0, start = 0, owner = null;
+    for (const segment of (mappings[i / 2] || '').split(',')) {
+      if (!segment) continue;
+      const [advance, at] = vlq(segment, 0);
+      column += advance;
+      const low = line.charCodeAt(column), high = line.charCodeAt(column - 1);
+      const end = low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff ? column + 1 : column;
+      add(owner, Buffer.byteLength(line.slice(start, end)));
+      start = end;
+      if (at < segment.length) { source += vlq(segment, at)[0]; owner = map.sources[source]; }
+      else owner = null;
+    }
+    add(owner, Buffer.byteLength(line.slice(start)));
+    if (lines[i + 1]) add(null, Buffer.byteLength(lines[i + 1]));
+  }
+  const gen = realpathSync(resolve(out, '.gen'));
+  const moduleName = source => {
+    const path = resolve(out, source);
+    return relative(gen, existsSync(path) ? realpathSync(path) : path);
+  };
+  const bytes = Buffer.from(chunk.code), rows = [...counts].sort((a, b) => b[1] - a[1]);
+  return [`Launch script ${chunk.fileName}, ${bytes.length} B (${gzipSync(bytes).length} B gzip)`, 'Minified bytes by source module',
+    ...rows.map(([source, n]) => `  ${n} B  ${source == null ? '(unmapped)' : moduleName(source)}`)].join('\n');
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -106,18 +154,23 @@ function replace(path, write) {
   return written instanceof Promise ? written.then(land, (error) => { clean(); throw error; }) : land(written);
 }
 const cargoWasmArgs = (manifest) => [`+${WEB}`, 'build', '--release', '--target', 'wasm32-unknown-unknown', '--manifest-path', manifest, ...LINK_FLAGS()];
-function cargoWasm(manifest) {
-  return spawnSync('cargo', cargoWasmArgs(manifest), { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: TARGET, EXACT_RUST_SHAPES: '1' } });
+function cargoWasm(manifest, args) {
+  return spawnSync('cargo', [...cargoWasmArgs(manifest), ...args], { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: TARGET, EXACT_RUST_BINDINGS: '1' } });
 }
-/** The dep-info of each module `buildModule` built, by the path it returned. */
+/** The dep-info and generated wrapper of each module, by its staged path. */
 const moduleDepInfo = new Map();
-/** The package directories the module at `built` (what `buildModule` returned) was compiled from, by its dep-info:
- * the data crate and every path dependency, wherever it is (LLP 1153.003 D1.6). Empty when it has none. */
+/** The module's package directories for the dev watcher (LLP 1153.003 D1.6).
+ * The generated wrapper is a build output. */
 export function moduleSourceDirs(built) {
   try {
-    const text = readFileSync(moduleDepInfo.get(built), 'utf8');
+    const { depInfo, wrapper } = moduleDepInfo.get(built);
+    const text = readFileSync(depInfo, 'utf8');
     const files = text.slice(text.indexOf(': ') + 2).trim().split(/(?<!\\)\s+/).map(f => f.replace(/\\ /g, ' '));
-    return [...new Set(files.map(crateDir).filter(Boolean))];
+    const dirs = [...new Set(files.map(crateDir).filter(Boolean))];
+    if (!wrapper) return dirs;
+    return dirs.filter(dir => {
+      try { return realpathSync(dir) !== wrapper; } catch { return true; }
+    });
   } catch { return []; }
 }
 /** An unchanged generated crate keeps its mtime for Cargo. */
@@ -131,42 +184,89 @@ function lockFrom(crate) {
   writeFileSync(resolve(crate, 'Cargo.lock'), lock);
   writeFileSync(from, id);
 }
+
+const LOCKFILE_KEY = 'resolver.lockfile-path';
+
+// Let Cargo apply configuration includes and environment overrides.
+function usesDefaultLock(env) {
+  const result = spawnSync('cargo', [`+${WEB}`, '-Z', 'unstable-options', 'config', 'get', LOCKFILE_KEY, '--color=never'], { env, encoding: 'utf8' });
+  if (result.status === 0) return false;
+  if (result.stderr?.trimEnd().endsWith(`error: config value \`${LOCKFILE_KEY}\` is not set`)) return true;
+  throw new Error(`module Cargo config: ${result.stderr || result.error?.message}`);
+}
+
+// Cargo prunes unused pins. Start each resolution with Exact's full lockfile
+// and preserve the build lockfile's mtime when the result is identical.
+function resolveDevLock(lock, readMetadata) {
+  const dir = mkdtempSync(resolve(dirname(lock), 'resolve-'));
+  try {
+    const seed = resolve(dir, 'Cargo.lock');
+    writeFileSync(seed, readFileSync(resolve(root, 'Cargo.lock')));
+    const metadata = readMetadata(['--config', `${LOCKFILE_KEY}=${JSON.stringify(seed)}`]);
+    const resolved = readFileSync(seed);
+    if (!existsSync(lock) || !resolved.equals(readFileSync(lock))) replace(lock, temp => writeFileSync(temp, resolved));
+    return metadata;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** Resolve the module's graph, refreshing a dev wrapper's default lockfile from Exact's pins. */
+export function moduleMetadata(manifest, env, dev = false) {
+  const readMetadata = (args = []) => {
+    const result = spawnSync('cargo', [`+${WEB}`, 'metadata', '--offline', '--format-version', '1', '--manifest-path', manifest, ...args],
+      { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    if (result.status !== 0) throw new Error(`module metadata: ${result.stderr || result.error?.message}`);
+    return JSON.parse(result.stdout);
+  };
+  const locked = dev && usesDefaultLock(env);
+  const metadata = locked ? resolveDevLock(resolve(dirname(manifest), 'Cargo.lock'), readMetadata) : readMetadata();
+  return { metadata, locked };
+}
+
 /** A built `app.js` past this is an order of magnitude over what the apps here build, and near what a host refuses
  * (a 25 MiB limit in one report): a guess, for a warning that fails nothing. */
 export const APP_JS_WARN_BYTES = 8 << 20;
 /** What a build says of a built `app.js` of `bytes` past that size, with the compiler's line of plan code by component
  * (`costs`) when it gave one; '' below it. Two apps reached 30 MB with no word (LLP 1156.006.000 D4). */
-export const sizeWarning = (name, bytes, costs = '') => (bytes <= APP_JS_WARN_BYTES ? '' : `warning: ${name} is ${(bytes / 2 ** 20).toFixed(1)} MiB: a component's body is compiled in at each place it is used, so a large body used many times multiplies. Draw repeated structure from data in one \`for\`, and keep a many-armed \`if\` out of a component used hundreds of times${costs ? `; ${costs}` : ''}`);
+export const sizeWarning = (name, bytes, costs = '') => bytes <= APP_JS_WARN_BYTES ? ''
+  : `warning: ${name} is ${(bytes / 2 ** 20).toFixed(1)} MiB. The plan expands each component use. Different mount bodies can add launch code. Add --sizes to the web build for bytes by source module.${costs ? ` ${costs}` : ''}`;
 /** What separates two directories of one app name (two worktrees of an app) in the names made from it: twelve hex
  * of the directory's real path, as `host/web/dev.mjs` keys `dev-generations` (LLP 1156.006.000 D13). Every app's
  * module builds into one Cargo target, where one crate name from two directories is one product and one claim. */
 export const dirKey = (dir) => createHash('sha256').update(realpathSync(dir)).digest('hex').slice(0, 12);
 
+// A path as a TOML basic string. JSON's escapes are TOML's, so a Windows path's
+// backslashes (`C:\Users`) are not read as escapes.
+const tomlString = (path) => JSON.stringify(path);
+
+// The workspace's `[patch.crates-io]` table, its vendor paths made absolute for a crate outside the workspace.
+const workspacePatch = (ws) => ws.slice(ws.indexOf('[patch.crates-io]')).split('\n[')[0]
+  .replace(/path = "(vendor[^"]*)"/g, (_, path) => `path = ${tomlString(resolve(root, path))}`);
+
 /** Cargo's module at `wasm`, optimized to `<out>/app.module.wasm`. */
-function module(manifest, name, out, label) {
+function module(manifest, name, out, label, writeInputs, dev = false) {
   const wasm = resolve(TARGET, 'wasm32-unknown-unknown/release', `${name}.wasm`), done = resolve(out, 'app.module.wasm');
   mkdirSync(out, { recursive: true });
-  const release = awaitBuildOutput({ id: label, dir: dirname(manifest) }, resolve(TARGET, '.claims', `${name}.lock`));
-  moduleDepInfo.set(done, wasm.replace(/\.wasm$/, '.d'));
+  const crate = dirname(manifest);
+  const release = awaitBuildOutput({ id: label, dir: crate }, resolve(TARGET, '.claims', `${name}.lock`));
   try {
-    prepareModule(wasm, done, { manifest, targetDir: TARGET, profile: 'release' }, () => {
-      if (cargoWasm(manifest).status !== 0) throw new Error(`${label} did not build`);
+    writeInputs?.();
+    prepareModule(wasm, done, { manifest, targetDir: TARGET, profile: 'release', dev }, locked => {
+      const args = locked ? ['--locked'] : [];
+      if (cargoWasm(manifest, args).status !== 0) throw new Error(`${label} did not build`);
     });
+    moduleDepInfo.set(done, { depInfo: wasm.replace(/\.wasm$/, '.d'), wrapper: writeInputs ? realpathSync(crate) : undefined });
     return done;
   } finally { release(); }
 }
 
 // A dev build's staging directory is replaced each time. Keep the optimized
 // module beside Cargo's artifact so a new stage need not optimize it again.
-function prepareModule(wasm, done, { manifest, targetDir, profile }, build) {
+function prepareModule(wasm, done, { manifest, targetDir, profile, dev }, build) {
   const cached = wasm.replace(/\.wasm$/, '.optimized.wasm'), from = `${cached}.from`;
-  const env = { ...process.env, CARGO_TARGET_DIR: targetDir, EXACT_RUST_SHAPES: '1' };
-  const result = spawnSync('cargo', [`+${WEB}`, 'metadata', '--offline', '--format-version', '1', '--manifest-path', manifest],
-    { env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  if (result.status !== 0) throw new Error(`module metadata: ${result.stderr || result.error?.message}`);
-  const metadata = JSON.parse(result.stdout);
-  refreshCargoRustShapes(targetDir, 'wasm32-unknown-unknown', profile, metadata.packages, env, metadata.build_directory);
-  build();
+  const env = { ...process.env, CARGO_TARGET_DIR: targetDir, EXACT_RUST_BINDINGS: '1' };
+  const { metadata, locked } = moduleMetadata(manifest, env, dev);
+  refreshCargoRustBindings(targetDir, 'wasm32-unknown-unknown', profile, metadata.packages, env, metadata.build_directory);
+  build(locked);
   // Cargo may restore an older artifact when features change back.
   const id = createHash('sha256').update(readFileSync(wasm)).update(JSON.stringify([WASM_OPT(), OPT])).digest('hex');
   if (!existsSync(cached) || !existsSync(from) || readFileSync(from, 'utf8') !== id) {
@@ -176,7 +276,7 @@ function prepareModule(wasm, done, { manifest, targetDir, profile }, build) {
   replace(done, temp => cpSync(cached, temp, { preserveTimestamps: true }));
 }
 
-export function buildModule(app, out, draw = false, dir = resolve(root, 'apps', app)) {
+export function buildModule(app, out, draw = false, dir = resolve(root, 'apps', app), { dev = false } = {}) {
   const key = dirKey(dir);
   out ??= resolve(MODULES, `${app}-${key}`);
   const manifest = JSON.parse(readFileSync(resolve(dir, 'app.json'), 'utf8'));
@@ -195,34 +295,39 @@ export function buildModule(app, out, draw = false, dir = resolve(root, 'apps', 
     const manifestPath = resolve(crate, 'Cargo.toml'), name = Bun.TOML.parse(readFileSync(manifestPath, 'utf8')).package.name;
     const wasm = resolve(resolved.target, 'wasm32-unknown-unknown/web', `${name.replaceAll('-', '_')}.wasm`), done = resolve(out, 'app.module.wasm');
     mkdirSync(out, { recursive: true });
-    moduleDepInfo.set(done, wasm.replace(/\.wasm$/, '.d'));
+    moduleDepInfo.set(done, { depInfo: wasm.replace(/\.wasm$/, '.d') });
     const release = awaitBuildOutput(resolved, resolve(resolved.target, '.claims', `${name}.lock`));
     try {
       keep(resolve(crate, 'src/lib.rs'), lib);
       prepareModule(wasm, done, { manifest: manifestPath, targetDir: resolved.target, profile: 'web' }, () => {
         const args = [`+${WEB}`, 'build', '--locked', '--offline', '--profile', 'web', '--target', 'wasm32-unknown-unknown', '--manifest-path', manifestPath, ...injectedProfiles({ manifest }, workspace), ...LINK_FLAGS()];
-        if (spawnSync('cargo', args, { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: resolved.target, EXACT_RUST_SHAPES: '1' } }).status !== 0) throw new Error(`${app}: the module did not build; if Cargo says above that it could not download a crate offline, ${SETUP_FETCHES}`);
+        if (spawnSync('cargo', args, { stdio: ['ignore', 'inherit', 'inherit'], env: { ...process.env, CARGO_TARGET_DIR: resolved.target, EXACT_RUST_BINDINGS: '1' } }).status !== 0) throw new Error(`${app}: the module did not build; if Cargo says above that it could not download a crate offline, ${SETUP_FETCHES}`);
       });
       return done;
     } finally { release(); }
   }
 
-  const dataCrate = appCrates(dir).find(crate => crate.name === data.krate)?.dir;
-  if (!dataCrate) throw new Error(`${app}: app.json's rust.data.crate is ${data.krate}, which is not a crate beside app.json`);
-  const crate = resolve(out, 'crate');
+  // The one the app's own host crates link by path, which they build, else the one beside app.json
+  const dataCrate = linkedCrate(resolved.dir, data.krate) ?? appCrates(resolved.dir).find(crate => crate.name === data.krate)?.dir;
+  if (!dataCrate) throw new Error(`${app}: app.json's rust.data.crate is ${data.krate}, which neither its host crates link by path nor is a crate beside app.json; name the data crate its host crates link, or link it by path from one of them`);
+  const packageName = `exact-js-module-${app}-${key}${dev ? '-dev' : ''}`;
+  // A stable path lets Cargo keep the dev wrapper fresh across stages. Its
+  // own package name keeps Cargo from reusing a stage-local wrapper's artifact.
+  const crate = dev ? resolve(MODULES, 'wrappers', packageName) : resolve(out, 'crate');
   mkdirSync(resolve(crate, 'src'), { recursive: true });
-  const ws = readFileSync(resolve(root, 'Cargo.toml'), 'utf8');
-  const patch = ws.slice(ws.indexOf('[patch.crates-io]')).split('\n[')[0].replace(/path = "vendor/g, `path = "${root}/vendor`);
-  keep(resolve(crate, 'Cargo.toml'), `[package]
-name = "exact-js-module-${app}-${key}"
+  const writeInputs = () => {
+    const ws = readFileSync(resolve(root, 'Cargo.toml'), 'utf8');
+    const patch = workspacePatch(ws);
+    keep(resolve(crate, 'Cargo.toml'), `[package]
+name = "${packageName}"
 version = "0.1.0"
 edition = "2021"
 publish = false
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
-${data.krate} = { path = "${dataCrate}" }
-exact-logic-abi = { path = "${resolve(root, 'logic/abi')}" }
+${data.krate} = { path = ${tomlString(dataCrate)} }
+exact-logic-abi = { path = ${tomlString(resolve(root, 'logic/abi'))} }
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -233,9 +338,10 @@ strip = true
 ${ws.slice(ws.indexOf('[workspace.dependencies]')).split('\n[workspace.package]')[0]}
 ${patch}
 `);
-  keep(resolve(crate, 'src/lib.rs'), lib);
-  lockFrom(crate);
-  return module(resolve(crate, 'Cargo.toml'), `exact_js_module_${app.replaceAll('-', '_')}_${key}`, out, `${app}: the module`);
+    keep(resolve(crate, 'src/lib.rs'), lib);
+    if (!dev) lockFrom(crate);
+  };
+  return module(resolve(crate, 'Cargo.toml'), packageName.replaceAll('-', '_'), out, `${app}: the module`, writeInputs, dev);
 }
 
 /** The refusal of an app at `dir` whose web crate bakes a Rust source while `manifest` names neither `rust.data` nor
@@ -294,7 +400,7 @@ export async function moduleGrants(path) {
  * alone from a wasm module the page fetches on its first Markdown node. */
 export function buildMarkdown({ own = false, out = resolve(MODULES, 'markdown'), keepFresh = false } = {}) {
   const ws = readFileSync(resolve(root, 'Cargo.toml'), 'utf8');
-  const patch = ws.slice(ws.indexOf('[patch.crates-io]')).split('\n[')[0].replace(/path = "vendor/g, `path = "${root}/vendor`);
+  const patch = workspacePatch(ws);
   return buildLeaf('markdown', 'exact-web-capabilities', 'host/web-capabilities', { out, keepFresh, own, patch, lib: `//! Generated: Markdown pieces for the JS runtime.
 static mut OUT: Vec<u8> = Vec::new();
 #[no_mangle]
@@ -371,7 +477,7 @@ function taken(name, at) {
   const missing = rustMissing();
   const kept = missing ? null : at().find();
   if (kept) return { path: kept, kept: true };
-  const fetched = fetchedAllowed() ? fromSet(name, 'fetched') : null;
+  const fetched = fetchedTool(name);
   if (fetched) return { path: fetched.path, kept: true };
   if (missing) throw new RustMissing(name);
   return null;
@@ -420,7 +526,7 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 [dependencies]
-${pkg} = { path = "${resolve(root, dir)}" }
+${pkg} = { path = ${tomlString(resolve(root, dir))} }
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -504,7 +610,7 @@ export function webCompiler() {
   const missing = rustMissing(), at = compilerKept();
   const taken = missing ? null : at.find();
   if (taken) return launch(taken);
-  const fetched = fetchedAllowed() ? fromSet('exact-web-js', 'fetched') : null;
+  const fetched = fetchedTool('exact-web-js');
   if (fetched) return launch(fetched.path);
   if (missing) throw new RustMissing('exact-web-js');
   const started = Date.now();

@@ -9,10 +9,11 @@ import { symbolSheet } from './glue-fixture.mjs';
 // runtime's symbol painter (glue.js `refreshSymbols`, symbols.js `refresh`)
 // under the shell and the neutral sheet, in each engine, measured from the
 // screen.
-import { expect } from 'bun:test';
+import { beforeAll, describe, expect } from 'bun:test';
 import { hostFixtureFile as readFileSync } from './glue-fixture.mjs';
 import { resolve } from 'node:path';
-import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
+import { spawnSync } from 'node:child_process';
+import { chromium, suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
 import { glueDeclarations } from './glue-fixture.mjs';
 import { engineTests } from '../../../scripts/coverage.mjs';
@@ -63,7 +64,7 @@ const content = `<div style="font-size:17px;display:flex;flex-direction:column;a
   <div style="display:flex">${['near-a', 'near-b'].map((id) => button(id, role(`${id}-i`, 'add'), 'width:20px;height:20px', 'data-exact-said="width height"')).join('')}</div>
   <div navigationPresentation="modal" style="visibility:hidden"><header>${button('word', role('word-i', 'add'), 'width:50px;height:30px', 'data-exact-said="width height" aria-label="Discard everything"')}${button('titled-word', role('titled-word-i', 'add') + title('Discard'), 'width:120px;height:30px', 'data-exact-said="width height" aria-label="Discard everything"')}</header></div>
   ${twins('bar', (id, image) => `<div role="tablist" style="display:flex;width:200px">${tab(id, image(`${id}-i`, 'home'))}</div>`)}
-  ${twins('side', (id, image) => `<div data-exact-sidebar style="display:flex"><div role="tablist" style="display:flex;flex-direction:column;width:200px">${tab(id, image(`${id}-i`, 'home'))}</div></div>`)}
+  ${twins('side', (id, image) => `<div data-exact-sidebar style="display:flex"><div data-exact-sidebar-tabs role="tablist" style="display:flex;flex-direction:column;width:200px">${tab(id, image(`${id}-i`, 'home'))}</div></div>`)}
   <div role="tablist" style="display:flex">${button('segment', role('segment-i', 'home') + title('Home', ''), '', 'role="tab" aria-selected="false"')}</div>
   <div role="radiogroup" style="display:flex">${button('radio', role('radio-i', 'home') + title('Home', ''), '', 'role="radio" aria-checked="false"')}</div>
   <div role="menu">${button('menu-row', role('menu-row-i', 'home') + title('Home', ''))}</div><div data-exact-chooser>${button('chooser-row', role('chooser-row-i', 'home') + title('Home', ''), '', 'data-exact-on="press"')}</div>
@@ -73,6 +74,202 @@ const RUNTIMES = {
   'host/web/glue.js': ['const views = new Map([...document.querySelectorAll("#exact-root img")].entries()), log = () => {}, host = {};', ['tintFit', 'refreshSymbols'], 'refreshSymbols();'],
   'host/web-js/symbols.js': ['const All = true, journal = [], clock = { now: 0 }, appSource = () => {}, Images = new Set(document.querySelectorAll("#exact-root img")), image = e => Images.add(e);', ['refresh'], 'refresh();'],
 };
+
+for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) {
+  engineTest.chromium(`scale-down reads fractional content sizes (${file})`, async () => {
+    const source = readFileSync(resolve(ROOT, file), 'utf8');
+    const suite = await suiteBrowser('chromium');
+    try {
+      const page = await suite.newPage();
+      const css = 'object-fit:scale-down;font-size:160px;width:0.625px;height:200px';
+      const borderBox = 'box-sizing:border-box;width:4.625px;padding:1px;border:1px solid';
+      await page.setContent(`<style>${symbolSheet(source)}</style><div id="exact-root">
+        ${icon('symbol', '', 'M0 0H1V160H0Z', '0 0 1 160', css)}
+        <img id="raster" style="${css};${borderBox};mask-size:var(--exact-tint-fit,contain)">
+        </div><script>${stand} ${glueDeclarations(source, names)} globalThis.paint = () => { ${run} };</script>`);
+      const fits = await page.evaluate(async () => {
+        const raster = document.getElementById('raster');
+        const canvas = document.createElement('canvas');
+        canvas.width = 1; canvas.height = 160;
+        raster.src = canvas.toDataURL();
+        raster.$template = true;
+        await raster.decode();
+        paint();
+        return ['symbol', 'raster'].map(id => getComputedStyle(document.getElementById(id)).maskSize);
+      });
+      expect(fits).toEqual(['contain', 'contain']);
+    } finally { await suite.close(); }
+  });
+}
+
+async function paintedTestExecutable() {
+  const build = Bun.spawn(['cargo', 'test', '-p', 'exact-painted', '--lib', '--no-run', '--message-format=json-render-diagnostics'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe', timeout: 360000,
+  });
+  const [out, err, status] = await Promise.all([build.stdout.text(), build.stderr.text(), build.exited]);
+  expect(status, err).toBe(0);
+  const manifest = resolve(ROOT, 'host/painted/Cargo.toml');
+  const artifact = out.trim().split('\n').map(line => JSON.parse(line)).find(row =>
+    row.reason === 'compiler-artifact' && row.manifest_path === manifest && row.profile.test && row.executable);
+  expect(artifact, 'Cargo should report the painted unit-test executable').toBeDefined();
+  return artifact.executable;
+}
+
+async function checkPlacement(engine, file, [stand, names, run], painted) {
+  const source = readFileSync(resolve(ROOT, file), 'utf8'), suite = await suiteBrowser(engine, { timeout: 10000 });
+  const cases = [];
+  for (const [w, h] of [[799.1, 184], [184, 799.1], [24, 24]]) {
+    for (const sf of ['', 'star']) for (const fit of ['contain', 'cover', 'fill', 'none', 'scale-down']) for (const position of [
+      '50% 50%', 'left bottom', 'top right', 'right 7px bottom 11px',
+      'var(--missing) 75%', '1em 0', '10vw 0',
+      'var(--missing, right) bottom', 'var(--missing, 7px 11px)',
+      'var(--missing, var(--other, 1em 0))', '0% 100%', '25% 75%', '7px 11px', 'max(25%, 20px) 11px',
+      'calc(max(25%, 20px) + min(5px, 10%)) clamp(3px, 40%, 9px)',
+    ]) {
+      cases.push({ w, h, fit, position, sf });
+    }
+    for (const intrinsic of [true, 'width', 'height']) for (const sf of ['', 'star']) cases.push({ w, h, fit: 'contain', position: '50% 50%', intrinsic, sf });
+  }
+  for (const position of ['var(--absent, left top 11px)', 'calc(10px)calc(12px)'])
+    cases.push({ w: 24, h: 24, fit: 'none', position, sf: '' });
+  if (engine === 'chromium') for (const position of ['env(safe-area-inset-left, 0px) top', 'env(titlebar-area-x, 7px 11px)'])
+    cases.push({ w: 799.1, h: 184, fit: 'none', position, sf: '' });
+  for (const [w, h] of [[400, 100], [100, 400]]) for (const sf of ['', 'star'])
+    for (const fit of ['contain', 'cover', 'fill', 'none', 'scale-down'])
+      for (const position of ['50% 50%', '7px 11px']) cases.push({ w, h, sf, fit, position, overflow: true });
+  for (const font of [20, 30]) cases.push({ w: 799.1, h: 184, fit: 'none', position: '1em 0', sf: '', font });
+  for (const font of [20, 30]) for (const kind of ['bitmap', ...(engine === 'chromium' ? ['video'] : [])])
+    for (const fit of ['contain', 'cover', 'fill', 'none', 'scale-down'])
+      for (const position of ['left top', '25% 75%', '1em 0', '10vw 0', 'var(--missing, right) bottom', 'var(--missing, 1em 0)'])
+        cases.push({ w: 40, h: 20, kind, fit, position, sf: '', font });
+  for (const fit of ['contain', 'cover', 'fill', 'none', 'scale-down'])
+    for (const position of ['var(--missing) 75%', 'var(--missing, bogus) 75%', 'var(--missing, 7px 11px)'])
+      cases.push({ w: 40, h: 20, kind: 'bitmap', tinted: true, fit, position, sf: '', font: 20 });
+  if (engine === 'chromium') for (const fit of ['', 'unset'])
+    cases.push({ w: 40, h: 10, kind: 'video', fit, position: 'left top', sf: '', font: 20 });
+  try {
+    const page = await suite.newPage({ viewport: { width: 840, height: 900 }, deviceScaleFactor: 1 });
+    await page.setContent(`<style>body{margin:0;background:white} #exact-root{display:grid;grid-template-columns:400px 400px;gap:0 20px} .row{display:flex;align-items:flex-start;min-height:80px;margin-bottom:10px;gap:20px} img{display:block;color:red;--exact-tint:red!important}</style>
+      <style>${symbolSheet(source)}</style><div id="exact-root">${cases.map(({ w, h, fit, position, intrinsic, sf = '', overflow, kind, tinted, font = 20 }, i) => {
+        const point = font * (sf ? scale : 1), nw = sf ? point : point * w / Math.max(w, h), nh = sf ? point : point * h / Math.max(w, h);
+        const css = `flex:none;font-size:${font}px;--exact-symbol-scale:${sf ? scale : 1};${fit ? `object-fit:${fit};` : ''}object-position:${position};${intrinsic === 'width' ? 'width:160px;height:auto' : intrinsic === 'height' ? 'width:auto;height:80px' : intrinsic ? '' : 'width:160px;height:80px'}`;
+        if (kind) {
+          const maskSize = { contain: 'contain', cover: 'cover', fill: '100% 100%', none: 'auto', 'scale-down': 'var(--exact-tint-fit,contain)' }[fit];
+          const tint = tinted ? `background-color:red;--exact-object-position:${position};object-position:-100000px 0;mask-size:${maskSize};mask-position:var(--exact-object-position,50% 50%);mask-origin:content-box;mask-clip:content-box;mask-repeat:no-repeat` : '';
+          const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><path d="M0 0H${w}V${h}H0Z" fill="red"/></svg>`;
+          const actual = kind === 'video' ? `<video id="actual-${i}" data-oracle-video="${h}" muted autoplay playsinline style="${css}"></video>`
+            : `<img id="actual-${i}" data-oracle-bitmap ${tinted ? 'data-oracle-tint' : ''} style="${css};${tint}">`;
+          return `<div class="row">${actual}<img id="oracle-${i}" style="${css};${fit ? '' : 'object-fit:contain'}" src="data:image/svg+xml,${encodeURIComponent(svg)}"></div>`;
+        }
+        const bottom = h * (overflow ? 2 : 1);
+        const d = `M 0 0 L ${w} 0 L ${w} ${bottom} L 0 ${bottom} Z`;
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" ${sf ? `width="${point}" height="${point}"` : fit === 'none' || fit === 'scale-down' ? (w >= h ? `width="${nw}"` : `height="${nh}"`) : `width="${w}" height="${h}"`} viewBox="0 0 ${w} ${h}"><path d="${d}" fill="red"/></svg>`;
+        return `<div class="row">${icon(`actual-${i}`, sf, d, `0 0 ${w} ${h}`, css)}<img id="oracle-${i}" style="${css};${intrinsic === true ? `width:${nw}px;height:auto` : ''}" src="data:image/svg+xml,${encodeURIComponent(svg)}"></div>`;
+      }).join('')}</div><script>${stand} ${glueDeclarations(source, names)} globalThis.paint = () => { ${run} }; paint();</script>`);
+    await page.evaluate(async () => {
+      const canvas = Object.assign(document.createElement('canvas'), { width: 40, height: 20 });
+      const context = canvas.getContext('2d'); context.fillStyle = 'red'; context.fillRect(0, 0, 40, 20);
+      for (const image of document.querySelectorAll('[data-oracle-bitmap]')) {
+        image.src = canvas.toDataURL();
+        if (image.hasAttribute('data-oracle-tint')) {
+          image.style.maskImage = `url("${image.src}")`;
+          image.$template = true;
+        }
+      }
+      for (const height of [10, 20]) {
+        const canvas = Object.assign(document.createElement('canvas'), { width: 40, height });
+        const context = canvas.getContext('2d');
+        const videos = [...document.querySelectorAll(`[data-oracle-video="${height}"]`)];
+        if (!videos.length) continue;
+        canvas.height = height; context.fillStyle = 'red'; context.fillRect(0, 0, 40, height);
+        const stream = canvas.captureStream(0);
+        const loaded = Promise.all(videos.map(video => new Promise(resolve => {
+          video.onloadeddata = resolve; video.srcObject = stream;
+        })));
+        const feed = () => {
+          context.fillRect(0, 0, 40, 20);
+          stream.getVideoTracks()[0].requestFrame();
+          if (videos.some(video => video.readyState < 2)) requestAnimationFrame(feed);
+        };
+        requestAnimationFrame(feed);
+        await loaded;
+        await Promise.all(videos.map(video => video.play()));
+      }
+    });
+    await page.waitForFunction(() => [...document.images].every(e => e.complete));
+    await page.evaluate(() => paint());
+    const png = (await page.screenshot({ fullPage: true })).toString('base64');
+    const results = await page.evaluate(async ([png, count]) => {
+      const image = new Image(); image.src = `data:image/png;base64,${png}`; await image.decode();
+      const canvas = Object.assign(document.createElement('canvas'), { width: image.width, height: image.height });
+      const context = canvas.getContext('2d'); context.drawImage(image, 0, 0);
+      const pixels = context.getImageData(0, 0, image.width, image.height).data;
+      const sample = id => {
+        const r = document.getElementById(id).getBoundingClientRect();
+        let x0 = r.width, y0 = r.height, x1 = -1, y1 = -1;
+        for (let y = 0; y < Math.ceil(r.height); y++) for (let x = 0; x < Math.ceil(r.width); x++) {
+          const at = ((Math.floor(r.y) + y) * image.width + Math.floor(r.x) + x) * 4;
+          if (pixels[at] - pixels[at + 1] > 128) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+        }
+        // Intrinsic rows can leave the next element at a fractional pixel.
+        const dx = r.x - Math.floor(r.x), dy = r.y - Math.floor(r.y);
+        return [r.width, r.height, x0 - dx, y0 - dy, x1 - dx, y1 - dy];
+      };
+      return Array.from({ length: count }, (_, i) => [sample(`actual-${i}`), sample(`oracle-${i}`)]);
+    }, [png, cases.length]);
+    // The SVG reference and mask rasterize fractional edges differently in WebKit.
+    const tolerance = engine === 'webkit' ? 2 : 1;
+    if (painted) {
+      const oracle = cases.flatMap((c, i) => c.intrinsic ? [] : [{ ...c, expected: results[i][1] }]);
+      const checked = spawnSync(painted, ['--ignored', '--exact', 'presenter::images::tests::template_placement_matches_browser', '--nocapture'], {
+        cwd: ROOT, encoding: 'utf8', env: { ...process.env, EXACT_SYMBOL_ORACLE: JSON.stringify(oracle) }, timeout: 60000,
+      });
+      expect(checked.status, checked.stdout + checked.stderr).toBe(0);
+      expect(checked.stdout).toContain('1 passed');
+    }
+    expect(results.flatMap(([actual, expected], i) => actual.some((v, axis) => Math.abs(v - expected[axis]) > tolerance)
+      ? [{ ...cases[i], actual, expected }] : [])).toEqual([]);
+    const changing = cases.flatMap((c, i) => c.sf && c.intrinsic === true ? [{ ...c, i }] : []);
+    for (const sf of ['', 'star']) {
+      const sizes = await page.evaluate(async ([changing, sf]) => {
+        for (const { i } of changing) {
+          const el = document.getElementById(`actual-${i}`);
+          el.setAttribute('data-symbol-source', el.getAttribute('data-symbol-source').replace(/^symbol:icon\|[^|]*\|/, `symbol:icon|${sf}|`));
+        }
+        const images = changing.map(({ i }) => document.getElementById(`actual-${i}`));
+        const loads = images.map(el => {
+          let done; const promise = new Promise(resolve => { done = resolve; });
+          el.addEventListener('load', done, { once: true });
+          return { previous: el.src, promise, done };
+        });
+        paint();
+        await Promise.all(images.map((el, i) => {
+          if (el.src !== loads[i].previous) return loads[i].promise;
+          el.removeEventListener('load', loads[i].done);
+        }));
+        return images.map(el => { const r = el.getBoundingClientRect(); return [r.width, r.height]; });
+      }, [changing, sf]);
+      for (let i = 0; i < changing.length; i++) {
+        const { w, h } = changing[i], point = 20 * scale;
+        const expected = sf ? [point, point] : [point * w / Math.max(w, h), point * h / Math.max(w, h)];
+        expect(sizes[i].every((v, axis) => Math.abs(v - expected[axis]) < .1), `${JSON.stringify(changing[i])}, sf=${sf}, size=${sizes[i]}, expected=${expected}`).toBe(true);
+      }
+    }
+  } finally { await suite.close(); }
+}
+
+for (const engine of ['chromium', 'firefox', 'webkit']) for (const [file, runtime] of Object.entries(RUNTIMES)) {
+  const name = `${engine}: template viewBoxes fit and position like SVG images (${file})`;
+  if (engine === 'chromium' && file === 'host/web/glue.js') {
+    describe('painted placement oracle', () => {
+      let painted;
+      beforeAll(async () => { if (!chromium().unavailable) painted = await paintedTestExecutable(); }, 370000);
+      engineTest[engine](name, () => checkPlacement(engine, file, runtime, painted), 90000);
+    });
+  } else {
+    engineTest[engine](name, () => checkPlacement(engine, file, runtime), 90000);
+  }
+}
 
 for (const engine of ['chromium', 'firefox', 'webkit']) for (const [file, [stand, names, run]] of Object.entries(RUNTIMES)) engineTest[engine](`${engine}: a symbol for an SF Symbol is SF's size, UIKit's image padding from its title (${file})`, async () => {
   const source = readFileSync(resolve(ROOT, file), 'utf8');

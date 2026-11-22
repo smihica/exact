@@ -46,10 +46,11 @@ impl Painter {
         if f.width <= 0. || f.height <= 0. {
             return true;
         }
-        let mut painter = self.apart(f.width, f.height);
+        let mut painter = self.apart(walk.scene.kernel, f.width, f.height);
         painter.placements.remove(&id);
         let mut child_walk = Walk {
             scene: walk.scene,
+            scrollbar_cover: walk.scrollbar_cover,
             hit_space: None,
             boxes: Vec::new(),
             text: BTreeMap::new(),
@@ -59,13 +60,14 @@ impl Painter {
             replay: None,
             ranks: Rc::clone(&walk.ranks),
             reveal: walk.reveal,
+            alert: walk.alert,
             dialog: walk.dialog,
         };
         painter.node(&mut child_walk, id, Transform::identity(), (f.x, f.y), None);
         walk.text.extend(child_walk.text);
         walk.fields.extend(child_walk.fields);
         walk.inline.extend(child_walk.inline);
-        self.gather(&mut painter);
+        self.gather(walk.scene.kernel, &mut painter);
         if let Ok(source) = painter.backend.finish() {
             if let Some((pixels, rect)) =
                 placement::warp_clipped(&source, h, clip_depth, self.scale, self.viewport)

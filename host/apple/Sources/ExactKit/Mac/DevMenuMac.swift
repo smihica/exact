@@ -275,6 +275,8 @@ public enum DevMenu {
         let sidebar = view.addItem(withTitle: "Show Sidebar", action: #selector(NSSplitViewController.toggleSidebar(_:)), keyEquivalent: "s")
         sidebar.keyEquivalentModifierMask = [.command, .control]
         sidebar.isHidden = true
+        let inspector = view.addItem(withTitle: "Show Inspector", action: #selector(NSSplitViewController.toggleInspector(_:)), keyEquivalent: "")
+        inspector.isHidden = true
         let fullScreen = view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.command, .control]
         bar.addItem(withTitle: "View", action: nil, keyEquivalent: "").submenu = view
@@ -469,7 +471,7 @@ public enum DevMenu {
             lines.append("plan: baked")
         }
         lines.append("app dir: \(ExactApp.shared.assetRoot.path)")
-        if let failure = WidgetContainer.publicationFailure { lines.append("widget generation: \(failure)") }
+        if let failure = WidgetLink.publication?.publicationFailure { lines.append("widget generation: \(failure)") }
         if let session {
             let size = session.presenter.viewportSize
             lines.append("session: \(session.label) · viewport: \(Int(size.width))×\(Int(size.height)) · \(session.viewCount) views")

@@ -6,6 +6,10 @@ prompt (the iOS 27 simulator shows none), a passcode removed, sleep. Each
 step says what to see; a step that shows something else is a failure to
 report with a screenshot.
 
+On platforms that support locked secrets, calling `store.protect(name)`
+directly turns on an optional lock without a prompt. Excord's switch calls
+`authenticate(reason=)` before it calls `store.protect(name)`.
+
 Build Excord for the device and sign in with a real account, or against the
 fixture, which signs in by itself. A development build bakes the fixture at
 `http://127.0.0.1:<port>`, a port of this checkout's own that `bun
@@ -23,10 +27,15 @@ scripts/agent-launch.mjs --fixture-port --app excord` prints (`<port>` below):
 
 Build: `bun host/apple/build.mjs excord-apple --ios --device --run`.
 
+Start with Face ID enrolled and Excord's Face ID permission undecided. Use
+an installation that has never requested Face ID.
+
 1. Open the account menu. The switch reads "Require Face ID".
-2. Turn it on. iOS asks "Do you want to allow Excord to use Face ID?" with
-   the text "Excord uses Face ID to unlock your Discord session." Allow.
-   Face ID's sheet shows; look at the phone. The switch is on.
+2. Turn it on. Excord's first `authenticate(reason=)` call shows the
+   system's Face ID permission alert with the text "Excord uses Face ID
+   to unlock your Discord session." Allow it, then look at the phone
+   when the Face ID sheet shows. The switch turns on after authentication
+   succeeds.
 3. Quit Excord from the app switcher and open it. The lock screen shows,
    then Face ID's sheet, before any channel or message. Look: the channels
    load.
@@ -56,8 +65,9 @@ show, and the token stays in the login keychain. When the signing lands:
 
 1. `bun host/apple/build.mjs excord-apple --run`: the build names the
    profile it signed with.
-2. The switch reads "Require Touch ID". Turn it on: Touch ID's sheet, with
-   "Unlock Excord". Touch: the switch is on.
+2. The switch reads "Require Touch ID". Turn it on. Excord's
+   `authenticate(reason=)` call shows Touch ID's sheet with "Unlock
+   Excord". Touch the sensor to confirm. The switch turns on.
 3. Quit and open: the lock screen, then the sheet, before any channel.
 4. A Mac without Touch ID, or with the lid closed on a display: the sheet
    asks for the login password.
@@ -68,8 +78,9 @@ Build the APK with the reader (`bun scripts/agent-android.mjs build excord --apk
 install it.
 
 1. The switch reads the platform's own label ("Use fingerprint", "Use
-   face"). Turn it on: BiometricPrompt with "Unlock Excord"; touch the
-   sensor. The switch is on.
+   face"). Turn it on. Excord's `authenticate(reason=)` call shows
+   BiometricPrompt with "Unlock Excord". Touch the sensor to confirm.
+   The switch turns on.
 2. Quit and open: the lock screen, then the prompt, before any channel.
    Use the PIN instead ("Use PIN"): the channels load.
 3. Home, then Excord again: the lock screen; Unlock; the prompt.

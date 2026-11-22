@@ -17,21 +17,21 @@ import UIKit
 #endif
 
 /// A box's fragments and a container's columns, as the kernel last cut them.
-struct ColumnRecord: Equatable {
-    struct Fragment: Equatable {
+package struct ColumnRecord: Equatable {
+    package struct Fragment: Equatable {
         /// In the box's own (published, union) frame.
         var rect: CGRect
-        var lines: Range<Int>
+        package var lines: Range<Int>
         /// What moves a point of the unfragmented box into this fragment.
-        var dx: CGFloat
-        var dy: CGFloat
+        package var dx: CGFloat
+        package var dy: CGFloat
     }
     struct Column: Equatable {
         /// In the container's border box.
         var rect: CGRect
         var holds: Bool
     }
-    var fragments: [Fragment] = []
+    package var fragments: [Fragment] = []
     var columns: [Column] = []
 
     init?(_ payload: [String: Any]) {
@@ -73,7 +73,7 @@ extension NodeView {
     /// The paragraph's unfragmented box, including its anonymous item's
     /// placement and wrapping width (a multi-column `text` uses its column
     /// width). Points mapped by `paragraphPoint` are in this space.
-    func paragraphBox() -> CGRect {
+    package func paragraphBox() -> CGRect {
         // The anonymous text item is placed by the kernel.
         let down = props["textOffset"].flatMap(Double.init).map { CGFloat($0) } ?? 0
         var box = contentBox()
@@ -100,7 +100,7 @@ extension NodeView {
     /// `paragraphPoint` for a caret: a point in the union's gap goes to the
     /// nearest fragment's edge, constrained to its assigned lines, so a
     /// selection dragged across a gap keeps its focus.
-    func caretPoint(_ point: CGPoint) -> CGPoint {
+    package func caretPoint(_ point: CGPoint) -> CGPoint {
         guard let frags = columnRecord?.fragments, !frags.isEmpty else { return point }
         func gap(_ r: CGRect) -> CGFloat { max(r.minX - point.x, 0, point.x - r.maxX) + max(r.minY - point.y, 0, point.y - r.maxY) }
         guard let f = frags.filter({ !isParagraph || !$0.lines.isEmpty }).min(by: { gap($0.rect) < gap($1.rect) }) else { return point }

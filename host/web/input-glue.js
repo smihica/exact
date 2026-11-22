@@ -1,4 +1,4 @@
-import { viewChildren, viewParent } from './navigation.js';
+import { focusStack, viewChildren, viewParent } from './navigation.js';
 // Input-only glue: loaded after the baked first pixel, independently of data readiness.
 import "./prompt-glue.js"; // a prompt's Return
 import "./alert-message.js"; // a grouped alert's message box
@@ -107,7 +107,7 @@ function roveArrow(root, event) {
   // An arrow steps from the focused member whatever its state; Home and End go to the first and last usable one.
   const menu = group.matches(MENUS), all = roversOf(group), usable = all.filter(radioUsable), live = all.filter(item => item === el || usable.includes(item));
   if (!open && !all.includes(el)) return false;
-  const vertical = menu || group.getAttribute("aria-orientation") === "vertical" || viewParent(group)?.hasAttribute("data-exact-sidebar"), rtl = getComputedStyle(group).direction === "rtl";
+  const vertical = menu || group.getAttribute("aria-orientation") === "vertical" || group.hasAttribute("data-exact-sidebar-tabs"), rtl = getComputedStyle(group).direction === "rtl";
   const step = (vertical ? { ArrowDown: 1, ArrowUp: -1 } : { ArrowRight: rtl ? -1 : 1, ArrowLeft: rtl ? 1 : -1 })[key];
   const next = open ? live.at(key === "ArrowDown" || key === "Home" ? 0 : -1) : step ? live[(live.indexOf(el) + step + live.length) % live.length] : key === "Home" ? usable[0] ?? el : key === "End" ? usable.at(-1) ?? el : null;
   if (!next) return false;
@@ -1118,8 +1118,8 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
   // ring is the browser's own `:focus-visible`: none after a pointer's press, one after a key's, and none before the
   // person has pressed a key or the pointer, as for a page's first route (`focusVisible` says which, where the engine
   // takes it). The stack is read from the attributes navigation.js projects from.
-  let shown = null, pressed = null, touched = false;
-  const origins = new WeakMap();
+  let pressed = null, touched = false;
+  const shown = new WeakMap(), origins = new WeakMap();
   // The press is noted as it begins (the pointer going down; Enter or Space, in the keys' listener above), before the
   // click any listener navigates by: a link to a route is followed from the document's capture phase (above, and the
   // JS target's router.js), so its commit arrives before a listener here would hear that click. A click with neither
@@ -1163,14 +1163,22 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     if (mark !== (names ? "named" : "")) { route.setAttribute("data-exact-dialog", names ? "named" : ""); route.setAttribute("role", "dialog"); route.setAttribute("aria-modal", "true"); }
   };
   const arrive = () => {
-    const nav = root.querySelector("[navigationBack]"), key = nav?.getAttribute("navigationKey");
-    for (const route of nav?.querySelectorAll(":is([navigationPresentation], [data-exact-dialog]):not([data-exiting])") ?? []) dialog(route); // a sheet sliding away is no route (navigation.js `sheetLeaves`)
-    const top = key == null ? null : [...nav.querySelectorAll("[navigationKey]")].find(r => r.getAttribute("navigationKey") === key && r.parentElement.closest("[navigationKey]") === nav);
-    if (!top) return;
-    const routes = viewChildren(viewParent(top)).filter(r => r.hasAttribute("navigationKey") && !r.hasAttribute("data-exiting")), stack = routes.slice(0, routes.indexOf(top) + 1);
-    const was = shown, active = document.activeElement, by = recentPress();
-    shown = stack;
-    if (!was || was[0] !== stack[0] || was.at(-1) === top) return;
+    const navs = root.querySelectorAll("[navigationBack]");
+    if (navs.length === 0) return;
+    for (const route of root.querySelectorAll(":is([navigationPresentation], [data-exact-dialog]):not([data-exiting])")) {
+      if (route.parentElement.closest("[navigationBack]")) dialog(route);
+    }
+    const active = document.activeElement, by = recentPress();
+    let arrival;
+    for (const nav of navs) {
+      const stack = focusStack(nav), top = stack.at(-1);
+      if (!top) { shown.delete(nav); continue; }
+      const was = shown.get(nav);
+      shown.set(nav, stack);
+      if (!arrival && was && was[0] === stack[0] && was.at(-1) !== top && !inertAncestor(nav)) arrival = { top, stack, was };
+    }
+    if (!arrival) return;
+    const { top, stack, was } = arrival;
     const back = was.includes(top);
     if (!back) origins.set(top, was.length === stack.length ? origins.get(was.at(-1)) : by?.el); // a replace keeps where its route came from
     pressed = null;
@@ -1179,7 +1187,15 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
     const to = lands(origin) ? origin : titleOf(top) ?? top;
     if (!to.hasAttribute("tabindex") && to.tabIndex < 0) {
       if (to.exactAuthoredTabIndex === undefined) to.exactAuthoredTabIndex = null;
-      to.tabIndex = -1; to.addEventListener("blur", () => to.removeAttribute("tabindex"), { once: true });
+      to.tabIndex = -1;
+      const blurred = e => {
+        // A top-layer overlay can restore the previous focus only if it remains focusable.
+        const overlay = e.relatedTarget?.closest?.("dialog:modal, :popover-open");
+        if (overlay && !overlay.contains(to)) return;
+        if (to.exactAuthoredTabIndex == null && to.getAttribute("tabindex") === "-1") to.removeAttribute("tabindex");
+        to.removeEventListener("blur", blurred);
+      };
+      to.addEventListener("blur", blurred);
     }
     const focus = () => to.focus({ preventScroll: true, ...(by ? { focusVisible: byKey(by) } : touched ? {} : { focusVisible: false }) }); focus(); if (document.activeElement?.closest("[data-exiting]")) focus(); // from a frame in a shadow root Firefox lands the focus on the second call
   };
@@ -1361,7 +1377,7 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
       // A child's implicit touch capture, lost when a deferred pan takes it, bubbles here.
       on("lostpointercapture", e => { if (e.target === el) cancel(); });
       el.addEventListener("click", e => { if (suppressClick) { suppressClick = false; e.preventDefault(); e.stopImmediatePropagation(); } }, true);
-      el.addEventListener("dragstart", e => { if (contact?.nested) e.preventDefault(); }); // a link's own drag is not the pan's
+      el.addEventListener("dragstart", e => { if (contact?.nested && !e.target.closest?.('[draggable="true"]')) e.preventDefault(); }); // a link's own drag is not the pan's; a draggable node's is the page's (LLP 1094.000 D6)
       return e => {
         // Only the click right after a pan is suppressed; a drag makes none.
         suppressClick = false;
@@ -1369,6 +1385,11 @@ export function createInputHandlers({ root, views, retiredViews, ready, inertAnc
         // A control or editor between the contact and this node keeps it (rule 3).
         const inner = e.target.closest("input,textarea,select,[contenteditable]");
         if (inner && inner !== el && el.contains(inner)) return;
+        // By a mouse the innermost draggable node that carries something drags (LLP 1094.000 D8).
+        const source = e.pointerType === "mouse" && e.target.closest('[draggable="true"]');
+        const carries = source && ["text", "url", "files"].some(k => source.hasAttribute(`data-datatransfer${k}`));
+        const kept = carries && e.target.closest("button,a[href],[data-exact-on~='press']");
+        if (carries && source !== el && el.contains(source) && !(kept && kept !== source && source.contains(kept))) return;
         // A press handler between keeps it only within the slop, as a draggable
         // element hears a drag that starts on a button inside it (kanban F6):
         // nothing is captured or prevented until the pan begins, so a tap stays the button's.

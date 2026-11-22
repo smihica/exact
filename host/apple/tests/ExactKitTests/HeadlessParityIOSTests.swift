@@ -1,14 +1,16 @@
 #if os(iOS)
 import UIKit
 import XCTest
+import ExactCore
+import ExactSnapshot
 @testable import ExactKit
 
 final class HeadlessParityIOSTests: XCTestCase {
     func testPreferencesUseSuppliedTraitsWithoutAScreen() {
         let traits = UITraitCollection(traitsFrom: [.init(userInterfaceStyle: .dark), .init(displayGamut: .P3), .init(displayScale: 3)])
         let preferences = Preferences(traits: traits, reducedMotion: true, reducedTransparency: true,
-            increasedContrast: true, boldText: true, highDynamicRange: true, displayMode: .fullscreen)
-        XCTAssertEqual(preferences.rawValue, UInt32(0x55B7))
+            increasedContrast: true, boldText: true, screenReader: true, highDynamicRange: true, displayMode: .fullscreen)
+        XCTAssertEqual(preferences.rawValue, UInt32(0x455B7))
         let facts = SessionFacts(traits: traits)
         XCTAssertEqual(facts.displayScale, 3)
         XCTAssertTrue(facts.preferences.contains([.dark, .p3]))

@@ -17,6 +17,7 @@
 //!             "formatVersion": 4, "kernelSchema": "<u64 hex>" },
 //!   "assets": { "url": "./assets.json", "sha256": "<hex>", "bytes": 1530,
 //!               "count": 8 },
+//!   "cohortReceipt": { "url": "../../blobs/<hex>", "sha256": "<hex>", "bytes": 78620 },
 //!   "stream": { "app": "com.exact.caltrain", "channel": "release",
 //!               "compatibilityId": "<hex>", "seq": 41 },
 //!   "release": "2026-09-03T18:04:11Z-7f1c",
@@ -27,8 +28,8 @@
 //!
 //! `stream` is required here and nowhere else: a bundle in an update store
 //! always belongs to a cohort's stream, which is what makes a head unreplayable
-//! onto another channel (LLP 1030 D3a). `sunset` and `signature` are optional;
-//! every other member of an unknown name is ignored.
+//! onto another channel (LLP 1030 D3a). `cohortReceipt`, `sunset`, and
+//! `signature` are optional. Unknown fields are ignored.
 //!
 //! The asset cards live in a separate file, the **asset index**, which the
 //! envelope names by digest as it names the plan, so the envelope stays a
@@ -40,9 +41,14 @@
 //! generation is served from. `count` is the number of cards, so a refusal can
 //! name it before the index is fetched. A bundle with no assets omits `assets`.
 //! The signature covers the index's digest, and so every asset card.
+//! The cohort receipt card names the receipt or, with `"chunked": true`,
+//! a manifest with an ordered `chunks` array of file cards. Each chunk URL
+//! resolves against the manifest. The store verifies every file by digest.
 
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::net::{Ipv4Addr, Ipv6Addr};
 // Both packages are publish=false and consumed by workspace path; vendoring
 // Exact requires the workspace tree. Share this leaf rule without linking the
 // plan VM into the update store or adding a crate for a filename predicate.
@@ -174,6 +180,61 @@ pub struct FileCard {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CohortReceipt {
+    pub(crate) card: FileCard,
+    pub(crate) chunked: bool,
+}
+
+impl CohortReceipt {
+    fn parse(value: &serde_json::Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or("the cohort receipt is not a file card")?;
+        let chunked = match object.get("chunked") {
+            None => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            _ => return Err("the cohort receipt has an invalid chunked flag".into()),
+        };
+        let card = Self::bounded_card("cohort receipt", object)?;
+        Ok(Self { card, chunked })
+    }
+
+    fn bounded_card(
+        name: &str,
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<FileCard, String> {
+        let card = file_card(name, object)?;
+        if card.bytes > crate::MAX_FILE_BYTES as u64 {
+            return Err(format!(
+                "{name} is {} bytes; the most is {}",
+                card.bytes,
+                crate::MAX_FILE_BYTES
+            ));
+        }
+        Ok(card)
+    }
+
+    pub(crate) fn chunks(raw: &[u8]) -> Result<Vec<FileCard>, String> {
+        let value: serde_json::Value = serde_json::from_slice(raw)
+            .map_err(|e| format!("the cohort receipt manifest is not JSON: {e}"))?;
+        let chunks = value
+            .get("chunks")
+            .and_then(|v| v.as_array())
+            .filter(|list| !list.is_empty())
+            .ok_or("the cohort receipt manifest has no chunks")?;
+        chunks
+            .iter()
+            .map(|value| {
+                let object = value
+                    .as_object()
+                    .ok_or("a cohort receipt chunk is not a file card")?;
+                Self::bounded_card("cohort receipt chunk", object)
+            })
+            .collect()
+    }
+}
+
 /// The stream this envelope heads (LLP 1030 D3a): `(app, channel,
 /// compatibility id)`, with its own monotonic `seq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +295,8 @@ pub struct Envelope {
     pub kernel_schema: Option<String>,
     /// The asset index, when the bundle has assets.
     pub index: Option<AssetIndex>,
+    /// The publisher's frozen cohort receipt, when named by a file card.
+    pub(crate) cohort_receipt: Option<CohortReceipt>,
     /// Every asset, by name and digest (LLP 1026 D11): `None` until the
     /// index is read.
     assets: Option<Vec<FileCard>>,
@@ -350,6 +413,10 @@ impl Envelope {
                 Some(AssetIndex { card, count })
             }
         };
+        let cohort_receipt = root
+            .get("cohortReceipt")
+            .map(CohortReceipt::parse)
+            .transpose()?;
         let sunset = match root.get("sunset") {
             None => None,
             Some(v) => {
@@ -408,6 +475,7 @@ impl Envelope {
                 .map(str::to_string),
             assets: index.is_none().then(Vec::new),
             index,
+            cohort_receipt,
             stream,
             release: root
                 .get("release")
@@ -433,6 +501,18 @@ impl Envelope {
             Some(index) => resolve_url(head_url, &index.card.url),
             None => Ok(head_url.to_string()),
         }
+    }
+
+    pub(crate) fn validate_card_urls(&self, head_url: &str) -> Result<(), String> {
+        resolve_url(head_url, &self.plan.url)?;
+        if let Some(receipt) = &self.cohort_receipt {
+            resolve_url(head_url, &receipt.card.url)?;
+        }
+        let base = self.asset_base(head_url)?;
+        for card in self.assets()? {
+            resolve_url(&base, &card.url)?;
+        }
+        Ok(())
     }
 
     /// Read the asset index this envelope names, as fetched or as stored:
@@ -730,7 +810,7 @@ fn remove_dot_segments(path: &str, url: &str) -> Result<String, String> {
 /// confusing an explicit default port with another origin.
 struct HttpUrl<'a> {
     scheme: &'a str,
-    authority: &'a str,
+    authority: Cow<'a, str>,
     host: String,
     port: u16,
     path: &'a str,
@@ -772,11 +852,14 @@ fn parse_http_url<'a>(text: &'a str, what: &str) -> Result<HttpUrl<'a>, String> 
             "{what} {text} has an invalid or credentialed authority"
         ));
     }
+    let mut request_authority = Cow::Borrowed(authority);
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let close = bracketed
             .find(']')
             .ok_or_else(|| format!("{what} {text} has an invalid IPv6 host"))?;
-        let host = format!("[{}]", &bracketed[..close]);
+        let address = bracketed[..close]
+            .parse::<Ipv6Addr>()
+            .map_err(|_| format!("{what} {text} has an invalid IPv6 host"))?;
         let suffix = &bracketed[close + 1..];
         let port = if suffix.is_empty() {
             default_port(scheme)
@@ -789,20 +872,32 @@ fn parse_http_url<'a>(text: &'a str, what: &str) -> Result<HttpUrl<'a>, String> 
                 text,
             )?
         };
-        (host.to_ascii_lowercase(), port)
+        (format!("[{address}]"), port)
     } else {
         if authority.matches(':').count() > 1 {
             return Err(format!("{what} {text} has an unbracketed IPv6 host"));
         }
-        match authority.rsplit_once(':') {
-            Some((host, port)) => {
-                if host.is_empty() {
-                    return Err(format!("{what} {text} has no host"));
+        let (raw_host, explicit_port) = authority
+            .rsplit_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        let port = match explicit_port {
+            Some(port) => parse_port(port, what, text)?,
+            None => default_port(scheme),
+        };
+        let host = match ipv4_host(raw_host) {
+            Ok(Some(address)) => {
+                let normalized = address.to_string();
+                if normalized != raw_host {
+                    // The transport must request the same address the origin check used.
+                    request_authority =
+                        Cow::Owned(format!("{normalized}{}", &authority[raw_host.len()..]));
                 }
-                (host.to_ascii_lowercase(), parse_port(port, what, text)?)
+                normalized
             }
-            None => (authority.to_ascii_lowercase(), default_port(scheme)),
-        }
+            Ok(None) => raw_host.to_ascii_lowercase(),
+            Err(()) => return Err(format!("{what} {text} has an invalid host")),
+        };
+        (host, port)
     };
     if host.is_empty() || host.chars().any(char::is_whitespace) {
         return Err(format!("{what} {text} has no valid host"));
@@ -814,11 +909,69 @@ fn parse_http_url<'a>(text: &'a str, what: &str) -> Result<HttpUrl<'a>, String> 
     };
     Ok(HttpUrl {
         scheme,
-        authority,
+        authority: request_authority,
         host,
         port,
         path,
     })
+}
+
+/// The [URL Standard](https://url.spec.whatwg.org/#concept-ipv4-parser) accepts
+/// short, octal and hexadecimal IPv4 addresses. A host with a numeric suffix
+/// must parse as an IPv4 address.
+fn ipv4_host(host: &str) -> Result<Option<Ipv4Addr>, ()> {
+    let host = decoded_host(host)?;
+    let mut parts = host.strip_suffix('.').unwrap_or(&host).rsplit('.');
+    let tail = parts.next().unwrap_or_default();
+    let hex = tail.strip_prefix("0x").or_else(|| tail.strip_prefix("0X"));
+    let numeric = !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())
+        || hex.is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !numeric {
+        return Ok(None);
+    }
+    let count = parts.clone().count();
+    let mut address = ipv4_number(tail).ok_or(())?;
+    if count > 3 || address > u32::MAX >> (count * 8) {
+        return Err(());
+    }
+    for (index, part) in parts.enumerate() {
+        let byte = ipv4_number(part)
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or(())?;
+        address |= u32::from(byte) << ((4 - count + index) * 8);
+    }
+    Ok(Some(Ipv4Addr::from(address)))
+}
+
+fn ipv4_number(part: &str) -> Option<u32> {
+    let (digits, radix) = match part.as_bytes() {
+        [] => return None,
+        [b'0', b'x' | b'X', ..] => (&part[2..], 16),
+        [b'0', _, ..] => (&part[1..], 8),
+        _ => (part, 10),
+    };
+    digits.chars().try_fold(0u32, |value, digit| {
+        value
+            .checked_mul(radix)?
+            .checked_add(digit.to_digit(radix)?)
+    })
+}
+
+fn decoded_host(host: &str) -> Result<Cow<'_, str>, ()> {
+    if !host.contains('%') {
+        return Ok(Cow::Borrowed(host));
+    }
+    let mut bytes = host.bytes();
+    let mut decoded = Vec::with_capacity(host.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut digit = || bytes.next().and_then(|byte| char::from(byte).to_digit(16));
+            decoded.push((digit().ok_or(())? * 16 + digit().ok_or(())?) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map(Cow::Owned).map_err(|_| ())
 }
 
 fn default_port(scheme: &str) -> u16 {
@@ -917,6 +1070,40 @@ mod url_tests {
                 resolve_url(base, refused).is_err(),
                 "cross-origin or credentialed card was admitted: {refused}"
             );
+        }
+    }
+
+    #[test]
+    fn equivalent_ipv6_hosts_share_an_origin() {
+        let compact = "https://[::1]/head";
+        let expanded = "https://[0:0:0:0:0:0:0:1]:443/receipt";
+        assert_eq!(resolve_url(compact, expanded).unwrap(), expanded);
+        assert_eq!(resolve_url(expanded, compact).unwrap(), compact);
+        assert!(resolve_url(compact, "https://[::2]/receipt").is_err());
+        assert!(resolve_url(compact, "https://[::1]:444/receipt").is_err());
+        assert!(resolve_url("https://[::x]/head", "./receipt").is_err());
+    }
+
+    #[test]
+    fn equivalent_ipv4_hosts_share_an_origin() {
+        let canonical = "http://127.0.0.1/receipt";
+        for host in [
+            "127.1",
+            "127.0.0.1.",
+            "0177.0.0.1",
+            "0x7f000001",
+            "2130706433",
+            "127%2e1",
+        ] {
+            let alternate = format!("http://{host}/receipt");
+            assert_eq!(resolve_url(canonical, &alternate).as_deref(), Ok(canonical));
+            assert_eq!(
+                resolve_url(&alternate, "./receipt").as_deref(),
+                Ok(canonical)
+            );
+        }
+        for host in ["127.2", "127.1:81", "127.0.0.256", "0x100000000", "127.08"] {
+            assert!(resolve_url(canonical, &format!("http://{host}/receipt")).is_err());
         }
     }
 

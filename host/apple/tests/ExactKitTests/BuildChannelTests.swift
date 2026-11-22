@@ -128,6 +128,21 @@ final class BuildChannelTests: XCTestCase {
         let override = ["EXACT_MODULES": "/elsewhere/libexact_modules.dylib"]
         XCTAssertEqual(NativeViews.modulePath(standard: "baked", production: BakedCompatibility.production(zero), environment: override), "baked")
         XCTAssertEqual(NativeViews.modulePath(standard: "baked", production: BakedCompatibility.production(developing), environment: override), override["EXACT_MODULES"])
+        let raw = [
+            "EXACT_PLAN": "/tmp/override.plan",
+            "EXACT_DEV_PLAN": "http://127.0.0.1:8765/",
+            "EXACT_AGENT": "1",
+            "EXACT_AGENT_SOCKET": "/tmp/a.sock",
+            "EXACT_HATCHES": "off",
+            "EXACT_MODULES": "/tmp/mod.dylib",
+            "KEEP": "yes",
+        ]
+        var unset: [String] = []
+        let prodEnv = ExactEnv.sanitize(raw, production: true) { unset.append($0) }
+        XCTAssertEqual(prodEnv, ["KEEP": "yes"])
+        XCTAssertEqual(Set(unset), ["EXACT_PLAN", "EXACT_DEV_PLAN", "EXACT_AGENT", "EXACT_AGENT_SOCKET", "EXACT_HATCHES", "EXACT_MODULES"])
+        let devEnv = ExactEnv.sanitize(raw, production: false) { _ in XCTFail("development keeps overrides") }
+        XCTAssertEqual(devEnv, raw)
     }
 
     #if os(macOS)

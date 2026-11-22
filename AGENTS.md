@@ -195,8 +195,10 @@ section binds (`rules/RULES.md`, "Agents").
   scripts/agent.mjs trace <file>` reads, `trace --pid <pid>` asks a running app for, and `trace --phone` copies off a
   phone; `--plan <dir>` joins another build's source map), the same on every host, with the clock
   in your hands (`clock settle` instead of waiting; `"screenshot out.png over 600 every
-  50"` films motion on it as a contact sheet, `.apng` to play). The driver refuses a
-  build older than its sources and names the rebuild (LLP 1012.001.000). `bun scripts/smoke.mjs
+  50"` films motion on it as a contact sheet, `.apng` to play). Android reader drives refuse films.
+  Use `android --live` and `adb shell screenrecord` to see Android's reader layers play.
+  The driver refuses a build older than its sources and names the rebuild (LLP 1012.001.000).
+  `bun scripts/smoke.mjs
   <web|macos|ios|linux|host>` is the whole app driven that way. The Linux host
   (`bun scripts/build-linux.mjs caltrain`: a development build, as
   `build.mjs` makes for Apple; a release build is the one that ships) runs headless

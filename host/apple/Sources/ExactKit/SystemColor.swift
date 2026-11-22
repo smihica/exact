@@ -83,8 +83,10 @@ package enum SystemColor {
                          tint resolvedTint: [Double]? = nil, tintColor: PlatformColor? = nil, fallback: [Double]?) -> [Double]? {
         let contrast = contrast ?? highContrast
         #if os(macOS)
-        // The grouped-card metric carries its identity until its window is known.
-        if name == "exactGroupedCardColor" { return dark && elevated ? [255, 255, 255, 8] : fallback }
+        // The grouped-card metric carries its identity until its window is known. On the page it
+        // is an overlay, as SwiftUI's grouped Form's card is: #272727 / #f9f9f9 over an untinted
+        // window (#1e1e1e / #ffffff), and the window's wallpaper tint showing through it.
+        if name == "exactGroupedCardColor" { return dark ? [255, 255, 255, elevated ? 8 : 10] : [0, 0, 0, 6] }
         if selectedItem, Thread.isMainThread, let share = selectedInk[name],
            var c = rgba(.alternateSelectedControlTextColor, dark: dark, contrast: contrast) { c[3] *= share; return c }
         #endif
@@ -309,7 +311,8 @@ extension NodeView {
     /// The tint `row` resolves `@tint` by: this view's inherited
     /// `tintColor` on iOS, so a second window's is its own (LLP 1095 D8);
     /// on macOS the nearest authored `accent-color` at or above it (LLP
-    /// 1115.000 D3.4), nil where there is none: the system's accent.
+    /// 1115.000 D3.4), nil where there is none or a written `auto` is
+    /// nearer: the app's accent.
     func ownTint(for row: BatchValue?) -> PlatformColor? {
         row?.namesTint == true ? viewTint : nil
     }
@@ -368,9 +371,14 @@ extension NodeView {
     /// The nearest node at or above this one in the authored tree (`Presenter.authoredParent`: a
     /// route under its tabpanel, a sheet under its invoker) whose authored `accent-color` is its
     /// subtree's tint
-    private var accentAuthor: NodeView? {
-        sequence(first: self as UIView, next: { [weak presenter] in presenter?.authoredParent(of: $0) ?? $0.superview })
-            .lazy.compactMap { $0 as? NodeView }.first { $0.authoredAccentTint != nil }
+    private var accentAuthor: NodeView? { authoredLine.first { $0.authoredAccentTint != nil } }
+
+    /// The nearest `-exact-tint-adjustment` other than `auto` at or above the node in the authored tree (LLP 1077
+    /// D19), `.automatic` where none is set: for a view outside the node's superviews, which UIKit carries the mode
+    /// down from, to take as its own. It reads the rows, since `tintAdjustmentMode` reads `.dimmed` wherever UIKit
+    /// dims the views behind an alert.
+    package var authoredTintAdjustment: UIView.TintAdjustmentMode {
+        authoredLine.lazy.map { UIView.TintAdjustmentMode($0.style["tint_adjustment"]) }.first { $0 != .automatic } ?? .automatic
     }
 
     /// The tint a view UIKit draws for this node outside the node's views takes as its own (a bar, a

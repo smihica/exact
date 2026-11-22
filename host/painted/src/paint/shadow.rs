@@ -6,13 +6,9 @@
 //! padding box, over the background and under the border. The first shadow
 //! is on top.
 //!
-//! Neither backend has a blur, and a blurred picture per node would be a
-//! second raster pass. A Gaussian of a straight edge falls off as the normal
-//! CDF of the distance to it, and the outline's offset curves are its
-//! contours, so the shadow is a stack of offset outlines (radius grown or
-//! shrunk with the distance), each filled with the alpha that brings the
-//! stack to the CDF at that band: one fill per band, through the border
-//! fill every backend already draws (a region inside a clip).
+//! A backend can blur the spread shape directly. The fallback draws its
+//! offset contours, each with the alpha that brings the straight edge to
+//! the Gaussian's cumulative coverage at that distance.
 
 use super::border::{shaped_rect, BorderFill, PathOp};
 use super::{Rect4, Shape};
@@ -35,6 +31,10 @@ pub(super) struct ShadowPaint {
 const STEP: f32 = 1.5;
 /// ...up to this many bands; wider blurs step a little coarser.
 const BANDS: f32 = 32.0;
+
+pub(super) fn shadow_outset(blur: f32, spread: f32) -> f32 {
+    1.5 * blur + spread.max(0.0) + 1.0
+}
 
 impl ShadowPaint {
     /// The node's shadows, in list order (the first on top); none of them
@@ -99,6 +99,20 @@ impl ShadowPaint {
     /// Whether it paints inside the padding box.
     pub fn inset(&self) -> bool {
         self.inset
+    }
+
+    /// A conservative bound on the pixels drawn by this shadow, without the box.
+    pub(super) fn outer_bounds(&self, (x, y, w, h): Rect4) -> Option<Rect4> {
+        if self.inset || self.color[3] == 0 {
+            return None;
+        }
+        let d = shadow_outset(self.blur, self.spread);
+        Some((
+            x + self.offset.0 - d,
+            y + self.offset.1 - d,
+            w + 2.0 * d,
+            h + 2.0 * d,
+        ))
     }
 
     /// An outer shadow as one blurred shape, for a backend with its own

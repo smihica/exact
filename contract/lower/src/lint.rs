@@ -316,7 +316,35 @@ pub(crate) fn active_migration_hint(name: &str, target: &str) -> String {
     format!("; write `{property}` in a `:active` block{migration}")
 }
 
+/// `lower-host-name-declared` (LLP 1123 D10): an `--exact-*` name is the host's, read with
+/// `var()` where the host defines it, and declared nowhere, a class style included.
+pub(crate) fn host_name_declared(a: &Attr) -> Option<LowerError> {
+    use exact_kernel::style::{calc::host_name, safe_area_properties::HOST_PREFIX};
+    if !a.name.starts_with(HOST_PREFIX) {
+        return None;
+    }
+    let read = if host_name(&a.name) {
+        format!("what the host reports, read with `var({})`", a.name)
+    } else {
+        "no name a host defines".to_string()
+    };
+    Some(LowerError {
+        id: "lower-host-name-declared",
+        message: format!(
+            "`{}` is {read}: `--exact-*` names are the host's, and an app declares none. Declare a custom property under a name of your own, as `--gap=\"12px\"`, and read it with `var(--gap)`",
+            a.name
+        ),
+        span: a.span,
+    })
+}
+
 pub(crate) fn unknown_attr(tag: &str, a: &Attr) -> LowerError {
+    if let Some(declared) = host_name_declared(a) {
+        return declared;
+    }
+    if matches!(a.name.as_str(), "dragstart" | "drag" | "dragend") {
+        return crate::transfer::handler_later(a);
+    }
     let hint = match tags::renamed(&a.name) {
         None if crate::fields::part_hint(&a.name).is_some() => {
             crate::fields::part_hint(&a.name).unwrap_or_default()
@@ -840,13 +868,6 @@ pub(crate) fn css_hint(name: &str) -> Option<String> {
         "border-collapse" => Some(
             "; tables use the separated model: `border-spacing=0` puts the cells edge to edge, and a \
              `border-bottom` on each cell draws a rule between rows"
-                .into(),
-        ),
-        // No `::marker` (CSS Lists 3 §3): every list is `list-style: none`, which is taken
-        // (`tags::attr_valued`); any other value is not.
-        _ if name.starts_with("list-style") => Some(
-            "; a list here draws no marker, as `list-style=\"none\"` has it; a bullet is a \
-             `text \"•\"` before the item's text in a row"
                 .into(),
         ),
         _ => None,

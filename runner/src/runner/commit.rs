@@ -359,15 +359,16 @@ impl<D: DataSource> Runner<D> {
         }
         for (i, p) in row.params.iter().enumerate() {
             let param = self.plan.param(p);
+            let name = param.declared_name(&self.plan);
             // A hidden parameter (`@capture:…`, a child's captured prop; `@`
             // begins no authored name) is the compiler's argument, not the
             // host's: it has its type, but its numbers need not be finite
             // nor its strings short, as a prop read in place needs neither.
-            if self.plan.str(param.name).starts_with('@') {
+            if name.starts_with('@') {
                 if !args[i].typed(&self.plan, param.ty) {
                     return Err(RunnerError::ArgumentType {
                         action: self.plan.str(row.name).to_string(),
-                        param: self.plan.str(param.name).to_string(),
+                        param: name.to_string(),
                     });
                 }
                 continue;
@@ -375,17 +376,17 @@ impl<D: DataSource> Runner<D> {
             if !args[i].conforms(&self.plan, param.ty) {
                 if args[i].typed(&self.plan, param.ty) {
                     return Err(RunnerError::NonFiniteValue {
-                        name: self.plan.str(param.name).to_string(),
+                        name: name.to_string(),
                     });
                 }
                 return Err(RunnerError::ArgumentType {
                     action: self.plan.str(row.name).to_string(),
-                    param: self.plan.str(param.name).to_string(),
+                    param: name.to_string(),
                 });
             }
             if too_long(&args[i]) {
                 return Err(RunnerError::StringTooLong {
-                    name: self.plan.str(param.name).to_string(),
+                    name: name.to_string(),
                 });
             }
         }
@@ -540,7 +541,7 @@ impl<D: DataSource> Runner<D> {
                 ))
             } else if too_long(value) {
                 Some(RunnerError::StringTooLong {
-                    name: self.plan.str(row.name).to_string(),
+                    name: row.declared_name(&self.plan).to_owned(),
                 })
             } else {
                 None
@@ -834,6 +835,24 @@ impl<D: DataSource> Runner<D> {
         RunnerError::Shape { resource, why }
     }
 
+    /// Resource `i`'s answer now. Outside its shape it fails the resource
+    /// with `shape`, as a TypeScript source's answer does: the commit that
+    /// asked stands, and the resource keeps what it showed, whose shape was
+    /// checked when it was taken. A runner-owned source's answer outside its
+    /// shape is the runner's own fault and refuses the commit.
+    pub(super) fn shaped_answer(&self, i: usize, value: Value) -> Result<Answer, RunnerError> {
+        let Err(refusal) = self.check_shape(i, &value) else {
+            return Ok(Answer::Now(value));
+        };
+        if exact_plan::runner_owned_source(self.plan.str(self.resource_row(i).source)) {
+            return Err(refusal);
+        }
+        Err(RunnerError::Data {
+            resource: self.plan.str(self.resource_row(i).name).to_string(),
+            error: crate::failure::Failure::of(&refusal).into(),
+        })
+    }
+
     pub(super) fn poison(&mut self) {
         self.poisoned = true;
         self.notes.clear();
@@ -889,6 +908,7 @@ impl<D: DataSource> Runner<D> {
         // also changed are then asked fresh. The cost is a fetch a preload
         // could have answered, never an old answer (LLP 1162.000 D1).
         self.launch.clear();
+        self.overrun.launch = false;
         for p in &mut self.pending {
             p.launch = false;
         }
@@ -989,7 +1009,14 @@ impl<D: DataSource> Runner<D> {
         let launch = matches!(target, Target::Resource(i) if self.launch.contains(&i));
         let refresh = forced && !launch;
         for request in requests {
-            self.append_request(target, source.clone(), args.clone(), request, refresh);
+            self.append_request(
+                target,
+                source.clone(),
+                args.clone(),
+                request,
+                refresh,
+                launch,
+            );
         }
         let origin = self.pending[first].origin;
         for p in &mut self.pending[first..] {
@@ -1005,7 +1032,9 @@ impl<D: DataSource> Runner<D> {
             && request.surface.is_none()
     }
 
-    /// `refresh`: the executor bypasses what it holds for the request.
+    /// `refresh`: the executor bypasses what it holds for the request;
+    /// `launch`: the launch's own ask, which a re-ask after a turn over its
+    /// budget keeps (`hold_overrun_reply`).
     pub(super) fn append_request(
         &mut self,
         target: Target,
@@ -1013,6 +1042,7 @@ impl<D: DataSource> Runner<D> {
         args: Vec<Value>,
         request: Request,
         refresh: bool,
+        launch: bool,
     ) {
         let keepable = Self::keepable(target, &request);
         let ticket = self.next_ticket;
@@ -1075,7 +1105,7 @@ impl<D: DataSource> Runner<D> {
             long_poll: request.stream && request.long_poll.is_some(),
             replied: false,
             reask_at: None,
-            launch: false,
+            launch,
             reasks: 0,
         });
         self.note_child(ticket, &request);

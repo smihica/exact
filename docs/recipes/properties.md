@@ -29,12 +29,11 @@ after "done" "done writes nothing and focuses the button"
 never refuses "reset"
 ```
 
-Choose the blocks your app means. Names read root states or derives; no fields,
-indices or expressions. A derive must depend only on state and pure functions:
-resources, mutation status, the clock and geometry are refused with the dependency
-chain. `stays true` means that a true value cannot become false at the next observed
-step. `after` checks an eligible commit and its landed continuations; extra commits
-can make a line counted only. The [grammar](../contract-grammar.md#authored-tests)
+Read root states or derives by name. Use `Component.action` for a child action.
+Derives may read state, pure functions and, in `always`, resources. A refusal
+shows the dependency chain. Once true, `stays true` must hold at each observed
+step. `after` checks an eligible commit and its landed continuations. Extra
+commits can make a line counted only. The [grammar](../contract-grammar.md#authored-tests)
 defines each form.
 
 Run `bun exact.mjs contract verify app.contract`. It delivers test prefixes, explores
@@ -53,8 +52,8 @@ and counts both in the receipt. Suggestions never edit tests. Keep the receipt
 unchanged in your diary; its digests identify the sources.
 
 “In the semantics' world” means seeded source answers arrive synchronously and
-never fail. The events are taps, typing, landing continuations and advancing the
-clock. Reloads, late answers and host inputs are outside that world. A property
+never fail. Scripts can tap, type, land continuations, advance the clock and change
+a source’s answer. Reloads, late answers and host inputs are outside that world. A property
 about a mutation result is therefore about the seeded answer, and a successful
 search establishes only what those scripts observed.
 

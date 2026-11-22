@@ -32,6 +32,7 @@ impl<D: DataSource> Presenter<D> {
             None,
             "/",
             Some(region),
+            crate::app::Services::default(),
         )?;
         presenter.measure(); // LLP 1079 D1
         Ok((presenter, error))
@@ -73,31 +74,57 @@ impl<D: DataSource> Presenter<D> {
         target: FrameTarget,
         canvas_frame: bool,
     ) -> Option<Arc<Pixmap>> {
+        let had_damage = self.dirty || self.picture_dirty;
+        let preserves_picture = target == FrameTarget::Geometry;
         #[cfg(windows)]
-        let window_damage = self.surfaces.direct_window.is_some() && self.dirty();
+        let preserves_picture = preserves_picture
+            || (self.surfaces.direct_window.is_some() && target != FrameTarget::Window);
         // Its session's roles, whatever else lives on the thread (LLP 1121 stage 5).
         let _roles = self.host.runner().bind_roles();
         let frame = crate::text::cache::deferring_eviction(|| {
             // The probe draws nothing, so the canvases' tick stays with the frame's own paint.
-            if !self.host.flights.reveal.is_empty() {
+            if self.focus_reveal.is_some() || !self.host.flights.reveal.is_empty() {
                 self.paint_frame(FrameTarget::Geometry, false, true);
                 if self.last_frame_succeeded {
-                    self.reveal_flights();
+                    self.reveal_before_paint();
                 }
             }
             let frame = self.paint_frame(target, canvas_frame, false);
-            // A field's caret, or a fragment's target as pictures arrive
-            // (LLP 1153 D5), moved by this frame's layout: paint again.
-            if self.last_frame_succeeded && (self.reveal_field_cursor() | self.hold_fragment()) {
-                self.paint_frame(target, false, false)
+            if !self.last_frame_succeeded {
+                return frame;
+            }
+            let immediate = !self.display.submitting();
+            let scrollbar_hover = immediate && self.scrollbars_shown();
+            // Layout can move a caret, a fragment target (LLP 1153 D5),
+            // or the exposed part of a scrollbar under a resting pointer.
+            let revealed = self.reveal_field_cursor();
+            let held = self.hold_fragment();
+            let frame = if revealed.is_some() || held || scrollbar_hover {
+                let frame = self.paint_frame(target, false, false);
+                if immediate && self.last_frame_succeeded {
+                    self.scrollbars_shown();
+                }
+                frame
             } else {
                 frame
+            };
+            // Report a field's caret reveal after the reveal repaint publishes
+            // its updated range geometry, so `rangeFrame()` in `scroll=` sees
+            // the post-scroll position.
+            if let Some(id) = revealed.filter(|_| self.last_frame_succeeded) {
+                self.scroll_end_moved(id, Completion::Instant);
+                self.collection_scrolled(id);
+                if self.dirty {
+                    return self.paint_frame(target, false, false);
+                }
             }
+            frame
         });
-        // A geometry/accessibility snapshot has not submitted the window's new picture.
-        #[cfg(windows)]
-        if window_damage {
-            self.repaint();
+        // A geometry query or non-window snapshot has not presented the new picture.
+        if preserves_picture {
+            self.picture_dirty |= had_damage;
+        } else if self.last_frame_succeeded {
+            self.picture_dirty = false;
         }
         frame
     }
@@ -109,7 +136,7 @@ impl<D: DataSource> Presenter<D> {
         &mut self,
         target: FrameTarget,
         canvas_frame: bool,
-        flight_probe: bool,
+        reveal_probe: bool,
     ) -> Option<Arc<Pixmap>> {
         self.brush.shared.update(&self.host);
         self.brush.composition = self.ime_paint();
@@ -117,18 +144,19 @@ impl<D: DataSource> Presenter<D> {
         self.prepare_overlay();
         if self.brush.scrollbars.enabled {
             self.brush.scrollbars.limits = self.collection_scroll_limits();
-            self.brush.scrollbars.pointer = self.hover_point;
         }
         self.brush.placements = self.surfaces.placements(&self.host, true);
         self.brush.composites.canvases = self.surfaces.composites();
-        self.draw_and_capture_canvases(canvas_frame);
-        let previous = std::mem::replace(&mut self.brush.canvases, self.host.canvas_snapshots());
-        self.brush.canvases.extend(self.surfaces.pixels(
-            &mut self.host,
-            self.brush.scale,
-            previous,
-            self.brush.window_canvas,
-        ));
+        if target != FrameTarget::Geometry {
+            self.draw_and_capture_canvases(canvas_frame);
+            let previous = std::mem::take(&mut self.brush.canvases.readbacks);
+            self.brush.canvases.readbacks = self.surfaces.pixels(
+                &mut self.host,
+                self.brush.scale,
+                previous,
+                self.brush.window_canvas,
+            );
+        }
         // The hatches' overlays as published (LLP 1075.003.000.001 §2.2.1):
         // read here, at the start of the paint; the walk calls no hatch.
         self.brush.overlays = (self.hatches.overlays.iter())
@@ -144,6 +172,7 @@ impl<D: DataSource> Presenter<D> {
             self.host.log(error);
         }
         self.refresh_looks(None); // the focus's ring (LLP 1121 D8)
+        self.brush.focus_presses = self.focus.is_some_and(|id| self.presses_itself(id));
         self.restore_scroll_anchors();
         self.arm_scroll_anchors();
         self.scroll_timelines();
@@ -153,6 +182,8 @@ impl<D: DataSource> Presenter<D> {
         self.sync_media(&mut dirty);
         self.brush.numerals.now = self.host.now();
         self.brush.numerals.still = self.host.runner().viewport().preferences.reduced_motion;
+        // A geometry paint records no layer, and leaves a played ripple played.
+        self.brush.ripples.reader = self.host.lowering && target != FrameTarget::Geometry;
         self.brush.rows_dirty(self.host.kernel(), dirty);
         self.sync_stage();
         let stage = self.stage_paint();
@@ -240,7 +271,7 @@ impl<D: DataSource> Presenter<D> {
             motion: &motion,
         };
         let mut paint = |brush: &mut Painter| match region {
-            _ if flight_probe => brush.flight_probe(&scene, self.viewport),
+            _ if reveal_probe => brush.reveal_probe(&scene, self.viewport),
             Some(region) => brush
                 .paint_region(
                     &scene,
@@ -303,7 +334,7 @@ impl<D: DataSource> Presenter<D> {
                 }
             }
         };
-        if self.last_frame_succeeded && !flight_probe && self.host.flights.enabled {
+        if self.last_frame_succeeded && !reveal_probe && self.host.flights.enabled {
             self.host
                 .flights
                 .recorded

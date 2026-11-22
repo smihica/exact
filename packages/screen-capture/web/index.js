@@ -52,12 +52,13 @@ export function implementation({ agent, files }) {
           const directory = args.directory.replace(/\/+$/, '');
           const type = (args.type || 'image/png').toLowerCase();
           const quality = typeof args.quality === 'number' && args.quality >= 0 && args.quality <= 1 ? args.quality : 0.92;
+          const captureId = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
           const encoded = await Promise.all(displays.map(async (display, index) => {
             const canvas = card(index, display.width, display.height);
             const blob = await canvas.convertToBlob({ type, quality });
             canvas.width = canvas.height = 1;
             const ext = { 'image/jpeg': 'jpg', 'image/webp': 'webp' }[blob.type] || 'png';
-            return { blob, answer: { ...display, path: `${directory}/screen-${index}.${ext}`, type: blob.type } };
+            return { blob, answer: { ...display, path: `${directory}/screen-${captureId}-${index}.${ext}`, type: blob.type } };
           }));
           if (!turn.held || ended) return { error: 'AbortError' };
           await files.putAll(encoded.map(({ blob, answer }) => ({ path: answer.path, blob })),

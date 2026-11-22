@@ -1,10 +1,62 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { chromium, suiteBrowser } from './agent-launch.mjs';
 import { need } from './coverage.mjs';
 import { formControlsSmoke, isDeckURL, rebooted } from './smoke-inspect.mjs';
+import { recorderSmoke, TAKES } from './smoke-recorder.mjs';
+import { nativeFixturePixel } from './smoke-native.mjs';
+import { encodePng } from './png.mjs';
+
+test('the native fixture smoke samples the phone snapshot callback in window coordinates', async () => {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-native-snapshot-'));
+  try {
+    const window = { x: 2, y: 3, w: 4, h: 4 }, color = [34, 102, 238];
+    const data = new Uint8Array(8 * 8 * 4).fill(255);
+    data.set(color, (5 * 8 + 4) * 4);
+    const s = {
+      target: async () => ({ id: 2 }), reveal: async () => {}, clock: async () => {},
+      op: async () => ({ node: { space: { window } } }),
+      screenshot: async (path, whole, form) => {
+        assert.deepEqual([whole, form], [true, 'app'], 'this capture calls native snapshot');
+        writeFileSync(path, encodePng({ width: 8, height: 8, data }));
+        return { w: 8, h: 8, window: true, pixels: 'app' };
+      },
+    };
+    assert.deepEqual(await nativeFixturePixel(s, resolve(dir, 'window.png'), 'box', { device: true }), color);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the recorder smoke samples the waveform in screen coordinates', async () => {
+  let recording = false, duration = 0, takes = 0;
+  const viewport = { x: 0, y: 0, w: 24, h: 20 };
+  const screen = { ...viewport, x: 4, y: 32 };
+  const session = {
+    prefer: async () => {}, close: async () => {},
+    tap: async () => { if (recording) takes++; recording = !recording; },
+    clock: async spec => { if (spec.startsWith('+')) duration = Number(spec.slice(1)); },
+    state: async () => ({
+      resources: { mic: { available: true, state: 'granted' }, rec: { state: 'recording', duration },
+        level: { totalSamplesDuration: duration / 1000 }, library: { takes: TAKES.slice(0, takes).map(label => ({ label })) } },
+      extensions: { 'media-capture': { agent: true }, recording: { agent: true } },
+      media: [{ state: { duration: 3 } }, { state: { duration: 1.5 } }],
+    }),
+    layout: async target => target === 'waveform' ? { node: { space: { screen } } }
+      : { nodes: [{ testId: 'waveform', ...viewport }] },
+    screenshot: async path => {
+      const width = 64, height = 128, data = new Uint8Array(width * height * 4).fill(255);
+      if (recording) for (let y = screen.y * 2; y < (screen.y + screen.h) * 2; y++) {
+        for (let x = screen.x * 2; x < (screen.x + screen.w) * 2; x++) data.set([0, 0, 255, 255], (y * width + x) * 4);
+      }
+      writeFileSync(path, encodePng({ width, height, data }));
+      return { w: width / 2, h: height / 2, captureSpace: 'screen' };
+    },
+  };
+  await recorderSmoke({ host: 'ios', open: async () => session, check: assert.ok });
+});
 
 test('web smoke builds keep module apps separate from generic fixture carriers', () => {
   const script = `

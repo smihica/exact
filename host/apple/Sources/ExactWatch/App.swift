@@ -109,7 +109,7 @@ final class EarlyBoot {
     /// from its bytes, which opens no update store.
     nonisolated static func session(size: CGSize, facts: SessionFacts) throws -> HeadlessSession {
         guard let name = Bundle.main.object(forInfoDictionaryKey: "ExactWatchPlan") as? String else {
-            throw HeadlessSession.Failure(description: "this app declares no watch entry (app.json `watch`)")
+            throw ExactFailure(description: "this app declares no watch entry (app.json `watch`)")
         }
         let plan = try Data(contentsOf: Bundle.main.bundleURL.appendingPathComponent(name))
         return try HeadlessSession(plan: plan, size: size, facts: facts, assetRoot: Bundle.main.bundleURL, live: true)

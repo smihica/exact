@@ -1,5 +1,6 @@
 //! Bounded contact synthesis through the same presenter as evdev/VNC.
-//! Moves timestamp samples without seeking the runner; holds seek its clock.
+//! Moves timestamp samples without seeking the runner. A seekable drive
+//! advances the clock on a hold. A live carrier waits outside the host.
 //! This is not OS input injection or evidence of physical frame delivery.
 use super::*;
 use serde_json::Value;
@@ -37,16 +38,17 @@ fn coordinate(n: f64) -> Result<f32, InputError> {
         Ok(n as f32)
     }
 }
-fn duration(request: &Value) -> Result<f64, InputError> {
+pub(crate) fn duration(request: &Value) -> Result<f64, &'static str> {
     let ms = if request.get("ms").is_some() {
-        number(request, "ms")?
+        request["ms"]
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or("contact ms must be finite")?
     } else {
         0.
     };
     if !(0. ..=10_000.).contains(&ms) {
-        return Err(InputError::malformed(
-            "contact duration must be in 0...10000ms",
-        ));
+        return Err("contact duration must be in 0...10000ms");
     }
     Ok(ms)
 }
@@ -80,10 +82,12 @@ fn perform<D: DataSource>(p: &mut Presenter<D>, request: &Value) -> Result<Strin
     // hears it. Terminal phases acknowledge that state without dispatch/time.
     if matches!(phase, "up" | "cancel") && p.contact_position().is_none() {
         p.pointer_released();
-        return Ok(reply(p, phase, None));
+        return Ok(reply(p, phase, None, None));
     }
     let from = p.host().now();
+    let live = p.live_time().is_some();
     let mut at;
+    let mut wait_ms = None;
     if phase == "down" {
         if p.contact_position().is_some() {
             return Err("a contact is already down".into());
@@ -114,6 +118,7 @@ fn perform<D: DataSource>(p: &mut Presenter<D>, request: &Value) -> Result<Strin
         at = (x, y);
     } else {
         let (x, y) = p.contact_position().ok_or("no contact is down")?;
+        let event_from = p.contact_event_ms(live.then_some(from)).unwrap();
         at = (x, y);
         match phase {
             "move" => {
@@ -133,8 +138,7 @@ fn perform<D: DataSource>(p: &mut Presenter<D>, request: &Value) -> Result<Strin
                     (number(request, "x")?, number(request, "y")?)
                 };
                 let (tx, ty) = (coordinate(tx)?, coordinate(ty)?);
-                let ms = duration(request)?;
-                let event_from = p.contact_event_ms().unwrap();
+                let ms = duration(request).map_err(InputError::malformed)?;
                 // Fixed upper bound; no real-time sleeps or queued work.
                 let steps = ((ms / 16.).ceil() as usize).clamp(1, 256);
                 for i in 1..=steps {
@@ -151,29 +155,55 @@ fn perform<D: DataSource>(p: &mut Presenter<D>, request: &Value) -> Result<Strin
                 }
             }
             "hold" => {
-                let ms = duration(request)?;
-                let (_, failure) = sensors::hold_framed(p, from + ms);
-                if let Some(error) = failure {
-                    return Err(error.into());
+                let ms = duration(request).map_err(InputError::malformed)?;
+                if live {
+                    wait_ms = Some(ms);
+                } else {
+                    let (_, failure) = sensors::hold_framed(p, from + ms);
+                    if let Some(error) = failure {
+                        return Err(error.into());
+                    }
+                    p.delay_contact_event(ms);
                 }
-                p.delay_contact_event(ms);
             }
             "up" => {
-                p.pointer_up_at(x, y, from, p.contact_event_ms().unwrap() + 8.)?;
+                let event_ms = if live { event_from } else { event_from + 8. };
+                p.pointer_up_at(x, y, from, event_ms)?;
             }
             "cancel" => p.pointer_lost(from)?,
             _ => unreachable!(),
         }
     }
-    p.land_presses();
-    Ok(reply(p, phase, Some(at)))
+    if !live {
+        p.land_presses();
+    }
+    Ok(reply(p, phase, Some(at), wait_ms))
 }
-fn reply<D: DataSource>(p: &Presenter<D>, phase: &str, at: Option<(f32, f32)>) -> String {
-    serde_json::json!({
+fn reply<D: DataSource>(
+    p: &Presenter<D>,
+    phase: &str,
+    at: Option<(f32, f32)>,
+    wait_ms: Option<f64>,
+) -> String {
+    let (mode, timing) = if p.live_time().is_some() {
+        (
+            "platform",
+            "moves timestamped; carrier waits for holds; physical delivery unobserved",
+        )
+    } else {
+        (
+            "headless",
+            "moves timestamped; holds seek; physical delivery unobserved",
+        )
+    };
+    let mut reply = serde_json::json!({
         "phase": phase, "contact": p.contact_position().is_some(), "at": at,
         "clock": p.host().now(),
-        "delivery": "presenter", "carrier": "linux", "mode": "headless",
-        "native": "Presenter.pointer_*", "timing": "moves timestamped; holds seek; physical delivery unobserved"
-    })
-    .to_string()
+        "delivery": "presenter", "carrier": std::env::consts::OS, "mode": mode,
+        "native": "Presenter.pointer_*", "timing": timing
+    });
+    if let Some(ms) = wait_ms {
+        reply["waitMs"] = ms.into();
+    }
+    reply.to_string()
 }

@@ -40,6 +40,7 @@ pub mod baked;
 pub mod batch;
 mod button;
 pub mod calc;
+mod canvas_exports;
 pub mod canvas_text;
 pub mod collapse;
 pub mod content_region;

@@ -50,7 +50,8 @@ object Native {
      * in the window (x, y, width, height, in pixels), the colour behind it and in the edges it keeps out of (ARGB),
      * and 1 when its scheme is dark (the bars' icons are then light). */
     @JvmStatic external fun chrome(): IntArray?
-    @JvmStatic external fun frame(): ByteBuffer?
+    /** Publish pending work. A Choreographer turn also delivers frame tasks. */
+    @JvmStatic external fun frame(vsync: Boolean): ByteBuffer?
     @JvmStatic external fun poll(): Boolean
     /** Advance tasks without recording a frame; milliseconds until the next task, or -1 while idle. */
     @JvmStatic external fun background(applying: Boolean): Double
@@ -76,7 +77,8 @@ object Native {
     /** The frame rates GPU canvases ask for (`Surface::max_fps`) that changed since last asked: view and rate (0: the
      * display's) pairs, or null. */
     @JvmStatic external fun frameRates(): IntArray?
-    @JvmStatic external fun animating(): Boolean
+    /** Whether a turn is needed. With [vsyncOnly], whether it needs a Choreographer callback. */
+    @JvmStatic external fun animating(vsyncOnly: Boolean = false): Boolean
     @JvmStatic external fun owed(): Boolean
     /** The collection pass a scroll left; `limit` >= 0 slices it (rows past what shows per list), the scrolled list
      * leading toward `velocity` px/s. Bit 0: a paint is wanted; bit 1: rows are left for another slice. */
@@ -104,12 +106,14 @@ object Native {
      * ([scrollers]). After the scrollers: the native module view under the point (0: none), then its painted
      * border box x, y, width and height as float bits, in pixels, its allocation slot and generation, how many long
      * presses a node has taken so far (wrapping), the session token's low and high words, its painted content origin
-     * x and y as float bits, and the Exact context-menu candidate (0: none). Then each scroller's snap, in the same
+     * x and y as float bits, and the node a long press there gives to, a context menu's or a drag's (0: none). Then
+     * each scroller's snap, in the same
      * order (`host/painted/src/presenter/snap.rs`,
      * `reader_snaps`): flags (bit 0 it snaps sideways, bit 1 up and down, bit 2 `mandatory`), then sideways and then up
      * and down its snapport's length as float bits, a count, and per snap area the least and greatest offsets it rests
      * at as float bits and 1 for `scroll-snap-stop: always`, in pixels; flag bit 3: a virtualized list, whose areas past
      * these [snapsAround] tells. */
+    @JvmStatic external fun readerSelection(action: Int, x: Float, y: Float): String?
     @JvmStatic external fun under(x: Float, y: Float): IntArray
     /** Virtualized list [id]'s snap areas up and down ([vertical]) or sideways, for a release at offset [release] whose
      * rest is projected near [projected] (pixels): a count, then per area its least and greatest offsets as float bits
@@ -140,6 +144,7 @@ object Native {
      * field its own text; once it ends, the value the app then shows (LLP 1115.000 §5, ruling 6). */
     @JvmStatic external fun fieldComposing(id: Int, generation: Int, composing: Boolean, value: String)
     /** Hosted field [id] moved its selection with no edit. */
+    @JvmStatic external fun fieldScrolled(id: Int, generation: Int, x: Int, y: Int)
     @JvmStatic external fun fieldSelected(id: Int, generation: Int, start: Int, end: Int)
     /** Hosted field [id] had its action key pressed, or Enter or Tab on a hardware keyboard. [action] is what the
      * key said it does: 0 Enter with no action, 2 done, 3 go, 4 next, 5 previous, 6 search, 7 send, 16 Tab, 17
@@ -147,9 +152,11 @@ object Native {
     @JvmStatic external fun fieldAction(id: Int, generation: Int, action: Int)
     /** A module event, checked against the session and allocation carried by its painted view. */
     @JvmStatic external fun moduleEvent(id: Int, slot: Int, generation: Int, session: Long, kind: String, payload: String)
+    @JvmStatic external fun frameLoaded(id: Int, slot: Int, generation: Int, session: Long)
     /** A media element's event ([event] by HTML's name, [payload] its value), or with an empty [event] its observed
      * [state] for `state.media` (LLP 1042.001 D7); checked as a module event is. */
     @JvmStatic external fun media(id: Int, slot: Int, generation: Int, session: Long, event: String, payload: String, state: String)
+    @JvmStatic external fun backgroundAudio(id: Int, slot: Int, generation: Int, session: Long): ByteArray?
     /** The reader moved scroller [id] by ([dx], [dy]) px, knowing revision [rev] of it. exact2 clamps the move to
      * the scroller's travel, and drops one sent under a revision the app's own scroll has moved on from. */
     @JvmStatic external fun scrolled(id: Int, dx: Float, dy: Float, rev: Int)
@@ -157,6 +164,7 @@ object Native {
      * `scrolldragend`): at ([vx], [vy]) px/s, positive as its offset grows, and, with [rest], to come to rest at
      * ([restX], [restY]) px; [flings] when it threw a fling. From the start until the lift, or the fling's end
      * ([flingEnded]), the scroller's moves owe no `scrollend`. */
+    @JvmStatic external fun sheetDrag(index: Int, generation: Int, top: Float, ended: Boolean, velocity: Float)
     @JvmStatic external fun scrollDrag(id: Int, ended: Boolean, vx: Float, vy: Float, rest: Boolean, restX: Float, restY: Float, flings: Boolean)
     /** A pull to refresh of scroller [id] was let go of past its threshold: its `refresh` ([Refresh]). */
     @JvmStatic external fun refresh(id: Int)
@@ -180,7 +188,9 @@ object Native {
      * ([android.view.MotionEvent.getToolType]). A finger is reported to the app as a touch that hovers nothing and
      * leaves no focus ring, a mouse as a mouse (LLP 1115.001 D7.4). Action 4 is no new touch: the one that is down
      * has been held still for the system's long-press time ([android.view.ViewConfiguration.getLongPressTimeout]).
-     * What names a context menu there opens it (D10), and that touch then presses nothing when it lifts. */
+     * A node with `draggable` nearer than any menu asks for its drag (request kind 23, LLP 1094.000 D7); else what
+     * names a context menu there opens it (D10), and a move past the touch slop then lifts the node's drag. That touch
+     * presses nothing when it lifts. */
     @JvmStatic external fun touch(action: Int, x: Float, y: Float, tool: Int)
     /** A finger past the touch's first ([Fingers]): 0 down, 1 up, 2 move, 3 cancel, at the view's pixels, by its pointer
      * [id] ([android.view.MotionEvent.getPointerId]). The canvas holding the touch takes it where it lands on that
@@ -224,7 +234,8 @@ object Native {
     @JvmStatic external fun access(again: Boolean): IntArray?
     /** An accessibility service acts on node [id] of the tree last told, on the host's thread: [action] 1 press
      * (the presenter's own press at the node, as a driver's `tap`), 2 hold (its context menu), 3 scroll a scroller
-     * on or step a range up, 4 back or down, 5 set a range to [value]. Whether anything took it. */
+     * on or step a range up, 4 back or down, 5 set a range to [value], 6 start the node's drag out of the app. Whether
+     * anything took it. */
     @JvmStatic external fun accessAct(id: Int, action: Int, value: Float): Boolean
     /** No accessibility service is on any more: exact2 forgets the tree it told and builds none until [access]. */
     @JvmStatic external fun accessOff()
@@ -321,6 +332,17 @@ object Native {
 
     /** The file an `app:/data|cache|tmp/…` path names, or null (`ExtensionContext.file`). */
     @JvmStatic external fun appFile(path: String): String?
+    /** The regular file an `app:/data|cache|tmp/…` path names, opened for reading as the app's own `fs.read` opens it,
+     * below its root and through no symbolic link ([Files]); null where it names none, and in a process whose reader
+     * has not booted, which knows no `app:/` root. */
+    @JvmStatic fun openApp(path: String): android.os.ParcelFileDescriptor? =
+        appDescriptor(path).takeIf { it >= 0 }?.let(android.os.ParcelFileDescriptor::adoptFd)
+    /** [openApp]'s descriptor for the caller to adopt, or -1. */
+    @JvmStatic external fun appDescriptor(path: String): Int
+    /** The reader's regular file [source] renamed to the `app:/` path [path], its missing directories made, each
+     * directory reached through no symbolic link and a link found at [path] refused: whether [source] is now the file
+     * at [path]. [source] is on the same file system. */
+    @JvmStatic external fun publishApp(path: String, source: String): Boolean
     /** The running generation's asset directory when a signed update's is running, else null ([AssetRoot]). */
     @JvmStatic external fun assetRoot(): String?
     /** The app's directory [index] names: 0 `data`, 1 `cache`, 2 `tmp` ([ExtensionContext.data]). */
@@ -345,8 +367,8 @@ object Native {
      * `hatches::reader::act`'s): its answer, a ticket for a registration, -1 when refused. */
     @JvmStatic external fun hatchAct(node: Int, kind: Int, text: String?): Long
     /** One request of the agent API (LLP 1012), a JSON line as UTF-8, and its answer the same way: the Linux
-     * host's own handler (`host/painted/src/canvas/agent.rs`), on the host's thread. From the first one the host's turns
-     * run at the driver's clock, which only a `clock` request moves. [AgentDrive] calls it for a driver over adb. */
+     * host's handler (`host/painted/src/canvas/agent.rs`), on the host's thread. A seekable drive owns the clock
+     * except during a frame capture. A `--live` drive uses the display clock from boot. [AgentDrive] serves adb. */
     @JvmStatic external fun agent(line: ByteArray): ByteArray
     /** What an [ExactForma] asks (LLP 1121 D12), on the host's thread: `{"view": id or 0, "names": [..]}`, answered
      * `{"inputs": "<u64>", "colors": {name: ARGB or null}}`, each colour as exact2 paints it at that view (its pinned

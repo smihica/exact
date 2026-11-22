@@ -69,22 +69,19 @@ fn an_early_image_or_window_redraw_survives_until_the_next_tick() {
     assert!(!schedule.defer(tick, &mut pending));
     assert_eq!(schedule.redraw(tick, pending), None);
 }
-#[test]
-fn only_direct_ink_devices_prepare_asynchronously() {
-    use exact_painted::presenter::PainterChoice;
-    use exact_painted::presenter::PainterChoice::*;
-    assert!(direct_device(PainterChoice::from_baked("{}"), None));
-    assert!(!direct_device(
-        PainterChoice::from_baked(r#"{"painter":"cpu"}"#),
-        None
-    ));
-    assert!(direct_device(Ink, None));
-    assert!(!direct_device(Ink, Some("wgpu")));
-    assert!(direct_device(Ink, Some("d3d11")));
-    assert!(direct_device(Ink, Some("warp")));
-    for painter in [Auto, Cpu, Gpu, Custom] {
-        assert!(!direct_device(painter, None));
-        assert!(!direct_device(painter, Some("d3d11")));
+fn present<D: DataSource>(p: &mut Presenter<D>, window: &exact_ink::device::d3d11::Window) {
+    let limit = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(p.window_frame(window.clone()).unwrap().is_none());
+        if p.last_frame_succeeded() && !p.dirty() {
+            break;
+        }
+        assert!(Instant::now() < limit, "window frame was not presented");
+        // A full swap chain defers this frame to the carrier's retry deadline.
+        let due = p
+            .painter_retry_deadline()
+            .expect("deferred present retries");
+        std::thread::sleep(due.min(limit).saturating_duration_since(Instant::now()));
     }
 }
 
@@ -92,22 +89,6 @@ fn only_direct_ink_devices_prepare_asynchronously() {
 #[ignore = "native Windows desktop, system caret blink enabled, EXACT_INK_DEVICE=d3d11"]
 #[allow(deprecated)]
 fn direct_window_blinks_without_a_softbuffer_surface() {
-    fn present(p: &mut Presenter<()>, window: &exact_ink::device::d3d11::Window) {
-        let limit = Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(p.window_frame(window.clone()).unwrap().is_none());
-            if p.last_frame_succeeded() && !p.dirty() {
-                break;
-            }
-            assert!(Instant::now() < limit, "caret frame was not presented");
-            // A full swap chain defers this frame to the carrier's retry deadline.
-            let due = p
-                .painter_retry_deadline()
-                .expect("deferred present retries");
-            std::thread::sleep(due.min(limit).saturating_duration_since(Instant::now()));
-        }
-    }
-
     let events = EventLoop::<crate::accessibility::Event>::with_user_event()
         .with_any_thread(true)
         .build()
@@ -152,6 +133,7 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         proxy: events.create_proxy(),
         accessibility: None,
         name: "Ink caret regression".into(),
+        title: WindowTitle::default(),
         min_size: (1., 1.),
         config: Config::from_env(&plan, ""),
         window: Some(window),
@@ -159,6 +141,7 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         preparing: None,
         jump_list_started: false,
         direct: true,
+        painter: PainterBoot::windows::<true>("{}"),
         presenter: Some(p),
         timers: crate::timers::Timers::new(|_| {}),
         started,
@@ -200,7 +183,9 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
         closing: false,
         keep_running: false,
         hidden: false,
+        pending_show: None,
         instance: None,
+        cold_documents: Vec::new(),
         tray: None,
         presents: Default::default(),
     };
@@ -217,6 +202,174 @@ fn direct_window_blinks_without_a_softbuffer_surface() {
     assert!(state.caret.visible());
     present(state.presenter.as_mut().unwrap(), &owned);
 }
+#[test]
+#[ignore = "native Windows desktop with DirectComposition"]
+#[allow(deprecated)]
+fn hiding_a_resident_window_releases_its_painter_and_preserves_its_canvas_and_editor() {
+    use exact_painted::presenter::PainterChoice;
+    use exact_runner::{exact_canvas, DataError, Value};
+    use winit::platform::pump_events::EventLoopExtPumpEvents;
+
+    #[derive(Default)]
+    struct Picture;
+    impl DataSource for Picture {
+        fn query(&mut self, name: &str, _: &[Value]) -> Result<Value, DataError> {
+            Err(DataError::UnknownSource(name.into()))
+        }
+        fn canvas_surfaces(&self) -> Vec<(String, usize)> {
+            vec![("picture".into(), 0)]
+        }
+        fn draw_2d(
+            &mut self,
+            _: &str,
+            _: &[Value],
+            ctx: &exact_canvas::Context2d,
+            frame: &exact_canvas::Frame,
+        ) -> Result<bool, exact_canvas::DrawError> {
+            let mut image = ctx
+                .create_image_data_with_sw_and_sh(frame.width, frame.height)
+                .unwrap();
+            for pixel in image.data.as_chunks_mut::<4>().0 {
+                *pixel = [24, 48, 96, 255];
+            }
+            ctx.put_image_data(&image, 0., 0.).unwrap();
+            Ok(false)
+        }
+    }
+
+    let size = [240u32, 120u32];
+    let mut events = EventLoop::<crate::accessibility::Event>::with_user_event()
+        .with_any_thread(true)
+        .build()
+        .unwrap();
+    let plan = contract::compile(
+        r#"component App
+  view
+    main position="absolute" inset=0
+      canvas surface=picture() position="absolute" inset=0 width="100%" height="100%"
+      input testId="field" width=120 height=40
+"#,
+    )
+    .unwrap()
+    .encode();
+    for (painter, name) in [(PainterChoice::Ink, "ink"), (PainterChoice::Cpu, "cpu")] {
+        let direct = painter == PainterChoice::Ink;
+        let window = Rc::new(
+            events
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Resident canvas test")
+                        .with_no_redirection_bitmap(direct)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(size[0], size[1])),
+                )
+                .unwrap(),
+        );
+        let owned = exact_ink::device::d3d11::Window::from_owner(window.clone()).unwrap();
+        let (mut p, warning) = Presenter::boot_with(
+            &plan,
+            Picture,
+            (size[0] as f32, size[1] as f32),
+            1.,
+            Default::default(),
+            painter,
+        )
+        .unwrap();
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(
+            p.attach_painter_window(owned.clone(), size).unwrap(),
+            direct
+        );
+        let k = p.host().kernel();
+        let field = k.node_by_key(k.find_by_test_id("field")[0]).unwrap().id;
+        p.type_text(field, "resident").unwrap();
+        p.reader_access(1., true);
+        let editor_id = p.access_told().iter().find(|n| n.view == field).unwrap().id;
+        let selection = exact_runner::FieldSelection {
+            start: 1,
+            end: 4,
+            direction: exact_runner::SelectionDirection::Backward,
+        };
+        assert!(p.access_select(editor_id, selection, 0.));
+        let mut app = test_app(events.create_proxy(), &plan, p);
+        app.window = Some(window);
+        app.keep_running = true;
+        app.direct = direct;
+        app.painter =
+            PainterBoot::windows::<false>(&serde_json::json!({"painter": name}).to_string());
+        let verify = |p: &mut Presenter<Picture>| {
+            let editor = p
+                .access_tree()
+                .0
+                .into_iter()
+                .find(|n| n.view == field)
+                .unwrap();
+            assert_eq!(editor.value, "resident");
+            assert_eq!(p.access_selection(editor_id), Some(selection));
+            let pixels = p.frame();
+            let offset = ((size[1] - 8) * size[0] + size[0] - 8) as usize * 4;
+            assert_eq!(&pixels.data()[offset..offset + 4], &[24, 48, 96, 255]);
+        };
+        let p = app.presenter.as_mut().unwrap();
+        if direct {
+            present(p, &owned);
+        }
+        verify(p);
+        let hwnd = owned.hwnd() as _;
+        #[allow(unsafe_code)]
+        let cloaked = || {
+            use windows_sys::Win32::Graphics::Dwm::{
+                DwmGetWindowAttribute, DWMWA_CLOAKED, DWM_CLOAKED_APP,
+            };
+            let mut flags = 0u32;
+            let hr = unsafe {
+                DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAKED as u32,
+                    (&mut flags as *mut u32).cast(),
+                    size_of_val(&flags) as u32,
+                )
+            };
+            assert!(hr >= 0, "{hr:#x}");
+            flags & DWM_CLOAKED_APP != 0
+        };
+        for cancel_first in [true, false] {
+            app.hide_by_app();
+            assert_eq!(app.presenter.as_ref().unwrap().painter.name, "cpu");
+            app.bring_forward();
+            app.bring_forward();
+            assert!(cloaked());
+            #[allow(unsafe_code)]
+            let foreground =
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            assert_ne!(foreground, hwnd);
+            if cancel_first {
+                app.hide_by_app();
+                assert!(!cloaked());
+                assert_eq!(app.window.as_ref().unwrap().is_visible(), Some(false));
+                app.bring_forward();
+                assert!(cloaked());
+            }
+            let previous = app.frames;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.frames == previous {
+                events.pump_app_events(
+                    Some(deadline.saturating_duration_since(Instant::now())),
+                    &mut app,
+                );
+                assert!(
+                    !app.failed && Instant::now() < deadline,
+                    "first window frame missing"
+                );
+            }
+            assert!(!cloaked());
+            assert_eq!(app.window.as_ref().unwrap().is_visible(), Some(true));
+            let p = app.presenter.as_mut().unwrap();
+            assert_eq!(p.painter.name, name);
+            verify(p);
+        }
+    }
+}
+
 #[test]
 fn text_without_a_physical_key_reaches_the_editor() {
     use winit::keyboard::{Key, KeyCode, NamedKey, NativeKey, NativeKeyCode, PhysicalKey};
@@ -278,8 +431,10 @@ fn early_redraws_preserve_cadence_and_stalls_resume_without_catch_up() {
     );
 }
 
-fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) -> App<()> {
-    let started = Instant::now();
+pub(super) fn windowless_app(
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+    plan: &[u8],
+) -> App<()> {
     let (p, _) = Presenter::boot_with(
         plan,
         (),
@@ -289,11 +444,21 @@ fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) 
         exact_painted::presenter::PainterChoice::Cpu,
     )
     .unwrap();
+    test_app(proxy, plan, p)
+}
+
+fn test_app<D: DataSource>(
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+    plan: &[u8],
+    p: Presenter<D>,
+) -> App<D> {
+    let started = Instant::now();
     App {
         service_causes: 0,
-        proxy: events.create_proxy(),
+        proxy,
         accessibility: None,
         name: "Frame scheduling regression".into(),
+        title: WindowTitle::default(),
         min_size: (1., 1.),
         config: Config::from_env(plan, ""),
         window: None,
@@ -301,6 +466,7 @@ fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) 
         preparing: None,
         jump_list_started: false,
         direct: true,
+        painter: PainterBoot::windows::<true>("{}"),
         presenter: Some(p),
         timers: crate::timers::Timers::new(|_| {}),
         started,
@@ -342,20 +508,20 @@ fn windowless_app(events: &EventLoop<crate::accessibility::Event>, plan: &[u8]) 
         closing: false,
         keep_running: false,
         hidden: false,
+        pending_show: None,
         instance: None,
+        cold_documents: Vec::new(),
         tray: None,
         presents: Default::default(),
     }
 }
 
 #[allow(deprecated)]
-pub(crate) fn about_to_wait_honors_retry_pending_redraw_and_earlier_timer(
-    events: EventLoop<crate::accessibility::Event>,
-) {
+pub(crate) fn run_carrier_tests(events: EventLoop<crate::accessibility::Event>) {
     let plan = contract::compile("component App\n  view\n    text \"idle\"\n")
         .unwrap()
         .encode();
-    let mut app = windowless_app(&events, &plan);
+    let mut app = windowless_app(events.create_proxy(), &plan);
     let mut checked = false;
     events.run(|event, events| {
         if !matches!(event, winit::event::Event::AboutToWait) { return; }
@@ -386,10 +552,107 @@ pub(crate) fn about_to_wait_honors_retry_pending_redraw_and_earlier_timer(
         app.presenter = Some(p);
         app.wait(events, |_| (Some(retry), Some(retry)));
         assert_eq!(events.control_flow(), ControlFlow::WaitUntil(app.started + Duration::from_secs_f64(wake / 1000.)));
+        file_drop::tests::shell_selection_over_an_editor(events, app.proxy.clone()).unwrap();
+        document_title_reaches_the_window_without_drawing(events, app.proxy.clone());
         checked = true;
         events.exit();
     }).unwrap();
     assert!(checked);
+}
+
+fn document_title_reaches_the_window_without_drawing(
+    events: &ActiveEventLoop,
+    proxy: EventLoopProxy<crate::accessibility::Event>,
+) {
+    let plan = contract::compile(
+        r#"component App
+  state step = 0
+  state timed = false
+  derive title = timed ? "Timed document" : step == 0 ? "First document" : step == 1 ? "Second document 📄" : ""
+  derive body = timed ? "Updated text" : "Initial text"
+  action next
+    step = (step + 1) % 4
+  action rename
+    timed = true
+  task timer mount
+    after(60000, rename)
+  view
+    column
+      if step != 3
+        head title=title
+      button "Next" press=next testId="next"
+      text body
+"#,
+    )
+    .unwrap()
+    .encode();
+    let mut app = windowless_app(proxy.clone(), &plan);
+    let initial_frames = app.frames;
+    let window = Rc::new(
+        events
+            .create_window(
+                Window::default_attributes()
+                    .with_title(&app.name)
+                    .with_visible(false)
+                    .with_inner_size(LogicalSize::new(160., 80.)),
+            )
+            .unwrap(),
+    );
+    app.window = Some(window.clone());
+    app.hidden = true;
+    let mut access = crate::accessibility::Access::new(events, &window, proxy);
+    let p = app.presenter.as_mut().unwrap();
+    access.event(
+        p,
+        &window,
+        &app.name,
+        accesskit_winit::WindowEvent::InitialTreeRequested,
+    );
+    app.accessibility = Some(access);
+    let kernel = p.host().kernel();
+    let next = kernel
+        .node_by_key(kernel.find_by_test_id("next")[0])
+        .unwrap()
+        .id;
+    let titles = [
+        Some("First document"),
+        Some("Second document 📄"),
+        Some(""),
+        None,
+        Some("First document"),
+    ];
+    for (step, title) in titles.into_iter().enumerate() {
+        if step > 0 {
+            let p = app.presenter.as_mut().unwrap();
+            assert_eq!(
+                p.host_mut()
+                    .dispatch_at(next, exact_runner::Event::Press, 0.),
+                None
+            );
+        }
+        app.wait(events, |_| (None, None));
+        let title = title.unwrap_or(&app.name);
+        assert_eq!(window.title(), title);
+        assert_eq!(
+            app.accessibility.as_ref().unwrap().root_label(),
+            Some(title)
+        );
+    }
+    assert_eq!(app.frames, initial_frames);
+
+    app.started -= Duration::from_secs(60);
+    app.wait(events, |_| (None, None));
+    let p = app.presenter.as_mut().unwrap();
+    let access = app.accessibility.as_mut().unwrap();
+    assert_eq!(window.title(), "Timed document");
+    assert_eq!(access.root_label(), Some("Timed document"));
+    assert!(p.access_told().iter().any(|n| n.name == "Initial text"));
+    assert!(p.dirty());
+
+    p.frame();
+    access.sync(p, &window, "Timed document");
+    assert!(p.access_told().iter().any(|n| n.name == "Updated text"));
+    assert_eq!(access.root_label(), Some("Timed document"));
 }
 
 #[test]

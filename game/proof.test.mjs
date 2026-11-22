@@ -964,6 +964,17 @@ test('R13 Fox screenshot reply scales logical bounds at DPR 2 and 3', async () =
   }
 });
 
+test('Fox samples the fitted game viewport inside a phone display capture', async () => {
+  const { foxScreenshotPixels } = await import('./games/skinned-fixture/proof.mjs');
+  const width = 100, height = 220, data = new Uint8Array(width * height * 4).fill(255);
+  const space = { screen: { x: 10, y: 80, w: 80, h: 45 }, viewport: { w: 160, h: 90 } };
+  for (let y = 90; y < 100; y++) for (let x = 55; x < 70; x++)
+    data.set([150 + x % 10 * 8, 70, 20, 255], (y * width + x) * 4);
+  const reply = { w: width, h: height, scale: 1, captureSpace: 'screen', front: true };
+  const result = foxScreenshotPixels({ width, height, data }, { x: 90, y: 20, w: 30, h: 20 }, reply, space);
+  expect(result).toMatchObject({ ok: true, crop: [45, 10, 60, 20] });
+});
+
 test('engine test sources are not bake inputs: editing one leaves the proof input hash alone', () => {
   const root = mkdtempSync(resolve(tmpdir(), 'r14-inputs-'));
   const app = resolve(root, 'game/games/fixture');

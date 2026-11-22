@@ -1,4 +1,5 @@
 import { viewParent, viewChildren } from './navigation/lists.js';
+import { focusStack } from './navigation/routes.js';
 // @ref LLP 1043.000 §3 D7/D8 — flow settlement must not change LLP 1012's API.
 import { afterAll, test, expect } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
@@ -238,7 +239,7 @@ test('ordinary reads and inputs are synchronous; the awaited entry returns the s
   for (const op of ['state', 'tree', 'logs', 'tags', 'layout', 'focus', 'tap', 'type', 'unknown']) {
     const request = { op, id: 1 }, reply = f.exact.agent(request);
     plain(reply);
-    expect(await f.exact.agentSettled(request)).toEqual(reply);
+    expect(await f.exact.agentSettled(request)).toEqual(f.tagged({ ...reply }));
   }
   expect(f.exact.agent({ op: 'state' }).slots.backPresses).toBe(3);
   expect(f.exact.agent({ op: 'tree' }).roots[0]).toBe(1);
@@ -256,14 +257,14 @@ test('ordinary reads and inputs are synchronous; the awaited entry returns the s
 test('GPU pending prevents the awaited operation from reading live state', async () => {
   const f = fixture();
   let reads = 0;
-  f.ask = request => { reads++; return request.op === 'tags' ? {epoch:2,incarnation:1,clock:0} : f.state; };
+  f.ask = request => { if (request.op !== 'tags') reads++; return request.op === 'tags' ? {epoch:2,incarnation:1,clock:0} : f.state; };
   f.exact.gpu = { settled: async () => [{name:'GPU recovery world'}] };
   const reply = await f.exact.agentSettled({op:'state'});
   expect(reply.error).toContain('GPU is not settled');
   expect(reply.pending).toEqual(['GPU recovery world']);
   expect(reads).toBe(0);
   const clock = await f.exact.agentSettled({op:'clock',settle:true});
-  expect(clock).toEqual({clock:0,settled:false,reason:'gpu',pending:['GPU recovery world']});
+  expect(clock).toEqual({clock:0,settled:false,reason:'gpu',pending:['GPU recovery world'],epoch:2,incarnation:1});
   expect(reads).toBe(0);
 });
 
@@ -752,7 +753,7 @@ test('non-flow operation transcripts remain byte-for-byte equal to the existing 
 });
 
 // Run the input adapter with controlled scheduling; browser tests cover geometry.
-let inputSource = readFileSync(new URL('./input-glue.js', import.meta.url), 'utf8').replace(/^import \{ viewChildren, viewParent \} from '\.\/navigation\.js';\n/m, '');
+let inputSource = readFileSync(new URL('./input-glue.js', import.meta.url), 'utf8').replace(/^import \{[^}]+\} from '\.\/navigation\.js';\n/m, '');
 for (const name of ['prompt-glue', 'alert-message']) {
   const stripped = inputSource.replace(new RegExp(`^import\\s+["']\\./${name}\\.js["'];[^\\n]*\\n`, 'm'), '');
   if (stripped === inputSource) throw new Error(`input glue must retain its ${name} side-effect import`);
@@ -769,7 +770,7 @@ function inputFixture() {
     closest() { return this.disabled ? this : null; }, matches: () => false, contains: () => true, setPointerCapture(id) { captured.push(id); } };
   const buttons = [];
   // `page` is a built document being adopted (LLP 1048.000 D6); this page was not built.
-  const f = vm.createContext({ viewParent, viewChildren, inputReady: false, inputHandlers: null, page: null,
+  const f = vm.createContext({ focusStack, viewParent, viewChildren, inputReady: false, inputHandlers: null, page: null,
     views: new Map([[7, el]]), retiredViews: new WeakSet(), frames, sent, captured, el,
     root: { querySelectorAll: s => s.includes('aria-modal') ? [] : buttons, addEventListener() {}, contains: () => true }, // press feedback's listener: press.test.mjs drives it
     // The shortcuts' keydown listens in the capture phase, a pressable's activation in the bubble phase.
@@ -987,7 +988,7 @@ async function startupFixture(rustOnly = false, served = null, timerFirst = fals
   f.host = f;
   f.exact = served ? { documentPage: { connect: () => ({ started: Promise.resolve(), ...served }) } } : {}; // a served document's capture (document-glue.js)
   // navigation.js's export, which a context global would confuse with the browser's own `globalThis.navigation`.
-  vm.runInContext([source.match(/^const AGENT_ADMITTED = .*$/m)[0], "const navigation = { activate: () => events.push('navigation') };", ...['setInputReady', 'activateData', 'main'].map(declaration)].join('\n')
+  vm.runInContext([source.match(/^const AGENT_ADMITTED = .*$/m)[0], "const navigation = { activate: () => events.push('navigation') };", ...['ModuleStopped', 'StageNotLoaded', 'withPlaceholders', 'guardedExports', 'stopModule', 'setInputReady', 'activateData', 'main'].map(declaration)].join('\n')
     .replaceAll('import.meta.url', '"https://fixture.invalid/glue.js"'), f);
   await f.main();
   if (served) return { f }; // a served document's first pixel is painted: activation is not a frame away
@@ -1220,7 +1221,8 @@ test('a hold is addressed by its node or capability, and an unclear name is refu
 });
 
 test('a pick answer keeps a path with a space when it comes one per line', () => {
-  const paths = new Function(readFileSync(new URL('../web-js/files.js', import.meta.url), 'utf8').match(/^const paths = .*;$/m)[0] + ';return paths;')();
+  const filesSource = readFileSync(new URL('../web-js/files.js', import.meta.url), 'utf8');
+  const paths = new Function(filesSource.match(/^const documentPaths = .*;$/m)[0] + '\n' + filesSource.match(/^const paths = .*;$/m)[0] + ';return paths;')();
   for (const input of ['/tmp/my photo.png\n', '/tmp/a b.png\n/tmp/c.png\n', 'a.png b.png', '']) expect(paths(input)).toEqual(pickedPaths(input));
   expect(pickedPaths('/tmp/my photo.png\n')).toEqual(['/tmp/my photo.png']);
   expect(pickedPaths('/tmp/a b.png\n/tmp/c.png\n')).toEqual(['/tmp/a b.png', '/tmp/c.png']);

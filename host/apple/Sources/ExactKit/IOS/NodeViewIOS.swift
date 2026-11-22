@@ -26,6 +26,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
     private(set) var textRasterWhole = false
     var textRasterReady = false { didSet { if oldValue != textRasterReady { presenter?.noteOwedText(self) } } }
     var textRasterFailed = false { didSet { if oldValue != textRasterFailed { presenter?.noteOwedText(self) } } }
+    var proseMarker: CATextLayer?
     var textLayoutValid = false
     /// Whether a frame has shown it where it is (`Presenter.showed`).
     var shown = Shown.uncopied
@@ -64,7 +65,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
     weak var paintParent: PaintView?
     let firstDraw: DrawReceipt?
     package let kind: String
-    var inlineText: [InlineText] = [] { didSet { hasInlineContextPopover = inlineText.contains { $0.props["contextPopover"]?.isEmpty == false }; hasInlineLink = inlineText.contains { $0.props["href"].map(NodeView.hasLinkMenu) == true } } }
+    package var inlineText: [InlineText] = [] { didSet { hasInlineContextPopover = inlineText.contains { $0.props["contextPopover"]?.isEmpty == false }; hasInlineLink = inlineText.contains { $0.props["href"].map(NodeView.hasLinkMenu) == true } } }
     /// A run names a context popover, or is a link with the host's own menu (`hasLinkMenu`): read for every paragraph each batch (`ContextMenuHost.sync`).
     private(set) var hasInlineContextPopover = false, hasInlineLink = false
     /// The rarely set fields (`NodeExtrasIOS.swift`); nil until one is set.
@@ -181,13 +182,6 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         }
         if let reorder = presenter?.reorders.shouldBegin(self, gesture) { return reorder }
         if let drag = DragLink.installed?.shouldBegin(self, gesture) { return drag }
-        if gesture === heightRecognizer, let pan = gesture as? UIPanGestureRecognizer {
-            let velocity = pan.velocity(in: window), translation = pan.translation(in: window)
-            return SwipeInput.allows(self) && HeightDragDirection.accepts(
-                velocityX: Double(velocity.x), velocityY: Double(velocity.y),
-                translationX: Double(translation.x), translationY: Double(translation.y))
-                && presenter?.heightBindings[id]?.target != nil
-        }
         if gesture === swipeRecognizer, let pan = gesture as? UIPanGestureRecognizer {
             let velocity = pan.velocity(in: window)
             // Where the finger landed: the translation leaves out the travel
@@ -227,20 +221,12 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         if gestureRecognizer === swipeRecognizer, gestureRecognizer.numberOfTouches == 0 { swipeDownX = touch.location(in: window).x }
         if stopsAtPress(gestureRecognizer), pressBoundary(touch, presses: gestureRecognizer !== layoutPanRecognizer) { return false } // LLP 1057.001 rule 3
         #if os(iOS)
-        if gestureRecognizer === contextRecognizer {
-            guard presenter?.menus.eligible(self, contextMenu: true) == true,
-                  hasOwnContextMenu || inlineContextTarget(at: touch.location(in: self)) != nil else { return false }
-            if !ExactEnv.agentMode {
-                let run = inlineContextTarget(at: touch.location(in: self))
-                if (run?.props["contextPopover"] ?? (run == nil ? props["contextPopover"] : nil))?.isEmpty == false { return false }
-            }
-            if let hit = touch.view as? NodeView, let source = hit.contextMenuSource(at: touch.location(in: hit)), source !== self { return false }
-        }
+        if gestureRecognizer === contextRecognizer, !hearsLongPress(on: touch.view, at: touch.location(in: self)) { return false }
         #endif
         if hitsNativeEditor(touch.view) { return false }
         var hit = touch.view
         while let current = hit, current !== self {
-            if (gestureRecognizer === heightRecognizer || gestureRecognizer === transformRecognizer || gestureRecognizer === transformContact?.pinch), current is UIScrollView { return false }
+            if (gestureRecognizer === heightRecognizer || gestureRecognizer === transformRecognizer || gestureRecognizer === transformContact?.pinchRecognizer), current is UIScrollView { return false }
             hit = current.superview
         }
         return true
@@ -495,7 +481,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
     /// A pointer over the node (an iPad's trackpad or mouse; a phone has
     /// none): `hover` in and out.
     package override var accessibilityElements: [Any]? {
-        get { textAccessibilityChildren() ?? tableElementsInDrawnOrder ?? super.accessibilityElements ?? NodeView.emptyBoxAccessibility(of: self) }
+        get { textAccessibilityChildren() ?? tableElementsInDrawnOrder ?? super.accessibilityElements ?? presenter?.navigation.lifted?.accessibilityElements(of: self) ?? NodeView.emptyBoxAccessibility(of: self) }
         set { super.accessibilityElements = newValue }
     }
     /// A text field's Enter as a key (its characters are its `input`, the
@@ -581,10 +567,10 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             // What the image says is its node's (`aria-label`), never the
             // name UIKit gives the symbol, which a cell gathering its
             // children's words would read ("checkmark.circle" is "selected").
-            SymbolEffectState.of(leaf).pathTemplate = nil
+            SymbolEffectState.of(leaf).clearPathTemplate()
             showSymbol(image, on: leaf); leaf.isAccessibilityElement = false; leaf.accessibilityElementsHidden = true; leaf.isUserInteractionEnabled = false
             // The symbol's size when the kernel's measurer could not say
-            presenter?.queueIntrinsicSize(self, generation: generation, props["symbolAsset"] != nil ? image?.size : SymbolMeasure.size(name, points: points, weight: weight))
+            presenter?.queueIntrinsicSize(self, generation: generation, (props["symbolAsset"] != nil || props["symbolPath"] != nil) ? image?.size : SymbolMeasure.size(name, points: points, weight: weight))
         }
         symbolView?.preferredSymbolConfiguration = symbolConfiguration(SymbolMeasure.configuration(points: points, weight: weight))
         if let leaf = symbolView { applySymbolEffect(leaf) }
@@ -719,7 +705,6 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         retainedScrollTop = nil; dropCarriedScroll()
         if handlers.contains("scrolldragstart") { presenter?.scrollDrag(id, nil) }
         #if os(iOS)
-        if #available(iOS 27.1, *) { presenter?.arrangements.cancelScrollHandoff(id) }
         if swipeOwner { presenter?.swipeActions.paintedBegan(self) }
         #endif
     }
@@ -742,7 +727,8 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         // The kernel's authored frames already include this content room.
         // Keep the physical UI inset basis, but do not count native padding twice.
         let room = extras?.nativeScrollContentInsets ?? .zero
-        presenter.onScrolled?(id, Double(scrollView.contentOffset.x + room.left), Double(scrollView.contentOffset.y + room.top + pageBand.top))
+        let outset = reportedScrollOutset
+        presenter.onScrolled?(id, Double(scrollView.contentOffset.x + room.left + outset.left), Double(scrollView.contentOffset.y + room.top + outset.top))
         presenter.stickies.scrolled(id); presenter.collections.changed(id, user: true, sequenceAdvanced: true)
         #if os(iOS)
         if swipeOwner, scrollView.isTracking { presenter.swipeActions.paintedScrolled(self) }
@@ -769,13 +755,13 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
     func sendScrollEvent() {
         guard handlers.contains("scroll"), let sv = scrollView,
               presenter?.views[id] === self, hasScrollLayoutBox else { return }
-        let point = sv.contentOffset, top = scrollTopInset(sv)
+        let left = scrollLeftInset(sv), top = scrollTopInset(sv), point = CGPoint(x: sv.contentOffset.x + left, y: sv.contentOffset.y)
         // CSS's extents (`ScrollEvent`): the port inside UI insets (native
         // padding and footer room remain content), and the
         // port plus the range UIKit clamps a settled offset to, so at the
         // end `scrollHeight - scrollTop - clientHeight` is 0 (chat F4).
         let inset = sv.adjustedContentInset, port = scrollPort(sv).size
-        let range = CGSize(width: max(0, sv.contentSize.width + inset.right - sv.bounds.width),
+        let range = CGSize(width: max(0, sv.contentSize.width + inset.right - sv.bounds.width + left),
                            height: max(0, sv.contentSize.height + inset.bottom - sv.bounds.height + top))
         // A zoomable scroller adds its zoom (LLP 1057.001.000 D2).
         let zoom = extras?.zoom, event = ([point.x, point.y + top, port.width + range.width, port.height + range.height, port.width, port.height]
@@ -799,7 +785,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
 
     /// The direct child of a canvas this node is under, when that child is
     /// placed by the surface: the node whose `placement` maps this subtree.
-    var placedAncestor: NodeView? {
+    package var placedAncestor: NodeView? {
         guard Self.placedViews.count > 0 else { return nil }
         var v: UIView? = self
         while let n = v {
@@ -874,11 +860,12 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             // CSS visible overflow remains hit-testable. A row in a horizontal
             // scroll can paint children beyond its own width; rejecting the
             // parent box first made those visible choices impossible to tap.
-            // A scroller's scroll view reaching into the page's bands takes them too (LLP 1130 D3).
-            let band = scrollView == nil ? .zero : pageBand
+            // A scroller's scroll view drawn past its box, into the page's bands or by reach, takes
+            // touches there too (LLP 1130 D3, LLP 1123 D13).
+            let outset = scrollView == nil ? .zero : scrollOutset
             let box = surface?.frame ?? bounds
-            let outsideX = point.x < box.minX || point.x > box.maxX
-            let outsideY = point.y < box.minY - band.top || point.y > box.maxY + band.bottom
+            let outsideX = point.x < box.minX - outset.left || point.x > box.maxX + outset.right
+            let outsideY = point.y < box.minY - outset.top || point.y > box.maxY + outset.bottom
             if outsideX && (style["overflow_x"]?.string ?? "visible") != "visible" { return nil }
             if outsideY && (style["overflow_y"]?.string ?? "visible") != "visible" { return nil }
             let passesThrough = style["pointer_events"]?.string == "none" || cssVisibilityHidden && !inlineRunShows(at: point)
@@ -915,7 +902,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             if event?.type == .touches, isParagraph {
                 touchedText()
                 #if os(iOS)
-                if let surface = presenter?.textSelection.text(for: self)?.document?.surface { return surface }
+                if let surface = presenter?.textSelection.surface(for: self) { return surface }
                 #endif
             } // selectable text takes its interaction for this touch
             // Interactive glass (a pressable glass box) answers a finger
@@ -1113,6 +1100,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         for k in clear { next.removeValue(forKey: k) }
         for (k, v) in set { next[k] = v }
         props = next
+        if set["listMarker"] != nil || clear.contains("listMarker") { layoutProseMarker() }
         if isParagraph, set.keys.contains(where: Self.paragraphProps.contains) || clear.contains(where: Self.paragraphProps.contains) { invalidateText() }
         #if os(iOS)
         let nativeList = kind == "list" && next["listStyle"] != nil
@@ -1278,7 +1266,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
     /// scroll container that scrolls that axis; `hidden` clips.
     /// Whether the style clips the children (`overflow: hidden` or `clip`); a waiting
     /// scroll clips as its scroll view would. Without a clip box, it is the
-    /// layer's `masksToBounds` (`syncScroll`; a landing flight, `FlightsIOS`).
+    /// layer's `masksToBounds`, except on a scroller drawn into a band (`clipsItself`).
     package var overflowClips: Bool {
         let ox = style["overflow_x"]?.string ?? "visible", oy = style["overflow_y"]?.string ?? "visible"
         return ["hidden", "clip"].contains(ox) || ["hidden", "clip"].contains(oy) || scrollDormant
@@ -1290,6 +1278,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         if scrolls { syncClipBox(false) }
         if scrolls && scroll == nil && !scrollWaits && !groupedOwner {
             if pageBand != .zero, extras?.nativeScrollView != nil { setPageBand(.zero) } // the list leaving keeps its scrollTop
+            if reach != .zero, extras?.nativeScrollView != nil { setReach(.zero) }
             let sv = ScrollView(frame: bounds)
             sv.backgroundColor = .clear
             sv.contentInsetAdjustmentBehavior = .never
@@ -1302,7 +1291,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
                 for child in children { sv.addSubview(child) }
             }
             scroll = sv
-            if pageBand != .zero || bandInset != .zero { more.pageBand = .zero; more.bandInset = .zero } // a new scroll view reaches no band until asked (LLP 1130 D3)
+            if pageBand != .zero || bandInset != .zero || reachGiven { more.pageBand = .zero; more.bandInset = .zero; more.reach = .zero; more.reachGiven = false } // a new scroll view reaches no band, and has no reach, until asked (LLP 1130 D3, LLP 1123 D13)
             scrollWritten = nil
             updateRefresh()
             presenter?.navigation.scrollBackendChanged(self)
@@ -1317,7 +1306,7 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
                 if presenter?.navigation.container === self { presenter?.navigation.fitOwner() }
                 sv.removeFromSuperview()
             }
-            if pageBand != .zero || bandInset != .zero { more.pageBand = .zero; more.bandInset = .zero }
+            if pageBand != .zero || bandInset != .zero || reachGiven { more.pageBand = .zero; more.bandInset = .zero; more.reach = .zero; more.reachGiven = false }
         }
         scroll?.scrollsX = (ox == "scroll" || ox == "auto")
         scroll?.scrollsY = (oy == "scroll" || oy == "auto")
@@ -1362,14 +1351,16 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
         // Ending where its last edge is drawn, from this box's place on the
         // pixel grid, so the furthest offset is a whole pixel and reaches it (`PixelGridIOS.swift`).
         let s = presenter?.gridScale ?? 1, o = grid?.origin ?? .zero, content = zoomExtent ?? self.content
-        let size = CGSize(width: sv.scrollsX ? max(PixelGrid.length(content.width, from: o, vertical: false, scale: s), sv.bounds.width) : sv.bounds.width,
-                          height: sv.scrollsY ? max(PixelGrid.length(content.height, from: o, vertical: true, scale: s), scrollFloor(sv)) : sv.bounds.height)
+        // The box: the scroll view less what it is drawn past the box
+        let outset = scrollOutset, box = CGSize(width: scrollFloorWidth(sv), height: max(0, sv.bounds.height - outset.top - outset.bottom))
+        let size = CGSize(width: sv.scrollsX ? max(PixelGrid.length(content.width, from: o, vertical: false, scale: s), box.width) : box.width,
+                          height: sv.scrollsY ? max(PixelGrid.length(content.height, from: o, vertical: true, scale: s), scrollFloor(sv)) : box.height)
         if sv.contentSize != size { sv.contentSize = size }
         // Forced bounce on a carousel's computed y traps Mac wheel input; one travels a quarter of its width or lays a
         // row (itself, or a child wider than the port), and a page a few points too wide keeps its bounce.
-        let travel = size.width - sv.bounds.width
+        let travel = size.width - box.width
         let row = { (v: NodeView) in v.style["display"]?.string == "flex" || v.style["flex_direction"] != nil ? !(v.style["flex_direction"]?.string ?? "row").hasPrefix("column") : false }
-        let carousel = travel > 0.5 && (travel > sv.bounds.width / 4 || row(self) || sv.subviews.contains { ($0 as? NodeView).map { $0.frame.width > sv.bounds.width + 0.5 && row($0) } ?? false })
+        let carousel = travel > 0.5 && (travel > box.width / 4 || row(self) || sv.subviews.contains { ($0 as? NodeView).map { $0.frame.width > box.width + 0.5 && row($0) } ?? false })
         // One that fits inside an author's scroller that scrolls down leaves
         // the drag to it, as a nested UIScrollView does (an `EmptyState` in a
         // page's `scroll`). The presenter's viewport is no author's.
@@ -1455,8 +1446,8 @@ package final class NodeView: UIView, UITextViewDelegate, UITextFieldDelegate, U
             // natural size, `scale-down` the smaller of none and contain;
             // an unknown value is the initial `fill`.
             let fit = style["object_fit"]?.string ?? "fill"
-            let content = contentBox()
-            let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: fit)
+            let content = flightLook?.contentClip ?? contentBox()
+            let rect = flightLook?.image ?? RasterGeometry.rect(natural: bitmap.naturalSize, content: content, fit: fit, position: style["object_position"]?.array)
             ctx.saveGState()
             path.addClip()
             clipToContentEdge(ctx, content)

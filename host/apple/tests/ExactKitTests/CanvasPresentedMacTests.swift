@@ -8,6 +8,10 @@ private let recordBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
 private var records: [String] = []
 private var taken = 0
 private var empty = false
+/// This test's canvas in the module. The session's own page has canvases
+/// too, which the module's `create` numbers 1 and which ask it for records
+/// at the same report: they get none.
+private let own: UInt32 = 2
 
 private final class VisibleWindow: NSWindow {
     override var occlusionState: NSWindow.OcclusionState { .visible }
@@ -30,14 +34,15 @@ final class CanvasPresentedMacTests: XCTestCase {
             childrenCount: { _, _ in 0 }, placement: { _, _, _, _ in 0 },
             shader: nil, validateShader: nil, clearShaders: nil, errorLen: { 0 },
             errorPtr: { nil }, wantsInput: nil, input: nil, messages: nil,
-            published: { _ in
+            published: { id in
+                guard id == own else { return UInt32.max }
                 taken += 1
                 guard !records.isEmpty else { return UInt32.max }
                 let bytes = Array(records.removeFirst().utf8)
                 bytes.withUnsafeBufferPointer { recordBuffer.update(from: $0.baseAddress!, count: $0.count) }
                 return UInt32(bytes.count)
             }, agent: nil, outPtr: { UnsafePointer(recordBuffer) })
-        m.presentationFlags = { _ in empty ? 4 : 0 }
+        m.presentationFlags = { id in id == own && empty ? 4 : 0 }
         let s = ExactApp.shared.makeSession(label: "canvas-presented")
         defer { s.destroy() }
         s.surfaceHost.modules[""] = m; s.surfaceHost.attempted = [""]
@@ -46,7 +51,7 @@ final class CanvasPresentedMacTests: XCTestCase {
         w.contentView = ExactView(session: s)
         let canvas = NodeView(id: 100, kind: "canvas", presenter: s.presenter)
         s.presenter.root.addSubview(canvas); s.presenter.views[100] = canvas
-        let e = CanvasesHost.Entry(view: canvas, name: "world", values: Data("[]".utf8)); e.id = 1; e.module = m
+        let e = CanvasesHost.Entry(view: canvas, name: "world", values: Data("[]".utf8)); e.id = own; e.module = m
         s.surfaceHost.entries[100] = e
 
         if s.surfaceHost.publishers["world"] == nil { s.surfaceHost.claimPublisher(e) }

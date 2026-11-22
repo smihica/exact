@@ -38,10 +38,11 @@ import { createConnection } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
 import { within } from './paths.mjs';
+import { parseColour, schemeColours } from './scheme-colours.mjs';
 import { missingDependencies } from './package-libraries.mjs';
 import { HOST_DEV, PINNED_RUST, androidPackageId, bakeWatchEnv, buildBake, claimLive, hermesBundle, cargoEnvironment, copyShaders, linuxBuild, mavenProblems, resolveApp } from './app.mjs';
 import { ANDROID_MIN_API } from './hermes-android.mjs';
-import { ANDROID_TARGET, ANDROID_ABIS, androidAbis, androidSdk, androidToolchainEnv, androidHermesDir } from './android-abi.mjs';
+import { ANDROID_TARGET, ANDROID_ABIS, androidAbis, androidSdk, androidToolchainEnv, androidHermesDir, androidBakeLibraryName, stageAndroidBake } from './android-abi.mjs';
 export { ANDROID_TARGET, androidSdk, androidToolchainEnv, androidHermesDir } from './android-abi.mjs';
 import { ANDROID_PAGE_SIZE, androidCargo } from './cargo-check.mjs';
 import { guardFlags, reportBuilt } from './help.mjs';
@@ -54,6 +55,7 @@ import { CHANNELS_RECEIVER, androidNotificationResources, googleServices } from 
 import { pickIcon, placeRgba, readPng, resize } from './app-icons.mjs';
 import { encodePng } from './png.mjs';
 import { copyStaticTreeIfPresent } from '../host/web/serve.mjs';
+import { takeLock } from '../host/web/build-lock.mjs';
 
 /** The oldest Android the binary runs on (the NDK's clang wrapper names it). */
 const API = ANDROID_MIN_API;
@@ -202,6 +204,7 @@ const quote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
  * the app's server on this Mac are reached through `adb reverse` for the drive (`reversedPorts`). */
 export function androidDeploy(app, bin, env) {
   if (bin.endsWith('.apk')) return readerDeploy(app, bin, env);
+  if (env.EXACT_AGENT === 'live') throw new Error('android --live requires the reader APK. Set EXACT_ANDROID_BIN to an APK.');
   const serial = androidDevice(env), tool = adb(env);
   const base = `/data/local/tmp/exact/${app.id}`, home = `${base}/home`;
   const dir = `${base}/run-${process.pid}-${Date.now().toString(36)}`, exe = basename(bin);
@@ -298,9 +301,7 @@ export const apkBuildDir = (app) => apkDirs(resolveApp(app)).app;
 const readerApk = (app) => resolve(apkDirs(app).app, 'outputs/apk/release/app-release.apk');
 /** Distribution builds keep full R8 and release lint; development APKs only shrink. */
 export const developmentApkArgs = (development, profile, bundle) => development && profile !== 'release' && !bundle ? ['-PdevelopmentApk=1'] : [];
-/** What `build --apk` records beside the APK, for a drive to tell whether it is older than its sources: when the build
- * began, the ABIs and libraries it packaged (whose dep-info names the Rust, plan and module sources), and the
- * app's Kotlin. Null without one. */
+/** The APK's freshness record covers its libraries, separate bakes and Kotlin. Null without one. */
 export function apkRecord(app, apk = readerApk(app)) {
   try { return JSON.parse(readFileSync(resolve(dirname(apk), 'exact-build.json'), 'utf8')); } catch { return null; }
 }
@@ -637,6 +638,16 @@ async function prepareAndroidScreen(tool, serial) {
   }
 }
 
+export async function readerReply(request, ask, wait = Bun.sleep) {
+  const reply = await ask();
+  if (request?.op === 'tap' && request.phase === 'hold') {
+    // The host owns this decision, including while a capture borrows a seekable drive's clock.
+    const { waitMs } = JSON.parse(reply);
+    if (waitMs > 0) await wait(waitMs);
+  }
+  return reply;
+}
+
 /** The reader carrier's process: launch the app with a driver's socket (the shell's `agent=<name>` extra), have
  * adb forward it, and carry the protocol's lines between this process's stdio and the app. Every line is the app's
  * to answer but `screenshot`, whose picture is the device's (`screencap`), tagged as the app tags a reply. The
@@ -673,8 +684,8 @@ async function relay([serial, id, vars, encodedLease]) {
     } catch (error) { console.error(error.message); }
     sh('logcat', '-c');
     // Clear only the app's task; a permission dialog in another task survives and is reported above.
-    // `lower=0`: the engine samples every animation, so none plays on the reader's own clock.
-    const started = sh('shell', ['am', 'start', '-W', '--activity-clear-task', '-n', `${id}/dev.exact.app.MainActivity`, '--es', 'agent', name, '--es', 'lower', '0', ...extras, intent].join(' '));
+    const lower = launch.EXACT_AGENT === 'live' ? '1' : '0';
+    const started = sh('shell', ['am', 'start', '-W', '--activity-clear-task', '-n', `${id}/dev.exact.app.MainActivity`, '--es', 'agent', name, '--es', 'lower', lower, ...extras, intent].join(' '));
     if (started.status !== 0 || /Error/.test(started.stdout + started.stderr)) throw new Error(`am start ${id}: ${(started.stderr || started.stdout).trim()}`);
     port = Number(sh('forward', 'tcp:0', `localabstract:${name}`).stdout.trim());
     if (!port) throw new Error('adb forward gave no port');
@@ -704,11 +715,10 @@ async function relay([serial, id, vars, encodedLease]) {
       let req = null;
       try { req = JSON.parse(line); } catch {}
       if (req?.op === 'quit') return done(0);
-      if (req?.op !== 'screenshot') {
+      if (req?.op !== 'screenshot') return say(await readerReply(req, () => {
         socket.write(line + '\n');
-        const reply = await answer();
-        return say(reply);
-      }
+        return answer();
+      }));
       if (req.film) return say(JSON.stringify({ error: 'the reader carrier films nothing: its picture is a screencap of the device' }));
       await new Promise((r) => setTimeout(r, SHOT_SETTLE_MS));
       const shot = sh('shell', `screencap -p ${quote(req.path)}`);
@@ -775,19 +785,6 @@ export function loadAlignment(path) {
 
 /** The capabilities the plan uses (LLP 1047 D2), one a line in `uses.txt`; none when the crate writes none. */
 const planUses = (out) => out && existsSync(resolve(out, 'uses.txt')) ? readFileSync(resolve(out, 'uses.txt'), 'utf8').split('\n').filter(Boolean) : [];
-
-/** The same, where the build ran without JSON (a bake): the crate's build script output that wrote `uses.txt` last,
- * under Cargo's `build` directory. */
-function bakedOut(dir, crate) {
-  const prefix = `${crate.replaceAll('-', '_')}-`, alt = `${crate}-`;
-  let newest = null;
-  for (const name of existsSync(dir) ? readdirSync(dir) : []) {
-    if (!name.startsWith(prefix) && !name.startsWith(alt)) continue;
-    const file = resolve(dir, name, 'out/uses.txt');
-    if (existsSync(file) && (!newest || statSync(file).mtimeMs > newest.at)) newest = { out: resolve(dir, name, 'out'), at: statSync(file).mtimeMs };
-  }
-  return newest?.out ?? null;
-}
 
 /** How the reader's Gradle wrapper starts on `platform`. Windows cannot run the POSIX `gradlew`, and Bun starts a `.bat`
  * only through cmd.exe, which would reparse every argument: there the JDK runs the wrapper jar with the arguments
@@ -882,8 +879,8 @@ const androidColour = (css) => {
 
 /** The launcher icon and TV banner from the manifest's `icons` (LLP 1163 D6), written as resources under `res`, and
  * the references to them: `icon` for `android:icon` and `android:roundIcon`, `banner` for `android:banner`, each null
- * when the manifest has none. A square `maskable` PNG of at least 432 px becomes an adaptive icon over
- * `background_color`, else over the image's top-left pixel, and a square `monochrome` one of that size, its alpha drawn
+ * when the manifest has none. A square `maskable` PNG of at least 432 px becomes an adaptive icon over the light
+ * launch colour (`schemeColours`: the icon has no scheme), clipped to sRGB, else over the image's top-left pixel, and a square `monochrome` one of that size, its alpha drawn
  * white, its themed layer. Without one, a square `any` PNG of at least 192 px is the legacy icon, which the launcher
  * encloses itself. A 16:9 `any` PNG of at least 640×360 px is the banner, the size Android TV asks for at xxxhdpi.
  * Every refusal is thrown at once, before anything is written. */
@@ -902,8 +899,9 @@ export function androidIcons(manifest, dir, res) {
   // `files`: each picked file and its digest, which the build record keeps for a drive's staleness check (`apkChanges`).
   const refs = { icon: adaptive || legacy ? '@mipmap/exact_icon' : null, banner: banner ? '@drawable/exact_banner' : null,
     files: picked.flatMap((file, i) => file ? [{ file: file.path, sha256: digests[i] }] : []) };
+  const backdrop = schemeColours(manifest, 'background_color', null).light;
   // Made again only when a picked file or the background colour changes: the key of what was made is kept beside `res`.
-  const key = createHash('sha256').update(JSON.stringify([ANDROID_ICONS, picked.map((file, i) => file && [file.src, digests[i]]), manifest.background_color ?? null])).digest('hex');
+  const key = createHash('sha256').update(JSON.stringify([ANDROID_ICONS, picked.map((file, i) => file && [file.src, digests[i]]), backdrop])).digest('hex');
   if (existsSync(res) && existsSync(`${res}.key`) && readFileSync(`${res}.key`, 'utf8') === key) return refs;
   rmSync(res, { recursive: true, force: true });
   const write = (path, bytes) => { mkdirSync(dirname(resolve(res, path)), { recursive: true }); writeFileSync(resolve(res, path), bytes); };
@@ -911,7 +909,7 @@ export function androidIcons(manifest, dir, res) {
   if (adaptive) {
     // The corner's colour without its alpha: the background layer is opaque.
     const image = readPng(adaptive.path), corner = `#${[...image.data.subarray(0, 3)].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
-    write('values/exact_icon.xml', `<resources>\n    <color name="exact_icon_background">${androidColour(manifest.background_color ?? corner)}</color>\n</resources>\n`);
+    write('values/exact_icon.xml', `<resources>\n    <color name="exact_icon_background">${androidColour(backdrop ? parseColour(backdrop, 'the light launch colour').hex : corner)}</color>\n</resources>\n`);
     write('drawable-nodpi/exact_icon_foreground.png', encodePng(onLayer(image)));
     if (glyph) {
       const placed = onLayer(readPng(glyph.path)), white = new Uint8Array(LAYER * LAYER * 4).fill(255);
@@ -948,24 +946,25 @@ const lightColour = (css) => {
  * on an Android 16 emulator, an Android 14 phone (HyperOS, which does not cut it) and an Android 17 emulator. */
 const SPLASH_ICON_SCALE = 108 / 192;
 
-/** The launch window in the app's first-frame background (LLP 1115.001 D3.6): the manifest's `background_color`, and
- * `color_scheme_dark.background_color` in night mode, as the iOS launch screen and the web page's first paint take
- * them (a fixed `userInterfaceStyle` takes its side alone, as there). Written under `res` as `ExactAppLaunch`, the
- * reader's `ExactLaunch` with that colour behind the window and on Android 12's starting window, and the bars' icons
- * dark over a light colour and light over a dark one, until the host says the page's (`ExactActivity.chrome`).
- * Android 12's starting window shows the launcher icon unless `host.android.launchImage` says otherwise: a picture
- * (`{ src, width }`) is that icon, laid out at [SPLASH_ICON_SCALE] of its `width`, and before Android 12 it is
- * centred on the window's background, which has no icon; `false` shows no icon. `dir` is the app's, which the
- * picture's path is relative to. Returns the activity's theme, null where the manifest says neither, which leaves the
- * platform's own launch, and the picture's file and digest for the APK's record of its sources. */
+/** The launch window in the app's first-frame background (LLP 1115.001 D3.6): each scheme's launch colour the manifest
+ * names (`schemeColours`, LLP 1163 D2), as the iOS launch screen and the web page's first paint take them, clipped to
+ * sRGB, which a colour resource holds. Android follows the device's scheme whatever `userInterfaceStyle` says. Written
+ * under `res` as `ExactAppLaunch`, the reader's `ExactLaunch` with that colour behind the window and on Android 12's
+ * starting window, and the bars' icons dark over a light colour and light over a dark one, until the host says the
+ * page's (`ExactActivity.chrome`). A scheme the manifest names none for keeps the reader's: `ExactAppLaunch` is
+ * written for each scheme (`values`, `values-night`), with the colour only in the one that names it, since a colour
+ * resource cannot name the theme's surface. Android 12's starting window shows the launcher icon unless
+ * `host.android.launchImage` says otherwise: a picture (`{ src, width }`) is that icon, laid out at
+ * [SPLASH_ICON_SCALE] of its `width`, and before Android 12 it is centred on the window's background, which has no
+ * icon; `false` shows no icon. `dir` is the app's, which the picture's path is relative to. Returns the activity's
+ * theme, null where the manifest says neither, which leaves the platform's own launch, and the picture's file and
+ * digest for the APK's record of its sources. */
 export function androidLaunch(manifest, res, dir = '.') {
   rmSync(res, { recursive: true, force: true });
-  const style = manifest.userInterfaceStyle, named = manifest.color_scheme_dark?.background_color;
+  const named = schemeColours(manifest, 'background_color', null);
   const image = manifest.host?.android?.launchImage;
-  let light = manifest.background_color;
-  if (!light && image === undefined) return { theme: null, files: [] };
-  const dark = style === 'light' ? light : named ?? light;
-  if (style === 'dark') light = dark;
+  if (!named.light && !named.dark && image === undefined) return { theme: null, files: [] };
+  const colour = (scheme) => named[scheme] && parseColour(named[scheme], `the ${scheme} launch colour`).hex;
   const write = (path, body) => {
     mkdirSync(dirname(resolve(res, path)), { recursive: true });
     writeFileSync(resolve(res, path), typeof body === 'string' ? `<?xml version="1.0" encoding="utf-8"?>\n${body}` : body);
@@ -973,6 +972,7 @@ export function androidLaunch(manifest, res, dir = '.') {
   const values = (body) => `<resources>\n${body}</resources>\n`;
   const scheme = (css) => `    <color name="exact_launch">${androidColour(css)}</color>\n    <bool name="exact_launch_light">${lightColour(css)}</bool>\n`;
   const files = [], picture = image ? readPng(resolve(dir, image.src)) : null;
+  const qualifier = { light: '', dark: '-night' };
   if (picture) {
     const source = resolve(dir, image.src);
     files.push({ file: source, sha256: createHash('sha256').update(readFileSync(source)).digest('hex') });
@@ -982,19 +982,25 @@ export function androidLaunch(manifest, res, dir = '.') {
     const size = (scale) => `android:width="${+(image.width * scale).toFixed(2)}dp" android:height="${+(image.width * picture.height / picture.width * scale).toFixed(2)}dp"`;
     const layers = (items) => `<layer-list xmlns:android="http://schemas.android.com/apk/res/android">\n${items}</layer-list>\n`;
     write('drawable/exact_launch_icon.xml', layers(`    <item ${size(SPLASH_ICON_SCALE)} android:gravity="center" android:drawable="@drawable/exact_launch_picture" />\n`));
-    write('drawable/exact_launch_window.xml', layers(`    <item android:drawable="${light ? '@color/exact_launch' : '?android:attr/colorBackground'}" />\n` +
-      `    <item ${size(1)} android:gravity="center" android:drawable="@drawable/exact_launch_picture" />\n`));
+    for (const s of ['light', 'dark']) {
+      write(`drawable${qualifier[s]}/exact_launch_window.xml`, layers(`    <item android:drawable="${colour(s) ? '@color/exact_launch' : '?android:attr/colorBackground'}" />\n` +
+        `    <item ${size(1)} android:gravity="center" android:drawable="@drawable/exact_launch_picture" />\n`));
+    }
   }
   const item = (name, value) => `        <item name="android:${name}">${value}</item>`;
-  const theme = (splash) => ['    <style name="ExactAppLaunch" parent="ExactLaunch">',
-    ...(picture && !splash ? [item('windowBackground', '@drawable/exact_launch_window')] : light ? [item('windowBackground', '@color/exact_launch')] : []),
-    ...(splash && light ? [item('windowSplashScreenBackground', '@color/exact_launch')] : []),
+  const theme = (splash, coloured) => ['    <style name="ExactAppLaunch" parent="ExactLaunch">',
+    ...(picture && !splash ? [item('windowBackground', '@drawable/exact_launch_window')] : coloured ? [item('windowBackground', '@color/exact_launch')] : []),
+    ...(splash && coloured ? [item('windowSplashScreenBackground', '@color/exact_launch')] : []),
     ...(splash && image !== undefined ? [item('windowSplashScreenAnimatedIcon', picture ? '@drawable/exact_launch_icon' : '@android:color/transparent')] : []),
-    ...(light ? [item('windowLightStatusBar', '@bool/exact_launch_light'), item('windowLightNavigationBar', '@bool/exact_launch_light')] : []),
+    ...(coloured ? [item('windowLightStatusBar', '@bool/exact_launch_light'), item('windowLightNavigationBar', '@bool/exact_launch_light')] : []),
     '    </style>', ''].join('\n');
-  write('values/exact_launch.xml', values((light ? scheme(light) : '') + theme(false)));
-  if (light) write('values-night/exact_launch.xml', values(scheme(dark)));
-  write('values-v31/exact_launch.xml', values(theme(true)));
+  // `values` declares the colour whichever scheme names it, since a resource only `values-night` has fails release lint
+  // (MissingDefaultResource); the day style reads it only where the light scheme names one
+  for (const s of ['light', 'dark']) {
+    const declared = s === 'light' ? colour('light') ?? colour('dark') : colour('dark');
+    write(`values${qualifier[s]}/exact_launch.xml`, values((declared ? scheme(declared) : '') + theme(false, !!colour(s))));
+    write(`values${qualifier[s]}-v31/exact_launch.xml`, values(theme(true, !!colour(s))));
+  }
   return { theme: '@style/ExactAppLaunch', files };
 }
 
@@ -1018,7 +1024,11 @@ export function androidReleaseEnvironment(env = process.env, bundle = false) {
  * path Cargo gave it: a crate's `[lib] name` names the file, and the bake records that name for the host to open. */
 export function bakeGpuLibraries(app, options, bake = buildBake) {
   const libraries = [];
-  bake(app, 'android', options.target ?? ANDROID_TARGET, { ...options, kind: 'android', prepareGpu: (product) => { libraries.push(product); return product; } });
+  let image;
+  bake(app, 'android', options.target ?? ANDROID_TARGET, { ...options, kind: 'android',
+    androidPayload: options.androidPayload ? () => (image = androidBakeLibraryName(libraries.map(path => basename(path)))) : null,
+    capture: receipt => options.capture?.(receipt, image, libraries),
+    prepareGpu: (product) => { libraries.push(product); return product; } });
   return libraries;
 }
 
@@ -1058,6 +1068,14 @@ export function stageSoundLibrary(jniLibs, env, target = ANDROID_TARGET) {
  * (`stageGpuLibraries`).
  * Gradle wants a JDK (17 or newer) and the SDK's platform. The APK's path, or null. */
 export function buildApk(app, env, profile, writeLocks = false, bundle = false, abis = ['arm64-v8a']) {
+  const dirs = apkDirs(app);
+  mkdirSync(dirname(dirs.app), { recursive: true });
+  const release = takeLock(`${dirs.app}.apk.lock`, { waitMs: Infinity });
+  try { return assembleApk(app, env, profile, writeLocks, bundle, abis, dirs); }
+  finally { release(); }
+}
+
+function assembleApk(app, env, profile, writeLocks, bundle, abis, dirs) {
   env = androidReleaseEnvironment(env, bundle);
   const java = androidJavaEnv(env);
   if (!java) throw new Error(androidJavaFix(env));
@@ -1066,7 +1084,6 @@ export function buildApk(app, env, profile, writeLocks = false, bundle = false, 
   if (!app.manifest.game && !crateManifest(app, 'android')) throw new Error(`${app.dir} has no android/ crate, the app's library for the Canvas host: bun exact.mjs update adds one to an app that names android in app.json (apps/shelf/android is one)`);
   refuseIdSuffix(env);
   // The icon and banner first, so a refused one costs no compile.
-  const dirs = apkDirs(app);
   let icons;
   try { icons = androidIcons(app.manifest, app.dir, resolve(dirs.app, 'icons/res')); }
   catch (error) { for (const line of error.message.split('\n')) console.error(`${app.name}: ${line}`); return null; }
@@ -1075,14 +1092,44 @@ export function buildApk(app, env, profile, writeLocks = false, bundle = false, 
   const androidWidgets = (app.manifest.widgets ?? []).filter((row) => (row.families ?? []).some((family) => family.startsWith('system')));
   if (app.manifest.widgets?.length && !androidWidgets.length) console.warn(`${app.name}: app.json's widgets declare only accessory families, which Android has no counterpart for, so this APK has no widget`);
   const widgetArgs = androidWidgets.length ? ['-Pwidgets=1', `-PwidgetsBuildDir=${dirs.widgets}`] : [];
-  const target = ANDROID_ABIS[abis[0]];
-  const built = (name, triple = target) => resolve(app.target, triple, profile, `lib${name.replaceAll('-', '_')}.so`);
+  const target = ANDROID_ABIS[abis[0]], bakeStarted = new Date().toISOString();
+  const androidPayload = profile === HOST_DEV && !bundle && env.EXACT_UPDATE_TRUST !== 'production';
+  const staged = resolve(dirs.app, 'rust'), out = resolve(staged, 'bake');
+  rmSync(staged, { recursive: true, force: true });
+  const built = triple => resolve(app.target, triple, profile, `lib${crate.replaceAll('-', '_')}.so`);
+  const bakes = [], libraries = [];
+  let gpuArgs = [];
+  const bake = abi => {
+    const triple = ANDROID_ABIS[abi], toolchain = androidToolchainEnv(env, process.platform, API, triple);
+    return bakeGpuLibraries(app, {profile, target:triple, env:toolchain, androidPayload,
+      capture: (receipt, image, modules) => {
+        bakes.push(receipt);
+        // Snapshot the inputs to Gradle while buildBake still owns the Cargo products.
+        const jniLibs = resolve(staged, 'jniLibs', abi), canvas = resolve(jniLibs, 'libexactcanvas.so');
+        mkdirSync(jniLibs, {recursive:true});
+        copyFileSync(built(triple), canvas);
+        const args = stageGpuLibraries(modules, jniLibs);
+        if (triple === target) {
+          gpuArgs = args;
+          mkdirSync(out, {recursive:true});
+          for (const file of ['artifacts.json', 'compat.json', 'uses.txt', 'permissions.txt', 'app.module.json', 'app.sources.json']) {
+            const path = resolve(receipt.androidOut, file);
+            if (existsSync(path)) copyFileSync(path, resolve(out, file));
+          }
+        }
+        const sound = stageSoundLibrary(jniLibs, toolchain, triple);
+        const payload = receipt.linkedPlan ? [stageAndroidBake(receipt.linkedPlan, jniLibs, toolchain, triple, androidWidgets, image)] : [];
+        for (const library of [canvas, ...modules.map(path => resolve(jniLibs, basename(path))), sound, ...payload]) {
+          if (loadAlignment(library) < 16384) throw new Error(`${abi}/${basename(library)} is not 16 KB aligned; add "${ANDROID_PAGE_SIZE}" to [target.${triple}] rustflags in the app's Cargo configuration`);
+          libraries.push({ abi, library });
+        }
+      }});
+  };
   // Every ABI is baked (`buildBake`), which writes its own android-<target>.build.json receipt:
   // a first `push` starts a stream from exactly this APK's cohort (LLP 1030.006 D6).
   let gpu;
-  try { gpu = bakeGpuLibraries(app, { profile, env, target }); }
+  try { gpu = bake(abis[0]); }
   catch (error) { console.error(error.message); return null; }
-  const out = bakedOut(resolve(app.target, target, profile, 'build'), crate);
   const extensions = JSON.parse(readFileSync(resolve(out, 'artifacts.json'), 'utf8')).extensions;
   const bound = androidImplementations(app.dir, extensions);
   const maven = mavenCoordinates(app, bound);
@@ -1099,31 +1146,9 @@ export function buildApk(app, env, profile, writeLocks = false, bundle = false, 
     if (!firebase && profile === 'release') { console.error(`${app.name}: push-google-services-missing: a release build that pushes needs a ${missing}`); return null; }
     if (!firebase) console.warn(`${app.name}: push is unavailable in this development build, which finds no ${missing} (a release build refuses it)`);
   }
-  const uses = planUses(out), modulesByAbi = new Map([[abis[0], gpu]]);
-  // Finish every bake before the packaging timestamp: dep-info also names the GPU libraries it produced.
-  try { for (const abi of abis.slice(1)) {
-    const triple = ANDROID_ABIS[abi];
-    modulesByAbi.set(abi, bakeGpuLibraries(app, { profile, target: triple, env: androidToolchainEnv(env, process.platform, API, triple) }));
-  } } catch (error) { console.error(error.message); return null; }
-  const started = new Date().toISOString(), staged = resolve(dirs.app, 'rust');
-  rmSync(staged, { recursive: true, force: true });
-  const libraries = [];
-  let gpuArgs = [];
-  for (const abi of abis) {
-    const triple = ANDROID_ABIS[abi], toolchain = androidToolchainEnv(env, process.platform, API, triple);
-    const modules = modulesByAbi.get(abi);
-    const jniLibs = resolve(staged, 'jniLibs', abi);
-    mkdirSync(jniLibs, { recursive: true });
-    copyFileSync(built(crate, triple), resolve(jniLibs, 'libexactcanvas.so'));
-    const args = stageGpuLibraries(modules, jniLibs);
-    if (triple === target) gpuArgs = args;
-    const sound = stageSoundLibrary(jniLibs, toolchain, triple);
-    for (const library of [resolve(jniLibs, 'libexactcanvas.so'), ...modules, sound]) {
-      // A table in the app's Cargo configuration can replace the build's page-size flag.
-      if (loadAlignment(library) < 16384) throw new Error(`${abi}/${basename(library)} is not 16 KB aligned; add "${ANDROID_PAGE_SIZE}" to [target.${triple}] rustflags in the app's Cargo configuration`);
-      libraries.push({ abi, library });
-    }
-  }
+  try { for (const abi of abis.slice(1)) bake(abi); }
+  catch (error) { console.error(error.message); return null; }
+  const started = new Date().toISOString(), uses = planUses(out);
   copyStaticTreeIfPresent(resolve(app.dir, 'assets'), resolve(staged, 'assets/app/assets'));
   // The modules' shader text (LLP 1030 D8), which the host registers from `shaders/` under the asset root.
   if (gpu.length) copyShaders(app, resolve(staged, 'assets/app/shaders'));
@@ -1163,7 +1188,9 @@ export function buildApk(app, env, profile, writeLocks = false, bundle = false, 
     const name = basename(library), kept = keptLibrary(readFileSync(library), zipEntry(packaged, `${bundle ? 'base/' : ''}lib/${abi}/${name}`), [dirs.app, dirs.canvas], name);
     if (kept) { console.error(`exact android ${abi}: ${kept}`); return null; }
   }
-  writeFileSync(resolve(dirname(apk), 'exact-build.json'), JSON.stringify({ started, package: androidPackageId(app.manifest), abis, libraries: abis.map(abi => built(crate, ANDROID_ABIS[abi])), workspace: app.workspace ?? app.dir,
+  writeFileSync(resolve(dirname(apk), 'exact-build.json'), JSON.stringify({ started, package: androidPackageId(app.manifest), abis, libraries: abis.map(abi => built(ANDROID_ABIS[abi])), workspace: app.workspace ?? app.dir,
+    bakeStarted, bakes: bakes.flatMap(receipt => receipt.linkedInputs ?
+      [{ ...receipt.linkedInputs, products: receipt.products.filter(({path}) => receipt.linkedInputs.paths.includes(path)) }] : []),
     sources: [...READER_SOURCES, ...[resolve(app.dir, 'modules/android')].filter(existsSync), ...icons.files, ...launch.files] }) + '\n');
   // What its bake inlined of each setting (LLP 1153 D4), bound to the APK, for a drive to compare with their sources.
   recordBuiltSettings(apk, app, out);
@@ -1310,7 +1337,7 @@ function extensionArgs(app, out, config, bound, firebase, development) {
 /** The `am start` arguments that launch the app `id`, following the dev loop at `url` when there is one (LLP 1122 D4):
  * `-S` stops a running reader first, since it reads its launch extras once per process. */
 export const launchArgs = (id, url = null) =>
-  ['shell', 'am', 'start', '-W', ...(url ? ['-S'] : []), '-n', `${id}/dev.exact.app.MainActivity`, ...(url ? ['--es', 'x_dev_plan', url] : [])];
+  ['shell', 'am', 'start', '-W', ...(url ? ['-S'] : []), '-n', `${id}/dev.exact.app.${url ? 'DevLoop' : 'MainActivity'}`, ...(url ? ['--es', 'x_dev_plan', url] : [])];
 
 /** `--install` (`--run`: and launch it): the APK onto the device `androidDevice` names. With none ready the build
  * stands and says how to install it; several entries must be one phone’s transports or name ANDROID_SERIAL. `url`

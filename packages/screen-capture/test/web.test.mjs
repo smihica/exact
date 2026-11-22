@@ -25,7 +25,8 @@ test('the web fixture writes every display, cancels before publication, and neve
         const screens = [{ left:0, top:0, width:64, height:40, devicePixelRatio:1.25 },
           { left:-80, top:-10, width:80, height:40, devicePixelRatio:2 }];
         const answer = await capture.captureScreens({ directory:'app:/tmp/freeze' }, { request:1, preferred:{screens} });
-        const bitmap = await createImageBitmap(files.get('app:/tmp/freeze/screen-0.png'));
+        const paths = answer.captures.map(c => c.path);
+        const bitmap = await createImageBitmap(files.get(paths[0]));
         const canvas = new OffscreenCanvas(bitmap.width,bitmap.height), ctx=canvas.getContext('2d'); ctx.drawImage(bitmap,0,0);
         const pixel = Array.from(ctx.getImageData(0,0,1,1).data);
         const pending = capture.captureScreens({directory:'app:/tmp/freeze'}, {request:2}); capture.cancel(2);
@@ -33,7 +34,7 @@ test('the web fixture writes every display, cancels before publication, and neve
         capture.preferred({screens:[{width:100000,height:100000,devicePixelRatio:1}]});
         const quota = await capture.captureScreens({directory:'app:/tmp/freeze'}, {request:3});
         capture.preferred({screens});
-        const stored = files.get('app:/tmp/freeze/screen-0.png');
+        const stored = files.get(paths[0]);
         const duringWrite = [];
         for (const end of ['cancel', 'destroy']) {
           let started, resume;
@@ -51,11 +52,11 @@ test('the web fixture writes every display, cancels before publication, and neve
           await writing;
           if (end === 'cancel') delayed.cancel(4); else delayed.destroy();
           resume();
-          duringWrite.push({ answer:await result, preserved:files.get('app:/tmp/freeze/screen-0.png') === stored });
+          duringWrite.push({ answer:await result, preserved:files.get(paths[0]) === stored });
         }
         const betweenWrites = [];
         for (const end of ['cancel', 'destroy']) {
-          const paths = [0, 1].map(n => 'app:/tmp/freeze/screen-' + n + '.png');
+          const before = new Set(files.keys());
           const old = paths.map(path => files.get(path));
           const interrupted = implementation({ agent:true, files:{
             put:async (path, blob, refusal) => {
@@ -71,7 +72,7 @@ test('the web fixture writes every display, cancels before publication, and neve
           } });
           const answer = await interrupted.captureScreens({directory:'app:/tmp/freeze'}, {request:5,preferred:{screens}});
           betweenWrites.push({ error:answer.error ?? null,
-            replaced: paths.map((path, i) => files.get(path) !== old[i]) });
+            fresh: answer.captures?.map(c => !before.has(c.path) && files.has(c.path)), preserved: paths.every((path, i) => files.get(path) === old[i]) });
         }
         const real = implementation({...context,agent:false});
         return { answer, pixel, cancelled, quota, writes, duringWrite, betweenWrites,
@@ -88,7 +89,7 @@ test('the web fixture writes every display, cancels before publication, and neve
       ['AbortError', true], ['AbortError', true],
     ]);
     expect(result.value.betweenWrites).toEqual([
-      { error:null, replaced:[true, true] }, { error:null, replaced:[true, true] },
+      { error:null, fresh:[true, true], preserved:true }, { error:null, fresh:[true, true], preserved:true },
     ]);
   } finally { await browser.close(); server.stop(true); }
 }, 60000);

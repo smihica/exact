@@ -260,6 +260,27 @@ package protocol NavigationHosting: AnyObject {
     func routeKey(containing view: UIView, layout: Bool) -> String?
     func isInactiveRoute(containing view: UIView, layout: Bool) -> Bool
     func resolve(route key: String, id: String) -> NodeView?
+    /// Each route shown beside its stack's top or under a pane over it, by
+    /// its node (LLP 1127 D8): a split's columns. The others show in their stack.
+    var routesShown: [UInt32: BlockShown] { get }
+    /// The blocks of the nodes UIKit holds in views of their own (the sidebar's footer, the tab bar's accessory).
+    var paneBlocks: [(id: UInt32, block: HostBlock, placement: BlockPlacement?)] { get }
+    /// The boxes UIKit draws above the routes without presenting them (the tab bar's accessory), which the runner
+    /// tests before the page, as it does a presentation's.
+    var topLayerBoxes: [TopLayerBox] { get }
+    #if os(iOS)
+    /// The views that hold an element out of its parent (the tab bar's accessory), with the element: a menu an
+    /// ancestor of it gives reaches a long press there, as one reaches a presentation's mount.
+    var relayMounts: [(mount: any RelayMount, node: NodeView)] { get }
+    #endif
+    /// Whether a grouped list shows as UIKit's sidebar: in a split's list column while the split is expanded (LLP 1127 D7).
+    func showsAsSidebar(_ list: UIView) -> Bool
+    /// The row of a sidebar list whose detail shows, which stays selected;
+    /// `.some(nil)` for none, and nil while the runner cannot say.
+    func sidebarSelection(_ list: UIView) -> UInt32??
+    /// A grouped list's `row`, in `list`, pressed by `press`: in a split's
+    /// list column, a detail its batches bring is the row's (LLP 1127 D3).
+    func listPress(_ row: UInt32, in list: UIView, _ press: () -> Void)
 
     // Focus and transitions: separate answers, each read where it is read today.
     var defersFocus: Bool { get }
@@ -268,6 +289,10 @@ package protocol NavigationHosting: AnyObject {
     var transitioning: Bool { get }
     var hasInteractiveTransition: Bool { get }
     var unanimated: Bool { get set }
+    /// A batch inside `startViewTransition()`'s cross-fade: its pushes, pops and presentations land unanimated.
+    var crossFading: Bool { get set }
+    /// Whether `controller` presents a route that is closed and yet to be dismissed.
+    func retires(_ controller: UIViewController) -> Bool
     func isArriving(_ node: NodeView) -> Bool
 
     // The boot owner: `bootOwnerDrawn` answers true only when it holds `ready`.
@@ -307,6 +332,8 @@ package protocol NavigationHosting: AnyObject {
     func scopes(tablist: NodeView) -> Bool
     func tabIntent(_ kind: UInt32, _ text: String) -> Bool
     func setAppDelegate(_ controller: AnyObject, _ delegate: AnyObject?)
+    /// The nodes it lifts out of their parents to paint over its tab container.
+    var lifted: (any LiftedNodes)? { get }
     #if os(tvOS)
     /// The Siri remote's Menu goes back in a pushed stack.
     var menuGoesBack: Bool { get }
@@ -338,6 +365,8 @@ package protocol NavigationHosting: AnyObject {
     /// The bar's search field submitting, as the keyboard's Search key does; false when `editor` is no bar's search field.
     func submitSearch(_ editor: UITextField) -> Bool
     func agentBack() -> String?
+    /// A list beside its detail as UIKit's split shows it, for `state window.split` (LLP 1127 D11).
+    var splitObservation: [String: Any] { get }
     func activateChrome(_ node: NodeView, before: (CGPoint?) -> Bool) -> [String: Any]?
     func drawnSearch(_ node: NodeView) -> UITextField?
     func barButtonItem(_ node: NodeView) -> (bar: UINavigationBar, item: UIBarButtonItem, of: UINavigationItem)?
@@ -345,6 +374,41 @@ package protocol NavigationHosting: AnyObject {
     /// `segments` is no route's scope control.
     func searchScopeTabs(of segments: UISegmentedControl) -> [UInt32]?
     #endif
+}
+
+/// The nodes a navigation lifts out of their parents to paint over its tab
+/// container (LLP 1083.000 D4), as the core's walks and passes meet them.
+package protocol LiftedNodes: AnyObject {
+    /// The parent a lifted node, or a view in its place, is under in the authored tree.
+    func parent(of view: UIView) -> NodeView?
+    /// Whether UIKit holds `view` away from its parent's box (the tab bar's
+    /// accessory), so a press on it lands in its own box, as in a presentation.
+    func heldApart(_ view: UIView) -> Bool
+    /// Whether `parent` lifted `node`, which `parent`'s children op then leaves where it is.
+    func holds(_ node: NodeView, under parent: NodeView) -> Bool
+    /// A children op on `parent`, before the presenter places it.
+    func children(_ parent: NodeView, _ ids: [UInt32], _ want: [NodeView])
+    /// The nodes `parent` lifted.
+    func lifted(from parent: NodeView) -> [NodeView]
+    /// The ids `parent` was last given, where it lifted nodes or holds panels.
+    func recordedIDs(of parent: NodeView) -> [UInt32]?
+    /// The lifted nodes at their parents' places, at the end of a batch.
+    func place()
+    /// `view`'s children in Tab's order: a lifted node on its side of the routes, as in the tree.
+    func focusChildren(of view: UIView) -> [UIView]
+    /// The mount's accessibility children while a lifted node reads before the routes.
+    func accessibilityElements(of view: UIView) -> [Any]?
+    /// The lifted nodes positioned `absolute` among `parent`'s children after `view`.
+    func absoluteNodes(after view: UIView, in parent: UIView) -> [NodeView]
+}
+
+/// A view that holds lifted nodes, which the focus search skips.
+package protocol HoldsLiftedNodes: UIView {}
+
+extension Presenter {
+    /// The view above `view` in a pass over the layout: a lifted node's
+    /// parent (LLP 1083.000 D4), else its superview.
+    package func layoutParent(of view: UIView) -> UIView? { navigation.lifted?.parent(of: view) ?? view.superview }
 }
 
 extension NavigationHosting {
@@ -413,6 +477,8 @@ package final class NoNavigation: NavigationHosting {
     private var windowless = false, settled = false
     package weak var scrollsToTopSelection: UIScrollView?
     package var unanimated = false
+    package var crossFading = false
+    package func retires(_ controller: UIViewController) -> Bool { false }
 
     package init(_ presenter: Presenter) { self.presenter = presenter }
 
@@ -485,6 +551,15 @@ package final class NoNavigation: NavigationHosting {
     package func routeKey(containing view: UIView, layout: Bool) -> String? { nil }
     package func isInactiveRoute(containing view: UIView, layout: Bool) -> Bool { false }
     package func resolve(route key: String, id: String) -> NodeView? { nil }
+    package var routesShown: [UInt32: BlockShown] { [:] }
+    package var paneBlocks: [(id: UInt32, block: HostBlock, placement: BlockPlacement?)] { [] }
+    package var topLayerBoxes: [TopLayerBox] { [] }
+    #if os(iOS)
+    package var relayMounts: [(mount: any RelayMount, node: NodeView)] { [] }
+    #endif
+    package func showsAsSidebar(_ list: UIView) -> Bool { false }
+    package func sidebarSelection(_ list: UIView) -> UInt32?? { .some(nil) }
+    package func listPress(_ row: UInt32, in list: UIView, _ press: () -> Void) { press() }
 
     package var defersFocus: Bool { syncing || mounting }
     package var inTransition: Bool { defersFocus }
@@ -536,6 +611,7 @@ package final class NoNavigation: NavigationHosting {
     package func scopes(tablist: NodeView) -> Bool { false }
     package func tabIntent(_ kind: UInt32, _ text: String) -> Bool { false }
     package func setAppDelegate(_ controller: AnyObject, _ delegate: AnyObject?) {}
+    package var lifted: (any LiftedNodes)? { nil }
     #if os(tvOS)
     package var menuGoesBack: Bool { false }
     package func menuBack() {}
@@ -558,6 +634,7 @@ package final class NoNavigation: NavigationHosting {
     package func observation() -> [String: Any] { ["linked": false] }
     package func submitSearch(_ editor: UITextField) -> Bool { false }
     package func agentBack() -> String? { nil }
+    package var splitObservation: [String: Any] { ["installed": false] }
     package func activateChrome(_ node: NodeView, before: (CGPoint?) -> Bool) -> [String: Any]? { nil }
     package func drawnSearch(_ node: NodeView) -> UITextField? { nil }
     package func barButtonItem(_ node: NodeView) -> (bar: UINavigationBar, item: UIBarButtonItem, of: UINavigationItem)? { nil }

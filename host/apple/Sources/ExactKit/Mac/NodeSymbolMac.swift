@@ -44,7 +44,7 @@ extension NodeView {
                 showSymbol(image, on: leaf); leaf.setAccessibilityElement(false)
             }
             // The symbol's size when the kernel's measurer could not say
-            presenter?.queueIntrinsicSize(self, generation: generation, props["symbolAsset"] != nil ? image?.size : SymbolMeasure.size(name, points: points, weight: weight))
+            presenter?.queueIntrinsicSize(self, generation: generation, (props["symbolAsset"] != nil || props["symbolPath"] != nil) ? image?.size : SymbolMeasure.size(name, points: points, weight: weight))
         }
         symbolView?.contentTintColor = faceSymbol.map(FaceSymbol.isOriginal) == true ? nil : symbolInk
         symbolView?.symbolConfiguration = symbolConfiguration(SymbolMeasure.configuration(points: points, weight: weight))
@@ -60,21 +60,12 @@ extension NodeView {
         clip.frame = content
         if let shape = symbolShape { shape.frame = clip.bounds; placeIconShape(shape); maskSymbol(clip, content); return }
         guard let leaf = symbolView else { return }
-        leaf.frame = clip.bounds
-        switch style["object_fit"]?.string ?? "fill" {
-        // `fill` too: a symbol keeps its aspect, as an SVG does (NodeViewIOS `layoutSymbol`).
-        case "contain", "fill": leaf.imageScaling = .scaleProportionallyUpOrDown
-        case "none": leaf.imageScaling = .scaleNone
-        case "scale-down": leaf.imageScaling = .scaleProportionallyDown
-        case "cover":
-            let size = image?.size ?? .zero
-            if size.width > 0 && size.height > 0 {
-                let ratio = max(content.width / size.width, content.height / size.height)
-                leaf.frame = CGRect(x: (content.width - size.width * ratio) / 2, y: (content.height - size.height * ratio) / 2, width: size.width * ratio, height: size.height * ratio)
-            }
-            leaf.imageScaling = .scaleAxesIndependently
-        default: leaf.imageScaling = .scaleAxesIndependently
-        }
+        let fit = style["object_fit"]?.string ?? "fill"
+        let rect = IconPath.placed(natural: image?.size ?? .zero, fit: fit,
+                                   position: style["object_position"]?.array, in: clip.bounds)
+        // The clip has AppKit's bottom-left origin; CSS positions start at the top.
+        leaf.frame = CGRect(x: rect.minX, y: clip.bounds.height - rect.maxY, width: rect.width, height: rect.height)
+        leaf.imageScaling = .scaleProportionallyUpOrDown
         maskSymbol(clip, content)
     }
     /// The clip takes the border box's rounded corners.

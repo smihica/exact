@@ -41,9 +41,9 @@ impl<D: DataSource> Presenter<D> {
         }
     }
 
-    /// The Canvas reader's turn: background work advances tasks without a display frame.
+    /// The Canvas reader's turn. Only a display callback delivers frame tasks.
     #[cfg(any(target_os = "android", test))]
-    pub(crate) fn reader_clock(&mut self, now: f64, live: bool) -> Option<String> {
+    pub(crate) fn reader_clock(&mut self, now: f64, live: bool, vsync: bool) -> Option<String> {
         let date_error = if self.timers_hidden && live {
             self.follow_local_offset()
         } else {
@@ -54,7 +54,7 @@ impl<D: DataSource> Presenter<D> {
         } else {
             self.wake_due_ms()
         };
-        let error = if !self.timers_hidden && self.wants_frames() && live {
+        let error = if live && vsync && !self.timers_hidden && self.wants_frames() {
             self.animation_frame(now)
         } else if live && due.is_some_and(|due| due <= now) {
             self.advance(now)
@@ -149,6 +149,10 @@ impl<D: DataSource> Presenter<D> {
         }
         self.live_clock = wall;
         self.give_clock();
+    }
+
+    pub(crate) fn live_time(&self) -> Option<f64> {
+        self.live_clock.as_ref().map(|wall| wall())
     }
 
     /// Delegate ordinary live timers to per-task OS timers.

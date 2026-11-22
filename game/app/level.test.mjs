@@ -1,8 +1,8 @@
 import {test, expect, spyOn} from 'bun:test';
-import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {resolve} from 'node:path';
-import {gameDefaults, gameShells, renderGraph, sharesAppleEntry} from './shells.mjs';
+import {gameDefaults, gameShells, prepareContractGame, renderGraph, sharesAppleEntry} from './shells.mjs';
 
 test('external shells use the SDK toolchain and refresh stale generated pins', () => {
   const dir = mkdtempSync(resolve(tmpdir(), 'exact-shell-toolchain-'));
@@ -327,3 +327,24 @@ for (const kind of ['dev', 'build']) {
     }
   });
 }
+
+test('Contract and bake write identical game manifests through a directory link', () => {
+  const root = mkdtempSync(resolve(tmpdir(), 'exact-game-link-'));
+  try {
+    const dir = resolve(root, 'original-game'), alias = resolve(root, 'alias-game');
+    mkdirSync(resolve(dir, 'logic/src'), {recursive:true});
+    writeFileSync(resolve(dir, 'logic/src/lib.rs'), 'impl Game for Island { const ID: &\'static str = "island"; }');
+    writeFileSync(resolve(dir, 'app.contract'), 'component App\n  view\n    text "Ready"\n');
+    symlinkSync(dir, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    expect(prepareContractGame(['build', resolve(alias, 'app.contract')])).toBe(true);
+    const manifest = () => readFileSync(resolve(dir, '.shells/app.json'), 'utf8');
+    const prepared = manifest();
+    gameShells(alias, gameDefaults(alias).game, resolve(import.meta.dir, '..'));
+    expect(JSON.parse(manifest()).app.name).toBe('Original Game');
+    expect(prepared).toBe(manifest());
+    expect(prepareContractGame(['build', resolve(alias, 'app.contract')])).toBe(true);
+    expect(manifest()).toBe(prepared);
+    // A missing input directory is left for the Contract compiler to diagnose, not reported as a manifest error.
+    expect(prepareContractGame(['build', resolve(root, 'missing/app.contract'), '--json'])).toBe(true);
+  } finally { rmSync(root, {recursive:true, force:true}); }
+});

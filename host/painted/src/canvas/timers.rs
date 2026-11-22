@@ -9,7 +9,7 @@ impl<D: DataSource + Default> CanvasHost<D> {
         self.p.timer_observation(false, false, applying);
         let now = self.now();
         let live = agent::clock(&self.p).is_none();
-        if let Some(e) = self.p.reader_clock(now, live) {
+        if let Some(e) = self.p.reader_clock(now, live, false) {
             eprintln!("exact: {e}");
         }
         self.p.run_commands(D::default);

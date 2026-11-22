@@ -49,8 +49,8 @@ component App
 /// `server(id, then)` reads the store, then spawns `path:t3 <id>` when
 /// `then` is `spawn`, and otherwise answers with what `then` names: `now`
 /// at once, or an `execFile`, a fetch or a storage read. `feed()` opens a
-/// WebSocket, whose `write` frame writes the store. `bad(id)` answers what
-/// its shape refuses for `x`. `poke()` writes to the child and sends a
+/// WebSocket, whose `write` frame writes the store. `bad(id)` refuses `x`,
+/// which refuses the commit that asked. `poke()` writes to the child and sends a
 /// frame on the feed; `run()` runs a program once.
 struct Src {
     ready: Rc<Cell<bool>>,
@@ -110,7 +110,7 @@ impl DataSource for Src {
                 socket: true,
                 ..Request::get("wss://x.test/feed")
             }),
-            "bad" if a(0) == "x" => Answer::Now(Value::Number(1.0)),
+            "bad" if a(0) == "x" => return Err(DataError::BadArguments("`x`".into())),
             "bad" => Answer::Now(Value::str("ok")),
             "run" => {
                 let body = br#"{"kind":"execFile","program":"path:t3","args":["run"]}"#;
@@ -359,7 +359,7 @@ fn a_refused_persons_commit_puts_the_refused_arguments_back() {
     r.act_from(CallOrigin::Tool, "switch", vec![]).unwrap();
     assert!(r.holds(ticket));
     // The person's commit to `x` changes the arguments and is refused
-    // (`bad`'s shape): the tool's `b` stays refused.
+    // (`bad` refuses `x`): the tool's `b` stays refused.
     assert!(r.act("broke", vec![]).is_err());
     // The child's next frame lands as the app's: the child stays, and the
     // tool's arguments start nothing.

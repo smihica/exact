@@ -34,6 +34,8 @@ pub(crate) fn is_symbol(source: &str) -> bool {
 #[cfg(test)]
 #[path = "image/allocation_tests.rs"]
 mod allocation_tests;
+#[cfg(test)]
+pub(crate) use allocation_tests::measure_allocations;
 #[path = "image/assets.rs"]
 mod assets;
 #[path = "image/bitmap.rs"]
@@ -54,6 +56,9 @@ pub mod kiosk_camera;
 #[path = "image/package.rs"]
 mod package;
 pub(crate) mod sampling;
+#[cfg(windows)]
+#[path = "image/windows_bitmap.rs"]
+mod windows_bitmap;
 pub use package::Ask as PackageAsk;
 #[path = "image/png.rs"]
 mod png_decode;
@@ -283,6 +288,9 @@ impl Images {
     pub(crate) fn with_assets(assets: Assets) -> Self {
         Self::make(assets, Backend::new())
     }
+    pub(crate) fn local(assets: Assets) -> Self {
+        Self::make(assets, Backend::local())
+    }
     fn make(assets: Assets, backend: Arc<Backend>) -> Self {
         Self {
             generation: backend.generation(),
@@ -423,6 +431,7 @@ impl Images {
             if self.views.get(id).is_some_and(|view| view.key != key) {
                 self.remove(*id);
             }
+            let fit = crate::paint::object_fit_of(&node);
             let view = self.views.entry(*id).or_insert_with(|| View {
                 key,
                 source: String::new(),
@@ -431,7 +440,7 @@ impl Images {
                 request: None,
                 accepted: None,
                 requested_for: (0., 0.),
-                requested_fit: node.style.object_fit,
+                requested_fit: fit,
                 requested_rendering: Default::default(),
                 requested_scale: scale,
                 lease: None,
@@ -441,7 +450,7 @@ impl Images {
                 refusal: None,
                 symbol_size: None,
                 fit: None,
-                object_fit: node.style.object_fit,
+                object_fit: fit,
                 rendering: Default::default(),
                 resized: false,
                 part: false,
@@ -463,8 +472,13 @@ impl Images {
                     view.desired = (size * scale, size * scale);
                 }
             }
-            view.fit = plain_box(node.style).then_some(node.style.object_fit);
-            view.object_fit = node.style.object_fit;
+            // A shared-element destination can borrow pixels outside the source's visible crop.
+            let shared = node
+                .props
+                .str(PropId::SharedElement)
+                .is_some_and(|name| !name.is_empty());
+            view.fit = (!shared && plain_box(node.style)).then_some(fit);
+            view.object_fit = fit;
             view.rendering =
                 node.computed_row(exact_kernel::StyleId::ImageRendering, |s| s.image_rendering);
             if let Some(side) = self.status_sizes.get(id) {
@@ -489,7 +503,10 @@ impl Images {
                 self.bitmaps.remove(id);
                 let size = crate::paint::look::symbol_size(&node);
                 if view.source != source || view.symbol_size != Some(size) {
-                    reports.push((*id, (size > 0.).then_some((size, size))));
+                    reports.push((
+                        *id,
+                        (size > 0.).then(|| crate::paint::look::symbol_natural(&node)),
+                    ));
                     view.source = source.to_owned();
                     view.symbol_size = Some(size);
                 }
@@ -541,7 +558,12 @@ impl Images {
                 view.lease = None;
                 self.bitmaps.remove(id);
             }
-            if source.len() > 4096 {
+            let limit = if source.starts_with("data:") {
+                exact_raster::MAX_DATA_URL_BYTES
+            } else {
+                4096
+            };
+            if source.len() > limit {
                 if let Some((request, _)) = view.request.take() {
                     self.backend.cancel(request);
                 }
@@ -562,7 +584,7 @@ impl Images {
                         key: view.key.view,
                         source: source.to_owned(),
                         assignment: view.assignment,
-                        error: Some("a source over 4096 bytes".into()),
+                        error: Some(format!("a source over {limit} bytes")),
                     });
                 }
                 continue; // Deliberately keep only the previously accepted picture.
@@ -762,7 +784,7 @@ impl Images {
                     if let Some(after) = (view.on_screen
                         && view.retry_at.is_none()
                         && view.retries < RETRY_AFTER.len()
-                        && remote::is_remote(&view.source))
+                        && exact_plan::has_http_scheme(&view.source))
                     .then(|| self.backend.transient(source))
                     .flatten()
                     {
@@ -777,8 +799,8 @@ impl Images {
                     // Its `error`, once its failure is final: at once if asking
                     // again cannot mend it; else once a showing's retries are
                     // spent on screen (off screen it waits until it has shown).
-                    let transient =
-                        remote::is_remote(&view.source) && self.backend.transient(source).is_some();
+                    let transient = exact_plan::has_http_scheme(&view.source)
+                        && self.backend.transient(source).is_some();
                     let spent = view.on_screen
                         && view.retry_at.is_none()
                         && view.retries >= RETRY_AFTER.len();
@@ -1028,6 +1050,11 @@ impl Images {
         }
         reports
     }
+    /// Whether view `id`'s picture is asked for.
+    #[cfg(test)]
+    pub(crate) fn wanted(&self, id: ViewId) -> bool {
+        self.views.get(&id).is_some_and(|view| view.visible)
+    }
     /// Which assignment of its source view `id` shows ([`LoadEvent`]).
     pub(crate) fn assignment(&self, id: ViewId) -> Option<u64> {
         self.views.get(&id).map(|view| view.assignment)
@@ -1079,7 +1106,9 @@ impl Images {
     pub fn retry_due_in(&self) -> Option<Duration> {
         let now = Instant::now();
         (self.views.values())
-            .filter(|v| v.on_screen && v.source_id.is_some() && remote::is_remote(&v.source))
+            .filter(|v| {
+                v.on_screen && v.source_id.is_some() && exact_plan::has_http_scheme(&v.source)
+            })
             .filter_map(|v| v.retry_at)
             .min()
             .map(|at| at.saturating_duration_since(now))
@@ -1104,7 +1133,7 @@ impl Images {
                 v.source.is_empty()
                     || is_symbol(&v.source)
                     || self.package.serves(&v.source)
-                    || remote::is_remote(&v.source)
+                    || exact_plan::has_http_scheme(&v.source)
                     || matches!(
                         v.source_id
                             .as_ref()
@@ -1221,8 +1250,8 @@ impl Images {
             "peakBytes":s.peak_bytes,"running":s.running,"processRunning":g.running,
             "ready":s.ready,"deliveryCells":s.delivery_cells,"pendingJobs":s.pending_jobs,
             "subscribers":s.subscribers,"coldEntries":s.cold_entries,"sourceEntries":self.backend.sources(),
-            "remoteFetches":self.backend.downloads.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            "remoteCacheBytes":self.backend.downloads.cached_bytes(),
+            "remoteFetches":self.backend.downloads.as_ref().map_or(0, |d| d.fetches.load(std::sync::atomic::Ordering::Relaxed)),
+            "remoteCacheBytes":self.backend.downloads.as_ref().map_or(0, |d| d.cached_bytes()),
             "liveDiagnostics":self.loaded.len(),"deferred":self.deferred,
             "budgetWaits":waiting,"refusalReasons":reasons,
             "refused":self.views.values().filter(|v| v.refusal.is_some()).count()})
@@ -1272,7 +1301,9 @@ fn drawn_size(
     crate::paint::object_fit(
         (natural.width, natural.height),
         fit,
+        &exact_kernel::object::Position::default(),
         (0., 0., desired.0 / scale, desired.1 / scale),
+        &exact_kernel::Env::default(),
     )
     .map_or(desired, |(_, _, w, h)| (w * scale, h * scale))
 }
@@ -1332,7 +1363,8 @@ static PARTS: std::sync::LazyLock<bool> =
 fn plain_box(style: &exact_kernel::StyleProps) -> bool {
     use exact_kernel::Dimension;
     let none = |d: &Dimension| matches!(d, Dimension::Points(p) if *p == 0.0);
-    style.border_widths() == [0.0; 4]
+    style.object_position == exact_kernel::object::Position::default()
+        && style.border_widths() == [0.0; 4]
         && none(&style.padding_top)
         && none(&style.padding_right)
         && none(&style.padding_bottom)

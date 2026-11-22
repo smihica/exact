@@ -2,6 +2,7 @@ import AppIntents
 import XCTest
 import UniformTypeIdentifiers
 @testable import ExactKit
+@testable import ExactToolDoor
 
 final class IntentFilesTests: XCTestCase {
     func testImportWaitsForStorageAndUsesTheSessionLanding() throws {

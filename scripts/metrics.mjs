@@ -1012,22 +1012,25 @@ const WEB_CORE_KIB = { realworld: 304, 'video-player': 249, caltrain: 310 };
 // These are a tripwire at main's size, not an accepted size: the core grew
 // about 0.3 MB a day for five weeks from October's ceilings, and once a row was
 // over, more growth was the same failure, so nothing attributed it. Each is
-// main at e27820042 (Xcode 27.2), after LLP 1047.001 §9's cuts so far: grid
-// layout and its grammars, the runner's native modules, tool calls, presence
-// secrets, font-axis motion, list engine, content regions and audio, the
-// animation, transition, gradient, filter and clip-path grammars, the turn's
-// transitions and exits, CSS filter, gradients and animations, SVG, images,
-// lists, optional controls, flights, sticky, pickers, traces, the wake lock,
-// video, web views, sound, MIDI, navigation with route modals,
-// notifications, the host-event mailbox, Live Activities, the wake carriers
-// and the native module with its hatches and Forma linked by use; hatch
-// diagnostics, the agent dispatcher, the plan connection, the build channel
-// and the development plan and link out of production; grant reads, the
-// motion handover and ibex2's transport objects through their links; the
+// main at 93e344919 (Xcode 27.2), after LLP 1047.001 §9's cuts: grid layout
+// and its grammars, the runner's native modules, tool calls, presence secrets,
+// font-axis motion, list engine, content regions, audio, drags and canvas
+// turn, the animation, transition, gradient, filter and clip-path grammars,
+// the turn's transitions and exits, CSS filter, gradients and animations, SVG,
+// images, lists with their reorder, optional controls, flights, sticky, drag
+// handles, pickers, traces, the wake lock, video, web views, sound, MIDI and
+// their heavy leaves, navigation with route modals, the dialog sheet, sharing,
+// text selection, icons in text, the tool door, the content index, widget
+// publication, notifications, the host-event mailbox, Live Activities, the
+// wake carriers and the native module with its hatches and Forma linked by
+// use; hatch diagnostics, the agent dispatcher, the plan connection, the build
+// channel and the development plan and link out of production; grant reads,
+// the motion handover and ibex2's transport objects through their links; the
 // metrics and device tables packed. Each is that size plus ~100 KB.
-// The size row's target is 8 MB, 8,000,000 B (Charlie, 2026-11-17); the cuts
-// that reach it are issues/20261113-ios-hello-app-twice-its-binary-budget.md's.
-const IOS_HELLO_BYTES = { speed: 13_580_000, size: 8_450_000, balanced: 12_350_000 };
+// The size row's target is 8 MB, 8,000,000 B (Charlie, 2026-11-17), which it
+// is under: keep its ceiling under the target. The cuts that reached it are
+// issues/closed/20261113-ios-hello-app-twice-its-binary-budget.md's.
+const IOS_HELLO_BYTES = { speed: 12_780_000, size: 7_850_000, balanced: 11_610_000 };
 
 // 8. Long: web bytes by capability (LLP 1047 D9), for the three apps the
 // size work tracks. Each app's app.wasm as shipped (raw, gzip, brotli-11),

@@ -158,22 +158,7 @@ pub(super) fn file_by_file(
         editor,
         ..Graph::default()
     };
-    let mut read = BTreeSet::new();
-    for (id, (path, text)) in sources.paths().iter().zip(&sources.texts).enumerate() {
-        // A file two lines named, each read anew; a package's module
-        // declaration is JSON.
-        if !read.insert(path) || path.file_name().is_some_and(|f| f == "exact.json") {
-            continue;
-        }
-        let (mut file, hidden) = match parse_source_partial(text, id as u32) {
-            Ok(file) => (file, Vec::new()),
-            Err(Partial {
-                file: Some(file),
-                hidden,
-                ..
-            }) => (*file, hidden),
-            Err(_) => continue,
-        };
+    for (id, mut file, hidden) in parsed_files(sources, parse_source_partial) {
         // A members file's block holds members of a component declared in
         // another file.
         let members = file.members.take().map(|block| {
@@ -185,9 +170,9 @@ pub(super) fn file_by_file(
             shapes,
             components: Vec::new(),
         };
-        let hidden: Vec<_> = hidden.into_iter().map(|h| (id as u32, h)).collect();
+        let hidden: Vec<_> = hidden.into_iter().map(|h| (id, h)).collect();
         graph.index.clear();
-        graph.alone = Some(id as u32);
+        graph.alone = Some(id);
         graph.ids.clear();
         graph.ambiguous.clear();
         graph.hidden = shadows(&file, &hidden);
@@ -211,4 +196,26 @@ pub(super) fn file_by_file(
         graph = r.graph;
     }
     graph
+}
+
+pub(super) fn parsed_files(
+    sources: &Sources,
+    parse: fn(&str, u32) -> Result<File, Partial>,
+) -> impl Iterator<Item = (u32, File, Vec<Hidden>)> + '_ {
+    let mut read = BTreeSet::new();
+    sources
+        .paths()
+        .iter()
+        .zip(&sources.texts)
+        .enumerate()
+        .filter_map(move |(id, (path, text))| {
+            if !read.insert(path) || path.file_name().is_some_and(|f| f == "exact.json") {
+                return None;
+            }
+            let id = id as u32;
+            match parse(text, id) {
+                Ok(file) => Some((id, file, Vec::new())),
+                Err(partial) => partial.file.map(|file| (id, *file, partial.hidden)),
+            }
+        })
 }

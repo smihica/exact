@@ -50,6 +50,42 @@ fn boot(src: &str) -> Runner<NoData> {
     .unwrap()
 }
 
+#[test]
+fn each_runner_keeps_its_host_through_page_changes_and_nested_boots() {
+    use exact_runner::page::Platform;
+    let src = r#"shape Page
+  platform: string
+  onLine: bool
+component App
+  resource page = exactPage() as shape Page
+  view
+    text page.platform
+"#;
+    let (mut browser, terminal) = Platform::Web.boot(|| {
+        let terminal = Platform::Terminal.boot(|| boot(src));
+        (boot(src), terminal)
+    });
+    browser
+        .set_page(Page {
+            on_line: false,
+            ..Page::default()
+        })
+        .unwrap();
+    let answer = |r: &Runner<NoData>| r.resource("page").cloned().unwrap();
+    assert_eq!(
+        answer(&browser),
+        Value::record(vec![Value::str("web"), Value::Bool(false)])
+    );
+    assert_eq!(
+        answer(&terminal),
+        Value::record(vec![Value::str("terminal"), Value::Bool(true)])
+    );
+    assert_eq!(
+        answer(&boot(src)),
+        Value::record(vec![Value::str("headless"), Value::Bool(true)])
+    );
+}
+
 /// Moves the runner's clock `ms` on (`advance` takes the time itself).
 fn wait(r: &mut Runner<NoData>, clock: &mut f64, ms: f64) {
     *clock += ms;
@@ -172,4 +208,35 @@ fn frozen_bakes_false_and_unknown_page_fields_refuse() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("bake-page-field"), "{error}");
+}
+
+#[test]
+fn a_geometry_fact_bakes_and_refuses_a_shape_an_answer_cannot_fill() {
+    // LLP 1123 D6: `exactGeometry`'s fields are filled by name, nested ones too, and a quantity
+    // it may not have is `none`, so a field it lacks, at any depth, and a family that is not an
+    // `option` are refused, each named
+    let bake = |shapes: &str, hero: &str| {
+        let source = format!("{shapes}shape Hero\n{hero}component App\n  resource g = exactGeometry(\"hero\") as shape Hero\n  view\n    column id=\"hero\"\n");
+        contract::bake(contract::compile(&source).unwrap(), NoData)
+    };
+    let rect = "shape Rect\n  x: number\n  y: number\n  width: number\n  height: number\n";
+    let insets = "shape Insets\n  top: number\n  right: number\n  bottom: number\n  left: number\n";
+    assert!(bake(rect, "  available: bool\n  frame: option<Rect>\n").is_ok());
+    for (shapes, hero, named) in [
+        ("", "  shown: bool\n", "`shown`"),
+        (
+            "shape Rect\n  x: number\n  w: number\n",
+            "  frame: option<Rect>\n",
+            "`frame.w`",
+        ),
+        (
+            &format!("{insets}shape Observed\n  safeArea: Insets\n"),
+            "  observations: option<Observed>\n",
+            "`observations.safeArea`",
+        ),
+    ] {
+        let error = bake(shapes, hero).unwrap_err().to_string();
+        assert!(error.contains("bake-geometry-field"), "{error}");
+        assert!(error.contains(named), "{named}: {error}");
+    }
 }

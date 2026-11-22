@@ -6,12 +6,11 @@
 // beyond mean |Δ| 4/255 or 6% of pixels off by more than 32 (LLP 1055's
 // measured residue: antialiasing and Chrome's 1× raster). Failing crops are
 // written out in pairs. Run: `bun scripts/smoke.mjs svg [--hosts linux,macos,ios]`.
-import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { webBuild } from './parity.mjs';
-import { crop, decodePng, encodePng } from './png.mjs';
+import { boxes, shot, webBuild } from './parity.mjs';
+import { encodePng } from './png.mjs';
 
 const MEAN = 4, OFF = 0.06, BAND = 32, SLOP = 3;
 // Linux paints text in its pinned font, not Chrome's system font, and does
@@ -31,21 +30,6 @@ export function undrawn(host, schema = JSON.parse(readFileSync(resolve(import.me
 // Core Animation blends in the display's colour space, CSS in sRGB (LLP
 // 1055.000 §0, stage 10): macOS's blend fixture is held to a looser share.
 const limits = (host, id) => (host === 'linux' && TEXT.test(id) ? { mean: 14, off: 0.16 } : host === 'macos' && id === 'fx-mix' ? { mean: MEAN, off: 0.16 } : { mean: MEAN, off: OFF });
-
-/** An RGBA image averaged down by an integer factor. */
-function shrink(img, k) {
-  if (k === 1) return img;
-  const width = Math.floor(img.width / k), height = Math.floor(img.height / k);
-  const data = new Uint8Array(width * height * 4);
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    for (let c = 0; c < 4; c++) {
-      let sum = 0;
-      for (let j = 0; j < k; j++) for (let i = 0; i < k; i++) sum += img.data[((y * k + j) * img.width + x * k + i) * 4 + c];
-      data[(y * width + x) * 4 + c] = Math.round(sum / (k * k));
-    }
-  }
-  return { width, height, data };
-}
 
 /** Mean |Δ| and the share of pixels off by more than `BAND`, `b` shifted by (dx, dy) over `a`'s interior. */
 function compare(a, b, dx, dy) {
@@ -70,29 +54,7 @@ async function capture(open, host, dir, check) {
     for (const page of pages) {
       await s.tap(page);
       await s.clock('settle');
-      const layout = await s.layout();
-      let path = resolve(dir, `${host}-${page}.png`);
-      const reply = await s.screenshot(path, host === 'macos');
-      if (host === 'macos' || host === 'ios') {
-        // A native capture is in the display's profile (Display P3 on a
-        // Mac); Chrome's is sRGB.
-        const srgb = resolve(dir, `${host}-${page}.srgb.png`);
-        const r = spawnSync('sips', ['--matchTo', '/System/Library/ColorSync/Profiles/sRGB Profile.icc', path, '--out', srgb], { encoding: 'utf8' });
-        if (r.status !== 0) throw new Error(`sips: ${r.stderr}`);
-        path = srgb;
-      }
-      const img = decodePng(readFileSync(path));
-      const k = Math.round(img.width / layout.viewport.w);
-      // A window capture carries the title bar above the viewport.
-      const top = Math.max(0, Math.round(img.height / k - layout.viewport.h));
-      const full = shrink(img, k);
-      out[page] = {};
-      for (const n of layout.nodes.filter((n) => n.testId?.startsWith('fx-'))) {
-        const x = Math.round(n.x) - SLOP, y = Math.round(n.y) + top - SLOP, w = Math.round(n.w) + 2 * SLOP, h = Math.round(n.h) + 2 * SLOP;
-        if (x < 0 || y < 0 || x + w > full.width || y + h > full.height) { out[page][n.testId] = null; continue; }
-        out[page][n.testId] = crop(full, x, y, w, h);
-      }
-      void reply;
+      out[page] = boxes(await shot(s, host, dir, page), { slop: SLOP });
     }
     // LLP 1055.000 D17: a tap on a tile's centre presses the element there — a point, `at` its middle: a plain
     // tap names the `svg`, which has no press of its own, and never presses an element inside it (LLP 1012 §1).

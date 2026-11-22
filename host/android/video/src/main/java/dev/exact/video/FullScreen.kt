@@ -20,7 +20,8 @@ import androidx.media3.ui.PlayerView
 /**
  * A video full screen (LLP 1042.001 D9): a window of the activity over everything, its system bars hidden as immersive
  * mode hides them, holding Media3's `PlayerView` with its controller on the element's own player. Back and the
- * controller's full-screen button leave; [left] then takes the player back.
+ * controller's full-screen button leave; [left] then takes the player back. Full screen is the platform player's
+ * presentation; inline object-position belongs to the element's box.
  */
 @OptIn(UnstableApi::class)
 internal class FullScreen(private val context: Context, private val exo: ExoPlayer, private val left: (PlayerView) -> Unit) {

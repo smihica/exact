@@ -9,9 +9,10 @@
 // white first). Two cells match when each lies within INK of the other's 3×3 neighbourhood, so anti-aliasing and
 // sub-point offsets do not count.
 import { MalformedOperation } from './agent-keys.mjs';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, relative, resolve } from 'node:path';
-import { crop, decodePng, encodePng, shrink } from './png.mjs';
+import { crop, decodePng, encodePng, readSrgbPng, shrink } from './png.mjs';
 import { scaledLines } from './agent-inspect.mjs';
 
 const INK = 40; // a channel difference (of 255) beyond the other image's neighbourhood that makes a cell differ
@@ -493,9 +494,50 @@ export function referenceScale(ref, w, h) {
   return sx;
 }
 
-/** The CLI's `screenshot <png> compare <reference.png>` (`args` after `screenshot`). On an iOS simulator the capture is
- *  the window with its status bar, as a device screenshot is (`window` and `window status` may be said); elsewhere the
- *  viewport, rotated onto the panel's axes on Linux. */
+/** The current viewport in points and its unscaled PNG. */
+async function viewportPixels(s) {
+  const dir = mkdtempSync(resolve(tmpdir(), 'exact-viewport-'));
+  try {
+    const shot = await s.screenshot(resolve(dir, 'viewport.png'));
+    if (!(shot.w > 0 && shot.h > 0)) throw new Error('the host returned an empty viewport');
+    return { png: decodePng(readFileSync(shot.screenshot)), w: shot.w, h: shot.h };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** Apple can sample extended-range layers. Other graphical hosts supply the displayed sRGB PNG. */
+export async function samplePoints(s, points, strict = false) {
+  if (['mac', 'macos', 'ios', 'tvos', 'host', 'host-ios'].includes(s.host))
+    return s.op({ op: 'sample', points, strict });
+  const { png, w, h } = await viewportPixels(s);
+  const values = points.map(([x, y]) => {
+    if (!(x >= 0 && x < w && y >= 0 && y < h)) throw new Error(`sample (${x}, ${y}) is outside the ${w}×${h} viewport`);
+    const i = 4 * (Math.floor(y * png.height / h) * png.width + Math.floor(x * png.width / w));
+    return Array.from(png.data.subarray(i, i + 4), v => v / 255);
+  });
+  return { space: 'srgb', values };
+}
+
+/** Compare the target's border box on the same point grid as a full-screen reference. */
+export async function compareBox(s, box, path) {
+  const { png, w, h } = await viewportPixels(s);
+  if (!(box.w > 0 && box.h > 0 && box.x >= 0 && box.y >= 0 && box.x + box.w <= w && box.y + box.h <= h))
+    throw new Error('the full border box must be visible in the viewport to compare it');
+  const pos = (v, pixels, points) => Math.round(v * pixels / points);
+  const x = pos(box.x, png.width, w), y = pos(box.y, png.height, h);
+  const width = pos(box.x + box.w, png.width, w) - x, height = pos(box.y + box.h, png.height, h) - y;
+  const cols = Math.round(box.w), rows = Math.round(box.h);
+  if (cols < 1 || rows < 1 || width < cols || height < rows) throw new Error('the capture needs at least one pixel per point of the target');
+  const ref = decodePng(readFileSync(path));
+  referenceScale(ref, cols, rows);
+  const result = compareGrids(grid(ref, cols, rows), grid(crop(png, x, y, width, height), cols, rows));
+  if (result.match === 1) return null;
+  const first = result.mask.indexOf(1);
+  return `${Math.round((1 - result.match) * cols * rows)} of ${cols * rows} points differ from ${path}, first at (${first % cols}, ${Math.floor(first / cols)})`;
+}
+
+/** The CLI's `screenshot <png> compare <reference.png>` (`args` after `screenshot`). On iOS the capture includes the
+ *  status bar (`window` and `window status` may be said). Other hosts capture the viewport, rotated onto the panel's
+ *  axes on Linux. */
 export function compareScreenshot(s, args) {
   const at = args.indexOf('compare'), [path, ...form] = args.slice(0, at), reference = args[at + 1];
   const ios = ['ios', 'host-ios'].includes(s.host);
@@ -504,9 +546,10 @@ export function compareScreenshot(s, args) {
   return compareOp(s, resolve(reference), () => s.screenshot(path, ios, ios ? 'status' : undefined));
 }
 
-/** What a capture's reply says it left out or could not do, a line each. */
+/** The capture's pixel source and any differences from the presentation, a line each. */
 function captureNotes(shot) {
   const out = [];
+  if (shot.pixels) out.push(`pixels=${JSON.stringify(shot.pixels)}`);
   for (const k of ['note', 'chromeNote', 'unshownNote']) if (typeof shot[k] === 'string') out.push(shot[k]);
   if (shot.notShown?.windows?.length) out.push(`not in the capture, as windows of their own: ${shot.notShown.windows.join(', ')} (the reference may show them)`);
   if (shot.imagesPending) out.push(`${shot.imagesPending} image${shot.imagesPending === 1 ? ' was' : 's were'} still loading`);
@@ -520,8 +563,9 @@ function captureNotes(shot) {
  *  reply with `compare`, `diff`, `side`, `close` and `text`. */
 export async function compareOp(s, referencePath, take) {
   let ref;
-  try { ref = decodePng(readFileSync(referencePath)); } catch (e) { throw new MalformedOperation(`compare ${referencePath}: ${e.code === 'ENOENT' ? 'no such file' : e.message}`); }
+  try { ref = readSrgbPng(referencePath); } catch (e) { throw new MalformedOperation(`compare ${referencePath}: ${e.code === 'ENOENT' ? 'no such file' : e.message}`); }
   let shot = await take();
+  if (shot.captureSpace === 'screen' && shot.scale === null) throw new Error(`compare: ${shot.note}`);
   const w = Math.round(shot.w);
   // A web page's reference as wide as the viewport and taller, a design's capture of the whole page: the viewport
   // takes the reference's height for the capture and the nodes read beside it, and its own back after.
@@ -531,29 +575,30 @@ export async function compareOp(s, referencePath, take) {
   let layout, tree, png;
   try {
     referenceScale(ref, w, h);
-    png = decodePng(readFileSync(shot.screenshot));
+    png = readSrgbPng(shot.screenshot);
     if (png.width < w || png.height < h) throw new Error(`compare: the capture is ${png.width}×${png.height} px for ${w}×${h} pt; take it at a pixel a point or more`);
     layout = await s.layout(undefined, undefined, s.host === 'web' ? { picture: true } : {}); tree = await s.tree();
   } finally {
     if (h !== back) await s.resize(w, back);
   }
   const notes = captureNotes(shot);
-  // A window capture (iOS) holds the viewport where the window has it, read from a node's own spaces; a viewport drawn
-  // smaller than its points (`--size`) has no such offset.
+  // A viewport drawn at another size than its points needs more than a translation into the picture.
+  const captureSpace = shot.captureSpace ?? (shot.window ? 'window' : null);
   let origin = [0, 0], placed = true;
-  if (shot.window) {
+  if (captureSpace) {
     const probe = (layout.nodes ?? []).find((n) => n.w > 0 && n.h > 0);
     const space = probe ? (await s.op({ op: 'layout', id: probe.id }).catch(() => null))?.node?.space : null;
-    if (space?.window && space?.viewport && (Math.abs(space.window.w - space.viewport.w) > 0.5 || Math.abs(space.window.h - space.viewport.h) > 0.5))
+    const box = space?.[captureSpace], viewport = space?.viewport;
+    if (box && viewport && (Math.abs(box.w - viewport.w) > 0.5 || Math.abs(box.h - viewport.h) > 0.5))
       throw new MalformedOperation('compare: the viewport is drawn at another size than its points (--size): compare at the device\'s own size');
-    if (space?.window && space?.viewport) origin = [space.window.x - space.viewport.x, space.window.y - space.viewport.y];
-    else { placed = false; notes.push('no node is named: the host gave no node\'s place in the window'); }
+    if (box && viewport) origin = [box.x - viewport.x, box.y - viewport.y];
+    else { placed = false; notes.push(`no node is named: the host gave no node's place in ${captureSpace} coordinates`); }
   }
   const nodes = placed ? viewNodes(layout, tree, origin, shot) : [];
-  // The rows other processes draw on a device (its status bar and home indicator), never scored: the window's safe area.
-  const top = shot.window ? Math.ceil(Math.max(shot.safeArea?.top ?? 0, typeof shot.statusBar === 'number' ? shot.statusBar : 0)) : 0;
-  const bottom = shot.window ? Math.ceil(shot.safeArea?.bottom ?? 0) : 0;
-  if (shot.window && !shot.safeArea) notes.push('the host gave no safe area: only a status bar it named is left out');
+  // Skip status bar and home indicator rows where the capture gives their insets.
+  const top = captureSpace ? Math.ceil(Math.max(shot.safeArea?.top ?? 0, typeof shot.statusBar === 'number' ? shot.statusBar : 0)) : 0;
+  const bottom = captureSpace ? Math.ceil(shot.safeArea?.bottom ?? 0) : 0;
+  if (captureSpace && !shot.safeArea) notes.push(top ? 'the host gave only the status bar height' : 'the host gave no safe-area or status bar height');
   const A = grid(ref, w, h), B = grid(png, w, h), result = compareGrids(A, B, { top, bottom });
   const base = shot.screenshot.replace(/\.png$/i, ''), diff = `${base}.diff.png`, side = `${base}.side.png`, near = closeUp(ref, png, result);
   writeFileSync(diff, encodePng(diffImage(A, B, result)));

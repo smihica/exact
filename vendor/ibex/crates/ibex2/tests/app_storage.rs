@@ -91,7 +91,7 @@ fn configuration_and_provider_are_explicit_and_denials_create_nothing() {
         .err()
         .unwrap()
         .to_string()
-        .contains("provider"));
+        .contains("Unlinked(\"sqlite\")"));
     let denied = Host::new()
         .with_app_directories(dirs)
         .with_sqlite_provider(Arc::new(ibex2_sqlite::SqliteProvider))

@@ -1,280 +1,369 @@
-//! Direct KMS scanout through wgpu's DRM surface (VK_KHR_display): the compose
-//! target reaches the screen with one GPU copy, no readback. That copy also
-//! turns the frame for a rotated panel.
-use super::*;
-use crate::Rotation;
+//! Ink frames on a Vulkan display plane. @ref LLP 1015 §6.
+use super::{block_on, checked, failure, Error, Instant, Result, TextureId, Wgpu};
+use ::wgpu::{hal::api::Vulkan, util::TextureBlitter};
+use ash::{ext, khr, vk};
+use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-pub(super) struct Scanout {
+/// A configured FIFO swapchain for one connector and mode.
+pub struct Scanout {
+    output: Arc<Output>,
+    blitter: TextureBlitter,
+    next_id: u64,
+    upload: Option<::wgpu::Texture>,
+    size: [u32; 2],
+    queue: ::wgpu::Queue,
+    errors: Arc<Mutex<Option<Error>>>,
+}
+
+struct Output {
+    // A receipt holds this configuration until its wait finishes. Replacing the
+    // output creates a new surface, so a waiter never uses a retired swapchain.
     surface: ::wgpu::Surface<'static>,
-    config: ::wgpu::SurfaceConfiguration,
-    pipeline: ::wgpu::RenderPipeline,
-    layout: ::wgpu::BindGroupLayout,
+    device: ::wgpu::Device,
+    wait: khr::present_wait::Device,
+    chain: vk::SwapchainKHR,
+    _card: OwnedFd,
 }
 
-const COPY: &str = "
-@group(0) @binding(0) var frame: texture_2d<f32>;
-struct Triangle {
-    @builtin(position) position: vec4<f32>,
-    @location(0) @interpolate(flat) turn: u32,
+/// A frame accepted by the presentation queue.
+pub struct QueuedFrame {
+    output: Arc<Output>,
+    id: NonZeroU64,
 }
-@vertex fn vs_main(@builtin(vertex_index) i: u32, @builtin(instance_index) turn: u32) -> Triangle {
-    let position = vec4<f32>(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0.0, 1.0);
-    return Triangle(position, turn);
-}
-@fragment fn fs_main(v: Triangle) -> @location(0) vec4<f32> {
-    let at = vec2<i32>(v.position.xy);
-    let last = vec2<i32>(textureDimensions(frame)) - vec2<i32>(1);
-    var src = at;
-    switch v.turn {
-        case 1u: { src = vec2<i32>(at.y, last.y - at.x); }
-        case 2u: { src = last - at; }
-        case 3u: { src = vec2<i32>(last.x - at.y, at.x); }
-        default: {}
+
+impl QueuedFrame {
+    /// Whether Vulkan has completed this presentation within the given time.
+    pub fn wait(&self, timeout: Duration) -> Result<bool> {
+        let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: the immutable output owns the swapchain and its device.
+        // This ID was submitted to this FIFO swapchain with presentWait enabled.
+        match unsafe {
+            self.output
+                .wait
+                .wait_for_present(self.output.chain, self.id.get(), ns)
+        } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(e) => Err(vk_error(e)),
+        }
     }
-    return textureLoad(frame, src, 0);
-}
-";
-
-fn layout(device: &::wgpu::Device) -> ::wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&::wgpu::BindGroupLayoutDescriptor {
-        label: Some("ink scanout"),
-        entries: &[::wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: ::wgpu::ShaderStages::FRAGMENT,
-            ty: ::wgpu::BindingType::Texture {
-                sample_type: ::wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: ::wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        }],
-    })
 }
 
-fn pipeline(
-    device: &::wgpu::Device,
-    layout: &::wgpu::BindGroupLayout,
-    format: ::wgpu::TextureFormat,
-) -> ::wgpu::RenderPipeline {
-    let pipeline_layout = device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
-        label: Some("ink scanout"),
-        bind_group_layouts: &[Some(layout)],
-        immediate_size: 0,
-    });
-    let shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
-        label: Some("ink scanout"),
-        source: ::wgpu::ShaderSource::Wgsl(COPY.into()),
-    });
-    device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-        label: Some("ink scanout"),
-        layout: Some(&pipeline_layout),
-        vertex: ::wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: Default::default(),
-        depth_stencil: None,
-        multisample: Default::default(),
-        fragment: Some(::wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(format.into())],
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
+fn vk_error(e: vk::Result) -> Error {
+    match e {
+        vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost(e.to_string()),
+        _ => Error::Device(e.to_string()),
+    }
 }
 
-/// Draw `frame` over the whole of `panel`.
-fn copy(
-    device: &::wgpu::Device,
-    encoder: &mut ::wgpu::CommandEncoder,
-    pipeline: &::wgpu::RenderPipeline,
-    rotation: Rotation,
-    layout: &::wgpu::BindGroupLayout,
-    frame: &::wgpu::TextureView,
-    panel: &::wgpu::TextureView,
-) {
-    let group = device.create_bind_group(&::wgpu::BindGroupDescriptor {
-        label: Some("ink scanout"),
-        layout,
-        entries: &[::wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ::wgpu::BindingResource::TextureView(frame),
-        }],
-    });
-    let mut pass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-        label: Some("ink scanout"),
-        color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-            view: panel,
-            depth_slice: None,
-            resolve_target: None,
-            ops: ::wgpu::Operations {
-                load: ::wgpu::LoadOp::Clear(::wgpu::Color::BLACK),
-                store: ::wgpu::StoreOp::Store,
-            },
-        })],
-        ..Default::default()
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, &group, &[]);
-    // The instance index carries the quarter turn without a per-frame buffer write.
-    let turn = rotation as u32;
-    pass.draw(0..3, turn..turn + 1);
-}
-
-impl Wgpu {
-    /// Take the connector's display for presentation. `size` and `refresh`
-    /// (millihertz) name one of its modes.
+impl Scanout {
+    /// Open Ink on the adapter that can present to the connector.
     ///
     /// # Safety
-    /// `fd` is the DRM master of the card that scans the connector out and
-    /// outlives the device; nothing else reads its events or flips its planes
-    /// afterwards, also when this fails: Vulkan may already drive the display.
-    pub unsafe fn attach_scanout(
-        &mut self,
-        fd: i32,
+    ///
+    /// `card` must be the DRM master for this connected display and the given
+    /// mode. Its owner must leave the connector and its DRM events to Vulkan
+    /// until the scanout and its queued frames have been dropped.
+    pub unsafe fn open(
+        card: OwnedFd,
         connector: u32,
         size: [u32; 2],
-        refresh: u32,
-    ) -> Result<()> {
-        // SAFETY: the caller's contract above.
-        let surface = unsafe {
-            self.instance
-                .create_surface_unsafe(::wgpu::SurfaceTargetUnsafe::Drm {
-                    fd,
-                    plane: 0,
+        refresh_millihz: u32,
+    ) -> Result<(Wgpu, Self)> {
+        if std::env::var("WGPU_BACKEND").is_ok_and(|s| {
+            !::wgpu::Backends::from_comma_list(&s).contains(::wgpu::Backends::VULKAN)
+        }) || std::env::var("EXACT_INK_DEVICE").is_ok_and(|s| s != "wgpu")
+        {
+            return Err(Error::Unsupported(
+                "Vulkan scanout with the selected Ink backend",
+            ));
+        }
+        let started = Instant::now();
+        let instance = ::wgpu::Instance::new(::wgpu::InstanceDescriptor {
+            backends: ::wgpu::Backends::VULKAN,
+            ..::wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        for adapter in block_on(instance.enumerate_adapters(::wgpu::Backends::VULKAN)) {
+            let Some(plane) = display_plane(&adapter, &card, connector)? else {
+                continue;
+            };
+            // SAFETY: the caller supplies the master and mode. Vulkan reported
+            // this plane for the connector. Output keeps the descriptor alive.
+            let surface = unsafe {
+                instance.create_surface_unsafe(::wgpu::SurfaceTargetUnsafe::Drm {
+                    fd: card.as_raw_fd(),
+                    plane,
                     connector_id: connector,
                     width: size[0],
                     height: size[1],
-                    refresh_rate: refresh,
+                    refresh_rate: refresh_millihz,
                 })
+            }
+            .map_err(|e| Error::Device(e.to_string()))?;
+            return Self::configure(instance, adapter, surface, size, card, started);
         }
-        .map_err(|e| Error::Device(e.to_string()))?;
-        let capabilities = surface.get_capabilities(&self.adapter);
-        // The dumb-buffer path shows the target's bytes as they are.
-        let format = capabilities
+        Err(Error::Unsupported(
+            "no Vulkan plane supports the DRM connector",
+        ))
+    }
+
+    fn configure(
+        instance: ::wgpu::Instance,
+        adapter: ::wgpu::Adapter,
+        surface: ::wgpu::Surface<'static>,
+        size: [u32; 2],
+        card: OwnedFd,
+        started: Instant,
+    ) -> Result<(Wgpu, Self)> {
+        let caps = surface.get_capabilities(&adapter);
+        // Ink's target holds the same RGBA bytes as a screenshot. An sRGB view
+        // would encode those bytes a second time before scanout.
+        let format = caps
             .formats
-            .iter()
-            .copied()
-            .find(|format| !format.is_srgb())
-            .ok_or(Error::Unsupported("a linear scanout format"))?;
+            .into_iter()
+            .find(|f| {
+                matches!(
+                    f,
+                    ::wgpu::TextureFormat::Bgra8Unorm | ::wgpu::TextureFormat::Rgba8Unorm
+                )
+            })
+            .ok_or(Error::Unsupported("an 8-bit UNORM scanout format"))?;
+        let alpha_mode = [
+            ::wgpu::CompositeAlphaMode::Opaque,
+            ::wgpu::CompositeAlphaMode::Inherit,
+        ]
+        .into_iter()
+        .find(|v| caps.alpha_modes.contains(v))
+        .ok_or(Error::Unsupported("opaque scanout"))?;
+        let (device, queue, wait) = open_device(&adapter)?;
+        let ink = block_on(Wgpu::from_device(
+            instance,
+            adapter,
+            device.clone(),
+            queue.clone(),
+            started,
+        ))?;
         let config = ::wgpu::SurfaceConfiguration {
             usage: ::wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            color_space: Default::default(),
             width: size[0],
             height: size[1],
+            color_space: ::wgpu::SurfaceColorSpace::Srgb,
             present_mode: ::wgpu::PresentMode::Fifo,
-            // Let the next frame render while the display scans out its predecessor.
-            desired_maximum_frame_latency: 2,
-            alpha_mode: ::wgpu::CompositeAlphaMode::Opaque,
+            desired_maximum_frame_latency: 1,
+            alpha_mode,
             view_formats: Vec::new(),
         };
-        let layout = layout(&self.device);
-        let pipeline = checked(&self.device, &self.errors, || {
-            surface.configure(&self.device, &config);
-            pipeline(&self.device, &layout, format)
+        let blitter = checked(&device, &ink.errors, || {
+            surface.configure(&device, &config);
+            TextureBlitter::new(&device, format)
         })?;
-        // On Mesa's direct display the last picture may wait for another present until
-        // the first blocking acquire starts the flip-event reader. Cycle one frame
-        // past the requested swapchain depth before handing the surface to the painter.
-        for _ in 0..config.desired_maximum_frame_latency + 2 {
-            match surface.get_current_texture() {
-                ::wgpu::CurrentSurfaceTexture::Success(t)
-                | ::wgpu::CurrentSurfaceTexture::Suboptimal(t) => self.queue.present(t),
-                other => return Err(Error::Device(format!("acquire scanout: {other:?}"))),
-            }
+        // SAFETY: this borrows the configured native surface and reads its handle.
+        let chain = unsafe { surface.as_hal::<Vulkan>() }
+            .and_then(|s| s.raw_native_swapchain())
+            .ok_or(Error::Unsupported("a native Vulkan swapchain"))?;
+        let errors = ink.errors.clone();
+        Ok((
+            ink,
+            Self {
+                output: Arc::new(Output {
+                    surface,
+                    device,
+                    wait,
+                    chain,
+                    _card: card,
+                }),
+                blitter,
+                next_id: 1,
+                upload: None,
+                size,
+                queue,
+                errors,
+            },
+        ))
+    }
+
+    /// A CPU-composited content region or fallback painter uses the same display.
+    pub fn present_pixels(&mut self, pixels: &tiny_skia::Pixmap) -> Result<QueuedFrame> {
+        if self.size != [pixels.width(), pixels.height()] {
+            return Err(Error::Invalid(
+                "panel pixels have a different extent from the display".into(),
+            ));
         }
-        failure(&self.errors)?;
-        self.scanout = Some(Scanout {
-            surface,
-            config,
-            pipeline,
-            layout,
+        let extent = ::wgpu::Extent3d {
+            width: pixels.width(),
+            height: pixels.height(),
+            depth_or_array_layers: 1,
+        };
+        let texture = self.upload.get_or_insert_with(|| {
+            self.output
+                .device
+                .create_texture(&::wgpu::TextureDescriptor {
+                    label: Some("Linux panel pixels"),
+                    size: extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: ::wgpu::TextureDimension::D2,
+                    format: ::wgpu::TextureFormat::Rgba8Unorm,
+                    usage: ::wgpu::TextureUsages::COPY_DST | ::wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
         });
-        Ok(())
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            pixels.data(),
+            ::wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pixels.width() * 4),
+                rows_per_image: None,
+            },
+            extent,
+        );
+        let view = texture.create_view(&Default::default());
+        self.present(&view)
     }
 
-    pub fn has_scanout(&self) -> bool {
-        self.scanout.is_some()
-    }
-
-    /// Queue the texture for the next refresh, turned onto the panel by
-    /// `rotation`. Blocks while the display holds every image, which paces
-    /// the caller to the refresh.
-    pub fn scan_out(&mut self, texture: TextureId, rotation: Rotation) -> Result<()> {
-        let scanout = self.scanout.as_ref().ok_or(Error::Unsupported("scanout"))?;
-        let frame = &self.texture(texture)?.view;
-        let mut acquired = scanout.surface.get_current_texture();
-        if matches!(
-            acquired,
-            ::wgpu::CurrentSurfaceTexture::Outdated | ::wgpu::CurrentSurfaceTexture::Lost
-        ) {
-            scanout.surface.configure(&self.device, &scanout.config);
-            acquired = scanout.surface.get_current_texture();
-        }
-        let output = match acquired {
+    /// Copy the completed Ink image to the swapchain and label its presentation.
+    pub fn present(&mut self, source: &::wgpu::TextureView) -> Result<QueuedFrame> {
+        failure(&self.errors)?;
+        let output = &self.output;
+        let image = match output.surface.get_current_texture() {
             ::wgpu::CurrentSurfaceTexture::Success(t)
             | ::wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             other => return Err(Error::Device(format!("acquire scanout: {other:?}"))),
         };
-        let view = output.texture.create_view(&Default::default());
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        copy(
-            &self.device,
-            &mut encoder,
-            &scanout.pipeline,
-            rotation,
-            &scanout.layout,
-            frame,
-            &view,
-        );
-        let submission = self.submit(encoder.finish())?;
-        self.textures.get_mut(&texture).unwrap().last = submission;
-        self.queue.present(output);
-        failure(&self.errors)
+        let id = NonZeroU64::new(self.next_id)
+            .ok_or(Error::Invalid("Vulkan presentation IDs exhausted".into()))?;
+        self.next_id = self.next_id.wrapping_add(1);
+        // SAFETY: open_device enabled presentId. IDs increase on this
+        // swapchain and each acquired image goes to the queue exactly once.
+        let tagged = unsafe {
+            output
+                .surface
+                .as_hal::<Vulkan>()
+                .is_some_and(|s| s.set_next_present_id(id))
+        };
+        if !tagged {
+            return Err(Error::Device(
+                "could not label the Vulkan presentation".into(),
+            ));
+        }
+        let view = image.texture.create_view(&Default::default());
+        let mut encoder = output.device.create_command_encoder(&Default::default());
+        self.blitter
+            .copy(&output.device, &mut encoder, source, &view);
+        self.queue.submit([encoder.finish()]);
+        self.queue.present(image);
+        failure(&self.errors)?;
+        Ok(QueuedFrame {
+            output: self.output.clone(),
+            id,
+        })
     }
 }
 
-#[cfg(test)]
-#[test]
-fn the_copy_turns_the_frame_as_the_blit_does_and_a_touch_lands_on_the_pixel_shown() {
-    let mut d = Wgpu::new().expect("GPU for scanout pixels");
-    let frame = d.create_texture(TextureDesc::rgba(3, 2)).unwrap();
-    let colors: Vec<u8> = (1..=6).flat_map(|v| [v * 20, 0, 0, 255]).collect();
-    d.upload_texture(frame, [0, 0], [3, 2], &colors).unwrap();
-    let layout = layout(&d.device);
-    let pipeline = checked(&d.device, &d.errors, || {
-        pipeline(&d.device, &layout, ::wgpu::TextureFormat::Rgba8Unorm)
-    })
-    .unwrap();
-    for rotation in [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270] {
-        let [w, h] = rotation.size([3, 2]);
-        let blitted = d.create_target(w, h).unwrap();
-        rotation.blit(&mut d, frame, [3, 2], blitted).unwrap();
-        let panel = d.create_target(w, h).unwrap();
-        let mut encoder = d.device.create_command_encoder(&Default::default());
-        copy(
-            &d.device,
-            &mut encoder,
-            &pipeline,
-            rotation,
-            &layout,
-            &d.textures[&frame].view,
-            &d.textures[&panel].view,
-        );
-        d.submit(encoder.finish()).unwrap();
-        let shown = d.readback(panel).unwrap();
-        assert_eq!(shown, d.readback(blitted).unwrap(), "{rotation:?}");
-        for (i, pixel) in shown.as_chunks::<4>().0.iter().enumerate() {
-            let [x, y] = [i as u32 % w, i as u32 / w].map(|v| v as f32 + 0.5);
-            let (x, y) = rotation.input(Some(x / w as f32), Some(y / h as f32));
-            let touched = (y.unwrap() * 2.) as usize * 3 + (x.unwrap() * 3.) as usize;
-            assert_eq!(pixel[..], colors[touched * 4..][..4], "{rotation:?} {i}");
+impl Wgpu {
+    /// The finished, optionally rotated Ink target for a scanout on this device.
+    pub fn scanout_view(&self, id: TextureId) -> Result<::wgpu::TextureView> {
+        Ok(self.texture(id)?.view.clone())
+    }
+}
+
+fn display_plane(adapter: &::wgpu::Adapter, card: &OwnedFd, connector: u32) -> Result<Option<u32>> {
+    // SAFETY: this guard only borrows the instance and physical device.
+    let hal =
+        unsafe { adapter.as_hal::<Vulkan>() }.ok_or(Error::Unsupported("a Vulkan adapter"))?;
+    let instance = hal.shared_instance();
+    if !instance
+        .extensions()
+        .contains(&ext::acquire_drm_display::NAME)
+    {
+        return Ok(None);
+    }
+    let drm = ext::acquire_drm_display::Instance::new(instance.entry(), instance.raw_instance());
+    let physical = hal.raw_physical_device();
+    // SAFETY: the live DRM card and its connector come from the carrier.
+    let display = match unsafe { drm.get_drm_display(physical, card.as_raw_fd(), connector) } {
+        Ok(display) if display != vk::DisplayKHR::null() => display,
+        Ok(_)
+        | Err(
+            vk::Result::ERROR_UNKNOWN
+            | vk::Result::ERROR_EXTENSION_NOT_PRESENT
+            | vk::Result::ERROR_INITIALIZATION_FAILED,
+        ) => return Ok(None),
+        Err(e) => return Err(vk_error(e)),
+    };
+    let api = khr::display::Instance::new(instance.entry(), instance.raw_instance());
+    // SAFETY: enumerate the planes and supported displays of the same physical device.
+    let planes =
+        unsafe { api.get_physical_device_display_plane_properties(physical) }.map_err(vk_error)?;
+    for (index, plane) in planes.iter().enumerate() {
+        if plane.current_display != vk::DisplayKHR::null() && plane.current_display != display {
+            continue;
+        }
+        let index = index as u32;
+        if unsafe { api.get_display_plane_supported_displays(physical, index) }
+            .map_err(vk_error)?
+            .contains(&display)
+        {
+            return Ok(Some(index));
         }
     }
+    Ok(None)
+}
+
+fn open_device(
+    adapter: &::wgpu::Adapter,
+) -> Result<(::wgpu::Device, ::wgpu::Queue, khr::present_wait::Device)> {
+    let desc = Wgpu::device_descriptor(adapter)?;
+    // SAFETY: the adapter guards its raw handles. The callback adds only two
+    // features that this physical device reports. Both feature structs live
+    // through vkCreateDevice and all of wgpu's requested features remain enabled.
+    let (open, wait) = unsafe {
+        let hal = adapter
+            .as_hal::<Vulkan>()
+            .ok_or(Error::Unsupported("a Vulkan adapter"))?;
+        let supported = hal.physical_device_capabilities();
+        let shared = hal.shared_instance();
+        if shared.instance_api_version() < vk::API_VERSION_1_1
+            || ![khr::present_id::NAME, khr::present_wait::NAME]
+                .iter()
+                .all(|ext| supported.supports_extension(ext))
+        {
+            return Err(Error::Unsupported("Vulkan presentation feedback"));
+        }
+        let instance = shared.raw_instance();
+        let mut id = vk::PhysicalDevicePresentIdFeaturesKHR::default();
+        let mut wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
+        let mut query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut id)
+            .push_next(&mut wait);
+        instance.get_physical_device_features2(hal.raw_physical_device(), &mut query);
+        if id.present_id != vk::TRUE || wait.present_wait != vk::TRUE {
+            return Err(Error::Unsupported("Vulkan presentation feedback"));
+        }
+        let mut id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut wait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        let open = hal
+            .open_with_callback(
+                desc.required_features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                Some(Box::new(|args| {
+                    args.extensions
+                        .extend([khr::present_id::NAME, khr::present_wait::NAME]);
+                    *args.create_info = args.create_info.push_next(&mut id).push_next(&mut wait);
+                })),
+            )
+            .map_err(|e| Error::Device(e.to_string()))?;
+        let wait = khr::present_wait::Device::new(instance, open.device.raw_device());
+        (open, wait)
+    };
+    // SAFETY: open belongs to this adapter and was created with this descriptor.
+    let (device, queue) = unsafe { adapter.create_device_from_hal::<Vulkan>(open, &desc) }
+        .map_err(|e| Error::Device(e.to_string()))?;
+    Ok((device, queue, wait))
 }

@@ -162,8 +162,19 @@ export function observe(views, inactive = () => false) {
     return pad > 0.5 && past > 1.5 && content <= room + 1.5 ? { by: viewOf(parent), dx: r2(past), pad: r2(pad), width: written } : null;
   };
   const page = document.scrollingElement;
+  // The box that covers `el` where `hit` is: the subtree beside `el` that `hit` is in. A subtree drawn around `el`, as a web
+  // sheet's header is (one grid over the whole sheet, its title above the content and its buttons at its foot), covers only
+  // from the top of its first child that starts at or above `my` and ends below `el`'s top, down to its own bottom: a row
+  // under the buttons is cleared by scrolling up past them, not past the whole sheet.
+  const coverBox = (el, hit, my) => {
+    let c = hit; while (c.parentElement && !c.parentElement.contains(el)) c = c.parentElement;
+    const r = c.getBoundingClientRect(), b = el.getBoundingClientRect();
+    if (r.top > b.top || r.bottom < b.bottom) return r;
+    const band = [...c.children].map((k) => k.getBoundingClientRect()).filter((k) => k.height > 0 && k.bottom > b.top && k.top <= my);
+    return band.length ? { top: Math.min(...band.map((k) => k.top)), bottom: r.bottom } : r;
+  };
   // Whether a scroller holding `el` could move it out from under `hit` (or, with none, into view): one `hit` does not
-  // move with. The cover is the subtree beside `el` that `hit` is in (the bar, the header, the sheet), and the middle `my`
+  // move with. The cover is `coverBox` (the bar, the header, the sheet), and the middle `my`
   // clears it by landing above it (the content moves up: room toward the end of at least `my - top`) or below it (the
   // content moves down: room back of at least `bottom - my`), within what the scroller shows of the screen: a bar along
   // its bottom edge is cleared only upward, a header along its top only downward, and a last row that scrolls only a few
@@ -171,8 +182,7 @@ export function observe(views, inactive = () => false) {
   // with the list's whole range to scroll it up by). With no `hit` (`my` unused), `above` says the element lies above
   // the screen: scrolling back reveals.
   const reach = (el, hit, above, my) => {
-    let cover = null;
-    if (hit) { let c = hit; while (c.parentElement && !c.parentElement.contains(el)) c = c.parentElement; cover = c.getBoundingClientRect(); }
+    const cover = hit ? coverBox(el, hit, my) : null;
     for (let s = el.parentElement; s; s = s.parentElement) {
       const scroller = s === page || s === document.body ? page : scrolls(s) ? s : null;
       if (!scroller || (hit && ((scroller !== page && scroller.contains(hit) && !fixed(hit, scroller)) || (scroller === page && !fixed(hit))))) continue;

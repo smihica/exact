@@ -6,8 +6,8 @@ license.workspace = true
 publish = false
 
 [features]
-# Present to a KMS display directly (VK_KHR_display) instead of reading pixels back.
-scanout = ["wgpu/drm"]
+# Older kiosk build manifests still name this feature. DRM is enabled on Linux.
+scanout = []
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
@@ -26,6 +26,10 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLResource", "MTLSampler", "MTLTexture", "MTLTypes", "MTLVertexDescriptor",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38", default-features = false }
+wgpu = { version = "30", default-features = false, features = ["drm"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSAppearance", "NSResponder", "NSView", "NSColor", "objc2-core-foundation", "objc2-core-graphics", "NSWindow", "NSApplication", "NSEvent", "objc2-quartz-core"] }
@@ -34,7 +38,8 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "CGDirectDisplay"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wgpu = { version = "30", default-features = false, features = ["wgsl", "metal", "vulkan", "dx12"] }
+# Each rendering thread owns its wgpu validation scopes.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["wgsl", "webgpu"] }

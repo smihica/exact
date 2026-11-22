@@ -10,6 +10,7 @@ import { chmodSync, closeSync, lstatSync, openSync, readlinkSync, readSync, copy
 export { buildInfo } from './buildinfo.mjs';
 import { alternateIcons, iconDigests, pickIcon, placeRgba, writeTinted } from '../../scripts/app-icons.mjs';
 import { encodePng } from '../../scripts/png.mjs';
+import { parseColour, schemeColours } from '../../scripts/scheme-colours.mjs';
 
 const run = (cmd, args, opts = {}) => {
   const r = spawnSync(cmd, args, { ...opts, stdio: opts.stdio === 'ignore' ? ['ignore', 'ignore', 'pipe'] : opts.stdio ?? 'inherit' });
@@ -331,7 +332,19 @@ export function appleRefusals(app, platform, { archive = false } = {}) {
 export function iosAssets(app, dir, device, options = {}) {
   return appleAssets(app, dir, { ...options, device, platform: options.tv ? 'tvos' : 'ios' });
 }
-export function appleAssets(app, dir, { platform = 'macos', device = false, catalog = false, requireIcon = catalog, kept = null, expected, expectedLaunchImage, icons = [], launch = 'system' } = {}) {
+/** The bake graph's inputs to an app's icons and launch assets, as appleAssets and appleAssetsKey take them. */
+export const bakedAssetInputs = (graph) => ({ icons: graph.appleIcons ?? [], launch: graph.launchBackground, ground: graph.launchGround });
+/** What an app's compiled icons and launch assets are made from: the key of their kept compile. */
+export function appleAssetsKey(app, { platform = 'ios', device = false, catalog = false, launch = 'system', ground = null, stamp = null, icons = [], catalogs = appleAssetCatalogInventory({ ...app, appleIcons: icons }, platform), launchImage = platform === 'ios' ? launchImageInventory(app) : null } = {}) {
+  const minimum = platform === 'watchos' ? WATCH_MINIMUM_OS : app.manifest.host?.[platform === 'tvos' ? 'ios' : platform]?.minimumOS ?? (platform === 'macos' ? '14.0' : '17.0');
+  return createHash('sha256').update(JSON.stringify([catalogs, iconDigests(app.manifest, app.dir), schemeColours(app.manifest, 'background_color'), app.manifest.userInterfaceStyle ?? null, launch, ground, launchImage,
+    minimum, platform, device, catalog, stamp,
+    // What the compile itself writes: a cache from before `--accent-color` named no accent,
+    // one from before `ExactLaunchImageSource` no launch image's source or digest,
+    // one from before `digest` launch assets under fixed names
+    'live-icons-with-manifest-fallback', 'accent-color', 'launch-image-source', 'launch-image-digest', 'launch-names-digest', 'alternate-app-icons', 'icon-appearances', 'tv-brand-assets', 'launch-color-components', 'declared-alternate-icons', 'launch-ground', 'launch-per-scheme'])).digest('hex').slice(0, 16);
+}
+export function appleAssets(app, dir, { platform = 'macos', device = false, catalog = false, requireIcon = catalog, kept = null, expected, expectedLaunchImage, icons = [], launch = 'system', ground = null } = {}) {
   // tvOS takes the manifest's iOS section.
   const minimum = platform === 'watchos' ? WATCH_MINIMUM_OS : app.manifest.host?.[platform === 'tvos' ? 'ios' : platform]?.minimumOS ?? (platform === 'macos' ? '14.0' : '17.0');
   const catalogs = appleAssetCatalogInventory({ ...app, appleIcons: icons }, platform);
@@ -345,19 +358,14 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
   if (refused) throw new Error(refused);
   if (platform === 'macos' && !catalogs.length) { rmSync(resolve(dir, 'Assets.car'), { force: true }); return {}; }
   if (kept) {
-    const key = createHash('sha256').update(JSON.stringify([catalogs, iconDigests(app.manifest, app.dir), app.manifest.background_color ?? null, app.manifest.color_scheme_dark?.background_color ?? null, launch, launchImage,
-      minimum, platform, device, catalog, kept.stamp,
-      // What the compile itself writes: a cache from before `--accent-color` named no accent,
-      // one from before `ExactLaunchImageSource` no launch image's source or digest,
-      // one from before `digest` launch assets under fixed names
-      'live-icons-with-manifest-fallback', 'accent-color', 'launch-image-source', 'launch-image-digest', 'launch-names-digest', 'alternate-app-icons', 'icon-appearances', 'tv-brand-assets', 'launch-color-components', 'declared-alternate-icons'])).digest('hex').slice(0, 16);
+    const key = appleAssetsKey(app, { platform, device, catalog, launch, ground, stamp: kept.stamp, catalogs, launchImage });
     const made = resolve(kept.dir, `assets-${platform}-${key}`);
     if (!existsSync(resolve(made, 'keys.json'))) {
       const making = `${made}.${process.pid}.tmp`;
       rmSync(making, { recursive: true, force: true });
       mkdirSync(making, { recursive: true });
       try {
-        writeFileSync(resolve(making, 'keys.json'), JSON.stringify(appleAssets(app, making, { platform, device, catalog, requireIcon, expected: catalogs, expectedLaunchImage: launchImage, icons, launch })));
+        writeFileSync(resolve(making, 'keys.json'), JSON.stringify(appleAssets(app, making, { platform, device, catalog, requireIcon, expected: catalogs, expectedLaunchImage: launchImage, icons, launch, ground })));
         rmSync(made, { recursive: true, force: true });
         renameSync(making, made);
       } finally { rmSync(making, { recursive: true, force: true }); }
@@ -392,7 +400,7 @@ export function appleAssets(app, dir, { platform = 'macos', device = false, cata
     // The icon is compiled in every build: only Assets.car carries its dark and tinted appearances, and actool
     // writes the bundle's fallback PNGs and CFBundleIcons from it (LLP 1163 D6). So is each alternate drawn
     // from its icons, as a set of its name (LLP 1163.000 D2).
-    const keys = platform === 'ios' ? { ...appIcon(app, dir, 'ios', { catalog: assets }), ...launchScreen(app, assets, launch, picture) }
+    const keys = platform === 'ios' ? { ...appIcon(app, dir, 'ios', { catalog: assets }), ...launchScreen(app, assets, launch, picture, ground) }
       : platform === 'watchos' ? appIcon(app, dir, 'watchos', { catalog: assets }) : {};
     for (const alternate of alternates.filter(alternate => alternate.generated)) appIconSet(alternate.fragment, assets, alternate.name, 'ios', icon(alternate.fragment, 'ios'));
     // tvOS's icon is the brand assets of the app's catalogs, else the manifest's.
@@ -451,28 +459,30 @@ export function composerFallback(manifest, dir) {
   return pickIcon(manifest, dir, { purposes: ['maskable', 'any'], px: 512, formats: ['png'], native: true, name: 'the older-iOS fallback' })?.path ?? null;
 }
 
-/** The launch screen in the app's own background, light and dark
- * (the manifest's `background_color` and `color_scheme_dark.background_color`): iOS crossfades
- * from the launch screen to the first frame, and between two screens of one
- * colour that crossfade is invisible, so the app opens on its first frame.
- * Where the manifest names none, the app's unsaid background is the platform's
- * (LLP 1115 D2): `systemBackground`, which an empty `UILaunchScreen` already is
- * in both schemes, or, where the first route scrolls a grouped list (`launch`,
- * the bake's `launchBackground`, LLP 1116.011 D2.3), `systemGroupedBackground`,
- * which the system shows as #F2F2F7 and black. That is a colour set of its own
- * (a reference to the system colour compiles to its light value alone), so the
- * window under the first frame (`ExactLaunchColor`, the same components) is the
- * same grey and nothing lighter shows between the launch screen and the first
- * frame (stopwatch, round 13: "blank white screen for ~1 s").
- * `UILaunchScreen` names colours and images only from an asset catalog, so
- * this writes its colour set, and the manifest's `host.ios.launchImage`
- * (`picture`: its captured bytes' file and width) as an image set at its
- * width in points (1x, 2x and 3x), which iOS centres on that colour, for the
- * shared compile. Returns the plist keys to merge. */
-function launchScreen(app, catalog, launch = 'system', picture = null) {
-  const named = app.manifest.background_color;
-  const light = named ?? (launch === 'grouped' ? '#F2F2F7' : undefined);
-  const dark = named ? app.manifest.color_scheme_dark?.background_color : launch === 'grouped' ? '#000000' : undefined;
+/** The launch screen in the app's own background, light and dark: iOS crossfades from the
+ * launch screen to the first frame, and between two screens of one colour that crossfade is
+ * invisible, so the app opens on its first frame. Each scheme's colour is the manifest's for it
+ * (`schemeColours`, LLP 1163 D2), else the app's own ground (`ground`, the bake's `launchGround`),
+ * else the platform's page (LLP 1115 D2): `systemBackground`, which an empty `UILaunchScreen`
+ * already is in both schemes, or, where the first screen scrolls a grouped list (`launch`, the
+ * bake's `launchBackground`, LLP 1116.011 D2.3), `systemGroupedBackground`. `UILaunchScreen`
+ * names one colour set or none, and a set's reference to a system colour compiles to its light
+ * value alone, so a page that shares a set with a named or read colour is written as the values
+ * the system shows at the base level: #FFFFFF or #F2F2F7 light, black dark, as a hand-built app's
+ * launch colour set writes them. A Display P3 colour is written in that space. The window under
+ * the first frame (`ExactLaunchColor`, the same components) is the same colour, so nothing else
+ * shows between the launch screen and the first frame (stopwatch, round 13: "blank white screen
+ * for ~1 s"). The manifest's `host.ios.launchImage` (`picture`: its captured bytes' file and
+ * width) is an image set at its width in points (1x, 2x and 3x), which iOS centres on that
+ * colour, for the shared compile. Returns the plist keys to merge. */
+export function launchScreen(app, catalog, launch = 'system', picture = null, ground = null) {
+  const named = schemeColours(app.manifest, 'background_color'), style = app.manifest.userInterfaceStyle;
+  const page = launch === 'grouped' ? { light: '#F2F2F7', dark: '#000000' } : { light: '#FFFFFF', dark: '#000000' };
+  // Write no colour where the launch is the plain page in both schemes: the system's own launch screen is that
+  const plain = !named.light && !named.dark && !ground && launch !== 'grouped';
+  const colour = (scheme) => (plain ? null : named[scheme] ?? ground?.[scheme] ?? page[scheme]);
+  const fixed = style === 'light' || style === 'dark' ? style : null;
+  const light = colour(fixed ?? 'light'), dark = colour(fixed ?? 'dark');
   const keys = {};
   if (picture) {
     keys.UIImageName = `ExactLaunchImage-${digest([picture.sha256, picture.width])}`;
@@ -490,22 +500,26 @@ function launchScreen(app, catalog, launch = 'system', picture = null) {
   // ImageIO reader; other bytes under the name (an update's) are decoded.
   const source = picture ? { ExactLaunchImageSource: app.manifest.host.ios.launchImage.src, ExactLaunchImageSHA256: picture.sha256 } : {};
   if (!light) return picture ? { UILaunchScreen: keys, ...source } : {};
-  const components = (hex, field) => {
-    const m = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(hex ?? '');
-    if (!m) throw new Error(`${field} must be a #RGB, #RRGGBB or #RRGGBBAA colour, not ${JSON.stringify(hex)}`);
-    const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join('') : m[1];
-    const a = h.length === 8 ? parseInt(h.slice(6), 16) : 255;
-    return { 'color-space': 'srgb', components: { red: `0x${h.slice(0, 2)}`, green: `0x${h.slice(2, 4)}`, blue: `0x${h.slice(4, 6)}`, alpha: (a / 255).toFixed(3) } };
+  const field = (scheme) => (app.manifest[`color_scheme_${scheme}`]?.background_color ? `color_scheme_${scheme}.background_color` : named[scheme] ? 'background_color' : `the ${scheme} launch colour`);
+  const components = (text, scheme) => {
+    const { space, rgb, alpha } = parseColour(text, field(scheme));
+    const value = (v) => (space === 'srgb' ? `0x${Math.round(v * 255).toString(16).padStart(2, '0')}` : v.toFixed(4));
+    return { 'color-space': space, components: { red: value(rgb[0]), green: value(rgb[1]), blue: value(rgb[2]), alpha: alpha.toFixed(3) } };
   };
-  const colors = [{ idiom: 'universal', color: components(light, 'background_color') }];
-  if (dark) colors.push({ idiom: 'universal', appearances: [{ appearance: 'luminosity', value: 'dark' }], color: components(dark, 'color_scheme_dark.background_color') });
+  const lightColour = components(light, fixed ?? 'light'), darkColour = components(dark, 'dark');
+  const colors = [{ idiom: 'universal', color: lightColour }];
+  // Write a dark appearance only where it differs, so a colour that serves both schemes keeps its set's name
+  if (JSON.stringify(darkColour) !== JSON.stringify(lightColour)) colors.push({ idiom: 'universal', appearances: [{ appearance: 'luminosity', value: 'dark' }], color: darkColour });
   const name = `ExactLaunch-${digest(colors)}`;
   mkdirSync(resolve(catalog, `${name}.colorset`), { recursive: true });
   writeFileSync(resolve(catalog, `${name}.colorset`, 'Contents.json'), JSON.stringify({ colors, info: { author: 'exact', version: 1 } }));
-  // The host uses the same sRGB components as the catalogue, including its
-  // rounded alpha, without loading Assets.car before UIApplicationMain.
-  const rgba = ({ color: { components: c } }) => [parseInt(c.red, 16) / 255, parseInt(c.green, 16) / 255, parseInt(c.blue, 16) / 255, Number(c.alpha)];
-  return { UILaunchScreen: { UIColorName: name, ...keys }, ExactLaunchColor: { light: rgba(colors[0]), ...(dark ? { dark: rgba(colors[1]) } : {}) }, ...source };
+  // The host uses the same components as the catalogue, including its rounded alpha, without loading
+  // Assets.car before UIApplicationMain: an sRGB colour's as they are, a Display P3 one's under its space
+  const rgba = ({ color: { 'color-space': space, components: c } }) => {
+    const value = [...[c.red, c.green, c.blue].map((v) => (space === 'srgb' ? parseInt(v, 16) / 255 : Number(v))), Number(c.alpha)];
+    return space === 'srgb' ? value : { [space]: value };
+  };
+  return { UILaunchScreen: { UIColorName: name, ...keys }, ExactLaunchColor: { light: rgba(colors[0]), ...(colors[1] ? { dark: rgba(colors[1]) } : {}) }, ...source };
 }
 
 /** A launch asset's name ends in a digest of what it draws: iOS keeps the launch
@@ -1039,12 +1053,14 @@ export function wrapFramework(frameworks, loose, name, app, platform = 'iPhoneOS
   writePrivacyManifest(dirname(layout.info), [layout.binary], { mac: platform === 'MacOSX', ...privacy });
 }
 
+/** The version and build number a framework's Info.plist carries: the app's, from EXACT_VERSION and EXACT_BUILD_NUMBER. */
+export const frameworkVersions = (env = process.env) => ({ CFBundleVersion: env.EXACT_BUILD_NUMBER ?? '1', CFBundleShortVersionString: env.EXACT_VERSION ?? '0.1.0' });
 /** The Info.plist `wrapFramework` writes. `signedGpuProduct` keys its signed copy on it, so
  * a change to what a framework declares makes the next build package it again. */
-export function frameworkInfo(name, app, platform) {
+export function frameworkInfo(name, app, platform, versions = frameworkVersions()) {
   return {
     CFBundleExecutable: name, CFBundleIdentifier: `${app.id}.${name.toLowerCase().replaceAll('_', '-')}`, CFBundleName: name,
-    CFBundlePackageType: 'FMWK', CFBundleVersion: process.env.EXACT_BUILD_NUMBER ?? '1', CFBundleShortVersionString: process.env.EXACT_VERSION ?? '0.1.0',
+    CFBundlePackageType: 'FMWK', ...versions,
     ...(platform === 'iPhoneOS' ? { UIRequiredDeviceCapabilities: ['arm64'] } : {}),
     CFBundleSupportedPlatforms: [platform], ...(platform === 'MacOSX' ? { LSMinimumSystemVersion: app.manifest.host?.macos?.minimumOS ?? '14.0' } : { MinimumOSVersion: app.manifest.host?.ios?.minimumOS ?? '17.0' }),
   };

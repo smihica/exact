@@ -342,7 +342,7 @@ extension NodeView {
     /// is told to the runner: before its own transform, which the runner
     /// applies, and after the host's placement, which the runner cannot know.
     /// UIKit transforms a view about its center.
-    func topLayerFrame(in viewport: UIScrollView, containingBlock: CGRect? = nil) -> CGRect {
+    package func topLayerFrame(in viewport: UIScrollView, containingBlock: CGRect? = nil) -> CGRect {
         guard let parent = superview else { return .zero }
         let box = (containingBlock ?? CGRect(origin: .zero, size: bounds.size))
             .offsetBy(dx: -bounds.width / 2, dy: -bounds.height / 2)

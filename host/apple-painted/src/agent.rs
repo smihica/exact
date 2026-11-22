@@ -1,8 +1,10 @@
 //! The native host's JSON-lines protocol, serviced by the window thread.
 use super::window::Event;
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::time::Duration;
 use winit::event_loop::EventLoopProxy;
 
 pub struct Agent {
@@ -68,8 +70,35 @@ fn serve(
         let Ok(answer) = receive.recv() else {
             break;
         };
-        writeln!(writer, "{answer}")?;
-        writer.flush()?;
+        write_reply(&mut writer, &answer, std::thread::sleep)?;
     }
     Ok(())
+}
+
+fn write_reply(
+    writer: &mut impl Write,
+    answer: &Value,
+    wait: impl FnOnce(Duration),
+) -> std::io::Result<()> {
+    // The window can keep turning while the contact is held.
+    if let Some(ms) = answer["waitMs"].as_f64().filter(|&ms| ms > 0.) {
+        wait(Duration::from_secs_f64(ms / 1000.));
+    }
+    writeln!(writer, "{answer}")?;
+    writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_drive_waits_for_the_contact_hold_before_replying() {
+        let mut output = Vec::new();
+        let answer = serde_json::json!({"phase":"hold","waitMs":250});
+        let mut waited = None;
+        write_reply(&mut output, &answer, |duration| waited = Some(duration)).unwrap();
+        assert_eq!(waited, Some(Duration::from_millis(250)));
+        assert_eq!(output, format!("{answer}\n").as_bytes());
+    }
 }

@@ -6,6 +6,10 @@ use super::{property, StyleId};
 pub(super) fn push(out: &mut String, id: StyleId, press: bool) -> bool {
     use StyleId::*;
     match id {
+        ObjectPosition => out.push_str(
+            "--exact-object-position:50% 50%;object-position:var(--exact-tint-offset,50% 50%);",
+        ),
+        ObjectFit => out.push_str("object-fit:unset;--exact-tint-size:100% 100%;"),
         TintColor | ExitAnimation | DragTimeline | AnimationTimeline | AnimationRange
         | TimelineScope | SafeAreaProperties | LayoutTransition | PressScale | PressHaptic
         | ControlSize | ControlCornerStyle | Fit | LineClamp | RotateAxis | TranslateZ
@@ -23,10 +27,43 @@ pub(super) fn push(out: &mut String, id: StyleId, press: bool) -> bool {
         // A clear is unsaid, as `auto` is (selection.rs): no declaration, so the
         // page's sheet decides.
         UserSelect => {}
-        // Their values write nothing (css.rs, LLP 1123 D4, D11, D12), so neither does a clear.
-        SafeAreaIgnore
+        // Their values write nothing (css.rs, LLP 1123 D4, D8, D11 to D14), so neither does a clear.
+        ScrollContentInsetTop
+        | ScrollContentInsetRight
+        | ScrollContentInsetBottom
+        | ScrollContentInsetLeft
+        | ScrollVerticalIndicatorInsetsTop
+        | ScrollVerticalIndicatorInsetsRight
+        | ScrollVerticalIndicatorInsetsBottom
+        | ScrollVerticalIndicatorInsetsLeft
+        | ScrollHorizontalIndicatorInsetsTop
+        | ScrollHorizontalIndicatorInsetsRight
+        | ScrollHorizontalIndicatorInsetsBottom
+        | ScrollHorizontalIndicatorInsetsLeft
+        | SafeAreaExtendBoundsTop
+        | SafeAreaExtendBoundsRight
+        | SafeAreaExtendBoundsBottom
+        | SafeAreaExtendBoundsLeft
+        | ScrollInsetAdjustment
+        | ScrollIndicatorAdjustment
+        | ScrollEdgeEffectSoft
+        | ScrollEdgeEffectHard
+        | ScrollEdgeEffectHidden
+        | SafeAreaReach
+        | SafeAreaReachEdges
+        | SafeAreaExtend
+        | SafeAreaIgnore
         | SafeAreaIgnoreAlign
         | SafeAreaBar
+        | LayoutMarginTop
+        | LayoutMarginRight
+        | LayoutMarginBottom
+        | LayoutMarginLeft
+        | LayoutMarginLeading
+        | LayoutMarginTrailing
+        | LayoutMarginsPreserved
+        | LayoutMarginsFromSafeArea
+        | LayoutMarginsMinimum
         | AdditionalSafeAreaTop
         | AdditionalSafeAreaRight
         | AdditionalSafeAreaBottom

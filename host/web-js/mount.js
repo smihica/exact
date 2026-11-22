@@ -29,7 +29,9 @@ import {
   presentArm,
   presentRows,
   Why,
+  startLate,
 } from './rt.js';
+import { canonical } from './route-pattern.js';
 import { clock, agentMode } from './clock.js';
 import { at, mark, Mismatch } from './tree.js';
 import { Leave, exiting } from './pieces.js';
@@ -39,7 +41,9 @@ import { conforms } from './shape.js';
 // clock runs, null before then. It may be 0 or less: a paused test clock can read 0 at the mount, and an adopted
 // render's clock may have run longer than the page has.
 export let Booting = false,
-  start = null;
+  start = null,
+  // Whether the boot adopted the rendered page, so its document is the one the server sent (marks.js)
+  Adopted = false;
 export const booting = () => Booting;
 export let Adopt = false,
   // The parents whose rows a keyed list adopted: one holding rows past the list's (a page built ahead, opened at a
@@ -538,12 +542,13 @@ export function mount(f) {
   // checkpoint, so this rule does not apply to them, as in the runner's carried boot.
   if (Store.map.size && checkpoint().kept) {
     for (const r of Resources) {
-      if (r.store) {
+      if (r.store && r.stand === 'page') {
         r.baked = true;
       }
     }
   }
   let built = false;
+  if (checkpoint().elsewhere) root.textContent = '';
   Adopt = !!(checkpoint().kept && root.firstElementChild);
   // Elapsed time continues from where a render's clock stopped.
   start = clock.start = performance.now() - clock.now;
@@ -557,6 +562,7 @@ export function mount(f) {
   Booting = true;
   let booted = commit(
     () => {
+      startLate();
       scope(() => f(root));
       for (const p of AdoptedLists) {
         let n = at(p);
@@ -574,12 +580,13 @@ export function mount(f) {
     Lazy.length = LazyAt = 0;
     LazyRows.clear();
   }
-  const adopted = adopting && built;
+  Adopted = adopting && built;
   if (!built && adopting) {
     // The document isn't this plan's projection: build afresh (and say so).
     say(`adoption abandoned ${Why}`);
     root.textContent = '';
     booted = commit(() => {
+      startLate();
       scope(() => f(root));
       built = true;
     }, 'boot');
@@ -593,7 +600,7 @@ export function mount(f) {
   }
   // the runner's journal line (LLP 1012 logs)
   say(`boot: ${root.getElementsByTagName('*').length} nodes, epoch ${clock.epoch}`);
-  if (adopted) say('adopted the document');
+  if (Adopted) say('adopted the document');
   autofocus(root); // the document's autofocus (LLP 1035.000 D9), then each commit's mounts (`commit`, focus.js)
   // Rows waiting are in flight, for the agent's `clock settle`.
   if (Lazy.length) {
@@ -617,7 +624,7 @@ export function mount(f) {
 }
 /** The page's checkpoint (LLP 1048.000 D6): the time the render stopped at, and by resource name the `source` and
  * `answers` its document used, each `[args, value, open, reads]`: one, or a list's elements', where a new element
- * looks first at `next`. */
+ * looks first at `next`; or `elsewhere`, and nothing kept, for a page rendered at another location. */
 export let Checkpoint = null,
   // A document's answer from the reader's own device was the render's: `res` asks it again, as a bake's
   // (LLP 1048.007 D2).
@@ -628,8 +635,16 @@ export function checkpoint() {
   const el =
     typeof document !== 'undefined' && document.querySelector('script[type="application/vnd.exact.checkpoint"]');
   if (!el) return Checkpoint;
-  const cp = JSON.parse(el.textContent),
-    open = new Set(cp.open),
+  const cp = JSON.parse(el.textContent);
+  // Render fresh, seeding nothing, where the browser's path is not the page's once both are canonical, the query aside
+  // (LLP 1048.000 D6): a page a static host serves at another path, its `404.html` or its fallback to `/`, is another
+  // location's document, and its answers are another location's. Both paths keep a mounted build's base.
+  if (canonical(location.pathname) !== canonical(cp.location).split('?')[0]) {
+    Checkpoint.elsewhere = true;
+    say(`document: rendered at ${cp.location}, not ${location.pathname}; rendering fresh`);
+    return Checkpoint;
+  }
+  const open = new Set(cp.open),
     readers = new Set(cp.readers);
   // A drive starts at zero even when its document was rendered on a wall clock.
   const driven = typeof location !== 'undefined' && agentMode() && !globalThis.__exactRender;

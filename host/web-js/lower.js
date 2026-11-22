@@ -4,7 +4,7 @@
 // those statements, the same maps and `cssText`, with `css`'s refusal read-back (A8), into one rule of
 // `<style id="exact-arms">` at three ids and a class: over every static class, under every `!important` rule.
 // That DOM work is once a site an arm, never an instance; after it the node's write is its class alone, cached.
-import { adopting, css, cssText, effect, normal, say } from "./rt.js";
+import { adopting, css, cssText, effect, normal, say, GPU_PLACEMENT } from "./rt.js";
 
 let Arms = null;
 // What builds a rule's text besides the recipe: a host whose runtime changed (a reload under a kept document) starts the
@@ -54,9 +54,12 @@ export function Pc(e, key, statics, name, values, props, recipe) {
       return;
     }
     rule(`${name}-${k}`, recipe, values[k]);
+    const placement = GPU_PLACEMENT && e.exactPlaced && props.includes("position") ? globalThis.exact?.gpu : null;
+    placement?.beforeStyle(e);
     e.className = `${statics}${name}-${k}`;
     // The renderer's inline rows go after the class is on, in the same task: no frame shows neither (theme2 condition 9).
     if (rendered) for (const p of props) e.style.removeProperty(p);
     rendered = false;
+    placement?.afterStyle(e);
   });
 }

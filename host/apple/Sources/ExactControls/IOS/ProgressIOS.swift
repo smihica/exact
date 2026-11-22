@@ -31,7 +31,8 @@ extension ControlHost {
         }
         for owner in owners {
             let spinner = spinners[owner.id] ?? {
-                let made = UIActivityIndicatorView(style: .medium)
+                let made = SpinnerIOS(style: .medium)
+                made.owner = owner
                 // Stopped, it still shows its frame: the agent's still one.
                 made.hidesWhenStopped = false
                 made.isUserInteractionEnabled = false
@@ -100,7 +101,8 @@ extension ControlHost {
         for owner in owners {
             let fresh = bars[owner.id] == nil
             let bar = bars[owner.id] ?? {
-                let made = UIProgressView(progressViewStyle: .default)
+                let made = ProgressBarIOS(progressViewStyle: .default)
+                made.owner = owner
                 made.isUserInteractionEnabled = false
                 bars[owner.id] = made
                 return made
@@ -112,6 +114,8 @@ extension ControlHost {
             assign(bar, \.frame, CGRect(x: box.minX, y: box.midY - height / 2, width: box.width, height: height))
             // UIKit draws the progress in the bar's tint and dims it; a share of it is the progress's colour
             assign(bar, \.progressTintColor, owner.accentShare)
+            // Authored background-color colours the bar's track rather than painting the outer box (expo/exact#836).
+            assign(bar, \.trackTintColor, owner.uiColor("background_color"))
             assign(bar, \.isHidden, owner.cssVisibilityHidden)
             assign(bar, \.accessibilityIdentifier, owner.props["testId"])
             assign(bar, \.accessibilityLabel, owner.props["accessibilityLabel"])
@@ -143,5 +147,27 @@ extension ControlHost {
         return ["view": "UIActivityIndicatorView", "style": s.style == .large ? "large" : "medium", "animating": s.isAnimating,
                 "size": [InspectionValue.r2(s.bounds.width), InspectionValue.r2(s.bounds.height)]]
     }
+}
+/// UIKit's progress bar, which VoiceOver reads as an element of its own:
+/// given the drag of a draggable node around it when asked (LLP 1094.000 D9).
+final class ProgressBarIOS: UIProgressView {
+    weak var owner: NodeView?
+    #if os(iOS)
+    override var accessibilityDragSourceDescriptors: [UIAccessibilityLocationDescriptor]? {
+        get { super.accessibilityDragSourceDescriptors ?? owner?.presenter?.dragOut?.descriptors(of: self, isElement: true) }
+        set { super.accessibilityDragSourceDescriptors = newValue }
+    }
+    #endif
+}
+
+/// UIKit's activity indicator, given that drag as the bar is.
+final class SpinnerIOS: UIActivityIndicatorView {
+    weak var owner: NodeView?
+    #if os(iOS)
+    override var accessibilityDragSourceDescriptors: [UIAccessibilityLocationDescriptor]? {
+        get { super.accessibilityDragSourceDescriptors ?? owner?.presenter?.dragOut?.descriptors(of: self, isElement: true) }
+        set { super.accessibilityDragSourceDescriptors = newValue }
+    }
+    #endif
 }
 #endif

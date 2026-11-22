@@ -591,12 +591,27 @@ export function planRouteTable(bytes) {
   const take = n => { const start = at; at += n; if (at > bytes.length) throw new Error('truncated plan'); return start; };
   const u32 = () => bytes.readUInt32LE(take(4));
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  const string = () => { const n = u32(); return decoder.decode(bytes.subarray(take(n), at)); };
+  const string = (length = u32()) => decoder.decode(bytes.subarray(take(length), at));
   for (const field of planFormat.header) {
     if (field.codec === 'string') string(); else take(4);
   }
-  const count = u32(), strings = [];
-  for (let i = 0; i < count; i++) strings.push(string());
+  const count = u32(), strings = [], members = [], owners = [];
+  for (let i = 0; i < count; i++) {
+    const tag = u32();
+    if (tag < 0x80000000) {
+      strings.push(string(tag));
+      continue;
+    }
+    const owner = tag - 0x80000000, member = u32();
+    if (owner > owners.length || member > members.length) throw new Error('unknown qualified plan name');
+    if (member === members.length) members.push(string());
+    if (owner === owners.length) owners.push(bytes.subarray(take(32), at).toString('hex'));
+    strings.push({member, owner});
+  }
+  const routeString = index => {
+    const ref = strings[index];
+    return typeof ref === 'object' ? `${members[ref.member]}#${owners[ref.owner]}` : ref;
+  };
   take(u32()); // code pool
   take(u32()); // data pool
   const width = codec => {
@@ -616,8 +631,8 @@ export function planRouteTable(bytes) {
       let offset = start + i * size;
       const row = {};
       for (const field of table.fields) {
-        if (field.name === 'name') row.name = strings[bytes.readUInt32LE(offset)];
-        if (field.name === 'pattern') row.pattern = strings[bytes.readUInt32LE(offset)];
+        if (field.name === 'name') row.name = routeString(bytes.readUInt32LE(offset));
+        if (field.name === 'pattern') row.pattern = routeString(bytes.readUInt32LE(offset));
         if (field.name === 'render') { row.render = renderPolicies[bytes[offset]]; if (!row.render) throw new Error('invalid route render policy'); }
         if (field.name === 'notfound') { const value = bytes[offset]; if (value > 1) throw new Error('invalid route'); row.notfound = !!value; }
         offset += width(field.codec);
@@ -1426,7 +1441,7 @@ function sourcesOf(dist, id) {
 /** A development page's trace (LLP 1079 D5): ⌥⇧T posts its journal, frames and
  * `perf`; this adds what only the server knows — the build's identity, as
  * stress-metrics.mjs writes it, the plan's digest and its source map — and
- * writes it under the app's target/traces/ for `agent.mjs trace <file>`. */
+ * writes it under the app's .exact/traces/ for `agent.mjs trace <file>`. */
 export async function saveTrace(req, res, { app, dist, root }) {
   const reply = (status, body) => { res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(body)); };
   try {
@@ -1441,8 +1456,9 @@ export async function saveTrace(req, res, { app, dist, root }) {
     trace.plan = trace.perf?.plan ?? plan;
     if (trace.perf && !trace.perf.plan) trace.perf.plan = plan;
     if (trace.plan === plan && existsSync(mapFile)) trace.map = JSON.parse(readFileSync(mapFile, 'utf8'));
-    mkdirSync(resolve(app.target, 'traces'), { recursive: true });
-    const path = resolve(app.target, 'traces', `trace-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    const dir = resolve(app.dir, '.exact', 'traces');
+    mkdirSync(dir, { recursive: true });
+    const path = resolve(dir, `trace-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
     writeFileSync(path, JSON.stringify(trace));
     console.log(`trace: ${path}`);
     reply(200, { path });

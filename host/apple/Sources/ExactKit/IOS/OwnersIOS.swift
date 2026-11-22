@@ -76,13 +76,13 @@ extension Presenter {
     /// except that a presented route, a dialog's sheet and a lifted popover
     /// bubble to their authored parent outside the presentation. The agent
     /// and accessibility activation take the same steps as a real touch.
-    func listenerParent(of view: UIView) -> UIView? {
+    package func listenerParent(of view: UIView) -> UIView? {
         if let node = view as? NodeView, let parent = dialogs.authoredParent(of: node) { return parent }
         if let parent = menus.logicalParent(of: view) { return parent }
         if let node = view as? NodeView, navigation.routeSurfaces[node.id]?.node === node, modals.mounts(node) {
             return eventParent(of: node)
         }
-        return view.superview
+        return navigation.lifted?.parent(of: view) ?? view.superview
     }
 
     package func authored(_ view: UIView, inside ancestor: UIView) -> Bool {
@@ -98,7 +98,8 @@ extension Presenter {
         var at: UIView? = start, crossed = false
         while let cur = at, cur !== target {
             let up = listenerParent(of: cur)
-            crossed = crossed || up !== cur.superview
+            // A node lifted over the tab container stays inside its parent's box on the page
+            crossed = crossed || (up !== cur.superview && (up !== navigation.lifted?.parent(of: cur) || navigation.lifted?.heldApart(cur) == true))
             at = up
         }
         return at != nil && crossed ? start : target
@@ -189,6 +190,9 @@ package struct TopLayerBox {
     let frame: TopLayerFrame?
     let modal: UIViewController?
     var backdrop: (bounds: CGRect, excluding: CGRect?)? = nil
+    package init(view: UIView, frame: TopLayerFrame?, modal: UIViewController?, backdrop: (bounds: CGRect, excluding: CGRect?)? = nil) {
+        (self.view, self.frame, self.modal, self.backdrop) = (view, frame, modal, backdrop)
+    }
 }
 
 /// Each route's root laid out in its controller's view (LLP 1123 D2): the
@@ -204,6 +208,9 @@ package final class OwnerBlocks {
     /// What the runtime was last told, by route: its block, and its
     /// placement unless it is presented.
     private(set) var told: [UInt32: (block: HostBlock, placement: BlockPlacement?)] = [:]
+    /// How the routes were last told they show against their stacks' tops,
+    /// where not in their stack (`NavigationHosting.routesShown`).
+    private(set) var toldShown: [UInt32: BlockShown] = [:]
     private var resetting = false, revealOwed = false
     private var viewChanges = 0
     /// Each block's rectangle in its root's coordinates (`BatchOp.blockRect`),
@@ -320,7 +327,7 @@ package final class OwnerBlocks {
             DispatchQueue.main.async { [weak self] in self?.publish() }
             return
         }
-        let records = takeChanges()
+        let records = takeChanges(shown: true)
         if !records.isEmpty {
             session.applyUnlessEmpty(session.runtime.blocks(records), scrolled: true)
         }
@@ -328,12 +335,16 @@ package final class OwnerBlocks {
     }
 
     /// Sample after UIKit has established containing bounds. A pending fill keeps
-    /// its deferred report, which samples again when that fill lands.
-    func takeChanges() -> Data {
+    /// its deferred report, which samples again when that fill lands. `shown`:
+    /// with how routes show against their stacks' tops (claim kind 23), which
+    /// `exact_host_covers` takes and `exact_view` refuses; without, a change
+    /// of it is told at the next publication.
+    func takeChanges(shown withShown: Bool = false) -> Data {
         guard !resetting, !presenter.resetting, !presenter.applying,
               !Owner.shared.isServingMain, let session = presenter.session,
               session.state != .destroyed, !session.fillInFlight else { return Data() }
         var now: [UInt32: (block: HostBlock, placement: BlockPlacement?)] = [:]
+        for pane in presenter.navigation.paneBlocks { now[pane.id] = (pane.block, pane.placement) }
         for (id, block) in presenter.dialogs.containingBlocks { now[id] = (block, nil) }
         for (route, view, block, shown, presented) in routes {
             let id = route.node.id
@@ -359,8 +370,24 @@ package final class OwnerBlocks {
         }
         // A block taken back forgets its placement with it
         blocks += told.keys.filter { now[$0] == nil && presenter.views[$0] != nil }.map { ($0, nil) }
+        // How a route shows is told of its block only: one given again starts
+        // in its stack in the kernel, so how it shows is told again (LLP 1127 D8)
+        for id in Array(toldShown.keys) where now[id] == nil { toldShown[id] = nil }
         told = now
-        return Runtime.blockRecords(blocks, placements: placements)
+        guard withShown else {
+            if !shownChanges().isEmpty { publish() }
+            return Runtime.blockRecords(blocks, placements: placements)
+        }
+        let shown = shownChanges()
+        toldShown = presenter.navigation.routesShown.filter { told[$0.key] != nil }
+        return Runtime.blockRecords(blocks, placements: placements, shown: shown)
+    }
+
+    /// How the routes with a block show against their stacks' tops, where
+    /// that changed since it was last told (`NavigationHosting.routesShown`).
+    private func shownChanges() -> [(UInt32, BlockShown)] {
+        let shown = presenter.navigation.routesShown.filter { told[$0.key] != nil }
+        return Set(toldShown.keys).union(shown.keys).filter { toldShown[$0] != shown[$0] }.map { ($0, shown[$0] ?? .inStack) }
     }
 
     private func revealIfOwed() {
@@ -400,6 +427,7 @@ package final class OwnerBlocks {
         teardown()
         resetting = false
         told = [:]
+        toldShown = [:]
         blockRects = [:]
         revealOwed = false
     }
@@ -411,7 +439,7 @@ extension Presenter {
     /// one opened earlier or outside the dialog stays beneath its card.
     /// The last modal boundary leaves only it and what is above it live.
     package var openTopLayer: TopLayerGeometry {
-        let boxes = owners.presented + dialogs.presented + menus.presented.map {
+        let boxes = navigation.topLayerBoxes + owners.presented + dialogs.presented + menus.presented.map {
             // Reported by its block, the viewport's (stage 14 B), as a dialog's sheet is.
             TopLayerBox(view: $0, frame: ($0.id, $0.topLayerFrame(in: viewport, containingBlock: owners.blockRects[$0.id]), nil), modal: nil)
         }
@@ -450,7 +478,7 @@ extension Presenter {
 
     /// A rectangle in the viewport's coordinates, less its scrolling: where
     /// a person sees it in the viewport, as the runner reads a top-layer box.
-    func viewportPoints(_ rect: CGRect) -> CGRect {
+    package func viewportPoints(_ rect: CGRect) -> CGRect {
         rect.offsetBy(dx: -viewport.pageOrigin.x, dy: -viewport.pageOrigin.y)
     }
 }

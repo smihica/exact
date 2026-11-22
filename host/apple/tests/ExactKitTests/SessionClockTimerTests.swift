@@ -9,6 +9,7 @@ import UIKit
 import UIKit.UIGestureRecognizerSubclass
 #endif
 @testable import ExactKit
+@testable import ExactDrag
 import ExactCore
 
 // Exercise the production decoder even when a fixture is written as JSON values.

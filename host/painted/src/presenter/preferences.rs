@@ -146,12 +146,12 @@ impl<D: DataSource> Presenter<D> {
         error
     }
 
-    /// Android's reader composes Activity and promoted service ownership in `Exact.executionEligible`.
-    /// Apply visibility and execution together, preserving the agent's substitute.
+    /// Apply the reader's visibility and execution together. A seekable drive
+    /// owns the frozen fact even while a frame capture borrows its clock.
     #[cfg(any(target_os = "android", test))]
-    pub(crate) fn page_execution(&mut self, hidden: bool, eligible: bool) -> bool {
+    pub(crate) fn page_execution(&mut self, hidden: bool, eligible: bool, seekable: bool) -> bool {
         let page = self.host.runner().page();
-        let frozen = if self.agent { page.frozen } else { !eligible };
+        let frozen = if seekable { page.frozen } else { !eligible };
         if page.hidden == hidden && page.frozen == frozen {
             return false;
         }
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_and_service_execution_edges_update_the_page_together() {
+    fn a_live_drive_tracks_activity_and_service_execution_together() {
         let plan = crate::test_plan("shape Page\n  frozen: bool\n  visibilityState: string\ncomponent App\n  resource page = exactPage() as shape Page\n  view\n    text `${page.frozen}`\n");
         let (mut p, error) = Presenter::boot_with(
             &plan,
@@ -570,6 +570,8 @@ mod tests {
         .unwrap();
         assert!(error.is_none(), "{error:?}");
         p.agent = false;
+        p.set_live_clock(Some(std::rc::Rc::new(|| 0.)));
+        crate::agent::handle_for_window(&mut p, r#"{"op":"tags"}"#);
         // Started; hidden with a promoted service; last claim released; foreground;
         // failed promotion at stop; promotion while hidden; service destroyed.
         for (hidden, eligible, frozen) in [
@@ -581,19 +583,18 @@ mod tests {
             (true, true, false),
             (true, false, true),
         ] {
-            p.page_execution(hidden, eligible);
+            p.page_execution(hidden, eligible, false);
             let page = p.host.runner().page();
             assert_eq!(page.hidden, hidden);
             assert_eq!(page.frozen, frozen);
             assert!(
-                !p.page_execution(hidden, eligible),
+                !p.page_execution(hidden, eligible, false),
                 "duplicate reports make no commit"
             );
         }
-        p.agent = true;
         let reply = crate::agent::handle(&mut p, r#"{"op":"prefer","page":{"frozen":true}}"#);
         assert!(!reply.contains("error"), "{reply}");
-        p.page_execution(false, true);
+        p.page_execution(false, true, true);
         assert!(
             p.host.runner().page().frozen,
             "live lifecycle cannot replace prefer"

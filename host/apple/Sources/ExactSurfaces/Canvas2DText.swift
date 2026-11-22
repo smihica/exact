@@ -6,6 +6,7 @@
 // declared family (LLP 1019) to its registered faces, then any installed
 // family by name; none is Chrome's default, serif.
 import CExact
+import CExact.Canvas
 import CoreGraphics
 import CoreText
 import Foundation

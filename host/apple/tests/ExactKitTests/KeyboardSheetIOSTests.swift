@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactDialogs
 @testable import ExactNavigation
 
 /// LLP 1039 D9 and LLP 1008 §9.1 (expo/exact#110): a sheet route's keyboard

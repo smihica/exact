@@ -210,10 +210,14 @@ impl Module {
             Ok(()) => {
                 inst.dirty = false;
                 // A canvas with no target of its own is shown by its host
-                // composing these pixels (Linux's display baseline): a
-                // complete frame is presented. One with a target is only
-                // being captured.
-                if inst.presentation.is_none() && !inst.has_ring() && inst.surface.frame_ready() {
+                // composing these pixels (Linux's display baseline), and a
+                // seekable agent drive falls back to readback when its window
+                // is occluded on macOS: a complete frame is presented. A live
+                // canvas with a target is only being captured.
+                if (inst.presentation.is_none() || self.seekable)
+                    && !inst.has_ring()
+                    && inst.surface.frame_ready()
+                {
                     inst.presented.now();
                 }
                 Some(wants)

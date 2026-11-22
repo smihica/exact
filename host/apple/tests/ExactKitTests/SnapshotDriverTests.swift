@@ -740,6 +740,38 @@ final class SnapshotDriverTests: XCTestCase {
         XCTAssertEqual(SnapshotSemantics.traits(HeadlessSession.Node(id: 3, kind: "view", frame: .zero, props: ["accessibilityRole": "button"])), .isButton)
     }
 
+    func testSFBackedTemplatesPositionTheirInkInSnapshots() throws {
+        let size = CGSize(width: 160, height: 80)
+        func bounds(_ position: BatchValue?, fit: String = "none") throws -> CGRect {
+            var style: NodeStyle = ["font_size": 20, "object_fit": .string(fit), "text_color": [0, 0, 0, 255]]
+            if let position { style["object_position"] = position }
+            let node = HeadlessSession.Node(id: 1, kind: "image", frame: CGRect(origin: .zero, size: size),
+                props: ["imageSource": "symbol:icon|square.fill|0 0 400 100||wide.svg", "symbolName": "square.fill"], style: style)
+            let view = SnapshotImageView(node: node, environment: SnapshotEnvironment(family: .systemSmall, contentMargins: EdgeInsets()))
+                .environment(\.colorScheme, .light).background(.white)
+            let p = try pixels(XCTUnwrap(render(view, size: size, scale: 1)))
+            var rect = CGRect.null
+            for y in 0..<p.height {
+                for x in 0..<p.width where p.data[(y * p.width + x) * 4] < 128 {
+                    rect = rect.union(CGRect(x: x, y: y, width: 1, height: 1))
+                }
+            }
+            XCTAssertFalse(rect.isNull)
+            return rect
+        }
+        let start = try bounds([0, 0]), placed = try bounds([7, 11])
+        XCTAssertEqual(placed, start.offsetBy(dx: 7, dy: 11))
+        let centered = try bounds(nil), invalid = try bounds(["invalid", 11])
+        XCTAssertEqual(invalid, centered)
+        XCTAssertGreaterThan(centered.minX, placed.maxX)
+        let filled = try bounds([0, 0], fit: "fill")
+        let contained = try bounds([0, 0], fit: "contain")
+        XCTAssertEqual(filled.midX, size.width / 2, accuracy: 0.5)
+        XCTAssertEqual(filled.minY, contained.minY, accuracy: 1)
+        XCTAssertEqual(filled.width, contained.width, accuracy: 1)
+        XCTAssertEqual(filled.height, contained.height, accuracy: 1)
+    }
+
     func testRasterIconCatalogsRenderInWidgetAndActivitySnapshots() throws {
         let path = try XCTUnwrap(ProcessInfo.processInfo.environment["EXACT_RASTER_ICONS_BUNDLE"])
         let bundle = try XCTUnwrap(Bundle(path: path))
@@ -761,6 +793,22 @@ final class SnapshotDriverTests: XCTestCase {
                     XCTAssertEqual(left, right)
                 }
             }
+        }
+    }
+
+    func testTemplateFillClipsAtTheWidgetObjectViewport() throws {
+        let size = CGSize(width: 160, height: 80)
+        for (w, h, inkX, inkY, blankX, blankY) in [(400, 100, 80, 70, 80, 10), (100, 400, 100, 40, 60, 40)] {
+            let props = ["imageSource": "symbol:icon||0 0 \(w) \(h)|M0 0|wide.svg", "symbolName": "",
+                         "symbolPath": "M 0 0 L \(w * 2) 0 L \(w * 2) \(h * 2) L 0 \(h * 2) Z",
+                         "symbolViewBox": "0 0 \(w) \(h)"]
+            let node = HeadlessSession.Node(id: 1, kind: "image", frame: CGRect(origin: .zero, size: size), props: props,
+                                            style: ["font_size": 20, "object_fit": "fill", "text_color": [0, 0, 0, 255]])
+            let view = SnapshotImageView(node: node, environment: SnapshotEnvironment(family: .systemSmall, contentMargins: EdgeInsets()))
+                .environment(\.colorScheme, .light).background(.white)
+            let image = try XCTUnwrap(render(view, size: size, scale: 1))
+            XCTAssertLessThan(try color(image, x: inkX, y: inkY)[0], 32)
+            XCTAssertGreaterThan(try color(image, x: blankX, y: blankY)[0], 240)
         }
     }
 

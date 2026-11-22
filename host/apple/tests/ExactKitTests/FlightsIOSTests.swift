@@ -56,12 +56,11 @@ final class FlightsIOSTests: XCTestCase {
     /// mix of the two: never taller than both ends, as the mix of fractions
     /// was (377 pt mid-flight against 245 and 301).
     func testAFlyingImageMovesInPointsBetweenItsTwoDrawings() {
-        let natural = CGSize(width: 1000, height: 750)
         let from = CGSize(width: 326, height: 245), to = CGSize(width: 402, height: 874)
-        let start = Presenter.fitFraction(natural: natural, box: from, fit: "cover")
-        let end = Presenter.fitFraction(natural: natural, box: to, fit: "contain")
-        let a = CGRect(x: start.minX * from.width, y: start.minY * from.height, width: start.width * from.width, height: start.height * from.height)
-        let b = CGRect(x: end.minX * to.width, y: end.minY * to.height, width: end.width * to.width, height: end.height * to.height)
+        let a = CGRect(x: (from.width - from.height * 4 / 3) / 2, y: 0, width: from.height * 4 / 3, height: from.height)
+        let b = CGRect(x: 0, y: (to.height - to.width * 3 / 4) / 2, width: to.width, height: to.width * 3 / 4)
+        let start = CGRect(x: a.minX / from.width, y: 0, width: a.width / from.width, height: 1)
+        let end = CGRect(x: 0, y: b.minY / to.height, width: 1, height: b.height / to.height)
         func close(_ r: CGRect, _ s: CGRect, _ what: String) {
             XCTAssertEqual(r.minX, s.minX, accuracy: 0.01, what); XCTAssertEqual(r.minY, s.minY, accuracy: 0.01, what)
             XCTAssertEqual(r.width, s.width, accuracy: 0.01, what); XCTAssertEqual(r.height, s.height, accuracy: 0.01, what)
@@ -199,36 +198,40 @@ final class FlightsIOSTests: XCTestCase {
         defer { loader.shutdown(); withExtendedLifetime(resolver) {} }
         p.apply(wireBatch([
             ["op": "create", "id": 1, "kind": "view", "props": ["testId": "n1"]],
-            ["op": "create", "id": 2, "kind": "image", "props": ["testId": "n2"], "style": ["object_fit": "cover"]],
+            ["op": "create", "id": 2, "kind": "image", "props": ["testId": "n2"], "style": ["object_fit": "none", "object_position": [0.0, 0.0]]],
             ["op": "create", "id": 3, "kind": "view", "props": ["testId": "n3"]],
             ["op": "children", "id": 1, "ids": [2, 3]], ["op": "roots", "ids": [1]],
             ["op": "frame", "id": 1, "x": 0.0, "y": 0.0, "w": 400.0, "h": 800.0],
             ["op": "frame", "id": 2, "x": 0.0, "y": 100.0, "w": 400.0, "h": 300.0],
+            contentOp(2, 400, 300, padding: [20, 15, 20, 15]),
             ["op": "frame", "id": 3, "x": 0.0, "y": 0.0, "w": 400.0, "h": 800.0]]))
         let leaver = try XCTUnwrap(p.views[2])
         land(leaver, "thumb.png", loader, resolver)
         let thumb = try XCTUnwrap(leaver.raster?.image.image, "the leaver's image decoded")
         p.apply(wireBatch([
             ["op": "flight", "id": 4, "from": 2], ["op": "destroy", "id": 2],
-            ["op": "create", "id": 4, "kind": "image", "props": ["testId": "n4"], "style": ["object_fit": "contain"]],
+            ["op": "create", "id": 4, "kind": "image", "props": ["testId": "n4"], "style": ["object_fit": "contain", "object_position": [0.0, 0.0]]],
             ["op": "children", "id": 3, "ids": [4]],
             ["op": "frame", "id": 4, "x": 0.0, "y": 0.0, "w": 400.0, "h": 800.0],
+            contentOp(4, 400, 800, padding: [30, 10, 30, 10]),
             ["op": "present", "id": 4, "property": "flight", "x": 0.0, "y": 0.0]]))
         let arriver = try XCTUnwrap(p.views[4])
         XCTAssertNil(arriver.raster, "no raster of its own yet (no session loads it here)")
         XCTAssertTrue(arriver.superview is FlightLayer, "it flies")
         let drawn = try XCTUnwrap(arriver.imageLayer, "it draws in the commit that hid the leaver")
         XCTAssertTrue((drawn.contents as AnyObject?) === thumb, "the leaver's pixels")
+        XCTAssertEqual(drawn.frame, CGRect(x: 15, y: 20, width: 200, height: 150))
         p.apply(wireBatch([["op": "present", "id": 4, "property": "flight", "x": 0.5, "y": 0.0]]))
         XCTAssertTrue((arriver.imageLayer?.contents as AnyObject?) === thumb, "still the leaver's mid-flight")
-        // Its own lands (a 4:1 image, contained in 400x800: 400x100 at y 350):
-        // from the next frame it draws that, where that is drawn.
+        XCTAssertEqual(arriver.flightLook?.image, CGRect(x: 12.5, y: 25, width: 290, height: 217.5))
         land(arriver, "full.png", loader, resolver)
         let full = try XCTUnwrap(arriver.raster?.image.image)
         p.apply(wireBatch([["op": "present", "id": 4, "property": "flight", "x": 1.0, "y": 0.0]]))
         XCTAssertTrue(((arriver.imageLayer?.contents ?? arriver.imageLayer?.sublayers?.first?.contents) as AnyObject?) === full, "its own pixels once they land")
         XCTAssertNil(arriver.flightLook?.stand, "the leaver's lease let go")
-        XCTAssertEqual(arriver.imageLayer?.frame.height ?? 0, 100, accuracy: 0.5, "at its own aspect")
+        XCTAssertEqual(arriver.flightLook?.image, CGRect(x: 10, y: 30, width: 380, height: 95))
+        p.landFlight(try XCTUnwrap(p.flights[4]))
+        XCTAssertEqual(arriver.imageLayer?.frame, CGRect(x: 10, y: 30, width: 380, height: 95))
     }
 
     /// A flight whose arriver is destroyed mid-flight drops the look that

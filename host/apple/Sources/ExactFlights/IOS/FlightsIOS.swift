@@ -4,8 +4,8 @@
 // another. It comes before the batch's destroys, so the leaver is still
 // here: where it is shown (window coordinates: its ancestors' transforms,
 // scroll offsets and a drag in progress included), its radius and an
-// image's fitted rectangle are captured. When the batch is applied, the
-// arriver's place is scrolled into view, then the arriver itself — live,
+// image's fitted rectangle and content clip are captured. When the batch is
+// applied, the arriver's place is scrolled into view, then the arriver itself — live,
 // not a snapshot — is lifted into a pass-through layer at the top of its
 // presentation's root view, leaving an empty slot where it lays out. Each
 // frame the host presents the curve's progress; the view is shown at the
@@ -21,8 +21,8 @@ import ExactKit
 struct FlightSource {
     var rect: CGRect // window coordinates
     var radius: CGFloat
-    /// An image's fitted rectangle as a fraction of its box.
-    var fit: CGRect?
+    /// The picture and its content clip, as fractions of the leaver's box.
+    var placement: FlightImagePlacement?
     var natural: CGSize?
     /// The leaver's decoded image (`FlightLook.stand`), held for the flight.
     package var raster: (any ImageLease)?
@@ -113,8 +113,8 @@ extension Presenter {
         var source = FlightSource(rect: Self.shownRect(leaver), radius: leaver.cornerRadii(in: leaver.bounds).max() ?? 0)
         if let flying = flights.values.first(where: { $0.view === leaver }), let look = leaver.flightLook {
             // A flight interrupted: from where it is now.
-            source.fit = CGRect(x: look.image.minX / max(leaver.bounds.width, 1), y: look.image.minY / max(leaver.bounds.height, 1),
-                                width: look.image.width / max(leaver.bounds.width, 1), height: look.image.height / max(leaver.bounds.height, 1))
+            source.placement = FlightImagePlacement(image: look.image, clip: look.contentClip ?? leaver.bounds)
+                .fraction(in: leaver.bounds)
             source.natural = flying.source.natural ?? leaver.raster?.image.naturalSize
             source.radius = leaver.layer.cornerRadius
             if let clip = flying.clip {
@@ -127,7 +127,7 @@ extension Presenter {
             // flying view's own raster landed, that is the replacement's.
             source.natural = source.raster?.image.naturalSize ?? source.natural
         } else if leaver.kind == "image", let natural = leaver.raster?.image.naturalSize {
-            source.fit = Self.fitFraction(natural: natural, box: leaver.bounds.size, fit: leaver.style["object_fit"]?.string ?? "fill")
+            source.placement = leaver.flightImagePlacement(natural: natural, in: leaver.bounds)
             source.natural = natural
             source.raster = leaver.raster
         }
@@ -213,7 +213,7 @@ extension Presenter {
         // new joint) was never put on it; in a clip, the clip flew rounded,
         // not the view. A gradient sublayer copies the layer's radius when
         // the view displays, so it displays again.
-        view.layer.masksToBounds = view.overflowClips && view.clipBox == nil
+        view.layer.masksToBounds = view.clipsItself
         view.applyBoxLayer()
         view.setNeedsDisplay()
     }
@@ -349,9 +349,10 @@ extension Presenter {
         view.layer.cornerRadius = mix(f.source.radius, view.cornerRadii(in: CGRect(origin: .zero, size: to.size)).max() ?? 0)
         if view.kind == "image" {
             let natural = view.raster?.image.naturalSize ?? f.source.raster?.image.naturalSize ?? f.source.natural ?? .zero
-            let end = Self.fitFraction(natural: natural, box: to.size, fit: view.style["object_fit"]?.string ?? "fill")
-            let start = f.source.fit ?? end
-            view.flightLook = FlightLook(image: Self.flightImage(from: from.size, fit: start, to: to.size, fit: end, progress: p),
+            let end = view.flightImagePlacement(natural: natural, in: slot.bounds)
+            let start = f.source.placement ?? end
+            view.flightLook = FlightLook(image: Self.flightImage(from: from.size, fit: start.image, to: to.size, fit: end.image, progress: p),
+                                         contentClip: Self.flightImage(from: from.size, fit: start.clip, to: to.size, fit: end.clip, progress: p),
                                          stand: view.raster == nil ? f.source.raster : nil)
             view.applyImageLayer()
         } else {
@@ -397,13 +398,6 @@ extension Presenter {
         func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * p }
         return CGRect(x: mix(start.minX * from.width, end.minX * to.width), y: mix(start.minY * from.height, end.minY * to.height),
                       width: mix(start.width * from.width, end.width * to.width), height: mix(start.height * from.height, end.height * to.height))
-    }
-
-    /// An image's fitted rectangle in a box, as a fraction of the box.
-    static func fitFraction(natural: CGSize, box: CGSize, fit: String) -> CGRect {
-        guard box.width > 0, box.height > 0, natural.width > 0, natural.height > 0 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
-        let r = RasterGeometry.rect(natural: natural, content: CGRect(origin: .zero, size: box), fit: fit)
-        return CGRect(x: r.minX / box.width, y: r.minY / box.height, width: r.width / box.width, height: r.height / box.height)
     }
 }
 #endif

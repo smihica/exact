@@ -1,5 +1,6 @@
 import XCTest
 import ExactCore
+import ExactSnapshot
 import CExact
 
 final class HeadlessSessionTests: XCTestCase {

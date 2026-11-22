@@ -24,7 +24,9 @@ fn run(dir: &Dir, args: &[&str], stdin: Option<&str>) -> Output {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
-    input.write_all(stdin.unwrap_or("").as_bytes()).unwrap();
+    if let Err(err) = input.write_all(stdin.unwrap_or("").as_bytes()) {
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+    }
     drop(input);
     child.wait_with_output().unwrap()
 }

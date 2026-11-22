@@ -6,7 +6,7 @@
 use accesskit::{ActionHandler, ActivationHandler};
 use std::{
     cell::RefCell,
-    sync::{Arc, Condvar, LazyLock, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex, mpsc},
     thread,
     time::Duration,
 };
@@ -193,13 +193,28 @@ pub(crate) fn scope<F>(
 where
     F: FnOnce(&Scope) -> Result<()>,
 {
+    scope_with_window(
+        || {
+            let window = create_window(window_title, activation_handler, action_handler)?;
+            Ok((window, |_: &MSG| false))
+        },
+        f,
+    )
+}
+
+pub(crate) fn scope_with_window<H>(
+    create: impl FnOnce() -> Result<(HWND, H)> + Send,
+    client: impl FnOnce(&Scope) -> Result<()>,
+) -> Result<()>
+where
+    H: FnMut(&MSG) -> bool,
+{
     let _lock_guard = MUTEX.lock();
 
-    let window_mutex: Mutex<Option<WindowHandle>> = Mutex::new(None);
-    let window_cv = Condvar::new();
+    let (send_window, receive_window) = mpsc::sync_channel(1);
 
     thread::scope(|thread_scope| {
-        thread_scope.spawn(|| {
+        thread_scope.spawn(move || {
             // We explicitly don't want to initialize COM on the provider thread,
             // because we want to make sure that the provider side of UIA works
             // even if COM is never initialized on the provider thread
@@ -207,31 +222,30 @@ where
             // initialized after the window is shown (as is the case,
             // at least on some Windows 10 machines, due to IME support).
 
-            let window = create_window(window_title, activation_handler, action_handler).unwrap();
-
-            {
-                let mut state = window_mutex.lock().unwrap();
-                *state = Some(window.into());
-                window_cv.notify_one();
-            }
+            let (window, mut handle) = match create() {
+                Ok(created) => created,
+                Err(error) => {
+                    send_window.send(Err(error)).unwrap();
+                    return;
+                }
+            };
+            send_window.send(Ok(WindowHandle::from(window))).unwrap();
 
             let mut message = MSG::default();
             while unsafe { GetMessageW(&mut message, None, 0, 0) }.into() {
-                let _ = unsafe { TranslateMessage(&message) };
-                unsafe { DispatchMessageW(&message) };
+                if !handle(&message) {
+                    let _ = unsafe { TranslateMessage(&message) };
+                    unsafe { DispatchMessageW(&message) };
+                }
             }
         });
 
-        let window = {
-            let mut state = window_mutex.lock().unwrap();
-            while state.is_none() {
-                state = window_cv.wait(state).unwrap();
-            }
-            state.take().unwrap()
-        };
+        let window = receive_window.recv().unwrap()?;
 
         let _window_guard = scopeguard::guard((), |_| {
-            unsafe { PostMessageW(Some(window.0), WM_CLOSE, WPARAM(0), LPARAM(0)) }.unwrap()
+            if unsafe { IsWindow(Some(window.0)) }.as_bool() {
+                let _ = unsafe { PostMessageW(Some(window.0), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
         });
 
         // We must initialize COM before creating the UIA client. The MTA option
@@ -253,7 +267,7 @@ where
             unsafe { CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) }?;
 
         let s = Scope { uia, window };
-        f(&s)
+        client(&s)
     })
 }
 

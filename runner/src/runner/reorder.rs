@@ -244,6 +244,7 @@ impl<D: DataSource> Runner<D> {
                 ops.extend(o);
             }
         }
+        self.sync_reorder_target();
         self.apply(ops).map(Some)
     }
     pub(super) fn reorder_collection(&self, key: NodeKey) -> Option<&Collection> {
@@ -264,8 +265,7 @@ impl<D: DataSource> Runner<D> {
         let mut tree = self.tree.take().expect("booted");
         let mut ids = std::mem::take(&mut self.ids);
         let result = {
-            let mut u = Update::new(self.env(&[], &[]), &self.sites, &mut ids);
-            u.fonts = Some(self.fonts.clone());
+            let mut u = self.instance_update(&mut ids);
             u.reuse = self.reuse;
             tree.edit_collection(id, &mut u, edit)
                 .map(|r| (r, u.ops, u.notes, u.renewed, u.shown))
@@ -284,6 +284,7 @@ impl<D: DataSource> Runner<D> {
         &mut self,
         ops: Vec<Op>,
     ) -> Result<Option<CommitReceipt>, RunnerError> {
+        self.sync_reorder_target();
         if ops.is_empty() {
             Ok(None)
         } else {

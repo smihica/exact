@@ -32,7 +32,7 @@ final class TransformDragHold {
               let binding = session.presenter.transformBindings[handle.id],
               let targetID = binding.target, let targetKey = binding.targetKey, let clipKey = binding.clipKey,
               let target = session.presenter.views[targetID], SwipeInput.allows(handle), SwipeInput.allows(target),
-              let geometry = session.presenter.transformGeometry.current(binding),
+              let geometry = session.presenter.handles?.geometry.current(binding),
               let presentation = target.transformDragPresentation() else { return nil }
         self.session = session; self.handle = handle; self.target = target; self.binding = binding
         window = target.window
@@ -66,7 +66,7 @@ final class TransformDragHold {
         guard incarnationLive, let session, let handle, let target else { return false }
         return session.presenter.views[handle.id] === handle && session.presenter.views[target.id] === target
             && session.presenter.transformBindings[handle.id] == binding
-            && session.presenter.transformGeometry.current(binding)?.sequence == sequence
+            && session.presenter.handles?.geometry.current(binding)?.sequence == sequence
             && target.window === window && window != nil
             && SwipeInput.allows(handle) && SwipeInput.allows(target)
     }

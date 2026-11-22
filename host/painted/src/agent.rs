@@ -180,7 +180,9 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
             p.tell_replacement_pending();
             // Host-only sections report `unavailable` instead of disappearing
             // (LLP 1035.002 D2), distinguishing no keyboard from no report.
-            let mut s = p.host().agent(line);
+            let runner = p.host().runner();
+            let observed = p.live_time().unwrap_or_else(|| runner.now_ms());
+            let mut s = exact_runner::agent::state_at(runner, line, observed);
             if s.ends_with('}') && !s.starts_with("{\"error\"") {
                 s.pop();
                 s.push_str(&p.state_sections());
@@ -314,13 +316,16 @@ fn answer_line<D: DataSource>(p: &mut Presenter<D>, line: &str) -> String {
             if request.get("close").is_some() {
                 return error("unsupported: the Linux presenter closes no window (no `beforeunload`); close drives a macOS window or the browser's page");
             }
-            // A drag from outside the app: this host takes none (no
-            // `drop`, `dragenter` or `dragleave`, as the guide says).
             if ["drop", "dragenter", "dragleave"]
                 .iter()
                 .any(|k| request.get(*k).is_some())
             {
-                return error(&format!("unsupported: the {HOST_NAME} host takes no drag from outside the app (no `drop`, `dragenter` or `dragleave`); drop drives the browser's page or a macOS window"));
+                if cfg!(windows) {
+                    return p
+                        .agent_file_drag(id(), &request)
+                        .unwrap_or_else(|e| error(&e));
+                }
+                return error(&format!("unsupported: the {HOST_NAME} host takes no drag from outside the app (no `drop`, `dragenter` or `dragleave`); drop is supported on web, macOS and Windows"));
             }
             // @ref LLP 1116.006 D4 — the platform's Back, as Alt+Left or a Back key takes it.
             if request.get("back").is_some() {

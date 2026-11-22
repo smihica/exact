@@ -77,6 +77,8 @@ impl Painter {
         let rows = self.has_rows(walk, node);
         let group = rows && !self.rows_wrapper(node.key);
         let wrap = group && self.wraps_rows(walk, &children);
+        let split_sections = rows && self.backend.independent_section_rows();
+        let sections = (split_sections && !wrap).then(|| self.row_sections(walk.scene.kernel));
         if group {
             self.group_begin(walk, node.id);
         }
@@ -84,7 +86,7 @@ impl Painter {
         let (last, count) = (self.stage_after(&children), children.len());
         for (at, child) in children.into_iter().enumerate() {
             self.replay_kept(walk.scene, &kept, at, space);
-            if wrap {
+            if wrap || Self::is_row_section(walk, sections.as_deref(), child) {
                 self.wrapped(walk, child, ts, child_offset, child_rect);
             } else if rows {
                 self.row(walk, child, ts, child_offset, child_rect);
@@ -131,9 +133,13 @@ impl Painter {
         let rect: Rect4 = (ghost.at.0, ghost.at.1, w, h);
         if ghost.shadow > 0. {
             let shadow = ShadowPaint::lifted(ghost.shadow);
-            for fill in shadow.fills(&Shape::rect(rect), [0.; 4]) {
-                self.backend.fill_border(&fill, ts);
-            }
+            let outer = Shape::rect(rect);
+            self.backend.box_shadow(
+                shadow.blurred(&outer),
+                &outer,
+                &|| shadow.fills(&outer, [0.; 4]),
+                ts,
+            );
         }
         let boxes = walk.boxes.len();
         let (reveal, page) = (walk.reveal, (node.frame.x - rect.0, node.frame.y - rect.1));

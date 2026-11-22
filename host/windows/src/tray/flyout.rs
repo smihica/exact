@@ -10,6 +10,8 @@
 //! it. Its pointer and keys are handed to the loop's next turn.
 #![allow(unsafe_code)]
 use super::placement::{Edge, Placement, Rect};
+use exact_painted::{presenter::top::StatusMenu, Presenter};
+use exact_runner::DataSource;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -39,10 +41,10 @@ use windows_sys::Win32::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, GetWindowRect,
             LoadCursorW, RegisterClassExW, SetForegroundWindow, SetWindowPos, ShowWindow,
             SystemParametersInfoW, CS_DROPSHADOW, HWND_TOPMOST, IDC_ARROW, SM_MENUDROPALIGNMENT,
-            SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE,
-            WM_CANCELMODE, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+            SPI_GETWHEELSCROLLLINES, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WA_INACTIVE,
+            WM_ACTIVATE, WM_CANCELMODE, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
@@ -88,8 +90,6 @@ impl State {
 pub(crate) struct Flyout {
     window: HWND,
     state: Rc<State>,
-    /// The opening shown.
-    shown: Option<u32>,
     access: crate::accessibility::MenuAccess,
 }
 
@@ -206,17 +206,20 @@ impl Flyout {
             access,
             window,
             state,
-            shown: None,
         })
     }
 
-    pub(crate) fn sync_access<D: exact_runner::DataSource>(
+    pub(crate) fn sync_access<D: DataSource>(
         &mut self,
-        p: &mut exact_painted::Presenter<D>,
+        p: &Presenter<D>,
+        menu: &StatusMenu,
         scale: f64,
     ) {
-        if self.shown.is_some() {
-            self.access.sync(p, scale);
+        if !self.state.shown.get() {
+            return;
+        }
+        if let Some(events) = self.access.update(p, menu, scale) {
+            events.raise();
         }
     }
 
@@ -272,19 +275,27 @@ impl Flyout {
         )
     }
 
-    /// Show opening `serial` beside its icon, with premultiplied RGBA
-    /// pixels. A new picture keeps the same anchor.
-    pub(crate) fn show(&mut self, serial: u32, anchor: Placement, rgba: &[u8], size: (u32, u32)) {
-        let bgra: Vec<u8> = rgba
+    /// Show the menu beside its icon. Prepare its tree before the HWND can be queried.
+    pub(crate) fn show<D: DataSource>(
+        &mut self,
+        menu: &StatusMenu,
+        (anchor, scale): (Placement, f32),
+        pixmap: &tiny_skia::Pixmap,
+        p: &Presenter<D>,
+    ) {
+        let bgra: Vec<u8> = pixmap
+            .data()
             .as_chunks::<4>()
             .0
             .iter()
             .flat_map(|px| [px[2], px[1], px[0], 255])
             .collect();
-        *self.state.pixels.borrow_mut() = (bgra, size.0 as i32, size.1 as i32);
+        let (width, height) = (pixmap.width() as i32, pixmap.height() as i32);
+        *self.state.pixels.borrow_mut() = (bgra, width, height);
         let right_align = unsafe { GetSystemMetrics(SM_MENUDROPALIGNMENT) } != 0;
-        let (width, height) = (size.0 as i32, size.1 as i32);
         let (x, y) = anchor.position((width, height), right_align);
+        let opening = !self.state.shown.replace(true);
+        let events = self.access.update(p, menu, f64::from(scale));
         unsafe {
             SetWindowPos(
                 self.window,
@@ -297,35 +308,40 @@ impl Flyout {
             );
             InvalidateRect(self.window, std::ptr::null(), 0);
         }
-        if self.shown != Some(serial) && !self.state.shown.get() {
-            self.state.shown.set(true);
+        if opening {
+            unsafe { ShowWindow(self.window, SW_SHOWNOACTIVATE) };
+        }
+        if let Some(events) = events {
+            events.raise();
+        }
+        if opening {
             unsafe {
-                ShowWindow(self.window, SW_SHOW);
                 // The shell lets the icon's process take the foreground for
                 // the person's click on it.
                 SetForegroundWindow(self.window);
                 SetFocus(self.window);
             }
         }
-        self.shown = Some(serial);
     }
 
     pub(crate) fn hide(&mut self) {
-        if self.shown.take().is_none() {
-            return;
-        }
-        self.state.shown.set(false);
-        self.access.hide();
-        unsafe {
-            ReleaseCapture();
-            ShowWindow(self.window, SW_HIDE);
-        }
-        self.state.input.borrow_mut().clear();
+        crate::accessibility::dismiss_popup(
+            &self.state.shown,
+            || {
+                unsafe {
+                    ReleaseCapture();
+                    ShowWindow(self.window, SW_HIDE);
+                }
+                self.state.input.borrow_mut().clear();
+            },
+            || self.access.hide(),
+        );
     }
 }
 
 impl Drop for Flyout {
     fn drop(&mut self) {
+        self.hide();
         unsafe { DestroyWindow(self.window) };
     }
 }

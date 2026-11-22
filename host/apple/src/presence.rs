@@ -249,7 +249,9 @@ impl<D: DataSource> Host<D> {
             let step = layout_step(&self.runner, to);
             let a = self.runner.advance_until_request(step);
             self.now_ms = a.now_ms.max(self.now_ms);
-            self.runner.canvas_frame();
+            if let Some(canvas) = self.turn.canvas {
+                (canvas.frame)(self);
+            }
             // A commit that sent stops the jump: the next send would drop
             // its reply (LLP 1016 D5).
             let stopped = a.error.is_some() || a.stopped_on_request || a.needs_apply || step >= to;

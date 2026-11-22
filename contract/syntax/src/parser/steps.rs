@@ -121,7 +121,10 @@ impl Parser {
             !launch_word(s).is_empty()
                 && !matches!(
                     s,
-                    Step::FailFetch { .. } | Step::AnswerFetch { .. } | Step::Prefer { .. }
+                    Step::FailFetch { .. }
+                        | Step::AnswerFetch { .. }
+                        | Step::AnswerSource { .. }
+                        | Step::Prefer { .. }
                 )
         });
         if let Some(late) = late {
@@ -166,6 +169,7 @@ impl Parser {
         for step in &steps {
             let refused = match step {
                 Step::Perf { .. } | Step::ExpectPerf { .. } => Some("a `perf` block measures steps; its `expect perf` lines follow it, and blocks do not nest".to_string()),
+                Step::Background { .. } => Some("`background` waits on iOS and the wall clock, so it cannot run in a `perf` block".to_string()),
                 // `clock +N real`, `clock held` and `clock until` let real
                 // time pass while the agent's clock stands.
                 Step::Clock { arg, .. }
@@ -489,7 +493,7 @@ impl Parser {
         })
     }
 
-    /// A JSON value from its tokens, as JSON text: a request's body. Its
+    /// A JSON value from its tokens, as JSON text. Its
     /// brackets may span lines.
     fn json_value(&mut self) -> R<String> {
         let token = self.next();
@@ -522,9 +526,9 @@ impl Parser {
                 return Err(SyntaxError {
                     id: "syntax-expected-step",
                     message: format!(
-                        "a request's body is JSON (an object, a list, a string, a number, true, false or null), not {}",
-                        describe(&other)
-                    ),
+                    "expected a JSON object, list, string, number, true, false or null, found {}",
+                    describe(&other)
+                ),
                     span: token.span,
                 })
             }
@@ -538,7 +542,7 @@ impl Parser {
                 return self.err(
                     "syntax-expected-step",
                     format!(
-                    "expected `tap`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `fail fetch`, `answer fetch`, `pass fetch`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`, `fail fetch`), found {}",
+                    "expected `tap`, `scroll`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `fail fetch`, `answer fetch`, `answer source`, `pass fetch`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `signed-in`, `stored`, `fresh`, `before data`, `fail fetch`), found {}",
                     describe(&other)
                 ),
                 )
@@ -565,6 +569,10 @@ impl Parser {
                 };
                 Step::Prefer { name, value, span }
             }
+            "scroll" => Step::Scroll {
+                target: self.str_lit("a testId")?,
+                span,
+            },
             "tap" => {
                 let target = self.str_lit("a testId")?;
                 if self.at_ident("drag") {
@@ -849,6 +857,13 @@ impl Parser {
                 }
                 Step::Authorize { cancel, span }
             }
+            "background" => {
+                let ms = self.step_number("the time away in milliseconds")?;
+                if ms.fract() != 0. || !(0.0..=i32::MAX as f64).contains(&ms) {
+                    return self.err("syntax-expected-step", "background takes a whole number of milliseconds from 0 through 2147483647");
+                }
+                Step::Background { ms: ms as u32, span }
+            }
             "clock" => {
                 let arg = match self.peek_kind().clone() {
                     TokenKind::Ident(w) if w == "settle" || w == "data" => {
@@ -1004,6 +1019,17 @@ impl Parser {
                 }
                 Step::At { location, span }
             }
+            "signed-in" => Step::SignedIn {
+                key: self.launch_str("signed-in", "the provider's secret.keep name")?,
+                account: self.json_value()?,
+                span,
+            },
+            "stored" => Step::Stored {
+                name: self.ident()?.0,
+                window: false,
+                value: self.json_value()?,
+                span,
+            },
             "seed" => {
                 let seed = self.step_number("the seed, a whole number")?;
                 // Below 2^32, as every host draws it (LLP 1116.005 D5).
@@ -1069,9 +1095,26 @@ impl Parser {
                 let prefix = self.launch_str("drop stream", "a URL prefix")?;
                 Step::DropStream { prefix, span }
             }
+            "answer" if self.at_ident("source") => {
+                self.next();
+                let source = self.ident()?.0;
+                self.expect_word("with")?;
+                Step::AnswerSource {
+                    source,
+                    value: self.json_value()?,
+                    span,
+                }
+            }
             "answer" => {
                 self.expect_word("fetch")?;
                 let prefix = self.launch_str("answer fetch", "a URL prefix")?;
+                let method = if self.at_ident("method") {
+                    self.next();
+                    let (name, _) = self.ident()?;
+                    Some(name)
+                } else {
+                    None
+                };
                 self.expect_word("with")?;
                 let status = self.step_number("an HTTP status from 200 through 599")?;
                 if status.fract() != 0.0 || !(200.0..=599.0).contains(&status)
@@ -1089,6 +1132,7 @@ impl Parser {
                     headers.push(format!("{}:{}", json_string(&name), json_string(&value)));
                 }
                 let (body, content_type) = match self.peek_kind() {
+                    _ if self.at_ident("after") => (String::new(), "text/plain; charset=utf-8"),
                     TokenKind::Newline | TokenKind::Eof => (String::new(), "text/plain; charset=utf-8"),
                     TokenKind::Str(_) => (self.str_lit("a text body")?, "text/plain; charset=utf-8"),
                     _ => (self.json_value()?, "application/json"),
@@ -1096,11 +1140,20 @@ impl Parser {
                 if !headers.iter().any(|h| h.starts_with("\"content-type\":")) {
                     headers.push(format!("\"content-type\":{}", json_string(content_type)));
                 }
-                let response = format!("{{\"status\":{status},\"headers\":{{{}}},\"body\":{}}}", headers.join(","), json_string(&body));
+                let delay = if self.at_ident("after") {
+                    self.next();
+                    let ms = self.step_number("a delay in milliseconds")?;
+                    if ms.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&ms) {
+                        return self.err("syntax-expected-step", "answer fetch: after takes a nonnegative whole number of milliseconds up to 4294967295");
+                    }
+                    if self.at_ident("ms") { self.next(); }
+                    format!(",\"afterMs\":{ms}")
+                } else { String::new() };
+                let response = format!("{{\"status\":{status},\"headers\":{{{}}},\"body\":{}{delay}}}", headers.join(","), json_string(&body));
                 if body.len() > 65536 || prefix.len() + response.len() + 20 > 65536 {
                     return self.err("syntax-expected-step", "answer fetch: encoded fixture exceeds 64 KiB");
                 }
-                Step::AnswerFetch { prefix, response, span }
+                Step::AnswerFetch { prefix, method, response, span }
             }
             // @ref LLP 1116.006 D8 — `request POST "/items" {"title": "Bread"} as grace`.
             "request" => self.request_step(span)?,
@@ -1132,14 +1185,14 @@ impl Parser {
                         return self.err(
                             "syntax-expected-step",
                             format!(
-                                "`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, found {}",
+                                "`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `drag`, `perf`, or `no failures`, found {}",
                                 describe(&other)
                             ),
                         )
                     }
                 };
                 match what.as_str() {
-                    "refusal" => Step::ExpectRefusal { target: self.str_lit("a mutation name")?, span },
+                    "refusal" => Step::ExpectRefusal { target: self.str_lit("a mutation or resource name")?, span },
                     "tree" => {
                         let present = if self.at_ident("has") {
                             self.next();
@@ -1193,6 +1246,12 @@ impl Parser {
                         span,
                     },
                     "layout" => self.expect_layout(span)?,
+                    "sample" => self.expect_sample(span)?,
+                    "screenshot" => {
+                        let target = self.str_lit("a testId")?;
+                        self.expect_word("matches")?;
+                        Step::ExpectScreenshot { target, reference: self.str_lit("a reference PNG path")?, span }
+                    }
                     "text" => {
                         let target = self.str_lit("a testId")?;
                         let other = match self.peek_kind() {
@@ -1231,6 +1290,7 @@ impl Parser {
                     "sound" => self.expect_sound(span)?,
                     "midi" => self.expect_midi(span)?,
                     "mediasession" => self.expect_media_session(span)?,
+                    "drag" => self.expect_drag(span)?,
                     "perf" => self.expect_perf(span)?,
                     "no" => {
                         self.expect_word("failures")?;
@@ -1248,7 +1308,7 @@ impl Parser {
                         };
                         return self.err(
                             "syntax-expected-step",
-                            format!("`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `perf`, or `no failures`, not `{other}`{hint}"),
+                            format!("`expect` reads `tree`, `text`, `state`, `disabled`, `enabled`, `focused`, `layout`, `refusal`, `sound`, `midi`, `wakelock`, `mediasession`, `drag`, `perf`, or `no failures`, not `{other}`{hint}"),
                         );
                     }
                 }
@@ -1257,7 +1317,7 @@ impl Parser {
                 return Err(SyntaxError {
                     id: "syntax-expected-step",
                     message: format!(
-                    "expected `tap`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `fresh`, `before data`), found `{other}`"
+                    "expected `tap`, `scroll`, `type`, `pick`, `authorize`, `presence`, `clock`, `resize`, `reload`, `close`, `back`, `screenshot`, `prefer`, `request`, `expect`, or a launch line (`size`, `epoch`, `time-zone`, `locale`, `seed`, `signed-in`, `stored`, `fresh`, `before data`), found `{other}`"
                 ),
                     span,
                 })
@@ -1298,13 +1358,15 @@ fn during_read(op: &str) -> bool {
 
 /// The words of a test's launch lines, which a test file may also write at
 /// its top level for every test in it (habits F7, calendar F13).
-pub(super) const LAUNCH: [&str; 11] = [
+pub(super) const LAUNCH: [&str; 13] = [
     "size",
     "at",
     "epoch",
     "time-zone",
     "locale",
     "seed",
+    "signed-in",
+    "stored",
     "fresh",
     "before",
     "fail",
@@ -1322,10 +1384,13 @@ pub(super) fn launch_word(step: &Step) -> &'static str {
         Step::TimeZone { .. } => "time-zone",
         Step::Locale { .. } => "locale",
         Step::Seed { .. } => "seed",
+        Step::SignedIn { .. } => "signed-in",
+        Step::Stored { .. } => "stored",
         Step::Fresh { .. } => "fresh",
         Step::BeforeData { .. } => "before data",
         Step::FailFetch { .. } => "fail fetch",
         Step::AnswerFetch { .. } => "answer fetch",
+        Step::AnswerSource { .. } => "answer source",
         _ => "",
     }
 }
@@ -1338,11 +1403,23 @@ pub fn is_launch(step: &Step) -> bool {
 /// Whether two launch lines set the same fact: `fail fetch` lines, the same
 /// prefix; preferences, the same fact after resolving drive aliases.
 pub fn same_launch(a: &Step, b: &Step) -> bool {
-    if let (
-        Step::FailFetch { prefix: x, .. } | Step::AnswerFetch { prefix: x, .. },
-        Step::FailFetch { prefix: y, .. } | Step::AnswerFetch { prefix: y, .. },
-    ) = (a, b)
-    {
+    fn fetch_rule(step: &Step) -> Option<(&str, Option<&str>)> {
+        match step {
+            Step::FailFetch { prefix, .. } => Some((prefix, None)),
+            Step::AnswerFetch { prefix, method, .. } => Some((prefix, method.as_deref())),
+            _ => None,
+        }
+    }
+    if let (Some(x), Some(y)) = (fetch_rule(a), fetch_rule(b)) {
+        return x == y;
+    }
+    if let (Step::AnswerSource { source: x, .. }, Step::AnswerSource { source: y, .. }) = (a, b) {
+        return x == y;
+    }
+    if let (Step::SignedIn { key: x, .. }, Step::SignedIn { key: y, .. }) = (a, b) {
+        return x == y;
+    }
+    if let (Step::Stored { name: x, .. }, Step::Stored { name: y, .. }) = (a, b) {
         return x == y;
     }
     if let (Step::Prefer { name: x, .. }, Step::Prefer { name: y, .. }) = (a, b) {
@@ -1390,6 +1467,7 @@ fn prefer_key(name: &str) -> &str {
         "keyboard-navigation",
         "bold-text",
         "root-font-size",
+        "safe-area",
         "display-scale",
         "gpu-tier",
         "posture",

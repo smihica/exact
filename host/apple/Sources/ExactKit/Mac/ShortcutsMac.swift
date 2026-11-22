@@ -291,6 +291,7 @@ final class ShortcutMenu: NSMenu {
         let silenced = removed.compactMap { item, _, _ in item.keyEquivalent.isEmpty ? nil : (item, item.keyEquivalent) }
         for (item, _) in silenced { item.keyEquivalent = "" }
         defer { for (item, key) in silenced where item.keyEquivalent.isEmpty { item.keyEquivalent = key } }
+        if historyArrow(event) { return true }
         // AppKit compares the typed character with the item's, so a key that
         // types no Latin one (ㅠ under Korean 2-Set) misses ⌘B: the item its
         // physical key's chord names runs here instead (its action validates,
@@ -313,6 +314,28 @@ final class ShortcutMenu: NSMenu {
         }
         defer { for (item, host) in suppressed { item.keyEquivalent = host.menuEquivalent(item) } }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// Command-Left and Command-Right act as Go ▸ Back and Go ▸ Forward outside
+    /// editable text views and fields, matching Safari and Finder (expo/exact#847).
+    private func historyArrow(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              event.keyCode == 123 || event.keyCode == 124,
+              event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command
+        else { return false }
+        let window = NSApp.keyWindow ?? NSApp.windows.first { $0.windowNumber == event.windowNumber }
+        if let responder = window?.firstResponder {
+            if let textView = responder as? NSTextView, textView.isEditable { return false }
+            if let textField = responder as? NSTextField, textField.isEditable { return false }
+        }
+        let action = event.keyCode == 123 ? #selector(GoMenuTarget.back(_:)) : #selector(GoMenuTarget.forward(_:))
+        guard let item = items.first(where: { $0.action == action && $0.target is GoMenuTarget }),
+              !item.isHidden,
+              !item.keyEquivalent.isEmpty,
+              let target = item.target as? GoMenuTarget,
+              target.validateMenuItem(item)
+        else { return false }
+        return NSApp.sendAction(action, to: target, from: item)
     }
 }
 
@@ -522,6 +545,9 @@ package final class ShortcutHost: NSObject, NSMenuItemValidation {
             // Show Sidebar is a window with a sidebar's (LLP 1115.002 D3).
             for item in viewMenu.items where item.action == #selector(NSSplitViewController.toggleSidebar(_:)) {
                 item.isHidden = presenter?.sidebar.installed != true
+            }
+            for item in viewMenu.items where item.action == #selector(NSSplitViewController.toggleInspector(_:)) {
+                item.isHidden = presenter?.navigation.stackSplit.hasInspector != true
             }
         }
         // Reconcile only our own items. In particular, Open… and Close must

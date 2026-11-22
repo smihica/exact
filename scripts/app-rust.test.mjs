@@ -11,7 +11,7 @@ import { ensureShells, rustDataOf } from './app-shells.mjs';
 import { authoredWorkspace } from './cargo-check.mjs';
 import { buildModule } from '../host/web-js/module.mjs';
 import { hostTriple } from './tools.mjs';
-import { refreshCargoRustShapes } from './cargo-dep-info.mjs';
+import { refreshCargoRustBindings } from './cargo-dep-info.mjs';
 import { resolveApp } from './app.mjs';
 import { webSourceRoots } from '../host/web/build.mjs';
 
@@ -24,7 +24,7 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('Contract presentation edits kee
   try {
     createApp(dir, { rust: true, title: 'Shapes Fixture', with: ['linux'] });
     const { workspace } = ensureShells(dir);
-    const env = { ...process.env, EXACT_RUST_SHAPES: '1' };
+    const env = { ...process.env, EXACT_RUST_BINDINGS: '1' };
     const cargo = args => {
       const r = spawnSync('cargo', args, { cwd: workspace, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       assert.equal(r.status, 0, r.stderr);
@@ -32,7 +32,7 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('Contract presentation edits kee
     };
     const packages = cargo(['metadata', '--offline', '--format-version', '1'])[0].packages;
     const native = () => {
-      refreshCargoRustShapes(target, hostTriple(), 'dev', packages, env);
+      refreshCargoRustBindings(target, hostTriple(), 'dev', packages, env);
       return cargo(['build', '--offline', '--lib', '-p', 'shapes-fixture-data', '--target', hostTriple(), '--message-format=json'])
         .find(m => m.reason === 'compiler-artifact' && m.target.name === 'shapes_fixture_data').fresh;
     };
@@ -60,7 +60,7 @@ test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST)('Contract presentation edits kee
     writeFileSync(lib, readFileSync(lib, 'utf8').replace('Hello from', 'Greetings from'));
     build();
     assert.notEqual(stamp(), shaped, 'a Rust edit must rebuild the module');
-    delete env.EXACT_RUST_SHAPES;
+    delete env.EXACT_RUST_BINDINGS;
     native();
     writeFileSync(path, original);
     assert.equal(native(), false, 'direct Cargo must still detect a shape edit');
@@ -81,11 +81,11 @@ function moduleFixture(run) {
     ensureShells(dir);
     const raw = resolve(target, 'wasm32-unknown-unknown/web/shapes_fixture_module.wasm');
     let packages, stage = 0;
-    const env = { ...process.env, EXACT_RUST_SHAPES: '1' }, workspace = resolve(dir, '.exact/shells');
+    const env = { ...process.env, EXACT_RUST_BINDINGS: '1' }, workspace = resolve(dir, '.exact/shells');
     const native = () => {
       packages ??= JSON.parse(spawnSync('cargo', ['metadata', '--offline', '--format-version', '1'],
         { cwd: workspace, env, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).stdout).packages;
-      refreshCargoRustShapes(target, hostTriple(), 'dev', packages, env);
+      refreshCargoRustBindings(target, hostTriple(), 'dev', packages, env);
       const result = spawnSync('cargo', ['build', '--offline', '--lib', '-p', 'shapes-fixture-data', '--target', hostTriple(), '--message-format=json'],
         { cwd: workspace, env, encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
@@ -112,6 +112,31 @@ function featureFixture(run) {
 }
 
 const moduleTest = test.skipIf(!process.env.EXACT_BAKE_CACHE_TEST);
+moduleTest('presentation edits keep module bindings and module calls rebuild them', () => moduleFixture(({ dir, native }) => {
+  const data = resolve(dir, 'data'), manifest = resolve(data, 'Cargo.toml');
+  const exactData = resolve(import.meta.dir, '../data');
+  writeFileSync(manifest, readFileSync(manifest, 'utf8').replace('[dependencies]', `[dependencies]\nexact-data = { path = ${JSON.stringify(exactData)} }`));
+  writeFileSync(resolve(data, 'build.rs'), `fn main() {
+    contract::build_module_rust(std::path::Path::new("../app.contract")).unwrap();
+}`);
+  writeFileSync(resolve(data, 'src/lib.rs'), 'include!(concat!(env!("OUT_DIR"), "/modules.rs"));\n');
+  const path = resolve(dir, 'app.contract');
+  writeFileSync(path, 'component App\n  view\n    text "Before"\n');
+  assert.equal(native(), false);
+  native();
+  writeFileSync(path, 'component App\n  view\n    text "After"\n');
+  assert.equal(native(), true, 'a view edit must leave the data crate fresh');
+  writeFileSync(path, `use geolocationStatus, GeolocationStatus from "@exact/geolocation"
+
+component App
+  resource status = geolocationStatus() as shape GeolocationStatus else empty()
+  view
+    text status.state
+`);
+  assert.equal(native(), false, 'a new module call must rebuild the data crate');
+  assert.equal(native(), true);
+}), 300_000);
+
 moduleTest('a dependency default-feature edit invalidates a module in a new stage', () => featureFixture(({ build, feature }) => {
   const before = build();
   feature(true);

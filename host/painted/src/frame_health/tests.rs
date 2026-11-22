@@ -1,4 +1,4 @@
-use super::android::{Lend, Reader, WINDOW_WORDS};
+use super::android::{FrameClock, Lend, Reader, WINDOW_WORDS};
 use serde_json::{json, Value};
 
 const P: u64 = 8_333_333;
@@ -14,6 +14,22 @@ fn health(r: &mut Reader, now: u64) -> Value {
         json!({"op": "perf", "frames": true, "health": true}),
         now,
     )
+}
+
+#[test]
+fn both_sources_name_the_clock_used_for_their_frames() {
+    let mut r = Reader::new(true);
+    for (clock, coverage) in [
+        (FrameClock::Platform, "platform-clock"),
+        (FrameClock::Held, "virtual-clock"),
+        (FrameClock::Lent, "lent-wall-clock"),
+    ] {
+        r.clock(clock, T0);
+        for source in ["app", "window"] {
+            let h = ask(&mut r, json!({"frames": true, "source": source}), T0);
+            assert_eq!(h["coverage"]["liveAgent"], coverage, "{source}");
+        }
+    }
 }
 
 /// Turn `n` at its vsync, publishing `n` (ingested `ingest` after the vsync).
@@ -98,7 +114,7 @@ fn idle_between_runs_is_no_frame_time() {
 #[test]
 fn the_agents_clock_records_nothing_and_a_lease_lends_the_wall() {
     let mut r = Reader::new(true);
-    r.clock(true, T0);
+    r.clock(FrameClock::Held, T0);
     turn(&mut r, 0, 3_000_000);
     turn(&mut r, 1, 3_000_000);
     let h = health(&mut r, T0 + 2 * P);
@@ -115,7 +131,7 @@ fn the_agents_clock_records_nothing_and_a_lease_lends_the_wall() {
         T0,
     );
     assert_eq!(lend, Lend::Wall, "{reply}");
-    r.clock(false, T0);
+    r.clock(FrameClock::Lent, T0);
     assert!(r.app.capturing(), "capture starts once the clock is lent");
     turn(&mut r, 2, 3_000_000);
     turn(&mut r, 3, 3_000_000);
@@ -260,8 +276,8 @@ fn a_cursor_from_another_generation_asks_for_a_baseline() {
     let mut r = Reader::new(true);
     turn(&mut r, 0, 3_000_000);
     let h = health(&mut r, T0 + P);
-    r.clock(true, T0 + P);
-    r.clock(false, T0 + P);
+    r.clock(FrameClock::Held, T0 + P);
+    r.clock(FrameClock::Lent, T0 + P);
     let again = ask(
         &mut r,
         json!({"op": "perf", "frames": true, "health": true, "cursor": h["cursor"]}),

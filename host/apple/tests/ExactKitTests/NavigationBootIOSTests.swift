@@ -4,6 +4,7 @@ import XCTest
 import ObjectiveC
 import ExactCore
 @testable import ExactKit
+@testable import ExactDrag
 @testable import ExactNavigation
 
 final class NavigationBootIOSTests: XCTestCase {

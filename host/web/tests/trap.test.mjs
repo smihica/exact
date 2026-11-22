@@ -16,7 +16,7 @@ test('the first trap stops the clock and every later call, and is said once', as
   const host = {}, root = { dataset: {} }, said = [], told = [];
   const exact = { onTrap: (error) => told.push(error) };
   const { guardedExports, ModuleStopped } = new Function('host', 'root', 'globalThis', 'console',
-    `${glueDeclarations(boot, ['ModuleStopped', 'guardedExports', 'stopModule'])}\nreturn { guardedExports, ModuleStopped };`)(
+    `${glueDeclarations(boot, ['ModuleStopped', 'StageNotLoaded', 'guardedExports', 'stopModule'])}\nreturn { guardedExports, ModuleStopped };`)(
     host, root, { exact }, { error: (...args) => said.push(args) });
   const wasm = guardedExports(instance.exports);
   expect(wasm.one()).toBe(1);
@@ -39,4 +39,17 @@ test('the first trap stops the clock and every later call, and is said once', as
   expect(told).toHaveLength(1);
   expect(told[0]).toBeInstanceOf(WebAssembly.RuntimeError);
   expect(root.dataset.error).toMatch(/^RuntimeError/);
+});
+
+// The page's agent requests enter app.wasm through `ask` (glue.js), which refuses one that would enter the inspection
+// stage before it loads. A picker's hold is the core's (`exact_runner::agent::answer`), so a press asks for it at once,
+// inside its activation.
+test('a picker hold is asked with the inspection stage unloaded, and other requests wait for it', () => {
+  const glue = readFileSync(new URL('../glue.js', import.meta.url), 'utf8'), asked = [];
+  const host = { wasm: { exact_agent: (len) => { asked.push(len); return 0; } } };
+  const ask = new Function('host', 'stageLoaded', 'readOut', 'writeIn', `${glueDeclarations(glue, ['ask'])}\nreturn ask;`)(
+    host, (name) => name !== 'inspection', () => '{"ticket":1}', (text) => text.length);
+  expect(ask({ op: 'showPicker', view: 3 })).toEqual({ ticket: 1 });
+  expect(() => ask({ op: 'tree' })).toThrow('has not loaded');
+  expect(asked).toHaveLength(1);
 });

@@ -23,7 +23,7 @@ impl Collection {
     }
 
     pub(super) fn retire_row(&self, u: &mut Update<'_>, row: &Mounted) {
-        if u.ids.work.sites.is_empty() {
+        if !crate::instance::retire::tracks(u) {
             return;
         }
         self.count_row(u, |w| w.row_retired += 1);

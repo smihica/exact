@@ -545,6 +545,50 @@ fn keyframe_arithmetic_does_not_spend_call_depth() {
 }
 
 #[test]
+fn keyframes_fold_records_and_copies() {
+    let source = r#"shape Cell
+  x: number
+  y: number
+fn xOf(cell: Cell): number = cell.x
+fn yOf(cell: Cell): number = cell.y
+fn cells(): number = sum([1, 2].map(n => Cell(y=0.25, x=n).y))
+keyframes k
+  from opacity=xOf(Cell(y=0.75, x=(false ? performanceNow() : 0.25)))
+  50% opacity=yOf(Cell(Cell(x=0.25, y=0.5), x=0.75))
+  to opacity=cells()
+component App
+  view
+    text "a"
+"#;
+    let plan = contract::compile(source).unwrap();
+    assert_eq!(
+        plan.str(plan.keyframes[0].css),
+        "0%{opacity:0.25;}50%{opacity:0.5;}100%{opacity:0.5;}"
+    );
+}
+
+#[test]
+fn keyframe_records_refuse_invalid_fields_and_runtime_inputs() {
+    for (value, reason) in [
+        ("Cell(x=0.25)", "a field is never defaulted"),
+        ("Cell(x=0.25, x=0.5, y=0.75)", "is given twice"),
+        ("Cell(x=0.25, y=true)", "field `y` of `Cell` is `number`"),
+        (
+            "Cell(x=0.25, y=performanceNow())",
+            "read `performanceNow()`",
+        ),
+        ("Cell(origin, x=0.25, y=0.5)", "read `origin`"),
+    ] {
+        let source = format!(
+            "shape Cell\n  x: number\n  y: number\nfn xOf(cell: Cell): number = cell.x\nkeyframes k\n  to opacity=xOf({value})\ncomponent App\n  resource origin = origin() as shape Cell\n  view\n    text \"a\"\n"
+        );
+        let error = contract::compile(&source).unwrap_err();
+        assert_eq!(error.id, "lower-keyframes", "{value}: {error}");
+        assert!(error.message.contains(reason), "{value}: {error}");
+    }
+}
+
+#[test]
 fn keyframe_functions_fold_constant_tables_and_pure_calls() {
     for (functions, value, expected) in [
         (

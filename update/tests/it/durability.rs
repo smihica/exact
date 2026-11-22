@@ -217,6 +217,103 @@ fn a_damaged_asset_index_keeps_the_rollback_floor() {
     windows,
     ignore = "Windows durable store is not qualified (LLP 1026 D11a)"
 )]
+fn a_tampered_cohort_receipt_refuses_the_signed_head() {
+    check_cohort_receipt(false);
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows durable store is not qualified (LLP 1026 D11a)"
+)]
+fn a_tampered_cohort_chunk_refuses_the_signed_head() {
+    check_cohort_receipt(true);
+}
+
+fn check_cohort_receipt(chunked: bool) {
+    use ed25519_dalek::{Signer, SigningKey};
+    use exact_update::{canonical_bytes, head_url, sha256_hex};
+    use serde_json::json;
+
+    let temp = Temp::new(if chunked {
+        "cohort-chunks"
+    } else {
+        "cohort-receipt"
+    });
+    let key = SigningKey::from_bytes(&[23; 32]);
+    let mut store = open_store(
+        temp.path(),
+        embedded(&[("test", key.verifying_key().to_bytes())]),
+    )
+    .unwrap();
+    let mut origin = Origin::of(&Bundle::new(4, b"plan four"));
+    let head = head_url(ORIGIN, "release", COHORT);
+    let mut envelope: serde_json::Value = serde_json::from_slice(&origin.files[&head]).unwrap();
+    let receipt = serde_json::to_vec(&json!({
+        "version": 1, "compat": {"id": COHORT, "inputs": {}},
+        "binary": "0".repeat(64), "sources": {},
+    }))
+    .unwrap();
+    let mut asked = vec![head.clone()];
+    let (payload, url, bytes) = if chunked {
+        let chunks = receipt.split_at(receipt.len() / 2);
+        let urls = [sha256_hex(chunks.0), sha256_hex(chunks.1)];
+        let manifest = serde_json::to_vec(&json!({"chunks": [
+            {"url": format!("./{}", urls[0]), "sha256": urls[0], "bytes": chunks.0.len()},
+            {"url": format!("./{}?v=1", urls[1]), "sha256": urls[1], "bytes": chunks.1.len()},
+        ]}))
+        .unwrap();
+        let first = format!("{ORIGIN}/.exact/blobs/{}", urls[0]);
+        let last = format!("{ORIGIN}/.exact/blobs/{}?v=1", urls[1]);
+        origin.files.insert(first.clone(), chunks.0.to_vec());
+        asked.extend([
+            format!("{ORIGIN}/.exact/blobs/{}", sha256_hex(&manifest)),
+            first,
+        ]);
+        (manifest, last, chunks.1.to_vec())
+    } else {
+        let url = format!("{ORIGIN}/.exact/blobs/{}", sha256_hex(&receipt));
+        (receipt.clone(), url, receipt)
+    };
+    let digest = sha256_hex(&payload);
+    envelope["cohortReceipt"] = json!({
+        "url": format!("../../blobs/{digest}"),
+        "sha256": digest,
+        "bytes": payload.len(),
+    });
+    if chunked {
+        envelope["cohortReceipt"]["chunked"] = json!(true);
+        origin
+            .files
+            .insert(format!("{ORIGIN}/.exact/blobs/{digest}"), payload);
+    }
+    let signature = key.sign(&canonical_bytes(&envelope.to_string()).unwrap());
+    envelope["signature"] = json!({"keyId": "test", "ed25519": base64(&signature.to_bytes())});
+    origin
+        .files
+        .insert(head.clone(), envelope.to_string().into_bytes());
+    origin.files.insert(url.clone(), vec![b' '; bytes.len()]);
+
+    let refusal = origin.check(&mut store).unwrap_err();
+    assert!(refusal.contains("cohort receipt"), "{refusal}");
+    assert!(refusal.contains("hashes to"), "{refusal}");
+    asked.push(url.clone());
+    assert_eq!(origin.asked, asked);
+    assert_eq!(store.select().seq, EMBEDDED_SEQ);
+    origin.files.insert(url, bytes);
+    assert!(matches!(
+        origin.check(&mut store),
+        Ok(Check::Staged { seq: 4, .. })
+    ));
+    assert!(origin.check(&mut store).is_ok());
+    assert_eq!(origin.asked, [head]);
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows durable store is not qualified (LLP 1026 D11a)"
+)]
 fn oversized_local_plan_falls_back_without_losing_the_floor() {
     let temp = Temp::new("oversized-plan");
     let six = Bundle::new(6, b"plan six");

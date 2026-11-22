@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 #[path = "receipt_schema.rs"]
 mod receipt_schema;
 
-pub(crate) const RELEASE_TAG: &str = "hermes-vanilla-d412d3bd8512-v6";
+pub(crate) const RELEASE_TAG: &str = "hermes-vanilla-d412d3bd8512-v7";
 const DEFAULT_RELEASE_BASE_URL: &str = "https://github.com/expo/ibex/releases/download";
 pub(crate) const CACHE_ARCHIVE: &str = ".hermes-lean-sys-bundle.tar.gz";
 
@@ -24,7 +24,7 @@ pub(crate) struct BundlePin {
 
 // @ref LLP 0057.000#l1--the-bindings-door — this table is the trust root for
 // the compiler/VM identity shared by the bindings and the owning runtime.
-// These are the authenticated immutable v6 release digests. Keep this tag and
+// These are the authenticated immutable v7 release digests. Keep this tag and
 // complete table together until a successor release is published and every
 // archive attestation is verified; scripts/update-hermes-lean-sys-pins.mjs
 // performs that single transition.
@@ -32,37 +32,37 @@ pub(crate) const PINNED_BUNDLES: &[BundlePin] = &[
     BundlePin {
         target: "aarch64-apple-darwin",
         asset: "hermes-vanilla-aarch64-apple-darwin.tar.gz",
-        sha256: "e6db264a7531461dae40aecda87163db7e5470ca58036885683c4914d2d2c5db",
+        sha256: "19eb7756be608f262acf88964a4710e4399211ce1e9923e1228380368d7aa650",
     },
     BundlePin {
         target: "x86_64-apple-darwin",
         asset: "hermes-vanilla-x86_64-apple-darwin.tar.gz",
-        sha256: "1b20955cfc8eb40dfe53473f45a863aa126fa88bbe8676eae444a78d629475e0",
+        sha256: "a0666fceef68cdede0f154e06f6f777a3236f41ed8a79f93449789eddbbabe22",
     },
     BundlePin {
         target: "aarch64-apple-ios",
         asset: "hermes-vanilla-aarch64-apple-ios.tar.gz",
-        sha256: "472c2c0e2489c6f6b84b051571b14ce73328ca09edf56ca01409d26204e568bf",
+        sha256: "c081d2bd24b6b2a7b046b3e33947d3520c33861386e2d51814931891ec006344",
     },
     BundlePin {
         target: "aarch64-apple-ios-sim",
         asset: "hermes-vanilla-universal-apple-ios-simulator.tar.gz",
-        sha256: "38552a30f15da5cff57839ba606f2319ebb1552372d3170badf7016dbc599b65",
+        sha256: "39c4da04ad504ca4b8b55a1cbf591f248333b0692cf0f85ffab76c66df8d624d",
     },
     BundlePin {
         target: "x86_64-apple-ios",
         asset: "hermes-vanilla-universal-apple-ios-simulator.tar.gz",
-        sha256: "38552a30f15da5cff57839ba606f2319ebb1552372d3170badf7016dbc599b65",
+        sha256: "39c4da04ad504ca4b8b55a1cbf591f248333b0692cf0f85ffab76c66df8d624d",
     },
     BundlePin {
         target: "aarch64-apple-tvos",
         asset: "hermes-vanilla-aarch64-apple-tvos.tar.gz",
-        sha256: "21096358ebd6c899396a233558d3529cb5a3bc72722393382c95a3efdb62077d",
+        sha256: "9aca7fb1e8ee894c58c805c4ac4acaba1af9726075761ce1ef8a48c5a7f778b4",
     },
     BundlePin {
         target: "aarch64-apple-tvos-sim",
         asset: "hermes-vanilla-aarch64-apple-tvos-simulator.tar.gz",
-        sha256: "80b0044cf5ff2b1db484eede6e00aeb70dc6def6087fd65d437d4cc625fe1319",
+        sha256: "74fbc78a3570c7999596007324cce537aca39b686fb2014cbf43625e8c94cef6",
     },
     BundlePin {
         target: "x86_64-unknown-linux-gnu",
@@ -77,12 +77,17 @@ pub(crate) const PINNED_BUNDLES: &[BundlePin] = &[
     BundlePin {
         target: "aarch64-linux-android",
         asset: "hermes-vanilla-aarch64-linux-android.tar.gz",
-        sha256: "7f6995e31dee7dd75aebf270c6af73a581f233399fce5aaee49d179d7248a9d6",
+        sha256: "7caacc204f4561d36e574e20b97edd6a1c15e0a3444179ce215983972485473c",
+    },
+    BundlePin {
+        target: "x86_64-linux-android",
+        asset: "hermes-vanilla-x86_64-linux-android.tar.gz",
+        sha256: "acb4986fa61307d108dcd229591aa4ef23fd6f936041a8b4abb752c86f5f09f6",
     },
     BundlePin {
         target: "x86_64-pc-windows-msvc",
         asset: "hermes-vanilla-x86_64-pc-windows-msvc.tar.gz",
-        sha256: "a16901a5fef798e9cc6fd7a2da0f76a27da2632d1dfdd476efa2f8eef4cd1217",
+        sha256: "3d558d3b15e58908dd71b8c36fb3b5e518d2678072137f2d795eb04a1677c183",
     },
 ];
 

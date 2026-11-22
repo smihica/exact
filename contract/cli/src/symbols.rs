@@ -18,6 +18,7 @@ mod elements;
 mod partial;
 mod types;
 use elements::Element;
+pub use elements::ElementFilters;
 
 /// A component's members, in the namespace its expressions read.
 const MEMBERS: [&str; 7] = [
@@ -304,23 +305,39 @@ pub struct PartialSymbols {
 /// value called) has no edge, nor does one to a shape or function the check
 /// refused. When loading stops, each file that parsed is read on its own.
 pub fn symbols_json(path: &Path, name: Option<&str>) -> Result<String, PartialSymbols> {
-    symbols(path, name, false)
+    symbols(path, name, false, None)
 }
 
 /// [`symbols_json`] with what an editor reads (`symbols --editor`): each
 /// definition's `type`, the `shapes` those name and, without `name`, each
 /// view element (`elements`).
 pub fn editor_symbols_json(path: &Path, name: Option<&str>) -> Result<String, PartialSymbols> {
-    symbols(path, name, true)
+    symbols(path, name, true, None)
 }
 
-fn symbols(path: &Path, name: Option<&str>, editor: bool) -> Result<String, PartialSymbols> {
+/// A focused editor query returning authored elements that match any filter group.
+pub fn editor_elements_json(
+    path: &Path,
+    filters: &[ElementFilters<'_>],
+) -> Result<String, PartialSymbols> {
+    symbols(path, None, true, Some(filters))
+}
+
+fn symbols(
+    path: &Path,
+    name: Option<&str>,
+    editor: bool,
+    filters: Option<&[ElementFilters<'_>]>,
+) -> Result<String, PartialSymbols> {
     let nothing = |errors: Vec<CompileError>| PartialSymbols {
         json: close(
-            match (editor, name) {
-                (false, _) => b"{\"definitions\":[],\"references\":[]".to_vec(),
-                (true, Some(_)) => b"{\"definitions\":[],\"references\":[],\"shapes\":[]".to_vec(),
-                (true, None) => {
+            match (editor, name, filters) {
+                (_, _, Some(_)) => b"{\"elements\":[]".to_vec(),
+                (false, _, None) => b"{\"definitions\":[],\"references\":[]".to_vec(),
+                (true, Some(_), None) => {
+                    b"{\"definitions\":[],\"references\":[],\"shapes\":[]".to_vec()
+                }
+                (true, None, None) => {
                     b"{\"definitions\":[],\"elements\":[],\"references\":[],\"shapes\":[]".to_vec()
                 }
             },
@@ -354,13 +371,26 @@ fn symbols(path: &Path, name: Option<&str>, editor: bool) -> Result<String, Part
     let strings = crate::strings::load(&root, path);
     let tables = strings.as_ref().ok().cloned().flatten();
     let mut refused = sources::Refused::default();
-    let (file, sources) = match sources::load_partial(path, &src, &root, &mut refused) {
+    let mut matches = Vec::new();
+    let mut collect = |sources: &Sources, file: &File| {
+        matches.extend(elements::lookup(sources, filters.unwrap_or_default(), file));
+    };
+    let visit = filters.map(|_| &mut collect as sources::ViewVisitor<'_>);
+    let loaded = sources::load_partial_visiting_views(path, &src, &root, &mut refused, visit);
+    let (file, sources) = match loaded {
         Ok(loaded) => loaded,
         Err(all) => {
             let errors = refused.join::<()>(Err(all)).unwrap_err();
             let sources = sources::read_all(path, &src, &root);
-            let json =
-                partial::file_by_file(&sources, &tables, editor).json(&sources, name, &errors);
+            let json = if let Some(filters) = filters {
+                let files = partial::parsed_files(&sources, parse_source_with_view_ranges);
+                let matches: Vec<_> = files
+                    .flat_map(|(_, file, _)| elements::lookup(&sources, filters, &file))
+                    .collect();
+                elements::write_filtered(&matches, &errors)
+            } else {
+                partial::file_by_file(&sources, &tables, editor).json(&sources, name, &errors)
+            };
             return Err(PartialSymbols { json, errors });
         }
     };
@@ -394,6 +424,14 @@ fn symbols(path: &Path, name: Option<&str>, editor: bool) -> Result<String, Part
             )
         }
     };
+    if filters.is_some() {
+        let json = elements::write_filtered(&matches, &errors);
+        return if errors.is_empty() {
+            Ok(json)
+        } else {
+            Err(PartialSymbols { json, errors })
+        };
+    }
     let types = Types { shapes, components };
     let aliases = types::aliases(&types.shapes, editor);
     let mut r = Resolver {

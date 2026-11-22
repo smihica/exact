@@ -101,7 +101,7 @@ test steps (app.test.contract, docs/contract-grammar.md)
   presence allow (cancel, fail, lockout, invalidated)
   fail fetch "<prefix>", pass fetch …
   drop stream "<prefix>"
-  answer fetch "<prefix>" with 200 {"text":"Hello"}
+  answer fetch "<prefix>" with 200 {…}, answer source s with {…}
   request POST "/items" {…} as grace expect 409
   size 390x844, at "/item/7#moves", epoch, time-zone, locale, seed, before data
 
@@ -112,6 +112,7 @@ ops: a target is a testId, else a view's exact text or label
   type <target> <text>|key <Name>   (a select, date or checkbox: its value)
   clock data|settle|held|+<ms> [real]    replies · transitions · push
   check [dark|both]  what is wrong · screenshot <png> [over <ms> every <ms>] [window]  window: bars
+  Android reader drives refuse film and play layers only under --live. Record a live or normal run with adb shell screenrecord.
   screenshot <png> compare <ref> · prefer <feature> <value> · fail|pass fetch <prefix>
 
 how (snippets compile)

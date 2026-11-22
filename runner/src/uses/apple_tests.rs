@@ -129,14 +129,45 @@ fn a_wake_lock_is_a_wakelock_that_can_be_screen() {
     assert!(!uses(&plan("text \"a\" wakelock=\"screen\"")).has(Capability::WakeLock));
 }
 
+/// D10: iOS selects text only where `user-select` says `text` or `all`,
+/// on a box, an inline run or through a class; a computed value can be
+/// either, and `none` or `auto` select nothing.
+#[test]
+fn text_selection_is_a_user_select_that_can_be_text_or_all() {
+    let selects = |source: &str| {
+        let plan = contract::compile(source).unwrap_or_else(|e| panic!("{source}: {e:?}"));
+        apple_uses(&plan).has(Capability::TextSelection)
+    };
+    let view = |view: &str| format!("component A\n  state wide = true\n  view\n    {view}\n");
+    for (source, selected) in [
+        (view("text \"a\""), false),
+        (view("text \"a\" user-select=\"text\""), true),
+        (view("column user-select=\"all\"\n      text \"a\""), true),
+        (view("text\n      text \"Folder: \"\n      text \"/tmp\" user-select=\"all\""), true),
+        (view("text \"a\" user-select=(wide ? \"none\" : \"text\")"), true),
+        (view("text \"a\" user-select=\"none\""), false),
+        (view("text \"a\" user-select=\"auto\""), false),
+        // An article is the Mac's document text, not iOS's.
+        (view("article\n      text \"a\""), false),
+        (
+            "style Prose\n  user-select=\"text\"\n\ncomponent A\n  view\n    text \"a\" class=Prose\n".to_string(),
+            true,
+        ),
+    ] {
+        assert_eq!(selects(&source), selected, "{source}");
+    }
+    let plan = plan("text \"a\" user-select=\"text\"");
+    assert!(!uses(&plan).has(Capability::TextSelection));
+}
+
 /// D10: each native roster entry is selected by the rows that reach its
 /// family's code, a computed value by whatever it can be, and a plain text
 /// and button plan by none; no other host's set moves.
 #[test]
 fn each_native_entry_is_selected_by_the_rows_that_reach_its_family() {
     use Capability::{
-        Collections, Controls, Effects, Flights, Images, NativeViews, Navigation, Sticky, Svg,
-        Traces,
+        Collections, Controls, Dialogs, Effects, Flights, Images, NativeViews, Navigation, Sticky,
+        Svg, Traces,
     };
     let plain = "column\n      text \"a\"\n      button \"b\" press=go";
     for (view, capability, selected) in [
@@ -196,6 +227,17 @@ fn each_native_entry_is_selected_by_the_rows_that_reach_its_family() {
             true,
         ),
         ("row role=\"tablist\"\n      button \"a\" role=\"tab\"", Navigation, false),
+        (plain, Dialogs, false),
+        ("dialog id=\"d\"\n      text \"a\"", Dialogs, true),
+        // A confirmation by its rows too: the host tells its shape when it
+        // opens, and any `dialog` its author paints is a sheet.
+        (
+            "dialog id=\"d\" role=\"alertdialog\" aria-label=\"Clear?\"\n      button \"Clear\" press=go commandfor=\"d\" command=\"close\"\n      button \"Cancel\" commandfor=\"d\" command=\"close\"",
+            Dialogs,
+            true,
+        ),
+        // ARIA's role alone is no HTML dialog (`lower-dialog-role`).
+        ("column role=\"dialog\"", Dialogs, false),
         ("input type=\"text\"", Controls, false),
         (
             "row role=\"tablist\"\n      button \"a\" press=go",
@@ -277,6 +319,39 @@ fn activities_are_a_plan_that_starts_or_reads_one() {
         );
         assert!(
             !uses(&plan).has(Capability::Activities),
+            "the web's set names none"
+        );
+    }
+}
+
+/// An entry's plan and a Live Activity's sends select `widgets`; an app's
+/// own plan does not.
+#[test]
+fn widgets_are_an_entry_plan_or_activities() {
+    let widget = contract::Widget {
+        kind: "card".into(),
+        title: None,
+        description: None,
+        families: vec!["systemSmall".into()],
+        watch_families: vec![],
+        component: "Card".into(),
+        props: "Props".into(),
+        refresh: "refresh".into(),
+        requires_secrets: false,
+        preview: serde_json::json!({"title": "preview"}),
+        configuration: None,
+    };
+    let card = "shape Props\n  title: string\ncomponent Card\n  props\n    title: string\n  view\n    text title\n";
+    let entry = contract::snapshot::compile(card, &widget).unwrap();
+    let app = contract::compile("component A\n  view\n    text \"a\"\n").unwrap();
+    let activity = contract::compile(
+        "shape ID\n  id: string\ncomponent A\n  resource live = exactActivities() as shape ID\n  view\n    text \"a\"\n",
+    )
+    .unwrap();
+    for (plan, selected) in [(&entry, true), (&activity, true), (&app, false)] {
+        assert_eq!(apple_uses(plan).has(Capability::Widgets), selected);
+        assert!(
+            !uses(plan).has(Capability::Widgets),
             "the web's set names none"
         );
     }
@@ -365,6 +440,27 @@ fn media_is_four_products_each_by_its_own_use() {
     }
 }
 
+/// Only `@exact/search-index` writes the content index: its names select it.
+#[test]
+fn the_search_indexs_names_select_the_content_index() {
+    for (name, selected) in [
+        ("setContentIndex", true),
+        ("contentIndexEntries", true),
+        ("battery", false),
+    ] {
+        let plan = built(|b| {
+            let ty = b.primitive(TypeKind::Number);
+            b.source(name, &[], ty);
+        });
+        assert_eq!(
+            apple_uses(&plan).has(Capability::ContentIndex),
+            selected,
+            "{name}"
+        );
+        assert!(!uses(&plan).has(Capability::ContentIndex));
+    }
+}
+
 /// On Apple a reorder is the lists family's: a reorder grip selects
 /// `Collections` and not `Drag`, which only a height or transform drag
 /// selects. Elsewhere a grip still names `drag`.
@@ -391,4 +487,32 @@ fn apple_links_drag_for_height_and_transform_drags_only() {
     assert!(apple_uses(&dropped).has(Collections));
     assert!(!apple_uses(&dropped).has(Drag));
     assert!(uses(&dropped).has(Drag));
+}
+
+/// A link the host's own context menu serves links sharing, as a plan's
+/// `share` does; a link that menu refuses does not, and the web's set moves
+/// for neither.
+#[test]
+fn a_link_with_the_hosts_menu_links_sharing() {
+    for (href, linked) in [
+        ("https://example.com", true),
+        ("HTTP://example.com", true),
+        ("/about", true),
+        ("about#top", true),
+        ("mailto:a@example.com", false),
+        ("tel:123", false),
+        ("", false),
+    ] {
+        let plan = plan(&format!("link href=\"{href}\"\n      text \"a\""));
+        assert_eq!(apple_uses(&plan).has(Capability::Share), linked, "{href:?}");
+        assert!(!uses(&plan).has(Capability::Share), "{href:?}");
+    }
+    let computed = contract::compile(
+        "component A\n  state u = \"x\"\n  view\n    link href=u\n      text \"a\"\n",
+    )
+    .unwrap();
+    assert!(
+        apple_uses(&computed).has(Capability::Share),
+        "a computed href can be any"
+    );
 }

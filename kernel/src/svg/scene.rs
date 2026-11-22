@@ -133,6 +133,8 @@ pub struct Item {
 /// host can animate the individual properties apart from the list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
+    /// Width and height of the box against which percentage translations resolve.
+    pub reference: (f32, f32),
     /// `transform-origin` in user units (after `transform-box`).
     pub origin: (f32, f32),
     /// `translate`, presented.
@@ -405,11 +407,7 @@ fn cascade(node: &NodeRef<'_>, inherited: &StyleProps) -> StyleProps {
 /// CSS Fonts 4 §2.2.1: a relative weight against the parent's computed weight.
 pub fn relative_font_weight(keyword: &str, inherited: u16) -> Option<u16> {
     match keyword {
-        "bolder" => Some(match inherited {
-            0..350 => 400,
-            350..550 => 700,
-            _ => inherited.max(900),
-        }),
+        "bolder" => Some(crate::text::css_bolder(inherited)),
         "lighter" => Some(match inherited {
             0..550 => inherited.min(100),
             550..750 => 400,
@@ -684,6 +682,7 @@ impl<'k> Resolver<'k, '_> {
             translate.1 + percent.1 / 100.0 * reference.3,
         );
         Some(Transform {
+            reference: (reference.2, reference.3),
             origin: origin.point(reference),
             translate,
             rotate,

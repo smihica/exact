@@ -42,7 +42,8 @@ impl Kernel {
     /// their natural ratio; a projected tablist or radio group (a segmented
     /// control, LLP 1116.004 D5.2) uses the height as its automatic
     /// minimum (LLP 1059); a form control takes it as its size, with no ratio
-    /// (LLP 1069.001 D3), as does a native module (LLP 1024 D4). Other nodes and nonpositive/nonfinite sizes are refused.
+    /// (LLP 1069.001 D3), as does a native module (LLP 1024 D4). A column header
+    /// takes its native header cell’s dimensions as its automatic minimum.
     pub fn set_intrinsic_size(
         &mut self,
         view: ViewId,
@@ -79,7 +80,11 @@ impl Kernel {
             self.arena.node_type(slot),
             crate::NodeType::Control | crate::NodeType::NativeView
         );
-        if !self.arena.node_type(slot).is_replaced() && !control && !tablist && !clearing_projection
+        if !self.arena.node_type(slot).is_replaced()
+            && !control
+            && !tablist
+            && !clearing_projection
+            && !crate::style::table::column_header(&self.arena, slot)
         {
             return Err(LayoutError::NotAnImage(view).into());
         }
@@ -236,7 +241,8 @@ impl Kernel {
             || (self.arena.symbols_owed.iter()).any(|slot| !covered_whole(&self.arena, slot))
     }
 
-    /// Measure the symbols owed a measurement. A system symbol's natural size
+    /// Measure the symbols owed a measurement. A template uses its viewBox at
+    /// the computed font size. A system symbol's natural size
     /// depends only on its role, its font and the traits its host measures
     /// under, so the kernel asks the host's measurer for it before laying out
     /// rather than wait for a view to report it: the first layout has its box
@@ -267,13 +273,15 @@ impl Kernel {
                 continue;
             }
             self.arena.symbols_owed.remove(slot);
-            let measured = crate::replaced::symbol_role(&self.arena, slot)
-                .and_then(|role| {
-                    let font = self.arena.computed_style(slot, crate::StyleMask::TEXT);
-                    self.measurer.symbol_size(&crate::SymbolRequest {
-                        role,
-                        font_size: font.font_size,
-                        font_weight: font.font_weight,
+            let measured = crate::replaced::template_size(&self.arena, slot)
+                .or_else(|| {
+                    crate::replaced::symbol_role(&self.arena, slot).and_then(|role| {
+                        let font = self.arena.computed_style(slot, crate::StyleMask::TEXT);
+                        self.measurer.symbol_size(&crate::SymbolRequest {
+                            role,
+                            font_size: font.font_size,
+                            font_weight: font.font_weight,
+                        })
                     })
                 })
                 .filter(|(w, h)| w.is_finite() && h.is_finite() && *w >= 0.0 && *h >= 0.0);

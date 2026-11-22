@@ -106,8 +106,12 @@ development build of an app that depends on the three packages.
    In Accessibility Insights, inspect the popup's Menu
    and MenuItem nodes, their names, Toggle state on the checkbox, Invoke on
    commands and ExpandCollapse on submenu items; observe MenuOpened,
-   MenuClosed and focus events. The root Menu keeps its name and identity
-   during submenu navigation, and closes only when the popup hides.
+   MenuClosed and focus events. The popup has a Menu root with the menu's
+   name and exposes its items on the first query after opening. Focus
+   lands on that Menu or its items. The root keeps its name
+   and identity during submenu navigation. Dismiss with Escape, then reopen
+   and invoke Exit through UI Automation. Each dismissal raises one
+   MenuClosed after the popup hides.
    Repeat with the app window hidden.
    Replace the status button's image with an `img` whose `src` is an asset
    PNG distinct from the app icon. On the two displays, check the authored

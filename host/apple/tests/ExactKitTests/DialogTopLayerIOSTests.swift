@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactDialogs
 
 /// LLP 1035.001 D11 (#109): a `dialog` whose author painted its surface is
 /// the author's box in HTML's top layer, not the platform's sheet or alert:

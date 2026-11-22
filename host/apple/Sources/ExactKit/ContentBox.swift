@@ -11,6 +11,20 @@ import UIKit
 import AppKit
 #endif
 
+package struct FlightImagePlacement {
+    package var image: CGRect
+    package var clip: CGRect
+
+    package init(image: CGRect, clip: CGRect) {
+        self.image = image; self.clip = clip
+    }
+
+    package func fraction(in box: CGRect) -> Self {
+        guard box.width > 0, box.height > 0 else { return Self(image: .zero, clip: .zero) }
+        return Self(image: RasterGeometry.unitRect(image, in: box), clip: RasterGeometry.unitRect(clip, in: box))
+    }
+}
+
 extension NodeView {
     /// Native fields keep their published editor box for field layout (LLP
     /// 1104 D5) and read their padding rows. Other content uses the published
@@ -24,15 +38,29 @@ extension NodeView {
     package var laidOutFrame: CGRect { grid?.layout ?? frame }
 
     package func contentBox() -> CGRect {
+        contentBox(in: layoutBounds)
+    }
+
+    private func contentBox(in layout: CGRect) -> CGRect {
         if !isNativeTextControl {
-            return kernelContentBox?.offsetBy(dx: bounds.minX, dy: bounds.minY) ?? layoutBounds
+            return kernelContentBox?.offsetBy(dx: layout.minX, dy: layout.minY) ?? layout
         }
         let uniform = number("border_width")
-        return layoutBounds.insetBy(
+        return layout.insetBy(
             left: number("border_width_left", uniform) + number("padding_left"),
             top: number("border_width_top", uniform) + number("padding_top"),
             right: number("border_width_right", uniform) + number("padding_right"),
             bottom: number("border_width_bottom", uniform) + number("padding_bottom"))
+    }
+
+    package func flightImagePlacement(natural: CGSize, in box: CGRect) -> FlightImagePlacement {
+        let layout = CGRect(origin: box.origin, size: grid?.layout.size ?? box.size)
+        let content = contentBox(in: layout)
+        let image = natural.width > 0 && natural.height > 0
+            ? RasterGeometry.rect(natural: natural, content: content, fit: style["object_fit"]?.string ?? "fill",
+                                  position: style["object_position"]?.array)
+            : box
+        return FlightImagePlacement(image: image, clip: content).fraction(in: box)
     }
 
     /// A content-box update can move content without changing the node's frame.
@@ -63,11 +91,16 @@ extension NodeView {
     /// (CSS Backgrounds 3 §4.2, §4.3). Laid out with the view, it waits with
     /// its frame and content box wherever those wait.
     func layoutContent() {
+        if props["listMarker"] != nil { layoutProseMarker() }
         guard kind == "svg" || kind == "canvas2d", let presenter else { return }
         let box = contentBox()
         if kind == "svg" { presenter.svg?.place(id, in: box); return }
         let radii = BorderPaint.contentRadii(cornerSizes(in: bounds), outer: bounds, inner: box)
-        presenter.canvas2d.place(id, in: box, radii: radii)
+        presenter.canvas2d.place(id, in: box, radii: radii) { [weak self] natural in
+            guard let self else { return box }
+            return IconPath.placed(natural: natural, fit: self.style["object_fit"]?.string ?? "fill",
+                                   position: self.style["object_position"]?.array, in: box)
+        }
     }
 
     /// The padding on `side` ("top", "right", "bottom" or "left") in points,

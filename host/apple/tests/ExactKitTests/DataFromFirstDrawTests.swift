@@ -155,7 +155,20 @@ final class DataFromFirstDrawTests: XCTestCase {
         let held = DispatchSemaphore(value: 0)
         var released = false
         defer { if !released { held.signal() } }
-        Owner.shared.post { _ = held.wait(timeout: .now() + 10) }
+        // Hold the owner after `afterFirstDraw`'s synchronous runtime read
+        // (`declaredValues`) finishes, right before `prepareData` posts to it.
+        let presenter = NotificationPresenter.shared, current = presenter.categories
+        var armed = false
+        presenter.categories = (
+            read: { done in
+                if !armed {
+                    armed = true
+                    Owner.shared.post { _ = held.wait(timeout: .now() + 10) }
+                }
+                current.read(done)
+            },
+            write: current.write
+        )
         session.drawReceipt().drawn()
         waitFor("the source's preparation") {
             session.dataPreparing && session.preparedGeneration == session.generation

@@ -291,6 +291,11 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
     // Native dismissal outlives logical removal and reload. Retire from the
     // top down, without letting an old completion touch a new owner.
     private var retiring: [Presentation] = []
+    /// Closed and yet to be dismissed: retiring, or still a layer whose route its batch destroyed (`prepare`),
+    /// which a held sync or a sheet above it keeps for a later pass.
+    func retires(_ controller: UIViewController) -> Bool {
+        retiring.contains { $0.controller === controller } || layers.contains { $0.controller === controller && ($0.controller.retiringRoot != nil || presenter.views[$0.route.id] !== $0.route) }
+    }
     private var dismissing: Presentation?
     private var closing = false
     /// The fullscreen controller hidden until its zoom starts (`present`).
@@ -618,7 +623,7 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         guard let image = zoomImage(target),
               let natural = image.raster?.image.naturalSize ?? fallbackNatural, natural.width > 0, natural.height > 0 else { return box }
         let content = image.contentBox()
-        let drawn = RasterGeometry.rect(natural: natural, content: content, fit: image.style["object_fit"]?.string ?? "fill")
+        let drawn = RasterGeometry.rect(natural: natural, content: content, fit: image.style["object_fit"]?.string ?? "fill", position: image.style["object_position"]?.array)
         return image.convert(drawn.intersection(content), to: zoomed)
     }
 
@@ -722,7 +727,7 @@ final class ModalHost: NSObject, UIAdaptivePresentationControllerDelegate {
         zoomGuard = nil
         defer { if owner.presentedViewController !== controller { endPress(layer) } } // UIKit refused it
         HostLog.note(presenter.session, "presentation: presenting the \(layer.kind) \(layer.route.props["navigationKey"] ?? "?")")
-        owner.present(controller, animated: !ExactEnv.agentFreezes) { [weak self, weak layer, weak controller] in
+        owner.present(controller, animated: !ExactEnv.agentFreezes && !presenter.navigation.crossFading) { [weak self, weak layer, weak controller] in
             if guarded { UIView.performWithoutAnimation { controller?.view.alpha = 1 } }
             guard let self, let layer else { return }
             HostLog.note(presenter.session, "presentation: presented the \(layer.kind) \(layer.route.props["navigationKey"] ?? "?")")

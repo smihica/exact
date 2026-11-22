@@ -1,6 +1,8 @@
 // @ref LLP 1126.001 WP9 — the app imports no ActivityKit. Its arm loads on demand.
 import Foundation
+import ExactCore
 import ExactKit
+import ExactWidgetPublication
 
 typealias ActivityCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
 
@@ -25,18 +27,18 @@ final class ActivityLibrary {
         shared = loaded
         return loaded
         #else
-        throw HeadlessSession.Failure(description: "ActivityKit is not linked into this artifact")
+        throw ExactFailure(description: "ActivityKit is not linked into this artifact")
         #endif
     }
     static func load(path: String) throws -> ActivityLibrary {
         _ = dlerror()
         guard let library = dlopen(path, RTLD_NOW | RTLD_LOCAL) else {
-            throw HeadlessSession.Failure(description: "ActivityKit arm: \(dlerror().map { String(cString: $0) } ?? "dlopen failed"): \(path)")
+            throw ExactFailure(description: "ActivityKit arm: \(dlerror().map { String(cString: $0) } ?? "dlopen failed"): \(path)")
         }
         func symbol(_ name: String) throws -> UnsafeMutableRawPointer {
             _ = dlerror()
             guard let symbol = dlsym(library, name) else {
-                throw HeadlessSession.Failure(description: "ActivityKit arm: \(dlerror().map { String(cString: $0) } ?? "missing \(name)"): \(path)")
+                throw ExactFailure(description: "ActivityKit arm: \(dlerror().map { String(cString: $0) } ?? "missing \(name)"): \(path)")
             }
             return symbol
         }
@@ -102,7 +104,7 @@ final class ActivityOutput: ActivityOutputting {
                 })
                 if listener == 0 {
                     Self.outputs.removeValue(forKey: context)
-                    throw HeadlessSession.Failure(description: "ActivityKit arm: exact_activity_open returned no listener")
+                    throw ExactFailure(description: "ActivityKit arm: exact_activity_open returned no listener")
                 }
             }
         } catch {

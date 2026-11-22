@@ -56,7 +56,7 @@ pub use module_decl::{ModuleDecl, ModuleKind, PlatformWords};
 pub use notfound::implicit_notfound;
 pub use parser::{
     is_launch, is_reserved, parse, parse_source, parse_source_all, parse_source_partial,
-    same_launch, Partial, SyntaxError,
+    parse_source_with_view_ranges, same_launch, Partial, SyntaxError,
 };
 pub use sequence::Sequence;
 pub use share::share_calls;
@@ -217,11 +217,13 @@ pub const HOST_COMMANDS: &[&str] = &[
     // `event.stopPropagation()` for the same event: no ancestor's `key`
     // handler hears it, and its default still happens (files diary F8).
     "stopPropagation",
-    // Observe's custom event, attributes added to every later event, and a
-    // caught error. The Observe module sends them when the app links it.
+    // Observe's custom event, attributes added to every later event, a
+    // caught error and user feedback. The Observe module sends them when the
+    // app links it.
     "observe",
     "observeAttributes",
     "observeError",
+    "observeFeedback",
     // `window.close()` (studio diary R17): the window closes without asking
     // its `beforeunload` again — what an app calls once its own "Save
     // changes?" is answered. An action prop named `close` may be bound, but
@@ -236,6 +238,10 @@ pub const HOST_COMMANDS: &[&str] = &[
     // status item, the app still running, as Electron's `BrowserWindow.hide`.
     // The Mac's; a host or an app that cannot keep running refuses it.
     "hideWindow",
+    // @ref LLP 1013.003 — `startViewTransition()`: the action's commit
+    // cross-fades the whole window from how it looked before, as the web's
+    // `document.startViewTransition()` with the root's default animation.
+    "startViewTransition",
     // @ref LLP 1096 D2, D14 — `playSound(src, at=, gain=, group=, playbackRate=, pan=)`,
     // `playSounds(hits)`, `stopSounds(group=)` and `setSounds(group=, gain=,
     // playbackRate=, pan=, ramp=)`: the runner keeps the voice table, so

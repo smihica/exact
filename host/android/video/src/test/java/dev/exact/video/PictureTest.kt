@@ -11,16 +11,14 @@ class PictureTest {
         assertEquals(want.width, got.width, 0.01f); assertEquals(want.height, got.height, 0.01f)
     }
 
-    @Test fun containLetterboxes() = near(Rect(0f, 224.75f, 1000f, 562.5f), Picture.rect("contain", 1000, 1012, 1920, 1080))
-
-    @Test fun coverFillsAndCrops() = near(Rect(-399.56f, 0f, 1799.11f, 1012f), Picture.rect("cover", 1000, 1012, 1920, 1080))
-
-    @Test fun noneIsTheVideosSizeCentred() = near(Rect(-460f, -34f, 1920f, 1080f), Picture.rect("none", 1000, 1012, 1920, 1080))
-
-    @Test fun scaleDownNeverEnlarges() = near(Rect(340f, 386f, 320f, 240f), Picture.rect("scale-down", 1000, 1012, 320, 240))
+    @Test fun sharedPlacementScalesToDevicePixels() {
+        near(Rect(0f, 60f, 40f, 20f), Picture.rect(floatArrayOf(0f, .75f, .25f, .25f), 160, 80))
+        near(Rect(0f, 120f, 80f, 40f), Picture.rect(floatArrayOf(0f, .75f, .25f, .25f), 320, 160))
+        near(Rect(-80f, 0f, 320f, 80f), Picture.rect(floatArrayOf(-.5f, 0f, 2f, 1f), 160, 80))
+    }
 
     @Test fun anUnknownSizeIsTheBox() =
-        assertEquals(Rect(0f, 0f, 1000f, 1012f), Picture.rect("contain", 1000, 1012, 0, 0))
+        assertEquals(Rect(0f, 0f, 1000f, 1012f), Picture.rect(null, 1000, 1012))
 
     @Test fun theViewportIsTheBoxButForCoverAndNone() {
         assertEquals(974 to 1090, Picture.viewport("contain", 974, 1090, 1920, 1080))

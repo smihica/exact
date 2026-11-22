@@ -12,9 +12,10 @@ mod inert_commit_tests;
 pub(super) mod separator;
 
 /// The props `emit_layout` derives from a node's layout, not its author's.
-pub(super) const DERIVED_PROPS: [&str; 5] = [
+pub(super) const DERIVED_PROPS: [&str; 6] = [
     "fitScale",
     "flexGrows",
+    "listMarker",
     "textOffset",
     "textLeft",
     "textWidth",
@@ -86,11 +87,15 @@ impl<D: DataSource> Host<D> {
         batch.facts = self.facts_moved();
         batch.landing = self.runner.data_timer_landing();
         batch.stored = std::mem::take(&mut self.stored);
+        if std::mem::take(&mut self.window_state_changed) {
+            batch.window_state =
+                Some(serde_json::to_string(&self.runner.window_state()).expect("string map"));
+        }
         batch.announced = self.runner.store().take_announced();
         batch.wakelock = self.wakelock_moved();
         batch.orientationlock = self.orientation_moved();
         batch.must_finish = self.finish_moved();
-        batch.root_tabs = self.root_tabs_moved();
+        self.navigation_shapes(&mut batch);
         // A package view's displayed state, by the same rule, now the
         // presenter's covers are set (LLP 1133.008 D8 item 2).
         self.runner.report_views();
@@ -145,9 +150,11 @@ impl<D: DataSource> Host<D> {
         }
         batch.seq = self.runner.seq_range();
         batch.alerts = self.runner.take_alerts();
+        batch.budget_warning = self.runner.take_budget_warning();
         batch.journal = self.runner.take_journal();
-        batch.canvas_frames(self.runner.canvas_wants_frame());
-        self.canvas_owed_onto(batch);
+        if let Some(canvas) = self.turn.canvas {
+            (canvas.onto)(self, batch);
+        }
     }
 
     fn withhold_layout(&mut self) {
@@ -231,6 +238,7 @@ impl<D: DataSource> Host<D> {
                     }),
             );
         let (w, h) = self.viewport;
+        let environment = self.runner.kernel().env();
         for root in self.runner.roots() {
             // A miss has filled its cache on main before returning. Re-run
             // silently, collecting both receipts so a final unchanged frame
@@ -264,6 +272,22 @@ impl<D: DataSource> Host<D> {
                     return Err("layout: field chrome remained provisional after three passes; batch refused before presentation".into());
                 }
             }
+        }
+        if environment != self.runner.kernel().env() {
+            let readers: Vec<_> = self
+                .preorder()
+                .into_iter()
+                .filter(|&id| {
+                    self.runner
+                        .kernel()
+                        .node(id)
+                        .is_some_and(|node| exact_kernel::uses_env(node.style))
+                })
+                .collect();
+            for id in readers {
+                self.update(id, batch);
+            }
+            self.emit_paragraphs(batch);
         }
         self.height_projection.clear();
         self.height_projection
@@ -479,18 +503,7 @@ impl<D: DataSource> Host<D> {
                 && node.style.flex_grow >= 1.0
                 && !node.style.mask.has(exact_kernel::StyleId::MaxHeight))
             .then(|| "true".to_string());
-            if m.props.get("flexGrows") != grows.as_ref() {
-                match grows {
-                    Some(value) => {
-                        batch.props(id, &[("flexGrows", value.clone())], &[]);
-                        m.props.insert("flexGrows", value);
-                    }
-                    None => {
-                        batch.props(id, &[], &["flexGrows"]);
-                        m.props.remove("flexGrows");
-                    }
-                }
-            }
+            m.derived_prop(id, "flexGrows", grows, batch);
             // The anonymous text item's placement within its content box.
             let offset = kernel.text_line_offset(&node);
             let item = kernel.text_item_box(&node);
@@ -616,6 +629,9 @@ impl<D: DataSource> Host<D> {
 
     /// The lists' metadata, when it moved.
     pub(super) fn emit_collections(&mut self, batch: &mut Batch) -> Result<(), String> {
+        let mut heads = self.runner.collections_shallow();
+        #[cfg(target_os = "macos")]
+        self.publish_section_tables(batch, &heads)?;
         let collections = if self.native_mode() {
             self.collection_heads = None;
             self.native_collections_json()?
@@ -623,7 +639,6 @@ impl<D: DataSource> Host<D> {
             // Revisions cover rows, extent and corrections; the window also
             // carries edge arming. A newer feedback sequence alone needs no
             // snapshot or serialization.
-            let mut heads = self.runner.collections_shallow();
             for head in &mut heads {
                 head.scroll_sequence = 0;
             }
@@ -634,7 +649,7 @@ impl<D: DataSource> Host<D> {
             self.runner.collections_json()
         };
         if collections != self.collections_json {
-            batch.collections(&collections);
+            batch.collections("items", &collections);
             self.collections_json = collections;
         }
         Ok(())

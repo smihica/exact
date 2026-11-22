@@ -50,8 +50,10 @@ impl<D: DataSource> Bridge<D> {
     /// bottom) — and f32 top, right, bottom, left), one layout. And the
     /// containing blocks they give subtrees (LLP 1115.002 D8.2): kind 4
     /// with f32 width, height and, for each, 0 for a size, 1 for a maximum,
-    /// 2 for a content-fit limit that an authored size may exceed, or 3 for a
-    /// position-area's region (`BlockAxis::Region`);
+    /// 2 for a content-fit limit that an authored size may exceed, 3 for a
+    /// position-area's region (`BlockAxis::Region`), 4 to fit the root's
+    /// border box to the allocation, or 5 for the axis a host sizes to the
+    /// content (`BlockAxis::Content`);
     /// then a u32 tactic: four two-bit side indices, top/right/bottom/left
     /// (28 bytes including view and kind). Kind 5 takes a block back.
     /// Kinds 6 and 13 place a block (LLP 1123 D2):
@@ -66,13 +68,23 @@ impl<D: DataSource> Bridge<D> {
     /// `Runner::show_split_placeholder`) and kind 15 hides it again; their
     /// four floats are unused. Kind 16 is the border box a person dragged
     /// the box's `resize` grip to (`Runner::resize_box`): f32 width and
-    /// height, a NaN keeping that axis, and two unused.
+    /// height, a NaN keeping that axis, and two unused. Kind 21 is a content
+    /// owner's update (LLP 1123 D2): a u32 byte length, then the update as
+    /// `exact_kernel::OwnerUpdate::encode` writes it, applied after the
+    /// blocks (`Host::set_claims` says when one is refused). Kind 22 is a
+    /// target native code registered for the session (D9, "Registration"):
+    /// a u32 byte length, then the registration as
+    /// `exact_kernel::encode_registration` writes it, refused as an update is.
+    /// Kind 23 says how a split shows a block's route against its stack's
+    /// top (LLP 1127 D8): its first f32 1 beside it, 2 under a pane over
+    /// it, 0 in its stack. Kind 24 sizes a table header’s column in points.
+    /// NaN restores automatic sizing.
     pub fn covers(&mut self, len: usize) -> u32 {
         let bytes = self.input.get(..len).unwrap_or(&[]);
         let out = if let Ok(records) = records(bytes) {
             let (mut covers, mut margins, mut lists, mut restyles) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            let mut locals = Vec::new();
+            let (mut locals, mut shown) = (Vec::new(), Vec::new());
             let mut owners = BlockChanges::default();
             for r in records {
                 match owners.push(r) {
@@ -104,6 +116,21 @@ impl<D: DataSource> Bridge<D> {
                         Some([edge(8), edge(12), edge(16), edge(20)]),
                     )),
                     18 | 20 => locals.push(((kind == 18).then_some(view), None)),
+                    23 => shown.push((
+                        view,
+                        match edge(8) {
+                            1.0 => exact_kernel::BlockShown::Beside,
+                            2.0 => exact_kernel::BlockShown::Under,
+                            _ => exact_kernel::BlockShown::InStack,
+                        },
+                    )),
+                    24 => {
+                        let width = edge(8);
+                        restyles.push((
+                            view,
+                            Restyle::TableColumn((!width.is_nan()).then_some(width)),
+                        ));
+                    }
                     10 => lists.push((view, Some([edge(8), edge(12)]))),
                     11 => lists.push((view, None)),
                     1 => {
@@ -114,6 +141,10 @@ impl<D: DataSource> Bridge<D> {
                     12 => covers.push((
                         view,
                         Some(exact_kernel::HostCover::Gutter([edge(12), edge(16)])),
+                    )),
+                    25 => covers.push((
+                        view,
+                        Some(exact_kernel::HostCover::RowSpacing([edge(8), edge(16)])),
                     )),
                     3 => {
                         let inset = exact_kernel::HostCover::Inset([edge(8), edge(16)]);
@@ -131,6 +162,8 @@ impl<D: DataSource> Bridge<D> {
                     &lists,
                     &restyles,
                     &locals,
+                    &shown,
+                    owners.reports,
                 )
             })
         } else {
@@ -334,12 +367,15 @@ impl<D: DataSource> Bridge<D> {
 }
 
 /// One axis of a host block from its wire length and policy: 0 a size, 1 a
-/// maximum, 2 a content-fit limit, 3 a position-area's region.
+/// maximum, 2 a content-fit limit, 3 a position-area's region, 4 a pane's
+/// border box, 5 the axis a container sizes to the content.
 fn block_axis(length: f32, policy: f32) -> exact_kernel::BlockAxis {
     match policy {
         0.0 => exact_kernel::BlockAxis::Is(length),
         2.0 => exact_kernel::BlockAxis::Fit(length),
         3.0 => exact_kernel::BlockAxis::Region(length),
+        4.0 => exact_kernel::BlockAxis::Fill(length),
+        5.0 => exact_kernel::BlockAxis::Content(length),
         _ => exact_kernel::BlockAxis::AtMost(length),
     }
 }
@@ -362,6 +398,11 @@ pub(super) fn records(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
         let size = match u32::from_le_bytes(rest[4..8].try_into().unwrap()) {
             4 => 28,
             6 | 13 => 36,
+            // An owner update's or a registration's length follows its kind
+            21 | 22 => match rest.get(8..12) {
+                Some(len) => 12 + u32::from_le_bytes(len.try_into().unwrap()) as usize,
+                None => return Err("covers: truncated record"),
+            },
             _ => 24,
         };
         let Some((record, after)) = rest.split_at_checked(size) else {
@@ -381,11 +422,15 @@ pub(super) fn records(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
 pub(super) struct BlockChanges {
     pub blocks: Vec<(u32, Option<exact_kernel::HostBlock>)>,
     pub placements: Vec<(u32, Option<exact_runner::BlockPlacement>)>,
+    /// Content owners' updates, each beside its block, and registered
+    /// targets (LLP 1123 D2, D9).
+    pub reports: crate::host::OwnerReports,
 }
 
 impl BlockChanges {
-    /// Whether this record is an owner allocation or placement; an error
-    /// for a block whose try tactic is no side permutation.
+    /// Whether this record is an owner allocation, placement, update or
+    /// registration; an error for a block whose try tactic is no side
+    /// permutation or an update or registration that does not decode.
     pub fn push(&mut self, r: &[u8]) -> Result<bool, &'static str> {
         let word = |i: usize| [r[i], r[i + 1], r[i + 2], r[i + 3]];
         let edge = |i: usize| f32::from_le_bytes(word(i));
@@ -424,6 +469,14 @@ impl BlockChanges {
                 ));
             }
             7 => self.placements.push((view, None)),
+            21 => {
+                let update = exact_kernel::OwnerUpdate::decode(&r[12..])?;
+                self.reports.updates.push((view, update));
+            }
+            22 => {
+                let registration = exact_kernel::decode_registration(&r[12..])?;
+                self.reports.registrations.push(registration);
+            }
             _ => return Ok(false),
         }
         Ok(true)

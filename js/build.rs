@@ -315,12 +315,19 @@ fn main() {
         } else {
             Command::new(&rolldown)
         };
+        let program = bundler.get_program().to_owned();
         let status = bundler
             .arg("--config")
             .arg(&config)
             .args(["--configLoader", "native"])
             .status()
-            .unwrap_or_else(|error| panic!("exact-js: cannot run {}: {error}", rolldown.display()));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "exact-js: cannot run {} for {}: {error}",
+                    Path::new(&program).display(),
+                    rolldown.display()
+                )
+            });
         assert!(
             status.success(),
             "exact-js: rolldown failed on {}",

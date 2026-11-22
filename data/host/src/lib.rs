@@ -59,8 +59,7 @@ pub struct Storage<D> {
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(not(target_arch = "wasm32"))]
     storage_changed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// A scripted drive (`EXACT_AGENT=1`): storage is the scratch store it
-    /// names, else none.
+    /// A scripted drive uses the scratch store it names, if any.
     agent: bool,
     /// Lines for the journal beside the source's own: the first write such a
     /// drive refuses, as a TypeScript source's prelude says it (LLP 1102 §3.17).
@@ -83,7 +82,7 @@ impl<D> Storage<D> {
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(not(target_arch = "wasm32"))]
             storage_changed: Default::default(),
-            agent: std::env::var("EXACT_AGENT").as_deref() == Ok("1"),
+            agent: exact_runner::agent::carried(),
             logs: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             told_agent: false,

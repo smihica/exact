@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { APK_COMMAND, binaryCommand, changesAgainst, defaultRelease, publishedModule, publishStream, streamCandidates, streams, sunsetFor } from './publisher.mjs';
+import { APK_COMMAND, binaryCommand, changesAgainst, defaultRelease, publishedModule, publishStream, readBinaryInputFile, streamCandidates, streams, sunsetFor } from './publisher.mjs';
 import { requireReleasePins } from '../game/inputs.mjs';
 // `exact deploy` — the publisher (LLP 1030.000 D3 the verb, D4 the policies,
 // D5 one library in its own process, D7 where things live; LLP 1030 D3 the
@@ -55,7 +55,7 @@ import { assertOwnTarget, bakedEntryAssets, bakeOutput, cargoReproducibilityFlag
 import { gameShells } from "../game/app/shells.mjs";
 import { streamBundle, unbundledTextures } from './texture-families.mjs';
 import { channelOf, channelOrigin, openOrigin, OriginUnavailable, sha256, streamPath, parseWebRoot, webRootPath, webRootStream, webReleasePath, validateChannel } from './origin.mjs';
-import { admitHead, cohortReceipt, latestRecord, nextSeq } from './deploy-heads.mjs';
+import { admitHead, cohortReceipt, nextSeq, recoverCohort } from './deploy-heads.mjs';
 export { admitHead, cohortReceipt, inspectHead } from './deploy-heads.mjs';
 import { filesystemLock, removePrivateTree } from './filesystem.mjs';
 import { listBuildFiles, listPublicFiles, readStaticCandidate } from '../host/web/serve.mjs';
@@ -874,16 +874,22 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
     let {platform,compatibilityId}=item;
     const stream={channel,compatibilityId};
     if(platform && compat[platform]?.inputs?.store?.L==='0') {binary.set(platform,{compatibilityId,reason:'store.L=0: links no update store; deliver changes in the platform binary'});continue;}
+    const known = knownStreams.find(s => s.stream.compatibilityId === compatibilityId);
     let head,record,admission;
-    try { head=await origin.head(stream); record=await latestRecord(origin,app,stream); admission=head?await admitHead(origin,head,app,stream):null; }
+    try {
+      head=await origin.head(stream);
+      admission=head?await admitHead(origin,head,app,stream):null;
+      if (!(admission?.usable && admission.authenticated && admission.cohort)) {
+        record = await recoverCohort(origin, app, stream, admission, known?.build ?? builds?.[platform]);
+      }
+    }
     catch(error) {
       if(!(error instanceof OriginUnavailable))throw error;
       rows.push({kind:'stream',platform,channel,compatibilityId,cohort:null,head:null,action:'unavailable',changes:[],reason:error.message});continue;
     }
     if(!head&&!record&&!platform&&!declared)continue;
-    const signed=admission?.usable&&admission.authenticated?admission.head:record?.envelope;
-    const frozen=signed?.cohort?.version===1 && signed.cohort.compat?.id===compatibilityId ? signed.cohort : null;
-    platform ??= frozen?.compat?.inputs?.platform ?? record?.platform ?? knownStreams.find(s=>s.stream.compatibilityId===compatibilityId)?.platform ?? null;
+    const frozen=(admission?.authenticated ? admission.cohort : null) ?? record?.cohort;
+    platform ??= frozen?.compat?.inputs?.platform ?? record?.platform ?? known?.platform ?? null;
     if(opts.platform?.length&&platform&&!opts.platform.includes(platform))continue;
     if(platform&&compat[platform]?.inputs?.store?.L==='0')continue;
     const update = candidates.get(compatibilityId);
@@ -892,11 +898,19 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
     // No stream yet: the build that will embed the initial publication owns
     // the capabilities. Existing streams require their signed frozen receipt.
     // A stream a production receipt starts is that binary's cohort.
-    const started=!head&&!record?knownStreams.find(s=>s.build&&s.stream.compatibilityId===compatibilityId):null;
+    const started=!head&&!record&&known?.build?known:null;
     const installed=frozen ?? started?.cohort ?? (!head&&!record&&candidate?cohortReceipt(candidate):null);
     if(started) notes.push(`${platform} stream ${compatibilityId.slice(0,8)} starts from the production build receipt ${anchors.get(compatibilityId) ?? '(its path not given)'}: binary ${started.cohort.binary.slice(0,12)}`);
     const check=classifyArtifacts(candidate,installed,signingKey);
     if (update?.reason) { check.bundle = false; check.missing = [update.reason]; }
+    if (!update && check.bundle && installed.binaryInputs && (head || record)) {
+      try { await readBinaryInputFile(origin, installed, known?.build ?? builds?.[platform]); }
+      catch (error) {
+        if (!(error instanceof Refusal)) throw error;
+        check.bundle = false;
+        check.missing = [error.message];
+      }
+    }
     // A plan whose first frame the binary's own data crate baked is for the binary built from that crate (LLP 1030.007
     // D5): an older binary keeps its bundle, and only a new binary carries the change.
     if (update?.nativeData?.length) { check.bundle = false; check.warnings = []; check.missing = [`its binary predates these native sources: ${update.nativeData.join(', ')}`]; }
@@ -911,7 +925,7 @@ export async function classify({ app, opts, origin, channel, snapshot, release, 
         rows.push({kind:'stream',platform,channel,compatibilityId,cohort:null,head:null,action:'unavailable',changes:[],reason:error.message});continue;
       }
     }
-    if(admission&&!admission.usable)notes.push(`the head of ${streamPath(stream)} is unusable: ${admission.problem}; authenticated history determines repair`);
+    if(admission&&!admission.usable)notes.push(`the head of ${streamPath(stream)} is unusable: ${admission.problem}`);
     notes.push(...check.warnings);
     rows.push({kind:'stream',platform,channel,compatibilityId,
       cohort:inputs?{L:inputs.store?.L??'?',E:inputs.executors??[]}:null,
@@ -1164,13 +1178,14 @@ async function deployCaptured(opts, capsule) {
   if (signer) origin.useSigner?.(signer);
 
   const env = sealedSourceEnv(sourceRoot, { CARGO_TARGET_DIR: app.target, EXACT_UPDATE_TRUST: 'production' });
-  // Android has no binary lane here: its cohort is the production APK's build receipt, which the launcher read from the
-  // live app's bake output, and which starts its stream as push's does (LLP 1030.006 D6, LLP 1030.007 D4).
+  // The live app's production receipts can restore a missing cohort. An Android receipt
+  // also starts its stream (LLP 1030.006 D6, LLP 1030.007 D4).
   const receipts = capsule.receipts;
   if (!Array.isArray(receipts) || receipts.some((r) => typeof r?.path !== 'string' || r.build?.version !== 1 || r.build.compat?.inputs?.app !== app.id)) refuse('the private deploy capsule names malformed production receipts');
   const knownStreams = platforms.length ? await streams(origin, app, channel, { deploying: true, platforms, builds: receipts.map((r) => r.build) }) : [];
   const anchors = new Map(receipts.map((r) => [r.build.compat.id, r.path]));
-  const nativeBakes = platforms.filter(platform => platform !== 'android' && !knownStreams.some(s => s.platform === platform && s.cohort));
+  const nativeBakes = platforms.filter(platform => platform !== 'android' && (!knownStreams.some(s => s.platform === platform && s.cohort)
+    || knownStreams.some(s => s.platform === platform && s.needsEvidenceBake)));
   const webOnly = app.manifest.game === undefined && !namesNative(app.manifest);
   log(`snapshot ${snapshot.id}${snapshot.sources.length > 1 ? ` (${snapshot.sources.map((source) => `${source.roles.join('+')} ${source.commit.slice(0, 7)}`).join(', ')})` : ''}${snapshot.dirty ? ' + uncommitted changes (--dirty)' : ''}; ${webOnly ? 'building the web root, no stream named,' : 'baking'} into ${run}`);
   const web = webOnly ? null : bake(app, run, exactRoot, sourceRoot);
@@ -1202,6 +1217,10 @@ async function deployCaptured(opts, capsule) {
   }
   if (!webOnly) log(`compatibility ids: ${Object.entries(compat).map(([p, c]) => `${p} ${c.id}`).join(', ')}`);
 
+  for (const stream of knownStreams) {
+    const baked = builds[stream.platform];
+    if (stream.needsEvidenceBake && baked?.compat.id === stream.stream.compatibilityId) stream.build = baked;
+  }
   const updates = await streamCandidates(app, origin, knownStreams.filter(s => s.cohort), env, { snapshot: { bundle, compat: builds.web?.compat, graph: builds.web?.graph } });
   const candidates = new Map(updates.map(update => [update.row.compatibilityId, update]));
   const table = await classify({ app, opts, origin, channel, snapshot, release, web: webRoot, bundle, compat, builds, platforms, wantOrigin, candidates, knownStreams, anchors });
@@ -1231,7 +1250,9 @@ async function deployCaptured(opts, capsule) {
     if (row.action === 'binary') { refused.push({ platform: row.platform, compatibilityId: row.compatibilityId, reason: row.reason }); log(`  ${name}: refused — ${row.reason}`); continue; }
     try {
       const update = candidates.get(row.compatibilityId);
-      const result = await publishStream({ origin, row, bundle: update?.bundle ?? streamBundle(bundle, row.platform, (row.receipt?.compat ?? compat[row.platform])?.inputs), compat: row.receipt?.compat ?? compat[row.platform], app, signer, release, snapshot: table.snapshot, opts, log, build:update?.build ?? builds[row.platform] });
+      const recoveryBuild = knownStreams.find(s => s.stream.compatibilityId === row.compatibilityId)?.build ?? builds[row.platform];
+      const result = await publishStream({ origin, row, bundle: update?.bundle ?? streamBundle(bundle, row.platform, (row.receipt?.compat ?? compat[row.platform])?.inputs), compat: row.receipt?.compat ?? compat[row.platform],
+        app, signer, release, snapshot: table.snapshot, opts, log, build: update?.build ?? builds[row.platform], recoveryBuild });
       published.push(result);
       log(result.action === 'published' ? `  ${name}: head seq ${result.seq} (${result.head.sha256.slice(0, 12)}), previous ${result.previous ? result.previous.slice(0, 12) : 'none'}` : `  ${name}: ${result.note}`);
     } catch (e) {
@@ -1280,12 +1301,11 @@ async function deploy(opts) {
   }
 }
 
-/** The production build receipts of the app's Android APKs at "A", each with its path: what a new Android stream
- * starts from (LLP 1030.007 D4). */
-function androidReceipts(app) {
+/** The live app's production receipts for native binaries with an update store. */
+function productionReceipts(app) {
   const env = { EXACT_UPDATE_TRUST: 'production' }, directory = bakeOutput(app, env);
-  return readBuilds(app, env).filter((build) => build.trust === 'production' && build.compat.inputs.platform === 'android' && build.compat.inputs.store?.L !== '0')
-    .map((build) => ({ path: resolve(directory, `android-${build.compat.target}.build.json`), build }));
+  return readBuilds(app, env).filter(({ trust, compat: { inputs } }) => trust === 'production' && inputs.platform !== 'web' && inputs.store?.L !== '0')
+    .map((build) => ({ path: resolve(directory, `${build.compat.inputs.platform}-${build.compat.target}.build.json`), build }));
 }
 
 /** The live module graph is only a launcher: freeze and relocate all source,
@@ -1306,8 +1326,8 @@ function launch(locatedApp, opts, cache = {}) {
         workspace: materialized.app.workspace, target: materialized.app.target,
         external: canonicalPath(locatedApp.workspace) !== canonicalPath(ROOT),
       },
-      // The live app's production Android receipts: the captured process bakes into its own target, where none is.
-      receipts: androidReceipts(locatedApp),
+      // The captured process bakes into its own target.
+      receipts: productionReceipts(locatedApp),
     };
     const capsulePath = resolve(materialized.sourceRoot, '.deploy-capsule.json');
     writeFileSync(capsulePath, `${JSON.stringify(capsule)}\n`, { flag: 'wx', mode: 0o600 });

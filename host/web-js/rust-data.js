@@ -129,8 +129,8 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
       if (!['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'].includes(cache) || ![1, 6, 9, 10].includes(tag)) throw new Error('invalid cached HTTP result');
     }
     if (tag === 0) return { v: r.value() };
-    // The source's own refusal refuses the commit, as the runner's does;
-    // UnknownSource (2): a mixed app's TypeScript module may answer it.
+    // A source's BadArguments or Unavailable ends its send unsent.
+    // UnknownSource (2) gives a mixed app's TypeScript module its turn.
     // A call the seam could not carry (`call` above) is the resource's
     // failure instead (LLP 1071 §7).
     if (tag >= 2 && tag <= 4) throw Object.assign(new Error(r.str()), { unknown: tag === 2, refuse: true });
@@ -294,6 +294,7 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
     let out;
     try { out = result(r); } catch (error) {
       threwRead = observed; threwWatches = topics.length ? new Set(topics) : null; if (error.refuse && !globalThis.__exactRender) for (const [k, v] of writes) store.set(k, v);
+      if (turn?.mutation && error.refuse && !error.unknown) error.refuse = false;
       if (ops.length) said(turn, error.message);
       throw error;
     }
@@ -391,7 +392,7 @@ export async function install(data, sources, load = p => fetchHostAsset(p).then(
       const call = req[CALL];
       if (!call) return run(req, controller?.signal, controller).catch(failed);
       // A held request's reply, a failure too, is a held reply for `clock held` (the runner's `held_replies`).
-      return run(req, controller?.signal, controller).catch(failed).then(o => {
+      return run(req, controller?.signal, controller, call).catch(failed).then(o => {
         if (call.held) { call.held = 0; heldReply(call); }
         o[CALL] = call;
         return o;

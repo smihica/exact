@@ -175,6 +175,18 @@ impl SubclassingAdapter {
         Self(r#impl)
     }
 
+    /// Initialize the tree if UI Automation clients have subscribed to events.
+    /// Call before updating the tree for a popup's opening so its MenuOpened
+    /// event reaches clients that have yet to send it a `WM_GETOBJECT`.
+    pub fn activate_for_listeners(&mut self) {
+        if !unsafe { windows::Win32::UI::Accessibility::UiaClientsAreListening() }.as_bool() {
+            return;
+        }
+        let mut state = self.0.state.borrow_mut();
+        let state = &mut *state;
+        state.adapter.activate(&mut *state.activation_handler);
+    }
+
     /// If and only if the tree has been initialized, call the provided function
     /// and apply the resulting update. Note: If the caller's implementation of
     /// [`ActivationHandler::request_initial_tree`] initially returned `None`,

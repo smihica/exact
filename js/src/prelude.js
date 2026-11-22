@@ -523,10 +523,12 @@
 
   // --- the seam ------------------------------------------------------------
   var calls = new Map(),
-    gcOwed = false; // calls: id -> { id, status, value, error, tickets }
+    gcOwed = false, // calls: id -> { id, status, value, error, tickets }
+    owedStamp = null; // pending calls to re-stamp with the epoch after an owed collection
   // Large native strings travel beside the JSON skeleton by explicit paths (no property
   // spelling reserved); the serializer owns getters, toJSON, omissions and cycles. One
-  // whose answer outlived a collection owes a full one, once no answer awaits (shim.cc).
+  // whose answer outlived a collection owes a full one on the reply, re-stamping pending
+  // answers' epochs so overlapping replies do not cascade (shim.cc).
   var captureString = global.__exact_capture_string,
     gcEpoch =
       global.__exact_gc_epoch ||
@@ -535,6 +537,14 @@
       };
   delete global.__exact_capture_string;
   delete global.__exact_gc_epoch;
+  function syncEpoch() {
+    var epoch = gcEpoch();
+    if (owedStamp) {
+      for (var i = 0; i < owedStamp.length; i++) owedStamp[i].epoch = epoch;
+      owedStamp = null;
+    }
+    return epoch;
+  }
   // Undrained synchronous app callbacks can queue any waiter's reactions (LLP 1162 D3).
   function readyAll() {
     calls.forEach(function (c) {
@@ -543,13 +553,13 @@
   }
   function cleanUp() {
     freeLocks();
-    var waiting = false;
-    calls.forEach(function (c) {
-      if (!c.stream && !c.letGo) waiting = true;
-    });
-    if (gcOwed && !waiting) {
+    if (gcOwed) {
       gcOwed = false;
       gcEpoch(true);
+      owedStamp = [];
+      calls.forEach(function (c) {
+        if (c.status === "pending") owedStamp.push(c);
+      });
     }
   }
   // An answer's value or failure as the seam carries it (reply.js).
@@ -588,14 +598,6 @@
   // D1): the storage it started and did not await finishes after it, as the
   // background's, so nothing is stranded (kanban F22's reason to wait). On a
   // worker placement, which runs one turn to its end, it still waits.
-  function reply(call, text) {
-    endYields(call); // a branch its value did not wait for goes on, as a browser's does
-    timers.drop(call); // its timers are its own (time.js `timers`)
-    call.replied = true;
-    calls.delete(call.id);
-    cleanUp();
-    return text;
-  }
   function settleResult(call, final) {
     var secret = call.secrets && call.secrets[0];
     if (secret && !secret.held) {
@@ -676,7 +678,19 @@
       });
       if (moduleWide && inFlight) return JSON.stringify({ tag: 1, call: call.id, ticket: 0, waiting: true });
       if (call.status === "done") handSocketOps(call);
-      return reply(call, call.status === "done" ? ok(call.value, call.epoch !== gcEpoch()) : fail(bakeIntl(call.error)));
+      try {
+        var body =
+          call.status === "done"
+            ? ok(call.value, call.epoch !== syncEpoch())
+            : fail(bakeIntl(call.error));
+      } finally {
+        endYields(call); // a branch its value did not wait for goes on, as a browser's does
+        timers.drop(call); // its timers are its own (time.js `timers`)
+        call.replied = true;
+        calls.delete(call.id);
+        cleanUp();
+      }
+      return body;
     }
     // Its own timers (time.js `timers`): the earliest is due on the runner's clock.
     var due = timers.wait(call),
@@ -810,7 +824,7 @@
       set: mutation === "resource",
       sync: false,
       socketOps: null,
-      epoch: gcEpoch(),
+      epoch: syncEpoch(),
     };
     var result;
     currentCall = call;
@@ -1139,7 +1153,7 @@
           answer: true,
           sync: true,
           socketOps: null,
-          epoch: gcEpoch(),
+          epoch: syncEpoch(),
         }
       : call;
     currentCall = mine;

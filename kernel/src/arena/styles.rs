@@ -69,8 +69,18 @@ impl NodeArena {
         } else if self.ignoring.remove(slot) {
             self.observations.forget_taken(slot);
         }
+        // Measure the readers at and under a box whose margins changed again (D8): its own,
+        // what its safe area adds, which it preserves, and which side leading maps to
+        let old = &self.styles[slot as usize];
+        let margins = crate::kernel::margins::ROWS
+            .into_iter()
+            .chain([crate::StyleId::Direction]);
+        let restyled = margins.into_iter().any(|id| {
+            old.mask.has(id) != style.mask.has(id)
+                || style.mask.has(id) && old.get(id) != style.get(id)
+        });
         self.styles[slot as usize] = style;
-        if scrolled != crate::kernel::area::scroll_axes(self, slot) {
+        if restyled || scrolled != crate::kernel::area::scroll_axes(self, slot) {
             self.observations.moved(slot);
         }
         self.refresh_sticky(slot);
@@ -79,5 +89,28 @@ impl NodeArena {
     /// Distinct styles the arena holds for its nodes, beyond the initial one.
     pub fn shared_style_count(&self) -> usize {
         self.shared.len()
+    }
+}
+
+impl NodeArena {
+    /// Mark the colours its styles hold: the shared table's, which every
+    /// node's style is one of, and the control and document styles.
+    pub(crate) fn wide_colors(&mut self, m: &mut crate::style::wide::WideMark) {
+        use crate::style::wide::Colors;
+        self.shared.wide_colors(m);
+        if let Some(control) = &self.control_styles {
+            control.colors(m);
+        }
+        self.document_style.colors(m);
+    }
+
+    /// The same, visiting every style (for a clone, once).
+    pub(super) fn wide_colors_shared(&self, m: &mut crate::style::wide::WideMark) {
+        use crate::style::wide::Colors;
+        self.shared.visit(m);
+        if let Some(control) = &self.control_styles {
+            control.colors(m);
+        }
+        self.document_style.colors(m);
     }
 }

@@ -8,6 +8,7 @@ import { plistFile } from './assets.mjs';
 import { stripProductionExecutable } from './link.mjs';
 import { appleActivationRule, applePresentation, appleShareMembers, appleSharePage } from '../../scripts/share-target.mjs';
 import { embeddedProfile } from './devices.mjs';
+import { swiftOptimization } from './toolchain.mjs';
 import { notificationServiceDirectoryExists, notificationServiceSourceRoot, snapshotNotificationService } from '../../scripts/notification-service.mjs';
 import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
@@ -33,7 +34,7 @@ export const keepMain = ['-Xlinker', '-u', '-Xlinker', '_main'];
 /** The kinds of app extension `--extensions` chooses among: what an iOS build packages from app.json beside the app,
  * the watch app included (a device build's, and `--watchos`'s). Widgets and Live Activities share one appex; an
  * alarm's countdown is drawn by it too. */
-export const EXTENSION_KINDS = ['widgets', 'activities', 'intents', 'alarms', 'notifications', 'watch'];
+export const EXTENSION_KINDS = ['widgets', 'activities', 'intents', 'alarms', 'notifications', 'watch', 'share'];
 /** The kinds `--extensions <all|none|kind,…>` keeps; every kind without the flag. An unknown kind is refused, so a
  * typo never builds more (or less) than was asked. */
 export function extensionKinds(args) {
@@ -54,6 +55,7 @@ export function withoutExtensions(manifest, kinds) {
   const dropped = { ...manifest };
   if (!kinds.has('widgets') && manifest.widgets) dropped.widgets = [];
   if (!kinds.has('activities') && manifest.live_activities) dropped.live_activities = [];
+  if (!kinds.has('share')) delete dropped.share_target;
   return dropped;
 }
 
@@ -171,7 +173,7 @@ export function packageShareExtension({ app, bundle, directory, sdk, triple, dev
   mkdirSync(directory, { recursive: true });
   const entitlementPath = resolve(directory, 'share-entitlements.plist');
   writeFileSync(entitlementPath, entitlements);
-  runApple('xcrun', ['--sdk', mac ? 'macosx' : device ? 'iphoneos' : 'iphonesimulator', 'swiftc', '-parse-as-library', '-O', ...(production ? ['-g'] : []), ...appexArgs,
+  runApple('xcrun', ['--sdk', mac ? 'macosx' : device ? 'iphoneos' : 'iphonesimulator', 'swiftc', '-parse-as-library', swiftOptimization(), ...(production ? ['-g'] : []), ...appexArgs,
     ...(page ? ['-D', 'EXACT_SHARE_PAGE'] : []), '-module-name', 'ExactShare', '-target', triple, '-sdk', sdk, '-module-cache-path', extensionModuleCache,
     ...(!device && !mac ? ['-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__entitlements', '-Xlinker', entitlementPath] : []),
     resolve(root, 'host/apple/share/ShareInbox.swift'), resolve(root, 'host/apple/share', presentationSource), '-o', binary]);
@@ -208,7 +210,7 @@ export function packageNotificationService({ service, identity, app, bundle, dir
     }));
     const entitlementPath = resolve(directory, 'notification-service-entitlements.plist'), binary = resolve(extension, service.name);
     writeFileSync(entitlementPath, plistFile(entitlements));
-    runApple('xcrun', ['--sdk', device ? 'iphoneos' : 'iphonesimulator', 'swiftc', '-parse-as-library', '-O', ...(production ? ['-g'] : []), ...appexArgs,
+    runApple('xcrun', ['--sdk', device ? 'iphoneos' : 'iphonesimulator', 'swiftc', '-parse-as-library', swiftOptimization(), ...(production ? ['-g'] : []), ...appexArgs,
       '-module-name', service.module, '-target', triple, '-sdk', sdk, '-module-cache-path', extensionModuleCache,
       ...(!device ? ['-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__entitlements', '-Xlinker', entitlementPath] : []),
       ...sources, '-o', binary]);

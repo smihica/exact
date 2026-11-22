@@ -25,6 +25,7 @@ val appDir = providers.gradleProperty("appDir").orNull?.let { file(it) } ?: root
 val manifest = JsonSlurper().parse(appDir.resolve("app.json")) as Map<*, *>
 val androidHost = (manifest["host"] as Map<*, *>?)?.get("android") as Map<*, *>?
 val packageId = providers.gradleProperty("applicationId").get()
+val backgroundPlayback = video && manifest["audio_session"] == "playback"
 // The manifest's `orientation` as Chromium maps an installed web app's: `-primary` is the device's own way up, a
 // bare `portrait` or `landscape` either way up by the sensor. `natural` is resolved in MainActivity.
 val screenOrientation = mapOf(
@@ -72,7 +73,7 @@ android {
         // shows the shell's plain one (res/drawable/banner.xml).
         manifestPlaceholders["appIcon"] = providers.gradleProperty("appIcon").orNull ?: "@null"
         manifestPlaceholders["appBanner"] = providers.gradleProperty("appBanner").orNull ?: "@drawable/banner"
-        // The launch window in the manifest's `background_color` and with its `host.android.launchImage`
+        // The launch window in the manifest's launch colours and with its `host.android.launchImage`
         // (agent-android.mjs `androidLaunch`); without either the reader's, the platform's (LLP 1115.001 D3.6).
         manifestPlaceholders["appTheme"] = providers.gradleProperty("appTheme").orNull ?: "@style/ExactLaunch"
     }
@@ -104,7 +105,11 @@ android {
     // (agent-android.mjs `androidNotificationResources`, LLP 1133.004.000 D1, D3).
     sourceSets["main"].res.directories.add(out.resolve("notify/res").path)
     sourceSets["main"].kotlin.directories.add(if (compose) "src/compose/java" else "src/nocompose/java")
-    sourceSets["main"].kotlin.directories.add(if (video) "src/video/java" else "src/novideo/java")
+    sourceSets["main"].kotlin.directories.add(when {
+        backgroundPlayback -> "src/playback/java"
+        video -> "src/video/java"
+        else -> "src/novideo/java"
+    })
     // The app's Kotlin hatches and module roster (LLP 1115.001.000 D4) in its `modules/android`; -PmodulesDir lets a
     // component fixture compile the app's actual provider without copying its Kotlin.
     val modulesDir = providers.gradleProperty("modulesDir").orNull?.let { file(it) } ?: appDir.resolve("modules/android")
@@ -131,7 +136,7 @@ android {
         val attr = { v: String -> v.replace("&", "&amp;").replace("<", "&lt;").replace("\"", "&quot;") }
         val text = { v: String -> attr(v).replace("\\", "\\\\").replace("'", "\\'").replace(Regex("^([@?])"), "\\\\$1") }
         // Apple's families as cell spans (D4); `systemExtraLarge` is iPad's, a 4×4 here as `systemLarge`.
-        val cells = mapOf("systemSmall" to (2 to 2), "systemMedium" to (4 to 2), "systemLarge" to (4 to 4), "systemExtraLarge" to (4 to 4))
+        val cells = mapOf("systemSmall" to (2 to 2), "systemMedium" to (4 to 2), "systemLarge" to (4 to 4), "systemExtraLarge" to (4 to 4), "systemExtraLargePortrait" to (4 to 4))
         // The settings screen offers fixed choices only (LLP 1126.003 D7). An entity parameter is left out, so its
         // field stays none here, and a row with no parameter left has no settings.
         val rows = (manifest["widgets"] as List<*>?).orEmpty().map { it as Map<*, *> }
@@ -184,7 +189,13 @@ android {
     }
     // Hardware and software features from grant lines (`-PandroidFeatures`, LLP 1133.022 D18, LLP 1133.037 D17).
     val lineFeatures = providers.gradleProperty("androidFeatures").orNull?.split(',')?.filter { it.isNotBlank() }.orEmpty()
-    (providers.gradleProperty("permissions").orNull?.split(',')?.filter { it.isNotEmpty() } ?: emptyList())
+    val linePermissions = providers.gradleProperty("permissions").orNull?.split(',')?.filter { it.isNotEmpty() }.orEmpty()
+    val playbackPermissions = if (backgroundPlayback) listOf(
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.WAKE_LOCK",
+    ) else emptyList()
+    (linePermissions + playbackPermissions).distinct()
         .takeIf { it.isNotEmpty() || fragment != null || lineFeatures.isNotEmpty() || widgetReceivers.isNotEmpty() }?.let { names ->
         val permissions = layout.buildDirectory.file("permissions/AndroidManifest.xml").get().asFile
         permissions.parentFile.mkdirs()
@@ -213,6 +224,15 @@ android {
                 "            android:foregroundServiceType=\"${(declared["types"] as List<*>).joinToString("|")}\">\n" +
                 "            <meta-data android:name=\"dev.exact.purpose\" android:value=\"${escape(declared["purpose"]?.toString() ?: "")}\" />\n        </service>\n"
         }
+        val playbackService = if (backgroundPlayback) """
+            |        <service android:name="dev.exact.video.PlaybackService" android:exported="false"
+            |            android:foregroundServiceType="mediaPlayback">
+            |            <intent-filter>
+            |                <action android:name="androidx.media3.session.MediaSessionService" />
+            |            </intent-filter>
+            |        </service>
+            |
+        """.trimMargin() else ""
         // The services join the fragment's `<application>` when it has one: a manifest holds one.
         val manifestChildren = { fragment: String?, services: String ->
             when {
@@ -221,15 +241,23 @@ android {
                 else -> (fragment?.let { "$it\n" } ?: "") + "    <application>\n$services    </application>\n"
             }
         }
-        permissions.writeText("<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" xmlns:tools=\"http://schemas.android.com/tools\">\n" +
+        val manifestOpen = "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" xmlns:tools=\"http://schemas.android.com/tools\">\n"
+        permissions.writeText(manifestOpen +
             names.joinToString("") { permission(it) } +
             features.joinToString("") {
                 val parts = it.split(' ')
                 require(parts.size == 1 || (parts.size == 2 && parts[1] == "required=false")) { "Invalid feature: $it" }
                 "    <uses-feature android:name=\"${parts[0]}\" android:required=\"${parts.size == 1}\" />\n"
             } +
-            manifestChildren(fragment, services.entries.joinToString("") { service(it.key, it.value) } + widgetReceivers) + "</manifest>\n")
+            manifestChildren(fragment, services.entries.joinToString("") { service(it.key, it.value) } + playbackService + widgetReceivers) + "</manifest>\n")
         sourceSets["release"].manifest.srcFile(permissions)
+        if (backgroundPlayback) {
+            val debug = permissions.parentFile.resolve("debug/AndroidManifest.xml")
+            debug.parentFile.mkdirs()
+            debug.writeText(manifestOpen + playbackPermissions.joinToString("") { permission(it) } +
+                manifestChildren(null, playbackService) + "</manifest>\n")
+            sourceSets["debug"].manifest.srcFile(debug)
+        }
     }
     // The manifest's `shortcuts` as the launcher activity's static shortcuts (LLP 1133.023 D3, D17), in order: each
     // starts the activity with its location as the intent's data, which the reader takes as a link's. Labels and the
@@ -352,6 +380,10 @@ dependencies {
     maven.forEach { implementation(it) }
     implementation(project(":canvas"))
     if (video) implementation(project(":video"))
+    if (backgroundPlayback) {
+        implementation(libs.media3.session)
+        implementation(libs.media3.ui)
+    }
     if (widgets) implementation(project(":widgets"))
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

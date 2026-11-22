@@ -3,8 +3,9 @@
 // app's composition links only when its plan has a drag, and installs here.
 // The core holds them through these protocols; without the module a node
 // never takes a drag gesture, and a plan that has one is refused at boot
-// (`Unlinked("drag")`). A list's reorder is the lists family's
-// (`ReorderLink`).
+// (`Unlinked("drag")`). The module keeps a presenter's handles too
+// (`DragHandles`): their bindings, their geometry reports and the packets
+// the runtime reads. A list's reorder is the lists family's (`ReorderLink`).
 #if canImport(UIKit)
 import UIKit
 #else
@@ -13,6 +14,8 @@ import AppKit
 
 /// What the core asks of the capability.
 package protocol DragCapability: AnyObject {
+    /// A presenter's transform and height handles.
+    func handles(_ presenter: Presenter) -> DragHandles
     #if os(macOS)
     /// A presenter's mouse drags.
     func mouseDrags(_ presenter: Presenter) -> MouseDrags
@@ -26,6 +29,33 @@ package protocol DragCapability: AnyObject {
     func shouldBegin(_ view: NodeView, _ gesture: UIGestureRecognizer) -> Bool?
     /// The agent's pinch on a transform handle: why it was refused, or nil.
     func recognizedPinch(_ handle: NodeView, scale: Double, focal: CGPoint) -> String?
+    #endif
+}
+
+/// A presenter's transform and height handles, bound by the batch's
+/// `transformDrag` and `heightDrag` ops.
+package protocol DragHandles: AnyObject {
+    /// A `transformDrag` or `heightDrag` op: the nodes it names, its handle
+    /// first, or none when it binds nothing.
+    func bind(_ kind: BatchOp.Kind, _ payload: [String: Any]) -> [UInt32]
+    func retire(_ id: UInt32)
+    func reset()
+    /// What may have moved a transform handle's geometry did.
+    func geometryChanged()
+    #if EXACT_AGENT
+    /// The clip of `id`'s transform handle, if it is one.
+    func transformClip(_ id: UInt32) -> UInt32?
+    #endif
+}
+
+/// An app without the capability: no node is a handle.
+final class NoDragHandles: DragHandles {
+    func bind(_ kind: BatchOp.Kind, _ payload: [String: Any]) -> [UInt32] { [] }
+    func retire(_ id: UInt32) {}
+    func reset() {}
+    func geometryChanged() {}
+    #if EXACT_AGENT
+    func transformClip(_ id: UInt32) -> UInt32? { nil }
     #endif
 }
 

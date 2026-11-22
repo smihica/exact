@@ -228,16 +228,21 @@ fn web_reads_the_builds(app: &Path) {
         "{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    let (page, render) = (out.join("app.js"), out.join(".gen/server.js"));
-    for bundle in [&page, &render] {
-        let text = std::fs::read_to_string(bundle).unwrap();
-        // No read of a launch's value: none of the launch module, which
-        // every such read imports.
-        assert!(
-            text.contains(BUILT) && !text.contains(LAUNCHED),
-            "{}",
-            bundle.display()
-        );
+    let routes: Json =
+        serde_json::from_slice(&std::fs::read(out.join("routes.json")).unwrap()).unwrap();
+    let page = routes["files"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|file| file.as_str().unwrap())
+        .filter(|file| file.ends_with(".js"))
+        .map(|file| std::fs::read_to_string(out.join(file)).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let render = std::fs::read_to_string(out.join(".gen/server.js")).unwrap();
+    // The page can load the TypeScript data module in a separate chunk.
+    for (bundle, text) in [("page", page), ("render", render)] {
+        assert!(text.contains(BUILT) && !text.contains(LAUNCHED), "{bundle}");
     }
 }
 

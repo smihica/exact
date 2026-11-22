@@ -50,6 +50,33 @@ fn the_date_arrives_as_one_commit_and_bad_facts_are_refused() {
     assert_eq!(text(&r), "1790000000000/120");
 }
 
+#[test]
+fn a_child_reads_the_host_clock_after_its_slots_exist() {
+    let app = r#"shape Time
+  epochAtZero: number
+  utcOffset: number
+component App
+  view
+    Clock()
+component Clock
+  resource time = exactTime() as shape Time else empty(epochAtZero=-1)
+  view
+    text `${time.epochAtZero}/${time.utcOffset}` testId="date"
+"#;
+    let plan = contract::bake(contract::compile(app).unwrap(), NoData).unwrap();
+    let mut r = Runner::boot(
+        plan,
+        NoData,
+        Kernel::with_monospace(),
+        Default::default(),
+        "/",
+    )
+    .unwrap();
+    assert_eq!(text(&r), "0/0");
+    r.set_time(1_790_000_000_000.0, 120.0).unwrap();
+    assert_eq!(text(&r), "1790000000000/120");
+}
+
 /// A host that knows the date at launch boots under it: the first frame
 /// reads it, and telling the same fact after commits nothing; an invalid
 /// fact boots on zero, as before.

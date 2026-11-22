@@ -86,7 +86,7 @@ package class ScrollView: UIScrollView {
             presenter.moveOrPlace(node) { super.bounds = newValue }
         }
     }
-    /// The insets the offset was last kept under (`adjustedContentInsetDidChange`).
+    /// The insets the offset was last kept under (`insetsSettled`, or D14's writer through `kept(under:)`).
     private var keptInset = UIEdgeInsets.zero
     /// A list that opens at its end (`scroll-start: end`) or follows it, at
     /// its end, stays there as its insets change, as SwiftUI's
@@ -94,23 +94,52 @@ package class ScrollView: UIScrollView {
     /// tab bar's inset reaches a grid after it opened at its newest row
     /// (r25's photos, at launch and as a viewer closes), and kept, the
     /// offset left that row under the bar.
+    /// The kept insets move once Exact's own writes to a controller above settle (LLP 1123 D11), so
+    /// the list compares the insets from before the writes with the settled ones, not a step's.
     package override func adjustedContentInsetDidChange() {
-        let was = keptInset
-        keptInset = adjustedContentInset
         super.adjustedContentInsetDidChange()
         setNeedsLayout()
+        scrollingNode?.scrollInsetMoved(self)
+        SafeAreaSteps.react(self) { [weak self] in self?.insetsSettled() }
+    }
+
+    private func insetsSettled() {
+        let atEnd = restsAtEnd, was = keptInset
+        keptInset = adjustedContentInset
         // the port is a `scroll` event's (`clientHeight`): one that changes without moving
         // the offset gets no `scrollViewDidScroll`, so its event is sent from here.
         (superview as? NodeView)?.queueScrollEvent()
-        guard let node = superview as? NodeView, node.props["scrollStart"] == "end" || node.props["scrollFollowEnd"] == "true",
-              node.presenter?.collections.snapshot(node.id)?.horizontal != true,
-              !isTracking, !isDecelerating, contentSize.height > 0, !node.authorOwnsScroll(self) else { return }
-        let end = { (inset: UIEdgeInsets) in max(-inset.top, self.contentSize.height + inset.bottom - self.bounds.height) }
-        guard contentOffset.y >= end(was) - 1, was.bottom != keptInset.bottom else { return }
-        contentOffset = PixelGrid.offset(CGPoint(x: contentOffset.x, y: end(keptInset)), in: self)
+        guard atEnd, !isTracking, !isDecelerating, was.bottom != keptInset.bottom else { return }
+        contentOffset = PixelGrid.offset(CGPoint(x: contentOffset.x, y: end(under: keptInset)), in: self)
     }
+    /// Whether it keeps its end as its insets change (`adjustedContentInsetDidChange`, and D14's writer, which moves
+    /// the offset itself): a list that opens at its end or follows it, with content, not a horizontal collection, and
+    /// not one whose author owns its scroll position.
+    package var keepsEnd: Bool { keepsEnd(atRest: false) }
+    /// `keepsEnd`, judged with `atRest` where UIKit reports the scroll view at rest and reports every animation it runs:
+    /// then only the list's own scroll owns its position (`listOwnsScroll`), whatever records a reveal or a smooth write
+    /// left behind.
+    package func keepsEnd(atRest: Bool) -> Bool {
+        guard let node = superview as? NodeView, node.props["scrollStart"] == "end" || node.props["scrollFollowEnd"] == "true" else { return false }
+        let owned = atRest ? node.listOwnsScroll : node.authorOwnsScroll(self)
+        return node.presenter?.collections.snapshot(node.id)?.horizontal != true && contentSize.height > 0 && !owned
+    }
+    /// The offset at which its content's end rests under `inset`.
+    package func end(under inset: UIEdgeInsets) -> CGFloat { max(-inset.top, contentSize.height + inset.bottom - bounds.height) }
+    /// Whether it keeps its end and rests there under the insets its offset was last kept under.
+    package var restsAtEnd: Bool { restsAtEnd(atRest: false) }
+    package func restsAtEnd(atRest: Bool) -> Bool { keepsEnd(atRest: atRest) && contentOffset.y >= end(under: keptInset) - 1 }
+    /// Records that its offset is kept under `inset`, as D14's writer keeps it, so the reaction to
+    /// the writer's insets keeps nothing again.
+    package func kept(under inset: UIEdgeInsets) { keptInset = inset }
+    /// Keeps `restsAtEnd` as it was across a change of its bounds' height by `growth` that moves no
+    /// inset, as reach makes (`setReach`), until D14's writer keeps the offset under its insets.
+    package func boundsGrew(by growth: CGFloat) { keptInset.bottom += growth }
     package override var accessibilityElements: [Any]? {
-        get { super.accessibilityElements ?? NodeView.emptyBoxAccessibility(in: self) }
+        get {
+            super.accessibilityElements ?? scrollingNode?.presenter?.navigation.lifted?.accessibilityElements(of: self)
+                ?? NodeView.emptyBoxAccessibility(in: self)
+        }
         set { super.accessibilityElements = newValue }
     }
     package override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
@@ -379,6 +408,7 @@ extension NodeView {
         }
         guard extras?.nativeScrollView !== view else { return }
         if pageBand != .zero { setPageBand(.zero) } // the scroll view leaving gives its band back (LLP 1130 D3)
+        if reach != .zero || reachGiven { more.reach = .zero; more.reachGiven = false } // and its reach, which its successor waits for anew (LLP 1123 D13)
         more.nativeScrollView = view
         more.nativeScrollDelegate = view?.delegate
         if scrollView == nil { presenter?.scrollers.remove(id) }
@@ -398,17 +428,69 @@ extension NodeView {
         if extras?.pendingScrollTransfer == true { pendingScrollTop = nil; pendingScrollLeft = nil }
     }
 
+    /// Runs `change`, an arranged pane's switch of `sv`'s inset adjustment behavior, keeping what D14 keeps across an
+    /// inset change: UIKit keeps CSS `scrollTop` across a change of the adjusted inset but the offset across one of the
+    /// behavior (LLP 1123, "Inset adoption"). A list that keeps its end and rests there keeps the end, which D14 puts
+    /// first (an Exact scroller's; a grouped list's collection keeps `scrollTop`), a scroller in motion keeps its own
+    /// position, with whatever a windowed list holds of it, and a switch that moves no inset is corrected not at all. Outside
+    /// a batch the write is clamped to the new range, as D14's writer clamps; inside one it is clamped when the batch
+    /// ends, so the batch's restore applies a row shift to the whole move first, and the batch's captures of the offset
+    /// (`followedScroll`, `beforeLayoutScroll`) and a windowed list's (`ListHosting.portMoved`) move with the write, as a
+    /// page band's move them.
+    package func keepingScrollTop(of sv: UIScrollView, _ change: () -> Void) {
+        let css = scrollTopInset(sv), was = sv.adjustedContentInset, before = sv.contentOffset.y
+        // In motion as UIKit reports it (an arrangement's iOS reports its animations), or under a windowed list's own
+        // smooth correction, which UIKit does not drive
+        let moving = sv.scrollsItself || presenter?.collections.animating.contains(id) == true
+        // Judged at rest, as it is wherever the end is kept: arrangements run where UIKit reports its animations
+        let atEnd = (sv as? ScrollView)?.restsAtEnd(atRest: true) == true, mark = presenter?.collections.portMark(id)
+        change()
+        let i = sv.adjustedContentInset
+        guard !moving, i != was || scrollTopInset(sv) != css else { return }
+        // At the end it moves as far as the inset moved the end, so a batch's row shift still applies after it
+        let end = { (i: UIEdgeInsets) in max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height) }
+        let y = atEnd ? before + end(i) - end(was) : before + css - scrollTopInset(sv)
+        let batch = presenter?.applying == true
+        sv.contentOffset = PixelGrid.offset(CGPoint(x: sv.contentOffset.x, y: y), in: sv, clamped: !batch)
+        // Clamped once the batch's restores are done, unless one wrote the offset since (a restore that moves it clamps)
+        // or the scroller is then in motion, the batch's smooth `scrollTop` among them
+        if batch, let presenter {
+            let written = sv.contentOffset
+            presenter.afterBatch { [weak self, weak sv] in
+                guard let self, let sv, sv.contentOffset == written, !sv.scrollsItself,
+                      self.presenter?.collections.animating.contains(id) != true else { return }
+                let clamped = PixelGrid.offset(written, in: sv)
+                if clamped != written { sv.contentOffset = clamped }
+            }
+        }
+        let moved = sv.contentOffset.y - before
+        if var followed = followedScroll { followed.top += moved; followed.port -= moved; followedScroll = followed }
+        if var saved = beforeLayoutScroll { saved.offset.y += moved; saved.topInset -= moved; beforeLayoutScroll = saved }
+        if let mark { presenter?.collections.portMoved(id, since: mark) }
+    }
+
+    /// `sv`'s adjusted inset moved: while `sv` is this node's scroll view and the node an arranged pane joined to UIKit's
+    /// adjustment, the arrangement takes a pass, which publishes its owners' values and the route's covers anew.
+    package func scrollInsetMoved(_ sv: UIScrollView) {
+        #if os(iOS)
+        if #available(iOS 27.1, *), scrollView === sv { presenter?.arrangements.scrollInsetMoved(id) }
+        #endif
+    }
+
     /// Whether a scroll newer than a position Exact carries is under way on `sv`: one the scroll view makes itself
     /// (`scrollsItself`), an element reveal, or a list's smooth correction
     package func scrollUnderWay(_ sv: UIScrollView) -> Bool {
         sv.scrollsItself || presenter?.elementScrolls.revealing(sv) != nil || presenter?.collections.animating.contains(id) == true
     }
 
-    /// A replacement keeps the logical offset; an authored write takes priority.
+    /// A replacement keeps the logical offset; an authored write takes priority. A position saved while the scroller had
+    /// no port (`hiddenScroll`) is already the reader's, and `applyPendingScroll` restores it into whichever scroll view
+    /// the node has then: nothing is carried over it.
     package func retainScrollPosition(from view: UIScrollView) {
+        guard hiddenScroll == nil else { return }
         let authored = extras?.pendingScrollTransfer != true && (pendingScrollTop != nil || pendingScrollLeft != nil)
         if pendingScrollTop == nil { pendingScrollTop = Double(view.contentOffset.y + scrollTopInset(view)) }
-        if pendingScrollLeft == nil { pendingScrollLeft = Double(view.contentOffset.x) }
+        if pendingScrollLeft == nil { pendingScrollLeft = Double(view.contentOffset.x + scrollLeftInset(view)) }
         more.pendingScrollTransfer = !authored
         presenter?.pendingScrolls.insert(id)
     }
@@ -423,7 +505,7 @@ extension NodeView {
         // UIKit may have pending row geometry and its own offset adjustment.
         // Snapshot both from the same layout before preserving the reader.
         if groupedOwner { scrollView?.layoutIfNeeded() }
-        beforeLayoutScroll = scrollView.map { ($0.contentOffset, scrollTopInset($0)) }
+        beforeLayoutScroll = scrollView.map { ($0.contentOffset, scrollTopInset($0), scrollLeftInset($0), extras?.nativeScrollContentInsets.top ?? 0) }
         followedScroll = nil
         readingAnchors.removeAll(keepingCapacity: true)
         scrollAnchor = nil
@@ -448,7 +530,8 @@ extension NodeView {
         let capturedTop = retainedScrollTop ?? sv.contentOffset.y
         followedScroll = (capturedTop,
                           (retainedScrollTop == nil && sv.contentOffset.y >= maximum - 1) || followingEndAnimated,
-                          abs(capturedTop + sv.adjustedContentInset.top) <= 0.5)
+                          abs(capturedTop + sv.adjustedContentInset.top) <= 0.5,
+                          scrollPortInsets(sv).top)
         guard let followedScroll, !followedScroll.end, followedScroll.top + sv.adjustedContentInset.top > 0.5 else { return }
         // A scroll by the reader invalidates the prior choice. Anchoring's
         // own adjustment does not: keep the same surviving row across batches.
@@ -483,9 +566,14 @@ extension NodeView {
                    let rect = scrollRect(anchor.node, in: sv) {
                     let shift = rect.minY - anchor.y
                     let i = sv.adjustedContentInset
-                    // Native layout may already have moved the offset. Restore
-                    // the captured reading position, counting the row shift once.
-                    let top = (beforeLayoutScroll?.offset.y ?? sv.contentOffset.y) + shift
+                    // Native layout may already have moved the offset. Restore the captured reading position, counting the
+                    // row shift once, and at rest keep CSS `scrollTop` across a change of the port's start inset, as UIKit
+                    // keeps a grouped collection's row in its port when a large title turns inline (LLP 1123 D14, "Inset
+                    // adoption"); the list's own padding is content, across which the row stays put
+                    let port = { (inset: CGFloat, room: CGFloat) in inset - room }
+                    let resting = !sv.scrollsItself && !authoredScrollAnimating
+                    let moved = resting ? beforeLayoutScroll.map { port($0.topInset, $0.room) - port(scrollTopInset(sv), extras?.nativeScrollContentInsets.top ?? 0) } ?? 0 : 0
+                    let top = (beforeLayoutScroll?.offset.y ?? sv.contentOffset.y) + moved + shift
                     let y = sv.isTracking || sv.isDecelerating ? top : min(max(top, -i.top), max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height))
                     // An element reveal heads for where its target now is instead (`IntoView.swift`).
                     if presenter?.elementScrolls.revealing(sv) != nil { presenter?.elementScrolls.retarget(sv) }
@@ -501,7 +589,8 @@ extension NodeView {
         // capture: the port stays where it is), and once it settles only
         // where it rests at the end (LLP 1070.000 §15).
         let owned = authored || authorOwnsScroll(sv)
-        let prior = followedScroll ?? (owned ? (top: sv.contentOffset.y, end: false, start: false) : (top: maximum, end: true, start: false))
+        let port = scrollPortInsets(sv).top
+        let prior = followedScroll ?? (owned ? (top: sv.contentOffset.y, end: false, start: false, port: port) : (top: maximum, end: true, start: false, port: port))
         let follows = prior.end && !owned
         // At rest at the start, UIKit's new minimum follows an inset change.
         // A captured physical offset would replay the obsolete inset instead.
@@ -514,10 +603,15 @@ extension NodeView {
             activeReadingAnchor = anchor.node
             top += (scrollRect(anchor.node, in: sv)?.minY ?? anchor.y) - anchor.y
         }
-        let y = Self.followedTop(current: sv.contentOffset.y, minimum: minimum, maximum: maximum, end: follows, top: top,
-                                 moving: sv.isTracking || sv.isDragging || sv.isDecelerating)
+        // At rest mid-list, CSS `scrollTop` is kept across a change of the port's start inset, as UIKit keeps it (LLP 1123
+        // D14): not at the end it was at, which D14 puts first, nor while the scroller moves, by the reader or by an
+        // animation UIKit or a smooth write runs, which keep the offset as they find it
+        let moving = sv.isTracking || sv.isDragging || sv.isDecelerating
+        let kept = restingStart || prior.end || sv.scrollsItself || authoredScrollAnimating ? top : top + prior.port - port
+        let y = Self.followedTop(current: sv.contentOffset.y, minimum: minimum, maximum: maximum, end: follows, top: kept,
+                                 moving: moving)
         let inactive = window == nil || presenter?.navigation.isInactiveRoute(containing: self, layout: true) == true
-        retainedScrollTop = !prior.end && top > maximum && (inactive || retainedScrollTop != nil) ? top : nil
+        retainedScrollTop = !prior.end && kept > maximum && (inactive || retainedScrollTop != nil) ? kept : nil
         // While the reader's finger is down or the fling is running, an
         // absolute write would cut the pan, the deceleration or the rubber
         // band (a batch every 250 ms yanked a bottom overscroll back to the
@@ -573,7 +667,7 @@ extension NodeView {
         if pendingScrollTop != nil { retainedScrollTop = nil }
         guard hasScrollLayoutBox else {
             if hiddenScroll == nil {
-                hiddenScroll = beforeLayoutScroll.map { CGPoint(x: $0.offset.x, y: $0.offset.y + $0.topInset) } ?? .zero
+                hiddenScroll = beforeLayoutScroll.map { CGPoint(x: $0.offset.x + $0.leftInset, y: $0.offset.y + $0.topInset) } ?? .zero
             }
             return
         }
@@ -601,7 +695,8 @@ extension NodeView {
             // CSS ends where a large title rests collapsed.
             let slack = titleSlack && scrollOrigin > 0 ? max(0, i.top - scrollCollapsed) : 0
             let y = top.map { CGFloat($0) - inset == sv.contentOffset.y ? sv.contentOffset.y : min(max(CGFloat($0) - inset, -i.top), max(-i.top, sv.contentSize.height + i.bottom - sv.bounds.height - slack)) } ?? sv.contentOffset.y
-            let x = left.map { CGFloat($0) == sv.contentOffset.x ? sv.contentOffset.x : min(max(CGFloat($0), -i.left), max(-i.left, sv.contentSize.width + i.right - sv.bounds.width)) } ?? sv.contentOffset.x
+            let leftInset = scrollLeftInset(sv)
+            let x = left.map { CGFloat($0) - leftInset == sv.contentOffset.x ? sv.contentOffset.x : min(max(CGFloat($0) - leftInset, -i.left), max(-i.left, sv.contentSize.width + i.right - sv.bounds.width)) } ?? sv.contentOffset.x
             // On the pixel grid inside the range, so the content it scrolls
             // stays on it and UIKit does not clamp it off (`PixelGridIOS.swift`).
             let s = presenter?.gridScale ?? 1

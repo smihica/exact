@@ -38,7 +38,14 @@ macro_rules! canvas_jni_start {
             static LAUNCH: std::sync::Once = std::sync::Once::new();
             LAUNCH.call_once(launch_parts);
             let updates = updates().map(|open| (open, std::path::Path::new(store)));
-            Host::boot(PLAN, COMPAT, size, scale, hatches(), updates)
+            Host::boot(
+                exact_plan(),
+                exact_compat(),
+                size,
+                scale,
+                hatches(),
+                updates,
+            )
         }
 
         #[no_mangle]
@@ -131,7 +138,7 @@ macro_rules! canvas_jni_start {
                     let booted = $crate::android::trace(c"exact boot", || {
                         boot((width as u32, height as u32), scale, &store).map(|mut h| {
                             h.set_borrowed(true);
-                            let first = $crate::canvas::agent::after_turn(h.frame());
+                            let first = $crate::canvas::agent::after_turn(h.frame(false));
                             h.roles_here(false);
                             Booted(h, first)
                         })

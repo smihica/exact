@@ -5,7 +5,7 @@
 //! runtime inputs are refused by name.
 
 use contract_syntax::{BinOp, Expr, FnDecl, TemplatePart, TypeExpr, UnOp};
-use contract_types::{Ref, Scope, Shapes, Ty};
+use contract_types::{records, Ref, Scope, Shapes, Ty};
 use exact_plan::{asm::Asm, builder::PlanBuilder, Opcode, Stdlib, TypeKind, Value};
 use exact_runner::vm;
 
@@ -383,6 +383,17 @@ impl Constant<'_> {
                     _ => Ty::Bool,
                 }
             }
+            Expr::Call(name, args, _) if records::is_record_call(name, self.shapes) => {
+                let ty = match contract_types::infer(e, scope, self.shapes) {
+                    Ok(ty) => ty,
+                    Err(error) => {
+                        self.failure = Some(error.message);
+                        return None;
+                    }
+                };
+                self.record(asm, name, args, scope, locals)?;
+                ty
+            }
             Expr::Call(name, args, _) => {
                 if let Some(f) = self.fns.iter().find(|f| f.name == *name) {
                     if f.params.len() != args.len() {
@@ -487,6 +498,49 @@ impl Constant<'_> {
             }
             _ => return None,
         })
+    }
+
+    fn record(
+        &mut self,
+        asm: &mut Asm,
+        name: &str,
+        args: &[Expr],
+        scope: &Scope,
+        locals: &mut u16,
+    ) -> Option<()> {
+        let fields = &self.shapes.map[name];
+        let base = if let Some(value) = records::base(args) {
+            self.emit(asm, value, scope, locals)?;
+            asm.bind_local();
+            *locals += 1;
+            Some(*locals - 1)
+        } else {
+            None
+        };
+        for (i, (field, _)) in fields.iter().enumerate() {
+            let value = args.iter().find_map(|arg| match arg {
+                Expr::NamedArg(n, value, _) if n == field => Some(value.as_ref()),
+                _ => None,
+            });
+            if let Some(value) = value {
+                self.emit(asm, value, scope, locals)?;
+            } else {
+                asm.load_local(base?).field(i as u16);
+            }
+        }
+        // The VM reads only the field count from this type. Inference checks
+        // field types before emission.
+        let placeholder = self.b.primitive(TypeKind::Number);
+        let fields: Vec<_> = fields
+            .iter()
+            .map(|(field, _)| (field.as_str(), placeholder))
+            .collect();
+        asm.record(self.b.record(name, &fields));
+        if base.is_some() {
+            *locals -= 1;
+            asm.drop_local();
+        }
+        Some(())
     }
 
     fn callback(

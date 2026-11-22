@@ -6,27 +6,32 @@ import CExact
 
 /// The containing block a native container gives one subtree, in points.
 package struct HostBlock: Equatable {
-    /// One axis: a size, a maximum, a limit for automatic content fitting, or
+    /// One axis: a size, a maximum, a limit for automatic content fitting,
     /// the region a `position-area` option places the box in (fit-content
-    /// across, min-content winning; its content's height down).
-    enum Axis: Equatable {
-        case size(CGFloat), atMost(CGFloat), fit(CGFloat), region(CGFloat)
+    /// across, min-content winning; its content's height down), or the axis
+    /// a container sizes to the content, measured as a region with the box's
+    /// own percentages there cyclic (`BlockAxis::Content`, LLP 1123 D7).
+    package enum Axis: Equatable {
+        case size(CGFloat), fill(CGFloat), atMost(CGFloat), fit(CGFloat), region(CGFloat), content(CGFloat)
         fileprivate var wire: (length: CGFloat, policy: CGFloat) {
             switch self {
             case .size(let length): (length, 0)
+            case .fill(let length): (length, 4)
             case .atMost(let length): (length, 1)
             case .fit(let length): (length, 2)
             case .region(let length): (length, 3)
+            case .content(let length): (length, 5)
             }
         }
     }
     /// The ordered flips composed into physical side indices, low two bits first.
-    struct Tactic: Hashable {
+    package struct Tactic: Hashable {
         var sides: UInt32 = 228 // top, right, bottom, left
-        static let none = Tactic()
+        package static let none = Tactic()
     }
     var width: Axis, height: Axis
     var tactic: Tactic = .none
+    package init(width: Axis, height: Axis, tactic: Tactic = .none) { (self.width, self.height, self.tactic) = (width, height, tactic) }
     /// A pane's: the block is its size.
     package static func size(_ size: CGSize) -> HostBlock { HostBlock(width: .size(size.width), height: .size(size.height)) }
     /// A sheet's: as large as its content, at most this.
@@ -53,6 +58,14 @@ package struct BlockPlacement: Equatable {
     package init(rect: CGRect, within: UInt32, contentOffset: CGPoint? = nil) { (self.rect, self.within, self.contentOffset) = (rect, within, contentOffset) }
 }
 
+/// How a host shows a route's block against its stack's top (LLP 1127 D8),
+/// as claim kind 23 says it: in its stack, beside the top and live (a
+/// split's list beside its detail), or under a pane over it and not live (a
+/// split's detail under the list over it, its columns under a sheet).
+package enum BlockShown: Float {
+    case inStack = 0, beside = 1, under = 2
+}
+
 extension Runtime {
     /// Subtrees' containing blocks (nil takes one back) under one layout,
     /// through the door the covers use (`exact_host_covers`, kinds 4 and 5),
@@ -67,8 +80,11 @@ extension Runtime {
 
     func blocks(_ records: Data) -> Batch { on(layout: true) { read(exact_host_covers(rt, write(records))) } }
 
-    static func blockRecords(_ blocks: [(UInt32, HostBlock?)], placements: [(UInt32, BlockPlacement?)] = [], shows: [(UInt32, Bool)] = []) -> Data {
-        var bytes = Data(capacity: (blocks.count + placements.count + shows.count) * 36)
+    /// `shown` says how blocks show against their stacks' tops (kind 23,
+    /// LLP 1127 D8), applied once the blocks stand.
+    static func blockRecords(_ blocks: [(UInt32, HostBlock?)], placements: [(UInt32, BlockPlacement?)] = [], shows: [(UInt32, Bool)] = [],
+                             shown: [(UInt32, BlockShown)] = []) -> Data {
+        var bytes = Data(capacity: (blocks.count + placements.count + shows.count + shown.count) * 36)
         let append = { (words: [UInt32]) in
             for word in words { withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) } }
         }
@@ -87,6 +103,7 @@ extension Runtime {
             let offset = placement.contentOffset ?? .zero
             append([view, placement.contentOffset == nil ? 6 : 13] + [r.minX, r.minY, r.width, r.height].map { Float($0).bitPattern } + [placement.within] + [offset.x, offset.y].map { Float($0).bitPattern })
         }
+        for (view, how) in shown { append([view, 23, how.rawValue.bitPattern, 0, 0, 0]) }
         return bytes
     }
 }

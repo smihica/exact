@@ -17,7 +17,7 @@ extension MenuHost {
 /// The dialog sheets that may host it are captured at opening: a later
 /// sheet must cover this layer. Elsewhere it is where BASE put every lifted
 /// popover, the top live route modal's view or the viewport.
-final class PopoverLayer: UIView {
+package final class PopoverLayer: UIView {
     private struct Host { weak var controller: UIViewController? }
     private var hosts: [Host]
     package let order: Int
@@ -26,14 +26,14 @@ final class PopoverLayer: UIView {
     var rehost: (() -> Void)?
     private var mounting = false
 
-    init(presenter: Presenter, order: Int, popover: UIView) {
+    package init(presenter: Presenter, order: Int, popover: UIView) {
         hosts = presenter.dialogs.controllers(holding: popover).reversed().map { Host(controller: $0) }
         self.order = order
         self.popover = popover
         super.init(frame: .zero)
         autoresizingMask = [.flexibleWidth, .flexibleHeight]
     }
-    required init?(coder: NSCoder) { nil }
+    package required init?(coder: NSCoder) { nil }
 
     /// Relocating the same open dialog preserves the popover's opening order.
     func replaceHost(_ old: UIViewController, with controller: UIViewController) {
@@ -80,17 +80,17 @@ final class PopoverLayer: UIView {
         if frame != place { frame = place }
     }
 
-    override func didMoveToWindow() {
+    package override func didMoveToWindow() {
         super.didMoveToWindow()
         if !mounting, window == nil, superview != nil { rehost?() }
     }
 
-    static func containing(_ view: UIView?) -> PopoverLayer? {
+    package static func containing(_ view: UIView?) -> PopoverLayer? {
         sequence(first: view, next: { $0?.superview }).compactMap { $0 as? PopoverLayer }.first
     }
 
     /// The layer takes no touch itself, only what it holds.
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    package override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard !isHidden, isUserInteractionEnabled, bounds.contains(point) else { return nil }
         for child in NodeView.hitOrder(subviews) {
             if let hit = child.hitTest(convert(point, to: child), with: event) { return hit }
@@ -100,18 +100,18 @@ final class PopoverLayer: UIView {
 }
 
 /// Observes UIKit touches without consuming the underlying control's activation.
-final class PopoverTouch: UIGestureRecognizer, UIGestureRecognizerDelegate {
+package final class PopoverTouch: UIGestureRecognizer, UIGestureRecognizerDelegate {
     private weak var host: MenuHost?
-    init(host: MenuHost) {
+    package init(host: MenuHost) {
         self.host = host
         super.init(target: nil, action: nil)
         cancelsTouchesInView = false; delaysTouchesBegan = false; delaysTouchesEnded = false
         delegate = self
     }
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    package override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         if let touched = touches.first?.view { host?.lightDismiss(touched) }
         state = .failed
     }
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+    package func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
 }
 #endif

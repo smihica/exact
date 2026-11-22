@@ -1,28 +1,6 @@
 use super::*;
 
 impl<D: DataSource> Presenter<D> {
-    /// The agent's wheel: over the node's center.
-    pub fn wheel(&mut self, id: ViewId, dx: f32, dy: f32) -> Result<String, String> {
-        if !dx.is_finite() || !dy.is_finite() {
-            return Err("wheel needs finite deltas".into());
-        }
-        if !self.alert_allows(id) || self.host.route_visibility(id).1 {
-            return Err(format!("view {id} is hidden or inert"));
-        }
-        let b = self
-            .box_of(id)
-            .ok_or_else(|| format!("no view {id} on screen"))?;
-        let (x, y) = (b.rect.0 + b.rect.2 / 2.0, b.rect.1 + b.rect.3 / 2.0);
-        self.wheel_at(x, y, dx, dy);
-        Ok(format!(
-            "{{\"tapped\":{id},\"wheel\":[{},{}],\"at\":[{},{}]}}",
-            num(dx as f64),
-            num(dy as f64),
-            num(r2(x)),
-            num(r2(y))
-        ))
-    }
-
     pub(crate) fn desktop_scroll_focus(&self, id: ViewId) -> bool {
         cfg!(windows)
             && self.host.kernel().node(id).is_some_and(|n| {

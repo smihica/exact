@@ -166,6 +166,11 @@ fn parse_codec(s: &str) -> Codec {
             variant: "Transform",
             error: "BadTransform",
         },
+        "object-position" => Codec::CssValue {
+            path: "crate::object::Position",
+            variant: "ObjectPosition",
+            error: "BadObjectPosition",
+        },
         "transform-origin" => Codec::CssValue {
             path: "crate::svg::TransformOrigin",
             variant: "TransformOrigin",

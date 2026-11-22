@@ -963,6 +963,23 @@ final class TextSelectionMacTests: XCTestCase {
             ]],
         ]))
         let link = try XCTUnwrap(p.views[32]), chrome = try XCTUnwrap(p.views[41])
+        let down = try at(link, 2)
+        func move(_ dx: CGFloat) {
+            let point = NSPoint(x: down.x + dx, y: down.y)
+            link.mouseDragged(with: mouse(.leftMouseDragged, point))
+        }
+        for dx: CGFloat in [1, 4] {
+            link.mouseDown(with: mouse(.leftMouseDown, down))
+            move(dx)
+            link.mouseUp(with: mouse(.leftMouseUp, NSPoint(x: down.x + dx, y: down.y)))
+            XCTAssertEqual(links.opened, ["https://example.com/docs"])
+            links.opened.removeAll()
+        }
+        link.mouseDown(with: mouse(.leftMouseDown, down))
+        move(10)
+        move(1)
+        link.mouseUp(with: mouse(.leftMouseUp, down))
+        XCTAssertTrue(links.opened.isEmpty)
         try press(link, 2)
         XCTAssertEqual(p.selection.selectedText(), "First\n\nOpen docs")
         XCTAssertEqual(links.opened, ["https://example.com/docs"], "the click's own paragraph follows its link")

@@ -184,6 +184,15 @@ pub(crate) fn style_json_rows(
                 push_length(&mut out, d, env);
                 true
             }
+            RowValue::ObjectPosition(o) => {
+                let o = env.map_or_else(|| o.clone(), |e| o.resolve(e));
+                out.push('[');
+                push_length(&mut out, o.x, env);
+                out.push(',');
+                push_length(&mut out, o.y, env);
+                out.push(']');
+                true
+            }
             // @ref LLP 1061 D6 — `[x, y]`, each points or `{"pct": n}`.
             RowValue::TransformOrigin(o) => {
                 out.push('[');
@@ -796,8 +805,8 @@ pub fn effective_overflow(node: &NodeRef<'_>) -> (Overflow, Overflow) {
 /// value — the font rows, alignment and colour it measures and paints with,
 /// as a `<span>` in a `<div>` would — and any other node its computed colour.
 /// A row resolved to its initial value stays out (the presenter carries
-/// CSS's defaults), except colour, which always crosses. The kernel touches
-/// the descendants an inherited change reaches (LLP 1035.000 D4), so this is
+/// CSS's defaults), except colour and a video's used `object-fit`. The kernel
+/// touches the descendants an inherited change reaches (LLP 1035.000 D4), so this is
 /// re-sent by the ordinary update path, never re-derived per frame.
 pub fn style_json_for(node: &NodeRef<'_>, env: &Env) -> (String, Vec<Skipped>) {
     style_json_presented(node, env, &Shown::default())
@@ -1052,6 +1061,13 @@ fn style_json_shown(
             .union(StyleMask::of(StyleId::ColorScheme))
     };
     let mut computed = node.computed_style(rows.union(node.style.written));
+    if node.node_type == NodeType::Video {
+        computed.object_fit = exact_kernel::object::video_fit(
+            computed.object_fit,
+            computed.written.has(StyleId::ObjectFit),
+        );
+        computed.mask.set(StyleId::ObjectFit);
+    }
     // PlaceholderColor's and BackdropColor's initial payloads are unread
     // sentinels; absence selects the platform's placeholder colour or dim,
     // including after a clear. So for the pressed paint: a cleared row is no

@@ -60,6 +60,17 @@ impl<D: DataSource> Runner<D> {
         let source = self.plan.str(row.source).to_string();
         let resource = self.plan.str(row.name).to_string();
         check_arguments(&resource, args)?;
+        if let Some(answer) = self
+            .seams
+            .source_answer
+            .and_then(|f| f(&mut self.data, &source, args))
+        {
+            self.log(lines::query(&resource, &source));
+            self.count_ask(i);
+            return answer
+                .map(Answer::Now)
+                .map_err(|error| RunnerError::Data { resource, error });
+        }
         // Delivery is the runner's own (LLP 1030 D7): the data seam never
         // sees it, and a data crate could not answer it if it did.
         if source == "exactActivities" {
@@ -71,6 +82,13 @@ impl<D: DataSource> Runner<D> {
         if source == crate::delivery::SOURCE {
             return self
                 .delivery_answer(i)
+                .map(Answer::Now)
+                .map_err(|error| RunnerError::Data { resource, error });
+        }
+        // @ref LLP 1123 D6 — the geometry facts, answered from the layout committed.
+        if crate::native_geometry::is_geometry(&source) {
+            return self
+                .geometry_answer(i, args)
                 .map(Answer::Now)
                 .map_err(|error| RunnerError::Data { resource, error });
         }
@@ -117,18 +135,19 @@ impl<D: DataSource> Runner<D> {
                 resource: resource.clone(),
                 error: DataError::Unavailable("this host links no surfaces".into()),
             })?;
+            let row = self.resource_row(i);
             let records = if source == crate::canvas_performance::SOURCE {
-                crate::canvas_performance::validate(&self.plan, self.resource_row(i).ty).map_err(
-                    |error| RunnerError::Data {
+                crate::canvas_performance::validate(&self.plan, row.ty).map_err(|error| {
+                    RunnerError::Data {
                         resource: resource.clone(),
                         error: DataError::Unavailable(error),
-                    },
-                )?;
+                    }
+                })?;
                 &self.canvas_performance
             } else {
                 &self.surface_records
             };
-            return answer(&self.plan, records, i)
+            return answer(&self.plan, records, row)
                 .map(Answer::Now)
                 .map_err(|error| RunnerError::Data { resource, error });
         }

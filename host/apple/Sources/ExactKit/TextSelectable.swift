@@ -20,7 +20,7 @@ extension NodeView {
     /// What is left is `auto` with nothing above it, and the platform's.
     /// On iOS and tvOS it is not selectable: a hand-built screen's text is
     /// a `UILabel`, which selects nothing, and only text its author made
-    /// selectable is (LLP 1115.000 D11.6; `TextSelectionIOS.swift`). On the
+    /// selectable is (LLP 1115.000 D11.6; `ExactTextSelection`). On the
     /// Mac it is AppKit's (LLP 1115 D8), where a control's or the window
     /// chrome's label is not selectable (an `NSTextField` label, an
     /// `NSButton` title, a toolbar, a tab, a table row's cell) and a
@@ -34,7 +34,7 @@ extension NodeView {
     /// On the Mac, ⌘A selects what this admits in the current virtualized
     /// list, including unmounted rows, or the window's mounted paragraphs
     /// when the reader is outside a list. The web keeps the browser's own.
-    var textSelectable: Bool {
+    package var textSelectable: Bool {
         var document = false, chrome = false
         var current: AncestorView? = self
         while let view = current {
@@ -65,7 +65,7 @@ extension NodeView {
     /// element is above a subtree shown in a view of its own (a dialog, a
     /// popover, a presented route), this is that subtree's root: the part of
     /// the element's content this text's selection can reach.
-    var selectAllElement: NodeView? {
+    package var selectAllElement: NodeView? {
         var found: NodeView?, root: NodeView?, crossed = false
         var current: AncestorView? = self
         while let view = current {
@@ -90,8 +90,12 @@ extension NodeView {
     /// the popover or command a button names (the Mac's `pressable`).
     package var pressable: Bool { handlers.contains("press") || defaultLink != nil || presenter?.invocation(of: self) != nil }
     #endif
-    #if os(tvOS)
-    // tvOS has no text selection (`TextSelectionIOS.swift` is iOS's).
+    #if os(iOS)
+    /// A touch hit-tested here (`hitTest`): selectable text is made ready
+    /// for it.
+    func touchedText() { presenter?.textSelection.touched(self) }
+    #elseif os(tvOS)
+    // tvOS has no text selection (`ExactTextSelection` is iOS's).
     func touchedText() {}
     #endif
 }

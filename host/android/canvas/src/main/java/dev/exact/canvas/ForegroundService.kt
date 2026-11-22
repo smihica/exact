@@ -120,6 +120,15 @@ class ForegroundClaim internal constructor(
 
 /** What [ExtensionContext.foregroundService] gives a package: claims on the host's services (LLP 1133.033 D2). */
 class ForegroundServices internal constructor(private val application: Context, private val extension: String, private val agent: () -> Boolean) {
+    companion object {
+        /** The media service reports its own promotion after Android accepts the foreground notification. */
+        fun playbackPromoted(promoted: Boolean) {
+            if (Claims.playback == promoted) return
+            Claims.playback = promoted
+            Exact.executionChanged()
+        }
+    }
+
     /** Whether the app's lines declare a service of [kind]: the manifest has its class. */
     fun declared(kind: String): Boolean = Claims.declared(application, kind)
 
@@ -196,7 +205,8 @@ internal object Claims {
     val held = ArrayList<ForegroundClaim>()
     private val services = HashMap<String, ForegroundService>()
     private val activeServices = HashSet<String>()
-    internal val keepsExecution: Boolean get() = held.any { !it.agent && it.kind in activeServices }
+    var playback = false
+    internal val keepsExecution: Boolean get() = playback || held.any { !it.agent && it.kind in activeServices }
     private val ids = mapOf("capture" to 0x45584301, "call" to 0x45584302)
 
     fun service(kind: String): Class<out ForegroundService> = if (kind == "call") ForegroundService.Call::class.java else ForegroundService.Capture::class.java

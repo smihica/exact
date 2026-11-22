@@ -24,14 +24,26 @@ pub(super) fn depth([outer, inner]: [f32; 2], at: f32) -> f32 {
 /// further out where that edge lies in the area; an owner's root from the
 /// allocation's edge, with the band as its observation and its padding
 /// stacked on the keyboard it clears. An ancestor's bars reserve past its
-/// own reservations, each its slot's depth, and a bar observes only the
-/// bars before it (D12). A box's own reservations are not among them.
+/// unsafe area, its observation and its own reservations, each its slot's
+/// depth, and a bar observes only the bars before it (D12). A box's own
+/// reservations are not among them.
 pub(super) fn area(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]) -> [[f32; 2]; 4] {
+    area_reserving(arena, slot, space, band).0
+}
+
+/// [`area`], with whether an ancestor's reservations or bars lie in it on
+/// each edge (D14's `reserved` term).
+pub(super) fn area_reserving(
+    arena: &NodeArena,
+    slot: u32,
+    space: &Space,
+    band: [f32; 4],
+) -> ([[f32; 2]; 4], [bool; 4]) {
     let from = |open: [bool; 4]| -> [[f32; 2]; 4] {
         std::array::from_fn(|e| [0.0, if open[e] { band[e] } else { 0.0 }])
     };
     if arena.reserving.is_empty() && arena.observations.bars.styled.is_empty() {
-        return from(open_edges(arena, slot, space, band));
+        return (from(open_edges(arena, slot, space, band)), [false; 4]);
     }
     let mut reserving = Vec::new();
     let mut open = [true; 4];
@@ -39,7 +51,7 @@ pub(super) fn area(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]) 
         .then(|| arena.parent(slot))
         .flatten();
     // What each box reserves this round, which `check_reservations` resolved
-    let (observations, tolerance) = (&arena.observations, arena.observations.tolerance());
+    let (observations, tolerance) = (&arena.observations, tolerance(arena));
     let mut via = slot;
     while let Some(s) = above {
         let r =
@@ -57,7 +69,7 @@ pub(super) fn area(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]) 
         }
         above = (space.root != Some(s)).then(|| arena.parent(s)).flatten();
     }
-    let mut sides = from(open);
+    let (mut sides, mut reserved) = (from(open), [false; 4]);
     for (s, r, bars, open) in reserving.into_iter().rev() {
         let edges = match space.owner == Some(s) {
             true => [0.0; 4],
@@ -73,14 +85,16 @@ pub(super) fn area(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]) 
         let cover = std::array::from_fn(|e| if r.padding[e] > 0.0 { cover[e] } else { 0.0 });
         let inside = r.inside_covered(observed, cover);
         // The slots begin where the engine places them, inside the box's border:
-        // at an owner's root's content root, past what its host clears, and past
-        // another box's own reservations (`bar::lay_out`)
+        // at an owner's root's content root, past what its host clears, and on an
+        // edge it takes past what it would clear there; past another box's unsafe
+        // area there (`bar::lay_out`)
         let slots = match space.owner == Some(s) {
             true => {
                 let (clear, border) = (super::block::clearance(arena, s), border(arena, s));
-                std::array::from_fn(|e| clear[e] + border[e])
+                let past = arena.blocks.bar_slots(s);
+                std::array::from_fn(|e| clear[e] + border[e].max(past[e]))
             }
-            false => r.inside([0.0; 4]),
+            false => inside,
         };
         for e in 0..4 {
             if open[e] && (r.added[e] != 0.0 || r.padding[e] != 0.0 || bars[e] != 0.0) {
@@ -94,10 +108,11 @@ pub(super) fn area(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]) 
                     false => inside[e],
                 };
                 sides[e] = [outer, edges[e] + inner];
+                reserved[e] = true;
             }
         }
     }
-    sides
+    (sides, reserved)
 }
 
 /// The band a box observes and where it lies.
@@ -140,7 +155,7 @@ impl Space {
 }
 
 /// `slot`'s border widths as last published, top right bottom left.
-fn border(arena: &NodeArena, slot: u32) -> [f32; 4] {
+pub(super) fn border(arena: &NodeArena, slot: u32) -> [f32; 4] {
     // A published inset's sides are left, top, right, bottom
     let [left, top, right, bottom] = arena.inset(slot).unwrap_or_default().border;
     [top, right, bottom, left]
@@ -262,8 +277,14 @@ pub(super) fn passed(arena: &NodeArena, slot: u32, space: &Space, band: [f32; 4]
         return [false; 4];
     }
     let (sides, edges) = (area(arena, slot, space, band), space.edges(arena, slot));
-    let tolerance = arena.observations.tolerance();
+    let tolerance = tolerance(arena);
     std::array::from_fn(|e| ignored[e] && edges[e] <= sides[e][1] + tolerance)
+}
+
+/// D9's tolerance: half a device pixel at the display scale, within which an edge meets the area,
+/// whether or not an observation solve has run (the solve settles readers within the same).
+pub(crate) fn tolerance(arena: &NodeArena) -> f32 {
+    0.5 / arena.display_scale.unwrap_or(1.0)
 }
 
 /// Whether the host presents `slot` as a scroll view: an axis whose
@@ -279,6 +300,15 @@ pub(crate) fn scroll_view(arena: &NodeArena, slot: u32) -> bool {
 /// Whether `slot` scrolls sideways and vertically, each axis as
 /// [`scroll_view`] reads it.
 pub(crate) fn scroll_axes(arena: &NodeArena, slot: u32) -> (bool, bool) {
+    let (x, y) = overflow(arena, slot);
+    let scrolls = |o| matches!(o, Overflow::Auto | Overflow::Scroll);
+    (scrolls(x), scrolls(y))
+}
+
+/// `slot`'s effective overflow, x then y: `auto` on the block axis of a node
+/// that scrolls by default and says no `overflow-y`, each axis computed
+/// beside the other (CSS Overflow 3 §3.1).
+pub(crate) fn overflow(arena: &NodeArena, slot: u32) -> (Overflow, Overflow) {
     let s = arena.style(slot);
     let default = !s.mask.has(StyleId::OverflowY) && arena.node_type(slot).scrolls_by_default();
     let y = if default {
@@ -286,9 +316,5 @@ pub(crate) fn scroll_axes(arena: &NodeArena, slot: u32) -> (bool, bool) {
     } else {
         s.overflow_y
     };
-    let scrolls = |o| matches!(o, Overflow::Auto | Overflow::Scroll);
-    (
-        scrolls(s.overflow_x.computed(y)),
-        scrolls(y.computed(s.overflow_x)),
-    )
+    (s.overflow_x.computed(y), y.computed(s.overflow_x))
 }

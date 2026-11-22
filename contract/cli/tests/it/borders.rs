@@ -349,6 +349,8 @@ fn a_computed_shorthand_list_is_refused_naming_the_longhands() {
         ("padding=`${radii(pad)}`", "write `padding-top`/"),
         // A `fn` choosing among literals, one of them a list (euxy port 14's
         // grouped cells, which drew square corners).
+        ("padding=edge", "write `padding-top`/"),
+        ("padding=indirect", "write `padding-top`/"),
         ("border-radius=corners(on)", "write `border-top-left-radius`/"),
         ("border-radius=(on ? \"4px\" : outer(on))", "write `border-top-left-radius`/"),
         // A call both arms make is bound once by a `let` (review round 1),
@@ -357,7 +359,7 @@ fn a_computed_shorthand_list_is_refused_naming_the_longhands() {
         ("border-radius=`${on ? \"12px 12px 2px 2px\" : \"12px\"}`", "write `border-top-left-radius`/"),
         ("padding=(\"\" + (on ? \"4px\" : \"4px 8px\"))", "write `padding-top`/"),
     ] {
-        let e = contract::compile(&format!("{FNS}component A\n  state pad = 16\n  state on = false\n  view\n    box {attr}\n"))
+        let e = contract::compile(&format!("{FNS}component A\n  state pad = 16\n  state on = false\n  derive edge = on ? \"28px 32px\" : \"22px 24px\"\n  derive indirect = edge\n  view\n    box {attr}\n"))
             .unwrap_err();
         assert_eq!(e.id, "lower-css-shorthand", "{attr}: {e}");
         assert!(e.message.contains(says), "{attr}: {e}");
@@ -365,12 +367,13 @@ fn a_computed_shorthand_list_is_refused_naming_the_longhands() {
     // A `fn`, or an arm, that is one value whichever way it goes is every
     // corner's.
     for attr in [
+        "padding=singleEdge",
         "border-radius=single(on)",
         "border-radius=`${on ? \"12px\" : \"4px\"}`",
         "border-radius=(on ? single(on) : \"2px\")",
     ] {
         let src = format!(
-            "{FNS}component A\n  state pad = 16\n  state on = false\n  view\n    box {attr}\n"
+            "{FNS}component A\n  state pad = 16\n  state on = false\n  derive singleEdge = on ? \"24px\" : \"2px\"\n  view\n    box {attr}\n"
         );
         contract::compile(&src).unwrap_or_else(|e| panic!("{attr}: {e}"));
     }

@@ -15,7 +15,7 @@ const KEPT: &str = "exact.kept";
 
 /// The kv scope persisted states live in (LLP 1116 D5): a preference, never
 /// a secret. The same scope Apple's agent stores write.
-const STATE: &str = "exact.state";
+use exact_data::storage::PERSISTED_SCOPE as STATE;
 
 /// What the app has kept — in a named agent drive's scratch tree, or outside
 /// the agent in its own data root ([`crate::picker::store_root`], LLP
@@ -42,7 +42,7 @@ pub(crate) fn store_read(app_id: &str, carried: bool) -> (Vec<(String, Vec<u8>)>
         return Default::default();
     };
     let kv = ibex2::kv::FileStore::new(root.join("kv"));
-    let mut out = Vec::new();
+    let mut out = exact_data::storage::take_window_seed(&root);
     if let Ok(Some(secret_root)) = crate::picker::secret_root(app_id) {
         let secrets = secret_backend(&secret_root);
         #[cfg(target_os = "android")]

@@ -145,7 +145,7 @@ check('popover commands preserve HTML source, focus, idempotence and toggle coal
 check('wasm popover and focus commands preserve authored order', async () => {
   const glue = readFileSync(resolve(ROOT, 'host/web/glue.js'), 'utf8');
   const dispatch = glueCase(glue, 'command');
-  const drain = glueNode(glue, node => node.type === 'ForOfStatement' && node.right.name === 'focusCommands' && node);
+  const drain = glueNode(glue, node => node.type === 'ForOfStatement' && node.right.name === 'focusCommands' && glue.slice(node.start, node.end).includes('popoverCommand') && node);
   const browser = await suiteBrowser();
   try {
     const page = await browser.newPage();

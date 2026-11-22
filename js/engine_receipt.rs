@@ -1,7 +1,8 @@
 use std::path::Path;
 
-/// v5 predates build flags. A bundle claiming recoverable OOM must supply
-/// the exact flags the shim relies on, including RTTI for its exception catch.
+/// v5 predates build flags; every release from v6 on records them. A bundle
+/// claiming recoverable OOM must supply the exact flags the shim relies on,
+/// including RTTI for its exception catch.
 pub(crate) fn oom_enabled(bytes: Option<&[u8]>, engine: &Path) -> Result<bool, &'static str> {
     let receipt = bytes.and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
     let flags = receipt
@@ -13,14 +14,13 @@ pub(crate) fn oom_enabled(bytes: Option<&[u8]>, engine: &Path) -> Result<bool, &
     ]
     .iter()
     .all(|required| flags.is_some_and(|flags| flags.iter().any(|flag| flag == required)));
-    let v6 = |tag: &str| tag == "v6" || tag.ends_with("-v6");
     let tagged = engine
         .components()
-        .any(|part| v6(&part.as_os_str().to_string_lossy()))
+        .any(|part| records_flags(&part.as_os_str().to_string_lossy()))
         || receipt
             .as_ref()
             .and_then(|r| r["tag"].as_str())
-            .is_some_and(v6);
+            .is_some_and(records_flags);
     let declared = flags.is_some_and(|flags| {
         flags.iter().any(|flag| {
             flag.as_str().is_some_and(|flag| {
@@ -35,6 +35,15 @@ pub(crate) fn oom_enabled(bytes: Option<&[u8]>, engine: &Path) -> Result<bool, &
     Ok(enabled)
 }
 
+/// Whether a release tag (`v7`, or a name ending `-v7`) is v6 or later.
+fn records_flags(tag: &str) -> bool {
+    let release = tag.rsplit('-').next().unwrap_or(tag);
+    release
+        .strip_prefix('v')
+        .and_then(|n| n.parse::<u32>().ok())
+        .is_some_and(|n| n >= 6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,9 +53,11 @@ mod tests {
     fn recovery_claims_require_both_exact_flags_and_v5_stays_supported() {
         let v5 = Path::new("hermes-vanilla-d412d3bd8512-v5/digest");
         let v6 = Path::new("hermes-vanilla-d412d3bd8512-v6/digest");
+        let v7 = Path::new("hermes-vanilla-d412d3bd8512-v7/digest");
         for bytes in [None, Some(b"{}".as_slice()), Some(b"invalid".as_slice())] {
             assert_eq!(oom_enabled(bytes, v5), Ok(false));
             assert!(oom_enabled(bytes, v6).is_err());
+            assert!(oom_enabled(bytes, v7).is_err());
         }
         for flags in [json!([]), json!(["-DHERMES_ENABLE_RTTI=true"])] {
             let bytes = json!({"build": {"flags": flags}}).to_string();
@@ -70,9 +81,12 @@ mod tests {
             "-DHERMESVM_EXCEPTION_ON_OOM=true", "-DHERMES_ENABLE_RTTI=true"
         ]}})
         .to_string();
-        for path in [v5, v6] {
+        for path in [v5, v6, v7] {
             assert_eq!(oom_enabled(Some(bytes.as_bytes()), path), Ok(true));
         }
         assert!(oom_enabled(Some(br#"{"tag":"hermes-vanilla-d412d3bd8512-v6"}"#), v5).is_err());
+        assert!(oom_enabled(Some(br#"{"tag":"hermes-vanilla-d412d3bd8512-v12"}"#), v5).is_err());
+        assert!(!records_flags("hermes-vanilla-d412d3bd8512-v5"));
+        assert!(!records_flags("digest"));
     }
 }

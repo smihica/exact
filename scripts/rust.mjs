@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { HOST_DEV, cargoReproducibilityFlags, developmentBuildEnv, readBuilds, resolveApp, rustPolicy, rustRemapFlags } from './app.mjs';
 import { channelOrigin } from './origin.mjs';
 import { within } from './paths.mjs';
-import { refreshCargoRustShapes } from './cargo-dep-info.mjs';
+import { refreshCargoRustBindings } from './cargo-dep-info.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -253,9 +253,9 @@ function compile(app, targets, env, profile) {
     const targetEnv = {...moduleEnv, CARGO_ENCODED_RUSTFLAGS:[...flags, ...rustRemapFlags(app, null, env), `--remap-path-prefix=${modules}=/rust-modules`,
       ...(target.includes('apple') ? ['-Clink-arg=-Wl,-install_name,@rpath/app.module.dylib'] : []),
     ].join('\x1f')};
-    targetEnv.EXACT_RUST_SHAPES = '1';
+    targetEnv.EXACT_RUST_BINDINGS = '1';
     const metadata = cargoMetadata(app, targetEnv);
-    refreshCargoRustShapes(modules, target, profile, metadata.packages, targetEnv, metadata.build_directory);
+    refreshCargoRustBindings(modules, target, profile, metadata.packages, targetEnv, metadata.build_directory);
     return run(app, 'cargo', ['build', ...cargoReproducibilityFlags(app), ...configuration, '--lib', '-p', packageName,
       '--target', target, '--profile', profile, '--message-format=json'], targetEnv)
       .split('\n').filter(Boolean).map(line => JSON.parse(line));

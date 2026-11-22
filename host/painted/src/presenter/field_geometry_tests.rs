@@ -127,6 +127,93 @@ component Fields
     assert_eq!(presenter.field_value(id), "a😀c @alice end");
 }
 
+#[test]
+fn decoration_colours_follow_forma_modes_independently() {
+    use exact_runner::design;
+
+    let dir = crate::TestDir::new("exact-painted-decoration-colours");
+    std::fs::write(
+        dir.join("app.forma"),
+        "forma colored\n\naxes\n  palette = paper | night\n\ntheme\n  highlightInk = #ff0060\n    when palette=night: #0060ff\n  highlightPaper = #ffffff\n    when palette=night: #eeeeee\n",
+    )
+    .unwrap();
+    let source = r##"decoration tokenInk color="var(--highlightInk)" background-color="highlightPaper"
+decoration literalInk color="#ff0060"
+component Example
+  state marks = [TextDecorationSpan(name="tokenInk", start=0, end=4), TextDecorationSpan(name="literalInk", start=4, end=8)]
+  action literalOnly
+    marks = [TextDecorationSpan(name="literalInk", start=4, end=8)]
+  view
+    column padding=10 gap=8 background-color="#ffffff"
+      text "MMMM" color="#ff0060" font-size=38 font-family="monospace"
+      textarea testId="field" value="MMMMMMMM" decorations=TextDecorations(value="MMMMMMMM", spans=marks) color="#111111" appearance="none" background-color="#ffffff" font-size=38 font-family="monospace" padding=0 height=60 width=320
+      button "Literal only" press=literalOnly testId="literal-only"
+"##;
+    let plan = contract::compile_path_source(&dir.join("app.contract"), source).unwrap();
+    let (mut p, field) = boot_plan(&plan.encode());
+    let (x, y, _, height) = p.rect_of(field).unwrap();
+    let midpoint = {
+        let paragraph = p.paragraph(field).unwrap();
+        let line = paragraph.layout_runs().next().unwrap();
+        (x + line.glyphs.iter().find(|glyph| glyph.start == 4).unwrap().x) as u32
+    };
+    let count = |pixels: &tiny_skia::Pixmap, xs: std::ops::Range<u32>, ink| {
+        ((y as u32)..((y + height) as u32))
+            .flat_map(|row| xs.clone().map(move |col| pixels.pixel(col, row).unwrap()))
+            .filter(|c| [c.red(), c.green(), c.blue()] == ink)
+            .count()
+    };
+    let pink = [255, 0, 96];
+    let blue = [0, 96, 255];
+    let paint = |p: &mut Presenter<()>, left_ink, palette| {
+        let pixels = p.frame();
+        let left = count(&pixels, x as u32..midpoint, left_ink);
+        let right = count(&pixels, midpoint..(x + 320.) as u32, pink);
+        assert!(
+            left > 100 && right > 100,
+            "{palette}: left={left}, right={right}"
+        );
+    };
+    paint(&mut p, pink, "paper");
+    assert_eq!(p.set_modes(&[("palette", "night")]), None);
+    paint(&mut p, blue, "night");
+    assert_eq!(p.set_modes(&[("palette", "paper")]), None);
+    paint(&mut p, pink, "paper again");
+
+    p.host.runner_mut().admit_live(None);
+    let shape = design::shape(&plan);
+    let edit = |p: &mut Presenter<()>, ink: &str, paper, night| {
+        let tokens = [
+            ("highlightInk", [ink, ink]),
+            ("highlightPaper", [paper, night]),
+        ]
+        .map(|(name, slices)| design::Token {
+            name: name.into(),
+            value: slices[0].into(),
+            slices: slices.map(str::to_string).into(),
+        });
+        let frame = design::snapshot(&shape, &tokens);
+        assert_eq!(p.apply_live(&frame.json()), None);
+    };
+    edit(&mut p, "12px", "#aaffaa", "#ffffaa");
+    paint(&mut p, pink, "after a refused edit");
+    let pixels = p.frame();
+    assert!(count(&pixels, x as u32..midpoint, [170, 255, 170]) > 100);
+    assert_eq!(p.set_modes(&[("palette", "night")]), None);
+    paint(&mut p, pink, "night with a refused edit");
+    let pixels = p.frame();
+    assert!(count(&pixels, x as u32..midpoint, [255, 255, 170]) > 100);
+    edit(&mut p, "#0060ff", "#ffffff", "#eeeeee");
+    paint(&mut p, blue, "after a valid edit");
+
+    let kernel = p.host.kernel();
+    let button = kernel.find_by_test_id("literal-only")[0];
+    p.tap(kernel.node_by_key(button).unwrap().id).unwrap();
+    let pixels = p.frame();
+    assert_eq!(count(&pixels, x as u32..midpoint, blue), 0);
+    assert!(count(&pixels, midpoint..(x + 320.) as u32, pink) > 100);
+}
+
 #[path = "field_shadow_tests.rs"]
 mod shadow_tests;
 
@@ -142,8 +229,12 @@ fn boot(tag: &str, value: &str, extra: &str) -> (Presenter<()>, ViewId) {
 }
 
 fn boot_source(source: &str) -> (Presenter<()>, ViewId) {
+    boot_plan(&crate::test_plan(source))
+}
+
+fn boot_plan(plan: &[u8]) -> (Presenter<()>, ViewId) {
     let (mut p, error) = Presenter::boot_with(
-        &crate::test_plan(source),
+        plan,
         (),
         (400., 600.),
         1.,

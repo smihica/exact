@@ -1,14 +1,399 @@
 // `state <name>` (agent-inspect.mjs `stateOp`, LLP 1116.007 D3.9): a state, derive or resource (or a field of the record)
 // reads by name, down a dotted path, as `expect state` does, even where a view carries the name; a plain view's is the record.
 import { test, expect } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { render, renderTrace, renderFrameHealthReport, renderFrameHealthMetrics, perfOp, readTrack, renderPerf, stateOp, tapRefusal, nextCommitTasks, settleBound, planLocators, perfDelta, pidTrace, scaledScreenshot } from './agent-inspect.mjs';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { open } from './agent-session.mjs';
+import { main } from './agent.mjs';
 import { launchFacts } from './agent-launch.mjs';
 import { compareOp } from './agent-compare.mjs';
-import { encodePng } from './png.mjs';
+import { checkOp } from './agent-check.mjs';
+import { phoneScreenshot } from './agent-stdio.mjs';
+import { decodePng, encodePng, pngDimensions, readSrgbPng } from './png.mjs';
+import { pngPixels } from '../host/apple/image.mjs';
+
+function openPhone(ask, run, options) {
+  return open({ host: 'ios', device: true, ...options }, {
+    openDevice: async ({ host }) => ({
+      host,
+      ask,
+      close: async () => {},
+      reveal: id => ask({ op: 'reveal', id }),
+      input: (id, phase) => ask({ op: 'tap', id, phase }),
+      screenshot: (path, window, film, options) => phoneScreenshot({
+        udid: 'test-phone', appId: 'test.app', container: '/app/container', path, window, film, ...options, ask, run,
+      }),
+    }),
+  });
+}
+
+test.each(['playing video.png', 'playing video'])('a phone display screenshot to %s reports display geometry', async name => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-display-'));
+  const png = encodePng({ width: 288, height: 192, data: new Uint8Array(288 * 192 * 4) });
+  try {
+    const path = join(dir, name), calls = [];
+    let destination;
+    const session = await openPhone(async req => {
+      if (req.op === 'state') return { world: [] };
+      calls.push(req);
+      return { screen: { w: 144, h: 96 }, statusBar: true, generation: 1,
+        safeArea: { top: 10, bottom: 6 }, front: true };
+    }, (cmd, args) => {
+      calls.push([cmd, ...args]);
+      destination = args.at(-1);
+      expect(destination).toEndWith('.png');
+      writeFileSync(destination, png);
+      return { status: 0 };
+    });
+    const reply = await session.screenshot(path);
+    expect(calls).toEqual([
+      { op: 'screenshot', window: 'display' },
+      ['xcrun', 'devicectl', 'device', 'capture', 'screenshot', '--device', 'test-phone', '--destination', destination],
+      { op: 'screenshot', window: 'display', probe: true },
+    ]);
+    expect(reply).toEqual({ screenshot: path, w: 144, h: 96, scale: 2, captureSpace: 'screen', statusBar: true,
+      safeArea: { top: 10, bottom: 6 }, front: true, pixels: 'display', generation: 1 });
+    expect(render('screenshot', reply)).toContain('pixels="display"');
+    expect(readFileSync(path)).toEqual(png);
+    expect(existsSync(destination)).toBe(false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a phone app screenshot and film frame copy the app-rendered PNG', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-app-picture-'));
+  const png = encodePng({ width: 4, height: 4, data: new Uint8Array(4 * 4 * 4) });
+  const calls = [];
+  const session = await openPhone(async req => {
+    if (req.op === 'state') return { world: [] };
+    calls.push(req);
+    return { screenshot: req.path, w: 4, h: 4, window: true, generation: 1 };
+  }, (cmd, args) => {
+    calls.push([cmd, ...args]);
+    writeFileSync(args.at(-1), png);
+    return { status: 0 };
+  });
+  const copy = (path, film) => [
+    { op: 'screenshot', path: '/app/container/tmp/exact-agent.png', window: true, ...(film ? { film: true } : {}) },
+    ['xcrun', 'devicectl', 'device', 'copy', 'from', '--quiet', '--device', 'test-phone',
+      '--domain-type', 'appDataContainer', '--domain-identifier', 'test.app', '--source', 'tmp/exact-agent.png',
+      '--destination', path],
+  ];
+  try {
+    const app = join(dir, 'app.png'), movie = join(dir, 'film.png');
+    expect(await session.screenshot(app, true, 'app')).toMatchObject({ screenshot: app, pixels: 'app' });
+    const reply = await session.screenshot(movie, { over: 0, every: 50, window: true });
+    expect(reply).toMatchObject({ screenshot: movie, pixels: 'app', frames: 1 });
+    expect(calls).toEqual([...copy(app, false), ...copy(join(reply.dir, '000-0ms.png'), true)]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a failed phone display capture reports the Xcode error', async () => {
+  const commands = [];
+  const session = await openPhone(async () => ({ screen: { w: 414, h: 896 } }), (_cmd, args) => {
+    commands.push(args[2]);
+    return { status: 1, stderr: 'device disconnected\n' };
+  });
+  await expect(session.screenshot(join(process.cwd(), 'app.png'))).rejects.toThrow('phone screenshot (devicectl capture): device disconnected');
+  expect(commands).toEqual(['capture']);
+});
+
+test('a phone captures the display with a detached viewport and a system overlay', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-fullscreen-'));
+  const path = join(dir, 'fullscreen.png'), calls = [];
+  const front = "the app's scene is not foreground-active";
+  try {
+    const session = await openPhone(async req => {
+      if (req.op === 'state') return { world: [] };
+      calls.push(req);
+      if (req.op === 'layout') return { nodes: [] };
+      return { screen: { w: 96, h: 144 }, front, generation: 1 };
+    }, (_cmd, args) => {
+      writeFileSync(args.at(-1), encodePng({ width: 192, height: 288, data: new Uint8Array(192 * 288 * 4) }));
+      return { status: 0 };
+    });
+    expect(await session.screenshot(path)).toMatchObject({ w: 96, h: 144, scale: 2, pixels: 'display', front,
+      note: `the capture may show another app or system overlay (${front})` });
+    expect(calls).toEqual([{ op: 'screenshot', window: 'display' }, { op: 'screenshot', window: 'display', probe: true }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a phone refreshes screen geometry when the capture is rotated', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-rotation-'));
+  const path = join(dir, 'landscape.png'), calls = [];
+  try {
+    const session = await openPhone(async req => {
+      if (req.op === 'state') return { world: [] };
+      calls.push(req);
+      return { screen: req.probe ? { w: 144, h: 96 } : { w: 96, h: 144 }, front: true, generation: 1 };
+    }, (_cmd, args) => {
+      writeFileSync(args.at(-1), encodePng({ width: 288, height: 192, data: new Uint8Array(288 * 192 * 4) }));
+      return { status: 0 };
+    }, { scale: 1 });
+    expect(await session.screenshot(path)).toMatchObject({ w: 144, h: 96, scale: 1, pixels: 'display' });
+    expect(pngDimensions(readFileSync(path))).toEqual({ width: 144, height: 96 });
+    expect(calls).toEqual([{ op: 'screenshot', window: 'display' }, { op: 'screenshot', window: 'display', probe: true }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.each(['changed', 'unconfirmed'])('a phone reports %s focus after capturing at the same size', async focus => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-focus-'));
+  const path = join(dir, 'screen.png');
+  try {
+    const session = await openPhone(async req => {
+      if (req.op === 'state') return { world: [] };
+      const screen = { w: 4, h: 4 };
+      if (!req.probe) return { screen, front: true, moving: true };
+      if (focus === 'unconfirmed') throw new Error('app disconnected');
+      return { screen, front: "the app's scene is not foreground-active" };
+    }, (_cmd, args) => {
+      writeFileSync(args.at(-1), encodePng({ width: 8, height: 8, data: new Uint8Array(8 * 8 * 4) }));
+      return { status: 0 };
+    });
+    const reply = await session.screenshot(path);
+    expect(reply).toMatchObject({ w: 4, h: 4, pixels: 'display', moving: true });
+    expect(reply.front).not.toBe(true);
+    expect(reply.note).toContain(focus === 'changed' ? 'focus changed' : 'focus could not be confirmed');
+    expect(existsSync(path)).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a phone keeps the display PNG when the app cannot supply its point geometry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-no-geometry-'));
+  const path = join(dir, 'screen.png'), width = 12, height = 24;
+  const png = encodePng({ width, height, data: new Uint8Array(width * height * 4) });
+  try {
+    for (const suspended of [false, true]) {
+      const calls = [];
+      const session = await openPhone(async req => {
+        if (req.op !== 'screenshot' || suspended) throw new Error('app suspended');
+        return { screen: { w: 12, h: 6 }, front: 'the scene is inactive' };
+      }, (_cmd, args) => {
+        calls.push(args[2]);
+        writeFileSync(args.at(-1), png);
+        return { status: 0 };
+      }, { scale: 1 });
+      const reply = await session.screenshot(path);
+      expect(calls).toEqual(['capture']);
+      expect(reply).toMatchObject({ screenshot: path, w: width, h: height, pixels: 'display', scale: null });
+      expect(reply.front).not.toBe(true);
+      expect(reply.note).toContain('the capture may show another app or system overlay');
+      expect(reply.note).toContain('native pixel size');
+      expect(readFileSync(path)).toEqual(png);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.each([
+  [375, 812, 1080, 2340, 1],
+  [100, 200, 200, 401, 1.5],
+  [375, 812, 1125, 2437, 3],
+])('a phone scales a rounded %d×%d-point display on both axes', async (w, h, width, height, scale) => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-rounded-'));
+  const path = join(dir, 'screen.png'), calls = [];
+  try {
+    const session = await openPhone(async req => {
+      if (req.op === 'state') return { world: [] };
+      calls.push(req);
+      return { screen: { w, h }, front: true, generation: 1 };
+    }, (_cmd, args) => {
+      writeFileSync(args.at(-1), encodePng({ width, height, data: new Uint8Array(width * height * 4) }));
+      return { status: 0 };
+    }, { scale });
+    expect(await session.screenshot(path)).toMatchObject({ w, h, scale, pixels: 'display' });
+    expect(calls).toEqual([{ op: 'screenshot', window: 'display' }, { op: 'screenshot', window: 'display', probe: true }]);
+    expect(pngDimensions(readFileSync(path))).toEqual({ width: Math.round(w * scale), height: Math.round(h * scale) });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a scaled phone display screenshot keeps its Display P3 profile', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-profile-'));
+  const path = join(dir, 'screen.png');
+  try {
+    const png = readFileSync(new URL('../apps/ui-gallery/assets/icon.png', import.meta.url));
+    const original = pngPixels(png);
+    const w = original.width / 2, h = original.height / 2;
+    const session = await openPhone(async req => req.op === 'state' ? { world: [] } : {
+      screen: { w, h }, front: true, generation: 1,
+    }, (_cmd, args) => {
+      writeFileSync(args.at(-1), png);
+      return { status: 0 };
+    }, { scale: 1 });
+    expect(await session.screenshot(path)).toMatchObject({ w, h, scale: 1, pixels: 'display' });
+    const resized = pngPixels(readFileSync(path));
+    expect([resized.width, resized.height, resized.space]).toEqual([w, h, 3]);
+    expect(resized.profile).toEqual(original.profile);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the phone CLI captures the display before lifting a held contact', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-held-'));
+  const path = join(dir, 'held.png'), calls = [], output = [];
+  const log = console.log;
+  try {
+    writeFileSync(join(dir, 'app.json'), JSON.stringify({ name: 'Phone screenshot', app: { id: 'test.phone', name: 'Phone screenshot' } }));
+    writeFileSync(join(dir, 'app.contract'), '');
+    console.log = line => output.push(JSON.parse(line));
+    const session = await openPhone(async req => {
+      if (req.op === 'tree') return { nodes: [{ id: 7, props: { testId: 'play' } }] };
+      if (req.op === 'tap') { calls.push(req.phase); return { contact: req.phase === 'down' ? 7 : false, phase: req.phase, at: [2, 2], generation: 1 }; }
+      if (req.op === 'logs') return { lines: [] };
+      if (req.op === 'screenshot') calls.push(req);
+      return { screen: { w: 4, h: 4 }, front: true, generation: 1 };
+    }, (_cmd, args) => {
+      calls.push(args[2]);
+      writeFileSync(args.at(-1), encodePng({ width: 8, height: 8, data: new Uint8Array(8 * 8 * 4) }));
+      return { status: 0 };
+    }, { storage: 'held-test' });
+    expect(await main(['ios', '--device', '--app', dir, '--storage', 'held-test', '--json', 'tap play down', `screenshot '${path}'`, 'tap up'], {
+      open: async () => session, driveServer: async () => null,
+      resolveDevice: () => 'test-phone', exclusiveNativeStore: async (_, launch) => launch(),
+    })).toBe(0);
+    expect(output[1]).toMatchObject({ screenshot: path, pixels: 'display' });
+    expect(calls).toEqual(['down', { op: 'screenshot', window: 'display', skipMotion: true }, 'capture',
+      { op: 'screenshot', window: 'display', probe: true }, 'up']);
+  } finally {
+    console.log = log;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('compare places the app window’s nodes on the display', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-compare-'));
+  const screenshot = join(dir, 'shot.png'), reference = join(dir, 'ref.png');
+  const viewport = { x: 0, y: 0, w: 10, h: 10 };
+  const window = { ...viewport, y: 12 }, screen = { ...window, x: 20 };
+  const session = {
+    host: 'ios',
+    layout: async () => ({ nodes: [{ id: 1, ...viewport }] }),
+    tree: async () => ({ nodes: [{ id: 1, props: { testId: 'card' } }] }),
+    op: async () => ({ node: { space: { viewport, window, screen } } }),
+  };
+  const width = 40, height = 32, data = new Uint8Array(width * height * 4).fill(255);
+  try {
+    writeFileSync(reference, encodePng({ width, height, data }));
+    for (let y = screen.y; y < screen.y + screen.h; y++) {
+      for (let x = screen.x; x < screen.x + screen.w; x++) data.set([0, 0, 0, 255], (y * width + x) * 4);
+    }
+    writeFileSync(screenshot, encodePng({ width, height, data }));
+    const shot = { screenshot, w: width, h: height, captureSpace: 'screen', pixels: 'display', safeArea: { top: 4, bottom: 3 } };
+    const result = await compareOp(session, reference, async () => shot);
+    expect(result.text).toContain('under card [20,12 10×10]');
+    expect(result.text).toContain('the top 4 (status bar) and the bottom 3 (home indicator) not scored');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a phone check samples the display at the app window’s offset', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-check-'));
+  const path = join(dir, 'check.png'), calls = [];
+  try {
+    const w = 40, h = 50, width = 80, height = 100;
+    const data = new Uint8Array(width * height * 4).fill(255);
+    for (let y = 40; y < 70; y++) {
+      for (let x = 20; x < 50; x++) data.set([0, 0, 0, 255], (y * width + x) * 4);
+    }
+    const obs = { viewport: { w: 22, h: 20 }, scheme: 'light', target: 44,
+      capture: { w: 22, h: 20, window: true, screen: { x: 8, y: 18, w, h } },
+      items: [{ id: 2, x: 3, y: 3, w: 10, h: 8, text: 'Video caption', fg: [0, 0, 0, 1], size: 17, weight: 400 }] };
+    const session = await openPhone(async req => {
+      if (req.op === 'check') return req.release ? {} : obs;
+      if (req.op === 'tree') return { nodes: [] };
+      return { screen: { w, h }, front: true };
+    }, (_cmd, args) => {
+      calls.push(args[2]);
+      writeFileSync(args.at(-1), encodePng({ width, height, data }));
+      return { status: 0 };
+    });
+    const result = await checkOp(session, [], { shots: () => path });
+    expect(calls).toEqual(['capture']);
+    expect(result.check[0].findings).toEqual([expect.objectContaining({ kind: 'contrast', detail: expect.objectContaining({ bg: '#000000' }) })]);
+    expect(pngDimensions(readFileSync(path))).toEqual({ width: w, height: h });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a phone check retries uncertain focus with a fresh observation and capture', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-phone-check-focus-'));
+  const path = join(dir, 'check.png'), w = 40, h = 50;
+  const pixels = value => {
+    const data = new Uint8Array(w * h * 4).fill(value);
+    for (let i = 3; i < data.length; i += 4) data[i] = 255;
+    return encodePng({ width: w, height: h, data });
+  };
+  try {
+    for (const recovers of [true, false]) {
+      let captures = 0, observations = 0, releases = 0;
+      const session = await openPhone(async req => {
+        if (req.op === 'check' && req.release) { releases++; return {}; }
+        if (req.op === 'check') {
+          if (req.capture) observations++;
+          return { viewport: { w, h }, scheme: 'light', target: 44,
+            capture: { w, h, window: true, screen: { x: 0, y: 0, w, h } },
+            items: [{ id: 2, x: 3, y: 3, w: 10, h: 8, text: 'Caption',
+              fg: observations === 2 ? [0, 0, 0, 1] : [255, 255, 255, 1], size: 17, weight: 400 }] };
+        }
+        if (req.op === 'tree') return { nodes: [] };
+        const front = req.probe ? recovers && captures === 2 : recovers && captures === 1;
+        return { screen: { w, h }, front: front || 'the scene is inactive' };
+      }, (_cmd, args) => {
+        captures++;
+        writeFileSync(args.at(-1), pixels(captures === 1 ? 255 : 0));
+        return { status: 0 };
+      });
+      const result = await checkOp(session, recovers ? [] : ['both'], { shots: () => path });
+      expect([observations, captures, releases]).toEqual([2, 2, 2]);
+      if (recovers) {
+        expect(result.check[0].findings).toEqual([expect.objectContaining({ kind: 'contrast' })]);
+        expect(result.check[0].incomplete).toBeUndefined();
+      } else {
+        expect(result.check[0].incomplete).toContain('focus');
+        expect(result.text).toContain('incomplete');
+        expect(result.text).not.toContain('no findings');
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform !== 'darwin')('compare matches the same red in Display P3 and sRGB', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-compare-color-'));
+  const screenshot = join(dir, 'shot.png'), reference = join(dir, 'ref.png'), w = 20, h = 20;
+  try {
+    const icon = readFileSync(new URL('../apps/ui-gallery/assets/icon.png', import.meta.url));
+    const { colorChunks } = decodePng(icon, { preserveColor: true });
+    const patch = rgb => Uint8Array.from(Array.from({ length: w * h }, () => [...rgb, 255]).flat());
+    const p3 = encodePng({ width: w, height: h, data: patch([234, 51, 35]), colorChunks });
+    writeFileSync(screenshot, p3);
+    writeFileSync(reference, encodePng({ width: w, height: h, data: patch([255, 0, 0]) }));
+    const session = { host: 'ios', layout: async () => ({ nodes: [] }), tree: async () => ({ nodes: [] }) };
+    const reply = await compareOp(session, reference, async () => ({ screenshot, w, h, pixels: 'display' }));
+    expect(reply.compare.match).toBe(1);
+    expect(readFileSync(screenshot)).toEqual(p3);
+    const side = decodePng(readFileSync(reply.side));
+    const [r, g, b] = side.data.slice(-4);
+    expect(r).toBeGreaterThan(250);
+    expect(g).toBeLessThan(5);
+    expect(b).toBeLessThan(5);
+    const reversed = await compareOp(session, screenshot, async () => ({ screenshot: reference, w, h }));
+    expect(reversed.compare.match).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test.skipIf(process.platform !== 'darwin')('a grayscale ICC capture is converted to sRGB before comparison', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'exact-compare-gray-'));
+  const source = join(dir, 'gray.pgm'), screenshot = join(dir, 'gray.png'), reference = join(dir, 'ref.png');
+  const profiles = '/System/Library/ColorSync/Profiles', w = 2, h = 2;
+  try {
+    writeFileSync(source, Buffer.concat([Buffer.from(`P5\n${w} ${h}\n255\n`), Buffer.alloc(w * h, 128)]));
+    expect(spawnSync('sips', ['-s', 'format', 'png', '--embedProfile', join(profiles, 'Generic Gray Profile.icc'),
+      source, '--out', screenshot]).status).toBe(0);
+    expect(spawnSync('sips', ['--matchTo', join(profiles, 'sRGB Profile.icc'), screenshot, '--out', reference]).status).toBe(0);
+    const gray = readFileSync(screenshot);
+    expect(gray[25]).toBe(0);
+    expect(readSrgbPng(screenshot).data).toEqual(decodePng(readFileSync(reference)).data);
+    expect(readFileSync(screenshot)).toEqual(gray);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('rotated panel captures scale on image axes and compare against rotated layout boxes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'exact-rotated-capture-'));

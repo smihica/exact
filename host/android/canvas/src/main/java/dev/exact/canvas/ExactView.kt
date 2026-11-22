@@ -196,6 +196,12 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
     /** The last stream applied changed only nodes the view's drawing references: no need to draw the view again. */
     private var quiet = false
 
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        val parent = parent as? View ?: return
+        main.window.set(-left.toFloat(), -top.toFloat(), (parent.width - left).toFloat(), (parent.height - top).toFloat())
+        relayer.window.set(main.window)
+    }
+
     /** The view's size is never told to exact2 (LLP 1115.001 D3.3): the activity tells it the window and its insets,
      * the presenter places the page in it, and the view is laid out there ([ExactActivity.chrome]). */
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -253,6 +259,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         frames.removeFrameCallback(sampler); samplerPosted = false
         frames.removeFrameCallback(holder); holdFrom = 0L
         removeCallbacks(timer); removeCallbacks(refiner)
+        pendingStream = null
         if (host && owner == null && started) schedule()
     }
 
@@ -260,6 +267,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
     private val scrolling = Scrolling(this)
     internal val fingers = Fingers(this)
 
+    internal val textSelection = TextSelection(this)
     private val contacts = Contacts(this, scrolling)
     internal fun hold(e: MotionEvent?) = contacts.hold(e)
     internal fun cancelContact(x: Float, y: Float, tool: Int) = contacts.scrollClaimed(x, y, tool)
@@ -268,7 +276,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
     override fun onTouchEvent(e: MotionEvent): Boolean {
         // Where the platform delivers the touch, before [Contacts] gives it to a scroll, a field or a hosted view.
         if (e.actionMasked == MotionEvent.ACTION_DOWN) touching(true)
-        val taken = contacts.touch(e)
+        val taken = textSelection.touch(e) || contacts.touch(e)
         if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) touching(false)
         return taken
     }
@@ -404,12 +412,13 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         keys?.connection(info)
 
     override fun onDraw(canvas: Canvas) {
-        if (!started) return
+        if (!started || !running) return
         val owned = owner != null
         if (owned) takeOwned() else if (taken) taken = false else take()
         android.os.Trace.beginSection("exact replay")
         ops?.let { main.replay(canvas, it, 0, it.limit()) }
         shared.draw(canvas)
+        textSelection.draw(canvas)
         android.os.Trace.endSection()
         presents.drew()
         // The first frame after startup counts even with no page ops (an empty page, or only bars).
@@ -471,18 +480,21 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         owner?.presented(t, at) ?: run { if (Native.picturePresented(t, at)) pump() }
     }
     override fun onAttachedToWindow() { super.onAttachedToWindow(); presents.attach() }
+    internal fun stopMainWakes() {
+        removeCallbacks(timer)
+        wakes?.close()
+        wakes = null
+    }
     override fun onDetachedFromWindow() {
         presents.detach()
         running(false, host = false)
-        removeCallbacks(timer)
+        stopMainWakes()
         scrolling.stopped()
         val frames = android.view.Choreographer.getInstance()
         for (callback in listOf(laterFrame, regroupFrame, turn, sampler, holder)) frames.removeFrameCallback(callback)
         laterPosted = false; regrouping = false; turnPosted = false; samplerPosted = false; holdFrom = 0L
         warmer.destroy()
         worker.shutdown()
-        wakes?.close()
-        wakes = null
         super.onDetachedFromWindow()
     }
     /** warm=0: a press that changes nothing draws no frame, to compare. */
@@ -491,6 +503,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
     /** Every stream the owner published since the last take: each paint ingested in order, the last move applied after
      * the last paint; the feed's group then drawn where the scrolls the owner has not applied put it. */
     private fun takeOwned(): Boolean {
+        if (!running) return false
         val o = owner ?: return false
         val began = System.nanoTime()
         var any = false
@@ -531,7 +544,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         // the hosted fields with their scrollers' rows.
         if (any) { placeFeed(); scrolling.place(); fields?.place() }
         // A view lent to another element by these streams (a paint, or a move's `placeFeed`) is asked at its new place.
-        if (any) Formas.placed()
+        if (any) { Formas.placed(); textSelection.refresh() }
         if (coverTrace && painted) traceNewRows()
         moved = !painted
         quiet = painted && allQuiet && move == null
@@ -891,10 +904,11 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
 
     private var pendingStream: IntBuffer? = null
     /** A new stream, if exact2 has one: made ready to replay. Whether there was one. */
-    private fun take(): Boolean {
+    private fun take(vsync: Boolean = false): Boolean {
+        if (!running) return false
         val stream = pendingStream ?: run {
             android.os.Trace.beginSection("exact native frame")
-            val fresh = Native.frame()
+            val fresh = Native.frame(vsync)
             presents.ingested(Native.presentToken())
             android.os.Trace.endSection()
             fresh?.order(ByteOrder.LITTLE_ENDIAN)?.asIntBuffer()?.let { b ->
@@ -912,8 +926,8 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         if (accessible) Native.access(accessAgain).also { accessAgain = false }?.let { access?.invoke(it) }
         // exact2 runs on this thread (owner=0): its bindings are checked here, as the owner checks them after a turn.
         Formas.turned()
-        stream ?: return false
         Native.chrome()?.let(chrome)
+        stream ?: return false
         val told = Native.scrollers()
         moved = stream.limit() > 0 && stream.get(0) == 22
         if (moved) { applyMove(stream); applyMoveTracks(stream) } else applyStream(stream)
@@ -921,6 +935,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         scrolling.place()
         fields?.place()
         Formas.placed()
+        textSelection.refresh()
         return true
     }
 
@@ -1008,13 +1023,13 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         android.os.Trace.endSection()
     }
     /** A wake (a reply, a picture, a timer): draw only when the stream changed. */
-    internal fun pump() {
+    internal fun pump(vsync: Boolean = false) {
         if (owner != null) return // the owner publishes what a key or a reply changed
         if (!running) { if (wakes != null) schedule(); return }
-        if (take()) { if (moved) ticker?.invalidate() else { taken = true; invalidate() } } else schedule()
+        if (take(vsync)) { if (moved) ticker?.invalidate() else { taken = true; invalidate() } } else schedule()
     }
     /** exact2 wants another turn: at the next vsync, ask it, and draw only if the stream changed. */
-    private val turn = android.view.Choreographer.FrameCallback { turnPosted = false; Native.displayFrame(); pump() }
+    private val turn = android.view.Choreographer.FrameCallback { turnPosted = false; Native.displayFrame(); pump(vsync = true) }
     private var turnPosted = false
     /** While a layer plays: each vsync, sample them and draw a frame (the ticker: nothing is recorded again). */
     private val sampler = android.view.Choreographer.FrameCallback { t ->
@@ -1038,11 +1053,12 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
         // What this turn asked of the platform (a press's haptic, the keyboard for a field it focused).
         asking()
         wakes?.sync()
-        if (!running) {
-            val due = Native.background(false)
+        val backgroundDue = if (!running) Native.background(false) else null
+        BackgroundAudio.reconcileOnMain()
+        if (backgroundDue != null) {
             asking()
             removeCallbacks(timer)
-            if (due >= 0) postDelayed(timer, kotlin.math.ceil(due).toLong())
+            if (backgroundDue >= 0) postDelayed(timer, kotlin.math.ceil(backgroundDue).toLong())
             return
         }
         if (!timerIdlePosted && Native.timerHeld() and 16 != 0) {
@@ -1280,7 +1296,7 @@ class ExactView(context: Context, private val live: Boolean, private val onFirst
     private var streamFrame = false
     private val laterFrame: android.view.Choreographer.FrameCallback = android.view.Choreographer.FrameCallback {
         laterPosted = false
-        if (worker.isShutdown) return@FrameCallback
+        if (!running || worker.isShutdown) return@FrameCallback
         makeSoon()
         if (streamFrame) {
             streamFrame = false

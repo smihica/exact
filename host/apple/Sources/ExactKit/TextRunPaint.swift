@@ -188,10 +188,10 @@ extension TextLinePaint {
         }
         ctx.setFillColor(ink)
         for (i, run) in runs.enumerated() {
-            if let icon = (CTRunGetAttributes(run) as NSDictionary)[NSAttributedString.Key.exactAtomIcon] as? TextAtomIcon {
+            if let icon = (CTRunGetAttributes(run) as NSDictionary)[NSAttributedString.Key.exactAtomIcon] as? any TextAtomIconPainting {
                 if !icon.tinted || paints[i] != .nothing {
                     let own = !icon.tinted || paints[i] == .own || paints[i] == .keptLined
-                    TextAtomIcon.draw(run, in: ctx, ink: own ? nil : ink)
+                    TextAtomIcons.draw(run, in: ctx, ink: own ? nil : ink)
                 }
                 continue
             }
@@ -297,7 +297,7 @@ extension TextLinePaint {
             ctx.textPosition = .zero
             CTLineDraw(line, ctx)
             ctx.restoreGState()
-            for run in shown { TextAtomIcon.draw(run, in: ctx) }
+            for run in shown { TextAtomIcons.draw(run, in: ctx) }
         }
         switch pass {
         case .all: break
@@ -372,7 +372,7 @@ extension TextLinePaint {
         }
         drawLine(clippedTo: split.map { half($0, above: true) })
         drawLine(clippedTo: whole.map(extent))
-        for run in shown { TextAtomIcon.draw(run, in: ctx) }
+        for run in shown { TextAtomIcons.draw(run, in: ctx) }
     }
 }
 

@@ -379,6 +379,34 @@ fn the_record_says_presented_once_a_complete_frame_is_shown() {
     drop((m, layer));
 }
 
+/// Under a seekable agent clock (e.g. an occluded macOS agent window),
+/// readback stands in for presentation and marks a complete frame presented;
+/// under a live clock, readback of a presented target is only a capture (#724).
+#[test]
+fn seekable_readback_marks_presented_target_but_live_readback_does_not() {
+    let Some(mut m) = module() else {
+        return;
+    };
+    let (layer, id) = canvas(&mut m, "clear");
+    m.set_seekable(false);
+    let mut live_frame = frame();
+    live_frame.seekable = false;
+    assert!(m.readback(id, &live_frame).is_some());
+    assert_eq!(
+        m.take_published(id),
+        None,
+        "live readback must not mark a presented target shown"
+    );
+    m.set_seekable(true);
+    assert!(m.readback(id, &frame()).is_some());
+    assert_eq!(
+        m.take_published(id).as_deref(),
+        Some(r#"{"presented":true}"#),
+        "seekable agent readback marks a complete frame presented"
+    );
+    drop((m, layer));
+}
+
 /// A target let go of takes what it showed with it: the canvas is not
 /// presented again until a frame on the target that replaces it is. Every
 /// replacement goes through `Module::release`, Android's buffers

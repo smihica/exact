@@ -5,6 +5,7 @@ import AppKit
 #endif
 import XCTest
 @testable import ExactKit
+@testable import ExactSharing
 
 /// `share`'s anchor (LLP 1069.003 D3): the pressed node's view; a menu
 /// row's popover invoker when the row is not on screen; the content's
@@ -15,13 +16,26 @@ import XCTest
 final class ShareIOSTests: XCTestCase {
     func testAnchor() throws { try ShareAnchorCase.run(self) }
     func testPicture() throws { try SharePictureCase.run() }
+    func testLink() { ShareLinkCase.run() }
 }
 #else
 final class ShareMacTests: XCTestCase {
     func testAnchor() throws { try ShareAnchorCase.run(self) }
     func testPicture() throws { try SharePictureCase.run() }
+    func testLink() { ShareLinkCase.run() }
 }
 #endif
+
+/// A share's URL (LLP 1094.000 D1): what Foundation reads, and one it cannot
+/// read left out with a journal line that does not echo it.
+enum ShareLinkCase {
+    static func run() {
+        var lines: [String] = []
+        XCTAssertEqual(ShareSheet.link("https://example.com/caf\u{e9}", log: { lines.append($0) })?.absoluteString, "https://example.com/caf%C3%A9")
+        XCTAssertNil(ShareSheet.link("https://[broken", log: { lines.append($0) }))
+        XCTAssertEqual(lines, ["share: url not shared: Foundation cannot read it as a URL; percent-encode what a browser would"])
+    }
+}
 
 /// `share(files=["#id"])` (LLP 1125 D12): the node's view drawn to a PNG at
 /// the display's scale, its pixels the view's.

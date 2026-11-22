@@ -2,6 +2,7 @@
 import UIKit
 import XCTest
 @testable import ExactKit
+@testable import ExactTextSelection
 
 /// LLP 1005 §3 on UIKit: a `pointerdown` action that calls `preventDefault()`
 /// keeps the focus where it is: the view the touch went down on takes no
@@ -119,7 +120,7 @@ final class PreventFocusIOSTests: XCTestCase {
         settle()
         XCTAssertTrue(a.isFirstResponder)
         let para = try node(session, "para")
-        let held = try XCTUnwrap(session.presenter.textSelection.install(para))
+        let held = try XCTUnwrap(session.presenter.selectionHost.install(para))
         let interaction = UITextInteraction(for: .nonEditable)
         XCTAssertTrue(held.interactionShouldBegin(interaction, at: CGPoint(x: 4, y: 4)), "selectable text, before any touch")
         let touch = Touch(para)

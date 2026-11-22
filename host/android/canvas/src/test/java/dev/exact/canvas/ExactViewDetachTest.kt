@@ -37,7 +37,7 @@ class ExactViewDetachTest {
         companion object {
             @JvmStatic @Implementation fun __staticInitializer__() {}
             @JvmStatic @Implementation fun displayFrame() {}
-            @JvmStatic @Implementation fun frame(): java.nio.ByteBuffer? = null
+            @JvmStatic @Implementation fun frame(vsync: Boolean): java.nio.ByteBuffer? = null
             @JvmStatic @Implementation fun requests(): IntArray? = null
             @JvmStatic @Implementation fun timerObservation(a: Boolean, b: Boolean, c: Boolean, d: Boolean) = false
         }

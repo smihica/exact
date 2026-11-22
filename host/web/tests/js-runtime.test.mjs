@@ -10,8 +10,9 @@ import { test, expect, describe, beforeAll, afterAll } from 'bun:test';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { root, dir, webJs, freshRuntime } from './js-runtime-harness.mjs';
+import { runtimeHarness, webJs } from './js-runtime-harness.mjs';
 import { fileURLToPath } from 'node:url';
+const { root, dir, freshRuntime } = runtimeHarness();
 
 // ts-data.js over a scripted store (the storage test below), written before
 // anything is imported from here: the loader reads this directory once.
@@ -485,7 +486,7 @@ describe('browser TypeScript send failures', () => {
         if (value === 'later') return new Promise(resolve => { globalThis.finish = resolve; });
         return value;
       }`, { headers: { 'Content-Type': 'text/javascript' } });
-      return new Response(Bun.file(resolve(dir, path.slice(1))));
+      return new Response(Bun.file(resolve(path.startsWith('/web/') ? root : dir, path.slice(1))));
     } });
     browser = await suiteBrowser();
   });
@@ -1330,7 +1331,6 @@ test('a refused derive names itself and only the failed resources it reads', asy
   try { derive(); } catch (error) { expect(error.message).not.toContain('loadOther'); }
   expect(memo(() => 1, 's', 'plain')).toThrow('derive "plain": value does not conform to its type');
 });
-
 
 test('a refused derive traces only failed resources it read through retained values', async () => {
   const { memo, res, data } = await freshRuntime('retained-derive-refusal');

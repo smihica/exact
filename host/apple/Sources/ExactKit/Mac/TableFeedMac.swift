@@ -58,7 +58,8 @@ private final class TableSeparatorRowView: NSTableRowView {
 final class TableRowCell: NSTableCellView {
     private(set) weak var feed: TableFeed?
     private(set) weak var row: NodeView?
-    /// Where layout has the row, in the list's document.
+    private(set) weak var sectionParent: NodeView?
+    /// The row's frame in its authored parent, which can be a section or its card.
     private(set) var kernel = NSRect.zero
     /// The row, or something in it, moved since its text's start was read.
     var textMoved = true
@@ -101,9 +102,11 @@ final class TableRowCell: NSTableCellView {
     func adopt(_ node: NodeView) {
         if row !== node { sendHome(); textMoved = true }
         row = node
+        sectionParent = feed?.sectionParent(of: node)
+        if sectionParent != nil { node.hideGroupedSeparator(true) }
         syncSelectionPaint()
         if node.superview !== self {
-            // Where the presenter has it: layout's frame, in the document.
+            // Save layout's frame before the cell places the row.
             // A row can come from another cell (its item moved, or the
             // runner rebound it to this one's, LLP 1078): that cell lets it
             // go, and the selected item's ink it took there goes with it.
@@ -133,7 +136,12 @@ final class TableRowCell: NSTableCellView {
     /// The row where layout has it, in this cell's space.
     func place() {
         guard let row, let feed, row.superview === self, let origin = feed.documentOrigin(of: self) else { return }
-        let wanted = kernel.offsetBy(dx: -origin.x, dy: -origin.y)
+        var wanted = feed.documentFrame(kernel, of: row).offsetBy(dx: -origin.x, dy: -origin.y)
+        if feed.sections, let slot = feed.row(at: feed.table.row(for: self)), slot.node === row {
+            // AppKit inserts space before a group and can pin its header.
+            // Each cell carries the inset layout gave its row within that slot.
+            wanted.origin.y = slot.kernel.minY - slot.top - frame.minY
+        }
         if row.frame != wanted { row.frame = wanted; textMoved = true }
         guard textMoved else { return }
         textMoved = false
@@ -149,16 +157,18 @@ final class TableRowCell: NSTableCellView {
     /// or one whose item moved goes from cell to cell), or in the document
     /// when the table has no cell for it.
     func sendHome() {
-        defer { row = nil }
+        defer { row = nil; sectionParent = nil }
         guard let row, row.superview === self else { return }
-        guard let feed, let home = feed.home, feed.holds(row) else { row.removeFromSuperview(); return }
+        guard let feed, let home = sectionParent?.container ?? feed.home,
+              feed.holds(row) || sectionParent != nil && feed.live(row) else { row.removeFromSuperview(); return }
         let inked = backgroundStyle == .emphasized
-        if feed.detaches(row) {
+        if feed.holds(row) && feed.detaches(row) {
             row.removeFromSuperview()
         } else {
             home.addSubview(row)
             feed.moved(home: true)
             row.rowDisclosure(hidden: false)
+            if sectionParent != nil { row.hideGroupedSeparator(false) }
         }
         row.frame = kernel
         if inked { row.rowEmphasisChanged(false) }
@@ -293,6 +303,8 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         let index: Int
         package let node: NodeView
         let root: UInt32
+        var sectionKey: String?
+        var offsetInSection = 0
         var kernel = NSRect.zero
         var top: CGFloat = 0, height: CGFloat = 0
     }
@@ -308,6 +320,20 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
     /// `children` op named them: each with a box in the flow is a row, and
     /// the feed mounts them all (`TableHost.owns`).
     package var children: [NodeView]? { didSet { dirty = true } }
+    let sections: Bool
+    var windowedSections: WindowedTableSections? {
+        didSet {
+            if oldValue?.shape !== windowedSections?.shape { groupShapeChanged = true }
+        }
+    }
+    private var groupShapeChanged = false
+    private var spacingBefore: [UInt32: CGFloat] = [:]
+    private var selectedOffset = 0
+    private func isGroup(_ row: Int) -> Bool { windowedSections?.isHeader(row) ?? groupRows.contains(row) }
+    private var sectionChildren: [UInt32: [NodeView]] = [:]
+    private var parents: [UInt32: NodeView] = [:]
+    private var shells: [NodeView] = []
+    private var groupRows = IndexSet()
     /// How tall the table has a row that is not mounted: the commonest
     /// height among the mounted rows when the table was last loaded, or the
     /// runner's own estimate (its extent shared among its items) while none
@@ -348,8 +374,10 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
     private(set) var moves = 0, noted = 0, crossed = 0, homed = 0
     private static let column = NSUserInterfaceItemIdentifier("exact.row")
 
-    init(_ list: NodeView, presenter: Presenter, style: NSTableView.Style) {
+    init(_ list: NodeView, presenter: Presenter, style: NSTableView.Style, sections: Bool = false, windowed: WindowedTableSections? = nil) {
         self.id = list.id
+        self.sections = sections
+        self.windowedSections = windowed
         self.list = list
         self.presenter = presenter
         super.init()
@@ -383,13 +411,15 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     /// The list's mounted children in their order, wherever each is (a
     /// cell, the document): the Tab loop walks them (KeyViewLoopMac.swift).
-    var mounted: [NodeView] { children?.filter { presenter?.views[$0.id] === $0 } ?? rows.map(\.node) }
+    var mounted: [NodeView] { sections ? rows.map(\.node) : children?.filter { presenter?.views[$0.id] === $0 } ?? rows.map(\.node) }
     /// Where the presenter keeps the list's rows: its document, or the
     /// list itself when it is no scroller of its own.
     var home: NSView? { list.map { $0.scroll?.documentView ?? $0.container } }
+    var sectionDocumentHeight: CGFloat? { sections && windowedSections == nil ? table.frame.maxY : nil }
     /// What the list shows of that: its port.
     private var port: NSRect { list?.scroll?.contentView.bounds ?? home?.bounds ?? .zero }
-    func holds(_ node: NodeView) -> Bool { presenter?.views[node.id] === node && held.contains(node.id) }
+    fileprivate func live(_ node: NodeView) -> Bool { presenter?.views[node.id] === node }
+    func holds(_ node: NodeView) -> Bool { live(node) && held.contains(node.id) }
     fileprivate func moved(across: Bool = false, home: Bool = false) { moves += 1; if across { crossed += 1 }; if home { homed += 1 } }
     /// Rows a cell let go during this sync, for its fill to place (`TableRowCell.sendHome`).
     private var detached = Set<ObjectIdentifier>()
@@ -479,6 +509,57 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
     }
     private func kernel(_ node: NodeView) -> NSRect { (node.superview as? TableRowCell)?.kernel ?? node.frame }
 
+    func sectionParent(of node: NodeView) -> NodeView? { parents[node.id] }
+
+    fileprivate func documentFrame(_ frame: NSRect, of node: NodeView) -> NSRect {
+        guard let parent = parents[node.id], let home else { return frame }
+        return home.convert(frame, from: parent.container)
+    }
+
+    func updateSection(_ id: UInt32, children: [NodeView]) {
+        guard sectionChildren[id] != nil else { return }
+        sectionChildren[id] = children
+        dirty = true
+    }
+
+    /// Keep the authored order while AppKit holds a header or body row in a cell.
+    /// A grouped form puts its body in one card. A plain section holds its rows directly.
+    private func sectionRows(_ presenter: Presenter, listChildren: [NodeView]) -> [NodeView] {
+        var next: [NodeView] = [], nextParents: [UInt32: NodeView] = [:]
+        var parts: [UInt32: [NodeView]] = [:], nextShells: [NodeView] = []
+        func children(of node: NodeView) -> [NodeView] {
+            let children = sectionChildren[node.id] ?? node.childNodes
+            parts[node.id] = children
+            return children.filter { presenter.views[$0.id] === $0 }
+        }
+        func append(_ node: NodeView, in parent: NodeView) {
+            nextParents[node.id] = parent
+            next.append(node)
+        }
+        for section in listChildren {
+            guard section.props["semanticTag"] == "section" else { next.append(section); continue }
+            nextShells.append(section)
+            let parts = children(of: section)
+            guard !section.hiddenByHost, section.style["display"]?.string != "none" else { continue }
+            for part in parts {
+                switch part.props["semanticTag"] {
+                case "footer": continue
+                case "header": append(part, in: section)
+                default:
+                    if list?.props["listStyle"] != nil {
+                        if !part.isHidden { for row in children(of: part) { append(row, in: part) } }
+                    } else { append(part, in: section) }
+                }
+            }
+        }
+        for shell in shells where parts[shell.id] == nil { shell.sectionInTable = false }
+        for shell in nextShells { shell.sectionInTable = true }
+        shells = nextShells
+        sectionChildren = parts
+        parents = nextParents
+        return next
+    }
+
     /// The items and the mounted rows as the runner has them (a list it
     /// windows), or as the list's children are (any other: every child with
     /// a box in the flow is a row, and all of them are mounted).
@@ -487,6 +568,23 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         if let snapshot = presenter.collections.snapshot(id) {
             // A table made before the runner said it windows the list.
             if children != nil { children = nil }
+            if let projection = windowedSections {
+                let sections = snapshot.rows.compactMap { presenter.views[$0.root] }
+                _ = sectionRows(presenter, listChildren: sections)
+                let wrappers = Dictionary(uniqueKeysWithValues: snapshot.rows.map { ($0.index, $0.view) })
+                var shape = Hasher()
+                for item in projection.mounted {
+                    guard let wrapperID = wrappers[item.section], let wrapper = presenter.views[wrapperID] else { continue }
+                    let first = projection.firstRow(of: item.section)
+                    for (offset, view) in item.cells.enumerated() {
+                        guard let node = presenter.views[view] else { continue }
+                        let frame = documentFrame(kernel(node), of: node)
+                        next.append(Row(index: first + offset, node: node, root: view, sectionKey: wrapper.props["listItemKey"], offsetInSection: offset, kernel: frame))
+                        shape.combine(view); shape.combine(first + offset); shape.combine(frame)
+                    }
+                }
+                return (projection.count, next, [snapshot.revision, UInt64(bitPattern: Int64(shape.finalize()))])
+            }
             next.reserveCapacity(snapshot.rows.count)
             var ordered = true
             for row in snapshot.rows where row.index >= 0 && row.index < snapshot.count {
@@ -510,7 +608,9 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         // some for a positioned box and for a scroller in the flow (a row
         // that swipes). So a ranked child is a row where it stands in the
         // flow: after the row before it and before the next plain box.
-        let boxes = (children ?? []).filter { presenter.views[$0.id] === $0 && !$0.isHidden }.map { ($0, kernel($0)) }.filter { $0.1.height > 0 }
+        let listChildren = children ?? []
+        let candidates = sections ? sectionRows(presenter, listChildren: listChildren) : listChildren
+        let boxes = candidates.filter { presenter.views[$0.id] === $0 && !$0.isHidden }.map { ($0, documentFrame(kernel($0), of: $0)) }.filter { $0.1.height > 0 }
         var before = [CGFloat](repeating: .greatestFiniteMagnitude, count: boxes.count + 1)
         for i in boxes.indices.reversed() { before[i] = boxes[i].0.rank == 0 ? boxes[i].1.minY : before[i + 1] }
         var end = list?.contentBox().minY ?? 0
@@ -518,6 +618,11 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
             if node.rank != 0, frame.minY < end - 0.5 || frame.maxY > before[i + 1] + 0.5 { continue }
             next.append(Row(index: next.count, node: node, root: node.id, kernel: frame))
             end = frame.maxY
+        }
+        if sections {
+            var shape = Hasher()
+            for row in next { shape.combine(row.node.id); shape.combine(row.kernel) }
+            return (next.count, next, [UInt64(bitPattern: Int64(shape.finalize()))])
         }
         return (next.count, next, [UInt64(next.count)])
     }
@@ -541,7 +646,7 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         // A batch that changed no row, no frame of one and nothing of the port's width leaves the table as it is.
         var (items, next, now) = read(presenter)
         now += [Double(port.width).bitPattern, Double(pixel).bitPattern]
-        guard dirty || now != stamp || table.superview !== home else { return }
+        guard dirty || groupShapeChanged || now != stamp || table.superview !== home else { return }
         separators = true
         stamp = now
         dirty = false
@@ -551,9 +656,13 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         // pixels, so a list with room between its rows still tiles.
         for i in next.indices {
             var top = next[i].kernel.minY, end = next[i].kernel.maxY
-            if i > 0, next[i - 1].index == next[i].index - 1 { top = next[i - 1].top + next[i - 1].height }
+            if i > 0, next[i - 1].index == next[i].index - 1 {
+                let room = max(0, top - next[i - 1].kernel.maxY)
+                top = next[i - 1].top + next[i - 1].height + min(room, spacingBefore[next[i].node.id] ?? 0)
+            }
             if i + 1 < next.count, next[i + 1].index == next[i].index + 1 {
-                let room = next[i + 1].kernel.minY - end
+                let distance = next[i + 1].kernel.minY - end
+                let room = distance - min(max(0, distance), spacingBefore[next[i + 1].node.id] ?? 0)
                 end += room > 0 ? (room / 2 / pixel).rounded(.down) * pixel : room
             }
             next[i].top = top
@@ -568,7 +677,12 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
             for row in next { seen[row.height, default: 0] += 1 }
             return seen.max { $0.value < $1.value || ($0.value == $1.value && $0.key > $1.key) }.map { ($0.key, $0.value) }
         }
-        var recount = items != count
+        let groups = sections && windowedSections == nil ? IndexSet(next.compactMap { row in
+            row.node.props["semanticTag"] == "header" && parents[row.node.id]?.props["semanticTag"] == "section" ? row.index : nil
+        }) : IndexSet()
+        var recount = items != count || groupRows != groups || groupShapeChanged
+        groupShapeChanged = false
+        groupRows = groups
         if recount {
             // The items changed: every row is asked again.
             count = items
@@ -588,10 +702,14 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         var disappeared = false
         let selected: Int?
         if let key = selectedKey {
-            if let mounted = next.first(where: { $0.node.props["listItemKey"] == key })?.index {
+            if let mounted = next.first(where: { ($0.sectionKey ?? $0.node.props["listItemKey"]) == key && $0.offsetInSection == selectedOffset })?.index {
                 selected = mounted
             } else if let lookup = presenter.onListIndex {
-                selected = lookup(id, key)
+                selected = lookup(id, key).flatMap { index in
+                    guard let projection = windowedSections else { return index }
+                    let first = projection.firstRow(of: index), row = first + selectedOffset
+                    return row < projection.firstRow(of: index + 1) && !projection.isHeader(row) ? row : nil
+                }
                 if selected == nil {
                     selectedKey = nil
                     disappeared = true
@@ -649,6 +767,7 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         // AppKit's layout may have guessed the far rows again and moved the near ones with them.
         align(port, anchor)
         fill()
+        if windowedSections != nil { reportSectionSpacing(presenter) }
         // After the batch, never inside it: moving the port tells the runner.
         if let row = reveal, self.row(at: row) != nil {
             reveal = nil
@@ -657,6 +776,22 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
                 self.show(row: row)
             }
         }
+    }
+
+    /// AppKit puts space outside group rows. The runner measures each mounted
+    /// section with that space so its scroll extent follows the native cells.
+    private func reportSectionSpacing(_ presenter: Presenter) {
+        var before: [UInt32: CGFloat] = [:], claims: [UInt32: HostCover] = [:]
+        for row in rows {
+            let rect = table.rect(ofRow: row.index)
+            let previous = row.index > 0 ? table.rect(ofRow: row.index - 1).maxY : table.bounds.minY
+            let top = max(0, rect.minY - previous)
+            let bottom = row.index == count - 1 ? max(0, table.bounds.maxY - rect.maxY) : 0
+            if top > 0 { before[row.node.id] = top }
+            if top > 0 || bottom > 0 { claims[row.node.id] = .rowSpacing(top: top, bottom: bottom) }
+        }
+        spacingBefore = before
+        presenter.covers.report("table row spacing \(id)", claims)
     }
 
     /// AppKit animates a table's rows to a new height or count inside
@@ -697,11 +832,14 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         }
         let y: CGFloat
         // Its view's place where it has one: AppKit rounds that to a pixel.
-        if let anchor, anchor < rows.count {
+        if sections, windowedSections == nil, let first = rows.first {
+            y = first.top - table.rect(ofRow: first.index).minY
+        } else if let anchor, anchor < rows.count {
             let row = rows[anchor]
             y = row.top - (table.rowView(atRow: row.index, makeIfNecessary: false)?.frame.minY ?? table.rect(ofRow: row.index).minY)
         } else { y = list.contentBox().minY - (table.numberOfRows > 0 ? table.rect(ofRow: 0).minY : 0) }
         if table.frame.origin != NSPoint(x: 0, y: y) { table.setFrameOrigin(NSPoint(x: 0, y: y)) }
+        if sections && windowedSections == nil { list.fitScroll() }
     }
     fileprivate func tableLaidOut() {
         guard !syncing, !aligning else { return }
@@ -745,6 +883,10 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
     /// it; the table's place for such a row is AppKit's guess from the
     /// estimate, and the table is no longer than its rows' estimates.
     private func span(ofRow row: Int) -> ClosedRange<CGFloat> {
+        if sections && windowedSections == nil {
+            let rect = table.rect(ofRow: row).offsetBy(dx: 0, dy: table.frame.minY)
+            return rect.minY...rect.maxY
+        }
         if let mounted = self.row(at: row) { return mounted.top...(mounted.top + mounted.height) }
         let content = list?.contentBox().minY ?? 0
         let extent = content + CGFloat(presenter?.collections.snapshot(id)?.extent ?? 0)
@@ -774,24 +916,32 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
         guard let home else { return }
         var kept = false
         func keep(_ node: NodeView) {
-            guard !(node.superview is TableRowCell), node.superview !== home else { return }
+            let destination = parents[node.id]?.container ?? home
+            guard !(node.superview is TableRowCell), node.superview !== destination else { return }
             node.prepareToMount()
-            home.addSubview(node)
+            destination.addSubview(node)
             moves += 1; homed += 1
             if detached.remove(ObjectIdentifier(node)) != nil { node.rowDisclosure(hidden: false) }
             kept = true
         }
         let all = children?.filter { presenter?.views[$0.id] === $0 } ?? rows.map(\.node)
         all.forEach(keep)
+        if sections { for row in rows { keep(row.node) } }
         // In the document they are in their order, as the presenter keeps its own.
         if kept { presenter?.orderChildren(all, in: home) }
     }
 
     package func numberOfRows(in tableView: NSTableView) -> Int { count }
+    package func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool { isGroup(row) }
     private func separates(at index: Int) -> Bool {
         guard index >= 0, index < count else { return false }
         // An estimated, unmounted row has no authored intent to read yet.
         guard let row = row(at: index) else { return index + 1 < count }
+        if sections {
+            guard !isGroup(index), let next = self.row(at: index + 1), !isGroup(next.index),
+                  parents[row.node.id] === parents[next.node.id] else { return false }
+            return presenter?.tables.separates(row.node, before: next.node) ?? false
+        }
         return presenter?.tables.separates(row.node, in: id) ?? false
     }
     private func separatorAppearanceSource(at index: Int) -> NodeView? {
@@ -833,20 +983,21 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
     // MARK: Selection and the row's press
 
     /// The node a row's click presses: its authored root's `rowPress`.
-    func pressing(_ row: Row) -> NodeView? { presenter?.views[row.root]?.rowPress }
+    func pressing(_ row: Row) -> NodeView? { isGroup(row.index) ? nil : presenter?.views[row.root]?.rowPress }
     /// A row is selected, by a click or a key, when it presses and is not
     /// disabled. Any other row is a row of text, as in SwiftUI's list with
     /// no selection. A row that is not mounted may be reached by a key (the
     /// list's last row): what it is shows when the runner has made it.
     private func selectable(_ row: Row) -> Bool { pressing(row).map { !$0.disabled && !$0.inert } ?? false }
-    package func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { self.row(at: row).map(selectable) ?? true }
+    package func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { !isGroup(row) && (self.row(at: row).map(selectable) ?? true) }
     /// A mounted row's text, for the table's type-select. A row that is not
     /// mounted has none here: the runner has its item, not the host.
     package func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
         self.row(at: row).map(\.node.accessibleName).flatMap { $0.isEmpty ? nil : $0 }
     }
     private func remember(_ row: Row?) {
-        selectedKey = row?.node.props["listItemKey"]
+        selectedOffset = row?.offsetInSection ?? 0
+        selectedKey = row?.sectionKey ?? row?.node.props["listItemKey"]
         selectedNode = selectedKey == nil ? row?.node.id : nil
     }
     /// Whether a row's press is known to show another screen of the app:
@@ -967,15 +1118,26 @@ package final class TableFeed: NSObject, NSTableViewDataSource, NSTableViewDeleg
 
     /// The table leaves the list: every row back in the document.
     func remove() {
+        if windowedSections != nil { presenter?.covers.report("table row spacing \(id)", [:]) }
         table.enumerateAvailableRowViews { view, _ in (view.view(atColumn: 0) as? TableRowCell)?.sendHome() }
-        if let home { for row in rows where row.node.superview == nil && holds(row.node) { home.addSubview(row.node) } }
+        if let home { for row in rows where row.node.superview == nil && holds(row.node) { (parents[row.node.id]?.container ?? home).addSubview(row.node) } }
+        for (id, children) in sectionChildren {
+            if let parent = presenter?.views[id] { presenter?.orderChildren(children, in: parent.container) }
+        }
+        for shell in shells { shell.sectionInTable = false }
         table.dataSource = nil
         table.delegate = nil
         table.removeFromSuperview()
+        if sections { list?.fitScroll() }
     }
 }
 
 extension NodeView {
+    /// The runner measures this wrapper, but its contents receive clicks in AppKit's cells.
+    var isProjectedSectionWrapper: Bool {
+        props["listItemKey"] != nil && childNodes.first?.sectionInTable == true
+    }
+
     /// The node a click on this row presses, this being a list's row's
     /// authored root: itself, when it has a press (a `press`, or a link's
     /// `href`). Else, where it is a swipe container (`swipeContent`, the row

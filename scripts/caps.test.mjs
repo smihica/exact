@@ -981,8 +981,8 @@ test('clock +N real never seeks behind the last reply and ends at from + N', asy
         reported = sent.length === 1 ? req.to + ahead : req.to;
         return { clock: reported };
       } };
-      const clock = new Function('s', 'carrier', 'performance', 'setTimeout', 'REAL_STEP_MS',
-        `return ({${source.slice(start, end)}}).clock;`)(s, { host }, { now: () => wall.shift() },
+      const clock = new Function('s', 'carrier', 'env', 'performance', 'setTimeout', 'REAL_STEP_MS',
+        `return ({${source.slice(start, end)}}).clock;`)(s, { host }, {}, { now: () => wall.shift() },
         (done, ms) => { sleeps.push(ms); done(); }, 50);
       const reply = await clock('+1 real');
       expect(sent).toEqual([250, Math.max(250.5, 250 + ahead), 251]);

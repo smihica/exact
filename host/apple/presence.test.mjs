@@ -485,3 +485,29 @@ test('Sensitive Content Analysis signs its array on iOS and under a Mac profile,
   expect(macProfileEntitlements(analyzer, { prefix: 'P', team: 'T', dev: true }, macProfileNeeds(compat), compat)[key]).toEqual(['analysis']);
   expect(PROFILE_KEYS).toContain(key);
 });
+
+test('an App Clip signs on-demand install, and its app names it where the profile lists that clip', async () => {
+  const { entitlements } = await import('./build.mjs');
+  const { clipEntitlements } = await import('./presence.mjs');
+  const app = { id: 'com.example.notes', displayName: 'Notes', manifest: { host: { ios: { appClip: {} } } } };
+  const clip = { ...app, id: 'com.example.notes.Clip', clipParent: app.id };
+  expect(clipEntitlements(clip, { prefix: 'PREFIX' })).toEqual({ 'com.apple.developer.parent-application-identifiers': ['PREFIX.com.example.notes'], 'com.apple.developer.on-demand-install-capable': true });
+  const key = 'com.apple.developer.associated-appclip-app-identifiers';
+  const profile = (ids) => ({ prefix: 'PREFIX', entitlements: ids ? [key] : [], entitlementValues: ids ? { [key]: ids } : {} });
+  expect(clipEntitlements(app, { profile: profile(['PREFIX.com.example.notes.Clip']) })).toEqual({ [key]: ['PREFIX.com.example.notes.Clip'] });
+  // None for a profile made before the clip's App ID, one that lists another clip, no profile, an extension, or no clip.
+  for (const [bundle, p] of [[app, profile(null)], [app, profile(['PREFIX.com.example.other.Clip'])], [app, null], [{ ...app, widgetAppId: app.id }, profile(['PREFIX.com.example.notes.Clip'])], [{ ...app, manifest: {} }, profile(['PREFIX.com.example.notes.Clip'])]]) {
+    expect(clipEntitlements(bundle, { profile: p })).toEqual({});
+  }
+  expect(entitlements(clip, 'TEAM', false, null, { prefix: 'PREFIX' })).toMatch(/<key>com.apple.developer.on-demand-install-capable<\/key>\s*<true\/>/);
+});
+
+test('macSigning preflight catches missing or ambiguous signing before a bake exists (LLP 1156.007)', () => {
+  const plain = { id: 'com.example.notes', manifest: { host: {} } };
+  const twoTeams = () => [{ sha1: 'A'.repeat(40), team: 'TEAM1' }, { sha1: 'B'.repeat(40), team: 'TEAM2' }];
+  expect(() => macSigning(plain, null, { preflight: true, identities: twoTeams, find: none, log: () => {} }))
+    .toThrow(/Apple Development identities span several teams/);
+  expect(() => macSigning(plain, null, { preflight: true, release: true, distribution: true, store: 'appstore', current: 'A'.repeat(40), teamOf: () => 'TEAM1', find: none, log: () => {} }))
+    .toThrow(/^appstore-needs-profile:/);
+  expect(macSigning(plain, null, { preflight: true, current: '-', identities: twoTeams, find: none, log: () => {} }).sha1).toBe('-');
+});

@@ -474,8 +474,7 @@ impl Lowerer<'_> {
             .collect();
         for (state, row, _) in &parts {
             if row.name == "border-color" {
-                let fns = &self.fns;
-                shorthands::computed_list(&row.name, &row.value, &|f| fns.get(f).map(|(_, b)| *b))?;
+                shorthands::computed_list(self, scope, &row.name, &row.value)?;
             }
             if let Some(e) = refusal(state, row, true) {
                 return Err(e);

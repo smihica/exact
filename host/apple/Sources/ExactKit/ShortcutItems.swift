@@ -87,23 +87,34 @@ public enum ExactShortcuts {
         @objc func open(_ sender: NSMenuItem) {
             guard let url = sender.representedObject as? String else { return }
             NSApp.activate(ignoringOtherApps: true)
-            ExactContentIndex.open(url)
+            ExactApp.shared.open(location: url)
         }
     }
     #endif
 }
 
 extension ExactApp {
-    /// The system's ways in that a package's code does not keep (LLP
-    /// 1133.023 D15 item 1): the tool door, the content index's mirror and
-    /// the icon's menu. Install at launch, before the app finishes launching.
-    /// `boot` boots a session with no view for a call that launched the app
-    /// with none.
-    public func installReach(boot: (() -> Void)? = nil) {
-        ExactTools.boot = boot
-        ExactTools.install()
+    /// The icon's menu and an entity's opening (LLP 1133.023 D15 item 1),
+    /// which a package's code does not keep. Install once at launch, before
+    /// the app finishes launching. The
+    /// content index and the tool door are their own products, which the
+    /// composition's launch hook installs.
+    public func installReach() {
         #if !os(tvOS)
         ExactShortcuts.install()
+        // A generated intent opens an entity at the location it already
+        // holds, which needs no index (`exact.contentIndex.open` `{url}`).
+        NotificationCenter.default.addObserver(forName: Notification.Name("exact.contentIndex.open"), object: nil, queue: .main) { note in
+            if let url = (note.object as? NSDictionary)?["url"] as? String { self.open(location: url) }
+        }
         #endif
+    }
+
+    /// Open a location in the app's session, as a quick action, a search
+    /// result or an entity does: a launch location before its boot, a
+    /// navigation after (LLP 1133.023 D1).
+    public func open(location url: String) {
+        guard let session = sessions.first(where: { $0.state != .destroyed }) else { return }
+        _ = session.openLocation(url)
     }
 }

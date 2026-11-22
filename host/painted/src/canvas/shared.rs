@@ -102,17 +102,14 @@ impl Recorder {
             ]
         };
         let bounds = rect(e.rect);
-        let crop = e.image.map(|(_, r)| rect(r)).unwrap_or([0.0; 4]);
+        let crop = e.crop.map(rect).unwrap_or([0.0; 4]);
         let content = rect(e.content);
-        let natural = e
-            .image
-            .map(|(image, _)| image.natural())
-            .unwrap_or_default();
+        let natural = e.image.map(|image| image.natural()).unwrap_or_default();
         let unit = e
             .image
-            .map(|(image, _)| image.placed((0.0, 0.0, 1.0, 1.0)))
+            .map(|image| image.placed((0.0, 0.0, 1.0, 1.0)))
             .unwrap_or((0.0, 0.0, 1.0, 1.0));
-        let image = e.image.map_or(0, |(image, _)| {
+        let image = e.image.map_or(0, |image| {
             self.image_id(&picture::Picture::Bitmap(image.clone()))
         });
         let scale = e.transform.sx.hypot(e.transform.ky) * self.scale;
@@ -215,6 +212,7 @@ mod tests {
             opacity: 1.,
             transform: Transform::identity(),
             image: None,
+            crop: None,
             fit: 0,
             content: (0., 0., 400., 800.),
         };
@@ -252,6 +250,7 @@ mod tests {
             opacity: 1.,
             transform: Transform::identity(),
             image: None,
+            crop: None,
             fit: 0,
             content: (0., 0., 80., 60.),
         };
@@ -259,6 +258,7 @@ mod tests {
             assert!(r.layer_begin(
                 7,
                 Transform::identity(),
+                (0., 0.),
                 (0., 0.),
                 [0., 0., 1., 0., alpha, 0., 0.]
             ));
@@ -449,6 +449,73 @@ mod tests {
             assert!(
                 (w - size.0).abs() < 0.01 && (h - size.1).abs() < 0.01,
                 "{own}: {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_borrowed_raster_uses_the_destinations_position_and_environment() {
+        use base64::Engine as _;
+        let mut pixels = tiny_skia::Pixmap::new(40, 20).unwrap();
+        pixels.fill(tiny_skia::Color::BLACK);
+        let png = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(pixels.encode_png().unwrap())
+        );
+        for (position, x, y) in [
+            ("left top", 0., 0.),
+            ("1em 10vw", 20., 40.),
+            ("var(--missing) 75%", 60., 30.),
+        ] {
+            let app = format!(
+                r#"component App
+  state open = false
+  state position = "{position}"
+  action toggle
+    open = not open
+  view
+    column
+      button "Toggle" press=toggle testId="toggle"
+      if open
+        image "" sharedElement="photo" testId="photo" width=160 height=80 font-size=20 object-fit="none" object-position=position -exact-layout-transition="1s linear"
+      else
+        image "{png}" sharedElement="photo" testId="photo" width=80 height=40
+"#
+            );
+            let (mut p, error) = Presenter::boot_with(
+                &crate::test_plan(&app),
+                (),
+                (400., 800.),
+                1.,
+                std::path::PathBuf::new(),
+                PainterChoice::Canvas,
+            )
+            .unwrap();
+            assert!(error.is_none(), "{error:?}");
+            assert!(p.wait_images(std::time::Duration::from_secs(30)));
+            p.frame();
+            take();
+            let k = p.host().kernel();
+            let toggle = k.node_by_key(k.find_by_test_id("toggle")[0]).unwrap().id;
+            p.tap(toggle).unwrap();
+            p.frame();
+            let ops = take();
+            let defs = sets(&ops);
+            let def = defs.last().unwrap();
+            assert_eq!(def[12], 0, "destination has no bitmap");
+            let rect = |at| {
+                (
+                    f32::from_bits(def[at]),
+                    f32::from_bits(def[at + 1]),
+                    f32::from_bits(def[at + 2]),
+                    f32::from_bits(def[at + 3]),
+                )
+            };
+            let content = rect(24);
+            assert_eq!(
+                rect(13),
+                (content.0 + x, content.1 + y, 40., 20.),
+                "{position}"
             );
         }
     }
@@ -925,6 +992,7 @@ component App
             opacity: 1.,
             transform: Transform::identity(),
             image: None,
+            crop: None,
             fit: 3,
             content: (0., 0., 100., 100.),
         };

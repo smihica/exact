@@ -167,6 +167,14 @@ enum InlineFrameFixture {
         let node = try XCTUnwrap(detail["node"] as? [String: Any])
         let space = try XCTUnwrap(node["space"] as? [String: Any])
         let viewport = try XCTUnwrap(space["viewport"] as? [String: Any])
+        if run.range.length == 0 {
+            XCTAssertNil(space["baseline"])
+        } else {
+            let baseline = try XCTUnwrap(space["baseline"] as? Double)
+            let first = agent.box(host, region: try XCTUnwrap(fragments.first))
+            XCTAssertGreaterThan(baseline, first.minY)
+            XCTAssertLessThan(baseline, first.maxY)
+        }
         let frame = try XCTUnwrap(p.inlineFrame(run.id), "mounted empty runs also have a frame")
         let origin = agent.box(host)
         let values = [frame.minX, frame.minY, frame.width, frame.height]

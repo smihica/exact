@@ -62,8 +62,12 @@ impl SourceOwner {
     /// and say so once.
     /// One that came with a status that is not 2xx fails as that status,
     /// asked again as a bodiless one is.
-    fn release(&self, refusal: Refusal, downloads: &remote::Downloads) {
-        let status = (self.remote.as_ref().and_then(|load| load.outcome()))
+    fn release(&self, refusal: Refusal, downloads: Option<&remote::Downloads>) {
+        let (Some(load), Some(downloads)) = (&self.remote, downloads) else {
+            return;
+        };
+        let status = load
+            .outcome()
             .and_then(|outcome| outcome.ok()?.status.clone());
         let failure = status.unwrap_or_else(|| remote::Failure {
             refusal,
@@ -78,7 +82,7 @@ impl SourceOwner {
         if let Some(at) = failure.after {
             downloads.cool(&self.name, at, &message);
         }
-        let Some(body) = self.remote.as_ref().and_then(|load| load.release(failure)) else {
+        let Some(body) = load.release(failure) else {
             return;
         };
         *self.transient.lock().unwrap() = transient;
@@ -98,7 +102,7 @@ struct State {
 pub(super) struct Backend {
     pub session: RasterSession,
     /// Where a URL's body comes from.
-    pub downloads: Arc<remote::Downloads>,
+    pub downloads: Option<Arc<remote::Downloads>>,
     /// This backend, for a download to wake its workers when it lands.
     me: Weak<Backend>,
     state: Mutex<State>,
@@ -125,12 +129,18 @@ impl Backend {
         Self::for_workers(Workers::process())
     }
     fn for_workers(workers: &Workers) -> Arc<Self> {
+        Self::with_downloads(workers, Some(remote::Downloads::process().clone()))
+    }
+    pub fn local() -> Arc<Self> {
+        Self::with_downloads(Workers::process(), None)
+    }
+    fn with_downloads(workers: &Workers, downloads: Option<Arc<remote::Downloads>>) -> Arc<Self> {
         let (wake_read, wake_write) = UnixStream::pair().expect("raster wake pair");
         wake_read.set_nonblocking(true).unwrap();
         wake_write.set_nonblocking(true).unwrap();
         let backend = Arc::new_cyclic(|me| Self {
             session: workers.gate.session(),
-            downloads: remote::Downloads::process().clone(),
+            downloads,
             me: me.clone(),
             state: Mutex::new(State {
                 sources: BTreeMap::new(),
@@ -184,8 +194,8 @@ impl Backend {
             .find(|s| s.generation == generation && s.name == name)
         {
             // Now one that fills the screen: its download, still waiting, goes first.
-            if let Some(load) = source.remote.as_ref().filter(|_| urgent) {
-                self.downloads.promote(load);
+            if urgent {
+                self.promote(source);
             }
             Ok(source.clone())
         } else if state.sources.len() >= SUBSCRIPTIONS + COLD_ENTRIES + 2
@@ -206,13 +216,17 @@ impl Backend {
         } else if let Some(next) = state.next_source.checked_add(1) {
             // A URL downloads now, off the workers; one reads its header
             // once it is settled (`prepare`).
-            let remote = if remote::is_remote(name) {
+            let remote = if exact_plan::has_http_scheme(name) {
                 let me = self.me.clone();
                 self.downloads
-                    .load(name, urgent, move || {
-                        if let Some(backend) = me.upgrade() {
-                            backend.session.wake();
-                        }
+                    .as_ref()
+                    .ok_or(Refusal::DecodeFailed)
+                    .and_then(|downloads| {
+                        downloads.load(name, urgent, move || {
+                            if let Some(backend) = me.upgrade() {
+                                backend.session.wake();
+                            }
+                        })
                     })
                     .map(Some)
             } else {
@@ -289,8 +303,8 @@ impl Backend {
     /// `source`'s download, if it still waits for a thread, goes first: its
     /// picture now fills the screen ([`remote::Downloads::promote`]).
     pub fn promote(&self, source: &SourceOwner) {
-        if let Some(load) = &source.remote {
-            self.downloads.promote(load);
+        if let (Some(load), Some(downloads)) = (&source.remote, &self.downloads) {
+            downloads.promote(load);
         }
     }
     /// Source `id`, failed, is found no more: the next ask for its name
@@ -412,7 +426,7 @@ impl Backend {
             }
             _ => open(source)
                 .and_then(|(mut input, bytes)| png_decode::inspect(&mut input, bytes))
-                .inspect_err(|e| source.release(*e, &self.downloads)),
+                .inspect_err(|e| source.release(*e, self.downloads.as_deref())),
         };
         *source.prepared.lock().unwrap() = match result {
             Ok(header) => Prepared::Ready(header),
@@ -533,7 +547,7 @@ impl Backend {
             Err(e) => {
                 if e == Refusal::DecodeFailed {
                     if let Some(source) = &decoded_source {
-                        source.release(e, &self.downloads);
+                        source.release(e, self.downloads.as_deref());
                     }
                 }
                 permit.fail()

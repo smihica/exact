@@ -1149,6 +1149,76 @@ final class BackSessionMacTests: XCTestCase {
         XCTAssertTrue(p.backSwipeHost.swiped(deltaX: -1))
         XCTAssertEqual(try text("url"), "/v/2", "the three-finger swipe went forward")
     }
+
+    func testCommandArrowsNavigateHistoryOutsideEditableText() throws {
+        _ = NSApplication.shared
+        let source = """
+        routes nav
+          home "/"
+            visit "/v/:n"
+
+        component App
+          state ways = "back forward"
+          action next(n: number)
+            nav = push(nav, path("visit", n))
+          action follow(location: string)
+            nav = go(nav, location)
+          action offer(w: string)
+            ways = w
+          view
+            main navigationKey="app" navigationBack="" navigate=follow navigationHistory=ways width="100%" height="100%"
+              text `${top(nav).url}` testId="url"
+              button press=next(1) testId="one"
+                text "One"
+              button press=offer("none") testId="none"
+                text "None"
+
+        """
+        let session = ExactApp.shared.makeSession()
+        defer { session.destroy() }
+        XCTAssertNil(session.boot(plan: try plan(source), size: CGSize(width: 480, height: 360)).error)
+        let view = ExactView(session: session)
+        let p = session.presenter
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 360),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = view
+        let previous = DevMenu.session
+        DevMenu.session = session
+        defer { DevMenu.session = previous; window.close() }
+        let bar = DevMenu.makeMenu(shortcuts: p.shortcuts, documents: false, develop: false)
+        let node = { (id: String) in try XCTUnwrap(p.views.values.first { $0.props["testId"] == id }) }
+        let text = { (id: String) in try node(id).props["text"] ?? "" }
+        let arrow = { (code: UInt16, mods: NSEvent.ModifierFlags) -> NSEvent in
+            let ch = String(UnicodeScalar(code == 123 ? NSEvent.SpecialKey.leftArrow.rawValue : NSEvent.SpecialKey.rightArrow.rawValue)!)
+            return NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: mods, timestamp: 0,
+                                    windowNumber: window.windowNumber, context: nil,
+                                    characters: ch, charactersIgnoringModifiers: ch, isARepeat: false, keyCode: code)!
+        }
+        try p.press(node("one").id)
+        XCTAssertEqual(try text("url"), "/v/1")
+        // Command-Left goes Back and Command-Right goes Forward.
+        XCTAssertTrue(bar.performKeyEquivalent(with: arrow(123, .command)))
+        XCTAssertEqual(try text("url"), "/")
+        XCTAssertFalse(bar.performKeyEquivalent(with: arrow(123, .command)), "nothing further back")
+        XCTAssertTrue(bar.performKeyEquivalent(with: arrow(124, .command)))
+        XCTAssertEqual(try text("url"), "/v/1")
+        // Shift-Command-Left does not hijack line-selection shortcuts.
+        XCTAssertFalse(bar.performKeyEquivalent(with: arrow(123, [.command, .shift])))
+        XCTAssertEqual(try text("url"), "/v/1")
+        // An editable text view keeps Command-Left/Right for caret movement.
+        let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 100, height: 30))
+        editor.isEditable = true
+        view.addSubview(editor)
+        XCTAssertTrue(window.makeFirstResponder(editor))
+        XCTAssertFalse(bar.performKeyEquivalent(with: arrow(123, .command)))
+        XCTAssertEqual(try text("url"), "/v/1")
+        editor.removeFromSuperview()
+        XCTAssertTrue(window.makeFirstResponder(view))
+        // When navigationHistory removes back, Command-Left does nothing.
+        try p.press(node("none").id)
+        XCTAssertFalse(bar.performKeyEquivalent(with: arrow(123, .command)))
+        XCTAssertEqual(try text("url"), "/v/1")
+    }
 }
 extension WindowToolbarHost {
     /// Whether the bar's Back goes: Back alone, or the back/forward group's Back.

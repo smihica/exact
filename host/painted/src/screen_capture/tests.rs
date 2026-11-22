@@ -18,6 +18,24 @@ impl Files {
             self.0.join("tmp"),
         ]
     }
+    fn local(&self, capture: &Json) -> PathBuf {
+        self.roots()[2].join(
+            capture["path"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("app:/tmp/")
+                .unwrap(),
+        )
+    }
+    // Canvas cache tests replace their own named image after a capture.
+    fn replace_image(&self, displays: Vec<Display>) {
+        let answer = self.capture(displays, &Mutex::new(true)).unwrap();
+        std::fs::copy(
+            self.local(&answer["captures"][0]),
+            self.roots()[2].join("freeze/screen-0.png"),
+        )
+        .unwrap();
+    }
     fn capture(&self, displays: Vec<Display>, held: &Mutex<bool>) -> Result<Json, Failure> {
         write(
             &self.roots(),
@@ -53,17 +71,35 @@ fn still_files_have_sorted_physical_pixels_and_drawable_pngs() {
     assert_eq!(answer["captures"][0]["height"], 80);
     assert_eq!(answer["captures"][0]["screen"]["clientRect"]["x"], -128);
     assert_eq!(answer["captures"][1]["width"], 80);
-    let path = files.roots()[2].join("freeze/screen-0.png");
+    let path = files.local(&answer["captures"][0]);
     let bytes = std::fs::read(&path).unwrap();
     let image = tiny_skia::Pixmap::decode_png(&bytes).unwrap();
     assert_eq!((image.width(), image.height()), (160, 80));
     assert_eq!(&image.data()[..4], &[32, 64, 128, 255]);
     assert_eq!(&image.data()[(8 * 160 + 8) * 4..][..4], &[255; 4]);
-    files.capture(two(), &Mutex::new(true)).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    // Keep an earlier display open with sharing denied while sixty more captures publish.
+    let mut reader = std::fs::OpenOptions::new();
+    reader.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        reader.share_mode(0);
+    }
+    let mut held = reader.open(&path).unwrap();
+    let mut paths =
+        std::collections::HashSet::from([path.clone(), files.local(&answer["captures"][1])]);
+    for _ in 0..60 {
+        let next = files.capture(two(), &Mutex::new(true)).unwrap();
+        for image in next["captures"].as_array().unwrap() {
+            assert!(paths.insert(files.local(image)));
+        }
+    }
+    let mut still = Vec::new();
+    std::io::Read::read_to_end(&mut held, &mut still).unwrap();
+    assert_eq!(still, bytes);
     assert_eq!(
         std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-        2
+        paths.len()
     );
     let at_root = write(
         &files.roots(),
@@ -74,7 +110,10 @@ fn still_files_have_sorted_physical_pixels_and_drawable_pngs() {
         &|_| {},
     )
     .unwrap();
-    assert_eq!(at_root["captures"][0]["path"], "app:/tmp/screen-0.png");
+    assert_eq!(
+        files.local(&at_root["captures"][0]).parent(),
+        Some(files.roots()[2].as_path())
+    );
 }
 
 #[test]
@@ -92,13 +131,14 @@ fn capture_directory_names_are_paths_not_grant_text() {
         )
         .unwrap();
         for index in 0..2 {
-            assert_eq!(
-                answer["captures"][index]["path"],
-                format!("{directory}/screen-{index}.png")
-            );
-            let path = files.roots()[2]
-                .join(name)
-                .join(format!("screen-{index}.png"));
+            let path = files.local(&answer["captures"][index]);
+            assert_eq!(path.parent().unwrap(), files.roots()[2].join(name));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("-{index}.png")));
             assert!(tiny_skia::Pixmap::load_png(path).is_ok());
         }
     }
@@ -107,8 +147,8 @@ fn capture_directory_names_are_paths_not_grant_text() {
 #[test]
 fn failure_or_cancellation_keeps_every_previous_file() {
     let files = Files::new();
-    files.capture(two(), &Mutex::new(true)).unwrap();
-    let paths = [0, 1].map(|n| files.roots()[2].join(format!("freeze/screen-{n}.png")));
+    let first = files.capture(two(), &Mutex::new(true)).unwrap();
+    let paths = [0, 1].map(|n| files.local(&first["captures"][n]));
     let before = paths.each_ref().map(|p| std::fs::read(p).unwrap());
     let held = Arc::new(Mutex::new(true));
     let mut displays = two();
@@ -180,11 +220,9 @@ fn a_link_in_the_destination_cannot_receive_pixels() {
         files.roots()[2].join("freeze/screen-1.png"),
     )
     .unwrap();
-    assert_eq!(
-        files.capture(two(), &Mutex::new(true)).unwrap_err().0,
-        "NotAllowedError"
-    );
-    assert!(!files.roots()[2].join("freeze/screen-0.png").exists());
+    let answer = files.capture(two(), &Mutex::new(true)).unwrap();
+    assert!(files.local(&answer["captures"][1]).is_file());
+    assert!(files.roots()[2].join("freeze/screen-1.png").is_symlink());
     assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
 }
 
@@ -255,7 +293,7 @@ fn a_replaced_still_refreshes_image_and_canvas_handles() {
             read: Box::new(move || Ok([red, 64, 128, 255].repeat(32 * 32))),
         }]
     };
-    files.capture(displays(32), &Mutex::new(true)).unwrap();
+    files.replace_image(displays(32));
     let plan = crate::test_plan("component App\n  view\n    column\n      image \"freeze/screen-0.png\" width=32 height=32\n      canvas surface=still() width=32 height=32\n");
     let (mut presenter, error) = Presenter::boot_with(
         &plan,
@@ -274,6 +312,7 @@ fn a_replaced_still_refreshes_image_and_canvas_handles() {
             p.images().bitmaps.values().next().unwrap().pixels().data()[..4].to_vec(),
             p.host()
                 .canvas_snapshots()
+                .borrow()
                 .values()
                 .next()
                 .unwrap()
@@ -286,17 +325,7 @@ fn a_replaced_still_refreshes_image_and_canvas_handles() {
         pixels(&presenter),
         (vec![32, 64, 128, 255], vec![32, 64, 128, 255])
     );
-    let published = std::cell::RefCell::new(Vec::new());
-    write(
-        &files.roots(),
-        "app:/tmp/freeze",
-        displays(192),
-        &Encoding::default(),
-        &Mutex::new(true),
-        &|path| published.borrow_mut().push(path.to_owned()),
-    )
-    .unwrap();
-    assert_eq!(*published.borrow(), ["app:/tmp/freeze/screen-0.png"]);
+    files.replace_image(displays(192));
     presenter.serve_packages(vec![crate::package::Entry::of::<PictureNotice>(
         "screen-capture",
     )]);
@@ -338,7 +367,7 @@ fn a_canvas_whose_still_was_missing_draws_it_once_captured() {
     assert!(error.is_none(), "{error:?}");
     let pixel = |p: &mut Presenter<StillCanvas>| {
         p.host.sync_canvases(1., true, &p.assets);
-        let canvases = p.host().canvas_snapshots();
+        let canvases = p.host().canvas_snapshots().borrow();
         canvases.values().next().unwrap().pixels.data()[..4].to_vec()
     };
     assert_eq!(pixel(&mut presenter), [0; 4]);
@@ -348,7 +377,7 @@ fn a_canvas_whose_still_was_missing_draws_it_once_captured() {
         height: 32,
         read: Box::new(|| Ok([192, 64, 128, 255].repeat(32 * 32))),
     }];
-    files.capture(red, &Mutex::new(true)).unwrap();
+    files.replace_image(red);
     presenter.picture_changed("freeze/screen-0.png", false);
     assert_eq!(pixel(&mut presenter), [192, 64, 128, 255]);
 }
@@ -362,7 +391,7 @@ fn a_still_reloads_only_for_mounted_canvases_and_a_remount_draws_it() {
     let files = Files::new();
     std::fs::create_dir_all(&files.roots()[2]).unwrap();
     let plan = crate::test_plan(
-        "component App\n  state shown = true\n  state other = false\n  action toggle\n    shown = not shown\n  action add\n    other = true\n  view\n    column\n      button press=toggle testId=\"toggle\" width=10 height=10\n      button press=add testId=\"add\" width=10 height=10\n      if other\n        canvas surface=blank() width=32 height=32\n      if shown\n        canvas surface=still() testId=\"still\" width=32 height=32\n",
+        "component App\n  state shown = true\n  state other = false\n  action toggle\n    shown = not shown\n  action add\n    other = true\n  view\n    column\n      button press=toggle testId=\"toggle\" width=10 height=10\n      button press=add testId=\"add\" width=10 height=10\n      if other\n        canvas surface=blank() testId=\"blank\" width=32 height=32\n      if shown\n        canvas surface=still() testId=\"still\" width=32 height=32\n",
     );
     let (mut presenter, error) = Presenter::boot_with(
         &plan,
@@ -381,12 +410,11 @@ fn a_still_reloads_only_for_mounted_canvases_and_a_remount_draws_it() {
     };
     let pixel = |p: &mut Presenter<StillCanvas>| {
         p.host.sync_canvases(1., true, &p.assets);
-        let canvases = p.host().canvas_snapshots();
+        let canvases = p.host().canvas_snapshots().borrow();
         canvases[&named(p, "still")].pixels.data()[..4].to_vec()
     };
     let tap = |p: &mut Presenter<StillCanvas>, id: &str| {
         p.tap(named(p, id)).unwrap();
-        p.host.sync_canvases(1., true, &p.assets);
     };
     let toggle = |p: &mut Presenter<StillCanvas>| tap(p, "toggle");
     let capture = |p: &mut Presenter<StillCanvas>, red: u8| {
@@ -396,7 +424,7 @@ fn a_still_reloads_only_for_mounted_canvases_and_a_remount_draws_it() {
             height: 32,
             read: Box::new(move || Ok([red, 64, 128, 255].repeat(32 * 32))),
         };
-        files.capture(vec![display], &Mutex::new(true)).unwrap();
+        files.replace_image(vec![display]);
         p.picture_changed(still, false);
     };
     // No canvas is left while the file appears.
@@ -407,10 +435,28 @@ fn a_still_reloads_only_for_mounted_canvases_and_a_remount_draws_it() {
     assert_eq!(pixel(&mut presenter), [192, 64, 128, 255]);
     // Another canvas stays while the still's goes.
     tap(&mut presenter, "add");
+    drop(presenter.frame());
+    let id = named(&presenter, "still");
+    let blank = named(&presenter, "blank");
+    let bitmap = Arc::downgrade(&presenter.host().canvas_snapshots().borrow()[&id].pixels);
+    let kept = Arc::downgrade(&presenter.host().canvas_snapshots().borrow()[&blank].pixels);
+    let image = Arc::downgrade(presenter.host().cached_canvas_image(still).unwrap());
+    presenter.timer_visibility(true);
     toggle(&mut presenter);
-    assert!(!presenter.host().canvas_image_cached(still));
+    assert!(
+        bitmap.upgrade().is_none(),
+        "the hidden commit must release the unmounted bitmap"
+    );
+    assert!(
+        kept.upgrade().is_some(),
+        "the other canvas is still mounted"
+    );
+    assert!(
+        image.upgrade().is_none(),
+        "the last canvas using the still is gone"
+    );
     capture(&mut presenter, 32);
-    assert!(!presenter.host().canvas_image_cached(still));
+    assert!(presenter.host().cached_canvas_image(still).is_none());
     toggle(&mut presenter);
     assert_eq!(pixel(&mut presenter), [32, 64, 128, 255]);
 }
@@ -427,7 +473,7 @@ fn a_retained_pattern_keeps_its_image_across_draws() {
         height: 32,
         read: Box::new(|| Ok([192, 64, 128, 255].repeat(32 * 32))),
     };
-    files.capture(vec![display], &Mutex::new(true)).unwrap();
+    files.replace_image(vec![display]);
     // One canvas at a time: another drawing the same image would keep it.
     for surface in ["pattern", "saved"] {
         let plan = crate::test_plan(&format!(
@@ -446,7 +492,7 @@ fn a_retained_pattern_keeps_its_image_across_draws() {
         for frame in 0..4 {
             presenter.host.advance(16. * frame as f64);
             presenter.host.sync_canvases(1., true, &presenter.assets);
-            let canvases = presenter.host().canvas_snapshots();
+            let canvases = presenter.host().canvas_snapshots().borrow();
             let pixel = &canvases.values().next().unwrap().pixels.data()[..4];
             assert_eq!(pixel, [192, 64, 128, 255], "{surface}, frame {frame}");
         }

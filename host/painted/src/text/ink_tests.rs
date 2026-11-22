@@ -168,6 +168,24 @@ fn wrapped_top_middle_and_end_match_pixels_without_prefix_glyph_visits() {
 }
 
 #[test]
+fn a_long_unwrapped_line_paints_only_the_visible_chunks_in_glyph_order() {
+    let mut engine = engine();
+    let p = engine.layout(&spec(&"abcdef café אבג ".repeat(400)), None);
+    assert_eq!(p.baselines.len(), 1);
+    for x in [0., -p.width * 0.5, 320. - p.width] {
+        let view = View {
+            origin: (x + 0.25, 10.),
+            ..View::at(0., 1.)
+        };
+        let visited = compare(&mut engine, &p, &palette(), view, None);
+        assert!(
+            (1..=3 * 128).contains(&visited),
+            "{x}: visited {visited} glyphs"
+        );
+    }
+}
+
+#[test]
 fn fractional_origins_scales_and_transforms_preserve_overhanging_ink() {
     let mut engine = engine();
     let mut s = spec(&"fjy Áé W\n".repeat(80));
@@ -323,10 +341,12 @@ fn physical_cpu_placement_uses_all_x_bins_and_only_zero_y_bin() {
     for scale in [0.75, 1.0, 1.25, 2.0] {
         for i in -32..32 {
             let offset = (i as f32 / 16.0, i as f32 / 13.0);
-            let (key, _, y) = ink::physical(&g, 0, offset, scale);
+            let (key, x, y) = ink::physical(&g, 0, offset, scale);
             x_bins.insert(key.x_bin);
             assert_eq!(key.y_bin, 0);
-            assert_eq!(y, g.y.mul_add(scale, offset.1).trunc() as i32);
+            assert_eq!(y, g.y.mul_add(scale, offset.1).floor() as i32);
+            // Where a stroke's band is cached by.
+            assert_eq!(g.pixel(offset, scale), (x, key.x_bin, y));
         }
     }
     assert_eq!(x_bins.len(), 4);
@@ -879,3 +899,68 @@ mod clip_masks {
 
 #[path = "cached_placement_tests.rs"]
 mod cached_placements;
+
+#[test]
+fn typing_at_the_start_of_a_textarea_shapes_places_and_indexes_only_the_edited_line() {
+    use crate::presenter::{PainterChoice, Presenter};
+
+    let document = ("x".repeat(63) + "\n").repeat(32);
+    let app = r#"component Host
+  state document = DOC
+  action edit(next: string)
+    document = next
+  view
+    textarea id="editor" testId="field" value=document input=edit width="100%" height=620 white-space="pre" font-family="monospace" font-size=14 appearance="none"
+"#.replace("DOC", &serde_json::to_string(&document).unwrap());
+    let (mut p, error) = Presenter::boot_with_fixture_fonts(
+        &crate::test_plan(&app),
+        (),
+        (800., 680.),
+        1.,
+        Default::default(),
+        PainterChoice::Cpu,
+    )
+    .unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let k = p.host().kernel();
+    let field = k.node_by_key(k.find_by_test_id("field")[0]).unwrap().id;
+    assert!(p.set_focus(Some(field), 0.).is_none());
+    use exact_plan::Value;
+    p.set_selection_range(&[Value::str("editor"), Value::Number(0.), Value::Number(0.)]);
+    p.frame();
+    for (i, ch) in "abcd".chars().enumerate() {
+        let before = ink::build_work();
+        let split = shaping::SPLIT_BYTES.get();
+        let shaped = shaping::shape_line_calls();
+        let broken = shaping::break_calls().1;
+        let placed = lines::EXTRACTED.with(std::cell::Cell::get);
+        p.key(Some(ch), false, 100. + i as f64);
+        p.frame();
+        let value = p
+            .host()
+            .kernel()
+            .node(field)
+            .unwrap()
+            .props
+            .str(exact_kernel::PropId::Value)
+            .unwrap();
+        assert!(value.starts_with(&"abcd"[..=i]));
+        assert_eq!(value.len(), document.len() + i + 1);
+        let caret = p.field_selection(field);
+        assert_eq!((caret.start, caret.end), ((i + 1) as u32, (i + 1) as u32));
+        assert_eq!(
+            shaping::SPLIT_BYTES.get() - split,
+            65 + i,
+            "split bytes after {ch}"
+        );
+        assert_eq!(shaping::shape_line_calls() - shaped, 1, "shapes after {ch}");
+        assert_eq!(shaping::break_calls().1 - broken, 1, "breaks after {ch}");
+        assert_eq!(
+            lines::EXTRACTED.with(std::cell::Cell::get) - placed,
+            64 + i,
+            "placements after {ch}"
+        );
+        let visited = ink::build_work().glyphs - before.glyphs;
+        assert_eq!(visited, 64 + i, "keystroke {ch}");
+    }
+}

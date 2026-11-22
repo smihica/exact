@@ -13,6 +13,8 @@ public enum ExactMarkdown {
 }
 
 final class MarkdownHost: MarkdownCapability {
+    func atomIcons(_ engine: TextEngine, _ runs: [Run], node: NodeView?) -> [Run] { engine.atomIcons(runs, node: node) }
+    func atomIcon(_ icon: AtomIconRun) -> any TextAtomIconPainting { TextAtomIcon(icon) }
     func expand(_ source: String, base: Run, color: [Double]?, boldText: Bool, atoms: MarkdownAtoms) -> [Run] {
         MarkupRuns.expand(source, base: base, color: color, boldText: boldText, atoms: atoms)
     }

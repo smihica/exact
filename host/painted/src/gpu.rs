@@ -13,8 +13,8 @@
 #![allow(unsafe_code)]
 
 use crate::image::Bitmap;
-use crate::paint::border::{BorderFill, PathOp};
-use crate::paint::{Backend, Rect4, Shape, POINTER};
+use crate::paint::border::BorderFill;
+use crate::paint::{bezier_outline as shape, bezier_path as bez, Backend, Rect4, Shape, POINTER};
 use crate::text::{Paragraph, RunPaint, TextEngine};
 mod backdrop;
 mod images;
@@ -173,7 +173,7 @@ impl Gpu {
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface,
-            force_fallback_adapter: false,
+            ..Default::default()
         }))
         .map_err(|e| format!("no adapter: {e}"))?;
         let info = adapter.get_info();
@@ -347,15 +347,16 @@ impl Gpu {
         rx.recv()
             .map_err(|_| "readback: no answer".to_string())?
             .map_err(|e| format!("readback: {e}"))?;
-        let mut data = Vec::with_capacity((width * height * 4) as usize);
-        {
-            let mapped = slice.get_mapped_range();
+        let data = slice.get_mapped_range().map(|mapped| {
+            let mut bytes = Vec::with_capacity((width * height * 4) as usize);
             for row in 0..height as usize {
                 let at = row * target.padded as usize;
-                data.extend_from_slice(&mapped[at..at + (width * 4) as usize]);
+                bytes.extend_from_slice(&mapped[at..at + (width * 4) as usize]);
             }
-        }
+            bytes
+        });
         target.buffer.unmap();
+        let data = data.map_err(|e| format!("readback: {e}"))?;
         self.last_ms = (encode_ms, t1.elapsed().as_secs_f64() * 1000.0);
         IntSize::from_wh(width, height)
             .and_then(|s| Pixmap::from_vec(data, s))
@@ -468,31 +469,6 @@ impl Gpu {
     }
 }
 
-/// A shape's path with its CSS-reduced radii. kurbo's `RoundedRect` would
-/// clamp each radius to half the shorter side, which CSS does not (a 40pt
-/// corner on a 70pt-high box whose neighbours fit keeps 40), so the path is
-/// the CPU painter's cubic arcs.
-fn shape(s: &Shape) -> BezPath {
-    let mut ops = Vec::new();
-    crate::paint::border::shape_path(&mut ops, s);
-    bez(&ops)
-}
-
-/// A border part's path for vello.
-fn bez(ops: &[PathOp]) -> BezPath {
-    let mut b = BezPath::new();
-    let p = |x: f32, y: f32| (x as f64, y as f64);
-    for op in ops {
-        match *op {
-            PathOp::Move(x, y) => b.move_to(p(x, y)),
-            PathOp::Line(x, y) => b.line_to(p(x, y)),
-            PathOp::Cubic(a, c, d, e, f, g) => b.curve_to(p(a, c), p(d, e), p(f, g)),
-            PathOp::Close => b.close_path(),
-        }
-    }
-    b
-}
-
 fn color(c: [u8; 4]) -> Color {
     Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
@@ -500,6 +476,9 @@ fn color(c: [u8; 4]) -> Color {
 impl Backend for Gpu {
     fn name(&self) -> &'static str {
         "gpu"
+    }
+    fn needs_geometry_paint(&self) -> bool {
+        false
     }
 
     fn page(&mut self, color: [u8; 4]) {
@@ -535,19 +514,7 @@ impl Backend for Gpu {
 
     // @ref LLP 1055 D4 — an SVG shape: fill under stroke.
     fn svg_path(&mut self, s: &crate::paint::SvgPaint<'_>, ts: Transform) {
-        let mut p = BezPath::new();
-        for seg in &s.path.0 {
-            match *seg {
-                exact_kernel::svg::Seg::Move(x, y) => p.move_to((x as f64, y as f64)),
-                exact_kernel::svg::Seg::Line(x, y) => p.line_to((x as f64, y as f64)),
-                exact_kernel::svg::Seg::Cubic(a, b, c, d, x, y) => p.curve_to(
-                    (a as f64, b as f64),
-                    (c as f64, d as f64),
-                    (x as f64, y as f64),
-                ),
-                exact_kernel::svg::Seg::Close => p.close_path(),
-            }
-        }
+        let p = crate::paint::svg_bezier_path(s.path);
         let a = self.affine(ts);
         // @ref LLP 1055.000 D7 — a gradient is a peniko brush in the path's
         // space, interpolated unpremultiplied as Chrome's SVG gradients are.
@@ -1164,7 +1131,14 @@ impl Backend for Gpu {
     fn slot_again(&mut self, row: u32, id: exact_kernel::ViewId) -> bool {
         self.replace_slot(row, id)
     }
-    fn layer_begin(&mut self, key: u64, ts: Transform, pivot: (f32, f32), base: [f32; 7]) -> bool {
+    fn layer_begin(
+        &mut self,
+        key: u64,
+        ts: Transform,
+        pivot: (f32, f32),
+        _reference: (f32, f32),
+        base: [f32; 7],
+    ) -> bool {
         self.record_layer(key, ts, pivot, base);
         true
     }

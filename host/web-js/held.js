@@ -40,7 +40,7 @@ export function trackAnswer(ticket) {
 const Waiting = new Set();
 /** The tickets `inflight` counts now: a wake owns those that were not counted at its delivery (wakes.js). */
 export const Counting = new Set();
-const current = t => !!t && t.owner?.ticket === t && !t.owner.gone;
+const current = t => !!t && !!t.owner && (t.owner.parallel ? t.owner.tickets?.includes(t) : t.owner.ticket === t) && !t.owner.gone;
 export const heldAsks = () => [...HeldAsks].filter(current).map(t => ({ name: t.name, ticket: t.id }));
 /** The held tickets themselves (wakes.js tells a stream's from an answer's). */
 export const heldTickets = () => [...HeldAsks].filter(current);

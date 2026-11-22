@@ -6,12 +6,13 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { suiteBrowser } from '../../../scripts/agent-launch.mjs';
 import { withLook } from '../look.mjs';
-import { fileURLToPath } from 'node:url';
+import { localImports } from '../../web-js/glue.mjs';
 
 // symbols.js beside stand-ins for the runtime and the picker glue it loads.
 const dir = mkdtempSync(resolve(tmpdir(), 'exact-js-symbols-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
-copyFileSync(resolve(fileURLToPath(new URL('../../web-js/symbols.js', import.meta.url))), resolve(dir, 'symbols.js'));
+writeFileSync(resolve(dir, 'symbols.js'), localImports(readFileSync(resolve(import.meta.dir, '../../web-js/symbols.js'), 'utf8')));
+copyFileSync(resolve(import.meta.dir, '../symbol-geometry.js'), resolve(dir, 'symbol-geometry.js'));
 writeFileSync(resolve(dir, 'rt.js'), 'export const { After, PropHooks, Hooks, inflight, journal, clock, data, onEnd } = globalThis.rtStandIn;\n');
 writeFileSync(resolve(dir, 'picker-glue.js'), '');
 const After = [], PropHooks = {}, inflight = { n: 0 };
@@ -26,6 +27,9 @@ class Img {
   removeAttribute(k) { this.attrs.delete(k); }
   toggleAttribute(k, on) { if (on) this.attrs.set(k, ''); else this.attrs.delete(k); }
   set src(v) { this.setAttribute('src', v); }
+  get src() { return this.getAttribute('src') ?? ''; }
+  get currentSrc() { return this.src; }
+  get complete() { return true; }
   get alt() { return this.getAttribute('alt') ?? ''; }
   set alt(v) { this.setAttribute('alt', v); }
   get isConnected() { return true; }
@@ -114,6 +118,28 @@ test('a symbol is decorative unless its author named it', async () => {
   expect(named.getAttribute('alt')).toBe('Add a stop');
 });
 
+test('a bound raster writes its tint mask during rendering without reading browser layout', async () => {
+  const { symbols } = await import(resolve(dir, 'symbols.js'));
+  const image = new Img();
+  const style = globalThis.getComputedStyle;
+  globalThis.__exactRender = true;
+  globalThis.getComputedStyle = () => ({ fontSize: '16px' });
+  try {
+    symbols({});
+    image.style.setProperty('--exact-tint', 'red');
+    for (const source of ['assets/first.png', 'assets/next.png']) {
+      expect(PropHooks.src(image, source)).toBe(false);
+      expect(image.style.getPropertyValue('mask-image')).toBe(`url("${source}")`);
+      expect(image.style.getPropertyValue('mask-clip')).toBe('content-box');
+    }
+    expect(image.style.getPropertyValue('mask-position')).toBe('var(--exact-object-position,50% 50%)');
+  } finally {
+    PropHooks.src(image, null);
+    delete globalThis.__exactRender;
+    globalThis.getComputedStyle = style;
+  }
+});
+
 // LLP 1011 §4: under `fill`, CSS's initial `object-fit`, a symbol keeps its
 // aspect in a box of another shape, as on the Apple hosts; `none` draws it at
 // its size.
@@ -122,7 +148,7 @@ test('a symbol keeps its aspect under object-fit: fill', async () => {
   symbols({ chevron: ['M8 6l6 6-6 6', false] });
   const was = globalThis.getComputedStyle;
   try {
-    for (const [fit, size] of [['fill', 'contain'], ['cover', 'cover'], ['none', '17px 17px']]) {
+    for (const [fit, size] of [['fill', '100% 100%'], ['cover', 'cover'], ['none', '17px 17px']]) {
       globalThis.getComputedStyle = () => ({ fontSize: '17px', fontWeight: '400', objectFit: fit, paddingLeft: '0', paddingRight: '0', paddingTop: '0', paddingBottom: '0', getPropertyValue: () => '' });
       const wide = new Img();
       expect(PropHooks.src(wide, 'symbol:chevron')).toBe(true);

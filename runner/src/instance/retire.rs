@@ -1,11 +1,15 @@
-//! The perf counter's walk over a destroyed subtree (@ref LLP 1142 §13.4):
-//! each retired row is counted against its list's site.
+//! Release decoration paint and count retired rows by list site (@ref LLP 1142 §13.4).
 use super::*;
 
+pub(in crate::instance) fn tracks(u: &Update<'_>) -> bool {
+    !u.ids.work.sites.is_empty() || !u.ids.theme.decorations.is_empty()
+}
+
 pub(in crate::instance) fn retire_node(u: &mut Update<'_>, node: &NodeInst) {
-    if u.ids.work.sites.is_empty() {
+    if !tracks(u) {
         return;
     }
+    u.ids.theme.decorations.remove(&node.view);
     if let Some(list) = node.list() {
         list.retire(u);
     }

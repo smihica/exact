@@ -11,6 +11,26 @@ fn view_with_test_id(host: &Host<caltrain_data::Caltrain>, test_id: &str) -> u32
 }
 
 #[test]
+fn video_fit_keeps_the_ua_default_separate_from_authored_clears() {
+    for (declaration, expected) in [
+        ("", "contain"),
+        (r#"object-fit="unset""#, "fill"),
+        (r#"object-fit="""#, "fill"),
+        (r#"object-fit="cover""#, "cover"),
+    ] {
+        let source =
+            format!("component App\n  view\n    video width=160 height=80 {declaration}\n");
+        let plan = contract::compile(&source).unwrap();
+        let (host, _) = Host::boot(&plan.encode(), (), Default::default(), "/").unwrap();
+        let html = host.document().unwrap().root;
+        assert!(
+            html.contains(&format!("object-fit:{expected};")),
+            "{declaration}: {html}"
+        );
+    }
+}
+
+#[test]
 fn a_tinted_raster_is_its_alpha_masking_the_tint() {
     let plan = contract::compile(
         r##"component App
@@ -20,7 +40,7 @@ fn a_tinted_raster_is_its_alpha_masking_the_tint() {
   view
     column
       button "Toggle" press=toggle testId="toggle"
-      image "assets/mark.png" testId="mark" width=80 height=40 object-fit=(wide ? "cover" : "contain") -exact-tint-color="light-dark(#000000, #ffffff)"
+      image "assets/mark.png" testId="mark" width=80 height=40 object-fit=(wide ? "cover" : "contain") object-position=(wide ? "right bottom" : "7px 11px") -exact-tint-color="light-dark(#000000, #ffffff)"
       image "assets/mark.png" testId="down" object-fit="scale-down" -exact-tint-color="#ff0000" transition="-exact-tint-color 200ms linear"
       image "assets/mark.png" testId="plain" object-fit="cover"
       image "symbol:search" testId="symbol" -exact-tint-color="#ff0000"
@@ -42,19 +62,21 @@ fn a_tinted_raster_is_its_alpha_masking_the_tint() {
     let mark = create("mark");
     assert!(mark.contains("--exact-tint:light-dark("), "{mark}");
     assert!(
-        mark.contains("background-color:var(--exact-tint);mask-image:url(\\\"assets/mark.png\\\");mask-size:contain;"),
+        mark.contains("background-color:var(--exact-tint);mask-image:url(\\\"assets/mark.png\\\");mask-size:var(--exact-tint-size);"),
         "{mark}"
     );
     assert!(
-        mark.contains("mask-origin:content-box;mask-clip:content-box;object-position:-100000px 0;"),
+        mark.contains("mask-position:var(--exact-object-position,50% 50%);mask-origin:content-box;mask-clip:content-box;--exact-tint-offset:-100000px 0;object-position:var(--exact-tint-offset,var(--exact-object-position));"),
         "{mark}"
     );
+    assert!(mark.contains("--exact-object-position:7px 11px;"), "{mark}");
+    assert!(mark.contains("--exact-tint-size:contain;"), "{mark}");
     assert!(
         mark.contains("\"src\":\"assets/mark.png\""),
         "the page still loads the picture: {mark}"
     );
     let down = create("down");
-    assert!(down.contains("mask-size:var(--exact-tint-fit,contain);"));
+    assert!(down.contains("--exact-tint-size:var(--exact-tint-fit,contain);"));
     assert!(
         down.contains("transition:--exact-tint 0.2s linear 0s;"),
         "{down}"
@@ -66,8 +88,12 @@ fn a_tinted_raster_is_its_alpha_masking_the_tint() {
     );
     let wide = host.dispatch(view_with_test_id(&host, "toggle"), Event::Press);
     assert!(
-        wide.contains("mask-size:cover;"),
+        wide.contains("--exact-tint-size:cover;"),
         "the mask follows object-fit: {wide}"
+    );
+    assert!(
+        wide.contains("--exact-object-position:100% 100%;"),
+        "{wide}"
     );
 }
 
@@ -224,4 +250,76 @@ fn a_symbols_own_tint_is_painted_in_its_colour_and_a_native_face_keeps_its_tint(
             "{kept}: {made}"
         );
     }
+}
+
+#[test]
+fn image_positions_use_the_nodes_own_value_and_the_browser_environment() {
+    let positions = [
+        "var(--missing) 75%",
+        "var(--missing, bogus) 75%",
+        "var(--missing, var(--other, bogus)) 75%",
+        "var(--missing, 7px 11px)",
+        "var(--shift, bogus) 75%",
+    ];
+    let svg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='20'%3E%3Cpath d='M0 0H40V20H0Z' fill='red'/%3E%3C/svg%3E";
+    let mut source = String::from("component App\n");
+    for (i, position) in positions.iter().enumerate() {
+        source.push_str(&format!("  state p{i} = \"{position}\"\n"));
+    }
+    source.push_str("  view\n    column --shift=\"7px\" object-position=\"37px 23px\"\n");
+    for i in 0..positions.len() {
+        source.push_str(&format!(r##"      image "{svg}" width=160 height=80 object-fit="none" object-position=p{i} -exact-tint-color="#ff0000"
+"##));
+    }
+    for attrs in [
+        r##"object-position="env(-exact-layout-margins-inset-left, 90px) top" -exact-tint-color="#ff0000""##,
+        r#"object-position="env(-exact-layout-margins-inset-left, 90px) top""#,
+        "",
+    ] {
+        source.push_str(&format!(
+            r#"      image "{svg}" width=160 height=80 object-fit="none" {attrs}
+"#
+        ));
+    }
+    let plan = contract::compile(&source).unwrap();
+    let (host, _) = Host::boot(&plan.encode(), (), Default::default(), "/").unwrap();
+    let html = host.document().unwrap().root;
+    let script = r#"
+import { strict as assert } from 'node:assert';
+import { suiteBrowser } from './scripts/agent-launch.mjs';
+import { drivable } from './scripts/coverage.mjs';
+import { decodePng } from './scripts/png.mjs';
+if (!(await drivable(['chromium'])).length) process.exit(0);
+const browser = await suiteBrowser('chromium');
+try {
+  const page = await browser.newPage({ deviceScaleFactor: 1 });
+  await page.setContent('<style>body{background:white}img{display:block}</style>' + process.argv[1]);
+  await page.waitForFunction(() => [...document.images].every(image => image.complete));
+  const expected = [[60, 30, 99, 49], [60, 30, 99, 49], [60, 30, 99, 49], [7, 11, 46, 30],
+                    [7, 45, 46, 64], [0, 0, 39, 19], [0, 0, 39, 19], [60, 30, 99, 49]];
+  for (const [i, wanted] of expected.entries()) {
+    const image = decodePng(await page.locator('img').nth(i).screenshot());
+    let bounds = [160, 80, -1, -1];
+    for (let y = 0; y < 80; y++) for (let x = 0; x < 160; x++) {
+      const at = (y * 160 + x) * 4;
+      if (image.data[at] - image.data[at + 1] > 128) {
+        bounds = [Math.min(bounds[0], x), Math.min(bounds[1], y),
+                  Math.max(bounds[2], x), Math.max(bounds[3], y)];
+      }
+    }
+    assert.deepEqual(bounds, wanted, `position ${i}`);
+  }
+} finally { await browser.close(); await browser.browser.close(); }
+"#;
+    let output = std::process::Command::new("bun")
+        .args(["-e", script, &html])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
 }

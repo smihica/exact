@@ -470,3 +470,78 @@ fn a_caret_between_directions_in_a_right_to_left_line() {
         "the space's right edge"
     );
 }
+
+#[test]
+fn a_resize_reads_the_textarea_scroll_extent_before_the_next_paint_or_wheel() {
+    let lines = std::iter::repeat_n("m".repeat(83), 70)
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let source = r#"component App
+  state long: number[] = []
+  state short: number[] = []
+  state unknown = false
+  action size(w: number, h: number)
+    long = match scrollMetrics("long") { case some(m) => [m.scrollLeft, m.scrollTop, m.scrollWidth, m.scrollHeight, m.clientWidth, m.clientHeight], case none => [] }
+    short = match scrollMetrics("short") { case some(m) => [m.scrollWidth, m.clientWidth], case none => [] }
+    unknown = match scrollMetrics("missing") { case some(m) => false, case none => true }
+  view
+    column
+      textarea id="long" value="LONG_LINES" resize=size width="100%" height=120 appearance="none" border-width=0 padding=0 white-space="pre" font-size=14 font-family="monospace"
+      textarea id="short" value="ok" width="100%" height=120 appearance="none" border-width=0 padding=0
+"#.replace("LONG_LINES", &lines);
+    let mut p = boot(&source);
+    for width in [370., 1180., 370.] {
+        assert_eq!(p.resize(width, 600.), None);
+        let state = slot(&p, "long");
+        let m = state.as_array().unwrap();
+        assert_eq!(m.len(), 6, "{state}");
+        assert_eq!(m[0], 0.);
+        assert_eq!(m[1], 0.);
+        assert_eq!(m[4], f64::from(width));
+        assert_eq!(m[5], 120.);
+        assert!(m[3].as_f64().unwrap() > 120.);
+        let overflow = m[2].as_f64().unwrap() - f64::from(width);
+        if width == 370. {
+            assert!(overflow > 100., "{m:?}");
+        } else {
+            assert_eq!(overflow, 0.);
+        }
+        let short = slot(&p, "short");
+        assert_eq!(short[0].as_f64(), Some(f64::from(width)));
+        assert_eq!(short[1].as_f64(), Some(f64::from(width)));
+        assert_eq!(slot(&p, "unknown"), true);
+        p.frame();
+    }
+}
+
+#[test]
+fn a_decorated_textarea_measured_on_mount_reuses_its_first_layout_in_paint() {
+    let source = r##"decoration token color="#b92025"
+component App
+  state mounted = false
+  state height = 0
+  derive doc = range(80).map(i => `const value${i} = 42;`).join("\n")
+  action open
+    mounted = true
+  action measure(w: number, h: number)
+    height = match scrollMetrics("source") { case some(m) => m.scrollHeight, case none => 0 }
+  view
+    column
+      button "Open editor" testId="open" press=open
+      if mounted
+        textarea id="source" value=doc resize=measure width=240 height=120 white-space="pre"
+          decorations=TextDecorations(value=doc, spans=[TextDecorationSpan(name="token", start=0, end=5)])
+"##;
+    let opening = |source: &str| {
+        let mut p = boot(source);
+        let before = p.text.borrow().layout_calls;
+        tap(&mut p, "open");
+        p.frame();
+        let layouts = p.text.borrow().layout_calls - before;
+        (layouts, slot(&p, "height"))
+    };
+    let (paint, _) = opening(&source.replace("resize=measure", ""));
+    let (measured_then_painted, height) = opening(source);
+    assert!(height.as_f64().unwrap() > 120.);
+    assert_eq!(measured_then_painted, paint);
+}

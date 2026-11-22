@@ -102,6 +102,8 @@ enum Payload {
     Image(
         Arc<Bitmap>,
         ObjectFit,
+        exact_kernel::object::Position,
+        Box<exact_kernel::Env>,
         Option<[u8; 4]>,
         exact_kernel::ImageRendering,
     ),
@@ -126,6 +128,7 @@ struct NodePaint {
     key: NodeKey,
     id: ViewId,
     pointer_hit: bool,
+    scrollbar: bool,
     paint: BoxPaint,
     payload: Payload,
     opacity: f32,
@@ -351,6 +354,8 @@ impl Picture {
                         Payload::Image(
                             image.clone(),
                             node.style.object_fit,
+                            node.style.object_position.clone(),
+                            Box::new(scene.kernel.env_of(id)),
                             super::image_tint(&node, &(scene.presented)(id), painter.dark),
                             node.computed_row(StyleId::ImageRendering, |s| s.image_rendering),
                         )
@@ -392,9 +397,10 @@ impl Picture {
                         s.walk(&mut |_| n += 1);
                         n
                     }
-                    Payload::Image(image, fit, _, _) => {
-                        usize::from(object_fit(image.natural(), *fit, geometry.content).is_some())
-                    }
+                    Payload::Image(image, fit, position, env, _, _) => usize::from(
+                        object_fit(image.natural(), *fit, position, geometry.content, env)
+                            .is_some(),
+                    ),
                 };
                 cost += 2 * usize::from(opacity < 1.)
                     + 2 * usize::from(clips)
@@ -476,6 +482,7 @@ impl Picture {
                 pointer_hit: node
                     .computed_row(exact_kernel::StyleId::PointerEvents, |s| s.pointer_events)
                     != exact_kernel::PointerEvents::None,
+                scrollbar: node.style.scrollbar_width != exact_kernel::ScrollbarWidth::None,
                 paint,
                 payload,
                 opacity,
@@ -756,8 +763,9 @@ impl<'a> Replay<'a> {
                                 .into_iter()
                                 .all(|(x, y)| x.is_finite() && y.is_finite());
                     });
-                    if let Payload::Image(image, fit, _, _) = &n.payload {
-                        finite &= object_fit(image.natural(), *fit, c).is_none_or(finite_rect);
+                    if let Payload::Image(image, fit, position, env, _, _) = &n.payload {
+                        finite &= object_fit(image.natural(), *fit, position, c, env)
+                            .is_none_or(finite_rect);
                     }
                     if !finite {
                         return Err("nonfinite content paint geometry".into());
@@ -837,6 +845,12 @@ impl<'a> Replay<'a> {
                     let parent = r.transform;
                     if r.live_hit {
                         walk.boxes.push(PaintedBox {
+                            baseline: None,
+                            rounded_border: if walk.scrollbar_cover {
+                                g.outer.rounded_outline()
+                            } else {
+                                None
+                            },
                             shape_clips: Vec::new(),
                             pointer_hit: n.pointer_hit,
                             projective: None,
@@ -875,8 +889,10 @@ impl<'a> Replay<'a> {
                     }
                     match &n.payload {
                         Payload::Empty => {}
-                        Payload::Image(image, fit, tint, rendering) => {
-                            if let Some(dst) = object_fit(image.natural(), *fit, g.content) {
+                        Payload::Image(image, fit, position, env, tint, rendering) => {
+                            if let Some(dst) =
+                                object_fit(image.natural(), *fit, position, g.content, env)
+                            {
                                 let clips = [g.content_edge()];
                                 let placed = image.placed(dst);
                                 painter
@@ -888,11 +904,9 @@ impl<'a> Replay<'a> {
                             painter.paint_svg(s, n.clips(), n.paint.content_shape(g), parent);
                         }
                         Payload::Text(p, inline, commands) => {
-                            if let Some(inline) = inline {
-                                walk.inline.insert(
-                                    n.id,
-                                    inline.place((g.content.0, g.content.1), &[], parent),
-                                );
+                            if r.live_hit {
+                                walk.boxes.last_mut().unwrap().baseline =
+                                    p.baseline_at((g.content.0, g.content.1));
                             }
                             walk.text.insert(n.key, p.clone());
                             for command in commands {
@@ -925,6 +939,11 @@ impl<'a> Replay<'a> {
                                     }
                                 }
                             }
+                            if let Some(inline) = inline {
+                                let placed = inline.place((g.content.0, g.content.1), &[], parent);
+                                painter.highlight_reader(&placed);
+                                walk.inline.insert(n.id, placed);
+                            }
                         }
                     }
                 }
@@ -956,6 +975,11 @@ impl<'a> Replay<'a> {
                         painter.backend.pop_clip();
                         clip = clips.pop().unwrap();
                     }
+                    if let Some(bounds) = self.picture.scroll.get(&n.key).filter(|_| {
+                        painter.scrollbars.enabled && r.live_hit && n.pointer_hit && n.scrollbar
+                    }) {
+                        painter.place_scrollbars(walk, start, n.key, *bounds, false);
+                    }
                     if n.css_clip.has_path() && css_clips.pop().unwrap() {
                         painter.backend.pop_clip();
                     }
@@ -978,6 +1002,8 @@ mod hit_tests {
             let ts = Transform::from_rotate_at(degrees, 50.0, 50.0);
             let rect = (0.0, 0.0, 100.0, 100.0);
             let mut b = PaintedBox {
+                baseline: None,
+                rounded_border: None,
                 shape_clips: Vec::new(),
                 pointer_hit: true,
                 id: 1,

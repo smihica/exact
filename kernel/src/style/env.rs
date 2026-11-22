@@ -46,6 +46,87 @@ impl Edge {
     }
 }
 
+impl From<Edge> for Side {
+    fn from(edge: Edge) -> Side {
+        Side::ALL[edge as usize]
+    }
+}
+
+/// The side an observation's name reads (LLP 1123 D9): an edge, or `start`
+/// or `end`, which resolve against the reading box's `direction`, the left
+/// and right edge under `ltr` and the right and left under `rtl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Side {
+    /// The top edge.
+    Top = 0,
+    /// The right edge.
+    Right = 1,
+    /// The bottom edge.
+    Bottom = 2,
+    /// The left edge.
+    Left = 3,
+    /// The inline start: the left edge, or the right under `rtl`.
+    Start = 4,
+    /// The inline end: the right edge, or the left under `rtl`.
+    End = 5,
+}
+
+impl Side {
+    /// Every side, in wire order.
+    pub const ALL: [Side; 6] = [
+        Side::Top,
+        Side::Right,
+        Side::Bottom,
+        Side::Left,
+        Side::Start,
+        Side::End,
+    ];
+
+    /// The name's tail: `top`, `right`, `bottom`, `left`, `start`, `end`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Side::Start => "start",
+            Side::End => "end",
+            side => side.edge(false).name(),
+        }
+    }
+
+    /// The side by its name's tail.
+    pub fn from_name(name: &str) -> Option<Side> {
+        Side::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// The side by wire index (0–5).
+    pub fn from_index(i: u8) -> Option<Side> {
+        Side::ALL.get(usize::from(i)).copied()
+    }
+
+    /// The edge it names in a box that lays out right to left where `rtl`.
+    pub fn edge(self, rtl: bool) -> Edge {
+        match (self, rtl) {
+            (Side::Top, _) => Edge::Top,
+            (Side::Right, _) | (Side::Start, true) | (Side::End, false) => Edge::Right,
+            (Side::Bottom, _) => Edge::Bottom,
+            (Side::Left, _) | (Side::Start, false) | (Side::End, true) => Edge::Left,
+        }
+    }
+
+    /// Whether it resolves against a direction, `start` or `end`.
+    pub fn logical(self) -> bool {
+        matches!(self, Side::Start | Side::End)
+    }
+
+    /// The edges it may name, as bits by [`Edge`]'s index: both side edges
+    /// for a logical side.
+    pub fn edges(self) -> u8 {
+        match self.logical() {
+            true => 1 << Edge::Left as u8 | 1 << Edge::Right as u8,
+            false => 1 << self.edge(false) as u8,
+        }
+    }
+}
+
 /// A layout region a native host reports beside the safe area (LLP 1123
 /// D10): UIKit's and AppKit's `LayoutRegion`s, each an inset per edge from
 /// the layout viewport, which `env(-exact-<region>-inset-<edge>)` names.
@@ -164,15 +245,17 @@ impl SegmentVar {
         SegmentVar::ALL.get(i as usize).copied()
     }
 
-    /// The length of a segment this variable names.
-    pub fn of(self, rect: &Rect) -> f32 {
+    /// The length of a segment this variable names, its far edges added in
+    /// `f64`.
+    pub fn of(self, rect: &Rect) -> f64 {
+        let [x, y, width, height] = [rect.x, rect.y, rect.width, rect.height].map(f64::from);
         match self {
-            SegmentVar::Width => rect.width,
-            SegmentVar::Height => rect.height,
-            SegmentVar::Top => rect.y,
-            SegmentVar::Left => rect.x,
-            SegmentVar::Bottom => rect.y + rect.height,
-            SegmentVar::Right => rect.x + rect.width,
+            SegmentVar::Width => width,
+            SegmentVar::Height => height,
+            SegmentVar::Top => y,
+            SegmentVar::Left => x,
+            SegmentVar::Bottom => y + height,
+            SegmentVar::Right => x + width,
         }
     }
 }
@@ -346,6 +429,8 @@ pub struct Env {
     /// own ([`crate::Kernel::set_root_font_size`]), which the next commit
     /// writes here; [`crate::Kernel::set_env`] keeps it.
     pub root_font_size: f32,
+    /// The node's computed font size, for object-position lengths in em.
+    pub font_size: f32,
     /// The session root's `--exact-safe-area-inset-*` (LLP 1123 D9), top
     /// right bottom left: the insets of the area the document covers, set
     /// apart from `env()` by a host whose document covers its view while
@@ -364,6 +449,10 @@ pub struct Env {
     /// 1123 D5), set, as `local` is, only in an environment made for that
     /// node.
     pub properties: Option<crate::style::safe_area_properties::Resolved>,
+    /// Whether the node this environment was made for lays out right to
+    /// left, which an observation's `start` and `end` resolve against (LLP
+    /// 1123 D9); set only for a node that reads one.
+    pub rtl: bool,
     /// What one node's observations are, each family top right bottom left,
     /// `None` where one is unavailable (LLP 1123 D7, D9): the solve's inputs,
     /// set, as `local` is, only in an environment made for that node.
@@ -372,6 +461,69 @@ pub struct Env {
     /// set, as `local` is, only in an environment made for a node that reads
     /// one.
     pub targets: Option<crate::style::targets::Scope>,
+    /// The owner segments one node reads (LLP 1123 D16), set, as `local` is,
+    /// only in an environment made for a node.
+    pub segments_held: Option<HeldSegments>,
+}
+
+/// The segments a node reads by `--exact-viewport-segment-*` (LLP 1123 D16).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeldSegments {
+    /// The document's, outside every owner.
+    Document,
+    /// Its holder's report: an owner's, `None` where it reported none or lies
+    /// on one segment, and `None` in a top-layer box its host places, where
+    /// the kernel is not told.
+    Holder(Option<std::sync::Arc<SegmentGrid>>),
+}
+
+/// An owner's segments, `cols × rows` rects row-major in its coordinates, as
+/// the host splits them (LLP 1078's rule, applied to the owner's own division
+/// regions).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentGrid {
+    /// Its columns, 1 to 16.
+    pub cols: u8,
+    /// Its rows, 1 to 16.
+    pub rows: u8,
+    /// Its segments, row-major.
+    pub rects: Vec<Rect>,
+}
+
+impl SegmentGrid {
+    /// The segment at column `x`, row `y`; `None` past the grid.
+    pub fn get(&self, x: u8, y: u8) -> Option<&Rect> {
+        if x >= self.cols || y >= self.rows {
+            return None;
+        }
+        self.rects
+            .get(usize::from(y) * usize::from(self.cols) + usize::from(x))
+    }
+
+    /// Why the grid is refused, if it is. A grid holds more than one segment,
+    /// at most 16 columns and rows, `cols × rows` rects, and each rect finite
+    /// and of a size that is not negative.
+    pub fn refusal(&self) -> Option<&'static str> {
+        let max = SegmentVar::MAX_INDEX + 1;
+        let count = usize::from(self.cols) * usize::from(self.rows);
+        if self.cols == 0 || self.rows == 0 || self.cols > max || self.rows > max {
+            return Some("an owner's segment grid takes 1 to 16 columns and rows; split the owner's active division regions by the document's rule (LLP 1078)");
+        }
+        if count < 2 {
+            return Some("an owner's segment grid of one segment is no grid; report none (`None`) where the owner lies on one segment");
+        }
+        if self.rects.len() != count {
+            return Some("an owner's segment grid holds cols × rows rects, row-major; report one rect for each column of each row");
+        }
+        let finite = |r: &Rect| {
+            [r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
+                && r.width >= 0.0
+                && r.height >= 0.0
+        };
+        (!self.rects.iter().all(finite)).then_some(
+            "a segment's rect is nonfinite or of negative size; report its frame in the owner's points",
+        )
+    }
 }
 
 impl Default for Env {
@@ -404,11 +556,14 @@ impl Env {
             default_padding: None,
             titlebar_area: None,
             root_font_size: crate::style::relative::MEDIUM,
+            font_size: crate::style::relative::MEDIUM,
             root_local: None,
             local: None,
             properties: None,
             observed: None,
             targets: None,
+            segments_held: None,
+            rtl: false,
         }
     }
 
@@ -431,13 +586,42 @@ impl Env {
     /// or keyboard as the solve gives it, or its target's raw insets; `None`
     /// where that is unavailable, or the environment was made for no node.
     pub fn observation(&self, leaf: &crate::style::calc::Observe) -> Option<f32> {
-        let edge = leaf.edge as usize;
+        let edge = leaf.side.edge(self.rtl) as usize;
         match &leaf.target {
-            crate::style::targets::Target::Box => self.observed.and_then(|o| o[leaf.component()]),
+            crate::style::targets::Target::Box => {
+                self.observed.and_then(|o| o[leaf.component(self.rtl)])
+            }
             // A native target reports its safe area alone
             _ if leaf.family != crate::style::calc::Family::SafeArea => None,
             target => self.targets.as_ref()?.insets(target).map(|i| i[edge]),
         }
+    }
+
+    /// An owner segment's field at the node this environment was made for
+    /// (LLP 1123 D16): its holder's, or the document's outside every owner;
+    /// `None` where the segment is absent.
+    pub fn owner_segment(&self, leaf: &crate::style::calc::SegmentRead) -> Option<f64> {
+        self.segment_held(self.segments_held.as_ref(), leaf)
+    }
+
+    /// An owner segment's field as `held` has it. With `held` `None` the
+    /// environment was made for no node, so reading one is a caller's
+    /// mistake, which a test stops at ([`misread_segment`]); the document's
+    /// stands in.
+    pub fn segment_held(
+        &self,
+        held: Option<&HeldSegments>,
+        leaf: &crate::style::calc::SegmentRead,
+    ) -> Option<f64> {
+        let rect = match held {
+            Some(HeldSegments::Holder(grid)) => grid.as_deref()?.get(leaf.x, leaf.y)?,
+            Some(HeldSegments::Document) => self.segment(leaf.x, leaf.y)?,
+            None => {
+                misread_segment(leaf);
+                self.segment(leaf.x, leaf.y)?
+            }
+        };
+        Some(leaf.var.of(rect))
     }
 
     /// An author's custom property's value at the node this environment was
@@ -711,12 +895,7 @@ pub(crate) fn decode(kind: u8, plus: f32, x: u8, y: u8) -> Option<Dimension> {
 }
 
 fn resolve_segment(var: SegmentVar, x: u8, y: u8, env: &Env) -> Option<f64> {
-    let rect = env.segment(x, y)?;
-    Some(match var {
-        SegmentVar::Right => f64::from(rect.x) + f64::from(rect.width),
-        SegmentVar::Bottom => f64::from(rect.y) + f64::from(rect.height),
-        _ => f64::from(var.of(rect)),
-    })
+    Some(var.of(env.segment(x, y)?))
 }
 
 fn segment_css(var: SegmentVar, x: u8, y: u8, plus: f32, out: &mut String) {
@@ -851,11 +1030,16 @@ pub fn parse(text: &str) -> Result<Option<Dimension>, EnvRefusal> {
 pub fn browser_css(c: super::Comparison, out: &mut String) {
     let mut text = String::new();
     c.css(&mut text);
+    browser_text(&text, out);
+}
+
+/// Translate region names in a CSS value, including fallbacks inside functions.
+pub fn browser_text(text: &str, out: &mut String) {
     if !text.contains("-exact-") && !text.contains('\\') {
-        out.push_str(&text);
+        out.push_str(text);
         return;
     }
-    let mut input = cssparser::ParserInput::new(&text);
+    let mut input = cssparser::ParserInput::new(text);
     rename_regions(&mut cssparser::Parser::new(&mut input), out);
 }
 
@@ -892,17 +1076,27 @@ fn rename_regions(p: &mut cssparser::Parser<'_, '_>, out: &mut String) {
 
 /// Whether a style reads a viewport or environment length.
 pub fn uses_env(style: &crate::StyleProps) -> bool {
-    style.mask.iter().any(|id| {
+    let reads = |d: &Dimension| {
         matches!(
-            style.get(id),
-            crate::RowValue::Dimension(
-                Dimension::Env(..)
-                    | Dimension::Region(..)
-                    | Dimension::Segment(..)
-                    | Dimension::Viewport(..)
-                    | Dimension::Compare(..)
-            )
+            d,
+            Dimension::Env(..)
+                | Dimension::Region(..)
+                | Dimension::Segment(..)
+                | Dimension::Viewport(..)
+                | Dimension::Compare(..)
         )
+    };
+    style.mask.iter().any(|id| match style.get(id) {
+        crate::RowValue::Dimension(d) => reads(&d),
+        crate::RowValue::ObjectPosition(p) => {
+            reads(&p.x)
+                || reads(&p.y)
+                || p.calculations()
+                    .into_iter()
+                    .flatten()
+                    .any(|c| reads(&Dimension::Compare(c)))
+        }
+        _ => false,
     })
 }
 
@@ -910,10 +1104,20 @@ pub fn uses_env(style: &crate::StyleProps) -> bool {
 /// calculation or a grid template that holds a `rem`, or a calculation that
 /// reads a custom property, which may hold one (LLP 1123 D5).
 pub(crate) fn root_font_readers(style: &crate::StyleProps) -> crate::StyleMask {
+    let reads =
+        |d: &Dimension| matches!(d, Dimension::Compare(c) if c.reads_rem() || c.reads_custom());
     let mut rows = crate::StyleMask::EMPTY;
     for id in style.mask.iter() {
         let reads = match style.get(id) {
-            crate::RowValue::Dimension(Dimension::Compare(c)) => c.reads_rem() || c.reads_custom(),
+            crate::RowValue::Dimension(d) => reads(&d),
+            crate::RowValue::ObjectPosition(p) => {
+                reads(&p.x)
+                    || reads(&p.y)
+                    || p.calculations()
+                        .into_iter()
+                        .flatten()
+                        .any(|c| reads(&Dimension::Compare(c)))
+            }
             _ => match id {
                 crate::StyleId::GridTemplateColumns => style.rare.grid_template_columns.reads_rem(),
                 crate::StyleId::GridTemplateRows => style.rare.grid_template_rows.reads_rem(),
@@ -969,6 +1173,20 @@ fn misread(edge: Edge) {
          resolve a box's lengths with NodeArena::env_of or Kernel::env_of (LLP 1123 D9); \
          the session root's inset stands in",
         edge.name()
+    ));
+}
+
+/// An owner segment read against an environment made for no node (LLP 1123
+/// D16): the reader should have taken the box's own ([`Env::segments_held`]),
+/// and the document's segments stand in.
+fn misread_segment(leaf: &crate::style::calc::SegmentRead) {
+    report(&format!(
+        "var({}{}-{}-{}) resolved against the document's environment: resolve a box's lengths \
+         with NodeArena::env_of or Kernel::env_of (LLP 1123 D16); the document's segment stands in",
+        crate::style::calc::SegmentRead::PREFIX,
+        leaf.var.name(),
+        leaf.x,
+        leaf.y
     ));
 }
 

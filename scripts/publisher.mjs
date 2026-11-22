@@ -3,19 +3,19 @@
 // snapshot allows (LLP 1030.000 D3). This module owns
 //
 // - discovery and stream start (`streams`): each admissible signed head with its cohort receipt, and each production
-//   build receipt the caller passes with no head yet, whose cohort is then exactly the binary that build made;
+//   build receipt for a new stream, whose cohort is exactly the binary that build made;
 // - the candidate per stream (`streamCandidates`): the plan baked by the app's kind, its graph, its assets and its
 //   module pair, checked by the caller against the stream's cohort (`classifyArtifacts`);
 // - the signed publish (`publishStream`): blobs read back, `seq` under the stream's lock, the head signed, an
 //   immutable release record (LLP 1026 D11).
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, userInfo } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Refusal, refuse, assetIndex, canonicalBytes, canonicalJson, envelopeBytes, portableAssetNames } from './deploy-signing.mjs';
-import { admitHead, binaryInputFile, cohortReceipt, keepRecord, latestRecord, nextSeq } from './deploy-heads.mjs';
+import { admitHead, authenticatedReleaseFloor, binaryInputFile, cohortFiles, cohortReceipt, keepRecord, nextSeq, recoverCohort, sameCohortPayload } from './deploy-heads.mjs';
 import { bakedEntryAssets, buildBake, classifyArtifacts, nativeManifestMetadata } from './app.mjs';
 import { directoryInputNames, watchOutput } from './cargo-dep-info.mjs';
 import { notificationServiceInputChanges, notificationServiceSourceRoot } from './notification-service.mjs';
@@ -34,46 +34,56 @@ export function defaultRelease(commit, now = new Date(), nonce = randomBytes(8).
   return `r-${now.toISOString().replace(/[-:]/g, '')}-${commit.slice(0, 7)}-${nonce}`;
 }
 
-/** The streams of `channel`: each admissible signed head with its cohort receipt, and each of `builds`, the production
- * build receipts the caller may start streams from, that has no head yet (the one stream start, LLP 1030.007 D1). */
+/** The streams of `channel` with their frozen cohorts (LLP 1030.007 D1).
+ * Push can start any stream from a production build receipt. Deploy uses
+ * production receipts for repair and to start Android streams (D4). */
 export async function streams(origin, app, channel, { deploying = false, platforms = [], builds = [] } = {}) {
   const out = [];
+  const productionBuilds = builds.filter(({ trust, compat: { inputs } }) => trust === 'production'
+    && inputs.platform !== 'web' && inputs.store?.L !== '0' && (!platforms.length || platforms.includes(inputs.platform)));
   // A declared list names the base app's streams; a variant finds its own (LLP 1030.008 D7).
   const declared = app.manifest.variant ? undefined : app.manifest.deploy?.streams?.filter(s => s.channel === channel);
   const names = deploying && declared ? declared.map(s => s.compatibilityId) : await origin.list(`.exact/${channel}`);
   for (const compatibilityId of names ?? []) {
     const stream = { channel, compatibilityId };
     const found = await origin.head(stream);
-    if (!found && !deploying) continue;
+    if (!found && !deploying) {
+      const history = await authenticatedReleaseFloor(origin, app, stream);
+      if (history.floor !== null) refuse(`${streamPath(stream)}: the head is missing with authenticated release history; run deploy to recover it`);
+      continue;
+    }
     // Apps share a channel's directory on an origin; another app's stream is not ours.
     try { if (found && JSON.parse(found.bytes).app?.id !== app.id) continue; } catch { /* admitHead says why */ }
     const admission = found ? await admitHead(origin, found, app, stream) : null;
-    const record = deploying && !(admission?.usable && admission.authenticated) ? await latestRecord(origin, app, stream) : null;
+    const build = productionBuilds.find(build => build.compat.id === compatibilityId);
+    const record = deploying && !(admission?.usable && admission.authenticated)
+      ? await recoverCohort(origin, app, stream, admission, build) : null;
     if (deploying && !found && !record) {
       const history = await origin.list(`${streamPath(stream)}/releases`, { includeHidden: true });
       if (history?.length === 0 || history === null && origin.kind === 'directory') continue;
     }
     const head = admission?.usable && admission.authenticated ? admission.head : null;
-    const cohort = (head ?? record?.envelope)?.cohort;
-    const valid = cohort?.version === 1 && cohort.compat?.id === compatibilityId && cohort.compat.inputs && cohort.sources && cohort.binary;
-    const platform = cohort?.compat?.inputs?.platform ?? record?.platform ?? found?.json?.cohort?.compat?.inputs?.platform ?? null;
+    const cohort = head ? admission.cohort : record?.cohort;
+    const platform = cohort?.compat?.inputs?.platform ?? record?.platform ?? null;
     if (platforms.length && platform && !platforms.includes(platform)) continue;
-    if (!valid) {
-      const problem = head ? 'the head carries no cohort receipt' : `the head is not admissible (${admission?.problem ?? 'unauthenticated'})`;
+    if (!cohort) {
+      const problem = head ? 'the head carries no cohort receipt' : `the head is not admissible (${admission?.problem ?? record?.cohortProblem ?? 'unauthenticated'})`;
       if (!deploying) refuse(`${streamPath(stream)}: ${problem}; run deploy`);
       out.push({ stream, platform, problem });
       continue;
     }
-    out.push({ stream, head, cohort, platform });
+    const needsEvidenceBake = deploying && cohort.binaryInputs
+      && await origin.get(blobPath(cohort.binaryInputs.sha256)) === null
+      && !matchingBinaryInputFile(cohort.binaryInputs, build);
+    out.push({ stream, head, cohort, platform, ...(record ? { recovered: true } : {}), ...(needsEvidenceBake ? { needsEvidenceBake } : {}) });
   }
-  for (const build of builds) {
+  for (const build of productionBuilds) {
     const inputs = build.compat.inputs;
-    if (build.trust !== 'production' || inputs.platform === 'web' || inputs.store?.L === '0') continue;
-    if (platforms.length && !platforms.includes(inputs.platform)) continue;
     // A stream that has a head keeps its frozen cohort; the receipt of its id is the binary just built, whose
     // evidence its candidate is compared with (LLP 1030.007 D3).
     const known = out.find((s) => s.stream.compatibilityId === build.compat.id);
     if (known) { if (known.cohort) known.build = build; continue; }
+    if (deploying && inputs.platform !== 'android') continue;
     out.push({ stream: { channel, compatibilityId: build.compat.id }, head: null, cohort: cohortReceipt(build), platform: inputs.platform, build });
   }
   if (!out.length && !deploying) refuse(`no stream on the channel ${channel} at ${origin.describe()} has a head; a first deploy publishes them (bun scripts/deploy.mjs ${app.name} --channel ${channel} --origin ${origin.describe()} --yes)`);
@@ -169,9 +179,14 @@ function planGraph(tool, app, plan, compat, env, entries) {
   try {
     writeFileSync(resolve(dir, 'app.plan'), plan);
     writeFileSync(resolve(dir, 'compat.json'), JSON.stringify(compat));
-    const r = spawnSync(tool, ['graph', resolve(dir, 'app.plan'), resolve(dir, 'compat.json'), compat.target, app.dir], { env, encoding: 'utf8' });
-    if (r.status !== 0) refuse(r.stderr.trim());
-    const graph = JSON.parse(r.stdout);
+    const graphPath = resolve(dir, 'graph.json');
+    const output = openSync(graphPath, 'w');
+    try {
+      const r = spawnSync(tool, ['graph', resolve(dir, 'app.plan'), resolve(dir, 'compat.json'), compat.target, app.dir],
+        { env, encoding: 'utf8', stdio: ['ignore', output, 'pipe'] });
+      if (r.status !== 0) refuse(r.stderr?.trim() || r.error?.message || `exact-bake graph exited with ${r.signal ?? r.status}`);
+    } finally { closeSync(output); }
+    const graph = JSON.parse(readFileSync(graphPath, 'utf8'));
     const icons = [...(graph.appleIcons ?? [])];
     for (const [name, bytes] of entries ?? []) {
       if (!name.startsWith('plans/') || !name.endsWith('.plan')) continue;
@@ -201,17 +216,23 @@ function snapshotCompat(tool, app, cohort, base, built, env) {
   return JSON.parse(r.stdout);
 }
 
-/** The native source evidence to compare a stream's candidate with: the signed blob the cohort names, which is what
- * its installed binaries were built from; for a stream with no head yet, that of `build`, the production receipt it
- * starts from; else null, for a cohort signed before evidence existed. A receipt rebuilt later under the same id
- * describes a binary not every device has, so it never stands in for the head's. */
-async function evidenceOf(origin, cohort, build, head) {
+function matchingBinaryInputFile(card, build) {
+  const file = binaryInputFile(build);
+  return file?.sha256 === card.sha256 && file.bytes.length === card.bytes ? file : null;
+}
+
+/** Read the binary input evidence named by the cohort. During stream start
+ * or repair a local build can supply missing bytes that match the card. */
+export async function readBinaryInputFile(origin, cohort, build) {
   const card = cohort.binaryInputs;
-  if (!head) return build?.binary?.sha256 === cohort.binary ? binaryInputFile(build)?.bytes ?? null : null;
   if (!card) return null;
-  const bytes = await origin.get(blobPath(card.sha256));
-  if (!bytes || bytes.length !== card.bytes || sha256(bytes) !== card.sha256) refuse('the cohort binary input receipt is missing or does not match its signed digest');
-  return bytes;
+  const bytes = origin ? await origin.get(blobPath(card.sha256)) : null;
+  if (bytes && bytes.length === card.bytes && sha256(bytes) === card.sha256) return { bytes };
+  if (bytes === null) {
+    const file = matchingBinaryInputFile(card, build);
+    if (file) return { bytes: file.bytes, restore: file };
+  }
+  refuse('the cohort binary input receipt is missing or does not match its signed digest');
 }
 
 /** Compare a native build's source evidence with this source. Native SDKs and generated products are not needed to
@@ -318,14 +339,15 @@ export async function streamCandidates(app, origin, found, env, { baker = null, 
   else if (rustPackage(app)) for (const target of nativeTargets.length ? nativeTargets : [null]) variants.set(target, await buildRust(app, { compat: found[0].cohort.compat, env, nativeTarget: target, profile: 'release', baker }));
   else variants.set(null, snapshot ? { plan: snapshot.bundle.plan.bytes, entries: new Map(snapshot.bundle.assets.filter(a => namedEntry(a.name)).map(a => [a.name, a.bytes])) } : bakeApp(app, env));
   const updates = [];
-  for (const { stream, head, cohort, platform, build: binary } of found) {
+  for (const { stream, head, cohort, platform, recovered, build: binary } of found) {
     // The compatibility inputs this source computes and the cohort's do not match: its binary predates the source.
     let superseded = [], nativeData = [];
     try {
       let built = variants.get(cohort.compat.target) ?? variants.values().next().value;
       // Without a snapshot's bake the grants are the cohort's: a module's are checked by its own receipt, and a data
       // crate's are its native code, which `dataCrate` covers.
-      const evidenceBytes = await evidenceOf(origin, cohort, binary, head);
+      const evidenceFile = await readBinaryInputFile(head || recovered ? origin : null, cohort, !head || snapshot ? binary : null);
+      const evidenceBytes = evidenceFile?.bytes ?? null;
       const evidence = evidenceBytes === null ? null : binaryInputEvidence(evidenceBytes);
       const compatEnv = evidence?.metadata.appleExtensions !== undefined ? { ...env, EXACT_APPLE_EXTENSIONS: evidence.metadata.appleExtensions.join(',') } : env;
       const compat = snapshotCompat(tools.graph, app, cohort, snapshot?.compat ? snapshot : { compat: cohort.compat }, built, compatEnv);
@@ -450,7 +472,7 @@ export async function publishedModule(origin, app, stream) {
  * content-addressed blobs, prepare the immutable release record, then swap
  * the signed head conditionally. A failure before that last operation leaves
  * every URL in the prior head untouched and its bytes still retrievable. */
-export async function publishStream({ origin, row, bundle, compat, app, signer, release, snapshot, opts, log, build }) {
+export async function publishStream({ origin, row, bundle, compat, app, signer, release, snapshot, opts, log, build, recoveryBuild }) {
   const stream = { channel: row.channel, compatibilityId: row.compatibilityId };
   const base = streamPath(stream);
   const recordPath = `${base}/releases/${release}.json`;
@@ -462,33 +484,45 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
     const current = await origin.head(stream);
     const previousDigest = current?.sha256 ?? null;
     const admission = current ? await admitHead(origin, current, app, stream) : null;
-    let installed = null;
+    let cohortCard = null;
+    let startingCohort = false;
+    let restoreEvidence;
     if (build) {
-      const frozen = admission?.usable && admission.authenticated ? admission.head.cohort : row.receipt;
-      installed = frozen ?? (!current ? cohortReceipt(build) : null);
+      const frozen = await recoverCohort(origin, app, stream, admission, recoveryBuild);
+      // A concurrent publication can freeze the cohort after classification.
+      startingCohort = !current && !frozen;
+      const installed = frozen?.cohort ?? (startingCohort ? row.receipt ?? cohortReceipt(build) : null);
+      const locked = admission?.authenticated ? admission.head.cohortReceipt : null;
+      if (locked && !installed) refuse(`the locked head's cohort receipt could not be verified: ${admission.problem}`);
       const checked = classifyArtifacts(build, installed, {id:signer.keyId,public:app.manifest.deploy?.signing?.keys?.[signer.keyId]});
       if (!checked.bundle || installed.compat.id !== stream.compatibilityId) refuse(`the locked cohort rejects the candidate: ${checked.missing.join('; ')}`);
-      const evidence = binaryInputFile(build);
-      if (evidence && evidence.sha256 === installed.binaryInputs?.sha256) files.push(evidence);
+      const cohort = frozen?.cohortCard ? [] : cohortFiles(installed);
+      cohortCard = frozen?.cohortCard ?? cohort[0].card;
+      if (locked && !sameCohortPayload(locked, cohortCard)) refuse('the recovered cohort receipt does not match the locked head');
+      files.push(...cohort);
+      const restoreFrom = startingCohort ? build : recoveryBuild;
+      restoreEvidence = (await readBinaryInputFile(origin, installed, restoreFrom))?.restore;
     }
     const changes = admission?.usable
       ? changesAgainst(bundle, admission.head, sunsetFor(app, stream))
       : current ? [{ name: 'exact.json', change: 'repair', note: admission.problem }] : changesAgainst(bundle, null, sunsetFor(app, stream));
-    if (admission?.usable && !changes.length && admission.seq > (opts.seqAbove ?? 0)) return { ...row, action: 'current', seq: admission.seq, note: 'the head is admissible and already names this bundle (published meanwhile)' };
-    // `seqAbove`: a stream moving to a new origin starts above every seq its clients accepted from the old one.
-    const seq = await nextSeq(origin, app, stream, admission, `the locked head at ${origin.describe()}/${base}/exact.json`, opts.seqAbove ?? 0);
-    let written = 0;
-    for (const file of files) {
-      if (await origin.put(blobPath(file.sha256), file.bytes, { immutable: true }) === 'written') written++;
-      const back = await origin.get(blobPath(file.sha256));
-      if (!back || sha256(back) !== file.sha256) refuse(`the blob ${file.sha256} (${file.name}) read back from ${origin.describe()} is not what was written`);
+    if (admission?.usable && !changes.length && admission.seq > (opts.seqAbove ?? 0)) {
+      if (restoreEvidence) await putVerifiedBlob(origin, restoreEvidence);
+      const note = restoreEvidence ? 'the head already names this bundle. Restored its signed binary input receipt' : 'the head is admissible and already names this bundle';
+      return { ...row, action: 'current', seq: admission.seq, note };
     }
-    log(`  ${row.platform} ${row.compatibilityId.slice(0, 8)}: ${files.length} blobs on the origin (${written} written, ${files.length - written} present), each read back and checked`);
-    const sunset = sunsetFor(app, stream);
-    const head = streamHead({ app, bundle, stream, seq, release, sunset });
-    if (installed) head.cohort = installed;
+    // `seqAbove`: a stream moving to a new origin starts above every seq its clients accepted from the old one.
+    const seq = await nextSeq(origin, app, stream, admission, `the locked head at ${origin.describe()}/${base}/exact.json`, opts.seqAbove ?? 0, { startingCohort });
+    const head = streamHead({ app, bundle, stream, seq, release, sunset: sunsetFor(app, stream) });
+    if (cohortCard) head.cohortReceipt = cohortCard;
     head.signature = signer.sign(head);
     const bytes = envelopeBytes(head);
+    if (restoreEvidence) files.push(restoreEvidence);
+    let written = 0;
+    for (const file of files) {
+      if (await putVerifiedBlob(origin, file) === 'written') written++;
+    }
+    log(`  ${row.platform} ${row.compatibilityId.slice(0, 8)}: ${files.length} blobs on the origin (${written} written, ${files.length - written} present), each read back and checked`);
     const originDigest = sha256(bytes);
     const entryDigest = sha256(canonicalBytes(head));
     const record = {
@@ -501,7 +535,7 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
       envelope: head, ...(index ? { assets: JSON.parse(index.bytes.toString('utf8')) } : {}),
     };
     await origin.put(recordPath, Buffer.from(JSON.stringify(record, null, 2) + '\n', 'utf8'), { immutable: true });
-    keepRecord(origin, stream, `${release}.json`, seq);
+    keepRecord(origin, app, stream, `${release}.json`, seq);
     try {
       await origin.putHead(stream, bytes, { previousDigest });
     } catch (error) {
@@ -518,4 +552,12 @@ export async function publishStream({ origin, row, bundle, compat, app, signer, 
     }
     return { ...row, action: 'published', seq, changes, head: { seq, sha256: originDigest, entryDigest, release }, previous: previousDigest };
   });
+}
+
+async function putVerifiedBlob(origin, file) {
+  const path = blobPath(file.sha256);
+  const status = await origin.put(path, file.bytes, { immutable: true });
+  const back = await origin.get(path);
+  if (!back || sha256(back) !== file.sha256) refuse(`the blob ${file.sha256} (${file.name}) read back from ${origin.describe()} is not what was written`);
+  return status;
 }

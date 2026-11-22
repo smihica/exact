@@ -7,9 +7,9 @@ import {resolve, relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {bakedEntryAssets, classifyArtifacts, nativeManifestMetadata} from './app.mjs';
 import {spawnSync as realSpawnSync} from 'node:child_process';
-import {canonicalBytes, classify, inspectHead} from './deploy.mjs';
+import {canonicalBytes, classify} from './deploy.mjs';
 import {publishedModule, publishStream, streamHead} from './publisher.mjs';
-import {admitHead, latestRecord} from './deploy-heads.mjs';
+import {admitHead, authenticatedReleaseFloor, cohortFiles, latestRecord, recoverCohort} from './deploy-heads.mjs';
 import {DirectoryOrigin, streamPath} from './origin.mjs';
 import {createHash, generateKeyPairSync, sign} from 'node:crypto';
 import {filesystem, filesystemRead, filesystemTree} from './filesystem.mjs';
@@ -26,7 +26,7 @@ import {notificationServiceInputChanges, notificationServiceSourceRoot} from './
 // needs `runtime` (its receipt's). Bun's native subprocess import bypasses
 // module mocks; explicit bindings also isolate deployment tests.
 // `entries`: the named entries (name to text) the Rust or TypeScript bake makes beside the plan.
-function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphTool, compatForEnv, cohortRuntime=4, grants='', watch=fs.watch, targets, entries={}, planRequires={}, moduleGrants='', rustModule=true, produced, reuseSignature, graphs, computed=c=>c, bytecodeVersion}={}) {
+function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphTool, compatForEnv, cohortRuntime=4, grants='', watch=fs.watch, targets, entries={}, planRequires={}, moduleGrants='', rustModule=true, produced, reuseSignature, graphs, computed=c=>c, bytecodeVersion, openOrigin}={}) {
   const root=fs.mkdtempSync(resolve(tmpdir(),'exact-push-profile-'));
   const app={id:'fixture',name:'fixture',displayName:'Fixture',dir:root,target:root,manifest:{app:{origin:root},deploy:{signing:{keys:{test:'public'}}}}};
   const compat={id:'a'.repeat(32),target:'fixture',inputs:{app:'fixture',platform:'linux',store:{L:'A'},rustMode:'native',grantCeiling:grants,keys:{test:'public'},typescriptRuntime:cohortRuntime}};
@@ -43,7 +43,7 @@ function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphT
     expect(env?.EXACT_UPDATE_TRUST,`${name} production trust`).toBe('production');
   };
   const bindings={
-    ...Object.fromEntries(['existsSync','mkdirSync','readFileSync','readlinkSync','writeFileSync','mkdtempSync','rmSync'].map(name=>[name,fs[name]])), watch,
+    ...Object.fromEntries(['closeSync','existsSync','mkdirSync','openSync','readFileSync','readlinkSync','writeFileSync','mkdtempSync','rmSync'].map(name=>[name,fs[name]])), watch,
     filesystem, filesystemRead, filesystemTree, unbundledTextures, streamBundle,
     nativeManifestMetadata, directoryInputNames, watchOutput, notificationServiceInputChanges, notificationServiceSourceRoot, appleAssetCatalogInventory, launchImageInventory, nativeResourceInventory,
     channelOf,validateChannel,resolve,relative,homedir,ROOT:fileURLToPath(new URL('..',import.meta.url)),
@@ -54,8 +54,8 @@ function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphT
     // The app's own bake (web, without its wasm): its plan, as the bake output names it.
     buildBake:appBake ?? ((app,platform,target,opts)=>{sealed('app',opts.env);fs.writeFileSync(resolve(opts.output,`${platform}-${target}.plan`),'plan');return {compat:{target,inputs:{platform}},graph:{artifacts:[]}}}),
     cohortReceipt:b=>b===build?cohort:{version:1,compat:b.compat,binary:'binary',sources:{}},classifyArtifacts:classify,
-    openOrigin:mock(spec=>({writable:true,list:async path=>{destinations.push({origin:spec,path});return []},describe:()=>spec})),
-    channelOrigin,sha256,blobPath,streamPath,latestRecord,canonicalJson,
+    openOrigin:openOrigin ?? mock(spec=>({writable:true,list:async path=>{destinations.push({origin:spec,path});return []},describe:()=>spec})),
+    channelOrigin,sha256,blobPath,streamPath,authenticatedReleaseFloor,recoverCohort,canonicalJson,
     defaultRelease:()=> 'r-fixture',admitHead,publishedModule,
     publishedSignature: reuseSignature ?? (() => null),
     requireReleasePins(){}, // the release pins' gate (game/inputs.mjs), not what this seals
@@ -73,7 +73,10 @@ function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphT
       sealed(name,opts.env);
       // `bake` runs the real one (its receipt's runtime is the bake's own).
       if(['graph','compat'].includes(name)&&graphTool)return realSpawnSync(graphTool,args,{...opts,env:{...process.env,...opts.env}});
-      if(name==='graph'&&graphs)return {status:0,stdout:JSON.stringify({...graph,...graphs[fs.readFileSync(args[1],'utf8')]})};
+      if(name==='graph'){
+        fs.writeFileSync(opts.stdio[1],JSON.stringify({...graph,...graphs?.[fs.readFileSync(args[1],'utf8')]}));
+        return {status:0};
+      }
       // Unchanged sources compute each cohort's own inputs for its target.
       if(name==='compat'){
         const target=args[args.indexOf('--target')+1];
@@ -103,7 +106,7 @@ function harness(classify=()=>({bundle:true}), runtime=4, {appBake, bake, graphT
 }
 
 test.each([
-  ['the default selection', ['widgets', 'activities', 'intents', 'alarms', 'notifications', 'watch']],
+  ['the default selection', ['widgets', 'activities', 'intents', 'alarms', 'notifications', 'watch', 'share']],
   ['--extensions none', []],
 ])('an unchanged Apple cohort keeps %s current', async (_, appleExtensions) => {
   const { root, app, binaryInputChanges } = harness();
@@ -468,6 +471,7 @@ test.each([false, true])('bundle candidates publish to signed iOS cohorts and le
     const initial = streamHead({ app, bundle: initialBundle, stream, seq: 7, release: 'initial' });
     initial.cohort = cohort; initial.signature = signer.sign(initial);
     await origin.putHead(stream, Buffer.from(JSON.stringify(initial)), { previousDigest: null });
+    await origin.put(`${streamPath(stream)}/releases/initial.json`, Buffer.from(JSON.stringify({ envelope: initial })), { immutable: true });
     const env = { EXACT_UPDATE_TRUST: 'production', EXACT_GAME_PROOF_PROFILE: 'release' };
     const found = await streams(origin, app, 'prod', { deploying: true, platforms: ['ios'] });
     expect(found.map(s => s.platform)).toEqual(['ios']);
@@ -480,15 +484,134 @@ test.each([false, true])('bundle candidates publish to signed iOS cohorts and le
     const update = updates[0], row = table.rows[0];
     const result = await publishStream({ ...update, origin, app, signer, row, release: 'update', snapshot: table.snapshot, opts: {}, log() {} });
     expect(result.seq).toBe(8);
-    expect(inspectHead(await origin.head(stream), app, stream).authenticated).toBe(true);
-    expect((await origin.head(stream)).json.cohort).toEqual(cohort);
+    const current = await origin.head(stream);
+    expect(current.json.cohort).toBeUndefined();
+    expect(await admitHead(origin, current, app, stream)).toMatchObject({ authenticated: true, cohort });
     expect((await classify({ ...args, release: 'unchanged' })).rows[0].action).toBe('current');
     const before = (await origin.head(stream)).bytes;
     expect((await publishStream({ ...update, origin, app, signer, row, release: 'unchanged', snapshot: table.snapshot, opts: {}, log() {} })).action).toBe('current');
     expect((await origin.head(stream)).bytes).toEqual(before);
     expect(await origin.get(`${streamPath(stream)}/releases/unchanged.json`)).toBeNull();
+
+    const receiptPath = blobPath(current.json.cohortReceipt.sha256);
+    const receiptBytes = await origin.get(receiptPath);
+    fs.unlinkSync(origin.path(receiptPath));
+    const unrelated = { ...initial, stream: { ...initial.stream, seq: 6 }, cohort: { ...cohort, binary: 'different' } };
+    unrelated.signature = signer.sign(unrelated);
+    const oldPath = `${streamPath(stream)}/releases/initial.json`;
+    const otherPath = `${streamPath(stream)}/releases/unrelated.json`;
+    await origin.put(otherPath, Buffer.from(JSON.stringify({ envelope: unrelated })), { immutable: true });
+    const oldRecord = await origin.get(oldPath);
+    fs.unlinkSync(origin.path(oldPath));
+    expect(await latestRecord(origin, app, stream)).toMatchObject({ cohort: null, envelope: { stream: { seq: 8 } } });
+    await origin.put(oldPath, oldRecord, { immutable: true });
+    expect(await latestRecord(origin, app, stream)).toMatchObject({ cohort, envelope: { stream: { seq: 8 } } });
+    const recovery = await streams(origin, app, 'prod', { deploying: true, platforms: ['ios'] });
+    expect(recovery[0]?.cohort).toEqual(cohort);
+    const [repaired] = await streamCandidates(app, origin, recovery, env, { snapshot: { bundle: update.bundle } });
+    const repair = (await classify({ ...args, knownStreams: recovery, release: 'repair',
+      candidates: new Map([[stream.compatibilityId, repaired]]) })).rows[0];
+    expect(repair).toMatchObject({ action: 'bundle', seq: 9 });
+    expect(await publishStream({ ...repaired, origin, app, signer, row: repair, release: 'repair', snapshot: table.snapshot, opts: {}, log() {} }))
+      .toMatchObject({ action: 'published', seq: 9 });
+    expect(await origin.get(receiptPath)).toEqual(receiptBytes);
+    expect(await admitHead(origin, await origin.head(stream), app, stream)).toMatchObject({ usable: true, authenticated: true, cohort });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a first push builds and publishes a plan with 137 native sources', async () => {
+  const target = resolve(import.meta.dir, '..', process.env.CARGO_TARGET_DIR || 'target', 'debug');
+  const compiler = resolve(target, `contract${EXE}`), graphTool = resolve(target, `exact-bake${EXE}`);
+  if (!fs.existsSync(compiler) || !fs.existsSync(graphTool)) throw Error('build the tools first: cargo build -p contract -p exact-bake');
+  const compile = (app, file, env) => {
+    const baked = realSpawnSync(compiler, ['build', resolve(app.dir, 'app.contract'), '-o', file], { env, encoding: 'utf8' });
+    expect(baked.status, baked.stderr).toBe(0);
+  };
+  const { root, app, build, cohort, streams, streamCandidates } = harness(classifyArtifacts, 4, { rustModule: false, graphTool,
+    appBake(app, platform, target, opts) {
+      compile(app, resolve(opts.output, `${platform}-${target}.plan`), opts.env);
+      return { compat: { target, inputs: { platform } }, graph: { artifacts: [] } };
+    },
+  });
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const raw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+    app.manifest = { name: 'fixture', app: { id: 'fixture', name: 'Fixture' }, deploy: { signing: { key: 'test', keys: { test: raw } } } };
+    fs.writeFileSync(resolve(root, 'app.json'), JSON.stringify(app.manifest));
+    const shapes = ['shape S0\n  leaf: string\n'];
+    for (let level = 1; level <= 6; level++) shapes.push(`shape S${level}\n  left: S${level - 1}\n  right: S${level - 1}\n`);
+    const sources = Array.from({ length: 137 }, (_, i) => `  resource value${i} = source${i}() as shape S6\n`);
+    const contract = shapes.join('\n') + 'component App\n' + sources.join('') + '  view\n    text "Before"\n';
+    const entry = resolve(root, 'app.contract');
+    fs.writeFileSync(entry, contract);
+    const env = { ...process.env, EXACT_UPDATE_TRUST: 'production', EXACT_GAME_PROOF_PROFILE: 'release' };
+    const initial = resolve(root, 'initial.plan');
+    compile(app, initial, env);
+    const computed = realSpawnSync(graphTool, ['compat', root, '--platform', 'ios', '--target', 'aarch64-apple-ios', '--json', '--grants', ''], { env, encoding: 'utf8' });
+    expect(computed.status, computed.stderr).toBe(0);
+    build.compat = JSON.parse(computed.stdout);
+    const compatFile = resolve(root, 'compat.json');
+    fs.writeFileSync(compatFile, computed.stdout);
+    const installed = realSpawnSync(graphTool, ['graph', initial, compatFile, build.compat.target, root],
+      { env, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    expect(installed.status, installed.error?.message ?? installed.stderr).toBe(0);
+    expect(Buffer.byteLength(installed.stdout)).toBeGreaterThan(1024 * 1024);
+    build.graph = JSON.parse(installed.stdout);
+    expect(Object.keys(build.graph.sources)).toHaveLength(137);
+    Object.assign(build, { version: 1, binary: { sha256: '0'.repeat(64) } });
+    Object.assign(cohort, cohortReceipt(build));
+    fs.writeFileSync(entry, contract.replace('Before', 'After'));
+    const origin = new DirectoryOrigin(resolve(root, 'origin'));
+    const signer = { keyId: 'test', sign: head => ({ keyId: 'test', ed25519: sign(null, canonicalBytes(head), privateKey).toString('base64') }) };
+    const [candidate] = await streamCandidates(app, origin, await streams(origin, app, 'prod', { builds: [build] }), env);
+    expect(candidate.reason).toBeUndefined();
+    expect(await publishStream({ ...candidate, origin, app, signer, release: 'first', snapshot: {}, opts: {}, log() {} }))
+      .toMatchObject({ action: 'published', seq: 1 });
+    const stream = { channel: 'prod', compatibilityId: build.compat.id };
+    const head = await origin.head(stream);
+    expect(head.bytes.length).toBeLessThan(2048);
+    expect(await admitHead(origin, head, app, stream)).toMatchObject({ usable: true, authenticated: true, cohort });
+
+    const receiptPath = blobPath(head.json.cohortReceipt.sha256);
+    const receiptBytes = await origin.get(receiptPath);
+    fs.unlinkSync(origin.path(receiptPath));
+    const newBinary = { ...build, binary: { ...build.binary, sha256: '1'.repeat(64) } };
+    const discovery = { deploying: true, platforms: ['ios'] };
+    expect((await streams(origin, app, 'prod', { ...discovery, builds: [newBinary] }))[0].cohort).toBeUndefined();
+    const knownStreams = await streams(origin, app, 'prod', { ...discovery, builds: [build] });
+    const [recovered] = await streamCandidates(app, origin, knownStreams.filter(s => s.cohort), env, { snapshot: { bundle: candidate.bundle } });
+    const table = await classify({ app, origin, opts: { platform: ['ios'] }, channel: 'prod', snapshot: {}, release: 'repair',
+      bundle: candidate.bundle, compat: {}, builds: {}, platforms: ['ios'], wantOrigin: false, knownStreams,
+      candidates: new Map(recovered ? [[stream.compatibilityId, recovered]] : []) });
+    expect(table.rows[0]).toMatchObject({ action: 'bundle', seq: 2 });
+    const repair = { ...recovered, origin, app, signer, row: table.rows[0], release: 'repair',
+      snapshot: {}, opts: {}, log() {}, recoveryBuild: build };
+    const otherHead = { ...head.json, stream: { ...head.json.stream, seq: 2 },
+      cohortReceipt: { ...head.json.cohortReceipt, sha256: 'f'.repeat(64) } };
+    otherHead.signature = signer.sign(otherHead);
+    const raced = Object.create(origin);
+    raced.head = async () => ({ bytes: Buffer.from(JSON.stringify(otherHead)), json: otherHead });
+    await expect(publishStream({ ...repair, origin: raced })).rejects.toThrow("the locked head's cohort receipt could not be verified");
+    expect(await origin.get(`${streamPath(stream)}/releases/repair.json`)).toBeNull();
+    expect(await publishStream(repair)).toMatchObject({ action: 'published', seq: 2 });
+    expect(await origin.get(receiptPath)).toEqual(receiptBytes);
+    expect(await admitHead(origin, await origin.head(stream), app, stream)).toMatchObject({ usable: true, cohort });
+
+    fs.unlinkSync(origin.path(receiptPath));
+    fs.unlinkSync(origin.path(`${streamPath(stream)}/exact.json`));
+    expect((await streams(origin, app, 'prod', { ...discovery, builds: [newBinary] }))[0].cohort).toBeUndefined();
+    const fromHistory = await streams(origin, app, 'prod', { ...discovery, builds: [build] });
+    const [historyCandidate] = await streamCandidates(app, origin, fromHistory.filter(s => s.cohort), env, { snapshot: { bundle: candidate.bundle } });
+    const historyTable = await classify({ app, origin, opts: { platform: ['ios'] }, channel: 'prod', snapshot: {}, release: 'restore',
+      bundle: candidate.bundle, compat: {}, builds: {}, platforms: ['ios'], wantOrigin: false, knownStreams: fromHistory,
+      candidates: new Map(historyCandidate ? [[stream.compatibilityId, historyCandidate]] : []) });
+    expect(historyTable.rows[0]).toMatchObject({ action: 'bundle', seq: 3 });
+    expect(await publishStream({ ...repair, ...historyCandidate, row: historyTable.rows[0], release: 'restore' }))
+      .toMatchObject({ action: 'published', seq: 3 });
+    expect(await origin.get(receiptPath)).toEqual(receiptBytes);
+    expect(await admitHead(origin, await origin.head(stream), app, stream)).toMatchObject({ usable: true, cohort });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 30_000);
 
 test.each([
   { name: 'a newer runtime', runtime: 5, reason: 'typescriptRuntime' },
@@ -803,11 +926,18 @@ test('signed binary source evidence detects changed inputs and refuses damaged r
       const table = await classify({ app, origin, opts: {}, channel: 'prod', snapshot: {}, release: 'damaged', bundle,
         compat: {}, builds: {}, platforms: ['ios'], wantOrigin: false, candidates: new Map([[stream.compatibilityId, update]]) });
       expect(table.rows.map(row => row.action)).toEqual(['binary']);
+      const withBuild = opts => streams(origin, app, 'prod', { builds: [build], ...opts });
+      const [push] = await streamCandidates(app, origin, await withBuild({}), env);
+      expect(push.reason).toContain('binary input receipt is missing or does not match');
+      const [deploy] = await streamCandidates(app, origin, await withBuild({ deploying: true }), env, { snapshot });
+      if (damaged) expect(deploy.reason).toContain('binary input receipt is missing or does not match');
+      else expect(deploy.build.pendingInputs).toEqual([]);
+      expect(await origin.get(blobPath(file.sha256))).toEqual(damaged);
       fs.writeFileSync(path, file.bytes);
     }
     expect((await origin.head(stream)).bytes).toEqual(head);
     expect((await origin.list(`${streamPath(stream)}/releases`)).length).toBe(1);
-    expect(calls.every(call => ['tools', 'graph', 'compat'].includes(call))).toBe(true);
+    expect(calls.every(call => ['tools', 'graph', 'compat', 'app'].includes(call))).toBe(true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -838,6 +968,130 @@ test('a first push from a production build publishes the evidence its cohort nam
     const [update] = await streamCandidates(app, origin, found, env, { snapshot });
     expect(update.reason).toBeUndefined();
     expect(update.build.pendingInputs).toEqual([]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('push refuses all streams when a signed stream has lost its head', async () => {
+  const { root, app, bindings, pusher, published } = harness(classifyArtifacts, 4, {
+    rustModule: false, targets: [['healthy', 'off'], ['headless', 'off']], openOrigin: path => new DirectoryOrigin(path),
+  });
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const raw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+    app.manifest.deploy.signing = { key: 'test', keys: { test: raw } };
+    const origin = new DirectoryOrigin(resolve(root, 'origin'));
+    const plan = Buffer.from('older plan');
+    const bundle = { plan: { bytes: plan, sha256: sha256(plan), formatVersion: 4, kernelSchema: '0'.repeat(16) }, assets: [] };
+    const [healthy, headless] = bindings.readBuilds();
+    for (const build of [healthy, headless]) {
+      Object.assign(build.compat.inputs, { keys: { test: raw }, formatVersion: 4, kernelSchema: '0'.repeat(16) });
+      Object.assign(build, { version: 1, binary: { sha256: '0'.repeat(64) } });
+      const stream = { channel: 'prod', compatibilityId: build.compat.id };
+      const head = streamHead({ app, bundle, stream, seq: 3, release: 'initial' });
+      if (build === healthy) head.cohort = cohortReceipt(build);
+      else head.cohortReceipt = cohortFiles(cohortReceipt(build))[0].card;
+      head.signature = { keyId: 'test', ed25519: sign(null, canonicalBytes(head), privateKey).toString('base64') };
+      if (build === healthy) await origin.putHead(stream, Buffer.from(JSON.stringify(head)), { previousDigest: null });
+      else await origin.put(`${streamPath(stream)}/releases/initial.json`, Buffer.from(JSON.stringify({ envelope: head })), { immutable: true });
+    }
+
+    await expect(pusher({ _: [root], origin: origin.describe(), keys: root }))
+      .rejects.toThrow(`${headless.compat.id}: the head is missing with authenticated release history`);
+    expect(published).toEqual([]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each(['head', 'history', 'late history'])('a first push rechecks the frozen cohort when signed evidence appears (%s)', async evidence => {
+  const { root, app, build, streams, streamCandidates } = harness(classifyArtifacts, 4, { rustModule: false });
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const raw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+    app.manifest.deploy.signing = { key: 'test', keys: { test: raw } };
+    Object.assign(build.compat.inputs, { rustMode: 'off', keys: { test: raw }, formatVersion: 4, kernelSchema: '0'.repeat(16) });
+    build.version = 1;
+    build.binary = { sha256: '0'.repeat(64) };
+    const origin = new DirectoryOrigin(resolve(root, 'origin'));
+    const env = { EXACT_UPDATE_TRUST: 'production', EXACT_GAME_PROOF_PROFILE: 'release' };
+    const [first] = await streamCandidates(app, origin, await streams(origin, app, 'prod', { builds: [build] }), env);
+    expect(first.reason).toBeUndefined();
+    const signer = { keyId: 'test', sign: head => ({ keyId: 'test', ed25519: sign(null, canonicalBytes(head), privateKey).toString('base64') }) };
+    const stream = { channel: 'prod', compatibilityId: build.compat.id };
+    const bytes = Buffer.from('older plan');
+    const bundle = { ...first.bundle, plan: { ...first.bundle.plan, bytes, sha256: sha256(bytes) } };
+    const head = streamHead({ app, bundle, stream, seq: 7, release: 'other' });
+    head.signature = signer.sign(head);
+    const headBytes = Buffer.from(JSON.stringify(head));
+    const recordPath = `${streamPath(stream)}/releases/other.json`;
+    const record = Buffer.from(JSON.stringify({ envelope: head }));
+    if (evidence === 'head') await origin.putHead(stream, headBytes, { previousDigest: null });
+    else if (evidence === 'history') await origin.put(recordPath, record, { immutable: true });
+    else {
+      const list = origin.list.bind(origin);
+      // AppDrop has a conditional head write. Another publisher can write its
+      // release record between recovery's listing and sequence allocation.
+      origin.list = async (...args) => {
+        origin.list = list;
+        const names = await list(...args);
+        await origin.put(recordPath, record, { immutable: true });
+        return names;
+      };
+    }
+
+    await expect(publishStream({ ...first, origin, app, signer, release: 'first', snapshot: {}, opts: {}, log() {} }))
+      .rejects.toThrow('no authenticated capability receipt');
+    expect((await origin.head(stream))?.bytes ?? null).toEqual(evidence === 'head' ? headBytes : null);
+    expect(await origin.get(`${streamPath(stream)}/releases/first.json`)).toBeNull();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each(['publish', 'repair'])('a recovered inline cohort requires its signed binary input receipt (%s)', async action => {
+  const { root, app, build, streams, streamCandidates } = harness(classifyArtifacts, 4, { rustModule: false });
+  try {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const raw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32).toString('base64');
+    app.manifest.deploy.signing = { key: 'test', keys: { test: raw } };
+    app.manifest.deploy.store = { android: 'A' };
+    Object.assign(build.compat.inputs, { platform: 'android', rustMode: 'off', keys: { test: raw }, formatVersion: 4, kernelSchema: '0'.repeat(16) });
+    const metadata = { ...nativeManifestMetadata(app.manifest, 'android'), store: build.compat.inputs.store, keys: build.compat.inputs.keys };
+    const sourceInputs = { version: 1, metadata, files: [], directories: [], absent: [], links: [] };
+    Object.assign(build, { version: 1, binary: { sha256: '0'.repeat(64), sourceInputs } });
+    const newer = { ...build, binary: { sha256: '1'.repeat(64), sourceInputs: { ...sourceInputs, metadata: { ...metadata, changed: true } } } };
+    const origin = new DirectoryOrigin(resolve(root, 'origin'));
+    const env = { EXACT_UPDATE_TRUST: 'production', EXACT_GAME_PROOF_PROFILE: 'release' };
+    const [first] = await streamCandidates(app, origin, await streams(origin, app, 'prod', { builds: [newer] }), env);
+    expect(first.reason).toBeUndefined();
+
+    const signer = { keyId: 'test', sign: head => ({ keyId: 'test', ed25519: sign(null, canonicalBytes(head), privateKey).toString('base64') }) };
+    const stream = { channel: 'prod', compatibilityId: build.compat.id };
+    const head = streamHead({ app, bundle: first.bundle, stream, seq: 7, release: 'older' });
+    head.cohort = cohortReceipt(build);
+    head.signature = signer.sign(head);
+    const base = streamPath(stream);
+    await origin.put(`${base}/releases/older.json`, Buffer.from(JSON.stringify({ envelope: head })), { immutable: true });
+    const file = binaryInputFile(build);
+    const publish = { origin, app, signer, release: 'next', snapshot: {}, opts: {}, log() {} };
+    const options = { deploying: true, platforms: ['android'] };
+    const discover = binary => streams(origin, app, 'prod', { ...options, builds: [binary] });
+    const candidates = found => streamCandidates(app, origin, found, env, { snapshot: { bundle: first.bundle } });
+    if (action === 'publish') {
+      await expect(publishStream({ ...first, ...publish })).rejects.toThrow('binary input receipt is missing or does not match');
+      expect(await origin.get(`${base}/releases/next.json`)).toBeNull();
+      expect(await origin.head(stream)).toBeNull();
+    } else {
+      const [unmatched] = await candidates(await discover(newer));
+      expect(unmatched.reason).toContain('binary input receipt is missing or does not match');
+      const knownStreams = await discover(build);
+      const [restored] = await candidates(knownStreams);
+      expect(restored.reason).toBeUndefined();
+      expect(restored.build.pendingInputs).toEqual([]);
+      const { rows } = await classify({ app, origin, opts: {}, channel: 'prod', snapshot: {}, release: 'next',
+        bundle: first.bundle, compat: {}, builds: {}, platforms: ['android'], wantOrigin: false, knownStreams,
+        candidates: new Map([[stream.compatibilityId, restored]]) });
+      expect(rows).toEqual([expect.objectContaining({ platform: 'android', action: 'bundle', seq: 8 })]);
+      expect(await publishStream({ ...restored, ...publish, row: rows[0], recoveryBuild: build })).toMatchObject({ action: 'published', seq: 8 });
+      expect(await origin.get(blobPath(file.sha256))).toEqual(file.bytes);
+      expect(await admitHead(origin, await origin.head(stream), app, stream)).toMatchObject({ usable: true, cohort: head.cohort });
+    }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -19,7 +19,7 @@ component Clip
 ```
 
 ```swift
-import UIKit // AppKit on macOS, under #if os(macOS)
+import UIKit // AppKit under #if os(macOS)
 
 final class Clip: ExactModule {
     override class var views: [String: ExactNativeFactory] {
@@ -60,11 +60,12 @@ final class Video: ExactNativeInstance {
   `CADisplayLink` or timer, so `clock +N` moves it; timed audio is a `sequence`.
 - **Touches:** recognizers on the view; a point `point(inside:)` declines goes under the box
   unless it has `press=`. Drive them with `agent ios --touch platform`.
+- **Delegates:** `ExactNativeInstance` is no `NSObject`; a delegate is an `NSObject` it holds.
 - **Size:** `intrinsicSize` is the natural size; an authored size wins.
 - **Accessibility:** [native views](../contract-for-agents.md#native-views-accessibility).
 - **Data:** `app.ts` asks: `native!.watch('state'); return native!.call({op: 'state'});`. The
-  build has no module, so the resource shows its `else` row until launch: write no bake code.
-- **A crash:** `agent ios logs` shows the newest crash report.
-- **First frame:** views attach after first paint. Only a cheap one says
-  `ExactNativeFactory(firstFrame: true)`, never an engine's; the module is made with it, on
-  main: make an `AVAudioEngine` on first use. A splash is Contract: native slows launch.
+  build has no module, so the resource shows its `else` row until launch.
+- **Crashes:** `agent ios logs`.
+- **First frame:** views attach after first paint. Only a cheap view says
+  `ExactNativeFactory(firstFrame: true)`, which makes its module on main at launch: make an
+  `AVAudioEngine` on first use. A splash is Contract.

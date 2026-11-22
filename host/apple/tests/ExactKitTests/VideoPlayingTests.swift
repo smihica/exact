@@ -26,8 +26,9 @@ extension AVPlayerItem {
 final class VideoPlayingTests: XCTestCase {
     private typealias Callback = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
     private typealias Configuring = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
+    private typealias Placement = @convention(c) (UnsafeMutableRawPointer?, Double, Double, Double, Double, UnsafeMutablePointer<Double>?) -> Void
     private typealias Create = @convention(c) (
-        UnsafeMutableRawPointer?, Callback?, Configuring?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?
+        UnsafeMutableRawPointer?, Callback?, Configuring?, Placement?, UnsafeMutablePointer<UnsafeMutableRawPointer?>?
     ) -> UnsafeMutableRawPointer?
     private typealias View = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
     private typealias Update = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int) -> Void
@@ -35,6 +36,86 @@ final class VideoPlayingTests: XCTestCase {
     private var events: [String] = []
     private var playingTimes: [Double] = []
     private var messages: [[String: Any]] = []
+
+    private var placedFrames: [CGRect] = []
+    private var offsetPicture = false
+
+    func testInlineVideoUsesTheHostsObjectPlacement() throws {
+        #if os(macOS)
+        _ = NSApplication.shared
+        #endif
+        let library = try XCTUnwrap(VideoArmLibrary.handle)
+        let create = unsafeBitCast(try XCTUnwrap(dlsym(library, "exact_video_create")), to: Create.self)
+        let view = unsafeBitCast(try XCTUnwrap(dlsym(library, "exact_video_view")), to: View.self)
+        let update = unsafeBitCast(try XCTUnwrap(dlsym(library, "exact_video_update")), to: Update.self)
+        let destroy = unsafeBitCast(try XCTUnwrap(dlsym(library, "exact_video_destroy")), to: Destroy.self)
+        let handle = try XCTUnwrap(create(Unmanaged.passUnretained(self).toOpaque(), { _, _, _ in }, nil, { context, nw, nh, w, h, out in
+            let test = Unmanaged<VideoPlayingTests>.fromOpaque(context!).takeUnretainedValue()
+            let rect = test.offsetPicture ? CGRect(x: 161, y: 0, width: w, height: h) : IconPath.placed(natural: CGSize(width: nw, height: nh), fit: "contain",
+                position: [.object(["pct": .number(0)]), .object(["pct": .number(100)])], in: CGRect(x: 0, y: 0, width: w, height: h))
+            test.placedFrames.append(rect)
+            for (i, n) in [rect.minX, rect.minY, rect.width, rect.height].enumerated() { out![i] = Double(n) }
+        }, nil))
+        defer { destroy(handle) }
+        #if os(macOS)
+        let container = Unmanaged<NSView>.fromOpaque(try XCTUnwrap(view(handle))).takeUnretainedValue()
+        #else
+        let container = Unmanaged<UIView>.fromOpaque(try XCTUnwrap(view(handle))).takeUnretainedValue()
+        #endif
+        container.frame = CGRect(x: 0, y: 0, width: 160, height: 300)
+        #if os(macOS)
+        let window = NSWindow(contentRect: container.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView?.addSubview(container)
+        window.orderFront(nil)
+        defer { window.close() }
+        #else
+        let window = UIWindow(frame: container.frame)
+        window.rootViewController = UIViewController()
+        window.rootViewController?.view.addSubview(container)
+        window.isHidden = false
+        defer { window.isHidden = true }
+        #endif
+        let source = Bundle.module.url(forResource: "ColorFixtures", withExtension: nil)!.appendingPathComponent("sdr.mp4").absoluteString
+        var props = ["src": source, "paused": "true", "muted": "true", "playsinline": "true", "controls": "true", "objectFit": "contain", "objectPositionAuthored": "true"]
+        let data = try JSONSerialization.data(withJSONObject: props)
+        data.withUnsafeBytes { update(handle, $0.bindMemory(to: UInt8.self).baseAddress, data.count) }
+        waitFor("video placement", cap: 10) { !self.placedFrames.isEmpty }
+        let rect = try XCTUnwrap(placedFrames.last)
+        XCTAssertEqual(rect.minX, 0, accuracy: 0.01)
+        XCTAssertEqual(rect.maxY, 300, accuracy: 0.01)
+        XCTAssertLessThan(rect.height, 300)
+        let presentation = try XCTUnwrap(container.subviews.first)
+        XCTAssertEqual(presentation.frame, container.bounds, "AVKit's controls stay in the element")
+        #if os(macOS)
+        let overlay = try XCTUnwrap((presentation as? AVPlayerView)?.contentOverlayView)
+        let overlayLayer = try XCTUnwrap(overlay.layer)
+        #else
+        let overlay = try XCTUnwrap((presentation.next as? AVPlayerViewController)?.contentOverlayView)
+        let overlayLayer = overlay.layer
+        #endif
+        func pictureFrame() throws -> CGRect {
+            let picture = try XCTUnwrap(overlayLayer.sublayers?.compactMap { $0 as? AVPlayerLayer }.first)
+            return container.convert(picture.frame, from: overlay)
+        }
+        waitFor("positioned picture's first frame", cap: 10) {
+            overlayLayer.sublayers?.compactMap { $0 as? AVPlayerLayer }.first?.isReadyForDisplay == true
+        }
+        XCTAssertEqual(try pictureFrame(), rect)
+        offsetPicture = true
+        props["objectFit"] = "fill"
+        let offset = try JSONSerialization.data(withJSONObject: props)
+        offset.withUnsafeBytes { update(handle, $0.bindMemory(to: UInt8.self).baseAddress, offset.count) }
+        XCTAssertEqual(presentation.frame, container.bounds)
+        XCTAssertEqual(try pictureFrame(), CGRect(x: 161, y: 0, width: 160, height: 300))
+        #if os(macOS)
+        let playerView = try XCTUnwrap(presentation as? AVPlayerView)
+        playerView.delegate?.playerViewWillEnterFullScreen?(playerView)
+        XCTAssertFalse(overlayLayer.sublayers?.contains { $0 is AVPlayerLayer } ?? false)
+        playerView.delegate?.playerViewDidExitFullScreen?(playerView)
+        XCTAssertEqual(try pictureFrame(), CGRect(x: 161, y: 0, width: 160, height: 300))
+        #endif
+    }
 
     func testPlayingARefusedPlaylistDoesNotReportAnotherError() throws {
         #if os(macOS)
@@ -50,7 +131,7 @@ final class VideoPlayingTests: XCTestCase {
             let handle = try XCTUnwrap(create(Unmanaged.passUnretained(self).toOpaque(), { context, bytes, count in
                 let test = Unmanaged<VideoPlayingTests>.fromOpaque(context!).takeUnretainedValue()
                 test.messages.append(try! JSONSerialization.jsonObject(with: Data(bytes: bytes!, count: count)) as! [String: Any])
-            }, nil, nil))
+            }, nil, nil, nil))
             defer { destroy(handle) }
             messages = []
             var props = ["src": source, "muted": "true", "playsinline": "true", "exactListeners": "error"]
@@ -98,7 +179,7 @@ final class VideoPlayingTests: XCTestCase {
         let handle = try XCTUnwrap(create(Unmanaged.passUnretained(self).toOpaque(), { context, bytes, count in
             let test = Unmanaged<VideoPlayingTests>.fromOpaque(context!).takeUnretainedValue()
             test.messages.append(try! JSONSerialization.jsonObject(with: Data(bytes: bytes!, count: count)) as! [String: Any])
-        }, nil, nil))
+        }, nil, nil, nil))
         defer { destroy(handle) }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("local-playlist-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -160,7 +241,7 @@ final class VideoPlayingTests: XCTestCase {
             if event == "playing", let state = message["state"] as? [String: Any] {
                 test.playingTimes.append(state["currentTime"] as! Double)
             }
-        }, nil, nil))
+        }, nil, nil, nil))
         defer { destroy(handle) }
         let source = Bundle.module.url(forResource: "ColorFixtures", withExtension: nil)!.appendingPathComponent("sdr.mp4").absoluteString
         var props = ["src": source, "paused": "false", "muted": "true", "playsinline": "true",
@@ -196,7 +277,7 @@ final class VideoPlayingTests: XCTestCase {
             let test = Unmanaged<VideoPlayingTests>.fromOpaque(context!).takeUnretainedValue()
             let message = try! JSONSerialization.jsonObject(with: Data(bytes: bytes!, count: count)) as! [String: Any]
             test.events.append(message["event"] as! String)
-        }, nil, nil))
+        }, nil, nil, nil))
         var destroyed = false
         defer { if !destroyed { destroy(handle) } }
         let rawView = try XCTUnwrap(view(handle))
@@ -370,7 +451,7 @@ final class VideoPlayingTests: XCTestCase {
             let test = Unmanaged<VideoPlayingTests>.fromOpaque(context!).takeUnretainedValue()
             let message = try! JSONSerialization.jsonObject(with: Data(bytes: bytes!, count: count)) as! [String: Any]
             test.events.append(message["event"] as! String)
-        }, nil, nil))
+        }, nil, nil, nil))
         let source = Bundle.module.url(forResource: "ColorFixtures", withExtension: nil)!.appendingPathComponent("sdr.mp4").absoluteString
         let props = Props(["src": source, "paused": "false", "muted": "true", "playsinline": "true", "loop": "true",
                            "automaticallyWaitsToMinimizeStalling": "false",

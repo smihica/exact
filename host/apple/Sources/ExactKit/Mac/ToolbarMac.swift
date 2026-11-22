@@ -392,9 +392,7 @@ package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
     }
 
     /// A native button's prominent style is a prominent item, tinted by its
-    /// `accent-color`, in the macOS 26 design; every other button, and every
-    /// button in the earlier design, is the plain bordered item (LLP
-    /// 1069.011.000 D2).
+    /// `accent-color`, in the macOS 26 design (LLP 1069.011.000 D2).
     private func prominence(_ item: NSToolbarItem, _ node: NodeView, _ face: ButtonFace?) {
         guard #available(macOS 26.0, *) else { return }
         let prominent = LinkedDesign.liquidGlass
@@ -568,6 +566,8 @@ package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
         if let said { presenter.session?.log("window header: \(said)") }
     }
 
+    var showsInspector: Bool { presenter.navigation.stackSplit.hasInspector && presenter.navigation.stackSplit.window === window }
+
     package func sync() {
         guard !syncing else { return }
         let adopted = header?.segments
@@ -608,7 +608,8 @@ package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
         // hiding the tab bar on a screen takes the two away with the
         // sidebar; the toolbar stays, as it stays for a stack.
         let sidebar = presenter.sidebar.installed(in: window), sidebarItems = sidebar && presenter.sidebar.inToolbar(of: window)
-        guard declared != nil || header != nil || beside != nil || held || sidebar else { reset(); return }
+        let inspector = showsInspector
+        guard declared != nil || header != nil || beside != nil || held || sidebar || inspector else { reset(); return }
         // A host that takes its toolbar back wins. Never overwrite it on a tick.
         guard window.toolbar == nil || window.toolbar === toolbar else { refuse("window owner installed another toolbar"); return }
         // Whether a toolbar is customizable is said when it is made, with its identity.
@@ -713,7 +714,8 @@ package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
                 item.image = FaceSymbol.image(symbol, points: FaceSymbol.toolbarPoints)
                 symbols[node.id] = symbol
             }
-            item.isBordered = true
+            let bordered = face?.macos != "borderless"
+            if item.isBordered != bordered { item.isBordered = bordered }
             // A header's buttons before its heading lead the bar, ahead of the title, as Back does.
             let navigational = node.props["toolbarPlacement"] == "navigation" || over?.leading.contains { $0 === node } == true
             if item.isNavigational != navigational { item.isNavigational = navigational }
@@ -752,6 +754,10 @@ package final class WindowToolbarHost: NSObject, NSToolbarItemValidation {
         order = (sidebarItems ? [.toggleSidebar, .sidebarTrackingSeparator] : [])
             + (back ? [showsHistory ? Self.historyIdentifier : Self.backIdentifier] : [])
             + nextOrder + appItems.map(\.itemIdentifier)
+        if inspector {
+            if order.last != .flexibleSpace { order.append(.flexibleSpace) }
+            order.append(.toggleInspector)
+        }
         if customizing != nil {
             // The arrangement is the person's, which AppKit makes from the
             // default order or their saved one as the bar is attached: an

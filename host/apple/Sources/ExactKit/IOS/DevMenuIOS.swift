@@ -337,7 +337,7 @@ public enum DevMenu {
             lines.append("plan: baked")
         }
         lines.append("app dir: \(ExactApp.shared.assetRoot.path)")
-        if let failure = WidgetContainer.publicationFailure { lines.append("widget generation: \(failure)") }
+        if let failure = WidgetLink.publication?.publicationFailure { lines.append("widget generation: \(failure)") }
         if let s = ExactEnv.environment["EXACT_AGENT_SOCKET"] { lines.append("agent: \(s)") }
         if let session {
             let size = session.presenter.viewportSize

@@ -8,7 +8,7 @@ import { requireReleasePins } from '../game/inputs.mjs';
 // source closure and classifies everything per platform. Push publishes the
 // working tree's edit now, to every stream on the channel that can take it
 // whole, or to none (LLP 1030.007 D1). Both call the publisher
-// (publisher.mjs): each stream's signed head carries its cohort's receipt,
+// (publisher.mjs): each stream's signed head names its cohort's receipt by digest,
 // a stream with no head yet starts from the receipt of the production build
 // that made the installed binary (`build.mjs` with EXACT_UPDATE_TRUST=
 // production writes it beside the bake), and push bakes only what an update

@@ -32,18 +32,21 @@ fn focus_event(context: &Arc<Context>, node_id: FullNodeId) -> QueuedEvent {
     }
 }
 
+fn exposed_menu(node: &NodeRef) -> bool {
+    // The filter includes focused nodes even when explicitly hidden.
+    node.role() == Role::Menu && !node.is_hidden() && filter(node) == FilterResult::Include
+}
+
 fn menu_event(context: &Arc<Context>, node: &NodeRef, opened: bool) -> Option<QueuedEvent> {
-    (node.role() == Role::Menu && filter(node) == FilterResult::Include).then(|| {
-        QueuedEvent::Simple {
-            element: context
-                .get_or_create_platform_node(node.id())
-                .into_interface(),
-            event_id: if opened {
-                UIA_MenuOpenedEventId
-            } else {
-                UIA_MenuClosedEventId
-            },
-        }
+    exposed_menu(node).then(|| QueuedEvent::Simple {
+        element: context
+            .get_or_create_platform_node(node.id())
+            .into_interface(),
+        event_id: if opened {
+            UIA_MenuOpenedEventId
+        } else {
+            UIA_MenuClosedEventId
+        },
     })
 }
 
@@ -283,8 +286,8 @@ impl TreeChangeHandler for AdapterChangeHandler<'_> {
     }
 
     fn node_updated(&mut self, old_node: &NodeRef, new_node: &NodeRef) {
-        let was_menu = old_node.role() == Role::Menu && filter(old_node) == FilterResult::Include;
-        let is_menu = new_node.role() == Role::Menu && filter(new_node) == FilterResult::Include;
+        let was_menu = exposed_menu(old_node);
+        let is_menu = exposed_menu(new_node);
         if was_menu != is_menu {
             self.queue.extend(menu_event(
                 self.context,
@@ -364,7 +367,9 @@ impl TreeChangeHandler for AdapterChangeHandler<'_> {
     }
 
     fn focus_moved(&mut self, _old_node: Option<&NodeRef>, new_node: Option<&NodeRef>) {
-        if let Some(new_node) = new_node {
+        if let Some(new_node) =
+            new_node.filter(|node| node.role() != Role::Menu || !node.is_hidden())
+        {
             self.queue.push(focus_event(self.context, new_node.id()));
         }
     }
@@ -562,6 +567,21 @@ impl Adapter {
         }
     }
 
+    pub(crate) fn activate(&mut self, activation_handler: &mut (impl ActivationHandler + ?Sized)) {
+        if let State::Inactive {
+            hwnd,
+            is_window_focused,
+            action_handler,
+        } = &self.state
+        {
+            if let Some(initial_state) = activation_handler.request_initial_tree() {
+                let tree = Tree::new(initial_state, *is_window_focused);
+                self.state =
+                    State::Active(Context::new(*hwnd, tree, Arc::clone(action_handler), false));
+            }
+        }
+    }
+
     /// Handle the `WM_GETOBJECT` window message. The accessibility tree
     /// is lazily initialized if necessary using the provided
     /// [`ActivationHandler`] implementation.
@@ -588,37 +608,27 @@ impl Adapter {
             return None;
         }
 
+        self.activate(activation_handler);
         let (hwnd, platform_node) = match &self.state {
             State::Inactive {
                 hwnd,
                 is_window_focused,
                 action_handler,
-            } => match activation_handler.request_initial_tree() {
-                Some(initial_state) => {
-                    let hwnd = *hwnd;
-                    let tree = Tree::new(initial_state, *is_window_focused);
-                    let context = Context::new(hwnd, tree, Arc::clone(action_handler), false);
-                    let node_id = context.read_tree().state().root_id();
-                    let platform_node = context.get_or_create_platform_node(node_id);
-                    self.state = State::Active(context);
-                    (hwnd, platform_node)
-                }
-                None => {
-                    let hwnd = *hwnd;
-                    let placeholder_update = TreeUpdate {
-                        nodes: vec![(PLACEHOLDER_ROOT_ID, Node::new(Role::Window))],
-                        tree: Some(TreeInfo::new(PLACEHOLDER_ROOT_ID)),
-                        tree_id: TreeId::ROOT,
-                        focus: PLACEHOLDER_ROOT_ID,
-                    };
-                    let placeholder_tree = Tree::new(placeholder_update, *is_window_focused);
-                    let context =
-                        Context::new(hwnd, placeholder_tree, Arc::clone(action_handler), true);
-                    let platform_node = PlatformNode::unspecified_root(&context);
-                    self.state = State::Placeholder(context);
-                    (hwnd, platform_node)
-                }
-            },
+            } => {
+                let hwnd = *hwnd;
+                let placeholder_update = TreeUpdate {
+                    nodes: vec![(PLACEHOLDER_ROOT_ID, Node::new(Role::Window))],
+                    tree: Some(TreeInfo::new(PLACEHOLDER_ROOT_ID)),
+                    tree_id: TreeId::ROOT,
+                    focus: PLACEHOLDER_ROOT_ID,
+                };
+                let placeholder_tree = Tree::new(placeholder_update, *is_window_focused);
+                let context =
+                    Context::new(hwnd, placeholder_tree, Arc::clone(action_handler), true);
+                let platform_node = PlatformNode::unspecified_root(&context);
+                self.state = State::Placeholder(context);
+                (hwnd, platform_node)
+            }
             State::Placeholder(context) => (context.hwnd, PlatformNode::unspecified_root(context)),
             State::Active(context) => {
                 let node_id = context.read_tree().state().root_id();
@@ -687,6 +697,10 @@ impl QueuedEvents {
             match event {
                 QueuedEvent::Simple { element, event_id } => {
                     unsafe { UiaRaiseAutomationEvent(&element, event_id) }.unwrap();
+                    #[cfg(test)]
+                    if event_id == UIA_MenuClosedEventId {
+                        menu_tests::MENU_CLOSES.with(|count| count.set(count.get() + 1));
+                    }
                 }
                 QueuedEvent::PropertyChanged {
                     element,
@@ -715,9 +729,13 @@ impl QueuedEvents {
 unsafe impl Send for QueuedEvents {}
 
 #[cfg(test)]
-mod menu_tests {
+pub(crate) mod menu_tests {
     use super::*;
     use accesskit::{Action, ActionRequest, Toggled};
+
+    thread_local! {
+        pub(crate) static MENU_CLOSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     struct Ignore;
     impl ActionHandler for Ignore {
@@ -779,5 +797,91 @@ mod menu_tests {
             .unwrap()
             .update_and_process_changes(update(false), &mut handler);
         assert!(handler.queue.iter().any(|event| matches!(event, QueuedEvent::Simple { event_id, .. } if *event_id == UIA_MenuClosedEventId)));
+    }
+
+    pub(crate) fn popup(visible: bool, focus: NodeId) -> TreeUpdate {
+        let mut menu = Node::new(Role::Menu);
+        menu.set_label("Ember");
+        let mut nodes = Vec::new();
+        if visible {
+            menu.set_children([NodeId(2)]);
+            let mut exit = Node::new(Role::MenuItem);
+            exit.set_label("Exit");
+            exit.add_action(Action::Click);
+            nodes.push((NodeId(2), exit));
+        } else {
+            menu.set_hidden();
+        }
+        nodes.push((NodeId(0), menu));
+        TreeUpdate {
+            nodes,
+            tree: Some(TreeInfo::new(NodeId(0))),
+            tree_id: TreeId::ROOT,
+            focus,
+        }
+    }
+
+    struct HiddenPopup;
+    impl ActivationHandler for HiddenPopup {
+        fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
+            Some(popup(false, NodeId(0)))
+        }
+    }
+
+    #[test]
+    fn a_prepared_popup_serves_its_items_before_focus_and_announces_one_close() {
+        let mut adapter = Adapter {
+            state: State::Inactive {
+                hwnd: HWND::default().into(),
+                is_window_focused: false,
+                action_handler: Arc::new(ActionHandlerWrapper::new(Ignore)),
+            },
+        };
+        let events = |events: Option<QueuedEvents>| {
+            events
+                .expect("adapter has a tree")
+                .0
+                .into_iter()
+                .filter_map(|event| match event {
+                    QueuedEvent::Simple { event_id, .. } => Some(event_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        adapter.activate(&mut HiddenPopup);
+        assert_eq!(
+            events(adapter.update_if_active(|| popup(true, NodeId(0)))),
+            [UIA_MenuOpenedEventId]
+        );
+        assert!(
+            adapter
+                .handle_wm_getobject(
+                    WPARAM(0),
+                    LPARAM(UiaRootObjectId as isize),
+                    &mut HiddenPopup
+                )
+                .is_some()
+        );
+        {
+            let tree = adapter.embedding_context().unwrap().read_tree();
+            let root = tree.state().root();
+            assert_eq!(root.role(), Role::Menu);
+            assert_eq!(root.data().label(), Some("Ember"));
+            assert_eq!(root.children().next().unwrap().data().label(), Some("Exit"));
+        }
+        assert_eq!(
+            events(adapter.update_window_focus_state(true)),
+            [UIA_AutomationFocusChangedEventId]
+        );
+        assert_eq!(
+            events(adapter.update_if_active(|| popup(true, NodeId(2)))),
+            [UIA_AutomationFocusChangedEventId]
+        );
+        assert_eq!(
+            events(adapter.update_if_active(|| popup(false, NodeId(0)))),
+            [UIA_MenuClosedEventId]
+        );
+        assert!(events(adapter.update_window_focus_state(false)).is_empty());
+        assert!(events(adapter.update_if_active(|| popup(false, NodeId(0)))).is_empty());
     }
 }
