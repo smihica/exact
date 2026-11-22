@@ -1,16 +1,18 @@
 //! Ink frames on a Vulkan display plane. @ref LLP 1015 §6.
 use super::{block_on, checked, failure, Error, Instant, Result, TextureId, Wgpu};
-use ::wgpu::{hal::api::Vulkan, util::TextureBlitter};
+use ::wgpu::hal::api::Vulkan;
 use ash::{ext, khr, vk};
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod blit;
+
 /// A configured FIFO swapchain for one connector and mode.
 pub struct Scanout {
     output: Arc<Output>,
-    blitter: TextureBlitter,
+    blitter: blit::Blit,
     next_id: u64,
     upload: Option<::wgpu::Texture>,
     size: [u32; 2],
@@ -159,7 +161,7 @@ impl Scanout {
         };
         let blitter = checked(&device, &ink.errors, || {
             surface.configure(&device, &config);
-            TextureBlitter::new(&device, format)
+            blit::Blit::new(&device, format)
         })?;
         // SAFETY: this borrows the configured native surface and reads its handle.
         let chain = unsafe { surface.as_hal::<Vulkan>() }
@@ -223,11 +225,15 @@ impl Scanout {
             extent,
         );
         let view = texture.create_view(&Default::default());
-        self.present(&view)
+        self.present(&view, crate::Rotation::R0)
     }
 
-    /// Copy the completed Ink image to the swapchain and label its presentation.
-    pub fn present(&mut self, source: &::wgpu::TextureView) -> Result<QueuedFrame> {
+    /// Turn and copy the completed Ink image to the swapchain, then label its presentation.
+    pub fn present(
+        &mut self,
+        source: &::wgpu::TextureView,
+        rotation: crate::Rotation,
+    ) -> Result<QueuedFrame> {
         failure(&self.errors)?;
         let output = &self.output;
         let image = match output.surface.get_current_texture() {
@@ -254,7 +260,7 @@ impl Scanout {
         let view = image.texture.create_view(&Default::default());
         let mut encoder = output.device.create_command_encoder(&Default::default());
         self.blitter
-            .copy(&output.device, &mut encoder, source, &view);
+            .copy(&output.device, &mut encoder, source, &view, rotation);
         self.queue.submit([encoder.finish()]);
         self.queue.present(image);
         failure(&self.errors)?;

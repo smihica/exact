@@ -31,7 +31,7 @@ named in [issue #145](https://github.com/expo/exact/issues/145#issuecomment-7068
 | Defer clipped-row repainting and handle sticky headings separately | Independent upstream changes `e18de7e97` and `fc49f60b6` | Fork `adb9add81` was tested by comparing retained rendering with fresh paints. The same rich-list benchmark still needs a stock-upstream run. |
 | Five more fixed programs, flat interiors and less shape-distance work | Fork only | Pixel and timing checks on the fork, measured with the other rendering changes. |
 | Cache shadow geometry and draw exterior bands | Fork only | Shadow scenes, card lists and moving dialogs tested on the fork. Upstream’s shadow early return is a separate change. |
-| Fuse rotation into the final scanout copy and allow two outstanding frames | Earlier fork experiment, retired in this integration | Four fork orientations matched reference pixels before integration. The integrated build uses upstream presentation and its single outstanding frame. |
+| Rotate in the final scanout copy | Fork experiment on upstream direct presentation | The display takes one outstanding frame. The [matched Pi runs](#rotating-in-the-swapchain-copy) measure the effect of removing the intermediate texture. |
 | Downsample images without per-mip vertex and uniform buffers | Fork only | Fork mip readbacks matched the reference filter at five sizes on both Pi backends. |
 | Bounded reuse of idle bitmap textures | Fork only, opt-in | List A/Bs with 32 and 160 photos, plus a ten-minute reuse-on run. See [frame pacing](frame-pacing.md#fast-flicks-through-photographs). |
 | Connect hatches when a display receipt activates the session, including when newer input is dirty | Fork only | Fork regression tests and direct-display QR flow passed. |
@@ -63,6 +63,53 @@ Across those same windows, V3D render-engine time divided by completed frames
 rose from about 15.1 to 18.2 ms. Upstream's separate rotation pass and its wait
 for actual presentation before the next paint both differ from the earlier
 fork. These timings do not isolate their individual costs.
+
+### Rotating in the swapchain copy
+
+Starting from fork `9c8338955`, we turned the logical Ink texture as it was
+copied into the Vulkan swapchain. Each presentation still waits for its own
+display completion before the next frame. A connected VNC viewer uses the
+existing panel-oriented readback, which also supplies the local display.
+
+With only the rotation fused, the photo drag averaged 29.81 fps against
+29.83 fps on the integration. Both had a 33.34 ms p95 flip interval.
+V3D render time fell from 18.24 to 17.09 ms per completed flip.
+These were two 16-second drags per build, alternating the order in two
+pairs, with the same app, photographs, gestures and 60 Hz panel. Fast
+flicks went from 27.62 to 28.21 fps. Opening the dialog went from 30.00
+to 31.43 fps. Closing it and showing live video both ran at about 30 fps.
+
+The copy covers the entire swapchain image with blending disabled. Clearing
+the attachment at the start of that pass lets wgpu initialize it in the
+same pass. We compared the fused copy with `Load` and `Clear` in that order.
+Each build ran one 16-second drag, three flicks and three dialog cycles.
+
+| Physical panel | Fused copy with Load | Fused copy with Clear |
+| --- | ---: | ---: |
+| Photo drag, fps | 29.94 | 29.94 |
+| Photo drag, V3D render ms per completed flip | 17.03 | 15.47 |
+| Fast photo flick, fps | 29.29 | 29.64 |
+| Dialog opening / closing, pooled fps | 30.00 / 30.00 | 49.09 / 49.09 |
+
+With Clear, the first two dialog cycles reached 57–60 fps and the third
+ran at 30 fps. The V3D counter covers render-engine work. At 60 Hz, the
+whole frame must reach the display every 16.67 ms.
+
+A separate four-second drag traced all 119 physical flips on the final build.
+All 118 intervals spanned two refreshes. From the preceding flip, the first
+GPU submission occurred at a median 7.87 ms and the last render-complete
+interrupt at 23.82 ms, 7.16 ms past the next vblank. The KMS atomic request
+had already succeeded at a median 9.09 ms. The trace does not separate host
+wakeup, scene preparation and driver submission within the first 7.87 ms.
+
+We compared the active panel framebuffer for the same static home screen.
+At 180°, the fused result matched an exact 180° rotation of its 0° capture
+in all 1,024,000 pixels. The separate rotation pass differed in 7,685 pixels,
+by at most two levels per 8-bit channel. At 90°, the two builds differed
+in 8,750 pixels, also by at most two levels. At 90°, the panel matched the
+integration while a VNC viewer was connected and returned to its previous
+pixels after disconnect. Load and Clear produced identical panel captures
+for all four rotations and all three viewer states.
 
 ### Stock direct presentation on the physical panel
 

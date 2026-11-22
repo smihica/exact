@@ -20,6 +20,8 @@ mod list_rows;
 mod live;
 mod media_session;
 mod presence;
+#[cfg(target_os = "linux")]
+mod scanout;
 mod svg;
 mod timeline;
 mod top_layer;

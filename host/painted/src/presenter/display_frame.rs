@@ -90,7 +90,9 @@ pub enum PanelImage {
     Ink {
         /// The view for the carrier to submit before painting another frame.
         view: wgpu::TextureView,
-        /// A readback of this target when a CPU reader needs the picture.
+        /// Clockwise turn from the view to the panel.
+        rotation: crate::paint::Rotation,
+        /// Panel-oriented pixels when a CPU reader needs the picture.
         pixels: Option<Arc<Pixmap>>,
     },
 }
@@ -261,8 +263,14 @@ impl<D: DataSource> Presenter<D> {
                     crate::paint::FrameTarget::Scanout { readback: mirror },
                     false,
                 );
-                if let Some(view) = p.brush.take_scanout().filter(|_| p.last_frame_succeeded) {
-                    return PanelImage::Ink { view, pixels };
+                if let Some((view, rotation)) =
+                    p.brush.take_scanout().filter(|_| p.last_frame_succeeded)
+                {
+                    return PanelImage::Ink {
+                        view,
+                        rotation,
+                        pixels,
+                    };
                 }
                 return PanelImage::Pixels(
                     pixels.expect("a CPU display fallback returns its image"),

@@ -385,7 +385,7 @@ pub trait Backend {
     fn finish_rotated(&mut self, _rotation: exact_ink::Rotation) -> Option<Result<Pixmap, String>> {
         None
     }
-    /// Finish in panel orientation on the GPU. A VNC mirror reads the same image.
+    /// Finish on the GPU with the requested rotation. A mirror reads the same image.
     #[cfg(target_os = "linux")]
     fn finish_scanout(
         &mut self,
