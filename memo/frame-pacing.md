@@ -1,5 +1,9 @@
 # Ink frame pacing on a portrait display
 
+These measurements cover the fork before it adopted upstream Vulkan
+presentation. The [integration comparison](kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream)
+repeats the list, dialog and camera workloads with upstream `9c348ab33`.
+
 The same release app and animated scenes were run against the fork's
 [`c45a69086`](https://github.com/smihica/exact/commit/c45a69086b7121c5c4fe90fde1fc504ef6fa4e11)
 and this change on a Raspberry Pi 4. Both used the Vulkan direct path on a

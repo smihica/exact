@@ -26,7 +26,8 @@ assesses its value to upstream, and records the measurements and open questions.
 ## Runtime switches
 
 Set `EXACT_PAINTER=ink` and `WGPU_BACKEND=vulkan` for Linux direct
-presentation. Select the display device with `EXACT_DRM`. The host reports
+presentation. Select the display device with `EXACT_DRM` to use the direct
+host even when launching from a Wayland session. The host reports
 `direct Vulkan` at startup when the driver supports presentation IDs and
 waits. On failure it reports the reason and uses KMS dumb buffers.
 Existing app manifests can keep their `scanout` feature.
@@ -36,7 +37,9 @@ that enables wgpu's GLES backend; the direct display path is Vulkan-only.
 Ink compiles thirteen fixed material and clip combinations at device creation.
 Large unclipped solid fills use a flat-color pipeline for their interior.
 The upstream display host tracks completed presentations and rotates on the GPU.
-See [the frame-pacing measurements](memo/frame-pacing.md) for the configurations tested.
+With this integration, a Pi 4 on a 60 Hz portrait panel averaged 29.8 fps
+on the same photo-list drag that reached 59.9 fps with the previous fork.
+See the [matched integration runs](memo/kiosk-upstream.md#rich-list-and-dialog-after-merging-upstream).
 
 The other experimental switches are `KIOSK_TOUCH_SCROLL=1`,
 `KIOSK_DIALOG_FADE=1`, `KIOSK_CAMERA=1`, `KIOSK_SHADOW_CACHE=1` and
