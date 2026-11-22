@@ -92,14 +92,16 @@ Each build ran one 16-second drag, three flicks and three dialog cycles.
 | Dialog opening / closing, pooled fps | 30.00 / 30.00 | 49.09 / 49.09 |
 
 With Clear, the first two dialog cycles reached 57–60 fps and the third
-ran at 30 fps. The V3D counter covers render-engine work. At 60 Hz, the
-whole frame must reach the display every 16.67 ms.
+ran at 30 fps. A repeat with six cycles averaged 34.69 fps opening and
+34.74 fps closing. Live preview from a 30 fps camera and the dialog over
+live video both ran at 30 fps. The V3D counter covers render-engine work.
+At 60 Hz, the whole frame must reach the display every 16.67 ms.
 
 A separate four-second drag traced all 119 physical flips on the final build.
 All 118 intervals spanned two refreshes. From the preceding flip, the first
 GPU submission occurred at a median 7.87 ms and the last render-complete
-interrupt at 23.82 ms, 7.16 ms past the next vblank. The KMS atomic request
-had already succeeded at a median 9.09 ms. The trace does not separate host
+interrupt at 23.82 ms, 7.16 ms past the next vblank. The successful KMS
+atomic requests started at a median 9.09 ms. The trace does not separate host
 wakeup, scene preparation and driver submission within the first 7.87 ms.
 
 We compared the active panel framebuffer for the same static home screen.
